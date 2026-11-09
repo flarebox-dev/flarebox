@@ -15,6 +15,8 @@ Pinned data:
 
 Implementations must produce the results of those versions. Under the Unicode stability policies, the case folding and normalization of an assigned code point never change. A library built on an earlier version therefore gives the pinned result for every name whose code points are all assigned in that version.
 
+Known limitation: names with code points that the server's normalization data treats as unassigned are still accepted. A user who could not sync a file at all would be worse off. On such a name, a server runtime whose ICU is older than 18.0.0 can compute a key that differs from the pinned one, so two names that differ only by case or canonical form may both stay live. This lasts until the runtime catches up.
+
 The server computes `name_key` and is the only party that enforces uniqueness among live siblings. A client that computes a different key has only mispredicted a clash, and the server resolves it with R1 or R2.
 
 The versions belong to the space format (§9.2). Moving to a newer Unicode version raises `format_version`, and the server recomputes every stored `name_key` in that migration. The RFC that raises the version defines how a clash created by the new data is resolved.
