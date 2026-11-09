@@ -669,6 +669,38 @@ fn a_parked_edit_whose_node_was_removed_remotely_goes_back_to_its_place() {
 }
 
 #[test]
+fn a_parked_edit_that_the_remote_tree_matches_is_still_moved_out() {
+    let (mut trees, mut disk) = space(&[("f", Some(file(ROOT, "a", 1)), Some(file(ROOT, "A", 2)))]);
+    trees.settle();
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    let park = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    disk.apply(&park.effect).unwrap();
+    effects.done(&mut trees, &park.effect_id, None).unwrap();
+    let mut observed = trees.local().get("f").unwrap().clone();
+    observed.shape.content = Some(content(3));
+    disk.entries.get_mut(&1).unwrap().content = Some(content(3));
+    trees.set_local("f".into(), observed);
+    trees.set_remote("f".into(), remote(file(ROOT, "a", 3)));
+    assert_eq!(trees.class("f"), Class::Same);
+    trees.settle();
+    assert_eq!(trees.class("f"), Class::InSync);
+    assert!(trees.dirty().contains("f"));
+    let out = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    assert_eq!(
+        out.effect,
+        Effect::Move {
+            from: Location::Parked("f".into()),
+            identity: identity(1),
+            to: root_at("a")
+        }
+    );
+    disk.apply(&out.effect).unwrap();
+    effects.done(&mut trees, &out.effect_id, None).unwrap();
+    disk.matches(&trees).unwrap();
+    assert_in_sync(&mut trees);
+}
+
+#[test]
 fn done_takes_only_the_effect_in_flight_and_a_created_entry_needs_its_identity() {
     let (mut trees, _) = space(&[("d", None, Some(dir(ROOT, "d")))]);
     trees.settle();

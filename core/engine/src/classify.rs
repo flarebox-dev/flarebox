@@ -128,6 +128,11 @@ impl Trees {
                 class => work.push((id, class)),
             }
         }
+        let parked: Vec<NodeId> = pending
+            .iter()
+            .filter(|id| self.l.get(id).is_some_and(|node| node.parked))
+            .cloned()
+            .collect();
         self.unsearched.clear();
         loop {
             let before = pending.len();
@@ -140,6 +145,10 @@ impl Trees {
                 break;
             }
             pending.retain(|id| !taken.contains(id));
+        }
+        for id in parked.into_iter().filter(|id| !pending.contains(id)) {
+            let class = self.class(&id);
+            work.push((id, class));
         }
         work.extend(pending.into_iter().map(|id| (id, Class::Same)));
         work.sort_by(|a, b| a.0.cmp(&b.0));
