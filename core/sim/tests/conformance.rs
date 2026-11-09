@@ -68,12 +68,21 @@ fn main() {
     }
 }
 
-/// Mutations of the first scenario that a correct runner must reject, each with the failure it
-/// must report. The first two once passed.
+/// The scenario whose missing-chunk list is longer than one error can carry.
+const LONG_MISSING_LIST: &str = "a-long-missing-chunk-list-is-capped-and-the-resent-commit-applies";
+
+/// Mutations of a scenario that a correct runner must reject, each with the failure it must
+/// report. The first two and the total once passed.
 fn self_tests(doc: &Value) -> Vec<(&'static str, Outcome)> {
     let base = &doc["scenarios"][0];
-    let mutate = |edit: &dyn Fn(&mut Value), reason: &str| -> Outcome {
-        let mut scenario = base.clone();
+    let long = doc["scenarios"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|s| s["name"] == LONG_MISSING_LIST)
+        .unwrap_or(&Value::Null);
+    let mutate = |scenario: &Value, edit: &dyn Fn(&mut Value), reason: &str| -> Outcome {
+        let mut scenario = scenario.clone();
         edit(&mut scenario);
         match run(doc, &scenario) {
             Ok(()) => Err("the mutated scenario passed".into()),
@@ -85,6 +94,7 @@ fn self_tests(doc: &Value) -> Vec<(&'static str, Outcome)> {
         (
             "a-literal-id-in-an-expectation-is-compared",
             mutate(
+                base,
                 &|s| s["steps"][2]["nodes"][0]["parent"] = "=not-the-root".into(),
                 "step 3: f1.parent: expected not-the-root",
             ),
@@ -92,6 +102,7 @@ fn self_tests(doc: &Value) -> Vec<(&'static str, Outcome)> {
         (
             "an-assertion-of-the-wrong-type-fails",
             mutate(
+                base,
                 &|s| s["steps"][0]["expect"]["seq"] = "999".into(),
                 "step 1: seq must be a non-negative integer",
             ),
@@ -99,6 +110,7 @@ fn self_tests(doc: &Value) -> Vec<(&'static str, Outcome)> {
         (
             "an-unknown-assertion-key-fails",
             mutate(
+                base,
                 &|s| {
                     let expect = s["steps"][0]["expect"].as_object_mut().unwrap();
                     let seq = expect.remove("seq").unwrap();
@@ -110,6 +122,7 @@ fn self_tests(doc: &Value) -> Vec<(&'static str, Outcome)> {
         (
             "a-field-for-the-other-branch-fails",
             mutate(
+                base,
                 &|s| s["steps"][0]["expect"]["missing"] = 123.into(),
                 "step 1: unknown field missing in expect",
             ),
@@ -117,8 +130,17 @@ fn self_tests(doc: &Value) -> Vec<(&'static str, Outcome)> {
         (
             "a-wrong-numeric-assertion-fails",
             mutate(
+                base,
                 &|s| s["steps"][0]["expect"]["seq"] = 999.into(),
                 "step 1: seq 1, expected 999",
+            ),
+        ),
+        (
+            "a-total-that-is-only-the-listed-count-fails",
+            mutate(
+                long,
+                &|s| s["steps"][0]["expect"]["missing_some"]["total"] = 1000.into(),
+                "does not give the total 1000 first",
             ),
         ),
         ("the-unmutated-scenario-passes", run(doc, base)),
@@ -858,13 +880,13 @@ impl Run {
                         return Err(format!("missing chunk {} is not in contents", hex(hash)));
                     }
                     let total = req(opt_u64(some, "total"), "total")?.to_string();
-                    if !e
+                    let first = e
                         .message
                         .split(|c: char| !c.is_ascii_digit())
-                        .any(|number| number == total)
-                    {
+                        .find(|number| !number.is_empty());
+                    if first != Some(total.as_str()) {
                         return Err(format!(
-                            "message {:?} does not give the total {total}",
+                            "message {:?} does not give the total {total} first",
                             e.message
                         ));
                     }

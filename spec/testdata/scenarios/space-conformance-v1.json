@@ -14,7 +14,7 @@
     "Ops: create_dir {node, parent, name}; create_file {node, parent, name, content}; update_content {node, content}; move {node, parent, name}; delete {node}; restore {node, version?, parent?, name?} where absent fields are empty; empty {} is an Op with no op set. Two macros expand in place: {repeat: n, op} is n copies of op, and create_dir_chain {prefix, parent, count} creates directories prefix1 to prefixN, each named after its symbol and each inside the previous one, the first inside parent.",
     "commit: commit_id is a symbol (a fresh ID when absent), base_seq is sent as given. Unless upload is false, the runner first uploads every chunk of the contents the ops reference (PrepareUpload in batches of at most 1,000 distinct chunks, then a PUT for each chunk the plan says to upload) and sends the receipts it got. With upload false it sends the receipts that the device's earlier upload steps got in the space named by receipts_from (the step's space by default), each with its size increased by receipt_size_delta when that is set.",
     "upload {contents}: PrepareUpload and PUT for those contents' chunks; the receipts are kept for the device in that space. upload {last_missing: true} does the same for the chunks that the device's last MISSING_CHUNKS error from a commit in that space listed, each a chunk of some content. prepare_upload {chunks} or {contents} sends one PrepareUpload; expect.actions lists the action of each distinct chunk in order.",
-    "Commit expectations: error is the whole-call error code; missing lists content symbols whose chunk hashes must be exactly the error's missing_chunks; missing_some {contents, count, total} requires that missing_chunks holds exactly count hashes, each a chunk of those contents, and that the error's message contains total as a decimal number. Otherwise seq, results (one per op, in order; code, and where given node, name and reason, compared exactly) and changed (the node symbols with a NodeState in the result's changes, compared as a set).",
+    "Commit expectations: error is the whole-call error code; missing lists content symbols whose chunk hashes must be exactly the error's missing_chunks; missing_some {contents, count, total} requires that missing_chunks holds exactly count hashes, each a chunk of those contents, and that the first decimal number in the error's message is total. Otherwise seq, results (one per op, in order; code, and where given node, name and reason, compared exactly) and changed (the node symbols with a NodeState in the result's changes, compared as a set).",
     "list_versions {node, cursor, limit}: cursor is absent (empty), a literal written with =, or {returned: k}, the next_cursor an earlier step bound to k; limit is 0 when absent. Expectations: error, count (the number of versions), versions (each with version symbol, seq and content) and next_cursor, which is either empty (the last page) or {bind: k}, which requires another page and keeps its cursor as k without looking inside it.",
     "nodes: each entry names a node and the fields it must have: parent, name, kind (DIR or FILE), status (LIVE or TRASHED), content_rev, meta_rev, trash_group (a symbol, or null for none), content (a content symbol, compared by size, manifest digest, executable bit and mtime_ns), or absent: true when the server must not know the node. live lists every live node other than the root, as a set. head is the space's head_seq.",
     "Expected values are written by hand from the spec, RFC 0001 and RFC 0002 section 11, not produced by either implementation.",
@@ -4410,10 +4410,11 @@
       ]
     },
     {
-      "name": "a-receipt-holds-only-for-its-space-chunk-size-and-hour",
+      "name": "a-receipt-holds-only-in-its-space-and-a-stored-object-stands-in-for-a-bad-one",
       "covers": [
         "regression 8",
-        "spec 8 step 4"
+        "spec 8 step 4",
+        "RFC 0002 section 11"
       ],
       "devices": {
         "a": {
@@ -4508,53 +4509,6 @@
             ]
           },
           "expect": {
-            "error": "MISSING_CHUNKS",
-            "missing": [
-              "c1"
-            ]
-          }
-        },
-        {
-          "device": "a",
-          "commit": {
-            "base_seq": 0,
-            "upload": false,
-            "ops": [
-              {
-                "create_file": {
-                  "node": "f",
-                  "parent": "root",
-                  "name": "f",
-                  "content": "c1"
-                }
-              }
-            ]
-          },
-          "expect": {
-            "error": "MISSING_CHUNKS",
-            "missing": [
-              "c1"
-            ]
-          },
-          "at_ms": 1794272340001
-        },
-        {
-          "device": "a",
-          "commit": {
-            "base_seq": 0,
-            "upload": false,
-            "ops": [
-              {
-                "create_file": {
-                  "node": "f",
-                  "parent": "root",
-                  "name": "f",
-                  "content": "c1"
-                }
-              }
-            ]
-          },
-          "expect": {
             "seq": 1,
             "results": [
               {
@@ -4562,8 +4516,7 @@
               }
             ]
           },
-          "at_ms": 1794272340000,
-          "reference_only": "Spec v0 section 8 gives a receipt one hour but does not say whether its last millisecond is inside that hour; the server and the reference accept it."
+          "at_ms": 1794272340001
         }
       ]
     },
@@ -4935,6 +4888,124 @@
               "kind": "FILE",
               "status": "LIVE",
               "content": "big"
+            }
+          ],
+          "live": [
+            "f"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "receipts-that-expire-between-resends-give-way-to-the-stored-objects",
+      "covers": [
+        "RFC 0002 section 11",
+        "spec 8 step 4"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        }
+      },
+      "contents": {
+        "early": {
+          "chunks": [
+            {
+              "text": "early"
+            }
+          ]
+        },
+        "late": {
+          "chunks": [
+            {
+              "text": "late"
+            }
+          ]
+        },
+        "both": {
+          "chunks": [
+            {
+              "text": "early"
+            },
+            {
+              "text": "late"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "upload": {
+            "contents": [
+              "early"
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "commit_id": "c",
+            "base_seq": 0,
+            "upload": false,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "f",
+                  "content": "both"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "MISSING_CHUNKS",
+            "missing": [
+              "late"
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "upload": {
+            "last_missing": true
+          },
+          "at_ms": 1794272340001
+        },
+        {
+          "device": "a",
+          "commit": {
+            "commit_id": "c",
+            "base_seq": 0,
+            "upload": false,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "f",
+                  "content": "both"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          },
+          "at_ms": 1794272340001
+        },
+        {
+          "head": 1,
+          "nodes": [
+            {
+              "node": "f",
+              "content": "both"
             }
           ],
           "live": [
