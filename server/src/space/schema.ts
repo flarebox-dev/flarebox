@@ -65,6 +65,9 @@ const MIGRATIONS: (string | ((sql: SqlStorage) => void))[] = [
     if (!columns.includes("head_checked")) sql.exec("ALTER TABLE chunks ADD COLUMN head_checked INTEGER NOT NULL DEFAULT 0");
     sql.exec("CREATE TABLE IF NOT EXISTS orphans (key TEXT PRIMARY KEY, hash BLOB NOT NULL, incarnation TEXT NOT NULL)");
   },
+  `
+  CREATE TABLE IF NOT EXISTS rewind_markers (rewind_id TEXT NOT NULL, attempt INTEGER NOT NULL, PRIMARY KEY (rewind_id, attempt));
+  `,
 ];
 
 export function migrate(sql: SqlStorage): void {

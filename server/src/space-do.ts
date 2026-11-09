@@ -55,6 +55,7 @@ import { type Identity, verifyAccessToken } from "./auth";
 import { type ChunkObject, sha256, signChunkGrant, verifyChunkGrant } from "./crypto";
 import { fromHex, isUuidV7, toHex, uuidv7 } from "./ids";
 import { type ApplyContext, CallFailure, CommitApplier } from "./space/commit";
+import { type Pitr, pitrBackend } from "./space/pitr";
 import { ChunkState, migrate } from "./space/schema";
 import {
   chunkKey,
@@ -105,6 +106,8 @@ const GC_BATCH = 1000;
 const GC_RETRY_MS = 10 * 60_000;
 const R2_DELETE_BATCH = 1000;
 const ORPHAN_SWEEP_MS = 7 * DAY_MS;
+/** While a rewind holds the space closed, the alarm runs no work and checks again this much later (RFC 0003 section 4). */
+const CLOSED_RECHECK_MS = 10 * 60_000;
 
 export type Role = "owner" | "editor" | "viewer";
 
@@ -114,7 +117,14 @@ export const CONNECT_HEADER = "X-Flarebox-Connect";
 export const TOKEN_GRACE_MS = 60_000;
 
 /** WebSocket close codes. */
-export const Close = { TRY_AGAIN_LATER: 1013, PROTOCOL: 4000, TOKEN_EXPIRED: 4001, UNSUPPORTED_VERSION: 4002, DEVICE_REVOKED: 4003 } as const;
+export const Close = {
+  TRY_AGAIN_LATER: 1013,
+  PROTOCOL: 4000,
+  TOKEN_EXPIRED: 4001,
+  UNSUPPORTED_VERSION: 4002,
+  DEVICE_REVOKED: 4003,
+  SPACE_REWOUND: 4004,
+} as const;
 
 export interface Connect {
   identity: Identity;
@@ -150,6 +160,26 @@ export interface SpaceSettings {
 }
 
 const DEFAULT_SETTINGS: SpaceSettings = { version_retention_days: 30, trash_retention_days: 30, chunk_grace_days: 30 };
+
+/** What the Account DO hands the Space DO to complete a rewind (RFC 0003 section 3, step 4). */
+export interface RewindCompletion {
+  rewindId: string;
+  attempt: number;
+  historyId: string;
+  rewindNumber: number;
+  restorePointMs: number;
+  completedAtMs: number;
+  revokedDevices: string[];
+  retired: { hashHex: string; incarnation: string }[];
+}
+
+/** Stored in meta when a rewind completes, so a repeated completion call returns it again. */
+export interface RewindReceipt {
+  rewindId: string;
+  historyId: string;
+  restoreSeq: number;
+  completedAtMs: number;
+}
 
 export interface GcReport {
   expiredVersions: number;
@@ -248,6 +278,7 @@ function fitPage<R, T>(rows: R[], build: (row: R) => T, encodedSize: (item: T) =
 /** One per space: tree, versions, chunks and the commit log. */
 export class SpaceDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
+  private readonly pitr: Pitr;
   private spaceKeyCache: Uint8Array | undefined;
   /** The time source for holds, retention and tickets. Tests replace it to move through days. */
   clock: () => number = () => Date.now();
@@ -255,6 +286,7 @@ export class SpaceDO extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
+    this.pitr = pitrBackend.open(ctx);
     ctx.storage.transactionSync(() => migrate(this.sql));
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
@@ -330,9 +362,10 @@ export class SpaceDO extends DurableObject<Env> {
     if (message.byteLength > MAX_CLIENT_FRAME) return this.goodbye(ws, Close.PROTOCOL, "message larger than 8 MiB");
     const attachment = ws.deserializeAttachment() as Attachment;
     if (this.clock() > attachment.identity.expiresAtMs + TOKEN_GRACE_MS) return this.goodbye(ws, Close.TOKEN_EXPIRED, "access token expired");
-    const active = await this.deviceActive(attachment.identity.deviceId);
-    if (active === undefined) return this.goodbye(ws, Close.TRY_AGAIN_LATER, "could not check the device; reconnect later");
-    if (!active) return this.goodbye(ws, Close.DEVICE_REVOKED, "device revoked");
+    const check = await this.checkDevice(attachment.identity.deviceId);
+    if (check === undefined) return this.goodbye(ws, Close.TRY_AGAIN_LATER, "could not check the device; reconnect later");
+    if (!check.active) return this.goodbye(ws, Close.DEVICE_REVOKED, "device revoked");
+    if (check.closed) return this.goodbye(ws, Close.SPACE_REWOUND, "the space is being rewound");
     if (ws.readyState !== WebSocket.OPEN) return;
     let msg;
     try {
@@ -373,23 +406,30 @@ export class SpaceDO extends DurableObject<Env> {
 
   /**
    * Asks the Account DO whether the device is still active, so a revocation stops the device even before its notice
-   * reaches this space, and remembers a refusal. Other events wait, so messages of one connection keep their order.
-   * Returns undefined when the Account DO cannot answer; the error is caught inside the callback, because an
-   * exception there would reset this object and drop every connection.
+   * reaches this space, and remembers a refusal. It also says whether a rewind holds the space closed (RFC 0003
+   * section 4). Other events wait, so messages of one connection keep their order. Returns undefined when the Account
+   * DO cannot answer; the error is caught inside the callback, because an exception there would reset this object and
+   * drop every connection.
    */
-  private async deviceActive(deviceId: string): Promise<boolean | undefined> {
-    if (this.revoked(deviceId)) return false;
+  private async checkDevice(deviceId: string): Promise<{ active: boolean; closed: boolean } | undefined> {
+    if (this.revoked(deviceId)) return { active: false, closed: false };
     const account = this.account();
-    const active = await this.ctx.blockConcurrencyWhile(async () => {
+    const spaceId = String(getMeta(this.sql, "space_id"));
+    const check = await this.ctx.blockConcurrencyWhile(async () => {
       try {
-        return await account.isDeviceActive(deviceId);
+        return await account.checkSession(deviceId, spaceId);
       } catch (error) {
         console.error("account device check failed", error);
         return undefined;
       }
     });
-    if (active === false) this.recordRevoked(deviceId);
-    return active;
+    if (check?.active === false) this.recordRevoked(deviceId);
+    return check;
+  }
+
+  /** A rewind of this space has written its marker and not yet restored or aborted (RFC 0003 section 3). */
+  private checkOpen(): void {
+    if (this.sql.exec("SELECT 1 FROM rewind_markers LIMIT 1").toArray().length > 0) fail(Error_Code.RETRY_LATER, "the space is being rewound");
   }
 
   /** Closes connections whose access token expired more than a minute ago; returns when to check next. */
@@ -516,9 +556,10 @@ export class SpaceDO extends DurableObject<Env> {
     if (!identity || identity.deviceId !== attachment.identity.deviceId || identity.userId !== attachment.identity.userId) {
       return this.goodbye(ws, Close.TOKEN_EXPIRED, "invalid access token");
     }
-    const active = await this.deviceActive(identity.deviceId);
-    if (active === undefined) return this.goodbye(ws, Close.TRY_AGAIN_LATER, "could not check the device; reconnect later");
-    if (!active) return this.goodbye(ws, Close.DEVICE_REVOKED, "device revoked");
+    const check = await this.checkDevice(identity.deviceId);
+    if (check === undefined) return this.goodbye(ws, Close.TRY_AGAIN_LATER, "could not check the device; reconnect later");
+    if (!check.active) return this.goodbye(ws, Close.DEVICE_REVOKED, "device revoked");
+    if (check.closed) return this.goodbye(ws, Close.SPACE_REWOUND, "the space is being rewound");
     const current = ws.deserializeAttachment() as Attachment;
     current.identity = identity;
     ws.serializeAttachment(current);
@@ -533,6 +574,7 @@ export class SpaceDO extends DurableObject<Env> {
   async call(session: Session, request: RpcRequest): Promise<{ response: RpcResponse; record?: CommitRecord }> {
     const reqId = request.reqId;
     try {
+      this.checkOpen();
       const call = request.call;
       switch (call.case) {
         case "commit": {
@@ -682,6 +724,7 @@ export class SpaceDO extends DurableObject<Env> {
 
     return this.ctx.storage.transactionSync(() => {
       if (this.revoked(session.deviceId)) fail(Error_Code.UNAUTHENTICATED, "device revoked");
+      this.checkOpen();
       const again = this.checkCommitOrder(session.deviceId, commit);
       if (again) return { result: again };
       const head = this.headSeq;
@@ -798,8 +841,9 @@ export class SpaceDO extends DurableObject<Env> {
     const chunks = [...byHash.values()];
     const nowMs = this.clock();
     const holdUntil = nowMs + HOLD_MS;
-    const actions = this.ctx.storage.transactionSync(() =>
-      chunks.map((chunk): { action: ChunkPlan_Action; incarnation?: string } => {
+    const actions = this.ctx.storage.transactionSync(() => {
+      this.checkOpen();
+      return chunks.map((chunk): { action: ChunkPlan_Action; incarnation?: string } => {
         const row = this.sql.exec("SELECT size, state, incarnation FROM chunks WHERE hash = ?", chunk.hash).toArray()[0];
         if (!row) {
           const incarnation = this.allocateIncarnation();
@@ -821,8 +865,8 @@ export class SpaceDO extends DurableObject<Env> {
         const incarnation = this.allocateIncarnation();
         this.sql.exec("UPDATE chunks SET incarnation = ? WHERE hash = ?", incarnation, chunk.hash);
         return { action: ChunkPlan_Action.UPLOAD, incarnation };
-      }),
-    );
+      });
+    });
     const expiresAtMs = nowMs + GRANT_MS;
     const spaceId = this.spaceId;
     const plans = [];
@@ -1050,6 +1094,98 @@ export class SpaceDO extends DurableObject<Env> {
     };
   }
 
+  /**
+   * Rewind admission (RFC 0003 section 3, step 1): the current history and head, whether the history's descriptor is
+   * durable, and the bookmark for the restore point. Changes nothing. The R2 metadata export of section 7 is not
+   * implemented yet, so no descriptor is awaited.
+   */
+  async rewindInfo(restorePointMs: number): Promise<{ historyId: string; headSeq: number; descriptorDurable: boolean; bookmark: string }> {
+    const bookmark = await this.pitr.bookmarkForTime(restorePointMs);
+    return { historyId: String(getMeta(this.sql, "history_id")), headSeq: this.headSeq, descriptorDurable: true, bookmark };
+  }
+
+  /**
+   * Step 2: closes every socket with 4004, writes the attempt's marker once, and reports whether the bookmark B to
+   * restore is earlier than the bookmark M read after the marker.
+   */
+  async rewindPrepare(args: { rewindId: string; attempt: number; bookmark: string }): Promise<{ historyId: string; headSeq: number; earlier: boolean }> {
+    for (const ws of this.ctx.getWebSockets()) this.goodbye(ws, Close.SPACE_REWOUND, "the space is being rewound");
+    this.sql.exec("INSERT INTO rewind_markers (rewind_id, attempt) VALUES (?, ?) ON CONFLICT DO NOTHING", args.rewindId, args.attempt);
+    await this.ctx.storage.sync();
+    const marked = await this.pitr.currentBookmark();
+    return { historyId: String(getMeta(this.sql, "history_id")), headSeq: this.headSeq, earlier: args.bookmark < marked };
+  }
+
+  /** Step 3: arms the restore of B and restarts the object, so the call always ends in an error. */
+  async rewindArm(bookmark: string): Promise<void> {
+    await this.pitr.restoreOnNextStart(bookmark);
+    this.ctx.abort("restarting to restore the space");
+  }
+
+  /** Restarts the object, so that a restore armed earlier has applied when it next answers (step 4). */
+  async restart(): Promise<void> {
+    this.ctx.abort("restarting");
+  }
+
+  /** Step 6: removes the markers of a rewind that failed before any restore could run. */
+  async rewindAbort(rewindId: string): Promise<void> {
+    this.sql.exec("DELETE FROM rewind_markers WHERE rewind_id = ?", rewindId);
+  }
+
+  /**
+   * Step 4, after the restart: reports a marker that is still present, returns the receipt of a completion that already
+   * ran, or completes the rewind of the restored database in one transaction. Every call then sets the alarm.
+   */
+  async rewindComplete(args: RewindCompletion): Promise<{ state: "marker" } | { state: "completed"; receipt: RewindReceipt }> {
+    if (this.sql.exec("SELECT 1 FROM rewind_markers WHERE rewind_id = ? AND attempt = ?", args.rewindId, args.attempt).toArray().length > 0) {
+      return { state: "marker" };
+    }
+    const receipt = this.ctx.storage.transactionSync((): RewindReceipt => {
+      const stored = getMeta(this.sql, "rewind_receipt");
+      const previous = stored === undefined ? undefined : (JSON.parse(String(stored)) as RewindReceipt);
+      if (previous?.rewindId === args.rewindId) return previous;
+      const completed: RewindReceipt = { rewindId: args.rewindId, historyId: args.historyId, restoreSeq: this.headSeq, completedAtMs: args.completedAtMs };
+      setMeta(this.sql, "history_id", args.historyId);
+      setMeta(this.sql, "rewind_number", args.rewindNumber);
+      setMeta(this.sql, "restore_seq", completed.restoreSeq);
+      setMeta(this.sql, "restore_point_ms", args.restorePointMs);
+      setMeta(this.sql, "rewind_completed_ms", args.completedAtMs);
+      for (const deviceId of args.revokedDevices) {
+        this.sql.exec("INSERT INTO revoked_devices (device_id, revoked_at_ms) VALUES (?, ?) ON CONFLICT DO NOTHING", deviceId, args.completedAtMs);
+      }
+      // Section 5, rule 9: a retired incarnation or a deleting row counts as absent.
+      for (const { hashHex, incarnation } of args.retired) {
+        this.sql.exec(
+          "UPDATE chunks SET state = ?, incarnation = NULL, head_checked = 0 WHERE hash = ? AND incarnation = ?",
+          ChunkState.PENDING,
+          fromHex(hashHex),
+          incarnation,
+        );
+      }
+      this.sql.exec("UPDATE chunks SET state = ?, incarnation = NULL, head_checked = 0 WHERE state = ?", ChunkState.PENDING, ChunkState.DELETING);
+      // Rule 2: every unreferenced chunk waits a full grace after the completion.
+      const holdUntil = args.completedAtMs + this.settings().chunk_grace_days * DAY_MS;
+      this.sql.exec("UPDATE chunks SET state = ?, hold_until_ms = ? WHERE refcount = 0", ChunkState.PENDING, holdUntil);
+      this.sql.exec("DELETE FROM rewind_markers");
+      setMeta(this.sql, "rewind_receipt", JSON.stringify(completed));
+      return completed;
+    });
+    await this.armAlarm();
+    return { state: "completed", receipt };
+  }
+
+  /** Whether a rewind holds this space closed; an unanswered check counts as closed. */
+  private async closedForRewind(): Promise<boolean> {
+    const spaceId = getMeta(this.sql, "space_id");
+    if (spaceId === undefined) return false;
+    try {
+      return await this.account().isSpaceClosed(String(spaceId));
+    } catch (error) {
+      console.error("account rewind check failed", error);
+      return true;
+    }
+  }
+
   private async schedule(task: string, dueMs: number): Promise<void> {
     this.sql.exec("INSERT INTO schedule (task, due_ms) VALUES (?, ?) ON CONFLICT (task) DO UPDATE SET due_ms = excluded.due_ms", task, dueMs);
     await this.armAlarm();
@@ -1063,6 +1199,10 @@ export class SpaceDO extends DurableObject<Env> {
 
   override async alarm(): Promise<void> {
     const nowMs = this.clock();
+    if (await this.closedForRewind()) {
+      await this.ctx.storage.setAlarm(nowMs + CLOSED_RECHECK_MS);
+      return;
+    }
     const due = this.sql.exec("SELECT task FROM schedule WHERE due_ms <= ?", nowMs).toArray().map((row) => String(row.task));
     for (const task of due) {
       if (task === "gc") {

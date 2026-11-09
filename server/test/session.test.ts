@@ -387,8 +387,8 @@ describe("owner claim, pairing and tokens", () => {
     await other.start();
     vi.spyOn(console, "error").mockImplementation(() => {});
     const prototype = await runInDurableObject(account(), (instance: import("../src/account-do").AccountDO) => Object.getPrototypeOf(instance) as import("../src/account-do").AccountDO);
-    const original = prototype.isDeviceActive;
-    prototype.isDeviceActive = async () => {
+    const original = prototype.checkSession;
+    prototype.checkSession = async () => {
       throw new Error("injected Account DO failure");
     };
     try {
@@ -396,7 +396,7 @@ describe("owner claim, pairing and tokens", () => {
       expect(await asking.next()).toMatchObject({ case: "goodbye", value: { code: Close.TRY_AGAIN_LATER } });
       expect((await asking.waitClosed()).code).toBe(Close.TRY_AGAIN_LATER);
     } finally {
-      prototype.isDeviceActive = original;
+      prototype.checkSession = original;
     }
     expect((await other.rpc({ case: "listTree", value: {} })).case).toBe("tree");
     expect(other.closed).toBeUndefined();
@@ -418,7 +418,7 @@ describe("owner claim, pairing and tokens", () => {
       version: state.storage.sql.exec("SELECT value FROM meta WHERE key = 'schema_version'").one().value,
       revoked: state.storage.sql.exec("SELECT device_id FROM revoked_devices").toArray(),
     }));
-    expect(after).toEqual({ version: 4, revoked: [{ device_id: device }] });
+    expect(after).toEqual({ version: 5, revoked: [{ device_id: device }] });
   });
 
   it("adds revoked_devices to a version-one Space database and keeps its data", async () => {
@@ -444,7 +444,7 @@ describe("owner claim, pairing and tokens", () => {
       node: state.storage.sql.exec("SELECT name FROM nodes WHERE node_id = ?", dir).toArray(),
       revoked: state.storage.sql.exec("SELECT device_id FROM revoked_devices").toArray(),
     }));
-    expect(after).toEqual({ version: 4, head: 1, commits: [{ seq: 1 }], node: [{ name: "kept" }], revoked: [{ device_id: device }] });
+    expect(after).toEqual({ version: 5, head: 1, commits: [{ seq: 1 }], node: [{ name: "kept" }], revoked: [{ device_id: device }] });
   });
 });
 

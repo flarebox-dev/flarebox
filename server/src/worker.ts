@@ -9,6 +9,8 @@ import {
   DeviceCredentialsSchema,
   PairCompleteRequestSchema,
   PairStartResponseSchema,
+  RewindRequestSchema,
+  RewindResultSchema,
   ServerInfo_DataPath,
   ServerInfoSchema,
   SpaceInfoSchema,
@@ -48,12 +50,33 @@ function key(env: Env): Promise<ServerKey> {
   return cached;
 }
 
-async function authenticate(request: Request, env: Env): Promise<Identity | Response> {
+/** Checks the access token and the device. With a space, it also refuses a space that a rewind holds closed (RFC 0003 section 4). */
+async function authenticate(request: Request, env: Env, spaceId?: string): Promise<Identity | Response> {
   const token = bearerToken(request);
   const identity = token ? await verifyAccessToken(await key(env), token, Date.now()) : undefined;
   if (!identity) return errorReply(request, Error_Code.UNAUTHENTICATED, "missing or invalid access token");
-  if (!(await account(env).isDeviceActive(identity.deviceId))) return errorReply(request, Error_Code.UNAUTHENTICATED, "this device was revoked");
+  const check = await account(env).checkSession(identity.deviceId, spaceId);
+  if (!check.active) return errorReply(request, Error_Code.UNAUTHENTICATED, "this device was revoked");
+  if (check.closed) return errorReply(request, Error_Code.RETRY_LATER, "the space is being rewound; retry later", 503);
   return identity;
+}
+
+/** HTTP statuses of the rewind endpoint's errors (RFC 0003 section 1). */
+const REWIND_STATUS: Partial<Record<Error_Code, number>> = { [Error_Code.HISTORY_MISMATCH]: 409, [Error_Code.RETRY_LATER]: 503 };
+
+async function rewind(request: Request, env: Env, spaceId: string): Promise<Response> {
+  const identity = await authenticate(request, env);
+  if (identity instanceof Response) return identity;
+  const body = await readMessage(request, RewindRequestSchema);
+  const outcome = await account(env).rewind({
+    userId: identity.userId,
+    spaceId,
+    rewindId: body.rewindId,
+    restorePointMs: Number(body.restorePointMs),
+    expectedHistoryId: body.expectedHistoryId,
+  });
+  if (!outcome.ok) return errorReply(request, outcome.code, outcome.message, REWIND_STATUS[outcome.code]);
+  return reply(request, RewindResultSchema, create(RewindResultSchema, outcome.value));
 }
 
 /** The per-space ticket key, derived for each request from the cached server key, so a request keeps no per-space state. */
@@ -161,9 +184,12 @@ async function route(request: Request, env: Env): Promise<Response> {
   const chunkRoute = /^\/v1\/spaces\/([0-9a-f-]{36})\/chunks\/([0-9a-f]{64})$/.exec(path);
   if (chunkRoute && isUuidV7(chunkRoute[1]!)) return chunk(request, env, chunkRoute[1]!, chunkRoute[2]!);
 
+  const rewindRoute = /^\/v1\/spaces\/([0-9a-f-]{36})\/rewind$/.exec(path);
+  if (rewindRoute && method === "POST" && isUuidV7(rewindRoute[1]!)) return rewind(request, env, rewindRoute[1]!);
+
   const spaceRoute = /^\/v1\/spaces\/([0-9a-f-]{36})\/(ws|rpc)$/.exec(path);
   if (path !== "/v1/pair/start" && path !== "/v1/spaces" && !spaceRoute) return new Response("Not Found", { status: 404 });
-  const identity = await authenticate(request, env);
+  const identity = await authenticate(request, env, spaceRoute && isUuidV7(spaceRoute[1]!) ? spaceRoute[1]! : undefined);
   if (identity instanceof Response) return identity;
 
   if (method === "POST" && path === "/v1/pair/start") {
