@@ -160,9 +160,10 @@ A delete, however late R2 applies it, removes only the object of a retired incar
 Each history keeps its own export files, and a new history starts from a full baseline:
 
 - Log segments are written under `meta/<history_id>/log/`, and snapshots under `meta/<history_id>/snap/`. The files of earlier histories are never changed.
-- `space.json` gains `history_id`, the history that an R2 restore reads. A restore from R2 reads only that history's files.
+- Each history has its own descriptor, `meta/<history_id>/space.json`, in place of the single `meta/space.json` of §11. It holds the fields of §11 plus `history_id` and the history's rewind number (§5, rule 6), and its `chunk_key` names the key layout of §5, rule 5. The Space DO writes only the current history's descriptor. So a write, however late R2 applies it, can only change the descriptor of the history that issued it.
+- An R2-only restore lists the descriptors under `meta/`, takes the one with the highest rewind number, and reads only that history's files. It finds a chunk by listing `chunks/<first 2 hex>/<hex>/` and using any incarnation there. Every incarnation of a hash holds the same bytes, which the hash verifies.
 - Completion resets the export state for the new history:
   - the exported log starts after `restore_seq`;
   - a full snapshot is due at once;
   - no snapshot of the new history exists yet.
-- The exporter writes the new history's first snapshot and the log segments from that snapshot's `start_seq + 1` through its `end_seq`. Only once all of them are durable does it rewrite `space.json` to name the new history. Until then, `space.json` still names the previous history, and an R2-only restore yields the state before the rewind.
+- The exporter writes the new history's first snapshot and the log segments from that snapshot's `start_seq + 1` through its `end_seq`. Only once all of them are durable does it write the new history's descriptor. Until then, the previous history's descriptor has the highest rewind number, and an R2-only restore yields the state before the rewind. A space's first history writes its descriptor when the space is created.
