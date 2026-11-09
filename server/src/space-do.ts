@@ -74,6 +74,7 @@ const MAX_COMMIT_ROW_BYTES = 7_900_000;
 const RETRY_LATER_MS = 60_000;
 const PAGE_BYTES = 1024 * 1024;
 const GC_BATCH = 1000;
+const GC_RETRY_MS = 10 * 60_000;
 const R2_DELETE_BATCH = 1000;
 
 export type Role = "owner" | "editor" | "viewer";
@@ -603,8 +604,14 @@ export class SpaceDO extends DurableObject<Env> {
     const due = this.sql.exec("SELECT task FROM schedule WHERE due_ms <= ?", nowMs).toArray().map((row) => String(row.task));
     for (const task of due) {
       if (task === "gc") {
-        const report = await this.collectGarbage(nowMs);
-        this.sql.exec("UPDATE schedule SET due_ms = ? WHERE task = 'gc'", nowMs + (report.more ? 60_000 : DAY_MS));
+        let nextMs = nowMs + GC_RETRY_MS;
+        try {
+          const report = await this.collectGarbage(nowMs);
+          nextMs = nowMs + (report.more ? 60_000 : DAY_MS);
+        } catch (error) {
+          console.error("space gc failed", error);
+        }
+        this.sql.exec("UPDATE schedule SET due_ms = ? WHERE task = 'gc'", nextMs);
       }
     }
     await this.armAlarm();

@@ -452,6 +452,27 @@ describe("GC and references", () => {
     expect(await table(space, "SELECT * FROM chunks")).toEqual([]);
     expect(await runInDurableObject(space.stub, (_i, state) => state.storage.getAlarm())).toBe(at + DAY);
   });
+
+  it("keeps the GC alarm armed when a run fails and finishes the deletion on the retry", async () => {
+    const space = await setup();
+    const parts = await content("left behind");
+    await space.a.uploadParts(parts);
+    await interceptDeletes(space, async () => {
+      throw new Error("injected R2 delete failure");
+    });
+    const at = Date.now() + DAY + HOUR;
+    await setClock(space, at);
+    expect(await runDurableObjectAlarm(space.stub)).toBe(true);
+    expect(await table(space, "SELECT state FROM chunks")).toEqual([{ state: 3 }]);
+    const retryAt = await runInDurableObject(space.stub, (_i, state) => state.storage.getAlarm());
+    expect(retryAt).toBe(at + 10 * 60_000);
+
+    await interceptDeletes(space, (keys, real) => real(keys));
+    await setClock(space, retryAt!);
+    expect(await runDurableObjectAlarm(space.stub)).toBe(true);
+    expect(await table(space, "SELECT * FROM chunks")).toEqual([]);
+    expect(await env.BUCKET.head(chunkKey(space.spaceId, toHex(parts.content.chunks[0]!.hash)))).toBeNull();
+  });
 });
 
 describe("more conflict rules", () => {
