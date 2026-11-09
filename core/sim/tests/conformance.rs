@@ -713,17 +713,7 @@ impl Run {
                     }
                 }
                 if let Some(next) = expect.get("next_cursor") {
-                    let want = match next {
-                        Value::String(s) if s.is_empty() => String::new(),
-                        pair => {
-                            let version = str_of(pair, "version")?;
-                            let id = self
-                                .symbols
-                                .get(version)
-                                .ok_or_else(|| format!("unbound symbol {version}"))?;
-                            format!("{}/{id}", int_of(pair, "seq")?)
-                        }
-                    };
+                    let want = self.cursor(next)?;
                     if list.next_cursor != want {
                         return Err(format!(
                             "next_cursor {:?}, expected {want:?}",

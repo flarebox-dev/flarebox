@@ -291,9 +291,11 @@ impl<'a> Applier<'a> {
     }
 
     /// R8 for the target of an edit or move: its ancestors, itself and its trash group come back.
-    fn revive_target(&mut self, node: Node) -> Node {
+    /// Revives a trashed op target with its ancestor chain and trash group (R8), and reports whether
+    /// it had to take a conflict name to do so (R1).
+    fn revive_target(&mut self, node: Node) -> (Node, bool) {
         if node.status != NodeStatus::Trashed {
-            return node;
+            return (node, false);
         }
         let group = node
             .trash_group
@@ -301,9 +303,9 @@ impl<'a> Applier<'a> {
             .expect("a trashed node has a trash group");
         let parent_id = node.parent_id.clone().expect("a trashed node has a parent");
         self.revive_chain(&parent_id);
-        self.revive_one(&node.node_id, &parent_id, &node.name);
+        let (_, renamed) = self.revive_one(&node.node_id, &parent_id, &node.name);
         self.revive_group(&node.node_id, &group);
-        self.st.nodes[&node.node_id].clone()
+        (self.st.nodes[&node.node_id].clone(), renamed)
     }
 
     /// Resolves a parent for a create or move, reviving it when trashed.
@@ -443,7 +445,7 @@ impl<'a> Applier<'a> {
         if found.kind != NodeKind::File {
             return Ok(rejected("NOT_FILE"));
         }
-        let node = self.revive_target(found);
+        let (node, renamed) = self.revive_target(found);
         let parent_id = node.parent_id.clone().expect("a file has a parent");
         if self.unseen_content(&node) {
             let copy_id = self.st.ids.uuid_v7(self.ctx.now_ms as u64);
@@ -469,7 +471,7 @@ impl<'a> Applier<'a> {
         stored.content_rev = seq;
         stored.content_dev = dev;
         self.touch(&node.node_id);
-        Ok(result(op_result::Code::Applied, "", &node.name))
+        Ok(applied(renamed, &node.name))
     }
 
     fn is_self_or_descendant(&self, candidate: &Node, ancestor_id: &str) -> bool {

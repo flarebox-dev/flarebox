@@ -1839,7 +1839,8 @@
             "seq": 4,
             "results": [
               {
-                "code": "APPLIED"
+                "code": "APPLIED_RENAMED",
+                "name": "a (conflict from Desk 2026-11-09).txt"
               }
             ],
             "changed": [
