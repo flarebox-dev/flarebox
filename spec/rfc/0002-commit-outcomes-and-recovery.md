@@ -108,3 +108,7 @@ Both are 0 when the history began with the creation of the space. The Account DO
 ## 9. Delete kept by a descendant (R7)
 
 A `Delete` whose target stays live because a descendant has an unseen change also returns `SUPERSEDED`, as when the target's own change keeps it. `SUPERSEDED` means that the target is still live after the op.
+
+## 10. Renamed revival on UpdateContent (R8)
+
+An `UpdateContent` whose target R8 revives under a conflict name, because the revived name clashes under R1, returns `APPLIED_RENAMED` with the name used, as `Move`, `Restore`, `CreateDir` and `CreateFile` do.
