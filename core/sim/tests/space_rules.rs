@@ -317,12 +317,20 @@ fn rejects_a_base_ahead_of_the_server_and_commits_from_viewers_or_old_clients() 
 }
 
 #[test]
-fn requires_every_pending_chunk_to_carry_an_upload_receipt() {
+fn requires_a_receipt_or_a_stored_object_for_every_pending_chunk() {
     let mut s = Space::new();
     let root = s.root();
     let (mut a, mut b) = (s.client("A"), s.client("B"));
     let content = Space::content("chunk bytes");
-    let receipts = s.upload(&a, &content);
+    s.space
+        .prepare_upload(
+            &a.session,
+            NOW,
+            &PrepareUpload {
+                chunks: content.chunks.clone(),
+            },
+        )
+        .unwrap();
     let f = s.id();
     let missing = s
         .commit_raw(
@@ -336,8 +344,9 @@ fn requires_every_pending_chunk_to_carry_an_upload_receipt() {
     assert_eq!(missing.code(), error::Code::MissingChunks);
     assert_eq!(missing.missing_chunks, [content.chunks[0].hash.clone()]);
     let forged = UploadReceipt {
+        hash: content.chunks[0].hash.clone(),
+        size: content.chunks[0].size,
         token: "forged".into(),
-        ..receipts[0].clone()
     };
     assert_eq!(
         error_code(s.commit_raw(
@@ -349,6 +358,7 @@ fn requires_every_pending_chunk_to_carry_an_upload_receipt() {
         )),
         error::Code::MissingChunks
     );
+    let receipts = s.upload(&a, &content);
     s.commit(
         &mut a,
         vec![create_file(&f, &root, "f.bin", content.clone())],
@@ -1325,20 +1335,25 @@ fn a_commit_whose_log_row_is_too_large_is_refused_whole() {
 }
 
 #[test]
-fn a_receipt_is_valid_only_for_its_space_chunk_size_and_hour() {
+fn a_receipt_holds_only_for_its_space_and_size_and_a_stored_object_outlasts_it() {
     let mut s = Space::new();
     let root = s.root();
     let a = s.client("A");
     let content = Space::content("receipted");
-    let receipts = s.upload(&a, &content);
-    let hash = &content.chunks[0].hash;
+    let (hash, size) = (&content.chunks[0].hash, content.chunks[0].size);
+    s.space
+        .prepare_upload(
+            &a.session,
+            NOW,
+            &PrepareUpload {
+                chunks: content.chunks.clone(),
+            },
+        )
+        .unwrap();
     let mut other = SpaceDo::new(9, NOW);
-    let foreign = other.put_chunk(hash, content.chunks[0].size, NOW);
-    let wrong_size = UploadReceipt {
-        size: content.chunks[0].size + 1,
-        ..receipts[0].clone()
-    };
-    let mut attempt = |receipts: Vec<UploadReceipt>, now_ms: i64| {
+    let foreign = other.put_chunk(hash, size, NOW);
+    let wrong_size = s.space.put_chunk(hash, size + 1, NOW);
+    let attempt = |s: &mut Space, receipts: Vec<UploadReceipt>, now_ms: i64| {
         let commit = Commit {
             commit_id: s.id(),
             base_seq: 0,
@@ -1350,15 +1365,12 @@ fn a_receipt_is_valid_only_for_its_space_chunk_size_and_hour() {
             .commit(&a.session, now_ms, &commit)
             .map(|c| c.result)
     };
-    for (receipts, now_ms) in [
-        (vec![foreign], NOW),
-        (vec![wrong_size], NOW),
-        (receipts.clone(), NOW + 3_600_001),
-    ] {
+    for receipts in [vec![foreign], vec![wrong_size]] {
         assert_eq!(
-            error_code(attempt(receipts, now_ms)),
+            error_code(attempt(&mut s, receipts, NOW)),
             error::Code::MissingChunks
         );
     }
-    assert!(attempt(receipts, NOW + 3_600_000).is_ok());
+    let receipts = vec![s.space.put_chunk(hash, size, NOW)];
+    assert!(attempt(&mut s, receipts, NOW + 3_600_001).is_ok());
 }
