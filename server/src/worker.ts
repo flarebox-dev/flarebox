@@ -15,28 +15,37 @@ import {
   SpaceListSchema,
   TokenRequestSchema,
 } from "./gen/flarebox/v1/auth_pb";
+import { UploadReceiptSchema } from "./gen/flarebox/v1/commit_pb";
 import { Error_Code } from "./gen/flarebox/v1/rpc_pb";
 import { BadRequest, errorReply, readMessage, reply } from "./http";
-import { isUuidV7 } from "./ids";
-import { CONNECT_HEADER, type Connect, MAX_CLIENT_FRAME } from "./space-do";
+import { deriveSpaceKey, signChunkGrant, verifyChunkGrant } from "./crypto";
+import { fromHex, isUuidV7 } from "./ids";
+import { CONNECT_HEADER, type Connect, GRANT_MS, MAX_CHUNK_BYTES, MAX_CLIENT_FRAME } from "./space-do";
+import { chunkKey } from "./space/store";
 import { PROTO_MAX, PROTO_MIN, SERVER_VERSION } from "./version";
 
 export { AccountDO } from "./account-do";
 export { SpaceDO } from "./space-do";
 
-let serverKey: Promise<ServerKey> | undefined;
+const serverKeys = new WeakMap<object, Promise<ServerKey>>();
 
 function account(env: Env) {
   return env.ACCOUNT.get(env.ACCOUNT.idFromName("account"));
 }
 
-/** The server key, read once per isolate from the Account DO so that tokens verify without a DO call. */
+/** The server key, read once per isolate and Account DO binding so that tokens verify without a DO call. A failed read is not kept. */
 function key(env: Env): Promise<ServerKey> {
-  serverKey ??= account(env).serverKey().catch((error: unknown) => {
-    serverKey = undefined;
-    throw error;
-  });
-  return serverKey;
+  let cached = serverKeys.get(env.ACCOUNT);
+  if (!cached) {
+    cached = account(env)
+      .serverKey()
+      .catch((error: unknown) => {
+        serverKeys.delete(env.ACCOUNT);
+        throw error;
+      });
+    serverKeys.set(env.ACCOUNT, cached);
+  }
+  return cached;
 }
 
 async function authenticate(request: Request, env: Env): Promise<Identity | Response> {
@@ -45,6 +54,53 @@ async function authenticate(request: Request, env: Env): Promise<Identity | Resp
   if (!identity) return errorReply(request, Error_Code.UNAUTHENTICATED, "missing or invalid access token");
   if (!(await account(env).isDeviceActive(identity.deviceId))) return errorReply(request, Error_Code.UNAUTHENTICATED, "this device was revoked");
   return identity;
+}
+
+/** The per-space ticket key, derived for each request from the cached server key, so a request keeps no per-space state. */
+async function spaceKey(env: Env, spaceId: string): Promise<Uint8Array> {
+  return deriveSpaceKey((await key(env)).secret, spaceId);
+}
+
+/**
+ * Relay-mode chunk transfer (spec v0 sections 8 and 10). The ticket from PrepareUpload or GetDownloadTargets is the
+ * only credential; R2 checks the SHA-256 of an upload, and the receipt lets the Space DO accept it in a commit.
+ */
+async function chunk(request: Request, env: Env, spaceId: string, hex: string): Promise<Response> {
+  const ticket = new URL(request.url).searchParams.get("ticket") ?? "";
+  const nowMs = Date.now();
+  const key = chunkKey(spaceId, hex);
+
+  if (request.method === "GET") {
+    if (!(await verifyChunkGrant(await spaceKey(env, spaceId), "get", spaceId, hex, 0, ticket, nowMs))) {
+      return errorReply(request, Error_Code.FORBIDDEN, "invalid or expired download ticket");
+    }
+    const object = await env.BUCKET.get(key);
+    if (!object) return errorReply(request, Error_Code.INVALID_ARGUMENT, "chunk not found", 404);
+    return new Response(object.body, {
+      headers: { "Content-Type": "application/octet-stream", "Content-Length": String(object.size), "Cache-Control": "private, max-age=3600" },
+    });
+  }
+
+  if (request.method !== "PUT") return new Response("Method Not Allowed", { status: 405, headers: { Allow: "GET, PUT" } });
+  const length = request.headers.get("Content-Length");
+  if (length === null || !/^\d+$/.test(length)) return errorReply(request, Error_Code.INVALID_ARGUMENT, "Content-Length is required", 411);
+  const size = Number(length);
+  if (size < 1 || size > MAX_CHUNK_BYTES) return errorReply(request, Error_Code.LIMIT_EXCEEDED, "chunk size out of range");
+  const secret = await spaceKey(env, spaceId);
+  if (!(await verifyChunkGrant(secret, "put", spaceId, hex, size, ticket, nowMs))) {
+    return errorReply(request, Error_Code.FORBIDDEN, "invalid or expired upload ticket, or a size the ticket does not cover");
+  }
+  try {
+    await env.BUCKET.put(key, request.body, { sha256: hex, onlyIf: { etagDoesNotMatch: "*" } });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("chunk upload failed", spaceId, hex, message);
+    if (/checksum/i.test(message)) return errorReply(request, Error_Code.INVALID_ARGUMENT, "the body does not match the chunk hash");
+    const throttled = /\b429\b|10058|too many|rate/i.test(message);
+    return errorReply(request, Error_Code.RETRY_LATER, "chunk storage is unavailable; retry the upload", throttled ? 429 : 503);
+  }
+  const token = await signChunkGrant(secret, "receipt", spaceId, hex, size, nowMs + GRANT_MS);
+  return reply(request, UploadReceiptSchema, create(UploadReceiptSchema, { hash: fromHex(hex), size, token }));
 }
 
 function space(env: Env, spaceId: string) {
@@ -96,6 +152,9 @@ async function route(request: Request, env: Env): Promise<Response> {
     if (!outcome.ok) return errorReply(request, outcome.code, outcome.message);
     return reply(request, AccessTokenSchema, create(AccessTokenSchema, outcome.value));
   }
+
+  const chunkRoute = /^\/v1\/spaces\/([0-9a-f-]{36})\/chunks\/([0-9a-f]{64})$/.exec(path);
+  if (chunkRoute && isUuidV7(chunkRoute[1]!)) return chunk(request, env, chunkRoute[1]!, chunkRoute[2]!);
 
   const spaceRoute = /^\/v1\/spaces\/([0-9a-f-]{36})\/(ws|rpc)$/.exec(path);
   if (path !== "/v1/pair/start" && path !== "/v1/spaces" && !spaceRoute) return new Response("Not Found", { status: 404 });

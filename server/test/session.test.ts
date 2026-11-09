@@ -17,7 +17,7 @@ import {
   SpaceListSchema,
   TokenRequestSchema,
 } from "../src/gen/flarebox/v1/auth_pb";
-import { OpResult_Code, UploadReceiptSchema } from "../src/gen/flarebox/v1/commit_pb";
+import { OpResult_Code, type UploadReceipt, UploadReceiptSchema } from "../src/gen/flarebox/v1/commit_pb";
 import {
   type ClientMessage,
   ClientMessageSchema,
@@ -28,12 +28,14 @@ import {
   ServerMessageSchema,
   type Welcome,
 } from "../src/gen/flarebox/v1/messages_pb";
-import { ChunkRefSchema, type CommitRecord, type Content, ContentSchema } from "../src/gen/flarebox/v1/model_pb";
-import { Error_Code } from "../src/gen/flarebox/v1/rpc_pb";
-import { deriveSpaceKey, sha256, signChunkGrant } from "../src/crypto";
+import { ChunkRefSchema, type CommitRecord, ContentSchema } from "../src/gen/flarebox/v1/model_pb";
+import { ChunkPlan_Action, Error_Code, ErrorSchema, type Target } from "../src/gen/flarebox/v1/rpc_pb";
+import type { ServerKey } from "../src/auth";
+import { sha256 } from "../src/crypto";
 import { toHex, uuidv7 } from "../src/ids";
-import { Close } from "../src/space-do";
+import { Close, HOLD_MS, type SpaceDO } from "../src/space-do";
 import { chunkKey, encodeChunkList } from "../src/space/store";
+import worker from "../src/worker";
 import { content, op } from "./helpers";
 
 const BASE = "https://flarebox.test";
@@ -207,24 +209,23 @@ class Socket {
   }
 }
 
-/** Stores chunks in R2 and signs receipts the way the relay upload route does. */
-async function upload(spaceId: string, parts: { content: Content; bytes: Uint8Array[] }) {
-  const spaceKey = await deriveSpaceKey((await account().serverKey()).secret, spaceId);
-  const receipts = [];
-  for (const [i, chunk] of parts.content.chunks.entries()) {
-    const hex = toHex(chunk.hash);
-    await env.BUCKET.put(chunkKey(spaceId, hex), parts.bytes[i]!);
-    const token = await signChunkGrant(spaceKey, "receipt", spaceId, hex, chunk.size, Date.now() + 3_600_000);
-    receipts.push(create(UploadReceiptSchema, { hash: chunk.hash, size: chunk.size, token }));
-  }
-  return receipts;
+async function put(target: Target, bytes: Uint8Array): Promise<Response> {
+  return exports.default.fetch(target.url, { method: target.method, body: bytes, headers: { "Content-Type": "application/x-protobuf" } });
 }
 
-async function prepared(socket: Socket, spaceId: string, text: string) {
+/** PrepareUpload over the socket, then PUT each requested chunk to its relay target and collect the receipts. */
+async function prepared(socket: Socket, text: string) {
   const parts = await content(text);
   const plan = await socket.rpc({ case: "prepareUpload", value: { chunks: parts.content.chunks } });
-  expect(plan.case).toBe("prepareUpload");
-  return { content: parts.content, receipts: await upload(spaceId, parts) };
+  if (plan.case !== "prepareUpload") throw new Error("prepareUpload failed");
+  const receipts: UploadReceipt[] = [];
+  for (const [i, chunkPlan] of plan.value.chunks.entries()) {
+    if (chunkPlan.action !== ChunkPlan_Action.UPLOAD) continue;
+    const response = await put(chunkPlan.target!, parts.bytes[i]!);
+    expect(response.status).toBe(200);
+    receipts.push(fromBinary(UploadReceiptSchema, new Uint8Array(await response.arrayBuffer())));
+  }
+  return { ...parts, plan: plan.value, receipts };
 }
 
 function nodeIds(records: CommitRecord[]): string[] {
@@ -462,8 +463,9 @@ describe("WebSocket session", () => {
     await reader.start();
     const parts = await content(...Array.from({ length: 16_000 }, () => "x"));
     const plan = await writer.rpc({ case: "prepareUpload", value: { chunks: [parts.content.chunks[0]!] } });
-    expect(plan.case).toBe("prepareUpload");
-    const receipts = await upload(spaceId, { content: { chunks: [parts.content.chunks[0]!] } as Content, bytes: [parts.bytes[0]!] });
+    if (plan.case !== "prepareUpload") throw new Error("prepareUpload failed");
+    const uploaded = await put(plan.value.chunks[0]!.target!, parts.bytes[0]!);
+    const receipts = [fromBinary(UploadReceiptSchema, new Uint8Array(await uploaded.arrayBuffer()))];
     const before = await snapshot();
     const both = await writer.rpc({
       case: "commit",
@@ -506,9 +508,10 @@ describe("WebSocket session", () => {
     const writer = await Socket.connect(spaceId, a);
     await writer.start();
     const parts = await content(...Array.from({ length: 16_000 }, () => "x"));
-    const single = { content: { chunks: [parts.content.chunks[0]!] } as Content, bytes: [parts.bytes[0]!] };
-    expect((await writer.rpc({ case: "prepareUpload", value: { chunks: single.content.chunks } })).case).toBe("prepareUpload");
-    const receipts = await upload(spaceId, single);
+    const plan = await writer.rpc({ case: "prepareUpload", value: { chunks: [parts.content.chunks[0]!] } });
+    if (plan.case !== "prepareUpload") throw new Error("prepareUpload failed");
+    const uploaded = await put(plan.value.chunks[0]!.target!, parts.bytes[0]!);
+    const receipts = [fromBinary(UploadReceiptSchema, new Uint8Array(await uploaded.arrayBuffer()))];
     const [one, two] = [uuidv7(), uuidv7()];
     await writer.commit(0n, [op.create(one, spaceId, "one", parts.content)], receipts);
     await writer.commit(1n, [op.update(one, parts.content)], receipts);
@@ -584,9 +587,12 @@ describe("WebSocket session", () => {
     };
     const uploadListed = async (hashes: Uint8Array[]) => {
       const indexes = hashes.map((hash) => parts.content.chunks.findIndex((chunk) => toHex(chunk.hash) === toHex(hash)));
-      const subset = { content: { chunks: indexes.map((i) => parts.content.chunks[i]!) } as Content, bytes: indexes.map((i) => parts.bytes[i]!) };
-      expect((await socket.rpc({ case: "prepareUpload", value: { chunks: subset.content.chunks } })).case).toBe("prepareUpload");
-      receipts.push(...(await upload(spaceId, subset)));
+      const plan = await socket.rpc({ case: "prepareUpload", value: { chunks: indexes.map((i) => parts.content.chunks[i]!) } });
+      if (plan.case !== "prepareUpload") throw new Error("prepareUpload failed");
+      for (const [n, chunk] of plan.value.chunks.entries()) {
+        const uploaded = await put(chunk.target!, parts.bytes[indexes[n]!]!);
+        receipts.push(fromBinary(UploadReceiptSchema, new Uint8Array(await uploaded.arrayBuffer())));
+      }
     };
     const first = await listed();
     expect(Array.isArray(first) && first.length).toBe(1000);
@@ -665,14 +671,14 @@ describe("WebSocket session", () => {
     await sa.start();
     await sb.start();
     const file = uuidv7();
-    const v1 = await prepared(sa, spaceId, "v1");
+    const v1 = await prepared(sa, "v1");
     await sa.commit(0n, [op.create(file, spaceId, "plan.txt", v1.content)], v1.receipts);
     await sb.pushed();
 
-    const fromB = await prepared(sb, spaceId, "B's edit");
+    const fromB = await prepared(sb, "B's edit");
     await sb.commit(1n, [op.update(file, fromB.content)], fromB.receipts);
     await sa.pushed();
-    const fromA = await prepared(sa, spaceId, "A's edit");
+    const fromA = await prepared(sa, "A's edit");
     const result = await sa.commit(1n, [op.update(file, fromA.content)], fromA.receipts);
     expect(result.results[0]!.code).toBe(OpResult_Code.CONFLICT_COPY);
     expect(result.results[0]!.name).toMatch(/^plan \(conflict from Laptop A \d{4}-\d{2}-\d{2}\)\.txt$/);
@@ -734,6 +740,211 @@ describe("WebSocket session", () => {
     const tree = await call("/v1/spaces/" + spaceId + "/rpc", { token: a.access!.token, body: list }, RpcResponseSchema);
     const page = tree.message!.result;
     expect(page.case === "tree" && page.value.nodes.map((n) => n.name).sort()).toEqual(["", "via http"]);
+  });
+});
+
+describe("chunk relay", () => {
+  async function connected() {
+    const a = await getOwner();
+    const spaceId = await createSpace(a);
+    const socket = await Socket.connect(spaceId, a);
+    await socket.start();
+    return { a, spaceId, socket };
+  }
+
+  it("uploads through the Worker, commits with the receipt, and downloads the same bytes", async () => {
+    const { a, spaceId, socket } = await connected();
+    const b = await pairDevice(a, "Reader");
+    const reader = await Socket.connect(spaceId, b);
+    await reader.start();
+
+    const file = await prepared(socket, "the bytes of a small file");
+    expect(file.plan.chunks[0]!.target!.url.startsWith(BASE + "/v1/spaces/" + spaceId + "/chunks/")).toBe(true);
+    expect(file.receipts).toHaveLength(1);
+    const head = await env.BUCKET.head(chunkKey(spaceId, toHex(file.content.chunks[0]!.hash)));
+    expect(head?.size).toBe(file.bytes[0]!.length);
+    const nodeId = uuidv7();
+    await socket.commit(0n, [op.create(nodeId, spaceId, "small.txt", file.content)], file.receipts);
+
+    const pushed = await reader.pushed();
+    const state = pushed[0]!.changes[0]!.change;
+    const hash = state.case === "node" ? state.value.current!.content!.chunks[0]!.hash : new Uint8Array();
+    const targets = await reader.rpc({ case: "getDownloadTargets", value: { hashes: [hash] } });
+    if (targets.case !== "downloadTargets") throw new Error("getDownloadTargets failed");
+    const response = await exports.default.fetch(targets.value.targets[0]!.target!.url);
+    expect(response.status).toBe(200);
+    const downloaded = new Uint8Array(await response.arrayBuffer());
+    expect(toHex(await sha256(downloaded))).toBe(toHex(hash));
+
+    const again = await socket.rpc({ case: "prepareUpload", value: { chunks: file.content.chunks } });
+    expect(again.case === "prepareUpload" && again.value.chunks[0]!.action).toBe(ChunkPlan_Action.PRESENT);
+  });
+
+  it("rejects uploads with a bad ticket, a wrong length or bytes that do not match the hash", async () => {
+    const { spaceId, socket } = await connected();
+    const parts = await content("expected bytes");
+    const plan = await socket.rpc({ case: "prepareUpload", value: { chunks: parts.content.chunks } });
+    if (plan.case !== "prepareUpload") throw new Error("prepareUpload failed");
+    const target = plan.value.chunks[0]!.target!;
+    const bytes = parts.bytes[0]!;
+    const key = chunkKey(spaceId, toHex(parts.content.chunks[0]!.hash));
+
+    const tampered = { ...target, url: target.url.slice(0, -3) + "AAA" };
+    expect((await put(tampered, bytes)).status).toBe(403);
+    expect((await put({ ...target, url: target.url.split("?")[0]! }, bytes)).status).toBe(403);
+    const otherSpace = { ...target, url: target.url.replace(spaceId, uuidv7()) };
+    expect((await put(otherSpace, bytes)).status).toBe(403);
+    expect((await put(target, new Uint8Array(bytes.length + 1))).status).toBe(403);
+    expect((await put(target, new Uint8Array(bytes.length))).status).toBe(400);
+    expect(await env.BUCKET.head(key)).toBeNull();
+
+    const download = await exports.default.fetch(target.url);
+    expect(download.status).toBe(403);
+    expect((await put(target, bytes)).status).toBe(200);
+    expect((await put(target, bytes)).status).toBe(200);
+  });
+
+  async function preparedTicket() {
+    const { spaceId, socket } = await connected();
+    const parts = await content("review chunk " + uuidv7());
+    const plan = await socket.rpc({ case: "prepareUpload", value: { chunks: parts.content.chunks } });
+    if (plan.case !== "prepareUpload") throw new Error("prepareUpload failed");
+    const bytes = parts.bytes[0]!;
+    const target = plan.value.chunks[0]!.target!;
+    const url = target.url;
+    const request = () => new Request(url, { method: "PUT", body: bytes, headers: { "Content-Length": String(bytes.length) } });
+    const stub = env.SPACE.get(env.SPACE.idFromName(spaceId));
+    return { spaceId, socket, parts, target, request, stub, key: chunkKey(spaceId, toHex(parts.content.chunks[0]!.hash)) };
+  }
+
+  function relay(request: Request, put: (key: string, body: ReadableStream | null, options: R2PutOptions) => Promise<R2Object | null>) {
+    const bucket = { put };
+    return worker.fetch(request as Parameters<typeof worker.fetch>[0], { ...env, BUCKET: bucket } as unknown as Env, {} as ExecutionContext);
+  }
+
+  it("removes an object that a late PUT recreated after GC deleted its row", async () => {
+    const { request, stub, key } = await preparedTicket();
+    let entered!: () => void;
+    let resume!: () => void;
+    const started = new Promise<void>((resolve) => (entered = resolve));
+    const released = new Promise<void>((resolve) => (resume = resolve));
+    const pending = relay(request(), async (k, body, options) => {
+      entered();
+      await released;
+      return env.BUCKET.put(k, body, options);
+    });
+    await started;
+    const at = Date.now() + HOLD_MS + 60_000;
+    const first = await runInDurableObject(stub, (instance: SpaceDO) => instance.collectGarbage(at));
+    expect(first).toMatchObject({ deletedChunks: 1, sweptChunks: 0 });
+    resume();
+    expect((await pending).status).toBe(200);
+    expect(await env.BUCKET.head(key)).not.toBeNull();
+    const rows = () => runInDurableObject(stub, (_instance, state) => state.storage.sql.exec("SELECT * FROM chunks").toArray());
+    expect(await rows()).toHaveLength(0);
+
+    const day = 24 * 3_600_000;
+    expect(await runInDurableObject(stub, (instance: SpaceDO) => instance.collectGarbage(at + day))).toMatchObject({ sweptChunks: 0 });
+    const sweep = await runInDurableObject(stub, (instance: SpaceDO) => instance.collectGarbage(at + 7 * day + 1));
+    expect(sweep).toMatchObject({ sweptChunks: 1, deletedChunks: 1 });
+    expect(await env.BUCKET.head(key)).toBeNull();
+    expect(await rows()).toHaveLength(0);
+  });
+
+  it("sweeps only objects without a chunk row and fences them from PrepareUpload while it deletes", async () => {
+    const { socket, parts, target, stub, spaceId, key } = await preparedTicket();
+    expect((await put(target, parts.bytes[0]!)).status).toBe(200);
+    const orphan = await content("orphan " + uuidv7());
+    const orphanHash = orphan.content.chunks[0]!.hash;
+    const orphanKey = chunkKey(spaceId, toHex(orphanHash));
+    await env.BUCKET.put(orphanKey, orphan.bytes[0]!);
+
+    const states: unknown[] = [];
+    const report = await runInDurableObject(stub, async (instance: SpaceDO, state) => {
+      const original = (instance as unknown as { env: Env }).env;
+      const bucket = {
+        list: original.BUCKET.list.bind(original.BUCKET),
+        delete: (keys: string[]) => {
+          states.push(...state.storage.sql.exec("SELECT state FROM chunks WHERE hash = ?", orphanHash).toArray().map((row) => row.state));
+          return original.BUCKET.delete(keys);
+        },
+      };
+      (instance as unknown as { env: Env }).env = { ...original, BUCKET: bucket as unknown as R2Bucket };
+      try {
+        return await instance.collectGarbage(Date.now());
+      } finally {
+        (instance as unknown as { env: Env }).env = original;
+      }
+    });
+    expect(states).toEqual([3]);
+    expect(report).toMatchObject({ sweptChunks: 1, deletedChunks: 1 });
+    expect(await env.BUCKET.head(orphanKey)).toBeNull();
+    expect(await env.BUCKET.head(key)).not.toBeNull();
+    const after = await socket.rpc({ case: "prepareUpload", value: { chunks: orphan.content.chunks } });
+    expect(after.case === "prepareUpload" && after.value.chunks[0]!.action).toBe(ChunkPlan_Action.UPLOAD);
+  });
+
+  it("answers a checksum mismatch with 400 and storage failures with a retryable error", async () => {
+    const { request, key } = await preparedTicket();
+    const fail = (message: string) => relay(request(), async () => {
+      throw new Error(message);
+    });
+    const decode = async (response: Response) => fromBinary(ErrorSchema, new Uint8Array(await response.arrayBuffer()));
+
+    const mismatch = await fail("put: The SHA-256 checksum you specified did not match what we received.");
+    expect(mismatch.status).toBe(400);
+    expect((await decode(mismatch)).code).toBe(Error_Code.INVALID_ARGUMENT);
+    const throttled = await fail("put: Reduce your concurrent request rate for the same object. (10058)");
+    expect(throttled.status).toBe(429);
+    expect((await decode(throttled)).code).toBe(Error_Code.RETRY_LATER);
+    const outage = await fail("put: We encountered an internal error. Please try again. (10001)");
+    expect(outage.status).toBe(503);
+    expect((await decode(outage)).code).toBe(Error_Code.RETRY_LATER);
+    expect(await env.BUCKET.head(key)).toBeNull();
+  });
+
+  /** An Account DO binding whose serverKey calls go through `serverKey`, so a test can count or fail them. */
+  function accountBinding(serverKey: () => Promise<ServerKey>) {
+    return { idFromName: (name: string) => env.ACCOUNT.idFromName(name), get: () => ({ serverKey }) };
+  }
+
+  it("reads the server key again on the next request after a failed Account DO call", async () => {
+    const { request, key } = await preparedTicket();
+    let calls = 0;
+    const ACCOUNT = accountBinding(async () => {
+      calls++;
+      if (calls === 1) throw new Error("injected Account DO failure");
+      return account().serverKey();
+    });
+    const send = () => worker.fetch(request() as Parameters<typeof worker.fetch>[0], { ...env, ACCOUNT } as unknown as Env, {} as ExecutionContext);
+    await expect(send()).rejects.toThrow("injected Account DO failure");
+    expect((await send()).status).toBe(200);
+    expect(calls).toBe(2);
+    expect(await env.BUCKET.head(key)).not.toBeNull();
+  });
+
+  it("keeps no per-space state for unknown space ids and touches no storage before the ticket check", async () => {
+    let calls = 0;
+    const ACCOUNT = accountBinding(() => {
+      calls++;
+      return account().serverKey();
+    });
+    const BUCKET = new Proxy(
+      {},
+      {
+        get: () => {
+          throw new Error("R2 was used before the ticket check");
+        },
+      },
+    );
+    const relayEnv = { ...env, ACCOUNT, BUCKET } as unknown as Env;
+    const send = (url: string, init?: RequestInit) => worker.fetch(new Request(url, init) as Parameters<typeof worker.fetch>[0], relayEnv, {} as ExecutionContext);
+    for (let i = 0; i < 20; i++) {
+      const url = `${BASE}/v1/spaces/${uuidv7()}/chunks/${"ab".repeat(32)}?ticket=v1.9999999999999.AAAA`;
+      expect((await send(url, { method: "PUT", body: new Uint8Array(4), headers: { "Content-Length": "4" } })).status).toBe(403);
+      expect((await send(url)).status).toBe(403);
+    }
+    expect(calls).toBe(1);
   });
 });
 
