@@ -1,0 +1,155 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+import { create } from "@bufbuild/protobuf";
+import {
+  type ChunkRef,
+  ChunkRefSchema,
+  type Content,
+  ContentSchema,
+  NodeKind,
+  type NodeState,
+  NodeStateSchema,
+  NodeStatus,
+  type VersionInfo,
+  VersionInfoSchema,
+} from "../gen/flarebox/v1/model_pb";
+
+/** Chunks per row of version_chunk_pages, and per GetVersionChunks page. */
+export const PAGE_CHUNKS = 4096;
+/** Versions with more chunks than this carry only chunk_count in messages. */
+export const INLINE_CHUNKS = 16384;
+const CHUNK_ENTRY_BYTES = 36;
+
+export interface NodeRow {
+  node_id: string;
+  parent_id: string | null;
+  name: string;
+  name_key: string;
+  kind: number;
+  status: number;
+  content_rev: number;
+  content_dev: string;
+  meta_rev: number;
+  meta_dev: string;
+  cur_version_id: string | null;
+  trash_group: string | null;
+  trashed_at_ms: number | null;
+}
+
+export interface VersionRow {
+  version_id: string;
+  node_id: string;
+  seq: number;
+  size: number;
+  mtime_ns: number;
+  executable: number;
+  chunk_count: number;
+  manifest_digest: ArrayBuffer;
+  chunker: string;
+  chunks: ArrayBuffer | null;
+  device_id: string;
+  user_id: string;
+  created_at_ms: number;
+  superseded_at_ms: number | null;
+}
+
+/** R2 key of a chunk: spaces/<space_id>/chunks/<first two hex digits>/<hex>. */
+export function chunkKey(spaceId: string, hashHex: string): string {
+  return `spaces/${spaceId}/chunks/${hashHex.slice(0, 2)}/${hashHex}`;
+}
+
+export function rows<T>(cursor: SqlStorageCursor<Record<string, SqlStorageValue>>): T[] {
+  return cursor.toArray() as unknown as T[];
+}
+
+/** (32-byte hash || u32 LE size) for every chunk, the layout manifest_digest is computed over. */
+export function encodeChunkList(chunks: readonly ChunkRef[]): Uint8Array {
+  const out = new Uint8Array(chunks.length * CHUNK_ENTRY_BYTES);
+  const view = new DataView(out.buffer);
+  chunks.forEach((chunk, i) => {
+    out.set(chunk.hash, i * CHUNK_ENTRY_BYTES);
+    view.setUint32(i * CHUNK_ENTRY_BYTES + 32, chunk.size, true);
+  });
+  return out;
+}
+
+export function decodeChunkList(bytes: Uint8Array): ChunkRef[] {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const out: ChunkRef[] = [];
+  for (let offset = 0; offset < bytes.length; offset += CHUNK_ENTRY_BYTES) {
+    out.push(create(ChunkRefSchema, { hash: bytes.slice(offset, offset + 32), size: view.getUint32(offset + 32, true) }));
+  }
+  return out;
+}
+
+export function getMeta(sql: SqlStorage, key: string): SqlStorageValue | undefined {
+  return sql.exec("SELECT value FROM meta WHERE key = ?", key).toArray()[0]?.value;
+}
+
+export function setMeta(sql: SqlStorage, key: string, value: SqlStorageValue): void {
+  sql.exec("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value", key, value);
+}
+
+export function getNode(sql: SqlStorage, nodeId: string): NodeRow | undefined {
+  return rows<NodeRow>(sql.exec("SELECT * FROM nodes WHERE node_id = ?", nodeId))[0];
+}
+
+export function getVersion(sql: SqlStorage, versionId: string): VersionRow | undefined {
+  return rows<VersionRow>(sql.exec("SELECT * FROM versions WHERE version_id = ?", versionId))[0];
+}
+
+export function versionPageCount(version: VersionRow): number {
+  return Math.max(1, Math.ceil(version.chunk_count / PAGE_CHUNKS));
+}
+
+export function versionChunkPage(sql: SqlStorage, version: VersionRow, page: number): ChunkRef[] {
+  if (version.chunks) return page === 0 ? decodeChunkList(new Uint8Array(version.chunks)) : [];
+  const row = sql
+    .exec("SELECT chunks FROM version_chunk_pages WHERE version_id = ? AND page = ?", version.version_id, page)
+    .toArray()[0];
+  return row ? decodeChunkList(new Uint8Array(row.chunks as ArrayBuffer)) : [];
+}
+
+export function versionChunks(sql: SqlStorage, version: VersionRow): ChunkRef[] {
+  const out: ChunkRef[] = [];
+  for (let page = 0; page < versionPageCount(version); page++) out.push(...versionChunkPage(sql, version, page));
+  return out;
+}
+
+export function versionContent(sql: SqlStorage, version: VersionRow, inline: boolean): Content {
+  return create(ContentSchema, {
+    size: BigInt(version.size),
+    mtimeNs: BigInt(version.mtime_ns),
+    executable: version.executable === 1,
+    chunks: inline && version.chunk_count <= INLINE_CHUNKS ? versionChunks(sql, version) : [],
+    chunkCount: version.chunk_count,
+    manifestDigest: new Uint8Array(version.manifest_digest),
+    chunker: version.chunker,
+  });
+}
+
+export function versionInfo(sql: SqlStorage, version: VersionRow): VersionInfo {
+  return create(VersionInfoSchema, {
+    versionId: version.version_id,
+    seq: BigInt(version.seq),
+    content: versionContent(sql, version, true),
+    deviceId: version.device_id,
+    userId: version.user_id,
+    createdAtMs: BigInt(version.created_at_ms),
+  });
+}
+
+export function nodeState(sql: SqlStorage, node: NodeRow): NodeState {
+  const version = node.cur_version_id ? getVersion(sql, node.cur_version_id) : undefined;
+  return create(NodeStateSchema, {
+    nodeId: node.node_id,
+    parentId: node.parent_id ?? "",
+    name: node.name,
+    kind: node.kind === 1 ? NodeKind.DIR : NodeKind.FILE,
+    status: node.status === 1 ? NodeStatus.LIVE : NodeStatus.TRASHED,
+    contentRev: BigInt(node.content_rev),
+    metaRev: BigInt(node.meta_rev),
+    trashGroup: node.trash_group ?? "",
+    current: version ? versionInfo(sql, version) : undefined,
+  });
+}

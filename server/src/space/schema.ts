@@ -1,0 +1,70 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+// Space DO storage, following spec v0 section 4.1. Migrations only move forward.
+
+const MIGRATIONS: string[] = [
+  `
+  CREATE TABLE meta (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+  CREATE TABLE members (user_id TEXT PRIMARY KEY, role TEXT NOT NULL, added_seq INTEGER NOT NULL);
+  CREATE TABLE devices (device_id TEXT PRIMARY KEY, user_id TEXT NOT NULL,
+    name TEXT NOT NULL, max_format INTEGER NOT NULL, last_seen_ms INTEGER);
+  CREATE TABLE nodes (
+    node_id TEXT PRIMARY KEY,
+    parent_id TEXT,
+    name TEXT NOT NULL,
+    name_key TEXT NOT NULL,
+    kind INTEGER NOT NULL,
+    status INTEGER NOT NULL,
+    content_rev INTEGER NOT NULL, content_dev TEXT NOT NULL,
+    meta_rev INTEGER NOT NULL, meta_dev TEXT NOT NULL,
+    cur_version_id TEXT,
+    trash_group TEXT, trashed_at_ms INTEGER
+  );
+  CREATE UNIQUE INDEX nodes_live_name ON nodes(parent_id, name_key) WHERE status = 1;
+  CREATE INDEX nodes_parent ON nodes(parent_id);
+  CREATE INDEX nodes_trashed ON nodes(trashed_at_ms) WHERE status = 2;
+  CREATE TABLE versions (
+    version_id TEXT PRIMARY KEY, node_id TEXT NOT NULL, seq INTEGER NOT NULL,
+    size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, executable INTEGER NOT NULL,
+    chunk_count INTEGER NOT NULL, manifest_digest BLOB NOT NULL, chunker TEXT NOT NULL,
+    chunks BLOB,
+    device_id TEXT NOT NULL, user_id TEXT NOT NULL, created_at_ms INTEGER NOT NULL,
+    superseded_at_ms INTEGER
+  );
+  CREATE INDEX versions_node ON versions(node_id, seq);
+  CREATE INDEX versions_superseded ON versions(superseded_at_ms) WHERE superseded_at_ms IS NOT NULL;
+  CREATE TABLE version_chunk_pages (version_id TEXT NOT NULL, page INTEGER NOT NULL,
+    chunks BLOB NOT NULL, PRIMARY KEY (version_id, page));
+  CREATE TABLE chunks (
+    hash BLOB PRIMARY KEY, size INTEGER NOT NULL,
+    state INTEGER NOT NULL,
+    refcount INTEGER NOT NULL DEFAULT 0,
+    hold_until_ms INTEGER NOT NULL,
+    zero_since_ms INTEGER
+  );
+  CREATE INDEX chunks_unreferenced ON chunks(state) WHERE refcount = 0;
+  CREATE TABLE commits (
+    seq INTEGER PRIMARY KEY, commit_id TEXT NOT NULL UNIQUE,
+    device_id TEXT NOT NULL, user_id TEXT NOT NULL, committed_at_ms INTEGER NOT NULL,
+    record BLOB NOT NULL,
+    results BLOB NOT NULL
+  );
+  CREATE TABLE schedule (task TEXT PRIMARY KEY, due_ms INTEGER NOT NULL);
+  `,
+];
+
+export function migrate(sql: SqlStorage): void {
+  const hasMeta = sql.exec("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").toArray().length > 0;
+  let version = hasMeta
+    ? Number(sql.exec("SELECT value FROM meta WHERE key = 'schema_version'").toArray()[0]?.value ?? 0)
+    : 0;
+  while (version < MIGRATIONS.length) {
+    sql.exec(MIGRATIONS[version]!);
+    version++;
+    sql.exec("INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value", version);
+  }
+}
+
+export const NodeKindValue = { DIR: 1, FILE: 2 } as const;
+export const NodeStatusValue = { LIVE: 1, TRASHED: 2 } as const;
+export const ChunkState = { PENDING: 1, LIVE: 2, DELETING: 3 } as const;
