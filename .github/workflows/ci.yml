@@ -109,7 +109,7 @@ jobs:
             exit 0
           fi
           git fetch --no-tags --depth=1 origin "$BASE"
-          changed="$(git diff --name-only "$BASE" HEAD)"
+          changed="$(git diff --no-renames --name-only "$BASE" HEAD)"
           if grep -qE '^(apps/macos/|core/|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|\.github/workflows/ci\.yml$)' <<< "$changed"; then
             echo "The change touches apps/macos, core, the Cargo files or ci.yml: building the macOS app."
             echo "affected=true" >> "$GITHUB_OUTPUT"
