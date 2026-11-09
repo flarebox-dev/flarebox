@@ -134,6 +134,38 @@ pub struct SpaceList {
     #[prost(message, repeated, tag="1")]
     pub spaces: ::prost::alloc::vec::Vec<SpaceInfo>,
 }
+/// POST /v1/spaces/{space_id}/rewind, owner only (RFC 0003).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RewindRequest {
+    /// The point in time to restore, in Unix milliseconds.
+    #[prost(int64, tag="1")]
+    pub restore_point_ms: i64,
+    /// The history the caller expects the space to be in; the rewind is refused with CODE_HISTORY_MISMATCH otherwise.
+    #[prost(string, tag="2")]
+    pub expected_history_id: ::prost::alloc::string::String,
+    /// A UUIDv7 chosen once per intended rewind and reused on every retry; a retry returns that rewind's result or state.
+    #[prost(string, tag="3")]
+    pub rewind_id: ::prost::alloc::string::String,
+}
+/// Response of POST /v1/spaces/{space_id}/rewind.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RewindResult {
+    /// The history that began with this rewind.
+    #[prost(string, tag="1")]
+    pub history_id: ::prost::alloc::string::String,
+    /// head_seq right after the rewind.
+    #[prost(uint64, tag="2")]
+    pub restore_seq: u64,
+    /// The point in time that was restored, as requested.
+    #[prost(int64, tag="3")]
+    pub restore_point_ms: i64,
+    #[prost(string, tag="4")]
+    pub previous_history_id: ::prost::alloc::string::String,
+    /// head_seq of previous_history_id right before the rewind. It counts in that history, while restore_seq counts in the
+    /// history the restore point belonged to, which can be an earlier one, so the two do not bound the discarded commits.
+    #[prost(uint64, tag="5")]
+    pub previous_head_seq: u64,
+}
 /// A content-addressed piece of a file.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ChunkRef {
@@ -489,7 +521,7 @@ pub struct Error {
     pub code: i32,
     #[prost(string, tag="2")]
     pub message: ::prost::alloc::string::String,
-    /// Set with CODE_MISSING_CHUNKS: the chunk hashes that are not ready.
+    /// Set with CODE_MISSING_CHUNKS: the chunk hashes that are not ready, at most 1,000 (RFC 0002 section 11).
     #[prost(bytes="vec", repeated, tag="3")]
     pub missing_chunks: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
     #[prost(uint64, tag="4")]
