@@ -89,10 +89,68 @@ jobs:
             exit 1
           fi
 
+  macos-app:
+    name: macos app
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: apps/macos
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check whether the change affects the macOS app
+        id: changes
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: |
+          if [ "$EVENT" = "push" ]; then
+            echo "Push to main: building the macOS app."
+            echo "affected=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch --no-tags --depth=1 origin "$BASE"
+          changed="$(git diff --name-only "$BASE" HEAD)"
+          if grep -qE '^(apps/macos/|core/|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|\.github/workflows/ci\.yml$)' <<< "$changed"; then
+            echo "The change touches apps/macos, core, the Cargo files or ci.yml: building the macOS app."
+            echo "affected=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "The change does not touch apps/macos, core, the Cargo files or ci.yml: skipping the macOS app build."
+            echo "affected=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install toolchain from rust-toolchain.toml
+        if: steps.changes.outputs.affected == 'true'
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: steps.changes.outputs.affected == 'true'
+      - name: Show Xcode and Swift versions
+        if: steps.changes.outputs.affected == 'true'
+        run: xcodebuild -version && swift --version
+      - name: Build the Rust core and generate the Swift bindings
+        if: steps.changes.outputs.affected == 'true'
+        run: scripts/build-ffi.sh
+      - name: Test the Swift bindings
+        if: steps.changes.outputs.affected == 'true'
+        run: swift test --package-path FlareboxFFI
+      - name: Build the app (unsigned)
+        if: steps.changes.outputs.affected == 'true'
+        run: >-
+          xcodebuild -project Flarebox.xcodeproj -scheme Flarebox -configuration Release
+          -derivedDataPath build/DerivedData -destination "platform=macOS,arch=$(uname -m)"
+          CODE_SIGNING_ALLOWED=NO build
+      - name: Check the app bundle
+        if: steps.changes.outputs.affected == 'true'
+        run: |
+          app=build/DerivedData/Build/Products/Release/Flarebox.app
+          if [ ! -x "$app/Contents/MacOS/Flarebox" ]; then
+            echo "::error::xcodebuild reported success but $app/Contents/MacOS/Flarebox is missing."
+            exit 1
+          fi
+          plutil -p "$app/Contents/Info.plist"
+
   ci-report:
     name: ci-report
     if: always()
-    needs: [rust, server, spec]
+    needs: [rust, server, spec, macos-app]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any CI job failed or was cancelled
@@ -100,10 +158,11 @@ jobs:
           RUST: ${{ needs.rust.result }}
           SERVER: ${{ needs.server.result }}
           SPEC: ${{ needs.spec.result }}
+          MACOS_APP: ${{ needs.macos-app.result }}
           FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
         run: |
-          echo "rust: $RUST, server: $SERVER, spec: $SPEC"
+          echo "rust: $RUST, server: $SERVER, spec: $SPEC, macos-app: $MACOS_APP"
           if [ "$FAILED" = "true" ]; then
-            echo "::error::At least one CI job failed or was cancelled (rust: $RUST, server: $SERVER, spec: $SPEC). Open that job's log for the cause."
+            echo "::error::At least one CI job failed or was cancelled (rust: $RUST, server: $SERVER, spec: $SPEC, macos-app: $MACOS_APP). Open that job's log for the cause."
             exit 1
           fi
