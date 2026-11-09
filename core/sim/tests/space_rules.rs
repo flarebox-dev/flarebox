@@ -8,7 +8,8 @@ use flarebox_engine::names::conflict_name;
 use flarebox_proto::v1::{
     ChunkRef, Commit, CommitResult, Content, CreateDir, CreateFile, Delete, Error, ListTrash,
     ListTree, ListVersions, Move, NodeState, NodeStatus, Op, PrepareUpload, Restore, Resume,
-    UpdateContent, UploadReceipt, chunk_plan, error, op, op_result, resync_required,
+    RpcRequest, UpdateContent, UploadReceipt, chunk_plan, error, op, op_result, resync_required,
+    rpc_request, rpc_response,
 };
 use flarebox_sim::space::{Role, Session, SpaceDo, node_states};
 use sha2::{Digest, Sha256};
@@ -1151,6 +1152,72 @@ fn version_pages_split_versions_of_one_commit_by_version_id() {
         list("one/x".into(), 1).unwrap_err().code(),
         error::Code::InvalidArgument
     );
+}
+
+/// The server reads the cursor's seq with JavaScript's `Number` and accepts only safe integers.
+#[test]
+fn version_cursors_follow_the_servers_number_parsing() {
+    let mut s = Space::new();
+    let root = s.root();
+    let mut a = s.client("A");
+    let (one, two) = (Space::content("one"), Space::content("two"));
+    let mut receipts = s.upload(&a, &one);
+    receipts.extend(s.upload(&a, &two));
+    let file = s.id();
+    s.commit(
+        &mut a,
+        vec![create_file(&file, &root, "f", one), update(&file, two)],
+        receipts,
+    );
+    let request = |cursor: &str| ListVersions {
+        node_id: file.clone(),
+        limit: 10,
+        cursor: cursor.into(),
+    };
+    for (cursor, count) in [
+        ("9007199254740991/x", 2),
+        ("2", 2),
+        ("1e0/x", 2),
+        ("1.0/x", 2),
+        ("+1/x", 2),
+        (" 1\t/x", 2),
+        ("0x2/", 2),
+        ("/x", 0),
+        ("-1/x", 0),
+        ("1/", 0),
+    ] {
+        let page = s.space.list_versions(&request(cursor));
+        assert_eq!(page.unwrap().versions.len(), count, "cursor {cursor:?}");
+    }
+    for cursor in [
+        "9007199254740992/x",
+        "-9007199254740992/x",
+        "1.5/x",
+        "1e400/x",
+        "Infinity/x",
+        "0x/x",
+        "-0x1/x",
+        "1_0/x",
+        "seven/x",
+    ] {
+        assert_eq!(
+            s.space.list_versions(&request(cursor)).unwrap_err().code(),
+            error::Code::InvalidArgument,
+            "cursor {cursor:?}"
+        );
+        let (response, _) = s.space.rpc(
+            &a.session,
+            NOW,
+            &RpcRequest {
+                req_id: 7,
+                call: Some(rpc_request::Call::ListVersions(request(cursor))),
+            },
+        );
+        let Some(rpc_response::Result::Error(failure)) = response.result else {
+            panic!("cursor {cursor:?} was accepted over RPC");
+        };
+        assert_eq!(failure.code(), error::Code::InvalidArgument);
+    }
 }
 
 #[test]

@@ -269,6 +269,55 @@ fn op_content(op: &Op) -> Option<Option<&Content>> {
     }
 }
 
+const MAX_SAFE_INTEGER: i64 = (1 << 53) - 1;
+
+/// JavaScript's `Number(text)` for a string, which the server applies to a version cursor: surrounding
+/// JavaScript whitespace is ignored, an empty string is 0, `0x`, `0o` and `0b` prefixes are unsigned
+/// integers, and anything else is a signed decimal literal with an optional fraction and exponent.
+/// `None` stands for `NaN` and the infinities, which no caller accepts.
+fn js_number(text: &str) -> Option<f64> {
+    let is_space = |c: char| {
+        matches!(
+            c,
+            '\t' | '\n' | '\u{B}' | '\u{C}' | '\r' | ' ' | '\u{A0}' | '\u{1680}' | '\u{2000}'
+                ..='\u{200A}'
+                    | '\u{2028}'
+                    | '\u{2029}'
+                    | '\u{202F}'
+                    | '\u{205F}'
+                    | '\u{3000}'
+                    | '\u{FEFF}'
+        )
+    };
+    let text = text.trim_matches(is_space);
+    if text.is_empty() {
+        return Some(0.0);
+    }
+    for (prefix, radix) in [("0x", 16), ("0o", 8), ("0b", 2)] {
+        if text.len() > 2 && text[..2].eq_ignore_ascii_case(prefix) {
+            let digits = &text[2..];
+            if !digits.chars().all(|c| c.is_digit(radix)) {
+                return None;
+            }
+            return Some(
+                digits
+                    .chars()
+                    .filter_map(|c| c.to_digit(radix))
+                    .fold(0.0, |n, d| n * f64::from(radix) + f64::from(d)),
+            );
+        }
+    }
+    let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
+    let decimal = unsigned.starts_with(|c: char| c.is_ascii_digit() || c == '.')
+        && unsigned
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E' | '+' | '-'));
+    if !decimal {
+        return None;
+    }
+    text.parse::<f64>().ok().filter(|n| n.is_finite())
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -777,28 +826,24 @@ impl SpaceDo {
         } else {
             request.limit.min(1000)
         } as usize;
-        let before: (u64, &str) = if request.cursor.is_empty() {
-            (u64::MAX, "")
+        let before: (i64, &str) = if request.cursor.is_empty() {
+            (MAX_SAFE_INTEGER, "")
         } else {
             let mut parts = request.cursor.split('/');
-            let seq = parts.next().unwrap_or_default();
-            let seq = if seq.is_empty() {
-                Some(0)
-            } else if seq.bytes().all(|b| b.is_ascii_digit()) {
-                seq.parse().ok()
-            } else {
-                None
-            };
+            let seq = js_number(parts.next().unwrap_or_default())
+                .filter(|n| n.fract() == 0.0 && n.abs() <= MAX_SAFE_INTEGER as f64);
             let Some(seq) = seq else {
                 return Err(fail(error::Code::InvalidArgument, "malformed cursor"));
             };
-            (seq, parts.next().unwrap_or_default())
+            (seq as i64, parts.next().unwrap_or_default())
         };
         let mut found: Vec<&Version> = self
             .state
             .versions
             .values()
-            .filter(|v| v.node_id == request.node_id && (v.seq, v.version_id.as_str()) < before)
+            .filter(|v| {
+                v.node_id == request.node_id && (v.seq as i64, v.version_id.as_str()) < before
+            })
             .collect();
         found.sort_by(|a, b| (b.seq, &b.version_id).cmp(&(a.seq, &a.version_id)));
         let page: Vec<&Version> = found.iter().take(limit).copied().collect();
