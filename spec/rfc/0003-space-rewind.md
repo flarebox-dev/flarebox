@@ -42,6 +42,7 @@ A new `rewind_id` is refused, with nothing recorded and nothing changed, in thes
 | `restore_point_ms` is not admissible (§2) | `INVALID_ARGUMENT` | 400 |
 | `expected_history_id` is not the space's current history | `HISTORY_MISMATCH` | 409 |
 | Another rewind of the space has not ended | `RETRY_LATER` | 503 |
+| The current history's descriptor is not yet durable (§7) | `RETRY_LATER` | 503 |
 
 ## 2. Admissible restore points
 
@@ -70,6 +71,7 @@ An Account DO alarm drives the phases with backoff from one second up to ten min
 
 1. **Admission.** The Account DO asks the Space DO, through a call that changes nothing, for:
    - its current `history_id` and `head_seq`;
+   - whether the current history's descriptor is durable (§7);
    - the bookmark B for P.
 
    It then checks §1 and §2. Any failure refuses the request and records nothing. Otherwise it records the rewind as `admitted`, with B, the new `history_id` and the rewind number. From then on the space is closed (§4).
@@ -166,4 +168,4 @@ Each history keeps its own export files, and a new history starts from a full ba
   - the exported log starts after `restore_seq`;
   - a full snapshot is due at once;
   - no snapshot of the new history exists yet.
-- The exporter writes the new history's first snapshot and the log segments from that snapshot's `start_seq + 1` through its `end_seq`. Only once all of them are durable does it write the new history's descriptor. Until then, the previous history's descriptor has the highest rewind number, and an R2-only restore yields the state before the rewind. A space's first history writes its descriptor when the space is created.
+- The exporter writes the new history's first snapshot and the log segments from that snapshot's `start_seq + 1` through its `end_seq`. Only once all of them are durable does it write the new history's descriptor. Until then, the previous history's descriptor has the highest rewind number, and an R2-only restore yields the state before the rewind. Admission refuses a further rewind with `RETRY_LATER` until then (§1), so the descriptor with the highest rewind number always belongs to the current history or the one just before it. A space's first history writes its descriptor when the space is created.
