@@ -22,6 +22,7 @@ const PAIRING_CODE_MS = 10 * 60_000;
 const PAIRING_FAILURES_PER_WINDOW = 20;
 /** Highest PBKDF2 iteration count workerd accepts; see cloudflare/workerd#1346. */
 export const SHARE_PASSWORD_ITERATIONS = 100_000;
+const SHARE_PASSWORD_KDF = "pbkdf2-sha256";
 const SHARE_FAILURES_BEFORE_LOCK = 5;
 const SHARE_LOCK_MS = 15 * 60_000;
 const BASE32 = "ABCDEFGHJKMNPQRSTVWXYZ0123456789";
@@ -70,8 +71,8 @@ const SCHEMA = `
   CREATE TABLE IF NOT EXISTS spaces (space_id TEXT PRIMARY KEY, name TEXT NOT NULL, owner_id TEXT NOT NULL,
     created_at_ms INTEGER NOT NULL, format_version INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS share_links (link_id TEXT PRIMARY KEY, space_id TEXT NOT NULL, node_id TEXT NOT NULL,
-    created_by TEXT NOT NULL, created_at_ms INTEGER NOT NULL, expires_at_ms INTEGER, password_hash BLOB,
-    password_salt BLOB, password_iterations INTEGER, revoked_at_ms INTEGER,
+    created_by TEXT NOT NULL, created_at_ms INTEGER NOT NULL, expires_at_ms INTEGER, password_kdf TEXT,
+    password_hash BLOB, password_salt BLOB, password_iterations INTEGER, revoked_at_ms INTEGER,
     failed_attempts INTEGER NOT NULL DEFAULT 0, locked_until_ms INTEGER);
   CREATE TABLE IF NOT EXISTS pairing_codes (code_hash BLOB PRIMARY KEY, device_id TEXT NOT NULL,
     expires_at_ms INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);
@@ -103,6 +104,7 @@ interface ShareLinkRow {
   space_id: string;
   node_id: string;
   expires_at_ms: number | null;
+  password_kdf: string | null;
   password_hash: ArrayBuffer | null;
   password_salt: ArrayBuffer | null;
   password_iterations: number | null;
@@ -295,14 +297,15 @@ export class AccountDO extends DurableObject<Env> {
     const linkId = base64url(crypto.getRandomValues(new Uint8Array(16)));
     const salt = args.password ? crypto.getRandomValues(new Uint8Array(16)) : undefined;
     this.sql.exec(
-      `INSERT INTO share_links (link_id, space_id, node_id, created_by, created_at_ms, expires_at_ms, password_hash,
-         password_salt, password_iterations) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO share_links (link_id, space_id, node_id, created_by, created_at_ms, expires_at_ms, password_kdf,
+         password_hash, password_salt, password_iterations) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       linkId,
       args.spaceId,
       args.nodeId,
       args.createdBy,
       Date.now(),
       args.expiresAtMs ?? null,
+      salt ? SHARE_PASSWORD_KDF : null,
       salt ? await passwordHash(args.password!, salt, SHARE_PASSWORD_ITERATIONS) : null,
       salt ? salt.buffer : null,
       salt ? SHARE_PASSWORD_ITERATIONS : null,
@@ -317,14 +320,18 @@ export class AccountDO extends DurableObject<Env> {
   /** Resolves a share link, checking expiry, revocation and the password, and locking it after repeated failures. */
   async openShareLink(linkId: string, password: string | undefined): Promise<Outcome<{ spaceId: string; nodeId: string }>> {
     const nowMs = Date.now();
-    const link = this.sql.exec("SELECT * FROM share_links WHERE link_id = ?", linkId).toArray()[0] as unknown as ShareLinkRow | undefined;
-    if (!link || link.revoked_at_ms !== null || (link.expires_at_ms !== null && link.expires_at_ms <= nowMs)) {
+    const read = () => this.sql.exec("SELECT * FROM share_links WHERE link_id = ?", linkId).toArray()[0] as unknown as ShareLinkRow | undefined;
+    const found = read();
+    if (!found || found.revoked_at_ms !== null || (found.expires_at_ms !== null && found.expires_at_ms <= nowMs)) {
       return failure(Error_Code.FORBIDDEN, "this link does not exist or has expired");
     }
-    if (link.password_hash) {
+    if (found.password_hash) {
+      if (found.locked_until_ms !== null && found.locked_until_ms > nowMs) return failure(Error_Code.RETRY_LATER, "too many wrong passwords");
+      if (found.password_kdf !== SHARE_PASSWORD_KDF) return failure(Error_Code.INTERNAL, "unsupported password scheme");
+      const given = password === undefined ? undefined : await passwordHash(password, new Uint8Array(found.password_salt!), found.password_iterations!);
+      const link = read()!;
       if (link.locked_until_ms !== null && link.locked_until_ms > nowMs) return failure(Error_Code.RETRY_LATER, "too many wrong passwords");
-      const given = password === undefined ? undefined : await passwordHash(password, new Uint8Array(link.password_salt!), link.password_iterations!);
-      if (!given || !sameBytes(given, link.password_hash)) {
+      if (!given || !sameBytes(given, link.password_hash!)) {
         const failed = link.failed_attempts + 1;
         const locked = failed >= SHARE_FAILURES_BEFORE_LOCK;
         this.sql.exec(
@@ -337,6 +344,6 @@ export class AccountDO extends DurableObject<Env> {
       }
       if (link.failed_attempts > 0) this.sql.exec("UPDATE share_links SET failed_attempts = 0 WHERE link_id = ?", linkId);
     }
-    return ok({ spaceId: link.space_id, nodeId: link.node_id });
+    return ok({ spaceId: found.space_id, nodeId: found.node_id });
   }
 }

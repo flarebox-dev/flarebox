@@ -29,6 +29,7 @@ import {
   type Welcome,
 } from "../src/gen/flarebox/v1/messages_pb";
 import type { CommitRecord, Content } from "../src/gen/flarebox/v1/model_pb";
+import { Error_Code } from "../src/gen/flarebox/v1/rpc_pb";
 import { deriveSpaceKey, signChunkGrant } from "../src/crypto";
 import { toHex, uuidv7 } from "../src/ids";
 import { Close } from "../src/space-do";
@@ -429,9 +430,62 @@ describe("share links", () => {
     for (let i = 0; i < 5; i++) expect((await links.openShareLink(locked, "wrong")).ok).toBe(false);
     expect(await links.openShareLink(locked, "correct horse")).toMatchObject({ ok: false, message: "too many wrong passwords" });
 
+    const row = await runInDurableObject(links, (_instance, state) =>
+      state.storage.sql.exec("SELECT password_kdf, password_salt, password_hash, password_iterations FROM share_links WHERE link_id = ?", locked).one(),
+    );
+    expect(row.password_kdf).toBe("pbkdf2-sha256");
+    expect(row.password_iterations).toBe(100_000);
+    expect((row.password_salt as ArrayBuffer).byteLength).toBe(16);
+    expect((row.password_hash as ArrayBuffer).byteLength).toBe(32);
+
     const expired = await links.createShareLink({ spaceId, nodeId, createdBy: uuidv7(), expiresAtMs: Date.now() - 1 });
     expect((await links.openShareLink(expired, undefined)).ok).toBe(false);
     await links.revokeShareLink(open);
     expect((await links.openShareLink(open, undefined)).ok).toBe(false);
+  });
+
+  it("counts consecutive failures per link, including a missing password, and starts over after success or a lock", async () => {
+    const links = account();
+    const link = await links.createShareLink({ spaceId: uuidv7(), nodeId: uuidv7(), createdBy: uuidv7(), password: "pw" });
+    const codes = async (attempts: (string | undefined)[]) => {
+      const out = [];
+      for (const attempt of attempts) {
+        const result = await links.openShareLink(link, attempt);
+        out.push(result.ok ? "ok" : Error_Code[result.code]);
+      }
+      return out;
+    };
+    expect(await codes(["x", undefined, "x", "x", "pw", "x", "x", "x", "x"])).toEqual([
+      "UNAUTHENTICATED", "UNAUTHENTICATED", "UNAUTHENTICATED", "UNAUTHENTICATED", "ok",
+      "UNAUTHENTICATED", "UNAUTHENTICATED", "UNAUTHENTICATED", "UNAUTHENTICATED",
+    ]);
+    expect(await codes(["x", "pw", "x"])).toEqual(["UNAUTHENTICATED", "RETRY_LATER", "RETRY_LATER"]);
+    const state = await runInDurableObject(links, (_instance, s) =>
+      s.storage.sql.exec("SELECT failed_attempts FROM share_links WHERE link_id = ?", link).one(),
+    );
+    expect(state.failed_attempts).toBe(0);
+    await runInDurableObject(links, (_instance, s) => {
+      s.storage.sql.exec("UPDATE share_links SET locked_until_ms = ? WHERE link_id = ?", Date.now() - 1, link);
+    });
+    expect(await codes(["x", "x", "x", "x", "pw"])).toEqual(["UNAUTHENTICATED", "UNAUTHENTICATED", "UNAUTHENTICATED", "UNAUTHENTICATED", "ok"]);
+  });
+
+  it("counts concurrent wrong passwords one by one, so they cannot get past the lock", async () => {
+    const links = account();
+    const link = await links.createShareLink({ spaceId: uuidv7(), nodeId: uuidv7(), createdBy: uuidv7(), password: "pw" });
+    const results = await Promise.all(Array.from({ length: 12 }, () => links.openShareLink(link, "x")));
+    const codes = results.map((r) => (r.ok ? "ok" : Error_Code[r.code]));
+    expect(codes.filter((c) => c === "UNAUTHENTICATED")).toHaveLength(5);
+    expect(codes.filter((c) => c === "RETRY_LATER")).toHaveLength(7);
+    expect(await links.openShareLink(link, "pw")).toMatchObject({ ok: false, code: Error_Code.RETRY_LATER });
+  });
+
+  it("refuses to open a link whose password scheme the server does not know", async () => {
+    const links = account();
+    const link = await links.createShareLink({ spaceId: uuidv7(), nodeId: uuidv7(), createdBy: uuidv7(), password: "pw" });
+    await runInDurableObject(links, (_instance, s) => {
+      s.storage.sql.exec("UPDATE share_links SET password_kdf = 'argon2id' WHERE link_id = ?", link);
+    });
+    expect(await links.openShareLink(link, "pw")).toMatchObject({ ok: false, code: Error_Code.INTERNAL });
   });
 });
