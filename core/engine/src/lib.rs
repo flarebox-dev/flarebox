@@ -2,10 +2,12 @@
 
 //! Sync state machine and conflict rules, free of I/O (docs/design/sync-engine.md). So far this
 //! holds the spec's identifier and name rules, which the reference server in `flarebox-sim` shares,
-//! and the three trees with the classification the planner starts from.
+//! the three trees with the classification the planner starts from, and the disk effects that
+//! apply remote changes.
 
 mod casefold_data;
 pub mod classify;
+pub mod effects;
 pub mod ids;
 pub mod names;
 pub mod tree;
