@@ -1,0 +1,471 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+import { fromBinary } from "@bufbuild/protobuf";
+import { runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:workers";
+import { describe, expect, it } from "vitest";
+import { OpResult_Code } from "../src/gen/flarebox/v1/commit_pb";
+import { CommitRecordSchema, NodeStatus } from "../src/gen/flarebox/v1/model_pb";
+import { ChunkPlan_Action, Error_Code } from "../src/gen/flarebox/v1/rpc_pb";
+import { toHex, uuidv7 } from "../src/ids";
+import type { SpaceDO } from "../src/space-do";
+import { conflictName, nameKey } from "../src/space/names";
+import { chunkKey } from "../src/space/store";
+import { client, content, newSpace, op, type TestClient } from "./helpers";
+
+const DAY = 24 * 3_600_000;
+
+async function setup() {
+  const space = await newSpace();
+  const a = await client(space, "Laptop A");
+  const b = await client(space, "Desktop B");
+  return { ...space, a, b, root: space.spaceId };
+}
+
+async function createFile(c: TestClient, parentId: string, name: string, text: string) {
+  const parts = await content(text);
+  const nodeId = uuidv7();
+  const result = await c.commit([op.create(nodeId, parentId, name, parts.content)], { receipts: await c.uploadParts(parts) });
+  return { nodeId, result };
+}
+
+async function newContent(c: TestClient, text: string) {
+  const parts = await content(text);
+  return { content: parts.content, receipts: await c.uploadParts(parts) };
+}
+
+describe("Space DO commits", () => {
+  it("lets two devices commit and see each other's changes", async () => {
+    const { a, b, root } = await setup();
+    const docs = uuidv7();
+    const notes = await content("hello from A");
+    const first = await a.commit([op.mkdir(docs, root, "Docs"), op.create(uuidv7(), docs, "a.txt", notes.content)], {
+      receipts: await a.uploadParts(notes),
+    });
+    expect(first.seq).toBe(1n);
+    expect(first.results.map((r) => r.code)).toEqual([OpResult_Code.APPLIED, OpResult_Code.APPLIED]);
+    expect(first.changes).toHaveLength(2);
+
+    b.baseSeq = 1n;
+    const { result: second } = await createFile(b, docs, "b.txt", "hello from B");
+    expect(second.seq).toBe(2n);
+
+    for (const device of [a, b]) {
+      const names = [...(await device.tree()).values()].map((node) => node.name).sort();
+      expect(names).toEqual(["", "Docs", "a.txt", "b.txt"]);
+    }
+  });
+
+  it("returns the stored result when a commit_id is retried", async () => {
+    const { a, root } = await setup();
+    const commitId = uuidv7();
+    const first = await a.commit([op.mkdir(uuidv7(), root, "Once")], { commitId });
+    const again = await a.commit([op.mkdir(uuidv7(), root, "Twice")], { commitId });
+    expect(again).toEqual(first);
+    expect([...(await a.tree()).values()].map((node) => node.name)).not.toContain("Twice");
+  });
+
+  it("rejects a base_seq ahead of the server and commits from viewers or old clients", async () => {
+    const space = await setup();
+    const ahead = await space.a.commitRaw([op.mkdir(uuidv7(), space.root, "X")], { baseSeq: 5n });
+    expect(ahead.case === "error" && ahead.value.code).toBe(Error_Code.INVALID_ARGUMENT);
+    const viewer = await client(space, "Viewer", { role: "viewer" });
+    const denied = await viewer.commitRaw([op.mkdir(uuidv7(), space.root, "X")]);
+    expect(denied.case === "error" && denied.value.code).toBe(Error_Code.FORBIDDEN);
+    const old = await client(space, "Old", { maxFormat: 0 });
+    const readOnly = await old.commitRaw([op.mkdir(uuidv7(), space.root, "X")]);
+    expect(readOnly.case === "error" && readOnly.value.code).toBe(Error_Code.READ_ONLY);
+  });
+
+  it("requires every pending chunk to carry an upload receipt", async () => {
+    const { a, b, root } = await setup();
+    const parts = await content("chunk bytes");
+    const receipts = await a.uploadParts(parts);
+    const missing = await a.commitRaw([op.create(uuidv7(), root, "f.bin", parts.content)]);
+    expect(missing.case).toBe("error");
+    if (missing.case === "error") {
+      expect(missing.value.code).toBe(Error_Code.MISSING_CHUNKS);
+      expect(missing.value.missingChunks.map(toHex)).toEqual([toHex(parts.content.chunks[0]!.hash)]);
+    }
+    const forged = await a.commitRaw([op.create(uuidv7(), root, "f.bin", parts.content)], {
+      receipts: [{ ...receipts[0]!, token: receipts[0]!.token.slice(0, -2) + "AA" }],
+    });
+    expect(forged.case === "error" && forged.value.code).toBe(Error_Code.MISSING_CHUNKS);
+    await a.commit([op.create(uuidv7(), root, "f.bin", parts.content)], { receipts });
+
+    const plan = await b.call({ case: "prepareUpload", value: { chunks: parts.content.chunks } });
+    expect(plan.case === "prepareUpload" && plan.value.chunks[0]!.action).toBe(ChunkPlan_Action.PRESENT);
+    b.baseSeq = 1n;
+    const reuse = await b.commit([op.create(uuidv7(), root, "copy.bin", parts.content)]);
+    expect(reuse.results[0]!.code).toBe(OpResult_Code.APPLIED);
+  });
+
+  it("rejects malformed content", async () => {
+    const { a, root } = await setup();
+    const parts = await content("abc");
+    parts.content.size = 4n;
+    const result = await a.commitRaw([op.create(uuidv7(), root, "bad", parts.content)], { receipts: await a.uploadParts(parts) });
+    expect(result.case === "error" && result.value.code).toBe(Error_Code.INVALID_ARGUMENT);
+  });
+});
+
+describe("conflict rules", () => {
+  it("R1: renames an incoming node whose name clashes case-insensitively", async () => {
+    const { a, b, root } = await setup();
+    await createFile(a, root, "Notes.txt", "a");
+    const { nodeId, result } = await createFile(b, root, "notes.TXT", "b");
+    const committedAt = Number((await b.tree()).get(nodeId)!.current!.createdAtMs);
+    expect(result.results[0]).toMatchObject({
+      code: OpResult_Code.APPLIED_RENAMED,
+      name: conflictName("notes.TXT", "Desktop B", committedAt, 1),
+    });
+    expect(result.results[0]!.name).toMatch(/^notes \(conflict from Desktop B \d{4}-\d{2}-\d{2}\)\.TXT$/);
+
+    const again = await createFile(b, root, "NOTES.txt", "c");
+    expect(again.result.results[0]!.name).toMatch(/^NOTES \(conflict from Desktop B \d{4}-\d{2}-\d{2} 2\)\.txt$/);
+  });
+
+  it("keeps conflict names within 255 bytes after NFC, even when NFC lengthens the device name", async () => {
+    const name = conflictName("x." + "e".repeat(200), "\u0A5E".repeat(40), Date.UTC(2026, 10, 10), 2);
+    expect(name).toBe(name.normalize("NFC"));
+    expect(new TextEncoder().encode(name).length).toBeLessThanOrEqual(255);
+    expect(name.startsWith(" (conflict from " + "\u0A2B\u0A3C".repeat(21) + " 2026-11-10 2).")).toBe(true);
+  });
+
+  it("gives canonical caseless pairs one key and keeps compatibility and accent distinctions", () => {
+    for (const [x, y] of [["\u0390", "\u03AA\u0301"], ["\u212A", "k"], ["\u00E9", "E\u0301"], ["Straße", "STRASSE"], ["a\u0315\u0300", "A\u0300\u0315"]]) {
+      expect(nameKey(x!)).toBe(nameKey(y!));
+    }
+    for (const [x, y] of [["\u2460", "1"], ["\uFF21", "A"], ["\u00E9", "e"], ["\u0130", "I"], ["\u0131", "i"]]) {
+      expect(nameKey(x!)).not.toBe(nameKey(y!));
+    }
+  });
+
+  it("keeps the date and attempt in conflict names when NFC expands the device name past the budget", () => {
+    const at = Date.UTC(2026, 10, 10);
+    const device = "\u{1D160}".repeat(32);
+    const names = [1, 2, 3].map((attempt) => conflictName("x.txt", device, at, attempt));
+    expect(new Set(names).size).toBe(3);
+    for (const name of names) {
+      expect(name).toBe(name.normalize("NFC"));
+      expect(new TextEncoder().encode(name).length).toBeLessThanOrEqual(255);
+      expect(new TextEncoder().encode(name.slice(name.indexOf(" (conflict from ") + 16, name.lastIndexOf(" 2026-11-10"))).length).toBeLessThanOrEqual(128);
+    }
+    expect(names[2]).toMatch(/ 2026-11-10 3\)\.txt$/);
+  });
+
+  it("commits repeated renames and conflict copies from a device whose name NFC expands past the budget", async () => {
+    const space = await newSpace();
+    const a = await client(space, "Laptop A");
+    const odd = await client(space, "\u{1D160}".repeat(32));
+    const root = space.spaceId;
+    const { nodeId } = await createFile(a, root, "x.txt", "original");
+    const renamed = [];
+    for (let i = 0; i < 3; i++) renamed.push((await createFile(odd, root, "x.txt", "copy " + i)).result.results[0]!);
+    expect(renamed.map((r) => r.code)).toEqual([OpResult_Code.APPLIED_RENAMED, OpResult_Code.APPLIED_RENAMED, OpResult_Code.APPLIED_RENAMED]);
+    expect(new Set(renamed.map((r) => r.name)).size).toBe(3);
+
+    const base = odd.baseSeq;
+    const update = await newContent(a, "newer");
+    await a.commit([op.update(nodeId, update.content)], { receipts: update.receipts });
+    const copies = [];
+    for (let i = 0; i < 3; i++) {
+      const stale = await newContent(odd, "stale " + i);
+      copies.push((await odd.commit([op.update(nodeId, stale.content)], { baseSeq: base, receipts: stale.receipts })).results[0]!);
+    }
+    expect(copies.map((r) => r.code)).toEqual([OpResult_Code.CONFLICT_COPY, OpResult_Code.CONFLICT_COPY, OpResult_Code.CONFLICT_COPY]);
+    expect(new Set([...renamed, ...copies].map((r) => r.name)).size).toBe(6);
+  });
+
+  it("R2: treats canonically equivalent names that differ only by case as one name", async () => {
+    const { a, b, root } = await setup();
+    const first = uuidv7();
+    await a.commit([op.mkdir(first, root, "\u0390")]);
+    const result = await b.commit([op.mkdir(uuidv7(), root, "\u03AA\u0301")]);
+    expect(result.results[0]).toMatchObject({ code: OpResult_Code.MERGED_INTO, nodeId: first });
+  });
+
+  it("R2: merges a new directory into an existing one with the same name", async () => {
+    const { a, b, root } = await setup();
+    const photosA = uuidv7();
+    await a.commit([op.mkdir(photosA, root, "Photos")]);
+    const photosB = uuidv7();
+    const fileId = uuidv7();
+    const parts = await content("img");
+    const result = await b.commit([op.mkdir(photosB, root, "photos"), op.create(fileId, photosB, "1.jpg", parts.content)], {
+      receipts: await b.uploadParts(parts),
+    });
+    expect(result.results[0]).toMatchObject({ code: OpResult_Code.MERGED_INTO, nodeId: photosA, name: "Photos" });
+    const tree = await b.tree();
+    expect(tree.get(fileId)!.parentId).toBe(photosA);
+    expect(tree.has(photosB)).toBe(false);
+  });
+
+  it("R3: keeps the first edit and turns a concurrent edit into a conflict copy", async () => {
+    const { a, b, root } = await setup();
+    const { nodeId } = await createFile(a, root, "report.docx", "v1");
+    b.baseSeq = 1n;
+    const fromB = await newContent(b, "v2 from B");
+    await b.commit([op.update(nodeId, fromB.content)], { receipts: fromB.receipts });
+
+    const fromA = await newContent(a, "v2 from A");
+    const result = await a.commit([op.update(nodeId, fromA.content)], { baseSeq: 1n, receipts: fromA.receipts });
+    const copy = result.results[0]!;
+    expect(copy.code).toBe(OpResult_Code.CONFLICT_COPY);
+    expect(copy.nodeId).not.toBe(nodeId);
+    const tree = await a.tree();
+    expect(copy.name).toBe(conflictName("report.docx", "Laptop A", Number(tree.get(copy.nodeId)!.current!.createdAtMs), 1));
+    expect(tree.get(nodeId)!.current!.content!.manifestDigest).toEqual(fromB.content.manifestDigest);
+    expect(tree.get(copy.nodeId)!.current!.content!.manifestDigest).toEqual(fromA.content.manifestDigest);
+    expect(tree.get(copy.nodeId)!.parentId).toBe(root);
+  });
+
+  it("R3: does not treat a device's own earlier commit as unseen", async () => {
+    const { a, root } = await setup();
+    const { nodeId } = await createFile(a, root, "draft.md", "1");
+    const second = await newContent(a, "2");
+    await a.commit([op.update(nodeId, second.content)], { baseSeq: 1n, receipts: second.receipts });
+    const third = await newContent(a, "3");
+    const result = await a.commit([op.update(nodeId, third.content)], { baseSeq: 1n, receipts: third.receipts });
+    expect(result.results[0]!.code).toBe(OpResult_Code.APPLIED);
+  });
+
+  it("R4: applies an edit over an unseen rename", async () => {
+    const { a, b, root } = await setup();
+    const { nodeId } = await createFile(a, root, "old.txt", "1");
+    b.baseSeq = 1n;
+    await b.commit([op.move(nodeId, root, "new.txt")]);
+    const edit = await newContent(a, "2");
+    const result = await a.commit([op.update(nodeId, edit.content)], { baseSeq: 1n, receipts: edit.receipts });
+    expect(result.results[0]!.code).toBe(OpResult_Code.APPLIED);
+    const node = (await a.tree()).get(nodeId)!;
+    expect(node.name).toBe("new.txt");
+    expect(node.current!.content!.manifestDigest).toEqual(edit.content.manifestDigest);
+  });
+
+  it("R5 and R6: applies moves in commit order and rejects the one that would make a cycle", async () => {
+    const { a, b, root } = await setup();
+    const x = uuidv7();
+    const y = uuidv7();
+    await a.commit([op.mkdir(x, root, "X"), op.mkdir(y, root, "Y")]);
+    b.baseSeq = 1n;
+    await a.commit([op.move(x, y, "X")]);
+    const result = await b.commit([op.move(y, x, "Y")]);
+    expect(result.results[0]).toMatchObject({ code: OpResult_Code.REJECTED, rejectReason: "CYCLE" });
+    const tree = await a.tree();
+    expect(tree.get(x)!.parentId).toBe(y);
+    expect(tree.get(y)!.parentId).toBe(root);
+  });
+
+  it("R7: keeps nodes with unseen changes and their ancestors when deleting", async () => {
+    const { a, b, root } = await setup();
+    const dir = uuidv7();
+    const sub = uuidv7();
+    await a.commit([op.mkdir(dir, root, "Project"), op.mkdir(sub, dir, "src")]);
+    const { nodeId: edited } = await createFile(a, sub, "main.rs", "fn main() {}");
+    const { nodeId: untouched } = await createFile(a, dir, "README", "readme");
+    b.baseSeq = a.baseSeq;
+    const edit = await newContent(a, "fn main() { edited }");
+    await a.commit([op.update(edited, edit.content)], { receipts: edit.receipts });
+
+    const result = await b.commit([op.delete(dir)]);
+    expect(result.results[0]!.code).toBe(OpResult_Code.SUPERSEDED);
+    const tree = await b.tree();
+    expect([dir, sub, edited].every((id) => tree.has(id))).toBe(true);
+    expect(tree.has(untouched)).toBe(false);
+
+    const trash = await b.call({ case: "listTrash", value: {} });
+    expect(trash.case === "trash" && trash.value.nodes.map((n) => n.nodeId)).toEqual([untouched]);
+  });
+
+  it("R7: trashes a whole subtree under one trash group", async () => {
+    const { a, root } = await setup();
+    const dir = uuidv7();
+    await a.commit([op.mkdir(dir, root, "Old")]);
+    const { nodeId: file } = await createFile(a, dir, "x", "x");
+    const result = await a.commit([op.delete(dir)]);
+    expect(result.results[0]!.code).toBe(OpResult_Code.APPLIED);
+    const states = result.changes.map((c) => (c.change.case === "node" ? c.change.value : undefined)!);
+    expect(states.map((s) => s.nodeId).sort()).toEqual([dir, file].sort());
+    expect(new Set(states.map((s) => s.trashGroup))).toEqual(new Set([`${result.seq}:0`]));
+    expect(states.every((s) => s.status === NodeStatus.TRASHED)).toBe(true);
+  });
+
+  it("R8: an unseen edit revives a deleted file, and creating inside a trashed folder revives the folder", async () => {
+    const { a, b, root } = await setup();
+    const dir = uuidv7();
+    await a.commit([op.mkdir(dir, root, "Shared")]);
+    const { nodeId: file } = await createFile(a, dir, "notes.txt", "1");
+    b.baseSeq = a.baseSeq;
+    await a.commit([op.delete(dir)]);
+
+    const edit = await newContent(b, "edited on B");
+    const revived = await b.commit([op.update(file, edit.content)], { receipts: edit.receipts });
+    expect(revived.results[0]!.code).toBe(OpResult_Code.APPLIED);
+    let tree = await b.tree();
+    expect(tree.get(file)!.status).toBe(NodeStatus.LIVE);
+    expect(tree.get(dir)!.status).toBe(NodeStatus.LIVE);
+
+    await a.commit([op.delete(dir)], { baseSeq: b.baseSeq });
+    const created = uuidv7();
+    await b.commit([op.mkdir(created, dir, "new")], { baseSeq: b.baseSeq + 1n });
+    tree = await b.tree();
+    expect(tree.has(dir)).toBe(true);
+    expect(tree.has(created)).toBe(true);
+    expect(tree.has(file)).toBe(false);
+  });
+
+  it("R9 and R10: restores from the trash and restores an old version", async () => {
+    const { a, root } = await setup();
+    const dir = uuidv7();
+    await a.commit([op.mkdir(dir, root, "Album")]);
+    const { nodeId: file, result: created } = await createFile(a, dir, "pic.png", "first");
+    const firstVersion = created.changes.find((c) => c.change.case === "node" && c.change.value.nodeId === file)!;
+    const firstVersionId = firstVersion.change.case === "node" ? firstVersion.change.value.current!.versionId : "";
+    const second = await newContent(a, "second");
+    await a.commit([op.update(file, second.content)], { receipts: second.receipts });
+
+    await a.commit([op.delete(dir)]);
+    const restored = await a.commit([op.restore(dir)]);
+    expect(restored.results[0]!.code).toBe(OpResult_Code.APPLIED);
+    expect([...(await a.tree()).keys()]).toEqual(expect.arrayContaining([dir, file]));
+
+    const back = await a.commit([op.restore(file, { versionId: firstVersionId })]);
+    expect(back.results[0]!.code).toBe(OpResult_Code.APPLIED);
+    const node = (await a.tree()).get(file)!;
+    expect(node.current!.versionId).not.toBe(firstVersionId);
+    expect(node.current!.content!.manifestDigest).toEqual((await content("first")).content.manifestDigest);
+
+    const versions = await a.call({ case: "listVersions", value: { nodeId: file, limit: 2 } });
+    expect(versions.case === "versions" && versions.value.versions.length).toBe(2);
+    expect(versions.case === "versions" && versions.value.nextCursor).not.toBe("");
+  });
+
+  it("R11: rejects invalid ops without failing the commit", async () => {
+    const { a, root } = await setup();
+    const { nodeId: file } = await createFile(a, root, "file", "x");
+    const dir = uuidv7();
+    const result = await a.commit([
+      op.move(root, root, "root"),
+      op.delete(root),
+      op.mkdir(uuidv7(), file, "under a file"),
+      op.delete(uuidv7()),
+      op.mkdir(file, root, "duplicate id"),
+      op.mkdir(uuidv7(), root, ".."),
+      op.mkdir(dir, root, "fine"),
+    ]);
+    expect(result.results.map((r) => r.rejectReason)).toEqual(["ROOT", "ROOT", "PARENT_NOT_DIR", "NOT_FOUND", "ID_EXISTS", "INVALID_NAME", ""]);
+    expect(result.results.at(-1)!.code).toBe(OpResult_Code.APPLIED);
+  });
+});
+
+describe("names", () => {
+  it("formats conflict names", () => {
+    const at = Date.UTC(2026, 10, 9, 23, 59);
+    expect(conflictName("a.tar.gz", "Mac/Book", at, 1)).toBe("a.tar (conflict from MacBook 2026-11-09).gz");
+    expect(conflictName(".bashrc", "pc", at, 2)).toBe(".bashrc (conflict from pc 2026-11-09 2)");
+    expect(conflictName("x", "d".repeat(40), at, 1)).toBe(`x (conflict from ${"d".repeat(32)} 2026-11-09)`);
+    expect(new TextEncoder().encode(conflictName("가".repeat(85), "pc", at, 1)).length).toBeLessThanOrEqual(255);
+  });
+
+  it("treats names that differ only by Unicode case folding as the same", async () => {
+    const { a, root } = await setup();
+    await a.commit([op.mkdir(uuidv7(), root, "Straße")]);
+    const result = await a.commit([op.mkdir(uuidv7(), root, "STRASSE")]);
+    expect(result.results[0]!.code).toBe(OpResult_Code.MERGED_INTO);
+    const nfd = await a.commit([op.mkdir(uuidv7(), root, "Cafe\u0301")]);
+    expect(nfd.results[0]!.name).toBe("Café");
+  });
+});
+
+describe("garbage collection", () => {
+  async function gc(space: { stub: DurableObjectStub<SpaceDO> }, atMs: number) {
+    return runInDurableObject(space.stub, (instance: SpaceDO) => instance.collectGarbage(atMs));
+  }
+
+  async function stored(spaceId: string, hash: Uint8Array): Promise<boolean> {
+    return (await env.BUCKET.head(chunkKey(spaceId, toHex(hash)))) !== null;
+  }
+
+  it("never deletes a pending chunk inside its hold, or a referenced chunk", async () => {
+    const space = await setup();
+    const kept = await content("referenced");
+    await space.a.commit([op.create(uuidv7(), space.root, "kept", kept.content)], { receipts: await space.a.uploadParts(kept) });
+    const pending = await content("uploaded, never committed");
+    await space.a.uploadParts(pending);
+    const keptHash = kept.content.chunks[0]!.hash;
+    const pendingHash = pending.content.chunks[0]!.hash;
+
+    const now = Date.now();
+    expect(await gc(space, now + 23 * 3_600_000)).toMatchObject({ deletedChunks: 0 });
+    expect(await stored(space.spaceId, pendingHash)).toBe(true);
+
+    expect(await gc(space, now + DAY + 60_000)).toMatchObject({ deletedChunks: 1 });
+    expect(await stored(space.spaceId, pendingHash)).toBe(false);
+    expect(await stored(space.spaceId, keptHash)).toBe(true);
+
+    expect(await gc(space, now + 3650 * DAY)).toMatchObject({ deletedChunks: 0 });
+    expect(await stored(space.spaceId, keptHash)).toBe(true);
+  });
+
+  it("deletes a chunk only after version retention and the 30-day grace", async () => {
+    const space = await setup();
+    const { nodeId, result } = await createFile(space.a, space.root, "doc", "old bytes");
+    const oldHash = (await content("old bytes")).content.chunks[0]!.hash;
+    const next = await newContent(space.a, "new bytes");
+    await space.a.commit([op.update(nodeId, next.content)], { receipts: next.receipts });
+    expect(result.seq).toBe(1n);
+
+    const now = Date.now();
+    expect(await gc(space, now + 29 * DAY)).toMatchObject({ expiredVersions: 0, deletedChunks: 0 });
+    const expiredAt = now + 31 * DAY;
+    expect(await gc(space, expiredAt)).toMatchObject({ expiredVersions: 1, deletedChunks: 0 });
+    expect(await gc(space, expiredAt + 29 * DAY)).toMatchObject({ deletedChunks: 0 });
+    expect(await stored(space.spaceId, oldHash)).toBe(true);
+
+    await runInDurableObject(space.stub, (_instance, state) => {
+      state.storage.sql.exec("UPDATE chunks SET hold_until_ms = ? WHERE hash = ?", expiredAt + 31 * DAY, oldHash);
+    });
+    expect(await gc(space, expiredAt + 30 * DAY + 1)).toMatchObject({ deletedChunks: 0 });
+    expect(await gc(space, expiredAt + 31 * DAY + 1)).toMatchObject({ deletedChunks: 1 });
+    expect(await stored(space.spaceId, oldHash)).toBe(false);
+    expect(await stored(space.spaceId, next.content.chunks[0]!.hash)).toBe(true);
+  });
+
+  it("purges expired trash with a NodePurged commit", async () => {
+    const space = await setup();
+    const dir = uuidv7();
+    await space.a.commit([op.mkdir(dir, space.root, "tmp")]);
+    const { nodeId } = await createFile(space.a, dir, "scratch", "temporary");
+    await space.a.commit([op.delete(dir)]);
+    const report = await gc(space, Date.now() + 31 * DAY);
+    expect(report.purgedNodes).toBe(2);
+    const head = await runInDurableObject(space.stub, (_i, state) =>
+      state.storage.sql.exec("SELECT seq, device_id, record FROM commits ORDER BY seq DESC LIMIT 1").one(),
+    );
+    expect({ seq: head.seq, device: head.device_id }).toEqual({ seq: 4, device: "" });
+    const record = fromBinary(CommitRecordSchema, new Uint8Array(head.record as ArrayBuffer));
+    expect(record.changes.map((c) => c.change.case === "purged" && c.change.value.nodeId)).toEqual([nodeId, dir]);
+    const trash = await space.a.call({ case: "listTrash", value: {} });
+    expect(trash.case === "trash" && trash.value.nodes).toEqual([]);
+  });
+
+  it("answers RETRY_LATER and MISSING_CHUNKS for a chunk being deleted", async () => {
+    const space = await setup();
+    const parts = await content("doomed");
+    const receipts = await space.a.uploadParts(parts);
+    await runInDurableObject(space.stub, (_instance, state) => {
+      state.storage.sql.exec("UPDATE chunks SET state = 3");
+    });
+    const plan = await space.a.call({ case: "prepareUpload", value: { chunks: parts.content.chunks } });
+    expect(plan.case === "prepareUpload" && plan.value.chunks[0]!.action).toBe(ChunkPlan_Action.RETRY_LATER);
+    const commit = await space.a.commitRaw([op.create(uuidv7(), space.root, "f", parts.content)], { receipts });
+    expect(commit.case === "error" && commit.value.code).toBe(Error_Code.MISSING_CHUNKS);
+  });
+
+  it("arms the GC alarm when the space is created", async () => {
+    const space = await setup();
+    const alarm = await runInDurableObject(space.stub, (_instance, state) => state.storage.getAlarm());
+    expect(alarm).toBeGreaterThan(Date.now() + DAY - 60_000);
+  });
+});

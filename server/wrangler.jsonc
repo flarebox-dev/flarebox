@@ -10,6 +10,7 @@
       { "name": "SPACE", "class_name": "SpaceDO" }
     ]
   },
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "flarebox" }],
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["AccountDO", "SpaceDO"] }
   ]

@@ -165,6 +165,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastcdc"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0431c3132902a1bed6fe77dcfa5d03844e083f263b81288246a2d43dd7d4b2ad"
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -173,6 +179,12 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 [[package]]
 name = "flarebox-chunk"
 version = "0.0.0"
+dependencies = [
+ "fastcdc",
+ "flarebox-proto",
+ "proptest",
+ "sha2",
+]
 
 [[package]]
 name = "flarebox-cli"
