@@ -83,6 +83,8 @@ export const HOLD_MS = DAY_MS;
 export const GRANT_MS = HOUR_MS;
 const MAX_OPS = 1000;
 const MAX_CHUNKS_PER_CALL = 1000;
+/** A MISSING_CHUNKS error lists at most this many hashes, the most one PrepareUpload takes; a retry after uploading them lists the rest. */
+export const MAX_MISSING_LISTED = MAX_CHUNKS_PER_CALL;
 export const MAX_CHUNK_BYTES = 16 * 1024 * 1024;
 /** Spec v0 section 7.2: a ServerMessage is at most 1 MiB, a ClientMessage at most 8 MiB. */
 const MAX_SERVER_FRAME = 1024 * 1024;
@@ -103,7 +105,7 @@ export const CONNECT_HEADER = "X-Flarebox-Connect";
 export const TOKEN_GRACE_MS = 60_000;
 
 /** WebSocket close codes. */
-export const Close = { PROTOCOL: 4000, TOKEN_EXPIRED: 4001, UNSUPPORTED_VERSION: 4002, DEVICE_REVOKED: 4003 } as const;
+export const Close = { TRY_AGAIN_LATER: 1013, PROTOCOL: 4000, TOKEN_EXPIRED: 4001, UNSUPPORTED_VERSION: 4002, DEVICE_REVOKED: 4003 } as const;
 
 export interface Connect {
   identity: Identity;
@@ -205,11 +207,15 @@ function opContent(op: Op): Content | undefined | null {
   return null;
 }
 
+/** The size of a reply as a WebSocket ServerMessage, which is a few bytes more than the HTTP body. */
+function frameBytes(response: RpcResponse): number {
+  return toBinary(ServerMessageSchema, create(ServerMessageSchema, { msg: { case: "rpc", value: response } })).length;
+}
+
 /** Wraps a non-commit result, refusing it if its WebSocket frame would exceed 1 MiB. Commit replies are bounded when stored. */
 function reply(reqId: bigint, result: RpcResponse["result"]): { response: RpcResponse } {
   const response = create(RpcResponseSchema, { reqId, result });
-  const frame = toBinary(ServerMessageSchema, create(ServerMessageSchema, { msg: { case: "rpc", value: response } }));
-  if (frame.length > MAX_SERVER_FRAME) fail(Error_Code.LIMIT_EXCEEDED, "the reply does not fit in one 1 MiB message");
+  if (frameBytes(response) > MAX_SERVER_FRAME) fail(Error_Code.LIMIT_EXCEEDED, "the reply does not fit in one 1 MiB message");
   return { response };
 }
 
@@ -314,7 +320,9 @@ export class SpaceDO extends DurableObject<Env> {
     if (message.byteLength > MAX_CLIENT_FRAME) return this.goodbye(ws, Close.PROTOCOL, "message larger than 8 MiB");
     const attachment = ws.deserializeAttachment() as Attachment;
     if (this.clock() > attachment.identity.expiresAtMs + TOKEN_GRACE_MS) return this.goodbye(ws, Close.TOKEN_EXPIRED, "access token expired");
-    if (!(await this.deviceActive(attachment.identity.deviceId))) return this.goodbye(ws, Close.DEVICE_REVOKED, "device revoked");
+    const active = await this.deviceActive(attachment.identity.deviceId);
+    if (active === undefined) return this.goodbye(ws, Close.TRY_AGAIN_LATER, "could not check the device; reconnect later");
+    if (!active) return this.goodbye(ws, Close.DEVICE_REVOKED, "device revoked");
     if (ws.readyState !== WebSocket.OPEN) return;
     let msg;
     try {
@@ -352,12 +360,21 @@ export class SpaceDO extends DurableObject<Env> {
   /**
    * Asks the Account DO whether the device is still active, so a revocation stops the device even before its notice
    * reaches this space, and remembers a refusal. Other events wait, so messages of one connection keep their order.
+   * Returns undefined when the Account DO cannot answer; the error is caught inside the callback, because an
+   * exception there would reset this object and drop every connection.
    */
-  private async deviceActive(deviceId: string): Promise<boolean> {
+  private async deviceActive(deviceId: string): Promise<boolean | undefined> {
     if (this.revoked(deviceId)) return false;
     const account = this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName("account"));
-    const active = await this.ctx.blockConcurrencyWhile(() => account.isDeviceActive(deviceId));
-    if (!active) this.recordRevoked(deviceId);
+    const active = await this.ctx.blockConcurrencyWhile(async () => {
+      try {
+        return await account.isDeviceActive(deviceId);
+      } catch (error) {
+        console.error("account device check failed", error);
+        return undefined;
+      }
+    });
+    if (active === false) this.recordRevoked(deviceId);
     return active;
   }
 
@@ -477,7 +494,9 @@ export class SpaceDO extends DurableObject<Env> {
     if (!identity || identity.deviceId !== attachment.identity.deviceId || identity.userId !== attachment.identity.userId) {
       return this.goodbye(ws, Close.TOKEN_EXPIRED, "invalid access token");
     }
-    if (!(await this.deviceActive(identity.deviceId))) return this.goodbye(ws, Close.DEVICE_REVOKED, "device revoked");
+    const active = await this.deviceActive(identity.deviceId);
+    if (active === undefined) return this.goodbye(ws, Close.TRY_AGAIN_LATER, "could not check the device; reconnect later");
+    if (!active) return this.goodbye(ws, Close.DEVICE_REVOKED, "device revoked");
     const current = ws.deserializeAttachment() as Attachment;
     current.identity = identity;
     ws.serializeAttachment(current);
@@ -525,7 +544,10 @@ export class SpaceDO extends DurableObject<Env> {
         missingChunks: failure.missingChunks,
         retryAfterMs: BigInt(failure.retryAfterMs),
       });
-      return { response: create(RpcResponseSchema, { reqId, result: { case: "error", value } }) };
+      const response = create(RpcResponseSchema, { reqId, result: { case: "error", value } });
+      if (frameBytes(response) <= MAX_SERVER_FRAME) return { response };
+      const limit = create(ErrorSchema, { code: Error_Code.LIMIT_EXCEEDED, message: "the error reply does not fit in one 1 MiB message" });
+      return { response: create(RpcResponseSchema, { reqId, result: { case: "error", value: limit } }) };
     }
   }
 
@@ -627,7 +649,10 @@ export class SpaceDO extends DurableObject<Env> {
         const ready = row && row.size === chunk.size && (row.state === ChunkState.LIVE || (row.state === ChunkState.PENDING && receipted.has(hex)));
         if (!ready) missing.push(chunk.hash);
       }
-      if (missing.length > 0) throw new CallFailure(Error_Code.MISSING_CHUNKS, "some chunks are not uploaded", missing);
+      if (missing.length > 0) {
+        const listed = missing.slice(0, MAX_MISSING_LISTED);
+        throw new CallFailure(Error_Code.MISSING_CHUNKS, `${missing.length} chunks are not uploaded; ${listed.length} are listed`, listed);
+      }
 
       const ctx: ApplyContext = {
         seq: head + 1,

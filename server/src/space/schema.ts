@@ -52,7 +52,7 @@ const MIGRATIONS: string[] = [
   CREATE TABLE schedule (task TEXT PRIMARY KEY, due_ms INTEGER NOT NULL);
   `,
   `
-  CREATE TABLE revoked_devices (device_id TEXT PRIMARY KEY, revoked_at_ms INTEGER NOT NULL);
+  CREATE TABLE IF NOT EXISTS revoked_devices (device_id TEXT PRIMARY KEY, revoked_at_ms INTEGER NOT NULL);
   `,
 ];
 

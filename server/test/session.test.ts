@@ -28,12 +28,12 @@ import {
   ServerMessageSchema,
   type Welcome,
 } from "../src/gen/flarebox/v1/messages_pb";
-import type { CommitRecord, Content } from "../src/gen/flarebox/v1/model_pb";
+import { ChunkRefSchema, type CommitRecord, type Content, ContentSchema } from "../src/gen/flarebox/v1/model_pb";
 import { Error_Code } from "../src/gen/flarebox/v1/rpc_pb";
-import { deriveSpaceKey, signChunkGrant } from "../src/crypto";
+import { deriveSpaceKey, sha256, signChunkGrant } from "../src/crypto";
 import { toHex, uuidv7 } from "../src/ids";
 import { Close } from "../src/space-do";
-import { chunkKey } from "../src/space/store";
+import { chunkKey, encodeChunkList } from "../src/space/store";
 import { content, op } from "./helpers";
 
 const BASE = "https://flarebox.test";
@@ -363,6 +363,51 @@ describe("owner claim, pairing and tokens", () => {
     expect(commits).toEqual([]);
   });
 
+  it("closes only the asking socket with 1013 when the Account DO cannot answer, and keeps the space running", async () => {
+    const owner = await getOwner();
+    const pad = await pairDevice(owner, "Pad");
+    const spaceId = await createSpace(owner);
+    const stub = env.SPACE.get(env.SPACE.idFromName(spaceId));
+    const asking = await Socket.connect(spaceId, pad);
+    await asking.start();
+    const other = await Socket.connect(spaceId, owner);
+    await other.start();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const prototype = await runInDurableObject(account(), (instance: import("../src/account-do").AccountDO) => Object.getPrototypeOf(instance) as import("../src/account-do").AccountDO);
+    const original = prototype.isDeviceActive;
+    prototype.isDeviceActive = async () => {
+      throw new Error("injected Account DO failure");
+    };
+    try {
+      asking.send({ case: "rpc", value: { reqId: 1n, call: { case: "listTree", value: {} } } });
+      expect(await asking.next()).toMatchObject({ case: "goodbye", value: { code: Close.TRY_AGAIN_LATER } });
+      expect((await asking.waitClosed()).code).toBe(Close.TRY_AGAIN_LATER);
+    } finally {
+      prototype.isDeviceActive = original;
+    }
+    expect((await other.rpc({ case: "listTree", value: {} })).case).toBe("tree");
+    expect(other.closed).toBeUndefined();
+    const revoked = await runInDurableObject(stub, (_instance, state) => state.storage.sql.exec("SELECT device_id FROM revoked_devices").toArray());
+    expect(revoked).toEqual([]);
+  });
+
+  it("migrates a schema-one database that already holds revoked_devices", async () => {
+    const owner = await getOwner();
+    const spaceId = await createSpace(owner);
+    const stub = env.SPACE.get(env.SPACE.idFromName(spaceId));
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec("UPDATE meta SET value = 1 WHERE key = 'schema_version'");
+    });
+    await evictDurableObject(stub);
+    const device = uuidv7();
+    await stub.closeDevice(device);
+    const after = await runInDurableObject(stub, (_instance, state) => ({
+      version: state.storage.sql.exec("SELECT value FROM meta WHERE key = 'schema_version'").one().value,
+      revoked: state.storage.sql.exec("SELECT device_id FROM revoked_devices").toArray(),
+    }));
+    expect(after).toEqual({ version: 2, revoked: [{ device_id: device }] });
+  });
+
   it("adds revoked_devices to a version-one Space database and keeps its data", async () => {
     const owner = await getOwner();
     const spaceId = await createSpace(owner);
@@ -502,6 +547,54 @@ describe("WebSocket session", () => {
       expect(page.http).toBeLessThanOrEqual(1024 * 1024);
       expect(page.socket).toBeLessThanOrEqual(1024 * 1024);
     }
+  });
+
+  it("lists at most 1,000 missing chunks so the error fits in 1 MiB, and lists the rest once those are uploaded", async () => {
+    const { a, spaceId, stub } = await twoDevices();
+    const socket = await Socket.connect(spaceId, a);
+    await socket.start();
+    const chunks = Array.from({ length: 32_768 }, (_, i) => {
+      const hash = new Uint8Array(32);
+      new DataView(hash.buffer).setUint32(0, i);
+      return create(ChunkRefSchema, { hash, size: 1 });
+    });
+    const many = create(ContentSchema, { chunks, chunkCount: chunks.length, size: BigInt(chunks.length), manifestDigest: await sha256(encodeChunkList(chunks)) });
+    const request: MessageInitShape<typeof RpcRequestSchema>["call"] = { case: "commit", value: { commitId: uuidv7(), baseSeq: 0n, ops: [op.create(uuidv7(), spaceId, "missing", many)] } };
+    const requestBytes = body(RpcRequestSchema, { reqId: 1n, call: request });
+    expect(requestBytes.length).toBeLessThan(8 * 1024 * 1024);
+    const http = await exports.default.fetch(BASE + "/v1/spaces/" + spaceId + "/rpc", { method: "POST", headers: { Authorization: "Bearer " + a.access!.token }, body: requestBytes });
+    const httpBytes = new Uint8Array(await http.arrayBuffer());
+    const viaHttp = fromBinary(RpcResponseSchema, httpBytes).result;
+    const viaSocket = await socket.rpc(request);
+    const wsBytes = toBinary(ServerMessageSchema, create(ServerMessageSchema, { msg: { case: "rpc", value: { reqId: 1n, result: viaSocket } } })).length;
+    for (const result of [viaHttp, viaSocket]) {
+      expect(result.case === "error" && result.value.code).toBe(Error_Code.MISSING_CHUNKS);
+      expect(result.case === "error" && result.value.missingChunks).toEqual(chunks.slice(0, 1000).map((chunk) => chunk.hash));
+    }
+    expect(httpBytes.length).toBeLessThanOrEqual(1024 * 1024);
+    expect(wsBytes).toBeLessThanOrEqual(1024 * 1024);
+    expect(await runInDurableObject(stub, (_instance, state) => state.storage.sql.exec("SELECT seq FROM commits").toArray())).toEqual([]);
+
+    const parts = await content(...Array.from({ length: 1500 }, (_, i) => "chunk " + i));
+    const commit = { commitId: uuidv7(), baseSeq: 0n, ops: [op.create(uuidv7(), spaceId, "big", parts.content)] };
+    const receipts: MessageInitShape<typeof UploadReceiptSchema>[] = [];
+    const listed = async () => {
+      const result = await socket.rpc({ case: "commit", value: { ...commit, receipts } });
+      return result.case === "error" && result.value.code === Error_Code.MISSING_CHUNKS ? result.value.missingChunks : result.case;
+    };
+    const uploadListed = async (hashes: Uint8Array[]) => {
+      const indexes = hashes.map((hash) => parts.content.chunks.findIndex((chunk) => toHex(chunk.hash) === toHex(hash)));
+      const subset = { content: { chunks: indexes.map((i) => parts.content.chunks[i]!) } as Content, bytes: indexes.map((i) => parts.bytes[i]!) };
+      expect((await socket.rpc({ case: "prepareUpload", value: { chunks: subset.content.chunks } })).case).toBe("prepareUpload");
+      receipts.push(...(await upload(spaceId, subset)));
+    };
+    const first = await listed();
+    expect(Array.isArray(first) && first.length).toBe(1000);
+    await uploadListed(first as Uint8Array[]);
+    const rest = await listed();
+    expect(Array.isArray(rest) && rest.map(toHex)).toEqual(parts.content.chunks.slice(1000).map((chunk) => toHex(chunk.hash)));
+    await uploadListed(rest as Uint8Array[]);
+    expect(await listed()).toBe("commit");
   });
 
   it("closes a connection on any text message except ping, an oversized one included", async () => {
