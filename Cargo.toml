@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[workspace]
+resolver = "3"
+members = [
+    "cli",
+    "core/chunk",
+    "core/engine",
+    "core/ffi",
+    "core/fs",
+    "core/net",
+    "core/proto",
+    "core/sim",
+    "core/store",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/flarebox-dev/flarebox"
+publish = false
+
+[workspace.dependencies]
+prost = "0.14"

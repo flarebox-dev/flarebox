@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "flarebox-store"
+description = "Local SQLite state for a synced space."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
