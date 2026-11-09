@@ -343,6 +343,62 @@ fn settling_never_gives_two_siblings_one_name_key() {
     assert_eq!(trees.check(), Ok(()));
 }
 
+/// Sets a node to `shape` in L and R, with `from` as its S shape.
+fn same_change(trees: &mut Trees, id: &str, from: Shape, to: Shape, ino: u64) {
+    trees.set_synced(id.into(), Some(from));
+    trees.set_local(id.into(), local(to.clone(), ino));
+    trees.set_remote(id.into(), remote(to));
+}
+
+#[test]
+fn settling_takes_a_name_swap_made_on_both_sides_together() {
+    let mut trees = Trees::new(ROOT);
+    same_change(&mut trees, "a", file(ROOT, "x", 1), file(ROOT, "y", 1), 1);
+    same_change(&mut trees, "b", file(ROOT, "y", 2), file(ROOT, "x", 2), 2);
+    assert_eq!(trees.check(), Ok(()));
+    assert_eq!(trees.settle(), []);
+    assert_eq!(trees.check(), Ok(()));
+    assert_eq!(trees.synced().get("a"), Some(&file(ROOT, "y", 1)));
+    assert_eq!(trees.synced().get("b"), Some(&file(ROOT, "x", 2)));
+}
+
+#[test]
+fn settling_takes_a_three_way_rotation_made_on_both_sides_together() {
+    let mut trees = Trees::new(ROOT);
+    trees.set_synced("d".into(), Some(dir(ROOT, "d")));
+    trees.set_local("d".into(), local(dir(ROOT, "d"), 9));
+    trees.set_remote("d".into(), remote(dir(ROOT, "d")));
+    same_change(&mut trees, "a", file("d", "x", 1), file("d", "Y", 1), 1);
+    same_change(&mut trees, "b", file("d", "y", 2), file("d", "z", 2), 2);
+    same_change(&mut trees, "c", file("d", "z", 3), file("d", "x", 3), 3);
+    assert_eq!(trees.check(), Ok(()));
+    assert_eq!(trees.settle(), []);
+    assert_eq!(trees.check(), Ok(()));
+    assert_eq!(trees.synced().get("a"), Some(&file("d", "Y", 1)));
+    assert_eq!(trees.synced().get("b"), Some(&file("d", "z", 2)));
+    assert_eq!(trees.synced().get("c"), Some(&file("d", "x", 3)));
+}
+
+#[test]
+fn a_swap_that_would_clash_with_an_unsettled_sibling_waits() {
+    let mut trees = Trees::new(ROOT);
+    same_change(&mut trees, "a", file(ROOT, "x", 1), file(ROOT, "y", 1), 1);
+    same_change(&mut trees, "b", file(ROOT, "y", 2), file(ROOT, "w", 2), 2);
+    trees.set_synced("c".into(), Some(file(ROOT, "w", 3)));
+    trees.set_local("c".into(), local(file(ROOT, "v", 3), 3));
+    trees.set_remote("c".into(), remote(file(ROOT, "u", 3)));
+    assert_eq!(trees.check(), Ok(()));
+    assert_eq!(
+        trees.settle(),
+        [
+            ("a".to_owned(), Class::Same),
+            ("b".to_owned(), Class::Same),
+            ("c".to_owned(), Class::Concurrent)
+        ]
+    );
+    assert_eq!(trees.check(), Ok(()));
+}
+
 /// The comparison of section 2.2 written out field by field, so that the properties do not test
 /// `Shape::same` against itself.
 fn equal(a: &Option<Shape>, b: &Option<Shape>) -> bool {

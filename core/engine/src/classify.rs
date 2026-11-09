@@ -106,9 +106,10 @@ impl Trees {
     /// Settles what needs no decision: a node changed the same way on both sides takes S := R, and
     /// a node in sync leaves the dirty set. S stays a valid tree: an update that would orphan a
     /// child, put a node under a missing or non-directory parent, close a cycle or take a sibling's
-    /// `name_key` waits until the updates it depends on have been made, and if they never are, the
-    /// node stays dirty as [`Class::Same`]. Returns every dirty node that is left, with its class,
-    /// in `node_id` order.
+    /// `name_key` waits until the updates it depends on have been made. Updates that depend on each
+    /// other, such as two names swapped or rotated the same way on both sides, are made together
+    /// when S is valid after all of them. A node whose update never fits stays dirty as
+    /// [`Class::Same`]. Returns every dirty node that is left, with its class, in `node_id` order.
     pub fn settle(&mut self) -> Vec<(NodeId, Class)> {
         let mut pending = Vec::new();
         let mut work = Vec::new();
@@ -122,14 +123,86 @@ impl Trees {
         loop {
             let before = pending.len();
             pending.retain(|id| !self.take_remote(id));
-            if pending.len() == before {
+            if pending.len() < before {
+                continue;
+            }
+            let taken = self.take_remote_together(&pending);
+            if taken.is_empty() {
                 break;
             }
+            pending.retain(|id| !taken.contains(id));
         }
         work.extend(pending.into_iter().map(|id| (id, Class::Same)));
         work.sort_by(|a, b| a.0.cmp(&b.0));
         self.dirty = work.iter().map(|(id, _)| id.clone()).collect();
         work
+    }
+
+    /// S := R for the largest group of `pending` nodes found whose updates leave S valid when made
+    /// together. Starting from all of them, each failed check drops one node the failure points
+    /// to, so this ends after at most one check per node. Returns the nodes it updated.
+    fn take_remote_together(&mut self, pending: &[NodeId]) -> BTreeSet<NodeId> {
+        let mut group: BTreeSet<NodeId> = pending.iter().cloned().collect();
+        while !group.is_empty() {
+            let mut s = self.s.clone();
+            for id in &group {
+                match self.r.live(id) {
+                    Some(shape) => {
+                        s.insert(id.clone(), shape.clone());
+                    }
+                    None => {
+                        s.remove(id);
+                    }
+                }
+            }
+            let culprit = match s.check(Names::ByKey) {
+                Ok(()) => {
+                    self.s = s;
+                    return group;
+                }
+                Err(TreeError::MissingParent(id) | TreeError::ParentNotDir(id)) => {
+                    if group.contains(&id) {
+                        Some(id)
+                    } else {
+                        s.live(&id)
+                            .map(|shape| shape.parent.clone())
+                            .filter(|parent| group.contains(parent))
+                    }
+                }
+                Err(TreeError::Cycle(id)) => {
+                    let mut current = Some(id);
+                    let mut found = None;
+                    for _ in 0..=s.len() {
+                        let Some(id) = current else { break };
+                        if group.contains(&id) {
+                            found = Some(id);
+                            break;
+                        }
+                        current = s.live(&id).map(|shape| shape.parent.clone());
+                    }
+                    found
+                }
+                Err(TreeError::NameTaken { parent, name }) => {
+                    let key = name_key(&name);
+                    s.iter()
+                        .filter(|(id, shape)| {
+                            group.contains(*id)
+                                && shape.parent == parent
+                                && name_key(&shape.name) == key
+                        })
+                        .map(|(id, _)| id.clone())
+                        .last()
+                }
+                Err(TreeError::RootStored) => None,
+            };
+            match culprit {
+                Some(id) => {
+                    group.remove(&id);
+                }
+                None => break,
+            }
+        }
+        BTreeSet::new()
     }
 
     /// S := R for one node, made only when S stays a valid tree.
