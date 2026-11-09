@@ -429,6 +429,23 @@ fn r1_renames_an_incoming_node_whose_name_clashes_case_insensitively() {
 }
 
 #[test]
+fn r2_treats_canonically_equivalent_names_that_differ_only_by_case_as_one_name() {
+    let mut s = Space::new();
+    let root = s.root();
+    let (mut a, mut b) = (s.client("A"), s.client("B"));
+    let first = s.id();
+    s.commit(&mut a, vec![mkdir(&first, &root, "\u{0390}")], vec![]);
+    let second = s.id();
+    let result = s.commit(
+        &mut b,
+        vec![mkdir(&second, &root, "\u{03AA}\u{0301}")],
+        vec![],
+    );
+    assert_eq!(result.results[0].code(), op_result::Code::MergedInto);
+    assert_eq!(result.results[0].node_id, first);
+}
+
+#[test]
 fn r2_merges_a_new_directory_into_an_existing_one_with_the_same_name() {
     let mut s = Space::new();
     let root = s.root();

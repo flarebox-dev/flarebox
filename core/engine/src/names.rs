@@ -26,9 +26,10 @@ pub fn nfc(name: &str) -> String {
     name.nfc().collect()
 }
 
-/// The key under which no two live children of a directory may collide: `casefold(NFC(name))`.
+/// The key under which no two live children of a directory may collide: canonical caseless matching,
+/// `NFD(casefold(NFD(name)))`, so canonically equivalent names that differ only by case share a key.
 pub fn name_key(name: &str) -> String {
-    casefold(&nfc(name))
+    casefold(&name.nfd().collect::<String>()).nfd().collect()
 }
 
 /// The NFC form of a valid node name, or `None` when the name is not allowed.

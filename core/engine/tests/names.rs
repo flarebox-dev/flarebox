@@ -4,6 +4,13 @@
 
 use flarebox_engine::names::{MAX_NAME_BYTES, casefold, conflict_name, name_key, normalize_name};
 use proptest::prelude::*;
+use unicode_normalization::UnicodeNormalization;
+
+#[test]
+fn name_key_matches_canonically_equivalent_names_that_differ_only_by_case() {
+    assert_eq!(name_key("\u{0390}"), name_key("\u{03AA}\u{0301}"));
+    assert_eq!(name_key("\u{0390}"), "\u{03B9}\u{0308}\u{0301}");
+}
 
 fn name() -> impl Strategy<Value = String> {
     prop_oneof![
@@ -21,6 +28,13 @@ proptest! {
     fn name_key_is_idempotent(s in "\\PC{0,40}") {
         prop_assert_eq!(name_key(&name_key(&s)), name_key(&s));
         prop_assert_eq!(casefold(&casefold(&s)), casefold(&s));
+    }
+
+    #[test]
+    fn canonically_equivalent_names_share_a_key(s in name()) {
+        let nfc: String = s.nfc().collect();
+        let nfd: String = s.nfd().collect();
+        prop_assert_eq!(name_key(&nfc), name_key(&nfd));
     }
 
     #[test]
