@@ -18,7 +18,7 @@ import {
 import { type ChangeRecord, ChangeRecordSchema, type ChunkRef, type Content } from "../gen/flarebox/v1/model_pb";
 import { Error_Code } from "../gen/flarebox/v1/rpc_pb";
 import { uuidv7 } from "../ids";
-import { conflictName, nameKey, normalizeName } from "./names";
+import { conflictName, isReservedAtRoot, nameKey, normalizeName } from "./names";
 import { NodeKindValue, NodeStatusValue } from "./schema";
 import {
   encodeChunkList,
@@ -172,10 +172,11 @@ export class CommitApplier {
     )[0];
   }
 
-  /** R1: the desired name, or the first free conflict name. */
+  /** R1: the desired name, or the first free conflict name. A name reserved at the root counts as taken there. */
   private pickName(parentId: string, desired: string, excludeId: string): { name: string; renamed: boolean } {
+    const atRoot = !getNode(this.sql, parentId)?.parent_id;
     let name = desired;
-    for (let attempt = 1; this.liveWithName(parentId, nameKey(name), excludeId); attempt++) {
+    for (let attempt = 1; this.liveWithName(parentId, nameKey(name), excludeId) || (atRoot && isReservedAtRoot(name)); attempt++) {
       name = conflictName(desired, this.ctx.committer.deviceName, this.ctx.nowMs, attempt);
     }
     return { name, renamed: name !== desired };
@@ -304,6 +305,7 @@ export class CommitApplier {
     if (getNode(this.sql, op.nodeId)) return rejected("ID_EXISTS");
     const parent = this.parentFor(op.parentId);
     if (typeof parent === "string") return rejected(parent);
+    if (!parent.parent_id && isReservedAtRoot(name)) return rejected("INVALID_NAME");
     const existing = this.liveWithName(parent.node_id, nameKey(name), "");
     if (existing?.kind === NodeKindValue.DIR) {
       this.remap.set(op.nodeId, existing.node_id);
@@ -320,6 +322,7 @@ export class CommitApplier {
     if (getNode(this.sql, op.nodeId)) return rejected("ID_EXISTS");
     const parent = this.parentFor(op.parentId);
     if (typeof parent === "string") return rejected(parent);
+    if (!parent.parent_id && isReservedAtRoot(name)) return rejected("INVALID_NAME");
     const picked = this.pickName(parent.node_id, name, "");
     const versionId = this.insertVersion(op.nodeId, op.content!, op.content!.chunks);
     this.insertNode(op.nodeId, parent.node_id, picked.name, NodeKindValue.FILE, versionId);
@@ -368,6 +371,10 @@ export class CommitApplier {
     if (!target) return rejected("NOT_FOUND");
     if (target.kind !== NodeKindValue.DIR) return rejected("PARENT_NOT_DIR");
     if (this.isSelfOrDescendant(target, found.node_id)) return rejected("CYCLE");
+    if (!target.parent_id && isReservedAtRoot(name)) return rejected("INVALID_NAME");
+    if (found.status === NodeStatusValue.LIVE && found.parent_id === target.node_id && found.name === name) {
+      return result(OpResult_Code.APPLIED, "", name);
+    }
     const parent = this.parentFor(target.node_id) as NodeRow;
     this.checkSubtreeDepth(found, parent);
     if (found.status === NodeStatusValue.TRASHED) {
@@ -433,6 +440,7 @@ export class CommitApplier {
     if (!target) return rejected("NOT_FOUND");
     if (target.kind !== NodeKindValue.DIR) return rejected("PARENT_NOT_DIR");
     if (this.isSelfOrDescendant(target, node.node_id)) return rejected("CYCLE");
+    if (!target.parent_id && isReservedAtRoot(name)) return rejected("INVALID_NAME");
     const parent = this.parentFor(target.node_id) as NodeRow;
     this.checkSubtreeDepth(node, parent);
     const group = node.trash_group!;

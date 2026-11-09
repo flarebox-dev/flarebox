@@ -109,6 +109,104 @@ describe("Space DO commits", () => {
   });
 });
 
+describe("RFC 0001 name and move rules", () => {
+  it("rejects .flarebox in any case directly under the root and allows it deeper", async () => {
+    const { a, root } = await setup();
+    const dir = uuidv7();
+    const nested = uuidv7();
+    const trashed = uuidv7();
+    const parts = await content("x");
+    const result = await a.commit(
+      [
+        op.mkdir(uuidv7(), root, ".flarebox"),
+        op.create(uuidv7(), root, ".FlareBox", parts.content),
+        op.mkdir(dir, root, "dir"),
+        op.mkdir(nested, dir, ".flarebox"),
+        op.mkdir(trashed, root, "old"),
+      ],
+      { receipts: await a.uploadParts(parts) },
+    );
+    expect(result.results.map((r) => [r.code, r.rejectReason])).toEqual([
+      [OpResult_Code.REJECTED, "INVALID_NAME"],
+      [OpResult_Code.REJECTED, "INVALID_NAME"],
+      [OpResult_Code.APPLIED, ""],
+      [OpResult_Code.APPLIED, ""],
+      [OpResult_Code.APPLIED, ""],
+    ]);
+    await a.commit([op.delete(trashed)]);
+    const moved = await a.commit([op.move(nested, root, ".flarebox"), op.move(dir, root, ".FLAREBOX"), op.restore(trashed, { name: ".flarebox" })]);
+    expect(moved.results.map((r) => [r.code, r.rejectReason])).toEqual([
+      [OpResult_Code.REJECTED, "INVALID_NAME"],
+      [OpResult_Code.REJECTED, "INVALID_NAME"],
+      [OpResult_Code.REJECTED, "INVALID_NAME"],
+    ]);
+    const tree = await a.tree();
+    expect(tree.get(nested)).toMatchObject({ parentId: dir, name: ".flarebox" });
+    expect(tree.get(dir)).toMatchObject({ parentId: root, name: "dir" });
+    expect(tree.has(trashed)).toBe(false);
+  });
+
+  it("rejects a full-casefold alias of .flarebox at the root", async () => {
+    const { a, root } = await setup();
+    const result = await a.commit([op.mkdir(uuidv7(), root, ".\uFB02arebox")]);
+    expect(result.results[0]).toMatchObject({ code: OpResult_Code.REJECTED, rejectReason: "INVALID_NAME" });
+  });
+
+  it("renames a stored reserved root name when R8 revives it", async () => {
+    const space = await setup();
+    const { a, root } = space;
+    const dir = uuidv7();
+    await a.commit([op.mkdir(dir, root, "legacy dir")]);
+    const updated = await createFile(a, root, "legacy file", "v1");
+    const restored = await createFile(a, root, "legacy restore", "v1");
+    const firstVersion = restored.result.changes[0]!.change;
+    const versionId = firstVersion.case === "node" ? firstVersion.value.current!.versionId : "";
+    await a.commit([op.delete(dir), op.delete(updated.nodeId), op.delete(restored.nodeId)]);
+    await runInDurableObject(space.stub, (_instance, state) => {
+      for (const [id, name] of [[dir, ".FlareBox"], [updated.nodeId, ".flarebox"], [restored.nodeId, ".\uFB02AREBOX"]]) {
+        state.storage.sql.exec("UPDATE nodes SET name = ?, name_key = ? WHERE node_id = ?", name, nameKey(name!), id);
+      }
+    });
+
+    const parts = await content("v2");
+    const result = await a.commit(
+      [op.mkdir(uuidv7(), dir, "child"), op.update(updated.nodeId, parts.content), op.restore(restored.nodeId, { versionId })],
+      { receipts: await a.uploadParts(parts) },
+    );
+    expect(result.results.map((r) => r.code)).toEqual([OpResult_Code.APPLIED, OpResult_Code.APPLIED, OpResult_Code.APPLIED]);
+    const tree = await a.tree();
+    expect(tree.get(dir)!.name).toMatch(/^\.FlareBox \(conflict from Laptop A \d{4}-\d{2}-\d{2}\)$/);
+    expect(tree.get(updated.nodeId)!.name).toMatch(/^\.flarebox \(conflict from Laptop A \d{4}-\d{2}-\d{2} 2\)$/);
+    expect(tree.get(restored.nodeId)!.name).toMatch(/^\.\uFB02AREBOX \(conflict from Laptop A \d{4}-\d{2}-\d{2} 3\)$/);
+    expect([...tree.values()].filter((n) => n.parentId === root && nameKey(n.name) === ".flarebox")).toEqual([]);
+  });
+
+  it("applies a no-op Move without a change record, so a concurrent delete still trashes the node", async () => {
+    const { a, b, root } = await setup();
+    const { nodeId } = await createFile(a, root, "notes.txt", "a");
+    const metaRev = (await b.tree()).get(nodeId)!.metaRev;
+    const noop = await b.commit([op.move(nodeId, root, "notes.txt")], { baseSeq: metaRev });
+    expect(noop.results[0]).toMatchObject({ code: OpResult_Code.APPLIED, name: "notes.txt" });
+    expect(noop.changes).toEqual([]);
+    expect((await b.tree()).get(nodeId)!.metaRev).toBe(metaRev);
+
+    const deleted = await a.commit([op.delete(nodeId)], { baseSeq: metaRev });
+    expect(deleted.results[0]!.code).toBe(OpResult_Code.APPLIED);
+    const state = deleted.changes[0]!.change;
+    expect(state.case === "node" && state.value.status).toBe(NodeStatus.TRASHED);
+  });
+
+  it("treats a case-only rename as a real move", async () => {
+    const { a, root } = await setup();
+    const { nodeId } = await createFile(a, root, "notes.txt", "a");
+    const before = (await a.tree()).get(nodeId)!.metaRev;
+    const renamed = await a.commit([op.move(nodeId, root, "Notes.txt")]);
+    expect(renamed.changes).toHaveLength(1);
+    expect((await a.tree()).get(nodeId)).toMatchObject({ name: "Notes.txt", metaRev: renamed.seq });
+    expect(renamed.seq).toBeGreaterThan(before);
+  });
+});
+
 describe("conflict rules", () => {
   it("R1: renames an incoming node whose name clashes case-insensitively", async () => {
     const { a, b, root } = await setup();
