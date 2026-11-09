@@ -196,3 +196,31 @@ fn new_folders_are_registered_before_their_rescan() {
     fs::write(root.join("sub/late.txt"), "l").unwrap();
     wait_for(&mut watcher, &[created("sub/late.txt", EntryKind::File)]);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_new_folder_that_vanishes_before_its_watch_is_not_a_watch_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let mut watcher = NativeWatcher::start(&root, Snapshot::default()).unwrap();
+    assert_eq!(watcher.poll(Duration::from_millis(300)).unwrap(), []);
+
+    let sub = root.join("tmp-build");
+    let gone = sub.clone();
+    watcher.before_register = Some(Box::new(move || fs::remove_dir(&gone).unwrap()));
+    fs::create_dir(&sub).unwrap();
+    let seen = wait_for(
+        &mut watcher,
+        &[
+            created("tmp-build", EntryKind::Dir),
+            Change::Removed {
+                path: "tmp-build".into(),
+                kind: EntryKind::Dir,
+            },
+        ],
+    );
+    assert_eq!(seen.len(), 2, "{seen:?}");
+
+    watcher.before_register = None;
+    assert_eq!(watcher.poll(Duration::from_millis(300)).unwrap(), []);
+}

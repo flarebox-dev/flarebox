@@ -726,11 +726,12 @@ impl NativeWatcher {
             hook();
         }
         for dir in &dirs {
-            if let Err(err) = self
-                .watcher
-                .watch(&self.root.join(dir), RecursiveMode::Recursive)
-            {
-                self.failed = Some(watch_error(err));
+            let path = self.root.join(dir);
+            if let Err(err) = self.watcher.watch(&path, RecursiveMode::Recursive) {
+                let still_a_dir = std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir());
+                if still_a_dir {
+                    self.failed = Some(watch_error(err));
+                }
             }
         }
         match self.snapshot.rescan(&self.root, dirs.iter().cloned()) {
