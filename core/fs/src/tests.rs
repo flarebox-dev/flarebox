@@ -174,6 +174,60 @@ fn ancestor_replaced_after_opening_publishes_nothing() {
     }
 }
 
+/// The reviewer's ABA schedule: `d` is swapped for an unreadable folder while
+/// the scan reads `m-victim` as missing from the detached original, then the
+/// original gets `m-victim` back and returns to the root. Every folder identity
+/// matches at publication, but the file exists, so its removal is not published
+/// and it is handed back for another rescan.
+#[test]
+fn ancestor_swapped_out_and_back_publishes_no_removal() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("space");
+    let detached = dir.path().join("detached-d");
+    let replacement = dir.path().join("replacement-d");
+    let scopes = [
+        vec![PathBuf::new()],
+        vec![
+            PathBuf::from("d/a-trigger"),
+            PathBuf::from("d/m-victim"),
+            PathBuf::from("d/z-trigger"),
+        ],
+    ];
+    for paths in scopes {
+        fs::create_dir_all(root.join("d/a-trigger")).unwrap();
+        fs::create_dir_all(root.join("d/z-trigger")).unwrap();
+        fs::write(root.join("d/m-victim"), "user content").unwrap();
+        let mut snapshot = Snapshot::scan(&root).unwrap();
+        let before = snapshot.clone();
+
+        let result = snapshot.rescan_with(&root, paths.clone(), &mut |cut| {
+            let Cut::OpeningDir(path) = cut else { return };
+            if path == Path::new("d/a-trigger") {
+                fs::rename(root.join("d"), &detached).unwrap();
+                fs::create_dir(root.join("d")).unwrap();
+                fs::write(root.join("d/m-victim"), "user content").unwrap();
+                fs::set_permissions(root.join("d"), fs::Permissions::from_mode(0o000)).unwrap();
+                fs::remove_file(detached.join("m-victim")).unwrap();
+            } else if path == Path::new("d/z-trigger") {
+                fs::write(detached.join("m-victim"), "user content").unwrap();
+                fs::set_permissions(root.join("d"), fs::Permissions::from_mode(0o755)).unwrap();
+                fs::rename(root.join("d"), &replacement).unwrap();
+                fs::rename(&detached, root.join("d")).unwrap();
+            }
+        });
+
+        let rescan = result.unwrap_or_else(|err| panic!("{paths:?}: {err:?}"));
+        assert_eq!(rescan.changes, [], "{paths:?}");
+        assert_eq!(rescan.unsettled, [PathBuf::from("d/m-victim")], "{paths:?}");
+        assert_eq!(snapshot, before, "{paths:?}");
+        assert!(root.join("d/m-victim").exists());
+        fs::remove_dir_all(&replacement).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+    }
+}
+
 fn wait_for(watcher: &mut NativeWatcher, expected: &[Change]) -> Vec<Change> {
     let deadline = Instant::now() + WAIT;
     let mut seen = Vec::new();

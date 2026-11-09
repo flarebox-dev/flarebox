@@ -5,7 +5,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use flarebox_fs::{Change, EntryKind, Error, NativeWatcher, RescanWatcher, Snapshot, Watcher};
+use flarebox_fs::{
+    Change, EntryKind, Error, NativeWatcher, Rescan, RescanWatcher, Snapshot, Watcher,
+};
 
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -201,7 +203,7 @@ fn replacing_a_file_reports_a_modification() {
     fs::remove_file(root.join("thing")).unwrap();
     fs::create_dir(root.join("thing")).unwrap();
 
-    let changes = snapshot.rescan(root, [PathBuf::new()]).unwrap();
+    let changes = snapshot.rescan(root, [PathBuf::new()]).unwrap().changes;
     assert_eq!(
         changes,
         [
@@ -242,7 +244,10 @@ fn case_only_rename_is_a_rename() {
 
     for alias in ["LETTER.txt", "DOCS/a.txt"] {
         let mut snapshot = previous.clone();
-        assert_eq!(snapshot.rescan(root, [PathBuf::from(alias)]).unwrap(), []);
+        assert_eq!(
+            snapshot.rescan(root, [PathBuf::from(alias)]).unwrap(),
+            Rescan::default()
+        );
         assert_eq!(snapshot, previous, "{alias} is not a name on disk");
     }
 
@@ -260,7 +265,8 @@ fn case_only_rename_is_a_rename() {
         let mut snapshot = previous.clone();
         let changes = snapshot
             .rescan(root, paths.iter().map(PathBuf::from))
-            .unwrap();
+            .unwrap()
+            .changes;
         assert_eq!(changes, expected, "{paths:?}");
         assert_eq!(snapshot, Snapshot::scan(root).unwrap(), "{paths:?}");
     }
@@ -277,7 +283,7 @@ fn normalization_alias_is_not_an_entry() {
         snapshot
             .rescan(root, [PathBuf::from("cafe\u{301}.txt")])
             .unwrap(),
-        []
+        Rescan::default()
     );
     assert_eq!(snapshot, previous);
 }
@@ -311,7 +317,10 @@ fn folder_replaced_by_a_symlink_is_removed_not_followed() {
 
     assert_eq!(
         snapshot.rescan(&root, [PathBuf::from("d/x")]).unwrap(),
-        [removed("d", Dir)]
+        Rescan {
+            changes: vec![removed("d", Dir)],
+            unsettled: vec![],
+        }
     );
     assert_eq!(snapshot, Snapshot::scan(&root).unwrap());
     assert!(snapshot.entries.is_empty());

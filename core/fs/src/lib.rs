@@ -23,6 +23,16 @@
 //! each directory they enter is the one they listed. A scan that sees its root
 //! disappear or a directory change under it publishes nothing.
 //!
+//! A scanner in userspace cannot take an atomic snapshot of a tree that keeps
+//! changing, so the guarantee is eventual consistency: once the tree is quiet,
+//! a rescan reports it exactly. While it changes, no removal is published for
+//! a path that exists when the scan is published. Before publishing, every
+//! path the scan saw disappear is looked up again from the root without
+//! following links; one that is present or cannot be read is kept and handed
+//! back for another rescan. What remains is the window between that lookup and
+//! the caller acting on the change, which the sync engine's mass-delete guard
+//! and the server trash cover.
+//!
 //! Symbolic links and special files are not synced in v0 (spec §5.1) and are
 //! skipped.
 
@@ -319,6 +329,17 @@ pub struct Snapshot {
     pub entries: BTreeMap<PathBuf, Entry>,
 }
 
+/// What one [`Snapshot::rescan`] found.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Rescan {
+    /// The changes, already applied to the snapshot.
+    pub changes: Vec<Change>,
+    /// Paths the scan saw disappear that were present, or could not be read,
+    /// when it was published. The snapshot keeps what it knew about them and
+    /// everything below them; rescan them later.
+    pub unsettled: Vec<PathBuf>,
+}
+
 impl Snapshot {
     pub fn scan(root: impl AsRef<Path>) -> Result<Self> {
         let mut snapshot = Self::default();
@@ -341,11 +362,16 @@ impl Snapshot {
     /// missing, unreadable or replaced at any point of the scan, so a lost root
     /// never reads as everything removed, and [`Error::Changed`] when a folder
     /// is replaced while the scan is inside it.
+    ///
+    /// A path is only reported removed, or as the source of a rename, if a
+    /// fresh lookup from the root confirms it is gone when the scan is
+    /// published. Otherwise it keeps its old entry and is returned in
+    /// [`Rescan::unsettled`].
     pub fn rescan(
         &mut self,
         root: impl AsRef<Path>,
         paths: impl IntoIterator<Item = PathBuf>,
-    ) -> Result<Vec<Change>> {
+    ) -> Result<Rescan> {
         self.rescan_with(root.as_ref(), paths, &mut |_| {})
     }
 
@@ -354,7 +380,7 @@ impl Snapshot {
         root: &Path,
         paths: impl IntoIterator<Item = PathBuf>,
         cut: &mut dyn FnMut(Cut<'_>),
-    ) -> Result<Vec<Change>> {
+    ) -> Result<Rescan> {
         let root_dir = open_root(root)?;
         let root_stat = stat_fd(root_dir.as_fd())?;
         cut(Cut::RootOpened);
@@ -431,20 +457,20 @@ impl Snapshot {
 
         let mut old = BTreeMap::new();
         for prefix in &scan.replaced {
-            let inside: Vec<PathBuf> = self
-                .entries
-                .range(prefix.clone()..)
-                .take_while(|(path, _)| path.starts_with(prefix))
-                .map(|(path, _)| path.clone())
-                .collect();
-            for path in inside {
-                let entry = self.entries.remove(&path).expect("collected from the map");
-                old.insert(path, entry);
-            }
+            old.extend(
+                self.entries
+                    .range(prefix.clone()..)
+                    .take_while(|(path, _)| path.starts_with(prefix))
+                    .map(|(path, entry)| (path.clone(), *entry)),
+            );
         }
+        let unsettled = keep_unconfirmed(again.as_fd(), &old, &mut scan.new);
         let changes = diff(&old, &scan.new);
+        for path in old.keys() {
+            self.entries.remove(path);
+        }
         self.entries.extend(scan.new);
-        Ok(changes)
+        Ok(Rescan { changes, unsettled })
     }
 
     /// Rescans the children of the known folder `parent`: every name in
@@ -555,6 +581,96 @@ fn revalidate(root: BorrowedFd<'_>, mut bindings: Vec<(PathBuf, FileId)>) -> Res
         open.push((path, dir));
     }
     Ok(())
+}
+
+/// Keeps the old entries of every path the scan saw disappear, and of
+/// everything below it, unless a fresh lookup from the root confirms it is gone
+/// now, and returns the paths kept. Folder identities can match again after a
+/// folder was swapped out and back while the scan read the detached copy, so an
+/// absence seen during the scan is only published once the attached tree
+/// confirms it. A path that is present or cannot be read stays as it was known.
+fn keep_unconfirmed(
+    root: BorrowedFd<'_>,
+    old: &BTreeMap<PathBuf, Entry>,
+    new: &mut BTreeMap<PathBuf, Entry>,
+) -> Vec<PathBuf> {
+    let gone: Vec<(PathBuf, EntryKind)> = old
+        .iter()
+        .filter(|(path, before)| {
+            !new.get(*path)
+                .is_some_and(|after| after.kind == before.kind)
+        })
+        .map(|(path, before)| (path.clone(), before.kind))
+        .collect();
+    let mut listings = HashMap::new();
+    let mut kept = Vec::new();
+    let mut checked: Option<PathBuf> = None;
+    for (path, kind) in gone {
+        if checked.as_ref().is_some_and(|done| path.starts_with(done)) {
+            continue;
+        }
+        checked = Some(path.clone());
+        if confirmed_gone(root, &path, kind, &mut listings) {
+            continue;
+        }
+        new.retain(|inside, _| !inside.starts_with(&path));
+        new.extend(
+            old.range(path.clone()..)
+                .take_while(|(inside, _)| inside.starts_with(&path))
+                .map(|(inside, entry)| (inside.clone(), *entry)),
+        );
+        kept.push(path);
+    }
+    kept
+}
+
+/// Whether `path` no longer holds an entry of `kind`: its parent, reached from
+/// the root without following links, does not list it under that exact name or
+/// holds something else there. `listings` caches each parent's names, with
+/// `None` for a parent that cannot be read.
+fn confirmed_gone(
+    root: BorrowedFd<'_>,
+    path: &Path,
+    kind: EntryKind,
+    listings: &mut HashMap<PathBuf, Option<BTreeSet<OsString>>>,
+) -> bool {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return false;
+    };
+    let names =
+        listings
+            .entry(parent.to_path_buf())
+            .or_insert_with(|| match open_attached(root, parent) {
+                Ok(Some(dir)) => list(dir.as_fd()).ok(),
+                Ok(None) => Some(BTreeSet::new()),
+                Err(_) => None,
+            });
+    match names {
+        None => false,
+        Some(names) if !names.contains(name) => true,
+        Some(_) => match open_attached(root, parent) {
+            Ok(Some(dir)) => match stat_at(dir.as_fd(), name) {
+                Ok(stat) => !stat.entry().is_some_and(|entry| entry.kind == kind),
+                Err(err) => is_gone(&err),
+            },
+            Ok(None) => true,
+            Err(_) => false,
+        },
+    }
+}
+
+/// Opens the folder at `rel` under the root one component at a time without
+/// following links, or returns `None` if no folder is there.
+fn open_attached(root: BorrowedFd<'_>, rel: &Path) -> io::Result<Option<OwnedFd>> {
+    let mut dir = root.try_clone_to_owned()?;
+    for component in rel.components() {
+        dir = match open_dir_at(dir.as_fd(), component.as_os_str()) {
+            Ok(next) => next,
+            Err(err) if is_gone(&err) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+    }
+    Ok(Some(dir))
 }
 
 /// Sorts the paths and drops every path inside another one.
@@ -785,7 +901,10 @@ impl NativeWatcher {
             }
         }
         match self.snapshot.rescan(&self.root, dirs.iter().cloned()) {
-            Ok(changes) => changes,
+            Ok(rescan) => {
+                self.dirty.extend(rescan.unsettled);
+                rescan.changes
+            }
             Err(Error::Changed) => {
                 self.dirty.extend(dirs);
                 Vec::new()
@@ -828,13 +947,14 @@ impl Watcher for NativeWatcher {
                 self.watcher = watch_root(&self.root, &self.sender)?;
                 self.rewatch = false;
             }
-            let changes = match self.snapshot.rescan(&self.root, self.dirty.iter().cloned()) {
-                Ok(changes) => changes,
+            let rescan = match self.snapshot.rescan(&self.root, self.dirty.iter().cloned()) {
+                Ok(rescan) => rescan,
                 Err(Error::Changed) if Instant::now() < deadline => continue,
                 Err(Error::Changed) => return Ok(Vec::new()),
                 Err(err) => return Err(err),
             };
-            self.dirty.clear();
+            self.dirty = rescan.unsettled.into_iter().collect();
+            let changes = rescan.changes;
             #[cfg(target_os = "linux")]
             let changes = {
                 let mut changes = changes;
@@ -876,7 +996,7 @@ impl Watcher for RescanWatcher {
         let deadline = Instant::now() + timeout;
         loop {
             let changes = match self.snapshot.rescan(&self.root, [PathBuf::new()]) {
-                Ok(changes) => changes,
+                Ok(rescan) => rescan.changes,
                 Err(Error::Changed) => Vec::new(),
                 Err(err) => return Err(err),
             };
