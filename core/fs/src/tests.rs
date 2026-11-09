@@ -337,6 +337,7 @@ fn sibling_recreated_after_its_parent_was_listed_publishes_no_removal() {
                     },
                 ],
                 unsettled: vec![],
+                unreadable: vec![],
             },
             "{paths:?}"
         );

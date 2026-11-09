@@ -236,6 +236,11 @@ fn open_dir_at(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<OwnedFd> {
     Ok(rustix::fs::openat(dir, name, DIR_FLAGS, Mode::empty())?)
 }
 
+/// Whether the error means the scan may not read there.
+fn denied(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::PermissionDenied
+}
+
 /// Whether the error means the name no longer leads to a directory: it is gone,
 /// or a file or symbolic link took its place.
 fn is_gone(err: &io::Error) -> bool {
@@ -273,6 +278,9 @@ struct Scan<'c> {
     bindings: Vec<(PathBuf, FileId)>,
     /// Paths whose old entry and everything below it give way to `new`.
     replaced: Vec<PathBuf>,
+    /// Folders the scan may not open or list. What lies below them stays as
+    /// it was known.
+    unreadable: Vec<PathBuf>,
     cut: &'c mut dyn FnMut(Cut<'_>),
 }
 
@@ -295,6 +303,10 @@ impl Scan<'_> {
         let sub = match open_dir_at(dir, name) {
             Ok(sub) => sub,
             Err(err) if is_gone(&err) => return Err(Error::Changed),
+            Err(err) if denied(&err) => {
+                self.unreadable.push(rel);
+                return Ok(());
+            }
             Err(err) => return Err(err.into()),
         };
         if !stat_fd(sub.as_fd())?.same_inode(&entry.id) {
@@ -305,10 +317,24 @@ impl Scan<'_> {
     }
 
     fn dir(&mut self, dir: BorrowedFd<'_>, rel: &Path) -> Result<()> {
-        for name in list(dir)? {
-            self.entry(dir, &name, rel.join(&name))?;
+        let result = list(dir).map_err(Error::from).and_then(|names| {
+            names
+                .iter()
+                .try_for_each(|name| self.entry(dir, name, rel.join(name)))
+        });
+        self.unless_denied(rel, result)
+    }
+
+    /// Records `rel` as unreadable and succeeds when `result` failed because
+    /// the scan may not read in that folder.
+    fn unless_denied(&mut self, rel: &Path, result: Result<()>) -> Result<()> {
+        match result {
+            Err(Error::Io(err)) if denied(&err) => {
+                self.unreadable.push(rel.to_path_buf());
+                Ok(())
+            }
+            other => other,
         }
-        Ok(())
     }
 }
 
@@ -356,6 +382,10 @@ pub struct Rescan {
     /// The snapshot keeps what it knew about them and everything below them;
     /// rescan them later.
     pub unsettled: Vec<PathBuf>,
+    /// Folders the scan may not open or list. The snapshot keeps what it knew
+    /// below them, so a folder the user cannot read never reads as emptied.
+    /// Report them, and rescan them once they can be read.
+    pub unreadable: Vec<PathBuf>,
 }
 
 impl Snapshot {
@@ -422,6 +452,7 @@ impl Snapshot {
             new: BTreeMap::new(),
             bindings: Vec::new(),
             replaced: Vec::new(),
+            unreadable: Vec::new(),
             cut,
         };
         let scopes = outermost(scopes);
@@ -436,9 +467,13 @@ impl Snapshot {
             let mut pending = scopes;
             while let Some(scope) = pending.pop() {
                 let parent = scope.parent().unwrap_or(Path::new(""));
-                if parent.as_os_str().is_empty()
-                    || self.open_known_dir(&root_dir, parent)?.is_some()
-                {
+                let known = parent.as_os_str().is_empty()
+                    || match self.open_known_dir(&root_dir, parent) {
+                        Ok(found) => found.is_some(),
+                        Err(Error::Io(err)) if denied(&err) => true,
+                        Err(err) => return Err(err),
+                    };
+                if known {
                     resolved.push(scope);
                 } else {
                     pending.push(parent.to_path_buf());
@@ -454,16 +489,8 @@ impl Snapshot {
                 groups.entry(parent).or_default().insert(name);
             }
             for (parent, focus) in groups {
-                let dir = if parent.as_os_str().is_empty() {
-                    root_dir.try_clone()?
-                } else {
-                    let (dir, chain) = self
-                        .open_known_dir(&root_dir, &parent)?
-                        .ok_or(Error::Changed)?;
-                    scan.bindings.extend(chain);
-                    dir
-                };
-                self.scan_children(&mut scan, dir.as_fd(), &parent, &focus)?;
+                let result = self.scan_children(&mut scan, &root_dir, &parent, &focus);
+                scan.unless_denied(&parent, result)?;
             }
         }
 
@@ -482,6 +509,17 @@ impl Snapshot {
                     .map(|(path, entry)| (path.clone(), *entry)),
             );
         }
+        let unreadable = std::mem::take(&mut scan.unreadable);
+        for blocked in &unreadable {
+            scan.new
+                .retain(|path, _| path == blocked || !path.starts_with(blocked));
+            scan.new.extend(
+                old.range(blocked.clone()..)
+                    .take_while(|(path, _)| path.starts_with(blocked))
+                    .filter(|(path, _)| *path != blocked)
+                    .map(|(path, entry)| (path.clone(), *entry)),
+            );
+        }
         let unsettled = keep_unconfirmed(
             root,
             &root_stat.id,
@@ -495,7 +533,11 @@ impl Snapshot {
             self.entries.remove(path);
         }
         self.entries.extend(scan.new);
-        Ok(Rescan { changes, unsettled })
+        Ok(Rescan {
+            changes,
+            unsettled,
+            unreadable,
+        })
     }
 
     /// Rescans the children of the known folder `parent`: every name in
@@ -504,10 +546,18 @@ impl Snapshot {
     fn scan_children(
         &self,
         scan: &mut Scan<'_>,
-        dir: BorrowedFd<'_>,
+        root: &OwnedFd,
         parent: &Path,
         focus: &BTreeSet<OsString>,
     ) -> Result<()> {
+        let dir = if parent.as_os_str().is_empty() {
+            root.try_clone()?
+        } else {
+            let (dir, chain) = self.open_known_dir(root, parent)?.ok_or(Error::Changed)?;
+            scan.bindings.extend(chain);
+            dir
+        };
+        let dir = dir.as_fd();
         let names = list(dir)?;
         for name in &names {
             let child = parent.join(name);
@@ -875,6 +925,9 @@ pub struct Poll {
     /// returned: a removal it could not confirm, or a scan that saw the tree
     /// change under it. The next poll rescans them.
     pub pending: Vec<PathBuf>,
+    /// Folders the scans of this poll may not read; see
+    /// [`Rescan::unreadable`].
+    pub unreadable: Vec<PathBuf>,
 }
 
 /// A source of changes under one root.
@@ -906,6 +959,7 @@ pub struct NativeWatcher {
     root: PathBuf,
     snapshot: Snapshot,
     dirty: BTreeSet<PathBuf>,
+    unreadable: BTreeSet<PathBuf>,
     rewatch: bool,
     failed: Option<Error>,
     sender: mpsc::Sender<notify::Result<notify::Event>>,
@@ -927,6 +981,7 @@ impl NativeWatcher {
             root,
             snapshot: previous,
             dirty: BTreeSet::from([PathBuf::new()]),
+            unreadable: BTreeSet::new(),
             rewatch: false,
             failed: None,
             sender,
@@ -1003,6 +1058,7 @@ impl NativeWatcher {
         match self.snapshot.rescan(&self.root, dirs.iter().cloned()) {
             Ok(rescan) => {
                 self.dirty.extend(rescan.unsettled);
+                self.unreadable.extend(rescan.unreadable);
                 rescan.changes
             }
             Err(Error::Changed) => {
@@ -1013,6 +1069,18 @@ impl NativeWatcher {
                 self.failed = Some(err);
                 Vec::new()
             }
+        }
+    }
+}
+
+impl NativeWatcher {
+    /// What a poll returns once it has `changes`: the scopes still dirty, and
+    /// the folders its scans could not read.
+    fn report(&mut self, changes: Vec<Change>) -> Poll {
+        Poll {
+            changes,
+            pending: self.dirty.iter().cloned().collect(),
+            unreadable: std::mem::take(&mut self.unreadable).into_iter().collect(),
         }
     }
 }
@@ -1050,15 +1118,11 @@ impl Watcher for NativeWatcher {
             let rescan = match self.snapshot.rescan(&self.root, self.dirty.iter().cloned()) {
                 Ok(rescan) => rescan,
                 Err(Error::Changed) if Instant::now() < deadline => continue,
-                Err(Error::Changed) => {
-                    return Ok(Poll {
-                        changes: Vec::new(),
-                        pending: self.dirty.iter().cloned().collect(),
-                    });
-                }
+                Err(Error::Changed) => return Ok(self.report(Vec::new())),
                 Err(err) => return Err(err),
             };
             self.dirty = rescan.unsettled.into_iter().collect();
+            self.unreadable.extend(rescan.unreadable);
             let changes = rescan.changes;
             #[cfg(target_os = "linux")]
             let changes = {
@@ -1068,10 +1132,7 @@ impl Watcher for NativeWatcher {
                 changes
             };
             if !changes.is_empty() || Instant::now() >= deadline {
-                return Ok(Poll {
-                    changes,
-                    pending: self.dirty.iter().cloned().collect(),
-                });
+                return Ok(self.report(changes));
             }
         }
     }
@@ -1103,14 +1164,21 @@ impl Watcher for RescanWatcher {
     fn poll(&mut self, timeout: Duration) -> Result<Poll> {
         let deadline = Instant::now() + timeout;
         loop {
-            let (changes, pending) = match self.snapshot.rescan(&self.root, [PathBuf::new()]) {
-                Ok(rescan) => (rescan.changes, rescan.unsettled),
-                Err(Error::Changed) => (Vec::new(), vec![PathBuf::new()]),
+            let poll = match self.snapshot.rescan(&self.root, [PathBuf::new()]) {
+                Ok(rescan) => Poll {
+                    changes: rescan.changes,
+                    pending: rescan.unsettled,
+                    unreadable: rescan.unreadable,
+                },
+                Err(Error::Changed) => Poll {
+                    pending: vec![PathBuf::new()],
+                    ..Poll::default()
+                },
                 Err(err) => return Err(err),
             };
             let left = deadline.saturating_duration_since(Instant::now());
-            if !changes.is_empty() || left.is_zero() {
-                return Ok(Poll { changes, pending });
+            if !poll.changes.is_empty() || left.is_zero() {
+                return Ok(poll);
             }
             std::thread::sleep(self.interval.min(left));
         }

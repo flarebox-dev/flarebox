@@ -332,6 +332,7 @@ fn folder_replaced_by_a_symlink_is_removed_not_followed() {
         Rescan {
             changes: vec![removed("d", Dir)],
             unsettled: vec![],
+            unreadable: vec![],
         }
     );
     assert_eq!(snapshot, Snapshot::scan(&root).unwrap());
@@ -350,5 +351,75 @@ fn rescan_rejects_paths_outside_the_root() {
             ),
             "{path}"
         );
+    }
+}
+
+#[test]
+fn unreadable_folder_is_kept_and_reported() {
+    for mode in [0o000, 0o600] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let locked = root.join("d/locked");
+        fs::create_dir_all(locked.join("inner")).unwrap();
+        fs::write(locked.join("x"), "x").unwrap();
+        let mut snapshot = Snapshot::scan(root).unwrap();
+        let known = snapshot.clone();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(mode)).unwrap();
+        if fs::symlink_metadata(locked.join("x")).is_ok() {
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        fs::write(root.join("new.txt"), "new").unwrap();
+        let blocked = vec![PathBuf::from("d/locked")];
+
+        assert_eq!(
+            snapshot.rescan(root, [PathBuf::new()]).unwrap(),
+            Rescan {
+                changes: vec![created("new.txt", File)],
+                unsettled: vec![],
+                unreadable: blocked.clone(),
+            },
+            "{mode:o}"
+        );
+        for (path, entry) in &known.entries {
+            assert_eq!(snapshot.entries.get(path), Some(entry), "{mode:o} {path:?}");
+        }
+        assert_eq!(
+            snapshot
+                .rescan(root, [PathBuf::from("d/locked/x")])
+                .unwrap(),
+            Rescan {
+                unreadable: blocked.clone(),
+                ..Rescan::default()
+            },
+            "{mode:o}"
+        );
+        let first = Snapshot::scan(root).unwrap();
+        assert!(
+            first.entries.contains_key(Path::new("d/locked")),
+            "{mode:o}"
+        );
+        assert!(
+            !first.entries.contains_key(Path::new("d/locked/x")),
+            "{mode:o}"
+        );
+        let mut watcher =
+            RescanWatcher::new(root, snapshot.clone(), Duration::from_millis(50)).unwrap();
+        assert_eq!(
+            watcher.poll(Duration::from_millis(100)).unwrap(),
+            Poll {
+                unreadable: blocked.clone(),
+                ..Poll::default()
+            },
+            "{mode:o}"
+        );
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            snapshot.rescan(root, [PathBuf::new()]).unwrap(),
+            Rescan::default(),
+            "{mode:o}"
+        );
+        assert_eq!(snapshot, Snapshot::scan(root).unwrap(), "{mode:o}");
     }
 }
