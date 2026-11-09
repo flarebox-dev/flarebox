@@ -43,3 +43,23 @@ import FlareboxFFI
 
     #expect(recorder.seen.withLock { $0 } == [.idle, .stopped])
 }
+
+@Test(.timeLimit(.minutes(1)))
+func statusStreamFinishesWhenTheSessionIsReleased() async {
+    var session: SyncSession?
+    let statuses: AsyncStream<SyncStatus>
+    (session, statuses) = SyncSession.withStatusStream()
+    async let seen: [SyncStatus] = {
+        var seen: [SyncStatus] = []
+        for await status in statuses {
+            seen.append(status)
+        }
+        return seen
+    }()
+
+    session?.start()
+    session?.stop()
+    session = nil
+
+    #expect(await seen == [.idle, .stopped])
+}

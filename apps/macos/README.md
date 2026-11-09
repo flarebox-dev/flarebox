@@ -28,7 +28,7 @@ open build/DerivedData/Build/Products/Release/Flarebox.app
 
 You can also open `Flarebox.xcodeproj` in Xcode after step 1 and run the Flarebox scheme. Local builds are signed ad hoc, so no Apple developer account is needed.
 
-Run `scripts/build-ffi.sh` again after every change to `core/ffi`. The Swift API is generated from the Rust code, and a stale copy fails at launch with a UniFFI checksum mismatch.
+Run `scripts/build-ffi.sh` again after every change to `core/ffi`. It rebuilds the Rust library and regenerates the Swift API together. UniFFI checksums stop the app at launch when the library and the bindings disagree on the API, but they do not detect a build that is merely out of date: an old library with its matching bindings still launches.
 
 ## Layout
 

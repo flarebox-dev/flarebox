@@ -10,16 +10,21 @@ final class SessionModel {
     let version = FlareboxFFI.version()
     private(set) var status: SyncStatus
     private let session: SyncSession
+    @ObservationIgnored private var consumer: Task<Void, Never>?
 
     init() {
-        let (statuses, continuation) = AsyncStream.makeStream(of: SyncStatus.self)
-        session = SyncSession(listener: StatusRelay(continuation: continuation))
+        let (session, statuses) = SyncSession.withStatusStream()
+        self.session = session
         status = session.status()
-        Task { [weak self] in
+        consumer = Task { [weak self] in
             for await status in statuses {
                 self?.status = status
             }
         }
+    }
+
+    deinit {
+        consumer?.cancel()
     }
 
     func toggle() {
@@ -28,17 +33,5 @@ final class SessionModel {
         } else {
             session.start()
         }
-    }
-}
-
-private final class StatusRelay: StatusListener {
-    let continuation: AsyncStream<SyncStatus>.Continuation
-
-    init(continuation: AsyncStream<SyncStatus>.Continuation) {
-        self.continuation = continuation
-    }
-
-    func onStatus(status: SyncStatus) {
-        continuation.yield(status)
     }
 }

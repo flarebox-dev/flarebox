@@ -27,8 +27,11 @@ pub enum SyncStatus {
 /// Receives every status change of a [`SyncSession`], in order.
 ///
 /// The session calls the listener on the thread that changed the status,
-/// while holding its lock, so the listener must not call back into the
-/// session before returning.
+/// while holding its lock, which keeps the changes in order. A listener that
+/// calls back into the session before returning deadlocks.
+///
+/// The session drops the listener when the session itself is dropped, so a
+/// listener can treat its own drop as the end of the stream.
 #[uniffi::export(callback_interface)]
 pub trait StatusListener: Send + Sync {
     fn on_status(&self, status: SyncStatus);
@@ -78,6 +81,7 @@ impl SyncSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     struct Recorder(Arc<Mutex<Vec<SyncStatus>>>);
 
@@ -105,5 +109,28 @@ mod tests {
             *seen.lock().unwrap(),
             [SyncStatus::Idle, SyncStatus::Stopped]
         );
+    }
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl StatusListener for DropFlag {
+        fn on_status(&self, _status: SyncStatus) {}
+    }
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn dropping_the_session_drops_the_listener() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let session = SyncSession::new(Box::new(DropFlag(dropped.clone())));
+        session.start();
+        assert!(!dropped.load(Ordering::SeqCst));
+
+        drop(session);
+        assert!(dropped.load(Ordering::SeqCst));
     }
 }
