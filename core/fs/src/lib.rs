@@ -241,6 +241,9 @@ enum Cut<'a> {
 /// The entries one rescan observed, and the parts of the snapshot they replace.
 struct Scan<'c> {
     new: BTreeMap<PathBuf, Entry>,
+    /// Every folder the scan opened, with the identity it had when opened.
+    /// Each must still be at its path when the scan is published.
+    bindings: Vec<(PathBuf, FileId)>,
     /// Paths whose old entry and everything below it give way to `new`.
     replaced: Vec<PathBuf>,
     cut: &'c mut dyn FnMut(Cut<'_>),
@@ -270,6 +273,7 @@ impl Scan<'_> {
         if !stat_fd(sub.as_fd())?.same_inode(&entry.id) {
             return Err(Error::Changed);
         }
+        self.bindings.push((rel.clone(), entry.id));
         self.dir(sub.as_fd(), &rel)
     }
 
@@ -372,6 +376,7 @@ impl Snapshot {
 
         let mut scan = Scan {
             new: BTreeMap::new(),
+            bindings: Vec::new(),
             replaced: Vec::new(),
             cut,
         };
@@ -408,8 +413,11 @@ impl Snapshot {
                 let dir = if parent.as_os_str().is_empty() {
                     root_dir.try_clone()?
                 } else {
-                    self.open_known_dir(&root_dir, &parent)?
-                        .ok_or(Error::Changed)?
+                    let (dir, chain) = self
+                        .open_known_dir(&root_dir, &parent)?
+                        .ok_or(Error::Changed)?;
+                    scan.bindings.extend(chain);
+                    dir
                 };
                 self.scan_children(&mut scan, dir.as_fd(), &parent, &focus)?;
             }
@@ -419,6 +427,7 @@ impl Snapshot {
         if !stat_fd(again.as_fd())?.same_inode(&root_stat.id) {
             return Err(Error::RootReplaced);
         }
+        revalidate(again.as_fd(), scan.bindings)?;
 
         let mut old = BTreeMap::new();
         for prefix in &scan.replaced {
@@ -473,12 +482,20 @@ impl Snapshot {
 
     /// Opens the folder the snapshot knows at `rel`, one component at a time,
     /// each one listed under its exact name and opened without following links.
-    /// Returns `None` if that path no longer leads to the same folder.
-    fn open_known_dir(&self, root: &OwnedFd, rel: &Path) -> Result<Option<OwnedFd>> {
+    /// Returns the folder with every folder opened on the way and its identity,
+    /// or `None` if that path no longer leads to the same folder.
+    #[allow(clippy::type_complexity)]
+    fn open_known_dir(
+        &self,
+        root: &OwnedFd,
+        rel: &Path,
+    ) -> Result<Option<(OwnedFd, Vec<(PathBuf, FileId)>)>> {
         let Some(known) = self.entries.get(rel).filter(|e| e.kind == EntryKind::Dir) else {
             return Ok(None);
         };
         let mut dir = root.try_clone()?;
+        let mut path = PathBuf::new();
+        let mut chain = Vec::new();
         for component in rel.components() {
             if !list(dir.as_fd())?.contains(component.as_os_str()) {
                 return Ok(None);
@@ -488,8 +505,13 @@ impl Snapshot {
                 Err(err) if is_gone(&err) => return Ok(None),
                 Err(err) => return Err(err.into()),
             };
+            path.push(component);
+            chain.push((path.clone(), stat_fd(dir.as_fd())?.id));
         }
-        Ok(stat_fd(dir.as_fd())?.same_inode(&known.id).then_some(dir))
+        let same = chain
+            .last()
+            .is_some_and(|(_, id)| id.dev == known.id.dev && id.ino == known.id.ino);
+        Ok(same.then_some((dir, chain)))
     }
 
     fn anchor(&self, mut path: PathBuf) -> PathBuf {
@@ -505,6 +527,34 @@ impl Snapshot {
         }
         path
     }
+}
+
+/// Checks that every folder the scan opened is still the folder at its path,
+/// opening each again from the root without following links. A folder that
+/// was moved, replaced or made unreadable after the scan opened it means the
+/// scan may have read a detached copy, so nothing it saw is published.
+fn revalidate(root: BorrowedFd<'_>, mut bindings: Vec<(PathBuf, FileId)>) -> Result<()> {
+    bindings.sort_by(|a, b| a.0.cmp(&b.0));
+    bindings.dedup_by(|a, b| a.0 == b.0);
+    let mut open: Vec<(PathBuf, OwnedFd)> = Vec::new();
+    for (path, id) in bindings {
+        while open.last().is_some_and(|(dir, _)| !path.starts_with(dir)) {
+            open.pop();
+        }
+        let (parent_path, parent) = match open.last() {
+            Some((dir, fd)) => (dir.as_path(), fd.as_fd()),
+            None => (Path::new(""), root),
+        };
+        let (Some(name), true) = (path.file_name(), path.parent() == Some(parent_path)) else {
+            return Err(Error::Changed);
+        };
+        let dir = open_dir_at(parent, name).map_err(|_| Error::Changed)?;
+        if !stat_fd(dir.as_fd()).is_ok_and(|stat| stat.same_inode(&id)) {
+            return Err(Error::Changed);
+        }
+        open.push((path, dir));
+    }
+    Ok(())
 }
 
 /// Sorts the paths and drops every path inside another one.

@@ -117,6 +117,63 @@ fn folder_replaced_during_traversal_publishes_nothing() {
     }
 }
 
+/// The reviewer's schedule: after `d` was opened and checked, it moves out of
+/// the root, an unreadable folder (or a symlink) takes its place with the
+/// file still in it, and the file disappears from the detached original. The
+/// scan read the detached copy, so it must publish nothing.
+#[test]
+fn ancestor_replaced_after_opening_publishes_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("space");
+    let outside = dir.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("z-victim"), "outside").unwrap();
+    let scopes = [
+        vec![PathBuf::new()],
+        vec![PathBuf::from("d/a-trigger"), PathBuf::from("d/z-victim")],
+    ];
+    for replacement in ["unreadable", "symlink"] {
+        for paths in scopes.clone() {
+            fs::create_dir_all(root.join("d/a-trigger")).unwrap();
+            fs::write(root.join("d/z-victim"), "user content").unwrap();
+            let detached = dir.path().join("detached-d");
+            let mut snapshot = Snapshot::scan(&root).unwrap();
+            let before = snapshot.clone();
+
+            let result = snapshot.rescan_with(&root, paths.clone(), &mut |cut| {
+                if let Cut::OpeningDir(path) = cut
+                    && path == Path::new("d/a-trigger")
+                {
+                    fs::rename(root.join("d"), &detached).unwrap();
+                    match replacement {
+                        "unreadable" => {
+                            fs::create_dir(root.join("d")).unwrap();
+                            fs::write(root.join("d/z-victim"), "new user content").unwrap();
+                            fs::set_permissions(root.join("d"), fs::Permissions::from_mode(0o000))
+                                .unwrap();
+                        }
+                        _ => std::os::unix::fs::symlink(&outside, root.join("d")).unwrap(),
+                    }
+                    fs::remove_file(detached.join("z-victim")).unwrap();
+                }
+            });
+
+            assert!(
+                matches!(result, Err(Error::Changed)),
+                "{replacement} {paths:?}: {result:?}"
+            );
+            assert_eq!(snapshot, before, "{replacement} {paths:?}");
+            if replacement == "unreadable" {
+                fs::set_permissions(root.join("d"), fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            fs::remove_dir_all(&root).unwrap();
+            fs::remove_dir_all(&detached).unwrap();
+        }
+    }
+}
+
 fn wait_for(watcher: &mut NativeWatcher, expected: &[Change]) -> Vec<Change> {
     let deadline = Instant::now() + WAIT;
     let mut seen = Vec::new();
