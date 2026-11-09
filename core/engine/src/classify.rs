@@ -2,10 +2,14 @@
 
 //! Classifying a node (docs/design/sync-engine.md section 2.3) and the dirty set the planner reads.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::names::name_key;
 use crate::tree::{Kind, LocalNode, Names, NodeId, RemoteNode, Shape, Tree, TreeError, same};
+
+/// The most mutually dependent [`Class::Same`] updates [`Trees::settle`] searches as one group.
+/// Every subset of a group is tried, so the search costs up to 2^n checks of n nodes.
+pub const SETTLE_GROUP_LIMIT: usize = 12;
 
 /// Where a node stands against its merge base S.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +46,7 @@ pub struct Trees {
     l: Tree<LocalNode>,
     s: Tree<Shape>,
     dirty: BTreeSet<NodeId>,
+    unsearched: BTreeSet<NodeId>,
 }
 
 impl Trees {
@@ -52,6 +57,7 @@ impl Trees {
             l: Tree::new(root.clone()),
             s: Tree::new(root),
             dirty: BTreeSet::new(),
+            unsearched: BTreeSet::new(),
         }
     }
 
@@ -104,12 +110,14 @@ impl Trees {
     }
 
     /// Settles what needs no decision: a node changed the same way on both sides takes S := R, and
-    /// a node in sync leaves the dirty set. S stays a valid tree: an update that would orphan a
+    /// a node in sync leaves the dirty set. S stays a valid tree, so an update that would orphan a
     /// child, put a node under a missing or non-directory parent, close a cycle or take a sibling's
-    /// `name_key` waits until the updates it depends on have been made. Updates that depend on each
-    /// other, such as two names swapped or rotated the same way on both sides, are made together
-    /// when S is valid after all of them. A node whose update never fits stays dirty as
-    /// [`Class::Same`]. Returns every dirty node that is left, with its class, in `node_id` order.
+    /// `name_key` is made only together with the updates it depends on. Settling stops only when no
+    /// non-empty set of the remaining [`Class::Same`] updates can be made together with S still valid,
+    /// searching each group of updates that depend on each other exhaustively. A group of more
+    /// than [`SETTLE_GROUP_LIMIT`] updates is not searched: its nodes stay dirty as [`Class::Same`] and
+    /// [`Trees::unsearched`] lists them. Returns every dirty node that is left, with its class, in
+    /// `node_id` order.
     pub fn settle(&mut self) -> Vec<(NodeId, Class)> {
         let mut pending = Vec::new();
         let mut work = Vec::new();
@@ -120,6 +128,7 @@ impl Trees {
                 class => work.push((id, class)),
             }
         }
+        self.unsearched.clear();
         loop {
             let before = pending.len();
             pending.retain(|id| !self.take_remote(id));
@@ -138,75 +147,183 @@ impl Trees {
         work
     }
 
-    /// S := R for the largest group of `pending` nodes found whose updates leave S valid when made
-    /// together. Starting from all of them, each failed check drops one node the failure points
-    /// to, so this ends after at most one check per node. Returns the nodes it updated.
+    /// The [`Class::Same`] nodes the last [`Trees::settle`] left without searching, because the
+    /// group of updates they belong to has more than [`SETTLE_GROUP_LIMIT`] members.
+    pub fn unsearched(&self) -> &BTreeSet<NodeId> {
+        &self.unsearched
+    }
+
+    /// S := R together for a non-empty set of `pending` nodes whose updates leave S valid, when one
+    /// exists. Returns the nodes it updated, or an empty set.
     fn take_remote_together(&mut self, pending: &[NodeId]) -> BTreeSet<NodeId> {
-        let mut group: BTreeSet<NodeId> = pending.iter().cloned().collect();
-        while !group.is_empty() {
-            let mut s = self.s.clone();
-            for id in &group {
-                match self.r.live(id) {
-                    Some(shape) => {
-                        s.insert(id.clone(), shape.clone());
-                    }
-                    None => {
-                        s.remove(id);
-                    }
-                }
+        let (taken, unsearched) = self.search_together(pending);
+        self.unsearched = unsearched;
+        for id in &taken {
+            let next = self.r.live(id).cloned();
+            self.set_synced_unmarked(id, next);
+        }
+        debug_assert_eq!(self.s.check(Names::ByKey), Ok(()));
+        taken
+    }
+
+    /// Finds a non-empty set of `pending` nodes whose updates leave S valid when made together, and
+    /// the nodes it did not search.
+    ///
+    /// Nodes outside the candidates keep their S shape. A candidate whose update breaks S because
+    /// of such a fixed node alone (a fixed child, a fixed parent that is not a live directory, a
+    /// fixed sibling holding its name key, or a parent chain through fixed nodes that leads back to
+    /// it) can never be updated, so it becomes fixed too, until no more do. An update then reaches
+    /// other nodes only through the first candidate on its new or old parent chain and through the
+    /// candidates holding its new name key in S. Those links split the candidates into groups
+    /// where any valid set's part in one group is valid on its own, so searching every subset of
+    /// each group, up to [`SETTLE_GROUP_LIMIT`] members, finds a valid set whenever one exists.
+    fn search_together(&self, pending: &[NodeId]) -> (BTreeSet<NodeId>, BTreeSet<NodeId>) {
+        let root = self.s.root.as_str();
+        let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        let mut holders: BTreeMap<(&str, String), Vec<&str>> = BTreeMap::new();
+        for (id, shape) in self.s.iter() {
+            children.entry(&shape.parent).or_default().push(id);
+            holders
+                .entry((&shape.parent, name_key(&shape.name)))
+                .or_default()
+                .push(id);
+        }
+        let mut candidates: BTreeSet<&str> = pending.iter().map(String::as_str).collect();
+        loop {
+            let never: Vec<&str> = candidates
+                .iter()
+                .copied()
+                .filter(|&id| {
+                    let fixed = |other: &&str| !candidates.contains(other);
+                    let fixed_child = children.get(id).is_some_and(|c| c.iter().any(fixed));
+                    let Some(shape) = self.r.live(id) else {
+                        return fixed_child;
+                    };
+                    (fixed_child && shape.kind != Kind::Dir)
+                        || (shape.parent != root
+                            && fixed(&shape.parent.as_str())
+                            && !self
+                                .s
+                                .live(&shape.parent)
+                                .is_some_and(|p| p.kind == Kind::Dir))
+                        || holders
+                            .get(&(shape.parent.as_str(), name_key(&shape.name)))
+                            .is_some_and(|h| h.iter().any(|h| *h != id && fixed(h)))
+                        || self
+                            .above(&shape.parent, &candidates)
+                            .is_none_or(|up| up == id)
+                })
+                .collect();
+            if never.is_empty() {
+                break;
             }
-            let culprit = match s.check(Names::ByKey) {
-                Ok(()) => {
-                    self.s = s;
-                    return group;
-                }
-                Err(TreeError::MissingParent(id) | TreeError::ParentNotDir(id)) => {
-                    if group.contains(&id) {
-                        Some(id)
-                    } else {
-                        s.live(&id)
-                            .map(|shape| shape.parent.clone())
-                            .filter(|parent| group.contains(parent))
-                    }
-                }
-                Err(TreeError::Cycle(id)) => {
-                    let mut path = vec![id];
-                    loop {
-                        let last = path.last().expect("the path starts with a node");
-                        let Some(parent) = s.live(last).map(|shape| shape.parent.clone()) else {
-                            break None;
-                        };
-                        if let Some(start) = path.iter().position(|id| *id == parent) {
-                            break path[start..]
-                                .iter()
-                                .filter(|id| group.contains(*id))
-                                .max()
-                                .cloned();
-                        }
-                        path.push(parent);
-                    }
-                }
-                Err(TreeError::NameTaken { parent, name }) => {
-                    let key = name_key(&name);
-                    s.iter()
-                        .filter(|(id, shape)| {
-                            group.contains(*id)
-                                && shape.parent == parent
-                                && name_key(&shape.name) == key
-                        })
-                        .map(|(id, _)| id.clone())
-                        .last()
-                }
-                Err(TreeError::RootStored) => None,
-            };
-            match culprit {
-                Some(id) => {
-                    group.remove(&id);
-                }
-                None => break,
+            for id in never {
+                candidates.remove(id);
             }
         }
-        BTreeSet::new()
+        let mut next: BTreeMap<(&str, bool), &str> = BTreeMap::new();
+        let mut links: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for &id in &candidates {
+            for (taken, shape) in [(true, self.r.live(id)), (false, self.s.live(id))] {
+                let Some(up) = shape
+                    .and_then(|shape| self.above(&shape.parent, &candidates))
+                    .filter(|up| *up != root)
+                else {
+                    continue;
+                };
+                next.insert((id, taken), up);
+                links.entry(id).or_default().push(up);
+                links.entry(up).or_default().push(id);
+            }
+            if let Some(shape) = self.r.live(id) {
+                let key = (shape.parent.as_str(), name_key(&shape.name));
+                for &other in holders.get(&key).into_iter().flatten() {
+                    if other != id && candidates.contains(other) {
+                        links.entry(id).or_default().push(other);
+                        links.entry(other).or_default().push(id);
+                    }
+                }
+            }
+        }
+        let mut unsearched = BTreeSet::new();
+        let mut seen = BTreeSet::new();
+        for &start in &candidates {
+            if !seen.insert(start) {
+                continue;
+            }
+            let mut group = vec![start];
+            let mut i = 0;
+            while let Some(&id) = group.get(i) {
+                i += 1;
+                for &other in links.get(id).into_iter().flatten() {
+                    if seen.insert(other) {
+                        group.push(other);
+                    }
+                }
+            }
+            if group.len() > SETTLE_GROUP_LIMIT {
+                unsearched.extend(group.iter().map(|id| id.to_string()));
+                continue;
+            }
+            for mask in (1..1u32 << group.len()).rev() {
+                let taken = |id: &str| {
+                    group
+                        .iter()
+                        .position(|member| *member == id)
+                        .is_some_and(|i| mask >> i & 1 == 1)
+                };
+                let entry = |id: &str| {
+                    if taken(id) {
+                        self.r.live(id)
+                    } else {
+                        self.s.live(id)
+                    }
+                };
+                let fits = group.iter().all(|&id| {
+                    let Some(shape) = entry(id) else {
+                        return true;
+                    };
+                    if shape.parent != root
+                        && !entry(&shape.parent).is_some_and(|p| p.kind == Kind::Dir)
+                    {
+                        return false;
+                    }
+                    if taken(id)
+                        && holders
+                            .get(&(shape.parent.as_str(), name_key(&shape.name)))
+                            .is_some_and(|h| h.iter().any(|h| *h != id && !taken(h)))
+                    {
+                        return false;
+                    }
+                    let mut current = id;
+                    for _ in 0..group.len() {
+                        match next.get(&(current, taken(current))) {
+                            Some(up) => current = up,
+                            None => return true,
+                        }
+                    }
+                    false
+                });
+                if fits {
+                    let taken = group.iter().filter(|id| taken(id));
+                    return (taken.map(|id| id.to_string()).collect(), unsearched);
+                }
+            }
+        }
+        (BTreeSet::new(), unsearched)
+    }
+
+    /// Follows S parents from `start` past nodes that are not candidates, and returns the first
+    /// candidate or the root it reaches, or `None` when the chain breaks.
+    fn above<'a>(&'a self, start: &'a str, candidates: &BTreeSet<&str>) -> Option<&'a str> {
+        let mut current = start;
+        for _ in 0..=self.s.len() {
+            if current == self.s.root || candidates.contains(current) {
+                return Some(current);
+            }
+            current = &self.s.live(current)?.parent;
+        }
+        None
     }
 
     /// S := R for one node, made only when S stays a valid tree.

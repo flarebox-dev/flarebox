@@ -2,8 +2,8 @@
 
 //! The three trees and the classification table of docs/design/sync-engine.md sections 2.2 and 2.3.
 
-use flarebox_engine::classify::{Class, Trees, classify};
-use flarebox_engine::names::nfc;
+use flarebox_engine::classify::{Class, SETTLE_GROUP_LIMIT, Trees, classify};
+use flarebox_engine::names::{name_key, nfc};
 use flarebox_engine::tree::{
     Content, FileIdentity, Kind, LocalNode, Names, RemoteNode, Shape, StateError, Tree, TreeError,
     same_content,
@@ -402,6 +402,88 @@ fn a_cycle_elsewhere_does_not_stop_a_swap_below_it() {
 }
 
 #[test]
+fn a_cycle_through_one_swap_does_not_stop_another_swap_that_fits() {
+    let mut trees = Trees::new(ROOT);
+    same_change(&mut trees, "a", dir(ROOT, "A"), dir("y", "A"), 1);
+    same_change(&mut trees, "b", dir("y", "A"), dir(ROOT, "A"), 2);
+    same_change(&mut trees, "y", dir("p", "x"), dir("q", "x"), 3);
+    same_change(&mut trees, "z", dir("q", "x"), dir("p", "x"), 4);
+    for id in ["p", "q"] {
+        trees.set_synced(id.into(), Some(dir("a", id)));
+        trees.set_local(id.into(), local(dir(ROOT, &format!("local-{id}")), 5));
+        trees.set_remote(id.into(), remote(dir(ROOT, &format!("remote-{id}"))));
+    }
+    assert_eq!(trees.check(), Ok(()));
+    assert_eq!(
+        trees.settle(),
+        [
+            ("a".to_owned(), Class::Same),
+            ("b".to_owned(), Class::Same),
+            ("p".to_owned(), Class::Concurrent),
+            ("q".to_owned(), Class::Concurrent),
+        ]
+    );
+    assert_eq!(trees.check(), Ok(()));
+    assert_eq!(trees.synced().get("y"), Some(&dir("q", "x")));
+    assert_eq!(trees.synced().get("z"), Some(&dir("p", "x")));
+}
+
+#[test]
+fn a_create_and_a_move_into_it_settle_together_beside_a_cycle() {
+    let mut trees = Trees::new(ROOT);
+    same_change(&mut trees, "top", dir(ROOT, "x"), dir("new", "u"), 1);
+    same_change(
+        &mut trees,
+        "old",
+        file("mid", "x", 1),
+        file("new", "x", 1),
+        2,
+    );
+    trees.set_local("new".into(), local(dir("mid", "x"), 3));
+    trees.set_remote("new".into(), remote(dir("mid", "x")));
+    trees.set_synced("mid".into(), Some(dir("top", "x")));
+    trees.set_local("mid".into(), local(dir(ROOT, "local-mid"), 4));
+    trees.set_remote("mid".into(), remote(dir(ROOT, "x")));
+    assert_eq!(trees.check(), Ok(()));
+    assert_eq!(
+        trees.settle(),
+        [
+            ("mid".to_owned(), Class::Concurrent),
+            ("top".to_owned(), Class::Same)
+        ]
+    );
+    assert_eq!(trees.check(), Ok(()));
+    assert_eq!(trees.synced().get("new"), Some(&dir("mid", "x")));
+    assert_eq!(trees.synced().get("old"), Some(&file("new", "x", 1)));
+}
+
+/// Renames `n` files in one directory in a ring, the same way on both sides, so that no update
+/// fits without all the others.
+fn rotation(n: usize) -> Trees {
+    let mut trees = Trees::new(ROOT);
+    for i in 0..n {
+        let from = file(ROOT, &format!("x{i}"), 1);
+        let to = file(ROOT, &format!("x{}", (i + 1) % n), 1);
+        same_change(&mut trees, &format!("f{i:02}"), from, to, i as u64);
+    }
+    trees
+}
+
+#[test]
+fn a_group_larger_than_the_search_limit_stays_dirty_and_is_listed() {
+    let mut trees = rotation(SETTLE_GROUP_LIMIT);
+    assert_eq!(trees.settle(), []);
+    assert!(trees.unsearched().is_empty());
+
+    let mut trees = rotation(SETTLE_GROUP_LIMIT + 1);
+    let work = trees.settle();
+    assert_eq!(work.len(), SETTLE_GROUP_LIMIT + 1);
+    assert!(work.iter().all(|(_, class)| *class == Class::Same));
+    assert_eq!(trees.unsearched(), trees.dirty());
+    assert_eq!(trees.check(), Ok(()));
+}
+
+#[test]
 fn a_swap_that_would_clash_with_an_unsettled_sibling_waits() {
     let mut trees = Trees::new(ROOT);
     same_change(&mut trees, "a", file(ROOT, "x", 1), file(ROOT, "y", 1), 1);
@@ -577,5 +659,116 @@ proptest! {
         let snapshot = trees.clone();
         prop_assert_eq!(trees.settle(), work);
         prop_assert_eq!(trees, snapshot);
+    }
+}
+
+/// One node's draw for one tree: ⊥, or its rank, a parent choice, a name and whether it is a
+/// directory.
+type Draw = Option<(u8, u8, u8, bool)>;
+
+/// Builds a valid tree over `n0`, `n1`, ... from one [`Draw`] per node. A node may only go under a directory of lower rank, so the tree has
+/// no cycle, but S and R are drawn with their own ranks, so their moves can swap, rotate and nest
+/// into each other. A node whose drawn name key its parent already holds takes a name of its own.
+fn draw_tree(draws: &[Draw]) -> Vec<Option<Shape>> {
+    let mut order: Vec<usize> = (0..draws.len()).collect();
+    order.sort_by_key(|&i| (draws[i].map(|draw| draw.0), i));
+    let mut out: Vec<Option<Shape>> = vec![None; draws.len()];
+    let mut placed: Vec<usize> = Vec::new();
+    for i in order {
+        let Some((_, parent, name, directory)) = draws[i] else {
+            continue;
+        };
+        let parent = placed
+            .get(parent as usize % (placed.len() + 1))
+            .filter(|&&p| out[p].as_ref().is_some_and(|shape| shape.kind == Kind::Dir))
+            .map_or(ROOT.to_owned(), |p| format!("n{p}"));
+        let mut name = ["x", "X", "y"][name as usize].to_owned();
+        if out
+            .iter()
+            .flatten()
+            .any(|shape| shape.parent == parent && name_key(&shape.name) == name_key(&name))
+        {
+            name = format!("u{i}");
+        }
+        out[i] = Some(if directory {
+            dir(&parent, &name)
+        } else {
+            file(&parent, &name, 0)
+        });
+        placed.push(i);
+    }
+    out
+}
+
+fn draws() -> impl Strategy<Value = Draw> {
+    prop_oneof![
+        1 => Just(None),
+        6 => (any::<u8>(), any::<u8>(), 0u8..3, proptest::bool::weighted(0.7)).prop_map(Some),
+    ]
+}
+
+fn searches() -> impl Strategy<Value = Vec<(Draw, Draw, u8)>> {
+    proptest::collection::vec((draws(), draws(), 0u8..5), 1..9)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(4096))]
+
+    /// Settling stops only when no non-empty set of the remaining Same updates can be made
+    /// together with S still valid, checked by trying every such set.
+    #[test]
+    fn settling_leaves_no_set_of_same_updates_that_fits(space in searches()) {
+        let s = draw_tree(&space.iter().map(|node| node.0).collect::<Vec<_>>());
+        let r = draw_tree(&space.iter().map(|node| node.1).collect::<Vec<_>>());
+        let mut trees = Trees::new(ROOT);
+        for (i, (_, _, choice)) in space.iter().enumerate() {
+            let id = format!("n{i}");
+            trees.set_synced(id.clone(), s[i].clone());
+            if let Some(shape) = r[i].clone() {
+                trees.set_remote(id.clone(), remote(shape));
+            }
+            let l = match choice {
+                0 => s[i].clone(),
+                1 => Some(dir(ROOT, &format!("l{i}"))),
+                _ => r[i].clone(),
+            };
+            if let Some(shape) = l {
+                trees.set_local(id, local(shape, i as u64));
+            }
+        }
+        prop_assert_eq!(trees.synced().check(Names::ByKey), Ok(()));
+        prop_assert_eq!(trees.remote().check(Names::ByKey), Ok(()));
+        let work = trees.settle();
+        prop_assert_eq!(trees.synced().check(Names::ByKey), Ok(()));
+        prop_assert!(trees.unsearched().is_empty());
+        let same: Vec<&String> = work
+            .iter()
+            .filter(|(_, class)| *class == Class::Same)
+            .map(|(id, _)| id)
+            .collect();
+        for set in 1..1u32 << same.len() {
+            let mut synced = trees.synced().clone();
+            let chosen: Vec<&String> = same
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| set >> i & 1 == 1)
+                .map(|(_, id)| *id)
+                .collect();
+            for id in &chosen {
+                match trees.remote().live(id) {
+                    Some(shape) => {
+                        synced.insert((*id).clone(), shape.clone());
+                    }
+                    None => {
+                        synced.remove(id);
+                    }
+                }
+            }
+            prop_assert!(
+                synced.check(Names::ByKey).is_err(),
+                "{:?} could still be settled together",
+                chosen
+            );
+        }
     }
 }
