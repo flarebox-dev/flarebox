@@ -126,10 +126,10 @@ describe("conflict rules", () => {
   });
 
   it("keeps conflict names within 255 bytes after NFC, even when NFC lengthens the device name", async () => {
-    const name = conflictName("x." + "e".repeat(200), "\u0958".repeat(40), Date.UTC(2026, 10, 10), 2);
+    const name = conflictName("x." + "e".repeat(200), "\u0A5E".repeat(40), Date.UTC(2026, 10, 10), 2);
     expect(name).toBe(name.normalize("NFC"));
     expect(new TextEncoder().encode(name).length).toBeLessThanOrEqual(255);
-    expect(name.startsWith(" (conflict from " + "\u0915\u093C".repeat(16) + " 2026-11-10 2).")).toBe(true);
+    expect(name.startsWith(" (conflict from " + "\u0A2B\u0A3C".repeat(32) + " 2026-11-10 2).")).toBe(true);
   });
 
   it("R2: treats canonically equivalent names that differ only by case as one name", async () => {

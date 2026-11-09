@@ -48,7 +48,7 @@ export function conflictName(name: string, deviceName: string, atMs: number, att
   const dot = name.lastIndexOf(".");
   const stem = dot > 0 ? name.slice(0, dot) : name;
   const ext = dot > 0 ? name.slice(dot) : "";
-  const device = [...deviceName.normalize("NFC").replaceAll("/", "").replaceAll("\0", "")].slice(0, MAX_DEVICE_NAME_CHARS).join("") || "unknown device";
+  const device = [...deviceName.replaceAll("/", "").replaceAll("\0", "")].slice(0, MAX_DEVICE_NAME_CHARS).join("") || "unknown device";
   const date = new Date(atMs).toISOString().slice(0, 10);
   const suffix = ` (conflict from ${device} ${date}${attempt > 1 ? ` ${attempt}` : ""})${ext}`;
   const fits = (text: string) => encoder.encode(text.normalize("NFC")).length <= MAX_NAME_BYTES;
