@@ -380,6 +380,28 @@ fn settling_takes_a_three_way_rotation_made_on_both_sides_together() {
 }
 
 #[test]
+fn a_cycle_elsewhere_does_not_stop_a_swap_below_it() {
+    let mut trees = Trees::new(ROOT);
+    same_change(&mut trees, "a", dir("c", "x"), dir("c", "y"), 1);
+    same_change(&mut trees, "b", dir("c", "y"), dir("c", "x"), 2);
+    same_change(&mut trees, "c", dir(ROOT, "c"), dir("z", "c"), 3);
+    trees.set_synced("z".into(), Some(dir("c", "z")));
+    trees.set_local("z".into(), local(dir(ROOT, "local-z"), 4));
+    trees.set_remote("z".into(), remote(dir(ROOT, "remote-z")));
+    assert_eq!(trees.check(), Ok(()));
+    assert_eq!(
+        trees.settle(),
+        [
+            ("c".to_owned(), Class::Same),
+            ("z".to_owned(), Class::Concurrent)
+        ]
+    );
+    assert_eq!(trees.check(), Ok(()));
+    assert_eq!(trees.synced().get("a"), Some(&dir("c", "y")));
+    assert_eq!(trees.synced().get("b"), Some(&dir("c", "x")));
+}
+
+#[test]
 fn a_swap_that_would_clash_with_an_unsettled_sibling_waits() {
     let mut trees = Trees::new(ROOT);
     same_change(&mut trees, "a", file(ROOT, "x", 1), file(ROOT, "y", 1), 1);

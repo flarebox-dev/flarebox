@@ -170,17 +170,21 @@ impl Trees {
                     }
                 }
                 Err(TreeError::Cycle(id)) => {
-                    let mut current = Some(id);
-                    let mut found = None;
-                    for _ in 0..=s.len() {
-                        let Some(id) = current else { break };
-                        if group.contains(&id) {
-                            found = Some(id);
-                            break;
+                    let mut path = vec![id];
+                    loop {
+                        let last = path.last().expect("the path starts with a node");
+                        let Some(parent) = s.live(last).map(|shape| shape.parent.clone()) else {
+                            break None;
+                        };
+                        if let Some(start) = path.iter().position(|id| *id == parent) {
+                            break path[start..]
+                                .iter()
+                                .filter(|id| group.contains(*id))
+                                .max()
+                                .cloned();
                         }
-                        current = s.live(&id).map(|shape| shape.parent.clone());
+                        path.push(parent);
                     }
-                    found
                 }
                 Err(TreeError::NameTaken { parent, name }) => {
                     let key = name_key(&name);
