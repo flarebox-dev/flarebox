@@ -125,6 +125,14 @@ describe("conflict rules", () => {
     expect(again.result.results[0]!.name).toMatch(/^NOTES \(conflict from Desktop B \d{4}-\d{2}-\d{2} 2\)\.txt$/);
   });
 
+  it("R2: treats canonically equivalent names that differ only by case as one name", async () => {
+    const { a, b, root } = await setup();
+    const first = uuidv7();
+    await a.commit([op.mkdir(first, root, "\u0390")]);
+    const result = await b.commit([op.mkdir(uuidv7(), root, "\u03AA\u0301")]);
+    expect(result.results[0]).toMatchObject({ code: OpResult_Code.MERGED_INTO, nodeId: first });
+  });
+
   it("R2: merges a new directory into an existing one with the same name", async () => {
     const { a, b, root } = await setup();
     const photosA = uuidv7();

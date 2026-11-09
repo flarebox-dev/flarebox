@@ -26,8 +26,9 @@ export function casefold(text: string): string {
   return out;
 }
 
+/** Canonical caseless matching: NFD(casefold(NFD(name))), so canonically equivalent names get one key. */
 export function nameKey(name: string): string {
-  return casefold(name);
+  return casefold(name.normalize("NFD")).normalize("NFD");
 }
 
 /** Returns the NFC form of a valid node name, or undefined when the name is not allowed (spec v0 section 6.1). */

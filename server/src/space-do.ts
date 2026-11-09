@@ -70,6 +70,7 @@ export const GRANT_MS = HOUR_MS;
 const MAX_OPS = 1000;
 const MAX_CHUNKS_PER_CALL = 1000;
 export const MAX_CHUNK_BYTES = 16 * 1024 * 1024;
+const MAX_COMMIT_ROW_BYTES = 7_900_000;
 const RETRY_LATER_MS = 60_000;
 const PAGE_BYTES = 1024 * 1024;
 const GC_BATCH = 1000;
@@ -279,6 +280,11 @@ export class SpaceDO extends DurableObject<Env> {
   }
 
   private appendCommit(record: CommitRecord, result: CommitResult): void {
+    const recordBytes = toBinary(CommitRecordSchema, record);
+    const resultBytes = toBinary(CommitResultSchema, result);
+    if (recordBytes.length + resultBytes.length > MAX_COMMIT_ROW_BYTES) {
+      fail(Error_Code.LIMIT_EXCEEDED, "the commit's change records are too large for one log entry; split the commit");
+    }
     this.sql.exec(
       "INSERT INTO commits (seq, commit_id, device_id, user_id, committed_at_ms, record, results) VALUES (?, ?, ?, ?, ?, ?, ?)",
       Number(record.seq),
@@ -286,8 +292,8 @@ export class SpaceDO extends DurableObject<Env> {
       record.deviceId,
       record.userId,
       Number(record.committedAtMs),
-      toBinary(CommitRecordSchema, record),
-      toBinary(CommitResultSchema, result),
+      recordBytes,
+      resultBytes,
     );
     setMeta(this.sql, "head_seq", Number(record.seq));
   }

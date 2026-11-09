@@ -159,11 +159,11 @@ describe("review regressions", () => {
     expect(seqs).toEqual([3n, 2n, 1n, 1n, 1n]);
   });
 
-  it("rejects moves and restores that would put a descendant deeper than 256, trashed descendants included", async () => {
+  it("rejects moves and restores that would put a descendant deeper than 256, even when only a trashed one would", async () => {
     const space = await setup();
     let parent = space.root;
     const ops = [];
-    for (let level = 1; level <= 255; level++) {
+    for (let level = 1; level <= 254; level++) {
       const id = uuidv7();
       ops.push(op.mkdir(id, parent, "d" + level));
       parent = id;
@@ -384,7 +384,7 @@ describe("GC and references", () => {
     await expectRetainedBytes(space);
   });
 
-  it("deletes nothing at the exact hold, retention and grace boundaries, and lets a PRESENT hold outlast the grace", async () => {
+  it("deletes nothing at the exact hold and version-retention boundaries, and lets a PRESENT hold outlast the grace", async () => {
     const space = await setup();
     const { nodeId, parts } = await createFile(space.a, space.root, "doc", "first bytes");
     const pendingParts = await content("pending only");
@@ -410,6 +410,37 @@ describe("GC and references", () => {
     expect(await env.BUCKET.head(chunkKey(space.spaceId, toHex(parts.content.chunks[0]!.hash)))).toBeNull();
     await expectRetainedBytes(space);
   });
+
+  it("purges trash and deletes an unreferenced chunk only after the exact trash-retention and grace boundaries", async () => {
+    const space = await setup();
+    const { nodeId, parts } = await createFile(space.a, space.root, "doc", "trash me");
+    await space.a.commit([op.delete(nodeId)]);
+    const trashedAt = Number((await table(space, "SELECT trashed_at_ms FROM nodes WHERE status = 2"))[0]!.trashed_at_ms);
+    expect(await gc(space, trashedAt + 30 * DAY)).toMatchObject({ purgedNodes: 0 });
+    const purgedAt = trashedAt + 30 * DAY + 1;
+    expect(await gc(space, purgedAt)).toMatchObject({ purgedNodes: 1, deletedChunks: 0 });
+
+    const [chunk] = await table(space, "SELECT refcount, zero_since_ms, hold_until_ms FROM chunks");
+    expect(chunk).toMatchObject({ refcount: 0, zero_since_ms: purgedAt });
+    expect(Number(chunk!.hold_until_ms)).toBeLessThan(purgedAt);
+    expect(await gc(space, purgedAt + 30 * DAY)).toMatchObject({ deletedChunks: 0 });
+    expect(await gc(space, purgedAt + 30 * DAY + 1)).toMatchObject({ deletedChunks: 1 });
+    expect(await env.BUCKET.head(chunkKey(space.spaceId, toHex(parts.content.chunks[0]!.hash)))).toBeNull();
+  });
+
+  it("rejects a commit whose change records do not fit in one log row and changes nothing", async () => {
+    const space = await setup();
+    const big = uuidv7();
+    await space.a.commit([op.mkdir(big, space.root, "big")]);
+    for (let batch = 0; batch < 14; batch++) {
+      await space.a.commit(Array.from({ length: 1000 }, (_, i) => op.mkdir(uuidv7(), big, String(batch * 1000 + i).padStart(250, "x"))));
+    }
+    const before = await table(space, "SELECT MAX(seq) AS seq, COUNT(*) AS n FROM commits");
+    const result = await space.a.commitRaw([op.delete(big)]);
+    expect(result.case === "error" && result.value.code).toBe(Error_Code.LIMIT_EXCEEDED);
+    expect(await table(space, "SELECT MAX(seq) AS seq, COUNT(*) AS n FROM commits")).toEqual(before);
+    expect(await table(space, "SELECT COUNT(*) AS n FROM nodes WHERE status = 2")).toEqual([{ n: 0 }]);
+  }, 120_000);
 
   it("runs GC from the alarm and re-arms it", async () => {
     const space = await setup();
