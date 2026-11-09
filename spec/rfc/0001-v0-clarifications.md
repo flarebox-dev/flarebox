@@ -24,10 +24,14 @@ R2 (merge) applies only when the existing live node with the same `name_key` is 
 
 The device name is cut to 32 Unicode scalar values after `/` and NUL are removed; an empty result becomes `unknown device`. If `<stem> (conflict from <device> <YYYY-MM-DD>[ <n>])<ext>` is longer than 255 bytes, scalar values are removed from the end of the stem until it fits, so the suffix and the extension survive. If it is still too long with an empty stem, scalar values are removed from the end of the whole name until it fits. The result is normalized to NFC.
 
-## 6. Commit size (§13)
+## 6. No-op Move
+
+A `Move` of a live node to its current parent under its current name, compared byte for byte after NFC, is `APPLIED` with no change record. `meta_rev` and `meta_dev` keep their values, so a no-op Move never counts as an unseen change and can never make another device's concurrent `Delete` keep the node under R7. A rename that changes only case is not a no-op.
+
+## 7. Commit size (§13)
 
 The server stores each commit's change records in one log row. A commit whose serialized `CommitRecord` and `CommitResult` together exceed 7,900,000 bytes is rejected with `LIMIT_EXCEEDED` and changes nothing; the bound sits below the 8 MB Durable Object SQLite row limit ([Durable Objects limits](https://developers.cloudflare.com/durable-objects/platform/limits/)). A client that gets this splits the commit. For a `Delete` of a very large subtree, it deletes subfolders in earlier commits.
 
-## 7. Share-link password KDF (§15.2)
+## 8. Share-link password KDF (§15.2)
 
 Known deviation: share-link passwords use PBKDF2-HMAC-SHA256 with 100,000 iterations. The [OWASP Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html) recommends 600,000, but workerd rejects WebCrypto PBKDF2 above 100,000 iterations ([cloudflare/workerd#1346](https://github.com/cloudflare/workerd/issues/1346)). Each link stores its algorithm and parameters, so a stronger KDF can replace this one without migrating existing links. Five wrong passwords lock a link for 15 minutes.
