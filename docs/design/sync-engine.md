@@ -31,6 +31,7 @@ Each change answers a blocking finding of the review of d37ee0d (B1–B7), of th
 | The no-lost-bytes guarantee is scoped to a stated writer contract, not live databases or long-lived descriptor writers: writes through a descriptor held open across an effect survive only as long as the local trash keeps the displaced file; the trash keeps its own index and reclamation is native-tested | §5.2, §7.4 | D3 |
 | Ignore transitions never delete or trash: an unexplained disappearance is first searched for in ignored subtrees by identity, a miss while any ignored entry exists is held for the user rather than deleted, and a remote move into a path ignored here leaves the local copy in place | §5.10 | D4, R3-2 |
 | The device counter has an explicit lifecycle: the store keeps the accepted counter, an uncertain commit keeps its slot, a refused commit's slot is reused, and only a counter the store cannot account for starts recovery | §2.8, §10 | R4-1 |
+| A changed `history_id` on connect starts recovery before any bootstrap; unanswered questions are asked again after a restart; deleting a folder that holds excluded nodes is split so they stay on the server; a user move out of an ignored path propagates | §2.8, §4.4, §5.10, §6.1, §7.5 | review of #7 (CodeRabbit) |
 | Recovery is a draft verified by simulation: holds are released only by a certain row, explicit intents such as a version restore are kept as evidence, and an answer is checked against the whole server transition, so R8 cannot revive nodes outside it; every counterexample of the four reviews is a named scenario | §6.4, §7.5, §10 | R4-2, R4-3, R4-4, owner decision |
 
 ## 1. Context
@@ -169,7 +170,7 @@ The result's change records update R like any other record, and like any other r
 
 ### 2.8 Persistence and crash recovery
 
-The store persists, per `handle` call and in one transaction: R with `history_id` and `last_seq`, S, L with file identities, the commit in flight (with its `history_id`, its `device_seq` and any buffered result), the accepted device counter, the effect in flight, the mass-delete state, parked, held and problem nodes, and the engine's ID generator state. Connection state and queued outputs other than the in-flight commit and effect are not persisted. **[changed]** The effect in flight, the commit's `history_id`, the buffered result and the mass-delete state are new.
+The store persists, per `handle` call and in one transaction: R with `history_id` and `last_seq`, S, L with file identities, the commit in flight (with its `history_id`, its `device_seq` and any buffered result), the accepted device counter, the effect in flight, the mass-delete state, parked, held and problem nodes, and the engine's ID generator state. Connection state and queued outputs other than the in-flight commit and effect are not persisted. **[changed]** The effect in flight, the commit's `history_id`, the buffered result and the mass-delete state are new. Every question (the guard's, an ambiguous disappearance of §5.10, recovery's) is persisted with what it holds, so after a restart the engine emits `AskUser` again for each unanswered one; the driver shows a question ID once, so a repeat after a crash is harmless.
 
 After a crash the engine restarts from that state. The fs driver first recovers the effect in flight from its record (§5.3), which leaves the disk in a state the record explains, and reports the outcome; only then does it rescan the whole root. Recovery makes adoption by guessing unnecessary for the engine's own effects. Adoption remains for one case: a device with no store at all (a first link, or a store that was lost), where the disk holds results of effects nobody remembers. The engine then **adopts** an unknown entry instead of uploading it as new when R has a node expected at that path with the same kind and content. Everything else on disk that L does not know is a new local node.
 
@@ -300,7 +301,7 @@ A commit is abandoned only after an error that proves it was not applied. **[cha
 
 ### 4.4 Receiving changes
 
-- After `Connected`, the engine sends `Resume{history_id, since_seq: last_seq}`, unless `history_id` changed, `last_seq` is above `head_seq`, or `last_seq` is below `log_floor_seq`; then it bootstraps with `ListTree` (spec §7.3–7.5).
+- After `Connected`, the engine first compares `Welcome.history_id` with R's. **[changed]** If they differ, the space enters recovery (§6.4) before any bootstrap or planning, so R, S and L are kept as evidence instead of being replaced. Otherwise it sends `Resume{history_id, since_seq: last_seq}`, unless `last_seq` is above `head_seq` or below `log_floor_seq`; then it bootstraps with `ListTree` (spec §7.3–7.5).
 - **[changed]** Records are applied as whole commits in contiguous seq order: commit `last_seq + 1`, then the next. A commit at or below `last_seq` is a duplicate and is skipped. A gap (a commit above `last_seq + 1`) triggers a new `Resume` and the rest of the batch is dropped. Within an applied commit, each `NodeState` overwrites the stored node only if its rev is above the stored one (spec §5.2), which makes the overlap between a bootstrap listing and the log replayed after it harmless. Rev gating is not a licence to apply commits out of order (review B7): `NodePurged` has no rev, so a purge followed by an older `NodeState` would recreate the node, and a post-image can name a parent created by an earlier commit that has not been applied yet.
 - **[changed]** The device's own commit results arrive in `CommitResult`, not as pushes (spec §7.3 step 2), but a log replay after a reconnect includes the device's own earlier commits like any other. A result is acknowledged as §2.7 describes: at once when its seq is `last_seq + 1` or already covered by R, after the gap is filled when it is further ahead. So R never gains a node whose parent is missing, and an own commit is never left in flight because its records arrived first.
 - The engine is **caught up** once `last_seq` reaches the `head_seq` of the last `CaughtUp`. It builds commits only when caught up, so local changes are rebased onto everything the server had when the session began.
@@ -412,7 +413,7 @@ The trees are indexed by `(parent, name)` and `(parent, name_key)`, so lookups d
 
 **Who evaluates it.** The engine never reads file bytes, so the fs driver parses each `.fbignore` file it observes and passes its rules to the engine with the observation. The engine owns the matcher, so that it can apply the same rules to remote nodes; `core/fs` uses the same matcher to leave ignored paths out of scans and watchers. Rules come from the `.fbignore` files on this device's disk. When a remote change creates or updates a `.fbignore` file, the planner applies that effect before any other effect in the same directory's subtree, so new rules are in force before the nodes they cover arrive.
 
-**Excluded nodes.** A node whose position in R, S or L matches the rules on this device is **excluded** here. The engine keeps its S entry, freezes it, and plans nothing for it in either direction: no ops, no effects. R keeps following the server. An excluded node is not a deletion and never enters the mass-delete ledger. It is ineligible for convergence (§3.4), and its local copy, if there is one, is left exactly as it is.
+**Excluded nodes.** A node whose position in R, S or L matches the rules on this device is **excluded** here. The engine keeps its S entry, freezes it, and plans nothing for it in either direction: no ops, no effects. **[changed]** One case comes before that rule: a node that L shows at an included position different from S's has been moved by the user out of exclusion on this device. It is not excluded; its move is planned against S like any local move, and it leaves exclusion once the result places it at an included position in R and S. A node whose local copy has not moved stays excluded, which keeps a remote move into an ignored path from moving the local copy. R keeps following the server. An excluded node is not a deletion and never enters the mass-delete ledger. It is ineligible for convergence (§3.4), and its local copy, if there is one, is left exactly as it is.
 
 | Situation | What happens on the device with the rule |
 |---|---|
@@ -423,6 +424,7 @@ The trees are indexed by `(parent, name)` and `(parent, name_key)`, so lookups d
 | The user moves an ignored entry into a synced path | It is a new local node, or, if it is an excluded node returning, a move of that node plus whatever edit it carries |
 | A remote change moves a node into a path ignored here | **[changed]** The node becomes excluded, and its local copy stays exactly where it is, with no effect of any kind (review D4). It is no longer synced on this device; deleting or editing it later sends nothing |
 | A remote change trashes an excluded node | R follows; the local copy is left alone until the node is included again, when the normal rules apply |
+| **[changed]** The user deletes a synced folder that holds excluded nodes | A `Delete` of the folder would trash its excluded descendants on the server, which this device does not sync. The deletion is split: each topmost deleted node with no excluded node in its subtree gets its `Delete`, and the folder and the other ancestors of excluded nodes stay on the server and become excluded here, so they are not created again locally. The guard still counts the folder as one deletion, with the affected files it removes |
 
 **Interplay with the guard.** Adding a rule, even `*`, excludes nodes and deletes nothing, so it never prompts. Removing a rule can make many files appear at once; they are uploads, not deletions. Only actual removals from disk count toward §6.1.
 
@@ -437,6 +439,8 @@ Other sync tools ask before propagating large deletions: Unison's `confirmbigdel
 **[changed]** The guard is redefined after review B5 and two decisions by the project owner: the thresholds, and counting a removed folder as one deletion.
 
 **What is counted.** A local deletion is planned as one `Delete` per **topmost deleted node**: a node of S that is absent from L while its parent is present in L (§2.6). Each topmost deleted node is one **deletion**, whether it is a file or a whole folder: removing `node_modules/` together with everything under it is one deletion. Emptying a folder but keeping it (`rm -rf dir/*`) makes each removed child a topmost deleted node, so each counts. Separately, the guard counts the **affected files** of each deletion: the live files of S in its subtree, excluding nodes the server will keep (§2.4) and nodes moved elsewhere first, which are not absent from L.
+
+Deleting a folder that holds excluded nodes is split as §5.10 describes; it still counts as one deletion.
 
 **Thresholds** (decided): the guard holds deletions when either
 
@@ -578,7 +582,7 @@ Like Trinity and FoundationDB's simulator, the harness runs whole devices agains
 
 ### 7.5 Named scenarios
 
-**[changed]** Every counterexample the four reviews found is a named, seeded scenario: a fixed schedule run by the simulation in every CI build, so the design is checked by execution rather than by rereading. Scenarios marked *recovery* verify the draft of §6.4 and must pass before 0.1.0; a failure there changes §6.4, not the scenario. The others check the final core.
+**[changed]** Every counterexample the four reviews and the automated review found is a named, seeded scenario: a fixed schedule run by the simulation in every CI build, so the design is checked by execution rather than by rereading. Scenarios marked *recovery* verify the draft of §6.4 and must pass before 0.1.0; a failure there changes §6.4, not the scenario. The others check the final core.
 
 | Scenario | From | Schedule | Must hold |
 |---|---|---|---|
@@ -601,6 +605,10 @@ Like Trinity and FoundationDB's simulator, the harness runs whole devices agains
 | `refused-then-replan` | R4-1 | K takes slot 5 and is refused with `MISSING_CHUNKS` because the file changed during upload; the engine re-plans | the new commit takes slot 5 with a new `commit_id` and is accepted (*recovery* trigger) |
 | `held-node-published-elsewhere` | R4-2 | device X holds n = B in recovery; device Y answers its own question and publishes n = C; variants B ≠ C, B = C at another position, B = C at the same position | the first two stay held on X with refreshed questions; only the last is released (*recovery*) |
 | `restore-intent-in-flight` | R4-3 | with L = S = B, an in-flight `Restore(n, version C)`, and in a variant a trash restore, has an unknown outcome when the history changes; R′ holds B | the restore is offered as a question; recovery does not end and the evidence is kept until it is answered (*recovery*) |
+| `history-change-on-connect` | review of #7 (CodeRabbit) | a device reconnects with no commit in flight and `Welcome` reports a new `history_id` | no `ListTree` bootstrap replaces R; recovery starts with R, S and L kept as evidence |
+| `delete-folder-with-excluded-child` | review of #7 (CodeRabbit) | synced folder D holds a synced file and a file excluded here by a rule; the user removes D locally | only the synced file is deleted on the server; D and the excluded file stay there and on other devices; D is not created again here; the guard counts one deletion |
+| `move-out-of-exclusion` | review of #7 (CodeRabbit) | a synced file becomes excluded by a new rule, and the user moves it to an included path; in a variant a remote move first took it into a path ignored here | the move reaches the server and the file syncs again; an unmoved local copy stays where it is |
+| `question-after-restart` | review of #7 (CodeRabbit) | the device crashes after the transaction that stores a guard hold and before `AskUser` reaches the user | after restart the question is asked again; the held deletions are neither committed nor lost |
 | `answer-revives-trash-group` | R4-4 | S₀ has directory D with child F; the user moves D and deletes F; R′ has D and F trashed in one trash group; the user publishes D | F stays trashed, or is listed in the question before anything is sent; no node outside the answer changes (*recovery*) |
 
 ## 8. Is a TLA+ model worth it?
