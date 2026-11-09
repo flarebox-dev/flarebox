@@ -53,7 +53,7 @@ import {
 } from "./gen/flarebox/v1/rpc_pb";
 import { type Identity, verifyAccessToken } from "./auth";
 import { sha256, signChunkGrant, verifyChunkGrant } from "./crypto";
-import { isUuidV7, toHex, uuidv7 } from "./ids";
+import { fromHex, isUuidV7, toHex, uuidv7 } from "./ids";
 import { type ApplyContext, CallFailure, CommitApplier } from "./space/commit";
 import { ChunkState, migrate } from "./space/schema";
 import {
@@ -96,6 +96,7 @@ const PAGE_ENVELOPE_BYTES = 1024;
 const GC_BATCH = 1000;
 const GC_RETRY_MS = 10 * 60_000;
 const R2_DELETE_BATCH = 1000;
+const ORPHAN_SWEEP_MS = 7 * DAY_MS;
 
 export type Role = "owner" | "editor" | "viewer";
 
@@ -146,6 +147,7 @@ export interface GcReport {
   expiredVersions: number;
   purgedNodes: number;
   deletedChunks: number;
+  sweptChunks: number;
   more: boolean;
 }
 
@@ -873,6 +875,27 @@ export class SpaceDO extends DurableObject<Env> {
       return hashes.length;
     });
 
+    let sweptChunks = 0;
+    let sweeping = false;
+    if (nowMs >= Number(getMeta(this.sql, "orphan_sweep_due_ms") ?? 0)) {
+      const listed = await this.env.BUCKET.list({
+        prefix: `spaces/${spaceId}/chunks/`,
+        cursor: String(getMeta(this.sql, "orphan_sweep_cursor") ?? "") || undefined,
+        limit: GC_BATCH,
+      });
+      this.ctx.storage.transactionSync(() => {
+        for (const object of listed.objects) {
+          const hash = fromHex(object.key.slice(object.key.lastIndexOf("/") + 1));
+          if (this.sql.exec("SELECT 1 FROM chunks WHERE hash = ?", hash).toArray().length > 0) continue;
+          this.sql.exec("INSERT INTO chunks (hash, size, state, refcount, hold_until_ms) VALUES (?, ?, ?, 0, ?)", hash, object.size, ChunkState.DELETING, nowMs);
+          sweptChunks++;
+        }
+        setMeta(this.sql, "orphan_sweep_cursor", listed.truncated ? listed.cursor : "");
+        if (!listed.truncated) setMeta(this.sql, "orphan_sweep_due_ms", nowMs + ORPHAN_SWEEP_MS);
+      });
+      sweeping = listed.truncated;
+    }
+
     let deletedChunks = 0;
     for (;;) {
       const batch = this.sql
@@ -891,7 +914,8 @@ export class SpaceDO extends DurableObject<Env> {
       expiredVersions,
       purgedNodes,
       deletedChunks,
-      more: expiredVersions === GC_BATCH || purgedNodes === GC_BATCH || marked === GC_BATCH,
+      sweptChunks,
+      more: expiredVersions === GC_BATCH || purgedNodes === GC_BATCH || marked === GC_BATCH || sweeping,
     };
   }
 

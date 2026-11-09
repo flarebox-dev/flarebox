@@ -29,11 +29,12 @@ import {
   type Welcome,
 } from "../src/gen/flarebox/v1/messages_pb";
 import { ChunkRefSchema, type CommitRecord, ContentSchema } from "../src/gen/flarebox/v1/model_pb";
-import { ChunkPlan_Action, Error_Code, type Target } from "../src/gen/flarebox/v1/rpc_pb";
+import { ChunkPlan_Action, Error_Code, ErrorSchema, type Target } from "../src/gen/flarebox/v1/rpc_pb";
 import { sha256 } from "../src/crypto";
 import { toHex, uuidv7 } from "../src/ids";
-import { Close } from "../src/space-do";
+import { Close, HOLD_MS, type SpaceDO } from "../src/space-do";
 import { chunkKey, encodeChunkList } from "../src/space/store";
+import worker from "../src/worker";
 import { content, op } from "./helpers";
 
 const BASE = "https://flarebox.test";
@@ -800,6 +801,105 @@ describe("chunk relay", () => {
     expect(download.status).toBe(403);
     expect((await put(target, bytes)).status).toBe(200);
     expect((await put(target, bytes)).status).toBe(200);
+  });
+
+  async function preparedTicket() {
+    const { spaceId, socket } = await connected();
+    const parts = await content("review chunk " + uuidv7());
+    const plan = await socket.rpc({ case: "prepareUpload", value: { chunks: parts.content.chunks } });
+    if (plan.case !== "prepareUpload") throw new Error("prepareUpload failed");
+    const bytes = parts.bytes[0]!;
+    const target = plan.value.chunks[0]!.target!;
+    const url = target.url;
+    const request = () => new Request(url, { method: "PUT", body: bytes, headers: { "Content-Length": String(bytes.length) } });
+    const stub = env.SPACE.get(env.SPACE.idFromName(spaceId));
+    return { spaceId, socket, parts, target, request, stub, key: chunkKey(spaceId, toHex(parts.content.chunks[0]!.hash)) };
+  }
+
+  function relay(request: Request, put: (key: string, body: ReadableStream | null, options: R2PutOptions) => Promise<R2Object | null>) {
+    const bucket = { put };
+    return worker.fetch(request as Parameters<typeof worker.fetch>[0], { ...env, BUCKET: bucket } as unknown as Env, {} as ExecutionContext);
+  }
+
+  it("removes an object that a late PUT recreated after GC deleted its row", async () => {
+    const { request, stub, key } = await preparedTicket();
+    let entered!: () => void;
+    let resume!: () => void;
+    const started = new Promise<void>((resolve) => (entered = resolve));
+    const released = new Promise<void>((resolve) => (resume = resolve));
+    const pending = relay(request(), async (k, body, options) => {
+      entered();
+      await released;
+      return env.BUCKET.put(k, body, options);
+    });
+    await started;
+    const at = Date.now() + HOLD_MS + 60_000;
+    const first = await runInDurableObject(stub, (instance: SpaceDO) => instance.collectGarbage(at));
+    expect(first).toMatchObject({ deletedChunks: 1, sweptChunks: 0 });
+    resume();
+    expect((await pending).status).toBe(200);
+    expect(await env.BUCKET.head(key)).not.toBeNull();
+    const rows = () => runInDurableObject(stub, (_instance, state) => state.storage.sql.exec("SELECT * FROM chunks").toArray());
+    expect(await rows()).toHaveLength(0);
+
+    const day = 24 * 3_600_000;
+    expect(await runInDurableObject(stub, (instance: SpaceDO) => instance.collectGarbage(at + day))).toMatchObject({ sweptChunks: 0 });
+    const sweep = await runInDurableObject(stub, (instance: SpaceDO) => instance.collectGarbage(at + 7 * day + 1));
+    expect(sweep).toMatchObject({ sweptChunks: 1, deletedChunks: 1 });
+    expect(await env.BUCKET.head(key)).toBeNull();
+    expect(await rows()).toHaveLength(0);
+  });
+
+  it("sweeps only objects without a chunk row and fences them from PrepareUpload while it deletes", async () => {
+    const { socket, parts, target, stub, spaceId, key } = await preparedTicket();
+    expect((await put(target, parts.bytes[0]!)).status).toBe(200);
+    const orphan = await content("orphan " + uuidv7());
+    const orphanHash = orphan.content.chunks[0]!.hash;
+    const orphanKey = chunkKey(spaceId, toHex(orphanHash));
+    await env.BUCKET.put(orphanKey, orphan.bytes[0]!);
+
+    const states: unknown[] = [];
+    const report = await runInDurableObject(stub, async (instance: SpaceDO, state) => {
+      const original = (instance as unknown as { env: Env }).env;
+      const bucket = {
+        list: original.BUCKET.list.bind(original.BUCKET),
+        delete: (keys: string[]) => {
+          states.push(...state.storage.sql.exec("SELECT state FROM chunks WHERE hash = ?", orphanHash).toArray().map((row) => row.state));
+          return original.BUCKET.delete(keys);
+        },
+      };
+      (instance as unknown as { env: Env }).env = { ...original, BUCKET: bucket as unknown as R2Bucket };
+      try {
+        return await instance.collectGarbage(Date.now());
+      } finally {
+        (instance as unknown as { env: Env }).env = original;
+      }
+    });
+    expect(states).toEqual([3]);
+    expect(report).toMatchObject({ sweptChunks: 1, deletedChunks: 1 });
+    expect(await env.BUCKET.head(orphanKey)).toBeNull();
+    expect(await env.BUCKET.head(key)).not.toBeNull();
+    const after = await socket.rpc({ case: "prepareUpload", value: { chunks: orphan.content.chunks } });
+    expect(after.case === "prepareUpload" && after.value.chunks[0]!.action).toBe(ChunkPlan_Action.UPLOAD);
+  });
+
+  it("answers a checksum mismatch with 400 and storage failures with a retryable error", async () => {
+    const { request, key } = await preparedTicket();
+    const fail = (message: string) => relay(request(), async () => {
+      throw new Error(message);
+    });
+    const decode = async (response: Response) => fromBinary(ErrorSchema, new Uint8Array(await response.arrayBuffer()));
+
+    const mismatch = await fail("put: The SHA-256 checksum you specified did not match what we received.");
+    expect(mismatch.status).toBe(400);
+    expect((await decode(mismatch)).code).toBe(Error_Code.INVALID_ARGUMENT);
+    const throttled = await fail("put: Reduce your concurrent request rate for the same object. (10058)");
+    expect(throttled.status).toBe(429);
+    expect((await decode(throttled)).code).toBe(Error_Code.RETRY_LATER);
+    const outage = await fail("put: We encountered an internal error. Please try again. (10001)");
+    expect(outage.status).toBe(503);
+    expect((await decode(outage)).code).toBe(Error_Code.RETRY_LATER);
+    expect(await env.BUCKET.head(key)).toBeNull();
   });
 });
 

@@ -91,10 +91,13 @@ async function chunk(request: Request, env: Env, spaceId: string, hex: string): 
     return errorReply(request, Error_Code.FORBIDDEN, "invalid or expired upload ticket, or a size the ticket does not cover");
   }
   try {
-    await env.BUCKET.put(key, request.body, { sha256: hex });
+    await env.BUCKET.put(key, request.body, { sha256: hex, onlyIf: { etagDoesNotMatch: "*" } });
   } catch (error) {
-    console.error("chunk upload rejected", spaceId, hex, error);
-    return errorReply(request, Error_Code.INVALID_ARGUMENT, "the body does not match the chunk hash");
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("chunk upload failed", spaceId, hex, message);
+    if (/checksum/i.test(message)) return errorReply(request, Error_Code.INVALID_ARGUMENT, "the body does not match the chunk hash");
+    const throttled = /\b429\b|10058|too many|rate/i.test(message);
+    return errorReply(request, Error_Code.RETRY_LATER, "chunk storage is unavailable; retry the upload", throttled ? 429 : 503);
   }
   const token = await signChunkGrant(secret, "receipt", spaceId, hex, size, nowMs + GRANT_MS);
   return reply(request, UploadReceiptSchema, create(UploadReceiptSchema, { hash: fromHex(hex), size, token }));
