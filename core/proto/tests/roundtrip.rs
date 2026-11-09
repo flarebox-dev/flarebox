@@ -16,6 +16,7 @@ fn commit_round_trips_through_binary_encoding() {
             })),
         }],
         receipts: vec![],
+        ..Default::default()
     };
     let bytes = commit.encode_to_vec();
     assert_eq!(Commit::decode(bytes.as_slice()).unwrap(), commit);
