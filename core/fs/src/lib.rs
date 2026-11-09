@@ -1124,11 +1124,16 @@ fn watch_root(
 /// Registers `path` and every folder below it that may be watched. The
 /// platform's recursive registration stops at the first folder it may not
 /// watch, so after a permission error the readable folders are registered one
-/// at a time. A folder that may not be read is left to the scans, which report
-/// it as unreadable.
+/// at a time, skipping a subfolder that disappears in the meantime. A folder
+/// that may not be read is left to the scans, which report it as unreadable.
 fn watch_tree(watcher: &mut RecommendedWatcher, path: &Path) -> notify::Result<()> {
     let refused =
         |err: &notify::Error| matches!(&err.kind, notify::ErrorKind::Io(err) if denied(err));
+    let vanished = |err: &notify::Error| match &err.kind {
+        notify::ErrorKind::PathNotFound => true,
+        notify::ErrorKind::Io(err) => err.kind() == io::ErrorKind::NotFound,
+        _ => false,
+    };
     match watcher.watch(path, RecursiveMode::Recursive) {
         Err(err) if refused(&err) => {}
         other => return other,
@@ -1141,8 +1146,12 @@ fn watch_tree(watcher: &mut RecommendedWatcher, path: &Path) -> notify::Result<(
         return Ok(());
     };
     for entry in entries.flatten() {
-        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            watch_tree(watcher, &entry.path())?;
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        match watch_tree(watcher, &entry.path()) {
+            Err(err) if vanished(&err) => {}
+            other => other?,
         }
     }
     Ok(())

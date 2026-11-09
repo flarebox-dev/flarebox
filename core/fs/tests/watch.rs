@@ -39,6 +39,36 @@ fn removed(path: &str, kind: EntryKind) -> Change {
 
 use EntryKind::{Dir, File};
 
+/// Whether the permission change a test just made blocks reads, given the read
+/// `probe` that should now fail. Only root reads through it; the test is then
+/// skipped, with a line written straight to stderr so that it shows up even
+/// when test output is captured. Anyone else fails the test.
+fn blocks_reads<T: std::fmt::Debug>(test: &str, probe: std::io::Result<T>) -> bool {
+    use std::io::Write;
+
+    match probe {
+        Err(err) => {
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{test}: {err}"
+            );
+            true
+        }
+        Ok(found) => {
+            assert!(
+                rustix::process::geteuid().is_root(),
+                "{test}: the permission change did not block reads ({found:?})"
+            );
+            let _ = writeln!(
+                std::io::stderr(),
+                "SKIPPED {test}: running as root, so permissions do not block reads"
+            );
+            false
+        }
+    }
+}
+
 /// Builds a tree, snapshots it, then changes it with no watcher running.
 fn tree_changed_offline() -> (tempfile::TempDir, Snapshot, Vec<Change>) {
     let dir = tempfile::tempdir().unwrap();
@@ -365,7 +395,8 @@ fn unreadable_folder_is_kept_and_reported() {
         let mut snapshot = Snapshot::scan(root).unwrap();
         let known = snapshot.clone();
         fs::set_permissions(&locked, fs::Permissions::from_mode(mode)).unwrap();
-        if fs::symlink_metadata(locked.join("x")).is_ok() {
+        let probe = fs::symlink_metadata(locked.join("x"));
+        if !blocks_reads("unreadable_folder_is_kept_and_reported", probe) {
             fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
             return;
         }
@@ -433,7 +464,8 @@ fn native_watcher_starts_beside_an_unreadable_folder() {
     fs::create_dir(root.join("e")).unwrap();
     let snapshot = Snapshot::scan(root).unwrap();
     fs::set_permissions(root.join("d/locked"), fs::Permissions::from_mode(0o000)).unwrap();
-    if fs::read_dir(root.join("d/locked")).is_ok() {
+    let probe = fs::read_dir(root.join("d/locked"));
+    if !blocks_reads("native_watcher_starts_beside_an_unreadable_folder", probe) {
         fs::set_permissions(root.join("d/locked"), fs::Permissions::from_mode(0o755)).unwrap();
         return;
     }
@@ -464,7 +496,8 @@ fn folder_readable_again_is_watched_again() {
     fs::create_dir_all(locked.join("inner")).unwrap();
     let snapshot = Snapshot::scan(root).unwrap();
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o600)).unwrap();
-    if fs::symlink_metadata(locked.join("inner")).is_ok() {
+    let probe = fs::symlink_metadata(locked.join("inner"));
+    if !blocks_reads("folder_readable_again_is_watched_again", probe) {
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
         return;
     }

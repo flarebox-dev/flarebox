@@ -11,6 +11,36 @@ use super::*;
 
 const WAIT: Duration = Duration::from_secs(10);
 
+/// Whether the permission change a test just made blocks reads, given the read
+/// `probe` that should now fail. Only root reads through it; the test is then
+/// skipped, with a line written straight to stderr so that it shows up even
+/// when test output is captured. Anyone else fails the test.
+fn blocks_reads<T: std::fmt::Debug>(test: &str, probe: std::io::Result<T>) -> bool {
+    use std::io::Write;
+
+    match probe {
+        Err(err) => {
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{test}: {err}"
+            );
+            true
+        }
+        Ok(found) => {
+            assert!(
+                rustix::process::geteuid().is_root(),
+                "{test}: the permission change did not block reads ({found:?})"
+            );
+            let _ = writeln!(
+                std::io::stderr(),
+                "SKIPPED {test}: running as root, so permissions do not block reads"
+            );
+            false
+        }
+    }
+}
+
 fn tree(root: &Path, files: usize) {
     fs::create_dir_all(root.join("d")).unwrap();
     fs::write(root.join("d/x"), "x").unwrap();
@@ -362,14 +392,15 @@ fn idle_native_poll_reports_an_unreadable_folder() {
     let watched = watcher.root.clone();
     watcher.watcher.unwatch(&watched).unwrap();
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
-    let denied = fs::symlink_metadata(locked.join("x")).is_err();
+    let probe = fs::symlink_metadata(locked.join("x"));
+    if !blocks_reads("idle_native_poll_reports_an_unreadable_folder", probe) {
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
 
     let first = watcher.poll(Duration::from_millis(200));
     let second = watcher.poll(Duration::from_millis(200));
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
-    if !denied {
-        return;
-    }
     assert_eq!(
         first.unwrap(),
         Poll {
