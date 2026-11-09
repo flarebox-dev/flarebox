@@ -60,7 +60,7 @@ pub enum EntryKind {
 pub struct FileId {
     pub dev: u64,
     pub ino: u64,
-    pub birth_ns: Option<u128>,
+    pub birth_ns: Option<i64>,
 }
 
 /// One file or folder. For folders, `size`, `mtime_ns` and `executable` are
@@ -90,7 +90,7 @@ impl Entry {
                 .created()
                 .ok()
                 .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                .map(|since| since.as_nanos()),
+                .and_then(|since| i64::try_from(since.as_nanos()).ok()),
         };
         Some(match kind {
             EntryKind::Dir => Self {

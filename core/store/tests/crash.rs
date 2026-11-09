@@ -9,14 +9,15 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use flarebox_proto::v1::{NodeKind, NodeState, NodeStatus};
-use flarebox_store::{Cursor, Error, Store};
+use flarebox_fs::FileId;
+use flarebox_proto::v1::{Commit, NodeKind, NodeState, NodeStatus};
+use flarebox_store::{Cursor, Error, InFlightCommit, LocalNode, Shape, Store, SyncedNode, Tx};
 use rusqlite::Connection;
 
 const CHILD_DB: &str = "FLAREBOX_STORE_CRASH_CHILD_DB";
-const NODES_PER_COMMIT: u64 = 500;
+const NODES_PER_INPUT: u64 = 500;
 
-fn node(n: u64) -> NodeState {
+fn remote(n: u64) -> NodeState {
     NodeState {
         node_id: format!("node-{n:08}"),
         parent_id: "root".into(),
@@ -29,18 +30,53 @@ fn node(n: u64) -> NodeState {
     }
 }
 
-/// Commit `seq` writes nodes `(seq - 1) * NODES_PER_COMMIT .. seq * NODES_PER_COMMIT`
-/// and moves the cursor to `seq`, so a consistent database always holds
-/// exactly `last_seq * NODES_PER_COMMIT` nodes.
-fn write_commit(store: &mut Store, seq: u64) -> Result<(), Error> {
-    store.transaction(|tx| {
-        for n in (seq - 1) * NODES_PER_COMMIT..seq * NODES_PER_COMMIT {
-            tx.put_node(&node(n))?;
-        }
-        tx.set_cursor(&Cursor {
-            history_id: "history".into(),
-            last_seq: seq,
-        })
+fn shape(n: u64) -> Shape {
+    Shape {
+        parent_id: "root".into(),
+        name: format!("file {n}"),
+        kind: NodeKind::File as i32,
+        content: None,
+    }
+}
+
+fn in_flight(seq: u64) -> InFlightCommit {
+    InFlightCommit {
+        commit: Commit {
+            commit_id: format!("commit-{seq}"),
+            base_seq: seq,
+            ..Default::default()
+        },
+        sent: vec![],
+    }
+}
+
+/// Input `seq` writes, in one transaction like one engine input, the remote,
+/// synced and local rows of nodes `(seq - 1) * NODES_PER_INPUT .. seq * NODES_PER_INPUT`,
+/// moves the cursor to `seq` and replaces the commit in flight. A consistent
+/// database therefore holds exactly `last_seq * NODES_PER_INPUT` nodes in each
+/// tree and the commit in flight of `last_seq`.
+fn write_input(tx: &Tx<'_>, seq: u64) -> Result<(), Error> {
+    for n in (seq - 1) * NODES_PER_INPUT..seq * NODES_PER_INPUT {
+        tx.put_remote_node(&remote(n))?;
+        tx.put_synced_node(&SyncedNode {
+            node_id: remote(n).node_id,
+            shape: shape(n),
+        })?;
+        tx.put_local_node(&LocalNode {
+            node_id: remote(n).node_id,
+            shape: shape(n),
+            identity: FileId {
+                dev: 1,
+                ino: n,
+                birth_ns: None,
+            },
+            parked: false,
+        })?;
+    }
+    tx.set_commit_in_flight(Some(&in_flight(seq)))?;
+    tx.set_cursor(&Cursor {
+        history_id: "history".into(),
+        last_seq: seq,
     })
 }
 
@@ -62,41 +98,37 @@ fn check_consistent(db: &Path) -> u64 {
     drop(conn);
 
     let mut store = Store::open(db).unwrap();
-    let last_seq = store
-        .transaction(|tx| tx.cursor())
-        .unwrap()
-        .map_or(0, |c| c.last_seq);
-    let expected = last_seq * NODES_PER_COMMIT;
     store
         .transaction(|tx| {
-            assert_eq!(tx.children("root")?.len() as u64, expected);
-            if expected > 0 {
-                assert_eq!(
-                    tx.node(&node(expected - 1).node_id)?,
-                    Some(node(expected - 1))
-                );
-            }
-            assert_eq!(tx.node(&node(expected).node_id)?, None);
-            Ok::<_, Error>(())
+            let last_seq = tx.cursor()?.map_or(0, |cursor| cursor.last_seq);
+            let expected = last_seq * NODES_PER_INPUT;
+            let remote_nodes = tx.remote_nodes()?;
+            assert_eq!(remote_nodes.len() as u64, expected);
+            assert_eq!(
+                remote_nodes.last(),
+                expected.checked_sub(1).map(remote).as_ref()
+            );
+            assert_eq!(tx.synced_nodes()?.len() as u64, expected);
+            assert_eq!(tx.local_nodes()?.len() as u64, expected);
+            assert_eq!(
+                tx.commit_in_flight()?,
+                (last_seq > 0).then(|| in_flight(last_seq))
+            );
+            Ok::<_, Error>(last_seq)
         })
-        .unwrap();
-    last_seq
+        .unwrap()
 }
 
 /// The child aborts the process inside a large transaction, after its pages
-/// have been written to the WAL but before the commit.
+/// have spilled to the WAL but before the commit.
 #[test]
 fn abort_inside_transaction_keeps_last_commit() {
     if let Ok(db) = env::var(CHILD_DB) {
         let mut store = Store::open(&db).unwrap();
         let _ = store.transaction(|tx| {
-            for n in NODES_PER_COMMIT..20 * NODES_PER_COMMIT {
-                tx.put_node(&node(n))?;
+            for seq in 2..=20 {
+                write_input(tx, seq)?;
             }
-            tx.set_cursor(&Cursor {
-                history_id: "history".into(),
-                last_seq: 20,
-            })?;
             std::process::abort();
             #[allow(unreachable_code)]
             Ok::<_, Error>(())
@@ -106,7 +138,10 @@ fn abort_inside_transaction_keeps_last_commit() {
 
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("state.db");
-    write_commit(&mut Store::open(&db).unwrap(), 1).unwrap();
+    Store::open(&db)
+        .unwrap()
+        .transaction(|tx| write_input(tx, 1))
+        .unwrap();
 
     let status = run_child("abort_inside_transaction_keeps_last_commit", &db)
         .wait()
@@ -116,9 +151,9 @@ fn abort_inside_transaction_keeps_last_commit() {
     assert_eq!(check_consistent(&db), 1);
 }
 
-/// The child commits in a loop and reports each commit; the parent kills it
-/// with SIGKILL at an arbitrary point. Every reported commit must survive and
-/// the database must hold exactly the commits up to its cursor.
+/// The child applies inputs in a loop and reports each commit; the parent kills
+/// it with SIGKILL at an arbitrary point. Every reported input must survive and
+/// the database must hold exactly the inputs up to its cursor.
 #[test]
 fn kill_during_commits_keeps_an_atomic_prefix() {
     if let Ok(db) = env::var(CHILD_DB) {
@@ -126,7 +161,7 @@ fn kill_during_commits_keeps_an_atomic_prefix() {
         let mut seq = 0;
         loop {
             seq += 1;
-            write_commit(&mut store, seq).unwrap();
+            store.transaction(|tx| write_input(tx, seq)).unwrap();
             println!("committed {seq}");
         }
     }
@@ -151,5 +186,5 @@ fn kill_during_commits_keeps_an_atomic_prefix() {
 
     let last_seq = check_consistent(&db);
     println!("reported {last_reported}, recovered {last_seq}");
-    assert!(last_seq >= last_reported, "a reported commit was lost");
+    assert!(last_seq >= last_reported, "a reported input was lost");
 }

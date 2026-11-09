@@ -120,6 +120,7 @@ version = "0.0.0"
 name = "flarebox-store"
 version = "0.0.0"
 dependencies = [
+ "flarebox-fs",
  "flarebox-proto",
  "prost",
  "rusqlite",

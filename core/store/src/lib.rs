@@ -1,33 +1,44 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Local SQLite state for one synced space on one device: the server tree as
-//! this device last applied it, the `(history_id, last_seq)` cursor, local ops
-//! waiting to be committed, and the index of chunks cached on disk.
+//! Local SQLite state for one synced space on one device, as the sync engine
+//! design lays it out (docs/design/sync-engine.md §2.2 and §2.8):
 //!
-//! Every read and write goes through [`Store::transaction`]. A transaction
-//! either commits as a whole or leaves no trace, including when the process is
-//! killed in the middle of it: the database runs in WAL mode with
-//! `synchronous = FULL`, so a commit that returned is durable and an
-//! interrupted one is rolled back the next time the file is opened.
+//! - the remote tree R: the `NodeState` records this device has applied, with
+//!   the `(history_id, last_seq)` cursor;
+//! - the synced tree S: per node, the shape on which disk and server last agreed;
+//! - the local tree L: the disk as last observed, with file identities and the
+//!   parked flag;
+//! - the one commit in flight, with the shape each op sent;
+//! - problem nodes, the engine's ID generator state, and the index of chunks
+//!   cached on disk.
+//!
+//! The engine keeps the trees in memory and reports row-level changes after each
+//! input; the driver writes them with the methods of [`Tx`] inside one
+//! [`Store::transaction`]. A transaction either commits as a whole or leaves no
+//! trace, including when the process is killed in the middle of it: the
+//! database runs in WAL mode with `synchronous = FULL`, so a commit that
+//! returned is durable and an interrupted one is rolled back the next time the
+//! file is opened.
 
 use std::path::Path;
 use std::time::Duration;
 
-use flarebox_proto::v1::{NodeState, Op, VersionInfo};
+use flarebox_fs::FileId;
+use flarebox_proto::v1::{Commit, Content, NodeState, VersionInfo};
 use prost::Message;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 /// Schema migrations, applied in order. Migration `i` moves the database from
-/// `user_version = i` to `user_version = i + 1`. Never edit a released entry;
-/// append a new one.
+/// `user_version = i` to `user_version = i + 1`. Never edit an entry once it
+/// has shipped; append a new one.
 const MIGRATIONS: &[&str] = &["
-    CREATE TABLE cursor (
+    CREATE TABLE remote_cursor (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         history_id TEXT NOT NULL,
         last_seq INTEGER NOT NULL
     ) STRICT;
 
-    CREATE TABLE nodes (
+    CREATE TABLE remote_nodes (
         node_id TEXT PRIMARY KEY,
         parent_id TEXT,
         name TEXT NOT NULL,
@@ -38,14 +49,49 @@ const MIGRATIONS: &[&str] = &["
         trash_group TEXT,
         current BLOB
     ) STRICT;
-    CREATE INDEX nodes_by_parent ON nodes (parent_id, name);
 
-    CREATE TABLE pending_ops (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        op BLOB NOT NULL,
-        commit_id TEXT
+    CREATE TABLE synced_nodes (
+        node_id TEXT PRIMARY KEY,
+        parent_id TEXT,
+        name TEXT NOT NULL,
+        kind INTEGER NOT NULL,
+        content BLOB
     ) STRICT;
-    CREATE INDEX pending_ops_by_commit ON pending_ops (commit_id) WHERE commit_id IS NOT NULL;
+
+    CREATE TABLE local_nodes (
+        node_id TEXT PRIMARY KEY,
+        parent_id TEXT,
+        name TEXT NOT NULL,
+        kind INTEGER NOT NULL,
+        content BLOB,
+        dev INTEGER NOT NULL,
+        ino INTEGER NOT NULL,
+        birth_ns INTEGER,
+        parked INTEGER NOT NULL CHECK (parked IN (0, 1))
+    ) STRICT;
+
+    CREATE TABLE commit_in_flight (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        commit_message BLOB NOT NULL
+    ) STRICT;
+
+    CREATE TABLE commit_in_flight_shapes (
+        op_index INTEGER PRIMARY KEY,
+        parent_id TEXT,
+        name TEXT NOT NULL,
+        kind INTEGER NOT NULL,
+        content BLOB
+    ) STRICT;
+
+    CREATE TABLE problems (
+        node_id TEXT PRIMARY KEY,
+        reason TEXT NOT NULL
+    ) STRICT;
+
+    CREATE TABLE engine_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        id_generator BLOB NOT NULL
+    ) STRICT;
 
     CREATE TABLE chunk_cache (
         hash BLOB PRIMARY KEY CHECK (length(hash) = 32),
@@ -77,14 +123,50 @@ pub struct Cursor {
     pub last_seq: u64,
 }
 
-/// A local op waiting to be committed. `commit_id` is set once the op is part
-/// of a commit that may have been sent, so a restart resends the same
-/// `commit_id` and the server's idempotency check applies.
+/// A node's position, kind and content: what the synced tree records per node
+/// and what each op of a commit sent. An empty `parent_id` marks the root;
+/// `kind` holds a `NodeKind` value as in `NodeState`; `content` is set for files.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Shape {
+    pub parent_id: String,
+    pub name: String,
+    pub kind: i32,
+    pub content: Option<Content>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
-pub struct PendingOp {
-    pub id: i64,
-    pub op: Op,
-    pub commit_id: Option<String>,
+pub struct SyncedNode {
+    pub node_id: String,
+    pub shape: Shape,
+}
+
+/// A node of the local tree. `shape.name` is the exact name on disk. A parked
+/// node sits in `.flarebox/parked/<node_id>` while `shape` keeps the
+/// position the engine compares it at.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalNode {
+    pub node_id: String,
+    pub shape: Shape,
+    pub identity: FileId,
+    pub parked: bool,
+}
+
+/// The one commit sent or about to be sent. `sent[i]` is the shape op `i`
+/// sent, or `None` for ops that send no shape (deletes and restores). Resend
+/// it unchanged after a restart; its `commit_id` makes the server return the
+/// stored result if it was already applied.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InFlightCommit {
+    pub commit: Commit,
+    pub sent: Vec<Option<Shape>>,
+}
+
+/// A node left out of planning until a rescan or a user action, with the
+/// engine's reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Problem {
+    pub node_id: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,7 +242,7 @@ impl Tx<'_> {
         Ok(self
             .0
             .query_row(
-                "SELECT history_id, last_seq FROM cursor WHERE id = 1",
+                "SELECT history_id, last_seq FROM remote_cursor WHERE id = 1",
                 [],
                 |row| {
                     Ok(Cursor {
@@ -174,41 +256,47 @@ impl Tx<'_> {
 
     pub fn set_cursor(&self, cursor: &Cursor) -> Result<()> {
         self.0.execute(
-            "INSERT INTO cursor (id, history_id, last_seq) VALUES (1, ?1, ?2)
-             ON CONFLICT (id) DO UPDATE SET history_id = excluded.history_id, last_seq = excluded.last_seq",
+            "INSERT OR REPLACE INTO remote_cursor (id, history_id, last_seq) VALUES (1, ?1, ?2)",
             params![cursor.history_id, cursor.last_seq],
         )?;
         Ok(())
     }
 
-    pub fn node(&self, node_id: &str) -> Result<Option<NodeState>> {
-        self.0
-            .query_row(
-                &format!("SELECT {NODE_COLUMNS} FROM nodes WHERE node_id = ?1"),
-                [node_id],
-                NodeRow::read,
-            )
-            .optional()?
-            .map(NodeRow::into_state)
-            .transpose()
+    /// Every node of the remote tree, live and trashed, ordered by `node_id`.
+    pub fn remote_nodes(&self) -> Result<Vec<NodeState>> {
+        let mut stmt = self.0.prepare_cached(
+            "SELECT node_id, parent_id, name, kind, status, content_rev, meta_rev, trash_group, current
+             FROM remote_nodes ORDER BY node_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                NodeState {
+                    node_id: row.get(0)?,
+                    parent_id: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    name: row.get(2)?,
+                    kind: row.get(3)?,
+                    status: row.get(4)?,
+                    content_rev: row.get(5)?,
+                    meta_rev: row.get(6)?,
+                    trash_group: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                    current: None,
+                },
+                row.get::<_, Option<Vec<u8>>>(8)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (mut node, current) = row?;
+            node.current = decode(current)?;
+            Ok(node)
+        })
+        .collect()
     }
 
-    /// The nodes whose parent is `parent_id`, live and trashed, ordered by name.
-    pub fn children(&self, parent_id: &str) -> Result<Vec<NodeState>> {
-        let mut stmt = self.0.prepare_cached(&format!(
-            "SELECT {NODE_COLUMNS} FROM nodes WHERE parent_id = ?1 ORDER BY name, node_id"
-        ))?;
-        let rows = stmt.query_map([parent_id], NodeRow::read)?;
-        rows.map(|row| row?.into_state()).collect()
-    }
-
-    /// Inserts or replaces the node with `node.node_id`. An empty `parent_id`
-    /// marks the root.
-    pub fn put_node(&self, node: &NodeState) -> Result<()> {
-        let current = node.current.as_ref().map(Message::encode_to_vec);
+    /// Inserts or replaces the remote node with `node.node_id`.
+    pub fn put_remote_node(&self, node: &NodeState) -> Result<()> {
         self.0
             .prepare_cached(
-                "INSERT OR REPLACE INTO nodes
+                "INSERT OR REPLACE INTO remote_nodes
                  (node_id, parent_id, name, kind, status, content_rev, meta_rev, trash_group, current)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?
@@ -221,78 +309,217 @@ impl Tx<'_> {
                 node.content_rev,
                 node.meta_rev,
                 non_empty(&node.trash_group),
-                current,
+                node.current.as_ref().map(VersionInfo::encode_to_vec),
             ])?;
         Ok(())
     }
 
-    /// Removes the node row. Returns whether it existed.
-    pub fn remove_node(&self, node_id: &str) -> Result<bool> {
-        Ok(self
-            .0
-            .execute("DELETE FROM nodes WHERE node_id = ?1", [node_id])?
-            > 0)
+    /// Removes the remote node, for example after `NodePurged`. Returns whether
+    /// it existed.
+    pub fn remove_remote_node(&self, node_id: &str) -> Result<bool> {
+        self.remove("remote_nodes", node_id)
     }
 
-    /// Appends an op to the pending queue and returns its id. Ids grow
-    /// monotonically and are never reused.
-    pub fn push_op(&self, op: &Op) -> Result<i64> {
-        self.0.execute(
-            "INSERT INTO pending_ops (op) VALUES (?1)",
-            [op.encode_to_vec()],
+    /// Every node of the synced tree, ordered by `node_id`.
+    pub fn synced_nodes(&self) -> Result<Vec<SyncedNode>> {
+        let mut stmt = self.0.prepare_cached(
+            "SELECT node_id, parent_id, name, kind, content FROM synced_nodes ORDER BY node_id",
         )?;
-        Ok(self.0.last_insert_rowid())
-    }
-
-    /// All pending ops in the order they were pushed.
-    pub fn pending_ops(&self) -> Result<Vec<PendingOp>> {
-        let mut stmt = self
-            .0
-            .prepare_cached("SELECT id, op, commit_id FROM pending_ops ORDER BY id")?;
         let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, Option<String>>(2)?,
-            ))
+            Ok((row.get::<_, String>(0)?, ShapeRow::read(row, 1)?))
         })?;
         rows.map(|row| {
-            let (id, op, commit_id) = row?;
-            Ok(PendingOp {
-                id,
-                op: Op::decode(op.as_slice())?,
-                commit_id,
+            let (node_id, shape) = row?;
+            Ok(SyncedNode {
+                node_id,
+                shape: shape.into_shape()?,
             })
         })
         .collect()
     }
 
-    /// Rewrites a pending op in place, for example after the server merged a
-    /// created folder into an existing one (spec §6.2 R2). Returns whether
-    /// the op existed.
-    pub fn replace_op(&self, id: i64, op: &Op) -> Result<bool> {
-        Ok(self.0.execute(
-            "UPDATE pending_ops SET op = ?2 WHERE id = ?1",
-            params![id, op.encode_to_vec()],
-        )? > 0)
+    pub fn put_synced_node(&self, node: &SyncedNode) -> Result<()> {
+        let shape = &node.shape;
+        self.0
+            .prepare_cached(
+                "INSERT OR REPLACE INTO synced_nodes (node_id, parent_id, name, kind, content)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?
+            .execute(params![
+                node.node_id,
+                non_empty(&shape.parent_id),
+                shape.name,
+                shape.kind,
+                shape.content.as_ref().map(Content::encode_to_vec),
+            ])?;
+        Ok(())
     }
 
-    /// Marks the given pending ops as part of the commit `commit_id`.
-    pub fn assign_commit(&self, ids: &[i64], commit_id: &str) -> Result<()> {
-        let mut stmt = self
+    /// Removes the synced node (S := ⊥). Returns whether it existed.
+    pub fn remove_synced_node(&self, node_id: &str) -> Result<bool> {
+        self.remove("synced_nodes", node_id)
+    }
+
+    /// Every node of the local tree, ordered by `node_id`.
+    pub fn local_nodes(&self) -> Result<Vec<LocalNode>> {
+        let mut stmt = self.0.prepare_cached(
+            "SELECT node_id, parent_id, name, kind, content, dev, ino, birth_ns, parked
+             FROM local_nodes ORDER BY node_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                ShapeRow::read(row, 1)?,
+                FileId {
+                    dev: row.get::<_, i64>(5)? as u64,
+                    ino: row.get::<_, i64>(6)? as u64,
+                    birth_ns: row.get(7)?,
+                },
+                row.get::<_, bool>(8)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (node_id, shape, identity, parked) = row?;
+            Ok(LocalNode {
+                node_id,
+                shape: shape.into_shape()?,
+                identity,
+                parked,
+            })
+        })
+        .collect()
+    }
+
+    /// Inserts or replaces the local node. `dev` and `ino` are stored as their
+    /// two's-complement `i64` bit patterns, so every `u64` round-trips.
+    pub fn put_local_node(&self, node: &LocalNode) -> Result<()> {
+        let shape = &node.shape;
+        self.0
+            .prepare_cached(
+                "INSERT OR REPLACE INTO local_nodes
+                 (node_id, parent_id, name, kind, content, dev, ino, birth_ns, parked)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?
+            .execute(params![
+                node.node_id,
+                non_empty(&shape.parent_id),
+                shape.name,
+                shape.kind,
+                shape.content.as_ref().map(Content::encode_to_vec),
+                node.identity.dev as i64,
+                node.identity.ino as i64,
+                node.identity.birth_ns,
+                node.parked,
+            ])?;
+        Ok(())
+    }
+
+    pub fn remove_local_node(&self, node_id: &str) -> Result<bool> {
+        self.remove("local_nodes", node_id)
+    }
+
+    pub fn commit_in_flight(&self) -> Result<Option<InFlightCommit>> {
+        let Some(commit) = self
             .0
-            .prepare_cached("UPDATE pending_ops SET commit_id = ?2 WHERE id = ?1")?;
-        for id in ids {
-            stmt.execute(params![id, commit_id])?;
+            .query_row(
+                "SELECT commit_message FROM commit_in_flight WHERE id = 1",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let commit = Commit::decode(commit.as_slice())?;
+        let mut sent = vec![None; commit.ops.len()];
+        let mut stmt = self.0.prepare_cached(
+            "SELECT op_index, parent_id, name, kind, content FROM commit_in_flight_shapes",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, usize>(0)?, ShapeRow::read(row, 1)?))
+        })?;
+        for row in rows {
+            let (index, shape) = row?;
+            if let Some(slot) = sent.get_mut(index) {
+                *slot = Some(shape.into_shape()?);
+            }
+        }
+        Ok(Some(InFlightCommit { commit, sent }))
+    }
+
+    /// Records the commit in flight, replacing any previous one, or clears it
+    /// with `None` once its result is applied.
+    pub fn set_commit_in_flight(&self, commit: Option<&InFlightCommit>) -> Result<()> {
+        self.0.execute("DELETE FROM commit_in_flight", [])?;
+        self.0.execute("DELETE FROM commit_in_flight_shapes", [])?;
+        let Some(in_flight) = commit else {
+            return Ok(());
+        };
+        self.0.execute(
+            "INSERT INTO commit_in_flight (id, commit_message) VALUES (1, ?1)",
+            [in_flight.commit.encode_to_vec()],
+        )?;
+        let mut stmt = self.0.prepare_cached(
+            "INSERT INTO commit_in_flight_shapes (op_index, parent_id, name, kind, content)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for (index, shape) in in_flight.sent.iter().enumerate() {
+            let Some(shape) = shape else { continue };
+            stmt.execute(params![
+                index,
+                non_empty(&shape.parent_id),
+                shape.name,
+                shape.kind,
+                shape.content.as_ref().map(Content::encode_to_vec),
+            ])?;
         }
         Ok(())
     }
 
-    /// Drops the ops of a commit the server answered. Returns how many there were.
-    pub fn remove_commit(&self, commit_id: &str) -> Result<usize> {
+    /// Every problem node, ordered by `node_id`.
+    pub fn problems(&self) -> Result<Vec<Problem>> {
+        let mut stmt = self
+            .0
+            .prepare_cached("SELECT node_id, reason FROM problems ORDER BY node_id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Problem {
+                node_id: row.get(0)?,
+                reason: row.get(1)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn put_problem(&self, problem: &Problem) -> Result<()> {
+        self.0.execute(
+            "INSERT OR REPLACE INTO problems (node_id, reason) VALUES (?1, ?2)",
+            params![problem.node_id, problem.reason],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_problem(&self, node_id: &str) -> Result<bool> {
+        self.remove("problems", node_id)
+    }
+
+    /// The engine's ID generator state, opaque to the store.
+    pub fn id_generator(&self) -> Result<Option<Vec<u8>>> {
         Ok(self
             .0
-            .execute("DELETE FROM pending_ops WHERE commit_id = ?1", [commit_id])?)
+            .query_row(
+                "SELECT id_generator FROM engine_state WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn set_id_generator(&self, state: &[u8]) -> Result<()> {
+        self.0.execute(
+            "INSERT OR REPLACE INTO engine_state (id, id_generator) VALUES (1, ?1)",
+            [state],
+        )?;
+        Ok(())
     }
 
     /// Records that the chunk is cached, or refreshes its size and last use.
@@ -348,42 +575,45 @@ impl Tx<'_> {
         let rows = stmt.query_map([limit], read_chunk)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
+
+    fn remove(&self, table: &str, node_id: &str) -> Result<bool> {
+        Ok(self
+            .0
+            .prepare_cached(&format!("DELETE FROM {table} WHERE node_id = ?1"))?
+            .execute([node_id])?
+            > 0)
+    }
 }
 
-const NODE_COLUMNS: &str =
-    "node_id, parent_id, name, kind, status, content_rev, meta_rev, trash_group, current";
-
-struct NodeRow {
-    state: NodeState,
-    current: Option<Vec<u8>>,
+/// The shape columns `parent_id, name, kind, content` starting at column
+/// `first`, with the content still encoded.
+struct ShapeRow {
+    shape: Shape,
+    content: Option<Vec<u8>>,
 }
 
-impl NodeRow {
-    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+impl ShapeRow {
+    fn read(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<Self> {
         Ok(Self {
-            state: NodeState {
-                node_id: row.get(0)?,
-                parent_id: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                name: row.get(2)?,
-                kind: row.get(3)?,
-                status: row.get(4)?,
-                content_rev: row.get(5)?,
-                meta_rev: row.get(6)?,
-                trash_group: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
-                current: None,
+            shape: Shape {
+                parent_id: row.get::<_, Option<String>>(first)?.unwrap_or_default(),
+                name: row.get(first + 1)?,
+                kind: row.get(first + 2)?,
+                content: None,
             },
-            current: row.get(8)?,
+            content: row.get(first + 3)?,
         })
     }
 
-    fn into_state(self) -> Result<NodeState> {
-        let mut state = self.state;
-        state.current = self
-            .current
-            .map(|bytes| VersionInfo::decode(bytes.as_slice()))
-            .transpose()?;
-        Ok(state)
+    fn into_shape(self) -> Result<Shape> {
+        let mut shape = self.shape;
+        shape.content = decode(self.content)?;
+        Ok(shape)
     }
+}
+
+fn decode<M: Message + Default>(bytes: Option<Vec<u8>>) -> Result<Option<M>> {
+    Ok(bytes.map(|bytes| M::decode(bytes.as_slice())).transpose()?)
 }
 
 fn read_chunk(row: &rusqlite::Row<'_>) -> rusqlite::Result<CachedChunk> {
