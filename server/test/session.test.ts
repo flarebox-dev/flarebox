@@ -30,6 +30,7 @@ import {
 } from "../src/gen/flarebox/v1/messages_pb";
 import { ChunkRefSchema, type CommitRecord, ContentSchema } from "../src/gen/flarebox/v1/model_pb";
 import { ChunkPlan_Action, Error_Code, ErrorSchema, type Target } from "../src/gen/flarebox/v1/rpc_pb";
+import type { ServerKey } from "../src/auth";
 import { sha256 } from "../src/crypto";
 import { toHex, uuidv7 } from "../src/ids";
 import { Close, HOLD_MS, type SpaceDO } from "../src/space-do";
@@ -900,6 +901,50 @@ describe("chunk relay", () => {
     expect(outage.status).toBe(503);
     expect((await decode(outage)).code).toBe(Error_Code.RETRY_LATER);
     expect(await env.BUCKET.head(key)).toBeNull();
+  });
+
+  /** An Account DO binding whose serverKey calls go through `serverKey`, so a test can count or fail them. */
+  function accountBinding(serverKey: () => Promise<ServerKey>) {
+    return { idFromName: (name: string) => env.ACCOUNT.idFromName(name), get: () => ({ serverKey }) };
+  }
+
+  it("reads the server key again on the next request after a failed Account DO call", async () => {
+    const { request, key } = await preparedTicket();
+    let calls = 0;
+    const ACCOUNT = accountBinding(async () => {
+      calls++;
+      if (calls === 1) throw new Error("injected Account DO failure");
+      return account().serverKey();
+    });
+    const send = () => worker.fetch(request() as Parameters<typeof worker.fetch>[0], { ...env, ACCOUNT } as unknown as Env, {} as ExecutionContext);
+    await expect(send()).rejects.toThrow("injected Account DO failure");
+    expect((await send()).status).toBe(200);
+    expect(calls).toBe(2);
+    expect(await env.BUCKET.head(key)).not.toBeNull();
+  });
+
+  it("keeps no per-space state for unknown space ids and touches no storage before the ticket check", async () => {
+    let calls = 0;
+    const ACCOUNT = accountBinding(() => {
+      calls++;
+      return account().serverKey();
+    });
+    const BUCKET = new Proxy(
+      {},
+      {
+        get: () => {
+          throw new Error("R2 was used before the ticket check");
+        },
+      },
+    );
+    const relayEnv = { ...env, ACCOUNT, BUCKET } as unknown as Env;
+    const send = (url: string, init?: RequestInit) => worker.fetch(new Request(url, init) as Parameters<typeof worker.fetch>[0], relayEnv, {} as ExecutionContext);
+    for (let i = 0; i < 20; i++) {
+      const url = `${BASE}/v1/spaces/${uuidv7()}/chunks/${"ab".repeat(32)}?ticket=v1.9999999999999.AAAA`;
+      expect((await send(url, { method: "PUT", body: new Uint8Array(4), headers: { "Content-Length": "4" } })).status).toBe(403);
+      expect((await send(url)).status).toBe(403);
+    }
+    expect(calls).toBe(1);
   });
 });
 

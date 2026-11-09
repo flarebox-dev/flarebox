@@ -27,19 +27,25 @@ import { PROTO_MAX, PROTO_MIN, SERVER_VERSION } from "./version";
 export { AccountDO } from "./account-do";
 export { SpaceDO } from "./space-do";
 
-let serverKey: Promise<ServerKey> | undefined;
+const serverKeys = new WeakMap<object, Promise<ServerKey>>();
 
 function account(env: Env) {
   return env.ACCOUNT.get(env.ACCOUNT.idFromName("account"));
 }
 
-/** The server key, read once per isolate from the Account DO so that tokens verify without a DO call. */
+/** The server key, read once per isolate and Account DO binding so that tokens verify without a DO call. A failed read is not kept. */
 function key(env: Env): Promise<ServerKey> {
-  serverKey ??= account(env).serverKey().catch((error: unknown) => {
-    serverKey = undefined;
-    throw error;
-  });
-  return serverKey;
+  let cached = serverKeys.get(env.ACCOUNT);
+  if (!cached) {
+    cached = account(env)
+      .serverKey()
+      .catch((error: unknown) => {
+        serverKeys.delete(env.ACCOUNT);
+        throw error;
+      });
+    serverKeys.set(env.ACCOUNT, cached);
+  }
+  return cached;
 }
 
 async function authenticate(request: Request, env: Env): Promise<Identity | Response> {
@@ -50,15 +56,9 @@ async function authenticate(request: Request, env: Env): Promise<Identity | Resp
   return identity;
 }
 
-const spaceKeys = new Map<string, Promise<Uint8Array>>();
-
-function spaceKey(env: Env, spaceId: string): Promise<Uint8Array> {
-  let derived = spaceKeys.get(spaceId);
-  if (!derived) {
-    derived = key(env).then((k) => deriveSpaceKey(k.secret, spaceId));
-    spaceKeys.set(spaceId, derived);
-  }
-  return derived;
+/** The per-space ticket key, derived for each request from the cached server key, so a request keeps no per-space state. */
+async function spaceKey(env: Env, spaceId: string): Promise<Uint8Array> {
+  return deriveSpaceKey((await key(env)).secret, spaceId);
 }
 
 /**
