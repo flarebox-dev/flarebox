@@ -264,7 +264,10 @@ describe("owner claim, pairing and tokens", () => {
     const forged = await call("/v1/token", { body: body(TokenRequestSchema, { deviceId: paired.message!.deviceId, refreshCredential: "nope" }) }, AccessTokenSchema);
     expect(forged.status).toBe(401);
     expect((await call("/v1/spaces", { method: "GET" }, SpaceListSchema)).status).toBe(401);
-    expect((await call("/v1/spaces", { method: "GET", token: owner.access!.token.slice(0, -1) + "x" }, SpaceListSchema)).status).toBe(401);
+    const token = owner.access!.token;
+    const at = token.length - 10;
+    const tampered = token.slice(0, at) + (token[at] === "A" ? "B" : "A") + token.slice(at + 1);
+    expect((await call("/v1/spaces", { method: "GET", token: tampered }, SpaceListSchema)).status).toBe(401);
   });
 
   it("stops accepting a revoked device", async () => {
