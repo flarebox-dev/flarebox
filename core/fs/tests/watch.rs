@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use flarebox_fs::{
-    Change, EntryKind, Error, NativeWatcher, Rescan, RescanWatcher, Snapshot, Watcher,
+    Change, EntryKind, Error, NativeWatcher, Poll, Rescan, RescanWatcher, Snapshot, Watcher,
 };
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -85,8 +85,11 @@ fn tree_changed_offline() -> (tempfile::TempDir, Snapshot, Vec<Change>) {
 fn rescan_watcher_catches_changes_made_while_nothing_watched() {
     let (dir, previous, expected) = tree_changed_offline();
     let mut watcher = RescanWatcher::new(dir.path(), previous, Duration::from_millis(20)).unwrap();
-    assert_eq!(watcher.poll(WAIT).unwrap(), expected);
-    assert_eq!(watcher.poll(Duration::from_millis(100)).unwrap(), []);
+    assert_eq!(watcher.poll(WAIT).unwrap().changes, expected);
+    assert_eq!(
+        watcher.poll(Duration::from_millis(100)).unwrap(),
+        Poll::default()
+    );
     assert_eq!(watcher.snapshot(), &Snapshot::scan(dir.path()).unwrap());
 }
 
@@ -94,8 +97,11 @@ fn rescan_watcher_catches_changes_made_while_nothing_watched() {
 fn native_watcher_catches_changes_made_while_nothing_watched() {
     let (dir, previous, expected) = tree_changed_offline();
     let mut watcher = NativeWatcher::start(dir.path(), previous).unwrap();
-    assert_eq!(watcher.poll(WAIT).unwrap(), expected);
-    assert_eq!(watcher.poll(Duration::from_millis(300)).unwrap(), []);
+    assert_eq!(watcher.poll(WAIT).unwrap().changes, expected);
+    assert_eq!(
+        watcher.poll(Duration::from_millis(300)).unwrap(),
+        Poll::default()
+    );
     assert_eq!(watcher.snapshot(), &Snapshot::scan(dir.path()).unwrap());
 }
 
@@ -110,9 +116,9 @@ fn expect(watcher: &mut dyn Watcher, expected: &[Change]) {
             Instant::now() < deadline,
             "timed out waiting for {expected:?}; saw {seen:?}"
         );
-        seen.extend(watcher.poll(Duration::from_millis(500)).unwrap());
+        seen.extend(watcher.poll(Duration::from_millis(500)).unwrap().changes);
     }
-    seen.extend(watcher.poll(Duration::from_millis(300)).unwrap());
+    seen.extend(watcher.poll(Duration::from_millis(300)).unwrap().changes);
     let unexpected: Vec<_> = seen
         .iter()
         .filter(|change| !expected.contains(change))
@@ -131,7 +137,10 @@ fn expect(watcher: &mut dyn Watcher, expected: &[Change]) {
 }
 
 fn live_changes(watcher: &mut dyn Watcher, root: &Path) {
-    assert_eq!(watcher.poll(Duration::from_millis(300)).unwrap(), []);
+    assert_eq!(
+        watcher.poll(Duration::from_millis(300)).unwrap(),
+        Poll::default()
+    );
 
     fs::write(root.join("a.txt"), "one").unwrap();
     expect(watcher, &[created("a.txt", File)]);
@@ -293,7 +302,10 @@ fn native_watcher_reports_a_case_only_rename() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let mut watcher = NativeWatcher::start(root, Snapshot::default()).unwrap();
-    assert_eq!(watcher.poll(Duration::from_millis(300)).unwrap(), []);
+    assert_eq!(
+        watcher.poll(Duration::from_millis(300)).unwrap(),
+        Poll::default()
+    );
     fs::write(root.join("letter.txt"), "l").unwrap();
     expect(&mut watcher, &[created("letter.txt", File)]);
     fs::rename(root.join("letter.txt"), root.join("LETTER.txt")).unwrap();

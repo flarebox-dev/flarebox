@@ -228,6 +228,123 @@ fn ancestor_swapped_out_and_back_publishes_no_removal() {
     }
 }
 
+/// A removal's parent is swapped for a folder that holds the path while the
+/// confirmation looks through the original, so the confirmation sees the path
+/// gone. The final look from a fresh root finds another folder there, so the
+/// removal is not published and the path is handed back for another rescan.
+#[test]
+fn parent_swapped_during_confirmation_publishes_no_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("space");
+    let detached = dir.path().join("detached-d");
+    for paths in [vec![PathBuf::new()], vec![PathBuf::from("d/sub/victim")]] {
+        fs::create_dir_all(root.join("d/sub")).unwrap();
+        fs::write(root.join("d/sub/victim"), "user content").unwrap();
+        let mut snapshot = Snapshot::scan(&root).unwrap();
+        let before = snapshot.clone();
+        fs::remove_file(root.join("d/sub/victim")).unwrap();
+
+        let mut swapped = false;
+        let result = snapshot.rescan_with(&root, paths.clone(), &mut |cut| {
+            let at_d = matches!(cut, Cut::Confirming(path) if path == Path::new("d"));
+            if swapped || !at_d {
+                return;
+            }
+            swapped = true;
+            fs::rename(root.join("d"), &detached).unwrap();
+            fs::create_dir_all(root.join("d/sub")).unwrap();
+            fs::write(root.join("d/sub/victim"), "user content").unwrap();
+        });
+
+        assert!(swapped, "{paths:?}");
+        let rescan = result.unwrap_or_else(|err| panic!("{paths:?}: {err:?}"));
+        assert_eq!(rescan.changes, [], "{paths:?}");
+        assert_eq!(
+            rescan.unsettled,
+            [PathBuf::from("d/sub/victim")],
+            "{paths:?}"
+        );
+        assert_eq!(snapshot, before, "{paths:?}");
+        assert!(root.join("d/sub/victim").exists());
+        fs::remove_dir_all(&detached).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+/// Siblings are confirmed against one listing of their parent. A sibling
+/// recreated after that listing, here while another parent is looked at, is
+/// not published as removed: the final look sees the parent changed and hands
+/// back every path confirmed against it. A rescan of those paths settles them.
+#[test]
+fn sibling_recreated_after_its_parent_was_listed_publishes_no_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("space");
+    let files = ["d/a-first", "d/m/y", "d/z-victim"];
+    let scopes = [
+        vec![PathBuf::new()],
+        files.iter().map(PathBuf::from).collect(),
+    ];
+    for paths in scopes {
+        fs::create_dir_all(root.join("d/m")).unwrap();
+        for file in files {
+            fs::write(root.join(file), "user content").unwrap();
+        }
+        let mut snapshot = Snapshot::scan(&root).unwrap();
+        let mut expected = snapshot.clone();
+        expected.entries.remove(Path::new("d/m/y"));
+        for file in files {
+            fs::remove_file(root.join(file)).unwrap();
+        }
+
+        let mut recreated = false;
+        let result = snapshot.rescan_with(&root, paths.clone(), &mut |cut| {
+            let at_m = matches!(cut, Cut::Confirming(path) if path == Path::new("d/m"));
+            if recreated || !at_m {
+                return;
+            }
+            recreated = true;
+            fs::write(root.join("d/z-victim"), "recreated by the user").unwrap();
+        });
+
+        assert!(recreated, "{paths:?}");
+        let rescan = result.unwrap_or_else(|err| panic!("{paths:?}: {err:?}"));
+        assert_eq!(
+            rescan.changes,
+            [Change::Removed {
+                path: PathBuf::from("d/m/y"),
+                kind: EntryKind::File
+            }],
+            "{paths:?}"
+        );
+        assert_eq!(
+            rescan.unsettled,
+            [PathBuf::from("d/a-first"), PathBuf::from("d/z-victim")],
+            "{paths:?}"
+        );
+        assert_eq!(snapshot, expected, "{paths:?}");
+
+        let settled = snapshot.rescan(&root, rescan.unsettled).unwrap();
+        assert_eq!(
+            settled,
+            Rescan {
+                changes: vec![
+                    Change::Removed {
+                        path: PathBuf::from("d/a-first"),
+                        kind: EntryKind::File
+                    },
+                    Change::Modified {
+                        path: PathBuf::from("d/z-victim")
+                    },
+                ],
+                unsettled: vec![],
+            },
+            "{paths:?}"
+        );
+        assert_eq!(snapshot, Snapshot::scan(&root).unwrap(), "{paths:?}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+}
+
 fn wait_for(watcher: &mut NativeWatcher, expected: &[Change]) -> Vec<Change> {
     let deadline = Instant::now() + WAIT;
     let mut seen = Vec::new();
@@ -236,7 +353,7 @@ fn wait_for(watcher: &mut NativeWatcher, expected: &[Change]) -> Vec<Change> {
             Instant::now() < deadline,
             "timed out waiting for {expected:?}; saw {seen:?}"
         );
-        seen.extend(watcher.poll(Duration::from_millis(500)).unwrap());
+        seen.extend(watcher.poll(Duration::from_millis(500)).unwrap().changes);
     }
     seen
 }
@@ -269,7 +386,10 @@ fn rescan_request_restores_lost_watch_coverage() {
     lose_coverage(&mut watcher);
     fs::write(root.join("sub/missed.txt"), "m").unwrap();
     #[cfg(target_os = "linux")]
-    assert_eq!(watcher.poll(Duration::from_millis(500)).unwrap(), []);
+    assert_eq!(
+        watcher.poll(Duration::from_millis(500)).unwrap(),
+        Poll::default()
+    );
 
     watcher
         .sender
@@ -289,7 +409,10 @@ fn new_folders_are_registered_before_their_rescan() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let mut watcher = NativeWatcher::start(&root, Snapshot::default()).unwrap();
-    assert_eq!(watcher.poll(Duration::from_millis(300)).unwrap(), []);
+    assert_eq!(
+        watcher.poll(Duration::from_millis(300)).unwrap(),
+        Poll::default()
+    );
 
     lose_coverage(&mut watcher);
     let early = root.join("sub/early.txt");
@@ -314,7 +437,10 @@ fn a_new_folder_that_vanishes_before_its_watch_is_not_a_watch_failure() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let mut watcher = NativeWatcher::start(&root, Snapshot::default()).unwrap();
-    assert_eq!(watcher.poll(Duration::from_millis(300)).unwrap(), []);
+    assert_eq!(
+        watcher.poll(Duration::from_millis(300)).unwrap(),
+        Poll::default()
+    );
 
     let sub = root.join("tmp-build");
     let gone = sub.clone();
@@ -333,5 +459,8 @@ fn a_new_folder_that_vanishes_before_its_watch_is_not_a_watch_failure() {
     assert_eq!(seen.len(), 2, "{seen:?}");
 
     watcher.before_register = None;
-    assert_eq!(watcher.poll(Duration::from_millis(300)).unwrap(), []);
+    assert_eq!(
+        watcher.poll(Duration::from_millis(300)).unwrap(),
+        Poll::default()
+    );
 }
