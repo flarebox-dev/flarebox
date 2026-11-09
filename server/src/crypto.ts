@@ -43,31 +43,30 @@ export function deriveSpaceKey(serverKey: Uint8Array, spaceId: string): Promise<
 
 export type ChunkGrant = "put" | "get" | "receipt";
 
-function grantMessage(grant: ChunkGrant, spaceId: string, hashHex: string, size: number, expiresAtMs: number): string {
-  return `${grant}|${spaceId}|${hashHex}|${size}|${expiresAtMs}`;
+/** The chunk a grant covers: one incarnation of one hash in one space (RFC 0003 section 5, rule 7). */
+export interface ChunkObject {
+  spaceId: string;
+  hashHex: string;
+  incarnation: string;
+}
+
+function grantMessage(grant: ChunkGrant, chunk: ChunkObject, size: number, expiresAtMs: number): string {
+  return `${grant}|${chunk.spaceId}|${chunk.hashHex}|${chunk.incarnation}|${size}|${expiresAtMs}`;
 }
 
 /**
  * Signs a chunk ticket (put, get) or upload receipt as "v1.<expires_at_ms>.<mac>".
  * Get tickets pass size 0 because a download does not depend on it.
  */
-export async function signChunkGrant(
-  spaceKey: Uint8Array,
-  grant: ChunkGrant,
-  spaceId: string,
-  hashHex: string,
-  size: number,
-  expiresAtMs: number,
-): Promise<string> {
-  const mac = await hmac(spaceKey, grantMessage(grant, spaceId, hashHex, size, expiresAtMs));
+export async function signChunkGrant(spaceKey: Uint8Array, grant: ChunkGrant, chunk: ChunkObject, size: number, expiresAtMs: number): Promise<string> {
+  const mac = await hmac(spaceKey, grantMessage(grant, chunk, size, expiresAtMs));
   return `v1.${expiresAtMs}.${base64url(mac)}`;
 }
 
 export async function verifyChunkGrant(
   spaceKey: Uint8Array,
   grant: ChunkGrant,
-  spaceId: string,
-  hashHex: string,
+  chunk: ChunkObject,
   size: number,
   token: string,
   nowMs: number,
@@ -78,5 +77,5 @@ export async function verifyChunkGrant(
   if (expiresAtMs < nowMs) return false;
   const mac = fromBase64url(macText);
   if (!mac) return false;
-  return hmacVerify(spaceKey, grantMessage(grant, spaceId, hashHex, size, expiresAtMs), mac);
+  return hmacVerify(spaceKey, grantMessage(grant, chunk, size, expiresAtMs), mac);
 }

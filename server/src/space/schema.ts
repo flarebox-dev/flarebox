@@ -2,7 +2,8 @@
 
 // Space DO storage, following spec v0 section 4.1. Migrations only move forward.
 
-const MIGRATIONS: string[] = [
+/** Each step is idempotent, so a database whose schema_version lags its tables still migrates. */
+const MIGRATIONS: (string | ((sql: SqlStorage) => void))[] = [
   `
   CREATE TABLE meta (key TEXT PRIMARY KEY, value BLOB NOT NULL);
   CREATE TABLE members (user_id TEXT PRIMARY KEY, role TEXT NOT NULL, added_seq INTEGER NOT NULL);
@@ -58,6 +59,12 @@ const MIGRATIONS: string[] = [
   CREATE TABLE IF NOT EXISTS device_commits (device_id TEXT PRIMARY KEY, device_seq INTEGER NOT NULL,
     commit_id TEXT NOT NULL, results BLOB NOT NULL);
   `,
+  (sql) => {
+    const columns = sql.exec("SELECT name FROM pragma_table_info('chunks')").toArray().map((row) => row.name);
+    if (!columns.includes("incarnation")) sql.exec("ALTER TABLE chunks ADD COLUMN incarnation TEXT");
+    if (!columns.includes("head_checked")) sql.exec("ALTER TABLE chunks ADD COLUMN head_checked INTEGER NOT NULL DEFAULT 0");
+    sql.exec("CREATE TABLE IF NOT EXISTS orphans (key TEXT PRIMARY KEY, hash BLOB NOT NULL, incarnation TEXT NOT NULL)");
+  },
 ];
 
 export function migrate(sql: SqlStorage): void {
@@ -66,7 +73,9 @@ export function migrate(sql: SqlStorage): void {
     ? Number(sql.exec("SELECT value FROM meta WHERE key = 'schema_version'").toArray()[0]?.value ?? 0)
     : 0;
   while (version < MIGRATIONS.length) {
-    sql.exec(MIGRATIONS[version]!);
+    const step = MIGRATIONS[version]!;
+    if (typeof step === "string") sql.exec(step);
+    else step(sql);
     version++;
     sql.exec("INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value", version);
   }

@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { OpResult_Code } from "../src/gen/flarebox/v1/commit_pb";
 import { Error_Code } from "../src/gen/flarebox/v1/rpc_pb";
-import { uuidv7 } from "../src/ids";
+import { toHex, uuidv7 } from "../src/ids";
+import { MAX_HEAD_CHECKS, type SpaceDO } from "../src/space-do";
 import { client, content, newSpace, op, type TestClient } from "./helpers";
 
 async function setup() {
@@ -112,5 +114,54 @@ describe("RFC 0002 section 10", () => {
     const edit = await content("B's edit");
     const result = await b.commit([op.update(file, edit.content)], { receipts: await b.uploadParts(edit) });
     expect(result.results[0]!.code).toBe(OpResult_Code.CONFLICT_COPY);
+  });
+});
+
+describe("RFC 0002 section 11", () => {
+  it("checks at most MAX_HEAD_CHECKS pending chunks without a receipt per call, records them and extends their holds", async () => {
+    const { a, root } = await setup();
+    const parts = await content(...Array.from({ length: MAX_HEAD_CHECKS + 10 }, (_, i) => "chunk " + i));
+    await a.uploadParts(parts);
+    const holds = () =>
+      runInDurableObject(a.stub, (_instance, state) => state.storage.sql.exec("SELECT hold_until_ms, head_checked FROM chunks").toArray());
+    const before = Math.max(...(await holds()).map((row) => Number(row.hold_until_ms)));
+    const file = [op.create(uuidv7(), root, "many", parts.content)];
+    const commitId = uuidv7();
+    const first = await a.commitRaw(file, { commitId });
+    expect(first.case === "error" && first.value.code).toBe(Error_Code.MISSING_CHUNKS);
+    expect(first.case === "error" && first.value.missingChunks.map(toHex)).toEqual(parts.content.chunks.slice(MAX_HEAD_CHECKS).map((c) => toHex(c.hash)));
+    const checked = (await holds()).filter((row) => row.head_checked === 1);
+    expect(checked).toHaveLength(MAX_HEAD_CHECKS);
+    expect(checked.every((row) => Number(row.hold_until_ms) > before)).toBe(true);
+    expect((await a.commit(file, { commitId })).seq).toBe(1n);
+  });
+
+  it("lists a head-checked chunk as missing when its row changed before the commit transaction", async () => {
+    const { a, root } = await setup();
+    const parts = await content("checked, then retired");
+    await a.uploadParts(parts);
+    const swap = (patch: boolean) =>
+      runInDurableObject(a.stub, (instance: SpaceDO, state) => {
+        const holder = instance as unknown as { env: Env; original?: Env };
+        if (!patch) {
+          holder.env = holder.original!;
+          return;
+        }
+        holder.original = holder.env;
+        const head = async (key: string) => {
+          const found = await env.BUCKET.head(key);
+          state.storage.sql.exec("UPDATE chunks SET state = 3");
+          return found;
+        };
+        holder.env = { ...holder.original, BUCKET: { head } as unknown as R2Bucket };
+      });
+    await swap(true);
+    try {
+      const result = await a.commitRaw([op.create(uuidv7(), root, "f", parts.content)]);
+      expect(result.case === "error" && result.value.code).toBe(Error_Code.MISSING_CHUNKS);
+      expect(result.case === "error" && result.value.missingChunks.map(toHex)).toEqual([toHex(parts.content.chunks[0]!.hash)]);
+    } finally {
+      await swap(false);
+    }
   });
 });

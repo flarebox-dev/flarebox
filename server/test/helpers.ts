@@ -58,6 +58,18 @@ export const op = {
     create(OpSchema, { op: { case: "restore", value: { nodeId, ...init } } }),
 };
 
+/** The key incarnation an upload or download target names. */
+export function targetIncarnation(url: string): string {
+  return new URL(url).searchParams.get("inc")!;
+}
+
+/** The R2 keys stored for a chunk, one per incarnation. */
+export async function storedObjects(spaceId: string, hash: Uint8Array | string): Promise<string[]> {
+  const hex = typeof hash === "string" ? hash : toHex(hash);
+  const listed = await env.BUCKET.list({ prefix: `spaces/${spaceId}/chunks/${hex.slice(0, 2)}/${hex}/` });
+  return listed.objects.map((object) => object.key);
+}
+
 type Stub = Awaited<ReturnType<typeof newSpace>>["stub"];
 
 export interface CommitInit {
@@ -110,8 +122,9 @@ export class TestClient {
       if (plan.action !== ChunkPlan_Action.UPLOAD) continue;
       const hex = toHex(plan.hash);
       const chunk = chunks.find((c) => toHex(c.hash) === hex)!;
-      await env.BUCKET.put(chunkKey(this.spaceId, hex), bytes.get(hex) ?? new Uint8Array(chunk.size));
-      const token = await signChunkGrant(SPACE_KEY, "receipt", this.spaceId, hex, chunk.size, (this.nowMs ?? Date.now()) + 3_600_000);
+      const object = { spaceId: this.spaceId, hashHex: hex, incarnation: targetIncarnation(plan.target!.url) };
+      await env.BUCKET.put(chunkKey(this.spaceId, hex, object.incarnation), bytes.get(hex) ?? new Uint8Array(chunk.size));
+      const token = await signChunkGrant(SPACE_KEY, "receipt", object, chunk.size, (this.nowMs ?? Date.now()) + 3_600_000);
       receipts.push(create(UploadReceiptSchema, { hash: plan.hash, size: chunk.size, token }));
     }
     return receipts;

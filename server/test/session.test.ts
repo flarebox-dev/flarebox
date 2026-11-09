@@ -36,7 +36,7 @@ import { toHex, uuidv7 } from "../src/ids";
 import { Close, HOLD_MS, type SpaceDO } from "../src/space-do";
 import { chunkKey, encodeChunkList } from "../src/space/store";
 import worker from "../src/worker";
-import { content, op } from "./helpers";
+import { content, op, storedObjects, targetIncarnation } from "./helpers";
 
 const BASE = "https://flarebox.test";
 
@@ -418,7 +418,7 @@ describe("owner claim, pairing and tokens", () => {
       version: state.storage.sql.exec("SELECT value FROM meta WHERE key = 'schema_version'").one().value,
       revoked: state.storage.sql.exec("SELECT device_id FROM revoked_devices").toArray(),
     }));
-    expect(after).toEqual({ version: 3, revoked: [{ device_id: device }] });
+    expect(after).toEqual({ version: 4, revoked: [{ device_id: device }] });
   });
 
   it("adds revoked_devices to a version-one Space database and keeps its data", async () => {
@@ -444,7 +444,7 @@ describe("owner claim, pairing and tokens", () => {
       node: state.storage.sql.exec("SELECT name FROM nodes WHERE node_id = ?", dir).toArray(),
       revoked: state.storage.sql.exec("SELECT device_id FROM revoked_devices").toArray(),
     }));
-    expect(after).toEqual({ version: 3, head: 1, commits: [{ seq: 1 }], node: [{ name: "kept" }], revoked: [{ device_id: device }] });
+    expect(after).toEqual({ version: 4, head: 1, commits: [{ seq: 1 }], node: [{ name: "kept" }], revoked: [{ device_id: device }] });
   });
 });
 
@@ -783,7 +783,7 @@ describe("chunk relay", () => {
     const file = await prepared(socket, "the bytes of a small file");
     expect(file.plan.chunks[0]!.target!.url.startsWith(BASE + "/v1/spaces/" + spaceId + "/chunks/")).toBe(true);
     expect(file.receipts).toHaveLength(1);
-    const head = await env.BUCKET.head(chunkKey(spaceId, toHex(file.content.chunks[0]!.hash)));
+    const head = await env.BUCKET.head(chunkKey(spaceId, toHex(file.content.chunks[0]!.hash), targetIncarnation(file.plan.chunks[0]!.target!.url)));
     expect(head?.size).toBe(file.bytes[0]!.length);
     const nodeId = uuidv7();
     await socket.commit(0n, [op.create(nodeId, spaceId, "small.txt", file.content)], file.receipts);
@@ -809,7 +809,7 @@ describe("chunk relay", () => {
     if (plan.case !== "prepareUpload") throw new Error("prepareUpload failed");
     const target = plan.value.chunks[0]!.target!;
     const bytes = parts.bytes[0]!;
-    const key = chunkKey(spaceId, toHex(parts.content.chunks[0]!.hash));
+    const key = chunkKey(spaceId, toHex(parts.content.chunks[0]!.hash), targetIncarnation(target.url));
 
     const tampered = { ...target, url: target.url.slice(0, -3) + "AAA" };
     expect((await put(tampered, bytes)).status).toBe(403);
@@ -836,7 +836,7 @@ describe("chunk relay", () => {
     const url = target.url;
     const request = () => new Request(url, { method: "PUT", body: bytes, headers: { "Content-Length": String(bytes.length) } });
     const stub = env.SPACE.get(env.SPACE.idFromName(spaceId));
-    return { spaceId, socket, parts, target, request, stub, key: chunkKey(spaceId, toHex(parts.content.chunks[0]!.hash)) };
+    return { spaceId, socket, parts, target, request, stub, key: chunkKey(spaceId, toHex(parts.content.chunks[0]!.hash), targetIncarnation(url)) };
   }
 
   function relay(request: Request, put: (key: string, body: ReadableStream | null, options: R2PutOptions) => Promise<R2Object | null>) {
@@ -867,43 +867,38 @@ describe("chunk relay", () => {
 
     const day = 24 * 3_600_000;
     expect(await runInDurableObject(stub, (instance: SpaceDO) => instance.collectGarbage(at + day))).toMatchObject({ sweptChunks: 0 });
-    const sweep = await runInDurableObject(stub, (instance: SpaceDO) => instance.collectGarbage(at + 7 * day + 1));
+    const sweep = await runInDurableObject(stub, (instance: SpaceDO) => instance.collectGarbage(at + 31 * day));
     expect(sweep).toMatchObject({ sweptChunks: 1, deletedChunks: 1 });
     expect(await env.BUCKET.head(key)).toBeNull();
     expect(await rows()).toHaveLength(0);
   });
 
-  it("sweeps only objects without a chunk row and fences them from PrepareUpload while it deletes", async () => {
+  it("sweeps only objects whose incarnation no chunk row holds, once the grace has passed, and retires each before deleting it", async () => {
     const { socket, parts, target, stub, spaceId, key } = await preparedTicket();
-    expect((await put(target, parts.bytes[0]!)).status).toBe(200);
+    const uploaded = await put(target, parts.bytes[0]!);
+    expect(uploaded.status).toBe(200);
+    const receipt = fromBinary(UploadReceiptSchema, new Uint8Array(await uploaded.arrayBuffer()));
+    await socket.commit(0n, [op.create(uuidv7(), spaceId, "kept", parts.content)], [receipt]);
+    const hex = toHex(parts.content.chunks[0]!.hash);
+    const otherIncarnation = chunkKey(spaceId, hex, "0.999999");
+    await env.BUCKET.put(otherIncarnation, parts.bytes[0]!);
     const orphan = await content("orphan " + uuidv7());
-    const orphanHash = orphan.content.chunks[0]!.hash;
-    const orphanKey = chunkKey(spaceId, toHex(orphanHash));
+    const orphanHex = toHex(orphan.content.chunks[0]!.hash);
+    const orphanKey = chunkKey(spaceId, orphanHex, "0.1");
     await env.BUCKET.put(orphanKey, orphan.bytes[0]!);
 
-    const states: unknown[] = [];
-    const report = await runInDurableObject(stub, async (instance: SpaceDO, state) => {
-      const original = (instance as unknown as { env: Env }).env;
-      const bucket = {
-        list: original.BUCKET.list.bind(original.BUCKET),
-        delete: (keys: string[]) => {
-          states.push(...state.storage.sql.exec("SELECT state FROM chunks WHERE hash = ?", orphanHash).toArray().map((row) => row.state));
-          return original.BUCKET.delete(keys);
-        },
-      };
-      (instance as unknown as { env: Env }).env = { ...original, BUCKET: bucket as unknown as R2Bucket };
-      try {
-        return await instance.collectGarbage(Date.now());
-      } finally {
-        (instance as unknown as { env: Env }).env = original;
-      }
-    });
-    expect(states).toEqual([3]);
-    expect(report).toMatchObject({ sweptChunks: 1, deletedChunks: 1 });
-    expect(await env.BUCKET.head(orphanKey)).toBeNull();
-    expect(await env.BUCKET.head(key)).not.toBeNull();
-    const after = await socket.rpc({ case: "prepareUpload", value: { chunks: orphan.content.chunks } });
-    expect(after.case === "prepareUpload" && after.value.chunks[0]!.action).toBe(ChunkPlan_Action.UPLOAD);
+    const gc = (atMs: number) => runInDurableObject(stub, (instance: SpaceDO) => instance.collectGarbage(atMs));
+    expect(await gc(Date.now())).toMatchObject({ sweptChunks: 0, deletedChunks: 0 });
+    expect(await gc(Date.now() + 31 * 24 * 3_600_000)).toMatchObject({ sweptChunks: 2, deletedChunks: 2 });
+    expect(await storedObjects(spaceId, hex)).toEqual([key]);
+    expect(await storedObjects(spaceId, orphanHex)).toEqual([]);
+    const retired = await runInDurableObject(account(), (_instance, state) =>
+      state.storage.sql.exec("SELECT hash_hex, incarnation FROM chunk_retirements WHERE space_id = ? ORDER BY incarnation DESC", spaceId).toArray(),
+    );
+    expect(retired).toEqual([
+      { hash_hex: hex, incarnation: "0.999999" },
+      { hash_hex: orphanHex, incarnation: "0.1" },
+    ]);
   });
 
   it("answers a checksum mismatch with 400 and storage failures with a retryable error", async () => {
@@ -962,7 +957,7 @@ describe("chunk relay", () => {
     const relayEnv = { ...env, ACCOUNT, BUCKET } as unknown as Env;
     const send = (url: string, init?: RequestInit) => worker.fetch(new Request(url, init) as Parameters<typeof worker.fetch>[0], relayEnv, {} as ExecutionContext);
     for (let i = 0; i < 20; i++) {
-      const url = `${BASE}/v1/spaces/${uuidv7()}/chunks/${"ab".repeat(32)}?ticket=v1.9999999999999.AAAA`;
+      const url = `${BASE}/v1/spaces/${uuidv7()}/chunks/${"ab".repeat(32)}?inc=0.1&ticket=v1.9999999999999.AAAA`;
       expect((await send(url, { method: "PUT", body: new Uint8Array(4), headers: { "Content-Length": "4" } })).status).toBe(403);
       expect((await send(url)).status).toBe(403);
     }

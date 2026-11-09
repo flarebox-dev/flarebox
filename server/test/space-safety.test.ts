@@ -11,7 +11,7 @@ import { sha256 } from "../src/crypto";
 import { fromHex, toHex, uuidv7 } from "../src/ids";
 import type { SpaceDO } from "../src/space-do";
 import { chunkKey, encodeChunkList, rows, type VersionRow, versionChunks } from "../src/space/store";
-import { client, content, newSpace, op, type TestClient } from "./helpers";
+import { client, content, newSpace, op, storedObjects, type TestClient } from "./helpers";
 
 const DAY = 24 * 3_600_000;
 const HOUR = 3_600_000;
@@ -67,7 +67,7 @@ async function expectRetainedBytes(space: Space) {
   });
   for (const { hex, state } of hashes) {
     expect([hex, state]).toEqual([hex, 2]);
-    expect(await env.BUCKET.head(chunkKey(space.spaceId, hex))).not.toBeNull();
+    expect(await storedObjects(space.spaceId, hex)).toHaveLength(1);
   }
 }
 
@@ -329,7 +329,7 @@ describe("GC under failures", () => {
 
     release();
     await running;
-    expect(await env.BUCKET.head(chunkKey(space.spaceId, toHex(parts.content.chunks[0]!.hash)))).toBeNull();
+    expect(await storedObjects(space.spaceId, parts.content.chunks[0]!.hash)).toEqual([]);
     const receipts = await space.a.uploadParts(parts);
     await space.a.commit([op.create(uuidv7(), space.root, "f", parts.content)], { receipts });
     await expectRetainedBytes(space);
@@ -411,7 +411,7 @@ describe("GC and references", () => {
     expect(await gc(space, zeroAt + 30 * DAY + 1)).toMatchObject({ deletedChunks: 0 });
     expect(await gc(space, held)).toMatchObject({ deletedChunks: 0 });
     expect(await gc(space, held + 1)).toMatchObject({ deletedChunks: 1 });
-    expect(await env.BUCKET.head(chunkKey(space.spaceId, toHex(parts.content.chunks[0]!.hash)))).toBeNull();
+    expect(await storedObjects(space.spaceId, parts.content.chunks[0]!.hash)).toEqual([]);
     await expectRetainedBytes(space);
   });
 
@@ -429,7 +429,7 @@ describe("GC and references", () => {
     expect(Number(chunk!.hold_until_ms)).toBeLessThan(purgedAt);
     expect(await gc(space, purgedAt + 30 * DAY)).toMatchObject({ deletedChunks: 0 });
     expect(await gc(space, purgedAt + 30 * DAY + 1)).toMatchObject({ deletedChunks: 1 });
-    expect(await env.BUCKET.head(chunkKey(space.spaceId, toHex(parts.content.chunks[0]!.hash)))).toBeNull();
+    expect(await storedObjects(space.spaceId, parts.content.chunks[0]!.hash)).toEqual([]);
   });
 
   it("rejects a commit whose change records do not fit in one log row and changes nothing", async () => {
@@ -475,7 +475,7 @@ describe("GC and references", () => {
     await setClock(space, retryAt!);
     expect(await runDurableObjectAlarm(space.stub)).toBe(true);
     expect(await table(space, "SELECT * FROM chunks")).toEqual([]);
-    expect(await env.BUCKET.head(chunkKey(space.spaceId, toHex(parts.content.chunks[0]!.hash)))).toBeNull();
+    expect(await storedObjects(space.spaceId, parts.content.chunks[0]!.hash)).toEqual([]);
   });
 });
 

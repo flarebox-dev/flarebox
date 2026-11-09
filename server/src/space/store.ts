@@ -54,9 +54,19 @@ export interface VersionRow {
   superseded_at_ms: number | null;
 }
 
-/** R2 key of a chunk: spaces/<space_id>/chunks/<first two hex digits>/<hex>. */
-export function chunkKey(spaceId: string, hashHex: string): string {
-  return `spaces/${spaceId}/chunks/${hashHex.slice(0, 2)}/${hashHex}`;
+/** A chunk key incarnation, "<rewind number>.<counter>" (RFC 0003 section 5, rules 5 and 6). */
+export const INCARNATION = /^\d{1,15}\.\d{1,15}$/;
+
+/** R2 key of one incarnation of a chunk: spaces/<space_id>/chunks/<first two hex digits>/<hex>/<incarnation>. */
+export function chunkKey(spaceId: string, hashHex: string, incarnation: string): string {
+  return `spaces/${spaceId}/chunks/${hashHex.slice(0, 2)}/${hashHex}/${incarnation}`;
+}
+
+/** The hash and incarnation an R2 key names, or undefined for a key outside the layout. */
+export function parseChunkKey(spaceId: string, key: string): { hashHex: string; incarnation: string } | undefined {
+  const match = /^([0-9a-f]{2})\/([0-9a-f]{64})\/([^/]+)$/.exec(key.slice(`spaces/${spaceId}/chunks/`.length));
+  if (!key.startsWith(`spaces/${spaceId}/chunks/`) || !match || !match[2]!.startsWith(match[1]!) || !INCARNATION.test(match[3]!)) return undefined;
+  return { hashHex: match[2]!, incarnation: match[3]! };
 }
 
 export function rows<T>(cursor: SqlStorageCursor<Record<string, SqlStorageValue>>): T[] {

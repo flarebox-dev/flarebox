@@ -26,6 +26,8 @@ const SHARE_PASSWORD_KDF = "pbkdf2-sha256";
 const SHARE_FAILURES_BEFORE_LOCK = 5;
 const SHARE_LOCK_MS = 15 * 60_000;
 const BASE32 = "ABCDEFGHJKMNPQRSTVWXYZ0123456789";
+/** How long a chunk retirement record is kept: PITR cannot restore a state older than 30 days (RFC 0003 section 5, rule 10). */
+const RETIREMENT_KEEP_MS = 30 * 24 * 3_600_000;
 const encoder = new TextEncoder();
 
 export type Outcome<T> = { ok: true; value: T } | { ok: false; code: Error_Code; message: string };
@@ -81,6 +83,8 @@ const SCHEMA = `
   CREATE TABLE IF NOT EXISTS server_keys (kid TEXT PRIMARY KEY, secret BLOB NOT NULL, created_at_ms INTEGER NOT NULL,
     status TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS chunk_retirements (space_id TEXT NOT NULL, hash_hex TEXT NOT NULL, incarnation TEXT NOT NULL,
+    retired_at_ms INTEGER NOT NULL, PRIMARY KEY (space_id, hash_hex, incarnation));
 `;
 
 interface DeviceRow {
@@ -283,6 +287,25 @@ export class AccountDO extends DurableObject<Env> {
       FORMAT_VERSION,
     );
     return spaceInfo({ space_id: spaceId, name, owner_id: args.userId, created_at_ms: nowMs, format_version: FORMAT_VERSION });
+  }
+
+  /**
+   * Records chunk key incarnations as retired before the space deletes their objects (RFC 0003 section 5, rule 8).
+   * The records live here, out of the Space DO's PITR, and are kept for at least RETIREMENT_KEEP_MS.
+   */
+  async retireChunks(spaceId: string, objects: { hashHex: string; incarnation: string }[]): Promise<Outcome<null>> {
+    const nowMs = Date.now();
+    this.sql.exec("DELETE FROM chunk_retirements WHERE space_id = ? AND retired_at_ms < ?", spaceId, nowMs - RETIREMENT_KEEP_MS);
+    for (const { hashHex, incarnation } of objects) {
+      this.sql.exec(
+        "INSERT INTO chunk_retirements (space_id, hash_hex, incarnation, retired_at_ms) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+        spaceId,
+        hashHex,
+        incarnation,
+        nowMs,
+      );
+    }
+    return ok(null);
   }
 
   async listSpaces(userId: string): Promise<SpaceInfo[]> {

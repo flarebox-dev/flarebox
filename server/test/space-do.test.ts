@@ -11,7 +11,7 @@ import { toHex, uuidv7 } from "../src/ids";
 import type { SpaceDO } from "../src/space-do";
 import { conflictName, nameKey } from "../src/space/names";
 import { chunkKey } from "../src/space/store";
-import { client, content, newSpace, op, type TestClient } from "./helpers";
+import { client, content, newSpace, op, storedObjects, type TestClient } from "./helpers";
 
 const DAY = 24 * 3_600_000;
 
@@ -77,10 +77,12 @@ describe("Space DO commits", () => {
     expect(readOnly.case === "error" && readOnly.value.code).toBe(Error_Code.READ_ONLY);
   });
 
-  it("requires every pending chunk to carry an upload receipt", async () => {
+  it("accepts a pending chunk only with a valid receipt or an object R2 holds under the row's incarnation", async () => {
     const { a, b, root } = await setup();
     const parts = await content("chunk bytes");
     const receipts = await a.uploadParts(parts);
+    const [key] = await storedObjects(a.spaceId, parts.content.chunks[0]!.hash);
+    await env.BUCKET.delete(key!);
     const missing = await a.commitRaw([op.create(uuidv7(), root, "f.bin", parts.content)]);
     expect(missing.case).toBe("error");
     if (missing.case === "error") {
@@ -91,7 +93,8 @@ describe("Space DO commits", () => {
       receipts: [{ ...receipts[0]!, token: receipts[0]!.token.slice(0, -2) + "AA" }],
     });
     expect(forged.case === "error" && forged.value.code).toBe(Error_Code.MISSING_CHUNKS);
-    await a.commit([op.create(uuidv7(), root, "f.bin", parts.content)], { receipts });
+    await env.BUCKET.put(key!, parts.bytes[0]!);
+    await a.commit([op.create(uuidv7(), root, "f.bin", parts.content)]);
 
     const plan = await b.call({ case: "prepareUpload", value: { chunks: parts.content.chunks } });
     expect(plan.case === "prepareUpload" && plan.value.chunks[0]!.action).toBe(ChunkPlan_Action.PRESENT);
@@ -482,7 +485,7 @@ describe("garbage collection", () => {
   }
 
   async function stored(spaceId: string, hash: Uint8Array): Promise<boolean> {
-    return (await env.BUCKET.head(chunkKey(spaceId, toHex(hash)))) !== null;
+    return (await storedObjects(spaceId, hash)).length > 0;
   }
 
   it("never deletes a pending chunk inside its hold, or a referenced chunk", async () => {

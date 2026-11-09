@@ -18,10 +18,10 @@ import {
 import { UploadReceiptSchema } from "./gen/flarebox/v1/commit_pb";
 import { Error_Code } from "./gen/flarebox/v1/rpc_pb";
 import { BadRequest, errorReply, readMessage, reply } from "./http";
-import { deriveSpaceKey, signChunkGrant, verifyChunkGrant } from "./crypto";
+import { type ChunkObject, deriveSpaceKey, signChunkGrant, verifyChunkGrant } from "./crypto";
 import { fromHex, isUuidV7 } from "./ids";
 import { CONNECT_HEADER, type Connect, GRANT_MS, MAX_CHUNK_BYTES, MAX_CLIENT_FRAME } from "./space-do";
-import { chunkKey } from "./space/store";
+import { chunkKey, INCARNATION } from "./space/store";
 import { PROTO_MAX, PROTO_MIN, SERVER_VERSION } from "./version";
 
 export { AccountDO } from "./account-do";
@@ -63,21 +63,26 @@ async function spaceKey(env: Env, spaceId: string): Promise<Uint8Array> {
 
 /**
  * Relay-mode chunk transfer (spec v0 sections 8 and 10). The ticket from PrepareUpload or GetDownloadTargets is the
- * only credential; R2 checks the SHA-256 of an upload, and the receipt lets the Space DO accept it in a commit.
+ * only credential; it names the key incarnation to read or write (RFC 0003 section 5). R2 checks the SHA-256 of an
+ * upload, and the receipt lets the Space DO accept it in a commit for that incarnation only.
  */
 async function chunk(request: Request, env: Env, spaceId: string, hex: string): Promise<Response> {
-  const ticket = new URL(request.url).searchParams.get("ticket") ?? "";
+  const params = new URL(request.url).searchParams;
+  const ticket = params.get("ticket") ?? "";
+  const incarnation = params.get("inc") ?? "";
+  if (!INCARNATION.test(incarnation)) return errorReply(request, Error_Code.FORBIDDEN, "invalid or expired ticket");
+  const object: ChunkObject = { spaceId, hashHex: hex, incarnation };
   const nowMs = Date.now();
-  const key = chunkKey(spaceId, hex);
+  const key = chunkKey(spaceId, hex, incarnation);
 
   if (request.method === "GET") {
-    if (!(await verifyChunkGrant(await spaceKey(env, spaceId), "get", spaceId, hex, 0, ticket, nowMs))) {
+    if (!(await verifyChunkGrant(await spaceKey(env, spaceId), "get", object, 0, ticket, nowMs))) {
       return errorReply(request, Error_Code.FORBIDDEN, "invalid or expired download ticket");
     }
-    const object = await env.BUCKET.get(key);
-    if (!object) return errorReply(request, Error_Code.INVALID_ARGUMENT, "chunk not found", 404);
-    return new Response(object.body, {
-      headers: { "Content-Type": "application/octet-stream", "Content-Length": String(object.size), "Cache-Control": "private, max-age=3600" },
+    const stored = await env.BUCKET.get(key);
+    if (!stored) return errorReply(request, Error_Code.INVALID_ARGUMENT, "chunk not found", 404);
+    return new Response(stored.body, {
+      headers: { "Content-Type": "application/octet-stream", "Content-Length": String(stored.size), "Cache-Control": "private, max-age=3600" },
     });
   }
 
@@ -87,7 +92,7 @@ async function chunk(request: Request, env: Env, spaceId: string, hex: string): 
   const size = Number(length);
   if (size < 1 || size > MAX_CHUNK_BYTES) return errorReply(request, Error_Code.LIMIT_EXCEEDED, "chunk size out of range");
   const secret = await spaceKey(env, spaceId);
-  if (!(await verifyChunkGrant(secret, "put", spaceId, hex, size, ticket, nowMs))) {
+  if (!(await verifyChunkGrant(secret, "put", object, size, ticket, nowMs))) {
     return errorReply(request, Error_Code.FORBIDDEN, "invalid or expired upload ticket, or a size the ticket does not cover");
   }
   try {
@@ -99,7 +104,7 @@ async function chunk(request: Request, env: Env, spaceId: string, hex: string): 
     const throttled = /\b429\b|10058|too many|rate/i.test(message);
     return errorReply(request, Error_Code.RETRY_LATER, "chunk storage is unavailable; retry the upload", throttled ? 429 : 503);
   }
-  const token = await signChunkGrant(secret, "receipt", spaceId, hex, size, nowMs + GRANT_MS);
+  const token = await signChunkGrant(secret, "receipt", object, size, nowMs + GRANT_MS);
   return reply(request, UploadReceiptSchema, create(UploadReceiptSchema, { hash: fromHex(hex), size, token }));
 }
 
