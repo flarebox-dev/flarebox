@@ -4,17 +4,21 @@
 // @generated from file flarebox/v1/messages.proto (package flarebox.v1, syntax proto3)
 /* eslint-disable */
 
-import type { GenFile, GenMessage } from "@bufbuild/protobuf/codegenv2";
-import { fileDesc, messageDesc } from "@bufbuild/protobuf/codegenv2";
+import type { GenEnum, GenFile, GenMessage } from "@bufbuild/protobuf/codegenv2";
+import { enumDesc, fileDesc, messageDesc } from "@bufbuild/protobuf/codegenv2";
+import type { Commit, CommitResult } from "./commit_pb";
+import { file_flarebox_v1_commit } from "./commit_pb";
 import type { CommitRecord } from "./model_pb";
 import { file_flarebox_v1_model } from "./model_pb";
+import type { DownloadTargets, Error, GetDownloadTargets, GetVersionChunks, ListTrash, ListTree, ListVersions, PrepareUpload, PrepareUploadResult, TrashPage, TreePage, VersionChunks, VersionList } from "./rpc_pb";
+import { file_flarebox_v1_rpc } from "./rpc_pb";
 import type { Message } from "@bufbuild/protobuf";
 
 /**
  * Describes the file flarebox/v1/messages.proto.
  */
 export const file_flarebox_v1_messages: GenFile = /*@__PURE__*/
-  fileDesc("ChpmbGFyZWJveC92MS9tZXNzYWdlcy5wcm90bxILZmxhcmVib3gudjEisQEKDUNsaWVudE1lc3NhZ2USIwoFaGVsbG8YASABKAsyEi5mbGFyZWJveC52MS5IZWxsb0gAEiUKBnJlc3VtZRgCIAEoCzITLmZsYXJlYm94LnYxLlJlc3VtZUgAEiYKA3JwYxgDIAEoCzIXLmZsYXJlYm94LnYxLlJwY1JlcXVlc3RIABIlCgZyZWF1dGgYBCABKAsyEy5mbGFyZWJveC52MS5SZWF1dGhIAEIFCgNtc2cixQIKDVNlcnZlck1lc3NhZ2USJwoHd2VsY29tZRgBIAEoCzIULmZsYXJlYm94LnYxLldlbGNvbWVIABInCgdjaGFuZ2VzGAIgASgLMhQuZmxhcmVib3gudjEuQ2hhbmdlc0gAEioKCWNhdWdodF91cBgDIAEoCzIVLmZsYXJlYm94LnYxLkNhdWdodFVwSAASJwoDcnBjGAQgASgLMhguZmxhcmVib3gudjEuUnBjUmVzcG9uc2VIABI2Cg9yZXN5bmNfcmVxdWlyZWQYBSABKAsyGy5mbGFyZWJveC52MS5SZXN5bmNSZXF1aXJlZEgAEiUKBm5vdGljZRgGIAEoCzITLmZsYXJlYm94LnYxLk5vdGljZUgAEicKB2dvb2RieWUYByABKAsyFC5mbGFyZWJveC52MS5Hb29kYnllSABCBQoDbXNnIjUKB0NoYW5nZXMSKgoHY29tbWl0cxgBIAMoCzIZLmZsYXJlYm94LnYxLkNvbW1pdFJlY29yZCIHCgVIZWxsbyIJCgdXZWxjb21lIggKBlJlc3VtZSIKCghDYXVnaHRVcCIMCgpScGNSZXF1ZXN0Ig0KC1JwY1Jlc3BvbnNlIggKBlJlYXV0aCIQCg5SZXN5bmNSZXF1aXJlZCIICgZOb3RpY2UiCQoHR29vZGJ5ZWIGcHJvdG8z", [file_flarebox_v1_model]);
+  fileDesc("ChpmbGFyZWJveC92MS9tZXNzYWdlcy5wcm90bxILZmxhcmVib3gudjEisQEKDUNsaWVudE1lc3NhZ2USIwoFaGVsbG8YASABKAsyEi5mbGFyZWJveC52MS5IZWxsb0gAEiUKBnJlc3VtZRgCIAEoCzITLmZsYXJlYm94LnYxLlJlc3VtZUgAEiYKA3JwYxgDIAEoCzIXLmZsYXJlYm94LnYxLlJwY1JlcXVlc3RIABIlCgZyZWF1dGgYBCABKAsyEy5mbGFyZWJveC52MS5SZWF1dGhIAEIFCgNtc2cixQIKDVNlcnZlck1lc3NhZ2USJwoHd2VsY29tZRgBIAEoCzIULmZsYXJlYm94LnYxLldlbGNvbWVIABInCgdjaGFuZ2VzGAIgASgLMhQuZmxhcmVib3gudjEuQ2hhbmdlc0gAEioKCWNhdWdodF91cBgDIAEoCzIVLmZsYXJlYm94LnYxLkNhdWdodFVwSAASJwoDcnBjGAQgASgLMhguZmxhcmVib3gudjEuUnBjUmVzcG9uc2VIABI2Cg9yZXN5bmNfcmVxdWlyZWQYBSABKAsyGy5mbGFyZWJveC52MS5SZXN5bmNSZXF1aXJlZEgAEiUKBm5vdGljZRgGIAEoCzITLmZsYXJlYm94LnYxLk5vdGljZUgAEicKB2dvb2RieWUYByABKAsyFC5mbGFyZWJveC52MS5Hb29kYnllSABCBQoDbXNnIoABCgVIZWxsbxITCgtjbGllbnRfbmFtZRgBIAEoCRIWCg5jbGllbnRfdmVyc2lvbhgCIAEoCRIRCglwcm90b19taW4YAyABKA0SEQoJcHJvdG9fbWF4GAQgASgNEhIKCm1heF9mb3JtYXQYBSABKA0SEAoIZmVhdHVyZXMYBiADKAkiwgEKB1dlbGNvbWUSDQoFcHJvdG8YASABKA0SFgoOc2VydmVyX3ZlcnNpb24YAiABKAkSFgoOZm9ybWF0X3ZlcnNpb24YAyABKA0SEgoKaGlzdG9yeV9pZBgEIAEoCRIQCghoZWFkX3NlcRgFIAEoBBIVCg1sb2dfZmxvb3Jfc2VxGAYgASgEEhEKCXJlYWRfb25seRgHIAEoCBIQCghmZWF0dXJlcxgIIAMoCRIWCg5sYXRlc3RfcmVsZWFzZRgJIAEoCSIvCgZSZXN1bWUSEgoKaGlzdG9yeV9pZBgBIAEoCRIRCglzaW5jZV9zZXEYAiABKAQiNQoHQ2hhbmdlcxIqCgdjb21taXRzGAEgAygLMhkuZmxhcmVib3gudjEuQ29tbWl0UmVjb3JkIhwKCENhdWdodFVwEhAKCGhlYWRfc2VxGAEgASgEIo0DCgpScGNSZXF1ZXN0Eg4KBnJlcV9pZBgBIAEoBBI0Cg5wcmVwYXJlX3VwbG9hZBgCIAEoCzIaLmZsYXJlYm94LnYxLlByZXBhcmVVcGxvYWRIABIlCgZjb21taXQYAyABKAsyEy5mbGFyZWJveC52MS5Db21taXRIABI/ChRnZXRfZG93bmxvYWRfdGFyZ2V0cxgEIAEoCzIfLmZsYXJlYm94LnYxLkdldERvd25sb2FkVGFyZ2V0c0gAEjsKEmdldF92ZXJzaW9uX2NodW5rcxgFIAEoCzIdLmZsYXJlYm94LnYxLkdldFZlcnNpb25DaHVua3NIABIyCg1saXN0X3ZlcnNpb25zGAYgASgLMhkuZmxhcmVib3gudjEuTGlzdFZlcnNpb25zSAASKgoJbGlzdF90cmVlGAcgASgLMhUuZmxhcmVib3gudjEuTGlzdFRyZWVIABIsCgpsaXN0X3RyYXNoGAggASgLMhYuZmxhcmVib3gudjEuTGlzdFRyYXNoSABCBgoEY2FsbCKjAwoLUnBjUmVzcG9uc2USDgoGcmVxX2lkGAEgASgEEiMKBWVycm9yGAIgASgLMhIuZmxhcmVib3gudjEuRXJyb3JIABI6Cg5wcmVwYXJlX3VwbG9hZBgDIAEoCzIgLmZsYXJlYm94LnYxLlByZXBhcmVVcGxvYWRSZXN1bHRIABIrCgZjb21taXQYBCABKAsyGS5mbGFyZWJveC52MS5Db21taXRSZXN1bHRIABI4ChBkb3dubG9hZF90YXJnZXRzGAUgASgLMhwuZmxhcmVib3gudjEuRG93bmxvYWRUYXJnZXRzSAASNAoOdmVyc2lvbl9jaHVua3MYBiABKAsyGi5mbGFyZWJveC52MS5WZXJzaW9uQ2h1bmtzSAASLAoIdmVyc2lvbnMYByABKAsyGC5mbGFyZWJveC52MS5WZXJzaW9uTGlzdEgAEiUKBHRyZWUYCCABKAsyFS5mbGFyZWJveC52MS5UcmVlUGFnZUgAEicKBXRyYXNoGAkgASgLMhYuZmxhcmVib3gudjEuVHJhc2hQYWdlSABCCAoGcmVzdWx0Ih4KBlJlYXV0aBIUCgxhY2Nlc3NfdG9rZW4YASABKAkiuAEKDlJlc3luY1JlcXVpcmVkEjIKBnJlYXNvbhgBIAEoDjIiLmZsYXJlYm94LnYxLlJlc3luY1JlcXVpcmVkLlJlYXNvbiJyCgZSZWFzb24SFgoSUkVBU09OX1VOU1BFQ0lGSUVEEAASGAoUUkVBU09OX0xPR19UUlVOQ0FURUQQARIaChZSRUFTT05fSElTVE9SWV9DSEFOR0VEEAISGgoWUkVBU09OX0FIRUFEX09GX1NFUlZFUhADIs8BCgZOb3RpY2USJgoEa2luZBgBIAEoDjIYLmZsYXJlYm94LnYxLk5vdGljZS5LaW5kEg8KB21lc3NhZ2UYAiABKAkSFgoOcmV0cnlfYWZ0ZXJfbXMYAyABKAQidAoES2luZBIUChBLSU5EX1VOU1BFQ0lGSUVEEAASFAoQS0lORF9ORVdfUkVMRUFTRRABEhMKD0tJTkRfUVVPVEFfTkVBUhACEhcKE0tJTkRfUVVPVEFfRVhDRUVERUQQAxISCg5LSU5EX1JFQURfT05MWRAEIicKB0dvb2RieWUSDAoEY29kZRgBIAEoDRIOCgZyZWFzb24YAiABKAliBnByb3RvMw", [file_flarebox_v1_commit, file_flarebox_v1_model, file_flarebox_v1_rpc]);
 
 /**
  * A binary WebSocket frame from client to server.
@@ -121,6 +125,143 @@ export const ServerMessageSchema: GenMessage<ServerMessage> = /*@__PURE__*/
   messageDesc(file_flarebox_v1_messages, 1);
 
 /**
+ * First message on a connection.
+ *
+ * @generated from message flarebox.v1.Hello
+ */
+export type Hello = Message<"flarebox.v1.Hello"> & {
+  /**
+   * @generated from field: string client_name = 1;
+   */
+  clientName: string;
+
+  /**
+   * @generated from field: string client_version = 2;
+   */
+  clientVersion: string;
+
+  /**
+   * Supported protocol minor versions, inclusive.
+   *
+   * @generated from field: uint32 proto_min = 3;
+   */
+  protoMin: number;
+
+  /**
+   * @generated from field: uint32 proto_max = 4;
+   */
+  protoMax: number;
+
+  /**
+   * Highest space format version this client can write.
+   *
+   * @generated from field: uint32 max_format = 5;
+   */
+  maxFormat: number;
+
+  /**
+   * @generated from field: repeated string features = 6;
+   */
+  features: string[];
+};
+
+/**
+ * Describes the message flarebox.v1.Hello.
+ * Use `create(HelloSchema)` to create a new message.
+ */
+export const HelloSchema: GenMessage<Hello> = /*@__PURE__*/
+  messageDesc(file_flarebox_v1_messages, 2);
+
+/**
+ * @generated from message flarebox.v1.Welcome
+ */
+export type Welcome = Message<"flarebox.v1.Welcome"> & {
+  /**
+   * The protocol minor version chosen for this connection.
+   *
+   * @generated from field: uint32 proto = 1;
+   */
+  proto: number;
+
+  /**
+   * @generated from field: string server_version = 2;
+   */
+  serverVersion: string;
+
+  /**
+   * @generated from field: uint32 format_version = 3;
+   */
+  formatVersion: number;
+
+  /**
+   * @generated from field: string history_id = 4;
+   */
+  historyId: string;
+
+  /**
+   * @generated from field: uint64 head_seq = 5;
+   */
+  headSeq: bigint;
+
+  /**
+   * The oldest seq a Resume can start after.
+   *
+   * @generated from field: uint64 log_floor_seq = 6;
+   */
+  logFloorSeq: bigint;
+
+  /**
+   * True when this device may not commit, for example because its max_format is below the space format.
+   *
+   * @generated from field: bool read_only = 7;
+   */
+  readOnly: boolean;
+
+  /**
+   * @generated from field: repeated string features = 8;
+   */
+  features: string[];
+
+  /**
+   * Newest known server release, empty when unknown or current.
+   *
+   * @generated from field: string latest_release = 9;
+   */
+  latestRelease: string;
+};
+
+/**
+ * Describes the message flarebox.v1.Welcome.
+ * Use `create(WelcomeSchema)` to create a new message.
+ */
+export const WelcomeSchema: GenMessage<Welcome> = /*@__PURE__*/
+  messageDesc(file_flarebox_v1_messages, 3);
+
+/**
+ * @generated from message flarebox.v1.Resume
+ */
+export type Resume = Message<"flarebox.v1.Resume"> & {
+  /**
+   * @generated from field: string history_id = 1;
+   */
+  historyId: string;
+
+  /**
+   * The last seq the client applied completely.
+   *
+   * @generated from field: uint64 since_seq = 2;
+   */
+  sinceSeq: bigint;
+};
+
+/**
+ * Describes the message flarebox.v1.Resume.
+ * Use `create(ResumeSchema)` to create a new message.
+ */
+export const ResumeSchema: GenMessage<Resume> = /*@__PURE__*/
+  messageDesc(file_flarebox_v1_messages, 4);
+
+/**
  * @generated from message flarebox.v1.Changes
  */
 export type Changes = Message<"flarebox.v1.Changes"> & {
@@ -135,51 +276,18 @@ export type Changes = Message<"flarebox.v1.Changes"> & {
  * Use `create(ChangesSchema)` to create a new message.
  */
 export const ChangesSchema: GenMessage<Changes> = /*@__PURE__*/
-  messageDesc(file_flarebox_v1_messages, 2);
-
-/**
- * @generated from message flarebox.v1.Hello
- */
-export type Hello = Message<"flarebox.v1.Hello"> & {
-};
-
-/**
- * Describes the message flarebox.v1.Hello.
- * Use `create(HelloSchema)` to create a new message.
- */
-export const HelloSchema: GenMessage<Hello> = /*@__PURE__*/
-  messageDesc(file_flarebox_v1_messages, 3);
-
-/**
- * @generated from message flarebox.v1.Welcome
- */
-export type Welcome = Message<"flarebox.v1.Welcome"> & {
-};
-
-/**
- * Describes the message flarebox.v1.Welcome.
- * Use `create(WelcomeSchema)` to create a new message.
- */
-export const WelcomeSchema: GenMessage<Welcome> = /*@__PURE__*/
-  messageDesc(file_flarebox_v1_messages, 4);
-
-/**
- * @generated from message flarebox.v1.Resume
- */
-export type Resume = Message<"flarebox.v1.Resume"> & {
-};
-
-/**
- * Describes the message flarebox.v1.Resume.
- * Use `create(ResumeSchema)` to create a new message.
- */
-export const ResumeSchema: GenMessage<Resume> = /*@__PURE__*/
   messageDesc(file_flarebox_v1_messages, 5);
 
 /**
+ * Sent once the backlog after a Resume is delivered; live pushes follow.
+ *
  * @generated from message flarebox.v1.CaughtUp
  */
 export type CaughtUp = Message<"flarebox.v1.CaughtUp"> & {
+  /**
+   * @generated from field: uint64 head_seq = 1;
+   */
+  headSeq: bigint;
 };
 
 /**
@@ -193,6 +301,59 @@ export const CaughtUpSchema: GenMessage<CaughtUp> = /*@__PURE__*/
  * @generated from message flarebox.v1.RpcRequest
  */
 export type RpcRequest = Message<"flarebox.v1.RpcRequest"> & {
+  /**
+   * Chosen by the client and echoed in the response.
+   *
+   * @generated from field: uint64 req_id = 1;
+   */
+  reqId: bigint;
+
+  /**
+   * @generated from oneof flarebox.v1.RpcRequest.call
+   */
+  call: {
+    /**
+     * @generated from field: flarebox.v1.PrepareUpload prepare_upload = 2;
+     */
+    value: PrepareUpload;
+    case: "prepareUpload";
+  } | {
+    /**
+     * @generated from field: flarebox.v1.Commit commit = 3;
+     */
+    value: Commit;
+    case: "commit";
+  } | {
+    /**
+     * @generated from field: flarebox.v1.GetDownloadTargets get_download_targets = 4;
+     */
+    value: GetDownloadTargets;
+    case: "getDownloadTargets";
+  } | {
+    /**
+     * @generated from field: flarebox.v1.GetVersionChunks get_version_chunks = 5;
+     */
+    value: GetVersionChunks;
+    case: "getVersionChunks";
+  } | {
+    /**
+     * @generated from field: flarebox.v1.ListVersions list_versions = 6;
+     */
+    value: ListVersions;
+    case: "listVersions";
+  } | {
+    /**
+     * @generated from field: flarebox.v1.ListTree list_tree = 7;
+     */
+    value: ListTree;
+    case: "listTree";
+  } | {
+    /**
+     * @generated from field: flarebox.v1.ListTrash list_trash = 8;
+     */
+    value: ListTrash;
+    case: "listTrash";
+  } | { case: undefined; value?: undefined };
 };
 
 /**
@@ -206,6 +367,63 @@ export const RpcRequestSchema: GenMessage<RpcRequest> = /*@__PURE__*/
  * @generated from message flarebox.v1.RpcResponse
  */
 export type RpcResponse = Message<"flarebox.v1.RpcResponse"> & {
+  /**
+   * @generated from field: uint64 req_id = 1;
+   */
+  reqId: bigint;
+
+  /**
+   * @generated from oneof flarebox.v1.RpcResponse.result
+   */
+  result: {
+    /**
+     * @generated from field: flarebox.v1.Error error = 2;
+     */
+    value: Error;
+    case: "error";
+  } | {
+    /**
+     * @generated from field: flarebox.v1.PrepareUploadResult prepare_upload = 3;
+     */
+    value: PrepareUploadResult;
+    case: "prepareUpload";
+  } | {
+    /**
+     * @generated from field: flarebox.v1.CommitResult commit = 4;
+     */
+    value: CommitResult;
+    case: "commit";
+  } | {
+    /**
+     * @generated from field: flarebox.v1.DownloadTargets download_targets = 5;
+     */
+    value: DownloadTargets;
+    case: "downloadTargets";
+  } | {
+    /**
+     * @generated from field: flarebox.v1.VersionChunks version_chunks = 6;
+     */
+    value: VersionChunks;
+    case: "versionChunks";
+  } | {
+    /**
+     * @generated from field: flarebox.v1.VersionList versions = 7;
+     */
+    value: VersionList;
+    case: "versions";
+  } | {
+    /**
+     * @generated from field: flarebox.v1.TreePage tree = 8;
+     */
+    value: TreePage;
+    case: "tree";
+  } | {
+    /**
+     * @generated from field: flarebox.v1.TrashPage trash = 9;
+     */
+    value: TrashPage;
+    case: "trash";
+  } | { case: undefined; value?: undefined };
 };
 
 /**
@@ -216,9 +434,15 @@ export const RpcResponseSchema: GenMessage<RpcResponse> = /*@__PURE__*/
   messageDesc(file_flarebox_v1_messages, 8);
 
 /**
+ * Replaces the access token of a connection before it expires.
+ *
  * @generated from message flarebox.v1.Reauth
  */
 export type Reauth = Message<"flarebox.v1.Reauth"> & {
+  /**
+   * @generated from field: string access_token = 1;
+   */
+  accessToken: string;
 };
 
 /**
@@ -232,6 +456,10 @@ export const ReauthSchema: GenMessage<Reauth> = /*@__PURE__*/
  * @generated from message flarebox.v1.ResyncRequired
  */
 export type ResyncRequired = Message<"flarebox.v1.ResyncRequired"> & {
+  /**
+   * @generated from field: flarebox.v1.ResyncRequired.Reason reason = 1;
+   */
+  reason: ResyncRequired_Reason;
 };
 
 /**
@@ -242,9 +470,54 @@ export const ResyncRequiredSchema: GenMessage<ResyncRequired> = /*@__PURE__*/
   messageDesc(file_flarebox_v1_messages, 10);
 
 /**
+ * @generated from enum flarebox.v1.ResyncRequired.Reason
+ */
+export enum ResyncRequired_Reason {
+  /**
+   * @generated from enum value: REASON_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: REASON_LOG_TRUNCATED = 1;
+   */
+  LOG_TRUNCATED = 1,
+
+  /**
+   * @generated from enum value: REASON_HISTORY_CHANGED = 2;
+   */
+  HISTORY_CHANGED = 2,
+
+  /**
+   * @generated from enum value: REASON_AHEAD_OF_SERVER = 3;
+   */
+  AHEAD_OF_SERVER = 3,
+}
+
+/**
+ * Describes the enum flarebox.v1.ResyncRequired.Reason.
+ */
+export const ResyncRequired_ReasonSchema: GenEnum<ResyncRequired_Reason> = /*@__PURE__*/
+  enumDesc(file_flarebox_v1_messages, 10, 0);
+
+/**
  * @generated from message flarebox.v1.Notice
  */
 export type Notice = Message<"flarebox.v1.Notice"> & {
+  /**
+   * @generated from field: flarebox.v1.Notice.Kind kind = 1;
+   */
+  kind: Notice_Kind;
+
+  /**
+   * @generated from field: string message = 2;
+   */
+  message: string;
+
+  /**
+   * @generated from field: uint64 retry_after_ms = 3;
+   */
+  retryAfterMs: bigint;
 };
 
 /**
@@ -255,9 +528,58 @@ export const NoticeSchema: GenMessage<Notice> = /*@__PURE__*/
   messageDesc(file_flarebox_v1_messages, 11);
 
 /**
+ * @generated from enum flarebox.v1.Notice.Kind
+ */
+export enum Notice_Kind {
+  /**
+   * @generated from enum value: KIND_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: KIND_NEW_RELEASE = 1;
+   */
+  NEW_RELEASE = 1,
+
+  /**
+   * @generated from enum value: KIND_QUOTA_NEAR = 2;
+   */
+  QUOTA_NEAR = 2,
+
+  /**
+   * @generated from enum value: KIND_QUOTA_EXCEEDED = 3;
+   */
+  QUOTA_EXCEEDED = 3,
+
+  /**
+   * @generated from enum value: KIND_READ_ONLY = 4;
+   */
+  READ_ONLY = 4,
+}
+
+/**
+ * Describes the enum flarebox.v1.Notice.Kind.
+ */
+export const Notice_KindSchema: GenEnum<Notice_Kind> = /*@__PURE__*/
+  enumDesc(file_flarebox_v1_messages, 11, 0);
+
+/**
+ * Sent right before the server closes the connection with the same code.
+ *
  * @generated from message flarebox.v1.Goodbye
  */
 export type Goodbye = Message<"flarebox.v1.Goodbye"> & {
+  /**
+   * WebSocket close code, for example 4001 for an expired token.
+   *
+   * @generated from field: uint32 code = 1;
+   */
+  code: number;
+
+  /**
+   * @generated from field: string reason = 2;
+   */
+  reason: string;
 };
 
 /**

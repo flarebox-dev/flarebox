@@ -1,0 +1,84 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package flarebox.v1;
+
+// Bodies of the HTTP endpoints in spec v0 section 15.
+
+// GET /v1/server
+message ServerInfo {
+  enum DataPath {
+    DATA_PATH_UNSPECIFIED = 0;
+    // Chunks go through the Worker.
+    DATA_PATH_RELAY = 1;
+    // Chunks go to R2 with presigned URLs.
+    DATA_PATH_DIRECT = 2;
+  }
+  string server_version = 1;
+  uint32 proto_min = 2;
+  uint32 proto_max = 3;
+  DataPath data_path = 4;
+  // True once an owner has claimed this deployment.
+  bool claimed = 5;
+}
+
+// POST /v1/claim
+message ClaimRequest {
+  // The one-time claim code from the Worker log.
+  string code = 1;
+  string user_name = 2;
+  string device_name = 3;
+  string platform = 4;
+}
+
+// Response of POST /v1/pair/start, called by an already paired device.
+message PairStartResponse {
+  string code = 1;
+  int64 expires_at_ms = 2;
+}
+
+// POST /v1/pair/complete, called by the new device.
+message PairCompleteRequest {
+  string code = 1;
+  string device_name = 2;
+  string platform = 3;
+}
+
+// Response of POST /v1/claim and POST /v1/pair/complete.
+message DeviceCredentials {
+  string user_id = 1;
+  string device_id = 2;
+  // Long-lived secret exchanged for access tokens. The server keeps only its SHA-256.
+  string refresh_credential = 3;
+  AccessToken access = 4;
+}
+
+// POST /v1/token
+message TokenRequest {
+  string device_id = 1;
+  string refresh_credential = 2;
+}
+
+message AccessToken {
+  // Opaque to clients.
+  string token = 1;
+  int64 expires_at_ms = 2;
+}
+
+message SpaceInfo {
+  string space_id = 1;
+  string name = 2;
+  uint32 format_version = 3;
+  int64 created_at_ms = 4;
+}
+
+// POST /v1/spaces
+message CreateSpaceRequest {
+  string name = 1;
+}
+
+// Response of GET /v1/spaces.
+message SpaceList {
+  repeated SpaceInfo spaces = 1;
+}
