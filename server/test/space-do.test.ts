@@ -146,6 +146,41 @@ describe("RFC 0001 name and move rules", () => {
     expect(tree.has(trashed)).toBe(false);
   });
 
+  it("rejects a full-casefold alias of .flarebox at the root", async () => {
+    const { a, root } = await setup();
+    const result = await a.commit([op.mkdir(uuidv7(), root, ".\uFB02arebox")]);
+    expect(result.results[0]).toMatchObject({ code: OpResult_Code.REJECTED, rejectReason: "INVALID_NAME" });
+  });
+
+  it("renames a stored reserved root name when R8 revives it", async () => {
+    const space = await setup();
+    const { a, root } = space;
+    const dir = uuidv7();
+    await a.commit([op.mkdir(dir, root, "legacy dir")]);
+    const updated = await createFile(a, root, "legacy file", "v1");
+    const restored = await createFile(a, root, "legacy restore", "v1");
+    const firstVersion = restored.result.changes[0]!.change;
+    const versionId = firstVersion.case === "node" ? firstVersion.value.current!.versionId : "";
+    await a.commit([op.delete(dir), op.delete(updated.nodeId), op.delete(restored.nodeId)]);
+    await runInDurableObject(space.stub, (_instance, state) => {
+      for (const [id, name] of [[dir, ".FlareBox"], [updated.nodeId, ".flarebox"], [restored.nodeId, ".\uFB02AREBOX"]]) {
+        state.storage.sql.exec("UPDATE nodes SET name = ?, name_key = ? WHERE node_id = ?", name, nameKey(name!), id);
+      }
+    });
+
+    const parts = await content("v2");
+    const result = await a.commit(
+      [op.mkdir(uuidv7(), dir, "child"), op.update(updated.nodeId, parts.content), op.restore(restored.nodeId, { versionId })],
+      { receipts: await a.uploadParts(parts) },
+    );
+    expect(result.results.map((r) => r.code)).toEqual([OpResult_Code.APPLIED, OpResult_Code.APPLIED, OpResult_Code.APPLIED]);
+    const tree = await a.tree();
+    expect(tree.get(dir)!.name).toMatch(/^\.FlareBox \(conflict from Laptop A \d{4}-\d{2}-\d{2}\)$/);
+    expect(tree.get(updated.nodeId)!.name).toMatch(/^\.flarebox \(conflict from Laptop A \d{4}-\d{2}-\d{2} 2\)$/);
+    expect(tree.get(restored.nodeId)!.name).toMatch(/^\.\uFB02AREBOX \(conflict from Laptop A \d{4}-\d{2}-\d{2} 3\)$/);
+    expect([...tree.values()].filter((n) => n.parentId === root && nameKey(n.name) === ".flarebox")).toEqual([]);
+  });
+
   it("applies a no-op Move without a change record, so a concurrent delete still trashes the node", async () => {
     const { a, b, root } = await setup();
     const { nodeId } = await createFile(a, root, "notes.txt", "a");

@@ -172,10 +172,11 @@ export class CommitApplier {
     )[0];
   }
 
-  /** R1: the desired name, or the first free conflict name. */
+  /** R1: the desired name, or the first free conflict name. A name reserved at the root counts as taken there. */
   private pickName(parentId: string, desired: string, excludeId: string): { name: string; renamed: boolean } {
+    const atRoot = !getNode(this.sql, parentId)?.parent_id;
     let name = desired;
-    for (let attempt = 1; this.liveWithName(parentId, nameKey(name), excludeId); attempt++) {
+    for (let attempt = 1; this.liveWithName(parentId, nameKey(name), excludeId) || (atRoot && isReservedAtRoot(name)); attempt++) {
       name = conflictName(desired, this.ctx.committer.deviceName, this.ctx.nowMs, attempt);
     }
     return { name, renamed: name !== desired };
