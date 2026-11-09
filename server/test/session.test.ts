@@ -17,7 +17,7 @@ import {
   SpaceListSchema,
   TokenRequestSchema,
 } from "../src/gen/flarebox/v1/auth_pb";
-import { OpResult_Code, UploadReceiptSchema } from "../src/gen/flarebox/v1/commit_pb";
+import { OpResult_Code, type UploadReceipt, UploadReceiptSchema } from "../src/gen/flarebox/v1/commit_pb";
 import {
   type ClientMessage,
   ClientMessageSchema,
@@ -28,9 +28,9 @@ import {
   ServerMessageSchema,
   type Welcome,
 } from "../src/gen/flarebox/v1/messages_pb";
-import { ChunkRefSchema, type CommitRecord, type Content, ContentSchema } from "../src/gen/flarebox/v1/model_pb";
-import { Error_Code } from "../src/gen/flarebox/v1/rpc_pb";
-import { deriveSpaceKey, sha256, signChunkGrant } from "../src/crypto";
+import { ChunkRefSchema, type CommitRecord, ContentSchema } from "../src/gen/flarebox/v1/model_pb";
+import { ChunkPlan_Action, Error_Code, type Target } from "../src/gen/flarebox/v1/rpc_pb";
+import { sha256 } from "../src/crypto";
 import { toHex, uuidv7 } from "../src/ids";
 import { Close } from "../src/space-do";
 import { chunkKey, encodeChunkList } from "../src/space/store";
@@ -207,24 +207,23 @@ class Socket {
   }
 }
 
-/** Stores chunks in R2 and signs receipts the way the relay upload route does. */
-async function upload(spaceId: string, parts: { content: Content; bytes: Uint8Array[] }) {
-  const spaceKey = await deriveSpaceKey((await account().serverKey()).secret, spaceId);
-  const receipts = [];
-  for (const [i, chunk] of parts.content.chunks.entries()) {
-    const hex = toHex(chunk.hash);
-    await env.BUCKET.put(chunkKey(spaceId, hex), parts.bytes[i]!);
-    const token = await signChunkGrant(spaceKey, "receipt", spaceId, hex, chunk.size, Date.now() + 3_600_000);
-    receipts.push(create(UploadReceiptSchema, { hash: chunk.hash, size: chunk.size, token }));
-  }
-  return receipts;
+async function put(target: Target, bytes: Uint8Array): Promise<Response> {
+  return exports.default.fetch(target.url, { method: target.method, body: bytes, headers: { "Content-Type": "application/x-protobuf" } });
 }
 
-async function prepared(socket: Socket, spaceId: string, text: string) {
+/** PrepareUpload over the socket, then PUT each requested chunk to its relay target and collect the receipts. */
+async function prepared(socket: Socket, text: string) {
   const parts = await content(text);
   const plan = await socket.rpc({ case: "prepareUpload", value: { chunks: parts.content.chunks } });
-  expect(plan.case).toBe("prepareUpload");
-  return { content: parts.content, receipts: await upload(spaceId, parts) };
+  if (plan.case !== "prepareUpload") throw new Error("prepareUpload failed");
+  const receipts: UploadReceipt[] = [];
+  for (const [i, chunkPlan] of plan.value.chunks.entries()) {
+    if (chunkPlan.action !== ChunkPlan_Action.UPLOAD) continue;
+    const response = await put(chunkPlan.target!, parts.bytes[i]!);
+    expect(response.status).toBe(200);
+    receipts.push(fromBinary(UploadReceiptSchema, new Uint8Array(await response.arrayBuffer())));
+  }
+  return { ...parts, plan: plan.value, receipts };
 }
 
 function nodeIds(records: CommitRecord[]): string[] {
@@ -462,8 +461,9 @@ describe("WebSocket session", () => {
     await reader.start();
     const parts = await content(...Array.from({ length: 16_000 }, () => "x"));
     const plan = await writer.rpc({ case: "prepareUpload", value: { chunks: [parts.content.chunks[0]!] } });
-    expect(plan.case).toBe("prepareUpload");
-    const receipts = await upload(spaceId, { content: { chunks: [parts.content.chunks[0]!] } as Content, bytes: [parts.bytes[0]!] });
+    if (plan.case !== "prepareUpload") throw new Error("prepareUpload failed");
+    const uploaded = await put(plan.value.chunks[0]!.target!, parts.bytes[0]!);
+    const receipts = [fromBinary(UploadReceiptSchema, new Uint8Array(await uploaded.arrayBuffer()))];
     const before = await snapshot();
     const both = await writer.rpc({
       case: "commit",
@@ -506,9 +506,10 @@ describe("WebSocket session", () => {
     const writer = await Socket.connect(spaceId, a);
     await writer.start();
     const parts = await content(...Array.from({ length: 16_000 }, () => "x"));
-    const single = { content: { chunks: [parts.content.chunks[0]!] } as Content, bytes: [parts.bytes[0]!] };
-    expect((await writer.rpc({ case: "prepareUpload", value: { chunks: single.content.chunks } })).case).toBe("prepareUpload");
-    const receipts = await upload(spaceId, single);
+    const plan = await writer.rpc({ case: "prepareUpload", value: { chunks: [parts.content.chunks[0]!] } });
+    if (plan.case !== "prepareUpload") throw new Error("prepareUpload failed");
+    const uploaded = await put(plan.value.chunks[0]!.target!, parts.bytes[0]!);
+    const receipts = [fromBinary(UploadReceiptSchema, new Uint8Array(await uploaded.arrayBuffer()))];
     const [one, two] = [uuidv7(), uuidv7()];
     await writer.commit(0n, [op.create(one, spaceId, "one", parts.content)], receipts);
     await writer.commit(1n, [op.update(one, parts.content)], receipts);
@@ -584,9 +585,12 @@ describe("WebSocket session", () => {
     };
     const uploadListed = async (hashes: Uint8Array[]) => {
       const indexes = hashes.map((hash) => parts.content.chunks.findIndex((chunk) => toHex(chunk.hash) === toHex(hash)));
-      const subset = { content: { chunks: indexes.map((i) => parts.content.chunks[i]!) } as Content, bytes: indexes.map((i) => parts.bytes[i]!) };
-      expect((await socket.rpc({ case: "prepareUpload", value: { chunks: subset.content.chunks } })).case).toBe("prepareUpload");
-      receipts.push(...(await upload(spaceId, subset)));
+      const plan = await socket.rpc({ case: "prepareUpload", value: { chunks: indexes.map((i) => parts.content.chunks[i]!) } });
+      if (plan.case !== "prepareUpload") throw new Error("prepareUpload failed");
+      for (const [n, chunk] of plan.value.chunks.entries()) {
+        const uploaded = await put(chunk.target!, parts.bytes[indexes[n]!]!);
+        receipts.push(fromBinary(UploadReceiptSchema, new Uint8Array(await uploaded.arrayBuffer())));
+      }
     };
     const first = await listed();
     expect(Array.isArray(first) && first.length).toBe(1000);
@@ -665,14 +669,14 @@ describe("WebSocket session", () => {
     await sa.start();
     await sb.start();
     const file = uuidv7();
-    const v1 = await prepared(sa, spaceId, "v1");
+    const v1 = await prepared(sa, "v1");
     await sa.commit(0n, [op.create(file, spaceId, "plan.txt", v1.content)], v1.receipts);
     await sb.pushed();
 
-    const fromB = await prepared(sb, spaceId, "B's edit");
+    const fromB = await prepared(sb, "B's edit");
     await sb.commit(1n, [op.update(file, fromB.content)], fromB.receipts);
     await sa.pushed();
-    const fromA = await prepared(sa, spaceId, "A's edit");
+    const fromA = await prepared(sa, "A's edit");
     const result = await sa.commit(1n, [op.update(file, fromA.content)], fromA.receipts);
     expect(result.results[0]!.code).toBe(OpResult_Code.CONFLICT_COPY);
     expect(result.results[0]!.name).toMatch(/^plan \(conflict from Laptop A \d{4}-\d{2}-\d{2}\)\.txt$/);
@@ -734,6 +738,68 @@ describe("WebSocket session", () => {
     const tree = await call("/v1/spaces/" + spaceId + "/rpc", { token: a.access!.token, body: list }, RpcResponseSchema);
     const page = tree.message!.result;
     expect(page.case === "tree" && page.value.nodes.map((n) => n.name).sort()).toEqual(["", "via http"]);
+  });
+});
+
+describe("chunk relay", () => {
+  async function connected() {
+    const a = await getOwner();
+    const spaceId = await createSpace(a);
+    const socket = await Socket.connect(spaceId, a);
+    await socket.start();
+    return { a, spaceId, socket };
+  }
+
+  it("uploads through the Worker, commits with the receipt, and downloads the same bytes", async () => {
+    const { a, spaceId, socket } = await connected();
+    const b = await pairDevice(a, "Reader");
+    const reader = await Socket.connect(spaceId, b);
+    await reader.start();
+
+    const file = await prepared(socket, "the bytes of a small file");
+    expect(file.plan.chunks[0]!.target!.url.startsWith(BASE + "/v1/spaces/" + spaceId + "/chunks/")).toBe(true);
+    expect(file.receipts).toHaveLength(1);
+    const head = await env.BUCKET.head(chunkKey(spaceId, toHex(file.content.chunks[0]!.hash)));
+    expect(head?.size).toBe(file.bytes[0]!.length);
+    const nodeId = uuidv7();
+    await socket.commit(0n, [op.create(nodeId, spaceId, "small.txt", file.content)], file.receipts);
+
+    const pushed = await reader.pushed();
+    const state = pushed[0]!.changes[0]!.change;
+    const hash = state.case === "node" ? state.value.current!.content!.chunks[0]!.hash : new Uint8Array();
+    const targets = await reader.rpc({ case: "getDownloadTargets", value: { hashes: [hash] } });
+    if (targets.case !== "downloadTargets") throw new Error("getDownloadTargets failed");
+    const response = await exports.default.fetch(targets.value.targets[0]!.target!.url);
+    expect(response.status).toBe(200);
+    const downloaded = new Uint8Array(await response.arrayBuffer());
+    expect(toHex(await sha256(downloaded))).toBe(toHex(hash));
+
+    const again = await socket.rpc({ case: "prepareUpload", value: { chunks: file.content.chunks } });
+    expect(again.case === "prepareUpload" && again.value.chunks[0]!.action).toBe(ChunkPlan_Action.PRESENT);
+  });
+
+  it("rejects uploads with a bad ticket, a wrong length or bytes that do not match the hash", async () => {
+    const { spaceId, socket } = await connected();
+    const parts = await content("expected bytes");
+    const plan = await socket.rpc({ case: "prepareUpload", value: { chunks: parts.content.chunks } });
+    if (plan.case !== "prepareUpload") throw new Error("prepareUpload failed");
+    const target = plan.value.chunks[0]!.target!;
+    const bytes = parts.bytes[0]!;
+    const key = chunkKey(spaceId, toHex(parts.content.chunks[0]!.hash));
+
+    const tampered = { ...target, url: target.url.slice(0, -3) + "AAA" };
+    expect((await put(tampered, bytes)).status).toBe(403);
+    expect((await put({ ...target, url: target.url.split("?")[0]! }, bytes)).status).toBe(403);
+    const otherSpace = { ...target, url: target.url.replace(spaceId, uuidv7()) };
+    expect((await put(otherSpace, bytes)).status).toBe(403);
+    expect((await put(target, new Uint8Array(bytes.length + 1))).status).toBe(403);
+    expect((await put(target, new Uint8Array(bytes.length))).status).toBe(400);
+    expect(await env.BUCKET.head(key)).toBeNull();
+
+    const download = await exports.default.fetch(target.url);
+    expect(download.status).toBe(403);
+    expect((await put(target, bytes)).status).toBe(200);
+    expect((await put(target, bytes)).status).toBe(200);
   });
 });
 
