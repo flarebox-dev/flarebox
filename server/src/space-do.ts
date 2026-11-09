@@ -279,7 +279,7 @@ export class SpaceDO extends DurableObject<Env> {
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     if (typeof message === "string") return;
     const attachment = ws.deserializeAttachment() as Attachment;
-    if (Date.now() > attachment.identity.expiresAtMs + TOKEN_GRACE_MS) return this.goodbye(ws, Close.TOKEN_EXPIRED, "access token expired");
+    if (this.clock() > attachment.identity.expiresAtMs + TOKEN_GRACE_MS) return this.goodbye(ws, Close.TOKEN_EXPIRED, "access token expired");
     let msg;
     try {
       msg = fromBinary(ClientMessageSchema, new Uint8Array(message)).msg;
@@ -363,7 +363,7 @@ export class SpaceDO extends DurableObject<Env> {
       identity.userId,
       identity.deviceName,
       hello.maxFormat,
-      Date.now(),
+      this.clock(),
     );
     const formatVersion = Number(getMeta(this.sql, "format_version"));
     const welcome = create(WelcomeSchema, {
@@ -408,7 +408,7 @@ export class SpaceDO extends DurableObject<Env> {
 
   private async reauth(ws: WebSocket, attachment: Attachment, token: string): Promise<void> {
     const key = await this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName("account")).serverKey();
-    const identity = await verifyAccessToken(key, token, Date.now());
+    const identity = await verifyAccessToken(key, token, this.clock());
     if (!identity || identity.deviceId !== attachment.identity.deviceId || identity.userId !== attachment.identity.userId) {
       return this.goodbye(ws, Close.TOKEN_EXPIRED, "invalid access token");
     }
