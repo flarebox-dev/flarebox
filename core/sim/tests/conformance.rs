@@ -782,6 +782,7 @@ impl Run {
             base_seq: req(opt_u64(body, "base_seq"), "base_seq")?,
             ops,
             receipts,
+            ..Default::default()
         };
         let expect = expectation(step, &["missing"], &["seq", "results", "changed"])?;
         let result = self.rpc(space, &session, at_ms, rpc_request::Call::Commit(commit))?;
