@@ -85,10 +85,11 @@ A client must not use step 4 in these cases:
 In each of these, the client does not commit its local-only changes again on its own, and it never resends or re-plans the commit in flight. It recovers as follows:
 
 1. It keeps its trees from before the reset, and its commit in flight, as evidence.
-2. It reads the current tree with `ListTree` (§7.5).
+2. It reads the current server state with both `ListTree` and `ListTrash` (§7.5). A node in the trash counts as present, so the client never takes a trashed `node_id` for absent and publishes it again, which the server would refuse with `ID_EXISTS`.
 3. It reconciles the two by `node_id`. A node is applied without asking only when the outcome is certain: the local version equals the current server version, or the device had not changed the node since its last sync and the client follows the server.
 4. Everything else is held until the user answers, with nothing published and nothing changed on disk. That covers nodes created after the restore point, nodes changed on this device, nodes created on this device, nodes deleted on this device, and operations requested before the reset.
-5. It commits each answer with `require_head` (§4). Every `Delete` an answer produces goes through the client's mass-delete guard.
+5. Before it sends an answer, it simulates the answer's ops with the §6 rules against a copy of the current server state. An op can change nodes outside the answered set: R8 revives a whole trash group, R2 merges directories, and a move carries its subtree. Every node the simulation changes outside that set must end in its current server state, or in the state that the evidence shows this device's user chose. The client may add compensating ops to the same commit, but only when a new simulation confirms the result. Otherwise those nodes join the question, which is asked again before anything is sent.
+6. It commits each answer with `require_head` (§4). Every `Delete` an answer produces goes through the client's mass-delete guard.
 
 Design §6.4 gives the full classification. The server's part is §1 to §4 and §7 to §8.
 
