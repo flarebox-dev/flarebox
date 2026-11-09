@@ -353,6 +353,11 @@ pub struct SpaceDo {
     log: Vec<CommitRecord>,
     results: HashMap<String, CommitResult>,
     receipts: HashMap<String, IssuedReceipt>,
+    /// The bucket: the size of every chunk object a `PUT` stored, by hash. A commit counts a
+    /// `pending` chunk without a valid receipt as uploaded when its object is here with the row's
+    /// size, the `head` check of RFC 0002 section 11. Nothing deletes objects, so the object cannot
+    /// go between that check and the commit.
+    objects: HashMap<Vec<u8>, u32>,
     head_seq: u64,
     log_floor_seq: u64,
 }
@@ -392,6 +397,7 @@ impl SpaceDo {
             log: Vec::new(),
             results: HashMap::new(),
             receipts: HashMap::new(),
+            objects: HashMap::new(),
             head_seq: 0,
             log_floor_seq: 0,
         }
@@ -457,6 +463,7 @@ impl SpaceDo {
         if let Some(reason) = reason {
             return Err(ResyncRequired {
                 reason: reason as i32,
+                ..Default::default()
             });
         }
         Ok(self
@@ -604,23 +611,30 @@ impl SpaceDo {
                 "base_seq is ahead of the server",
             ));
         }
-        let missing: Vec<Vec<u8>> = referenced
+        let mut missing: Vec<Vec<u8>> = referenced
             .iter()
             .filter(|chunk| {
                 let ready = self.state.chunks.get(&chunk.hash).is_some_and(|row| {
                     row.size == chunk.size
                         && (row.state == ChunkState::Live
                             || (row.state == ChunkState::Pending
-                                && receipted.contains(chunk.hash.as_slice())))
+                                && (receipted.contains(chunk.hash.as_slice())
+                                    || self.objects.get(&chunk.hash) == Some(&row.size))))
                 });
                 !ready
             })
             .map(|chunk| chunk.hash.clone())
             .collect();
         if !missing.is_empty() {
+            let total = missing.len();
+            missing.truncate(MAX_CHUNKS_PER_CALL);
+            let message = format!(
+                "{total} chunks are not uploaded; {} are listed",
+                missing.len()
+            );
             return Err(Error {
                 missing_chunks: missing,
-                ..fail(error::Code::MissingChunks, "some chunks are not uploaded")
+                ..fail(error::Code::MissingChunks, message)
             });
         }
 
@@ -739,6 +753,7 @@ impl SpaceDo {
     /// The relay `PUT` of one chunk at `now_ms`: stores it in the bucket and returns the receipt a
     /// commit presents, valid for this space, chunk and size until `now_ms` plus one hour.
     pub fn put_chunk(&mut self, hash: &[u8], size: u32, now_ms: i64) -> UploadReceipt {
+        self.objects.insert(hash.to_vec(), size);
         let token = format!("receipt:{}:{}", self.space_id, self.receipts.len() + 1);
         self.receipts.insert(
             token.clone(),
@@ -953,6 +968,7 @@ mod tests {
                 base_seq: space.head_seq(),
                 ops: vec![Op { op: Some(op) }],
                 receipts: vec![],
+                ..Default::default()
             };
             space.commit(&session, 0, &commit).unwrap().result
         };

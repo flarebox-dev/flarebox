@@ -87,7 +87,7 @@ async function newContent(c: TestClient, ...text: string[]) {
 function interceptDeletes(space: Space, onDelete: (keys: string[], real: (keys: string[]) => Promise<void>) => Promise<void>) {
   return runInDurableObject(space.stub, (instance: SpaceDO) => {
     const real = (keys: string[]) => env.BUCKET.delete(keys);
-    const bucket = { delete: (keys: string[]) => onDelete(keys, real) };
+    const bucket = { list: env.BUCKET.list.bind(env.BUCKET), delete: (keys: string[]) => onDelete(keys, real) };
     const original = (instance as unknown as { env: Env }).env;
     (instance as unknown as { env: unknown }).env = new Proxy(original, { get: (target, key) => (key === "BUCKET" ? bucket : Reflect.get(target, key)) });
   });
