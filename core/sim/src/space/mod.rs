@@ -546,6 +546,18 @@ impl SpaceDo {
         commit: &Commit,
     ) -> Result<Committed, Error> {
         self.check_can_write(session)?;
+        if let Some(stored) = self.results.get(&commit.commit_id) {
+            return Ok(Committed {
+                result: stored.clone(),
+                record: None,
+            });
+        }
+        if commit.base_seq > self.head_seq {
+            return Err(fail(
+                error::Code::AheadOfServer,
+                "base_seq is ahead of the server",
+            ));
+        }
         if !is_uuid_v7(&commit.commit_id) {
             return Err(fail(
                 error::Code::InvalidArgument,
@@ -563,12 +575,6 @@ impl SpaceDo {
                 error::Code::LimitExceeded,
                 format!("at most {MAX_OPS} ops per commit"),
             ));
-        }
-        if let Some(stored) = self.results.get(&commit.commit_id) {
-            return Ok(Committed {
-                result: stored.clone(),
-                record: None,
-            });
         }
 
         let mut referenced: Vec<&ChunkRef> = Vec::new();
@@ -605,12 +611,6 @@ impl SpaceDo {
             .map(|r| r.hash.as_slice())
             .collect();
 
-        if commit.base_seq > self.head_seq {
-            return Err(fail(
-                error::Code::InvalidArgument,
-                "base_seq is ahead of the server",
-            ));
-        }
         let mut missing: Vec<Vec<u8>> = referenced
             .iter()
             .filter(|chunk| {

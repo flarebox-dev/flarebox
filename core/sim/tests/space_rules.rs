@@ -300,7 +300,7 @@ fn rejects_a_base_ahead_of_the_server_and_commits_from_viewers_or_old_clients() 
     let x = s.id();
     assert_eq!(
         error_code(s.commit_raw(&a, vec![mkdir(&x, &root, "X")], 5, vec![], None)),
-        error::Code::InvalidArgument
+        error::Code::AheadOfServer
     );
     let viewer = s.client_with("Viewer", Role::Viewer, 1);
     assert_eq!(
