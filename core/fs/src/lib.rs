@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use notify::event::{AccessKind, AccessMode, EventKind};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher as _};
 
 /// How long native events must be quiet before the watcher rescans, so both
@@ -162,6 +163,9 @@ impl Snapshot {
         paths: impl IntoIterator<Item = PathBuf>,
     ) -> Result<Vec<Change>> {
         let root = root.as_ref();
+        if !fs::metadata(root)?.is_dir() {
+            return Err(io::Error::from(io::ErrorKind::NotADirectory).into());
+        }
         let mut scopes: Vec<PathBuf> = paths.into_iter().map(|path| self.anchor(path)).collect();
         scopes.sort();
         scopes.dedup();
@@ -389,6 +393,11 @@ impl NativeWatcher {
         let event = event.map_err(watch_error)?;
         if event.need_rescan() {
             self.dirty.insert(PathBuf::new());
+        }
+        if let EventKind::Access(access) = event.kind
+            && access != AccessKind::Close(AccessMode::Write)
+        {
+            return Ok(());
         }
         for path in event.paths {
             let rel = path.strip_prefix(&self.root).unwrap_or(Path::new(""));

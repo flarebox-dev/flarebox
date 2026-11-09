@@ -222,9 +222,11 @@ fn rescan_refuses_a_missing_root() {
     fs::remove_dir_all(&root).unwrap();
 
     let before = snapshot.clone();
-    assert!(matches!(
-        snapshot.rescan(&root, [PathBuf::new()]),
-        Err(Error::Io(_))
-    ));
-    assert_eq!(snapshot, before);
+    for scope in ["", "a.txt"] {
+        assert!(matches!(
+            snapshot.rescan(&root, [PathBuf::from(scope)]),
+            Err(Error::Io(_))
+        ));
+        assert_eq!(snapshot, before);
+    }
 }
