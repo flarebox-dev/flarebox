@@ -78,7 +78,50 @@ fn v0_matches_the_spec() {
         (1 << 20, 4 << 20, 16 << 20, 4 << 20)
     );
     assert_eq!(v0.name(), "fastcdc2020-1m-4m-16m");
-    assert_eq!(small_config().name(), "fastcdc2020-64-256-1k");
+    assert_eq!(small_config().name(), "fastcdc2020-64-256-1k-t512");
+}
+
+#[test]
+fn the_identifier_names_the_small_file_threshold() {
+    let unthresholded = ChunkerConfig::new(1 << 20, 4 << 20, 16 << 20, 0).unwrap();
+    let data = noise((4 << 20) - 1, 2);
+    let lengths =
+        |config| -> Vec<usize> { split(&data, config).iter().map(|c| c.data.len()).collect() };
+    assert_eq!(lengths(ChunkerConfig::V0), [4_194_303]);
+    assert_eq!(lengths(unthresholded), [3_116_686, 1_077_617]);
+    assert_eq!(unthresholded.name(), "fastcdc2020-1m-4m-16m-t0");
+    assert_ne!(unthresholded.name(), ChunkerConfig::V0.name());
+}
+
+#[test]
+fn identifiers_parse_back_to_their_configuration() {
+    for config in [
+        ChunkerConfig::V0,
+        small_config(),
+        ChunkerConfig::new(1 << 20, 4 << 20, 16 << 20, 0).unwrap(),
+        ChunkerConfig::new(1000, 3000, 9000, 4000).unwrap(),
+    ] {
+        assert_eq!(ChunkerConfig::from_name(&config.name()), Ok(config));
+    }
+}
+
+#[test]
+fn rejects_identifiers_that_do_not_name_exactly_one_profile() {
+    for name in [
+        "",
+        "fastcdc2020",
+        "fastcdc2016-1m-4m-16m",
+        "fastcdc2020-1m-4m-8m",
+        "fastcdc2020-1024k-4m-16m",
+        "fastcdc2020-1m-4m-16m-t4m",
+        "fastcdc2020-1m-4m-16m-4m",
+        "fastcdc2020-64-256-1024-t512",
+        "fastcdc2020-64-256-1k-t2k",
+        "fastcdc2020-64-256-1k-t512-x",
+        "fastcdc2020-4096m-4m-16m-t0",
+    ] {
+        assert!(ChunkerConfig::from_name(name).is_err(), "{name}");
+    }
 }
 
 #[test]
@@ -153,7 +196,7 @@ fn manifest_digest_hashes_hash_and_le_size() {
         (c.size, c.chunk_count, c.mtime_ns, c.executable),
         (5 + 0x0102_0304, 2, 42, true)
     );
-    assert_eq!(c.chunker, "fastcdc2020-64-256-1k");
+    assert_eq!(c.chunker, "fastcdc2020-64-256-1k-t512");
 }
 
 #[test]
@@ -173,6 +216,68 @@ fn an_insertion_changes_only_nearby_chunks() {
         "only {shared} of {} chunks survived an 8-byte insertion",
         before.len()
     );
+}
+
+/// Yields `good` bytes, then fails with `kind` once and keeps yielding.
+struct FailOnce<'a> {
+    data: &'a [u8],
+    good: usize,
+    kind: Option<io::ErrorKind>,
+}
+
+impl Read for FailOnce<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.good == 0
+            && let Some(kind) = self.kind.take()
+        {
+            return Err(kind.into());
+        }
+        let n = buf.len().min(self.data.len()).min(self.good.max(1));
+        buf[..n].copy_from_slice(&self.data[..n]);
+        self.data = &self.data[n..];
+        self.good = self.good.saturating_sub(n);
+        Ok(n)
+    }
+}
+
+#[test]
+fn interrupted_reads_are_retried() {
+    let config = small_config();
+    let data = noise(6000, 5);
+    for good in [0, 100, 3000] {
+        let reader = FailOnce {
+            data: &data,
+            good,
+            kind: Some(io::ErrorKind::Interrupted),
+        };
+        let parts: Vec<Chunk> = chunks(reader, config).collect::<io::Result<_>>().unwrap();
+        assert_eq!(
+            parts,
+            split(&data, config),
+            "interrupted after {good} bytes"
+        );
+    }
+}
+
+#[test]
+fn a_read_error_is_returned_once_and_ends_the_chunks() {
+    let config = small_config();
+    let data = noise(6000, 5);
+    for good in [0, 100, 3000] {
+        let reader = FailOnce {
+            data: &data,
+            good,
+            kind: Some(io::ErrorKind::Other),
+        };
+        let items: Vec<io::Result<Chunk>> = chunks(reader, config).collect();
+        let last = items.last().expect("an error is reported");
+        assert_eq!(
+            last.as_ref().err().map(io::Error::kind),
+            Some(io::ErrorKind::Other),
+            "failed after {good} bytes"
+        );
+        assert!(items[..items.len() - 1].iter().all(Result::is_ok));
+    }
 }
 
 fn hex(s: &str) -> Vec<u8> {

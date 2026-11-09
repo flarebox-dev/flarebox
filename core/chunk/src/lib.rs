@@ -7,15 +7,24 @@
 //! configured minimum, average and maximum sizes. A chunk is identified by the
 //! SHA-256 of its bytes, and a file's [Content] carries the manifest digest
 //! over its chunk list.
+//!
+//! Every client must cut the same bytes at the same offsets, so the boundary
+//! algorithm is frozen as the `fastcdc2020` profile: the v2020 algorithm of
+//! fastcdc-rs 5.0.0 with its Gear table (the first eight bytes, big-endian, of
+//! MD5 over 64 repetitions of each byte value), hash seed 0 and normalization
+//! level 1. `tests/golden.rs` pins the V0 output against an independent
+//! implementation (`scripts/fastcdc_reference.py`); changing any of these
+//! needs a new identifier.
 
 use std::fmt;
 use std::io::{self, Chain, Cursor, Read};
 
-use fastcdc::v2020::StreamCDC;
+use fastcdc::v2020::{Normalization, StreamCDC};
 use flarebox_proto::v1::{ChunkRef, Content};
 use sha2::{Digest, Sha256};
 
 const MIB: u32 = 1 << 20;
+const FAMILY: &str = "fastcdc2020";
 
 /// Chunk boundary parameters. [ChunkerConfig::V0] is the spec's; smaller
 /// configurations exist for tests and simulations that need many chunks from
@@ -99,24 +108,67 @@ impl ChunkerConfig {
         self.small_file_threshold
     }
 
-    /// The identifier recorded in [Content::chunker], for example
-    /// `fastcdc2020-1m-4m-16m` for [ChunkerConfig::V0].
+    /// The identifier recorded in [Content::chunker]. It names every parameter
+    /// that moves a boundary: `fastcdc2020-1m-4m-16m` is reserved for
+    /// [ChunkerConfig::V0], and every other configuration also names its
+    /// small-file threshold, as in `fastcdc2020-64-256-1k-t512`.
     pub fn name(&self) -> String {
         let size = |v: u32| {
-            if v.is_multiple_of(MIB) {
+            if v > 0 && v.is_multiple_of(MIB) {
                 format!("{}m", v / MIB)
-            } else if v.is_multiple_of(1024) {
+            } else if v > 0 && v.is_multiple_of(1024) {
                 format!("{}k", v / 1024)
             } else {
                 v.to_string()
             }
         };
-        format!(
-            "fastcdc2020-{}-{}-{}",
+        let sizes = format!(
+            "{FAMILY}-{}-{}-{}",
             size(self.min_size),
             size(self.avg_size),
             size(self.max_size)
-        )
+        );
+        if *self == Self::V0 {
+            sizes
+        } else {
+            format!("{sizes}-t{}", size(self.small_file_threshold))
+        }
+    }
+
+    /// The configuration an identifier names. Only the exact spelling
+    /// [ChunkerConfig::name] produces is accepted, so an identifier that could
+    /// describe another profile (another family, the V0 sizes without the V0
+    /// threshold, a size written another way) is rejected.
+    pub fn from_name(name: &str) -> Result<Self, InvalidConfig> {
+        let unknown = InvalidConfig("unknown chunker identifier");
+        let size = |part: &str| -> Option<u32> {
+            let (digits, unit) = match part.strip_suffix('m') {
+                Some(digits) => (digits, MIB),
+                None => match part.strip_suffix('k') {
+                    Some(digits) => (digits, 1024),
+                    None => (part, 1),
+                },
+            };
+            digits.parse::<u32>().ok()?.checked_mul(unit)
+        };
+        let config = match name.split('-').collect::<Vec<_>>().as_slice() {
+            [FAMILY, _, _, _] => Self::V0,
+            [FAMILY, min, avg, max, threshold] => {
+                let sizes = threshold
+                    .strip_prefix('t')
+                    .and_then(|t| Some((size(min)?, size(avg)?, size(max)?, size(t)?)));
+                let Some((min, avg, max, threshold)) = sizes else {
+                    return Err(unknown);
+                };
+                Self::new(min, avg, max, threshold)?
+            }
+            _ => return Err(unknown),
+        };
+        if config.name() == name {
+            Ok(config)
+        } else {
+            Err(unknown)
+        }
     }
 }
 
@@ -189,8 +241,18 @@ pub fn content(
     }
 }
 
-/// Splits everything `reader` yields into chunks. Holds at most one maximum-size
-/// chunk (or the small-file threshold, whichever is larger) in memory.
+/// Splits everything `reader` yields into chunks.
+///
+/// Memory is bounded by the configuration, not the file: the retained prefix up
+/// to the small-file threshold, a maximum-size read buffer and the chunk being
+/// returned, about 36 MiB for [ChunkerConfig::V0], plus what the caller keeps.
+///
+/// Reads interrupted with [io::ErrorKind::Interrupted] are retried. Any other
+/// read error is returned once and ends the iteration; chunk again from the
+/// start. The reader is trusted to yield one version of the file: a file that
+/// is truncated or rewritten while it is read gives chunks of whatever bytes
+/// were read, so the caller must check that the file did not change before it
+/// publishes the result.
 pub fn chunks<R: Read>(reader: R, config: ChunkerConfig) -> Chunks<R> {
     Chunks {
         state: State::Start(reader, config),
@@ -202,10 +264,25 @@ pub struct Chunks<R: Read> {
     state: State<R>,
 }
 
+type Source<R> = Chain<Cursor<Vec<u8>>, Uninterrupted<R>>;
+
 enum State<R: Read> {
     Start(R, ChunkerConfig),
-    Cdc(Box<StreamCDC<Chain<Cursor<Vec<u8>>, R>>>),
+    Cdc(Box<StreamCDC<Source<R>>>),
     Done,
+}
+
+struct Uninterrupted<R>(R);
+
+impl<R: Read> Read for Uninterrupted<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            match self.0.read(buf) {
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                result => return result,
+            }
+        }
+    }
 }
 
 impl<R: Read> Iterator for Chunks<R> {
@@ -214,7 +291,8 @@ impl<R: Read> Iterator for Chunks<R> {
     fn next(&mut self) -> Option<Self::Item> {
         match std::mem::replace(&mut self.state, State::Done) {
             State::Done => None,
-            State::Start(mut reader, config) => {
+            State::Start(reader, config) => {
+                let mut reader = Uninterrupted(reader);
                 let threshold = config.small_file_threshold as usize;
                 let mut head = Vec::with_capacity(threshold);
                 if let Err(err) = (&mut reader).take(threshold as u64).read_to_end(&mut head) {
@@ -223,22 +301,23 @@ impl<R: Read> Iterator for Chunks<R> {
                 if head.len() < threshold {
                     return (!head.is_empty()).then(|| Ok(Chunk::new(0, head)));
                 }
-                self.state = State::Cdc(Box::new(StreamCDC::new(
+                self.state = State::Cdc(Box::new(StreamCDC::with_level_and_seed(
                     Cursor::new(head).chain(reader),
                     config.min_size as usize,
                     config.avg_size as usize,
                     config.max_size as usize,
+                    Normalization::Level1,
+                    0,
                 )));
                 self.next()
             }
-            State::Cdc(mut cdc) => {
-                let item = cdc.next()?;
-                self.state = State::Cdc(cdc);
-                Some(
-                    item.map(|c| Chunk::new(c.offset, c.data))
-                        .map_err(io::Error::from),
-                )
-            }
+            State::Cdc(mut cdc) => match cdc.next()? {
+                Ok(c) => {
+                    self.state = State::Cdc(cdc);
+                    Some(Ok(Chunk::new(c.offset, c.data)))
+                }
+                Err(err) => Some(Err(io::Error::from(err))),
+            },
         }
     }
 }
