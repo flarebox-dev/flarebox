@@ -10,6 +10,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+flarebox-proto = { path = "../proto" }
 unicode-normalization = "0.1"
 
 [dev-dependencies]
