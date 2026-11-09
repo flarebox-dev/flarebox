@@ -11,6 +11,8 @@ The schema changes add messages and fields only:
 | `RewindRequest` (new, `auth.proto`) | `restore_point_ms = 1`, `expected_history_id = 2`, `rewind_id = 3` | 1 |
 | `RewindResult` (new, `auth.proto`) | `history_id = 1`, `restore_seq = 2`, `restore_point_ms = 3`, `previous_history_id = 4`, `previous_head_seq = 5` | 1 |
 
+The chunk key incarnations of §5 are internal to the server and change no message.
+
 PITR behaves as [the SQLite storage API documentation](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/#pitr-point-in-time-recovery-api) describes (accessed 2026-11-10):
 - it restores to any point in the past 30 days;
 - `getBookmarkForTime` returns a bookmark for approximately the given time;
@@ -58,6 +60,7 @@ The Account DO directs the rewind and keeps a record of it in its own storage, w
 - the request;
 - the selected bookmark B;
 - the new `history_id`;
+- the rewind number (§5, rule 6);
 - the previous history and head;
 - the attempt number;
 - the phase;
@@ -69,10 +72,9 @@ An Account DO alarm drives the phases with backoff from one second up to ten min
    - its current `history_id` and `head_seq`;
    - the bookmark B for P.
 
-   It then checks §1 and §2. Any failure refuses the request and records nothing. Otherwise it records the rewind as `admitted`, with B and the new `history_id`. From then on the space is closed (§4).
+   It then checks §1 and §2. Any failure refuses the request and records nothing. Otherwise it records the rewind as `admitted`, with B, the new `history_id` and the rewind number. From then on the space is closed (§4).
 2. **Preparing attempt k.** The Space DO:
    - closes every WebSocket after sending `Goodbye` with close code 4004 (space rewound);
-   - drains destructive work (§5, rule 5);
    - writes a marker row for the rewind and attempt k, and reads its current bookmark M;
    - returns its `history_id` and `head_seq`, and whether B is earlier than M.
 
@@ -81,8 +83,8 @@ An Account DO alarm drives the phases with backoff from one second up to ten min
 4. **Settling.** After an arming call, whether it answered, failed or has an unknown outcome, the Account DO first restarts the Space DO once more. A restore that is pending applies when the object starts, so after this restart none can still be pending. The Account DO then asks the Space DO to complete the rewind:
    - **Marker of attempt k present.** No restore happened and none is pending. The Account DO goes back to step 2 with attempt k + 1, or ends in step 6 if B can no longer be restored.
    - **No marker, but a completion receipt for this rewind in `meta`.** Completion already ran, and the Space DO returns that receipt again.
-   - **Neither.** The storage was restored to B, which predates every marker of this rewind. The Space DO then completes the rewind in one transaction:
-     - sets the new `history_id`, plus `restore_seq` (its `head_seq`) and `restore_point_ms` in `meta` (RFC 0002 §8);
+   - **Neither.** The storage was restored to B, which predates every marker of this rewind. The Space DO reads the space's retired incarnations from the Account DO (§5, rule 9). It then completes the rewind in one transaction:
+     - sets the new `history_id` and the rewind number, plus `restore_seq` (its `head_seq`) and `restore_point_ms` in `meta` (RFC 0002 §8);
      - adds every device that the Account DO has revoked to `revoked_devices`;
      - applies the chunk rules of §5;
      - resets the export state (§7);
@@ -101,7 +103,8 @@ An Account DO alarm drives the phases with backoff from one second up to ten min
 From admission until the record is `completed` or `failed`, the space is closed:
 - every HTTP RPC and WebSocket upgrade gets `RETRY_LATER`;
 - the Space DO answers every socket message by closing the socket with 4004;
-- the Space DO's alarm runs no work and leaves the `schedule` table as it is.
+- the Space DO's alarm runs no work and leaves the `schedule` table as it is;
+- the Account DO records no chunk retirements (§5, rule 8).
 
 A closed alarm sets the alarm again for at most ten minutes later. Work that comes due during the closure, such as GC, the orphan sweep or export, therefore runs within ten minutes of reopening, even with no client activity.
 
@@ -109,15 +112,29 @@ The Account DO decides whether the space is closed. The Worker and the Space DO 
 
 ## 5. Chunk retention
 
-Invariant: no chunk object is deleted earlier than `chunk_grace_days` after the last moment at which any history referenced it. These rules keep it:
+Two invariants protect chunk objects:
+- **Retention.** No chunk object is deleted earlier than `chunk_grace_days` after the last moment at which any history referenced it.
+- **Delete isolation.** An R2 delete never removes the object of a `pending` or `live` chunk row of the current history, however late R2 applies the delete. [R2 lets overlapping writes to one key finish in any order](https://developers.cloudflare.com/r2/reference/consistency/), and a delete whose outcome is unknown may still take effect later. So once a delete of a key may have been issued, the server never relies on that key again.
+
+Rules 1 to 4 keep the retention invariant:
 
 1. GC deletes a chunk no earlier than `chunk_grace_days` after its refcount reaches 0, as in §12.
-2. At completion, every chunk row whose refcount is 0, in any state, becomes `pending` with `hold_until` set to the completion time plus `chunk_grace_days`. The discarded history may have referenced the chunk until the rewind, and GC may already have deleted the object. As `pending`, `PrepareUpload` answers `UPLOAD`, so a commit that needs the chunk stores it again; a conditional PUT that finds the object present counts as stored. If no commit needs it, it ages out through the normal grace.
-3. The orphan sweep deletes an object that has no chunk row only once both its upload time and the space's latest rewind completion are more than `chunk_grace_days` in the past. The Account DO keeps the latest completion time per space, and every completion copies it into `meta`, so a later rewind cannot lose it.
+2. At completion, every chunk row whose refcount is 0, in any state, becomes `pending` with `hold_until` set to the completion time plus `chunk_grace_days`. The discarded history may have referenced the chunk until the rewind, and GC may already have deleted the object. As `pending`, `PrepareUpload` answers `UPLOAD`, so a commit that needs the chunk stores it again. A conditional PUT that finds the object present under the row's incarnation counts as stored; rule 9 has already made sure that incarnation is not retired. If no commit needs the chunk, it ages out through the normal grace.
+3. The orphan sweep deletes an object whose incarnation no chunk row holds only once both its upload time and the space's latest rewind completion are more than `chunk_grace_days` in the past. The Account DO keeps the latest completion time per space, and every completion copies it into `meta`, so a later rewind cannot lose it.
 4. `chunk_grace_days` cannot be set below 30.
-5. Before it writes a marker (§3 step 2), the Space DO waits for any GC run in progress to end. It then deletes the object of every chunk row in state `deleting` (orphan-sweep rows included), awaits each R2 response, and removes those rows. So every R2 delete the space issued before admission has completed before any restored row can become `pending` and uploadable again. [R2 lets overlapping writes to one key finish in any order](https://developers.cloudflare.com/r2/reference/consistency/), so a delete still outstanding could otherwise remove a fresh upload. A `deleting` row at admission had a refcount of 0 for at least `chunk_grace_days`, so no admissible target references it, and finishing its delete keeps the invariant. This drain assumes that R2 does not apply a request after its sender has received the response, or after the sending instance has ended and the object has restarted. The R2 documentation does not state this (unverified).
 
-Any admissible target T satisfies T ≥ now − 29 days, and a chunk referenced at T was referenced until some time no earlier than T. By the invariant it is kept until at least T + 30 days, which is after now. The bound holds across repeated rewinds, including a target in an interval that an earlier rewind discarded. It does not depend on how `chunk_grace_days` changed over time, because rule 4 makes 30 days the floor. Rewinds therefore do not narrow the window. The cost is that the chunks only a discarded history used stay in R2 for 30 days after the rewind.
+Any admissible target T satisfies T ≥ now − 29 days, and a chunk referenced at T was referenced until some time no earlier than T. By the retention invariant it is kept until at least T + 30 days, which is after now. The bound holds across repeated rewinds, including a target in an interval that an earlier rewind discarded. It does not depend on how `chunk_grace_days` changed over time, because rule 4 makes 30 days the floor. Rewinds therefore do not narrow the window. The cost is that the chunks only a discarded history used stay in R2 for 30 days after the rewind.
+
+Rules 5 to 10 keep delete isolation with key incarnations:
+
+5. A chunk object is stored under `spaces/<space_id>/chunks/<first 2 hex>/<hex>/<incarnation>`, which replaces the key of §10. A chunk row holds at most one incarnation: the key its object is stored under. When `PrepareUpload` answers `UPLOAD` for a row that holds none, the Space DO gives the row a fresh incarnation. Spec v0 has not been released, so the layout changes without a migration.
+6. An incarnation is `<r>.<n>`. r is the rewind number of the current history: 0 for the space's first history, and otherwise the number that the Account DO gave the rewind at admission from a per-space count that only goes up. n comes from a counter in the Space DO's `meta` that only goes up. The Space DO allocates incarnations only while the space is open. Each rewind number belongs to one history, because completion runs once per rewind. Within one history the Space DO's storage only moves forward, because a restored database takes a new rewind number before the space reopens (§3 step 4). So no incarnation is allocated twice.
+7. Clients still address chunks by hash (§10), so the wire format does not change. The server puts the row's incarnation into the key of every upload and download target it issues, relay tickets and presigned URLs alike. An upload counts only for the incarnation it wrote. If the row no longer holds that incarnation, the object is an orphan for rule 3.
+8. **Retirement.** Before the Space DO deletes the object of incarnation i, through GC (§12 step 4) or the orphan sweep, it asks the Account DO to record i as retired. It issues the delete only after the Account DO has confirmed, and the delete targets that one key. GC makes one such call per batch of deletes. GC marks a row `deleting` before it retires the row's incarnation, and the orphan sweep retires only incarnations that no row holds. If the call's outcome is unknown, the Space DO issues no delete and asks again later. The Account DO keeps the records in its own storage, out of PITR's reach. It refuses new retirements while the space is closed (§4), so the set of retired incarnations does not change while a rewind runs.
+9. At completion, before its transaction, the Space DO reads the space's retired incarnations from the Account DO. In the transaction, a restored row counts as absent if its incarnation is retired or the row is `deleting`. It loses its incarnation and becomes `pending` under rule 2, keeping its refcount, so a commit that needs the chunk uploads it again under a fresh incarnation that no earlier delete can reach. The retention invariant means that only rows with refcount 0 should be affected, but this rule does not rely on that.
+10. The Account DO keeps each retirement record for at least 30 days, and never prunes a space's records while a rewind of that space is open. Every Space DO state written after a retirement holds the retired incarnation, if at all, on a `deleting` row, which rule 9 treats as absent anyway. A state written before the retirement can only be restored by a rewind armed within PITR's 30 days of it, and the record still exists until that rewind ends.
+
+A delete, however late R2 applies it, removes only the object of a retired incarnation (rule 8). No `pending` or `live` row of the current history holds a retired incarnation: rows take only fresh incarnations (rules 5 and 6), GC retires a row's incarnation only after marking the row `deleting`, and completion strips retired incarnations from restored rows (rule 9), using a set that cannot change during the rewind. Delete isolation therefore holds whatever order R2 applies overlapping requests in, and it needs no assumption about requests sent by an object instance that has ended. The cost is that a chunk whose incarnation a rewind strips is uploaded and stored again, and the old object stays until the orphan sweep removes it.
 
 ## 6. What a rewind restores, keeps and loses
 
@@ -125,7 +142,7 @@ Any admissible target T satisfies T ≥ now − 29 days, and a chunk referenced 
   - the tree, every node's versions and the trash;
   - the commit log, chunk rows, members, the space's name and settings;
   - `device_commits` (RFC 0002 §2).
-- **Kept:** the Account DO's state, including devices, revocations, spaces, share links and rewind records. A share link that points to a node absent after the rewind finds nothing.
+- **Kept:** the Account DO's state, including devices, revocations, spaces, share links, rewind records and chunk retirement records. A share link that points to a node absent after the rewind finds nothing.
 - **Removed from the current history:** everything committed after `restore_seq`. That includes:
   - every intermediate version written after the restore point, not only the latest one;
   - nodes trashed after the restore point, and their trash state;
