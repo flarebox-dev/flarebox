@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: Apache-2.0
+
+name: macOS app
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-app-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: macos app
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: apps/macos
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Show Xcode and Swift versions
+        run: xcodebuild -version && swift --version
+      - name: Build the Rust core and generate the Swift bindings
+        run: scripts/build-ffi.sh
+      - name: Test the Swift bindings
+        run: swift test --package-path FlareboxFFI
+      - name: Build the app (unsigned)
+        run: >-
+          xcodebuild -project Flarebox.xcodeproj -scheme Flarebox -configuration Release
+          -derivedDataPath build/DerivedData -destination "platform=macOS,arch=$(uname -m)"
+          CODE_SIGNING_ALLOWED=NO build
+      - name: Check the app bundle
+        run: |
+          app=build/DerivedData/Build/Products/Release/Flarebox.app
+          if [ ! -x "$app/Contents/MacOS/Flarebox" ]; then
+            echo "::error::xcodebuild reported success but $app/Contents/MacOS/Flarebox is missing."
+            exit 1
+          fi
+          plutil -p "$app/Contents/Info.plist"
