@@ -99,6 +99,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check whether the change affects the macOS app
         id: changes
+        working-directory: ${{ github.workspace }}
         env:
           EVENT: ${{ github.event_name }}
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
@@ -109,14 +110,23 @@ jobs:
             exit 0
           fi
           git fetch --no-tags --depth=1 origin "$BASE"
-          changed="$(git diff --no-renames --name-only "$BASE" HEAD)"
-          if grep -qE '^(apps/macos/|core/|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|\.github/workflows/ci\.yml$)' <<< "$changed"; then
-            echo "The change touches apps/macos, core, the Cargo files or ci.yml: building the macOS app."
-            echo "affected=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "The change does not touch apps/macos, core, the Cargo files or ci.yml: skipping the macOS app build."
-            echo "affected=false" >> "$GITHUB_OUTPUT"
-          fi
+          status=0
+          git diff --quiet --no-renames "$BASE" HEAD -- \
+            apps/macos core Cargo.toml Cargo.lock rust-toolchain.toml .github/workflows/ci.yml || status=$?
+          case "$status" in
+            0)
+              echo "The change does not touch apps/macos, core, the Cargo files or ci.yml: skipping the macOS app build."
+              echo "affected=false" >> "$GITHUB_OUTPUT"
+              ;;
+            1)
+              echo "The change touches apps/macos, core, the Cargo files or ci.yml: building the macOS app."
+              echo "affected=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::git diff between $BASE and HEAD failed with exit code $status, so the affected paths are unknown."
+              exit 1
+              ;;
+          esac
       - name: Install toolchain from rust-toolchain.toml
         if: steps.changes.outputs.affected == 'true'
         run: rustup show active-toolchain || rustup toolchain install
