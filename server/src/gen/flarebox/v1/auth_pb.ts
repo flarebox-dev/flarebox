@@ -12,7 +12,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file flarebox/v1/auth.proto.
  */
 export const file_flarebox_v1_auth: GenFile = /*@__PURE__*/
-  fileDesc("ChZmbGFyZWJveC92MS9hdXRoLnByb3RvEgtmbGFyZWJveC52MSLiAQoKU2VydmVySW5mbxIWCg5zZXJ2ZXJfdmVyc2lvbhgBIAEoCRIRCglwcm90b19taW4YAiABKA0SEQoJcHJvdG9fbWF4GAMgASgNEjMKCWRhdGFfcGF0aBgEIAEoDjIgLmZsYXJlYm94LnYxLlNlcnZlckluZm8uRGF0YVBhdGgSDwoHY2xhaW1lZBgFIAEoCCJQCghEYXRhUGF0aBIZChVEQVRBX1BBVEhfVU5TUEVDSUZJRUQQABITCg9EQVRBX1BBVEhfUkVMQVkQARIUChBEQVRBX1BBVEhfRElSRUNUEAIiVgoMQ2xhaW1SZXF1ZXN0EgwKBGNvZGUYASABKAkSEQoJdXNlcl9uYW1lGAIgASgJEhMKC2RldmljZV9uYW1lGAMgASgJEhAKCHBsYXRmb3JtGAQgASgJIjgKEVBhaXJTdGFydFJlc3BvbnNlEgwKBGNvZGUYASABKAkSFQoNZXhwaXJlc19hdF9tcxgCIAEoAyJKChNQYWlyQ29tcGxldGVSZXF1ZXN0EgwKBGNvZGUYASABKAkSEwoLZGV2aWNlX25hbWUYAiABKAkSEAoIcGxhdGZvcm0YAyABKAkifQoRRGV2aWNlQ3JlZGVudGlhbHMSDwoHdXNlcl9pZBgBIAEoCRIRCglkZXZpY2VfaWQYAiABKAkSGgoScmVmcmVzaF9jcmVkZW50aWFsGAMgASgJEigKBmFjY2VzcxgEIAEoCzIYLmZsYXJlYm94LnYxLkFjY2Vzc1Rva2VuIj0KDFRva2VuUmVxdWVzdBIRCglkZXZpY2VfaWQYASABKAkSGgoScmVmcmVzaF9jcmVkZW50aWFsGAIgASgJIjMKC0FjY2Vzc1Rva2VuEg0KBXRva2VuGAEgASgJEhUKDWV4cGlyZXNfYXRfbXMYAiABKAMiWgoJU3BhY2VJbmZvEhAKCHNwYWNlX2lkGAEgASgJEgwKBG5hbWUYAiABKAkSFgoOZm9ybWF0X3ZlcnNpb24YAyABKA0SFQoNY3JlYXRlZF9hdF9tcxgEIAEoAyIiChJDcmVhdGVTcGFjZVJlcXVlc3QSDAoEbmFtZRgBIAEoCSIzCglTcGFjZUxpc3QSJgoGc3BhY2VzGAEgAygLMhYuZmxhcmVib3gudjEuU3BhY2VJbmZvYgZwcm90bzM");
+  fileDesc("ChZmbGFyZWJveC92MS9hdXRoLnByb3RvEgtmbGFyZWJveC52MSLiAQoKU2VydmVySW5mbxIWCg5zZXJ2ZXJfdmVyc2lvbhgBIAEoCRIRCglwcm90b19taW4YAiABKA0SEQoJcHJvdG9fbWF4GAMgASgNEjMKCWRhdGFfcGF0aBgEIAEoDjIgLmZsYXJlYm94LnYxLlNlcnZlckluZm8uRGF0YVBhdGgSDwoHY2xhaW1lZBgFIAEoCCJQCghEYXRhUGF0aBIZChVEQVRBX1BBVEhfVU5TUEVDSUZJRUQQABITCg9EQVRBX1BBVEhfUkVMQVkQARIUChBEQVRBX1BBVEhfRElSRUNUEAIiVgoMQ2xhaW1SZXF1ZXN0EgwKBGNvZGUYASABKAkSEQoJdXNlcl9uYW1lGAIgASgJEhMKC2RldmljZV9uYW1lGAMgASgJEhAKCHBsYXRmb3JtGAQgASgJIjgKEVBhaXJTdGFydFJlc3BvbnNlEgwKBGNvZGUYASABKAkSFQoNZXhwaXJlc19hdF9tcxgCIAEoAyJKChNQYWlyQ29tcGxldGVSZXF1ZXN0EgwKBGNvZGUYASABKAkSEwoLZGV2aWNlX25hbWUYAiABKAkSEAoIcGxhdGZvcm0YAyABKAkifQoRRGV2aWNlQ3JlZGVudGlhbHMSDwoHdXNlcl9pZBgBIAEoCRIRCglkZXZpY2VfaWQYAiABKAkSGgoScmVmcmVzaF9jcmVkZW50aWFsGAMgASgJEigKBmFjY2VzcxgEIAEoCzIYLmZsYXJlYm94LnYxLkFjY2Vzc1Rva2VuIj0KDFRva2VuUmVxdWVzdBIRCglkZXZpY2VfaWQYASABKAkSGgoScmVmcmVzaF9jcmVkZW50aWFsGAIgASgJIjMKC0FjY2Vzc1Rva2VuEg0KBXRva2VuGAEgASgJEhUKDWV4cGlyZXNfYXRfbXMYAiABKAMiWgoJU3BhY2VJbmZvEhAKCHNwYWNlX2lkGAEgASgJEgwKBG5hbWUYAiABKAkSFgoOZm9ybWF0X3ZlcnNpb24YAyABKA0SFQoNY3JlYXRlZF9hdF9tcxgEIAEoAyIiChJDcmVhdGVTcGFjZVJlcXVlc3QSDAoEbmFtZRgBIAEoCSIzCglTcGFjZUxpc3QSJgoGc3BhY2VzGAEgAygLMhYuZmxhcmVib3gudjEuU3BhY2VJbmZvIkYKDVJld2luZFJlcXVlc3QSGAoQcmVzdG9yZV9wb2ludF9tcxgBIAEoAxIbChNleHBlY3RlZF9oaXN0b3J5X2lkGAIgASgJIokBCgxSZXdpbmRSZXN1bHQSEgoKaGlzdG9yeV9pZBgBIAEoCRITCgtyZXN0b3JlX3NlcRgCIAEoBBIYChByZXN0b3JlX3BvaW50X21zGAMgASgDEhsKE3ByZXZpb3VzX2hpc3RvcnlfaWQYBCABKAkSGQoRcHJldmlvdXNfaGVhZF9zZXEYBSABKARiBnByb3RvMw");
 
 /**
  * GET /v1/server
@@ -327,4 +327,79 @@ export type SpaceList = Message<"flarebox.v1.SpaceList"> & {
  */
 export const SpaceListSchema: GenMessage<SpaceList> = /*@__PURE__*/
   messageDesc(file_flarebox_v1_auth, 9);
+
+/**
+ * POST /v1/spaces/{space_id}/rewind, owner only (RFC 0003).
+ *
+ * @generated from message flarebox.v1.RewindRequest
+ */
+export type RewindRequest = Message<"flarebox.v1.RewindRequest"> & {
+  /**
+   * The point in time to restore, in Unix milliseconds.
+   *
+   * @generated from field: int64 restore_point_ms = 1;
+   */
+  restorePointMs: bigint;
+
+  /**
+   * The history the caller expects the space to be in; the rewind is refused with CODE_HISTORY_MISMATCH otherwise.
+   *
+   * @generated from field: string expected_history_id = 2;
+   */
+  expectedHistoryId: string;
+};
+
+/**
+ * Describes the message flarebox.v1.RewindRequest.
+ * Use `create(RewindRequestSchema)` to create a new message.
+ */
+export const RewindRequestSchema: GenMessage<RewindRequest> = /*@__PURE__*/
+  messageDesc(file_flarebox_v1_auth, 10);
+
+/**
+ * Response of POST /v1/spaces/{space_id}/rewind.
+ *
+ * @generated from message flarebox.v1.RewindResult
+ */
+export type RewindResult = Message<"flarebox.v1.RewindResult"> & {
+  /**
+   * The history that began with this rewind.
+   *
+   * @generated from field: string history_id = 1;
+   */
+  historyId: string;
+
+  /**
+   * head_seq right after the rewind.
+   *
+   * @generated from field: uint64 restore_seq = 2;
+   */
+  restoreSeq: bigint;
+
+  /**
+   * The point in time that was restored, as requested.
+   *
+   * @generated from field: int64 restore_point_ms = 3;
+   */
+  restorePointMs: bigint;
+
+  /**
+   * @generated from field: string previous_history_id = 4;
+   */
+  previousHistoryId: string;
+
+  /**
+   * head_seq right before the rewind; the commits after restore_seq up to it were discarded.
+   *
+   * @generated from field: uint64 previous_head_seq = 5;
+   */
+  previousHeadSeq: bigint;
+};
+
+/**
+ * Describes the message flarebox.v1.RewindResult.
+ * Use `create(RewindResultSchema)` to create a new message.
+ */
+export const RewindResultSchema: GenMessage<RewindResult> = /*@__PURE__*/
+  messageDesc(file_flarebox_v1_auth, 11);
 

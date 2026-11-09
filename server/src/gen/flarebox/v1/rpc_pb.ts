@@ -33,7 +33,7 @@ export type Error = Message<"flarebox.v1.Error"> & {
   message: string;
 
   /**
-   * Set with CODE_MISSING_CHUNKS: the chunk hashes that are not ready.
+   * Set with CODE_MISSING_CHUNKS: the chunk hashes that are not ready, at most 1,000 (RFC 0002 section 11).
    *
    * @generated from field: repeated bytes missing_chunks = 3;
    */

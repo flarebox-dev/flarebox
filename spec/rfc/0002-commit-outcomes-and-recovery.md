@@ -118,3 +118,7 @@ A `Delete` whose target stays live because a descendant has an unseen change als
 ## 10. Renamed revival on UpdateContent (R8)
 
 An `UpdateContent` whose target R8 revives under a conflict name, because the revived name clashes under R1, returns `APPLIED_RENAMED` with the name used, as `Move`, `Restore`, `CreateDir` and `CreateFile` do. `APPLIED_RENAMED` replaces only a result that would otherwise be `APPLIED`. If the update also has an unseen content change, so that R3 applies, the result stays `CONFLICT_COPY`. A client acknowledges an `APPLIED_RENAMED` update as it would an `APPLIED` one: the content it sent becomes synced. The new name and position reach the disk through the node's `NodeState` in the result's changes, like any remote rename.
+
+## 11. Missing-chunk list (§8 step 4)
+
+A `MISSING_CHUNKS` error lists at most 1,000 hashes, the most one `PrepareUpload` takes, so the error always fits in one message. Its `message` gives the total number of missing chunks. To get the rest, the client runs `PrepareUpload` for the listed chunks, uploads them, and resends the same commit with the same `commit_id`. Each retry lists up to 1,000 more, until none are missing and the commit is applied.
