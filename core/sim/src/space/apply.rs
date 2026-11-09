@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use flarebox_engine::names::{conflict_name, name_key, normalize_name};
+use flarebox_engine::names::{conflict_name, is_reserved_at_root, name_key, normalize_name};
 use flarebox_proto::v1::{
     ChangeRecord, ChunkRef, Content, CreateDir, CreateFile, Delete, Error, Move, NodeKind,
     NodeStatus, Op, OpResult, Restore, change_record, error, op, op_result,
@@ -156,6 +156,42 @@ impl<'a> Applier<'a> {
         Ok(())
     }
 
+    /// Rejects the commit when placing `node` under `parent` would put it or a descendant, trashed ones
+    /// included, deeper than [`MAX_DEPTH`]. A destination no deeper than the current position cannot,
+    /// because the tree already satisfies the limit.
+    fn check_subtree_depth(&self, node: &Node, parent: &Node) -> Result<(), Error> {
+        let new_depth = self.depth(parent) + 1;
+        if new_depth <= self.depth(node) {
+            return Ok(());
+        }
+        let mut level = BTreeSet::from([node.node_id.clone()]);
+        let mut height = 0;
+        while new_depth + height <= MAX_DEPTH {
+            level = self
+                .st
+                .nodes
+                .values()
+                .filter(|n| n.parent_id.as_ref().is_some_and(|p| level.contains(p)))
+                .map(|n| n.node_id.clone())
+                .collect();
+            if level.is_empty() {
+                return Ok(());
+            }
+            height += 1;
+        }
+        Err(fail(
+            error::Code::LimitExceeded,
+            format!("path depth would exceed {MAX_DEPTH}"),
+        ))
+    }
+
+    fn is_root(&self, node_id: &str) -> bool {
+        self.st
+            .nodes
+            .get(node_id)
+            .is_some_and(|n| n.parent_id.is_none())
+    }
+
     fn live_with_name(&self, parent_id: &str, key: &str, exclude_id: &str) -> Option<&Node> {
         self.st
             .nodes
@@ -169,13 +205,16 @@ impl<'a> Applier<'a> {
             .min_by_key(|n| n.row)
     }
 
-    /// R1: the desired name, or the first free conflict name.
+    /// R1: the desired name, or the first free conflict name. A name reserved at the root counts as
+    /// taken there.
     fn pick_name(&self, parent_id: &str, desired: &str, exclude_id: &str) -> (String, bool) {
+        let at_root = self.is_root(parent_id);
         let mut name = desired.to_string();
         let mut attempt = 1;
         while self
             .live_with_name(parent_id, &name_key(&name), exclude_id)
             .is_some()
+            || (at_root && is_reserved_at_root(&name))
         {
             name = conflict_name(
                 desired,
@@ -349,6 +388,9 @@ impl<'a> Applier<'a> {
             Ok(parent) => parent,
             Err(reason) => return Ok(rejected(reason)),
         };
+        if parent.parent_id.is_none() && is_reserved_at_root(&name) {
+            return Ok(rejected("INVALID_NAME"));
+        }
         if let Some(existing) = self
             .live_with_name(&parent.node_id, &name_key(&name), "")
             .filter(|n| n.kind == NodeKind::Dir)
@@ -373,6 +415,9 @@ impl<'a> Applier<'a> {
             Ok(parent) => parent,
             Err(reason) => return Ok(rejected(reason)),
         };
+        if parent.parent_id.is_none() && is_reserved_at_root(&name) {
+            return Ok(rejected("INVALID_NAME"));
+        }
         let (name, renamed) = self.pick_name(&parent.node_id, &name, "");
         let content = op.content.as_ref().expect("checked before applying");
         let version_id = self.insert_version(&op.node_id, content, &content.chunks);
@@ -457,9 +502,19 @@ impl<'a> Applier<'a> {
         if self.is_self_or_descendant(&target, &found.node_id) {
             return Ok(rejected("CYCLE"));
         }
+        if target.parent_id.is_none() && is_reserved_at_root(&name) {
+            return Ok(rejected("INVALID_NAME"));
+        }
+        if found.status == NodeStatus::Live
+            && found.parent_id.as_deref() == Some(target.node_id.as_str())
+            && found.name == name
+        {
+            return Ok(result(op_result::Code::Applied, "", &name));
+        }
         let parent = self
             .parent_for(&target.node_id)?
             .expect("the target is an existing directory");
+        self.check_subtree_depth(&found, &parent)?;
         if found.status == NodeStatus::Trashed {
             let group = found
                 .trash_group
@@ -582,9 +637,13 @@ impl<'a> Applier<'a> {
         if self.is_self_or_descendant(&target, &node.node_id) {
             return Ok(rejected("CYCLE"));
         }
+        if target.parent_id.is_none() && is_reserved_at_root(&name) {
+            return Ok(rejected("INVALID_NAME"));
+        }
         let parent = self
             .parent_for(&target.node_id)?
             .expect("the target is an existing directory");
+        self.check_subtree_depth(&node, &parent)?;
         let group = node
             .trash_group
             .clone()

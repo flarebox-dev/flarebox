@@ -7,6 +7,24 @@ use proptest::prelude::*;
 use unicode_normalization::UnicodeNormalization;
 
 #[test]
+fn nfc_expansion_of_the_device_name_never_cuts_the_attempt_number() {
+    let original = format!("x.{}", "e".repeat(200));
+    for device in ["\u{0A5E}".repeat(40), "\u{1D160}".repeat(40)] {
+        let names: Vec<String> = (1..=5)
+            .map(|attempt| conflict_name(&original, &device, 1_794_268_740_000, attempt))
+            .collect();
+        for (i, name) in names.iter().enumerate() {
+            assert!(name.len() <= MAX_NAME_BYTES, "{name}");
+            if i > 0 {
+                assert!(name.contains(&format!(" {})", i + 1)), "{name}");
+            }
+        }
+        let distinct: std::collections::BTreeSet<&String> = names.iter().collect();
+        assert_eq!(distinct.len(), names.len());
+    }
+}
+
+#[test]
 fn name_key_matches_canonically_equivalent_names_that_differ_only_by_case() {
     assert_eq!(name_key("\u{0390}"), name_key("\u{03AA}\u{0301}"));
     assert_eq!(name_key("\u{0390}"), "\u{03B9}\u{0308}\u{0301}");

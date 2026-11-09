@@ -60,24 +60,7 @@ impl Space {
     }
 
     fn content(text: &str) -> Content {
-        let chunks = vec![ChunkRef {
-            hash: Sha256::digest(text).to_vec(),
-            size: text.len() as u32,
-            encoding: 0,
-        }];
-        let list: Vec<u8> = chunks
-            .iter()
-            .flat_map(|c| c.hash.iter().copied().chain(c.size.to_le_bytes()))
-            .collect();
-        Content {
-            size: text.len() as u64,
-            mtime_ns: 1,
-            executable: false,
-            chunk_count: 1,
-            manifest_digest: Sha256::digest(list).to_vec(),
-            chunker: "fastcdc2020-1m-4m-16m".into(),
-            chunks,
-        }
+        content_of(vec![chunk(text.as_bytes(), text.len() as u32)])
     }
 
     fn upload(&mut self, c: &Client, content: &Content) -> Vec<UploadReceipt> {
@@ -95,7 +78,7 @@ impl Space {
             .iter()
             .zip(&content.chunks)
             .filter(|(p, _)| p.action == chunk_plan::Action::Upload as i32)
-            .map(|(_, chunk)| self.space.put_chunk(&chunk.hash, chunk.size))
+            .map(|(_, chunk)| self.space.put_chunk(&chunk.hash, chunk.size, NOW))
             .collect()
     }
 
@@ -165,6 +148,31 @@ impl Space {
             .collect();
         names.sort();
         names
+    }
+}
+
+fn chunk(seed: &[u8], size: u32) -> ChunkRef {
+    ChunkRef {
+        hash: Sha256::digest(seed).to_vec(),
+        size,
+        encoding: 0,
+    }
+}
+
+/// A content listing `chunks` inline, with a correct size, count and manifest digest.
+fn content_of(chunks: Vec<ChunkRef>) -> Content {
+    let list: Vec<u8> = chunks
+        .iter()
+        .flat_map(|c| c.hash.iter().copied().chain(c.size.to_le_bytes()))
+        .collect();
+    Content {
+        size: chunks.iter().map(|c| u64::from(c.size)).sum(),
+        mtime_ns: 1,
+        executable: false,
+        chunk_count: chunks.len() as u32,
+        manifest_digest: Sha256::digest(list).to_vec(),
+        chunker: "fastcdc2020-1m-4m-16m".into(),
+        chunks,
     }
 }
 
@@ -695,18 +703,24 @@ fn r9_and_r10_restore_from_the_trash_and_restore_an_old_version() {
         Space::content("first").manifest_digest
     );
 
-    let versions = s.space.list_versions(&ListVersions {
-        node_id: file.clone(),
-        limit: 2,
-        ..Default::default()
-    });
+    let versions = s
+        .space
+        .list_versions(&ListVersions {
+            node_id: file.clone(),
+            limit: 2,
+            ..Default::default()
+        })
+        .unwrap();
     assert_eq!(versions.versions.len(), 2);
     assert_ne!(versions.next_cursor, "");
-    let rest = s.space.list_versions(&ListVersions {
-        node_id: file,
-        limit: 2,
-        cursor: versions.next_cursor,
-    });
+    let rest = s
+        .space
+        .list_versions(&ListVersions {
+            node_id: file,
+            limit: 2,
+            cursor: versions.next_cursor,
+        })
+        .unwrap();
     assert_eq!(rest.versions.len(), 1);
     assert_eq!(rest.next_cursor, "");
 }
@@ -975,4 +989,301 @@ fn serves_downloads_only_for_committed_chunks() {
             .code(),
         error::Code::InvalidArgument
     );
+}
+
+fn restore_to(id: &str, parent: &str, name: &str) -> Op {
+    wrap(op::Op::Restore(Restore {
+        node_id: id.into(),
+        target_parent_id: parent.into(),
+        name: name.into(),
+        ..Default::default()
+    }))
+}
+
+fn reject_reasons(result: &CommitResult) -> Vec<&str> {
+    result
+        .results
+        .iter()
+        .map(|r| r.reject_reason.as_str())
+        .collect()
+}
+
+#[test]
+fn rejects_one_chunk_hash_listed_with_two_sizes() {
+    let mut s = Space::new();
+    let root = s.root();
+    let a = s.client("A");
+    let (three, two) = (chunk(b"h", 3), chunk(b"h", 2));
+    let prepared = s.space.prepare_upload(
+        &a.session,
+        NOW,
+        &PrepareUpload {
+            chunks: vec![three.clone(), two.clone()],
+        },
+    );
+    assert_eq!(prepared.unwrap_err().code(), error::Code::InvalidArgument);
+
+    let receipts = s.upload(&a, &content_of(vec![three.clone()]));
+    let within = content_of(vec![three.clone(), two.clone()]);
+    let id = s.id();
+    let one_manifest = s.commit_raw(
+        &a,
+        vec![create_file(&id, &root, "within", within)],
+        0,
+        receipts.clone(),
+        None,
+    );
+    assert_eq!(error_code(one_manifest), error::Code::InvalidArgument);
+    let (x, y) = (s.id(), s.id());
+    let across_ops = s.commit_raw(
+        &a,
+        vec![
+            create_file(&x, &root, "x", content_of(vec![three])),
+            create_file(&y, &root, "y", content_of(vec![two])),
+        ],
+        0,
+        receipts,
+        None,
+    );
+    assert_eq!(error_code(across_ops), error::Code::InvalidArgument);
+    assert_eq!(s.space.head_seq(), 0);
+}
+
+#[test]
+fn moving_or_restoring_a_subtree_cannot_exceed_the_depth_limit() {
+    let mut s = Space::new();
+    let root = s.root();
+    let mut a = s.client("A");
+    let mut chain = Vec::new();
+    let mut ops = Vec::new();
+    let mut parent = root.clone();
+    for depth in 1..=254 {
+        let id = s.id();
+        ops.push(mkdir(&id, &parent, &format!("d{depth}")));
+        parent = id.clone();
+        chain.push(id);
+    }
+    let (top, mid, leaf) = (s.id(), s.id(), s.id());
+    ops.extend([
+        mkdir(&top, &root, "top"),
+        mkdir(&mid, &top, "mid"),
+        mkdir(&leaf, &mid, "leaf"),
+    ]);
+    s.commit(&mut a, ops, vec![]);
+    let (deepest, shallower) = (&chain[253], &chain[251]);
+    let head = s.space.head_seq();
+
+    let moved = s.commit_raw(&a, vec![mv(&top, deepest, "top")], head, vec![], None);
+    assert_eq!(error_code(moved), error::Code::LimitExceeded);
+    assert_eq!(s.get(&top).parent_id, root);
+
+    s.commit(&mut a, vec![delete(&leaf)], vec![]);
+    let head = s.space.head_seq();
+    let with_trashed_leaf = s.commit_raw(&a, vec![mv(&top, deepest, "top")], head, vec![], None);
+    assert_eq!(error_code(with_trashed_leaf), error::Code::LimitExceeded);
+
+    s.commit(&mut a, vec![delete(&top)], vec![]);
+    let head = s.space.head_seq();
+    let restored = s.commit_raw(&a, vec![restore_to(&top, deepest, "")], head, vec![], None);
+    assert_eq!(error_code(restored), error::Code::LimitExceeded);
+    assert_eq!(s.space.head_seq(), head);
+    assert!(!s.live(&top) && !s.live(&mid));
+
+    let fits = s.commit(&mut a, vec![restore_to(&top, shallower, "")], vec![]);
+    assert_eq!(codes(&fits), [op_result::Code::Applied]);
+    assert!(s.live(&top) && s.live(&mid) && !s.live(&leaf));
+}
+
+#[test]
+fn version_pages_split_versions_of_one_commit_by_version_id() {
+    let mut s = Space::new();
+    let root = s.root();
+    let mut a = s.client("A");
+    let (one, two, three) = (
+        Space::content("one"),
+        Space::content("two"),
+        Space::content("three"),
+    );
+    let mut receipts = s.upload(&a, &one);
+    receipts.extend(s.upload(&a, &two));
+    receipts.extend(s.upload(&a, &three));
+    let file = s.id();
+    s.commit(
+        &mut a,
+        vec![
+            create_file(&file, &root, "f", one),
+            update(&file, two),
+            update(&file, three),
+        ],
+        receipts,
+    );
+    let list = |cursor: String, limit: u32| {
+        s.space.list_versions(&ListVersions {
+            node_id: file.clone(),
+            limit,
+            cursor,
+        })
+    };
+    let all: Vec<String> = list(String::new(), 10)
+        .unwrap()
+        .versions
+        .into_iter()
+        .map(|v| v.version_id)
+        .collect();
+    assert_eq!(all.len(), 3);
+    let mut sorted = all.clone();
+    sorted.sort();
+    sorted.reverse();
+    assert_eq!(all, sorted, "newest first by (seq, version_id)");
+
+    let (mut paged, mut cursor) = (Vec::new(), String::new());
+    loop {
+        let page = list(cursor, 1).unwrap();
+        paged.extend(page.versions.into_iter().map(|v| v.version_id));
+        if page.next_cursor.is_empty() {
+            break;
+        }
+        assert_eq!(page.next_cursor, format!("1/{}", paged.last().unwrap()));
+        cursor = page.next_cursor;
+    }
+    assert_eq!(paged, all);
+    assert_eq!(
+        list("one/x".into(), 1).unwrap_err().code(),
+        error::Code::InvalidArgument
+    );
+}
+
+#[test]
+fn a_no_op_move_changes_nothing_so_a_concurrent_delete_applies() {
+    let mut s = Space::new();
+    let root = s.root();
+    let (mut a, mut b) = (s.client("A"), s.client("B"));
+    let (file, created) = s.create_file(&mut a, &root, "notes.txt", "a");
+    b.base_seq = created.seq;
+    let before = s.get(&file);
+
+    let same = s.commit(&mut a, vec![mv(&file, &root, "notes.txt")], vec![]);
+    assert_eq!(codes(&same), [op_result::Code::Applied]);
+    assert_eq!(same.results[0].name, "notes.txt");
+    assert!(same.changes.is_empty());
+    assert_eq!(s.get(&file), before);
+
+    let deleted = s.commit(&mut b, vec![delete(&file)], vec![]);
+    assert_eq!(codes(&deleted), [op_result::Code::Applied]);
+    assert!(!s.live(&file));
+
+    let (other, _) = s.create_file(&mut a, &root, "case.txt", "c");
+    let renamed = s.commit(&mut a, vec![mv(&other, &root, "Case.txt")], vec![]);
+    assert_eq!(renamed.changes.len(), 1);
+    assert_eq!(s.get(&other).meta_rev, renamed.seq);
+}
+
+#[test]
+fn the_root_reserves_flarebox_in_every_case_for_every_op() {
+    let mut s = Space::new();
+    let root = s.root();
+    let mut a = s.client("A");
+    let (docs, moved, trashed) = (s.id(), s.id(), s.id());
+    s.commit(
+        &mut a,
+        vec![
+            mkdir(&docs, &root, "docs"),
+            mkdir(&moved, &docs, "moved"),
+            mkdir(&trashed, &docs, "trashed"),
+        ],
+        vec![],
+    );
+    s.commit(&mut a, vec![delete(&trashed)], vec![]);
+    let before = s.space.nodes();
+    let (dir, file, alias) = (s.id(), s.id(), s.id());
+    let content = Space::content("x");
+    let receipts = s.upload(&a, &content);
+    let result = s.commit(
+        &mut a,
+        vec![
+            mkdir(&dir, &root, ".Flarebox"),
+            create_file(&file, &root, ".FLAREBOX", content),
+            mv(&moved, &root, ".flarebox"),
+            mv(&trashed, &root, ".fLaReBoX"),
+            restore_to(&trashed, &root, ".flarebox"),
+            mkdir(&alias, &root, ".\u{FB02}arebox"),
+        ],
+        receipts,
+    );
+    assert_eq!(reject_reasons(&result), ["INVALID_NAME"; 6]);
+    assert!(result.changes.is_empty());
+    assert_eq!(s.space.nodes(), before);
+    assert!(!s.live(&trashed));
+
+    let below = s.id();
+    let allowed = s.commit(&mut a, vec![mkdir(&below, &docs, ".flarebox")], vec![]);
+    assert_eq!(codes(&allowed), [op_result::Code::Applied]);
+}
+
+#[test]
+fn a_commit_whose_log_row_is_too_large_is_refused_whole() {
+    let mut s = Space::new();
+    let root = s.root();
+    let a = s.client("A");
+    let chunks: Vec<ChunkRef> = (0u32..16_384).map(|i| chunk(&i.to_le_bytes(), 1)).collect();
+    let content = content_of(chunks.clone());
+    let mut receipts = Vec::new();
+    for part in chunks.chunks(1000) {
+        receipts.extend(s.upload(&a, &content_of(part.to_vec())));
+    }
+    let files: Vec<String> = (0..7).map(|_| s.id()).collect();
+    let ops = |n: usize| -> Vec<Op> {
+        files[..n]
+            .iter()
+            .enumerate()
+            .map(|(i, id)| create_file(id, &root, &format!("f{i}"), content.clone()))
+            .collect()
+    };
+    let commit_id = s.id();
+    for _ in 0..2 {
+        let too_large = s.commit_raw(&a, ops(7), 0, receipts.clone(), Some(commit_id.clone()));
+        assert_eq!(error_code(too_large), error::Code::LimitExceeded);
+        assert_eq!(s.space.head_seq(), 0);
+        assert!(s.space.node(&files[0]).is_none());
+    }
+    let smaller = s.commit_raw(&a, ops(3), 0, receipts, None).unwrap();
+    assert_eq!(smaller.seq, 1);
+}
+
+#[test]
+fn a_receipt_is_valid_only_for_its_space_chunk_size_and_hour() {
+    let mut s = Space::new();
+    let root = s.root();
+    let a = s.client("A");
+    let content = Space::content("receipted");
+    let receipts = s.upload(&a, &content);
+    let hash = &content.chunks[0].hash;
+    let mut other = SpaceDo::new(9, NOW);
+    let foreign = other.put_chunk(hash, content.chunks[0].size, NOW);
+    let wrong_size = UploadReceipt {
+        size: content.chunks[0].size + 1,
+        ..receipts[0].clone()
+    };
+    let mut attempt = |receipts: Vec<UploadReceipt>, now_ms: i64| {
+        let commit = Commit {
+            commit_id: s.id(),
+            base_seq: 0,
+            ops: vec![create_file(&s.id(), &root, "f", content.clone())],
+            receipts,
+        };
+        s.space
+            .commit(&a.session, now_ms, &commit)
+            .map(|c| c.result)
+    };
+    for (receipts, now_ms) in [
+        (vec![foreign], NOW),
+        (vec![wrong_size], NOW),
+        (receipts.clone(), NOW + 3_600_001),
+    ] {
+        assert_eq!(
+            error_code(attempt(receipts, now_ms)),
+            error::Code::MissingChunks
+        );
+    }
+    assert!(attempt(receipts, NOW + 3_600_000).is_ok());
 }

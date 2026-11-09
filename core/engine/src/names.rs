@@ -8,6 +8,7 @@ use crate::casefold_data::CASE_FOLDING;
 
 pub const MAX_NAME_BYTES: usize = 255;
 const MAX_DEVICE_NAME_CHARS: usize = 32;
+const MAX_DEVICE_NAME_BYTES: usize = 128;
 
 /// Unicode default full case folding (CaseFolding.txt statuses C and F).
 pub fn casefold(text: &str) -> String {
@@ -32,6 +33,12 @@ pub fn name_key(name: &str) -> String {
     casefold(&name.nfd().collect::<String>()).nfd().collect()
 }
 
+/// RFC 0001 section 2: clients keep their local state in `.flarebox/` at the root of the synced
+/// folder, so no node may take that name, in any case or normalization, directly under the root.
+pub fn is_reserved_at_root(name: &str) -> bool {
+    name_key(name) == ".flarebox"
+}
+
 /// The NFC form of a valid node name, or `None` when the name is not allowed.
 pub fn normalize_name(name: &str) -> Option<String> {
     let name = nfc(name);
@@ -43,18 +50,24 @@ pub fn normalize_name(name: &str) -> Option<String> {
 }
 
 /// `<stem> (conflict from <device> <YYYY-MM-DD>)<ext>`, with ` <attempt>` before `)` from the second attempt on.
-/// The stem is shortened when the result would exceed 255 bytes once normalized to NFC; NFC can lengthen a
-/// name, for example by decomposing a composition exclusion such as U+0A5E in the device name.
+/// The device name is capped at 128 bytes after NFC, so the date and the attempt number always fit; then the
+/// stem, and after it the extension, is shortened when the result would exceed 255 bytes once normalized to
+/// NFC. NFC can lengthen a name, for example by decomposing a composition exclusion such as U+0A5E or
+/// U+1D160 in the device name, and without the cap it could push the attempt number out of the name.
 pub fn conflict_name(name: &str, device_name: &str, at_ms: i64, attempt: u32) -> String {
     let (stem, ext) = match name.rfind('.') {
         Some(dot) if dot > 0 => name.split_at(dot),
         _ => (name, ""),
     };
-    let device: String = device_name
+    let mut device: Vec<char> = device_name
         .chars()
         .filter(|&c| c != '/' && c != '\0')
         .take(MAX_DEVICE_NAME_CHARS)
         .collect();
+    while nfc(&device.iter().collect::<String>()).len() > MAX_DEVICE_NAME_BYTES {
+        device.pop();
+    }
+    let device: String = device.into_iter().collect();
     let device = if device.is_empty() {
         "unknown device"
     } else {

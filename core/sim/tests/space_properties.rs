@@ -170,7 +170,7 @@ fn run(actions: &[Action]) -> Vec<NodeState> {
             )
             .unwrap();
         let receipts = if plan.chunks[0].action == chunk_plan::Action::Upload as i32 {
-            vec![space.put_chunk(&c.chunks[0].hash, 3)]
+            vec![space.put_chunk(&c.chunks[0].hash, 3, NOW)]
         } else {
             vec![]
         };

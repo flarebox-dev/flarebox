@@ -30,6 +30,8 @@ pub const MAX_OPS: usize = 1000;
 pub const MAX_CHUNKS_PER_CALL: usize = 1000;
 pub const MAX_CHUNK_BYTES: u32 = 16 * 1024 * 1024;
 pub const INLINE_CHUNKS: u32 = 16_384;
+/// The largest commit log row: the encoded `CommitRecord` and `CommitResult` together.
+pub const MAX_COMMIT_ROW_BYTES: usize = 7_900_000;
 pub const PAGE_CHUNKS: usize = 4096;
 const GRANT_MS: i64 = 3_600_000;
 const PAGE_BYTES: usize = 1024 * 1024;
@@ -271,10 +273,14 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The token the reference relay returns for an upload. The real one is an HMAC; here it only has to
-/// be unforgeable by a test that does not call [`SpaceDo::put_chunk`].
-fn receipt_token(hash: &[u8], size: u32) -> String {
-    format!("receipt:{}:{size}", hex(hash))
+/// An upload receipt this space issued. The server's token is an HMAC over the space, hash, size and
+/// expiry (server/src/crypto.ts); here the token is an opaque handle to this record, so a receipt from
+/// another space, for another chunk or past its expiry is refused the same way.
+#[derive(Clone, Debug)]
+struct IssuedReceipt {
+    hash: Vec<u8>,
+    size: u32,
+    expires_at_ms: i64,
 }
 
 /// The outcome of [`SpaceDo::commit`]: the result for the committing device and, for a commit that was
@@ -292,6 +298,7 @@ pub struct SpaceDo {
     state: State,
     log: Vec<CommitRecord>,
     results: HashMap<String, CommitResult>,
+    receipts: HashMap<String, IssuedReceipt>,
     head_seq: u64,
     log_floor_seq: u64,
 }
@@ -330,6 +337,7 @@ impl SpaceDo {
             space_id,
             log: Vec::new(),
             results: HashMap::new(),
+            receipts: HashMap::new(),
             head_seq: 0,
             log_floor_seq: 0,
         }
@@ -436,7 +444,7 @@ impl SpaceDo {
                 None,
             ),
             Some(Call::GetVersionChunks(c)) => (self.version_chunks(c).map(R::VersionChunks), None),
-            Some(Call::ListVersions(c)) => (Ok(R::Versions(self.list_versions(c))), None),
+            Some(Call::ListVersions(c)) => (self.list_versions(c).map(R::Versions), None),
             Some(Call::ListTree(c)) => (Ok(R::Tree(self.list_tree(c))), None),
             Some(Call::ListTrash(c)) => (Ok(R::Trash(self.list_trash(c))), None),
             None => (
@@ -503,15 +511,22 @@ impl SpaceDo {
         }
 
         let mut referenced: Vec<&ChunkRef> = Vec::new();
-        let mut seen = BTreeSet::new();
+        let mut sizes: BTreeMap<&[u8], u32> = BTreeMap::new();
         for (index, op) in commit.ops.iter().enumerate() {
             check_ids(op, index)?;
             let Some(content) = op_content(op) else {
                 continue;
             };
             for chunk in &check_content(content)?.chunks {
-                if seen.insert(chunk.hash.as_slice()) {
-                    referenced.push(chunk);
+                match sizes.insert(chunk.hash.as_slice(), chunk.size) {
+                    None => referenced.push(chunk),
+                    Some(size) if size != chunk.size => {
+                        return Err(fail(
+                            error::Code::InvalidArgument,
+                            "one chunk hash is listed with two sizes",
+                        ));
+                    }
+                    Some(_) => {}
                 }
             }
         }
@@ -519,10 +534,12 @@ impl SpaceDo {
             .receipts
             .iter()
             .filter(|r| {
-                referenced
-                    .iter()
-                    .any(|c| c.hash == r.hash && c.size == r.size)
-                    && r.token == receipt_token(&r.hash, r.size)
+                sizes.get(r.hash.as_slice()) == Some(&r.size)
+                    && self.receipts.get(&r.token).is_some_and(|issued| {
+                        issued.hash == r.hash
+                            && issued.size == r.size
+                            && issued.expires_at_ms >= now_ms
+                    })
             })
             .map(|r| r.hash.as_slice())
             .collect();
@@ -562,7 +579,6 @@ impl SpaceDo {
             committer: session,
         };
         let (results, changes) = Applier::new(&mut state, ctx).apply(&commit.ops)?;
-        self.state = state;
         let record = CommitRecord {
             seq,
             commit_id: commit.commit_id.clone(),
@@ -576,6 +592,13 @@ impl SpaceDo {
             results,
             changes,
         };
+        if record.encoded_len() + result.encoded_len() > MAX_COMMIT_ROW_BYTES {
+            return Err(fail(
+                error::Code::LimitExceeded,
+                "the commit's change records are too large for one log entry; split the commit",
+            ));
+        }
+        self.state = state;
         self.log.push(record.clone());
         self.results
             .insert(commit.commit_id.clone(), result.clone());
@@ -600,12 +623,20 @@ impl SpaceDo {
             ));
         }
         request.chunks.iter().try_for_each(check_chunk_ref)?;
-        let mut seen = BTreeSet::new();
-        let chunks: Vec<&ChunkRef> = request
-            .chunks
-            .iter()
-            .filter(|c| seen.insert(c.hash.clone()))
-            .collect();
+        let mut sizes: BTreeMap<&[u8], u32> = BTreeMap::new();
+        let mut chunks: Vec<&ChunkRef> = Vec::new();
+        for chunk in &request.chunks {
+            match sizes.insert(chunk.hash.as_slice(), chunk.size) {
+                None => chunks.push(chunk),
+                Some(size) if size != chunk.size => {
+                    return Err(fail(
+                        error::Code::InvalidArgument,
+                        "one chunk hash is listed with two sizes",
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
         let mut chunk_rows = self.state.chunks.clone();
         let mut plans = Vec::with_capacity(chunks.len());
         for chunk in chunks {
@@ -651,12 +682,22 @@ impl SpaceDo {
         Ok(PrepareUploadResult { chunks: plans })
     }
 
-    /// The relay `PUT` of one chunk: stores it in the bucket and returns the receipt a commit presents.
-    pub fn put_chunk(&mut self, hash: &[u8], size: u32) -> UploadReceipt {
+    /// The relay `PUT` of one chunk at `now_ms`: stores it in the bucket and returns the receipt a
+    /// commit presents, valid for this space, chunk and size until `now_ms` plus one hour.
+    pub fn put_chunk(&mut self, hash: &[u8], size: u32, now_ms: i64) -> UploadReceipt {
+        let token = format!("receipt:{}:{}", self.space_id, self.receipts.len() + 1);
+        self.receipts.insert(
+            token.clone(),
+            IssuedReceipt {
+                hash: hash.to_vec(),
+                size,
+                expires_at_ms: now_ms + GRANT_MS,
+            },
+        );
         UploadReceipt {
             hash: hash.to_vec(),
             size,
-            token: receipt_token(hash, size),
+            token,
         }
     }
 
@@ -728,34 +769,50 @@ impl SpaceDo {
         })
     }
 
-    /// The retained versions of a node, newest first, paged by seq.
-    pub fn list_versions(&self, request: &ListVersions) -> VersionList {
+    /// The retained versions of a node, newest first by `(seq, version_id)`, with the server's
+    /// `<seq>/<version_id>` cursor, so versions written by one commit are never split or skipped.
+    pub fn list_versions(&self, request: &ListVersions) -> Result<VersionList, Error> {
         let limit = if request.limit == 0 {
             100
         } else {
             request.limit.min(1000)
         } as usize;
-        let before: u64 = request.cursor.parse().unwrap_or(u64::MAX);
+        let before: (u64, &str) = if request.cursor.is_empty() {
+            (u64::MAX, "")
+        } else {
+            let mut parts = request.cursor.split('/');
+            let seq = parts.next().unwrap_or_default();
+            let seq = if seq.is_empty() {
+                Some(0)
+            } else if seq.bytes().all(|b| b.is_ascii_digit()) {
+                seq.parse().ok()
+            } else {
+                None
+            };
+            let Some(seq) = seq else {
+                return Err(fail(error::Code::InvalidArgument, "malformed cursor"));
+            };
+            (seq, parts.next().unwrap_or_default())
+        };
         let mut found: Vec<&Version> = self
             .state
             .versions
             .values()
-            .filter(|v| v.node_id == request.node_id && v.seq < before)
+            .filter(|v| v.node_id == request.node_id && (v.seq, v.version_id.as_str()) < before)
             .collect();
-        found.sort_by_key(|v| std::cmp::Reverse(v.seq));
+        found.sort_by(|a, b| (b.seq, &b.version_id).cmp(&(a.seq, &a.version_id)));
         let page: Vec<&Version> = found.iter().take(limit).copied().collect();
-        let next_cursor = if found.len() > limit {
-            page.last().map(|v| v.seq.to_string()).unwrap_or_default()
-        } else {
-            String::new()
+        let next_cursor = match page.last() {
+            Some(last) if found.len() > limit => format!("{}/{}", last.seq, last.version_id),
+            _ => String::new(),
         };
-        VersionList {
+        Ok(VersionList {
             versions: page
                 .into_iter()
                 .map(|v| self.state.version_info(v))
                 .collect(),
             next_cursor,
-        }
+        })
     }
 
     fn node_page(
@@ -817,4 +874,69 @@ pub fn node_states(changes: &[ChangeRecord]) -> impl Iterator<Item = &NodeState>
         Some(flarebox_proto::v1::change_record::Change::Node(n)) => Some(n),
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use flarebox_engine::names::name_key;
+    use flarebox_proto::v1::{CreateDir, Delete, op_result};
+
+    use super::*;
+
+    /// A name stored before the `.flarebox` reservation is renamed when R8 brings it back to the root.
+    #[test]
+    fn r8_revival_renames_a_stored_reserved_root_name() {
+        let mut space = SpaceDo::new(1, 0);
+        let session = Session {
+            device_id: "dev-a".into(),
+            user_id: "user".into(),
+            device_name: "Laptop A".into(),
+            role: Role::Owner,
+            max_format: 1,
+        };
+        let mut ids = IdGen::new(2);
+        let root = space.space_id().to_string();
+        let (dir, child) = (ids.uuid_v7(1), ids.uuid_v7(1));
+        let mut commit = |space: &mut SpaceDo, op: op::Op| {
+            let commit = Commit {
+                commit_id: ids.uuid_v7(1),
+                base_seq: space.head_seq(),
+                ops: vec![Op { op: Some(op) }],
+                receipts: vec![],
+            };
+            space.commit(&session, 0, &commit).unwrap().result
+        };
+        commit(
+            &mut space,
+            op::Op::CreateDir(CreateDir {
+                node_id: dir.clone(),
+                parent_id: root,
+                name: "legacy".into(),
+            }),
+        );
+        commit(
+            &mut space,
+            op::Op::Delete(Delete {
+                node_id: dir.clone(),
+            }),
+        );
+        let stored = space.state.nodes.get_mut(&dir).unwrap();
+        stored.name = ".FlareBox".into();
+        stored.name_key = name_key(".FlareBox");
+
+        let result = commit(
+            &mut space,
+            op::Op::CreateDir(CreateDir {
+                node_id: child,
+                parent_id: dir.clone(),
+                name: "child".into(),
+            }),
+        );
+        assert_eq!(result.results[0].code(), op_result::Code::Applied);
+        let name = space.node(&dir).unwrap().name;
+        assert!(
+            name.starts_with(".FlareBox (conflict from Laptop A "),
+            "{name}"
+        );
+    }
 }
