@@ -294,18 +294,23 @@ fn js_number(text: &str) -> Option<f64> {
         return Some(0.0);
     }
     for (prefix, radix) in [("0x", 16), ("0o", 8), ("0b", 2)] {
-        if text.len() > 2 && text[..2].eq_ignore_ascii_case(prefix) {
-            let digits = &text[2..];
-            if !digits.chars().all(|c| c.is_digit(radix)) {
-                return None;
-            }
-            return Some(
-                digits
-                    .chars()
-                    .filter_map(|c| c.to_digit(radix))
-                    .fold(0.0, |n, d| n * f64::from(radix) + f64::from(d)),
-            );
+        let Some(digits) = text
+            .get(..2)
+            .filter(|head| head.eq_ignore_ascii_case(prefix))
+            .and(text.get(2..))
+            .filter(|digits| !digits.is_empty())
+        else {
+            continue;
+        };
+        if !digits.chars().all(|c| c.is_digit(radix)) {
+            return None;
         }
+        return Some(
+            digits
+                .chars()
+                .filter_map(|c| c.to_digit(radix))
+                .fold(0.0, |n, d| n * f64::from(radix) + f64::from(d)),
+        );
     }
     let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
     let decimal = unsigned.starts_with(|c: char| c.is_ascii_digit() || c == '.')

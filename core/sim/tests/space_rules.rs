@@ -1199,6 +1199,11 @@ fn version_cursors_follow_the_servers_number_parsing() {
         "-0x1/x",
         "1_0/x",
         "seven/x",
+        "\u{2603}/x",
+        "\u{2603}",
+        "0\u{2603}/x",
+        "1\u{2603}/x",
+        "0x\u{2603}/x",
     ] {
         assert_eq!(
             s.space.list_versions(&request(cursor)).unwrap_err().code(),
