@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+reviews:
+  auto_review:
+    auto_pause_after_reviewed_commits: 0
