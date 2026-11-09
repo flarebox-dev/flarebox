@@ -406,6 +406,15 @@ pub struct Commit {
     pub ops: ::prost::alloc::vec::Vec<Op>,
     #[prost(message, repeated, tag="4")]
     pub receipts: ::prost::alloc::vec::Vec<UploadReceipt>,
+    /// The history the commit was built in. A commit for another history is refused with CODE_HISTORY_MISMATCH.
+    #[prost(string, tag="5")]
+    pub history_id: ::prost::alloc::string::String,
+    /// This device's commit slot: one more than its highest accepted device_seq. A retry keeps it.
+    #[prost(uint64, tag="6")]
+    pub device_seq: u64,
+    /// When true, the commit is refused with CODE_HEAD_MOVED unless head_seq equals base_seq.
+    #[prost(bool, tag="7")]
+    pub require_head: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OpResult {
@@ -502,6 +511,14 @@ pub mod error {
         RetryLater = 8,
         UnsupportedVersion = 9,
         Internal = 10,
+        /// The commit's history_id is not the space's current history.
+        HistoryMismatch = 11,
+        /// An unknown commit whose device_seq is at or below the device's highest accepted one.
+        StaleDeviceState = 12,
+        /// A commit with require_head whose base_seq is below head_seq.
+        HeadMoved = 13,
+        /// The commit's base_seq is above head_seq in the same history: the server is behind what the client saw.
+        AheadOfServer = 14,
     }
     impl Code {
         /// String value of the enum field names used in the ProtoBuf definition.
@@ -521,6 +538,10 @@ pub mod error {
                 Self::RetryLater => "CODE_RETRY_LATER",
                 Self::UnsupportedVersion => "CODE_UNSUPPORTED_VERSION",
                 Self::Internal => "CODE_INTERNAL",
+                Self::HistoryMismatch => "CODE_HISTORY_MISMATCH",
+                Self::StaleDeviceState => "CODE_STALE_DEVICE_STATE",
+                Self::HeadMoved => "CODE_HEAD_MOVED",
+                Self::AheadOfServer => "CODE_AHEAD_OF_SERVER",
             }
         }
         /// Creates an enum from field names used in the ProtoBuf definition.
@@ -537,6 +558,10 @@ pub mod error {
                 "CODE_RETRY_LATER" => Some(Self::RetryLater),
                 "CODE_UNSUPPORTED_VERSION" => Some(Self::UnsupportedVersion),
                 "CODE_INTERNAL" => Some(Self::Internal),
+                "CODE_HISTORY_MISMATCH" => Some(Self::HistoryMismatch),
+                "CODE_STALE_DEVICE_STATE" => Some(Self::StaleDeviceState),
+                "CODE_HEAD_MOVED" => Some(Self::HeadMoved),
+                "CODE_AHEAD_OF_SERVER" => Some(Self::AheadOfServer),
                 _ => None,
             }
         }
@@ -788,6 +813,9 @@ pub struct Welcome {
     /// Newest known server release, empty when unknown or current.
     #[prost(string, tag="9")]
     pub latest_release: ::prost::alloc::string::String,
+    /// The highest device_seq the server accepted from this device in the current history, 0 if none.
+    #[prost(uint64, tag="10")]
+    pub device_seq: u64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Resume {
@@ -875,6 +903,12 @@ pub struct Reauth {
 pub struct ResyncRequired {
     #[prost(enumeration="resync_required::Reason", tag="1")]
     pub reason: i32,
+    /// With REASON_HISTORY_CHANGED, when the current history began with a rewind: the head_seq right after the rewind
+    /// and the point in time it restored, in Unix milliseconds. Both 0 otherwise.
+    #[prost(uint64, tag="2")]
+    pub restore_seq: u64,
+    #[prost(int64, tag="3")]
+    pub restore_point_ms: i64,
 }
 /// Nested message and enum types in `ResyncRequired`.
 pub mod resync_required {
