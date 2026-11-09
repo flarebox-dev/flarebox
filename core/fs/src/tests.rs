@@ -346,6 +346,40 @@ fn sibling_recreated_after_its_parent_was_listed_publishes_no_removal() {
     }
 }
 
+/// The scans of a poll found an unreadable folder and nothing else happened,
+/// so the poll ends on its timeout. It must still report the folder.
+#[test]
+fn idle_native_poll_reports_an_unreadable_folder() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let locked = root.join("d/locked");
+    fs::create_dir_all(&locked).unwrap();
+    fs::write(locked.join("x"), "x").unwrap();
+    let snapshot = Snapshot::scan(root).unwrap();
+    let mut watcher = NativeWatcher::start(root, snapshot).unwrap();
+    let watched = watcher.root.clone();
+    watcher.watcher.unwatch(&watched).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let denied = fs::symlink_metadata(locked.join("x")).is_err();
+
+    let first = watcher.poll(Duration::from_millis(200));
+    let second = watcher.poll(Duration::from_millis(200));
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    if !denied {
+        return;
+    }
+    assert_eq!(
+        first.unwrap(),
+        Poll {
+            unreadable: vec![PathBuf::from("d/locked")],
+            ..Poll::default()
+        }
+    );
+    assert_eq!(second.unwrap(), Poll::default());
+}
+
 fn wait_for(watcher: &mut NativeWatcher, expected: &[Change]) -> Vec<Change> {
     let deadline = Instant::now() + WAIT;
     let mut seen = Vec::new();

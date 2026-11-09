@@ -960,6 +960,10 @@ pub struct NativeWatcher {
     snapshot: Snapshot,
     dirty: BTreeSet<PathBuf>,
     unreadable: BTreeSet<PathBuf>,
+    /// Folders a scan could not read that no scan has read since. Their
+    /// subfolders may be unwatched, so they are registered again once readable.
+    #[cfg(target_os = "linux")]
+    blocked: BTreeSet<PathBuf>,
     rewatch: bool,
     failed: Option<Error>,
     sender: mpsc::Sender<notify::Result<notify::Event>>,
@@ -982,6 +986,8 @@ impl NativeWatcher {
             snapshot: previous,
             dirty: BTreeSet::from([PathBuf::new()]),
             unreadable: BTreeSet::new(),
+            #[cfg(target_os = "linux")]
+            blocked: BTreeSet::new(),
             rewatch: false,
             failed: None,
             sender,
@@ -1018,10 +1024,29 @@ impl NativeWatcher {
         }
     }
 
-    /// Registers watches on the folders the changes created or moved, then
-    /// rescans them, so anything written before the watch existed is seen.
+    /// Records the folders a rescan of `scopes` could not read, and returns
+    /// the blocked folders it read again.
     #[cfg(target_os = "linux")]
-    fn cover(&mut self, changes: &[Change]) -> Vec<Change> {
+    fn unblock(&mut self, scopes: &[PathBuf], unreadable: &[PathBuf]) -> Vec<PathBuf> {
+        let readable: Vec<PathBuf> = self
+            .blocked
+            .iter()
+            .filter(|blocked| scopes.iter().any(|scope| blocked.starts_with(scope)))
+            .filter(|blocked| !unreadable.iter().any(|path| blocked.starts_with(path)))
+            .cloned()
+            .collect();
+        for path in &readable {
+            self.blocked.remove(path);
+        }
+        self.blocked.extend(unreadable.iter().cloned());
+        readable
+    }
+
+    /// Registers watches on the folders the changes created or moved, and on
+    /// the blocked folders that became `readable`, then rescans them, so
+    /// anything written before the watch existed is seen.
+    #[cfg(target_os = "linux")]
+    fn cover(&mut self, changes: &[Change], readable: Vec<PathBuf>) -> Vec<Change> {
         let dirs = outermost(
             changes
                 .iter()
@@ -1037,6 +1062,7 @@ impl NativeWatcher {
                     } => Some(path.clone()),
                     _ => None,
                 })
+                .chain(readable)
                 .collect(),
         );
         if dirs.is_empty() {
@@ -1048,7 +1074,7 @@ impl NativeWatcher {
         }
         for dir in &dirs {
             let path = self.root.join(dir);
-            if let Err(err) = self.watcher.watch(&path, RecursiveMode::Recursive) {
+            if let Err(err) = watch_tree(&mut self.watcher, &path) {
                 let still_a_dir = std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir());
                 if still_a_dir {
                     self.failed = Some(watch_error(err));
@@ -1058,6 +1084,7 @@ impl NativeWatcher {
         match self.snapshot.rescan(&self.root, dirs.iter().cloned()) {
             Ok(rescan) => {
                 self.dirty.extend(rescan.unsettled);
+                self.blocked.extend(rescan.unreadable.iter().cloned());
                 self.unreadable.extend(rescan.unreadable);
                 rescan.changes
             }
@@ -1090,10 +1117,35 @@ fn watch_root(
     sender: &mpsc::Sender<notify::Result<notify::Event>>,
 ) -> Result<RecommendedWatcher> {
     let mut watcher = notify::recommended_watcher(sender.clone()).map_err(watch_error)?;
-    watcher
-        .watch(root, RecursiveMode::Recursive)
-        .map_err(watch_error)?;
+    watch_tree(&mut watcher, root).map_err(watch_error)?;
     Ok(watcher)
+}
+
+/// Registers `path` and every folder below it that may be watched. The
+/// platform's recursive registration stops at the first folder it may not
+/// watch, so after a permission error the readable folders are registered one
+/// at a time. A folder that may not be read is left to the scans, which report
+/// it as unreadable.
+fn watch_tree(watcher: &mut RecommendedWatcher, path: &Path) -> notify::Result<()> {
+    let refused =
+        |err: &notify::Error| matches!(&err.kind, notify::ErrorKind::Io(err) if denied(err));
+    match watcher.watch(path, RecursiveMode::Recursive) {
+        Err(err) if refused(&err) => {}
+        other => return other,
+    }
+    match watcher.watch(path, RecursiveMode::NonRecursive) {
+        Err(err) if refused(&err) => return Ok(()),
+        other => other?,
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            watch_tree(watcher, &entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 impl Watcher for NativeWatcher {
@@ -1106,7 +1158,7 @@ impl Watcher for NativeWatcher {
             if self.dirty.is_empty() {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if !self.receive(left)? {
-                    return Ok(Poll::default());
+                    return Ok(self.report(Vec::new()));
                 }
             }
             let settle_until = Instant::now() + MAX_SETTLE;
@@ -1115,19 +1167,22 @@ impl Watcher for NativeWatcher {
                 self.watcher = watch_root(&self.root, &self.sender)?;
                 self.rewatch = false;
             }
-            let rescan = match self.snapshot.rescan(&self.root, self.dirty.iter().cloned()) {
+            let scopes: Vec<PathBuf> = self.dirty.iter().cloned().collect();
+            let rescan = match self.snapshot.rescan(&self.root, scopes.iter().cloned()) {
                 Ok(rescan) => rescan,
                 Err(Error::Changed) if Instant::now() < deadline => continue,
                 Err(Error::Changed) => return Ok(self.report(Vec::new())),
                 Err(err) => return Err(err),
             };
             self.dirty = rescan.unsettled.into_iter().collect();
+            #[cfg(target_os = "linux")]
+            let readable = self.unblock(&scopes, &rescan.unreadable);
             self.unreadable.extend(rescan.unreadable);
             let changes = rescan.changes;
             #[cfg(target_os = "linux")]
             let changes = {
                 let mut changes = changes;
-                let more = self.cover(&changes);
+                let more = self.cover(&changes, readable);
                 changes.extend(more);
                 changes
             };

@@ -423,3 +423,65 @@ fn unreadable_folder_is_kept_and_reported() {
         assert_eq!(snapshot, Snapshot::scan(root).unwrap(), "{mode:o}");
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_watcher_starts_beside_an_unreadable_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("d/locked/inner")).unwrap();
+    fs::create_dir(root.join("e")).unwrap();
+    let snapshot = Snapshot::scan(root).unwrap();
+    fs::set_permissions(root.join("d/locked"), fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(root.join("d/locked")).is_ok() {
+        fs::set_permissions(root.join("d/locked"), fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let watcher = NativeWatcher::start(root, snapshot);
+    let result = watcher.map(|mut watcher| {
+        let first = watcher.poll(Duration::from_millis(300)).unwrap();
+        fs::write(root.join("e/new.txt"), "new").unwrap();
+        expect(&mut watcher, &[created("e/new.txt", File)]);
+        first
+    });
+    fs::set_permissions(root.join("d/locked"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        result.unwrap(),
+        Poll {
+            unreadable: vec![PathBuf::from("d/locked")],
+            ..Poll::default()
+        }
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn folder_readable_again_is_watched_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let locked = root.join("d/locked");
+    fs::create_dir_all(locked.join("inner")).unwrap();
+    let snapshot = Snapshot::scan(root).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o600)).unwrap();
+    if fs::symlink_metadata(locked.join("inner")).is_ok() {
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let mut watcher = NativeWatcher::start(root, snapshot).unwrap();
+    assert_eq!(
+        watcher.poll(Duration::from_millis(300)).unwrap(),
+        Poll {
+            unreadable: vec![PathBuf::from("d/locked")],
+            ..Poll::default()
+        }
+    );
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    let quiet = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < quiet {
+        watcher.poll(Duration::from_millis(300)).unwrap();
+    }
+    fs::write(locked.join("inner/new.txt"), "new").unwrap();
+    expect(&mut watcher, &[created("d/locked/inner/new.txt", File)]);
+}
