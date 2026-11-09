@@ -10,7 +10,9 @@ Flarebox is licensed under two licenses, by directory:
 
 Source files carry an SPDX-License-Identifier header naming their
 license. Code generated from spec/ into server/src/gen/ is Apache-2.0,
-which may be combined with the AGPL-3.0-or-later server.
+which may be combined with the AGPL-3.0-or-later server; this exception
+and the Apache-2.0 text are also in server/LICENSE-APACHE-2.0, so they
+stay with server/ when it is copied on its own.
 
 --------------------------------------------------------------------------
 
