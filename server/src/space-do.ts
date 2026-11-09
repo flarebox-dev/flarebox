@@ -4,10 +4,21 @@ import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { DurableObject } from "cloudflare:workers";
 import { type Commit, type CommitResult, CommitResultSchema, type Op } from "./gen/flarebox/v1/commit_pb";
 import {
+  CaughtUpSchema,
+  ChangesSchema,
+  ClientMessageSchema,
+  GoodbyeSchema,
+  type Hello,
+  type Resume,
+  ResyncRequired_Reason,
+  ResyncRequiredSchema,
   type RpcRequest,
   type RpcResponse,
   RpcRequestSchema,
   RpcResponseSchema,
+  type ServerMessage,
+  ServerMessageSchema,
+  WelcomeSchema,
 } from "./gen/flarebox/v1/messages_pb";
 import {
   type ChangeRecord,
@@ -39,6 +50,7 @@ import {
   VersionChunksSchema,
   VersionListSchema,
 } from "./gen/flarebox/v1/rpc_pb";
+import { type Identity, verifyAccessToken } from "./auth";
 import { sha256, signChunkGrant, verifyChunkGrant } from "./crypto";
 import { isUuidV7, toHex, uuidv7 } from "./ids";
 import { type ApplyContext, CallFailure, CommitApplier } from "./space/commit";
@@ -59,6 +71,7 @@ import {
   versionInfo,
   versionPageCount,
 } from "./space/store";
+import { PROTO_MAX, PROTO_MIN, SERVER_VERSION } from "./version";
 
 export const FORMAT_VERSION = 1;
 const HOUR_MS = 3_600_000;
@@ -78,6 +91,30 @@ const GC_RETRY_MS = 10 * 60_000;
 const R2_DELETE_BATCH = 1000;
 
 export type Role = "owner" | "editor" | "viewer";
+
+/** Header the Worker sets on the WebSocket upgrade it forwards: JSON of {@link Connect}. */
+export const CONNECT_HEADER = "X-Flarebox-Connect";
+/** How long past its access token's expiry a connection may stay open (spec v0 section 7.1). */
+export const TOKEN_GRACE_MS = 60_000;
+
+/** WebSocket close codes. */
+export const Close = { PROTOCOL: 4000, TOKEN_EXPIRED: 4001, UNSUPPORTED_VERSION: 4002, DEVICE_REVOKED: 4003 } as const;
+
+export interface Connect {
+  identity: Identity;
+  origin: string;
+}
+
+/** Per-connection state kept in the WebSocket attachment so it survives hibernation. */
+interface Attachment {
+  connId: string;
+  identity: Identity;
+  origin: string;
+  role: Role;
+  maxFormat: number;
+  hello: boolean;
+  live: boolean;
+}
 
 /** Who is calling, as established by the Worker from the access token and by the WebSocket Hello. */
 export interface Session {
@@ -174,6 +211,7 @@ export class SpaceDO extends DurableObject<Env> {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     ctx.storage.transactionSync(() => migrate(this.sql));
+    ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
 
   /** Creates the space on first call; later calls with the same id do nothing. */
@@ -208,6 +246,182 @@ export class SpaceDO extends DurableObject<Env> {
     return toBinary(RpcResponseSchema, response);
   }
 
+  /** The HTTP RPC path: the role comes from the member list, the format from the device's last Hello. */
+  async httpRpc(connect: Connect, request: Uint8Array): Promise<Uint8Array> {
+    const req = fromBinary(RpcRequestSchema, request);
+    const role = this.memberRole(connect.identity.userId);
+    if (!role) {
+      const error = create(ErrorSchema, { code: Error_Code.FORBIDDEN, message: "not a member of this space" });
+      return toBinary(RpcResponseSchema, create(RpcResponseSchema, { reqId: req.reqId, result: { case: "error", value: error } }));
+    }
+    const device = this.sql.exec("SELECT max_format FROM devices WHERE device_id = ?", connect.identity.deviceId).toArray()[0];
+    const session = this.sessionOf(connect, role, device ? Number(device.max_format) : FORMAT_VERSION);
+    const { response, record } = await this.call(session, req);
+    if (record) this.broadcast(record);
+    return toBinary(RpcResponseSchema, response);
+  }
+
+  /** Accepts a WebSocket upgrade forwarded by the Worker after it checked the access token. */
+  override async fetch(request: Request): Promise<Response> {
+    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return new Response("expected a WebSocket upgrade", { status: 426 });
+    const connect = JSON.parse(request.headers.get(CONNECT_HEADER) ?? "null") as Connect | null;
+    if (!connect) return new Response("missing identity", { status: 401 });
+    const role = this.memberRole(connect.identity.userId);
+    if (!role) return new Response("not a member of this space", { status: 403 });
+    const [client, server] = Object.values(new WebSocketPair()) as [WebSocket, WebSocket];
+    this.ctx.acceptWebSocket(server, [connect.identity.deviceId]);
+    const attachment: Attachment = { connId: uuidv7(), identity: connect.identity, origin: connect.origin, role, maxFormat: 0, hello: false, live: false };
+    server.serializeAttachment(attachment);
+    await this.scheduleTokenSweep(connect.identity.expiresAtMs + TOKEN_GRACE_MS);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    if (typeof message === "string") return;
+    const attachment = ws.deserializeAttachment() as Attachment;
+    if (Date.now() > attachment.identity.expiresAtMs + TOKEN_GRACE_MS) return this.goodbye(ws, Close.TOKEN_EXPIRED, "access token expired");
+    let msg;
+    try {
+      msg = fromBinary(ClientMessageSchema, new Uint8Array(message)).msg;
+    } catch {
+      return this.goodbye(ws, Close.PROTOCOL, "malformed ClientMessage");
+    }
+    if (msg.case === "hello") return this.hello(ws, attachment, msg.value);
+    if (msg.case === "reauth") return this.reauth(ws, attachment, msg.value.accessToken);
+    if (!attachment.hello) return this.goodbye(ws, Close.PROTOCOL, "Hello must come first");
+    if (msg.case === "resume") return this.resume(ws, attachment, msg.value);
+    if (msg.case === "rpc") {
+      const { response, record } = await this.call(this.sessionOf(attachment, attachment.role, attachment.maxFormat), msg.value);
+      this.send(ws, { case: "rpc", value: response });
+      if (record) this.broadcast(record, attachment.connId);
+      return;
+    }
+    return this.goodbye(ws, Close.PROTOCOL, "empty ClientMessage");
+  }
+
+  /** Closes every connection of a revoked device with 4003. */
+  async closeDevice(deviceId: string): Promise<void> {
+    for (const ws of this.ctx.getWebSockets(deviceId)) this.goodbye(ws, Close.DEVICE_REVOKED, "device revoked");
+  }
+
+  /** Closes connections whose access token expired more than a minute ago; returns when to check next. */
+  closeExpired(nowMs: number): number | undefined {
+    let next: number | undefined;
+    for (const ws of this.ctx.getWebSockets()) {
+      const deadline = (ws.deserializeAttachment() as Attachment).identity.expiresAtMs + TOKEN_GRACE_MS;
+      if (deadline < nowMs) this.goodbye(ws, Close.TOKEN_EXPIRED, "access token expired");
+      else next = Math.min(next ?? deadline, deadline);
+    }
+    return next;
+  }
+
+  private memberRole(userId: string): Role | undefined {
+    const row = this.sql.exec("SELECT role FROM members WHERE user_id = ?", userId).toArray()[0];
+    return row ? (String(row.role) as Role) : undefined;
+  }
+
+  private sessionOf(connect: Connect, role: Role, maxFormat: number): Session {
+    const { identity, origin } = connect;
+    return { deviceId: identity.deviceId, userId: identity.userId, deviceName: identity.deviceName, role, maxFormat, origin };
+  }
+
+  private send(ws: WebSocket, msg: ServerMessage["msg"]): void {
+    ws.send(toBinary(ServerMessageSchema, create(ServerMessageSchema, { msg })));
+  }
+
+  private goodbye(ws: WebSocket, code: number, reason: string): void {
+    try {
+      this.send(ws, { case: "goodbye", value: create(GoodbyeSchema, { code, reason }) });
+      ws.close(code, reason);
+    } catch {
+      // Already closed.
+    }
+  }
+
+  /** Pushes a new commit to every caught-up connection except the one that made it. */
+  private broadcast(record: CommitRecord, exceptConnId?: string): void {
+    const frame = toBinary(ServerMessageSchema, create(ServerMessageSchema, { msg: { case: "changes", value: { commits: [record] } } }));
+    for (const ws of this.ctx.getWebSockets()) {
+      const attachment = ws.deserializeAttachment() as Attachment;
+      if (attachment.live && attachment.connId !== exceptConnId) ws.send(frame);
+    }
+  }
+
+  private hello(ws: WebSocket, attachment: Attachment, hello: Hello): void {
+    const proto = Math.min(PROTO_MAX, hello.protoMax);
+    if (proto < Math.max(PROTO_MIN, hello.protoMin)) {
+      return this.goodbye(ws, Close.UNSUPPORTED_VERSION, "this server speaks protocol 1." + PROTO_MIN + " to 1." + PROTO_MAX);
+    }
+    attachment.hello = true;
+    attachment.maxFormat = hello.maxFormat;
+    ws.serializeAttachment(attachment);
+    const { identity } = attachment;
+    this.sql.exec(
+      `INSERT INTO devices (device_id, user_id, name, max_format, last_seen_ms) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (device_id) DO UPDATE SET name = excluded.name, max_format = excluded.max_format, last_seen_ms = excluded.last_seen_ms`,
+      identity.deviceId,
+      identity.userId,
+      identity.deviceName,
+      hello.maxFormat,
+      Date.now(),
+    );
+    const formatVersion = Number(getMeta(this.sql, "format_version"));
+    const welcome = create(WelcomeSchema, {
+      proto,
+      serverVersion: SERVER_VERSION,
+      formatVersion,
+      historyId: String(getMeta(this.sql, "history_id")),
+      headSeq: BigInt(this.headSeq),
+      logFloorSeq: BigInt(Number(getMeta(this.sql, "log_floor_seq"))),
+      readOnly: attachment.role === "viewer" || hello.maxFormat < formatVersion,
+    });
+    this.send(ws, { case: "welcome", value: welcome });
+  }
+
+  /** Sends every commit after since_seq, then CaughtUp, then marks the connection live (spec v0 section 7.3). */
+  private resume(ws: WebSocket, attachment: Attachment, resume: Resume): void {
+    const head = this.headSeq;
+    let reason: ResyncRequired_Reason | undefined;
+    if (resume.historyId !== getMeta(this.sql, "history_id")) reason = ResyncRequired_Reason.HISTORY_CHANGED;
+    else if (resume.sinceSeq > BigInt(head)) reason = ResyncRequired_Reason.AHEAD_OF_SERVER;
+    else if (resume.sinceSeq < BigInt(Number(getMeta(this.sql, "log_floor_seq")))) reason = ResyncRequired_Reason.LOG_TRUNCATED;
+    if (reason !== undefined) return this.send(ws, { case: "resyncRequired", value: create(ResyncRequiredSchema, { reason }) });
+
+    let batch: CommitRecord[] = [];
+    let bytes = 0;
+    const flush = () => {
+      if (batch.length > 0) this.send(ws, { case: "changes", value: create(ChangesSchema, { commits: batch }) });
+      batch = [];
+      bytes = 0;
+    };
+    for (const row of this.sql.exec("SELECT record FROM commits WHERE seq > ? ORDER BY seq", Number(resume.sinceSeq))) {
+      const record = new Uint8Array(row.record as ArrayBuffer);
+      if (bytes + record.length > PAGE_BYTES) flush();
+      batch.push(fromBinary(CommitRecordSchema, record));
+      bytes += record.length;
+    }
+    flush();
+    this.send(ws, { case: "caughtUp", value: create(CaughtUpSchema, { headSeq: BigInt(head) }) });
+    attachment.live = true;
+    ws.serializeAttachment(attachment);
+  }
+
+  private async reauth(ws: WebSocket, attachment: Attachment, token: string): Promise<void> {
+    const key = await this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName("account")).serverKey();
+    const identity = await verifyAccessToken(key, token, Date.now());
+    if (!identity || identity.deviceId !== attachment.identity.deviceId || identity.userId !== attachment.identity.userId) {
+      return this.goodbye(ws, Close.TOKEN_EXPIRED, "invalid access token");
+    }
+    const current = ws.deserializeAttachment() as Attachment;
+    current.identity = identity;
+    ws.serializeAttachment(current);
+    await this.scheduleTokenSweep(identity.expiresAtMs + TOKEN_GRACE_MS);
+  }
+
+  private async scheduleTokenSweep(dueMs: number): Promise<void> {
+    const current = this.sql.exec("SELECT due_ms FROM schedule WHERE task = 'tokens'").toArray()[0];
+    if (!current || Number(current.due_ms) > dueMs) await this.schedule("tokens", dueMs);
+  }
   /** Runs one RPC. A new commit also returns its CommitRecord so the caller can push it. */
   async call(session: Session, request: RpcRequest): Promise<{ response: RpcResponse; record?: CommitRecord }> {
     const reqId = request.reqId;
@@ -514,7 +728,7 @@ export class SpaceDO extends DurableObject<Env> {
   async collectGarbage(nowMs: number): Promise<GcReport> {
     const settings = this.settings();
     const spaceId = this.spaceId;
-    const { expiredVersions, purgedNodes } = this.ctx.storage.transactionSync(() => {
+    const purge = this.ctx.storage.transactionSync(() => {
       const expired = rows<VersionRow>(
         this.sql.exec(
           "SELECT * FROM versions WHERE superseded_at_ms IS NOT NULL AND superseded_at_ms < ? LIMIT ?",
@@ -545,13 +759,15 @@ export class SpaceDO extends DurableObject<Env> {
           changes.push(create(ChangeRecordSchema, { change: { case: "purged", value: create(NodePurgedSchema, { nodeId: node.node_id }) } }));
         }
       }
+      let record: CommitRecord | undefined;
       if (changes.length > 0) {
         const seq = BigInt(this.headSeq + 1);
-        const record = create(CommitRecordSchema, { seq, commitId: uuidv7(nowMs), committedAtMs: BigInt(nowMs), changes });
+        record = create(CommitRecordSchema, { seq, commitId: uuidv7(nowMs), committedAtMs: BigInt(nowMs), changes });
         this.appendCommit(record, create(CommitResultSchema, { seq, changes }));
       }
-      return { expiredVersions: expired.length, purgedNodes: changes.length };
+      return { expiredVersions: expired.length, purgedNodes: changes.length, record };
     });
+    if (purge.record) this.broadcast(purge.record);
 
     const marked = this.ctx.storage.transactionSync(() => {
       const hashes = this.sql
@@ -580,6 +796,7 @@ export class SpaceDO extends DurableObject<Env> {
       });
       deletedChunks += batch.length;
     }
+    const { expiredVersions, purgedNodes } = purge;
     return {
       expiredVersions,
       purgedNodes,
@@ -612,6 +829,11 @@ export class SpaceDO extends DurableObject<Env> {
           console.error("space gc failed", error);
         }
         this.sql.exec("UPDATE schedule SET due_ms = ? WHERE task = 'gc'", nextMs);
+      }
+      if (task === "tokens") {
+        const next = this.closeExpired(nowMs);
+        if (next === undefined) this.sql.exec("DELETE FROM schedule WHERE task = 'tokens'");
+        else this.sql.exec("UPDATE schedule SET due_ms = ? WHERE task = 'tokens'", next);
       }
     }
     await this.armAlarm();
