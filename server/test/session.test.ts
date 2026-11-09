@@ -321,6 +321,73 @@ describe("owner claim, pairing and tokens", () => {
     socket.send({ case: "reauth", value: { accessToken: phone.access!.token } });
     expect((await socket.waitClosed()).code).toBe(Close.DEVICE_REVOKED);
   });
+
+  it("refuses every socket message, a Commit included, once the Account DO revoked the device without a notice to the space", async () => {
+    const owner = await getOwner();
+    const watch = await pairDevice(owner, "Watch");
+    const spaceId = await createSpace(owner);
+    const stub = env.SPACE.get(env.SPACE.idFromName(spaceId));
+    const live = await Socket.connect(spaceId, watch);
+    await live.start();
+    const fresh = await Socket.connect(spaceId, watch);
+    await runInDurableObject(account(), (_instance, state) => {
+      state.storage.sql.exec("UPDATE devices SET revoked_at_ms = ? WHERE device_id = ?", Date.now(), watch.deviceId);
+    });
+    expect(await account().isDeviceActive(watch.deviceId)).toBe(false);
+
+    fresh.send({ case: "hello", value: { clientName: "test", clientVersion: "0", protoMin: 1, protoMax: 1, maxFormat: 1 } });
+    expect(await fresh.next()).toMatchObject({ case: "goodbye", value: { code: Close.DEVICE_REVOKED } });
+    live.send({ case: "rpc", value: { reqId: 1n, call: { case: "commit", value: { commitId: uuidv7(), baseSeq: 0n, ops: [op.mkdir(uuidv7(), spaceId, "after revocation")] } } } });
+    expect(await live.next()).toMatchObject({ case: "goodbye", value: { code: Close.DEVICE_REVOKED } });
+    expect((await live.waitClosed()).code).toBe(Close.DEVICE_REVOKED);
+
+    const stored = await runInDurableObject(stub, (_instance, state) => ({
+      commits: state.storage.sql.exec("SELECT commit_id FROM commits").toArray(),
+      revoked: state.storage.sql.exec("SELECT device_id FROM revoked_devices").toArray(),
+    }));
+    expect(stored).toEqual({ commits: [], revoked: [{ device_id: watch.deviceId }] });
+  });
+
+  it("refuses a revoked device in the Space DO itself after eviction, without the Worker's check in front", async () => {
+    const owner = await getOwner();
+    const tv = await pairDevice(owner, "TV");
+    const spaceId = await createSpace(owner);
+    const stub = env.SPACE.get(env.SPACE.idFromName(spaceId));
+    await stub.closeDevice(tv.deviceId);
+    await evictDurableObject(stub);
+    const identity = { userId: tv.userId, deviceId: tv.deviceId, deviceName: "TV", expiresAtMs: Date.now() + 900_000 };
+    const request = body(RpcRequestSchema, { reqId: 1n, call: { case: "commit", value: { commitId: uuidv7(), baseSeq: 0n, ops: [op.mkdir(uuidv7(), spaceId, "x")] } } });
+    const result = fromBinary(RpcResponseSchema, await stub.httpRpc({ identity, origin: BASE }, request)).result;
+    expect(result.case === "error" && result.value.code).toBe(Error_Code.UNAUTHENTICATED);
+    const commits = await runInDurableObject(stub, (_instance, state) => state.storage.sql.exec("SELECT seq FROM commits").toArray());
+    expect(commits).toEqual([]);
+  });
+
+  it("adds revoked_devices to a version-one Space database and keeps its data", async () => {
+    const owner = await getOwner();
+    const spaceId = await createSpace(owner);
+    const stub = env.SPACE.get(env.SPACE.idFromName(spaceId));
+    const socket = await Socket.connect(spaceId, owner);
+    await socket.start();
+    const dir = uuidv7();
+    await socket.commit(0n, [op.mkdir(dir, spaceId, "kept")]);
+    socket.ws.close(1000);
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec("DROP TABLE revoked_devices");
+      state.storage.sql.exec("UPDATE meta SET value = 1 WHERE key = 'schema_version'");
+    });
+    await evictDurableObject(stub);
+    const device = uuidv7();
+    await stub.closeDevice(device);
+    const after = await runInDurableObject(stub, (_instance, state) => ({
+      version: state.storage.sql.exec("SELECT value FROM meta WHERE key = 'schema_version'").one().value,
+      head: state.storage.sql.exec("SELECT value FROM meta WHERE key = 'head_seq'").one().value,
+      commits: state.storage.sql.exec("SELECT seq FROM commits").toArray(),
+      node: state.storage.sql.exec("SELECT name FROM nodes WHERE node_id = ?", dir).toArray(),
+      revoked: state.storage.sql.exec("SELECT device_id FROM revoked_devices").toArray(),
+    }));
+    expect(after).toEqual({ version: 2, head: 1, commits: [{ seq: 1 }], node: [{ name: "kept" }], revoked: [{ device_id: device }] });
+  });
 });
 
 describe("WebSocket session", () => {
@@ -332,7 +399,18 @@ describe("WebSocket session", () => {
   }
 
   it("rejects a commit whose change records do not fit in one 1 MiB message and keeps every frame under 1 MiB", async () => {
-    const { a, b, spaceId } = await twoDevices();
+    const { a, b, spaceId, stub } = await twoDevices();
+    const snapshot = () =>
+      runInDurableObject(stub, (_instance, state) => {
+        const all = (query: string) => state.storage.sql.exec(query).toArray();
+        return {
+          head: all("SELECT value FROM meta WHERE key = 'head_seq'"),
+          commits: all("SELECT seq FROM commits"),
+          nodes: all("SELECT node_id, name, status, meta_rev, content_rev FROM nodes ORDER BY node_id"),
+          versions: all("SELECT version_id FROM versions"),
+          chunks: all("SELECT hex(hash) AS hash, state, refcount FROM chunks ORDER BY hash"),
+        };
+      });
     const writer = await Socket.connect(spaceId, a);
     await writer.start();
     const reader = await Socket.connect(spaceId, b);
@@ -341,11 +419,13 @@ describe("WebSocket session", () => {
     const plan = await writer.rpc({ case: "prepareUpload", value: { chunks: [parts.content.chunks[0]!] } });
     expect(plan.case).toBe("prepareUpload");
     const receipts = await upload(spaceId, { content: { chunks: [parts.content.chunks[0]!] } as Content, bytes: [parts.bytes[0]!] });
+    const before = await snapshot();
     const both = await writer.rpc({
       case: "commit",
       value: { commitId: uuidv7(), baseSeq: 0n, ops: [op.create(uuidv7(), spaceId, "one", parts.content), op.create(uuidv7(), spaceId, "two", parts.content)], receipts },
     });
     expect(both.case === "error" && both.value.code).toBe(Error_Code.LIMIT_EXCEEDED);
+    expect(await snapshot()).toEqual(before);
 
     const frameSize = (msg: MessageInitShape<typeof ServerMessageSchema>["msg"]) => toBinary(ServerMessageSchema, create(ServerMessageSchema, { msg })).length;
     for (const name of ["one", "two"]) {
@@ -374,6 +454,68 @@ describe("WebSocket session", () => {
     expect(await over.waitClosed()).toMatchObject({ code: Close.PROTOCOL, reason: "message larger than 8 MiB" });
     const rpc = await call("/v1/spaces/" + spaceId + "/rpc", { token: a.access!.token, body: new Uint8Array(8 * 1024 * 1024 + 1) }, RpcResponseSchema);
     expect(rpc.status).toBe(413);
+  });
+
+  it("pages ListVersions, ListTree and ListTrash so that no reply exceeds 1 MiB over HTTP or WebSocket", async () => {
+    const { a, spaceId } = await twoDevices();
+    const writer = await Socket.connect(spaceId, a);
+    await writer.start();
+    const parts = await content(...Array.from({ length: 16_000 }, () => "x"));
+    const single = { content: { chunks: [parts.content.chunks[0]!] } as Content, bytes: [parts.bytes[0]!] };
+    expect((await writer.rpc({ case: "prepareUpload", value: { chunks: single.content.chunks } })).case).toBe("prepareUpload");
+    const receipts = await upload(spaceId, single);
+    const [one, two] = [uuidv7(), uuidv7()];
+    await writer.commit(0n, [op.create(one, spaceId, "one", parts.content)], receipts);
+    await writer.commit(1n, [op.update(one, parts.content)], receipts);
+    await writer.commit(2n, [op.create(two, spaceId, "two", parts.content)], receipts);
+    const frame = (result: MessageInitShape<typeof RpcResponseSchema>["result"]) =>
+      toBinary(ServerMessageSchema, create(ServerMessageSchema, { msg: { case: "rpc", value: { reqId: 1n, result } } })).length;
+
+    const pages = async (request: (cursor: string) => MessageInitShape<typeof RpcRequestSchema>["call"]) => {
+      const seen: { http: number; socket: number; items: number }[] = [];
+      for (let cursor = "", first = true; first || cursor !== ""; first = false) {
+        const http = await exports.default.fetch(BASE + "/v1/spaces/" + spaceId + "/rpc", {
+          method: "POST",
+          headers: { Authorization: "Bearer " + a.access!.token },
+          body: body(RpcRequestSchema, { reqId: 1n, call: request(cursor) }),
+        });
+        const httpBytes = new Uint8Array(await http.arrayBuffer());
+        const result = await writer.rpc(request(cursor));
+        expect(fromBinary(RpcResponseSchema, httpBytes).result.case).toBe(result.case);
+        if (result.case !== "versions" && result.case !== "tree" && result.case !== "trash") throw new Error("unexpected " + result.case);
+        const items = result.case === "versions" ? result.value.versions.length : result.value.nodes.length;
+        seen.push({ http: httpBytes.length, socket: frame(result), items });
+        cursor = result.value.nextCursor;
+      }
+      return seen;
+    };
+    const versions = await pages((cursor) => ({ case: "listVersions", value: { nodeId: one, cursor } }));
+    expect(versions.map((p) => p.items)).toEqual([1, 1]);
+    const tree = await pages((cursor) => ({ case: "listTree", value: { cursor } }));
+    expect(tree.reduce((sum, p) => sum + p.items, 0)).toBe(3);
+    expect(tree.length).toBeGreaterThan(1);
+    await writer.commit(3n, [op.delete(one)]);
+    await writer.commit(4n, [op.delete(two)]);
+    const trash = await pages((cursor) => ({ case: "listTrash", value: { cursor } }));
+    expect(trash.reduce((sum, p) => sum + p.items, 0)).toBe(2);
+    for (const page of [...versions, ...tree, ...trash]) {
+      expect(page.http).toBeLessThanOrEqual(1024 * 1024);
+      expect(page.socket).toBeLessThanOrEqual(1024 * 1024);
+    }
+  });
+
+  it("closes a connection on any text message except ping, an oversized one included", async () => {
+    const { a, spaceId } = await twoDevices();
+    const big = await Socket.connect(spaceId, a);
+    big.ws.send("ping");
+    expect(await big.text()).toBe("pong");
+    big.ws.send("x".repeat(8 * 1024 * 1024 + 1));
+    big.send({ case: "hello", value: { clientName: "test", clientVersion: "0", protoMin: 1, protoMax: 1, maxFormat: 1 } });
+    expect(await big.next()).toMatchObject({ case: "goodbye", value: { code: Close.PROTOCOL } });
+    expect((await big.waitClosed()).code).toBe(Close.PROTOCOL);
+    const small = await Socket.connect(spaceId, a);
+    small.ws.send("hello");
+    expect((await small.waitClosed()).code).toBe(Close.PROTOCOL);
   });
 
   it("lets two devices commit and receive each other's changes", async () => {

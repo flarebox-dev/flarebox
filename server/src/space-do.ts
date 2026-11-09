@@ -29,6 +29,7 @@ import {
   type Content,
   NodePurgedSchema,
   NodeStateSchema,
+  VersionInfoSchema,
 } from "./gen/flarebox/v1/model_pb";
 import {
   ChunkPlan_Action,
@@ -88,7 +89,8 @@ const MAX_SERVER_FRAME = 1024 * 1024;
 export const MAX_CLIENT_FRAME = 8 * 1024 * 1024;
 const MAX_REQ_ID = 2n ** 64n - 1n;
 const RETRY_LATER_MS = 60_000;
-const PAGE_BYTES = 1024 * 1024;
+/** Room for the ServerMessage, RpcResponse and page fields around a page's items: tags, lengths, req_id, cursor and head_seq. */
+const PAGE_ENVELOPE_BYTES = 1024;
 const GC_BATCH = 1000;
 const GC_RETRY_MS = 10 * 60_000;
 const R2_DELETE_BATCH = 1000;
@@ -203,6 +205,30 @@ function opContent(op: Op): Content | undefined | null {
   return null;
 }
 
+/** Wraps a non-commit result, refusing it if its WebSocket frame would exceed 1 MiB. Commit replies are bounded when stored. */
+function reply(reqId: bigint, result: RpcResponse["result"]): { response: RpcResponse } {
+  const response = create(RpcResponseSchema, { reqId, result });
+  const frame = toBinary(ServerMessageSchema, create(ServerMessageSchema, { msg: { case: "rpc", value: response } }));
+  if (frame.length > MAX_SERVER_FRAME) fail(Error_Code.LIMIT_EXCEEDED, "the reply does not fit in one 1 MiB message");
+  return { response };
+}
+
+/**
+ * Takes items from the front while a page of them fits in one 1 MiB ServerMessage, counting each item's field tag and
+ * length prefix and leaving room for the envelope. The first item is always taken; the commit size limit keeps it small enough.
+ */
+function fitPage<R, T>(rows: R[], build: (row: R) => T, encodedSize: (item: T) => number): T[] {
+  const page: T[] = [];
+  let bytes = PAGE_ENVELOPE_BYTES;
+  for (const row of rows) {
+    const item = build(row);
+    bytes += encodedSize(item) + 6;
+    if (page.length > 0 && bytes > MAX_SERVER_FRAME) break;
+    page.push(item);
+  }
+  return page;
+}
+
 /** One per space: tree, versions, chunks and the commit log. */
 export class SpaceDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
@@ -283,11 +309,13 @@ export class SpaceDO extends DurableObject<Env> {
   }
 
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
-    if (typeof message === "string") return;
+    if (ws.readyState !== WebSocket.OPEN) return;
+    if (typeof message === "string") return this.goodbye(ws, Close.PROTOCOL, "text messages other than ping are not supported");
     if (message.byteLength > MAX_CLIENT_FRAME) return this.goodbye(ws, Close.PROTOCOL, "message larger than 8 MiB");
     const attachment = ws.deserializeAttachment() as Attachment;
-    if (this.revoked(attachment.identity.deviceId)) return this.goodbye(ws, Close.DEVICE_REVOKED, "device revoked");
     if (this.clock() > attachment.identity.expiresAtMs + TOKEN_GRACE_MS) return this.goodbye(ws, Close.TOKEN_EXPIRED, "access token expired");
+    if (!(await this.deviceActive(attachment.identity.deviceId))) return this.goodbye(ws, Close.DEVICE_REVOKED, "device revoked");
+    if (ws.readyState !== WebSocket.OPEN) return;
     let msg;
     try {
       msg = fromBinary(ClientMessageSchema, new Uint8Array(message)).msg;
@@ -309,12 +337,28 @@ export class SpaceDO extends DurableObject<Env> {
 
   /** Closes every connection of a revoked device with 4003. */
   async closeDevice(deviceId: string): Promise<void> {
-    this.sql.exec("INSERT INTO revoked_devices (device_id, revoked_at_ms) VALUES (?, ?) ON CONFLICT DO NOTHING", deviceId, Date.now());
+    this.recordRevoked(deviceId);
     for (const ws of this.ctx.getWebSockets(deviceId)) this.goodbye(ws, Close.DEVICE_REVOKED, "device revoked");
+  }
+
+  private recordRevoked(deviceId: string): void {
+    this.sql.exec("INSERT INTO revoked_devices (device_id, revoked_at_ms) VALUES (?, ?) ON CONFLICT DO NOTHING", deviceId, Date.now());
   }
 
   private revoked(deviceId: string): boolean {
     return this.sql.exec("SELECT 1 FROM revoked_devices WHERE device_id = ?", deviceId).toArray().length > 0;
+  }
+
+  /**
+   * Asks the Account DO whether the device is still active, so a revocation stops the device even before its notice
+   * reaches this space, and remembers a refusal. Other events wait, so messages of one connection keep their order.
+   */
+  private async deviceActive(deviceId: string): Promise<boolean> {
+    if (this.revoked(deviceId)) return false;
+    const account = this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName("account"));
+    const active = await this.ctx.blockConcurrencyWhile(() => account.isDeviceActive(deviceId));
+    if (!active) this.recordRevoked(deviceId);
+    return active;
   }
 
   /** Closes connections whose access token expired more than a minute ago; returns when to check next. */
@@ -338,7 +382,9 @@ export class SpaceDO extends DurableObject<Env> {
     return { deviceId: identity.deviceId, userId: identity.userId, deviceName: identity.deviceName, role, maxFormat, origin };
   }
 
+  /** Sends one ServerMessage; a socket this server already closed gets nothing. */
   private send(ws: WebSocket, msg: ServerMessage["msg"]): void {
+    if (ws.readyState !== WebSocket.OPEN) return;
     ws.send(toBinary(ServerMessageSchema, create(ServerMessageSchema, { msg })));
   }
 
@@ -356,7 +402,12 @@ export class SpaceDO extends DurableObject<Env> {
     const frame = toBinary(ServerMessageSchema, create(ServerMessageSchema, { msg: { case: "changes", value: { commits: [record] } } }));
     for (const ws of this.ctx.getWebSockets()) {
       const attachment = ws.deserializeAttachment() as Attachment;
-      if (attachment.live && attachment.connId !== exceptConnId) ws.send(frame);
+      if (!attachment.live || attachment.connId === exceptConnId) continue;
+      try {
+        ws.send(frame);
+      } catch {
+        // The socket is closing; the client catches up with Resume when it reconnects.
+      }
     }
   }
 
@@ -426,9 +477,7 @@ export class SpaceDO extends DurableObject<Env> {
     if (!identity || identity.deviceId !== attachment.identity.deviceId || identity.userId !== attachment.identity.userId) {
       return this.goodbye(ws, Close.TOKEN_EXPIRED, "invalid access token");
     }
-    if (!(await account.isDeviceActive(identity.deviceId)) || this.revoked(identity.deviceId)) {
-      return this.goodbye(ws, Close.DEVICE_REVOKED, "device revoked");
-    }
+    if (!(await this.deviceActive(identity.deviceId))) return this.goodbye(ws, Close.DEVICE_REVOKED, "device revoked");
     const current = ws.deserializeAttachment() as Attachment;
     current.identity = identity;
     ws.serializeAttachment(current);
@@ -450,17 +499,17 @@ export class SpaceDO extends DurableObject<Env> {
           return { response: create(RpcResponseSchema, { reqId, result: { case: "commit", value: result } }), record };
         }
         case "prepareUpload":
-          return { response: create(RpcResponseSchema, { reqId, result: { case: "prepareUpload", value: await this.prepareUpload(session, call.value) } }) };
+          return reply(reqId, { case: "prepareUpload", value: await this.prepareUpload(session, call.value) });
         case "getDownloadTargets":
-          return { response: create(RpcResponseSchema, { reqId, result: { case: "downloadTargets", value: await this.downloadTargets(session, call.value) } }) };
+          return reply(reqId, { case: "downloadTargets", value: await this.downloadTargets(session, call.value) });
         case "getVersionChunks":
-          return { response: create(RpcResponseSchema, { reqId, result: { case: "versionChunks", value: this.versionChunks(call.value) } }) };
+          return reply(reqId, { case: "versionChunks", value: this.versionChunks(call.value) });
         case "listVersions":
-          return { response: create(RpcResponseSchema, { reqId, result: { case: "versions", value: this.listVersions(call.value) } }) };
+          return reply(reqId, { case: "versions", value: this.listVersions(call.value) });
         case "listTree":
-          return { response: create(RpcResponseSchema, { reqId, result: { case: "tree", value: this.listTree(call.value) } }) };
+          return reply(reqId, { case: "tree", value: this.listTree(call.value) });
         case "listTrash":
-          return { response: create(RpcResponseSchema, { reqId, result: { case: "trash", value: this.listTrash(call.value) } }) };
+          return reply(reqId, { case: "trash", value: this.listTrash(call.value) });
         default:
           return fail(Error_Code.INVALID_ARGUMENT, "empty request");
       }
@@ -566,6 +615,7 @@ export class SpaceDO extends DurableObject<Env> {
     }
 
     return this.ctx.storage.transactionSync(() => {
+      if (this.revoked(session.deviceId)) fail(Error_Code.UNAUTHENTICATED, "device revoked");
       const again = this.storedResult(commit.commitId);
       if (again) return { result: again };
       const head = this.headSeq;
@@ -696,11 +746,11 @@ export class SpaceDO extends DurableObject<Env> {
         limit + 1,
       ),
     );
-    const page = found.slice(0, limit);
-    const last = page.at(-1);
+    const page = fitPage(found.slice(0, limit), (version) => versionInfo(this.sql, version), (info) => toBinary(VersionInfoSchema, info).length);
+    const last = found[page.length - 1];
     return create(VersionListSchema, {
-      versions: page.map((version) => versionInfo(this.sql, version)),
-      nextCursor: found.length > limit && last ? `${last.seq}/${last.version_id}` : "",
+      versions: page,
+      nextCursor: found.length > page.length && last ? `${last.seq}/${last.version_id}` : "",
     });
   }
 
@@ -709,14 +759,7 @@ export class SpaceDO extends DurableObject<Env> {
     const found = rows<NodeRow>(
       this.sql.exec("SELECT * FROM nodes WHERE status = ? AND node_id > ? ORDER BY node_id LIMIT ?", status, cursor, limit + 1),
     );
-    const nodes = [];
-    let bytes = 0;
-    for (const node of found.slice(0, limit)) {
-      const state = nodeState(this.sql, node);
-      bytes += toBinary(NodeStateSchema, state).length;
-      if (nodes.length > 0 && bytes > PAGE_BYTES) break;
-      nodes.push(state);
-    }
+    const nodes = fitPage(found.slice(0, limit), (node) => nodeState(this.sql, node), (state) => toBinary(NodeStateSchema, state).length);
     const more = nodes.length < found.length;
     return { nodes, nextCursor: more ? nodes.at(-1)!.nodeId : "" };
   }
