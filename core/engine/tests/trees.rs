@@ -423,10 +423,7 @@ fn apply(i: usize, s: &[Option<Shape>], change: &Change, out: &[Option<Shape>]) 
     };
     if shape.parent != ROOT {
         let parent: usize = shape.parent[1..].parse().unwrap();
-        if out[parent].is_none() {
-            return None;
-        }
-        if out[parent].as_ref().unwrap().kind != Kind::Dir {
+        if out[parent].as_ref()?.kind != Kind::Dir {
             shape.parent = ROOT.into();
         }
     }
