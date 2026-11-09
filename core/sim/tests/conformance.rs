@@ -108,6 +108,13 @@ fn self_tests(doc: &Value) -> Vec<(&'static str, Outcome)> {
             ),
         ),
         (
+            "a-field-for-the-other-branch-fails",
+            mutate(
+                &|s| s["steps"][0]["expect"]["missing"] = 123.into(),
+                "step 1: unknown field missing in expect",
+            ),
+        ),
+        (
             "a-wrong-numeric-assertion-fails",
             mutate(
                 &|s| s["steps"][0]["expect"]["seq"] = 999.into(),
@@ -205,6 +212,24 @@ fn check_doc(doc: &Value) -> Outcome {
     }
     req(opt_list(doc, "scenarios"), "scenarios")?;
     Ok(())
+}
+
+/// A call step's expectations. With `error` only the fields of the error branch apply, without it
+/// only those of the success branch, so a field for the other branch fails instead of being ignored.
+fn expectation<'a>(
+    step: &'a Value,
+    on_error: &[&str],
+    on_success: &[&str],
+) -> Result<&'a Value, String> {
+    let expect = step
+        .get("expect")
+        .ok_or("a call step needs expect, even if empty")?;
+    if opt_str(expect, "error")?.is_some() {
+        keys(expect, "an error expect", &[&["error"], on_error].concat())
+    } else {
+        keys(expect, "expect", on_success)
+    }?;
+    Ok(expect)
 }
 
 fn chunk_list(chunks: &[Value]) -> Result<Vec<ChunkRef>, String> {
@@ -572,8 +597,7 @@ impl Run {
             (None, Some(list)) => chunk_list(list)?,
             _ => return Err("prepare_upload needs exactly one of chunks and contents".into()),
         };
-        let expect = &step["expect"];
-        keys(expect, "expect", &["error", "actions"])?;
+        let expect = expectation(step, &[], &["actions"])?;
         let result = self.rpc(
             space,
             &session,
@@ -727,7 +751,13 @@ impl Run {
             Some(symbol) => self.id(space, symbol)?,
             None => self.ids.uuid_v7(self.now_ms as u64),
         };
-        let receipts = if opt_bool(body, "upload")? == Some(false) {
+        let upload = opt_bool(body, "upload")?.unwrap_or(true);
+        if upload
+            && (body.get("receipts_from").is_some() || body.get("receipt_size_delta").is_some())
+        {
+            return Err("receipts_from and receipt_size_delta apply only with upload false".into());
+        }
+        let receipts = if !upload {
             let from = opt_str(body, "receipts_from")?.unwrap_or(space).to_owned();
             let delta = opt_u64(body, "receipt_size_delta")?.unwrap_or(0) as u32;
             self.wallets
@@ -753,12 +783,7 @@ impl Run {
             ops,
             receipts,
         };
-        let expect = &step["expect"];
-        keys(
-            expect,
-            "expect",
-            &["error", "missing", "seq", "results", "changed"],
-        )?;
+        let expect = expectation(step, &["missing"], &["seq", "results", "changed"])?;
         let result = self.rpc(space, &session, at_ms, rpc_request::Call::Commit(commit))?;
         match (result, opt_str(expect, "error")?) {
             (rpc_response::Result::Error(e), Some(code)) => {
@@ -913,12 +938,7 @@ impl Run {
             cursor,
             limit: opt_u64(body, "limit")?.unwrap_or(0) as u32,
         };
-        let expect = &step["expect"];
-        keys(
-            expect,
-            "expect",
-            &["error", "count", "versions", "next_cursor"],
-        )?;
+        let expect = expectation(step, &[], &["count", "versions", "next_cursor"])?;
         let result = self.rpc(
             space,
             &session,
@@ -1041,7 +1061,11 @@ impl Run {
         let symbol = req(opt_str(want, "node"), "node")?;
         let id = self.known(space, symbol)?;
         let got: Option<NodeState> = self.space(space)?.node(&id);
-        if opt_bool(want, "absent")? == Some(true) {
+        if let Some(absent) = opt_bool(want, "absent")? {
+            if !absent {
+                return Err(format!("{symbol}: absent may only be true"));
+            }
+            keys(want, "an absent node", &["node", "absent"])?;
             return match got {
                 None => Ok(()),
                 Some(_) => Err(format!("{symbol} exists, expected it absent")),
