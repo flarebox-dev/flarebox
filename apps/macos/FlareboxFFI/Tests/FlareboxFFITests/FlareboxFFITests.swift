@@ -12,11 +12,15 @@ import FlareboxFFI
         .appending(path: "../../../../../Cargo.toml")
         .standardizedFileURL
     let manifest = try String(contentsOf: cargoToml, encoding: .utf8)
+    let workspacePackage = try #require(
+        manifest.components(separatedBy: "[workspace.package]").dropFirst().first?
+            .components(separatedBy: "\n[").first
+    )
     let workspaceVersion = try #require(
-        manifest.split(separator: "\n").first { $0.hasPrefix("version = ") }
+        workspacePackage.firstMatch(of: /^version\s*=\s*"([^"]+)"/.anchorsMatchLineEndings())
     )
 
-    #expect(workspaceVersion == "version = \"\(version())\"")
+    #expect(String(workspaceVersion.1) == version())
 }
 
 @Test func sessionStreamsEachStatusChange() {
