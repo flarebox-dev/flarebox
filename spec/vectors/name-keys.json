@@ -1,0 +1,138 @@
+{
+  "case_folding": "CaseFolding.txt 18.0.0, statuses C and F",
+  "normalization": "Unicode 18.0.0",
+  "vectors": [
+    {
+      "name": "Notes.TXT",
+      "nfc": "Notes.TXT",
+      "name_key": "notes.txt",
+      "note": "ASCII case"
+    },
+    {
+      "name": "Stra\u00dfe",
+      "nfc": "Stra\u00dfe",
+      "name_key": "strasse",
+      "note": "sharp s folds to ss (status F)"
+    },
+    {
+      "name": "STRASSE",
+      "nfc": "STRASSE",
+      "name_key": "strasse",
+      "note": "same key as Stra\u00dfe"
+    },
+    {
+      "name": "\u1e9e",
+      "nfc": "\u1e9e",
+      "name_key": "ss",
+      "note": "capital sharp s"
+    },
+    {
+      "name": "\u0390",
+      "nfc": "\u0390",
+      "name_key": "\u03b9\u0308\u0301",
+      "note": "precomposed; full folding of the NFC form alone is not normalized"
+    },
+    {
+      "name": "\u03aa\u0301",
+      "nfc": "\u03aa\u0301",
+      "name_key": "\u03b9\u0308\u0301",
+      "note": "same key as U+0390"
+    },
+    {
+      "name": "\u00c5",
+      "nfc": "\u00c5",
+      "name_key": "a\u030a",
+      "note": "A with ring above"
+    },
+    {
+      "name": "\u212b",
+      "nfc": "\u00c5",
+      "name_key": "a\u030a",
+      "note": "Angstrom sign; NFC is U+00C5"
+    },
+    {
+      "name": "A\u030a",
+      "nfc": "\u00c5",
+      "name_key": "a\u030a",
+      "note": "decomposed A with ring above"
+    },
+    {
+      "name": "\u212a",
+      "nfc": "K",
+      "name_key": "k",
+      "note": "Kelvin sign"
+    },
+    {
+      "name": "\ufb01le",
+      "nfc": "\ufb01le",
+      "name_key": "file",
+      "note": "fi ligature folds to fi"
+    },
+    {
+      "name": "\u0130",
+      "nfc": "\u0130",
+      "name_key": "i\u0307",
+      "note": "capital I with dot above (status F, not T)"
+    },
+    {
+      "name": "\u0131",
+      "nfc": "\u0131",
+      "name_key": "\u0131",
+      "note": "dotless i has no fold and stays distinct from i"
+    },
+    {
+      "name": "\u01c5",
+      "nfc": "\u01c5",
+      "name_key": "\u01c6",
+      "note": "titlecase DZ with caron"
+    },
+    {
+      "name": "\uab70",
+      "nfc": "\uab70",
+      "name_key": "\u13a0",
+      "note": "Cherokee small letter folds to the capital"
+    },
+    {
+      "name": "\u03a3\u03c2",
+      "nfc": "\u03a3\u03c2",
+      "name_key": "\u03c3\u03c3",
+      "note": "sigma and final sigma"
+    },
+    {
+      "name": "\u2460",
+      "nfc": "\u2460",
+      "name_key": "\u2460",
+      "note": "circled digit one; no compatibility folding"
+    },
+    {
+      "name": "\ud55c",
+      "nfc": "\ud55c",
+      "name_key": "\u1112\u1161\u11ab",
+      "note": "Hangul syllable; the key is decomposed"
+    },
+    {
+      "name": "\u0a5e",
+      "nfc": "\u0a2b\u0a3c",
+      "name_key": "\u0a2b\u0a3c",
+      "note": "composition exclusion; NFC is longer than the input"
+    },
+    {
+      "name": "a\u0315\u0300",
+      "nfc": "\u00e0\u0315",
+      "name_key": "a\u0300\u0315",
+      "note": "canonical reordering of combining marks"
+    },
+    {
+      "name": ".FlareBox",
+      "nfc": ".FlareBox",
+      "name_key": ".flarebox",
+      "note": "reserved at the root"
+    },
+    {
+      "name": ".\ufb02arebox",
+      "nfc": ".\ufb02arebox",
+      "name_key": ".flarebox",
+      "note": "reserved at the root through full folding"
+    }
+  ]
+}
