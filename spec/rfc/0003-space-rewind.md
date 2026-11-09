@@ -8,62 +8,136 @@ The schema changes add messages and fields only:
 
 | Message | Fields | Section |
 |---|---|---|
-| `RewindRequest` (new, `auth.proto`) | `restore_point_ms = 1`, `expected_history_id = 2` | 1 |
+| `RewindRequest` (new, `auth.proto`) | `restore_point_ms = 1`, `expected_history_id = 2`, `rewind_id = 3` | 1 |
 | `RewindResult` (new, `auth.proto`) | `history_id = 1`, `restore_seq = 2`, `restore_point_ms = 3`, `previous_history_id = 4`, `previous_head_seq = 5` | 1 |
+
+PITR behaves as [the SQLite storage API documentation](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/#pitr-point-in-time-recovery-api) describes (accessed 2026-11-10):
+- it restores to any point in the past 30 days;
+- `getBookmarkForTime` returns a bookmark for approximately the given time;
+- bookmarks compare lexically in time order;
+- `onNextSessionRestoreBookmark` restores the storage when the object next starts.
 
 ## 1. API (§15.1)
 
 `POST /v1/spaces/{space_id}/rewind` takes a `RewindRequest` and returns a `RewindResult`. The body is protobuf, like the other endpoints of §15.1. The CLI command `flarebox space rewind` calls this endpoint and nothing else, so this request and response are the CLI's stable interface.
 
-The request is refused, and nothing changes, in these cases:
+`rewind_id` is a UUIDv7 that the caller chooses once per intended rewind and reuses on every retry. The Account DO looks it up before checking anything else:
+
+- **Same `rewind_id`, same fields.** The request returns that rewind's state:
+  - the stored `RewindResult` once the rewind is complete, even though the space's history has since changed;
+  - `RETRY_LATER` while it runs;
+  - its stored error if it failed.
+- **Same `rewind_id`, different `restore_point_ms` or `expected_history_id`.** `INVALID_ARGUMENT`.
+- **New `rewind_id`.** The checks below apply. A new request built on the old `expected_history_id` fails the history check, so it cannot start a second rewind.
+
+The Account DO keeps every rewind record for at least 30 days after it ends.
+
+A new `rewind_id` is refused, with nothing recorded and nothing changed, in these cases:
 
 | Condition | Error code | HTTP status |
 |---|---|---|
-| The caller is not the space's owner, or the device is revoked | `FORBIDDEN` or `UNAUTHENTICATED` | 403 or 401 |
-| `restore_point_ms` is not inside the window (§2) | `INVALID_ARGUMENT` | 400 |
+| The device is revoked, or the caller is not the space's owner | `UNAUTHENTICATED` or `FORBIDDEN` | 401 or 403 |
+| `restore_point_ms` is not admissible (§2) | `INVALID_ARGUMENT` | 400 |
 | `expected_history_id` is not the space's current history | `HISTORY_MISMATCH` | 409 |
-| Another rewind of the space has not completed | `RETRY_LATER` | 503 |
+| Another rewind of the space has not ended | `RETRY_LATER` | 503 |
 
-`expected_history_id` ties the request to the state the owner looked at. Two rewinds sent from the same view therefore cannot both apply.
+## 2. Admissible restore points
 
-## 2. Window
+At admission, `restore_point_ms` (P) must meet all of these:
+- it is at least one minute and at most 29 days before the request;
+- it is not before the space was created;
+- it is not inside the interval during which an earlier rewind of the space held the space closed (§3).
 
-`restore_point_ms` must be in the past and no earlier than the space's creation. It must also be no more than `min(chunk_grace_days, 29)` days before the request.
+The 29-day bound keeps P inside the 30-day PITR range, with a day for the rewind to finish. The window is checked once, at admission. A rewind already admitted is never refused later because time has passed.
 
-- **29 days.** PITR restores to any point in the past 30 days ([SQLite-backed Durable Object Storage, PITR API](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/#pitr-point-in-time-recovery-api), accessed 2026-11-10). The one-day margin leaves time for the rewind to finish inside that limit.
-- **`chunk_grace_days`.** This bound keeps every chunk that the restored state references in R2. A version that existed at the restore point P either still exists now, or it was removed at some time T ≥ P. Removing it lowers refcounts, and GC deletes a chunk no earlier than `chunk_grace_days` after its refcount reaches 0 (§12). So the earliest such deletion is at T + `chunk_grace_days` ≥ P + `chunk_grace_days`, which is after now.
+P is the requested point. The restored state is the one at the bookmark that PITR selects for P, which is approximately P. `RewindResult.restore_seq` and `ResyncRequired.restore_seq` give the exact `head_seq` of the restored state, and `restore_point_ms` is always the requested P.
 
-## 3. Procedure (§7.4)
+## 3. Phases
 
-The Account DO directs the rewind, because the Space DO's own storage is what gets replaced:
+The Account DO directs the rewind and keeps a record of it in its own storage, which PITR on the Space DO does not touch. The record holds:
+- the request;
+- the selected bookmark B;
+- the new `history_id`;
+- the previous history and head;
+- the attempt number;
+- the phase;
+- the result or the error.
 
-1. **Record.** The Account DO records a pending rewind for the space: the restore point and a new `history_id`. From this moment until step 4 completes, the space serves nothing. Every HTTP RPC and WebSocket upgrade gets `RETRY_LATER`, and the Space DO accepts no socket message.
-2. **Restore.** The Space DO checks the window (§2) and `expected_history_id`, and records its current `history_id` and `head_seq` for the result. It sends `Goodbye` with close code 4004 (space rewound) on every WebSocket and closes it. It then gets the bookmark for the restore point, calls `onNextSessionRestoreBookmark` with it, and restarts with `ctx.abort()`.
-3. **Check.** On the next call, the Space DO confirms that the restore happened: no commit in its log is later than the restore point. Otherwise the rewind fails and the pending record stays, so the Account DO retries step 2.
-4. **Complete**, in one Space DO transaction:
-   - set `history_id` to the new value, and `restore_seq` (the current `head_seq`) and `restore_point_ms` in `meta` (RFC 0002 §8);
-   - add every device that the Account DO has revoked to `revoked_devices`, because the restore may have removed later revocations;
-   - mark every chunk row with refcount 0, `pending` or `live`, as `deleting`. GC may have deleted such a chunk after the restore point, and a `PRESENT` answer for it would let a commit reference bytes that are gone. Uploads after the rewind store these chunks again;
-   - schedule GC and the orphan sweep to run now, and re-arm the alarm from the restored `schedule` table. The orphan sweep removes the objects uploaded after the restore point, which have no row in the restored state.
+An Account DO alarm drives every phase forward, retrying with backoff from one second up to ten minutes, so a crash at any point resumes where it stopped.
 
-   The Account DO then clears the pending record and returns the `RewindResult`. If step 2, 3 or 4 fails after the restore began, the Account DO keeps the record and retries until the rewind completes, and the space stays closed meanwhile (step 1).
+1. **Admission.** The Account DO asks the Space DO, through a call that changes nothing, for:
+   - its current `history_id` and `head_seq`;
+   - the bookmark B for P.
 
-## 4. What a rewind keeps and discards
+   It then checks §1 and §2. Any failure refuses the request and records nothing. Otherwise it records the rewind as `admitted`, with B and the new `history_id`. From then on the space is closed (§4).
+2. **Arming**, one attempt at a time:
+   - The Space DO closes every WebSocket after sending `Goodbye` with close code 4004 (space rewound).
+   - It writes a marker row naming the rewind and the attempt, then reads its current bookmark M.
+   - If B is not earlier than M, the rewind fails (step 5). Otherwise the restored state cannot contain the marker.
+   - It calls `onNextSessionRestoreBookmark(B)`.
+   - It returns its `history_id` and `head_seq`. The Account DO stores them from the first attempt as the previous history and head, and records the phase `armed`.
+   - The Account DO then has the Space DO restart with `ctx.abort()`.
+3. **Proof and completion.** The Account DO asks the Space DO to complete the rewind.
+   - **Marker present.** The restore did not happen: for example, the object crashed before the restore was armed. The Account DO goes back to step 2 with the next attempt.
+   - **No marker, but a completion receipt for this rewind in `meta`.** Completion already ran, and the Space DO returns that receipt again.
+   - **Neither.** The storage was restored to B, which predates every marker of this rewind. The Space DO then completes the rewind in one transaction:
+     - sets the new `history_id`, plus `restore_seq` (its `head_seq`) and `restore_point_ms` in `meta` (RFC 0002 §8);
+     - adds every device that the Account DO has revoked to `revoked_devices`;
+     - applies the chunk rules of §5;
+     - resets the export state (§7);
+     - stores the completion receipt, then re-arms its alarm from the restored `schedule` table.
 
-- **Restored** to the restore point: everything in the Space DO. That includes the tree, versions, trash, commit log, chunk rows, members, the space's name and settings, and `device_commits` (RFC 0002 §2).
-- **Kept**: the Account DO's state, including devices, revocations, spaces and share links. A share link that points to a node absent after the rewind finds nothing.
-- **Discarded**: commits after `restore_seq`, and the chunks that only they referenced. A rewind cannot be undone with another rewind, because step 4 deletes those chunks. The bytes of discarded changes survive on devices, which hold them during recovery (RFC 0002 §6) until the user decides.
+   A repeated completion call therefore always returns the same receipt.
+4. **Reopening.** The Account DO stores the `RewindResult` and records the phase `completed`, which reopens the space.
+5. **Failure.** The rewind can fail only while no restore can be pending. Before it calls `onNextSessionRestoreBookmark`, the Space DO answers definitely that it did not arm when B is not earlier than M, or when B can no longer be restored. On that answer, the Account DO removes the attempt's marker, records the phase `failed` with the error, and reopens the space unchanged.
 
-## 5. Devices
+   Once an arming call has started without such an answer, a restore may be pending for the object's next start. From then on the rewind only moves forward: each further attempt arms B again and restarts, until completion succeeds. While it cannot finish, the space stays closed, for example because PITR keeps failing, or because completion hits a server bug. A retried request with the same `rewind_id` reports `RETRY_LATER` and the last error. The space is never reopened while a restore may still be pending, nor with a restored database under its old history.
 
-A connected device sees close code 4004 and reconnects. Its `Welcome` then carries the new `history_id`, and the device enters recovery (RFC 0002 §6). A device that sends `Resume` with its stored `history_id` gets `ResyncRequired` with `HISTORY_CHANGED`, `restore_seq` and `restore_point_ms` (RFC 0002 §8). Its commits from the old history are refused with `HISTORY_MISMATCH` (RFC 0002 §1).
+## 4. Closed space
 
-## 6. R2 metadata export (§11)
+From admission until the record is `completed` or `failed`, the space is closed:
+- every HTTP RPC and WebSocket upgrade gets `RETRY_LATER`;
+- the Space DO answers every socket message by closing the socket with 4004;
+- the Space DO's alarm does no work.
 
-The export layout changes so that each history keeps its own files:
+The Account DO decides this. The Worker and the Space DO already ask it about every request and message, and the alarm handler also asks it before it runs GC, the orphan sweep or export. So the restored database cannot run GC before completion has applied §5, and no client reaches the restored state before it carries its new history.
 
-- Log segments are written under `meta/<history_id>/log/`, and snapshots under `meta/<history_id>/snap/`.
-- `space.json` gains `history_id`, the current history. It is rewritten when a history begins.
-- A restore from R2 reads only the files of the history that `space.json` names.
+## 5. Chunk retention
 
-The files of earlier histories are never changed. Without this change, the new history would write segments with the same seq ranges, under the same names, as the old history's segments, and the rule that a written segment is never changed would break.
+Invariant: no chunk object is deleted earlier than `chunk_grace_days` after the last moment at which any history referenced it. These rules keep it:
+
+1. GC deletes a chunk no earlier than `chunk_grace_days` after its refcount reaches 0, as in §12.
+2. At completion, every chunk row whose refcount is 0, in any state, becomes `pending` with `hold_until` set to the completion time plus `chunk_grace_days`. The discarded history may have referenced the chunk until the rewind, and GC may already have deleted the object. As `pending`, `PrepareUpload` answers `UPLOAD`, so a commit that needs the chunk stores it again; a conditional PUT that finds the object present counts as stored. If no commit needs it, it ages out through the normal grace.
+3. The orphan sweep deletes an object that has no chunk row only once both its upload time and the space's latest rewind completion are more than `chunk_grace_days` in the past. The Account DO keeps the latest completion time per space, and every completion copies it into `meta`, so a later rewind cannot lose it.
+4. `chunk_grace_days` cannot be set below 30.
+
+Any admissible target T satisfies T ≥ now − 29 days, and a chunk referenced at T was referenced until some time no earlier than T. By the invariant it is kept until at least T + 30 days, which is after now. The bound holds across repeated rewinds, including a target in an interval that an earlier rewind discarded. It does not depend on how `chunk_grace_days` changed over time, because rule 4 makes 30 days the floor. Rewinds therefore do not narrow the window. The cost is that the chunks only a discarded history used stay in R2 for 30 days after the rewind.
+
+## 6. What a rewind restores, keeps and loses
+
+- **Restored to the restore point:** everything in the Space DO. That includes:
+  - the tree, every node's versions and the trash;
+  - the commit log, chunk rows, members, the space's name and settings;
+  - `device_commits` (RFC 0002 §2).
+- **Kept:** the Account DO's state, including devices, revocations, spaces, share links and rewind records. A share link that points to a node absent after the rewind finds nothing.
+- **Lost from the server for good:** everything committed after `restore_seq`. That includes:
+  - every intermediate version written after the restore point, not only the latest one;
+  - nodes trashed after the restore point, and their trash state;
+  - changes that no device downloaded before the rewind.
+- **What devices keep.** Devices keep only what is on their disks, through recovery (RFC 0002 §6):
+  - A local file the device changed is held for the user's answer.
+  - A local file the device did not change follows the restored server: the newer local copy moves to the device's local trash, which keeps it only as long as that trash's own retention allows.
+  - Versions a device never had on disk, such as an intermediate version B in A → B → C after the restore point, exist nowhere after the rewind.
+- **Undo.** There is no undo operation, and this RFC does not guarantee one. A later rewind to a point before this one began restores the state at that point like any other admissible target (§2 and §5), as yet another history. It does not reverse what devices did during their recovery.
+
+## 7. R2 metadata export (§11)
+
+Each history keeps its own export files, and a new history starts from a full baseline:
+
+- Log segments are written under `meta/<history_id>/log/`, and snapshots under `meta/<history_id>/snap/`. The files of earlier histories are never changed.
+- `space.json` gains `history_id`, the history that an R2 restore reads. A restore from R2 reads only that history's files.
+- Completion resets the export state for the new history:
+  - the exported log starts after `restore_seq`;
+  - a full snapshot is due at once;
+  - no snapshot of the new history exists yet.
+- The exporter writes the new history's first snapshot and the log segments from that snapshot's `start_seq + 1` through its `end_seq`. Only once all of them are durable does it rewrite `space.json` to name the new history. Until then, `space.json` still names the previous history, and an R2-only restore yields the state before the rewind.

@@ -143,6 +143,9 @@ pub struct RewindRequest {
     /// The history the caller expects the space to be in; the rewind is refused with CODE_HISTORY_MISMATCH otherwise.
     #[prost(string, tag="2")]
     pub expected_history_id: ::prost::alloc::string::String,
+    /// A UUIDv7 chosen once per intended rewind and reused on every retry; a retry returns that rewind's result or state.
+    #[prost(string, tag="3")]
+    pub rewind_id: ::prost::alloc::string::String,
 }
 /// Response of POST /v1/spaces/{space_id}/rewind.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

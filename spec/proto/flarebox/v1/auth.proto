@@ -89,6 +89,8 @@ message RewindRequest {
   int64 restore_point_ms = 1;
   // The history the caller expects the space to be in; the rewind is refused with CODE_HISTORY_MISMATCH otherwise.
   string expected_history_id = 2;
+  // A UUIDv7 chosen once per intended rewind and reused on every retry; a retry returns that rewind's result or state.
+  string rewind_id = 3;
 }
 
 // Response of POST /v1/spaces/{space_id}/rewind.
