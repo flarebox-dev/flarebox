@@ -17,19 +17,27 @@
 //! first poll rescans the whole tree, so changes made while nothing was
 //! watching are reported like any other.
 //!
+//! Scans never trust a path spelling or follow a link. They walk the tree
+//! through directory handles opened without following symbolic links, take
+//! names from directory listings rather than from event paths, and check that
+//! each directory they enter is the one they listed. A scan that sees its root
+//! disappear or a directory change under it publishes nothing.
+//!
 //! Symbolic links and special files are not synced in v0 (spec §5.1) and are
 //! skipped.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::fs::{self, Metadata};
+use std::ffi::{OsStr, OsString};
 use std::io;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use notify::event::{AccessKind, AccessMode, EventKind};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher as _};
+use rustix::fs::{FileType, Mode, OFlags, RawMode};
 
 /// How long native events must be quiet before the watcher rescans, so both
 /// halves of a rename and a create followed by a write land in one batch.
@@ -43,6 +51,13 @@ pub enum Error {
     Io(#[from] io::Error),
     #[error("file system watcher: {0}")]
     Watch(Box<dyn std::error::Error + Send + Sync>),
+    /// A directory was replaced or removed while the scan was inside it. The
+    /// snapshot is unchanged; scan again once the tree is quiet.
+    #[error("the tree changed during the scan")]
+    Changed,
+    /// The root path now names a different directory than the one scanned.
+    #[error("the root directory was replaced during the scan")]
+    RootReplaced,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -74,40 +89,195 @@ pub struct Entry {
     pub executable: bool,
 }
 
-impl Entry {
-    fn from_metadata(meta: &Metadata) -> Option<Self> {
-        let kind = if meta.is_dir() {
-            EntryKind::Dir
-        } else if meta.is_file() {
-            EntryKind::File
-        } else {
-            return None;
-        };
-        let id = FileId {
-            dev: meta.dev(),
-            ino: meta.ino(),
-            birth_ns: meta
-                .created()
-                .ok()
-                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                .and_then(|since| i64::try_from(since.as_nanos()).ok()),
-        };
-        Some(match kind {
-            EntryKind::Dir => Self {
-                kind,
-                id,
+/// What `stat` reports about one directory entry, before deciding whether it is
+/// something the snapshot records.
+struct Stat {
+    file_type: FileType,
+    id: FileId,
+    size: u64,
+    mtime_ns: i128,
+    mode: u32,
+}
+
+impl Stat {
+    fn entry(&self) -> Option<Entry> {
+        Some(match self.file_type {
+            FileType::Directory => Entry {
+                kind: EntryKind::Dir,
+                id: self.id,
                 size: 0,
                 mtime_ns: 0,
                 executable: false,
             },
-            EntryKind::File => Self {
-                kind,
-                id,
-                size: meta.len(),
-                mtime_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
-                executable: meta.permissions().mode() & 0o111 != 0,
+            FileType::RegularFile => Entry {
+                kind: EntryKind::File,
+                id: self.id,
+                size: self.size,
+                mtime_ns: self.mtime_ns,
+                executable: self.mode & 0o111 != 0,
             },
+            _ => return None,
         })
+    }
+
+    fn same_inode(&self, id: &FileId) -> bool {
+        self.id.dev == id.dev && self.id.ino == id.ino
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn statx(dir: BorrowedFd<'_>, name: &OsStr, flags: rustix::fs::AtFlags) -> io::Result<Stat> {
+    use rustix::fs::StatxFlags;
+    let st = rustix::fs::statx(
+        dir,
+        name,
+        flags,
+        StatxFlags::BASIC_STATS | StatxFlags::BTIME,
+    )?;
+    let nanos = |sec: i64, nsec: u32| i128::from(sec) * 1_000_000_000 + i128::from(nsec);
+    let birth_ns = (st.stx_mask & StatxFlags::BTIME.bits() != 0)
+        .then(|| i64::try_from(nanos(st.stx_btime.tv_sec, st.stx_btime.tv_nsec)).ok())
+        .flatten();
+    Ok(Stat {
+        file_type: FileType::from_raw_mode(RawMode::from(st.stx_mode)),
+        id: FileId {
+            dev: rustix::fs::makedev(st.stx_dev_major, st.stx_dev_minor),
+            ino: st.stx_ino,
+            birth_ns,
+        },
+        size: st.stx_size,
+        mtime_ns: nanos(st.stx_mtime.tv_sec, st.stx_mtime.tv_nsec),
+        mode: u32::from(st.stx_mode),
+    })
+}
+
+/// Stats `name` inside `dir` without following a symbolic link.
+#[cfg(target_os = "linux")]
+fn stat_at(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<Stat> {
+    statx(dir, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+}
+
+#[cfg(target_os = "linux")]
+fn stat_fd(fd: BorrowedFd<'_>) -> io::Result<Stat> {
+    statx(fd, OsStr::new(""), rustix::fs::AtFlags::EMPTY_PATH)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn from_stat(st: rustix::fs::Stat) -> Stat {
+    let nanos = |sec: i64, nsec: i64| i128::from(sec) * 1_000_000_000 + i128::from(nsec);
+    Stat {
+        file_type: FileType::from_raw_mode(RawMode::from(st.st_mode)),
+        id: FileId {
+            dev: st.st_dev as u64,
+            ino: st.st_ino,
+            birth_ns: i64::try_from(nanos(st.st_birthtime, st.st_birthtime_nsec)).ok(),
+        },
+        size: st.st_size as u64,
+        mtime_ns: nanos(st.st_mtime, st.st_mtime_nsec),
+        mode: u32::from(st.st_mode),
+    }
+}
+
+/// Stats `name` inside `dir` without following a symbolic link.
+#[cfg(not(target_os = "linux"))]
+fn stat_at(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<Stat> {
+    Ok(from_stat(rustix::fs::statat(
+        dir,
+        name,
+        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+    )?))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stat_fd(fd: BorrowedFd<'_>) -> io::Result<Stat> {
+    Ok(from_stat(rustix::fs::fstat(fd)?))
+}
+
+const DIR_FLAGS: OFlags = OFlags::RDONLY
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
+
+fn open_root(root: &Path) -> io::Result<OwnedFd> {
+    Ok(rustix::fs::open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?)
+}
+
+/// Opens the directory `name` inside `dir`, refusing to follow a symbolic link.
+fn open_dir_at(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<OwnedFd> {
+    Ok(rustix::fs::openat(dir, name, DIR_FLAGS, Mode::empty())?)
+}
+
+/// Whether the error means the name no longer leads to a directory: it is gone,
+/// or a file or symbolic link took its place.
+fn is_gone(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    ) || err.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error())
+}
+
+fn list(dir: BorrowedFd<'_>) -> io::Result<BTreeSet<OsString>> {
+    let mut names = BTreeSet::new();
+    for item in rustix::fs::Dir::read_from(dir)? {
+        let name = item?.file_name().to_bytes().to_vec();
+        if name != b"." && name != b".." {
+            names.insert(OsString::from(OsStr::from_bytes(&name)));
+        }
+    }
+    Ok(names)
+}
+
+/// Where a scan can be interrupted in tests.
+#[cfg_attr(not(test), allow(dead_code))]
+enum Cut<'a> {
+    RootOpened,
+    OpeningDir(&'a Path),
+}
+
+/// The entries one rescan observed, and the parts of the snapshot they replace.
+struct Scan<'c> {
+    new: BTreeMap<PathBuf, Entry>,
+    /// Paths whose old entry and everything below it give way to `new`.
+    replaced: Vec<PathBuf>,
+    cut: &'c mut dyn FnMut(Cut<'_>),
+}
+
+impl Scan<'_> {
+    /// Records the entry `name` of `dir` at `rel`, and everything below it.
+    fn entry(&mut self, dir: BorrowedFd<'_>, name: &OsStr, rel: PathBuf) -> Result<()> {
+        let stat = match stat_at(dir, name) {
+            Ok(stat) => stat,
+            Err(err) if is_gone(&err) => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+        let Some(entry) = stat.entry() else {
+            return Ok(());
+        };
+        self.new.insert(rel.clone(), entry);
+        if entry.kind == EntryKind::File {
+            return Ok(());
+        }
+        (self.cut)(Cut::OpeningDir(&rel));
+        let sub = match open_dir_at(dir, name) {
+            Ok(sub) => sub,
+            Err(err) if is_gone(&err) => return Err(Error::Changed),
+            Err(err) => return Err(err.into()),
+        };
+        if !stat_fd(sub.as_fd())?.same_inode(&entry.id) {
+            return Err(Error::Changed);
+        }
+        self.dir(sub.as_fd(), &rel)
+    }
+
+    fn dir(&mut self, dir: BorrowedFd<'_>, rel: &Path) -> Result<()> {
+        for name in list(dir)? {
+            self.entry(dir, &name, rel.join(&name))?;
+        }
+        Ok(())
     }
 }
 
@@ -138,7 +308,8 @@ pub enum Change {
     },
 }
 
-/// The known state of every entry under a root, keyed by relative path.
+/// The known state of every entry under a root, keyed by relative path with the
+/// exact names the directory listings return.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Snapshot {
     pub entries: BTreeMap<PathBuf, Entry>,
@@ -146,46 +317,115 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub fn scan(root: impl AsRef<Path>) -> Result<Self> {
-        let mut entries = BTreeMap::new();
-        scan_into(root.as_ref(), Path::new(""), &mut entries)?;
-        Ok(Self { entries })
+        let mut snapshot = Self::default();
+        snapshot.rescan(root, [PathBuf::new()])?;
+        Ok(snapshot)
     }
 
     /// Rescans the given relative paths, each with everything below it, updates
     /// the snapshot and returns what changed. An empty path rescans the whole
-    /// tree. A path whose parent the snapshot does not know as a folder is
-    /// widened to its highest unknown ancestor, so the snapshot never holds an
-    /// entry without its parent. Fails without changing the snapshot if the root
-    /// is missing, rather than reporting everything as removed.
+    /// tree.
+    ///
+    /// A path is looked up in a listing of its parent, so a spelling the file
+    /// system resolves case- or normalization-insensitively counts as absent,
+    /// and the listing also reveals entries of that parent the snapshot knows
+    /// by a name that is gone. A path whose parent the snapshot does not know
+    /// as a folder, or whose parent is no longer that folder, is widened to the
+    /// parent.
+    ///
+    /// On any error the snapshot is unchanged. That includes a root that is
+    /// missing, unreadable or replaced at any point of the scan, so a lost root
+    /// never reads as everything removed, and [`Error::Changed`] when a folder
+    /// is replaced while the scan is inside it.
     pub fn rescan(
         &mut self,
         root: impl AsRef<Path>,
         paths: impl IntoIterator<Item = PathBuf>,
     ) -> Result<Vec<Change>> {
-        let root = root.as_ref();
-        if !fs::metadata(root)?.is_dir() {
-            return Err(io::Error::from(io::ErrorKind::NotADirectory).into());
+        self.rescan_with(root.as_ref(), paths, &mut |_| {})
+    }
+
+    fn rescan_with(
+        &mut self,
+        root: &Path,
+        paths: impl IntoIterator<Item = PathBuf>,
+        cut: &mut dyn FnMut(Cut<'_>),
+    ) -> Result<Vec<Change>> {
+        let root_dir = open_root(root)?;
+        let root_stat = stat_fd(root_dir.as_fd())?;
+        cut(Cut::RootOpened);
+
+        let mut scopes = Vec::new();
+        for path in paths {
+            if path
+                .components()
+                .any(|c| !matches!(c, Component::Normal(_)))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("not a relative path inside the root: {}", path.display()),
+                )
+                .into());
+            }
+            scopes.push(self.anchor(path));
         }
-        let mut scopes: Vec<PathBuf> = paths.into_iter().map(|path| self.anchor(path)).collect();
-        scopes.sort();
-        scopes.dedup();
-        let mut outermost: Vec<PathBuf> = Vec::new();
-        for scope in scopes {
-            if !outermost.last().is_some_and(|last| scope.starts_with(last)) {
-                outermost.push(scope);
+
+        let mut scan = Scan {
+            new: BTreeMap::new(),
+            replaced: Vec::new(),
+            cut,
+        };
+        let scopes = outermost(scopes);
+        if scopes
+            .first()
+            .is_some_and(|scope| scope.as_os_str().is_empty())
+        {
+            scan.replaced.push(PathBuf::new());
+            scan.dir(root_dir.as_fd(), Path::new(""))?;
+        } else {
+            let mut resolved = Vec::new();
+            let mut pending = scopes;
+            while let Some(scope) = pending.pop() {
+                let parent = scope.parent().unwrap_or(Path::new(""));
+                if parent.as_os_str().is_empty()
+                    || self.open_known_dir(&root_dir, parent)?.is_some()
+                {
+                    resolved.push(scope);
+                } else {
+                    pending.push(parent.to_path_buf());
+                }
+            }
+            let mut groups: BTreeMap<PathBuf, BTreeSet<OsString>> = BTreeMap::new();
+            for scope in outermost(resolved) {
+                let name = scope
+                    .file_name()
+                    .expect("scopes are non-empty")
+                    .to_os_string();
+                let parent = scope.parent().unwrap_or(Path::new("")).to_path_buf();
+                groups.entry(parent).or_default().insert(name);
+            }
+            for (parent, focus) in groups {
+                let dir = if parent.as_os_str().is_empty() {
+                    root_dir.try_clone()?
+                } else {
+                    self.open_known_dir(&root_dir, &parent)?
+                        .ok_or(Error::Changed)?
+                };
+                self.scan_children(&mut scan, dir.as_fd(), &parent, &focus)?;
             }
         }
 
-        let mut new = BTreeMap::new();
-        for scope in &outermost {
-            scan_into(root, scope, &mut new)?;
+        let again = open_root(root)?;
+        if !stat_fd(again.as_fd())?.same_inode(&root_stat.id) {
+            return Err(Error::RootReplaced);
         }
+
         let mut old = BTreeMap::new();
-        for scope in &outermost {
+        for prefix in &scan.replaced {
             let inside: Vec<PathBuf> = self
                 .entries
-                .range(scope.clone()..)
-                .take_while(|(path, _)| path.starts_with(scope))
+                .range(prefix.clone()..)
+                .take_while(|(path, _)| path.starts_with(prefix))
                 .map(|(path, _)| path.clone())
                 .collect();
             for path in inside {
@@ -193,9 +433,63 @@ impl Snapshot {
                 old.insert(path, entry);
             }
         }
-        let changes = diff(&old, &new);
-        self.entries.extend(new);
+        let changes = diff(&old, &scan.new);
+        self.entries.extend(scan.new);
         Ok(changes)
+    }
+
+    /// Rescans the children of the known folder `parent`: every name in
+    /// `focus`, every listed name the snapshot does not know, and every known
+    /// child the listing no longer contains.
+    fn scan_children(
+        &self,
+        scan: &mut Scan<'_>,
+        dir: BorrowedFd<'_>,
+        parent: &Path,
+        focus: &BTreeSet<OsString>,
+    ) -> Result<()> {
+        let names = list(dir)?;
+        for name in &names {
+            let child = parent.join(name);
+            if focus.contains(name) || !self.entries.contains_key(&child) {
+                scan.replaced.push(child.clone());
+                scan.entry(dir, name, child)?;
+            }
+        }
+        for name in focus.difference(&names) {
+            scan.replaced.push(parent.join(name));
+        }
+        let known_children = self
+            .entries
+            .range(parent.to_path_buf()..)
+            .take_while(|(path, _)| path.starts_with(parent))
+            .filter(|(path, _)| path.parent() == Some(parent))
+            .filter(|(path, _)| !path.file_name().is_some_and(|name| names.contains(name)));
+        for (path, _) in known_children {
+            scan.replaced.push(path.clone());
+        }
+        Ok(())
+    }
+
+    /// Opens the folder the snapshot knows at `rel`, one component at a time,
+    /// each one listed under its exact name and opened without following links.
+    /// Returns `None` if that path no longer leads to the same folder.
+    fn open_known_dir(&self, root: &OwnedFd, rel: &Path) -> Result<Option<OwnedFd>> {
+        let Some(known) = self.entries.get(rel).filter(|e| e.kind == EntryKind::Dir) else {
+            return Ok(None);
+        };
+        let mut dir = root.try_clone()?;
+        for component in rel.components() {
+            if !list(dir.as_fd())?.contains(component.as_os_str()) {
+                return Ok(None);
+            }
+            dir = match open_dir_at(dir.as_fd(), component.as_os_str()) {
+                Ok(next) => next,
+                Err(err) if is_gone(&err) => return Ok(None),
+                Err(err) => return Err(err.into()),
+            };
+        }
+        Ok(stat_fd(dir.as_fd())?.same_inode(&known.id).then_some(dir))
     }
 
     fn anchor(&self, mut path: PathBuf) -> PathBuf {
@@ -213,44 +507,17 @@ impl Snapshot {
     }
 }
 
-fn is_absent(err: &io::Error) -> bool {
-    matches!(
-        err.kind(),
-        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-    )
-}
-
-/// Adds `rel` and everything below it to `out`. The empty path stands for the
-/// root, which must exist and is not an entry itself.
-fn scan_into(root: &Path, rel: &Path, out: &mut BTreeMap<PathBuf, Entry>) -> Result<()> {
-    if !rel.as_os_str().is_empty() {
-        let meta = match fs::symlink_metadata(root.join(rel)) {
-            Ok(meta) => meta,
-            Err(err) if is_absent(&err) => return Ok(()),
-            Err(err) => return Err(err.into()),
-        };
-        let Some(entry) = Entry::from_metadata(&meta) else {
-            return Ok(());
-        };
-        out.insert(rel.to_path_buf(), entry);
-        if entry.kind == EntryKind::File {
-            return Ok(());
+/// Sorts the paths and drops every path inside another one.
+fn outermost(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.sort();
+    paths.dedup();
+    let mut outermost: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        if !outermost.last().is_some_and(|last| path.starts_with(last)) {
+            outermost.push(path);
         }
     }
-    let dir = match fs::read_dir(root.join(rel)) {
-        Ok(dir) => dir,
-        Err(err) if is_absent(&err) && !rel.as_os_str().is_empty() => return Ok(()),
-        Err(err) => return Err(err.into()),
-    };
-    for item in dir {
-        let item = match item {
-            Ok(item) => item,
-            Err(err) if is_absent(&err) => continue,
-            Err(err) => return Err(err.into()),
-        };
-        scan_into(root, &rel.join(item.file_name()), out)?;
-    }
-    Ok(())
+    outermost
 }
 
 fn diff(old: &BTreeMap<PathBuf, Entry>, new: &BTreeMap<PathBuf, Entry>) -> Vec<Change> {
@@ -358,15 +625,28 @@ pub trait Watcher {
     fn snapshot(&self) -> &Snapshot;
 }
 
-/// Watches with FSEvents on macOS and inotify on Linux. If [`Watcher::poll`]
-/// fails with [`Error::Watch`], the platform watcher lost events; continue
-/// with a [`RescanWatcher`] built from [`Watcher::snapshot`].
+/// Watches with FSEvents on macOS and inotify on Linux.
+///
+/// When the platform reports lost events (an inotify queue overflow, or
+/// FSEvents asking for a subtree rescan), the watcher re-registers the whole
+/// root before rescanning it, so no folder found by the rescan is left
+/// unwatched. On Linux it also registers each new or moved folder itself and
+/// rescans it after the registration, so a write between the folder's creation
+/// and its watch is not missed. If [`Watcher::poll`] fails with
+/// [`Error::Watch`], the platform watcher cannot cover the tree (for example
+/// the inotify watch limit); continue with a [`RescanWatcher`] built from
+/// [`Watcher::snapshot`].
 pub struct NativeWatcher {
     root: PathBuf,
     snapshot: Snapshot,
     dirty: BTreeSet<PathBuf>,
+    rewatch: bool,
+    failed: Option<Error>,
+    sender: mpsc::Sender<notify::Result<notify::Event>>,
     events: mpsc::Receiver<notify::Result<notify::Event>>,
-    _watcher: RecommendedWatcher,
+    watcher: RecommendedWatcher,
+    #[cfg(all(test, target_os = "linux"))]
+    before_register: Option<Box<dyn FnMut()>>,
 }
 
 impl NativeWatcher {
@@ -374,24 +654,27 @@ impl NativeWatcher {
     /// tree with `previous`; pass `Snapshot::default()` on a first run to have
     /// everything reported as created.
     pub fn start(root: impl AsRef<Path>, previous: Snapshot) -> Result<Self> {
-        let root = fs::canonicalize(root)?;
+        let root = std::fs::canonicalize(root)?;
         let (sender, events) = mpsc::channel();
-        let mut watcher = notify::recommended_watcher(sender).map_err(watch_error)?;
-        watcher
-            .watch(&root, RecursiveMode::Recursive)
-            .map_err(watch_error)?;
+        let watcher = watch_root(&root, &sender)?;
         Ok(Self {
             root,
             snapshot: previous,
             dirty: BTreeSet::from([PathBuf::new()]),
+            rewatch: false,
+            failed: None,
+            sender,
             events,
-            _watcher: watcher,
+            watcher,
+            #[cfg(all(test, target_os = "linux"))]
+            before_register: None,
         })
     }
 
     fn note(&mut self, event: notify::Result<notify::Event>) -> Result<()> {
         let event = event.map_err(watch_error)?;
         if event.need_rescan() {
+            self.rewatch = true;
             self.dirty.insert(PathBuf::new());
         }
         if let EventKind::Access(access) = event.kind
@@ -413,12 +696,75 @@ impl NativeWatcher {
             Err(RecvTimeoutError::Disconnected) => Err(watch_error("the platform watcher stopped")),
         }
     }
+
+    /// Registers watches on the folders the changes created or moved, then
+    /// rescans them, so anything written before the watch existed is seen.
+    #[cfg(target_os = "linux")]
+    fn cover(&mut self, changes: &[Change]) -> Vec<Change> {
+        let dirs = outermost(
+            changes
+                .iter()
+                .filter_map(|change| match change {
+                    Change::Created {
+                        path,
+                        kind: EntryKind::Dir,
+                    }
+                    | Change::Renamed {
+                        to: path,
+                        kind: EntryKind::Dir,
+                        ..
+                    } => Some(path.clone()),
+                    _ => None,
+                })
+                .collect(),
+        );
+        if dirs.is_empty() {
+            return Vec::new();
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.before_register.as_mut() {
+            hook();
+        }
+        for dir in &dirs {
+            if let Err(err) = self
+                .watcher
+                .watch(&self.root.join(dir), RecursiveMode::Recursive)
+            {
+                self.failed = Some(watch_error(err));
+            }
+        }
+        match self.snapshot.rescan(&self.root, dirs.iter().cloned()) {
+            Ok(changes) => changes,
+            Err(Error::Changed) => {
+                self.dirty.extend(dirs);
+                Vec::new()
+            }
+            Err(err) => {
+                self.failed = Some(err);
+                Vec::new()
+            }
+        }
+    }
+}
+
+fn watch_root(
+    root: &Path,
+    sender: &mpsc::Sender<notify::Result<notify::Event>>,
+) -> Result<RecommendedWatcher> {
+    let mut watcher = notify::recommended_watcher(sender.clone()).map_err(watch_error)?;
+    watcher
+        .watch(root, RecursiveMode::Recursive)
+        .map_err(watch_error)?;
+    Ok(watcher)
 }
 
 impl Watcher for NativeWatcher {
     fn poll(&mut self, timeout: Duration) -> Result<Vec<Change>> {
         let deadline = Instant::now() + timeout;
         loop {
+            if let Some(err) = self.failed.take() {
+                return Err(err);
+            }
             if self.dirty.is_empty() {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if !self.receive(left)? {
@@ -427,10 +773,24 @@ impl Watcher for NativeWatcher {
             }
             let settle_until = Instant::now() + MAX_SETTLE;
             while Instant::now() < settle_until && self.receive(SETTLE)? {}
-            let changes = self
-                .snapshot
-                .rescan(&self.root, self.dirty.iter().cloned())?;
+            if self.rewatch {
+                self.watcher = watch_root(&self.root, &self.sender)?;
+                self.rewatch = false;
+            }
+            let changes = match self.snapshot.rescan(&self.root, self.dirty.iter().cloned()) {
+                Ok(changes) => changes,
+                Err(Error::Changed) if Instant::now() < deadline => continue,
+                Err(Error::Changed) => return Ok(Vec::new()),
+                Err(err) => return Err(err),
+            };
             self.dirty.clear();
+            #[cfg(target_os = "linux")]
+            let changes = {
+                let mut changes = changes;
+                let more = self.cover(&changes);
+                changes.extend(more);
+                changes
+            };
             if !changes.is_empty() || Instant::now() >= deadline {
                 return Ok(changes);
             }
@@ -453,7 +813,7 @@ pub struct RescanWatcher {
 impl RescanWatcher {
     pub fn new(root: impl AsRef<Path>, previous: Snapshot, interval: Duration) -> Result<Self> {
         Ok(Self {
-            root: fs::canonicalize(root)?,
+            root: std::fs::canonicalize(root)?,
             snapshot: previous,
             interval,
         })
@@ -464,7 +824,11 @@ impl Watcher for RescanWatcher {
     fn poll(&mut self, timeout: Duration) -> Result<Vec<Change>> {
         let deadline = Instant::now() + timeout;
         loop {
-            let changes = self.snapshot.rescan(&self.root, [PathBuf::new()])?;
+            let changes = match self.snapshot.rescan(&self.root, [PathBuf::new()]) {
+                Ok(changes) => changes,
+                Err(Error::Changed) => Vec::new(),
+                Err(err) => return Err(err),
+            };
             let left = deadline.saturating_duration_since(Instant::now());
             if !changes.is_empty() || left.is_zero() {
                 return Ok(changes);
@@ -481,3 +845,6 @@ impl Watcher for RescanWatcher {
 fn watch_error(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Error {
     Error::Watch(err.into())
 }
+
+#[cfg(test)]
+mod tests;

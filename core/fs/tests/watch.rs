@@ -230,3 +230,104 @@ fn rescan_refuses_a_missing_root() {
         assert_eq!(snapshot, before);
     }
 }
+
+#[test]
+fn case_only_rename_is_a_rename() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("letter.txt"), "l").unwrap();
+    fs::create_dir(root.join("docs")).unwrap();
+    fs::write(root.join("docs/a.txt"), "a").unwrap();
+    let previous = Snapshot::scan(root).unwrap();
+
+    for alias in ["LETTER.txt", "DOCS/a.txt"] {
+        let mut snapshot = previous.clone();
+        assert_eq!(snapshot.rescan(root, [PathBuf::from(alias)]).unwrap(), []);
+        assert_eq!(snapshot, previous, "{alias} is not a name on disk");
+    }
+
+    fs::rename(root.join("letter.txt"), root.join("LETTER.txt")).unwrap();
+    fs::rename(root.join("docs"), root.join("DOCS")).unwrap();
+    let expected = [
+        renamed("docs", "DOCS", Dir),
+        renamed("letter.txt", "LETTER.txt", File),
+    ];
+    for paths in [
+        vec!["LETTER.txt", "DOCS/a.txt"],
+        vec!["letter.txt", "docs/a.txt"],
+        vec!["letter.txt", "LETTER.txt", "docs", "DOCS"],
+    ] {
+        let mut snapshot = previous.clone();
+        let changes = snapshot
+            .rescan(root, paths.iter().map(PathBuf::from))
+            .unwrap();
+        assert_eq!(changes, expected, "{paths:?}");
+        assert_eq!(snapshot, Snapshot::scan(root).unwrap(), "{paths:?}");
+    }
+}
+
+#[test]
+fn normalization_alias_is_not_an_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("caf\u{e9}.txt"), "c").unwrap();
+    let mut snapshot = Snapshot::scan(root).unwrap();
+    let previous = snapshot.clone();
+    assert_eq!(
+        snapshot
+            .rescan(root, [PathBuf::from("cafe\u{301}.txt")])
+            .unwrap(),
+        []
+    );
+    assert_eq!(snapshot, previous);
+}
+
+#[test]
+fn native_watcher_reports_a_case_only_rename() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut watcher = NativeWatcher::start(root, Snapshot::default()).unwrap();
+    assert_eq!(watcher.poll(Duration::from_millis(300)).unwrap(), []);
+    fs::write(root.join("letter.txt"), "l").unwrap();
+    expect(&mut watcher, &[created("letter.txt", File)]);
+    fs::rename(root.join("letter.txt"), root.join("LETTER.txt")).unwrap();
+    expect(&mut watcher, &[renamed("letter.txt", "LETTER.txt", File)]);
+    assert_eq!(watcher.snapshot(), &Snapshot::scan(root).unwrap());
+}
+
+#[test]
+fn folder_replaced_by_a_symlink_is_removed_not_followed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("space");
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(root.join("d")).unwrap();
+    fs::write(root.join("d/x"), "inside").unwrap();
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("x"), "outside, longer").unwrap();
+    let mut snapshot = Snapshot::scan(&root).unwrap();
+
+    fs::remove_dir_all(root.join("d")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("d")).unwrap();
+
+    assert_eq!(
+        snapshot.rescan(&root, [PathBuf::from("d/x")]).unwrap(),
+        [removed("d", Dir)]
+    );
+    assert_eq!(snapshot, Snapshot::scan(&root).unwrap());
+    assert!(snapshot.entries.is_empty());
+}
+
+#[test]
+fn rescan_rejects_paths_outside_the_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut snapshot = Snapshot::scan(dir.path()).unwrap();
+    for path in ["../x", "/etc", "a/../b"] {
+        assert!(
+            matches!(
+                snapshot.rescan(dir.path(), [PathBuf::from(path)]),
+                Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::InvalidInput
+            ),
+            "{path}"
+        );
+    }
+}

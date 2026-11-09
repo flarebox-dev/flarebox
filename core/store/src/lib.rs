@@ -18,7 +18,10 @@
 //! trace, including when the process is killed in the middle of it: the
 //! database runs in WAL mode with `synchronous = FULL`, so a commit that
 //! returned is durable and an interrupted one is rolled back the next time the
-//! file is opened.
+//! file is opened. On macOS the store also enables `fullfsync`, so each commit
+//! ends with `F_FULLFSYNC` and survives power loss on drives that honor it;
+//! `fsync` alone may leave the data in the drive's cache. Process-kill tests
+//! cover the rollback, not power loss.
 
 use std::path::Path;
 use std::time::Duration;
@@ -112,6 +115,28 @@ pub enum Error {
     Decode(#[from] prost::DecodeError),
     #[error("database schema version {found} is newer than this build supports ({supported})")]
     SchemaTooNew { found: u32, supported: u32 },
+    #[error("the database did not accept the durability settings: {0:?}")]
+    NotDurable(Durability),
+}
+
+/// The connection settings that make a returned commit durable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Durability {
+    pub journal_mode: String,
+    /// `PRAGMA synchronous`: 2 is `FULL`.
+    pub synchronous: i64,
+    pub fullfsync: bool,
+}
+
+impl Durability {
+    /// What [`Store::open`] requires on this platform.
+    pub fn required() -> Self {
+        Self {
+            journal_mode: "wal".into(),
+            synchronous: 2,
+            fullfsync: cfg!(target_os = "macos"),
+        }
+    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -185,12 +210,40 @@ impl Store {
     /// migrations it lacks. Fails with [`Error::SchemaTooNew`] if a newer build
     /// already migrated it.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let mut conn = Connection::open(path)?;
+        let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
-        migrate(&mut conn)?;
-        Ok(Self { conn })
+        #[cfg(target_os = "macos")]
+        conn.pragma_update(None, "fullfsync", true)?;
+        let mut store = Self { conn };
+        let durability = store.durability()?;
+        if durability != Durability::required() {
+            return Err(Error::NotDurable(durability));
+        }
+        migrate(&mut store.conn)?;
+        Ok(store)
+    }
+
+    /// The durability settings in effect on this connection.
+    pub fn durability(&self) -> Result<Durability> {
+        let pragma = |name: &str| {
+            self.conn
+                .pragma_query_value(None, name, |row| row.get::<_, rusqlite::types::Value>(0))
+        };
+        let journal_mode = match pragma("journal_mode")? {
+            rusqlite::types::Value::Text(mode) => mode.to_ascii_lowercase(),
+            other => format!("{other:?}"),
+        };
+        let integer = |value| match value {
+            rusqlite::types::Value::Integer(n) => n,
+            _ => -1,
+        };
+        Ok(Durability {
+            journal_mode,
+            synchronous: integer(pragma("synchronous")?),
+            fullfsync: integer(pragma("fullfsync")?) == 1,
+        })
     }
 
     pub fn schema_version(&self) -> Result<u32> {

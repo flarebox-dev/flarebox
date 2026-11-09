@@ -6,8 +6,8 @@ use flarebox_proto::v1::{
     VersionInfo, op,
 };
 use flarebox_store::{
-    CachedChunk, Cursor, Error, InFlightCommit, LocalNode, Problem, SCHEMA_VERSION, Shape, Store,
-    SyncedNode,
+    CachedChunk, Cursor, Durability, Error, InFlightCommit, LocalNode, Problem, SCHEMA_VERSION,
+    Shape, Store, SyncedNode,
 };
 use rusqlite::Connection;
 
@@ -79,6 +79,17 @@ fn migrations_apply_from_empty() {
         .pragma_query_value(None, "journal_mode", |row| row.get(0))
         .unwrap();
     assert_eq!(journal, "wal");
+}
+
+#[test]
+fn connection_uses_durable_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("state.db")).unwrap();
+    let durability = store.durability().unwrap();
+    assert_eq!(durability, Durability::required());
+    assert_eq!(durability.journal_mode, "wal");
+    assert_eq!(durability.synchronous, 2);
+    assert_eq!(durability.fullfsync, cfg!(target_os = "macos"));
 }
 
 #[test]

@@ -97,6 +97,7 @@ name = "flarebox-fs"
 version = "0.0.0"
 dependencies = [
  "notify",
+ "rustix",
  "tempfile",
  "thiserror",
 ]
