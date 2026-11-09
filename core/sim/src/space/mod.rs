@@ -605,7 +605,7 @@ impl SpaceDo {
                 "base_seq is ahead of the server",
             ));
         }
-        let missing: Vec<Vec<u8>> = referenced
+        let mut missing: Vec<Vec<u8>> = referenced
             .iter()
             .filter(|chunk| {
                 let ready = self.state.chunks.get(&chunk.hash).is_some_and(|row| {
@@ -619,9 +619,15 @@ impl SpaceDo {
             .map(|chunk| chunk.hash.clone())
             .collect();
         if !missing.is_empty() {
+            let total = missing.len();
+            missing.truncate(MAX_CHUNKS_PER_CALL);
+            let message = format!(
+                "{total} chunks are not uploaded; {} are listed",
+                missing.len()
+            );
             return Err(Error {
                 missing_chunks: missing,
-                ..fail(error::Code::MissingChunks, "some chunks are not uploaded")
+                ..fail(error::Code::MissingChunks, message)
             });
         }
 

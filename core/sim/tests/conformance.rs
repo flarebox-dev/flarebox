@@ -258,6 +258,10 @@ fn chunk_list(chunks: &[Value]) -> Result<Vec<ChunkRef>, String> {
     Ok(out)
 }
 
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn error_name(code: i32) -> String {
     error::Code::try_from(code)
         .map(|c| c.as_str_name().trim_start_matches("CODE_").to_owned())
@@ -280,6 +284,7 @@ struct Run {
     devices: HashMap<String, Session>,
     contents: HashMap<String, Content>,
     wallets: HashMap<(String, String), Vec<UploadReceipt>>,
+    last_missing: HashMap<(String, String), Vec<Vec<u8>>>,
     symbols: HashMap<String, String>,
     values: HashMap<String, String>,
     cursors: HashMap<String, String>,
@@ -371,6 +376,7 @@ impl Run {
             devices,
             contents,
             wallets: HashMap::new(),
+            last_missing: HashMap::new(),
             symbols: HashMap::new(),
             values: HashMap::new(),
             cursors: HashMap::new(),
@@ -525,9 +531,42 @@ impl Run {
                 "a step",
                 &["device", "space", "at_ms", "reference_only", "upload"],
             )?;
-            keys(upload, "upload", &["contents"])?;
+            keys(upload, "upload", &["contents", "last_missing"])?;
             let session = self.session(step)?;
-            let chunks = self.contents_of(req(opt_list(upload, "contents"), "contents")?)?;
+            let chunks = match (
+                opt_list(upload, "contents")?,
+                opt_bool(upload, "last_missing")?,
+            ) {
+                (Some(list), None) => self.contents_of(list)?,
+                (None, Some(true)) => {
+                    let listed = self
+                        .last_missing
+                        .get(&(session.device_id.clone(), space.clone()))
+                        .ok_or("no MISSING_CHUNKS error was listed yet")?;
+                    let known: HashMap<&[u8], &ChunkRef> = self
+                        .contents
+                        .values()
+                        .flat_map(|content| &content.chunks)
+                        .map(|chunk| (chunk.hash.as_slice(), chunk))
+                        .collect();
+                    listed
+                        .iter()
+                        .map(|hash| {
+                            known
+                                .get(hash.as_slice())
+                                .map(|chunk| (*chunk).clone())
+                                .ok_or_else(|| {
+                                    format!("listed hash {} is no known chunk", hex(hash))
+                                })
+                        })
+                        .collect::<Result<_, _>>()?
+                }
+                _ => {
+                    return Err(
+                        "upload needs exactly one of contents and last_missing: true".into(),
+                    );
+                }
+            };
             let receipts = self.upload(&space, &session, at_ms, chunks)?;
             self.wallets
                 .entry((session.device_id.clone(), space))
@@ -784,11 +823,52 @@ impl Run {
             receipts,
             ..Default::default()
         };
-        let expect = expectation(step, &["missing"], &["seq", "results", "changed"])?;
+        let expect = expectation(
+            step,
+            &["missing", "missing_some"],
+            &["seq", "results", "changed"],
+        )?;
         let result = self.rpc(space, &session, at_ms, rpc_request::Call::Commit(commit))?;
+        if let rpc_response::Result::Error(e) = &result
+            && !e.missing_chunks.is_empty()
+        {
+            self.last_missing.insert(
+                (session.device_id.clone(), space.to_owned()),
+                e.missing_chunks.clone(),
+            );
+        }
         match (result, opt_str(expect, "error")?) {
             (rpc_response::Result::Error(e), Some(code)) => {
                 check_error(&e, code)?;
+                if let Some(some) = expect.get("missing_some") {
+                    keys(some, "missing_some", &["contents", "count", "total"])?;
+                    let from: BTreeSet<Vec<u8>> = self
+                        .contents_of(req(opt_list(some, "contents"), "contents")?)?
+                        .into_iter()
+                        .map(|c| c.hash)
+                        .collect();
+                    let count = req(opt_u64(some, "count"), "count")?;
+                    if e.missing_chunks.len() as u64 != count {
+                        return Err(format!(
+                            "{} missing chunks listed, expected {count}",
+                            e.missing_chunks.len()
+                        ));
+                    }
+                    if let Some(hash) = e.missing_chunks.iter().find(|h| !from.contains(*h)) {
+                        return Err(format!("missing chunk {} is not in contents", hex(hash)));
+                    }
+                    let total = req(opt_u64(some, "total"), "total")?.to_string();
+                    if !e
+                        .message
+                        .split(|c: char| !c.is_ascii_digit())
+                        .any(|number| number == total)
+                    {
+                        return Err(format!(
+                            "message {:?} does not give the total {total}",
+                            e.message
+                        ));
+                    }
+                }
                 if let Some(missing) = opt_list(expect, "missing")? {
                     let want: BTreeSet<Vec<u8>> = self
                         .contents_of(missing)?
