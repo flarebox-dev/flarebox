@@ -41,7 +41,8 @@ export interface VersionRow {
   node_id: string;
   seq: number;
   size: number;
-  mtime_ns: number;
+  /** Decimal text, because SQLite bindings carry no 64-bit integers. */
+  mtime_ns: string;
   executable: number;
   chunk_count: number;
   manifest_digest: ArrayBuffer;

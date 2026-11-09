@@ -25,7 +25,7 @@ const MIGRATIONS: string[] = [
   CREATE INDEX nodes_trashed ON nodes(trashed_at_ms) WHERE status = 2;
   CREATE TABLE versions (
     version_id TEXT PRIMARY KEY, node_id TEXT NOT NULL, seq INTEGER NOT NULL,
-    size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, executable INTEGER NOT NULL,
+    size INTEGER NOT NULL, mtime_ns TEXT NOT NULL, executable INTEGER NOT NULL,
     chunk_count INTEGER NOT NULL, manifest_digest BLOB NOT NULL, chunker TEXT NOT NULL,
     chunks BLOB,
     device_id TEXT NOT NULL, user_id TEXT NOT NULL, created_at_ms INTEGER NOT NULL,

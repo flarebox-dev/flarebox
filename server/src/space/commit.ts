@@ -139,6 +139,28 @@ export class CommitApplier {
     }
   }
 
+  /**
+   * Rejects the commit when placing node under parent would put it or a descendant, trashed ones included, deeper
+   * than MAX_DEPTH. A destination no deeper than the current position cannot, because the tree already satisfies
+   * the limit.
+   */
+  private checkSubtreeDepth(node: NodeRow, parent: NodeRow): void {
+    const newDepth = this.depth(parent) + 1;
+    if (newDepth <= this.depth(node)) return;
+    const height = this.sql
+      .exec(
+        `WITH RECURSIVE sub(id, d) AS (
+           SELECT ?, 0 UNION ALL SELECT n.node_id, sub.d + 1 FROM nodes n JOIN sub ON n.parent_id = sub.id WHERE sub.d <= ?)
+         SELECT MAX(d) AS height FROM sub`,
+        node.node_id,
+        MAX_DEPTH - newDepth,
+      )
+      .one().height;
+    if (newDepth + Number(height) > MAX_DEPTH) {
+      throw new CallFailure(Error_Code.LIMIT_EXCEEDED, `path depth would exceed ${MAX_DEPTH}`);
+    }
+  }
+
   private liveWithName(parentId: string, key: string, excludeId: string): NodeRow | undefined {
     return rows<NodeRow>(
       this.sql.exec(
@@ -251,7 +273,7 @@ export class CommitApplier {
       nodeId,
       this.ctx.seq,
       Number(content.size),
-      Number(content.mtimeNs),
+      String(content.mtimeNs),
       content.executable ? 1 : 0,
       chunks.length,
       content.manifestDigest,
@@ -347,6 +369,7 @@ export class CommitApplier {
     if (target.kind !== NodeKindValue.DIR) return rejected("PARENT_NOT_DIR");
     if (this.isSelfOrDescendant(target, found.node_id)) return rejected("CYCLE");
     const parent = this.parentFor(target.node_id) as NodeRow;
+    this.checkSubtreeDepth(found, parent);
     if (found.status === NodeStatusValue.TRASHED) {
       const group = found.trash_group!;
       const picked = this.reviveOne(found, parent.node_id, name);
@@ -411,6 +434,7 @@ export class CommitApplier {
     if (target.kind !== NodeKindValue.DIR) return rejected("PARENT_NOT_DIR");
     if (this.isSelfOrDescendant(target, node.node_id)) return rejected("CYCLE");
     const parent = this.parentFor(target.node_id) as NodeRow;
+    this.checkSubtreeDepth(node, parent);
     const group = node.trash_group!;
     const picked = this.reviveOne(node, parent.node_id, name);
     this.reviveGroup(node.node_id, group);

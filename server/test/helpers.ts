@@ -62,6 +62,8 @@ type Stub = Awaited<ReturnType<typeof newSpace>>["stub"];
 /** A device talking to one space through the binary RPC entry point. */
 export class TestClient {
   baseSeq = 0n;
+  /** Time the receipts are signed for; set it when the Space DO clock is moved. */
+  nowMs: number | undefined;
   private nextReq = 1n;
 
   constructor(
@@ -96,7 +98,7 @@ export class TestClient {
       const hex = toHex(plan.hash);
       const chunk = chunks.find((c) => toHex(c.hash) === hex)!;
       await env.BUCKET.put(chunkKey(this.spaceId, hex), bytes.get(hex) ?? new Uint8Array(chunk.size));
-      const token = await signChunkGrant(SPACE_KEY, "receipt", this.spaceId, hex, chunk.size, Date.now() + 3_600_000);
+      const token = await signChunkGrant(SPACE_KEY, "receipt", this.spaceId, hex, chunk.size, (this.nowMs ?? Date.now()) + 3_600_000);
       receipts.push(create(UploadReceiptSchema, { hash: plan.hash, size: chunk.size, token }));
     }
     return receipts;

@@ -403,7 +403,7 @@ describe("garbage collection", () => {
     expect(commit.case === "error" && commit.value.code).toBe(Error_Code.MISSING_CHUNKS);
   });
 
-  it("runs from the alarm", async () => {
+  it("arms the GC alarm when the space is created", async () => {
     const space = await setup();
     const alarm = await runInDurableObject(space.stub, (_instance, state) => state.storage.getAlarm());
     expect(alarm).toBeGreaterThan(Date.now() + DAY - 60_000);

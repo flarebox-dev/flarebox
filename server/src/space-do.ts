@@ -165,6 +165,8 @@ function opContent(op: Op): Content | undefined | null {
 export class SpaceDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
   private spaceKeyCache: Uint8Array | undefined;
+  /** The time source for holds, retention and tickets. Tests replace it to move through days. */
+  clock: () => number = () => Date.now();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -195,7 +197,7 @@ export class SpaceDO extends DurableObject<Env> {
         args.spaceId,
       );
     });
-    await this.schedule("gc", Date.now() + DAY_MS);
+    await this.schedule("gc", this.clock() + DAY_MS);
   }
 
   /** Answers one binary RpcRequest with a binary RpcResponse (the HTTP path, and tests). */
@@ -303,10 +305,14 @@ export class SpaceDO extends DurableObject<Env> {
     for (const op of commit.ops) {
       const content = opContent(op);
       if (content === null) continue;
-      for (const chunk of (await checkContent(content)).chunks) referenced.set(toHex(chunk.hash), chunk);
+      for (const chunk of (await checkContent(content)).chunks) {
+        const hex = toHex(chunk.hash);
+        if ((referenced.get(hex)?.size ?? chunk.size) !== chunk.size) fail(Error_Code.INVALID_ARGUMENT, "one chunk hash is listed with two sizes");
+        referenced.set(hex, chunk);
+      }
     }
     const spaceId = this.spaceId;
-    const nowMs = Date.now();
+    const nowMs = this.clock();
     const receipted = new Set<string>();
     for (const receipt of commit.receipts) {
       const hex = toHex(receipt.hash);
@@ -359,8 +365,14 @@ export class SpaceDO extends DurableObject<Env> {
     this.checkCanWrite(session);
     if (request.chunks.length > MAX_CHUNKS_PER_CALL) fail(Error_Code.LIMIT_EXCEEDED, `at most ${MAX_CHUNKS_PER_CALL} chunks per call`);
     request.chunks.forEach(checkChunkRef);
-    const chunks = [...new Map(request.chunks.map((chunk) => [toHex(chunk.hash), chunk])).values()];
-    const nowMs = Date.now();
+    const byHash = new Map<string, ChunkRef>();
+    for (const chunk of request.chunks) {
+      const hex = toHex(chunk.hash);
+      if ((byHash.get(hex)?.size ?? chunk.size) !== chunk.size) fail(Error_Code.INVALID_ARGUMENT, "one chunk hash is listed with two sizes");
+      byHash.set(hex, chunk);
+    }
+    const chunks = [...byHash.values()];
+    const nowMs = this.clock();
     const holdUntil = nowMs + HOLD_MS;
     const actions = this.ctx.storage.transactionSync(() =>
       chunks.map((chunk) => {
@@ -405,7 +417,7 @@ export class SpaceDO extends DurableObject<Env> {
       return row?.state !== ChunkState.LIVE;
     });
     if (missing.length > 0) throw new CallFailure(Error_Code.MISSING_CHUNKS, "some chunks are not stored", missing);
-    const expiresAtMs = Date.now() + GRANT_MS;
+    const expiresAtMs = this.clock() + GRANT_MS;
     const spaceId = this.spaceId;
     const targets = [];
     for (const hash of request.hashes) {
@@ -427,14 +439,25 @@ export class SpaceDO extends DurableObject<Env> {
 
   private listVersions(request: ListVersions) {
     const limit = Math.min(request.limit || 100, 1000);
-    const before = request.cursor ? Number(request.cursor) : Number.MAX_SAFE_INTEGER;
+    const [seqText, versionId = ""] = request.cursor ? request.cursor.split("/") : [String(Number.MAX_SAFE_INTEGER)];
+    const seq = Number(seqText);
+    if (!Number.isSafeInteger(seq)) fail(Error_Code.INVALID_ARGUMENT, "malformed cursor");
     const found = rows<VersionRow>(
-      this.sql.exec("SELECT * FROM versions WHERE node_id = ? AND seq < ? ORDER BY seq DESC LIMIT ?", request.nodeId, before, limit + 1),
+      this.sql.exec(
+        `SELECT * FROM versions WHERE node_id = ? AND (seq < ? OR (seq = ? AND version_id < ?))
+         ORDER BY seq DESC, version_id DESC LIMIT ?`,
+        request.nodeId,
+        seq,
+        seq,
+        versionId,
+        limit + 1,
+      ),
     );
     const page = found.slice(0, limit);
+    const last = page.at(-1);
     return create(VersionListSchema, {
       versions: page.map((version) => versionInfo(this.sql, version)),
-      nextCursor: found.length > limit ? String(page.at(-1)!.seq) : "",
+      nextCursor: found.length > limit && last ? `${last.seq}/${last.version_id}` : "",
     });
   }
 
@@ -487,7 +510,7 @@ export class SpaceDO extends DurableObject<Env> {
     const { expiredVersions, purgedNodes } = this.ctx.storage.transactionSync(() => {
       const expired = rows<VersionRow>(
         this.sql.exec(
-          "SELECT * FROM versions WHERE superseded_at_ms IS NOT NULL AND superseded_at_ms <= ? LIMIT ?",
+          "SELECT * FROM versions WHERE superseded_at_ms IS NOT NULL AND superseded_at_ms < ? LIMIT ?",
           nowMs - settings.version_retention_days * DAY_MS,
           GC_BATCH,
         ),
@@ -499,7 +522,7 @@ export class SpaceDO extends DurableObject<Env> {
       for (let budget = GC_BATCH; budget > 0; ) {
         const due = rows<NodeRow>(
           this.sql.exec(
-            `SELECT * FROM nodes n WHERE status = 2 AND trashed_at_ms <= ?
+            `SELECT * FROM nodes n WHERE status = 2 AND trashed_at_ms < ?
                AND NOT EXISTS (SELECT 1 FROM nodes c WHERE c.parent_id = n.node_id) LIMIT ?`,
             nowMs - settings.trash_retention_days * DAY_MS,
             budget,
@@ -526,8 +549,8 @@ export class SpaceDO extends DurableObject<Env> {
     const marked = this.ctx.storage.transactionSync(() => {
       const hashes = this.sql
         .exec(
-          `SELECT hash FROM chunks WHERE refcount = 0 AND hold_until_ms <= ?
-             AND (state = 1 OR (state = 2 AND zero_since_ms <= ?)) LIMIT ?`,
+          `SELECT hash FROM chunks WHERE refcount = 0 AND hold_until_ms < ?
+             AND (state = 1 OR (state = 2 AND zero_since_ms < ?)) LIMIT ?`,
           nowMs,
           nowMs - settings.chunk_grace_days * DAY_MS,
           GC_BATCH,
@@ -570,7 +593,7 @@ export class SpaceDO extends DurableObject<Env> {
   }
 
   override async alarm(): Promise<void> {
-    const nowMs = Date.now();
+    const nowMs = this.clock();
     const due = this.sql.exec("SELECT task FROM schedule WHERE due_ms <= ?", nowMs).toArray().map((row) => String(row.task));
     for (const task of due) {
       if (task === "gc") {
