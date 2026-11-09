@@ -4,6 +4,7 @@ name: CI
 
 on:
   pull_request:
+  merge_group:
   push:
     branches: [main]
 
@@ -23,10 +24,10 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
@@ -42,11 +43,11 @@ jobs:
       run:
         working-directory: server
     steps:
-      - uses: actions/checkout@v7
-      - uses: pnpm/action-setup@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           package_json_file: server/package.json
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           cache: pnpm
@@ -66,8 +67,8 @@ jobs:
       run:
         working-directory: spec
     steps:
-      - uses: actions/checkout@v7
-      - uses: bufbuild/buf-action@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: bufbuild/buf-action@37ac33d8960807670a6e9719080e885197b09cc6 # v1.7.0
         with:
           version: 1.75.0
           setup_only: true
@@ -78,5 +79,31 @@ jobs:
           if ! git diff --exit-code -- ../server/src/gen ../core/proto/src/gen || [ -n "$(git status --porcelain -- ../server/src/gen ../core/proto/src/gen)" ]; then
             echo "::error::Generated code in server/src/gen or core/proto/src/gen is out of date. Run 'buf generate' in spec/ and commit the result."
             git status --short -- ../server/src/gen ../core/proto/src/gen
+            exit 1
+          fi
+      - name: Check for breaking changes against main
+        run: |
+          git fetch --no-tags --depth=1 origin +refs/heads/main:refs/remotes/origin/main
+          if ! buf breaking --against "../.git#ref=refs/remotes/origin/main,subdir=spec"; then
+            echo "::error::The schema in spec/proto breaks compatibility with main (see the buf output above). Keep field numbers, names and types stable; reserve removed fields instead of deleting them."
+            exit 1
+          fi
+
+  ci-report:
+    name: ci-report
+    if: always()
+    needs: [rust, server, spec]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any CI job failed or was cancelled
+        env:
+          RUST: ${{ needs.rust.result }}
+          SERVER: ${{ needs.server.result }}
+          SPEC: ${{ needs.spec.result }}
+          FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          echo "rust: $RUST, server: $SERVER, spec: $SPEC"
+          if [ "$FAILED" = "true" ]; then
+            echo "::error::At least one CI job failed or was cancelled (rust: $RUST, server: $SERVER, spec: $SPEC). Open that job's log for the cause."
             exit 1
           fi

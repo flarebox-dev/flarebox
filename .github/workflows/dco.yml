@@ -4,6 +4,7 @@ name: DCO
 
 on:
   pull_request:
+  merge_group:
 
 permissions:
   contents: read
@@ -12,11 +13,16 @@ jobs:
   dco:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - name: Skip in the merge queue
+        if: github.event_name == 'merge_group'
+        run: echo "Every commit was already checked for a sign-off on its pull request; merge_group events carry no pull request commit range."
+      - if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
       - name: Check Signed-off-by on every commit
+        if: github.event_name == 'pull_request'
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
           HEAD: ${{ github.event.pull_request.head.sha }}
