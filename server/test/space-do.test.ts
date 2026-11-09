@@ -9,7 +9,7 @@ import { CommitRecordSchema, NodeStatus } from "../src/gen/flarebox/v1/model_pb"
 import { ChunkPlan_Action, Error_Code } from "../src/gen/flarebox/v1/rpc_pb";
 import { toHex, uuidv7 } from "../src/ids";
 import type { SpaceDO } from "../src/space-do";
-import { conflictName } from "../src/space/names";
+import { conflictName, nameKey } from "../src/space/names";
 import { chunkKey } from "../src/space/store";
 import { client, content, newSpace, op, type TestClient } from "./helpers";
 
@@ -129,7 +129,52 @@ describe("conflict rules", () => {
     const name = conflictName("x." + "e".repeat(200), "\u0A5E".repeat(40), Date.UTC(2026, 10, 10), 2);
     expect(name).toBe(name.normalize("NFC"));
     expect(new TextEncoder().encode(name).length).toBeLessThanOrEqual(255);
-    expect(name.startsWith(" (conflict from " + "\u0A2B\u0A3C".repeat(32) + " 2026-11-10 2).")).toBe(true);
+    expect(name.startsWith(" (conflict from " + "\u0A2B\u0A3C".repeat(21) + " 2026-11-10 2).")).toBe(true);
+  });
+
+  it("gives canonical caseless pairs one key and keeps compatibility and accent distinctions", () => {
+    for (const [x, y] of [["\u0390", "\u03AA\u0301"], ["\u212A", "k"], ["\u00E9", "E\u0301"], ["Straße", "STRASSE"], ["a\u0315\u0300", "A\u0300\u0315"]]) {
+      expect(nameKey(x!)).toBe(nameKey(y!));
+    }
+    for (const [x, y] of [["\u2460", "1"], ["\uFF21", "A"], ["\u00E9", "e"], ["\u0130", "I"], ["\u0131", "i"]]) {
+      expect(nameKey(x!)).not.toBe(nameKey(y!));
+    }
+  });
+
+  it("keeps the date and attempt in conflict names when NFC expands the device name past the budget", () => {
+    const at = Date.UTC(2026, 10, 10);
+    const device = "\u{1D160}".repeat(32);
+    const names = [1, 2, 3].map((attempt) => conflictName("x.txt", device, at, attempt));
+    expect(new Set(names).size).toBe(3);
+    for (const name of names) {
+      expect(name).toBe(name.normalize("NFC"));
+      expect(new TextEncoder().encode(name).length).toBeLessThanOrEqual(255);
+      expect(new TextEncoder().encode(name.slice(name.indexOf(" (conflict from ") + 16, name.lastIndexOf(" 2026-11-10"))).length).toBeLessThanOrEqual(128);
+    }
+    expect(names[2]).toMatch(/ 2026-11-10 3\)\.txt$/);
+  });
+
+  it("commits repeated renames and conflict copies from a device whose name NFC expands past the budget", async () => {
+    const space = await newSpace();
+    const a = await client(space, "Laptop A");
+    const odd = await client(space, "\u{1D160}".repeat(32));
+    const root = space.spaceId;
+    const { nodeId } = await createFile(a, root, "x.txt", "original");
+    const renamed = [];
+    for (let i = 0; i < 3; i++) renamed.push((await createFile(odd, root, "x.txt", "copy " + i)).result.results[0]!);
+    expect(renamed.map((r) => r.code)).toEqual([OpResult_Code.APPLIED_RENAMED, OpResult_Code.APPLIED_RENAMED, OpResult_Code.APPLIED_RENAMED]);
+    expect(new Set(renamed.map((r) => r.name)).size).toBe(3);
+
+    const base = odd.baseSeq;
+    const update = await newContent(a, "newer");
+    await a.commit([op.update(nodeId, update.content)], { receipts: update.receipts });
+    const copies = [];
+    for (let i = 0; i < 3; i++) {
+      const stale = await newContent(odd, "stale " + i);
+      copies.push((await odd.commit([op.update(nodeId, stale.content)], { baseSeq: base, receipts: stale.receipts })).results[0]!);
+    }
+    expect(copies.map((r) => r.code)).toEqual([OpResult_Code.CONFLICT_COPY, OpResult_Code.CONFLICT_COPY, OpResult_Code.CONFLICT_COPY]);
+    expect(new Set([...renamed, ...copies].map((r) => r.name)).size).toBe(6);
   });
 
   it("R2: treats canonically equivalent names that differ only by case as one name", async () => {
