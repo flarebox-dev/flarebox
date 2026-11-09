@@ -4,6 +4,7 @@ name: CI
 
 on:
   pull_request:
+  merge_group:
   push:
     branches: [main]
 
@@ -85,5 +86,24 @@ jobs:
           git fetch --no-tags --depth=1 origin +refs/heads/main:refs/remotes/origin/main
           if ! buf breaking --against "../.git#ref=refs/remotes/origin/main,subdir=spec"; then
             echo "::error::The schema in spec/proto breaks compatibility with main (see the buf output above). Keep field numbers, names and types stable; reserve removed fields instead of deleting them."
+            exit 1
+          fi
+
+  ci-report:
+    name: ci-report
+    if: always()
+    needs: [rust, server, spec]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any CI job failed or was cancelled
+        env:
+          RUST: ${{ needs.rust.result }}
+          SERVER: ${{ needs.server.result }}
+          SPEC: ${{ needs.spec.result }}
+          FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          echo "rust: $RUST, server: $SERVER, spec: $SPEC"
+          if [ "$FAILED" = "true" ]; then
+            echo "::error::At least one CI job failed or was cancelled (rust: $RUST, server: $SERVER, spec: $SPEC). Open that job's log for the cause."
             exit 1
           fi
