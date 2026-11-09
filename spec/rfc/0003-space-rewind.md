@@ -63,44 +63,49 @@ The Account DO directs the rewind and keeps a record of it in its own storage, w
 - the phase;
 - the result or the error.
 
-An Account DO alarm drives every phase forward, retrying with backoff from one second up to ten minutes, so a crash at any point resumes where it stopped.
+An Account DO alarm drives the phases with backoff from one second up to ten minutes. Each phase is recorded before the call it starts, so a crash or an unknown call outcome resumes from the recorded phase.
 
 1. **Admission.** The Account DO asks the Space DO, through a call that changes nothing, for:
    - its current `history_id` and `head_seq`;
    - the bookmark B for P.
 
    It then checks §1 and §2. Any failure refuses the request and records nothing. Otherwise it records the rewind as `admitted`, with B and the new `history_id`. From then on the space is closed (§4).
-2. **Arming**, one attempt at a time:
-   - The Space DO closes every WebSocket after sending `Goodbye` with close code 4004 (space rewound).
-   - It writes a marker row naming the rewind and the attempt, then reads its current bookmark M.
-   - If B is not earlier than M, the rewind fails (step 5). Otherwise the restored state cannot contain the marker.
-   - It calls `onNextSessionRestoreBookmark(B)`.
-   - It returns its `history_id` and `head_seq`. The Account DO stores them from the first attempt as the previous history and head, and records the phase `armed`.
-   - The Account DO then has the Space DO restart with `ctx.abort()`.
-3. **Proof and completion.** The Account DO asks the Space DO to complete the rewind.
-   - **Marker present.** The restore did not happen: for example, the object crashed before the restore was armed. The Account DO goes back to step 2 with the next attempt.
+2. **Preparing attempt k.** The Space DO:
+   - closes every WebSocket after sending `Goodbye` with close code 4004 (space rewound);
+   - drains destructive work (§5, rule 5);
+   - writes a marker row for the rewind and attempt k, and reads its current bookmark M;
+   - returns its `history_id` and `head_seq`, and whether B is earlier than M.
+
+   If B is not earlier than M, the restored state could contain the marker, and the rewind fails (step 5). Otherwise the Account DO records the phase `prepared`, and, on the first attempt, the returned history and head as the previous history and head. All of this happens before any restore can be armed. Preparing is idempotent: repeating it for the same attempt leaves one marker.
+3. **Arming attempt k.** The Account DO records the phase `arming`. Then the Space DO calls `onNextSessionRestoreBookmark(B)` and restarts with `ctx.abort()`.
+4. **Settling.** After an arming call, whether it answered, failed or has an unknown outcome, the Account DO first restarts the Space DO once more. A restore that is pending applies when the object starts, so after this restart none can still be pending. The Account DO then asks the Space DO to complete the rewind:
+   - **Marker of attempt k present.** No restore happened and none is pending. The Account DO goes back to step 2 with attempt k + 1, or ends in step 6 if B can no longer be restored.
    - **No marker, but a completion receipt for this rewind in `meta`.** Completion already ran, and the Space DO returns that receipt again.
    - **Neither.** The storage was restored to B, which predates every marker of this rewind. The Space DO then completes the rewind in one transaction:
      - sets the new `history_id`, plus `restore_seq` (its `head_seq`) and `restore_point_ms` in `meta` (RFC 0002 §8);
      - adds every device that the Account DO has revoked to `revoked_devices`;
      - applies the chunk rules of §5;
      - resets the export state (§7);
-     - stores the completion receipt, then re-arms its alarm from the restored `schedule` table.
+     - stores the completion receipt.
 
-   A repeated completion call therefore always returns the same receipt.
-4. **Reopening.** The Account DO stores the `RewindResult` and records the phase `completed`, which reopens the space.
-5. **Failure.** The rewind can fail only while no restore can be pending. Before it calls `onNextSessionRestoreBookmark`, the Space DO answers definitely that it did not arm when B is not earlier than M, or when B can no longer be restored. On that answer, the Account DO removes the attempt's marker, records the phase `failed` with the error, and reopens the space unchanged.
+   Every completion call, a replay included, then sets the Space DO's alarm from its `schedule` table. A repeated call therefore returns the same receipt and leaves the alarm set.
 
-   Once an arming call has started without such an answer, a restore may be pending for the object's next start. From then on the rewind only moves forward: each further attempt arms B again and restarts, until completion succeeds. While it cannot finish, the space stays closed, for example because PITR keeps failing, or because completion hits a server bug. A retried request with the same `rewind_id` reports `RETRY_LATER` and the last error. The space is never reopened while a restore may still be pending, nor with a restored database under its old history.
+   An Account DO that restarts in the phase `arming` resumes at this step. So it never arms again before it has settled the earlier attempt.
+5. **Reopening.** The Account DO stores the `RewindResult` and records the phase `completed`, which reopens the space.
+6. **Failure.** A rewind ends as `failed` only when no restore can have happened or be pending. That is the case when B is not earlier than M in step 2, or after step 4 has proved that the marker is still present and B can no longer be restored. The Account DO then removes the markers, records the error, and reopens the space unchanged.
+
+   Once step 4 has found the marker gone, the rewind can only complete. If completion keeps failing, the space stays closed: reopening a restored database under its old history would let devices treat it as that history. This can only happen through a server bug. A retried request with the same `rewind_id` reports `RETRY_LATER` and the last error.
 
 ## 4. Closed space
 
 From admission until the record is `completed` or `failed`, the space is closed:
 - every HTTP RPC and WebSocket upgrade gets `RETRY_LATER`;
 - the Space DO answers every socket message by closing the socket with 4004;
-- the Space DO's alarm does no work.
+- the Space DO's alarm runs no work and leaves the `schedule` table as it is.
 
-The Account DO decides this. The Worker and the Space DO already ask it about every request and message, and the alarm handler also asks it before it runs GC, the orphan sweep or export. So the restored database cannot run GC before completion has applied §5, and no client reaches the restored state before it carries its new history.
+A closed alarm sets the alarm again for at most ten minutes later. Work that comes due during the closure, such as GC, the orphan sweep or export, therefore runs within ten minutes of reopening, even with no client activity.
+
+The Account DO decides whether the space is closed. The Worker and the Space DO already ask it about every request and message, and the alarm handler also asks it before it runs any work. So the restored database cannot run GC before completion has applied §5, and no client reaches the restored state before it carries its new history.
 
 ## 5. Chunk retention
 
@@ -110,6 +115,7 @@ Invariant: no chunk object is deleted earlier than `chunk_grace_days` after the 
 2. At completion, every chunk row whose refcount is 0, in any state, becomes `pending` with `hold_until` set to the completion time plus `chunk_grace_days`. The discarded history may have referenced the chunk until the rewind, and GC may already have deleted the object. As `pending`, `PrepareUpload` answers `UPLOAD`, so a commit that needs the chunk stores it again; a conditional PUT that finds the object present counts as stored. If no commit needs it, it ages out through the normal grace.
 3. The orphan sweep deletes an object that has no chunk row only once both its upload time and the space's latest rewind completion are more than `chunk_grace_days` in the past. The Account DO keeps the latest completion time per space, and every completion copies it into `meta`, so a later rewind cannot lose it.
 4. `chunk_grace_days` cannot be set below 30.
+5. Before it writes a marker (§3 step 2), the Space DO waits for any GC run in progress to end. It then deletes the object of every chunk row in state `deleting` (orphan-sweep rows included), awaits each R2 response, and removes those rows. So every R2 delete the space issued before admission has completed before any restored row can become `pending` and uploadable again. [R2 lets overlapping writes to one key finish in any order](https://developers.cloudflare.com/r2/reference/consistency/), so a delete still outstanding could otherwise remove a fresh upload. A `deleting` row at admission had a refcount of 0 for at least `chunk_grace_days`, so no admissible target references it, and finishing its delete keeps the invariant. This drain assumes that R2 does not apply a request after its sender has received the response, or after the sending instance has ended and the object has restarted. The R2 documentation does not state this (unverified).
 
 Any admissible target T satisfies T ≥ now − 29 days, and a chunk referenced at T was referenced until some time no earlier than T. By the invariant it is kept until at least T + 30 days, which is after now. The bound holds across repeated rewinds, including a target in an interval that an earlier rewind discarded. It does not depend on how `chunk_grace_days` changed over time, because rule 4 makes 30 days the floor. Rewinds therefore do not narrow the window. The cost is that the chunks only a discarded history used stay in R2 for 30 days after the rewind.
 
@@ -120,14 +126,16 @@ Any admissible target T satisfies T ≥ now − 29 days, and a chunk referenced 
   - the commit log, chunk rows, members, the space's name and settings;
   - `device_commits` (RFC 0002 §2).
 - **Kept:** the Account DO's state, including devices, revocations, spaces, share links and rewind records. A share link that points to a node absent after the rewind finds nothing.
-- **Lost from the server for good:** everything committed after `restore_seq`. That includes:
+- **Removed from the current history:** everything committed after `restore_seq`. That includes:
   - every intermediate version written after the restore point, not only the latest one;
   - nodes trashed after the restore point, and their trash state;
   - changes that no device downloaded before the rewind.
+
+  For a while, PITR and the earlier history's export files still hold their metadata, and §5 keeps their chunks for 30 days. Within the window, a later rewind to a point before this one can bring them back. Nothing guarantees that, and once the window and the grace have passed they are gone.
 - **What devices keep.** Devices keep only what is on their disks, through recovery (RFC 0002 §6):
   - A local file the device changed is held for the user's answer.
   - A local file the device did not change follows the restored server: the newer local copy moves to the device's local trash, which keeps it only as long as that trash's own retention allows.
-  - Versions a device never had on disk, such as an intermediate version B in A → B → C after the restore point, exist nowhere after the rewind.
+  - No device is guaranteed to have a copy of a version it never had on disk, such as an intermediate version B in A → B → C after the restore point. Such a version exists only where the previous bullet allows, until it expires.
 - **Undo.** There is no undo operation, and this RFC does not guarantee one. A later rewind to a point before this one began restores the state at that point like any other admissible target (§2 and §5), as yet another history. It does not reverse what devices did during their recovery.
 
 ## 7. R2 metadata export (§11)
