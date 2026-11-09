@@ -103,6 +103,9 @@ class Socket {
   private wake: (() => void) | undefined;
   private nextReq = 1n;
   closed: { code: number; reason: string } | undefined;
+  /** From the last Welcome: the space's history and this device's highest accepted device_seq (RFC 0002 section 2). */
+  historyId = "";
+  acceptedSeq = 0n;
 
   private constructor(readonly ws: WebSocket) {
     ws.addEventListener("message", (event) => {
@@ -166,6 +169,8 @@ class Socket {
     this.send({ case: "hello", value: { clientName: "test", clientVersion: "0", protoMin: 1, protoMax: 1, maxFormat } });
     const msg = await this.next();
     if (msg.case !== "welcome") throw new Error("expected Welcome, got " + msg.case);
+    this.historyId = msg.value.historyId;
+    this.acceptedSeq = msg.value.deviceSeq;
     return msg.value;
   }
 
@@ -189,9 +194,16 @@ class Socket {
     return msg.value.result;
   }
 
+  /** The history and the next device slot for a new commit. */
+  slot() {
+    return { historyId: this.historyId, deviceSeq: this.acceptedSeq + 1n };
+  }
+
   async commit(baseSeq: bigint, ops: ReturnType<typeof op.mkdir>[], receipts: MessageInitShape<typeof UploadReceiptSchema>[] = []) {
-    const result = await this.rpc({ case: "commit", value: { commitId: uuidv7(), baseSeq, ops, receipts } });
+    const slot = this.slot();
+    const result = await this.rpc({ case: "commit", value: { commitId: uuidv7(), baseSeq, ops, receipts, ...slot } });
     if (result.case !== "commit") throw new Error("commit failed: " + (result.case === "error" ? result.value.message : result.case));
+    this.acceptedSeq = slot.deviceSeq;
     return result.value;
   }
 
@@ -406,7 +418,7 @@ describe("owner claim, pairing and tokens", () => {
       version: state.storage.sql.exec("SELECT value FROM meta WHERE key = 'schema_version'").one().value,
       revoked: state.storage.sql.exec("SELECT device_id FROM revoked_devices").toArray(),
     }));
-    expect(after).toEqual({ version: 2, revoked: [{ device_id: device }] });
+    expect(after).toEqual({ version: 3, revoked: [{ device_id: device }] });
   });
 
   it("adds revoked_devices to a version-one Space database and keeps its data", async () => {
@@ -432,7 +444,7 @@ describe("owner claim, pairing and tokens", () => {
       node: state.storage.sql.exec("SELECT name FROM nodes WHERE node_id = ?", dir).toArray(),
       revoked: state.storage.sql.exec("SELECT device_id FROM revoked_devices").toArray(),
     }));
-    expect(after).toEqual({ version: 2, head: 1, commits: [{ seq: 1 }], node: [{ name: "kept" }], revoked: [{ device_id: device }] });
+    expect(after).toEqual({ version: 3, head: 1, commits: [{ seq: 1 }], node: [{ name: "kept" }], revoked: [{ device_id: device }] });
   });
 });
 
@@ -469,7 +481,7 @@ describe("WebSocket session", () => {
     const before = await snapshot();
     const both = await writer.rpc({
       case: "commit",
-      value: { commitId: uuidv7(), baseSeq: 0n, ops: [op.create(uuidv7(), spaceId, "one", parts.content), op.create(uuidv7(), spaceId, "two", parts.content)], receipts },
+      value: { commitId: uuidv7(), baseSeq: 0n, ops: [op.create(uuidv7(), spaceId, "one", parts.content), op.create(uuidv7(), spaceId, "two", parts.content)], receipts, ...writer.slot() },
     });
     expect(both.case === "error" && both.value.code).toBe(Error_Code.LIMIT_EXCEEDED);
     expect(await snapshot()).toEqual(before);
@@ -562,7 +574,7 @@ describe("WebSocket session", () => {
       return create(ChunkRefSchema, { hash, size: 1 });
     });
     const many = create(ContentSchema, { chunks, chunkCount: chunks.length, size: BigInt(chunks.length), manifestDigest: await sha256(encodeChunkList(chunks)) });
-    const request: MessageInitShape<typeof RpcRequestSchema>["call"] = { case: "commit", value: { commitId: uuidv7(), baseSeq: 0n, ops: [op.create(uuidv7(), spaceId, "missing", many)] } };
+    const request: MessageInitShape<typeof RpcRequestSchema>["call"] = { case: "commit", value: { commitId: uuidv7(), baseSeq: 0n, ops: [op.create(uuidv7(), spaceId, "missing", many)], ...socket.slot() } };
     const requestBytes = body(RpcRequestSchema, { reqId: 1n, call: request });
     expect(requestBytes.length).toBeLessThan(8 * 1024 * 1024);
     const http = await exports.default.fetch(BASE + "/v1/spaces/" + spaceId + "/rpc", { method: "POST", headers: { Authorization: "Bearer " + a.access!.token }, body: requestBytes });
@@ -579,7 +591,7 @@ describe("WebSocket session", () => {
     expect(await runInDurableObject(stub, (_instance, state) => state.storage.sql.exec("SELECT seq FROM commits").toArray())).toEqual([]);
 
     const parts = await content(...Array.from({ length: 1010 }, (_, i) => "chunk " + i));
-    const commit = { commitId: uuidv7(), baseSeq: 0n, ops: [op.create(uuidv7(), spaceId, "big", parts.content)] };
+    const commit = { commitId: uuidv7(), baseSeq: 0n, ops: [op.create(uuidv7(), spaceId, "big", parts.content)], ...socket.slot() };
     const receipts: MessageInitShape<typeof UploadReceiptSchema>[] = [];
     const listed = async () => {
       const result = await socket.rpc({ case: "commit", value: { ...commit, receipts } });
@@ -615,6 +627,16 @@ describe("WebSocket session", () => {
     const small = await Socket.connect(spaceId, a);
     small.ws.send("hello");
     expect((await small.waitClosed()).code).toBe(Close.PROTOCOL);
+  });
+
+  it("reports each device's highest accepted device_seq in Welcome", async () => {
+    const { a, b, spaceId } = await twoDevices();
+    const sa = await Socket.connect(spaceId, a);
+    expect((await sa.start()).deviceSeq).toBe(0n);
+    await sa.commit(0n, [op.mkdir(uuidv7(), spaceId, "one")]);
+    await sa.commit(1n, [op.mkdir(uuidv7(), spaceId, "two")]);
+    expect((await (await Socket.connect(spaceId, a)).hello()).deviceSeq).toBe(2n);
+    expect((await (await Socket.connect(spaceId, b)).hello()).deviceSeq).toBe(0n);
   });
 
   it("lets two devices commit and receive each other's changes", async () => {
@@ -731,7 +753,7 @@ describe("WebSocket session", () => {
     const { a, b, spaceId } = await twoDevices();
     const sb = await Socket.connect(spaceId, b);
     await sb.start();
-    const commit = body(RpcRequestSchema, { reqId: 1n, call: { case: "commit", value: { commitId: uuidv7(), baseSeq: 0n, ops: [op.mkdir(uuidv7(), spaceId, "via http")] } } });
+    const commit = body(RpcRequestSchema, { reqId: 1n, call: { case: "commit", value: { commitId: uuidv7(), baseSeq: 0n, ops: [op.mkdir(uuidv7(), spaceId, "via http")], historyId: sb.historyId, deviceSeq: 1n } } });
     const response = await call("/v1/spaces/" + spaceId + "/rpc", { token: a.access!.token, body: commit }, RpcResponseSchema);
     expect(response.message!.result.case).toBe("commit");
     expect((await sb.pushed())[0]!.seq).toBe(1n);

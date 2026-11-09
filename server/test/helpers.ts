@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { create, fromBinary, type MessageInitShape, toBinary } from "@bufbuild/protobuf";
+import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { type CommitResult, type Op, OpSchema, UploadReceiptSchema, type UploadReceipt } from "../src/gen/flarebox/v1/commit_pb";
 import { type RpcRequest, RpcRequestSchema, type RpcResponse, RpcResponseSchema } from "../src/gen/flarebox/v1/messages_pb";
@@ -59,9 +60,21 @@ export const op = {
 
 type Stub = Awaited<ReturnType<typeof newSpace>>["stub"];
 
+export interface CommitInit {
+  baseSeq?: bigint;
+  receipts?: UploadReceipt[];
+  commitId?: string;
+  historyId?: string;
+  deviceSeq?: bigint;
+  requireHead?: boolean;
+}
+
 /** A device talking to one space through the binary RPC entry point. */
 export class TestClient {
   baseSeq = 0n;
+  /** The highest device_seq the server accepted from this device, and the slot each commit_id was sent with (RFC 0002 section 2). */
+  acceptedSeq = 0n;
+  private readonly slots = new Map<string, bigint>();
   /** Time the receipts are signed for; set it when the Space DO clock is moved. */
   nowMs: number | undefined;
   private nextReq = 1n;
@@ -104,15 +117,38 @@ export class TestClient {
     return receipts;
   }
 
-  async commitRaw(ops: Op[], init: { baseSeq?: bigint; receipts?: UploadReceipt[]; commitId?: string } = {}): Promise<RpcResponse["result"]> {
-    return this.call({
+  /** The space's current history_id. */
+  history(): Promise<string> {
+    return runInDurableObject(this.stub, (_instance, state) => String(state.storage.sql.exec("SELECT value FROM meta WHERE key = 'history_id'").one().value));
+  }
+
+  /**
+   * Sends a commit in the current history. A new commit_id takes the next device slot and a repeated one keeps its slot,
+   * as a client does; init overrides either field.
+   */
+  async commitRaw(ops: Op[], init: CommitInit = {}): Promise<RpcResponse["result"]> {
+    const commitId = init.commitId ?? uuidv7();
+    const slot = this.slots.get(commitId) ?? this.acceptedSeq + 1n;
+    this.slots.set(commitId, slot);
+    const deviceSeq = init.deviceSeq ?? slot;
+    const result = await this.call({
       case: "commit",
-      value: { commitId: init.commitId ?? uuidv7(), baseSeq: init.baseSeq ?? this.baseSeq, ops, receipts: init.receipts ?? [] },
+      value: {
+        commitId,
+        baseSeq: init.baseSeq ?? this.baseSeq,
+        ops,
+        receipts: init.receipts ?? [],
+        historyId: init.historyId ?? (await this.history()),
+        deviceSeq,
+        requireHead: init.requireHead ?? false,
+      },
     });
+    if (result.case === "commit" && deviceSeq > this.acceptedSeq) this.acceptedSeq = deviceSeq;
+    return result;
   }
 
   /** Commits and advances baseSeq; throws when the call fails. */
-  async commit(ops: Op[], init: { baseSeq?: bigint; receipts?: UploadReceipt[]; commitId?: string } = {}): Promise<CommitResult> {
+  async commit(ops: Op[], init: CommitInit = {}): Promise<CommitResult> {
     const result = await this.commitRaw(ops, init);
     if (result.case !== "commit") throw new Error(`commit failed: ${JSON.stringify((result.value as RpcError | undefined)?.message)}`);
     if (result.value.seq > this.baseSeq) this.baseSeq = result.value.seq;

@@ -226,14 +226,14 @@ export class CommitApplier {
     }
   }
 
-  /** R8 for the target of an edit or move: its ancestors, itself and its trash group come back. */
-  private reviveTarget(node: NodeRow): NodeRow {
-    if (node.status !== NodeStatusValue.TRASHED) return node;
+  /** R8 for the target of an edit or move: its ancestors, itself and its trash group come back. renamed tells whether the target took a conflict name. */
+  private reviveTarget(node: NodeRow): { node: NodeRow; renamed: boolean } {
+    if (node.status !== NodeStatusValue.TRASHED) return { node, renamed: false };
     const group = node.trash_group!;
     this.reviveChain(node.parent_id!);
-    this.reviveOne(node, node.parent_id!, node.name);
+    const { renamed } = this.reviveOne(node, node.parent_id!, node.name);
     this.reviveGroup(node.node_id, group);
-    return getNode(this.sql, node.node_id)!;
+    return { node: getNode(this.sql, node.node_id)!, renamed };
   }
 
   /** Resolves a parent for a create or move, reviving it when trashed. */
@@ -333,7 +333,7 @@ export class CommitApplier {
     const found = this.node(nodeId);
     if (!found) return rejected("NOT_FOUND");
     if (found.kind !== NodeKindValue.FILE) return rejected("NOT_FILE");
-    const node = this.reviveTarget(found);
+    const { node, renamed } = this.reviveTarget(found);
     if (this.unseenContent(node)) {
       const copyId = uuidv7(this.ctx.nowMs);
       const name = this.pickConflictCopyName(node.parent_id!, node.name);
@@ -351,7 +351,7 @@ export class CommitApplier {
       node.node_id,
     );
     this.touched.add(node.node_id);
-    return result(OpResult_Code.APPLIED, "", node.name);
+    return result(renamed ? OpResult_Code.APPLIED_RENAMED : OpResult_Code.APPLIED, "", node.name);
   }
 
   private isSelfOrDescendant(candidate: NodeRow, ancestorId: string): boolean {

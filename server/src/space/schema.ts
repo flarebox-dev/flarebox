@@ -54,6 +54,10 @@ const MIGRATIONS: string[] = [
   `
   CREATE TABLE IF NOT EXISTS revoked_devices (device_id TEXT PRIMARY KEY, revoked_at_ms INTEGER NOT NULL);
   `,
+  `
+  CREATE TABLE IF NOT EXISTS device_commits (device_id TEXT PRIMARY KEY, device_seq INTEGER NOT NULL,
+    commit_id TEXT NOT NULL, results BLOB NOT NULL);
+  `,
 ];
 
 export function migrate(sql: SqlStorage): void {

@@ -65,10 +65,10 @@ describe("Space DO commits", () => {
     expect([...(await a.tree()).values()].map((node) => node.name)).not.toContain("Twice");
   });
 
-  it("rejects a base_seq ahead of the server and commits from viewers or old clients", async () => {
+  it("refuses a base_seq ahead of the server with AHEAD_OF_SERVER, and commits from viewers or old clients", async () => {
     const space = await setup();
     const ahead = await space.a.commitRaw([op.mkdir(uuidv7(), space.root, "X")], { baseSeq: 5n });
-    expect(ahead.case === "error" && ahead.value.code).toBe(Error_Code.INVALID_ARGUMENT);
+    expect(ahead.case === "error" && ahead.value.code).toBe(Error_Code.AHEAD_OF_SERVER);
     const viewer = await client(space, "Viewer", { role: "viewer" });
     const denied = await viewer.commitRaw([op.mkdir(uuidv7(), space.root, "X")]);
     expect(denied.case === "error" && denied.value.code).toBe(Error_Code.FORBIDDEN);
@@ -173,7 +173,7 @@ describe("RFC 0001 name and move rules", () => {
       [op.mkdir(uuidv7(), dir, "child"), op.update(updated.nodeId, parts.content), op.restore(restored.nodeId, { versionId })],
       { receipts: await a.uploadParts(parts) },
     );
-    expect(result.results.map((r) => r.code)).toEqual([OpResult_Code.APPLIED, OpResult_Code.APPLIED, OpResult_Code.APPLIED]);
+    expect(result.results.map((r) => r.code)).toEqual([OpResult_Code.APPLIED, OpResult_Code.APPLIED_RENAMED, OpResult_Code.APPLIED_RENAMED]);
     const tree = await a.tree();
     expect(tree.get(dir)!.name).toMatch(/^\.FlareBox \(conflict from Laptop A \d{4}-\d{2}-\d{2}\)$/);
     expect(tree.get(updated.nodeId)!.name).toMatch(/^\.flarebox \(conflict from Laptop A \d{4}-\d{2}-\d{2} 2\)$/);

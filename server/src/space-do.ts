@@ -456,6 +456,7 @@ export class SpaceDO extends DurableObject<Env> {
       historyId: String(getMeta(this.sql, "history_id")),
       headSeq: BigInt(this.headSeq),
       logFloorSeq: BigInt(Number(getMeta(this.sql, "log_floor_seq"))),
+      deviceSeq: this.acceptedDeviceSeq(identity.deviceId),
       readOnly: attachment.role === "viewer" || hello.maxFormat < formatVersion,
     });
     this.send(ws, { case: "welcome", value: welcome });
@@ -468,7 +469,14 @@ export class SpaceDO extends DurableObject<Env> {
     if (resume.historyId !== getMeta(this.sql, "history_id")) reason = ResyncRequired_Reason.HISTORY_CHANGED;
     else if (resume.sinceSeq > BigInt(head)) reason = ResyncRequired_Reason.AHEAD_OF_SERVER;
     else if (resume.sinceSeq < BigInt(Number(getMeta(this.sql, "log_floor_seq")))) reason = ResyncRequired_Reason.LOG_TRUNCATED;
-    if (reason !== undefined) return this.send(ws, { case: "resyncRequired", value: create(ResyncRequiredSchema, { reason }) });
+    if (reason !== undefined) {
+      const resync = create(ResyncRequiredSchema, { reason });
+      if (reason === ResyncRequired_Reason.HISTORY_CHANGED) {
+        resync.restoreSeq = BigInt(Number(getMeta(this.sql, "restore_seq") ?? 0));
+        resync.restorePointMs = BigInt(Number(getMeta(this.sql, "restore_point_ms") ?? 0));
+      }
+      return this.send(ws, { case: "resyncRequired", value: resync });
+    }
 
     let batch: CommitRecord[] = [];
     let bytes = 0;
@@ -579,9 +587,37 @@ export class SpaceDO extends DurableObject<Env> {
     }
   }
 
+  /** The result stored for a commit, in the log or as its device's latest accepted commit (RFC 0002 section 2). */
   private storedResult(commitId: string): CommitResult | undefined {
-    const row = this.sql.exec("SELECT results FROM commits WHERE commit_id = ?", commitId).toArray()[0];
+    const row =
+      this.sql.exec("SELECT results FROM commits WHERE commit_id = ?", commitId).toArray()[0] ??
+      this.sql.exec("SELECT results FROM device_commits WHERE commit_id = ?", commitId).toArray()[0];
     return row ? fromBinary(CommitResultSchema, new Uint8Array(row.results as ArrayBuffer)) : undefined;
+  }
+
+  private acceptedDeviceSeq(deviceId: string): bigint {
+    const row = this.sql.exec("SELECT device_seq FROM device_commits WHERE device_id = ?", deviceId).toArray()[0];
+    return BigInt(Number(row?.device_seq ?? 0));
+  }
+
+  /**
+   * RFC 0002 section 3, steps 1 to 4: the history fence, the stored result, the device counter and the base.
+   * Returns the stored result of a commit that was already accepted; throws for a refused one.
+   */
+  private checkCommitOrder(deviceId: string, commit: Commit): CommitResult | undefined {
+    if (commit.historyId !== getMeta(this.sql, "history_id")) fail(Error_Code.HISTORY_MISMATCH, "the commit was built in another history of this space");
+    const stored = this.storedResult(commit.commitId);
+    if (stored) return stored;
+    const accepted = this.acceptedDeviceSeq(deviceId);
+    if (commit.deviceSeq === 0n) fail(Error_Code.INVALID_ARGUMENT, "device_seq is required");
+    if (commit.deviceSeq <= accepted) {
+      fail(Error_Code.STALE_DEVICE_STATE, `device_seq ${commit.deviceSeq} is at or below this device's highest accepted one, ${accepted}`);
+    }
+    if (commit.deviceSeq > accepted + 1n) fail(Error_Code.INVALID_ARGUMENT, `device_seq must be ${accepted + 1n}`);
+    const head = BigInt(this.headSeq);
+    if (commit.baseSeq > head) fail(Error_Code.AHEAD_OF_SERVER, "base_seq is ahead of the server");
+    if (commit.requireHead && commit.baseSeq < head) fail(Error_Code.HEAD_MOVED, "the space changed after base_seq");
+    return undefined;
   }
 
   private appendCommit(record: CommitRecord, result: CommitResult): void {
@@ -611,10 +647,10 @@ export class SpaceDO extends DurableObject<Env> {
   private async commit(session: Session, commit: Commit): Promise<{ result: CommitResult; record?: CommitRecord }> {
     this.checkCanWrite(session);
     if (!isUuidV7(commit.commitId)) fail(Error_Code.INVALID_ARGUMENT, "commit_id must be a UUIDv7");
+    const stored = this.checkCommitOrder(session.deviceId, commit);
+    if (stored) return { result: stored };
     if (commit.ops.length === 0) fail(Error_Code.INVALID_ARGUMENT, "a commit needs at least one op");
     if (commit.ops.length > MAX_OPS) fail(Error_Code.LIMIT_EXCEEDED, `at most ${MAX_OPS} ops per commit`);
-    const stored = this.storedResult(commit.commitId);
-    if (stored) return { result: stored };
 
     commit.ops.forEach(checkIds);
     const referenced = new Map<string, ChunkRef>();
@@ -640,10 +676,9 @@ export class SpaceDO extends DurableObject<Env> {
 
     return this.ctx.storage.transactionSync(() => {
       if (this.revoked(session.deviceId)) fail(Error_Code.UNAUTHENTICATED, "device revoked");
-      const again = this.storedResult(commit.commitId);
+      const again = this.checkCommitOrder(session.deviceId, commit);
       if (again) return { result: again };
       const head = this.headSeq;
-      if (commit.baseSeq > BigInt(head)) fail(Error_Code.INVALID_ARGUMENT, "base_seq is ahead of the server");
 
       const missing: Uint8Array[] = [];
       for (const [hex, chunk] of referenced) {
@@ -673,6 +708,14 @@ export class SpaceDO extends DurableObject<Env> {
       });
       const result = create(CommitResultSchema, { seq: BigInt(ctx.seq), results, changes });
       this.appendCommit(record, result);
+      this.sql.exec(
+        `INSERT INTO device_commits (device_id, device_seq, commit_id, results) VALUES (?, ?, ?, ?)
+         ON CONFLICT (device_id) DO UPDATE SET device_seq = excluded.device_seq, commit_id = excluded.commit_id, results = excluded.results`,
+        session.deviceId,
+        Number(commit.deviceSeq),
+        commit.commitId,
+        toBinary(CommitResultSchema, result),
+      );
       return { result, record };
     });
   }
