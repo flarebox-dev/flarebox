@@ -143,7 +143,7 @@ A delete, however late R2 applies it, removes only the object of a retired incar
   - the commit log, chunk rows, members, the space's name and settings;
   - `device_commits` (RFC 0002 §2).
 - **Kept:** the Account DO's state, including devices, revocations, spaces, share links, rewind records and chunk retirement records. A share link that points to a node absent after the rewind finds nothing.
-- **Removed from the current history:** everything committed after `restore_seq`. That includes:
+- **Removed from the current history:** every commit that the previous history held and the restored state does not. `restore_seq` and `previous_head_seq` each count in their own history, and those differ when the restore point lies in an earlier history, so the two numbers do not bound these commits. They include:
   - every intermediate version written after the restore point, not only the latest one;
   - nodes trashed after the restore point, and their trash state;
   - changes that no device downloaded before the rewind.

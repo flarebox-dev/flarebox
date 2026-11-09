@@ -161,7 +161,8 @@ pub struct RewindResult {
     pub restore_point_ms: i64,
     #[prost(string, tag="4")]
     pub previous_history_id: ::prost::alloc::string::String,
-    /// head_seq right before the rewind; the commits after restore_seq up to it were discarded.
+    /// head_seq of previous_history_id right before the rewind. It counts in that history, while restore_seq counts in the
+    /// history the restore point belonged to, which can be an earlier one, so the two do not bound the discarded commits.
     #[prost(uint64, tag="5")]
     pub previous_head_seq: u64,
 }
