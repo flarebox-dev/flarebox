@@ -112,4 +112,4 @@ A `Delete` whose target stays live because a descendant has an unseen change als
 
 ## 10. Renamed revival on UpdateContent (R8)
 
-An `UpdateContent` whose target R8 revives under a conflict name, because the revived name clashes under R1, returns `APPLIED_RENAMED` with the name used, as `Move`, `Restore`, `CreateDir` and `CreateFile` do.
+An `UpdateContent` whose target R8 revives under a conflict name, because the revived name clashes under R1, returns `APPLIED_RENAMED` with the name used, as `Move`, `Restore`, `CreateDir` and `CreateFile` do. `APPLIED_RENAMED` replaces only a result that would otherwise be `APPLIED`. If the update also has an unseen content change, so that R3 applies, the result stays `CONFLICT_COPY`.
