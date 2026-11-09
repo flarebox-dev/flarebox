@@ -48,6 +48,11 @@
 //! - Replacing a file with a folder, or a folder with a file, is reported as
 //!   the old entry removed and the new one created at the same path.
 //!
+//! The engine's private folder [`PRIVATE_DIR`] at the root is never scanned.
+//! The [`check_root`] of design §6.2, the root [`Marker`] and the rename that
+//! never replaces its target ([`rename_no_replace`], [`probe_no_replace`])
+//! live next to the scans.
+//!
 //! Symbolic links and special files are not synced in v0 (spec §5.1) and are
 //! skipped.
 
@@ -236,6 +241,11 @@ fn open_dir_at(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<OwnedFd> {
     Ok(rustix::fs::openat(dir, name, DIR_FLAGS, Mode::empty())?)
 }
 
+/// Whether `name` in the folder at `parent` is the engine's private folder.
+fn private(parent: &Path, name: &OsStr) -> bool {
+    parent.as_os_str().is_empty() && name == PRIVATE_DIR
+}
+
 /// Whether the error means the scan may not read there.
 fn denied(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::PermissionDenied
@@ -320,6 +330,7 @@ impl Scan<'_> {
         let result = list(dir).map_err(Error::from).and_then(|names| {
             names
                 .iter()
+                .filter(|name| !private(rel, name))
                 .try_for_each(|name| self.entry(dir, name, rel.join(name)))
         });
         self.unless_denied(rel, result)
@@ -445,6 +456,13 @@ impl Snapshot {
                 )
                 .into());
             }
+            if path
+                .components()
+                .next()
+                .is_some_and(|first| first.as_os_str() == PRIVATE_DIR)
+            {
+                continue;
+            }
             scopes.push(self.anchor(path));
         }
 
@@ -558,7 +576,8 @@ impl Snapshot {
             dir
         };
         let dir = dir.as_fd();
-        let names = list(dir)?;
+        let mut names = list(dir)?;
+        names.retain(|name| !private(parent, name));
         for name in &names {
             let child = parent.join(name);
             if focus.contains(name) || !self.entries.contains_key(&child) {
@@ -1288,5 +1307,11 @@ fn watch_error(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Erro
     Error::Watch(err.into())
 }
 
+mod root;
 #[cfg(test)]
 mod tests;
+
+pub use root::{
+    Marker, PRIVATE_DIR, RootProblem, check_root, probe_no_replace, read_marker, rename_no_replace,
+    write_marker,
+};
