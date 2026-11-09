@@ -70,6 +70,11 @@ pub trait Node {
     fn is_live(&self) -> bool {
         true
     }
+    /// False for an entry that is not under its shape's parent on disk: a parked node (section
+    /// 2.5). Such an entry holds no name, and a chain of parents ends at it.
+    fn is_placed(&self) -> bool {
+        true
+    }
 }
 
 impl Node for Shape {
@@ -165,6 +170,9 @@ impl Node for LocalNode {
     fn shape(&self) -> &Shape {
         &self.shape
     }
+    fn is_placed(&self) -> bool {
+        !self.parked
+    }
 }
 
 /// How sibling names must differ in a tree.
@@ -235,14 +243,18 @@ impl<N: Node> Tree<N> {
         self.nodes.is_empty()
     }
 
-    /// Checks the invariants of section 2.2 over live nodes: every node's parent is the root or a
-    /// live directory, there are no cycles, and sibling names differ as `names` requires.
+    /// Checks the invariants of section 2.2 over live nodes: every placed node's parent is the root
+    /// or a live directory, there are no cycles, and sibling names differ as `names` requires.
     pub fn check(&self, names: Names) -> Result<(), TreeError> {
         if self.nodes.contains_key(&self.root) {
             return Err(TreeError::RootStored);
         }
         let mut seen = BTreeSet::new();
-        for (id, node) in self.nodes.iter().filter(|(_, node)| node.is_live()) {
+        let placed = self
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.is_live() && node.is_placed());
+        for (id, node) in placed {
             let shape = node.shape();
             if shape.parent != self.root {
                 let parent = self
@@ -271,16 +283,17 @@ impl<N: Node> Tree<N> {
         Ok(())
     }
 
-    /// True when following live parents from `id` reaches the root within as many steps as there
-    /// are nodes.
+    /// True when following live parents from `id` reaches the root, or a node that is not placed,
+    /// within as many steps as there are nodes.
     pub fn reaches_root(&self, id: &str) -> bool {
         let mut current = id;
         for _ in 0..=self.nodes.len() {
             if current == self.root {
                 return true;
             }
-            match self.live(current) {
-                Some(shape) => current = &shape.parent,
+            match self.nodes.get(current).filter(|node| node.is_live()) {
+                Some(node) if !node.is_placed() => return true,
+                Some(node) => current = &node.shape().parent,
                 None => return false,
             }
         }

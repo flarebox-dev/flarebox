@@ -110,7 +110,7 @@ impl Trees {
     }
 
     /// Settles what needs no decision: a node changed the same way on both sides takes S := R, and
-    /// a node in sync leaves the dirty set. S stays a valid tree, so an update that would orphan a
+    /// a node in sync leaves the dirty set unless it is parked. S stays a valid tree, so an update that would orphan a
     /// child, put a node under a missing or non-directory parent, close a cycle or take a sibling's
     /// `name_key` is made only together with the updates it depends on. Settling stops only when no
     /// non-empty set of the remaining [`Class::Same`] updates can be made together with S still valid,
@@ -123,7 +123,7 @@ impl Trees {
         let mut work = Vec::new();
         for id in std::mem::take(&mut self.dirty) {
             match self.class(&id) {
-                Class::InSync => {}
+                Class::InSync if !self.l.get(&id).is_some_and(|node| node.parked) => {}
                 Class::Same => pending.push(id),
                 class => work.push((id, class)),
             }
