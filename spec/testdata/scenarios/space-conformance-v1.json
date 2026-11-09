@@ -1,0 +1,4627 @@
+{
+  "format": "flarebox.space-conformance",
+  "version": 1,
+  "spec": "Flarebox spec v0 with RFC 0001",
+  "unicode": "18.0.0",
+  "now_ms": 1794268740000,
+  "mtime_ns": "1794268740123456789",
+  "conventions": [
+    "Each scenario starts from empty spaces (one named main unless the scenario lists spaces) and runs its steps in order. A step runs in the space named by its space field, main by default, at at_ms, or now_ms when absent; the runner pins the server clock to that time.",
+    "devices maps a device symbol to its session: name (the device name used in conflict names), role (owner by default, editor or viewer) and max_format (the newest space format the client supports, 1 by default).",
+    "Every ID in a scenario is a symbol. root is the space's root (its space_id). A symbol that starts with = is the literal text after it. An op symbol not seen before is bound to a fresh UUIDv7 that the runner mints. A symbol in an expectation that is not bound yet is bound to the value the server returned; one already bound must equal it. Two different symbols never bind the same value.",
+    "contents maps a content symbol to a file content. chunks lists its chunks: {text} is a chunk of those UTF-8 bytes, {counter_le32: n} is n chunks whose bytes are the 4-byte little-endian encodings of 0 to n-1. A chunk's hash is the SHA-256 of its bytes and its size is its byte length unless size overrides it. The content's size is the sum of its chunk sizes unless size overrides it; mtime_ns is the file-level mtime_ns (an int64 written as a string, as in proto3 JSON), executable is false, encoding is 0, chunker is fastcdc2020-1m-4m-16m, and manifest_digest follows spec v0 section 5.1 over the listed (hash, size) pairs.",
+    "Ops: create_dir {node, parent, name}; create_file {node, parent, name, content}; update_content {node, content}; move {node, parent, name}; delete {node}; restore {node, version?, parent?, name?} where absent fields are empty; empty {} is an Op with no op set. Two macros expand in place: {repeat: n, op} is n copies of op, and create_dir_chain {prefix, parent, count} creates directories prefix1 to prefixN, each named after its symbol and each inside the previous one, the first inside parent.",
+    "commit: commit_id is a symbol (a fresh ID when absent), base_seq is sent as given. Unless upload is false, the runner first uploads every chunk of the contents the ops reference (PrepareUpload in batches of at most 1,000 distinct chunks, then a PUT for each chunk the plan says to upload) and sends the receipts it got. With upload false it sends the receipts that the device's earlier upload steps got in the space named by receipts_from (the step's space by default), each with its size increased by receipt_size_delta when that is set.",
+    "upload {contents}: PrepareUpload and PUT for those contents' chunks; the receipts are kept for the device in that space. prepare_upload {chunks} or {contents} sends one PrepareUpload; expect.actions lists the action of each distinct chunk in order.",
+    "Commit expectations: error is the whole-call error code; missing lists content symbols whose chunk hashes must be exactly the error's missing_chunks. Otherwise seq, results (one per op, in order; code, and where given node, name and reason, compared exactly) and changed (the node symbols with a NodeState in the result's changes, compared as a set).",
+    "list_versions {node, cursor, limit}: cursor is a {seq, version} pair written as seq/version_id, a literal with =, or empty when absent; limit is 0 when absent. Expectations: error, count (the number of versions), versions (each with version symbol, seq and content) and next_cursor ({seq, version} or empty).",
+    "nodes: each entry names a node and the fields it must have: parent, name, kind (DIR or FILE), status (LIVE or TRASHED), content_rev, meta_rev, trash_group (a symbol, or null for none), content (a content symbol, compared by size, manifest digest, executable bit and mtime_ns), or absent: true when the server must not know the node. live lists every live node other than the root, as a set. head is the space's head_seq.",
+    "Expected values are written by hand from the spec and RFC 0001, not produced by either implementation."
+  ],
+  "scenarios": [
+    {
+      "name": "r1-file-name-clash-gets-a-conflict-name",
+      "covers": [
+        "R1"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "one"
+            }
+          ]
+        },
+        "c2": {
+          "chunks": [
+            {
+              "text": "two"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f1",
+                  "parent": "root",
+                  "name": "notes.txt",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "f1"
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f2",
+                  "parent": "root",
+                  "name": "NOTES.TXT",
+                  "content": "c2"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED_RENAMED",
+                "name": "NOTES (conflict from Desk 2026-11-09).TXT"
+              }
+            ],
+            "changed": [
+              "f2"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "f1",
+              "parent": "root",
+              "name": "notes.txt",
+              "kind": "FILE",
+              "status": "LIVE",
+              "content": "c1",
+              "content_rev": 1,
+              "meta_rev": 1
+            },
+            {
+              "node": "f2",
+              "parent": "root",
+              "name": "NOTES (conflict from Desk 2026-11-09).TXT",
+              "status": "LIVE",
+              "content": "c2",
+              "content_rev": 2,
+              "meta_rev": 2
+            }
+          ],
+          "live": [
+            "f1",
+            "f2"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "r2-a-new-directory-merges-into-an-existing-one",
+      "covers": [
+        "R2"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "photo"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d1",
+                  "parent": "root",
+                  "name": "Photos"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "d1"
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d2",
+                  "parent": "root",
+                  "name": "photos"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "d2",
+                  "name": "a.jpg",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "MERGED_INTO",
+                "node": "d1"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "f"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "d1",
+              "parent": "root",
+              "name": "Photos",
+              "kind": "DIR",
+              "status": "LIVE",
+              "meta_rev": 1
+            },
+            {
+              "node": "f",
+              "parent": "d1",
+              "name": "a.jpg",
+              "status": "LIVE"
+            },
+            {
+              "node": "d2",
+              "absent": true
+            }
+          ],
+          "live": [
+            "d1",
+            "f"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "r2-canonically-equivalent-names-that-differ-by-case-are-one-name",
+      "covers": [
+        "R2",
+        "regression: name_key is NFD(casefold(NFD))"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d1",
+                  "parent": "root",
+                  "name": "ΐ"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d2",
+                  "parent": "root",
+                  "name": "Ϊ́"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "d3",
+                  "parent": "root",
+                  "name": "ẞ"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "d4",
+                  "parent": "root",
+                  "name": "SS"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "MERGED_INTO",
+                "node": "d1"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "MERGED_INTO",
+                "node": "d3"
+              }
+            ],
+            "changed": [
+              "d3"
+            ]
+          }
+        },
+        {
+          "live": [
+            "d1",
+            "d3"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "rfc0001-4-a-directory-onto-a-live-file-gets-a-conflict-name",
+      "covers": [
+        "R1",
+        "R2",
+        "RFC 0001 section 4"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "doc"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "Docs",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": "docs"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED_RENAMED",
+                "name": "docs (conflict from Desk 2026-11-09)"
+              }
+            ],
+            "changed": [
+              "d"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "d",
+              "kind": "DIR",
+              "name": "docs (conflict from Desk 2026-11-09)",
+              "status": "LIVE"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "r3-a-concurrent-edit-becomes-a-conflict-copy",
+      "covers": [
+        "R3"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "v1"
+            }
+          ]
+        },
+        "c2": {
+          "chunks": [
+            {
+              "text": "v2 from a"
+            }
+          ]
+        },
+        "c3": {
+          "chunks": [
+            {
+              "text": "v3 from b"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "report.txt",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "update_content": {
+                  "node": "f",
+                  "content": "c2"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "f"
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "update_content": {
+                  "node": "f",
+                  "content": "c3"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "CONFLICT_COPY",
+                "node": "y",
+                "name": "report (conflict from Desk 2026-11-09).txt"
+              }
+            ],
+            "changed": [
+              "y"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "f",
+              "name": "report.txt",
+              "content": "c2",
+              "content_rev": 2,
+              "meta_rev": 1
+            },
+            {
+              "node": "y",
+              "parent": "root",
+              "name": "report (conflict from Desk 2026-11-09).txt",
+              "kind": "FILE",
+              "status": "LIVE",
+              "content": "c3",
+              "content_rev": 3,
+              "meta_rev": 3
+            }
+          ],
+          "live": [
+            "f",
+            "y"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "r3-a-devices-own-earlier-commit-is-not-unseen",
+      "covers": [
+        "R3",
+        "unseen change"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "1"
+            }
+          ]
+        },
+        "c2": {
+          "chunks": [
+            {
+              "text": "2"
+            }
+          ]
+        },
+        "c3": {
+          "chunks": [
+            {
+              "text": "3"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "f",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "update_content": {
+                  "node": "f",
+                  "content": "c2"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "update_content": {
+                  "node": "f",
+                  "content": "c3"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "f"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "f",
+              "content": "c3",
+              "content_rev": 3
+            }
+          ],
+          "live": [
+            "f"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "r4-an-edit-applies-over-an-unseen-rename",
+      "covers": [
+        "R4"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "old"
+            }
+          ]
+        },
+        "c2": {
+          "chunks": [
+            {
+              "text": "new"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "a.txt",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "move": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "b.txt"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "f"
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "update_content": {
+                  "node": "f",
+                  "content": "c2"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "f"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "f",
+              "parent": "root",
+              "name": "b.txt",
+              "content": "c2",
+              "content_rev": 3,
+              "meta_rev": 2
+            }
+          ],
+          "live": [
+            "f"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "r5-moves-apply-in-commit-order",
+      "covers": [
+        "R5"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "x"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d1",
+                  "parent": "root",
+                  "name": "one"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "d2",
+                  "parent": "root",
+                  "name": "two"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "f",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "move": {
+                  "node": "f",
+                  "parent": "d1",
+                  "name": "f"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "move": {
+                  "node": "f",
+                  "parent": "d2",
+                  "name": "f"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "f"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "f",
+              "parent": "d2",
+              "name": "f",
+              "meta_rev": 3,
+              "content_rev": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "r6-a-move-that-would-create-a-cycle-is-rejected",
+      "covers": [
+        "R6"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d1",
+                  "parent": "root",
+                  "name": "one"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "d2",
+                  "parent": "root",
+                  "name": "two"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "move": {
+                  "node": "d1",
+                  "parent": "d2",
+                  "name": "one"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "d1"
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "move": {
+                  "node": "d2",
+                  "parent": "d1",
+                  "name": "two"
+                }
+              },
+              {
+                "move": {
+                  "node": "d2",
+                  "parent": "d2",
+                  "name": "self"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "REJECTED",
+                "reason": "CYCLE"
+              },
+              {
+                "code": "REJECTED",
+                "reason": "CYCLE"
+              }
+            ],
+            "changed": []
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "d1",
+              "parent": "d2"
+            },
+            {
+              "node": "d2",
+              "parent": "root",
+              "name": "two",
+              "meta_rev": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "r7-a-delete-keeps-nodes-with-unseen-edits-and-their-ancestors",
+      "covers": [
+        "R7"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "1"
+            }
+          ]
+        },
+        "c2": {
+          "chunks": [
+            {
+              "text": "2"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": "d"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f1",
+                  "parent": "d",
+                  "name": "1.txt",
+                  "content": "c1"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f2",
+                  "parent": "d",
+                  "name": "2.txt",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "update_content": {
+                  "node": "f1",
+                  "content": "c2"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "delete": {
+                  "node": "d"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "SUPERSEDED"
+              }
+            ],
+            "changed": [
+              "f2"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "d",
+              "status": "LIVE"
+            },
+            {
+              "node": "f1",
+              "status": "LIVE",
+              "content": "c2"
+            },
+            {
+              "node": "f2",
+              "status": "TRASHED"
+            }
+          ],
+          "live": [
+            "d",
+            "f1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "r7-a-delete-keeps-an-unseen-create-and-its-ancestors",
+      "covers": [
+        "R7"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "new"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": "d"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "e",
+                  "parent": "d",
+                  "name": "e"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "e",
+                  "name": "new.txt",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "delete": {
+                  "node": "d"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "SUPERSEDED"
+              }
+            ],
+            "changed": []
+          }
+        },
+        {
+          "live": [
+            "d",
+            "e",
+            "f"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "r7-a-delete-trashes-the-subtree-under-one-trash-group",
+      "covers": [
+        "R7"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "x"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": "d"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "s",
+                  "parent": "d",
+                  "name": "s"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "s",
+                  "name": "f",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "delete": {
+                  "node": "d"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "d",
+              "s",
+              "f"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "d",
+              "status": "TRASHED",
+              "trash_group": "g"
+            },
+            {
+              "node": "s",
+              "status": "TRASHED",
+              "trash_group": "g",
+              "parent": "d"
+            },
+            {
+              "node": "f",
+              "status": "TRASHED",
+              "trash_group": "g",
+              "parent": "s"
+            }
+          ],
+          "live": []
+        }
+      ]
+    },
+    {
+      "name": "r8-an-unseen-edit-revives-a-deleted-file",
+      "covers": [
+        "R8"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "1"
+            }
+          ]
+        },
+        "c2": {
+          "chunks": [
+            {
+              "text": "2"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "f.txt",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "delete": {
+                  "node": "f"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "f"
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "update_content": {
+                  "node": "f",
+                  "content": "c2"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "f"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "f",
+              "status": "LIVE",
+              "parent": "root",
+              "name": "f.txt",
+              "content": "c2",
+              "content_rev": 3,
+              "trash_group": null
+            }
+          ],
+          "live": [
+            "f"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "r8-creating-inside-a-trashed-folder-revives-only-the-ancestor-chain",
+      "covers": [
+        "R8"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "x"
+            }
+          ]
+        },
+        "c2": {
+          "chunks": [
+            {
+              "text": "y"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": "d"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "e",
+                  "parent": "d",
+                  "name": "e"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "x",
+                  "parent": "d",
+                  "name": "x.txt",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "delete": {
+                  "node": "d"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "d",
+              "e",
+              "x"
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 2,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "e",
+                  "name": "f.txt",
+                  "content": "c2"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "d",
+              "e",
+              "f"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "d",
+              "status": "LIVE",
+              "parent": "root"
+            },
+            {
+              "node": "e",
+              "status": "LIVE",
+              "parent": "d"
+            },
+            {
+              "node": "x",
+              "status": "TRASHED"
+            },
+            {
+              "node": "f",
+              "status": "LIVE",
+              "parent": "e"
+            }
+          ],
+          "live": [
+            "d",
+            "e",
+            "f"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "r8-a-revived-name-that-clashes-gets-a-conflict-name",
+      "covers": [
+        "R8",
+        "R1"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "1"
+            }
+          ]
+        },
+        "c2": {
+          "chunks": [
+            {
+              "text": "2"
+            }
+          ]
+        },
+        "c3": {
+          "chunks": [
+            {
+              "text": "3"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "a.txt",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "delete": {
+                  "node": "f"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 2,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "g",
+                  "parent": "root",
+                  "name": "a.txt",
+                  "content": "c3"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "update_content": {
+                  "node": "f",
+                  "content": "c2"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 4,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "f"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "f",
+              "status": "LIVE",
+              "name": "a (conflict from Desk 2026-11-09).txt",
+              "content": "c2"
+            },
+            {
+              "node": "g",
+              "status": "LIVE",
+              "name": "a.txt",
+              "content": "c3"
+            }
+          ],
+          "live": [
+            "f",
+            "g"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "r9-restore-brings-back-the-trash-group",
+      "covers": [
+        "R9"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "x"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": "d"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "d",
+                  "name": "f",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "delete": {
+                  "node": "d"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 2,
+            "ops": [
+              {
+                "restore": {
+                  "node": "d"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "d",
+              "f"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "d",
+              "status": "LIVE",
+              "parent": "root",
+              "name": "d",
+              "trash_group": null
+            },
+            {
+              "node": "f",
+              "status": "LIVE",
+              "parent": "d",
+              "trash_group": null
+            }
+          ],
+          "live": [
+            "d",
+            "f"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "r9-restore-into-another-parent-under-a-new-name",
+      "covers": [
+        "R9"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "x"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": "d"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "t",
+                  "parent": "root",
+                  "name": "t"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "d",
+                  "name": "f",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "delete": {
+                  "node": "f"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 2,
+            "ops": [
+              {
+                "restore": {
+                  "node": "f",
+                  "parent": "t",
+                  "name": "g"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "f"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "f",
+              "status": "LIVE",
+              "parent": "t",
+              "name": "g",
+              "content": "c1"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "r10-restoring-a-version-writes-it-as-a-new-version",
+      "covers": [
+        "R10"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "first"
+            }
+          ]
+        },
+        "c2": {
+          "chunks": [
+            {
+              "text": "second"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "f",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "update_content": {
+                  "node": "f",
+                  "content": "c2"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 10
+          },
+          "expect": {
+            "versions": [
+              {
+                "version": "v2",
+                "seq": 2,
+                "content": "c2"
+              },
+              {
+                "version": "v1",
+                "seq": 1,
+                "content": "c1"
+              }
+            ],
+            "next_cursor": ""
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 2,
+            "ops": [
+              {
+                "restore": {
+                  "node": "f",
+                  "version": "v1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "f"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "f",
+              "content": "c1",
+              "content_rev": 3,
+              "meta_rev": 1
+            }
+          ]
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 1
+          },
+          "expect": {
+            "versions": [
+              {
+                "version": "v3",
+                "seq": 3,
+                "content": "c1"
+              }
+            ],
+            "next_cursor": {
+              "seq": 3,
+              "version": "v3"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "r10-restoring-a-version-over-an-unseen-edit-makes-a-conflict-copy",
+      "covers": [
+        "R10",
+        "R3"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "first"
+            }
+          ]
+        },
+        "c2": {
+          "chunks": [
+            {
+              "text": "second"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "f.md",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "list_versions": {
+            "node": "f"
+          },
+          "expect": {
+            "versions": [
+              {
+                "version": "v1",
+                "seq": 1,
+                "content": "c1"
+              }
+            ],
+            "next_cursor": ""
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "update_content": {
+                  "node": "f",
+                  "content": "c2"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "restore": {
+                  "node": "f",
+                  "version": "v1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "CONFLICT_COPY",
+                "node": "y",
+                "name": "f (conflict from Desk 2026-11-09).md"
+              }
+            ],
+            "changed": [
+              "y"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "f",
+              "content": "c2"
+            },
+            {
+              "node": "y",
+              "content": "c1",
+              "parent": "root"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "r11-invalid-ops-are-rejected-without-failing-the-commit",
+      "covers": [
+        "R11",
+        "RFC 0001 section 3"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "x"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "file",
+                  "parent": "root",
+                  "name": "file",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "move": {
+                  "node": "root",
+                  "parent": "root",
+                  "name": "root"
+                }
+              },
+              {
+                "delete": {
+                  "node": "root"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "under",
+                  "parent": "file",
+                  "name": "under a file"
+                }
+              },
+              {
+                "delete": {
+                  "node": "missing"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "file",
+                  "parent": "root",
+                  "name": "duplicate id"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "dot",
+                  "parent": "root",
+                  "name": ".."
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "dir",
+                  "parent": "root",
+                  "name": "fine"
+                }
+              },
+              {
+                "update_content": {
+                  "node": "dir",
+                  "content": "c1"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "dir2",
+                  "parent": "root",
+                  "name": "fine too"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "REJECTED",
+                "reason": "ROOT"
+              },
+              {
+                "code": "REJECTED",
+                "reason": "ROOT"
+              },
+              {
+                "code": "REJECTED",
+                "reason": "PARENT_NOT_DIR"
+              },
+              {
+                "code": "REJECTED",
+                "reason": "NOT_FOUND"
+              },
+              {
+                "code": "REJECTED",
+                "reason": "ID_EXISTS"
+              },
+              {
+                "code": "REJECTED",
+                "reason": "INVALID_NAME"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "REJECTED",
+                "reason": "NOT_FILE"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "dir",
+              "dir2"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "under",
+              "absent": true
+            },
+            {
+              "node": "dot",
+              "absent": true
+            }
+          ],
+          "live": [
+            "file",
+            "dir",
+            "dir2"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "whole-commit-errors-change-nothing",
+      "covers": [
+        "spec 6.3"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "v": {
+          "name": "Viewer",
+          "role": "viewer"
+        },
+        "old": {
+          "name": "Old",
+          "role": "editor",
+          "max_format": 0
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "abc"
+            }
+          ]
+        },
+        "bad": {
+          "chunks": [
+            {
+              "text": "abc"
+            }
+          ],
+          "size": 4
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": []
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "empty": {}
+              }
+            ]
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "=not-a-uuid",
+                  "parent": "root",
+                  "name": "x"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "bad",
+                  "content": "bad"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "repeat": 1001,
+                "op": {
+                  "delete": {
+                    "node": "root"
+                  }
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "LIMIT_EXCEEDED"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 5,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "x",
+                  "parent": "root",
+                  "name": "X"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "device": "v",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "x",
+                  "parent": "root",
+                  "name": "X"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "FORBIDDEN"
+          }
+        },
+        {
+          "device": "old",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "x",
+                  "parent": "root",
+                  "name": "X"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "READ_ONLY"
+          }
+        },
+        {
+          "head": 0,
+          "live": []
+        }
+      ]
+    },
+    {
+      "name": "a-retried-commit-id-returns-the-stored-result",
+      "covers": [
+        "spec 8 step 4"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "x"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "commit_id": "k",
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "f",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "f"
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": "d"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "commit_id": "k",
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "f",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "f"
+            ]
+          }
+        },
+        {
+          "head": 2,
+          "live": [
+            "f",
+            "d"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "a-chunk-hash-listed-with-two-sizes-is-refused",
+      "covers": [
+        "regression 2"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        }
+      },
+      "contents": {
+        "ok": {
+          "chunks": [
+            {
+              "text": "abc"
+            }
+          ]
+        },
+        "both": {
+          "chunks": [
+            {
+              "text": "abc"
+            },
+            {
+              "text": "abc",
+              "size": 2
+            }
+          ]
+        },
+        "short": {
+          "chunks": [
+            {
+              "text": "abc",
+              "size": 2
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "prepare_upload": {
+            "chunks": [
+              {
+                "text": "abc"
+              },
+              {
+                "text": "abc",
+                "size": 2
+              }
+            ]
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "device": "a",
+          "upload": {
+            "contents": [
+              "ok"
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "upload": false,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "f",
+                  "content": "both"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "upload": false,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "f",
+                  "content": "ok"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "g",
+                  "parent": "root",
+                  "name": "g",
+                  "content": "short"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "head": 0,
+          "live": []
+        }
+      ]
+    },
+    {
+      "name": "moving-or-restoring-a-subtree-respects-the-depth-limit",
+      "covers": [
+        "regression 3",
+        "spec 13"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir_chain": {
+                  "prefix": "d",
+                  "parent": "root",
+                  "count": 254
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "top",
+                  "parent": "root",
+                  "name": "top"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "mid",
+                  "parent": "top",
+                  "name": "mid"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "leaf",
+                  "parent": "mid",
+                  "name": "leaf"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "move": {
+                  "node": "top",
+                  "parent": "d254",
+                  "name": "top"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "LIMIT_EXCEEDED"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "delete": {
+                  "node": "leaf"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 2,
+            "ops": [
+              {
+                "move": {
+                  "node": "top",
+                  "parent": "d254",
+                  "name": "top"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "LIMIT_EXCEEDED"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 2,
+            "ops": [
+              {
+                "delete": {
+                  "node": "top"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 3,
+            "ops": [
+              {
+                "restore": {
+                  "node": "top",
+                  "parent": "d254"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "LIMIT_EXCEEDED"
+          }
+        },
+        {
+          "head": 3,
+          "nodes": [
+            {
+              "node": "top",
+              "status": "TRASHED",
+              "parent": "root"
+            },
+            {
+              "node": "mid",
+              "status": "TRASHED"
+            }
+          ]
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 3,
+            "ops": [
+              {
+                "restore": {
+                  "node": "top",
+                  "parent": "d252"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 4,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "top",
+              "status": "LIVE",
+              "parent": "d252"
+            },
+            {
+              "node": "mid",
+              "status": "LIVE"
+            },
+            {
+              "node": "leaf",
+              "status": "TRASHED"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "version-pages-split-the-versions-of-one-commit",
+      "covers": [
+        "regression 4"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "1"
+            }
+          ]
+        },
+        "c2": {
+          "chunks": [
+            {
+              "text": "2"
+            }
+          ]
+        },
+        "c3": {
+          "chunks": [
+            {
+              "text": "3"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "f",
+                  "content": "c1"
+                }
+              },
+              {
+                "update_content": {
+                  "node": "f",
+                  "content": "c2"
+                }
+              },
+              {
+                "update_content": {
+                  "node": "f",
+                  "content": "c3"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 1
+          },
+          "expect": {
+            "versions": [
+              {
+                "version": "p1",
+                "seq": 1
+              }
+            ],
+            "next_cursor": {
+              "seq": 1,
+              "version": "p1"
+            }
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 1,
+            "cursor": {
+              "seq": 1,
+              "version": "p1"
+            }
+          },
+          "expect": {
+            "versions": [
+              {
+                "version": "p2",
+                "seq": 1
+              }
+            ],
+            "next_cursor": {
+              "seq": 1,
+              "version": "p2"
+            }
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 1,
+            "cursor": {
+              "seq": 1,
+              "version": "p2"
+            }
+          },
+          "expect": {
+            "versions": [
+              {
+                "version": "p3",
+                "seq": 1
+              }
+            ],
+            "next_cursor": ""
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 2,
+            "cursor": {
+              "seq": 1,
+              "version": "p3"
+            }
+          },
+          "expect": {
+            "versions": [],
+            "next_cursor": ""
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "f",
+              "content": "c3",
+              "content_rev": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "version-cursors-parse-the-seq-as-a-javascript-number",
+      "covers": [
+        "regression 4",
+        "cursor parsing"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        }
+      },
+      "contents": {
+        "one": {
+          "chunks": [
+            {
+              "text": "one"
+            }
+          ]
+        },
+        "two": {
+          "chunks": [
+            {
+              "text": "two"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "f",
+                  "content": "one"
+                }
+              },
+              {
+                "update_content": {
+                  "node": "f",
+                  "content": "two"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 10,
+            "cursor": "=9007199254740991/x"
+          },
+          "expect": {
+            "count": 2
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 10,
+            "cursor": "=2"
+          },
+          "expect": {
+            "count": 2
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 10,
+            "cursor": "=1e0/x"
+          },
+          "expect": {
+            "count": 2
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 10,
+            "cursor": "=1.0/x"
+          },
+          "expect": {
+            "count": 2
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 10,
+            "cursor": "=+1/x"
+          },
+          "expect": {
+            "count": 2
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 10,
+            "cursor": "= 1\t/x"
+          },
+          "expect": {
+            "count": 2
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 10,
+            "cursor": "=0x2/"
+          },
+          "expect": {
+            "count": 2
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 10,
+            "cursor": "=/x"
+          },
+          "expect": {
+            "count": 0
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 10,
+            "cursor": "=-1/x"
+          },
+          "expect": {
+            "count": 0
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 10,
+            "cursor": "=1/"
+          },
+          "expect": {
+            "count": 0
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 10,
+            "cursor": "=9007199254740992/x"
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 10,
+            "cursor": "=-9007199254740992/x"
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 10,
+            "cursor": "=1.5/x"
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 10,
+            "cursor": "=1e400/x"
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 10,
+            "cursor": "=Infinity/x"
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 10,
+            "cursor": "=0x/x"
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 10,
+            "cursor": "=-0x1/x"
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 10,
+            "cursor": "=1_0/x"
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 10,
+            "cursor": "=seven/x"
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 10,
+            "cursor": "=☃/x"
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 10,
+            "cursor": "=☃"
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 10,
+            "cursor": "=0☃/x"
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 10,
+            "cursor": "=1☃/x"
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "device": "a",
+          "list_versions": {
+            "node": "f",
+            "limit": 10,
+            "cursor": "=0x☃/x"
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a-no-op-move-changes-nothing-so-a-concurrent-delete-applies",
+      "covers": [
+        "regression 5",
+        "RFC 0001 section 6"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "x"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "f.txt",
+                  "content": "c1"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "g",
+                  "parent": "root",
+                  "name": "g.txt",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "move": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "f.txt"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": []
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "f",
+              "meta_rev": 1
+            }
+          ]
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "delete": {
+                  "node": "f"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "f"
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 3,
+            "ops": [
+              {
+                "move": {
+                  "node": "g",
+                  "parent": "root",
+                  "name": "G.txt"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 4,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "g"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "f",
+              "status": "TRASHED"
+            },
+            {
+              "node": "g",
+              "name": "G.txt",
+              "meta_rev": 4
+            }
+          ],
+          "live": [
+            "g"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "flarebox-is-reserved-at-the-root-only",
+      "covers": [
+        "regression 6",
+        "RFC 0001 section 2"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "x"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": "d"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "t",
+                  "parent": "root",
+                  "name": "t",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "delete": {
+                  "node": "t"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 2,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "x",
+                  "parent": "root",
+                  "name": ".Flarebox"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "y",
+                  "parent": "root",
+                  "name": ".ﬂarebox",
+                  "content": "c1"
+                }
+              },
+              {
+                "move": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": ".flarebox"
+                }
+              },
+              {
+                "restore": {
+                  "node": "t",
+                  "parent": "root",
+                  "name": ".FLAREBOX"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "z",
+                  "parent": "d",
+                  "name": ".flarebox"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "REJECTED",
+                "reason": "INVALID_NAME"
+              },
+              {
+                "code": "REJECTED",
+                "reason": "INVALID_NAME"
+              },
+              {
+                "code": "REJECTED",
+                "reason": "INVALID_NAME"
+              },
+              {
+                "code": "REJECTED",
+                "reason": "INVALID_NAME"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "z"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "x",
+              "absent": true
+            },
+            {
+              "node": "y",
+              "absent": true
+            },
+            {
+              "node": "d",
+              "name": "d",
+              "parent": "root",
+              "meta_rev": 1
+            },
+            {
+              "node": "t",
+              "status": "TRASHED"
+            },
+            {
+              "node": "z",
+              "parent": "d",
+              "name": ".flarebox",
+              "status": "LIVE"
+            }
+          ],
+          "live": [
+            "d",
+            "z"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "a-commit-whose-log-row-is-too-large-is-refused-whole",
+      "covers": [
+        "regression 7",
+        "RFC 0001 section 7"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        }
+      },
+      "contents": {
+        "big": {
+          "chunks": [
+            {
+              "counter_le32": 16384
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "commit_id": "k",
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f0",
+                  "parent": "root",
+                  "name": "f0",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f1",
+                  "parent": "root",
+                  "name": "f1",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f2",
+                  "parent": "root",
+                  "name": "f2",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f3",
+                  "parent": "root",
+                  "name": "f3",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f4",
+                  "parent": "root",
+                  "name": "f4",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f5",
+                  "parent": "root",
+                  "name": "f5",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f6",
+                  "parent": "root",
+                  "name": "f6",
+                  "content": "big"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "LIMIT_EXCEEDED"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "commit_id": "k",
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f0",
+                  "parent": "root",
+                  "name": "f0",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f1",
+                  "parent": "root",
+                  "name": "f1",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f2",
+                  "parent": "root",
+                  "name": "f2",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f3",
+                  "parent": "root",
+                  "name": "f3",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f4",
+                  "parent": "root",
+                  "name": "f4",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f5",
+                  "parent": "root",
+                  "name": "f5",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f6",
+                  "parent": "root",
+                  "name": "f6",
+                  "content": "big"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "LIMIT_EXCEEDED"
+          }
+        },
+        {
+          "head": 0,
+          "live": []
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f0",
+                  "parent": "root",
+                  "name": "f0",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f1",
+                  "parent": "root",
+                  "name": "f1",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f2",
+                  "parent": "root",
+                  "name": "f2",
+                  "content": "big"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "a-receipt-holds-only-for-its-space-chunk-size-and-hour",
+      "covers": [
+        "regression 8",
+        "spec 8 step 4"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        }
+      },
+      "spaces": [
+        "main",
+        "other"
+      ],
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "receipted"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "space": "main",
+          "prepare_upload": {
+            "contents": [
+              "c1"
+            ]
+          },
+          "expect": {
+            "actions": [
+              "UPLOAD"
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "space": "other",
+          "upload": {
+            "contents": [
+              "c1"
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "upload": false,
+            "receipts_from": "other",
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "f",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "MISSING_CHUNKS",
+            "missing": [
+              "c1"
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "space": "main",
+          "upload": {
+            "contents": [
+              "c1"
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "upload": false,
+            "receipt_size_delta": 1,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "f",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "MISSING_CHUNKS",
+            "missing": [
+              "c1"
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "upload": false,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "f",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "MISSING_CHUNKS",
+            "missing": [
+              "c1"
+            ]
+          },
+          "at_ms": 1794272340001
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "upload": false,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "f",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          },
+          "at_ms": 1794272340000
+        }
+      ]
+    },
+    {
+      "name": "conflict-names-measure-the-device-name-after-nfc",
+      "covers": [
+        "R1",
+        "RFC 0001 section 5",
+        "U+0A5E",
+        "U+1D160"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "g": {
+          "name": "ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼"
+        },
+        "m": {
+          "name": "𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "x"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "x.eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                  "content": "c1"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "s",
+                  "parent": "root",
+                  "name": "song.txt",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "g",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f1",
+                  "parent": "root",
+                  "name": "x.eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED_RENAMED",
+                "name": " (conflict from ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ 2026-11-09).eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+              }
+            ]
+          }
+        },
+        {
+          "device": "g",
+          "commit": {
+            "base_seq": 2,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f2",
+                  "parent": "root",
+                  "name": "x.eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "APPLIED_RENAMED",
+                "name": " (conflict from ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ਫ਼ 2026-11-09 2).eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+              }
+            ]
+          }
+        },
+        {
+          "device": "m",
+          "commit": {
+            "base_seq": 3,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "s1",
+                  "parent": "root",
+                  "name": "song.txt",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 4,
+            "results": [
+              {
+                "code": "APPLIED_RENAMED",
+                "name": "song (conflict from 𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮𝅘𝅥𝅮 2026-11-09).txt"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "a-conflict-name-carries-the-utc-date-of-the-commit",
+      "covers": [
+        "R1",
+        "spec 6.1"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "x"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "plan.txt",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "g",
+                  "parent": "root",
+                  "name": "Plan.txt",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED_RENAMED",
+                "name": "Plan (conflict from Desk 2026-11-10).txt"
+              }
+            ]
+          },
+          "at_ms": 1794268800000
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "h",
+                  "parent": "root",
+                  "name": "PLAN.txt",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "APPLIED_RENAMED",
+                "name": "PLAN (conflict from Desk 2026-11-10 2).txt"
+              }
+            ]
+          },
+          "at_ms": 1794268800000
+        }
+      ]
+    }
+  ]
+}
