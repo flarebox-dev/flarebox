@@ -1,6 +1,7 @@
 build/
 .build/
 .swiftpm/
+Flarebox.xcodeproj/
 FlareboxFFI/Frameworks/
 FlareboxFFI/Sources/FlareboxFFI/flarebox_ffi.swift
 xcuserdata/

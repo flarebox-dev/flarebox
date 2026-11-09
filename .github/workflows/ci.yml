@@ -131,6 +131,9 @@ jobs:
       - name: Test the Swift bindings
         if: steps.changes.outputs.affected == 'true'
         run: swift test --package-path FlareboxFFI
+      - name: Generate the Xcode project with the pinned XcodeGen
+        if: steps.changes.outputs.affected == 'true'
+        run: scripts/generate-project.sh
       - name: Build the app (unsigned)
         if: steps.changes.outputs.affected == 'true'
         run: >-

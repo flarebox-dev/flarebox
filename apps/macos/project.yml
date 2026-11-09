@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# XcodeGen spec for Flarebox.xcodeproj. Generate the project with scripts/generate-project.sh.
+
+name: Flarebox
+options:
+  bundleIdPrefix: dev.flarebox
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+packages:
+  FlareboxFFI:
+    path: FlareboxFFI
+targets:
+  Flarebox:
+    type: application
+    platform: macOS
+    sources:
+      - Flarebox
+    dependencies:
+      - package: FlareboxFFI
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.flarebox.Flarebox
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_LSUIElement: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Flarebox
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.productivity
+        MARKETING_VERSION: 0.0.0
+        CURRENT_PROJECT_VERSION: 1
+        SWIFT_VERSION: 6.0
+        ONLY_ACTIVE_ARCH: YES
+        CODE_SIGN_IDENTITY: "-"
+schemes:
+  Flarebox:
+    build:
+      targets:
+        Flarebox: all
