@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+
+version: v2
+clean: true
+plugins:
+  - remote: buf.build/bufbuild/es:v2.17.0
+    out: ../server/src/gen
+    opt: target=ts
+  - remote: buf.build/community/neoeinstein-prost:v0.5.0
+    out: ../core/proto/src/gen

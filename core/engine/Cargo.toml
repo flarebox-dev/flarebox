@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "flarebox-engine"
+description = "Sync state machine and conflict rules, free of I/O."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true

@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "flarebox-ffi"
+description = "Bindings for the native desktop apps."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true

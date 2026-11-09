@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "flarebox",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-11-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "ACCOUNT", "class_name": "AccountDO" },
+      { "name": "SPACE", "class_name": "SpaceDO" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["AccountDO", "SpaceDO"] }
+  ]
+}

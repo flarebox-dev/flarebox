@@ -1,0 +1,57 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package flarebox.v1;
+
+import "flarebox/v1/model.proto";
+
+// A binary WebSocket frame from client to server.
+message ClientMessage {
+  oneof msg {
+    Hello hello = 1;
+    Resume resume = 2;
+    RpcRequest rpc = 3;
+    Reauth reauth = 4;
+  }
+}
+
+// A binary WebSocket frame from server to client.
+message ServerMessage {
+  oneof msg {
+    Welcome welcome = 1;
+    Changes changes = 2;
+    CaughtUp caught_up = 3;
+    RpcResponse rpc = 4;
+    ResyncRequired resync_required = 5;
+    Notice notice = 6;
+    Goodbye goodbye = 7;
+  }
+}
+
+message Changes {
+  repeated CommitRecord commits = 1;
+}
+
+// The messages below are placeholders. Their fields are defined in the
+// first Phase 1 change to this schema, following spec v0 sections 7 and 8.
+
+message Hello {}
+
+message Welcome {}
+
+message Resume {}
+
+message CaughtUp {}
+
+message RpcRequest {}
+
+message RpcResponse {}
+
+message Reauth {}
+
+message ResyncRequired {}
+
+message Notice {}
+
+message Goodbye {}

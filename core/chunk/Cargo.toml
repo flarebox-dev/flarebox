@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "flarebox-chunk"
+description = "Content-defined chunking and chunk hashing."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
