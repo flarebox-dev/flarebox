@@ -4,7 +4,8 @@
 
 use std::collections::BTreeSet;
 
-use crate::tree::{LocalNode, Names, NodeId, RemoteNode, Shape, Tree, TreeError, same};
+use crate::names::name_key;
+use crate::tree::{Kind, LocalNode, Names, NodeId, RemoteNode, Shape, Tree, TreeError, same};
 
 /// Where a node stands against its merge base S.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,15 +95,8 @@ impl Trees {
 
     /// Sets S, or clears it with `None` (S := ⊥).
     pub fn set_synced(&mut self, id: NodeId, shape: Option<Shape>) {
-        self.dirty.insert(id.clone());
-        match shape {
-            Some(shape) => {
-                self.s.insert(id, shape);
-            }
-            None => {
-                self.s.remove(&id);
-            }
-        }
+        self.set_synced_unmarked(&id, shape);
+        self.dirty.insert(id);
     }
 
     pub fn class(&self, id: &str) -> Class {
@@ -110,28 +104,82 @@ impl Trees {
     }
 
     /// Settles what needs no decision: a node changed the same way on both sides takes S := R, and
-    /// a node in sync leaves the dirty set. Returns every dirty node that is left, with its class.
+    /// a node in sync leaves the dirty set. S stays a valid tree: an update that would orphan a
+    /// child, put a node under a missing or non-directory parent, close a cycle or take a sibling's
+    /// `name_key` waits until the updates it depends on have been made, and if they never are, the
+    /// node stays dirty as [`Class::Same`]. Returns every dirty node that is left, with its class,
+    /// in `node_id` order.
     pub fn settle(&mut self) -> Vec<(NodeId, Class)> {
+        let mut pending = Vec::new();
         let mut work = Vec::new();
         for id in std::mem::take(&mut self.dirty) {
             match self.class(&id) {
                 Class::InSync => {}
-                Class::Same => {
-                    let shape = self.r.live(&id).cloned();
-                    match shape {
-                        Some(shape) => {
-                            self.s.insert(id, shape);
-                        }
-                        None => {
-                            self.s.remove(&id);
-                        }
-                    }
-                }
+                Class::Same => pending.push(id),
                 class => work.push((id, class)),
             }
         }
+        loop {
+            let before = pending.len();
+            pending.retain(|id| !self.take_remote(id));
+            if pending.len() == before {
+                break;
+            }
+        }
+        work.extend(pending.into_iter().map(|id| (id, Class::Same)));
+        work.sort_by(|a, b| a.0.cmp(&b.0));
         self.dirty = work.iter().map(|(id, _)| id.clone()).collect();
         work
+    }
+
+    /// S := R for one node, made only when S stays a valid tree.
+    fn take_remote(&mut self, id: &str) -> bool {
+        let next = self.r.live(id).cloned();
+        let has_children = self.s.iter().any(|(_, shape)| shape.parent == id);
+        match &next {
+            None if has_children => return false,
+            None => {}
+            Some(shape) => {
+                if has_children && shape.kind != Kind::Dir {
+                    return false;
+                }
+                if shape.parent != self.s.root {
+                    match self.s.live(&shape.parent) {
+                        Some(parent) if parent.kind == Kind::Dir => {}
+                        _ => return false,
+                    }
+                }
+                let mut ancestor = shape.parent.as_str();
+                while ancestor != self.s.root {
+                    if ancestor == id {
+                        return false;
+                    }
+                    match self.s.live(ancestor) {
+                        Some(parent) => ancestor = &parent.parent,
+                        None => return false,
+                    }
+                }
+                let key = name_key(&shape.name);
+                if self.s.iter().any(|(other, sibling)| {
+                    other != id && sibling.parent == shape.parent && name_key(&sibling.name) == key
+                }) {
+                    return false;
+                }
+            }
+        }
+        self.set_synced_unmarked(id, next);
+        true
+    }
+
+    fn set_synced_unmarked(&mut self, id: &str, shape: Option<Shape>) {
+        match shape {
+            Some(shape) => {
+                self.s.insert(id.to_owned(), shape);
+            }
+            None => {
+                self.s.remove(id);
+            }
+        }
     }
 
     /// The invariants of section 2.2 for all three trees.

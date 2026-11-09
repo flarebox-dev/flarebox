@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use flarebox_proto::v1::{self as proto, NodeKind, NodeStatus};
 
-use crate::names::name_key;
+use crate::names::{name_key, nfc};
 
 pub type NodeId = String;
 
@@ -36,11 +36,11 @@ pub struct Shape {
 }
 
 impl Shape {
-    /// Equality as the planner compares trees: positions and kinds exactly, contents by
-    /// [`same_content`].
+    /// Equality as the planner compares trees: parents and kinds exactly, names by their NFC form
+    /// (L keeps the spelling on disk), contents by [`same_content`]. A rename that changes only
+    /// case is a change.
     pub fn same(&self, other: &Shape) -> bool {
-        self.parent == other.parent
-            && self.name == other.name
+        self.same_position(other)
             && self.kind == other.kind
             && match (&self.content, &other.content) {
                 (Some(a), Some(b)) => same_content(a, b),
@@ -50,7 +50,8 @@ impl Shape {
     }
 
     pub fn same_position(&self, other: &Shape) -> bool {
-        self.parent == other.parent && self.name == other.name
+        self.parent == other.parent
+            && (self.name == other.name || nfc(&self.name) == nfc(&other.name))
     }
 }
 

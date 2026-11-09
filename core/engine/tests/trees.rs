@@ -3,6 +3,7 @@
 //! The three trees and the classification table of docs/design/sync-engine.md sections 2.2 and 2.3.
 
 use flarebox_engine::classify::{Class, Trees, classify};
+use flarebox_engine::names::nfc;
 use flarebox_engine::tree::{
     Content, FileIdentity, Kind, LocalNode, Names, RemoteNode, Shape, StateError, Tree, TreeError,
     same_content,
@@ -254,62 +255,252 @@ impl WithName for Shape {
     }
 }
 
+#[test]
+fn names_compare_by_their_nfc_form_but_case_still_counts() {
+    let s = file(ROOT, "\u{e9}", 1);
+    let decomposed = file(ROOT, "e\u{301}", 1);
+    assert!(decomposed.same_position(&s));
+    assert_eq!(
+        classify(Some(&decomposed), Some(&s), Some(&s)),
+        Class::InSync
+    );
+    let upper = file(ROOT, "\u{c9}", 1);
+    assert_eq!(classify(Some(&upper), Some(&s), Some(&s)), Class::Local);
+}
+
+#[test]
+fn a_move_to_another_parent_under_the_same_name_is_a_change() {
+    let s = file("p", "x", 1);
+    let moved = file("q", "x", 1);
+    assert!(!moved.same_position(&s));
+    assert_eq!(classify(Some(&moved), Some(&s), Some(&s)), Class::Local);
+    assert_eq!(classify(Some(&s), Some(&s), Some(&moved)), Class::Remote);
+}
+
+#[test]
+fn settling_never_orphans_a_child_in_s() {
+    let mut trees = Trees::new(ROOT);
+    trees.set_synced("p".into(), Some(dir(ROOT, "p")));
+    trees.set_synced("x".into(), Some(file("p", "x", 1)));
+    trees.set_local("x".into(), local(file(ROOT, "a", 1), 1));
+    trees.set_remote("x".into(), remote(file(ROOT, "b", 1)));
+    assert_eq!(trees.check(), Ok(()));
+    assert_eq!(trees.class("p"), Class::Same);
+    assert_eq!(trees.class("x"), Class::Concurrent);
+
+    let work = trees.settle();
+    assert_eq!(trees.check(), Ok(()));
+    assert_eq!(
+        work,
+        [
+            ("p".to_owned(), Class::Same),
+            ("x".to_owned(), Class::Concurrent)
+        ]
+    );
+    assert!(trees.synced().get("p").is_some());
+
+    trees.set_synced("x".into(), Some(file(ROOT, "b", 1)));
+    trees.set_local("x".into(), local(file(ROOT, "b", 1), 1));
+    assert_eq!(trees.settle(), []);
+    assert!(trees.synced().get("p").is_none());
+    assert_eq!(trees.check(), Ok(()));
+}
+
+#[test]
+fn settling_waits_for_the_updates_it_depends_on() {
+    let mut trees = Trees::new(ROOT);
+    trees.set_synced("p".into(), Some(dir(ROOT, "p")));
+    trees.set_synced("x".into(), Some(file("p", "x", 1)));
+    trees.set_local("x".into(), local(file(ROOT, "x", 1), 1));
+    trees.set_remote("x".into(), remote(file(ROOT, "x", 1)));
+    trees.set_local("q".into(), local(dir(ROOT, "q"), 2));
+    trees.set_remote("q".into(), remote(dir(ROOT, "q")));
+    trees.set_local("y".into(), local(file("q", "y", 1), 3));
+    trees.set_remote("y".into(), remote(file("q", "y", 1)));
+    assert_eq!(trees.settle(), []);
+    assert_eq!(trees.check(), Ok(()));
+    assert!(trees.synced().get("p").is_none());
+    assert_eq!(trees.synced().get("y"), Some(&file("q", "y", 1)));
+}
+
+#[test]
+fn settling_never_gives_two_siblings_one_name_key() {
+    let mut trees = Trees::new(ROOT);
+    trees.set_synced("a".into(), Some(file(ROOT, "Stra\u{df}e", 1)));
+    trees.set_local("a".into(), local(file(ROOT, "y", 1), 1));
+    trees.set_remote("a".into(), remote(file(ROOT, "z", 1)));
+    trees.set_synced("b".into(), Some(file(ROOT, "b", 2)));
+    trees.set_local("b".into(), local(file(ROOT, "STRASSE", 2), 2));
+    trees.set_remote("b".into(), remote(file(ROOT, "STRASSE", 2)));
+    assert_eq!(trees.check(), Ok(()));
+    assert_eq!(
+        trees.settle(),
+        [
+            ("a".to_owned(), Class::Concurrent),
+            ("b".to_owned(), Class::Same)
+        ]
+    );
+    assert_eq!(trees.check(), Ok(()));
+}
+
+/// The comparison of section 2.2 written out field by field, so that the properties do not test
+/// `Shape::same` against itself.
+fn equal(a: &Option<Shape>, b: &Option<Shape>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            a.parent == b.parent
+                && nfc(&a.name) == nfc(&b.name)
+                && a.kind == b.kind
+                && match (&a.content, &b.content) {
+                    (None, None) => true,
+                    (Some(x), Some(y)) => {
+                        x.size == y.size
+                            && x.manifest_digest == y.manifest_digest
+                            && x.executable == y.executable
+                    }
+                    _ => false,
+                }
+        }
+        _ => false,
+    }
+}
+
 fn shapes() -> impl Strategy<Value = Option<Shape>> {
     prop_oneof![
         Just(None),
-        (0u8..3, 0u8..2, 0u8..2).prop_map(|(digest, name, parent)| {
-            let parent = if parent == 0 { ROOT } else { "d" };
-            Some(file(parent, ["a", "b"][name as usize], digest))
+        (0u8..3, 0u8..4, 0u8..2, any::<bool>()).prop_map(|(digest, name, parent, directory)| {
+            let parent = ["p", "q"][parent as usize];
+            let name = ["a", "A", "\u{e9}", "e\u{301}"][name as usize];
+            Some(if directory {
+                dir(parent, name)
+            } else {
+                file(parent, name, digest)
+            })
         }),
     ]
 }
 
+/// One node of a generated space: its S shape, and what L and R did with it.
+#[derive(Clone, Debug)]
+enum Change {
+    Keep,
+    Delete,
+    Edit(u8),
+    Move { parent: usize, name: u8 },
+}
+
+fn changes() -> impl Strategy<Value = Change> {
+    prop_oneof![
+        3 => Just(Change::Keep),
+        1 => Just(Change::Delete),
+        1 => (0u8..3).prop_map(Change::Edit),
+        2 => (0usize..8, 0u8..3).prop_map(|(parent, name)| Change::Move { parent, name }),
+    ]
+}
+
+/// A node's shape after `change`, or ⊥. Parents always have a smaller index, so no tree has a
+/// cycle, and a node whose parent is gone is gone too, so every tree is valid.
+fn apply(i: usize, s: &[Option<Shape>], change: &Change, out: &[Option<Shape>]) -> Option<Shape> {
+    let base = s[i].clone()?;
+    let mut shape = match change {
+        Change::Keep => base,
+        Change::Delete => return None,
+        Change::Edit(digest) if base.kind == Kind::File => Shape {
+            content: Some(content(*digest, 3)),
+            ..base
+        },
+        Change::Edit(_) => base,
+        Change::Move { parent, name } => Shape {
+            parent: if *parent < i && out[*parent].as_ref().is_some_and(|p| p.kind == Kind::Dir) {
+                format!("n{parent}")
+            } else {
+                ROOT.into()
+            },
+            name: format!("{}{i}", ["n", "a", "b"][*name as usize]),
+            ..base
+        },
+    };
+    if shape.parent != ROOT {
+        let parent: usize = shape.parent[1..].parse().unwrap();
+        if out[parent].is_none() {
+            return None;
+        }
+        if out[parent].as_ref().unwrap().kind != Kind::Dir {
+            shape.parent = ROOT.into();
+        }
+    }
+    Some(shape)
+}
+
+fn spaces() -> impl Strategy<Value = Vec<(bool, Change, Change)>> {
+    proptest::collection::vec((any::<bool>(), changes(), changes()), 1..9)
+}
+
 proptest! {
-    /// Balasubramaniam and Pierce, Definition 4.1.2 in ID form: a side that did not change takes
-    /// the other side's value, and a node changed on both sides is never settled by overwriting.
+    /// Balasubramaniam and Pierce, Definition 4.1.2 in ID form, against an independent equality:
+    /// a side that did not change takes the other side's value, and a node changed on both sides is
+    /// never settled by overwriting.
     #[test]
     fn classification_takes_only_the_side_that_changed(
         l in shapes(), s in shapes(), r in shapes()
     ) {
-        let eq = |a: &Option<Shape>, b: &Option<Shape>| match (a, b) {
-            (Some(a), Some(b)) => a.same(b),
-            (None, None) => true,
-            _ => false,
-        };
         let class = classify(l.as_ref(), s.as_ref(), r.as_ref());
-        let expected = match (eq(&l, &s), eq(&r, &s)) {
+        let expected = match (equal(&l, &s), equal(&r, &s)) {
             (true, true) => Class::InSync,
             (true, false) => Class::Remote,
             (false, true) => Class::Local,
-            (false, false) if eq(&l, &r) => Class::Same,
+            (false, false) if equal(&l, &r) => Class::Same,
             (false, false) => Class::Concurrent,
         };
         prop_assert_eq!(class, expected);
     }
 
+    /// Settling valid trees leaves valid trees, takes every change made the same way on both sides
+    /// that it can take without breaking S, leaves nothing in sync dirty, and is idempotent.
     #[test]
-    fn settling_twice_changes_nothing_more(
-        nodes in proptest::collection::vec((shapes(), shapes(), shapes()), 1..8)
-    ) {
+    fn settling_keeps_every_tree_valid(space in spaces()) {
+        let mut s: Vec<Option<Shape>> = Vec::new();
+        for (i, (directory, _, _)) in space.iter().enumerate() {
+            let parent = (0..i).rev().find(|&j| s[j].as_ref().is_some_and(|p| p.kind == Kind::Dir));
+            let parent = parent.map_or(ROOT.to_owned(), |j| format!("n{j}"));
+            let name = format!("n{i}");
+            s.push(Some(if *directory { dir(&parent, &name) } else { file(&parent, &name, 0) }));
+        }
+        let (mut l, mut r) = (Vec::new(), Vec::new());
+        for (i, (_, local_change, remote_change)) in space.iter().enumerate() {
+            let next_l = apply(i, &s, local_change, &l);
+            l.push(next_l);
+            let next_r = apply(i, &s, remote_change, &r);
+            r.push(next_r);
+        }
         let mut trees = Trees::new(ROOT);
-        for (i, (l, s, r)) in nodes.into_iter().enumerate() {
+        for i in 0..space.len() {
             let id = format!("n{i}");
-            let with = |shape: Shape| shape.with_name(&id);
-            trees.set_synced(id.clone(), s.map(with));
-            if let Some(r) = r {
-                trees.set_remote(id.clone(), remote(with(r)));
+            trees.set_synced(id.clone(), s[i].clone());
+            if let Some(shape) = r[i].clone() {
+                trees.set_remote(id.clone(), remote(shape));
             }
-            if let Some(l) = l {
-                trees.set_local(id.clone(), local(with(l), i as u64));
+            if let Some(shape) = l[i].clone() {
+                trees.set_local(id.clone(), local(shape, i as u64));
             }
         }
-        let first = trees.settle();
-        for (id, class) in &first {
-            prop_assert!(matches!(class, Class::Remote | Class::Local | Class::Concurrent));
-            prop_assert_eq!(trees.class(id), *class);
+        prop_assert_eq!(trees.check(), Ok(()));
+        let work = trees.settle();
+        prop_assert_eq!(trees.check(), Ok(()));
+        for i in 0..space.len() {
+            let id = format!("n{i}");
+            let class = trees.class(&id);
+            match work.iter().find(|(w, _)| *w == id) {
+                Some((_, listed)) => {
+                    prop_assert_eq!(*listed, class);
+                    prop_assert_ne!(class, Class::InSync);
+                }
+                None => prop_assert_eq!(class, Class::InSync, "{} left the dirty set", id),
+            }
         }
         let snapshot = trees.clone();
-        prop_assert_eq!(trees.settle(), first);
+        prop_assert_eq!(trees.settle(), work);
         prop_assert_eq!(trees, snapshot);
     }
 }
