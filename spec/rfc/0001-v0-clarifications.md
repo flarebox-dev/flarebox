@@ -15,6 +15,10 @@ Pinned data:
 
 Implementations must produce the results of those versions. Under the Unicode stability policies, the case folding and normalization of an assigned code point never change. A library built on an earlier version therefore gives the pinned result for every name whose code points are all assigned in that version.
 
+Known limitation: this is the one exception to the requirement above. The server folds case with its own copy of the 18.0.0 `CaseFolding.txt`, but it normalizes with the runtime's ICU data. If that data is older than 18.0.0, the server's NFD can differ from the pinned NFD for names that contain code points the data treats as unassigned. Such names are still accepted, because refusing to sync a file would be worse. Their stored `name_key` can differ from the pinned key. Two canonically equivalent names can then both stay live, and so can two case variants whose match depends on decomposing such a code point.
+
+A runtime that later reaches 18.0.0 normalization does not repair this: keys already stored and clashes already live stay as they are. No repair migration exists yet; one would recompute every stored `name_key` and resolve the clashes it finds, under rules set by the RFC that adds it. Moving to a newer Unicode pin is a separate change. It raises `format_version` and recomputes every key, as described below.
+
 The server computes `name_key` and is the only party that enforces uniqueness among live siblings. A client that computes a different key has only mispredicted a clash, and the server resolves it with R1 or R2.
 
 The versions belong to the space format (§9.2). Moving to a newer Unicode version raises `format_version`, and the server recomputes every stored `name_key` in that migration. The RFC that raises the version defines how a clash created by the new data is resolved.

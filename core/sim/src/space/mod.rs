@@ -457,6 +457,7 @@ impl SpaceDo {
         if let Some(reason) = reason {
             return Err(ResyncRequired {
                 reason: reason as i32,
+                ..Default::default()
             });
         }
         Ok(self
@@ -953,6 +954,7 @@ mod tests {
                 base_seq: space.head_seq(),
                 ops: vec![Op { op: Some(op) }],
                 receipts: vec![],
+                ..Default::default()
             };
             space.commit(&session, 0, &commit).unwrap().result
         };

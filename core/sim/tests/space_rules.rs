@@ -97,6 +97,7 @@ impl Space {
             base_seq,
             ops,
             receipts,
+            ..Default::default()
         };
         self.space
             .commit(&c.session, NOW, &commit)
@@ -895,6 +896,7 @@ fn answers_rpcs_and_returns_the_record_only_for_a_new_commit() {
         base_seq: 0,
         ops: vec![mkdir(&dir, &root, "D")],
         receipts: vec![],
+        ..Default::default()
     };
     let request = RpcRequest {
         req_id: 7,
@@ -1342,6 +1344,7 @@ fn a_receipt_is_valid_only_for_its_space_chunk_size_and_hour() {
             base_seq: 0,
             ops: vec![create_file(&s.id(), &root, "f", content.clone())],
             receipts,
+            ..Default::default()
         };
         s.space
             .commit(&a.session, now_ms, &commit)
