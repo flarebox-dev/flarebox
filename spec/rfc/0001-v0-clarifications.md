@@ -22,7 +22,7 @@ R2 (merge) applies only when the existing live node with the same `name_key` is 
 
 ## 5. Long conflict names (§6.1)
 
-The device name is cut to 32 Unicode scalar values after `/` and NUL are removed; an empty result becomes `unknown device`. If `<stem> (conflict from <device> <YYYY-MM-DD>[ <n>])<ext>` is longer than 255 bytes, scalar values are removed from the end of the stem until it fits, so the suffix and the extension survive. If it is still too long with an empty stem, scalar values are removed from the end of the whole name until it fits. The result is normalized to NFC.
+The device name is cut to 32 Unicode scalar values after `/` and NUL are removed; an empty result becomes `unknown device`. Length is measured on the NFC form, because NFC can lengthen a name (U+0A5E becomes U+0A2B U+0A3C). If the NFC form of `<stem> (conflict from <device> <YYYY-MM-DD>[ <n>])<ext>` is longer than 255 bytes, scalar values are removed from the end of the stem until it fits, so the suffix and the extension survive. If it is still too long with an empty stem, scalar values are removed from the end of the whole name until it fits. The result is the NFC form.
 
 ## 6. No-op Move
 
