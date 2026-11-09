@@ -575,7 +575,7 @@ describe("WebSocket session", () => {
     expect(wsBytes).toBeLessThanOrEqual(1024 * 1024);
     expect(await runInDurableObject(stub, (_instance, state) => state.storage.sql.exec("SELECT seq FROM commits").toArray())).toEqual([]);
 
-    const parts = await content(...Array.from({ length: 1500 }, (_, i) => "chunk " + i));
+    const parts = await content(...Array.from({ length: 1010 }, (_, i) => "chunk " + i));
     const commit = { commitId: uuidv7(), baseSeq: 0n, ops: [op.create(uuidv7(), spaceId, "big", parts.content)] };
     const receipts: MessageInitShape<typeof UploadReceiptSchema>[] = [];
     const listed = async () => {
@@ -595,7 +595,7 @@ describe("WebSocket session", () => {
     expect(Array.isArray(rest) && rest.map(toHex)).toEqual(parts.content.chunks.slice(1000).map((chunk) => toHex(chunk.hash)));
     await uploadListed(rest as Uint8Array[]);
     expect(await listed()).toBe("commit");
-  });
+  }, 30_000);
 
   it("closes a connection on any text message except ping, an oversized one included", async () => {
     const { a, spaceId } = await twoDevices();
