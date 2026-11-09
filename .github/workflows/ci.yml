@@ -81,11 +81,13 @@ jobs:
             git status --short -- ../server/src/gen ../core/proto/src/gen
             exit 1
           fi
-      - name: Check for breaking changes against main
+      - name: Check for breaking changes against the base
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || 'refs/heads/main' }}
         run: |
-          git fetch --no-tags --depth=1 origin +refs/heads/main:refs/remotes/origin/main
-          if ! buf breaking --against "../.git#ref=refs/remotes/origin/main,subdir=spec"; then
-            echo "::error::The schema in spec/proto breaks compatibility with main (see the buf output above). Keep field numbers, names and types stable; reserve removed fields instead of deleting them."
+          git fetch --no-tags --depth=1 origin "+$BASE:refs/remotes/origin/breaking-base"
+          if ! buf breaking --against "../.git#ref=refs/remotes/origin/breaking-base,subdir=spec"; then
+            echo "::error::The schema in spec/proto breaks compatibility with the base $BASE (see the buf output above). Keep field numbers, names and types stable; reserve removed fields instead of deleting them."
             exit 1
           fi
 
