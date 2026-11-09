@@ -64,6 +64,12 @@ message Commit {
   uint64 base_seq = 2;
   repeated Op ops = 3;
   repeated UploadReceipt receipts = 4;
+  // The history the commit was built in. A commit for another history is refused with CODE_HISTORY_MISMATCH.
+  string history_id = 5;
+  // This device's commit slot: one more than its highest accepted device_seq. A retry keeps it.
+  uint64 device_seq = 6;
+  // When true, the commit is refused with CODE_HEAD_MOVED unless head_seq equals base_seq.
+  bool require_head = 7;
 }
 
 message OpResult {

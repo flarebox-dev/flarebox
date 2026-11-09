@@ -179,6 +179,7 @@ fn run(actions: &[Action]) -> Vec<NodeState> {
             base_seq: space.head_seq().saturating_sub(a.lag),
             ops: vec![Op { op: Some(body) }],
             receipts,
+            ..Default::default()
         };
         let done = space
             .commit(&s, NOW, &commit)
