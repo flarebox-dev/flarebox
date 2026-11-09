@@ -9,9 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::classify::{Class, Trees};
 use crate::ids::IdGen;
 use crate::names::name_key;
-use crate::tree::{
-    Content, FileIdentity, Kind, LocalNode, NodeId, RemoteNode, Shape, same_content,
-};
+use crate::tree::{Content, FileIdentity, Kind, LocalNode, NodeId, Shape, same_content};
 
 /// A directory on the way to an entry, with the identity L holds for it. The driver resolves a
 /// location one directory at a time and fails the effect when an identity differs (section 5.2).
@@ -125,14 +123,15 @@ pub enum EffectError {
     MissingIdentity,
 }
 
-/// The disk side of a space: the effect in flight, the effects cleared so far, and for each node
-/// whose last effect failed, its L and R entries then. Such a node is not planned again until one
-/// of them changes, so an effect is never retried blindly.
+/// The disk side of a space: the effect in flight, the effects cleared so far, and the effect that
+/// failed last for each blocked node. An effect that failed is never emitted again unchanged, so it
+/// is not retried blindly; a change to anything it was computed from, such as the identity of a
+/// directory on its path, gives the node a new effect.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Effects {
     in_flight: Option<EffectRecord>,
     cleared: u64,
-    failed: BTreeMap<NodeId, (Option<LocalNode>, Option<RemoteNode>)>,
+    failed: BTreeMap<NodeId, Effect>,
 }
 
 impl Effects {
@@ -145,6 +144,18 @@ impl Effects {
         self.cleared
     }
 
+    /// The nodes whose last effect failed, with that effect. Each stays blocked until the effect
+    /// planned for it differs, or until [`Effects::unblock`].
+    pub fn blocked(&self) -> &BTreeMap<NodeId, Effect> {
+        &self.failed
+    }
+
+    /// Lets the planner emit the failed effect of `node` again, for a caller that knows the
+    /// cause is gone. Returns false when the node was not blocked.
+    pub fn unblock(&mut self, node: &str) -> bool {
+        self.failed.remove(node).is_some()
+    }
+
     /// Emits the next effect, unless one is in flight. A dirty node whose only change is remote,
     /// or that is parked, gets the effect that makes L equal to R when it applies to L as it is:
     /// its parent is a directory there, no other entry there holds its name key, and a move does
@@ -152,20 +163,24 @@ impl Effects {
     /// such effect applies, a node that blocks one is parked, if it has a remote change of its
     /// own: the entry holding a name, or a directory that would move into its own subtree. A
     /// rename that changes only case or normalization goes through the parked directory too.
+    ///
+    /// A parked node with a local change, such as an edit observed in the parked directory, is
+    /// only moved out: to its R position, or to the position L keeps for it when R has none. Its
+    /// content is never replaced or removed, so the change is planned like any other local one.
     pub fn plan(&mut self, trees: &Trees, ids: &mut IdGen, now_ms: u64) -> Option<&EffectRecord> {
         if self.in_flight.is_some() {
             return None;
         }
-        self.failed.retain(|id, seen| *seen == entries(trees, id));
+        self.failed.retain(|id, _| candidate(trees, id));
         let view = View::new(trees);
         let mut blockers = BTreeSet::new();
         let mut chosen = None;
         for id in trees.dirty() {
-            let parked = trees.local().get(id).is_some_and(|node| node.parked);
-            if (trees.class(id) != Class::Remote && !parked) || self.failed.contains_key(id) {
+            if !candidate(trees, id) {
                 continue;
             }
             match view.step(id) {
+                Step::Apply(effect, _) if self.failed.get(id) == Some(&effect) => {}
                 Step::Apply(effect, after) => {
                     chosen = Some((id.clone(), effect, after));
                     break;
@@ -177,15 +192,17 @@ impl Effects {
             }
         }
         let (node, effect, after) = chosen.or_else(|| {
-            blockers
-                .into_iter()
-                .find(|id| {
-                    trees.class(id) == Class::Remote
-                        && !self.failed.contains_key(id)
-                        && trees.local().get(id).is_some_and(|node| !node.parked)
-                })
-                .and_then(|id| view.park(&id).map(|(effect, after)| (id, effect, after)))
+            blockers.into_iter().find_map(|id| {
+                if trees.class(&id) != Class::Remote
+                    || trees.local().get(&id).is_none_or(|node| node.parked)
+                {
+                    return None;
+                }
+                let (effect, after) = view.park(&id)?;
+                (self.failed.get(&id) != Some(&effect)).then_some((id, effect, after))
+            })
         })?;
+        self.failed.remove(&node);
         self.in_flight = Some(EffectRecord {
             effect_id: ids.uuid_v7(now_ms),
             node,
@@ -235,12 +252,11 @@ impl Effects {
         Ok(())
     }
 
-    /// The driver did not do the effect. Its observations of the disk go to L separately; until L
-    /// or R changes for the node, no effect is planned for it.
-    pub fn failed(&mut self, trees: &Trees, effect_id: &str) -> Result<(), EffectError> {
+    /// The driver did not do the effect. Its observations of the disk go to L separately; the node
+    /// is blocked until the effect planned for it differs from this one.
+    pub fn failed(&mut self, effect_id: &str) -> Result<(), EffectError> {
         let record = self.take(effect_id)?;
-        self.failed
-            .insert(record.node.clone(), entries(trees, &record.node));
+        self.failed.insert(record.node, record.effect);
         self.cleared = record.counter;
         Ok(())
     }
@@ -252,11 +268,9 @@ impl Effects {
     }
 }
 
-fn entries(trees: &Trees, id: &str) -> (Option<LocalNode>, Option<RemoteNode>) {
-    (
-        trees.local().get(id).cloned(),
-        trees.remote().get(id).cloned(),
-    )
+/// A node the planner considers: one whose only change is remote, or one that is parked.
+fn candidate(trees: &Trees, id: &str) -> bool {
+    trees.class(id) == Class::Remote || trees.local().get(id).is_some_and(|node| node.parked)
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -291,6 +305,9 @@ impl<'a> View<'a> {
         let remote = self.trees.remote().live(id);
         let (local, remote) = match (local, remote) {
             (None, None) => return Step::Skip,
+            (Some(local), None) if local.parked && self.trees.class(id) != Class::Remote => {
+                return self.unpark(id, local, &local.shape);
+            }
             (Some(local), None) => return self.remove(id, local),
             (None, Some(remote)) => {
                 if let Some(blocked) = self.blocked(id, remote) {
@@ -312,6 +329,9 @@ impl<'a> View<'a> {
             }
             (Some(local), Some(remote)) => (local, remote),
         };
+        if local.parked && self.trees.class(id) != Class::Remote {
+            return self.unpark(id, local, remote);
+        }
         if local.shape.kind != remote.kind {
             return Step::Skip;
         }
@@ -377,6 +397,29 @@ impl<'a> View<'a> {
         Step::Apply(
             Effect::Move {
                 from: here,
+                identity: local.identity,
+                to,
+            },
+            Some(after),
+        )
+    }
+
+    /// Moves a parked node to `target`'s position with its content as L has it.
+    fn unpark(&self, id: &str, local: &LocalNode, target: &Shape) -> Step {
+        if let Some(blocked) = self.blocked(id, target) {
+            return blocked;
+        }
+        let Some(to) = self.location_in(&target.parent, &target.name) else {
+            return Step::Skip;
+        };
+        let after = Shape {
+            parent: target.parent.clone(),
+            name: target.name.clone(),
+            ..local.shape.clone()
+        };
+        Step::Apply(
+            Effect::Move {
+                from: Location::Parked(id.to_owned()),
                 identity: local.identity,
                 to,
             },

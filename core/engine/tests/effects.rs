@@ -522,18 +522,16 @@ fn only_a_node_whose_only_change_is_remote_gets_an_effect_and_one_at_a_time() {
 }
 
 #[test]
-fn a_failed_effect_waits_until_l_or_r_changes() {
+fn a_failed_effect_is_not_emitted_again_unchanged() {
     let (mut trees, _) = space(&[("f", Some(file(ROOT, "f", 1)), Some(file(ROOT, "f", 2)))]);
     trees.settle();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
-    let id = effects
-        .plan(&trees, &mut ids, NOW)
-        .unwrap()
-        .effect_id
-        .clone();
-    assert_eq!(effects.failed(&trees, &id), Ok(()));
+    let first = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    let id = first.effect_id.clone();
+    assert_eq!(effects.failed(&id), Ok(()));
     assert_eq!(effects.cleared(), 1);
     assert_eq!(effects.plan(&trees, &mut ids, NOW), None);
+    assert_eq!(effects.blocked().get("f"), Some(&first.effect));
 
     let same = trees.local().get("f").unwrap().clone();
     trees.set_local("f".into(), same.clone());
@@ -549,6 +547,125 @@ fn a_failed_effect_waits_until_l_or_r_changes() {
     let again = effects.plan(&trees, &mut ids, NOW).unwrap();
     assert_eq!(again.counter, 2);
     assert_ne!(again.effect_id, id);
+}
+
+#[test]
+fn a_blocked_node_can_be_unblocked_by_the_caller() {
+    let (mut trees, _) = space(&[("f", Some(file(ROOT, "f", 1)), Some(file(ROOT, "f", 2)))]);
+    trees.settle();
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    let first = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    effects.failed(&first.effect_id).unwrap();
+    assert_eq!(effects.plan(&trees, &mut ids, NOW), None);
+    assert!(effects.unblock("f"));
+    assert!(!effects.unblock("f"));
+    assert!(effects.blocked().is_empty());
+    assert_eq!(
+        effects.plan(&trees, &mut ids, NOW).map(|r| &r.effect),
+        Some(&first.effect)
+    );
+}
+
+#[test]
+fn a_failed_create_is_planned_again_once_its_parent_has_a_new_identity() {
+    let (mut trees, _) = space(&[
+        ("d", Some(dir(ROOT, "d")), Some(dir(ROOT, "d"))),
+        ("f", None, Some(file("d", "f", 1))),
+    ]);
+    trees.settle();
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    let first = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    effects.failed(&first.effect_id).unwrap();
+    let mut parent = trees.local().get("d").unwrap().clone();
+    parent.identity = identity(7);
+    trees.set_local("d".into(), parent);
+    trees.settle();
+    assert_eq!(trees.class("f"), Class::Remote);
+    let again = effects.plan(&trees, &mut ids, NOW).unwrap();
+    assert_eq!(
+        again.effect,
+        Effect::WriteFile {
+            at: Location::At {
+                base: Base::Root,
+                dirs: vec![Dir {
+                    name: "d".into(),
+                    identity: identity(7)
+                }],
+                name: "f".into()
+            },
+            content: content(1),
+            replaces: None
+        }
+    );
+    assert!(effects.blocked().is_empty());
+}
+
+#[test]
+fn an_edit_observed_while_parked_is_moved_out_and_never_displaced() {
+    let (mut trees, mut disk) = space(&[("f", Some(file(ROOT, "a", 1)), Some(file(ROOT, "A", 2)))]);
+    trees.settle();
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    let park = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    assert!(matches!(
+        park.effect,
+        Effect::Move {
+            to: Location::Parked(_),
+            ..
+        }
+    ));
+    disk.apply(&park.effect).unwrap();
+    effects.done(&mut trees, &park.effect_id, None).unwrap();
+    let mut observed = trees.local().get("f").unwrap().clone();
+    observed.shape.content = Some(content(3));
+    disk.entries.get_mut(&1).unwrap().content = Some(content(3));
+    trees.set_local("f".into(), observed);
+    trees.settle();
+    assert_eq!(trees.class("f"), Class::Concurrent);
+    let out = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    assert_eq!(
+        out.effect,
+        Effect::Move {
+            from: Location::Parked("f".into()),
+            identity: identity(1),
+            to: root_at("A")
+        }
+    );
+    disk.apply(&out.effect).unwrap();
+    effects.done(&mut trees, &out.effect_id, None).unwrap();
+    disk.matches(&trees).unwrap();
+    assert_eq!(trees.local().get("f").unwrap().shape, file(ROOT, "A", 3));
+    trees.settle();
+    assert_eq!(trees.class("f"), Class::Concurrent);
+    assert_eq!(effects.plan(&trees, &mut ids, NOW), None);
+}
+
+#[test]
+fn a_parked_edit_whose_node_was_removed_remotely_goes_back_to_its_place() {
+    let (mut trees, mut disk) = space(&[
+        ("a", Some(file(ROOT, "x", 1)), Some(file(ROOT, "y", 1))),
+        ("b", Some(file(ROOT, "y", 2)), Some(file(ROOT, "x", 2))),
+    ]);
+    trees.settle();
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    let park = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    disk.apply(&park.effect).unwrap();
+    effects.done(&mut trees, &park.effect_id, None).unwrap();
+    let mut observed = trees.local().get("a").unwrap().clone();
+    observed.shape.content = Some(content(3));
+    disk.entries.get_mut(&1).unwrap().content = Some(content(3));
+    trees.set_local("a".into(), observed);
+    trees.remove_remote("a");
+    trees.remove_remote("b");
+    trees.settle();
+    let out = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    assert_eq!(
+        out.effect,
+        Effect::Move {
+            from: Location::Parked("a".into()),
+            identity: identity(1),
+            to: root_at("x")
+        }
+    );
 }
 
 #[test]
