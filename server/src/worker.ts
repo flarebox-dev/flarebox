@@ -18,7 +18,7 @@ import {
 import { Error_Code } from "./gen/flarebox/v1/rpc_pb";
 import { BadRequest, errorReply, readMessage, reply } from "./http";
 import { isUuidV7 } from "./ids";
-import { CONNECT_HEADER, type Connect } from "./space-do";
+import { CONNECT_HEADER, type Connect, MAX_CLIENT_FRAME } from "./space-do";
 import { PROTO_MAX, PROTO_MIN, SERVER_VERSION } from "./version";
 
 export { AccountDO } from "./account-do";
@@ -42,7 +42,9 @@ function key(env: Env): Promise<ServerKey> {
 async function authenticate(request: Request, env: Env): Promise<Identity | Response> {
   const token = bearerToken(request);
   const identity = token ? await verifyAccessToken(await key(env), token, Date.now()) : undefined;
-  return identity ?? errorReply(request, Error_Code.UNAUTHENTICATED, "missing or invalid access token");
+  if (!identity) return errorReply(request, Error_Code.UNAUTHENTICATED, "missing or invalid access token");
+  if (!(await account(env).isDeviceActive(identity.deviceId))) return errorReply(request, Error_Code.UNAUTHENTICATED, "this device was revoked");
+  return identity;
 }
 
 function space(env: Env, spaceId: string) {
@@ -128,7 +130,10 @@ async function route(request: Request, env: Env): Promise<Response> {
       return stub.fetch(new Request(request.url, { headers }));
     }
     if (spaceRoute[2] === "rpc" && method === "POST") {
+      const tooLarge = () => errorReply(request, Error_Code.LIMIT_EXCEEDED, "request body larger than 8 MiB", 413);
+      if (Number(request.headers.get("Content-Length") ?? 0) > MAX_CLIENT_FRAME) return tooLarge();
       const body = new Uint8Array(await request.arrayBuffer());
+      if (body.length > MAX_CLIENT_FRAME) return tooLarge();
       return new Response(await stub.httpRpc(connect, body), { headers: { "Content-Type": "application/x-protobuf" } });
     }
   }

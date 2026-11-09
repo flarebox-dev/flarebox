@@ -83,7 +83,10 @@ export const GRANT_MS = HOUR_MS;
 const MAX_OPS = 1000;
 const MAX_CHUNKS_PER_CALL = 1000;
 export const MAX_CHUNK_BYTES = 16 * 1024 * 1024;
-const MAX_COMMIT_ROW_BYTES = 7_900_000;
+/** Spec v0 section 7.2: a ServerMessage is at most 1 MiB, a ClientMessage at most 8 MiB. */
+const MAX_SERVER_FRAME = 1024 * 1024;
+export const MAX_CLIENT_FRAME = 8 * 1024 * 1024;
+const MAX_REQ_ID = 2n ** 64n - 1n;
 const RETRY_LATER_MS = 60_000;
 const PAGE_BYTES = 1024 * 1024;
 const GC_BATCH = 1000;
@@ -250,8 +253,10 @@ export class SpaceDO extends DurableObject<Env> {
   async httpRpc(connect: Connect, request: Uint8Array): Promise<Uint8Array> {
     const req = fromBinary(RpcRequestSchema, request);
     const role = this.memberRole(connect.identity.userId);
-    if (!role) {
-      const error = create(ErrorSchema, { code: Error_Code.FORBIDDEN, message: "not a member of this space" });
+    if (!role || this.revoked(connect.identity.deviceId)) {
+      const error = role
+        ? create(ErrorSchema, { code: Error_Code.UNAUTHENTICATED, message: "device revoked" })
+        : create(ErrorSchema, { code: Error_Code.FORBIDDEN, message: "not a member of this space" });
       return toBinary(RpcResponseSchema, create(RpcResponseSchema, { reqId: req.reqId, result: { case: "error", value: error } }));
     }
     const device = this.sql.exec("SELECT max_format FROM devices WHERE device_id = ?", connect.identity.deviceId).toArray()[0];
@@ -268,6 +273,7 @@ export class SpaceDO extends DurableObject<Env> {
     if (!connect) return new Response("missing identity", { status: 401 });
     const role = this.memberRole(connect.identity.userId);
     if (!role) return new Response("not a member of this space", { status: 403 });
+    if (this.revoked(connect.identity.deviceId)) return new Response("device revoked", { status: 401 });
     const [client, server] = Object.values(new WebSocketPair()) as [WebSocket, WebSocket];
     this.ctx.acceptWebSocket(server, [connect.identity.deviceId]);
     const attachment: Attachment = { connId: uuidv7(), identity: connect.identity, origin: connect.origin, role, maxFormat: 0, hello: false, live: false };
@@ -278,7 +284,9 @@ export class SpaceDO extends DurableObject<Env> {
 
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     if (typeof message === "string") return;
+    if (message.byteLength > MAX_CLIENT_FRAME) return this.goodbye(ws, Close.PROTOCOL, "message larger than 8 MiB");
     const attachment = ws.deserializeAttachment() as Attachment;
+    if (this.revoked(attachment.identity.deviceId)) return this.goodbye(ws, Close.DEVICE_REVOKED, "device revoked");
     if (this.clock() > attachment.identity.expiresAtMs + TOKEN_GRACE_MS) return this.goodbye(ws, Close.TOKEN_EXPIRED, "access token expired");
     let msg;
     try {
@@ -301,7 +309,12 @@ export class SpaceDO extends DurableObject<Env> {
 
   /** Closes every connection of a revoked device with 4003. */
   async closeDevice(deviceId: string): Promise<void> {
+    this.sql.exec("INSERT INTO revoked_devices (device_id, revoked_at_ms) VALUES (?, ?) ON CONFLICT DO NOTHING", deviceId, Date.now());
     for (const ws of this.ctx.getWebSockets(deviceId)) this.goodbye(ws, Close.DEVICE_REVOKED, "device revoked");
+  }
+
+  private revoked(deviceId: string): boolean {
+    return this.sql.exec("SELECT 1 FROM revoked_devices WHERE device_id = ?", deviceId).toArray().length > 0;
   }
 
   /** Closes connections whose access token expired more than a minute ago; returns when to check next. */
@@ -396,9 +409,10 @@ export class SpaceDO extends DurableObject<Env> {
     };
     for (const row of this.sql.exec("SELECT record FROM commits WHERE seq > ? ORDER BY seq", Number(resume.sinceSeq))) {
       const record = new Uint8Array(row.record as ArrayBuffer);
-      if (bytes + record.length > PAGE_BYTES) flush();
+      const framed = record.length + 4;
+      if (bytes + framed > MAX_SERVER_FRAME - 8) flush();
       batch.push(fromBinary(CommitRecordSchema, record));
-      bytes += record.length;
+      bytes += framed;
     }
     flush();
     this.send(ws, { case: "caughtUp", value: create(CaughtUpSchema, { headSeq: BigInt(head) }) });
@@ -407,10 +421,13 @@ export class SpaceDO extends DurableObject<Env> {
   }
 
   private async reauth(ws: WebSocket, attachment: Attachment, token: string): Promise<void> {
-    const key = await this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName("account")).serverKey();
-    const identity = await verifyAccessToken(key, token, this.clock());
+    const account = this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName("account"));
+    const identity = await verifyAccessToken(await account.serverKey(), token, this.clock());
     if (!identity || identity.deviceId !== attachment.identity.deviceId || identity.userId !== attachment.identity.userId) {
       return this.goodbye(ws, Close.TOKEN_EXPIRED, "invalid access token");
+    }
+    if (!(await account.isDeviceActive(identity.deviceId)) || this.revoked(identity.deviceId)) {
+      return this.goodbye(ws, Close.DEVICE_REVOKED, "device revoked");
     }
     const current = ws.deserializeAttachment() as Attachment;
     current.identity = identity;
@@ -497,8 +514,13 @@ export class SpaceDO extends DurableObject<Env> {
   private appendCommit(record: CommitRecord, result: CommitResult): void {
     const recordBytes = toBinary(CommitRecordSchema, record);
     const resultBytes = toBinary(CommitResultSchema, result);
-    if (recordBytes.length + resultBytes.length > MAX_COMMIT_ROW_BYTES) {
-      fail(Error_Code.LIMIT_EXCEEDED, "the commit's change records are too large for one log entry; split the commit");
+    const pushed = toBinary(ServerMessageSchema, create(ServerMessageSchema, { msg: { case: "changes", value: { commits: [record] } } }));
+    const answered = toBinary(
+      ServerMessageSchema,
+      create(ServerMessageSchema, { msg: { case: "rpc", value: { reqId: MAX_REQ_ID, result: { case: "commit", value: result } } } }),
+    );
+    if (Math.max(pushed.length, answered.length) > MAX_SERVER_FRAME) {
+      fail(Error_Code.LIMIT_EXCEEDED, "the commit's change records do not fit in one 1 MiB message; split the commit");
     }
     this.sql.exec(
       "INSERT INTO commits (seq, commit_id, device_id, user_id, committed_at_ms, record, results) VALUES (?, ?, ?, ?, ?, ?, ?)",

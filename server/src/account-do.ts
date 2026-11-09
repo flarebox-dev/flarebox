@@ -207,6 +207,10 @@ export class AccountDO extends DurableObject<Env> {
     return create(AccessTokenSchema, { token, expiresAtMs: BigInt(expiresAtMs) });
   }
 
+  async isDeviceActive(deviceId: string): Promise<boolean> {
+    return this.activeDevice(deviceId) !== undefined;
+  }
+
   private activeDevice(deviceId: string): DeviceRow | undefined {
     const row = this.sql.exec("SELECT * FROM devices WHERE device_id = ? AND revoked_at_ms IS NULL", deviceId).toArray()[0];
     return row as unknown as DeviceRow | undefined;

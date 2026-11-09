@@ -278,6 +278,46 @@ describe("owner claim, pairing and tokens", () => {
     const refresh = await call("/v1/token", { body: body(TokenRequestSchema, { deviceId: laptop.deviceId, refreshCredential: laptop.refreshCredential }) }, AccessTokenSchema);
     expect(refresh.status).toBe(401);
   });
+
+  it("refuses a revoked device's old access token on every path, also after the Space DO was evicted", async () => {
+    const owner = await getOwner();
+    const laptop = await pairDevice(owner, "Stolen laptop");
+    const spaceId = await createSpace(owner);
+    await account().revokeDevice(laptop.deviceId);
+    expect(await Socket.open(spaceId, laptop.access!.token)).toBe(401);
+    const rpc = await call("/v1/spaces/" + spaceId + "/rpc", { token: laptop.access!.token, body: body(RpcRequestSchema, { reqId: 1n, call: { case: "listTree", value: {} } }) }, RpcResponseSchema);
+    expect(rpc.status).toBe(401);
+    await evictDurableObject(env.SPACE.get(env.SPACE.idFromName(spaceId)));
+    expect(await Socket.open(spaceId, laptop.access!.token)).toBe(401);
+  });
+
+  it("keeps a revocation in the Space DO, so a missed Account DO check cannot reopen the space", async () => {
+    const owner = await getOwner();
+    const tablet = await pairDevice(owner, "Tablet");
+    const spaceId = await createSpace(owner);
+    const stub = env.SPACE.get(env.SPACE.idFromName(spaceId));
+    await stub.closeDevice(tablet.deviceId);
+    expect(await account().isDeviceActive(tablet.deviceId)).toBe(true);
+    expect(await Socket.open(spaceId, tablet.access!.token)).toBe(401);
+    const rpc = await call("/v1/spaces/" + spaceId + "/rpc", { token: tablet.access!.token, body: body(RpcRequestSchema, { reqId: 1n, call: { case: "listTree", value: {} } }) }, RpcResponseSchema);
+    const result = rpc.message!.result;
+    expect(result.case === "error" && result.value.code).toBe(Error_Code.UNAUTHENTICATED);
+    const stored = await runInDurableObject(stub, (_instance, state) => state.storage.sql.exec("SELECT device_id FROM revoked_devices").toArray());
+    expect(stored).toEqual([{ device_id: tablet.deviceId }]);
+  });
+
+  it("closes a connection whose Reauth comes from a device revoked without a notice to the space", async () => {
+    const owner = await getOwner();
+    const phone = await pairDevice(owner, "Phone");
+    const spaceId = await createSpace(owner);
+    const socket = await Socket.connect(spaceId, phone);
+    await socket.start();
+    await runInDurableObject(account(), (_instance, state) => {
+      state.storage.sql.exec("UPDATE devices SET revoked_at_ms = ? WHERE device_id = ?", Date.now(), phone.deviceId);
+    });
+    socket.send({ case: "reauth", value: { accessToken: phone.access!.token } });
+    expect((await socket.waitClosed()).code).toBe(Close.DEVICE_REVOKED);
+  });
 });
 
 describe("WebSocket session", () => {
@@ -287,6 +327,51 @@ describe("WebSocket session", () => {
     const spaceId = await createSpace(a);
     return { a, b, spaceId, stub: env.SPACE.get(env.SPACE.idFromName(spaceId)) };
   }
+
+  it("rejects a commit whose change records do not fit in one 1 MiB message and keeps every frame under 1 MiB", async () => {
+    const { a, b, spaceId } = await twoDevices();
+    const writer = await Socket.connect(spaceId, a);
+    await writer.start();
+    const reader = await Socket.connect(spaceId, b);
+    await reader.start();
+    const parts = await content(...Array.from({ length: 16_000 }, () => "x"));
+    const plan = await writer.rpc({ case: "prepareUpload", value: { chunks: [parts.content.chunks[0]!] } });
+    expect(plan.case).toBe("prepareUpload");
+    const receipts = await upload(spaceId, { content: { chunks: [parts.content.chunks[0]!] } as Content, bytes: [parts.bytes[0]!] });
+    const both = await writer.rpc({
+      case: "commit",
+      value: { commitId: uuidv7(), baseSeq: 0n, ops: [op.create(uuidv7(), spaceId, "one", parts.content), op.create(uuidv7(), spaceId, "two", parts.content)], receipts },
+    });
+    expect(both.case === "error" && both.value.code).toBe(Error_Code.LIMIT_EXCEEDED);
+
+    const frameSize = (msg: MessageInitShape<typeof ServerMessageSchema>["msg"]) => toBinary(ServerMessageSchema, create(ServerMessageSchema, { msg })).length;
+    for (const name of ["one", "two"]) {
+      const result = await writer.commit(0n, [op.create(uuidv7(), spaceId, name, parts.content)], receipts);
+      expect(frameSize({ case: "rpc", value: { reqId: 1n, result: { case: "commit", value: result } } })).toBeLessThanOrEqual(1024 * 1024);
+      const live = await reader.next();
+      expect(live.case).toBe("changes");
+      expect(frameSize(live)).toBeLessThanOrEqual(1024 * 1024);
+    }
+    const late = await Socket.connect(spaceId, b);
+    const welcome = await late.hello();
+    late.send({ case: "resume", value: { historyId: welcome.historyId, sinceSeq: 0n } });
+    const sizes: number[] = [];
+    for (let msg = await late.next(); msg.case !== "caughtUp"; msg = await late.next()) sizes.push(frameSize(msg));
+    expect(sizes).toHaveLength(2);
+    expect(Math.max(...sizes)).toBeLessThanOrEqual(1024 * 1024);
+  });
+
+  it("closes a connection on a message over 8 MiB before parsing it, and refuses an RPC body over 8 MiB", async () => {
+    const { a, spaceId } = await twoDevices();
+    const exact = await Socket.connect(spaceId, a);
+    exact.ws.send(new Uint8Array(8 * 1024 * 1024));
+    expect(await exact.waitClosed()).toMatchObject({ code: Close.PROTOCOL, reason: "malformed ClientMessage" });
+    const over = await Socket.connect(spaceId, a);
+    over.ws.send(new Uint8Array(8 * 1024 * 1024 + 1));
+    expect(await over.waitClosed()).toMatchObject({ code: Close.PROTOCOL, reason: "message larger than 8 MiB" });
+    const rpc = await call("/v1/spaces/" + spaceId + "/rpc", { token: a.access!.token, body: new Uint8Array(8 * 1024 * 1024 + 1) }, RpcResponseSchema);
+    expect(rpc.status).toBe(413);
+  });
 
   it("lets two devices commit and receive each other's changes", async () => {
     const { a, b, spaceId } = await twoDevices();
