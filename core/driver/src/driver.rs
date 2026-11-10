@@ -990,10 +990,10 @@ fn now_ms() -> i64 {
 }
 
 /// Revokes the credential's own device on the server. An answer that another device already revoked it counts as
-/// revoked. Any HTTP 409 is the server's refusal to revoke the user's last active device, [`DriverError::LastDevice`],
-/// whatever its body. Any other failure, including no answer within [`SERVER_WAIT`], is
-/// [`DriverError::NotRevoked`] unless `confirm_last_device` is set, in which case it is logged and the device stays
-/// active on the server until another device revokes it.
+/// revoked. Without `confirm_last_device`, any HTTP 409 is the server's refusal to revoke the user's last active device,
+/// [`DriverError::LastDevice`], whatever its body, and any other failure, including no answer within [`SERVER_WAIT`],
+/// is [`DriverError::NotRevoked`]. With it, every failure, a 409 included, is logged and the device stays active on the
+/// server until another device revokes it.
 async fn revoke(credential: &Credential, confirm_last_device: bool) -> Result<(), DriverError> {
     let revoked = async {
         let auth = Auth::new(credential.api()?, credential.net());
@@ -1007,7 +1007,9 @@ async fn revoke(credential: &Credential, confirm_last_device: bool) -> Result<()
             );
             return Ok(());
         }
-        Ok(Err(error)) if error.status() == Some(409) => return Err(DriverError::LastDevice),
+        Ok(Err(error)) if !confirm_last_device && error.status() == Some(409) => {
+            return Err(DriverError::LastDevice);
+        }
         Ok(Err(error)) if error.is_unauthenticated() => {
             tracing::info!(
                 device_id = credential.device_id,
@@ -1850,6 +1852,24 @@ mod tests {
             assert!(paths.credential().exists(), "{case}");
             assert_eq!(driver.status().folders.len(), 1, "{case}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_sign_out_that_gets_a_409_finishes_on_the_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let server = revocation_answered_with(
+            b"HTTP/1.1 409 Conflict\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            false,
+        )
+        .await;
+        let paths = linked_with_server(&base, server);
+        let driver = Driver::open(paths.clone()).unwrap();
+
+        driver.sign_out(true).await.unwrap();
+        assert_eq!(driver.status().account, None);
+        assert!(driver.status().folders.is_empty());
+        assert!(!paths.credential().exists());
     }
 
     #[tokio::test]
