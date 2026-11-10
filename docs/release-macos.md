@@ -109,7 +109,7 @@ GitHub never shows a secret again after you save it. If the secret is lost, crea
 ## Run a release build
 
 - **Manually:** open **Actions**, **macOS release**, **Run workflow**, keep `main` under "Use workflow from", and enter a version such as `0.1.0` or leave it empty. A run from any other branch fails in the "commit on main" job.
-- **From a tag:** merge the release to `main`, then tag a commit on `main`, for example `git tag v0.1.0 origin/main && git push origin v0.1.0`. The tag must be three numbers after the `v`, and a tag on a commit that is not on `main` fails in the "commit on main" job.
+- **From a tag:** merge the release to `main`, then tag a commit on `main`, for example `git fetch origin main && git tag v0.1.0 origin/main && git push origin v0.1.0`, so the tag lands on the latest merged commit. The tag must be three numbers after the `v`, and a tag on a commit that is not on `main` fails in the "commit on main" job.
 
 Either way, approve the deployment to `macos-release` on the run page when it asks.
 
