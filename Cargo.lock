@@ -652,6 +652,7 @@ dependencies = [
 name = "flarebox-store"
 version = "0.0.0"
 dependencies = [
+ "flarebox-engine",
  "flarebox-fs",
  "flarebox-proto",
  "prost",

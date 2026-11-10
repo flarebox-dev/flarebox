@@ -1,12 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::{BTreeMap, BTreeSet};
+
+use flarebox_engine::commit::{Halt, InFlight};
+use flarebox_engine::effects::{Base, Dir, Displaced, Effect, EffectRecord, Location};
+use flarebox_engine::state::{CommitsState, EffectsState, TreesState};
+use flarebox_engine::tree::{FileIdentity, Kind, Shape as EngineShape};
 use flarebox_fs::FileId;
 use flarebox_proto::v1::{
-    ChunkRef, Commit, Content, CreateFile, Delete, NodeKind, NodeState, NodeStatus, Op,
-    VersionInfo, op,
+    ChunkRef, Commit, CommitResult, Content, CreateFile, Delete, NodeKind, NodeState, NodeStatus,
+    Op, OpResult, VersionInfo, op, op_result,
 };
 use flarebox_store::{
-    CachedChunk, Cursor, Durability, Error, GivenAnswer, InFlightCommit, Link, LocalNode, Problem,
+    CachedChunk, Cursor, Durability, EngineState, Error, GivenAnswer, Link, LocalNode,
     SCHEMA_VERSION, Shape, Store, StoredQuestion, SyncedNode,
 };
 use rusqlite::Connection;
@@ -66,15 +72,20 @@ fn migrations_apply_from_empty() {
         [
             "chunk_cache",
             "commit_in_flight",
-            "commit_in_flight_shapes",
+            "commit_in_flight_deletes",
+            "commit_state",
+            "effect_state",
             "engine_state",
+            "failed_effects",
             "link",
             "local_nodes",
-            "problems",
+            "node_maps",
+            "node_sets",
             "questions",
             "remote_cursor",
             "remote_nodes",
             "synced_nodes",
+            "waiting_updates",
         ]
     );
     let journal: String = conn
@@ -230,103 +241,216 @@ fn three_trees_round_trip() {
         .unwrap();
 }
 
+fn identity(ino: u64) -> FileIdentity {
+    FileIdentity {
+        dev: u64::MAX,
+        ino,
+        birth_ns: -1,
+    }
+}
+
+fn engine_shape(parent: &str, name: &str) -> EngineShape {
+    EngineShape {
+        parent: parent.into(),
+        name: name.into(),
+        kind: Kind::File,
+        content: Some(content(3)),
+    }
+}
+
+fn nodes<const N: usize>(ids: [&str; N]) -> BTreeSet<String> {
+    ids.into_iter().map(String::from).collect()
+}
+
+/// An engine state with every field set, and every kind of effect and location.
+fn engine_state() -> EngineState {
+    let in_docs = |name: &str| Location::At {
+        base: Base::Root,
+        dirs: vec![Dir {
+            name: "docs".into(),
+            identity: identity(2),
+        }],
+        name: name.into(),
+    };
+    let in_parked = Location::At {
+        base: Base::Parked {
+            node: "p".into(),
+            identity: identity(3),
+        },
+        dirs: vec![],
+        name: "inner.txt".into(),
+    };
+    let displaced = Displaced {
+        at: in_docs("old.txt"),
+        identity: identity(4),
+        content: content(5),
+    };
+    let commit = Commit {
+        commit_id: "c1".into(),
+        base_seq: 12,
+        ops: vec![
+            Op {
+                op: Some(op::Op::CreateFile(CreateFile {
+                    node_id: "n".into(),
+                    parent_id: "root".into(),
+                    name: "new.txt".into(),
+                    content: Some(content(3)),
+                })),
+            },
+            Op {
+                op: Some(op::Op::Delete(Delete {
+                    node_id: "old".into(),
+                })),
+            },
+        ],
+        history_id: "h1".into(),
+        device_seq: 5,
+        require_head: true,
+        ..Default::default()
+    };
+    let applied = OpResult {
+        code: op_result::Code::Applied as i32,
+        ..Default::default()
+    };
+    EngineState {
+        trees: TreesState {
+            dirty: nodes(["a", "b"]),
+            unsearched: nodes(["b"]),
+            reverted: nodes(["r"]),
+            parked_as: BTreeMap::from([("p".into(), "p-before".into())]),
+            waiting: BTreeMap::from([
+                ("w".into(), Some(engine_shape("root", "w.txt"))),
+                ("gone".into(), None),
+            ]),
+        },
+        commits: CommitsState {
+            accepted: 4,
+            in_flight: Some(InFlight {
+                commit,
+                deletes: BTreeMap::from([(
+                    "old".into(),
+                    vec!["old".into(), "old-child".into(), "old-grandchild".into()],
+                )]),
+                result: Some(CommitResult {
+                    seq: 30,
+                    results: vec![applied.clone(), applied],
+                    changes: vec![],
+                }),
+            }),
+            problems: nodes(["rejected"]),
+            halted: Some(Halt::Policy { code: 42 }),
+            cap: Some(8),
+            split: nodes(["big"]),
+            aliases: BTreeMap::from([("twin".into(), "kept".into())]),
+        },
+        effects: EffectsState {
+            in_flight: Some(EffectRecord {
+                effect_id: "e1".into(),
+                node: "n".into(),
+                counter: 3,
+                effect: Effect::WriteFile {
+                    at: in_parked,
+                    content: content(7),
+                    replaces: Some(displaced.clone()),
+                },
+                after: Some(engine_shape("p", "inner.txt")),
+            }),
+            cleared: 2,
+            failed: BTreeMap::from([
+                (
+                    "c".into(),
+                    Effect::CreateDir {
+                        at: Location::Parked("c".into()),
+                    },
+                ),
+                (
+                    "m".into(),
+                    Effect::Move {
+                        from: in_docs("a"),
+                        identity: identity(6),
+                        to: Location::Parked("m".into()),
+                    },
+                ),
+                ("f".into(), Effect::RemoveFile { displaced }),
+                (
+                    "d".into(),
+                    Effect::RemoveDir {
+                        at: in_docs("empty"),
+                        identity: identity(8),
+                    },
+                ),
+            ]),
+        },
+    }
+}
+
 #[test]
-fn commit_in_flight_keeps_ops_and_sent_shapes() {
+fn engine_state_survives_a_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
-    let in_flight = InFlightCommit {
-        commit: Commit {
-            commit_id: "c1".into(),
-            base_seq: 12,
-            ops: vec![
-                Op {
-                    op: Some(op::Op::CreateFile(CreateFile {
-                        node_id: "n".into(),
-                        parent_id: "root".into(),
-                        name: "new.txt".into(),
-                        content: Some(content(3)),
-                    })),
-                },
-                Op {
-                    op: Some(op::Op::Delete(Delete {
-                        node_id: "old".into(),
-                    })),
-                },
-            ],
-            receipts: vec![],
-            history_id: "h1".into(),
-            device_seq: 4,
-            require_head: true,
-            run_id: String::new(),
-        },
-        sent: vec![Some(file_shape("root", "new.txt")), None],
-    };
-
+    let state = engine_state();
     let mut store = Store::open(&path).unwrap();
-    assert_eq!(store.transaction(|tx| tx.commit_in_flight()).unwrap(), None);
-    store
-        .transaction(|tx| tx.set_commit_in_flight(Some(&in_flight)))
-        .unwrap();
+    assert_eq!(
+        store.transaction(|tx| tx.engine_state()).unwrap(),
+        EngineState::default()
+    );
+    store.transaction(|tx| tx.set_engine_state(&state)).unwrap();
     drop(store);
 
     let mut store = Store::open(&path).unwrap();
-    assert_eq!(
-        store.transaction(|tx| tx.commit_in_flight()).unwrap(),
-        Some(in_flight.clone())
-    );
-
-    let next = InFlightCommit {
-        commit: Commit {
-            commit_id: "c2".into(),
-            base_seq: 13,
-            ops: in_flight.commit.ops[1..].to_vec(),
-            receipts: vec![],
-            history_id: "h1".into(),
-            device_seq: 5,
-            require_head: false,
-            run_id: String::new(),
-        },
-        sent: vec![None],
-    };
+    assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), state);
     store
         .transaction(|tx| {
-            tx.set_commit_in_flight(Some(&next))?;
-            assert_eq!(tx.commit_in_flight()?, Some(next.clone()));
-            tx.set_commit_in_flight(None)?;
-            assert_eq!(tx.commit_in_flight()?, None);
+            tx.set_engine_state(&EngineState::default())?;
+            assert_eq!(tx.engine_state()?, EngineState::default());
             Ok::<_, Error>(())
         })
         .unwrap();
 }
 
 #[test]
-fn problems_and_id_generator_persist() {
+fn a_halt_survives_a_reopen_with_its_commit() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
-    let problem = Problem {
-        node_id: "n".into(),
-        reason: "REJECTED: INVALID_NAME".into(),
-    };
+    for halted in [
+        None,
+        Some(Halt::ReadOnly),
+        Some(Halt::Recovery),
+        Some(Halt::Policy { code: 7 }),
+    ] {
+        let mut state = engine_state();
+        state.commits.halted = halted;
+        Store::open(&path)
+            .unwrap()
+            .transaction(|tx| tx.set_engine_state(&state))
+            .unwrap();
+        let stored = Store::open(&path)
+            .unwrap()
+            .transaction(|tx| tx.engine_state())
+            .unwrap();
+        assert_eq!(stored.commits.halted, halted);
+        assert_eq!(stored.commits.in_flight, state.commits.in_flight);
+    }
+}
+
+#[test]
+fn id_generator_persists() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
     let mut store = Store::open(&path).unwrap();
     store
         .transaction(|tx| {
             assert_eq!(tx.id_generator()?, None);
-            tx.set_id_generator(&[1, 2, 3])?;
-            tx.put_problem(&problem)
+            tx.set_id_generator(&[1, 2, 3])
         })
         .unwrap();
     drop(store);
 
     let mut store = Store::open(&path).unwrap();
-    store
-        .transaction(|tx| {
-            assert_eq!(tx.id_generator()?, Some(vec![1, 2, 3]));
-            assert_eq!(tx.problems()?, std::slice::from_ref(&problem));
-            assert!(tx.remove_problem("n")?);
-            assert_eq!(tx.problems()?, []);
-            Ok::<_, Error>(())
-        })
-        .unwrap();
+    assert_eq!(
+        store.transaction(|tx| tx.id_generator()).unwrap(),
+        Some(vec![1, 2, 3])
+    );
 }
 
 #[test]
