@@ -323,3 +323,103 @@ async fn a_file_of_several_chunks_arrives_with_the_same_bytes() {
     a.stop().await;
     b.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a local Worker; run core/driver/scripts/integration-test.sh"]
+async fn an_edit_replaces_the_file_on_the_other_device() {
+    log();
+    let owner = owner().await;
+    let space = new_space(&owner, "edit").await;
+    let mut a = Device::linked(&owner, &space, "a").await;
+    let mut b = Device::linked(&owner, &space, "b").await;
+    converged(&a, &b).await;
+    fs::write(a.folder().join("notes.txt"), b"first\n").unwrap();
+    converged(&a, &b).await;
+
+    fs::write(b.folder().join("notes.txt"), b"written in place on b\n").unwrap();
+    let (synced, _) = converged(&a, &b).await;
+    let expected = Tree::from([("notes.txt".into(), file(b"written in place on b\n"))]);
+    assert_eq!(synced, expected);
+
+    let saved = a.folder().join(".notes.txt.swp");
+    fs::write(&saved, b"saved by rename on a\n").unwrap();
+    fs::rename(&saved, a.folder().join("notes.txt")).unwrap();
+    let (synced, _) = converged(&a, &b).await;
+    let expected = Tree::from([("notes.txt".into(), file(b"saved by rename on a\n"))]);
+    assert_eq!(synced, expected);
+    a.stop().await;
+    b.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a local Worker; run core/driver/scripts/integration-test.sh"]
+async fn a_rename_moves_the_file_on_the_other_device() {
+    log();
+    let owner = owner().await;
+    let space = new_space(&owner, "rename").await;
+    let mut a = Device::linked(&owner, &space, "a").await;
+    let mut b = Device::linked(&owner, &space, "b").await;
+    converged(&a, &b).await;
+    fs::create_dir_all(a.folder().join("docs/drafts")).unwrap();
+    fs::write(a.folder().join("docs/plan.txt"), b"plan\n").unwrap();
+    fs::write(a.folder().join("docs/drafts/one.txt"), b"one\n").unwrap();
+    fs::write(a.folder().join("top.txt"), b"top\n").unwrap();
+    converged(&a, &b).await;
+
+    fs::rename(
+        b.folder().join("top.txt"),
+        b.folder().join("docs/moved.txt"),
+    )
+    .unwrap();
+    let (synced, _) = converged(&a, &b).await;
+    assert_eq!(
+        synced,
+        Tree::from([
+            ("docs".into(), Entry::Folder),
+            ("docs/drafts".into(), Entry::Folder),
+            ("docs/drafts/one.txt".into(), file(b"one\n")),
+            ("docs/moved.txt".into(), file(b"top\n")),
+            ("docs/plan.txt".into(), file(b"plan\n")),
+        ])
+    );
+
+    fs::rename(a.folder().join("docs"), a.folder().join("papers")).unwrap();
+    let (synced, _) = converged(&a, &b).await;
+    assert_eq!(
+        synced,
+        Tree::from([
+            ("papers".into(), Entry::Folder),
+            ("papers/drafts".into(), Entry::Folder),
+            ("papers/drafts/one.txt".into(), file(b"one\n")),
+            ("papers/moved.txt".into(), file(b"top\n")),
+            ("papers/plan.txt".into(), file(b"plan\n")),
+        ])
+    );
+    a.stop().await;
+    b.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a local Worker; run core/driver/scripts/integration-test.sh"]
+async fn a_second_hard_link_arrives_as_a_file_of_its_own() {
+    log();
+    let owner = owner().await;
+    let space = new_space(&owner, "hard link").await;
+    let mut a = Device::linked(&owner, &space, "a").await;
+    let mut b = Device::linked(&owner, &space, "b").await;
+    converged(&a, &b).await;
+    fs::write(a.folder().join("one.txt"), b"linked\n").unwrap();
+    converged(&a, &b).await;
+
+    fs::hard_link(a.folder().join("one.txt"), a.folder().join("two.txt")).unwrap();
+    let (synced, _) = converged(&a, &b).await;
+    assert_eq!(
+        synced,
+        Tree::from([
+            ("one.txt".into(), file(b"linked\n")),
+            ("two.txt".into(), file(b"linked\n")),
+        ])
+    );
+    a.stop().await;
+    b.stop().await;
+}

@@ -60,16 +60,19 @@ pub struct Observation {
 /// One change, in the terms of `core/fs` (paths relative to the root, previous-state paths first).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Observed {
-    /// `content` is set for a file that could be read whole.
+    /// `content` is set for a file that could be read whole. `linked` is set, here and on the other changes, for a
+    /// file that another path also links, a hard link, whose identity therefore names no single path.
     Created {
         path: PathBuf,
         kind: EntryKind,
         id: FileId,
+        linked: bool,
         content: Option<Content>,
     },
     Modified {
         path: PathBuf,
         id: FileId,
+        linked: bool,
         content: Option<Content>,
     },
     Renamed {
@@ -77,6 +80,7 @@ pub enum Observed {
         to: PathBuf,
         kind: EntryKind,
         id: FileId,
+        linked: bool,
     },
     Removed {
         path: PathBuf,
@@ -204,6 +208,7 @@ impl FsObserver {
                     .then(|| self.content(&path, &entry, busy))
                     .flatten();
                 out.push(Observed::Created {
+                    linked: self.linked(&path, kind),
                     path,
                     kind,
                     id: entry.id,
@@ -219,6 +224,7 @@ impl FsObserver {
                 out.push(Observed::Modified {
                     content,
                     id: entry.id,
+                    linked: self.linked(&path, entry.kind),
                     path,
                 });
             }
@@ -233,6 +239,7 @@ impl FsObserver {
                     to: to.clone(),
                     kind,
                     id: entry.id,
+                    linked: self.linked(&to, kind),
                 });
                 if leaves {
                     self.brought_in(&to, out, busy);
@@ -266,6 +273,7 @@ impl FsObserver {
                     out.push(Observed::Modified {
                         path: path.clone(),
                         id: entry.id,
+                        linked: self.linked(path, entry.kind),
                         content,
                     });
                 }
@@ -275,6 +283,7 @@ impl FsObserver {
                 path: path.clone(),
                 kind: entry.kind,
                 id: entry.id,
+                linked: self.linked(path, entry.kind),
                 content,
             });
         }
@@ -338,6 +347,7 @@ impl FsObserver {
                 Ok(Some(content)) => {
                     self.unread.remove(&path);
                     out.push(Observed::Modified {
+                        linked: self.linked(&path, entry.kind),
                         path,
                         id: entry.id,
                         content: Some(content),
@@ -349,6 +359,12 @@ impl FsObserver {
                 }
             }
         }
+    }
+
+    /// True for a file with more than one link. A file that cannot be read is taken to have one.
+    fn linked(&self, path: &Path, kind: EntryKind) -> bool {
+        kind == EntryKind::File
+            && std::fs::symlink_metadata(self.root.join(path)).is_ok_and(|meta| meta.nlink() > 1)
     }
 
     /// Chunks the file at `path` if it is still the entry the scan saw and does not change while it is read.

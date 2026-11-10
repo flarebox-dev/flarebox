@@ -1294,6 +1294,7 @@ fn a_stale_batch_does_not_undo_an_effect_and_the_rescan_reports_its_result() {
         vec![Observed::Modified {
             path: "report.txt".into(),
             id: known.id,
+            linked: false,
             content: written.shape.content.clone(),
         }],
         "the rescan reads the written file again and reports nothing else"
