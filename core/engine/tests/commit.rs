@@ -1221,40 +1221,64 @@ fn refusal(code: error::Code, retry_after_ms: u64) -> proto::Error {
 }
 
 #[test]
-fn an_unknown_error_or_a_quota_without_a_retry_time_is_refused_and_never_resent() {
+fn a_policy_refusal_keeps_the_commit_and_outlasts_any_welcome() {
     use error::Code;
     let unknown = proto::Error {
         code: 99,
         ..Default::default()
     };
-    let cases = [
-        (unknown, Failure::Halted(Halt::Refused)),
-        (
-            refusal(Code::Unspecified, 0),
-            Failure::Halted(Halt::Refused),
-        ),
-        (
-            refusal(Code::QuotaExceeded, 0),
-            Failure::Halted(Halt::Refused),
-        ),
-        (refusal(Code::QuotaExceeded, 5_000), Failure::Resend),
-        (refusal(Code::RetryLater, 0), Failure::Resend),
+    let policy = [
+        unknown,
+        refusal(Code::Unspecified, 0),
+        refusal(Code::QuotaExceeded, 0),
+        refusal(Code::Forbidden, 0),
+        refusal(Code::InvalidArgument, 0),
+        refusal(Code::NotFound, 0),
+        refusal(Code::ConfirmationRequired, 0),
     ];
-    for (error, failure) in cases {
+    for error in policy {
         let mut trees = trees(&[("a", Some(file(ROOT, "x", 1)), None, None)]);
         let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
         let sent = build(&mut commits, &mut trees, &mut ids).unwrap();
-        assert_eq!(commits.failed(&error), Ok(failure), "{error:?}");
-        assert_eq!(commits.in_flight().unwrap().commit, sent, "{error:?}");
-        let resend = match failure {
-            Failure::Resend => Reconnect::Resend,
-            _ => Reconnect::Idle,
-        };
-        assert_eq!(commits.connected(&welcome(0)), resend, "{error:?}");
-        if failure == Failure::Halted(Halt::Refused) {
-            assert_eq!(commits.halted(), Some(Halt::Refused), "{error:?}");
-            assert_eq!(build(&mut commits, &mut trees, &mut ids), None, "{error:?}");
+        let halt = Halt::Policy { code: error.code };
+        assert_eq!(
+            commits.failed(&error),
+            Ok(Failure::Halted(halt)),
+            "{error:?}"
+        );
+        let welcomes = [
+            welcome(0),
+            welcome(1),
+            Welcome {
+                read_only: true,
+                ..welcome(0)
+            },
+            Welcome {
+                history_id: "another".into(),
+                ..welcome(0)
+            },
+        ];
+        for welcome in welcomes {
+            assert_eq!(commits.connected(&welcome), Reconnect::Idle, "{error:?}");
+            assert_eq!(commits.halted(), Some(halt), "{error:?}");
         }
+        assert!(!commits.abandon(), "{error:?}");
+        assert_eq!(commits.in_flight().unwrap().commit, sent, "{error:?}");
+        assert_eq!(build(&mut commits, &mut trees, &mut ids), None, "{error:?}");
+    }
+    for error in [
+        refusal(Code::QuotaExceeded, 5_000),
+        refusal(Code::RetryLater, 0),
+    ] {
+        let mut trees = trees(&[("a", Some(file(ROOT, "x", 1)), None, None)]);
+        let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+        build(&mut commits, &mut trees, &mut ids).unwrap();
+        assert_eq!(commits.failed(&error), Ok(Failure::Resend), "{error:?}");
+        assert_eq!(
+            commits.connected(&welcome(0)),
+            Reconnect::Resend,
+            "{error:?}"
+        );
     }
 }
 
@@ -1302,12 +1326,10 @@ fn errors_forget_the_commit_only_when_nothing_was_applied() {
         (Code::RetryLater, Failure::Resend, true),
         (Code::Unauthenticated, Failure::Resend, true),
         (Code::Internal, Failure::Resend, true),
-        (Code::InvalidArgument, Failure::Abandoned, false),
         (Code::HeadMoved, Failure::Abandoned, false),
         (Code::UnsupportedVersion, Failure::Abandoned, false),
         (Code::AheadOfServer, Failure::Resync, false),
         (Code::ReadOnly, Failure::Halted(Halt::ReadOnly), false),
-        (Code::Forbidden, Failure::Halted(Halt::ReadOnly), false),
         (Code::HistoryMismatch, Failure::Halted(Halt::Recovery), true),
         (
             Code::StaleDeviceState,
