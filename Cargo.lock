@@ -560,6 +560,7 @@ dependencies = [
 name = "flarebox-driver"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "flarebox-chunk",
  "flarebox-engine",
  "flarebox-fs",

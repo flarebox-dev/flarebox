@@ -30,7 +30,7 @@
 //! same window for parents). Nothing is ever written into a folder that replaced the root, since every write goes
 //! through the locked descriptor.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io;
@@ -41,6 +41,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use flarebox_chunk::ChunkerConfig;
 use flarebox_engine::effects::{
     Base as EngineBase, Displaced as EngineDisplaced, Effect as EngineEffect, EffectRecord,
@@ -48,15 +49,15 @@ use flarebox_engine::effects::{
 };
 use flarebox_engine::tree::Content;
 use flarebox_fs::{
-    Action, Base, Contents, Dir, Displaced, Effect, Entry, EntryKind, Location, Marker, Outcome,
-    Reason, RootProblem, Space, Step,
+    Action, Base, Contents, Dir, Displaced, Effect, Entry, EntryKind, FileId, Location, Marker,
+    Outcome, Reason, RootProblem, Space, Step,
 };
-use flarebox_net::{ChunkError, Session, Transfer};
-use flarebox_proto::v1::ChunkRef;
+use flarebox_net::{ChunkError, Session, StopReason, Transfer};
+use flarebox_proto::v1::{ChunkRef, Commit, op};
 use flarebox_store::{Link, Store, Tx};
 
 use crate::engine::{Engine, file_id, file_identity};
-use crate::observe::{Observation, Observed, Reset};
+use crate::observe::{Observation, Observed, Reset, open_under};
 use crate::policy::{self, Disposition};
 
 /// How many effect sections [`Disk`] remembers for batches that span them. A batch older than all of them is dropped
@@ -92,6 +93,19 @@ pub(crate) enum Stop {
     Store(#[from] flarebox_store::Error),
     #[error("the folder: {0}")]
     Io(#[from] io::Error),
+    #[error("{0}")]
+    Session(StopReason),
+    /// The store and the server disagree in a way only recovery (design §6.4) resolves, and this build has none.
+    #[error("{0}; this build cannot recover the folder yet")]
+    Recovery(String),
+    /// The server refused a call for good.
+    #[error("{0}")]
+    Refused(String),
+    /// The server sent something this build cannot apply.
+    #[error("{0}")]
+    Protocol(String),
+    #[error("{0}; this build cannot sync that yet")]
+    Unsupported(String),
 }
 
 /// Why [`Pending::stage`] returned without a staged file. The effect stays in flight.
@@ -249,6 +263,9 @@ impl Disk {
     /// 4. The effect in flight is recovered without staging anything again, and acknowledged. An interrupted one is
     ///    planned again; one that met another state on disk stays blocked. The marker must then equal *e*.
     /// 5. Staged files without an effect are deleted.
+    ///
+    /// The observer then resets the paths of a recovered effect to L, so it reads a file the effect placed before
+    /// the crash once, whatever the snapshot it starts from says about that file.
     pub fn start(
         lock: &File,
         link: &Link,
@@ -313,6 +330,8 @@ impl Disk {
             if marker != cleared {
                 return Err(Stop::DiskBehind { marker, cleared });
             }
+            let scopes = scopes(&effect.action, &outcome);
+            disk.sections.request(engine.resets(scopes));
         }
         disk.space.clear_staging(None)?;
         Ok(disk)
@@ -347,7 +366,7 @@ impl Disk {
             };
             let (effect, contents) = translate(&record)?;
             let version = version_of(tx, &record)?;
-            engine.save(tx, [])?;
+            engine.checkpoint(tx)?;
             hook(Cut::BeforePlan);
             Ok(Some(Pending {
                 space: space.clone(),
@@ -464,14 +483,50 @@ impl Disk {
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |since| since.as_millis() as u64);
             store.transaction(|tx| -> Result<(), Stop> {
-                let touched = engine.observe(&changes, now_ms);
-                Ok(engine.save(tx, &touched)?)
+                engine.observe(&changes, now_ms);
+                Ok(engine.checkpoint(tx)?)
             })?;
         }
         if !dropped.is_empty() {
             self.sections.request(engine.resets(dropped));
         }
         Ok(())
+    }
+
+    /// Asks the observer to reset `paths` to L and scan them again.
+    pub fn rescan(&self, engine: &Engine, paths: Vec<PathBuf>) {
+        self.sections.request(engine.resets(paths));
+    }
+
+    /// The chunks `commit` adds, with where the bytes of each are: for every content the commit creates or
+    /// updates, the file of its node in L and the offset of each chunk in it.
+    pub fn upload(&self, commit: &Commit, engine: &Engine) -> Upload {
+        let mut upload = Upload {
+            space: self.space.clone(),
+            chunks: Vec::new(),
+            sources: HashMap::new(),
+        };
+        for op in &commit.ops {
+            let (node, content) = match &op.op {
+                Some(op::Op::CreateFile(create)) => (&create.node_id, &create.content),
+                Some(op::Op::UpdateContent(update)) => (&update.node_id, &update.content),
+                _ => continue,
+            };
+            let Some(content) = content else { continue };
+            let path = engine.path_of(node);
+            let identity = (engine.trees.local().get(node)).map(|held| file_id(held.identity));
+            let mut offset = 0;
+            for chunk in &content.chunks {
+                upload.sources.entry(chunk.hash.clone()).or_insert(Source {
+                    path: path.clone(),
+                    identity,
+                    offset,
+                });
+                upload.chunks.push(chunk.clone());
+                offset += u64::from(chunk.size);
+            }
+        }
+        upload
     }
 
     fn counter(&self, effects: u64) -> Marker {
@@ -492,6 +547,52 @@ impl Disk {
             return Err(Stop::Root(RootProblem::OtherSpace(marker.space_id)));
         }
         Ok(marker.effects)
+    }
+}
+
+/// The chunks a commit adds to the server and where the bytes of each are in the folder.
+pub(crate) struct Upload {
+    space: Arc<Space>,
+    /// Every chunk of every content the commit creates or updates, in the order of its ops.
+    pub chunks: Vec<ChunkRef>,
+    sources: HashMap<Vec<u8>, Source>,
+}
+
+struct Source {
+    /// `None` when L no longer holds the node under the root.
+    path: Option<PathBuf>,
+    identity: Option<FileId>,
+    offset: u64,
+}
+
+impl Upload {
+    /// The bytes of `chunk`, read from the file L holds for its node, through the locked descriptor and without
+    /// following a link. Another file at that path is an error. The caller checks the bytes against the chunk's hash.
+    pub fn read(&self, chunk: &ChunkRef) -> io::Result<Bytes> {
+        let gone = || {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "the file is no longer in the folder",
+            )
+        };
+        let source = self.sources.get(&chunk.hash).ok_or_else(gone)?;
+        let file = open_under(self.space.root(), source.path.as_deref().ok_or_else(gone)?)?;
+        let meta = file.metadata()?;
+        let same = |id: FileId| meta.is_file() && meta.dev() == id.dev && meta.ino() == id.ino;
+        if !source.identity.is_some_and(same) {
+            return Err(gone());
+        }
+        let mut bytes = vec![0; chunk.size as usize];
+        file.read_exact_at(&mut bytes, source.offset)?;
+        Ok(Bytes::from(bytes))
+    }
+
+    /// The files the chunks are read from, relative to the root.
+    pub fn paths(&self) -> Vec<PathBuf> {
+        let paths: BTreeSet<&PathBuf> = (self.sources.values())
+            .filter_map(|source| source.path.as_ref())
+            .collect();
+        paths.into_iter().cloned().collect()
     }
 }
 
@@ -663,7 +764,7 @@ fn acknowledge(
                 Settled::Failed(format!("{reason:?}"))
             }
         };
-        engine.save(tx, [&record.node])?;
+        engine.checkpoint(tx)?;
         hook(Cut::BeforeAck);
         Ok(settled)
     })?;
@@ -978,4 +1079,4 @@ impl io::Read for Positioned<'_> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

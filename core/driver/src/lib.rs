@@ -18,21 +18,15 @@
 mod claim;
 mod config;
 mod credential;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the folder task's loop starts using it in the next change"
-    )
+#[expect(
+    dead_code,
+    reason = "the folder task's loop starts using it in the next change"
 )]
 mod disk;
 mod driver;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the folder task's loop starts using it in the next change"
-    )
+#[expect(
+    dead_code,
+    reason = "the folder task's loop starts using it in the next change"
 )]
 mod engine;
 mod folder;
