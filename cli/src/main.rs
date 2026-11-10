@@ -393,9 +393,9 @@ fn device_table(devices: &[DeviceInfo], now_ms: i64) -> String {
                 (revoked, _) => format!("revoked {}", ago(revoked, now_ms)),
             };
             [
-                device.device_id.clone(),
-                device.name.clone(),
-                device.platform.clone(),
+                printable(&device.device_id),
+                printable(&device.name),
+                printable(&device.platform),
                 ago(device.last_seen_ms, now_ms),
                 state,
             ]
@@ -419,6 +419,20 @@ fn device_table(devices: &[DeviceInfo], now_ms: i64) -> String {
         table.push('\n');
     }
     table
+}
+
+/// The text with control characters and bidirectional formatting characters escaped, such as `\u{1b}`. Another device
+/// chose its name and platform, and a terminal would run the escape sequences in them or show forged rows.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => {
+                c.escape_unicode().to_string()
+            }
+            c if c.is_control() => c.escape_unicode().to_string(),
+            c => c.to_string(),
+        })
+        .collect()
 }
 
 /// How long before `now_ms` a time in Unix milliseconds was, or "never" for 0.
@@ -542,6 +556,33 @@ mod tests {
         ] {
             assert!(device_id(text).is_err(), "{text:?}");
         }
+    }
+
+    #[test]
+    fn names_and_platforms_cannot_send_terminal_controls_or_forge_rows() {
+        let forged = DeviceInfo {
+            device_id: ID.into(),
+            name: "\u{1b}[2J\u{1b}[Hsafe-looking\u{202e}".into(),
+            platform: "linux\nFORGED ROW\u{9b}".into(),
+            ..Default::default()
+        };
+        let table = device_table(&[forged], 0);
+        assert_eq!(table.lines().count(), 2, "{table}");
+        assert!(
+            !table.chars().any(|c| c.is_control() && c != '\n'),
+            "{table:?}"
+        );
+        assert!(
+            table.contains(r"\u{1b}[2J\u{1b}[Hsafe-looking\u{202e}  linux\u{a}FORGED ROW\u{9b}"),
+            "{table}"
+        );
+        assert_eq!(
+            device_json(&DeviceInfo {
+                name: "a\nb".into(),
+                ..Default::default()
+            })["name"],
+            "a\nb"
+        );
     }
 
     #[test]

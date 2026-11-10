@@ -383,6 +383,9 @@ export class AccountDO extends DurableObject<Env> {
    */
   async revokeUserDevice(args: { userId: string; callerId: string; deviceId: string }): Promise<Outcome<null>> {
     if (args.deviceId === args.callerId) return failure(Error_Code.FORBIDDEN, "a device cannot revoke itself; revoke it from another device");
+    // The Worker checked the caller in an earlier event, and a concurrent revocation may have revoked it since. Checked
+    // again here, with no await before revokeDevice's update, so of two devices revoking each other only one succeeds.
+    if (!this.activeDevice(args.callerId)) return failure(Error_Code.UNAUTHENTICATED, "this device was revoked");
     const found = this.sql.exec("SELECT 1 FROM devices WHERE device_id = ? AND user_id = ?", args.deviceId, args.userId).toArray().length > 0;
     if (!found) return failure(Error_Code.NOT_FOUND, "no such device");
     await this.revokeDevice(args.deviceId);

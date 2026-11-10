@@ -12,6 +12,8 @@ An owner who loses a computer, or has one stolen, removes it from the deployment
 2. The target belongs to the caller's user. In 0.1.0 a deployment has one user, its owner, so every device belongs to the owner. A `device_id` that is unknown or belongs to another user is `NOT_FOUND`.
 3. The target is not the caller's own principal. A request to revoke the caller's own principal is refused with `FORBIDDEN` and changes nothing (§5).
 
+The Account DO checks rule 1 again in the same step that stores the revocation, because another revocation may have revoked the caller after the Worker checked its token. Of two devices that revoke each other at the same time, one succeeds and the other gets `UNAUTHENTICATED` (401).
+
 Revoking a principal that is already revoked succeeds with 204 and changes nothing.
 
 An owner who has lost every device first adds a new one with owner recovery (deploy-and-upgrade.md §2), or with `flarebox setup`, which runs the same recovery after a Cloudflare login. The owner then lists the devices from the new one and revokes the lost ones.
@@ -57,7 +59,7 @@ The device syncs again only after it is paired again (§2).
 
 RFC 0006 §7 allowed a principal to revoke itself. This RFC removes that permission, for two reasons:
 
-- **The last device.** A caller is always an active principal. If it cannot be its own target, every revocation leaves at least one active principal, the caller. The device list API therefore cannot revoke the last active device, and an owner never loses every device through a revocation. The only way back would be owner recovery, which needs access to the Cloudflare account.
+- **The last device.** A caller is active when its revocation is stored (§1). If it cannot be its own target, every revocation leaves at least one active principal, the caller. The device list API therefore cannot revoke the last active device, and an owner never loses every device through a revocation. The only way back would be owner recovery, which needs access to the Cloudflare account.
 - **Lost devices.** Revocation exists for devices the owner no longer holds, and those cannot send a request. A device the owner still holds can be revoked from another device.
 
 A client that wants to sign this computer out without another device at hand deletes its local credential. That stops the computer from syncing but leaves its principal active on the server until the owner revokes it from another device.

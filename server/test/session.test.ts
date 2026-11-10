@@ -604,6 +604,19 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
     expect((await refresh(owner)).status).toBe(200);
   });
 
+  it("lets only one of two devices that revoke each other at the same time succeed, so one stays active (RFC 0009 section 5)", async () => {
+    const owner = await getOwner();
+    const [first, second] = [await pairDevice(owner, "First"), await pairDevice(owner, "Second")];
+    const replies = await Promise.all([
+      send("/v1/devices/" + second.deviceId, { method: "DELETE", token: first.access!.token }),
+      send("/v1/devices/" + first.deviceId, { method: "DELETE", token: second.access!.token }),
+    ]);
+    expect(replies.map((reply) => reply.status).sort()).toEqual([204, 401]);
+    const listed = (await listDevices(owner.access!.token)).message!.devices;
+    const active = listed.filter((device) => [first.deviceId, second.deviceId].includes(device.deviceId) && device.revokedAtMs === 0n);
+    expect(active).toHaveLength(1);
+  });
+
   it("denies everything to a principal whose kind or scope this server does not know", async () => {
     const owner = await getOwner();
     const spaceId = await createSpace(owner);
