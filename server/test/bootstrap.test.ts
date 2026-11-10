@@ -146,6 +146,21 @@ describe("owner recovery", () => {
     }
   });
 
+  it("answers wrong recovery claims the same whether the Worker has a recovery key, a short one or none", async () => {
+    async function answers(address: string, key: string | undefined) {
+      const seen: string[] = [];
+      for (let i = 0; i <= CLAIM_FAILURES_PER_WINDOW; i++) {
+        const outcome = await account().claim({ ...request, code: `not-the-recovery-key-${i}` }, address, key);
+        seen.push(outcome.ok ? "ok" : `${Error_Code[outcome.code]}: ${outcome.message}`);
+      }
+      return seen;
+    }
+    const withKey = await answers("198.51.100.31", RECOVERY_KEY);
+    expect(withKey.at(-1)).toMatch(/^RETRY_LATER/);
+    expect(await answers("198.51.100.32", undefined)).toEqual(withKey);
+    expect(await answers("198.51.100.33", "short-key")).toEqual(withKey);
+  });
+
   it("throttles wrong keys, but the right key still adds a device for the existing owner, once", async () => {
     await throttle(STRANGER_ADDRESS, "not-the-recovery-key-");
     const recovered = await claim(RECOVERY_KEY, STRANGER_ADDRESS, "New laptop");
