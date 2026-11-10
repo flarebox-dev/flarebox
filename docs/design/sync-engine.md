@@ -111,6 +111,8 @@ The planner looks only at **dirty** nodes, those whose L, S or R entry changed s
 
 These rules are the B&P reconciler requirement in ID form ([Balasubramaniam and Pierce 1998](#ref-bp), Definition 4.1.2): a node that is not dirty on one side takes the other side's value, and a node dirty on both sides is never overwritten by the synchronizer.
 
+**[changed]** S := R for a node both sides changed the same way can wait, because S stays a valid tree (§2.7): its new name may still be held in S. S then takes R's content at once and the position once it fits, so the next edit on either side is compared with the content both sides already hold and is not taken for a concurrent one. A node whose acknowledged update waits keeps that update instead.
+
 ### 2.4 Concurrent changes the client resolves
 
 The client commits with `base_seq = last_seq`, which tells the server "I have seen everything up to here". A local change, though, was made against S, which may be older than R. If the client sent it unchanged, the server would treat the newer remote change as seen and apply the local change on top, losing the remote one. So before building a commit, the client rebases each concurrent change onto R with the same outcome the server would choose if it had not been seen (spec §6.2):
