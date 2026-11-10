@@ -1657,6 +1657,7 @@ mod tests {
                 name: "Projects".into(),
                 ..Default::default()
             }],
+            ..Default::default()
         });
         let (server, held) = serve_held(vec![token, spaces]).await;
         Credential {
