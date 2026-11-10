@@ -45,6 +45,8 @@ pub(crate) struct FolderTask {
     pub owner: Owner,
     /// The observer's thread, joined before the task ends so the folder's lock is released with it.
     pub observer: Mutex<Option<JoinHandle<()>>>,
+    /// Marked whenever the folder's status changes (`Driver::watch`).
+    pub changed: Arc<watch::Sender<()>>,
 }
 
 /// Why the task stopped syncing before it was asked to.
@@ -418,6 +420,7 @@ impl FolderTask {
 
     fn update(&self, change: impl FnOnce(&mut FolderStatus)) {
         change(&mut self.status.lock().unwrap());
+        self.changed.send_replace(());
     }
 }
 

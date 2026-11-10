@@ -363,6 +363,7 @@ impl Core for DriverCore {
         Credential {
             server: api.base().to_string(),
             user_id: issued.user_id,
+            user_name: Some(user_name.to_owned()),
             device_id: issued.device_id,
             device_name: device_name.to_owned(),
             refresh_credential: issued.refresh_credential,
@@ -573,8 +574,7 @@ fn account(account: &driver::Account) -> Account {
     Account {
         server_url: account.server.trim_end_matches('/').to_owned(),
         user_id: account.user_id.clone(),
-        // interim until driver Account.user_name: the driver does not keep the owner's name.
-        user_name: String::new(),
+        user_name: account.user_name.clone().unwrap_or_default(),
         device_id: account.device_id.clone(),
         device_name: account.device_name.clone(),
     }
@@ -815,6 +815,7 @@ mod tests {
             account: Some(driver::Account {
                 server: "https://files.example.com/".into(),
                 user_id: "u1".into(),
+                user_name: None,
                 device_id: "d1".into(),
                 device_name: "Mac".into(),
             }),

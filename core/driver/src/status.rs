@@ -18,6 +18,10 @@ pub struct Status {
 pub struct Account {
     pub server: String,
     pub user_id: String,
+    /// The user's name, known on the device that claimed the server. A paired device does not learn it: no server
+    /// response carries it yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
     pub device_id: String,
     pub device_name: String,
 }

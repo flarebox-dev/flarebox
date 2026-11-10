@@ -544,6 +544,7 @@ dependencies = [
  "flarebox-net",
  "flarebox-proto",
  "flarebox-store",
+ "prost",
  "rustix",
  "serde",
  "serde_json",

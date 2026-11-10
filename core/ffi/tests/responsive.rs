@@ -65,6 +65,7 @@ fn paired_profile(base: &Path, server: &str, root: PathBuf) -> PathBuf {
     Credential {
         server: server.into(),
         user_id: "user".into(),
+        user_name: None,
         device_id: "device".into(),
         device_name: "Mac".into(),
         refresh_credential: "not-a-secret".into(),

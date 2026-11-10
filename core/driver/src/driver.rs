@@ -11,11 +11,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use flarebox_fs::{Marker, probe_no_replace, read_marker, write_marker};
 use flarebox_net::{ApiError, Auth};
-use flarebox_proto::v1::{PairCompleteRequest, SpaceInfo};
+use flarebox_proto::v1::{ClaimRequest, DeviceCredentials, PairCompleteRequest, SpaceInfo};
 use flarebox_store::{GivenAnswer, Link, Store, StoredQuestion};
 use rustix::fs::FlockOperation;
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
 
 use crate::claim::{self, Owner};
 use crate::config::{Config, ConfigError};
@@ -38,6 +37,8 @@ pub enum DriverError {
     AlreadyPaired { device_id: String },
     #[error("a device name is required")]
     EmptyName,
+    #[error("a user name is required")]
+    EmptyUserName,
     #[error(transparent)]
     Paths(#[from] PathsError),
     #[error(transparent)]
@@ -119,20 +120,75 @@ struct Inner {
     paths: Paths,
     _lock: File,
     matcher: Arc<dyn Matcher>,
+    /// Held for the whole of a pair, claim, sign-out, link or unlink, so one runs at a time: a sign-out waits for a
+    /// claim or a link in flight and then undoes it, and a credential the server issued is always stored.
+    lifecycle: tokio::sync::Mutex<()>,
     credential: Mutex<Option<Credential>>,
     folders: Mutex<BTreeMap<String, Folder>>,
     running: AtomicBool,
+    changed: Arc<watch::Sender<()>>,
 }
 
+/// A linked folder. It stays in the driver's map until unlinking it has finished, so a stop, an unlink or a sign-out
+/// that starts later still finds its task and its cleanup, also after an earlier caller gave up waiting.
 struct Folder {
     link: Link,
     status: Arc<Mutex<FolderStatus>>,
+    /// The folder's task, from its start until a stop has seen it end.
     run: Option<Running>,
+    /// Set from the moment an unlink begins until it has removed the folder or failed. No task starts for the folder
+    /// meanwhile, also after its last task has ended, so the cleanup never leaves a task it does not wait for.
+    unlink: Option<Unlink>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Unlink {
+    Running,
+    /// Its caller stopped waiting before it finished. Another unlink or a sign-out finishes it.
+    Abandoned,
+}
+
+/// Marks the folder's unlink abandoned if it is dropped while the unlink still runs, that is, when the caller cancels it.
+struct Unlinking<'a> {
+    driver: &'a Driver,
+    space_id: String,
+}
+
+impl Drop for Unlinking<'_> {
+    fn drop(&mut self) {
+        let mut folders = self.driver.inner.folders.lock().unwrap();
+        let Some(folder) = folders.get_mut(&self.space_id) else {
+            return;
+        };
+        if folder.unlink == Some(Unlink::Running) {
+            folder.unlink = Some(Unlink::Abandoned);
+            drop(folders);
+            self.driver.changed();
+        }
+    }
 }
 
 struct Running {
     stop: watch::Sender<bool>,
-    task: JoinHandle<()>,
+    /// Closed when the task has ended, its observer and its hold on the folder included.
+    done: watch::Receiver<()>,
+}
+
+impl Running {
+    /// Tells the task to stop and returns what closes once it has.
+    fn stop(&self) -> watch::Receiver<()> {
+        let _ = self.stop.send(true);
+        self.done.clone()
+    }
+
+    fn ended(&self) -> bool {
+        self.done.has_changed().is_err()
+    }
+}
+
+/// Waits until a task that [`Running::stop`] told to stop has ended. Any number of callers can wait for one task.
+async fn ended(mut done: watch::Receiver<()>) {
+    while done.changed().await.is_ok() {}
 }
 
 impl Driver {
@@ -178,9 +234,11 @@ impl Driver {
                 matcher: matcher(&input),
                 paths,
                 _lock: lock,
+                lifecycle: tokio::sync::Mutex::new(()),
                 credential: Mutex::new(credential),
                 folders: Mutex::new(folders),
                 running: AtomicBool::new(false),
+                changed: Arc::new(watch::Sender::new(())),
             }),
         })
     }
@@ -196,25 +254,39 @@ impl Driver {
             .lock()
             .unwrap()
             .as_ref()
-            .map(|credential| Account {
-                server: credential.server.clone(),
-                user_id: credential.user_id.clone(),
-                device_id: credential.device_id.clone(),
-                device_name: credential.device_name.clone(),
-            });
+            .map(Credential::account);
         let folders = self
             .inner
             .folders
             .lock()
             .unwrap()
             .values()
-            .map(|folder| folder.status.lock().unwrap().clone())
+            .map(|folder| {
+                let mut status = folder.status.lock().unwrap().clone();
+                if folder.unlink == Some(Unlink::Abandoned) {
+                    status.state = FolderState::Halted;
+                    status.problem = Some(
+                        "unlinking the folder did not finish; unlink it again to finish".into(),
+                    );
+                }
+                status
+            })
             .collect();
         Status {
             account,
             running: self.inner.running.load(Ordering::SeqCst),
             folders,
         }
+    }
+
+    /// A receiver that is marked changed whenever [`Driver::status`] or [`Driver::questions`] may have changed, so
+    /// the app can wait for a change instead of polling. A change may be signalled without a visible difference.
+    pub fn watch(&self) -> watch::Receiver<()> {
+        self.inner.changed.subscribe()
+    }
+
+    fn changed(&self) {
+        self.inner.changed.send_replace(());
     }
 
     /// Pairs this profile with a server, using a code from a device that is already paired (`POST
@@ -225,11 +297,8 @@ impl Driver {
         code: &str,
         device_name: &str,
     ) -> Result<Account, DriverError> {
-        if let Some(credential) = self.inner.credential.lock().unwrap().as_ref() {
-            return Err(DriverError::AlreadyPaired {
-                device_id: credential.device_id.clone(),
-            });
-        }
+        let _lifecycle = self.inner.lifecycle.lock().await;
+        self.check_unpaired()?;
         if device_name.trim().is_empty() {
             return Err(DriverError::EmptyName);
         }
@@ -241,9 +310,96 @@ impl Driver {
                 platform: std::env::consts::OS.to_owned(),
             })
             .await?;
+        self.adopt(
+            api.base().to_string(),
+            issued,
+            None,
+            device_name,
+            "paired this device",
+        )
+    }
+
+    /// Claims a new server as its first device (`POST /v1/claim`), with the one-time code from the server's log,
+    /// creating the user `user_name`, and stores the credential. Like pairing, it happens once per profile.
+    pub async fn claim(
+        &self,
+        server: &str,
+        code: &str,
+        user_name: &str,
+        device_name: &str,
+    ) -> Result<Account, DriverError> {
+        let _lifecycle = self.inner.lifecycle.lock().await;
+        self.check_unpaired()?;
+        if user_name.trim().is_empty() {
+            return Err(DriverError::EmptyUserName);
+        }
+        if device_name.trim().is_empty() {
+            return Err(DriverError::EmptyName);
+        }
+        let api = api_for(server)?;
+        let issued = api
+            .claim(&ClaimRequest {
+                code: code.to_owned(),
+                user_name: user_name.to_owned(),
+                device_name: device_name.to_owned(),
+                platform: std::env::consts::OS.to_owned(),
+            })
+            .await?;
+        self.adopt(
+            api.base().to_string(),
+            issued,
+            Some(user_name.to_owned()),
+            device_name,
+            "claimed the server",
+        )
+    }
+
+    /// Signs this device out: stops syncing, unlinks every folder (their files stay) and deletes the credential, so
+    /// the profile can be paired or claimed again. The server is not told; the device stays registered there. A
+    /// folder that cannot be unlinked stops the sign-out with its error and stays linked, so signing out again
+    /// finishes it.
+    pub async fn sign_out(&self) -> Result<(), DriverError> {
+        let _lifecycle = self.inner.lifecycle.lock().await;
+        self.stop().await;
+        let roots = roots(&self.inner.folders.lock().unwrap());
+        for root in roots {
+            self.unlink_folder(&root).await?;
+        }
+        let path = self.inner.paths.credential();
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error(&path)(error)),
+        }
+        *self.inner.credential.lock().unwrap() = None;
+        self.inner.running.store(false, Ordering::SeqCst);
+        tracing::info!("signed out");
+        self.changed();
+        Ok(())
+    }
+
+    fn check_unpaired(&self) -> Result<(), DriverError> {
+        match self.inner.credential.lock().unwrap().as_ref() {
+            Some(credential) => Err(DriverError::AlreadyPaired {
+                device_id: credential.device_id.clone(),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Stores the credential the server issued, unless another one was stored meanwhile.
+    fn adopt(
+        &self,
+        server: String,
+        issued: DeviceCredentials,
+        user_name: Option<String>,
+        device_name: &str,
+        done: &str,
+    ) -> Result<Account, DriverError> {
         let credential = Credential {
-            server: api.base().to_string(),
+            server,
             user_id: issued.user_id,
+            user_name,
             device_id: issued.device_id,
             device_name: device_name.to_owned(),
             refresh_credential: issued.refresh_credential,
@@ -258,21 +414,19 @@ impl Driver {
         tracing::info!(
             device_id = credential.device_id,
             server = credential.server,
-            "paired this device"
+            "{done}"
         );
-        let account = Account {
-            server: credential.server.clone(),
-            user_id: credential.user_id.clone(),
-            device_id: credential.device_id.clone(),
-            device_name: credential.device_name.clone(),
-        };
+        let account = credential.account();
         *slot = Some(credential);
+        drop(slot);
+        self.changed();
         Ok(account)
     }
 
     /// Links `folder` to the space with id or name `space`: checks the folder, writes its root marker, and creates
     /// its store. The folder starts syncing at once if the driver is running.
     pub async fn link(&self, folder: &Path, space: &str) -> Result<FolderStatus, DriverError> {
+        let _lifecycle = self.inner.lifecycle.lock().await;
         let credential = self.credential()?;
         let root = fs::canonicalize(folder).map_err(|error| match error.kind() {
             io::ErrorKind::NotFound => DriverError::FolderNotFound(folder.to_path_buf()),
@@ -351,53 +505,92 @@ impl Driver {
             link,
             status: status.clone(),
             run: None,
+            unlink: None,
         };
         drop(lock);
         if self.inner.running.load(Ordering::SeqCst) {
             self.spawn(&mut folder, &credential, linked);
         }
         folders.insert(space.space_id, folder);
+        drop(folders);
+        self.changed();
         let status = status.lock().unwrap().clone();
         Ok(status)
     }
 
     /// Stops syncing the folder at `folder` and forgets its sync state. The files stay, and so does the folder's
-    /// `.flarebox` directory, whose local trash may hold displaced files.
+    /// `.flarebox` directory, whose local trash may hold displaced files. If the owner record or the store cannot be
+    /// removed, the folder stays linked and halted with the error, so unlinking it again finishes the job.
     pub async fn unlink(&self, folder: &Path) -> Result<Link, DriverError> {
+        let _lifecycle = self.inner.lifecycle.lock().await;
+        self.unlink_folder(folder).await
+    }
+
+    async fn unlink_folder(&self, folder: &Path) -> Result<Link, DriverError> {
         let wanted = absolute(folder);
         let canonical = fs::canonicalize(folder).ok();
-        let removed = {
+        let (link, done) = {
             let mut folders = self.inner.folders.lock().unwrap();
-            let space_id = folders
-                .iter()
-                .find(|(_, linked)| {
+            let found = folders
+                .values_mut()
+                .find(|linked| {
                     linked.link.root == wanted || Some(&linked.link.root) == canonical.as_ref()
                 })
-                .map(|(space_id, _)| space_id.clone())
                 .ok_or_else(|| DriverError::NotLinked(folder.to_path_buf()))?;
-            folders.remove(&space_id).expect("found above")
+            found.unlink = Some(Unlink::Running);
+            (found.link.clone(), found.run.as_ref().map(Running::stop))
         };
-        if let Some(run) = removed.run {
-            let _ = run.stop.send(true);
-            let _ = run.task.await;
+        let _unlinking = Unlinking {
+            driver: self,
+            space_id: link.space_id.clone(),
+        };
+        if let Some(done) = done {
+            ended(done).await;
+        }
+        let forgotten = self.forget(&link);
+        let mut folders = self.inner.folders.lock().unwrap();
+        match forgotten {
+            Ok(()) => {
+                folders.remove(&link.space_id);
+                tracing::info!(space_id = link.space_id, path = %link.root.display(), "unlinked a folder");
+            }
+            Err(ref error) => {
+                if let Some(folder) = folders.get_mut(&link.space_id) {
+                    folder.run = None;
+                    folder.unlink = None;
+                    halt(folder, format!("the folder could not be unlinked: {error}"));
+                }
+            }
+        }
+        drop(folders);
+        self.changed();
+        forgotten.map(|()| link)
+    }
+
+    /// Removes the folder's owner record, then its store. The store records the link, so it goes last: until both are
+    /// gone, the folder is found again to finish unlinking it. Either one already missing counts as removed.
+    fn forget(&self, link: &Link) -> Result<(), DriverError> {
+        let owner = Owner {
+            server: link.server_url.clone(),
+            device_id: link.device_id.clone(),
+        };
+        match claim::release(&link.root, &owner) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error(&link.root)(error)),
         }
         let store_dir = self
             .inner
             .paths
-            .store(&removed.link.space_id)?
+            .store(&link.space_id)?
             .parent()
             .expect("a store path has a parent")
             .to_path_buf();
-        fs::remove_dir_all(&store_dir).map_err(io_error(&store_dir))?;
-        let owner = Owner {
-            server: removed.link.server_url.clone(),
-            device_id: removed.link.device_id.clone(),
-        };
-        if let Err(error) = claim::release(&removed.link.root, &owner) {
-            tracing::warn!(path = %removed.link.root.display(), %error, "the folder's owner record was not removed");
+        match fs::remove_dir_all(&store_dir) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(io_error(&store_dir)(error)),
         }
-        tracing::info!(space_id = removed.link.space_id, path = %removed.link.root.display(), "unlinked a folder");
-        Ok(removed.link)
     }
 
     /// Unanswered questions of every linked folder, oldest first per folder.
@@ -455,6 +648,7 @@ impl Driver {
                         folder.status.lock().unwrap().questions = left;
                     }
                     tracing::info!(space_id, question_id, %answer, "answered a question");
+                    self.changed();
                     return Ok(());
                 }
             }
@@ -472,6 +666,9 @@ impl Driver {
         let mut folders = self.inner.folders.lock().unwrap();
         let all = roots(&folders);
         for folder in folders.values_mut() {
+            if folder.unlink.is_some() || folder.run.as_ref().is_some_and(|run| !run.ended()) {
+                continue;
+            }
             let linked = all
                 .iter()
                 .filter(|root| **root != folder.link.root)
@@ -485,28 +682,32 @@ impl Driver {
                 ),
             }
         }
+        drop(folders);
+        self.changed();
     }
 
-    /// Stops every folder and waits for their tasks to end. State on disk is kept.
+    /// Stops every folder and waits for their tasks to end, also those an earlier stop or unlink is still waiting for.
+    /// State on disk is kept.
     pub async fn stop(&self) {
         self.inner.running.store(false, Ordering::SeqCst);
-        let runs: Vec<Running> = self
+        let stopping: Vec<_> = self
             .inner
             .folders
             .lock()
             .unwrap()
-            .values_mut()
-            .filter_map(|folder| folder.run.take())
+            .values()
+            .filter_map(|folder| folder.run.as_ref().map(Running::stop))
             .collect();
-        for run in &runs {
-            let _ = run.stop.send(true);
+        for done in stopping {
+            ended(done).await;
         }
-        for run in runs {
-            let _ = run.task.await;
+        for folder in self.inner.folders.lock().unwrap().values_mut() {
+            if folder.run.as_ref().is_none_or(Running::ended) {
+                folder.run = None;
+                folder.status.lock().unwrap().state = FolderState::Stopped;
+            }
         }
-        for folder in self.inner.folders.lock().unwrap().values() {
-            folder.status.lock().unwrap().state = FolderState::Stopped;
-        }
+        self.changed();
     }
 
     /// Starts the task of `folder`. `linked` are the roots of the profile's other folders, which it must not overlap.
@@ -543,13 +744,16 @@ impl Driver {
                 device_id: credential.device_id.clone(),
             },
             observer: Mutex::default(),
+            changed: self.inner.changed.clone(),
         };
         let (stop, stopped) = watch::channel(false);
+        let (finished, done) = watch::channel(());
         folder.status.lock().unwrap().state = FolderState::Connecting;
-        folder.run = Some(Running {
-            stop,
-            task: tokio::spawn(task.run(stopped)),
+        tokio::spawn(async move {
+            task.run(stopped).await;
+            drop(finished);
         });
+        folder.run = Some(Running { stop, done });
     }
 
     fn credential(&self) -> Result<Credential, DriverError> {
@@ -705,6 +909,7 @@ fn load_folders(paths: &Paths) -> Result<BTreeMap<String, Folder>, DriverError> 
                 status: Arc::new(Mutex::new(status)),
                 link,
                 run: None,
+                unlink: None,
             },
         );
     }
@@ -769,6 +974,7 @@ mod tests {
         Credential {
             server: "https://files.example.com/".into(),
             user_id: "u1".into(),
+            user_name: None,
             device_id: device_id.into(),
             device_name: "vm".into(),
             refresh_credential: "secret".into(),
@@ -1108,6 +1314,627 @@ mod tests {
         assert!(problem.contains("no longer the folder"), "{problem}");
         driver.stop().await;
         assert!(claim::lock(&base.join("Moved")).unwrap().is_some());
+    }
+
+    /// Reads one HTTP request and returns its path and its body.
+    async fn read_request(socket: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            let n = socket.read(&mut chunk).await.unwrap();
+            request.extend_from_slice(&chunk[..n]);
+            if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                break at + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&request[..head_end]).into_owned();
+        let length: usize = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().unwrap())
+            })
+            .unwrap_or(0);
+        while request.len() < head_end + length {
+            let n = socket.read(&mut chunk).await.unwrap();
+            request.extend_from_slice(&chunk[..n]);
+        }
+        let path = head.split_whitespace().nth(1).unwrap().to_owned();
+        (path, request[head_end..head_end + length].to_vec())
+    }
+
+    async fn write_reply(socket: &mut tokio::net::TcpStream, reply: &[u8]) {
+        use tokio::io::AsyncWriteExt;
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/x-protobuf\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            reply.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+        socket.write_all(reply).await.unwrap();
+    }
+
+    /// Serves one request on a loopback port with `reply`, a protobuf body, and returns the server's address and
+    /// what the request was: its path and its body.
+    async fn serve_once(reply: Vec<u8>) -> (String, tokio::task::JoinHandle<(String, Vec<u8>)>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = format!("http://{}/", listener.local_addr().unwrap());
+        let served = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            write_reply(&mut socket, &reply).await;
+            request
+        });
+        (server, served)
+    }
+
+    /// A request the server has read and not answered yet.
+    struct Held {
+        /// Fires once the last request has arrived.
+        arrived: tokio::sync::oneshot::Receiver<()>,
+        /// Lets the server answer it.
+        release: tokio::sync::oneshot::Sender<()>,
+        /// The paths of the requests, once all are answered.
+        served: tokio::task::JoinHandle<Vec<String>>,
+    }
+
+    /// Serves one request per entry of `replies` on a loopback port, in order, and holds the answer to the last one
+    /// until it is released.
+    async fn serve_held(replies: Vec<Vec<u8>>) -> (String, Held) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = format!("http://{}/", listener.local_addr().unwrap());
+        let (arrived_tx, arrived) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let served = tokio::spawn(async move {
+            let mut paths = Vec::new();
+            let mut arrived_tx = Some(arrived_tx);
+            let mut released = Some(released);
+            let last = replies.len() - 1;
+            for (i, reply) in replies.into_iter().enumerate() {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                paths.push(read_request(&mut socket).await.0);
+                if i == last {
+                    arrived_tx.take().unwrap().send(()).unwrap();
+                    released.take().unwrap().await.unwrap();
+                }
+                write_reply(&mut socket, &reply).await;
+            }
+            paths
+        });
+        (
+            server,
+            Held {
+                arrived,
+                release,
+                served,
+            },
+        )
+    }
+
+    /// Whether `task` is still waiting a while after it was started.
+    async fn still_waiting<T>(task: &tokio::task::JoinHandle<T>) -> bool {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        !task.is_finished()
+    }
+
+    /// Sets the mode of `dir` and tells whether it keeps this process out: it does not for root. The tests that rely
+    /// on it skip when it does not.
+    fn close_dir(dir: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let probe = dir.join("probe");
+        if fs::write(&probe, b"").is_err() {
+            return true;
+        }
+        fs::remove_file(probe).unwrap();
+        open_dir(dir);
+        assert!(rustix::process::geteuid().is_root());
+        eprintln!("SKIPPED: running as root, so permissions do not block writes");
+        false
+    }
+
+    fn open_dir(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn issued(device_id: &str) -> Vec<u8> {
+        prost::Message::encode_to_vec(&DeviceCredentials {
+            user_id: "u1".into(),
+            device_id: device_id.into(),
+            refresh_credential: "secret".into(),
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn claiming_creates_the_first_device_with_its_user_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let driver = Driver::open(paths.clone()).unwrap();
+        assert!(matches!(
+            driver
+                .claim("http://127.0.0.1:9/", "code", " ", "laptop")
+                .await,
+            Err(DriverError::EmptyUserName)
+        ));
+
+        let (server, served) = serve_once(issued("d1")).await;
+        let account = driver
+            .claim(&server, "claim-code", "Ada", "laptop")
+            .await
+            .unwrap();
+        assert_eq!(account.user_name.as_deref(), Some("Ada"));
+        assert_eq!(account.device_id, "d1");
+        let (path, body) = served.await.unwrap();
+        assert_eq!(path, "/v1/claim");
+        let request: ClaimRequest = prost::Message::decode(body.as_slice()).unwrap();
+        assert_eq!(
+            (
+                request.code.as_str(),
+                request.user_name.as_str(),
+                request.device_name.as_str()
+            ),
+            ("claim-code", "Ada", "laptop")
+        );
+        assert!(matches!(
+            driver.claim(&server, "claim-code", "Ada", "laptop").await,
+            Err(DriverError::AlreadyPaired { .. })
+        ));
+        drop(driver);
+        let reopened = Driver::open(paths).unwrap();
+        assert_eq!(reopened.status().account, Some(account));
+    }
+
+    #[tokio::test]
+    async fn a_paired_device_does_not_know_the_user_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver = Driver::open(Paths::under(dir.path())).unwrap();
+        let (server, served) = serve_once(issued("d2")).await;
+        let account = driver.pair(&server, "pair-code", "desktop").await.unwrap();
+        assert_eq!(served.await.unwrap().0, "/v1/pair/complete");
+        assert_eq!(account.user_name, None);
+        assert_eq!(account.device_name, "desktop");
+    }
+
+    #[tokio::test]
+    async fn watchers_wake_when_status_or_questions_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        let paths = Paths::under(&base.join("profile"));
+        linked(&paths, &root, "d1");
+        fs::write(root.join("one"), b"1").unwrap();
+        let store = paths.store(SPACE).unwrap();
+        Store::open(&store)
+            .unwrap()
+            .transaction(|tx| {
+                tx.put_question(&StoredQuestion {
+                    question_id: "q1".into(),
+                    asked_at_ms: 10,
+                    body: serde_json::to_vec(&mass_delete("q1")).unwrap(),
+                    answer: None,
+                })
+            })
+            .unwrap();
+        let driver = Driver::open(paths).unwrap();
+        let mut watch = driver.watch();
+        assert!(!watch.has_changed().unwrap());
+
+        driver.answer("q1", Answer::Restore).unwrap();
+        assert!(watch.has_changed().unwrap());
+        watch.borrow_and_update();
+
+        driver.start();
+        assert!(watch.has_changed().unwrap());
+        watch.borrow_and_update();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while driver.status().folders[0].local_entries != Some(1) {
+                watch.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the folder task's progress wakes the watcher");
+
+        watch.borrow_and_update();
+        driver.stop().await;
+        assert!(watch.has_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn signing_out_unlinks_every_folder_and_forgets_the_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        let paths = Paths::under(&base.join("profile"));
+        linked(&paths, &root, "d1");
+        fs::write(root.join("keep.txt"), b"mine").unwrap();
+        let driver = Driver::open(paths.clone()).unwrap();
+        driver.start();
+        eventually("the folder is claimed", || {
+            claim::owner(&root).unwrap().is_some()
+        })
+        .await;
+        let mut watch = driver.watch();
+        watch.borrow_and_update();
+
+        driver.sign_out().await.unwrap();
+        let status = driver.status();
+        assert_eq!(status.account, None);
+        assert!(!status.running);
+        assert!(status.folders.is_empty());
+        assert!(watch.has_changed().unwrap());
+        assert!(!paths.credential().exists());
+        assert!(!paths.store(SPACE).unwrap().parent().unwrap().exists());
+        assert_eq!(claim::owner(&root).unwrap(), None);
+        assert_eq!(fs::read(root.join("keep.txt")).unwrap(), b"mine");
+
+        let (server, served) = serve_once(issued("d3")).await;
+        driver.pair(&server, "pair-code", "laptop").await.unwrap();
+        served.await.unwrap();
+        drop(driver);
+        let reopened = Driver::open(paths).unwrap().status();
+        assert_eq!(reopened.account.unwrap().device_id, "d3");
+        assert!(reopened.folders.is_empty());
+    }
+
+    #[tokio::test]
+    async fn signing_out_waits_for_a_claim_in_flight_and_then_undoes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let driver = Driver::open(paths.clone()).unwrap();
+        let (server, held) = serve_held(vec![issued("d1")]).await;
+        let claim = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.claim(&server, "code", "Ada", "laptop").await }
+        });
+        held.arrived.await.unwrap();
+        let sign_out = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.sign_out().await }
+        });
+        assert!(still_waiting(&sign_out).await);
+
+        held.release.send(()).unwrap();
+        assert_eq!(claim.await.unwrap().unwrap().device_id, "d1");
+        sign_out.await.unwrap().unwrap();
+        assert_eq!(held.served.await.unwrap(), ["/v1/claim"]);
+        assert_eq!(driver.status().account, None);
+        assert!(!paths.credential().exists());
+    }
+
+    #[tokio::test]
+    async fn a_pair_during_a_claim_keeps_the_claimed_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let driver = Driver::open(paths.clone()).unwrap();
+        let (server, held) = serve_held(vec![issued("d1")]).await;
+        let claim = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.claim(&server, "code", "Ada", "laptop").await }
+        });
+        held.arrived.await.unwrap();
+        let (pair_server, pair_served) = serve_once(issued("d2")).await;
+        let pair = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.pair(&pair_server, "code", "desktop").await }
+        });
+        assert!(still_waiting(&pair).await);
+
+        held.release.send(()).unwrap();
+        assert_eq!(claim.await.unwrap().unwrap().device_id, "d1");
+        assert!(matches!(
+            pair.await.unwrap(),
+            Err(DriverError::AlreadyPaired { device_id }) if device_id == "d1"
+        ));
+        assert!(!pair_served.is_finished(), "the pair reached the server");
+        pair_served.abort();
+        held.served.await.unwrap();
+        drop(driver);
+        let reopened = Driver::open(paths).unwrap().status();
+        assert_eq!(reopened.account.unwrap().device_id, "d1");
+    }
+
+    #[tokio::test]
+    async fn signing_out_waits_for_a_link_in_flight_and_then_unlinks_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        fs::create_dir(&root).unwrap();
+        let paths = Paths::under(&base.join("profile"));
+        let token = prost::Message::encode_to_vec(&flarebox_proto::v1::AccessToken {
+            token: "token".into(),
+            expires_at_ms: i64::MAX,
+        });
+        let spaces = prost::Message::encode_to_vec(&flarebox_proto::v1::SpaceList {
+            spaces: vec![SpaceInfo {
+                space_id: SPACE.into(),
+                name: "Projects".into(),
+                ..Default::default()
+            }],
+        });
+        let (server, held) = serve_held(vec![token, spaces]).await;
+        Credential {
+            server,
+            ..credential("d1")
+        }
+        .save_new(&paths.credential())
+        .unwrap();
+        let driver = Driver::open(paths.clone()).unwrap();
+        let link = tokio::spawn({
+            let driver = driver.clone();
+            let root = root.clone();
+            async move { driver.link(&root, "Projects").await }
+        });
+        held.arrived.await.unwrap();
+        let sign_out = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.sign_out().await }
+        });
+        assert!(still_waiting(&sign_out).await);
+
+        held.release.send(()).unwrap();
+        link.await.unwrap().unwrap();
+        sign_out.await.unwrap().unwrap();
+        assert_eq!(held.served.await.unwrap(), ["/v1/token", "/v1/spaces"]);
+        let status = driver.status();
+        assert_eq!(status.account, None);
+        assert!(status.folders.is_empty());
+        assert!(!paths.store(SPACE).unwrap().parent().unwrap().exists());
+        assert_eq!(claim::owner(&root).unwrap(), None);
+        assert!(!paths.credential().exists());
+    }
+
+    #[tokio::test]
+    async fn a_folder_whose_owner_record_stays_keeps_the_device_signed_in_until_a_retry_removes_it()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        let paths = Paths::under(&base.join("profile"));
+        linked(&paths, &root, "d1");
+        claim::set_owner(
+            &root,
+            &Owner {
+                server: NOWHERE.into(),
+                device_id: "d1".into(),
+            },
+        )
+        .unwrap();
+        let driver = Driver::open(paths.clone()).unwrap();
+        let mut watch = driver.watch();
+        let private = root.join(flarebox_fs::PRIVATE_DIR);
+        if !close_dir(&private) {
+            return;
+        }
+
+        let failed = driver.sign_out().await;
+        open_dir(&private);
+        assert!(matches!(failed, Err(DriverError::Io { .. })), "{failed:?}");
+        assert!(watch.has_changed().unwrap());
+        watch.borrow_and_update();
+        let status = driver.status();
+        assert_eq!(status.account.unwrap().device_id, "d1");
+        assert_eq!(status.folders[0].state, FolderState::Halted);
+        let problem = status.folders[0].problem.clone().unwrap();
+        assert!(problem.contains("could not be unlinked"), "{problem}");
+        assert!(paths.credential().exists());
+        assert!(paths.store(SPACE).unwrap().exists());
+        assert!(claim::owner(&root).unwrap().is_some());
+
+        driver.sign_out().await.unwrap();
+        assert!(watch.has_changed().unwrap());
+        assert!(driver.status().folders.is_empty());
+        assert_eq!(claim::owner(&root).unwrap(), None);
+        assert!(!paths.store(SPACE).unwrap().parent().unwrap().exists());
+        assert!(!paths.credential().exists());
+    }
+
+    #[tokio::test]
+    async fn a_failed_unlink_wakes_watchers_and_can_be_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        let paths = Paths::under(&base.join("profile"));
+        linked(&paths, &root, "d1");
+        let driver = Driver::open(paths.clone()).unwrap();
+        let mut watch = driver.watch();
+        let store_dir = paths.store(SPACE).unwrap().parent().unwrap().to_path_buf();
+        if !close_dir(&store_dir) {
+            return;
+        }
+
+        let failed = driver.unlink(&root).await;
+        open_dir(&store_dir);
+        assert!(matches!(failed, Err(DriverError::Io { .. })), "{failed:?}");
+        assert!(watch.has_changed().unwrap());
+        watch.borrow_and_update();
+        assert_eq!(driver.status().folders[0].state, FolderState::Halted);
+        assert!(paths.store(SPACE).unwrap().exists());
+
+        driver.unlink(&root).await.unwrap();
+        assert!(watch.has_changed().unwrap());
+        assert!(driver.status().folders.is_empty());
+        assert!(!store_dir.exists());
+    }
+
+    /// Holds the observer of a folder inside its first matcher call until it is opened or dropped.
+    struct Gate(Arc<(Mutex<bool>, std::sync::Condvar)>);
+
+    impl Gate {
+        fn open(&self) {
+            *self.0.0.lock().unwrap() = true;
+            self.0.1.notify_all();
+        }
+    }
+
+    impl Drop for Gate {
+        fn drop(&mut self) {
+            self.open();
+        }
+    }
+
+    struct Paused {
+        entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl Matcher for Paused {
+        fn is_excluded(&self, _: &Path, _: bool) -> bool {
+            if let Some(entered) = self.entered.lock().unwrap().take() {
+                let _ = entered.send(());
+            }
+            let (open, opened) = &*self.gate;
+            let _open = opened
+                .wait_while(open.lock().unwrap(), |open| !*open)
+                .unwrap();
+            false
+        }
+    }
+
+    /// A started driver whose one folder's observer is paused, holding the folder's lock, until the gate opens.
+    async fn paused_driver(paths: &Paths, root: &Path) -> (Driver, Gate) {
+        linked(paths, root, "d1");
+        fs::write(root.join("file"), b"mine").unwrap();
+        let mut driver = Driver::open(paths.clone()).unwrap();
+        let (entered, observing) = tokio::sync::oneshot::channel();
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        Arc::get_mut(&mut driver.inner).unwrap().matcher = Arc::new(Paused {
+            entered: Mutex::new(Some(entered)),
+            gate: gate.clone(),
+        });
+        driver.start();
+        tokio::time::timeout(Duration::from_secs(10), observing)
+            .await
+            .unwrap()
+            .unwrap();
+        (driver, Gate(gate))
+    }
+
+    /// Whether this process could lock `root` now, which it cannot while a folder task holds it.
+    fn lockable(root: &Path) -> bool {
+        claim::lock(root).unwrap().is_some()
+    }
+
+    /// Checks that signing out finished: no account, no folders, no running tasks, nothing left in the profile or
+    /// the folder.
+    fn signed_out(driver: &Driver, paths: &Paths, root: &Path) {
+        let status = driver.status();
+        assert_eq!(status.account, None);
+        assert!(status.folders.is_empty());
+        assert!(!status.running);
+        assert!(!paths.credential().exists());
+        assert!(!paths.store(SPACE).unwrap().parent().unwrap().exists());
+        assert_eq!(claim::owner(root).unwrap(), None);
+        assert!(lockable(root));
+        assert_eq!(fs::read(root.join("file")).unwrap(), b"mine");
+    }
+
+    #[tokio::test]
+    async fn signing_out_waits_for_a_stop_already_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        let paths = Paths::under(&base.join("profile"));
+        let (driver, gate) = paused_driver(&paths, &root).await;
+        let stop = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.stop().await }
+        });
+        eventually("the stop begins", || !driver.status().running).await;
+        let sign_out = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.sign_out().await }
+        });
+        assert!(still_waiting(&sign_out).await);
+        assert!(!lockable(&root));
+
+        gate.open();
+        stop.await.unwrap();
+        sign_out.await.unwrap().unwrap();
+        signed_out(&driver, &paths, &root);
+    }
+
+    #[tokio::test]
+    async fn signing_out_finishes_a_cancelled_unlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        let paths = Paths::under(&base.join("profile"));
+        let (driver, gate) = paused_driver(&paths, &root).await;
+        let unlink = tokio::spawn({
+            let driver = driver.clone();
+            let root = root.clone();
+            async move { driver.unlink(&root).await }
+        });
+        assert!(still_waiting(&unlink).await);
+        unlink.abort();
+        assert!(unlink.await.unwrap_err().is_cancelled());
+        assert_eq!(driver.status().folders.len(), 1);
+        let sign_out = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.sign_out().await }
+        });
+        assert!(still_waiting(&sign_out).await);
+
+        gate.open();
+        sign_out.await.unwrap().unwrap();
+        signed_out(&driver, &paths, &root);
+    }
+
+    #[tokio::test]
+    async fn no_task_starts_while_an_unlink_is_unfinished() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        let paths = Paths::under(&base.join("profile"));
+        let (driver, gate) = paused_driver(&paths, &root).await;
+        let unlink = tokio::spawn({
+            let driver = driver.clone();
+            let root = root.clone();
+            async move { driver.unlink(&root).await }
+        });
+        assert!(still_waiting(&unlink).await);
+        unlink.abort();
+        assert!(unlink.await.unwrap_err().is_cancelled());
+        gate.open();
+        driver.stop().await;
+        assert!(lockable(&root));
+
+        driver.start();
+        let folder = &driver.status().folders[0];
+        assert_eq!(
+            folder.state,
+            FolderState::Halted,
+            "a task started for a folder whose unlink is unfinished"
+        );
+        assert!(folder.problem.as_ref().unwrap().contains("unlink it again"));
+        driver.sign_out().await.unwrap();
+        signed_out(&driver, &paths, &root);
+    }
+
+    #[tokio::test]
+    async fn a_start_during_a_sign_out_leaves_the_driver_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        let paths = Paths::under(&base.join("profile"));
+        let (driver, gate) = paused_driver(&paths, &root).await;
+        let sign_out = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.sign_out().await }
+        });
+        eventually("the sign-out stops the driver", || !driver.status().running).await;
+        driver.start();
+
+        gate.open();
+        sign_out.await.unwrap().unwrap();
+        signed_out(&driver, &paths, &root);
     }
 
     #[tokio::test]
