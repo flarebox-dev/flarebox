@@ -94,6 +94,9 @@ pub struct DeviceCredentials {
     pub refresh_credential: ::prost::alloc::string::String,
     #[prost(message, optional, tag="4")]
     pub access: ::core::option::Option<AccessToken>,
+    /// When the refresh credential stops working, in Unix milliseconds; 0 if it never expires (RFC 0006 section 7).
+    #[prost(int64, tag="5")]
+    pub credential_expires_at_ms: i64,
 }
 /// POST /v1/token
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -133,6 +136,79 @@ pub struct CreateSpaceRequest {
 pub struct SpaceList {
     #[prost(message, repeated, tag="1")]
     pub spaces: ::prost::alloc::vec::Vec<SpaceInfo>,
+}
+/// One principal of the caller's user, as GET /v1/devices lists it (RFC 0006 section 7).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DeviceInfo {
+    /// The principal ID (RFC 0006 section 4).
+    #[prost(string, tag="1")]
+    pub device_id: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag="3")]
+    pub platform: ::prost::alloc::string::String,
+    #[prost(enumeration="device_info::Kind", tag="4")]
+    pub kind: i32,
+    #[prost(int64, tag="5")]
+    pub created_at_ms: i64,
+    /// 0 if the principal has never refreshed an access token.
+    #[prost(int64, tag="6")]
+    pub last_seen_ms: i64,
+    /// 0 if not revoked.
+    #[prost(int64, tag="7")]
+    pub revoked_at_ms: i64,
+    /// 0 if the refresh credential never expires.
+    #[prost(int64, tag="8")]
+    pub credential_expires_at_ms: i64,
+    /// The principal whose request created this one; empty for the device created by claim or owner recovery.
+    #[prost(string, tag="9")]
+    pub issued_by: ::prost::alloc::string::String,
+    /// True for the principal that made the request.
+    #[prost(bool, tag="10")]
+    pub current: bool,
+}
+/// Nested message and enum types in `DeviceInfo`.
+pub mod device_info {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+    #[repr(i32)]
+    pub enum Kind {
+        Unspecified = 0,
+        /// A person's computer.
+        Device = 1,
+        /// An automated client; not issued in 0.1.0.
+        Agent = 2,
+    }
+    impl Kind {
+        /// String value of the enum field names used in the ProtoBuf definition.
+        ///
+        /// The values are not transformed in any way and thus are considered stable
+        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+        pub fn as_str_name(&self) -> &'static str {
+            match self {
+                Self::Unspecified => "KIND_UNSPECIFIED",
+                Self::Device => "KIND_DEVICE",
+                Self::Agent => "KIND_AGENT",
+            }
+        }
+        /// Creates an enum from field names used in the ProtoBuf definition.
+        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+            match value {
+                "KIND_UNSPECIFIED" => Some(Self::Unspecified),
+                "KIND_DEVICE" => Some(Self::Device),
+                "KIND_AGENT" => Some(Self::Agent),
+                _ => None,
+            }
+        }
+    }
+}
+/// Response of GET /v1/devices.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeviceList {
+    #[prost(message, repeated, tag="1")]
+    pub devices: ::prost::alloc::vec::Vec<DeviceInfo>,
+    /// Empty on the last page; otherwise pass it back as ?cursor=.
+    #[prost(string, tag="2")]
+    pub next_cursor: ::prost::alloc::string::String,
 }
 /// POST /v1/spaces/{space_id}/rewind, owner only (RFC 0003).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -281,6 +357,9 @@ pub struct CommitRecord {
     pub committed_at_ms: i64,
     #[prost(message, repeated, tag="6")]
     pub changes: ::prost::alloc::vec::Vec<ChangeRecord>,
+    /// Reserved for labelling the commits of one automated run (RFC 0006 section 4). Servers leave it empty.
+    #[prost(string, tag="7")]
+    pub run_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -447,6 +526,10 @@ pub struct Commit {
     /// When true, the commit is refused with CODE_HEAD_MOVED unless head_seq equals base_seq.
     #[prost(bool, tag="7")]
     pub require_head: bool,
+    /// Reserved for labelling the commits of one automated run (RFC 0006 section 4). Clients leave it empty, and servers
+    /// ignore it.
+    #[prost(string, tag="8")]
+    pub run_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OpResult {
@@ -585,6 +668,9 @@ pub mod error {
         AheadOfServer = 14,
         /// The share link, or the node or link the request names, does not exist or is not reachable (RFC 0005).
         NotFound = 15,
+        /// A commit that would trash more than the server's delete policy allows, until the owner confirms (RFC 0006
+        /// section 10). Reserved: no 0.1.0 server sends it.
+        ConfirmationRequired = 16,
     }
     impl Code {
         /// String value of the enum field names used in the ProtoBuf definition.
@@ -609,6 +695,7 @@ pub mod error {
                 Self::HeadMoved => "CODE_HEAD_MOVED",
                 Self::AheadOfServer => "CODE_AHEAD_OF_SERVER",
                 Self::NotFound => "CODE_NOT_FOUND",
+                Self::ConfirmationRequired => "CODE_CONFIRMATION_REQUIRED",
             }
         }
         /// Creates an enum from field names used in the ProtoBuf definition.
@@ -630,6 +717,7 @@ pub mod error {
                 "CODE_HEAD_MOVED" => Some(Self::HeadMoved),
                 "CODE_AHEAD_OF_SERVER" => Some(Self::AheadOfServer),
                 "CODE_NOT_FOUND" => Some(Self::NotFound),
+                "CODE_CONFIRMATION_REQUIRED" => Some(Self::ConfirmationRequired),
                 _ => None,
             }
         }

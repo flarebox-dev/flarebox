@@ -52,6 +52,8 @@ message DeviceCredentials {
   // Long-lived secret exchanged for access tokens. The server keeps only its SHA-256.
   string refresh_credential = 3;
   AccessToken access = 4;
+  // When the refresh credential stops working, in Unix milliseconds; 0 if it never expires (RFC 0006 section 7).
+  int64 credential_expires_at_ms = 5;
 }
 
 // POST /v1/token
@@ -81,6 +83,40 @@ message CreateSpaceRequest {
 // Response of GET /v1/spaces.
 message SpaceList {
   repeated SpaceInfo spaces = 1;
+}
+
+// One principal of the caller's user, as GET /v1/devices lists it (RFC 0006 section 7).
+message DeviceInfo {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    // A person's computer.
+    KIND_DEVICE = 1;
+    // An automated client; not issued in 0.1.0.
+    KIND_AGENT = 2;
+  }
+  // The principal ID (RFC 0006 section 4).
+  string device_id = 1;
+  string name = 2;
+  string platform = 3;
+  Kind kind = 4;
+  int64 created_at_ms = 5;
+  // 0 if the principal has never refreshed an access token.
+  int64 last_seen_ms = 6;
+  // 0 if not revoked.
+  int64 revoked_at_ms = 7;
+  // 0 if the refresh credential never expires.
+  int64 credential_expires_at_ms = 8;
+  // The principal whose request created this one; empty for the device created by claim or owner recovery.
+  string issued_by = 9;
+  // True for the principal that made the request.
+  bool current = 10;
+}
+
+// Response of GET /v1/devices.
+message DeviceList {
+  repeated DeviceInfo devices = 1;
+  // Empty on the last page; otherwise pass it back as ?cursor=.
+  string next_cursor = 2;
 }
 
 // POST /v1/spaces/{space_id}/rewind, owner only (RFC 0003).

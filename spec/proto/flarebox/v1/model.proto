@@ -87,4 +87,6 @@ message CommitRecord {
   string user_id = 4;
   int64 committed_at_ms = 5;
   repeated ChangeRecord changes = 6;
+  // Reserved for labelling the commits of one automated run (RFC 0006 section 4). Servers leave it empty.
+  string run_id = 7;
 }

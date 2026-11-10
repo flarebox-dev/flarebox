@@ -864,6 +864,7 @@ impl Run {
             history_id,
             device_seq,
             require_head: opt_bool(body, "require_head")?.unwrap_or(false),
+            run_id: String::new(),
         };
         let expect = expectation(
             step,

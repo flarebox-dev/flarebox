@@ -12,7 +12,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file flarebox/v1/auth.proto.
  */
 export const file_flarebox_v1_auth: GenFile = /*@__PURE__*/
-  fileDesc("ChZmbGFyZWJveC92MS9hdXRoLnByb3RvEgtmbGFyZWJveC52MSLiAQoKU2VydmVySW5mbxIWCg5zZXJ2ZXJfdmVyc2lvbhgBIAEoCRIRCglwcm90b19taW4YAiABKA0SEQoJcHJvdG9fbWF4GAMgASgNEjMKCWRhdGFfcGF0aBgEIAEoDjIgLmZsYXJlYm94LnYxLlNlcnZlckluZm8uRGF0YVBhdGgSDwoHY2xhaW1lZBgFIAEoCCJQCghEYXRhUGF0aBIZChVEQVRBX1BBVEhfVU5TUEVDSUZJRUQQABITCg9EQVRBX1BBVEhfUkVMQVkQARIUChBEQVRBX1BBVEhfRElSRUNUEAIiVgoMQ2xhaW1SZXF1ZXN0EgwKBGNvZGUYASABKAkSEQoJdXNlcl9uYW1lGAIgASgJEhMKC2RldmljZV9uYW1lGAMgASgJEhAKCHBsYXRmb3JtGAQgASgJIjgKEVBhaXJTdGFydFJlc3BvbnNlEgwKBGNvZGUYASABKAkSFQoNZXhwaXJlc19hdF9tcxgCIAEoAyJKChNQYWlyQ29tcGxldGVSZXF1ZXN0EgwKBGNvZGUYASABKAkSEwoLZGV2aWNlX25hbWUYAiABKAkSEAoIcGxhdGZvcm0YAyABKAkifQoRRGV2aWNlQ3JlZGVudGlhbHMSDwoHdXNlcl9pZBgBIAEoCRIRCglkZXZpY2VfaWQYAiABKAkSGgoScmVmcmVzaF9jcmVkZW50aWFsGAMgASgJEigKBmFjY2VzcxgEIAEoCzIYLmZsYXJlYm94LnYxLkFjY2Vzc1Rva2VuIj0KDFRva2VuUmVxdWVzdBIRCglkZXZpY2VfaWQYASABKAkSGgoScmVmcmVzaF9jcmVkZW50aWFsGAIgASgJIjMKC0FjY2Vzc1Rva2VuEg0KBXRva2VuGAEgASgJEhUKDWV4cGlyZXNfYXRfbXMYAiABKAMiWgoJU3BhY2VJbmZvEhAKCHNwYWNlX2lkGAEgASgJEgwKBG5hbWUYAiABKAkSFgoOZm9ybWF0X3ZlcnNpb24YAyABKA0SFQoNY3JlYXRlZF9hdF9tcxgEIAEoAyIiChJDcmVhdGVTcGFjZVJlcXVlc3QSDAoEbmFtZRgBIAEoCSIzCglTcGFjZUxpc3QSJgoGc3BhY2VzGAEgAygLMhYuZmxhcmVib3gudjEuU3BhY2VJbmZvIlkKDVJld2luZFJlcXVlc3QSGAoQcmVzdG9yZV9wb2ludF9tcxgBIAEoAxIbChNleHBlY3RlZF9oaXN0b3J5X2lkGAIgASgJEhEKCXJld2luZF9pZBgDIAEoCSKJAQoMUmV3aW5kUmVzdWx0EhIKCmhpc3RvcnlfaWQYASABKAkSEwoLcmVzdG9yZV9zZXEYAiABKAQSGAoQcmVzdG9yZV9wb2ludF9tcxgDIAEoAxIbChNwcmV2aW91c19oaXN0b3J5X2lkGAQgASgJEhkKEXByZXZpb3VzX2hlYWRfc2VxGAUgASgEYgZwcm90bzM");
+  fileDesc("ChZmbGFyZWJveC92MS9hdXRoLnByb3RvEgtmbGFyZWJveC52MSLiAQoKU2VydmVySW5mbxIWCg5zZXJ2ZXJfdmVyc2lvbhgBIAEoCRIRCglwcm90b19taW4YAiABKA0SEQoJcHJvdG9fbWF4GAMgASgNEjMKCWRhdGFfcGF0aBgEIAEoDjIgLmZsYXJlYm94LnYxLlNlcnZlckluZm8uRGF0YVBhdGgSDwoHY2xhaW1lZBgFIAEoCCJQCghEYXRhUGF0aBIZChVEQVRBX1BBVEhfVU5TUEVDSUZJRUQQABITCg9EQVRBX1BBVEhfUkVMQVkQARIUChBEQVRBX1BBVEhfRElSRUNUEAIiVgoMQ2xhaW1SZXF1ZXN0EgwKBGNvZGUYASABKAkSEQoJdXNlcl9uYW1lGAIgASgJEhMKC2RldmljZV9uYW1lGAMgASgJEhAKCHBsYXRmb3JtGAQgASgJIjgKEVBhaXJTdGFydFJlc3BvbnNlEgwKBGNvZGUYASABKAkSFQoNZXhwaXJlc19hdF9tcxgCIAEoAyJKChNQYWlyQ29tcGxldGVSZXF1ZXN0EgwKBGNvZGUYASABKAkSEwoLZGV2aWNlX25hbWUYAiABKAkSEAoIcGxhdGZvcm0YAyABKAkinwEKEURldmljZUNyZWRlbnRpYWxzEg8KB3VzZXJfaWQYASABKAkSEQoJZGV2aWNlX2lkGAIgASgJEhoKEnJlZnJlc2hfY3JlZGVudGlhbBgDIAEoCRIoCgZhY2Nlc3MYBCABKAsyGC5mbGFyZWJveC52MS5BY2Nlc3NUb2tlbhIgChhjcmVkZW50aWFsX2V4cGlyZXNfYXRfbXMYBSABKAMiPQoMVG9rZW5SZXF1ZXN0EhEKCWRldmljZV9pZBgBIAEoCRIaChJyZWZyZXNoX2NyZWRlbnRpYWwYAiABKAkiMwoLQWNjZXNzVG9rZW4SDQoFdG9rZW4YASABKAkSFQoNZXhwaXJlc19hdF9tcxgCIAEoAyJaCglTcGFjZUluZm8SEAoIc3BhY2VfaWQYASABKAkSDAoEbmFtZRgCIAEoCRIWCg5mb3JtYXRfdmVyc2lvbhgDIAEoDRIVCg1jcmVhdGVkX2F0X21zGAQgASgDIiIKEkNyZWF0ZVNwYWNlUmVxdWVzdBIMCgRuYW1lGAEgASgJIjMKCVNwYWNlTGlzdBImCgZzcGFjZXMYASADKAsyFi5mbGFyZWJveC52MS5TcGFjZUluZm8itAIKCkRldmljZUluZm8SEQoJZGV2aWNlX2lkGAEgASgJEgwKBG5hbWUYAiABKAkSEAoIcGxhdGZvcm0YAyABKAkSKgoEa2luZBgEIAEoDjIcLmZsYXJlYm94LnYxLkRldmljZUluZm8uS2luZBIVCg1jcmVhdGVkX2F0X21zGAUgASgDEhQKDGxhc3Rfc2Vlbl9tcxgGIAEoAxIVCg1yZXZva2VkX2F0X21zGAcgASgDEiAKGGNyZWRlbnRpYWxfZXhwaXJlc19hdF9tcxgIIAEoAxIRCglpc3N1ZWRfYnkYCSABKAkSDwoHY3VycmVudBgKIAEoCCI9CgRLaW5kEhQKEEtJTkRfVU5TUEVDSUZJRUQQABIPCgtLSU5EX0RFVklDRRABEg4KCktJTkRfQUdFTlQQAiJLCgpEZXZpY2VMaXN0EigKB2RldmljZXMYASADKAsyFy5mbGFyZWJveC52MS5EZXZpY2VJbmZvEhMKC25leHRfY3Vyc29yGAIgASgJIlkKDVJld2luZFJlcXVlc3QSGAoQcmVzdG9yZV9wb2ludF9tcxgBIAEoAxIbChNleHBlY3RlZF9oaXN0b3J5X2lkGAIgASgJEhEKCXJld2luZF9pZBgDIAEoCSKJAQoMUmV3aW5kUmVzdWx0EhIKCmhpc3RvcnlfaWQYASABKAkSEwoLcmVzdG9yZV9zZXEYAiABKAQSGAoQcmVzdG9yZV9wb2ludF9tcxgDIAEoAxIbChNwcmV2aW91c19oaXN0b3J5X2lkGAQgASgJEhkKEXByZXZpb3VzX2hlYWRfc2VxGAUgASgEYgZwcm90bzM");
 
 /**
  * GET /v1/server
@@ -201,6 +201,13 @@ export type DeviceCredentials = Message<"flarebox.v1.DeviceCredentials"> & {
    * @generated from field: flarebox.v1.AccessToken access = 4;
    */
   access?: AccessToken | undefined;
+
+  /**
+   * When the refresh credential stops working, in Unix milliseconds; 0 if it never expires (RFC 0006 section 7).
+   *
+   * @generated from field: int64 credential_expires_at_ms = 5;
+   */
+  credentialExpiresAtMs: bigint;
 };
 
 /**
@@ -329,6 +336,138 @@ export const SpaceListSchema: GenMessage<SpaceList> = /*@__PURE__*/
   messageDesc(file_flarebox_v1_auth, 9);
 
 /**
+ * One principal of the caller's user, as GET /v1/devices lists it (RFC 0006 section 7).
+ *
+ * @generated from message flarebox.v1.DeviceInfo
+ */
+export type DeviceInfo = Message<"flarebox.v1.DeviceInfo"> & {
+  /**
+   * The principal ID (RFC 0006 section 4).
+   *
+   * @generated from field: string device_id = 1;
+   */
+  deviceId: string;
+
+  /**
+   * @generated from field: string name = 2;
+   */
+  name: string;
+
+  /**
+   * @generated from field: string platform = 3;
+   */
+  platform: string;
+
+  /**
+   * @generated from field: flarebox.v1.DeviceInfo.Kind kind = 4;
+   */
+  kind: DeviceInfo_Kind;
+
+  /**
+   * @generated from field: int64 created_at_ms = 5;
+   */
+  createdAtMs: bigint;
+
+  /**
+   * 0 if the principal has never refreshed an access token.
+   *
+   * @generated from field: int64 last_seen_ms = 6;
+   */
+  lastSeenMs: bigint;
+
+  /**
+   * 0 if not revoked.
+   *
+   * @generated from field: int64 revoked_at_ms = 7;
+   */
+  revokedAtMs: bigint;
+
+  /**
+   * 0 if the refresh credential never expires.
+   *
+   * @generated from field: int64 credential_expires_at_ms = 8;
+   */
+  credentialExpiresAtMs: bigint;
+
+  /**
+   * The principal whose request created this one; empty for the device created by claim or owner recovery.
+   *
+   * @generated from field: string issued_by = 9;
+   */
+  issuedBy: string;
+
+  /**
+   * True for the principal that made the request.
+   *
+   * @generated from field: bool current = 10;
+   */
+  current: boolean;
+};
+
+/**
+ * Describes the message flarebox.v1.DeviceInfo.
+ * Use `create(DeviceInfoSchema)` to create a new message.
+ */
+export const DeviceInfoSchema: GenMessage<DeviceInfo> = /*@__PURE__*/
+  messageDesc(file_flarebox_v1_auth, 10);
+
+/**
+ * @generated from enum flarebox.v1.DeviceInfo.Kind
+ */
+export enum DeviceInfo_Kind {
+  /**
+   * @generated from enum value: KIND_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * A person's computer.
+   *
+   * @generated from enum value: KIND_DEVICE = 1;
+   */
+  DEVICE = 1,
+
+  /**
+   * An automated client; not issued in 0.1.0.
+   *
+   * @generated from enum value: KIND_AGENT = 2;
+   */
+  AGENT = 2,
+}
+
+/**
+ * Describes the enum flarebox.v1.DeviceInfo.Kind.
+ */
+export const DeviceInfo_KindSchema: GenEnum<DeviceInfo_Kind> = /*@__PURE__*/
+  enumDesc(file_flarebox_v1_auth, 10, 0);
+
+/**
+ * Response of GET /v1/devices.
+ *
+ * @generated from message flarebox.v1.DeviceList
+ */
+export type DeviceList = Message<"flarebox.v1.DeviceList"> & {
+  /**
+   * @generated from field: repeated flarebox.v1.DeviceInfo devices = 1;
+   */
+  devices: DeviceInfo[];
+
+  /**
+   * Empty on the last page; otherwise pass it back as ?cursor=.
+   *
+   * @generated from field: string next_cursor = 2;
+   */
+  nextCursor: string;
+};
+
+/**
+ * Describes the message flarebox.v1.DeviceList.
+ * Use `create(DeviceListSchema)` to create a new message.
+ */
+export const DeviceListSchema: GenMessage<DeviceList> = /*@__PURE__*/
+  messageDesc(file_flarebox_v1_auth, 11);
+
+/**
  * POST /v1/spaces/{space_id}/rewind, owner only (RFC 0003).
  *
  * @generated from message flarebox.v1.RewindRequest
@@ -361,7 +500,7 @@ export type RewindRequest = Message<"flarebox.v1.RewindRequest"> & {
  * Use `create(RewindRequestSchema)` to create a new message.
  */
 export const RewindRequestSchema: GenMessage<RewindRequest> = /*@__PURE__*/
-  messageDesc(file_flarebox_v1_auth, 10);
+  messageDesc(file_flarebox_v1_auth, 12);
 
 /**
  * Response of POST /v1/spaces/{space_id}/rewind.
@@ -409,5 +548,5 @@ export type RewindResult = Message<"flarebox.v1.RewindResult"> & {
  * Use `create(RewindResultSchema)` to create a new message.
  */
 export const RewindResultSchema: GenMessage<RewindResult> = /*@__PURE__*/
-  messageDesc(file_flarebox_v1_auth, 11);
+  messageDesc(file_flarebox_v1_auth, 13);
 

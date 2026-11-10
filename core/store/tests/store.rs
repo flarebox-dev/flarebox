@@ -255,6 +255,7 @@ fn commit_in_flight_keeps_ops_and_sent_shapes() {
             history_id: "h1".into(),
             device_seq: 4,
             require_head: true,
+            run_id: String::new(),
         },
         sent: vec![Some(file_shape("root", "new.txt")), None],
     };
@@ -281,6 +282,7 @@ fn commit_in_flight_keeps_ops_and_sent_shapes() {
             history_id: "h1".into(),
             device_seq: 5,
             require_head: false,
+            run_id: String::new(),
         },
         sent: vec![None],
     };
