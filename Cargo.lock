@@ -569,6 +569,7 @@ dependencies = [
  "flarebox-sim",
  "flarebox-store",
  "prost",
+ "reqwest",
  "rustix",
  "serde",
  "serde_json",
@@ -577,6 +578,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "tracing-subscriber",
  "url",
 ]
 
