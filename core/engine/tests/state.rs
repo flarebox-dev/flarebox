@@ -40,7 +40,7 @@ fn trees() -> Trees {
         let identity = FileIdentity {
             dev: 1,
             ino: ino as u64,
-            birth_ns: 0,
+            birth_ns: Some(0),
         };
         trees.set_remote(id.into(), remote(shape.clone()));
         trees.set_local(
@@ -244,4 +244,75 @@ fn effects_restore_a_valid_state_and_refuse_each_broken_one() {
         counter: 4,
     };
     assert_eq!(Effects::from_state(state), Err(error));
+}
+
+/// An entry on a filesystem that reports no birth time keeps an unknown birth time through a
+/// restore, and its identity never equals one with a known birth time.
+#[test]
+fn an_identity_without_a_birth_time_round_trips() {
+    let unknown = FileIdentity {
+        dev: 1,
+        ino: 7,
+        birth_ns: None,
+    };
+    assert_ne!(
+        unknown,
+        FileIdentity {
+            birth_ns: Some(0),
+            ..unknown
+        }
+    );
+    let shape = dir(ROOT, "u");
+    let mut trees = Trees::new(ROOT);
+    trees.set_remote("u".into(), remote(shape.clone()));
+    trees.set_local(
+        "u".into(),
+        LocalNode {
+            shape: shape.clone(),
+            identity: unknown,
+            parked: false,
+        },
+    );
+    trees.set_synced("u".into(), Some(shape));
+    let mut loaded = Trees::new(ROOT);
+    for (id, node) in trees.remote().iter() {
+        loaded.set_remote(id.clone(), node.clone());
+    }
+    for (id, node) in trees.local().iter() {
+        loaded.set_local(id.clone(), node.clone());
+    }
+    for (id, shape) in trees.synced().iter() {
+        loaded.set_synced(id.clone(), Some(shape.clone()));
+    }
+    assert_eq!(loaded.restore(trees.state()), Ok(()));
+    assert_eq!(loaded, trees);
+    assert_eq!(
+        loaded.local().get("u").map(|node| node.identity),
+        Some(unknown)
+    );
+
+    let state = EffectsState {
+        in_flight: Some(EffectRecord {
+            effect_id: "effect".into(),
+            node: "u".into(),
+            counter: 1,
+            effect: Effect::Move {
+                from: Location::Parked("u".into()),
+                identity: unknown,
+                to: Location::Parked("v".into()),
+            },
+            after: None,
+        }),
+        cleared: 0,
+        failed: [(
+            "w".into(),
+            Effect::RemoveDir {
+                at: Location::Parked("w".into()),
+                identity: unknown,
+            },
+        )]
+        .into(),
+    };
+    let restored = Effects::from_state(state.clone()).map(|effects| effects.state());
+    assert_eq!(restored, Ok(state));
 }

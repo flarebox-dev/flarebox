@@ -154,7 +154,8 @@ impl RemoteNode {
 pub struct FileIdentity {
     pub dev: u64,
     pub ino: u64,
-    pub birth_ns: i64,
+    /// `None` when the filesystem does not report a birth time, which never equals a known one.
+    pub birth_ns: Option<i64>,
 }
 
 /// A node of L: the disk as last observed, under its exact on-disk name.

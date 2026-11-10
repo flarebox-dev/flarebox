@@ -179,11 +179,13 @@ fn remote_action(space: &mut SpaceDo, ids: &mut IdGen, device: u8, action: &Acti
     space.commit(&session, NOW, &commit).unwrap();
 }
 
+/// An identity with inode `ino`. Entries with an odd inode stand for a filesystem that reports no
+/// birth time.
 fn identity(ino: u64) -> FileIdentity {
     FileIdentity {
         dev: 1,
         ino,
-        birth_ns: 0,
+        birth_ns: (ino % 2 == 0).then_some(1_700_000_000_000_000_000),
     }
 }
 
