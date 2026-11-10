@@ -240,13 +240,18 @@ export class AccountDO extends DurableObject<Env> {
     };
     const outcome = this.ctx.storage.transactionSync(() => redeemClaim(this.sql, attempt));
     if (!outcome.ok) return outcome;
-    return ok(device.credentials);
+    return ok(create(DeviceCredentialsSchema, { ...device.credentials, userName: this.userName(userId) }));
   }
 
   private async addDevice(userId: string, deviceName: string, platform: string, nowMs: number, issuedBy: string): Promise<DeviceCredentials> {
     const device = await this.prepareDevice(userId, deviceName, platform, nowMs, issuedBy);
     device.store();
-    return device.credentials;
+    return create(DeviceCredentialsSchema, { ...device.credentials, userName: this.userName(userId) });
+  }
+
+  /** The user's display name, as the first claim stored it (RFC 0008). */
+  private userName(userId: string): string {
+    return String(this.sql.exec("SELECT name FROM users WHERE user_id = ?", userId).toArray()[0]?.name ?? "");
   }
 
   /**

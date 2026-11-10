@@ -868,6 +868,24 @@ describe("RFC 0007 name limits and space list pages", () => {
     expect(listed.message!.devices.find((device) => device.current)).toMatchObject({ name: longest, platform: longest });
   });
 
+  it("gives a paired device its user's name, and keeps its credentials within 4 KiB with the longest user and device names", async () => {
+    const owner = await getOwner();
+    expect(owner.userName).toBe("Owner");
+    expect((await pairDevice(owner, "Phone")).userName).toBe("Owner");
+    const setName = (name: string) =>
+      runInDurableObject(account(), (_instance, state) => {
+        state.storage.sql.exec("UPDATE users SET name = ? WHERE user_id = ?", name, owner.userId);
+      });
+    await setName("\u0001".repeat(255));
+    try {
+      const paired = await pairDevice(owner, "\u0001".repeat(255));
+      expect(paired.userName).toBe("\u0001".repeat(255));
+      expect(toBinary(DeviceCredentialsSchema, paired).length).toBeLessThanOrEqual(4096);
+    } finally {
+      await setName("Owner");
+    }
+  });
+
   it("keeps the credentials and the access token of a device with the longest name within 4 KiB", async () => {
     const owner = await getOwner();
     const paired = await pairDevice(owner, "\u0001".repeat(255));

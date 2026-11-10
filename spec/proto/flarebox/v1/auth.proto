@@ -55,6 +55,8 @@ message DeviceCredentials {
   AccessToken access = 4;
   // When the refresh credential stops working, in Unix milliseconds; 0 if it never expires (RFC 0006 section 7).
   int64 credential_expires_at_ms = 5;
+  // The display name of the user the device belongs to, as the server stores it (RFC 0008).
+  string user_name = 6;
 }
 
 // POST /v1/token

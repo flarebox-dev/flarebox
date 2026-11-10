@@ -577,6 +577,7 @@ mod tests {
                 expires_at_ms: i64::MAX,
             }),
             credential_expires_at_ms: i64::MAX,
+            user_name: String::new(),
         };
         assert!(
             credentials.encoded_len() <= MAX_ANSWER,

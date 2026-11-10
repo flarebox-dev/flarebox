@@ -50,8 +50,8 @@ async function call<S extends DescMessage>(
   return { status: response.status, error: fromBinary(ErrorSchema, bytes).message };
 }
 
-function claim(code: string, address: string | undefined, deviceName = "Laptop") {
-  const body = toBinary(ClaimRequestSchema, create(ClaimRequestSchema, { code, userName: "Owner", deviceName, platform: "macos" }));
+function claim(code: string, address: string | undefined, deviceName = "Laptop", userName = "Owner") {
+  const body = toBinary(ClaimRequestSchema, create(ClaimRequestSchema, { code, userName, deviceName, platform: "macos" }));
   return call("/v1/claim", body, DeviceCredentialsSchema, address);
 }
 
@@ -123,6 +123,7 @@ describe("first owner claim", () => {
     expect(winners).toHaveLength(1);
     expect(results.find((result) => result.status !== 200)).toMatchObject({ status: 403 });
     owner = winners[0]!.message!;
+    expect(owner.userName).toBe("Owner");
     expect(await claimed()).toBe(true);
   });
 
@@ -163,9 +164,10 @@ describe("owner recovery", () => {
 
   it("throttles wrong keys, but the right key still adds a device for the existing owner, once", async () => {
     await throttle(STRANGER_ADDRESS, "not-the-recovery-key-");
-    const recovered = await claim(RECOVERY_KEY, STRANGER_ADDRESS, "New laptop");
+    const recovered = await claim(RECOVERY_KEY, STRANGER_ADDRESS, "New laptop", "Someone else");
     expect(recovered.status).toBe(200);
     expect(recovered.message!.userId).toBe(owner!.userId);
+    expect(recovered.message!.userName).toBe("Owner");
     expect(recovered.message!.deviceId).not.toBe(owner!.deviceId);
     const body = toBinary(
       TokenRequestSchema,

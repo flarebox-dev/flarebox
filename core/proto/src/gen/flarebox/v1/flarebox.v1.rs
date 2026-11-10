@@ -98,6 +98,9 @@ pub struct DeviceCredentials {
     /// When the refresh credential stops working, in Unix milliseconds; 0 if it never expires (RFC 0006 section 7).
     #[prost(int64, tag="5")]
     pub credential_expires_at_ms: i64,
+    /// The display name of the user the device belongs to, as the server stores it (RFC 0008).
+    #[prost(string, tag="6")]
+    pub user_name: ::prost::alloc::string::String,
 }
 /// POST /v1/token
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
