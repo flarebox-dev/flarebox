@@ -2336,17 +2336,27 @@ mod tests {
         let paths = Paths::under(home.path());
         paired(&paths, "d1");
         rustix::fs::removexattr(paths.credential(), BACKUP_EXCLUSION.0).unwrap();
-        let chflags = |flag: &str| {
-            let status = std::process::Command::new("chflags")
-                .arg(flag)
-                .arg(paths.credential())
-                .status()
-                .unwrap();
-            assert!(status.success());
-        };
-        chflags("uchg");
+        struct Unlock(std::path::PathBuf);
+        impl Drop for Unlock {
+            fn drop(&mut self) {
+                let status = std::process::Command::new("chflags")
+                    .arg("nouchg")
+                    .arg(&self.0)
+                    .status();
+                if !std::thread::panicking() {
+                    assert!(status.unwrap().success());
+                }
+            }
+        }
+        let status = std::process::Command::new("chflags")
+            .arg("uchg")
+            .arg(paths.credential())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let unlock = Unlock(paths.credential());
         let refused = Driver::open(paths.clone()).err();
-        chflags("nouchg");
+        drop(unlock);
         let error = refused.expect("the driver opened with a credential that backups would copy");
         assert!(
             matches!(
@@ -2356,6 +2366,7 @@ mod tests {
             "{error}"
         );
         assert!(error.to_string().contains("Time Machine"), "{error}");
+        assert!(error.to_string().contains("restart Flarebox"), "{error}");
 
         drop(Driver::open(paths.clone()).unwrap());
         assert!(time_machine_excludes(&paths.credential()));

@@ -61,7 +61,7 @@ pub enum CredentialError {
     #[error("this profile already has a credential at {path}")]
     Exists { path: PathBuf },
     #[error(
-        "cannot keep the credential file {path} out of Time Machine backups ({source}); Flarebox does not use a credential that backups would copy"
+        "cannot keep the credential file {path} out of Time Machine backups ({source}); Flarebox does not use a credential that backups would copy. Restore write access to the file (it may be locked), keep the profile on storage that supports extended attributes, then restart Flarebox"
     )]
     NotExcludedFromBackups {
         path: PathBuf,
