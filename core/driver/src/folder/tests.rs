@@ -932,6 +932,48 @@ fn an_edit_after_a_restart_is_an_edit_of_the_synced_file() {
     assert_eq!(a.state(), FolderState::UpToDate);
 }
 
+/// Design §2.7 leaves a node the server refused an op for out of commits until the next rescan. The first whole scan
+/// of a start is that rescan (GUN-345). Nothing cleared the node before, so it never synced again.
+#[test]
+fn a_node_the_server_refused_is_committed_again_after_the_scan_of_the_next_start() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::write(site.root.join("notes.txt"), b"written on a").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    let Some(upload @ Work::Upload(_)) = a.work.pop_front() else {
+        panic!("the new file is uploaded");
+    };
+    a.perform(upload, &mut remote).unwrap();
+    let Some(Work::Send(commit)) = a.work.pop_front() else {
+        panic!("the commit is sent");
+    };
+    assert_eq!(kinds(&commit), ["create file"]);
+    let refusal = flarebox_proto::v1::Error {
+        code: Code::LimitExceeded as i32,
+        ..Default::default()
+    };
+    let step = a.folder.sent(Err(CallError::Server(ServerError(refusal))));
+    a.take(step).unwrap();
+    assert_eq!(a.folder.engine.commits.problems().len(), 1);
+
+    // Neither an edit of the file nor the scans of the running folder bring the node back.
+    fs::write(site.root.join("notes.txt"), b"edited on a").unwrap();
+    a.settle();
+    assert!(a.work.is_empty(), "the refused node stays out of commits");
+    assert_eq!(a.folder.engine.commits.problems().len(), 1);
+    assert!(remote.names().is_empty());
+    drop(a);
+
+    let mut a = site.start();
+    assert_eq!(a.folder.engine.commits.problems().len(), 1);
+    a.connect(&remote);
+    a.scan_until(|a| a.folder.scanned);
+    assert!(a.folder.engine.commits.problems().is_empty());
+    assert_eq!(a.run(&mut remote), ["subscribe", "upload", "send"]);
+    assert_eq!(remote.names(), ["notes.txt"]);
+    assert_eq!(a.state(), FolderState::UpToDate);
+}
+
 #[test]
 fn a_restart_with_a_commit_in_flight_sends_the_stored_commit_again() {
     for reached_the_server in [false, true] {
