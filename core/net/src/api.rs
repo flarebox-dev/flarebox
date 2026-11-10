@@ -21,11 +21,20 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bounds a whole call to an HTTP endpoint.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// The longest name the server can store: it keeps a space or device name in one SQLite row of a Durable Object, which
+/// holds at most 8 MB. The server does not bound names yet; once it does (GUN-289), this and `MAX_ANSWER` shrink.
+const MAX_STORED_NAME: usize = 8 << 20;
+/// `JSON.stringify` writes a control character as `\u00XX`, six bytes for one.
+const JSON_ESCAPE_EXPANSION: usize = 6;
+/// Room for everything in a single answer besides its one name: ids, the token's key id and MAC, JSON keys and protobuf
+/// framing, which together take well under 1 KiB.
+const ANSWER_FRAMING: usize = 64 << 10;
 /// The most bytes read of a single answer. Like the other two limits, this is a memory ceiling, not a check of the
-/// answer's shape, set well above what the server can send until it bounds names (GUN-289). It stores a space or device
-/// name in one SQLite row of a Durable Object, which holds at most 8 MB. The largest answer is an access token, which
-/// carries the device name base64url-encoded, so about 10.7 MB.
-const MAX_ANSWER: usize = 32 << 20;
+/// answer's shape, so it covers the worst case the server can send today. The largest answer is an access token, which
+/// carries the device name JSON-escaped inside claims encoded as base64url (four bytes for every three): 64 MiB and
+/// framing for a name of control characters. GUN-289 lowers it.
+const MAX_ANSWER: usize =
+    (MAX_STORED_NAME * JSON_ESCAPE_EXPANSION).div_ceil(3) * 4 + ANSWER_FRAMING;
 /// The most bytes read of a `SpaceList`, which the server neither bounds nor pages yet (GUN-289). The Worker builds the
 /// whole answer in memory, and a Worker isolate has at most 128 MB, so it cannot send a larger one.
 const MAX_LIST_ANSWER: usize = 128 << 20;
@@ -263,7 +272,17 @@ impl Api {
             MAX_ERROR
         };
         let mut body = Vec::new();
-        while let Some(part) = response.chunk().await.map_err(ApiError::Transport)? {
+        while let Some(part) =
+            response
+                .chunk()
+                .await
+                .map_err(|error| match status.is_success() {
+                    true => ApiError::Transport(error),
+                    false => ApiError::Unreadable {
+                        status: status.as_u16(),
+                    },
+                })?
+        {
             if body.len() + part.len() > limit {
                 return Err(match status.is_success() {
                     true => ApiError::TooLarge { limit },
@@ -477,6 +496,44 @@ mod tests {
                 .expect("the client hung up")
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn a_single_answer_cap_covers_the_largest_answer_the_server_can_send() {
+        let id = "0190a0b0-0000-7000-8000-000000000001";
+        let claims = {
+            let name = "\\u0000".repeat(MAX_STORED_NAME);
+            format!(r#"{{"u":"{id}","d":"{id}","n":"{name}","e":{}}}"#, i64::MAX).len()
+        };
+        assert!(claims > MAX_STORED_NAME * JSON_ESCAPE_EXPANSION);
+        let token = format!(
+            "v1.{}.{}.{}",
+            "k".repeat(8),
+            "p".repeat(claims.div_ceil(3) * 4),
+            "m".repeat(43)
+        );
+        let credentials = DeviceCredentials {
+            user_id: id.into(),
+            device_id: id.into(),
+            refresh_credential: "r".repeat(43),
+            access: Some(AccessToken {
+                token,
+                expires_at_ms: i64::MAX,
+            }),
+            credential_expires_at_ms: i64::MAX,
+        };
+        assert!(
+            credentials.encoded_len() <= MAX_ANSWER,
+            "{} > {MAX_ANSWER}",
+            credentials.encoded_len()
+        );
+        let space = SpaceInfo {
+            space_id: id.into(),
+            name: "n".repeat(MAX_STORED_NAME),
+            format_version: u32::MAX,
+            created_at_ms: i64::MAX,
+        };
+        assert!(space.encoded_len() <= MAX_ANSWER);
     }
 
     #[tokio::test]

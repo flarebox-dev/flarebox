@@ -84,7 +84,7 @@ pub enum ApiError {
     /// tried again.
     #[error("the server sent an answer of more than {limit} bytes")]
     TooLarge { limit: usize },
-    /// The server refused with a protobuf error that could not be read: too large, or not an `Error`. As with `Status`,
+    /// The server refused with an error that could not be read: cut short, too large, or not an `Error`. As with `Status`,
     /// only the status is known, and a caller that tries again bounds how often (H1).
     #[error("the server answered HTTP {status} with an error that could not be read")]
     Unreadable { status: u16 },

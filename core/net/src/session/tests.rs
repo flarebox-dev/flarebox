@@ -1290,6 +1290,17 @@ async fn answer_not_an_error(mut tcp: TcpStream) {
         .unwrap();
 }
 
+/// Answers a request with a protobuf error that ends before its Content-Length.
+async fn answer_cut_short(mut tcp: TcpStream) {
+    let mut request = [0; 4096];
+    assert!(tcp.read(&mut request).await.unwrap() > 0);
+    let head =
+        b"HTTP/1.1 500 X\r\ncontent-type: application/x-protobuf\r\ncontent-length: 1000\r\n\r\n";
+    tcp.write_all(&[head.as_slice(), &[0x08; 10]].concat())
+        .await
+        .unwrap();
+}
+
 /// The first event that is not a connection coming or going.
 async fn settled(events: &mut Events) -> Event {
     let settle = async {
@@ -1306,18 +1317,18 @@ async fn settled(events: &mut Events) -> Event {
 }
 
 #[tokio::test]
-async fn oversized_or_undecodable_token_errors_stop_the_session_in_a_row() {
+async fn unreadable_token_errors_stop_the_session_in_a_row() {
     let unreadable_until_stopped = |listener: TcpListener| async move {
         let mut attempts = 0;
         while let Ok(Ok((tcp, _))) =
             tokio::time::timeout(Duration::from_secs(2), listener.accept()).await
         {
             attempts += 1;
-            if attempts % 2 == 0 {
-                tokio::spawn(answer_endlessly(tcp, 500));
-            } else {
-                tokio::spawn(answer_not_an_error(tcp));
-            }
+            match attempts % 3 {
+                0 => tokio::spawn(answer_endlessly(tcp, 500)),
+                1 => tokio::spawn(answer_not_an_error(tcp)),
+                _ => tokio::spawn(answer_cut_short(tcp)),
+            };
         }
         attempts
     };
