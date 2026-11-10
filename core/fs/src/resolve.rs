@@ -277,7 +277,7 @@ fn join(route: &[Dir], name: &OsStr) -> PathBuf {
 
 /// Refuses anything but one ordinary file name, so a name can neither climb
 /// out of its folder nor reach past it.
-fn check_name(name: &OsStr) -> Result<(), Unresolved> {
+pub(crate) fn check_name(name: &OsStr) -> Result<(), Unresolved> {
     let bytes = name.as_bytes();
     if matches!(bytes, b"" | b"." | b"..") || bytes.contains(&b'/') || bytes.contains(&0) {
         return Err(Unresolved::BadName(name.to_owned()));

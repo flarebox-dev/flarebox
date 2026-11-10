@@ -239,11 +239,16 @@ fn entry_missing_from_the_index_is_kept_for_a_full_period() {
         Reclaimed::default()
     );
     assert_eq!(names(&trash_dir(root)), ["e2"]);
+    // Its size and ctime were not recorded when it entered, so it is
+    // recovered rather than deleted.
     assert_eq!(
         space
             .reclaim_trash(later + TRASH_RETENTION, u64::MAX)
             .unwrap(),
-        removed(&["e2"])
+        Reclaimed {
+            removed: Vec::new(),
+            recovered: vec!["e2 (recovered 2023-11-28)".into()],
+        }
     );
 }
 
@@ -299,4 +304,203 @@ fn recovered_names_keep_the_extension_and_fit() {
     assert!(fitted.len() <= 255, "{}", fitted.len());
     assert!(fitted.starts_with("éé"));
     assert!(fitted.ends_with(" (recovered 2026-11-10 12).txt"));
+}
+
+/// Moves the root entry `name` into the trash as `entry` without indexing it,
+/// as a crash between the trash's rename and its index write leaves it.
+fn put_unindexed(root: &Path, name: &str, entry: &str) {
+    fs::create_dir_all(trash_dir(root)).unwrap();
+    fs::rename(root.join(name), trash_dir(root).join(entry)).unwrap();
+}
+
+#[test]
+fn unindexed_entry_written_late_is_recovered_under_the_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("notes.txt"), "synced").unwrap();
+    let mut held = OpenOptions::new()
+        .append(true)
+        .open(root.join("notes.txt"))
+        .unwrap();
+    put_unindexed(root, "notes.txt", "e1");
+    held.write_all(b" and written late").unwrap();
+    drop(held);
+
+    let space = Space::open(root).unwrap();
+    let reclaimed = space.reclaim_trash(at(T0), 0).unwrap();
+    let name = "e1 (recovered 2023-11-14)";
+    assert_eq!(
+        reclaimed,
+        Reclaimed {
+            removed: Vec::new(),
+            recovered: vec![name.into()],
+        }
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(name)).unwrap(),
+        "synced and written late"
+    );
+}
+
+#[test]
+fn unindexed_entry_written_late_is_recovered_on_expiry() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("notes.txt"), "synced").unwrap();
+    let mut held = OpenOptions::new()
+        .append(true)
+        .open(root.join("notes.txt"))
+        .unwrap();
+    put_unindexed(root, "notes.txt", "e1");
+    held.write_all(b" and written late").unwrap();
+    drop(held);
+
+    let space = Space::open(root).unwrap();
+    assert_eq!(
+        space.reclaim_trash(at(T0), u64::MAX).unwrap(),
+        Reclaimed::default()
+    );
+    let reclaimed = space
+        .reclaim_trash(at(T0) + TRASH_RETENTION, u64::MAX)
+        .unwrap();
+    let name = "e1 (recovered 2023-11-21)";
+    assert_eq!(
+        reclaimed,
+        Reclaimed {
+            removed: Vec::new(),
+            recovered: vec![name.into()],
+        }
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(name)).unwrap(),
+        "synced and written late"
+    );
+}
+
+#[test]
+fn unindexed_entry_is_never_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("a.txt"), "a").unwrap();
+    put_unindexed(root, "a.txt", "e1");
+    let space = Space::open(root).unwrap();
+    let reclaimed = space.reclaim_trash(at(T0) + TRASH_RETENTION, 0).unwrap();
+    assert_eq!(
+        reclaimed,
+        Reclaimed {
+            removed: Vec::new(),
+            recovered: vec!["e1 (recovered 2023-11-21)".into()],
+        }
+    );
+    assert_eq!(
+        fs::read(root.join("e1 (recovered 2023-11-21)")).unwrap(),
+        b"a"
+    );
+}
+
+#[test]
+fn stale_index_temporary_file_does_not_stop_reclamation() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("a.txt"), "a").unwrap();
+    let space = Space::open(root).unwrap();
+    put(&space, "a.txt", "e1", at(T0));
+    fs::write(root.join(PRIVATE_DIR).join("trash.json.tmp"), "torn").unwrap();
+    fs::write(root.join("b.txt"), "b").unwrap();
+    put(&space, "b.txt", "e2", at(T0 + 1));
+
+    assert_eq!(
+        space.reclaim_trash(at(T0 + 2), 1).unwrap(),
+        removed(&["e1"])
+    );
+    assert_eq!(names(&trash_dir(root)), ["e2"]);
+}
+
+#[test]
+fn trash_names_must_be_single_components() {
+    let outside = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("space");
+    fs::create_dir_all(root.join("d")).unwrap();
+    fs::write(root.join("d/a.txt"), "a").unwrap();
+    let space = Space::open(&root).unwrap();
+    let location = Location::At {
+        base: Base::Root,
+        dirs: Vec::new(),
+        name: "d".into(),
+    };
+    let (folder, _) = space.parent(&location).unwrap();
+    let escaped = outside.path().join("escaped");
+    let escaped = escaped.to_str().unwrap();
+    for (name, entry, original) in [
+        ("d", "../../escaped", "a.txt"),
+        ("d", escaped, "a.txt"),
+        ("d", "e/1", "a.txt"),
+        ("d", "..", "a.txt"),
+        ("d", ".", "a.txt"),
+        ("d", "", "a.txt"),
+        ("d/a.txt", "e1", "a.txt"),
+        ("../space/d", "e1", "a.txt"),
+        ("d", "e1", "../a.txt"),
+        ("d", "e1", ".."),
+    ] {
+        let err = space
+            .trash(
+                &folder,
+                OsStr::new(name),
+                entry,
+                OsStr::new(original),
+                at(T0),
+            )
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "{name:?} {entry:?} {original:?}"
+        );
+    }
+    assert_eq!(names(&root), ["d"]);
+    assert_eq!(names(&root.join("d")), ["a.txt"]);
+    assert!(names(outside.path()).is_empty());
+    assert!(names(dir.path()).iter().all(|name| name == "space"));
+}
+
+#[test]
+fn trash_moved_out_of_the_root_during_reclamation_is_left_alone() {
+    let outside = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("a.txt"), "a").unwrap();
+    let space = Space::open(root).unwrap();
+    put(&space, "a.txt", "e1", at(T0));
+    let index_path = root.join(PRIVATE_DIR).join("trash.json");
+    let index = fs::read(&index_path).unwrap();
+    fs::remove_file(&index_path).unwrap();
+    let made = std::process::Command::new("mkfifo")
+        .arg(&index_path)
+        .status()
+        .unwrap();
+    assert!(made.success());
+
+    // Reclamation blocks reading the index from the FIFO until it is written,
+    // which happens after the trash folder has moved out of the root.
+    let reclaim = std::thread::spawn({
+        let root = root.to_path_buf();
+        move || {
+            Space::open(&root)
+                .unwrap()
+                .reclaim_trash(at(T0) + TRASH_RETENTION, u64::MAX)
+        }
+    });
+    let mut fifo = OpenOptions::new().write(true).open(&index_path).unwrap();
+    fs::rename(trash_dir(root), outside.path().join("trash")).unwrap();
+    fifo.write_all(&index).unwrap();
+    drop(fifo);
+
+    assert!(reclaim.join().unwrap().is_err());
+    assert_eq!(
+        fs::read(outside.path().join("trash").join("e1")).unwrap(),
+        b"a"
+    );
+    assert_eq!(names(outside.path()), ["trash"]);
 }
