@@ -12,7 +12,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file flarebox/v1/auth.proto.
  */
 export const file_flarebox_v1_auth: GenFile = /*@__PURE__*/
-  fileDesc("ChZmbGFyZWJveC92MS9hdXRoLnByb3RvEgtmbGFyZWJveC52MSLiAQoKU2VydmVySW5mbxIWCg5zZXJ2ZXJfdmVyc2lvbhgBIAEoCRIRCglwcm90b19taW4YAiABKA0SEQoJcHJvdG9fbWF4GAMgASgNEjMKCWRhdGFfcGF0aBgEIAEoDjIgLmZsYXJlYm94LnYxLlNlcnZlckluZm8uRGF0YVBhdGgSDwoHY2xhaW1lZBgFIAEoCCJQCghEYXRhUGF0aBIZChVEQVRBX1BBVEhfVU5TUEVDSUZJRUQQABITCg9EQVRBX1BBVEhfUkVMQVkQARIUChBEQVRBX1BBVEhfRElSRUNUEAIiVgoMQ2xhaW1SZXF1ZXN0EgwKBGNvZGUYASABKAkSEQoJdXNlcl9uYW1lGAIgASgJEhMKC2RldmljZV9uYW1lGAMgASgJEhAKCHBsYXRmb3JtGAQgASgJIjgKEVBhaXJTdGFydFJlc3BvbnNlEgwKBGNvZGUYASABKAkSFQoNZXhwaXJlc19hdF9tcxgCIAEoAyJKChNQYWlyQ29tcGxldGVSZXF1ZXN0EgwKBGNvZGUYASABKAkSEwoLZGV2aWNlX25hbWUYAiABKAkSEAoIcGxhdGZvcm0YAyABKAkinwEKEURldmljZUNyZWRlbnRpYWxzEg8KB3VzZXJfaWQYASABKAkSEQoJZGV2aWNlX2lkGAIgASgJEhoKEnJlZnJlc2hfY3JlZGVudGlhbBgDIAEoCRIoCgZhY2Nlc3MYBCABKAsyGC5mbGFyZWJveC52MS5BY2Nlc3NUb2tlbhIgChhjcmVkZW50aWFsX2V4cGlyZXNfYXRfbXMYBSABKAMiPQoMVG9rZW5SZXF1ZXN0EhEKCWRldmljZV9pZBgBIAEoCRIaChJyZWZyZXNoX2NyZWRlbnRpYWwYAiABKAkiMwoLQWNjZXNzVG9rZW4SDQoFdG9rZW4YASABKAkSFQoNZXhwaXJlc19hdF9tcxgCIAEoAyJaCglTcGFjZUluZm8SEAoIc3BhY2VfaWQYASABKAkSDAoEbmFtZRgCIAEoCRIWCg5mb3JtYXRfdmVyc2lvbhgDIAEoDRIVCg1jcmVhdGVkX2F0X21zGAQgASgDIiIKEkNyZWF0ZVNwYWNlUmVxdWVzdBIMCgRuYW1lGAEgASgJIjMKCVNwYWNlTGlzdBImCgZzcGFjZXMYASADKAsyFi5mbGFyZWJveC52MS5TcGFjZUluZm8itAIKCkRldmljZUluZm8SEQoJZGV2aWNlX2lkGAEgASgJEgwKBG5hbWUYAiABKAkSEAoIcGxhdGZvcm0YAyABKAkSKgoEa2luZBgEIAEoDjIcLmZsYXJlYm94LnYxLkRldmljZUluZm8uS2luZBIVCg1jcmVhdGVkX2F0X21zGAUgASgDEhQKDGxhc3Rfc2Vlbl9tcxgGIAEoAxIVCg1yZXZva2VkX2F0X21zGAcgASgDEiAKGGNyZWRlbnRpYWxfZXhwaXJlc19hdF9tcxgIIAEoAxIRCglpc3N1ZWRfYnkYCSABKAkSDwoHY3VycmVudBgKIAEoCCI9CgRLaW5kEhQKEEtJTkRfVU5TUEVDSUZJRUQQABIPCgtLSU5EX0RFVklDRRABEg4KCktJTkRfQUdFTlQQAiJLCgpEZXZpY2VMaXN0EigKB2RldmljZXMYASADKAsyFy5mbGFyZWJveC52MS5EZXZpY2VJbmZvEhMKC25leHRfY3Vyc29yGAIgASgJIlkKDVJld2luZFJlcXVlc3QSGAoQcmVzdG9yZV9wb2ludF9tcxgBIAEoAxIbChNleHBlY3RlZF9oaXN0b3J5X2lkGAIgASgJEhEKCXJld2luZF9pZBgDIAEoCSKJAQoMUmV3aW5kUmVzdWx0EhIKCmhpc3RvcnlfaWQYASABKAkSEwoLcmVzdG9yZV9zZXEYAiABKAQSGAoQcmVzdG9yZV9wb2ludF9tcxgDIAEoAxIbChNwcmV2aW91c19oaXN0b3J5X2lkGAQgASgJEhkKEXByZXZpb3VzX2hlYWRfc2VxGAUgASgEYgZwcm90bzM");
+  fileDesc("ChZmbGFyZWJveC92MS9hdXRoLnByb3RvEgtmbGFyZWJveC52MSLiAQoKU2VydmVySW5mbxIWCg5zZXJ2ZXJfdmVyc2lvbhgBIAEoCRIRCglwcm90b19taW4YAiABKA0SEQoJcHJvdG9fbWF4GAMgASgNEjMKCWRhdGFfcGF0aBgEIAEoDjIgLmZsYXJlYm94LnYxLlNlcnZlckluZm8uRGF0YVBhdGgSDwoHY2xhaW1lZBgFIAEoCCJQCghEYXRhUGF0aBIZChVEQVRBX1BBVEhfVU5TUEVDSUZJRUQQABITCg9EQVRBX1BBVEhfUkVMQVkQARIUChBEQVRBX1BBVEhfRElSRUNUEAIiVgoMQ2xhaW1SZXF1ZXN0EgwKBGNvZGUYASABKAkSEQoJdXNlcl9uYW1lGAIgASgJEhMKC2RldmljZV9uYW1lGAMgASgJEhAKCHBsYXRmb3JtGAQgASgJIjgKEVBhaXJTdGFydFJlc3BvbnNlEgwKBGNvZGUYASABKAkSFQoNZXhwaXJlc19hdF9tcxgCIAEoAyJKChNQYWlyQ29tcGxldGVSZXF1ZXN0EgwKBGNvZGUYASABKAkSEwoLZGV2aWNlX25hbWUYAiABKAkSEAoIcGxhdGZvcm0YAyABKAkinwEKEURldmljZUNyZWRlbnRpYWxzEg8KB3VzZXJfaWQYASABKAkSEQoJZGV2aWNlX2lkGAIgASgJEhoKEnJlZnJlc2hfY3JlZGVudGlhbBgDIAEoCRIoCgZhY2Nlc3MYBCABKAsyGC5mbGFyZWJveC52MS5BY2Nlc3NUb2tlbhIgChhjcmVkZW50aWFsX2V4cGlyZXNfYXRfbXMYBSABKAMiPQoMVG9rZW5SZXF1ZXN0EhEKCWRldmljZV9pZBgBIAEoCRIaChJyZWZyZXNoX2NyZWRlbnRpYWwYAiABKAkiMwoLQWNjZXNzVG9rZW4SDQoFdG9rZW4YASABKAkSFQoNZXhwaXJlc19hdF9tcxgCIAEoAyJaCglTcGFjZUluZm8SEAoIc3BhY2VfaWQYASABKAkSDAoEbmFtZRgCIAEoCRIWCg5mb3JtYXRfdmVyc2lvbhgDIAEoDRIVCg1jcmVhdGVkX2F0X21zGAQgASgDIiIKEkNyZWF0ZVNwYWNlUmVxdWVzdBIMCgRuYW1lGAEgASgJIkgKCVNwYWNlTGlzdBImCgZzcGFjZXMYASADKAsyFi5mbGFyZWJveC52MS5TcGFjZUluZm8SEwoLbmV4dF9jdXJzb3IYAiABKAkitAIKCkRldmljZUluZm8SEQoJZGV2aWNlX2lkGAEgASgJEgwKBG5hbWUYAiABKAkSEAoIcGxhdGZvcm0YAyABKAkSKgoEa2luZBgEIAEoDjIcLmZsYXJlYm94LnYxLkRldmljZUluZm8uS2luZBIVCg1jcmVhdGVkX2F0X21zGAUgASgDEhQKDGxhc3Rfc2Vlbl9tcxgGIAEoAxIVCg1yZXZva2VkX2F0X21zGAcgASgDEiAKGGNyZWRlbnRpYWxfZXhwaXJlc19hdF9tcxgIIAEoAxIRCglpc3N1ZWRfYnkYCSABKAkSDwoHY3VycmVudBgKIAEoCCI9CgRLaW5kEhQKEEtJTkRfVU5TUEVDSUZJRUQQABIPCgtLSU5EX0RFVklDRRABEg4KCktJTkRfQUdFTlQQAiJLCgpEZXZpY2VMaXN0EigKB2RldmljZXMYASADKAsyFy5mbGFyZWJveC52MS5EZXZpY2VJbmZvEhMKC25leHRfY3Vyc29yGAIgASgJIlkKDVJld2luZFJlcXVlc3QSGAoQcmVzdG9yZV9wb2ludF9tcxgBIAEoAxIbChNleHBlY3RlZF9oaXN0b3J5X2lkGAIgASgJEhEKCXJld2luZF9pZBgDIAEoCSKJAQoMUmV3aW5kUmVzdWx0EhIKCmhpc3RvcnlfaWQYASABKAkSEwoLcmVzdG9yZV9zZXEYAiABKAQSGAoQcmVzdG9yZV9wb2ludF9tcxgDIAEoAxIbChNwcmV2aW91c19oaXN0b3J5X2lkGAQgASgJEhkKEXByZXZpb3VzX2hlYWRfc2VxGAUgASgEYgZwcm90bzM");
 
 /**
  * GET /v1/server
@@ -86,7 +86,7 @@ export const ServerInfo_DataPathSchema: GenEnum<ServerInfo_DataPath> = /*@__PURE
   enumDesc(file_flarebox_v1_auth, 0, 0);
 
 /**
- * POST /v1/claim
+ * POST /v1/claim. user_name, device_name and platform are at most 255 bytes of UTF-8 each (RFC 0007 section 1).
  *
  * @generated from message flarebox.v1.ClaimRequest
  */
@@ -146,7 +146,8 @@ export const PairStartResponseSchema: GenMessage<PairStartResponse> = /*@__PURE_
   messageDesc(file_flarebox_v1_auth, 2);
 
 /**
- * POST /v1/pair/complete, called by the new device.
+ * POST /v1/pair/complete, called by the new device. device_name and platform are at most 255 bytes of UTF-8 each
+ * (RFC 0007 section 1).
  *
  * @generated from message flarebox.v1.PairCompleteRequest
  */
@@ -298,7 +299,7 @@ export const SpaceInfoSchema: GenMessage<SpaceInfo> = /*@__PURE__*/
   messageDesc(file_flarebox_v1_auth, 7);
 
 /**
- * POST /v1/spaces
+ * POST /v1/spaces. name is at most 255 bytes of UTF-8 (RFC 0007 section 1).
  *
  * @generated from message flarebox.v1.CreateSpaceRequest
  */
@@ -317,7 +318,7 @@ export const CreateSpaceRequestSchema: GenMessage<CreateSpaceRequest> = /*@__PUR
   messageDesc(file_flarebox_v1_auth, 8);
 
 /**
- * Response of GET /v1/spaces.
+ * Response of GET /v1/spaces?cursor=, at most 100 spaces per page (RFC 0007 section 2).
  *
  * @generated from message flarebox.v1.SpaceList
  */
@@ -326,6 +327,13 @@ export type SpaceList = Message<"flarebox.v1.SpaceList"> & {
    * @generated from field: repeated flarebox.v1.SpaceInfo spaces = 1;
    */
   spaces: SpaceInfo[];
+
+  /**
+   * Empty on the last page; otherwise pass it back as ?cursor=.
+   *
+   * @generated from field: string next_cursor = 2;
+   */
+  nextCursor: string;
 };
 
 /**

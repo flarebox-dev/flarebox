@@ -36,9 +36,10 @@ const ANSWER_FRAMING: usize = 64 << 10;
 /// framing for a name of control characters. GUN-289 lowers it.
 const MAX_ANSWER: usize =
     (MAX_STORED_NAME * JSON_ESCAPE_EXPANSION).div_ceil(3) * 4 + ANSWER_FRAMING;
-/// The most bytes read of a `SpaceList`, which the server neither bounds nor pages yet (GUN-289), or of a `DeviceList`
-/// page, whose 100 names the server does not bound either. The Worker builds the whole answer in memory, and a Worker
-/// isolate has at most 128 MB, so it cannot send a larger one.
+/// The most bytes read of a `DeviceList` page, and the most a listing of `SpaceList` pages holds at once, the pages
+/// kept plus the one being read. A page holds at most 100 entries (RFC 0006 section 7, RFC 0007 section 2), but a
+/// server from before RFC 0007 bounds no names and sends every space in one answer. Such a Worker builds the whole
+/// answer in memory, and a Worker isolate has at most 128 MB, so it cannot send a larger one.
 const MAX_LIST_ANSWER: usize = 128 << 20;
 /// The most bytes read of an error. The server's error messages are sentences it writes itself, without names or other
 /// text from clients.
@@ -161,17 +162,43 @@ impl Api {
         .await
     }
 
-    /// `GET /v1/spaces`.
+    /// `GET /v1/spaces`, following `next_cursor` to the last page (RFC 0007 section 2). Each page is read up to
+    /// `MAX_LIST_ANSWER` minus the encoded size of the pages kept so far, so the listing never holds more than
+    /// `MAX_LIST_ANSWER` bytes at once. A page that repeats any earlier cursor ends the listing as undecodable.
     pub async fn list_spaces(&self, auth: &Auth) -> Result<SpaceList, ApiError> {
-        self.authed(
-            auth,
-            Method::GET,
-            "v1/spaces",
-            None,
-            "SpaceList",
-            MAX_LIST_ANSWER,
-        )
-        .await
+        let mut list = SpaceList::default();
+        let mut read = 0;
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let path = match list.next_cursor.as_str() {
+                "" => "v1/spaces".to_owned(),
+                cursor => format!(
+                    "v1/spaces?{}",
+                    url::form_urlencoded::Serializer::new(String::new())
+                        .append_pair("cursor", cursor)
+                        .finish()
+                ),
+            };
+            let page: SpaceList = self
+                .authed(
+                    auth,
+                    Method::GET,
+                    &path,
+                    None,
+                    "SpaceList",
+                    MAX_LIST_ANSWER - read,
+                )
+                .await?;
+            read += page.encoded_len();
+            if !page.next_cursor.is_empty() && !seen.insert(page.next_cursor.clone()) {
+                return Err(ApiError::Decode("SpaceList"));
+            }
+            list.spaces.extend(page.spaces);
+            list.next_cursor = page.next_cursor;
+            if list.next_cursor.is_empty() {
+                return Ok(list);
+            }
+        }
     }
 
     /// `POST /v1/spaces`.
@@ -589,10 +616,25 @@ mod tests {
                 name: "n".repeat(MAX_ANSWER),
                 ..Default::default()
             }],
+            ..Default::default()
         }
         .encode_to_vec();
         assert!(spaces.len() > MAX_ANSWER && spaces.len() <= MAX_LIST_ANSWER);
         let (base, _server) = answering(200, Some(spaces.clone())).await;
+        let auth = signed_in(base);
+        let list = auth.api().list_spaces(&auth).await.unwrap();
+        assert_eq!(list.spaces[0].name.len(), MAX_ANSWER);
+
+        let (base, _server) = answering(200, Some(spaces)).await;
+        let outcome = Api::local_development(base).unwrap().server_info().await;
+        assert!(
+            matches!(outcome, Err(ApiError::TooLarge { limit: MAX_ANSWER })),
+            "{outcome:?}"
+        );
+    }
+
+    /// An `Auth` for `base` holding an access token valid for an hour.
+    fn signed_in(base: Url) -> Auth {
         let credentials = crate::auth::Credentials {
             user_id: "u".into(),
             device_id: "d".into(),
@@ -606,14 +648,77 @@ mod tests {
                 .unwrap()
                 .as_millis() as i64,
         };
-        let auth = Auth::new(Api::local_development(base).unwrap(), credentials).with_token(token);
-        let list = auth.api().list_spaces(&auth).await.unwrap();
-        assert_eq!(list.spaces[0].name.len(), MAX_ANSWER);
+        Auth::new(Api::local_development(base).unwrap(), credentials).with_token(token)
+    }
 
-        let (base, _server) = answering(200, Some(spaces)).await;
-        let outcome = Api::local_development(base).unwrap().server_info().await;
+    /// Answers one `SpaceList` page per connection, in order, and returns the request line of each.
+    async fn paging(
+        pages: Vec<(Vec<&'static str>, &'static str)>,
+    ) -> (Url, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (ids, cursor) in pages {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                let read = socket.read(&mut request).await.unwrap();
+                let head = String::from_utf8_lossy(&request[..read]);
+                requests.push(head.lines().next().unwrap().to_owned());
+                let body = SpaceList {
+                    spaces: ids
+                        .into_iter()
+                        .map(|id| SpaceInfo {
+                            space_id: id.into(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    next_cursor: cursor.into(),
+                }
+                .encode_to_vec();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: {PROTOBUF}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(head.as_bytes()).await.unwrap();
+                socket.write_all(&body).await.unwrap();
+            }
+            requests
+        });
+        (base, server)
+    }
+
+    #[tokio::test]
+    async fn list_spaces_follows_the_cursor_to_the_last_page() {
+        let (base, server) = paging(vec![(vec!["a", "b&c"], "b&c"), (vec!["d"], "")]).await;
+        let auth = signed_in(base);
+        let list = auth.api().list_spaces(&auth).await.unwrap();
+        let ids: Vec<_> = list
+            .spaces
+            .iter()
+            .map(|space| space.space_id.as_str())
+            .collect();
+        assert_eq!(ids, ["a", "b&c", "d"]);
+        assert_eq!(list.next_cursor, "");
+        assert_eq!(
+            server.await.unwrap(),
+            [
+                "GET /v1/spaces HTTP/1.1",
+                "GET /v1/spaces?cursor=b%26c HTTP/1.1"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_spaces_stops_at_a_cursor_it_has_seen() {
+        let (base, _server) =
+            paging(vec![(vec!["a"], "a"), (vec!["b"], "b"), (vec!["c"], "a")]).await;
+        let auth = signed_in(base);
+        let outcome = auth.api().list_spaces(&auth).await;
         assert!(
-            matches!(outcome, Err(ApiError::TooLarge { limit: MAX_ANSWER })),
+            matches!(outcome, Err(ApiError::Decode("SpaceList"))),
             "{outcome:?}"
         );
     }

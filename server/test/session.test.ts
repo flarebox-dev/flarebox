@@ -17,6 +17,7 @@ import {
   RewindRequestSchema,
   ServerInfoSchema,
   SpaceInfoSchema,
+  type SpaceList,
   SpaceListSchema,
   TokenRequestSchema,
 } from "../src/gen/flarebox/v1/auth_pb";
@@ -68,6 +69,16 @@ async function call<Res extends DescMessage>(
 
 function body<S extends DescMessage>(schema: S, init: MessageInitShape<S>): Uint8Array {
   return toBinary(schema, create(schema, init));
+}
+
+/** A request's status, and the error code of a refusal that carries an Error. */
+async function send(path: string, init: { method?: string; token?: string; body?: Uint8Array }) {
+  const headers: Record<string, string> = { "Content-Type": "application/x-protobuf" };
+  if (init.token) headers.Authorization = "Bearer " + init.token;
+  const response = await exports.default.fetch(BASE + path, { method: init.method ?? "POST", headers, body: init.body });
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  const error = !response.ok && response.headers.get("Content-Type") === "application/x-protobuf";
+  return { status: response.status, code: error ? fromBinary(ErrorSchema, bytes).code : undefined };
 }
 
 let owner: DeviceCredentials | undefined;
@@ -455,16 +466,6 @@ describe("owner claim, pairing and tokens", () => {
 });
 
 describe("RFC 0006 principals, capabilities and device routes", () => {
-  /** A request's status, and the error code of a refusal that carries an Error. */
-  async function send(path: string, init: { method?: string; token?: string; body?: Uint8Array }) {
-    const headers: Record<string, string> = { "Content-Type": "application/x-protobuf" };
-    if (init.token) headers.Authorization = "Bearer " + init.token;
-    const response = await exports.default.fetch(BASE + path, { method: init.method ?? "POST", headers, body: init.body });
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    const error = !response.ok && response.headers.get("Content-Type") === "application/x-protobuf";
-    return { status: response.status, code: error ? fromBinary(ErrorSchema, bytes).code : undefined };
-  }
-
   function refresh(creds: DeviceCredentials) {
     return call("/v1/token", { body: body(TokenRequestSchema, { deviceId: creds.deviceId, refreshCredential: creds.refreshCredential }) }, AccessTokenSchema);
   }
@@ -820,6 +821,132 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
     }
     expect((await refresh(owner)).status).toBe(200);
     expect((await call(`/v1/spaces/${spaceId}/links`, { method: "GET", token }, ShareLinkListSchema)).status).toBe(200);
+  });
+});
+
+describe("RFC 0007 name limits and space list pages", () => {
+  const refused = { status: 400, code: Error_Code.INVALID_ARGUMENT };
+  /** 255 bytes of UTF-8 in 85 three-byte characters. */
+  const longest = "가".repeat(85);
+  const tooLong = longest + "a";
+
+  function listSpaces(token: string, cursor = "") {
+    return call("/v1/spaces" + (cursor ? "?cursor=" + cursor : ""), { method: "GET", token }, SpaceListSchema);
+  }
+
+  async function spacePages(token: string, from = ""): Promise<SpaceList[]> {
+    const pages: SpaceList[] = [];
+    let cursor = from;
+    do {
+      const page = await listSpaces(token, cursor);
+      expect(page.status).toBe(200);
+      pages.push(page.message!);
+      cursor = page.message!.nextCursor;
+    } while (cursor);
+    return pages;
+  }
+
+  it("refuses a claim whose user name, device name or platform is longer than 255 bytes before it checks the code", async () => {
+    await getOwner();
+    const claim = (init: MessageInitShape<typeof ClaimRequestSchema>) => send("/v1/claim", { body: body(ClaimRequestSchema, { code: "AAAA-BBBB-CCCC", ...init }) });
+    expect(await claim({ userName: tooLong })).toEqual(refused);
+    expect(await claim({ deviceName: tooLong })).toEqual(refused);
+    expect(await claim({ platform: tooLong })).toEqual(refused);
+    expect(await claim({ userName: longest, deviceName: longest, platform: longest })).toEqual({ status: 403, code: Error_Code.FORBIDDEN });
+  });
+
+  it("refuses a pairing whose device name or platform is longer than 255 bytes, and keeps the pairing code valid", async () => {
+    const owner = await getOwner();
+    const started = await call("/v1/pair/start", { token: owner.access!.token }, PairStartResponseSchema);
+    const complete = (deviceName: string, platform: string) =>
+      body(PairCompleteRequestSchema, { code: started.message!.code, deviceName, platform });
+    expect(await send("/v1/pair/complete", { body: complete(tooLong, "linux") })).toEqual(refused);
+    expect(await send("/v1/pair/complete", { body: complete("Desk", tooLong) })).toEqual(refused);
+    const paired = await call("/v1/pair/complete", { body: complete(longest, longest) }, DeviceCredentialsSchema);
+    expect(paired.status).toBe(200);
+    const listed = await call("/v1/devices", { method: "GET", token: paired.message!.access!.token }, DeviceListSchema);
+    expect(listed.message!.devices.find((device) => device.current)).toMatchObject({ name: longest, platform: longest });
+  });
+
+  it("keeps the credentials and the access token of a device with the longest name within 4 KiB", async () => {
+    const owner = await getOwner();
+    const paired = await pairDevice(owner, "\u0001".repeat(255));
+    expect(toBinary(DeviceCredentialsSchema, paired).length).toBeLessThanOrEqual(4096);
+    const refreshed = await call("/v1/token", { body: body(TokenRequestSchema, { deviceId: paired.deviceId, refreshCredential: paired.refreshCredential }) }, AccessTokenSchema);
+    expect(refreshed.status).toBe(200);
+    expect(toBinary(AccessTokenSchema, refreshed.message!).length).toBeLessThanOrEqual(4096);
+  });
+
+  it("refuses a space name longer than 255 bytes and creates one of exactly 255", async () => {
+    const token = (await getOwner()).access!.token;
+    expect(await send("/v1/spaces", { token, body: body(CreateSpaceRequestSchema, { name: tooLong }) })).toEqual(refused);
+    const created = await call("/v1/spaces", { token, body: body(CreateSpaceRequestSchema, { name: longest }) }, SpaceInfoSchema);
+    expect(created.status).toBe(201);
+    expect(created.message!.name).toBe(longest);
+  });
+
+  it("lists a space whose create was still storing it when a listing passed newer spaces", async () => {
+    const owner = await getOwner();
+    const token = owner.access!.token;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let gated: Promise<void> | undefined;
+    await runInDurableObject(account(), (instance) => {
+      const spaces = (instance as unknown as { env: Env }).env.SPACE;
+      const get = spaces.get.bind(spaces);
+      vi.spyOn(spaces, "get").mockImplementationOnce((id) => {
+        const stub = get(id);
+        return {
+          init: (args: Parameters<typeof stub.init>[0]) => {
+            gated = Promise.resolve();
+            return gate.then(() => stub.init(args));
+          },
+        } as unknown as typeof stub;
+      });
+    });
+    const pending = call("/v1/spaces", { token, body: body(CreateSpaceRequestSchema, { name: "Slow" }) }, SpaceInfoSchema);
+    await vi.waitFor(() => expect(gated).toBeDefined());
+    const newer: string[] = [];
+    for (let i = 0; i < 101; i++) newer.push(await createSpace(owner));
+    const first = await listSpaces(token);
+    expect(first.message!.nextCursor).not.toBe("");
+    release();
+    const created = await pending;
+    expect(created.status).toBe(201);
+    const later = await spacePages(token, first.message!.nextCursor);
+    const listed = [...first.message!.spaces, ...later.flatMap((page) => page.spaces)].map((space) => space.spaceId);
+    expect(listed).toContain(created.message!.spaceId);
+    expect(listed).toEqual(expect.arrayContaining(newer));
+    expect(new Set(listed).size).toBe(listed.length);
+  });
+
+  it("lists the user's spaces in creation order and pages them by cursor, each page within 32 KiB", async () => {
+    const owner = await getOwner();
+    const token = owner.access!.token;
+    expect(await send("/v1/spaces?cursor=" + uuidv7(), { method: "GET", token })).toEqual(refused);
+    const before = (await spacePages(token)).flatMap((page) => page.spaces.map((space) => space.spaceId));
+    const extra = Array.from({ length: 150 }, () => uuidv7());
+    await runInDurableObject(account(), (_instance, state) => {
+      for (const id of extra) {
+        state.storage.sql.exec(
+          "INSERT INTO spaces (space_id, name, owner_id, created_at_ms, format_version, list_seq) VALUES (?, ?, ?, ?, 1, (SELECT MAX(list_seq) + 1 FROM spaces))",
+          id,
+          "\u0001".repeat(255),
+          owner.userId,
+          Date.now(),
+        );
+      }
+    });
+    try {
+      const pages = await spacePages(token);
+      expect(pages[0]!.spaces).toHaveLength(100);
+      expect(pages.flatMap((page) => page.spaces.map((space) => space.spaceId))).toEqual([...before, ...extra]);
+      for (const page of pages) expect(toBinary(SpaceListSchema, page).length).toBeLessThanOrEqual(32 * 1024);
+    } finally {
+      await runInDurableObject(account(), (_instance, state) => {
+        for (const id of extra) state.storage.sql.exec("DELETE FROM spaces WHERE space_id = ?", id);
+      });
+    }
   });
 });
 

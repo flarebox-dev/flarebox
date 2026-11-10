@@ -51,7 +51,7 @@ pub mod server_info {
         }
     }
 }
-/// POST /v1/claim
+/// POST /v1/claim. user_name, device_name and platform are at most 255 bytes of UTF-8 each (RFC 0007 section 1).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ClaimRequest {
     /// The one-time claim code from the Worker log.
@@ -72,7 +72,8 @@ pub struct PairStartResponse {
     #[prost(int64, tag="2")]
     pub expires_at_ms: i64,
 }
-/// POST /v1/pair/complete, called by the new device.
+/// POST /v1/pair/complete, called by the new device. device_name and platform are at most 255 bytes of UTF-8 each
+/// (RFC 0007 section 1).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PairCompleteRequest {
     #[prost(string, tag="1")]
@@ -125,17 +126,20 @@ pub struct SpaceInfo {
     #[prost(int64, tag="4")]
     pub created_at_ms: i64,
 }
-/// POST /v1/spaces
+/// POST /v1/spaces. name is at most 255 bytes of UTF-8 (RFC 0007 section 1).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CreateSpaceRequest {
     #[prost(string, tag="1")]
     pub name: ::prost::alloc::string::String,
 }
-/// Response of GET /v1/spaces.
+/// Response of GET /v1/spaces?cursor=, at most 100 spaces per page (RFC 0007 section 2).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SpaceList {
     #[prost(message, repeated, tag="1")]
     pub spaces: ::prost::alloc::vec::Vec<SpaceInfo>,
+    /// Empty on the last page; otherwise pass it back as ?cursor=.
+    #[prost(string, tag="2")]
+    pub next_cursor: ::prost::alloc::string::String,
 }
 /// One principal of the caller's user, as GET /v1/devices lists it (RFC 0006 section 7).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

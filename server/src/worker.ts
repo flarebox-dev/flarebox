@@ -90,6 +90,17 @@ async function devices(request: Request, env: Env, deviceId: string | undefined)
   return new Response("Method Not Allowed", { status: 405 });
 }
 
+const encoder = new TextEncoder();
+/** The most UTF-8 bytes in a name or platform a request carries (RFC 0007 section 1). */
+const MAX_NAME_BYTES = 255;
+
+/** Refuses a request whose name or platform is too long, before it changes anything (RFC 0007 section 1). */
+function checkNames(fields: Record<string, string>): void {
+  for (const [field, value] of Object.entries(fields)) {
+    if (encoder.encode(value).length > MAX_NAME_BYTES) throw new BadRequest(`${field} is longer than ${MAX_NAME_BYTES} bytes`);
+  }
+}
+
 /** HTTP statuses of the rewind endpoint's errors (RFC 0003 section 1). */
 const REWIND_STATUS: Partial<Record<Error_Code, number>> = { [Error_Code.HISTORY_MISMATCH]: 409, [Error_Code.RETRY_LATER]: 503 };
 
@@ -199,6 +210,7 @@ async function route(request: Request, env: Env): Promise<Response> {
 
   if (method === "POST" && path === "/v1/claim") {
     const body = await readMessage(request, ClaimRequestSchema);
+    checkNames({ user_name: body.userName, device_name: body.deviceName, platform: body.platform });
     const recoveryKey = (env as Env & { FLAREBOX_RECOVERY_KEY?: string }).FLAREBOX_RECOVERY_KEY;
     const outcome = await account(env).claim(body, request.headers.get("CF-Connecting-IP") ?? "", recoveryKey);
     if (!outcome.ok) return errorReply(request, outcome.code, outcome.message);
@@ -207,6 +219,7 @@ async function route(request: Request, env: Env): Promise<Response> {
 
   if (method === "POST" && path === "/v1/pair/complete") {
     const body = await readMessage(request, PairCompleteRequestSchema);
+    checkNames({ device_name: body.deviceName, platform: body.platform });
     const outcome = await account(env).completePairing(body);
     if (!outcome.ok) return errorReply(request, outcome.code, outcome.message);
     return reply(request, DeviceCredentialsSchema, create(DeviceCredentialsSchema, outcome.value));
@@ -244,13 +257,15 @@ async function route(request: Request, env: Env): Promise<Response> {
 
   if (path === "/v1/spaces") {
     if (method === "GET") {
-      const spaces = await account(env).listSpaces(identity.userId);
-      return reply(request, SpaceListSchema, create(SpaceListSchema, { spaces: spaces.map((s) => create(SpaceInfoSchema, s)) }));
+      const cursor = url.searchParams.get("cursor") ?? "";
+      if (!/^\d{0,15}$/.test(cursor)) throw new BadRequest("malformed cursor");
+      return reply(request, SpaceListSchema, await account(env).listSpaces({ userId: identity.userId, after: Number(cursor) }));
     }
     if (method === "POST") {
       const refused = refuseWithout(request, identity, "space.create");
       if (refused) return refused;
       const body = await readMessage(request, CreateSpaceRequestSchema);
+      checkNames({ name: body.name });
       const created = await account(env).createSpace({ userId: identity.userId, name: body.name });
       return reply(request, SpaceInfoSchema, create(SpaceInfoSchema, created), 201);
     }
