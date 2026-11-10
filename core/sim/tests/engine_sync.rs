@@ -1291,3 +1291,554 @@ fn an_edited_reverted_file_parked_under_a_folder_deleted_remotely_is_kept() {
     ];
     run(&seed, &local, &remote, fits, fresh_dir_names, &during).unwrap();
 }
+
+/// A folder created here is merged into one the other device created, and its S update waits
+/// because S still has a parked folder at that name. The user then renames it onto the name the
+/// parked folder needs, so it blocks that folder and is parked too (GUN-285).
+#[test]
+fn a_folder_renamed_onto_the_name_a_parked_folder_needs_is_parked_too() {
+    let seed = vec![Action {
+        kind: 0,
+        target: 0,
+        parent: 0,
+        name: 5,
+        text: 0,
+    }];
+    let local = vec![
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 4,
+            target: 1370376148349361013,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 1,
+            target: 0,
+            parent: 1015448658534533405,
+            name: 0,
+            text: 0,
+        },
+    ];
+    let remote = vec![
+        Action {
+            kind: 3,
+            target: 0,
+            parent: 4747322177713459370,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 4,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 0,
+            name: 5,
+            text: 0,
+        },
+    ];
+    let fits = 1000;
+    let fresh_dir_names = false;
+    let during = vec![
+        (
+            true,
+            vec![Action {
+                kind: 0,
+                target: 0,
+                parent: 0,
+                name: 5,
+                text: 0,
+            }],
+        ),
+        (
+            true,
+            vec![Action {
+                kind: 3,
+                target: 0,
+                parent: 5182897700414857884,
+                name: 0,
+                text: 0,
+            }],
+        ),
+    ];
+    run(&seed, &local, &remote, fits, fresh_dir_names, &during).unwrap();
+}
+
+/// A file whose S update waits blocks a remote create, and the server then deletes it. It holds
+/// no edit against its waiting shape, so it is removed rather than uploaded again.
+#[test]
+fn a_parked_file_whose_server_update_waits_is_removed_when_the_server_deletes_it() {
+    let seed = vec![
+        Action {
+            kind: 1,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 0,
+            name: 3,
+            text: 0,
+        },
+        Action {
+            kind: 1,
+            target: 0,
+            parent: 971099645012382092,
+            name: 2,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+    ];
+    let local = vec![Action {
+        kind: 4,
+        target: 1956793324523920083,
+        parent: 0,
+        name: 0,
+        text: 0,
+    }];
+    let remote = vec![
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 2832855709947514548,
+            name: 3,
+            text: 0,
+        },
+        Action {
+            kind: 4,
+            target: 5522577497956667845,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 1,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 3,
+            target: 438823430391821631,
+            parent: 5221277148646417130,
+            name: 0,
+            text: 0,
+        },
+    ];
+    let fits = 1000;
+    let fresh_dir_names = false;
+    let during = vec![
+        (
+            false,
+            vec![
+                Action {
+                    kind: 3,
+                    target: 5190931714523467330,
+                    parent: 9928977605353883034,
+                    name: 3,
+                    text: 0,
+                },
+                Action {
+                    kind: 2,
+                    target: 5762732690084641497,
+                    parent: 0,
+                    name: 0,
+                    text: 0,
+                },
+            ],
+        ),
+        (
+            false,
+            vec![
+                Action {
+                    kind: 3,
+                    target: 2270514295357040306,
+                    parent: 0,
+                    name: 0,
+                    text: 0,
+                },
+                Action {
+                    kind: 0,
+                    target: 0,
+                    parent: 7086831897136368260,
+                    name: 3,
+                    text: 0,
+                },
+            ],
+        ),
+        (
+            false,
+            vec![Action {
+                kind: 4,
+                target: 14243556372242850438,
+                parent: 0,
+                name: 0,
+                text: 0,
+            }],
+        ),
+    ];
+    run(&seed, &local, &remote, fits, fresh_dir_names, &during).unwrap();
+}
+
+/// A created file's S update waits, and settling then gives S the other device's content. The user
+/// then writes the content the file was created with again; the stale update must not make that
+/// write look uploaded.
+#[test]
+fn a_waiting_update_that_settling_replaced_does_not_hide_a_later_edit() {
+    let seed = vec![
+        Action {
+            kind: 1,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 0,
+            name: 3,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 5154893513058372197,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 3121141568318315682,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 15085739982097279210,
+            name: 5,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 12042687951629207403,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 1,
+            target: 0,
+            parent: 805902510814196342,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 752737086628574172,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 2061236886198686334,
+            name: 2,
+            text: 0,
+        },
+    ];
+    let local = vec![
+        Action {
+            kind: 3,
+            target: 11231637698525412811,
+            parent: 4780766426531151849,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 4,
+            target: 11675596971973797087,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 7216849391709144393,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 4,
+            target: 13401659892108216031,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 1,
+            target: 0,
+            parent: 6236013527037087150,
+            name: 3,
+            text: 1,
+        },
+    ];
+    let remote = vec![
+        Action {
+            kind: 2,
+            target: 7088491083489211429,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 3,
+            target: 17401249810093626761,
+            parent: 231179896921208167,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 3,
+            target: 10774319552713167365,
+            parent: 2638094422400810531,
+            name: 2,
+            text: 0,
+        },
+    ];
+    let fits = 1000;
+    let fresh_dir_names = false;
+    let during = vec![
+        (
+            false,
+            vec![
+                Action {
+                    kind: 4,
+                    target: 158282335639317271,
+                    parent: 0,
+                    name: 0,
+                    text: 0,
+                },
+                Action {
+                    kind: 4,
+                    target: 1121437384512356461,
+                    parent: 0,
+                    name: 0,
+                    text: 0,
+                },
+            ],
+        ),
+        (
+            false,
+            vec![Action {
+                kind: 2,
+                target: 3139751682532370971,
+                parent: 0,
+                name: 0,
+                text: 0,
+            }],
+        ),
+        (
+            true,
+            vec![
+                Action {
+                    kind: 4,
+                    target: 6209302477719205039,
+                    parent: 0,
+                    name: 0,
+                    text: 0,
+                },
+                Action {
+                    kind: 2,
+                    target: 4326100334342803349,
+                    parent: 0,
+                    name: 0,
+                    text: 1,
+                },
+            ],
+        ),
+    ];
+    run(&seed, &local, &remote, fits, fresh_dir_names, &during).unwrap();
+}
+
+/// A move's S update waits, and the other device moves the file back before it is made. Once L
+/// follows, the update is stale, so the user's edit to the file is uploaded.
+#[test]
+fn a_waiting_update_both_sides_moved_past_does_not_hold_back_an_edit() {
+    let seed = vec![
+        Action {
+            kind: 1,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 0,
+            name: 5,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 978237978856208785,
+            name: 2,
+            text: 0,
+        },
+        Action {
+            kind: 1,
+            target: 0,
+            parent: 4194549617926577008,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 8070810026119318711,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 17775129536871628555,
+            name: 2,
+            text: 0,
+        },
+        Action {
+            kind: 1,
+            target: 0,
+            parent: 3309602263058540387,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 1280557214040556292,
+            name: 0,
+            text: 0,
+        },
+    ];
+    let local = vec![
+        Action {
+            kind: 4,
+            target: 10356890765720543216,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 1,
+            target: 0,
+            parent: 1115092823749830263,
+            name: 3,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 9079959440039050417,
+            name: 2,
+            text: 0,
+        },
+    ];
+    let remote = vec![
+        Action {
+            kind: 4,
+            target: 15907938580905265140,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 4,
+            target: 4229855130926676766,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 3,
+            target: 6810740145664341458,
+            parent: 2110593086026663230,
+            name: 5,
+            text: 0,
+        },
+    ];
+    let fits = 2;
+    let fresh_dir_names = false;
+    let during = vec![
+        (
+            true,
+            vec![Action {
+                kind: 1,
+                target: 0,
+                parent: 12430656056815562337,
+                name: 0,
+                text: 0,
+            }],
+        ),
+        (
+            false,
+            vec![Action {
+                kind: 3,
+                target: 291780538349244884,
+                parent: 0,
+                name: 0,
+                text: 0,
+            }],
+        ),
+        (
+            false,
+            vec![Action {
+                kind: 3,
+                target: 1207142123533410396,
+                parent: 14415471485496758628,
+                name: 0,
+                text: 0,
+            }],
+        ),
+        (
+            true,
+            vec![Action {
+                kind: 2,
+                target: 4350527627605106883,
+                parent: 0,
+                name: 0,
+                text: 0,
+            }],
+        ),
+    ];
+    run(&seed, &local, &remote, fits, fresh_dir_names, &during).unwrap();
+}

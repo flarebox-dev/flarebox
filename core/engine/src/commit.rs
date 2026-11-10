@@ -96,7 +96,6 @@ pub struct Commits {
     in_flight: Option<InFlight>,
     problems: BTreeSet<NodeId>,
     halted: Option<Halt>,
-    waiting: BTreeMap<NodeId, Option<Shape>>,
     /// The most ops the next commit holds after a `LIMIT_EXCEEDED`, doubled back towards
     /// [`MAX_OPS`] by every acknowledged commit.
     cap: Option<usize>,
@@ -131,13 +130,6 @@ impl Commits {
 
     pub fn halted(&self) -> Option<Halt> {
         self.halted
-    }
-
-    /// S updates of acknowledged ops that would not leave S a valid tree yet, by node. Each is
-    /// made as soon as it fits, or dropped once S agrees with L for the node anyway; until then
-    /// the node is left out of planning.
-    pub fn waiting(&self) -> &BTreeMap<NodeId, Option<Shape>> {
-        &self.waiting
     }
 
     /// Builds the next commit from local changes, unless one is in flight or committing has
@@ -176,7 +168,7 @@ impl Commits {
         let skip: BTreeSet<NodeId> = self
             .problems
             .iter()
-            .chain(self.waiting.keys())
+            .chain(trees.waiting().keys())
             .chain(parked.map(|(id, _)| id))
             .cloned()
             .collect();
@@ -229,7 +221,7 @@ impl Commits {
     /// the commit's slot. Returns false while there is nothing to acknowledge.
     ///
     /// S stays a valid tree. When the updates together would break it, because S still lags R
-    /// elsewhere, each is made as soon as it fits and the rest wait (see [`Commits::waiting`]).
+    /// elsewhere, each is made as soon as it fits and the rest wait (see [`Trees::waiting`]).
     pub fn acknowledge(&mut self, trees: &mut Trees, last_seq: u64) -> bool {
         let Some(flight) = self
             .in_flight
@@ -343,7 +335,7 @@ impl Commits {
             }
         }
         for (id, shape) in synced.apply(trees) {
-            self.waiting.insert(id, shape);
+            trees.wait(id, shape);
         }
         self.retry_waiting(trees, BTreeSet::new(), Vec::new());
         self.accepted = flight.commit.device_seq;
@@ -361,13 +353,14 @@ impl Commits {
         needed: BTreeSet<NodeId>,
         agreed: Vec<(NodeId, Option<Shape>)>,
     ) -> BTreeSet<NodeId> {
-        self.waiting.retain(|id, _| {
+        let mut waiting = trees.take_waiting();
+        waiting.retain(|id, shape| {
             !same(
                 trees.synced().live(id),
                 trees.local().get(id).map(|node| &node.shape),
-            )
+            ) && !overtaken(trees, id, shape.as_ref())
         });
-        let updates = std::mem::take(&mut self.waiting)
+        let updates = waiting
             .into_iter()
             .chain(needed.iter().map(|id| (id.clone(), None)))
             .chain(agreed.iter().cloned())
@@ -377,7 +370,7 @@ impl Commits {
             if needed.contains(&id) {
                 still.insert(id);
             } else if !agreed.iter().any(|(other, _)| *other == id) {
-                self.waiting.insert(id, shape);
+                trees.wait(id, shape);
             }
         }
         still
@@ -588,7 +581,8 @@ fn rebase(
 ) -> (BTreeSet<NodeId>, Vec<(NodeId, Option<Shape>)>) {
     let dirty: Vec<NodeId> = trees.dirty().iter().cloned().collect();
     for id in &dirty {
-        if trees.reverted().contains(id) && trees.remote().live(id).is_none() && trees.edited(id) {
+        let held = trees.reverted().contains(id) || trees.waiting().contains_key(id);
+        if held && trees.remote().live(id).is_none() && trees.edited(id) {
             rekey(trees, id, &ids.uuid_v7(now_ms));
         }
     }
@@ -700,6 +694,28 @@ fn keep(trees: &mut Trees, id: &str, needed: &mut BTreeSet<NodeId>) {
         }
         current = parent;
     }
+}
+
+/// Whether both sides moved past a waiting S update the same way: wherever R no longer matches it,
+/// L matches R. The update is then stale, and S keeps what it had, as for any change both sides
+/// made alike.
+fn overtaken(trees: &Trees, id: &str, waiting: Option<&Shape>) -> bool {
+    let (Some(waiting), Some(local), Some(remote)) = (
+        waiting,
+        trees.local().get(id).map(|node| &node.shape),
+        trees.remote().live(id),
+    ) else {
+        return false;
+    };
+    let content = |a: &Shape, b: &Shape| match (&a.content, &b.content) {
+        (Some(a), Some(b)) => same_content(a, b),
+        (a, b) => a.is_none() && b.is_none(),
+    };
+    let moved = !waiting.same_position(remote);
+    let rewritten = !content(waiting, remote);
+    (moved || rewritten)
+        && (!moved || local.same_position(remote))
+        && (!rewritten || content(local, remote))
 }
 
 /// The bytes a change record of a node with this shape takes, roughly.

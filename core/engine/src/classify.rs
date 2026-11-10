@@ -51,6 +51,7 @@ pub struct Trees {
     unsearched: BTreeSet<NodeId>,
     reverted: BTreeSet<NodeId>,
     parked_as: BTreeMap<NodeId, NodeId>,
+    waiting: BTreeMap<NodeId, Option<Shape>>,
 }
 
 impl Trees {
@@ -64,6 +65,7 @@ impl Trees {
             unsearched: BTreeSet::new(),
             reverted: BTreeSet::new(),
             parked_as: BTreeMap::new(),
+            waiting: BTreeMap::new(),
         }
     }
 
@@ -123,6 +125,22 @@ impl Trees {
         }
     }
 
+    /// S updates of acknowledged ops that would not leave S a valid tree yet, by node. The commit
+    /// layer makes each as soon as it fits, or drops it once S agrees with L for the node anyway;
+    /// until then the node is left out of planning.
+    pub fn waiting(&self) -> &BTreeMap<NodeId, Option<Shape>> {
+        &self.waiting
+    }
+
+    pub(crate) fn take_waiting(&mut self) -> BTreeMap<NodeId, Option<Shape>> {
+        std::mem::take(&mut self.waiting)
+    }
+
+    pub(crate) fn wait(&mut self, id: NodeId, shape: Option<Shape>) {
+        self.dirty.insert(id.clone());
+        self.waiting.insert(id, shape);
+    }
+
     /// Sets S, or clears it with `None` (S := ⊥).
     pub fn set_synced(&mut self, id: NodeId, shape: Option<Shape>) {
         self.set_synced_unmarked(&id, shape);
@@ -142,11 +160,15 @@ impl Trees {
         classify(self.l.live(id), self.s.live(id), self.r.live(id))
     }
 
-    /// Whether L holds content that S does not: an edit not uploaded yet.
+    /// Whether L holds content that S does not, or, while the node's S update waits, content the
+    /// waiting shape does not: an edit not uploaded yet.
     pub fn edited(&self, id: &str) -> bool {
         let content = self.l.get(id).and_then(|node| node.shape.content.as_ref());
-        let synced = self.s.live(id).and_then(|shape| shape.content.as_ref());
-        match (content, synced) {
+        let synced = match self.waiting.get(id) {
+            Some(shape) => shape.as_ref(),
+            None => self.s.live(id),
+        };
+        match (content, synced.and_then(|shape| shape.content.as_ref())) {
             (Some(local), Some(synced)) => !same_content(local, synced),
             (local, _) => local.is_some(),
         }
@@ -446,6 +468,7 @@ impl Trees {
     }
 
     fn set_synced_unmarked(&mut self, id: &str, shape: Option<Shape>) {
+        self.waiting.remove(id);
         match shape {
             Some(shape) => {
                 self.s.insert(id.to_owned(), shape);

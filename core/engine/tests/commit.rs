@@ -772,6 +772,88 @@ fn a_parked_file_rekeyed_for_its_edit_is_moved_out_from_where_it_was_parked() {
 }
 
 #[test]
+fn a_file_whose_s_update_waits_is_removed_or_uploaded_anew_after_a_remote_delete() {
+    for (edit, parked) in [(None, false), (None, true), (Some(2), false)] {
+        let mut trees = trees(&[synced("h", file(ROOT, "x", 9))]);
+        trees.set_remote("h".into(), remote(file(ROOT, "y", 9)));
+        trees.set_local(
+            "h".into(),
+            LocalNode {
+                parked: true,
+                ..local(file(ROOT, "x", 9), 1)
+            },
+        );
+        trees.set_local("n".into(), local(file(ROOT, "x", 1), 2));
+        trees.settle();
+        let (mut commits, mut ids, mut effects) =
+            (Commits::default(), IdGen::new(1), Effects::default());
+        let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+        assert!(matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id == "n"));
+        trees.set_remote("n".into(), remote(file(ROOT, "x", 1)));
+        acknowledge(
+            &mut commits,
+            &mut trees,
+            vec![outcome(op_result::Code::Applied)],
+        );
+        assert!(trees.waiting().contains_key("n"), "S still has h at x");
+        if let Some(digest) = edit {
+            trees.set_local("n".into(), local(file(ROOT, "x", digest), 3));
+        }
+        if parked {
+            trees.set_local(
+                "n".into(),
+                LocalNode {
+                    parked: true,
+                    ..local(file(ROOT, "x", 1), 2)
+                },
+            );
+            trees.set_local("b".into(), local(file(ROOT, "x", 5), 4));
+        }
+        trees.set_remote("n".into(), trashed(file(ROOT, "x", 1)));
+        trees.settle();
+        let mut removed = false;
+        for _ in 0..4 {
+            let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() else {
+                break;
+            };
+            if record.node == "h" {
+                effects.failed(&record.effect_id).unwrap();
+                continue;
+            }
+            assert_eq!(record.node, "n", "{record:?}");
+            removed = matches!(record.effect, Effect::RemoveFile { .. });
+            effects.done(&mut trees, &record.effect_id, None).unwrap();
+            trees.settle();
+        }
+        let commit = build(&mut commits, &mut trees, &mut ids);
+        match edit {
+            None => {
+                assert!(
+                    removed,
+                    "a file with no edit follows the delete, parked={parked}"
+                );
+                assert!(trees.local().get("n").is_none());
+                let ops = commit.map(|commit| ops(&commit)).unwrap_or_default();
+                assert!(
+                    ops.iter()
+                        .all(|op| matches!(op, op::Op::CreateFile(c) if c.node_id == "b")),
+                    "{ops:?}"
+                );
+            }
+            Some(digest) => {
+                assert!(!removed, "an edit is never removed");
+                let ops = ops(&commit.expect("the edit is uploaded"));
+                assert!(
+                    matches!(&ops[..], [op::Op::CreateFile(c)]
+                        if c.node_id != "n" && c.content == Some(content(digest))),
+                    "{ops:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn a_parked_reverted_folder_the_server_lacks_is_removed_even_when_its_name_is_taken() {
     let mut trees = trees(&[synced("h", dir(ROOT, "x"))]);
     trees.set_local(
