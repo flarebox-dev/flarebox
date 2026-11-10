@@ -3122,3 +3122,76 @@ fn a_file_moved_into_an_ignored_folder_before_a_folder_above_it_was_moved_is_kep
     assert_eq!(fs::read(site.root.join("ig/file")).unwrap(), b"kept");
     assert_eq!(a.folder.engine.trees.check(), Ok(()));
 }
+
+/// The user moves the folder `d/a` into the ignored folder `ig`, moves its file from there into the ignored folder
+/// `other`, brings the empty folder back as `returned` and removes it. The file stays out the whole time, so the
+/// server keeps it, with the folder it is in there.
+#[test]
+fn a_file_moved_out_of_its_folder_while_the_folder_was_ignored_stays_on_the_server_when_the_folder_returns_and_is_removed()
+ {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::create_dir_all(site.root.join("d/a")).unwrap();
+    a.create(&mut remote, &site.root.join("d/a/file"), b"kept");
+    a.create(&mut remote, &site.root.join(".fbignore"), b"ig/\nother/\n");
+    fs::create_dir(site.root.join("ig")).unwrap();
+    fs::create_dir(site.root.join("other")).unwrap();
+    fs::rename(site.root.join("d/a"), site.root.join("ig/a")).unwrap();
+    fs::rename(site.root.join("ig/a/file"), site.root.join("other/file")).unwrap();
+    a.scan_until(|a| !a.folder.engine.trees.ignored_local().is_empty());
+    a.run(&mut remote);
+    fs::rename(site.root.join("ig/a"), site.root.join("returned")).unwrap();
+    a.scan_until(|a| (a.observer.snapshot().entries).contains_key(Path::new("returned")));
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    assert_eq!(remote.names(), [".fbignore", "d", "file", "returned"]);
+    fs::remove_dir(site.root.join("returned")).unwrap();
+    a.scan_until(|a| !(a.observer.snapshot().entries).contains_key(Path::new("returned")));
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    assert_eq!(remote.names(), [".fbignore", "d", "file", "returned"]);
+    assert_eq!(fs::read(site.root.join("other/file")).unwrap(), b"kept");
+    assert_eq!(a.folder.engine.trees.check(), Ok(()));
+}
+
+/// As above, with a restart after the folder returns: the snapshot rebuilt from L holds the file in `returned`, and
+/// the first scan finds it in `other`.
+#[test]
+fn a_file_moved_out_of_its_folder_while_the_folder_was_ignored_stays_on_the_server_after_a_restart()
+{
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::create_dir_all(site.root.join("d/a")).unwrap();
+    a.create(&mut remote, &site.root.join("d/a/file"), b"kept");
+    a.create(&mut remote, &site.root.join(".fbignore"), b"ig/\nother/\n");
+    fs::create_dir(site.root.join("ig")).unwrap();
+    fs::create_dir(site.root.join("other")).unwrap();
+    fs::rename(site.root.join("d/a"), site.root.join("ig/a")).unwrap();
+    fs::rename(site.root.join("ig/a/file"), site.root.join("other/file")).unwrap();
+    a.scan_until(|a| !a.folder.engine.trees.ignored_local().is_empty());
+    a.run(&mut remote);
+    fs::rename(site.root.join("ig/a"), site.root.join("returned")).unwrap();
+    a.scan_until(|a| (a.observer.snapshot().entries).contains_key(Path::new("returned")));
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    drop(a);
+
+    let mut a = site.start();
+    a.connect(&remote);
+    a.scan_until(|a| a.folder.scanned);
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    assert_eq!(remote.names(), [".fbignore", "d", "file", "returned"]);
+    fs::remove_dir(site.root.join("returned")).unwrap();
+    a.scan_until(|a| !(a.observer.snapshot().entries).contains_key(Path::new("returned")));
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    assert_eq!(remote.names(), [".fbignore", "d", "file", "returned"]);
+    assert_eq!(fs::read(site.root.join("other/file")).unwrap(), b"kept");
+    assert_eq!(a.folder.engine.trees.check(), Ok(()));
+}

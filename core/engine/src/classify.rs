@@ -310,7 +310,10 @@ impl Trees {
             self.parked_as.remove(&id);
             self.l_names.insert(&id, &node.shape);
         }
-        self.outside.remove(&id);
+        if self.outside.remove(&id) {
+            let children: Vec<NodeId> = self.l_names.children(&id).cloned().collect();
+            self.outside.extend(children);
+        }
         (self.l_identities.entry(node.identity).or_default()).insert(id.clone());
         self.mark(&id);
         self.l.insert(id, node);
@@ -403,9 +406,11 @@ impl Trees {
 
     /// Records that the user moved the local copy of `id` into an ignored folder that is no node,
     /// so L cannot hold its new position. L keeps the entry as it was, and the node is excluded
-    /// until an observation places it again or removes it. This is not part of the stored state:
-    /// after a restart the entry is missing from its path again, and the scan that finds it
-    /// under the ignored folder reports the move once more.
+    /// until an observation places it again or removes it. When the node is placed again, its
+    /// children are recorded in its place: the user may have moved them elsewhere while it was
+    /// excluded, so each stays excluded until an observation places it too. This is not part of
+    /// the stored state: after a restart the entry is missing from its path again, and the scan
+    /// that finds it under the ignored folder reports the move once more.
     pub fn ignore_local(&mut self, id: &str) {
         if self.l.get(id).is_some() {
             self.outside.insert(id.to_owned());

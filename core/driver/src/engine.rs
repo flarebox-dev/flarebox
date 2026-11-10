@@ -610,6 +610,9 @@ impl Engine {
         let existing = node.as_ref().and_then(|id| self.trees.local().get(id));
         let unchanged = existing.is_some_and(|old| {
             !old.parked
+                && node
+                    .as_ref()
+                    .is_some_and(|id| !self.trees.ignored_local().contains(id))
                 && old.identity == identity
                 && old.shape.parent == shape.parent
                 && old.shape.name == shape.name
