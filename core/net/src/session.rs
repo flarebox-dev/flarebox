@@ -635,6 +635,7 @@ impl Task {
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.starts_with(PROTOBUF));
+        let unreadable = std::mem::take(&mut self.unreadable_refusals);
         if protobuf {
             let (head, tail) = response.into_parts();
             let error = refusal_body(&head, tail.unwrap_or_default(), kept)
@@ -652,7 +653,7 @@ impl Task {
                 }
                 Some(None) => {}
                 None => {
-                    self.unreadable_refusals += 1;
+                    self.unreadable_refusals = unreadable + 1;
                     if self.unreadable_refusals >= MAX_UNREADABLE_REFUSALS {
                         return Err(Exit::Stop(StopReason::Refused(format!(
                             "HTTP {status}, {} times in a row, with an error that could not be read",

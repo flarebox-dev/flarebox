@@ -1143,7 +1143,7 @@ async fn chunked_and_close_delimited_upgrade_refusals_are_read_whole() {
 }
 
 #[tokio::test]
-async fn a_refusal_whose_error_cannot_be_read_is_retried_a_bounded_number_of_times() {
+async fn a_refusal_whose_error_cannot_be_read_is_retried_a_bounded_number_of_times_in_a_row() {
     let (listener, auth) = listen().await;
     let (_session, mut events) = Session::start(auth, config()).unwrap();
     let server = tokio::spawn(async move {
@@ -1152,7 +1152,10 @@ async fn a_refusal_whose_error_cannot_be_read_is_retried_a_bounded_number_of_tim
             tokio::time::timeout(Duration::from_secs(2), listener.accept()).await
         {
             attempts += 1;
-            let answer = if attempts % 2 == 0 {
+            let answer = if attempts == MAX_UNREADABLE_REFUSALS {
+                // A refusal that is read ends the run.
+                vec![b"HTTP/1.1 500 X\r\ncontent-length: 0\r\n\r\n".to_vec()]
+            } else if attempts % 2 == 0 {
                 // A whole body that is not an `Error`.
                 vec![
                     b"HTTP/1.1 500 X\r\ncontent-type: application/x-protobuf\r\ncontent-length: 3\r\n\r\n".to_vec(),
@@ -1182,7 +1185,7 @@ async fn a_refusal_whose_error_cannot_be_read_is_retried_a_bounded_number_of_tim
         matches!(&stopped, Event::Stopped(StopReason::Refused(why)) if why.contains("could not be read")),
         "{stopped:?}"
     );
-    assert_eq!(server.await.unwrap(), MAX_UNREADABLE_REFUSALS);
+    assert_eq!(server.await.unwrap(), 2 * MAX_UNREADABLE_REFUSALS);
 }
 
 #[tokio::test]
