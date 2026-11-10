@@ -657,7 +657,15 @@ impl Session {
         server: Option<&str>,
         device_name: &str,
     ) -> Result<(), String> {
-        self.resumable(paths)?;
+        if let (Some(state), Some(name)) = (self.resumable(paths)?, server)
+            && state.script != name
+        {
+            return Err(unfinished(
+                &state,
+                self.account(),
+                StateFile::new(paths).path(),
+            ));
+        }
         let found = self.pick(server).await?;
         self.add_device(paths, found, device_name, false).await
     }
@@ -1488,6 +1496,36 @@ mod tests {
                 .iter()
                 .any(|seen| seen.path.contains("/accounts/") || seen.path.starts_with("/v1/"))
         );
+    }
+
+    #[tokio::test]
+    async fn adding_a_device_to_a_named_server_stops_at_another_workers_deploy_before_calling_the_account()
+     {
+        let fake = Fake::start(vec![tokens()]).await;
+        let mut session = fake::session(&fake).await;
+        let before = fake.seen().len();
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let unfinished = SetupState {
+            account: ACCOUNT.into(),
+            script: "flarebox-2".into(),
+            bucket: new_bucket_name("flarebox"),
+            step: Step::BucketCreated,
+            ..SetupState::default()
+        };
+        StateFile::new(&paths).save(&unfinished).unwrap();
+
+        let error = session
+            .server_add_device(&paths, Some("flarebox"), "laptop")
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.contains("the deploy of flarebox-2 has not finished"),
+            "{error}"
+        );
+        assert_eq!(StateFile::new(&paths).load().unwrap(), Some(unfinished));
+        assert_eq!(fake.seen().len(), before);
     }
 
     #[test]
