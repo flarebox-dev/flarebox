@@ -71,10 +71,42 @@ private func item(_ path: String) -> HeldItem {
         let storage = try await model.storage()
         let spaces = try await model.spaces()
         #expect(storage.map(\.space) == spaces)
-        let first = try #require(storage.first)
-        let usage = first.usage
-        #expect(first.totalBytes > 0)
-        #expect(first.totalBytes == usage.liveBytes + usage.trashBytes + usage.oldVersionBytes + usage.unreferencedBytes)
+        let usage = try #require(storage.first).usage.get()
+        #expect(usage.totalBytes > 0)
+        #expect(usage.totalBytes == usage.liveBytes + usage.trashBytes + usage.oldVersionBytes + usage.unreferencedBytes)
+    }
+
+    @Test func storageKeepsTheSpacesThatAnswer() async throws {
+        let model = AppModel.fake(scenario: .upToDate)
+        let spaces = try await model.spaces()
+        try #require(spaces.count > 1)
+        let refusal = SessionError.ServerUnreachable(reason: "space closed for a rewind")
+        try #require(model.session.fakeCore()).refuseSpaceUsage(spaceId: spaces[0].spaceId, error: refusal)
+        let storage = try await model.storage()
+        #expect(storage.map(\.space) == spaces)
+        #expect(storage[0].usage == .failure(refusal))
+        for answered in storage.dropFirst() {
+            #expect(try answered.usage.get().totalBytes > 0)
+        }
+    }
+
+    @Test func storageListsEveryRefusal() async throws {
+        let model = AppModel.fake(scenario: .upToDate)
+        let spaces = try await model.spaces()
+        let fake = try #require(model.session.fakeCore())
+        for space in spaces {
+            fake.refuseSpaceUsage(spaceId: space.spaceId, error: .SpaceNotFound)
+        }
+        let storage = try await model.storage()
+        #expect(storage.map(\.space) == spaces)
+        #expect(storage.map(\.usage) == spaces.map { _ in Result<SpaceUsage, SessionError>.failure(.SpaceNotFound) })
+    }
+
+    @Test func storageFailsWhenNotSignedIn() async throws {
+        let model = AppModel.fake(scenario: .upToDate)
+        let space = try #require(try await model.spaces().last)
+        try #require(model.session.fakeCore()).refuseSpaceUsage(spaceId: space.spaceId, error: .NotSignedIn)
+        await #expect(throws: SessionError.NotSignedIn) { try await model.storage() }
     }
 
     @Test func pauseAndResume() throws {

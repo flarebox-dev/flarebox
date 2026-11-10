@@ -254,11 +254,16 @@ private struct StorageSettings: View {
                 Form {
                     ForEach(spaces ?? []) { storage in
                         Section(storage.space.name) {
-                            StorageRow(title: "Live files", count: "^[\(storage.usage.liveFiles) file](inflect: true)", bytes: storage.usage.liveBytes)
-                            StorageRow(title: "Trash", count: "^[\(storage.usage.trashedFiles) file](inflect: true)", bytes: storage.usage.trashBytes)
-                            StorageRow(title: "Old versions", count: "^[\(storage.usage.oldVersions) version](inflect: true)", bytes: storage.usage.oldVersionBytes)
-                            StorageRow(title: "Unreferenced", count: nil, bytes: storage.usage.unreferencedBytes)
-                            StorageRow(title: "Total", count: nil, bytes: storage.totalBytes).bold()
+                            switch storage.usage {
+                            case .success(let usage):
+                                StorageRow(title: "Live files", count: "^[\(usage.liveFiles) file](inflect: true)", bytes: usage.liveBytes)
+                                StorageRow(title: "Trash", count: "^[\(usage.trashedFiles) file](inflect: true)", bytes: usage.trashBytes)
+                                StorageRow(title: "Old versions", count: "^[\(usage.oldVersions) version](inflect: true)", bytes: usage.oldVersionBytes)
+                                StorageRow(title: "Unreferenced", count: nil, bytes: usage.unreferencedBytes)
+                                StorageRow(title: "Total", count: nil, bytes: usage.totalBytes).bold()
+                            case .failure(let refusal):
+                                Label(refusal.message, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red)
+                            }
                         }
                     }
                     Section {

@@ -101,6 +101,8 @@ struct State {
     recent: Vec<RecentChange>,
     answers: Vec<GivenAnswer>,
     fail_next: Option<SessionError>,
+    /// The spaces whose usage the server refuses, and how.
+    usage_refusals: Vec<(String, SessionError)>,
     fail_saves: bool,
     /// [`ProblemKind::StateNotWritable`] after a failed save, until a save succeeds. It is
     /// not saved itself.
@@ -214,6 +216,7 @@ impl FakeCore {
                 recent: Vec::new(),
                 answers: Vec::new(),
                 fail_next: None,
+                usage_refusals: Vec::new(),
                 fail_saves: false,
                 not_writable: None,
                 status: SyncStatus::Stopped,
@@ -337,6 +340,7 @@ impl FakeCore {
         state.recent = script.recent;
         state.answers.clear();
         state.fail_next = None;
+        state.usage_refusals.clear();
         self.publish(&mut state, &ALL_PARTS, cleared);
         Ok(())
     }
@@ -472,6 +476,11 @@ impl FakeCore {
     /// Makes the next call that can fail return `error` instead.
     pub fn fail_next(&self, error: SessionError) {
         self.lock().fail_next = Some(error);
+    }
+
+    /// Makes every usage read of the space fail with `error`, as for a space a rewind holds closed.
+    pub fn refuse_space_usage(&self, space_id: String, error: SessionError) {
+        self.lock().usage_refusals.push((space_id, error));
     }
 
     /// Makes every save fail, as an unwritable store would, until called with false.
@@ -700,6 +709,9 @@ impl Core for FakeCore {
         let mut state = self.lock();
         state.take_failure()?;
         state.saved.account()?;
+        if let Some((_, error)) = state.usage_refusals.iter().find(|(id, _)| id == space_id) {
+            return Err(error.clone());
+        }
         let n = state
             .saved
             .spaces
