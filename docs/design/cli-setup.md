@@ -7,12 +7,13 @@ Every step below ran against the test account "Flarebox deploy test" on 2026-11-
 ## Summary
 
 - One OAuth login (Authorization Code with PKCE, public client, no secret) is enough to deploy the server, claim it and upgrade it later. The CLI needs no Node, no Wrangler and no API token. The measured setup took 13 seconds from the first API call to a claimed server with the secret deleted again.
-- The client needs four scopes: `account-settings.read`, `workers-scripts.admin`, `workers-r2.write` and `offline_access`. Workers Editor (`workers-scripts.edit`) is not enough, because script upload and asset upload return 403 under it. Workers Scripts Write (`workers-scripts.write`) exists but the dashboard cannot add it to a client.
-- The loopback redirect works on `http://127.0.0.1` with any port. The device-code grant is not available to third-party clients, so a headless Linux machine joins with a pairing code from a device that has a browser, or pastes the redirect URL.
+- The client needs four scopes: `account-settings.read`, `workers-scripts.admin`, `workers-r2.write` and `offline_access`. Workers Editor (`workers-scripts.edit`) is not enough, because script upload and asset upload return 403 under it. Flarebox uses Workers Admin (section 11, decision 1).
+- The loopback redirect works on `http://127.0.0.1` with any port. The device-code grant is not available to third-party clients, so a headless Linux machine joins with a pairing code from a device that has a browser by default, or pastes the redirect URL with `--no-browser`.
 - The claim moves from the Worker log to a one-time Worker secret. The server needs one small change, so that a correct `FLAREBOX_RECOVERY_KEY` also claims a server that has no owner yet. Adding a device to an existing owner through the same secret already works on main.
-- `flarebox setup` finds an existing server by a script tag (`flarebox-server`) and confirms it with `GET /v1/server`. With no server it deploys and claims one. With one it adds this device.
+- `flarebox setup` finds an existing server by a script tag (`flarebox-server`) and confirms it with `GET /v1/server`. With no server it deploys and claims one. With one it adds this device. A run that stopped halfway resumes from a small state file that holds no secrets (section 4.6).
 - Upgrades upload a newer bundle under the same names. Bindings, secrets and data survive, and storage migrations run when each Durable Object adopts the new code, which Cloudflare now defers for up to 300 seconds by default.
-- Before Flarebox can ship this to everyone, the OAuth client must become public. That needs a verified domain on the client URL, a logo and a name, and promotion is permanent.
+- Before Flarebox can ship this to everyone, the OAuth client must become public. That needs a verified domain on the client URL (flarebox.dev, bought before launch), a logo and a name, and promotion is permanent.
+- Section 11 records the project owner's decisions and lists the points still waiting for one.
 
 ## 1. Commands
 
@@ -38,12 +39,13 @@ flowchart TD
     E --> D
     D -->|Yes| F{Flarebox servers in the account}
     F -->|None| G[Create bucket, upload bundle with a one-time secret, enable workers.dev]
-    G --> H[Claim with the secret, then delete the secret]
+    F -->|Interrupted deploy| L[Finish the missing steps, section 4.6] --> H
+    G --> H[Claim with the secret, save credentials, delete the secret]
     F -->|One| I[Set a one-time secret, claim as a new device of the owner, delete the secret]
     F -->|Several| K[Ask which one] --> I
 ```
 
-The pairing code carries the server address, so a new device needs nothing else. Today `POST /v1/pair/start` returns an 8-character code such as `K7QM-2XPD` that is valid for 600 seconds (measured on the deployed server). The proposal is `<code>@<host>`, for example `K7QM-2XPD@flarebox.alice.workers.dev`. The CLI splits on the last `@` and prepends `https://`. The code alone still works with `--server`. The existing `flarebox pair --server --code --name` becomes `flarebox join`, and `pair` is removed in the same change.
+The pairing code carries the server address, so a new device needs nothing else. Today `POST /v1/pair/start` returns an 8-character code such as `K7QM-2XPD` that is valid for 600 seconds (measured on the deployed server). The CLI shows it as `<code>@<host>`, for example `K7QM-2XPD@flarebox.alice.workers.dev` (decision 3). A QR code in the macOS app comes later. The CLI splits on the last `@` and prepends `https://`. The code alone still works with `--server`. The existing `flarebox pair --server --code --name` becomes `flarebox join`, and `pair` is removed in the same change.
 
 The explicit subcommands never ask questions, so scripts can use them. Each one that needs Cloudflare runs the login itself (section 5).
 
@@ -76,13 +78,14 @@ Measured behaviour:
 Rules this gives the implementation:
 
 - Exchange each code exactly once. After a timeout or a lost response, start a new login instead of resending the exchange, or the user loses the grant.
-- Keep one writer for the refresh token. Write the new refresh token to storage (atomic rename) before using the new access token, and hold a lock across the refresh. Two processes refreshing from the same old token risk revoking the grant.
+- Treat a lost refresh response the same way. The CLI does not resend the old refresh token, because a late reuse revokes the grant. It starts a new login.
+- Keep the grant inside one process. The CLI revokes it when the command ends (decision 2), so a command normally finishes on its first access token. A command that outlives the hour, for example one waiting on the R2 checkout, refreshes once in the same process and uses only the newest refresh token. Two processes refreshing from the same old token would risk revoking the grant.
 - Read the granted `scope` from the token response and stop with a clear message if a required scope is missing. Optional scopes can be declined on the consent page ([Authorizing an application](#ref-authorizing)).
 
 **Headless Linux.** The device grant is not available, so a machine without a browser has three options:
 
-1. Join with a pairing code from a device that has a browser. A server needs one Cloudflare login, not one per device. This is the recommended path.
-2. `flarebox setup --no-browser` prints the authorize URL. The user opens it on any machine, and the final redirect to `127.0.0.1` fails to load there. The user copies that page's address and pastes it into the CLI, which checks the state and exchanges the code. *Unverified* end to end; it relies only on the code and state in the URL, which the prototype received.
+1. Join with a pairing code from a device that has a browser. A server needs one Cloudflare login, not one per device. This is the default (decision 4).
+2. `flarebox setup --no-browser` (decision 4) prints the authorize URL. The user opens it on any machine, and the final redirect to `127.0.0.1` fails to load there. The user copies that page's address and pastes it into the CLI, which checks the state and exchanges the code. *Unverified* end to end; it relies only on the code and state in the URL, which the prototype received.
 3. SSH port forwarding (`ssh -L <port>:127.0.0.1:<port> host`) with `--port <port>`, so the laptop's browser reaches the CLI's listener.
 
 A hosted HTTPS page that shows the code to copy would also work, but it needs a domain and a server, and it is not needed while option 2 exists.
@@ -98,7 +101,9 @@ A hosted HTTPS page that shows the code to copy would also work, but it needs a 
 
 Not needed: User Details Read (`GET /user` returns 403 without it; only useful to show the user's email), Workers Observability Write (the upload's `observability` block applied without it), and Workers Routes (the workers.dev route goes through `POST .../scripts/<name>/subdomain`).
 
-Workers Editor (`workers-scripts.edit`) was the first choice and failed: `POST .../assets-upload-session` and `PUT .../workers/scripts/<name>` returned 403 "No access to the specified resource." even for a five-line Worker with no bindings. The API reference lists only Workers Scripts Write for the asset session ([Assets upload](#ref-assets-api)). `GET /client/v4/oauth/scopes` lists `workers-scripts.write` as "Workers Scripts Write", but the dashboard's scope picker does not offer it, and the authorize endpoint refuses it with `invalid_scope` for a client created in the dashboard. Workers Admin is broader than Scripts Write. A client created through the API with `workers-scripts.write` might work with less access; *unverified* (open question 1).
+Workers Editor (`workers-scripts.edit`) was the first choice and failed: `POST .../assets-upload-session` and `PUT .../workers/scripts/<name>` returned 403 "No access to the specified resource." even for a five-line Worker with no bindings. The API reference lists only Workers Scripts Write for the asset session ([Assets upload](#ref-assets-api)). `GET /client/v4/oauth/scopes` lists `workers-scripts.write` as "Workers Scripts Write", but the dashboard's scope picker does not offer it, and the authorize endpoint refuses it with `invalid_scope` for a client created in the dashboard. Workers Admin is broader than Scripts Write, and Flarebox accepts it (decision 1). A client with `workers-scripts.write` is not pursued.
+
+**What the grant can reach.** Cloudflare does not limit the grant to Flarebox's resources. On the account picked at consent, whoever holds the grant can upload, replace and delete any Worker, set and delete any Worker's secrets, and list and delete objects in every R2 bucket and delete the buckets. On a Flarebox server, setting `FLAREBOX_RECOVERY_KEY` adds a device for the owner, which gives that device the owner's files. The tag and the `/v1/server` check of section 6 keep the CLI itself on Flarebox's resources, but the token does not. The grant lives for one command (section 7), which keeps this window short. Section 11 lists this for the owner.
 
 ## 4. Deploy and claim
 
@@ -114,7 +119,7 @@ The release job builds the server once with `wrangler deploy --dry-run --outdir`
 - `assets/`: `server/web/dist`, the share-link viewer.
 - `manifest.json`: the server version, main module, compatibility date, Durable Object classes, R2 binding name and default bucket name, the migration list, the assets binding and the observability settings, read from `server/wrangler.jsonc`. The prototype's [`make-manifest.mjs`](https://github.com/flarebox-dev/flarebox/blob/spike/cli-setup-oauth/spike/cli-setup/make-manifest.mjs) shows the shape.
 
-The CLI embeds the bundle for its own version: CLI 0.3.0 deploys and upgrades to server 0.3.0. That keeps the deploy offline once the CLI is installed, and the bundle is covered by the same checksum as the CLI. A CI check compares the manifest with `wrangler.jsonc`, so the button path and the CLI path cannot drift.
+The CLI embeds the bundle for its own version (decision 5): CLI 0.3.0 deploys and upgrades to server 0.3.0. That keeps the deploy offline once the CLI is installed, and the bundle is covered by the same checksum as the CLI. A CI check compares the manifest with `wrangler.jsonc`, so the button path and the CLI path cannot drift.
 
 ### 4.3 Upload
 
@@ -153,11 +158,15 @@ The upload response echoed `migration_tag: v1`, the tag, `has_assets: true` and 
 
 ### 4.4 Claim with a one-time secret
 
-The secret travels in the same upload as the code, so the Worker never runs without it, and nobody who lacks the secret can claim the new server first. The CLI generates 32 random bytes and sends them base64url-encoded (43 characters, above the server's 32-character floor), then:
+The secret travels in the same upload as the code, so the Worker never runs without it. The `/setup` page stays, though, so the secret is not the only way to claim the new server. Anyone who opens `/setup` before the CLI claims gets a claim code printed to the Worker log, and whoever can read that log can claim first. That person is an account member who could already replace the Worker, which is the trust argument of deploy-and-upgrade.md section 2. The window lasts from enabling workers.dev to the first successful claim, a few seconds in the measured run. Section 11 lists whether CLI deploys should turn `/setup` off.
+
+The CLI generates 32 random bytes and sends them base64url-encoded (43 characters, above the server's 32-character floor), then:
 
 1. `POST <url>/v1/claim` with `{"code": <secret>, "userName": ..., "deviceName": ..., "platform": ...}`, the JSON form of `ClaimRequest`. The first attempt returned 200 with the owner's `userId` and the device's `deviceId` (measured).
-2. `DELETE /workers/scripts/<name>/secrets/FLAREBOX_RECOVERY_KEY`, then `GET .../secrets` to confirm the list is empty.
-3. Store the device credentials. A replay of the same secret afterwards returned 403 "this deployment already has an owner".
+2. Store the device credentials and wait until the store reports them written: the Keychain call returns, or the file is renamed into place and synced. The prototype saved the credentials before it deleted the secret, in this order.
+3. `DELETE /workers/scripts/<name>/secrets/FLAREBOX_RECOVERY_KEY`, then `GET .../secrets` to confirm the list is empty. A 404 counts as deleted. A replay of the same secret afterwards returned 403 "this deployment already has an owner".
+
+The CLI retries the claim only while the server cannot see the key yet. Two refusals mean that: "no valid claim code; open /setup to issue one" on an unclaimed server whose Account DO still runs code without the key claim, and "this deployment already has an owner" while a new secret propagates. The refusal "this recovery key was already used; set a new one" means the key is spent, and section 4.6 handles it. The CLI never retries a spent key.
 
 **Server change.** Main is not enough. On an unclaimed deployment, `redeemClaim` checks only claim codes from `/setup`, so the recovery key is ignored. On a Worker running main with the secret in its upload, 20 claims over 63 seconds were all refused with "no valid claim code; open /setup to issue one" (measured). The prototype's patch (12 lines in `server/src/account/claim.ts`) lets a correct, unused key claim an unclaimed deployment. It records the key as used, deletes any claim code, and creates the owner and the device in the same transaction. With it, the claim succeeded. The trust argument of deploy-and-upgrade.md section 2 carries over unchanged, because whoever can set the Worker's secrets can already replace its code. Spec section 15.2 needs one sentence for it. The `/setup` claim code stays for button deploys.
 
@@ -165,9 +174,27 @@ The change also needs the Durable Object to run the new code. On the Worker that
 
 ### 4.5 Existing server: add this device
 
-When `flarebox setup` finds a claimed server, it sets a one-time secret with `PUT /workers/scripts/<name>/secrets` (`{"name": "FLAREBOX_RECOVERY_KEY", "text": ..., "type": "secret_text"}`), claims, and deletes the secret. On a claimed server this is today's recovery path, so main needs no change for it. In the measured run, after a second login, the first claim 0.2 seconds after setting the secret was refused, and the next one 3.4 seconds after returned a device with the same `userId` as the first device. That device listed the space the first device had created. The CLI retries the claim for up to 60 seconds.
+When `flarebox setup` finds a claimed server, it sets a one-time secret with `PUT /workers/scripts/<name>/secrets` (`{"name": "FLAREBOX_RECOVERY_KEY", "text": ..., "type": "secret_text"}`), claims, and deletes the secret. On a claimed server this is today's recovery path, so main needs no change for it. In the measured run, after a second login, the first claim 0.2 seconds after setting the secret was refused, and the next one 3.4 seconds after returned a device with the same `userId` as the first device. That device listed the space the first device had created. The CLI retries the claim for up to 60 seconds, then saves the credentials and deletes the secret in the order of section 4.4.
 
-Recovery adds a device; it does not revoke the others ([deploy-and-upgrade.md §2](deploy-and-upgrade.md)). This branch makes that path the normal way to add a device, so device revocation becomes more pressing (open question 8).
+`GET /v1/server` returns `claimed`, so the CLI tells an unclaimed server from a claimed one before it sets the secret. An unclaimed server found in the account, such as a button deploy nobody claimed, takes the fresh-claim path of section 4.4. If its `server_version` predates the key-claim change, the CLI first upgrades it to the embedded bundle (section 5), after asking. The Account DO then keeps the old claim logic for up to 300 seconds, so this case retries for up to 330 seconds instead of 60.
+
+Recovery adds a device; it does not revoke the others ([deploy-and-upgrade.md §2](deploy-and-upgrade.md)). This branch makes that path the normal way to add a device. The server already lists and revokes devices: `GET /v1/devices` and `DELETE /v1/devices/{device_id}` in `server/src/worker.ts`, backed by `AccountDO.revokeDevice`. The CLI and app commands that use them ship in the same release as this setup path (decision 8).
+
+### 4.6 Interrupted runs
+
+A deploy, an add-device run or an uninstall can stop at any step: a crash, Ctrl-C, a lost network. The CLI keeps a state file, `setup-state.json` in its config directory, and writes it with an atomic rename before each step that creates or deletes something. The file holds the account id, the script name, the bucket name, the last finished step, and whether a one-time secret may still be set. It holds no secret. A rerun on the same machine reads it and continues. On another machine, section 6 finds the same resources from the account.
+
+| Stopped after | What exists in the account | What a rerun does |
+|---|---|---|
+| Bucket create | An empty bucket, no script | Reuses the bucket the state file names. |
+| Asset upload | The bucket, uploaded asset files that no script uses yet | Starts a new upload session. Files already uploaded are skipped; a second session for the same assets returned zero files to upload (measured). |
+| Script upload | A tagged script bound to the bucket, with a one-time secret, no workers.dev route | Section 6 finds it from the tag and the bucket binding. The secret's value died with the process, so the CLI sets a new one, enables workers.dev and claims as in section 4.4. |
+| workers.dev enabled | An unclaimed server that answers `GET /v1/server` | Sets a new secret and claims as in section 4.4. |
+| Claim sent, but the response was lost or the credentials were not saved | A claimed server, a spent key, a device whose credentials nobody holds | Sets a new secret and claims again as a new device of the owner (section 4.5). The first device stays listed under the same device name, and the CLI prints its name so the user can revoke it. |
+| Credentials saved, secret not deleted | A claimed server whose secret is a spent key | Deletes the secret. A spent key cannot claim again, because the server records used keys. |
+| Uninstall | See section 5 | Continues the uninstall from the step after the last finished one. |
+
+The CLI never takes over a resource it cannot tie to Flarebox. A script counts as a Flarebox server when it has the tag and binds a bucket, or when it answers `GET /v1/server`. A bucket counts as Flarebox's when the state file names it or a Flarebox script binds it. If the default names `flarebox` are taken by anything else, the CLI picks the next free name, `flarebox-2` and so on, and records it in the state file. An unbound bucket that the state file does not name is reported and left alone.
 
 ## 5. Upgrade and uninstall
 
@@ -181,15 +208,27 @@ The measured upgrade from 0.0.1 to 0.0.2 kept the space created before it, and t
 
 Because of the deferred code update, an upgrade is complete for each Durable Object only after it adopts the new code, within 300 seconds by default. The CLI sets `code_update_strategy` explicitly (`{"mode": "deferred", "max_delay": 300}`), so the behaviour does not depend on Cloudflare's default, and it tells the user that open sync sessions move to the new release within 5 minutes. The API accepted `{"mode": "immediate"}` in a measured upload; it resets active objects at once and drops their WebSockets, so it is not the default.
 
-`flarebox server uninstall` must empty the bucket first. `DELETE /r2/buckets/<bucket>` on a bucket the server had written to returned 409 with "10008 ... is not empty". Creating a space writes `spaces/<space id>/meta/<id>/space.json`. `GET /r2/buckets/<bucket>/objects` and `DELETE .../objects/<key>` worked under `workers-r2.write`. `DELETE /workers/scripts/<name>?force=true` also removed the Worker's two Durable Object namespaces, and the namespace list was empty afterwards. Uninstall asks for confirmation and names the bucket and the number of objects, because it deletes the owner's files.
+`flarebox server uninstall` must empty the bucket before it deletes it. `DELETE /r2/buckets/<bucket>` on a bucket the server had written to returned 409 with "10008 ... is not empty". Creating a space writes `spaces/<space id>/meta/<id>/space.json`. `GET /r2/buckets/<bucket>/objects` and `DELETE .../objects/<key>` worked under `workers-r2.write`. `DELETE /workers/scripts/<name>?force=true` also removed the Worker's two Durable Object namespaces, and the namespace list was empty afterwards.
+
+The Worker is the only place that names the bucket, so the CLI records the bucket before it deletes the Worker:
+
+1. Find the server (section 6), read the bucket name from its settings, count the objects, and ask for confirmation, naming the bucket and the number of objects, because the uninstall deletes the owner's files.
+2. Write the state file with the script and the bucket.
+3. Delete the Worker with `?force=true`. This stops all writes to the bucket.
+4. List the bucket with `per_page=1000` and delete each key, following `cursor` until a list comes back empty ([List objects](#ref-r2-list)). The measured run deleted one object, so the multi-page case is *unverified*.
+5. Delete the bucket, then the state file.
+
+Every delete treats 404 as done, so a rerun repeats a finished step without error. A rerun with the state file starts at step 3. On another machine, or after the state file is lost, the Worker is gone and nothing in the account links the bucket to it. `flarebox server uninstall --bucket <name>` then empties and deletes the named bucket after the same confirmation. The CLI does not guess the name.
 
 ## 6. Finding a Flarebox server in an account
 
-An account may hold other Workers. The upload sets `tags: ["flarebox-server"]`, and `GET /workers/scripts` returns each script's `tags` (measured: `{"id": "flarebox-proto", "tags": ["flarebox-server"], "migration_tag": "v1", "has_assets": true}`). The CLI keeps the scripts with that tag, then calls `GET <workers.dev URL>/v1/server` on each and keeps those that answer with a valid `ServerInfo`. A tag alone is not proof, since anyone with the account can tag a script. A Worker deployed with the button has no tag; the CLI also probes a script named `flarebox` and adds the tag on its next upgrade. With several matches the CLI lists their names and URLs and asks. `--server <name>` picks one in scripts.
+An account may hold other Workers. The upload sets `tags: ["flarebox-server"]`, and `GET /workers/scripts` returns each script's `tags` (measured: `{"id": "flarebox-proto", "tags": ["flarebox-server"], "migration_tag": "v1", "has_assets": true}`). The CLI keeps the scripts with that tag, then calls `GET <workers.dev URL>/v1/server` on each and keeps those that answer with a valid `ServerInfo`. A tag alone is not proof, since anyone with the account can tag a script. A tagged script that binds a bucket but has no workers.dev route is a deploy that stopped halfway, and the CLI offers to finish it (section 4.6). A Worker deployed with the button has no tag; the CLI also probes a script named `flarebox` and adds the tag on its next upgrade. With several matches the CLI lists their names and URLs and asks. `--server <name>` picks one in scripts.
 
 ## 7. Credentials on the device
 
-- The Cloudflare grant is needed for deploy, add-device, upgrade and uninstall, which are rare. The default is to revoke it at the end of each command and log in again next time, so no Workers Admin credential stays on disk (open question 2). With `--keep-login` the CLI keeps the refresh token in the macOS Keychain, or on Linux in the Secret Service when available and otherwise a 0600 file, under the single-writer rule of section 2.
+- The Cloudflare grant is needed for deploy, add-device, upgrade and uninstall, which are rare. Each of these commands logs in, keeps the tokens in memory only, and revokes the grant when it ends (decision 2). No Workers Admin credential stays on disk, and `flarebox server upgrade` logs in again.
+- The CLI revokes on success, on failure, and on Ctrl-C or `SIGTERM`. It sends `POST /oauth2/revoke` with the refresh token, then with the access token. If revocation fails, it retries three times, then prints that the grant is still active, that the access token expires within an hour, and that the user can revoke it under Manage OAuth authorizations in the dashboard ([Authorizing an application](#ref-authorizing)).
+- A process that is killed, or a machine that loses power, leaves the grant active on Cloudflare's side. Nothing on the device holds its tokens any more, but the grant stays until the refresh token expires or the user revokes it in the dashboard. Deleting local tokens does not revoke a grant.
 - The refresh token's lifetime was not measured and Cloudflare does not document it; *unverified*. A third-party report measured the same one-hour access token ([Mailda](#ref-mailda)).
 - Flarebox device credentials (`DeviceCredentials`) stay where the CLI and the app keep them today. The Cloudflare grant never reaches the Flarebox server.
 
@@ -204,7 +243,7 @@ An account may hold other Workers. The upload sets `tags: ["flarebox-server"]`, 
 
 **`cli/` and `core/`**
 
-- A new crate, `core/cloudflare`, with the OAuth client (PKCE, loopback listener, paste-URL fallback, token store with a lock), a small API client over `reqwest` (already a dependency of `core/net`), the bundle upload and the server discovery. It holds no Flarebox protocol logic, so the macOS app can call it through `core/ffi`.
+- A new crate, `core/cloudflare`, with the OAuth client (PKCE, loopback listener, paste-URL fallback, tokens kept in memory and revoked on exit), the state file of section 4.6, a small API client over `reqwest` (already a dependency of `core/net`), the bundle upload and the server discovery. It holds no Flarebox protocol logic, so the macOS app can call it through `core/ffi`.
 - `cli/`: the commands of section 1, the embedded bundle, and `pair` renamed to `join` with the address-carrying code. The claim and pairing calls reuse `core/net`.
 
 **`apps/macos/`**
@@ -213,9 +252,9 @@ The setup screen (`SetupModel`) gains "Log in with Cloudflare" next to "Enter a 
 
 ## 9. Distribution
 
-**Homebrew.** A tap, `flarebox-dev/homebrew-tap`, carries a `flarebox` formula that builds the CLI from the tagged source archive, with bottles for macOS arm64 and Linux x86_64 and arm64 built by the tap's GitHub Actions ([Taps](#ref-tap)). Users run `brew install flarebox-dev/tap/flarebox`. The short `brew install flarebox` needs the formula in homebrew/core, which requires a stable tagged release, a build from source on Homebrew's macOS and Linux CI, and a DFSG-compatible licence ([Acceptable formulae](#ref-core)); Apache-2.0 and AGPL-3.0-or-later both qualify. The name was free on 2026-11-10: `brew info flarebox` found no formula and no cask. Homebrew's notability thresholds for new formulae were not checked; *unverified*.
+**Homebrew.** Flarebox starts in its own tap (decision 7). The repository `flarebox-dev/homebrew-tap` (tap name `flarebox-dev/tap`) carries a `flarebox` formula that builds the CLI from the tagged source archive, with bottles for macOS arm64 and Linux x86_64 and arm64 built by the tap's GitHub Actions ([Taps](#ref-tap)). Users run `brew install flarebox-dev/tap/flarebox`. The short `brew install flarebox` needs the formula in homebrew/core, which requires a stable tagged release, a build from source on Homebrew's macOS and Linux CI, and a DFSG-compatible licence ([Acceptable formulae](#ref-core)); Apache-2.0 and AGPL-3.0-or-later both qualify. The name was free on 2026-11-10: `brew info flarebox` found no formula and no cask. Flarebox submits the formula to homebrew/core once its usage meets Homebrew's notability bar (decision 7). Those thresholds were not checked; *unverified*.
 
-**macOS app.** The DMG from `release-macos.yml` goes into the tap as a cask. homebrew/core does not accept formulae whose main output is a `.app` ([Acceptable formulae](#ref-core)). Whether the cask can also be named `flarebox` next to the formula, or needs another name, is open question 7.
+**macOS app.** The DMG from `release-macos.yml` goes into the tap as the cask `flarebox-app` (decision 7): `brew install --cask flarebox-dev/tap/flarebox-app`. homebrew/core does not accept formulae whose main output is a `.app` ([Acceptable formulae](#ref-core)).
 
 **Linux without Homebrew.** Each release also attaches static `x86_64` and `aarch64` musl binaries with SHA-256 checksums. `.deb`, `.rpm` and a systemd user unit for `flarebox daemon` can follow. Release work is out of scope here.
 
@@ -224,33 +263,43 @@ The setup screen (`SetupModel`) gains "Log in with Cloudflare" next to "Enter a 
 The prototype used a private client, which only members of the test account can authorize ([Create an OAuth client](#ref-client)). Before anyone else can use `flarebox setup`, the client must become public, which needs:
 
 - A client name, a logo, a client URL and at least one scope.
-- Domain verification of the client URL: a DNS `TXT` record `cloudflare_oauth_client_publisher=<value>`, which Cloudflare polls for up to two days. After verification the domain cannot change.
-- Promotion to public, which cannot be undone.
+- Domain verification of the client URL: a DNS `TXT` record `cloudflare_oauth_client_publisher=<value>`, which Cloudflare polls for up to two days. After verification the domain cannot change ([Create an OAuth client](#ref-client)).
+- Promotion to public, which cannot be undone. The API accepts only `public` for `visibility` and does not support demotion ([Update OAuth client](#ref-client-update)).
 
-Until then the consent page shows the amber "has not verified ownership of any domain" warning, as it did for every login in this run. The client belongs in an account the project controls long-term, not the test account. Account administrators can turn off public OAuth app access for their account ([Authorizing an application](#ref-authorizing)); for them the CLI needs a fallback that accepts an API token with the same permissions (`--api-token`, read from an environment variable).
+Until then the consent page shows the amber "has not verified ownership of any domain" warning, as it did for every login in this run. The public client uses the client URL domain flarebox.dev, which the project owner buys before launch and keeps on the project owner's main account (decision 9). Until then the private client on the test account stays, for development only. Account administrators can turn off public OAuth app access for their account ([Authorizing an application](#ref-authorizing)); for them the CLI needs a fallback that accepts an API token with the same permissions (`--api-token`, read from an environment variable).
 
-## 11. Decisions for the project owner
+## 11. Decisions
 
-1. Workers Admin is the only Workers scope the dashboard offers that works. Should we try a client created through the API with `workers-scripts.write` (narrower) before launch, or accept Workers Admin?
-2. Revoke the Cloudflare grant after each command (the proposal), or keep it so `flarebox server upgrade` runs without a browser?
-3. Pairing code format: `<code>@<host>` (the proposal), a URL, or a QR code in the app.
-4. Headless Linux: is "join with a code from another device" enough as the default, with the paste-URL fallback behind `--no-browser`?
-5. Embed the server bundle in the CLI (the proposal) or download it from the release by checksum?
-6. Keep the name `FLAREBOX_RECOVERY_KEY` for the one-time claim secret, or rename it to something like `FLAREBOX_OWNER_KEY` now that it also claims new servers?
-7. Homebrew names: the formula `flarebox` for the CLI, and the cask `flarebox` or `flarebox-app` for the macOS app. When to submit to homebrew/core?
-8. Adding a device from a Cloudflare login does not revoke lost devices. Should device revocation land before or with this change?
-9. Which domain and account will own the public OAuth client?
+The project owner decided the open points on 2026-11-10:
+
+1. Scopes. Flarebox uses Workers Admin (`workers-scripts.admin`). It does not try a client created through the API with `workers-scripts.write`.
+2. Cloudflare grant. Every command that needs Cloudflare logs in and revokes the grant when it ends. `flarebox server upgrade` logs in again (section 7).
+3. Pairing code. The format is `<code>@<host>` (section 1). A QR code in the macOS app comes later.
+4. Headless Linux. Joining with a code from another device is the default. The paste-URL login sits behind `--no-browser` (section 2).
+5. Server bundle. The CLI embeds the bundle for its own version (section 4.2).
+6. Secret name. The one-time claim secret keeps the name `FLAREBOX_RECOVERY_KEY` (section 4.4).
+7. Homebrew. The formula `flarebox` is for the CLI and the cask `flarebox-app` for the macOS app, both in the tap `flarebox-dev/tap`. Flarebox submits to homebrew/core once usage meets its notability bar (section 9).
+8. Lost devices. The CLI and app commands that revoke a lost device ship in the same release as this setup path. The server side already exists (section 4.5).
+9. Public client. Its client URL uses flarebox.dev, which the project owner buys before launch on the project owner's main account. Until then the private test client stays (section 10).
+
+Still open for the owner. The design assumes the first answer to each of these:
+
+- Reach of the grant. Decision 1 came before section 3 described what a Workers Admin and R2 Write grant can do outside Flarebox. Keep Workers Admin with a grant that lives for one command, or look for a narrower scope set first.
+- Durable Object code updates. The CLI and `wrangler.jsonc` set `{"mode": "deferred", "max_delay": 300}`, so open sync sessions move to a new release within 5 minutes and are not dropped at once (section 5). Keep this, or use `immediate` and accept dropped sessions.
+- `/setup` on CLI deploys. Keep it, under the trust argument of section 4.4, or turn it off for servers the CLI deploys. Turning it off needs a server change.
 
 ## References
 
 - <a id="ref-client"></a>Cloudflare. "Create your OAuth client." [Link](https://developers.cloudflare.com/fundamentals/oauth/create-an-oauth-client/), last updated 2026-08-20, accessed 2026-11-10.
 - <a id="ref-client-api"></a>Cloudflare API. "Create OAuth Client." [Link](https://developers.cloudflare.com/api/resources/iam/subresources/oauth_clients/methods/create/), accessed 2026-11-10.
+- <a id="ref-client-update"></a>Cloudflare API. "Update OAuth Client." [Link](https://developers.cloudflare.com/api/resources/iam/subresources/oauth_clients/methods/update/), accessed 2026-11-10.
 - <a id="ref-integrate"></a>Cloudflare. "Integrate your OAuth client with Cloudflare." [Link](https://developers.cloudflare.com/fundamentals/oauth/integrate-with-cloudflare/), last updated 2026-06-03, accessed 2026-11-10.
 - <a id="ref-authorizing"></a>Cloudflare. "Authorizing an application." [Link](https://developers.cloudflare.com/fundamentals/oauth/authorizing-an-application/), last updated 2026-08-20, accessed 2026-11-10.
 - <a id="ref-assets-api"></a>Cloudflare API. "Create Assets Upload Session." [Link](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/assets/subresources/upload/methods/create/), accessed 2026-11-10.
 - <a id="ref-direct-upload"></a>Cloudflare. "Direct Uploads", Workers static assets. [Link](https://developers.cloudflare.com/workers/static-assets/direct-upload/), last updated 2026-08-10, accessed 2026-11-10.
 - <a id="ref-do-updates"></a>Cloudflare. "Durable Objects code updates." [Link](https://developers.cloudflare.com/durable-objects/deployments/durable-objects-code-updates/), last updated 2026-10-30, accessed 2026-11-10.
 - <a id="ref-r2"></a>Cloudflare. "Get started", Before you begin. R2 docs. [Link](https://developers.cloudflare.com/r2/get-started/#before-you-begin), accessed 2026-11-10.
+- <a id="ref-r2-list"></a>Cloudflare API. "List Objects", R2. [Link](https://developers.cloudflare.com/api/resources/r2/subresources/buckets/subresources/objects/methods/list/), accessed 2026-11-10.
 - <a id="ref-r2-cli"></a>cloudflare/workers-sdk issue #15468, "R2: support an explicit first-time subscription enablement flow in Wrangler" (opened 2026-09-02, open). [Link](https://github.com/cloudflare/workers-sdk/issues/15468), accessed 2026-11-10.
 - <a id="ref-tap"></a>Homebrew. "How to Create and Maintain a Tap." [Link](https://docs.brew.sh/How-to-Create-and-Maintain-a-Tap), accessed 2026-11-10.
 - <a id="ref-core"></a>Homebrew. "Acceptable Formulae." [Link](https://docs.brew.sh/Acceptable-Formulae), accessed 2026-11-10.
