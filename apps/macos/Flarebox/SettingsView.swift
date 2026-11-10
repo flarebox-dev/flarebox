@@ -245,16 +245,15 @@ extension DeviceList {
 
 private struct StorageSettings: View {
     @Environment(AppModel.self) private var model
-    @State private var spaces: [SpaceStorage]?
-    @State private var error: SessionError?
+    @State private var storage = StorageModel()
 
     var body: some View {
         Group {
             if let account = model.state.account {
                 Form {
-                    ForEach(spaces ?? []) { storage in
-                        Section(storage.space.name) {
-                            switch storage.usage {
+                    ForEach(storage.spaces ?? []) { entry in
+                        Section(entry.space.name) {
+                            switch entry.usage {
                             case .success(let usage):
                                 StorageRow(title: "Live files", count: "^[\(usage.liveFiles) file](inflect: true)", bytes: usage.liveBytes)
                                 StorageRow(title: "Trash", count: "^[\(usage.trashedFiles) file](inflect: true)", bytes: usage.trashBytes)
@@ -267,10 +266,10 @@ private struct StorageSettings: View {
                         }
                     }
                     Section {
-                        if spaces?.isEmpty == true {
+                        if storage.spaces?.isEmpty == true {
                             Text("This account has no spaces yet.").foregroundStyle(.secondary)
                         }
-                        if let error {
+                        if let error = storage.error {
                             Label(error.message, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red)
                         }
                         HStack {
@@ -278,30 +277,20 @@ private struct StorageSettings: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                             Spacer()
-                            if spaces == nil && error == nil {
+                            if storage.isLoading {
                                 ProgressView().controlSize(.small)
                             } else {
-                                Button("Refresh") { Task { await load() } }
+                                Button("Refresh") { Task { await storage.load(model.storage) } }
                             }
                         }
                     }
                 }
                 .formStyle(.grouped)
-                .task(id: account.deviceId) { await load() }
+                .task(id: account.deviceId) { await storage.load(model.storage) }
             } else {
                 ContentUnavailableView("Not Signed In", systemImage: "person.crop.circle.badge.questionmark")
             }
         }
-    }
-
-    private func load() async {
-        spaces = nil
-        error = nil
-        do {
-            spaces = try await model.storage()
-        } catch let failure as SessionError {
-            error = failure
-        } catch {}
     }
 }
 

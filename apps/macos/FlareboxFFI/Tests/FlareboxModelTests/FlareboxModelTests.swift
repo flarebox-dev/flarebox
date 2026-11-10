@@ -16,6 +16,20 @@ private func item(_ path: String) -> HeldItem {
     HeldItem(nodeId: path, path: path, kind: .file, files: 1, detail: .plain)
 }
 
+/// Storage fetches that finish only when the test resumes them.
+@MainActor
+private final class Fetches {
+    var pending: [CheckedContinuation<[SpaceStorage], any Error>] = []
+
+    func next() async throws -> [SpaceStorage] {
+        try await withCheckedThrowingContinuation { pending.append($0) }
+    }
+
+    func waitFor(_ count: Int) async {
+        while pending.count < count { await Task.yield() }
+    }
+}
+
 @MainActor
 @Suite struct AppModelTests {
     @Test func eventsReplaceTheirPartOfTheState() {
@@ -107,6 +121,35 @@ private func item(_ path: String) -> HeldItem {
         let space = try #require(try await model.spaces().last)
         try #require(model.session.fakeCore()).refuseSpaceUsage(spaceId: space.spaceId, error: .NotSignedIn)
         await #expect(throws: SessionError.NotSignedIn) { try await model.storage() }
+    }
+
+    @Test func storageKeepsTheNewestLoad() async throws {
+        let fresh = try await AppModel.fake(scenario: .upToDate).storage()
+        let storage = StorageModel()
+        let fetches = Fetches()
+        let older = Task { await storage.load(fetches.next) }
+        await fetches.waitFor(1)
+        let newer = Task { await storage.load(fetches.next) }
+        await fetches.waitFor(2)
+        fetches.pending[1].resume(returning: fresh)
+        await newer.value
+        fetches.pending[0].resume(throwing: SessionError.ServerUnreachable(reason: "timed out"))
+        await older.value
+        #expect(storage.spaces == fresh)
+        #expect(storage.error == nil)
+    }
+
+    @Test func storageDropsACancelledLoad() async throws {
+        let fresh = try await AppModel.fake(scenario: .upToDate).storage()
+        let storage = StorageModel()
+        let fetches = Fetches()
+        let load = Task { await storage.load(fetches.next) }
+        await fetches.waitFor(1)
+        load.cancel()
+        fetches.pending[0].resume(returning: fresh)
+        await load.value
+        #expect(storage.spaces == nil)
+        #expect(storage.error == nil)
     }
 
     @Test func pauseAndResume() throws {
