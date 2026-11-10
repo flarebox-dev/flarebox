@@ -158,7 +158,7 @@ The upload response echoed `migration_tag: v1`, the tag, `has_assets: true` and 
 
 ### 4.4 Claim with a one-time secret
 
-The secret travels in the same upload as the code, so the Worker never runs without it. The `/setup` page stays, though, so the secret is not the only way to claim the new server. Anyone who opens `/setup` before the CLI claims gets a claim code printed to the Worker log, and whoever can read that log can claim first. That person is an account member who could already replace the Worker, which is the trust argument of deploy-and-upgrade.md section 2. The window lasts from enabling workers.dev to the first successful claim, a few seconds in the measured run. Section 11 lists whether CLI deploys should turn `/setup` off.
+The secret travels in the same upload as the code, so the Worker never runs without it. The `/setup` page stays, though, so the secret is not the only way to claim the new server. Anyone who opens `/setup` before the CLI claims gets a claim code printed to the Worker log, and whoever can read that log can claim first. That group is wider than the people who can replace the Worker. It includes account members and API tokens with the Workers Metadata Read-Only role, which can read logs but not deploy. deploy-and-upgrade.md section 2 already accepts this group for button deploys, and CLI deploys inherit the same exposure. The window lasts from enabling workers.dev to the first successful claim, a few seconds in the measured run. Section 11 lists whether CLI deploys should turn `/setup` off.
 
 The CLI generates 32 random bytes and sends them base64url-encoded (43 characters, above the server's 32-character floor), then:
 
@@ -182,7 +182,9 @@ Recovery adds a device; it does not revoke the others ([deploy-and-upgrade.md §
 
 ### 4.6 Interrupted runs
 
-A deploy, an add-device run or an uninstall can stop at any step: a crash, Ctrl-C, a lost network. The CLI keeps a state file, `setup-state.json` in its config directory, and writes it with an atomic rename before each step that creates or deletes something. The file holds the account id, the script name, the bucket name, the last finished step, and whether a one-time secret may still be set. It holds no secret. A rerun on the same machine reads it and continues. On another machine, section 6 finds the same resources from the account.
+A deploy, an add-device run or an uninstall can stop at any step: a crash, Ctrl-C, a lost network. The CLI keeps a state file, `setup-state.json` in its config directory, and writes it with an atomic rename before each step that creates or deletes something. The file holds the account id, the script name, the bucket name, the last finished step, whether a one-time secret may still be set, and a setup attempt id. It holds no secret.
+
+The setup attempt id is 16 random bytes the CLI creates before its first claim and keeps until a claim's credentials are saved. Every claim of that attempt sends it as `ClaimRequest.setup_attempt`, a new optional field. In the claim's transaction, the server stores it on the new device and revokes every earlier device with the same attempt id that has never refreshed a token (`last_seen_ms` is 0). Those devices came from claims whose credentials never reached storage, so nobody can use them. A device that has refreshed a token is never touched, so the rule cannot remove a device that works. However many claim responses get lost, the attempt ends with one device. The id is not a secret: only a caller who also presents a valid one-time key can make the server revoke anything with it. A rerun on the same machine reads it and continues. On another machine, section 6 finds the same resources from the account.
 
 | Stopped after | What exists in the account | What a rerun does |
 |---|---|---|
@@ -190,7 +192,7 @@ A deploy, an add-device run or an uninstall can stop at any step: a crash, Ctrl-
 | Asset upload | The bucket, uploaded asset files that no script uses yet | Starts a new upload session. Files already uploaded are skipped; a second session for the same assets returned zero files to upload (measured). |
 | Script upload | A tagged script bound to the bucket, with a one-time secret, no workers.dev route | Section 6 finds it from the tag and the bucket binding. The secret's value died with the process, so the CLI sets a new one, enables workers.dev and claims as in section 4.4. |
 | workers.dev enabled | An unclaimed server that answers `GET /v1/server` | Sets a new secret and claims as in section 4.4. |
-| Claim sent, but the response was lost or the credentials were not saved | A claimed server, a spent key, a device whose credentials nobody holds | Sets a new secret and claims again as a new device of the owner (section 4.5). The first device stays listed under the same device name, and the CLI prints its name so the user can revoke it. |
+| Claim sent, but the response was lost or the credentials were not saved | A claimed server, a spent key, a device whose credentials nobody holds | Sets a new secret and claims again with the same setup attempt id, as a new device of the owner (section 4.5). That claim revokes the unused device, so the server ends with one device from this attempt. |
 | Credentials saved, secret not deleted | A claimed server whose secret is a spent key | Deletes the secret. A spent key cannot claim again, because the server records used keys. |
 | Uninstall | See section 5 | Continues the uninstall from the step after the last finished one. |
 
@@ -218,7 +220,7 @@ The Worker is the only place that names the bucket, so the CLI records the bucke
 4. List the bucket with `per_page=1000` and delete each key, following `cursor` until a list comes back empty ([List objects](#ref-r2-list)). The measured run deleted one object, so the multi-page case is *unverified*.
 5. Delete the bucket, then the state file.
 
-Every delete treats 404 as done, so a rerun repeats a finished step without error. A rerun with the state file starts at step 3. On another machine, or after the state file is lost, the Worker is gone and nothing in the account links the bucket to it. `flarebox server uninstall --bucket <name>` then empties and deletes the named bucket after the same confirmation. The CLI does not guess the name.
+Every delete treats 404 as done, so a rerun repeats a finished step without error. A rerun with the state file starts at step 3. If step 4 finds that the bucket no longer exists, the bucket was deleted before the run stopped, so the CLI deletes the state file and reports the uninstall as complete. The exact R2 error for a missing bucket was not measured; *unverified*. Any other error, such as a 403 or a network failure, keeps the state file for the next rerun. On another machine, or after the state file is lost, the Worker is gone and nothing in the account links the bucket to it. `flarebox server uninstall --bucket <name>` then empties and deletes the named bucket after the same confirmation. The CLI does not guess the name.
 
 ## 6. Finding a Flarebox server in an account
 
@@ -237,9 +239,11 @@ An account may hold other Workers. The upload sets `tags: ["flarebox-server"]`, 
 **`server/`**
 
 - `account/claim.ts`: a correct, unused recovery key claims an unclaimed deployment (section 4.4). Tests next to the existing bootstrap tests cover a claim by key on an unclaimed server, refusal of a used key, refusal of a short key, and that the key path never counts as a wrong claim code.
+- `account/claim.ts` and the devices table: store `setup_attempt` on a device made by a key claim, and revoke unused devices of the same attempt in the claim's transaction (section 4.6). Tests cover two lost responses followed by a successful claim ending with one device, and that a device that has refreshed a token stays.
 - `wrangler.jsonc`: add `durable_objects.code_update_strategy` so button deploys and CLI deploys behave the same.
 - `scripts/`: the manifest generator, and a CI check that the manifest matches `wrangler.jsonc`.
-- Spec section 15.2: one sentence for the key claim. No proto change.
+- Spec section 15.2: one sentence for the key claim and one for `setup_attempt`.
+- `spec/proto`: `ClaimRequest` gains `string setup_attempt = 5`. An added field is not a breaking change for `buf breaking`.
 
 **`cli/` and `core/`**
 
@@ -286,7 +290,7 @@ Still open for the owner. The design assumes the first answer to each of these:
 
 - Reach of the grant. Decision 1 came before section 3 described what a Workers Admin and R2 Write grant can do outside Flarebox. Keep Workers Admin with a grant that lives for one command, or look for a narrower scope set first.
 - Durable Object code updates. The CLI and `wrangler.jsonc` set `{"mode": "deferred", "max_delay": 300}`, so open sync sessions move to a new release within 5 minutes and are not dropped at once (section 5). Keep this, or use `immediate` and accept dropped sessions.
-- `/setup` on CLI deploys. Keep it, under the trust argument of section 4.4, or turn it off for servers the CLI deploys. Turning it off needs a server change.
+- `/setup` on CLI deploys. Keep it, accepting that log readers can claim first as section 4.4 describes, or turn it off for servers the CLI deploys. Turning it off needs a server change.
 
 ## References
 
