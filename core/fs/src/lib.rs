@@ -473,19 +473,25 @@ impl Snapshot {
         self.rescan_with(root.as_ref(), paths, None, &mut |_| {})
     }
 
-    /// Drops what the snapshot knows at and below `scope`, a relative path,
-    /// so the next rescan of `scope` reports what is there as created. An
-    /// empty path drops everything.
-    pub fn forget(&mut self, scope: &Path) {
-        let known: Vec<PathBuf> = self
+    /// Replaces what the snapshot knows at and below `scope`, a relative
+    /// path, with the entries of `known` there, so the next rescan of `scope`
+    /// reports how the disk differs from `known`. An empty path covers the
+    /// whole tree. Entries of `known` outside `scope` are ignored.
+    pub fn reset(&mut self, scope: &Path, known: BTreeMap<PathBuf, Entry>) {
+        let held: Vec<PathBuf> = self
             .entries
             .range(scope.to_path_buf()..)
             .take_while(|(path, _)| path.starts_with(scope))
             .map(|(path, _)| path.clone())
             .collect();
-        for path in known {
+        for path in held {
             self.entries.remove(&path);
         }
+        self.entries.extend(
+            known
+                .into_iter()
+                .filter(|(path, _)| path.starts_with(scope)),
+        );
     }
 
     /// [`Snapshot::rescan`], failing with [`Error::RootReplaced`] and
@@ -1026,10 +1032,11 @@ pub trait Watcher {
     /// pass it to the next watcher to catch changes made in between.
     fn snapshot(&self) -> &Snapshot;
 
-    /// Drops what the snapshot knows at and below `scope`, a relative path,
-    /// so the next poll reports what is there as created. Entries outside
-    /// `scope` are not reported again unless they changed.
-    fn forget(&mut self, scope: &Path);
+    /// Replaces what the snapshot knows at and below `scope` with `known`, as
+    /// [`Snapshot::reset`] does. The next poll rescans `scope` and reports
+    /// how the disk differs from `known` there. Entries outside `scope` are
+    /// not reported again unless they changed.
+    fn reset(&mut self, scope: &Path, known: BTreeMap<PathBuf, Entry>);
 }
 
 /// Watches with FSEvents on macOS and inotify on Linux.
@@ -1333,8 +1340,8 @@ impl Watcher for NativeWatcher {
         &self.snapshot
     }
 
-    fn forget(&mut self, scope: &Path) {
-        self.snapshot.forget(scope);
+    fn reset(&mut self, scope: &Path, known: BTreeMap<PathBuf, Entry>) {
+        self.snapshot.reset(scope, known);
         self.dirty.insert(scope.to_path_buf());
     }
 }
@@ -1386,8 +1393,8 @@ impl Watcher for RescanWatcher {
         &self.snapshot
     }
 
-    fn forget(&mut self, scope: &Path) {
-        self.snapshot.forget(scope);
+    fn reset(&mut self, scope: &Path, known: BTreeMap<PathBuf, Entry>) {
+        self.snapshot.reset(scope, known);
     }
 }
 

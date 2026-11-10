@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use flarebox_fs::{
-    Change, EntryKind, Error, FileId, NativeWatcher, Poll, Rescan, RescanWatcher, Snapshot, Space,
-    Watcher,
+    Change, Entry, EntryKind, Error, FileId, NativeWatcher, Poll, Rescan, RescanWatcher, Snapshot,
+    Space, Watcher,
 };
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -601,7 +602,7 @@ fn forgotten_scope_is_reported_again_by_the_next_rescan() {
         nothing(root)
     );
 
-    snapshot.forget(Path::new("d/sub"));
+    snapshot.reset(Path::new("d/sub"), BTreeMap::new());
     let known: Vec<&Path> = snapshot.entries.keys().map(PathBuf::as_path).collect();
     assert_eq!(known, ["d", "d/x", "e", "e/z"].map(Path::new));
     assert_eq!(
@@ -613,7 +614,7 @@ fn forgotten_scope_is_reported_again_by_the_next_rescan() {
     );
     assert_eq!(snapshot, full);
 
-    snapshot.forget(Path::new("d"));
+    snapshot.reset(Path::new("d"), BTreeMap::new());
     assert_eq!(
         snapshot.rescan(root, [PathBuf::from("d")]).unwrap(),
         Rescan {
@@ -628,11 +629,11 @@ fn forgotten_scope_is_reported_again_by_the_next_rescan() {
     );
     assert_eq!(snapshot, full);
 
-    snapshot.forget(Path::new(""));
+    snapshot.reset(Path::new(""), BTreeMap::new());
     assert!(snapshot.entries.is_empty());
 }
 
-/// A tree with a folder `d` to forget and a folder `e` beside it.
+/// A tree with a folder `d` to reset and a folder `e` beside it.
 fn two_folders() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -644,16 +645,16 @@ fn two_folders() -> tempfile::TempDir {
     dir
 }
 
-/// Forgets `d` in a watcher that has caught up with the tree, then polls
-/// without waiting for events. Nothing on disk changed, so the poll can only
-/// report `d` because the watcher rescans it on its own.
+/// Resets `d` to nothing in a watcher that has caught up with the tree, then
+/// polls without waiting for events. Nothing on disk changed, so the poll can
+/// only report `d` because the watcher rescans it on its own.
 fn forgotten_scope_is_reported(watcher: &mut dyn Watcher, root: &Path) {
     assert_eq!(
         watcher.poll(Duration::from_millis(300)).unwrap(),
         quiet(root)
     );
 
-    watcher.forget(Path::new("d"));
+    watcher.reset(Path::new("d"), BTreeMap::new());
     assert_eq!(
         watcher.poll(Duration::ZERO).unwrap(),
         Poll {
@@ -688,6 +689,65 @@ fn rescan_watcher_reports_only_a_forgotten_scope() {
     )
     .unwrap();
     forgotten_scope_is_reported(&mut watcher, &root);
+}
+
+/// A tree as `two_folders` makes it, and what was under `d` before
+/// `d/gone` was deleted from it.
+fn tree_that_lost_a_file() -> (tempfile::TempDir, PathBuf, BTreeMap<PathBuf, Entry>) {
+    let dir = two_folders();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    fs::write(root.join("d/gone"), "gone").unwrap();
+    let known = Snapshot::scan(&root)
+        .unwrap()
+        .entries
+        .into_iter()
+        .filter(|(path, _)| path.starts_with("d"))
+        .collect();
+    fs::remove_file(root.join("d/gone")).unwrap();
+    (dir, root, known)
+}
+
+/// Resets `d` to entries that include `d/gone`, which the disk lacks, in a
+/// watcher that has caught up with the tree. The next poll reports only that
+/// removal.
+fn reset_entry_the_disk_lacks_is_removed(
+    watcher: &mut dyn Watcher,
+    root: &Path,
+    known: BTreeMap<PathBuf, Entry>,
+) {
+    assert_eq!(
+        watcher.poll(Duration::from_millis(300)).unwrap(),
+        quiet(root)
+    );
+
+    watcher.reset(Path::new("d"), known);
+    assert_eq!(
+        watcher.poll(Duration::ZERO).unwrap(),
+        Poll {
+            changes: vec![removed("d/gone", File)],
+            ..quiet(root)
+        }
+    );
+    assert_eq!(watcher.snapshot(), &Snapshot::scan(root).unwrap());
+}
+
+#[test]
+fn native_watcher_reports_a_reset_entry_the_disk_lacks_as_removed() {
+    let (_dir, root, known) = tree_that_lost_a_file();
+    let mut watcher = NativeWatcher::start(&root, Snapshot::scan(&root).unwrap()).unwrap();
+    reset_entry_the_disk_lacks_is_removed(&mut watcher, &root, known);
+}
+
+#[test]
+fn rescan_watcher_reports_a_reset_entry_the_disk_lacks_as_removed() {
+    let (_dir, root, known) = tree_that_lost_a_file();
+    let mut watcher = RescanWatcher::new(
+        &root,
+        Snapshot::scan(&root).unwrap(),
+        Duration::from_millis(20),
+    )
+    .unwrap();
+    reset_entry_the_disk_lacks_is_removed(&mut watcher, &root, known);
 }
 
 #[test]
