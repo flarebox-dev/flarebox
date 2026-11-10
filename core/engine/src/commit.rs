@@ -730,14 +730,20 @@ fn edited_on_both_sides(trees: &Trees, id: &str) -> bool {
 /// from the root, by setting S := ⊥ for them, so they are downloaded again. A kept node that S
 /// cannot drop yet, because S still has children under it, is reverted instead, so the effects
 /// bring it back at its R position, and it goes into `needed` so it is not deleted. A reverted node
-/// L deleted is an ordinary local delete.
+/// L deleted is an ordinary local delete. While a node's S update waits, its change is compared
+/// with the waiting shape, and S := ⊥ drops the waiting update, which would otherwise hold a kept
+/// node out of planning for good.
 fn keep(trees: &mut Trees, id: &str, needed: &mut BTreeSet<NodeId>) {
     let reverted = trees
         .local()
         .get(id)
         .is_some_and(|node| node.parked || trees.reverted().contains(id));
+    let acknowledged = match trees.waiting().get(id) {
+        Some(waiting) => waiting.as_ref(),
+        None => trees.synced().live(id),
+    };
     if trees.remote().live(id).is_none()
-        || (!reverted && same(trees.remote().live(id), trees.synced().live(id)))
+        || (!reverted && same(trees.remote().live(id), acknowledged))
     {
         return;
     }
@@ -748,7 +754,9 @@ fn keep(trees: &mut Trees, id: &str, needed: &mut BTreeSet<NodeId>) {
         };
         let parent = remote.parent.clone();
         match trees.local().get(&current) {
-            None if trees.synced().live(&current).is_some() => {
+            None if trees.synced().live(&current).is_some()
+                || trees.waiting().contains_key(&current) =>
+            {
                 if !trees.set_synced_if_valid(current.clone(), None) {
                     trees.revert(current.clone());
                     needed.insert(current.clone());

@@ -1785,3 +1785,53 @@ fn a_waiting_update_is_made_while_committing_is_halted() {
         Some(&file(ROOT, "q", 1))
     );
 }
+
+/// The user creates folder d at X, where S still holds parked file h at x, and file m in d, so the
+/// updates of both wait. The other device moves h into d, and the user deletes d with m. d is
+/// brought back for h, and m's delete is uploaded once its update fits.
+#[test]
+fn a_waiting_folder_the_user_deleted_is_brought_back_for_a_remote_move_into_it() {
+    let mut trees = trees(&[
+        ("d", Some(dir(ROOT, "X")), None, None),
+        (
+            "h",
+            Some(file(ROOT, "x", 9)),
+            Some(file(ROOT, "x", 9)),
+            Some(remote(file(ROOT, "y", 9))),
+        ),
+        ("m", Some(file("d", "c", 1)), None, None),
+    ]);
+    trees.set_local(
+        "h".into(),
+        LocalNode {
+            parked: true,
+            ..local(file(ROOT, "x", 9), 2)
+        },
+    );
+    trees.settle();
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(commit.ops.len(), 2);
+    trees.set_remote("d".into(), remote(dir(ROOT, "X")));
+    trees.set_remote("m".into(), remote(file("d", "c", 1)));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied); 2],
+    );
+    assert!(trees.waiting().contains_key("d") && trees.waiting().contains_key("m"));
+    trees.set_remote("h".into(), remote(file("d", "h", 9)));
+    trees.remove_local("m");
+    trees.remove_local("d");
+    trees.settle();
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    effects_for(&mut trees, &mut ids, "");
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [delete("m")]);
+    assert_eq!(
+        trees.local().get("d").map(|node| &node.shape),
+        Some(&dir(ROOT, "X"))
+    );
+    let h = trees.local().get("h").unwrap();
+    assert_eq!((&h.shape, h.parked), (&file("d", "h", 9), false));
+}
