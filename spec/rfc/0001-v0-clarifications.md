@@ -58,7 +58,7 @@ A `Move` of a live node to its current parent under its current name, compared b
 
 A commit is accepted only if both of these fit in one `ServerMessage` of at most 1 MiB (§7.2):
 - its `CommitRecord`, as the only record of a `Changes` message;
-- its `CommitResult`, as the result of an `RpcResponse`.
+- its `CommitResult`, as the result of an `RpcResponse` whose `req_id` is the largest `uint64`, so that the outcome does not depend on the `req_id` of the request or of a retry.
 
 A `CommitRecord` cannot be split across messages, so this is the effective bound on a commit. A commit that exceeds it is rejected with `LIMIT_EXCEEDED` and changes nothing.
 
