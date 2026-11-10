@@ -18,6 +18,7 @@
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use flarebox_proto::v1::error;
@@ -117,10 +118,18 @@ fn keep(devices: usize, phases: &[Vec<(usize, Step)>]) -> Result<World, Failure>
 /// The cases of this run that ended at GUN-342.
 static ADOPTED: AtomicUsize = AtomicUsize::new(0);
 
+/// Appends a line to the job summary. The step that runs these tests may not have written to
+/// its summary yet, so the file is made when it does not exist.
+fn summarize(path: &Path, line: &str) -> std::io::Result<()> {
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(line.as_bytes())
+}
+
 /// Passes a case that ended at GUN-342, where the trees cannot be judged any more, and fails a
 /// case with any other failure. Every such case is reported with the seed of the run: on
 /// stderr, which the test harness does not capture, and in the job summary on GitHub Actions.
-/// The fix of GUN-342 removes this function.
+/// A summary that cannot be written is reported on stderr too. The fix of GUN-342 removes this
+/// function.
 fn judge(run: Result<World, Failure>) -> Result<(), TestCaseError> {
     let why = match run {
         Err(Failure::Adopted(why)) => why,
@@ -133,12 +142,29 @@ fn judge(run: Result<World, Failure>) -> Result<(), TestCaseError> {
         "- devices: case {count} of this run that ended at GUN-342 (PROPTEST_RNG_SEED {seed}): {why}\n"
     );
     let _ = std::io::stderr().write_all(line.as_bytes());
-    let summary = std::env::var_os("GITHUB_STEP_SUMMARY");
-    let summary = summary.and_then(|path| OpenOptions::new().append(true).open(path).ok());
-    if let Some(mut file) = summary {
-        let _ = file.write_all(line.as_bytes());
+    if let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY")
+        && let Err(error) = summarize(Path::new(&path), &line)
+    {
+        let path = Path::new(&path).display();
+        let _ = writeln!(
+            std::io::stderr(),
+            "- devices: the job summary {path} was not written: {error}"
+        );
     }
     Ok(())
+}
+
+#[test]
+fn a_report_is_written_to_a_job_summary_that_does_not_exist_yet() {
+    let folder = std::env::temp_dir().join(format!("flarebox-sim-devices-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&folder);
+    std::fs::create_dir_all(&folder).unwrap();
+    let path = folder.join("summary.md");
+    summarize(&path, "first\n").unwrap();
+    summarize(&path, "second\n").unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\nsecond\n");
+    assert!(summarize(&folder.join("missing").join("summary.md"), "third\n").is_err());
+    std::fs::remove_dir_all(&folder).unwrap();
 }
 
 proptest! {
