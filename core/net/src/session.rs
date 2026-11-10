@@ -159,6 +159,7 @@ impl Session {
                     stream: Stream::default(),
                     attempt: 0,
                     token: None,
+                    expired: None,
                 }
                 .run(),
             ),
@@ -450,6 +451,9 @@ struct Task {
     attempt: u32,
     /// The access token of the current connection.
     token: Option<String>,
+    /// A token the server closed the connection over, rejected before the next connection gets a token. Not
+    /// rejected at once, because a refresh in flight may hold the token lock until the connection is dropped.
+    expired: Option<String>,
 }
 
 impl Task {
@@ -538,6 +542,9 @@ impl Task {
 
     /// Gets a token and opens the WebSocket: TCP, TLS for `wss`, and the upgrade.
     async fn open(&mut self) -> Result<(Socket, AccessToken), Exit> {
+        if let Some(expired) = self.expired.take() {
+            self.auth.reject(&expired).await;
+        }
         let token = match self.auth.access_token().await {
             Ok(token) => token,
             Err(error) if error.is_unauthenticated() => {
@@ -638,7 +645,7 @@ impl Task {
             match self.frame(item).await? {
                 Some(Msg::Welcome(welcome)) => return self.negotiated(welcome),
                 Some(Msg::Goodbye(goodbye)) => {
-                    return Err(self.closed(Some(goodbye.code as u16), goodbye.reason).await);
+                    return Err(self.closed(Some(goodbye.code as u16), goodbye.reason));
                 }
                 Some(Msg::Notice(notice)) => self.emit(Event::Notice(notice)),
                 Some(_) => return Err(Exit::violation("a message before Welcome")),
@@ -805,21 +812,19 @@ impl Task {
                 let (code, reason) = frame
                     .map(|f| (Some(u16::from(f.code)), f.reason.to_string()))
                     .unwrap_or_default();
-                Err(self.closed(code, reason).await)
+                Err(self.closed(code, reason))
             }
             Some(Ok(_)) => Ok(None),
         }
     }
 
     /// The server is closing the connection with this code.
-    async fn closed(&mut self, code: Option<u16>, reason: String) -> Exit {
+    fn closed(&mut self, code: Option<u16>, reason: String) -> Exit {
         match code {
             Some(CLOSE_UNSUPPORTED_VERSION) => Exit::Stop(StopReason::UnsupportedVersion(reason)),
             Some(CLOSE_DEVICE_REVOKED) => Exit::Stop(StopReason::DeviceRevoked),
             Some(CLOSE_TOKEN_EXPIRED) => {
-                if let Some(token) = &self.token {
-                    self.auth.reject(token).await;
-                }
+                self.expired = self.token.clone();
                 Exit::Reconnect {
                     reason: DisconnectReason::Closed { code, reason },
                     now: true,
@@ -851,9 +856,7 @@ impl Task {
                 self.emit(Event::Notice(notice));
                 Ok(())
             }
-            Msg::Goodbye(goodbye) => {
-                Err(self.closed(Some(goodbye.code as u16), goodbye.reason).await)
-            }
+            Msg::Goodbye(goodbye) => Err(self.closed(Some(goodbye.code as u16), goodbye.reason)),
             Msg::Welcome(_) => Err(Exit::violation("a second Welcome")),
         }
     }

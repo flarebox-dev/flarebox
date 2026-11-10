@@ -822,3 +822,51 @@ async fn tokens_that_are_due_at_once_are_not_refreshed_in_a_loop() {
     session.close().await;
     server.abort();
 }
+
+#[tokio::test]
+async fn a_token_expiry_close_during_a_refresh_reconnects_with_a_new_token() {
+    let (listener, auth) = listen_on(
+        "127.0.0.1:0",
+        Duration::from_millis(300),
+        Some(Duration::ZERO),
+    )
+    .await;
+    let mut config = config();
+    config.connect_timeout = Duration::from_secs(60);
+    let (session, mut events) = Session::start(auth, config).unwrap();
+    let mut ws = accept(&listener, welcome("h", 0)).await;
+    assert!(matches!(next(&mut events).await, Event::Connected(_)));
+    let (mut refresh, _) = listener.accept().await.unwrap();
+    assert!(
+        refresh.read(&mut [0; 4096]).await.unwrap() > 0,
+        "a refresh is in flight and gets no answer"
+    );
+    let goodbye = Goodbye {
+        code: u32::from(CLOSE_TOKEN_EXPIRED),
+        reason: "expired".into(),
+    };
+    push(&mut ws, server_message::Msg::Goodbye(goodbye)).await;
+    let event = tokio::time::timeout(Duration::from_millis(500), events.next()).await;
+    assert!(
+        matches!(
+            event,
+            Ok(Some(Event::Disconnected {
+                reason: DisconnectReason::Closed {
+                    code: Some(CLOSE_TOKEN_EXPIRED),
+                    ..
+                },
+                ..
+            }))
+        ),
+        "the expiry is handled while the refresh waits: {event:?}"
+    );
+    let (mut token_request, _) =
+        tokio::time::timeout(Duration::from_millis(500), listener.accept())
+            .await
+            .expect("the session asks for a new token to reconnect")
+            .unwrap();
+    assert!(token_request.read(&mut [0; 4096]).await.unwrap() > 0);
+    let closed = tokio::time::timeout(Duration::from_millis(500), session.close()).await;
+    assert!(closed.is_ok(), "close does not wait for the token request");
+    drop(refresh);
+}
