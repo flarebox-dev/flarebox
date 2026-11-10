@@ -361,9 +361,10 @@ impl Engine {
     /// (`Removed::path`, `Renamed::from`) are resolved before any change applies. A renamed or modified entry is the
     /// node L holds at its path with its identity, else the node with its identity, else the node at its path. A
     /// created entry with the identity of a node L holds is that node, wherever L had it. So is a created entry with
-    /// the path and identity a node had before an earlier change of the batch took it out of L, as when a folder is
-    /// replaced around a child that stays. Any other created entry is a new node. An entry that another path also
-    /// links is a hard link, a file of its own (design §5.6), so its identity never takes a node from another path.
+    /// the path and identity a node had before an earlier change of the batch took it out of L, unless the batch
+    /// placed that node again. That keeps a child's node when its folder is replaced around it. Any other created
+    /// entry is a new node. An entry that another path also links is a hard link, a file of its own (design §5.6),
+    /// so its identity never takes a node from another path.
     ///
     /// A node that held the name a change puts an entry at is gone from there, so it leaves L with everything under
     /// it. A file that arrives over a file keeps the node of the file it replaces when L's own node for the arriving
@@ -440,7 +441,9 @@ impl Engine {
                         .cloned()
                         .or_else(|| {
                             (gone.get(path))
-                                .filter(|(_, held)| *held == identity)
+                                .filter(|(node, held)| {
+                                    *held == identity && self.trees.local().get(node).is_none()
+                                })
                                 .map(|(node, _)| node.clone())
                         });
                     self.place(
@@ -1698,6 +1701,44 @@ mod tests {
             Some(incoming)
         );
         assert_eq!(engine.path_of(&synced), Some(PathBuf::from("d/x")));
+    }
+
+    /// A node a batch takes out of L and then places again elsewhere is not taken back by an entry created later at
+    /// its old path with its old identity, so the entry it was placed for stays in L.
+    #[test]
+    fn a_node_placed_again_in_a_batch_stays_where_it_was_placed() {
+        let (_dir, mut engine) = mapper();
+        let folder = |path: &str, id: u64| Observed::Created {
+            path: path.into(),
+            kind: EntryKind::Dir,
+            id: ino(id),
+            linked: false,
+            content: None,
+        };
+        engine.observe(&[folder("a", 1)], 0);
+        let (node, _, _) = holding(&engine, "a").unwrap();
+
+        let batch = [
+            Observed::Removed {
+                path: "a".into(),
+                kind: EntryKind::Dir,
+            },
+            Observed::Renamed {
+                from: "a".into(),
+                to: "b".into(),
+                kind: EntryKind::Dir,
+                id: ino(2),
+                linked: false,
+            },
+            folder("a", 1),
+        ];
+        engine.observe(&batch, 1);
+        assert_eq!(
+            holding(&engine, "b").map(|(id, _, _)| id),
+            Some(node.clone())
+        );
+        assert!(holding(&engine, "a").is_some_and(|(id, _, _)| id != node));
+        assert_eq!(engine.trees.local().len(), 2);
     }
 
     #[test]
