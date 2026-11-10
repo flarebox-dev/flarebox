@@ -9,7 +9,8 @@
     "bindings": [
       { "name": "ACCOUNT", "class_name": "AccountDO" },
       { "name": "SPACE", "class_name": "SpaceDO" }
-    ]
+    ],
+    "code_update_strategy": { "mode": "deferred", "max_delay": 300 }
   },
   "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "flarebox" }],
   "assets": { "directory": "./web/dist", "binding": "ASSETS" },
