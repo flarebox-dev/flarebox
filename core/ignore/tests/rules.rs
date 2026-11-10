@@ -330,6 +330,29 @@ fn gitignore_syntax() {
     }
 }
 
+/// Git lets `**` match zero directories only before a slash that is not escaped, so `**\/b`
+/// needs a directory above `b`. An escaped slash before `**` counts like a plain one.
+#[test]
+fn an_escaped_slash_after_a_double_star_needs_a_directory() {
+    let cases: &[(&str, &[&str], &[&str])] = &[
+        ("**\\/b\n", &["x/b", "x/y/b"], &["b"]),
+        ("a/**\\/b\n", &["a/x/b", "a/x/y/b"], &["a/b"]),
+        ("a\\/**/b\n", &["a/b", "a/x/b"], &["b"]),
+    ];
+    for (rules, hit, miss) in cases {
+        let m = matcher(&[("", rules)]);
+        for path in *hit {
+            assert!(excluded(&m, path), "{rules:?} should exclude {path:?}");
+        }
+        for path in *miss {
+            assert!(!excluded(&m, path), "{rules:?} should not exclude {path:?}");
+        }
+    }
+    let nested = matcher(&[("d/e", "**\\/b\n")]);
+    assert!(!excluded(&nested, "d/e/b"));
+    assert!(excluded(&nested, "d/e/x/b"));
+}
+
 #[test]
 fn unusable_lines_are_reported_and_skipped() {
     let file = RuleFile::<Folded>::parse(b"ok\n\xff\nfoo\\\n[ab\n[[:nope:]]\nx\0y\nlast");
