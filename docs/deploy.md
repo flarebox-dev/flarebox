@@ -26,7 +26,7 @@ Until someone claims it, a new server has no owner, and the first valid claim ma
 
 1. Open `<your server>/setup` in a browser. It writes a one-time claim code, valid for one hour, to the Worker's log.
 2. In the Cloudflare dashboard, open **Workers & Pages**, select your Worker, open **Observability** and search for `Flarebox claim code`.
-3. *Not yet available:* enter the server address and the code in the Flarebox app, or run `flarebox server claim`. That device becomes your first device.
+3. Enter the server address and the code in the setup window of the macOS app. That Mac becomes your first device. The `flarebox` command can't claim a server with this code yet; `flarebox setup` deploys and claims a server in one step instead ([Set up](guide/setup.md)).
 
 If the code expired, open `/setup` again for a new one. Someone who found your address cannot see the code, and their wrong guesses do not affect yours.
 
@@ -34,7 +34,7 @@ If the code expired, open `/setup` again for a new one. Someone who found your a
 
 ## If you lose every device
 
-*Not yet available:* the apps and the CLI cannot send a recovery key yet. The server side works as follows.
+`flarebox server add-device` does these steps for you after a Cloudflare login ([Devices](guide/devices.md#if-you-lose-every-device)). Without that login, no client can send a recovery key yet. The server side works as follows.
 
 You can add a new device without losing anything, as long as you can still change the Worker's settings. Recovery does not sign out your other devices: if a lost device may be in someone else's hands, it keeps working until it is revoked, and revoking devices is not available yet either.
 
