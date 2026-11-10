@@ -27,6 +27,7 @@ jobs:
       macos_app: ${{ steps.paths.outputs.macos_app }}
       macos_runs_on: ${{ steps.runners.outputs.macos_runs_on }}
       macos_developer_dir: ${{ steps.runners.outputs.macos_developer_dir }}
+      site_only: ${{ steps.paths.outputs.site_only }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -55,7 +56,7 @@ jobs:
             echo "macos_runs_on=$(jq -c . <<<"$RUNS_ON")"
             echo "macos_developer_dir=$developer_dir"
           } >> "$GITHUB_OUTPUT"
-      - name: Decide which macOS jobs the change needs
+      - name: Decide which jobs the change needs
         id: paths
         env:
           EVENT: ${{ github.event_name }}
@@ -64,6 +65,7 @@ jobs:
           if [ "$EVENT" = push ]; then
             echo "Push to $GITHUB_REF: every macOS job runs."
             printf '%s=true\n' rust_macos server_macos spec_macos macos_app >> "$GITHUB_OUTPUT"
+            echo "site_only=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git fetch --no-tags --depth=1 origin "$BASE"
@@ -73,6 +75,13 @@ jobs:
           fi
           echo "Files this $EVENT run changes against $BASE:"
           printf '%s\n' "$changed"
+          if [ -n "$changed" ] && ! grep -qv '^site/' <<<"$changed"; then
+            echo "site_only: true, because every changed file is under site/, so the build and test jobs skip."
+            echo "site_only=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "site_only: false, because a changed file is outside site/."
+            echo "site_only=false" >> "$GITHUB_OUTPUT"
+          fi
           decide() {
             if grep -Eq "$2" <<<"$changed"; then
               echo "$1: runs, because a changed file matches $2"
@@ -90,6 +99,7 @@ jobs:
   rust:
     name: rust (${{ matrix.os }})
     needs: changes
+    if: needs.changes.outputs.site_only != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -123,6 +133,7 @@ jobs:
   server:
     name: server (${{ matrix.os }})
     needs: changes
+    if: needs.changes.outputs.site_only != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -154,6 +165,8 @@ jobs:
 
   server-deploy:
     name: server deploy check
+    needs: changes
+    if: needs.changes.outputs.site_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -180,6 +193,8 @@ jobs:
 
   net-integration:
     name: net integration (ubuntu-latest)
+    needs: changes
+    if: needs.changes.outputs.site_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -203,6 +218,8 @@ jobs:
 
   cli-integration:
     name: cli integration (ubuntu-latest)
+    needs: changes
+    if: needs.changes.outputs.site_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -226,6 +243,8 @@ jobs:
 
   ffi-integration:
     name: ffi integration (ubuntu-latest)
+    needs: changes
+    if: needs.changes.outputs.site_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -250,6 +269,7 @@ jobs:
   spec:
     name: spec (${{ matrix.os }})
     needs: changes
+    if: needs.changes.outputs.site_only != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -348,6 +368,7 @@ jobs:
   runner-hook:
     name: runner hook
     needs: changes
+    if: needs.changes.outputs.site_only != 'true'
     runs-on: ${{ fromJSON(needs.changes.outputs.macos_runs_on) }}
     timeout-minutes: 5
     steps:
@@ -368,6 +389,7 @@ jobs:
       - name: Fail if any CI job failed or was cancelled
         env:
           CHANGES: ${{ needs.changes.result }}
+          SITE_ONLY: ${{ needs.changes.outputs.site_only }}
           RUST: ${{ needs.rust.result }}
           SERVER: ${{ needs.server.result }}
           SERVER_DEPLOY: ${{ needs.server-deploy.result }}
@@ -379,6 +401,7 @@ jobs:
           RUNNER_HOOK: ${{ needs.runner-hook.result }}
           FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
         run: |
+          echo "site-only change: ${SITE_ONLY:-unknown}. Build and test jobs that skip for a site-only change report skipped."
           echo "changes: $CHANGES, rust: $RUST, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, cli-integration: $CLI_INTEGRATION, ffi-integration: $FFI_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP, runner-hook: $RUNNER_HOOK"
           if [ "$FAILED" = "true" ]; then
             echo "::error::At least one CI job failed or was cancelled (changes: $CHANGES, rust: $RUST, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, cli-integration: $CLI_INTEGRATION, ffi-integration: $FFI_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP, runner-hook: $RUNNER_HOOK). Open that job's log for the cause."

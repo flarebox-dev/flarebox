@@ -1,7 +1,3 @@
-/* Hallmark · shape: single screen · genre: modern-minimal · theme: Cobalt (by request) · job: install · draw: 11041c
- * hero: Stage · nav: floating bar · footer: legal line · imagery: the product built (setup running in a terminal panel) · signature: the two install commands with copy keys, and flarebox setup running under them step by step
- * axes: light/grotesk-sans/cool · posture: restrained · contrast: pass · fold: pass · field: removed at the owner's request · v2.0.0 */
-/* Hallmark · dismissed 77 · the project owner asked for the hero alone for now, with more sections only when they are needed, so the page is one screen and a legal line */
 /* SPDX-License-Identifier: Apache-2.0 */
 @import url("./tokens.css");
 @import url("./base.css");
@@ -62,4 +58,4 @@ code { font-family: var(--font-outlier); font-size: 0.9em; }
   .hero__grid { grid-template-columns: minmax(0, 1fr); gap: var(--space-xl); min-height: 0; padding-block: var(--space-2xl) var(--space-xl); }
   .term__log { gap: var(--space-md); padding-bottom: var(--space-xl); }
 }
-@media (max-width: 40rem) { .term { font-size: 0.8125rem; } .term__cmds, .term__log { padding-inline: var(--space-md); } .cmd code { font-size: 0.8125rem; white-space: nowrap; overflow-x: auto; scrollbar-width: thin; } .term__log b.url { display: block; white-space: nowrap; overflow-wrap: normal; } }
+@media (max-width: 40rem) { .term { font-size: 0.8125rem; } .term__cmds, .term__log { padding-inline: var(--space-md); } .cmd code { font-size: 0.8125rem; white-space: nowrap; overflow-x: auto; scrollbar-width: thin; } .term__log b.url { display: block; } }
