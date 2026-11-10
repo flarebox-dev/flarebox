@@ -1,0 +1,1301 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! The effect executor against a real folder and a real store, with the network behind [`Fetch`] replaced by chunks
+//! held in memory. A crash is a panic that unwinds out of the executor at a cut, dropping the store, the engine and
+//! the lock; nothing runs between the cut and the next start, as after a process kill.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs;
+use std::future::Future;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::path::{Path, PathBuf};
+use std::pin::pin;
+use std::sync::Mutex;
+use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
+
+use flarebox_chunk::{ChunkerConfig, chunks, content};
+use flarebox_engine::effects::{Base as EngineBase, Dir as EngineDir};
+use flarebox_engine::state::{EffectsState, TreesState};
+use flarebox_engine::tree::{FileIdentity, LocalNode};
+use flarebox_fs::{
+    FileId, PRIVATE_DIR, QUARANTINE_DIR, STAGING_DIR, Snapshot, TRASH_DIR, read_marker,
+    write_marker,
+};
+use flarebox_proto::v1::{NodeKind, NodeState, NodeStatus, VersionInfo};
+use flarebox_store::{EngineState, SyncedNode};
+
+use super::*;
+use crate::claim;
+use crate::ignore::Unfiltered;
+use crate::observe::{FsObserver, Observer};
+
+const SPACE: &str = "0190f0a0-0000-7000-8000-000000000001";
+const NODE: &str = "0190f0a0-0000-7000-8000-0000000000a1";
+const SYNCED: &[u8] = b"the synced report";
+const REMOTE: &[u8] = b"the report as the other device wrote it";
+const REMOTE_MTIME: i64 = 1_700_000_000_123_456_789;
+
+/// A linked folder with its store.
+struct Folder {
+    dir: tempfile::TempDir,
+    root: PathBuf,
+    db: PathBuf,
+    link: Link,
+}
+
+impl Folder {
+    fn new() -> Folder {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("space");
+        fs::create_dir(&root).unwrap();
+        set_marker(&root, 0);
+        let db = dir.path().join("store.sqlite");
+        let link = Link {
+            space_id: SPACE.into(),
+            space_name: "test".into(),
+            root: root.clone(),
+            root_dev: fs::metadata(&root).unwrap().dev(),
+            server_url: "https://files.example.com/".into(),
+            device_id: "device".into(),
+            linked_at_ms: 0,
+        };
+        let mut store = Store::open(&db).unwrap();
+        store.transaction(|tx| tx.set_link(&link)).unwrap();
+        Folder {
+            dir,
+            root,
+            db,
+            link,
+        }
+    }
+
+    /// Writes R, S and L rows and the effect counter, with every node dirty.
+    fn seed(&self, remote: &[NodeState], held: &[(&str, &str, &str)], cleared: u64) {
+        let mut store = Store::open(&self.db).unwrap();
+        store
+            .transaction(|tx| {
+                let mut dirty = BTreeSet::new();
+                for node in remote {
+                    tx.put_remote_node(node)?;
+                    dirty.insert(node.node_id.clone());
+                }
+                for (id, parent, path) in held {
+                    let shape = disk_shape(&self.root, parent, path);
+                    tx.put_synced_node(&SyncedNode {
+                        node_id: (*id).into(),
+                        shape: shape.clone(),
+                    })?;
+                    tx.put_local_node(&flarebox_store::LocalNode {
+                        node_id: (*id).into(),
+                        shape,
+                        identity: Snapshot::scan(&self.root).unwrap().entries[Path::new(path)].id,
+                        parked: false,
+                    })?;
+                    dirty.insert((*id).into());
+                }
+                tx.set_engine_state(&EngineState {
+                    trees: TreesState {
+                        dirty,
+                        ..TreesState::default()
+                    },
+                    effects: EffectsState {
+                        cleared,
+                        ..EffectsState::default()
+                    },
+                    ..EngineState::default()
+                })
+            })
+            .unwrap();
+    }
+
+    fn open(&self) -> (Store, Engine) {
+        let mut store = Store::open(&self.db).unwrap();
+        let engine = store.transaction(|tx| Engine::load(tx, SPACE)).unwrap();
+        (store, engine)
+    }
+
+    /// Starts the disk, with `hook` at every cut when there is one.
+    fn start(&self, hook: Option<Hook>) -> Result<Running, Stop> {
+        let (mut store, mut engine) = self.open();
+        let lock = claim::lock(&self.root)
+            .unwrap()
+            .expect("the folder is not locked");
+        let disk = match hook {
+            Some(hook) => Disk::start_with_hook(&lock, &self.link, &mut engine, &mut store, hook)?,
+            None => Disk::start(&lock, &self.link, &mut engine, &mut store)?,
+        };
+        Ok(Running {
+            disk,
+            engine,
+            store,
+            _lock: lock,
+        })
+    }
+
+    fn marker(&self) -> u64 {
+        read_marker(&self.root).unwrap().unwrap().effects
+    }
+
+    fn private(&self, dir: &str) -> PathBuf {
+        self.root.join(PRIVATE_DIR).join(dir)
+    }
+}
+
+/// A started disk with what it acts on.
+struct Running {
+    disk: Disk,
+    engine: Engine,
+    store: Store,
+    _lock: File,
+}
+
+impl Running {
+    /// Plans, stages and applies one effect. `None` when nothing is planned.
+    fn step(&mut self, server: &Server) -> Option<Settled> {
+        let pending = self.disk.next(&mut self.engine, &mut self.store).unwrap()?;
+        let staged = ready(pending.stage(server)).unwrap();
+        Some(
+            self.disk
+                .apply(staged, &mut self.engine, &mut self.store)
+                .unwrap(),
+        )
+    }
+
+    fn local(&self, id: &str) -> Option<&LocalNode> {
+        self.engine.trees.local().get(id)
+    }
+}
+
+/// Chunks held in memory, standing in for the server and the chunk store.
+#[derive(Default)]
+struct Server {
+    chunks: HashMap<Vec<u8>, Vec<u8>>,
+    versions: HashMap<String, Vec<ChunkRef>>,
+    /// Flips a bit of every chunk it hands over.
+    corrupt: bool,
+    /// How many more downloads fail for now before one goes through.
+    unavailable: Mutex<u32>,
+    /// Runs once, before the first chunk is handed over.
+    during: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl Server {
+    fn hold(&mut self, data: &[u8], config: ChunkerConfig) -> Content {
+        let mut refs = Vec::new();
+        for chunk in chunks(data, config) {
+            let chunk = chunk.unwrap();
+            refs.push(chunk.chunk_ref());
+            self.chunks.insert(chunk.hash.to_vec(), chunk.data);
+        }
+        content(refs, REMOTE_MTIME, false, &config)
+    }
+}
+
+impl Fetch for Server {
+    async fn version_chunks(&self, version_id: &str) -> Result<Vec<ChunkRef>, ChunkError> {
+        self.versions
+            .get(version_id)
+            .cloned()
+            .ok_or(ChunkError::NoTarget { hash: Vec::new() })
+    }
+
+    async fn download(
+        &self,
+        chunks: &[ChunkRef],
+        write: &mut (dyn FnMut(&ChunkRef, &[u8]) -> io::Result<()> + Send),
+    ) -> Result<(), ChunkError> {
+        {
+            let mut unavailable = self.unavailable.lock().unwrap();
+            if *unavailable > 0 {
+                *unavailable -= 1;
+                return Err(ChunkError::Unavailable {
+                    hash: chunks[0].hash.clone(),
+                    message: "the server is busy".into(),
+                });
+            }
+        }
+        let mut handed = BTreeSet::new();
+        for chunk in chunks {
+            if !handed.insert(chunk.hash.clone()) {
+                continue;
+            }
+            if let Some(during) = self.during.lock().unwrap().take() {
+                during();
+            }
+            let mut bytes =
+                self.chunks
+                    .get(&chunk.hash)
+                    .cloned()
+                    .ok_or_else(|| ChunkError::NoTarget {
+                        hash: chunk.hash.clone(),
+                    })?;
+            if self.corrupt {
+                bytes[0] ^= 1;
+            }
+            write(chunk, &bytes).map_err(|source| ChunkError::Io {
+                hash: chunk.hash.clone(),
+                source,
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// The output of a future that never waits, as every future of [`Server`] is.
+fn ready<F: Future>(future: F) -> F::Output {
+    match pin!(future).poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(output) => output,
+        Poll::Pending => panic!("the future waited"),
+    }
+}
+
+/// The payload a crash unwinds with. `resume_unwind` skips the panic hook, so a crash prints nothing.
+struct Crash;
+
+fn crash_at(cut: Cut) -> Option<Hook> {
+    Some(Box::new(move |reached| {
+        if reached == cut {
+            resume_unwind(Box::new(Crash));
+        }
+    }))
+}
+
+fn no_hook() -> Option<Hook> {
+    None
+}
+
+fn set_marker(root: &Path, effects: u64) {
+    write_marker(
+        root,
+        &Marker {
+            space_id: SPACE.into(),
+            effects,
+        },
+    )
+    .unwrap();
+}
+
+/// The content of the file at `path`, as the observer reports it.
+fn disk_content(path: &Path) -> Content {
+    let meta = fs::metadata(path).unwrap();
+    let refs = chunks(fs::File::open(path).unwrap(), ChunkerConfig::V0)
+        .map(|chunk| chunk.unwrap().chunk_ref())
+        .collect();
+    let mtime = i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec());
+    content(
+        refs,
+        mtime as i64,
+        meta.mode() & 0o111 != 0,
+        &ChunkerConfig::V0,
+    )
+}
+
+fn disk_shape(root: &Path, parent: &str, path: &str) -> flarebox_store::Shape {
+    let full = root.join(path);
+    let dir = fs::symlink_metadata(&full).unwrap().is_dir();
+    flarebox_store::Shape {
+        parent_id: parent.into(),
+        name: Path::new(path)
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .into(),
+        kind: if dir { NodeKind::Dir } else { NodeKind::File } as i32,
+        content: (!dir).then(|| disk_content(&full)),
+    }
+}
+
+fn remote(id: &str, name: &str, content: Option<Content>) -> NodeState {
+    NodeState {
+        node_id: id.into(),
+        parent_id: SPACE.into(),
+        name: name.into(),
+        kind: if content.is_some() {
+            NodeKind::File
+        } else {
+            NodeKind::Dir
+        } as i32,
+        status: NodeStatus::Live as i32,
+        content_rev: 1,
+        meta_rev: 1,
+        trash_group: String::new(),
+        current: content.map(|content| VersionInfo {
+            version_id: format!("version-{id}"),
+            content: Some(content),
+            ..VersionInfo::default()
+        }),
+    }
+}
+
+/// The names in the private folder `dir`.
+fn names(folder: &Folder, dir: &str) -> Vec<String> {
+    match fs::read_dir(folder.private(dir)) {
+        Ok(entries) => entries
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Every file and folder under `dir` with the bytes of each file.
+fn tree(dir: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    let mut found = BTreeMap::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(next) = todo.pop() {
+        for entry in fs::read_dir(&next).unwrap() {
+            let path = entry.unwrap().path();
+            let relative = path.strip_prefix(dir).unwrap().to_path_buf();
+            if path.is_dir() {
+                todo.push(path);
+                found.insert(relative, None);
+            } else {
+                found.insert(relative, Some(fs::read(&path).unwrap()));
+            }
+        }
+    }
+    found
+}
+
+/// Whether some file in the local trash holds `bytes`.
+fn trashed(folder: &Folder, bytes: &[u8]) -> bool {
+    match fs::metadata(folder.private(TRASH_DIR)) {
+        Ok(_) => tree(&folder.private(TRASH_DIR))
+            .values()
+            .any(|held| held.as_deref() == Some(bytes)),
+        Err(_) => false,
+    }
+}
+
+/// One effect kind on a small tree.
+struct Scenario {
+    name: &'static str,
+    setup: fn(&Folder, &mut Server),
+    /// Checks the folder once the effect is done.
+    check: fn(&Folder),
+    /// The bytes the effect displaces, which must stay at their name or reach the trash.
+    displaces: Option<&'static [u8]>,
+    /// The first cut after which the next start finds the effect done.
+    done_from: Cut,
+}
+
+const SCENARIOS: [Scenario; 6] = [
+    Scenario {
+        name: "create a folder",
+        setup: |folder, _| folder.seed(&[remote(NODE, "docs", None)], &[], 0),
+        check: |folder| assert!(folder.root.join("docs").is_dir()),
+        displaces: None,
+        done_from: Cut::Step(Step::Placed),
+    },
+    Scenario {
+        name: "write a new file",
+        setup: |folder, server| {
+            let content = server.hold(REMOTE, ChunkerConfig::V0);
+            folder.seed(&[remote(NODE, "report.txt", Some(content))], &[], 0);
+        },
+        check: |folder| {
+            let path = folder.root.join("report.txt");
+            assert_eq!(fs::read(&path).unwrap(), REMOTE);
+            let meta = fs::metadata(&path).unwrap();
+            assert_eq!(
+                i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
+                i128::from(REMOTE_MTIME)
+            );
+        },
+        displaces: None,
+        done_from: Cut::Step(Step::Placed),
+    },
+    Scenario {
+        name: "replace a file",
+        setup: |folder, server| {
+            fs::write(folder.root.join("report.txt"), SYNCED).unwrap();
+            let content = server.hold(REMOTE, ChunkerConfig::V0);
+            folder.seed(
+                &[remote(NODE, "report.txt", Some(content))],
+                &[(NODE, SPACE, "report.txt")],
+                0,
+            );
+        },
+        check: |folder| assert_eq!(fs::read(folder.root.join("report.txt")).unwrap(), REMOTE),
+        displaces: Some(SYNCED),
+        done_from: Cut::Step(Step::Quarantined),
+    },
+    Scenario {
+        name: "move a file",
+        setup: |folder, _| {
+            fs::write(folder.root.join("report.txt"), SYNCED).unwrap();
+            let content = disk_content(&folder.root.join("report.txt"));
+            folder.seed(
+                &[remote(NODE, "renamed.txt", Some(content))],
+                &[(NODE, SPACE, "report.txt")],
+                0,
+            );
+        },
+        check: |folder| {
+            assert!(!folder.root.join("report.txt").exists());
+            assert_eq!(fs::read(folder.root.join("renamed.txt")).unwrap(), SYNCED);
+        },
+        displaces: None,
+        done_from: Cut::Step(Step::Placed),
+    },
+    Scenario {
+        name: "remove a file",
+        setup: |folder, _| {
+            fs::write(folder.root.join("report.txt"), SYNCED).unwrap();
+            folder.seed(&[], &[(NODE, SPACE, "report.txt")], 0);
+        },
+        check: |folder| assert!(!folder.root.join("report.txt").exists()),
+        displaces: Some(SYNCED),
+        done_from: Cut::Step(Step::Quarantined),
+    },
+    Scenario {
+        name: "remove a folder",
+        setup: |folder, _| {
+            fs::create_dir(folder.root.join("docs")).unwrap();
+            folder.seed(&[], &[(NODE, SPACE, "docs")], 0);
+        },
+        check: |folder| assert!(!folder.root.join("docs").exists()),
+        displaces: None,
+        done_from: Cut::Step(Step::Quarantined),
+    },
+];
+
+/// The cuts an uninterrupted run of the scenario reaches, in order.
+fn cuts(scenario: &Scenario) -> Vec<Cut> {
+    let folder = Folder::new();
+    let mut server = Server::default();
+    (scenario.setup)(&folder, &mut server);
+    let reached = Arc::new(Mutex::new(Vec::new()));
+    let record = reached.clone();
+    let mut running = folder
+        .start(Some(Box::new(move |cut| record.lock().unwrap().push(cut))))
+        .unwrap();
+    assert_eq!(
+        running.step(&server),
+        Some(Settled::Done),
+        "{}",
+        scenario.name
+    );
+    reached.lock().unwrap().clone()
+}
+
+/// Checks a folder whose effect is done and acknowledged: L holds R's shape, the disk the effect's result, the
+/// marker equals the effect counter, and nothing is left in quarantine or staging.
+fn assert_done(scenario: &Scenario, folder: &Folder, running: &Running, context: &str) {
+    assert!(running.engine.effects.in_flight().is_none(), "{context}");
+    assert!(running.engine.effects.blocked().is_empty(), "{context}");
+    let remote = running.engine.trees.remote().live(NODE);
+    let local = running.local(NODE).map(|node| &node.shape);
+    assert!(
+        flarebox_engine::tree::same(local, remote),
+        "{context}: L {local:?}, R {remote:?}"
+    );
+    (scenario.check)(folder);
+    assert_eq!(
+        folder.marker(),
+        running.engine.effects.cleared(),
+        "{context}"
+    );
+    assert_eq!(
+        names(folder, QUARANTINE_DIR),
+        Vec::<String>::new(),
+        "{context}"
+    );
+    assert_eq!(
+        names(folder, STAGING_DIR),
+        Vec::<String>::new(),
+        "{context}"
+    );
+    if let Some(bytes) = scenario.displaces {
+        assert!(
+            trashed(folder, bytes),
+            "{context}: the displaced bytes are not in the trash"
+        );
+    }
+}
+
+/// Crashes the scenario's effect at `cut`, starts again, checks what the start left, and finishes the effect.
+fn crash_and_finish(scenario: &Scenario, cut: Cut, cuts: &[Cut]) {
+    let context = format!("{} crashed at {cut:?}", scenario.name);
+    let folder = Folder::new();
+    let mut server = Server::default();
+    (scenario.setup)(&folder, &mut server);
+    let crashed = catch_unwind(AssertUnwindSafe(|| {
+        let mut running = folder.start(crash_at(cut)).unwrap();
+        running.step(&server);
+    }));
+    assert!(
+        crashed.is_err_and(|payload| payload.is::<Crash>()),
+        "{context}: no crash"
+    );
+
+    let mut running = folder.start(no_hook()).unwrap();
+    assert!(running.engine.effects.in_flight().is_none(), "{context}");
+    assert_eq!(
+        folder.marker(),
+        running.engine.effects.cleared(),
+        "{context}"
+    );
+    assert_eq!(
+        names(&folder, QUARANTINE_DIR),
+        Vec::<String>::new(),
+        "{context}"
+    );
+    assert_eq!(
+        names(&folder, STAGING_DIR),
+        Vec::<String>::new(),
+        "{context}"
+    );
+    if let Some(bytes) = scenario.displaces {
+        let at_name = fs::read(folder.root.join("report.txt")).is_ok_and(|held| held == bytes);
+        assert!(
+            at_name || trashed(&folder, bytes),
+            "{context}: the displaced bytes are neither at their name nor in the trash"
+        );
+    }
+    let position = |wanted: Cut| cuts.iter().position(|reached| *reached == wanted);
+    let done = position(cut) >= position(scenario.done_from);
+    let planned = cut != Cut::BeforePlan;
+    let cleared = running.engine.effects.cleared();
+    assert_eq!(cleared, u64::from(planned), "{context}");
+    let again = running.step(&server);
+    if done {
+        assert_eq!(
+            again, None,
+            "{context}: done at the start, yet planned again"
+        );
+    } else {
+        assert_eq!(again, Some(Settled::Done), "{context}: not planned again");
+    }
+    assert_eq!(running.step(&server), None, "{context}");
+    assert_done(scenario, &folder, &running, &context);
+}
+
+#[test]
+fn a_crash_at_every_cut_of_every_effect_is_recovered_on_the_next_start() {
+    for scenario in &SCENARIOS {
+        let cuts = cuts(scenario);
+        assert_eq!(cuts.first(), Some(&Cut::BeforePlan), "{}", scenario.name);
+        assert_eq!(cuts.last(), Some(&Cut::AfterAck), "{}", scenario.name);
+        assert!(
+            cuts.contains(&scenario.done_from),
+            "{}: {cuts:?}",
+            scenario.name
+        );
+        for &cut in &cuts {
+            crash_and_finish(scenario, cut, &cuts);
+        }
+    }
+}
+
+#[test]
+fn a_crash_during_recovery_is_recovered_on_the_start_after() {
+    for scenario in SCENARIOS
+        .iter()
+        .filter(|scenario| scenario.displaces.is_some())
+    {
+        for recovery_cut in [
+            Cut::Step(Step::Marked),
+            Cut::Step(Step::Compared),
+            Cut::Step(Step::Placed),
+            Cut::Step(Step::Trashed),
+            Cut::BeforeAck,
+            Cut::AfterAck,
+        ] {
+            let context = format!(
+                "{} crashed at Quarantined, then at {recovery_cut:?}",
+                scenario.name
+            );
+            let folder = Folder::new();
+            let mut server = Server::default();
+            (scenario.setup)(&folder, &mut server);
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                let mut running = folder
+                    .start(crash_at(Cut::Step(Step::Quarantined)))
+                    .unwrap();
+                running.step(&server);
+            }));
+            let reached =
+                catch_unwind(AssertUnwindSafe(|| folder.start(crash_at(recovery_cut)))).is_err();
+            let mut running = folder.start(no_hook()).unwrap();
+            assert_eq!(
+                running.step(&server),
+                None,
+                "{context} (crashed: {reached})"
+            );
+            assert_done(scenario, &folder, &running, &context);
+        }
+    }
+}
+
+/// A folder whose store has cleared three effects and holds a fourth in flight, planned for writing a file.
+fn three_cleared_and_one_in_flight() -> (Folder, Server, String) {
+    let folder = Folder::new();
+    let mut server = Server::default();
+    let content = server.hold(REMOTE, ChunkerConfig::V0);
+    folder.seed(&[remote(NODE, "report.txt", Some(content))], &[], 3);
+    set_marker(&folder.root, 3);
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        folder
+            .start(crash_at(Cut::AfterPlan))
+            .unwrap()
+            .step(&server);
+    }));
+    let (_, engine) = folder.open();
+    let record = engine.effects.in_flight().unwrap().clone();
+    assert_eq!(record.counter, 4);
+    (folder, server, record.effect_id)
+}
+
+#[test]
+fn a_marker_below_the_effect_counter_pauses_without_writing() {
+    let folder = Folder::new();
+    folder.seed(&[], &[], 3);
+    set_marker(&folder.root, 2);
+    let before = tree(&folder.root);
+    assert!(matches!(
+        folder.start(no_hook()),
+        Err(Stop::DiskBehind {
+            marker: 2,
+            cleared: 3
+        })
+    ));
+    assert_eq!(tree(&folder.root), before);
+}
+
+#[test]
+fn a_marker_equal_to_the_effect_counter_starts() {
+    let folder = Folder::new();
+    folder.seed(&[], &[], 3);
+    set_marker(&folder.root, 3);
+    let running = folder.start(no_hook()).unwrap();
+    assert_eq!(running.engine.effects.cleared(), 3);
+    assert_eq!(folder.marker(), 3);
+}
+
+#[test]
+fn a_marker_one_above_with_an_effect_in_flight_is_recovered() {
+    let (folder, server, _) = three_cleared_and_one_in_flight();
+    set_marker(&folder.root, 4);
+    let mut running = folder.start(no_hook()).unwrap();
+    assert_eq!(running.engine.effects.cleared(), 4);
+    assert_eq!(folder.marker(), 4);
+    assert_eq!(running.step(&server), Some(Settled::Done));
+    assert_eq!(folder.marker(), 5);
+    assert_eq!(fs::read(folder.root.join("report.txt")).unwrap(), REMOTE);
+}
+
+#[test]
+fn a_marker_above_what_the_store_accounts_for_keeps_every_trace() {
+    let (folder, _, effect_id) = three_cleared_and_one_in_flight();
+    set_marker(&folder.root, 6);
+    fs::create_dir_all(folder.private(STAGING_DIR)).unwrap();
+    fs::write(folder.private(STAGING_DIR).join(&effect_id), b"staged").unwrap();
+    fs::create_dir_all(folder.private(QUARANTINE_DIR)).unwrap();
+    fs::write(folder.private(QUARANTINE_DIR).join(&effect_id), SYNCED).unwrap();
+    let before = tree(&folder.root);
+    assert!(matches!(
+        folder.start(no_hook()),
+        Err(Stop::StoreBehind {
+            marker: 6,
+            upper: 4
+        })
+    ));
+    assert_eq!(tree(&folder.root), before);
+    let (_, engine) = folder.open();
+    assert_eq!(
+        engine.effects.in_flight().map(|record| &record.effect_id),
+        Some(&effect_id)
+    );
+
+    let idle = Folder::new();
+    idle.seed(&[], &[], 3);
+    set_marker(&idle.root, 4);
+    assert!(matches!(
+        idle.start(no_hook()),
+        Err(Stop::StoreBehind {
+            marker: 4,
+            upper: 3
+        })
+    ));
+}
+
+#[test]
+fn a_missing_marker_halts_without_writing() {
+    let folder = Folder::new();
+    folder.seed(&[], &[], 0);
+    fs::remove_file(folder.root.join(PRIVATE_DIR).join("space.json")).unwrap();
+    let before = tree(&folder.root);
+    assert!(matches!(
+        folder.start(no_hook()),
+        Err(Stop::Root(RootProblem::NoMarker))
+    ));
+    assert_eq!(tree(&folder.root), before);
+}
+
+#[test]
+fn an_interrupted_effect_is_planned_again_after_a_restart() {
+    let folder = Folder::new();
+    let mut server = Server::default();
+    (SCENARIOS[1].setup)(&folder, &mut server);
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        folder
+            .start(crash_at(Cut::Step(Step::Marked)))
+            .unwrap()
+            .step(&server);
+    }));
+    let (_, engine) = folder.open();
+    let interrupted = engine.effects.in_flight().unwrap().effect_id.clone();
+    let mut running = folder.start(no_hook()).unwrap();
+    assert!(running.engine.effects.blocked().is_empty());
+    let pending = running
+        .disk
+        .next(&mut running.engine, &mut running.store)
+        .unwrap()
+        .expect("planned again");
+    assert_eq!(pending.record.node, NODE);
+    assert_ne!(pending.record.effect_id, interrupted);
+    assert_eq!(
+        pending.record.effect,
+        engine.effects.in_flight().unwrap().effect
+    );
+}
+
+#[test]
+fn an_effect_that_met_a_taken_name_or_a_changed_file_stays_blocked() {
+    for (scenario, disturb) in [(&SCENARIOS[1], "Taken"), (&SCENARIOS[2], "Changed")] {
+        let folder = Folder::new();
+        let mut server = Server::default();
+        (scenario.setup)(&folder, &mut server);
+        let mut running = folder.start(no_hook()).unwrap();
+        let pending = running
+            .disk
+            .next(&mut running.engine, &mut running.store)
+            .unwrap()
+            .unwrap();
+        let staged = ready(pending.stage(&server)).unwrap();
+        fs::write(folder.root.join("report.txt"), b"the user's own words").unwrap();
+        let settled = running
+            .disk
+            .apply(staged, &mut running.engine, &mut running.store)
+            .unwrap();
+        assert_eq!(settled, Settled::Failed(disturb.into()));
+        assert_eq!(
+            fs::read(folder.root.join("report.txt")).unwrap(),
+            b"the user's own words"
+        );
+        assert_eq!(running.step(&server), None, "{disturb}");
+        drop((running, pending));
+        let mut running = folder.start(no_hook()).unwrap();
+        assert!(
+            running.engine.effects.blocked().contains_key(NODE),
+            "{disturb}"
+        );
+        assert_eq!(running.step(&server), None, "{disturb}");
+        assert_eq!(folder.marker(), 1);
+    }
+}
+
+/// Moves the root aside and puts an empty folder at its path.
+fn replace_root(root: &Path) -> PathBuf {
+    let aside = root.with_file_name("moved");
+    fs::rename(root, &aside).unwrap();
+    fs::create_dir(root).unwrap();
+    aside
+}
+
+#[test]
+fn a_root_replaced_during_a_download_receives_nothing() {
+    let folder = Folder::new();
+    let mut server = Server::default();
+    (SCENARIOS[1].setup)(&folder, &mut server);
+    let root = folder.root.clone();
+    *server.during.lock().unwrap() = Some(Box::new(move || {
+        replace_root(&root);
+    }));
+    let mut running = folder.start(no_hook()).unwrap();
+    let pending = running
+        .disk
+        .next(&mut running.engine, &mut running.store)
+        .unwrap()
+        .unwrap();
+    match ready(pending.stage(&server)) {
+        Err(Stall::Halt(stop)) => assert!(stop.to_string().contains("no longer names"), "{stop}"),
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+    assert_eq!(tree(&folder.root), BTreeMap::new());
+    assert!(running.engine.effects.in_flight().is_some());
+    let aside = folder.dir.path().join("moved");
+    assert!(!aside.join("report.txt").exists());
+}
+
+#[test]
+fn a_root_replaced_before_an_effect_applies_receives_nothing() {
+    let folder = Folder::new();
+    let mut server = Server::default();
+    (SCENARIOS[1].setup)(&folder, &mut server);
+    let mut running = folder.start(no_hook()).unwrap();
+    let pending = running
+        .disk
+        .next(&mut running.engine, &mut running.store)
+        .unwrap()
+        .unwrap();
+    let staged = ready(pending.stage(&server)).unwrap();
+    let aside = replace_root(&folder.root);
+    let before = tree(&aside);
+    assert!(matches!(
+        running
+            .disk
+            .apply(staged, &mut running.engine, &mut running.store),
+        Err(Stop::Withdrawn(_))
+    ));
+    assert_eq!(tree(&folder.root), BTreeMap::new());
+    assert_eq!(tree(&aside), before);
+    drop(running);
+    let (_, engine) = folder.open();
+    assert!(engine.effects.in_flight().is_some());
+}
+
+/// Observes until `done` accepts the changes seen so far, for at most ten seconds, and returns them as one batch.
+fn observe_until(
+    observer: &mut FsObserver,
+    stamp: Stamp,
+    done: impl Fn(&[Observed]) -> bool,
+) -> Batch {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = Vec::new();
+    loop {
+        assert!(Instant::now() < deadline, "not observed in time: {seen:?}");
+        if let Some(observation) = observer.observe(Duration::from_millis(200)).unwrap() {
+            seen.extend(observation.changes.iter().cloned());
+            if done(&seen) {
+                return Batch {
+                    stamp,
+                    observation: Observation {
+                        changes: seen,
+                        ..observation
+                    },
+                };
+            }
+        }
+    }
+}
+
+fn observer(root: &Path, previous: Snapshot) -> FsObserver {
+    let dev = fs::metadata(root).unwrap().dev();
+    FsObserver::start(root, SPACE, dev, previous, Arc::new(Unfiltered)).unwrap()
+}
+
+fn created(changes: &[Observed], name: &str) -> Option<(FileId, Option<Content>)> {
+    changes.iter().find_map(|change| match change {
+        Observed::Created {
+            path, id, content, ..
+        } if path == Path::new(name) => Some((*id, content.clone())),
+        _ => None,
+    })
+}
+
+#[test]
+fn a_root_replaced_between_a_scan_and_its_consumption_is_refused() {
+    let folder = Folder::new();
+    fs::write(folder.root.join("notes.txt"), b"notes").unwrap();
+    folder.seed(&[], &[], 0);
+    let mut running = folder.start(no_hook()).unwrap();
+    let sections = running.disk.sections();
+    let mut watching = observer(&folder.root, Snapshot::default());
+    let batch = observe_until(&mut watching, sections.stamp(), |seen| {
+        created(seen, "notes.txt").is_some()
+    });
+    let aside = replace_root(&folder.root);
+    set_marker(&folder.root, 0);
+    fs::write(folder.root.join("other.txt"), b"other").unwrap();
+    assert!(matches!(
+        running
+            .disk
+            .observed(batch, &mut running.engine, &mut running.store),
+        Err(Stop::Withdrawn(_))
+    ));
+    assert!(running.engine.trees.local().is_empty());
+
+    let mut replacement = observer(&folder.root, Snapshot::default());
+    let batch = observe_until(&mut replacement, sections.stamp(), |seen| {
+        created(seen, "other.txt").is_some()
+    });
+    assert!(matches!(
+        running
+            .disk
+            .observed(batch, &mut running.engine, &mut running.store),
+        Err(Stop::OtherRoot)
+    ));
+    assert!(running.engine.trees.local().is_empty());
+    assert_eq!(fs::read(aside.join("notes.txt")).unwrap(), b"notes");
+}
+
+#[test]
+fn a_stale_batch_does_not_undo_an_effect_and_the_rescan_reports_its_result() {
+    let folder = Folder::new();
+    let mut server = Server::default();
+    (SCENARIOS[2].setup)(&folder, &mut server);
+    fs::write(folder.root.join("notes.txt"), b"notes").unwrap();
+    let mut running = folder.start(no_hook()).unwrap();
+    let sections = running.disk.sections();
+    let mut watching = observer(&folder.root, Snapshot::default());
+    let stale = observe_until(&mut watching, sections.stamp(), |seen| {
+        created(seen, "report.txt").is_some() && created(seen, "notes.txt").is_some()
+    });
+    let (old, _) = created(&stale.observation.changes, "report.txt").unwrap();
+
+    assert_eq!(running.step(&server), Some(Settled::Done));
+    let written = running.local(NODE).unwrap().clone();
+    assert_ne!(written.identity, file_identity(old));
+    running
+        .disk
+        .observed(stale, &mut running.engine, &mut running.store)
+        .unwrap();
+    assert_eq!(running.local(NODE), Some(&written));
+    let notes: Vec<&LocalNode> = running
+        .engine
+        .trees
+        .local()
+        .iter()
+        .filter(|(_, node)| node.shape.name == "notes.txt")
+        .map(|(_, node)| node)
+        .collect();
+    assert_eq!(
+        notes.len(),
+        1,
+        "a change outside the effect's paths is kept"
+    );
+
+    let rescans = sections.take_rescans();
+    assert_eq!(rescans, vec![PathBuf::from("report.txt")]);
+    watching.forget(&rescans).unwrap();
+    let fresh = observe_until(&mut watching, sections.stamp(), |seen| {
+        created(seen, "report.txt").is_some()
+    });
+    let (id, content) = created(&fresh.observation.changes, "report.txt").unwrap();
+    assert_eq!(file_identity(id), written.identity);
+    assert_eq!(
+        content.map(|content| content.manifest_digest),
+        written
+            .shape
+            .content
+            .as_ref()
+            .map(|content| content.manifest_digest.clone())
+    );
+    let nodes = running.engine.trees.local().len();
+    running
+        .disk
+        .observed(fresh, &mut running.engine, &mut running.store)
+        .unwrap();
+    assert_eq!(running.local(NODE), Some(&written));
+    assert_eq!(running.engine.trees.local().len(), nodes);
+    drop(running);
+    let (_, engine) = folder.open();
+    assert_eq!(engine.trees.local().get(NODE), Some(&written));
+}
+
+#[test]
+fn a_download_that_fails_for_now_keeps_the_effect_and_stages_again() {
+    let folder = Folder::new();
+    let mut server = Server::default();
+    (SCENARIOS[1].setup)(&folder, &mut server);
+    *server.unavailable.lock().unwrap() = 1;
+    let mut running = folder.start(no_hook()).unwrap();
+    let pending = running
+        .disk
+        .next(&mut running.engine, &mut running.store)
+        .unwrap()
+        .unwrap();
+    match ready(pending.stage(&server)) {
+        Err(Stall::Later(wait)) => assert_eq!(wait, STAGE_AGAIN),
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+    assert!(running.engine.effects.in_flight().is_some());
+    assert!(!folder.root.join("report.txt").exists());
+    let staged = ready(pending.stage(&server)).unwrap();
+    assert_eq!(
+        running
+            .disk
+            .apply(staged, &mut running.engine, &mut running.store)
+            .unwrap(),
+        Settled::Done
+    );
+    assert_eq!(fs::read(folder.root.join("report.txt")).unwrap(), REMOTE);
+}
+
+/// Writes `data` as a new file named `name` and returns the folder after the effect.
+fn write_new(name: &str, data: &[u8], config: ChunkerConfig) -> (Folder, Settled) {
+    let folder = Folder::new();
+    let mut server = Server::default();
+    let content = server.hold(data, config);
+    folder.seed(&[remote(NODE, name, Some(content))], &[], 0);
+    let mut running = folder.start(no_hook()).unwrap();
+    let settled = running.step(&server).unwrap();
+    assert_eq!(folder.marker(), running.engine.effects.cleared());
+    assert_eq!(names(&folder, STAGING_DIR), Vec::<String>::new());
+    (folder, settled)
+}
+
+#[test]
+fn a_chunk_that_repeats_is_written_at_every_offset() {
+    let config = ChunkerConfig::new(64, 256, 1024, 512).unwrap();
+    let data = vec![0u8; 5_000];
+    let mut server = Server::default();
+    let content = server.hold(&data, config);
+    let distinct: BTreeSet<&Vec<u8>> = content.chunks.iter().map(|chunk| &chunk.hash).collect();
+    assert!(distinct.len() < content.chunks.len(), "{content:?}");
+    let (folder, settled) = write_new("zeros", &data, config);
+    assert_eq!(settled, Settled::Done);
+    assert_eq!(fs::read(folder.root.join("zeros")).unwrap(), data);
+}
+
+#[test]
+fn an_empty_file_is_written() {
+    let (folder, settled) = write_new("empty", b"", ChunkerConfig::V0);
+    assert_eq!(settled, Settled::Done);
+    assert_eq!(fs::read(folder.root.join("empty")).unwrap(), b"");
+}
+
+#[test]
+fn a_name_keeps_its_exact_bytes() {
+    let name = "re\u{301}sume\u{301} 한글.txt";
+    let (folder, settled) = write_new(name, REMOTE, ChunkerConfig::V0);
+    assert_eq!(settled, Settled::Done);
+    let names: Vec<Vec<u8>> = fs::read_dir(&folder.root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().as_bytes().to_vec())
+        .filter(|found| found.as_slice() != PRIVATE_DIR.as_bytes())
+        .collect();
+    assert_eq!(names, vec![name.as_bytes().to_vec()]);
+}
+
+#[test]
+fn a_corrupted_download_fails_the_effect_and_writes_nothing() {
+    let folder = Folder::new();
+    let mut server = Server::default();
+    (SCENARIOS[1].setup)(&folder, &mut server);
+    server.corrupt = true;
+    let mut running = folder.start(no_hook()).unwrap();
+    let settled = running.step(&server).unwrap();
+    assert!(
+        matches!(&settled, Settled::Failed(why) if why.contains("cannot be downloaded")),
+        "{settled:?}"
+    );
+    assert!(!folder.root.join("report.txt").exists());
+    assert_eq!(names(&folder, STAGING_DIR), Vec::<String>::new());
+    assert_eq!(folder.marker(), 1);
+    assert!(running.engine.effects.blocked().contains_key(NODE));
+    assert_eq!(running.step(&server), None);
+}
+
+#[test]
+fn a_content_without_its_chunk_list_is_fetched_through_the_remote_version() {
+    let folder = Folder::new();
+    let mut server = Server::default();
+    let mut content = server.hold(REMOTE, ChunkerConfig::V0);
+    let chunks = std::mem::take(&mut content.chunks);
+    server.versions.insert(format!("version-{NODE}"), chunks);
+    folder.seed(&[remote(NODE, "report.txt", Some(content))], &[], 0);
+    let mut running = folder.start(no_hook()).unwrap();
+    assert_eq!(running.step(&server), Some(Settled::Done));
+    assert_eq!(fs::read(folder.root.join("report.txt")).unwrap(), REMOTE);
+
+    let folder = Folder::new();
+    let mut server = Server::default();
+    let mut content = server.hold(REMOTE, ChunkerConfig::V0);
+    content.chunks.clear();
+    folder.seed(&[remote(NODE, "report.txt", Some(content))], &[], 0);
+    let mut running = folder.start(no_hook()).unwrap();
+    let settled = running.step(&server).unwrap();
+    assert!(matches!(settled, Settled::Failed(_)), "{settled:?}");
+    assert!(!folder.root.join("report.txt").exists());
+    assert_eq!(folder.marker(), 1);
+}
+
+fn record(effect: EngineEffect) -> EffectRecord {
+    EffectRecord {
+        effect_id: "0190f0a0-0000-7000-8000-0000000000e1".into(),
+        node: NODE.into(),
+        counter: 1,
+        effect,
+        after: None,
+    }
+}
+
+#[test]
+fn translation_copies_names_and_identities_and_refuses_what_is_not_a_name() {
+    let no_birth = FileIdentity {
+        dev: 7,
+        ino: 8,
+        birth_ns: None,
+    };
+    let born = FileIdentity {
+        birth_ns: Some(-5),
+        ..no_birth
+    };
+    let at = EngineLocation::At {
+        base: EngineBase::Parked {
+            node: "parked-node".into(),
+            identity: born,
+        },
+        dirs: vec![EngineDir {
+            name: "dossier".into(),
+            identity: no_birth,
+        }],
+        name: "e\u{301}t\u{e9}.txt".into(),
+    };
+    let synced = Content {
+        size: 3,
+        mtime_ns: -1,
+        executable: true,
+        ..Content::default()
+    };
+    let (effect, contents) = translate(&record(EngineEffect::RemoveFile {
+        displaced: EngineDisplaced {
+            at: at.clone(),
+            identity: no_birth,
+            content: synced.clone(),
+        },
+    }))
+    .unwrap();
+    let Action::RemoveFile { displaced } = effect.action else {
+        panic!("{effect:?}");
+    };
+    assert_eq!(
+        displaced.at,
+        Location::At {
+            base: Base::Parked {
+                name: "parked-node".into(),
+                id: FileId {
+                    dev: 7,
+                    ino: 8,
+                    birth_ns: Some(-5)
+                },
+            },
+            dirs: vec![Dir {
+                name: "dossier".into(),
+                id: FileId {
+                    dev: 7,
+                    ino: 8,
+                    birth_ns: None
+                },
+            }],
+            name: OsString::from("e\u{301}t\u{e9}.txt"),
+        }
+    );
+    assert_eq!(
+        displaced.entry,
+        Entry {
+            kind: EntryKind::File,
+            id: file_id(no_birth),
+            size: 3,
+            mtime_ns: -1,
+            executable: true,
+        }
+    );
+    assert_eq!(contents.displaced, Some(synced));
+    assert_eq!(file_identity(file_id(no_birth)), no_birth);
+    assert_eq!(file_identity(file_id(born)), born);
+
+    for bad in ["", ".", "..", "a/b", "/", "a\0b"] {
+        let effect = EngineEffect::CreateDir {
+            at: EngineLocation::At {
+                base: EngineBase::Root,
+                dirs: Vec::new(),
+                name: bad.into(),
+            },
+        };
+        assert!(
+            matches!(translate(&record(effect)), Err(Stop::Record { .. })),
+            "{bad:?}"
+        );
+    }
+    let parked = EngineEffect::Move {
+        from: EngineLocation::Parked("..".into()),
+        identity: no_birth,
+        to: at,
+    };
+    assert!(translate(&record(parked)).is_err());
+}
+
+#[test]
+fn a_record_whose_name_is_not_a_file_name_is_never_committed() {
+    let folder = Folder::new();
+    folder.seed(&[remote(NODE, "a/b", None)], &[], 0);
+    let mut running = folder.start(no_hook()).unwrap();
+    assert!(matches!(
+        running.disk.next(&mut running.engine, &mut running.store),
+        Err(Stop::Record { .. })
+    ));
+    drop(running);
+    let (_, engine) = folder.open();
+    assert!(engine.effects.in_flight().is_none());
+    assert_eq!(folder.marker(), 0);
+}
+
+#[test]
+fn kinds_map_one_to_one() {
+    let identity = FileIdentity {
+        dev: 1,
+        ino: 2,
+        birth_ns: Some(3),
+    };
+    let here = EngineLocation::At {
+        base: EngineBase::Root,
+        dirs: Vec::new(),
+        name: "here".into(),
+    };
+    let content = Content {
+        size: 1,
+        ..Content::default()
+    };
+    let cases = [
+        EngineEffect::CreateDir { at: here.clone() },
+        EngineEffect::WriteFile {
+            at: here.clone(),
+            content: content.clone(),
+            replaces: Some(EngineDisplaced {
+                at: EngineLocation::Parked(NODE.into()),
+                identity,
+                content: content.clone(),
+            }),
+        },
+        EngineEffect::Move {
+            from: here.clone(),
+            identity,
+            to: EngineLocation::Parked(NODE.into()),
+        },
+        EngineEffect::RemoveDir {
+            at: here.clone(),
+            identity,
+        },
+    ];
+    let kinds: Vec<&str> = cases
+        .into_iter()
+        .map(
+            |effect| match translate(&record(effect)).unwrap().0.action {
+                Action::CreateDir { .. } => "create",
+                Action::WriteFile {
+                    replaces:
+                        Some(Displaced {
+                            at: Location::Parked(_),
+                            ..
+                        }),
+                    ..
+                } => "replace",
+                Action::Move {
+                    to: Location::Parked(_),
+                    id,
+                    ..
+                } if id == file_id(identity) => "park",
+                Action::RemoveDir { id, .. } if id == file_id(identity) => "remove",
+                other => panic!("{other:?}"),
+            },
+        )
+        .collect();
+    assert_eq!(kinds, ["create", "replace", "park", "remove"]);
+}

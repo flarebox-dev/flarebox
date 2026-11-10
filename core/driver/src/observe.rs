@@ -47,6 +47,9 @@ pub struct Observation {
     pub root: Result<(), RootProblem>,
     /// Folders the scans may not read. What is below them is unknown, not absent.
     pub unreadable: Vec<PathBuf>,
+    /// The identity of the root folder the observer's scans opened, from the latest poll that scanned. A batch
+    /// whose root is not the folder the task locked describes another folder. `None` only before the first scan.
+    pub scanned: Option<FileId>,
     /// Files that changed while they were chunked, or that could not be opened or read as the entry the scan saw.
     /// Their changes carry no content. The observer keeps reading them, waiting longer after each failure, and
     /// reports a `Modified` with the content once a read succeeds, unless a later change to the path replaces it
@@ -98,6 +101,8 @@ pub struct FsObserver {
     watcher: Box<dyn Watcher + Send>,
     native: bool,
     matcher: Arc<dyn Matcher>,
+    /// The root folder the latest scan opened.
+    scanned: Option<FileId>,
     /// Files whose content could not be read, with when to read them again.
     unread: BTreeMap<PathBuf, Retry>,
 }
@@ -130,20 +135,7 @@ impl FsObserver {
         previous: Snapshot,
         matcher: Arc<dyn Matcher>,
     ) -> Result<Self, FsError> {
-        let (watcher, native): (Box<dyn Watcher + Send>, bool) = match NativeWatcher::start(
-            root,
-            previous.clone(),
-        ) {
-            Ok(watcher) => (Box::new(watcher), true),
-            Err(FsError::Watch(error)) => {
-                tracing::warn!(%error, "the platform watcher is unavailable; rescanning periodically");
-                (
-                    Box::new(RescanWatcher::new(root, previous, RESCAN_INTERVAL)?),
-                    false,
-                )
-            }
-            Err(error) => return Err(error),
-        };
+        let (watcher, native) = watch(root, previous, true)?;
         Ok(FsObserver {
             root: std::fs::canonicalize(root)?,
             space_id: space_id.to_owned(),
@@ -151,8 +143,22 @@ impl FsObserver {
             watcher,
             native,
             matcher,
+            scanned: None,
             unread: BTreeMap::new(),
         })
+    }
+
+    /// Forgets what the snapshot knows at and below each of `scopes`, relative paths, so the next observation reports
+    /// what is there now as created, with the content of every file. The watcher starts again from the reduced
+    /// snapshot, so that observation also rescans the rest of the tree; what did not change there is not reported.
+    pub fn forget(&mut self, scopes: &[PathBuf]) -> Result<(), FsError> {
+        let mut snapshot = self.watcher.snapshot().clone();
+        for scope in scopes {
+            snapshot.forget(scope);
+            self.unread.retain(|path, _| !path.starts_with(scope));
+        }
+        (self.watcher, self.native) = watch(&self.root, snapshot, self.native)?;
+        Ok(())
     }
 
     fn excluded(&self, path: &Path, kind: EntryKind) -> bool {
@@ -352,6 +358,9 @@ impl Observer for FsObserver {
             }
             poll => poll?,
         };
+        if poll.root.is_some() {
+            self.scanned = poll.root;
+        }
         let now = Instant::now();
         let mut changes = Vec::new();
         let mut busy = Vec::new();
@@ -372,6 +381,7 @@ impl Observer for FsObserver {
             changes,
             root,
             unreadable: poll.unreadable,
+            scanned: self.scanned,
             busy,
         }))
     }
@@ -379,6 +389,28 @@ impl Observer for FsObserver {
     fn snapshot(&self) -> &Snapshot {
         self.watcher.snapshot()
     }
+}
+
+/// A watcher of `root` that starts from `previous`: the platform's when `native` is set and it is available, else one
+/// that rescans the whole tree periodically. Returns whether it is the platform's.
+fn watch(
+    root: &Path,
+    previous: Snapshot,
+    native: bool,
+) -> Result<(Box<dyn Watcher + Send>, bool), FsError> {
+    if native {
+        match NativeWatcher::start(root, previous.clone()) {
+            Ok(watcher) => return Ok((Box::new(watcher), true)),
+            Err(FsError::Watch(error)) => {
+                tracing::warn!(%error, "the platform watcher is unavailable; rescanning periodically");
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok((
+        Box::new(RescanWatcher::new(root, previous, RESCAN_INTERVAL)?),
+        false,
+    ))
 }
 
 /// The content of the file at `path` under `root`, or `None` when it is not the file the scan saw or changed while
