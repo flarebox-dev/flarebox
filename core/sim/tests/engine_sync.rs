@@ -2010,3 +2010,171 @@ fn a_waiting_update_of_a_file_both_sides_deleted_is_dropped() {
     ];
     run(&seed, &local, &remote, fits, fresh_dir_names, &during).unwrap();
 }
+
+/// The server merges the user's new folder ß into the other device's ß, whose S update waits
+/// because S still holds a parked file at ss, the same name after case folding. The other device
+/// has moved that file into the folder, and the user deletes the folder. The folder is brought
+/// back for the file instead of its update holding both out of convergence.
+#[test]
+fn a_waiting_folder_the_user_deleted_is_brought_back_for_a_file_moved_into_it() {
+    let seed = vec![
+        Action {
+            kind: 1,
+            target: 0,
+            parent: 0,
+            name: 5,
+            text: 0,
+        },
+        Action {
+            kind: 1,
+            target: 0,
+            parent: 0,
+            name: 2,
+            text: 0,
+        },
+    ];
+    let local = vec![
+        Action {
+            kind: 2,
+            target: 11079414779518565354,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 2,
+            target: 5832766238116930057,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+    ];
+    let remote = vec![
+        Action {
+            kind: 3,
+            target: 351730081019129726,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 0,
+            name: 5,
+            text: 0,
+        },
+        Action {
+            kind: 1,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 2,
+            target: 554097051787814230,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+    ];
+    let fits = 1000;
+    let fresh_dir_names = false;
+    let during = vec![
+        (
+            false,
+            vec![
+                Action {
+                    kind: 2,
+                    target: 3032609202697743113,
+                    parent: 0,
+                    name: 0,
+                    text: 0,
+                },
+                Action {
+                    kind: 3,
+                    target: 2731698343566406169,
+                    parent: 304348770870888498,
+                    name: 2,
+                    text: 0,
+                },
+            ],
+        ),
+        (
+            false,
+            vec![
+                Action {
+                    kind: 4,
+                    target: 3172150523246826267,
+                    parent: 0,
+                    name: 0,
+                    text: 0,
+                },
+                Action {
+                    kind: 3,
+                    target: 9725551978640732566,
+                    parent: 1209946197345948991,
+                    name: 0,
+                    text: 0,
+                },
+                Action {
+                    kind: 3,
+                    target: 936650056549699008,
+                    parent: 1061052580595229545,
+                    name: 3,
+                    text: 0,
+                },
+            ],
+        ),
+        (
+            true,
+            vec![
+                Action {
+                    kind: 0,
+                    target: 0,
+                    parent: 0,
+                    name: 5,
+                    text: 0,
+                },
+                Action {
+                    kind: 0,
+                    target: 0,
+                    parent: 65492476661922611,
+                    name: 3,
+                    text: 0,
+                },
+            ],
+        ),
+        (
+            true,
+            vec![Action {
+                kind: 4,
+                target: 600126837695760128,
+                parent: 0,
+                name: 0,
+                text: 0,
+            }],
+        ),
+        (
+            false,
+            vec![
+                Action {
+                    kind: 0,
+                    target: 0,
+                    parent: 0,
+                    name: 0,
+                    text: 0,
+                },
+                Action {
+                    kind: 0,
+                    target: 0,
+                    parent: 0,
+                    name: 0,
+                    text: 0,
+                },
+            ],
+        ),
+    ];
+    run(&seed, &local, &remote, fits, fresh_dir_names, &during).unwrap();
+}
