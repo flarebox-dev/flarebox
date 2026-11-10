@@ -9,11 +9,11 @@ mod common;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use common::bind;
+use common::{bind, rewrite_keeping_mtime, same};
 use flarebox_fs::{
     Base, Location, PRIVATE_DIR, Reclaimed, Space, TRASH_DIR, TRASH_RETENTION, recovered_name,
 };
@@ -39,15 +39,20 @@ fn names(path: &Path) -> Vec<String> {
     names
 }
 
-/// Trashes the root entry `name` as `entry`.
-fn put(space: &Space, name: &str, entry: &str, now: SystemTime) {
+/// Trashes the root entry `name` as `entry`, recording a file's bytes as its
+/// content.
+fn put(root: &Path, space: &Space, name: &str, entry: &str, now: SystemTime) {
+    let path = root.join(name);
+    let content = (!path.is_dir()).then(|| fs::read(&path).unwrap());
     let location = Location::At {
         base: Base::Root,
         dirs: Vec::new(),
         name: name.into(),
     };
     let (folder, name) = space.parent(&location).unwrap();
-    space.trash(&folder, name, entry, name, now).unwrap();
+    space
+        .trash(&folder, name, entry, name, content.as_deref(), now)
+        .unwrap();
 }
 
 fn removed(entries: &[&str]) -> Reclaimed {
@@ -64,19 +69,21 @@ fn trashed_entries_stay_until_they_expire() {
     fs::write(root.join("old.txt"), "old").unwrap();
     fs::write(root.join("new.txt"), "new").unwrap();
     let space = bind(root);
-    put(&space, "old.txt", "e1", at(T0));
-    put(&space, "new.txt", "e2", at(T0) + 3 * DAY);
+    put(root, &space, "old.txt", "e1", at(T0));
+    put(root, &space, "new.txt", "e2", at(T0) + 3 * DAY);
     assert_eq!(names(root), [PRIVATE_DIR]);
     assert_eq!(names(&trash_dir(root)), ["e1", "e2"]);
 
     let before_expiry = at(T0) + TRASH_RETENTION - Duration::from_secs(1);
     assert_eq!(
-        space.reclaim_trash(before_expiry, u64::MAX).unwrap(),
+        space
+            .reclaim_trash(before_expiry, u64::MAX, &mut same)
+            .unwrap(),
         Reclaimed::default()
     );
     assert_eq!(
         space
-            .reclaim_trash(at(T0) + TRASH_RETENTION, u64::MAX)
+            .reclaim_trash(at(T0) + TRASH_RETENTION, u64::MAX, &mut same)
             .unwrap(),
         removed(&["e1"])
     );
@@ -84,7 +91,7 @@ fn trashed_entries_stay_until_they_expire() {
     assert_eq!(fs::read(trash_dir(root).join("e2")).unwrap(), b"new");
     assert_eq!(
         space
-            .reclaim_trash(at(T0) + 3 * DAY + TRASH_RETENTION, u64::MAX)
+            .reclaim_trash(at(T0) + 3 * DAY + TRASH_RETENTION, u64::MAX, &mut same)
             .unwrap(),
         removed(&["e2"])
     );
@@ -99,29 +106,29 @@ fn size_cap_evicts_the_oldest_entries_first() {
     for (i, size) in [10, 20, 30].into_iter().enumerate() {
         let name = format!("f{i}");
         fs::write(root.join(&name), vec![b'x'; size]).unwrap();
-        put(&space, &name, &format!("e{i}"), at(T0 + i as u64));
+        put(root, &space, &name, &format!("e{i}"), at(T0 + i as u64));
     }
     fs::create_dir(root.join("empty")).unwrap();
-    put(&space, "empty", "e3", at(T0 + 3));
+    put(root, &space, "empty", "e3", at(T0 + 3));
 
     assert_eq!(
-        space.reclaim_trash(at(T0 + 4), 60).unwrap(),
+        space.reclaim_trash(at(T0 + 4), 60, &mut same).unwrap(),
         Reclaimed::default()
     );
     assert_eq!(
-        space.reclaim_trash(at(T0 + 4), 35).unwrap(),
+        space.reclaim_trash(at(T0 + 4), 35, &mut same).unwrap(),
         removed(&["e0", "e1"])
     );
     assert_eq!(names(&trash_dir(root)), ["e2", "e3"]);
     // An empty folder takes no room, so only its expiry reclaims it.
     assert_eq!(
-        space.reclaim_trash(at(T0 + 4), 0).unwrap(),
+        space.reclaim_trash(at(T0 + 4), 0, &mut same).unwrap(),
         removed(&["e2"])
     );
     assert_eq!(names(&trash_dir(root)), ["e3"]);
     assert_eq!(
         space
-            .reclaim_trash(at(T0 + 3) + TRASH_RETENTION, 0)
+            .reclaim_trash(at(T0 + 3) + TRASH_RETENTION, 0, &mut same)
             .unwrap(),
         removed(&["e3"])
     );
@@ -138,12 +145,12 @@ fn write_through_an_old_descriptor_is_recovered_on_expiry() {
         .open(root.join("report.txt"))
         .unwrap();
     let space = bind(root);
-    put(&space, "report.txt", "e1", at(T0));
+    put(root, &space, "report.txt", "e1", at(T0));
 
     held.write_all(b" and appended later").unwrap();
     drop(held);
     let reclaimed = space
-        .reclaim_trash(at(T0) + TRASH_RETENTION, u64::MAX)
+        .reclaim_trash(at(T0) + TRASH_RETENTION, u64::MAX, &mut same)
         .unwrap();
     let name = "report (recovered 2023-11-21).txt";
     assert_eq!(
@@ -171,7 +178,7 @@ fn write_through_an_old_descriptor_is_recovered_under_the_size_cap() {
         .open(root.join("notes"))
         .unwrap();
     let space = bind(root);
-    put(&space, "notes", "e1", at(T0));
+    put(root, &space, "notes", "e1", at(T0));
     fs::write(root.join("notes (recovered 2023-11-14)"), "taken").unwrap();
 
     // Same size, so only the ctime tells. Coarse kernel clocks tick every few
@@ -179,8 +186,8 @@ fn write_through_an_old_descriptor_is_recovered_under_the_size_cap() {
     std::thread::sleep(Duration::from_millis(50));
     held.write_all_at(b"ABCDEFGHIJ", 0).unwrap();
     drop(held);
-    put(&space, "other.txt", "e2", at(T0 + 1));
-    let reclaimed = space.reclaim_trash(at(T0 + 2), 5).unwrap();
+    put(root, &space, "other.txt", "e2", at(T0 + 1));
+    let reclaimed = space.reclaim_trash(at(T0 + 2), 5, &mut same).unwrap();
     let name = "notes (recovered 2023-11-14 2)";
     assert_eq!(
         reclaimed,
@@ -197,6 +204,56 @@ fn write_through_an_old_descriptor_is_recovered_under_the_size_cap() {
     assert_eq!(names(&trash_dir(root)), ["e2"]);
 }
 
+/// Changing only an entry's metadata, as `chmod -R`, `chown -R` or `xattr -cr`
+/// on the linked folder does, writes nothing to it, so it is deleted when due.
+#[test]
+fn an_entry_whose_metadata_alone_changed_is_deleted_when_due() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("report.txt"), "synced").unwrap();
+    fs::create_dir(root.join("empty.d")).unwrap();
+    let space = bind(root);
+    put(root, &space, "report.txt", "e1", at(T0));
+    put(root, &space, "empty.d", "e2", at(T0));
+
+    std::thread::sleep(Duration::from_millis(50));
+    for entry in ["e1", "e2"] {
+        let path = trash_dir(root).join(entry);
+        let mode = if path.is_dir() { 0o700 } else { 0o600 };
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+    assert_eq!(
+        space
+            .reclaim_trash(at(T0) + TRASH_RETENTION, u64::MAX, &mut same)
+            .unwrap(),
+        removed(&["e1", "e2"])
+    );
+    assert_eq!(names(root), [PRIVATE_DIR]);
+}
+
+/// A write through an old descriptor that keeps the file's size and sets its
+/// modification time back is still found, by content, and recovered.
+#[test]
+fn a_write_that_keeps_size_and_modification_time_is_recovered_when_due() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("report.txt"), "synced").unwrap();
+    let space = bind(root);
+    put(root, &space, "report.txt", "e1", at(T0));
+
+    std::thread::sleep(Duration::from_millis(50));
+    rewrite_keeping_mtime(&trash_dir(root).join("e1"), b"SYNCED");
+    let reclaimed = space
+        .reclaim_trash(at(T0) + TRASH_RETENTION, u64::MAX, &mut same)
+        .unwrap();
+    assert_eq!(reclaimed.removed, Vec::<String>::new());
+    assert_eq!(reclaimed.recovered.len(), 1);
+    assert_eq!(
+        fs::read(root.join(&reclaimed.recovered[0])).unwrap(),
+        b"SYNCED"
+    );
+}
+
 #[test]
 fn folder_written_into_after_trashing_is_recovered() {
     let dir = tempfile::tempdir().unwrap();
@@ -204,7 +261,7 @@ fn folder_written_into_after_trashing_is_recovered() {
     fs::create_dir(root.join("photos.d")).unwrap();
     let held = fs::File::open(root.join("photos.d")).unwrap();
     let space = bind(root);
-    put(&space, "photos.d", "e1", at(T0));
+    put(root, &space, "photos.d", "e1", at(T0));
 
     std::thread::sleep(Duration::from_millis(50));
     let inside = rustix::fs::openat(
@@ -216,7 +273,7 @@ fn folder_written_into_after_trashing_is_recovered() {
     .unwrap();
     fs::File::from(inside).write_all(b"late").unwrap();
     let reclaimed = space
-        .reclaim_trash(at(T0) + TRASH_RETENTION, u64::MAX)
+        .reclaim_trash(at(T0) + TRASH_RETENTION, u64::MAX, &mut same)
         .unwrap();
     let name = "photos.d (recovered 2023-11-21)";
     assert_eq!(reclaimed.recovered, [OsStr::new(name)]);
@@ -232,13 +289,13 @@ fn entry_missing_from_the_index_is_kept_for_a_full_period() {
     let root = dir.path();
     let space = bind(root);
     fs::write(root.join("a.txt"), "a").unwrap();
-    put(&space, "a.txt", "e1", at(T0));
+    put(root, &space, "a.txt", "e1", at(T0));
     fs::write(trash_dir(root).join("e2"), "moved in before a crash").unwrap();
     fs::remove_file(trash_dir(root).join("e1")).unwrap();
 
     let later = at(T0) + TRASH_RETENTION;
     assert_eq!(
-        space.reclaim_trash(later, u64::MAX).unwrap(),
+        space.reclaim_trash(later, u64::MAX, &mut same).unwrap(),
         Reclaimed::default()
     );
     assert_eq!(names(&trash_dir(root)), ["e2"]);
@@ -246,7 +303,7 @@ fn entry_missing_from_the_index_is_kept_for_a_full_period() {
     // recovered rather than deleted.
     assert_eq!(
         space
-            .reclaim_trash(later + TRASH_RETENTION, u64::MAX)
+            .reclaim_trash(later + TRASH_RETENTION, u64::MAX, &mut same)
             .unwrap(),
         Reclaimed {
             removed: Vec::new(),
@@ -262,14 +319,16 @@ fn trashing_never_replaces_an_entry() {
     let space = bind(root);
     fs::write(root.join("a.txt"), "a").unwrap();
     fs::write(root.join("b.txt"), "b").unwrap();
-    put(&space, "a.txt", "e1", at(T0));
+    put(root, &space, "a.txt", "e1", at(T0));
     let location = Location::At {
         base: Base::Root,
         dirs: Vec::new(),
         name: "b.txt".into(),
     };
     let (folder, name) = space.parent(&location).unwrap();
-    let err = space.trash(&folder, name, "e1", name, at(T0)).unwrap_err();
+    let err = space
+        .trash(&folder, name, "e1", name, None, at(T0))
+        .unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     assert_eq!(fs::read(trash_dir(root).join("e1")).unwrap(), b"a");
     assert_eq!(fs::read(root.join("b.txt")).unwrap(), b"b");
@@ -336,7 +395,7 @@ fn unindexed_entry_written_late_is_recovered_under_the_cap() {
     drop(held);
 
     let space = bind(root);
-    let reclaimed = space.reclaim_trash(at(T0), 0).unwrap();
+    let reclaimed = space.reclaim_trash(at(T0), 0, &mut same).unwrap();
     let name = "e1 (recovered 2023-11-14)";
     assert_eq!(
         reclaimed,
@@ -366,11 +425,11 @@ fn unindexed_entry_written_late_is_recovered_on_expiry() {
 
     let space = bind(root);
     assert_eq!(
-        space.reclaim_trash(at(T0), u64::MAX).unwrap(),
+        space.reclaim_trash(at(T0), u64::MAX, &mut same).unwrap(),
         Reclaimed::default()
     );
     let reclaimed = space
-        .reclaim_trash(at(T0) + TRASH_RETENTION, u64::MAX)
+        .reclaim_trash(at(T0) + TRASH_RETENTION, u64::MAX, &mut same)
         .unwrap();
     let name = "e1 (recovered 2023-11-21)";
     assert_eq!(
@@ -393,7 +452,9 @@ fn unindexed_entry_is_never_deleted() {
     fs::write(root.join("a.txt"), "a").unwrap();
     put_unindexed(root, "a.txt", "e1");
     let space = bind(root);
-    let reclaimed = space.reclaim_trash(at(T0) + TRASH_RETENTION, 0).unwrap();
+    let reclaimed = space
+        .reclaim_trash(at(T0) + TRASH_RETENTION, 0, &mut same)
+        .unwrap();
     assert_eq!(
         reclaimed,
         Reclaimed {
@@ -413,13 +474,13 @@ fn stale_index_temporary_file_does_not_stop_reclamation() {
     let root = dir.path();
     fs::write(root.join("a.txt"), "a").unwrap();
     let space = bind(root);
-    put(&space, "a.txt", "e1", at(T0));
+    put(root, &space, "a.txt", "e1", at(T0));
     fs::write(root.join(PRIVATE_DIR).join("trash.json.tmp"), "torn").unwrap();
     fs::write(root.join("b.txt"), "b").unwrap();
-    put(&space, "b.txt", "e2", at(T0 + 1));
+    put(root, &space, "b.txt", "e2", at(T0 + 1));
 
     assert_eq!(
-        space.reclaim_trash(at(T0 + 2), 1).unwrap(),
+        space.reclaim_trash(at(T0 + 2), 1, &mut same).unwrap(),
         removed(&["e1"])
     );
     assert_eq!(names(&trash_dir(root)), ["e2"]);
@@ -459,6 +520,7 @@ fn trash_names_must_be_single_components() {
                 OsStr::new(name),
                 entry,
                 OsStr::new(original),
+                None,
                 at(T0),
             )
             .unwrap_err();
@@ -481,7 +543,7 @@ fn trash_moved_out_of_the_root_during_reclamation_is_left_alone() {
     let root = dir.path();
     fs::write(root.join("a.txt"), "a").unwrap();
     let space = bind(root);
-    put(&space, "a.txt", "e1", at(T0));
+    put(root, &space, "a.txt", "e1", at(T0));
     let index_path = root.join(PRIVATE_DIR).join("trash.json");
     let index = fs::read(&index_path).unwrap();
     fs::remove_file(&index_path).unwrap();
@@ -495,7 +557,7 @@ fn trash_moved_out_of_the_root_during_reclamation_is_left_alone() {
     // which happens after the trash folder has moved out of the root.
     let reclaim = std::thread::spawn({
         let root = root.to_path_buf();
-        move || bind(&root).reclaim_trash(at(T0) + TRASH_RETENTION, u64::MAX)
+        move || bind(&root).reclaim_trash(at(T0) + TRASH_RETENTION, u64::MAX, &mut same)
     });
     let mut fifo = OpenOptions::new().write(true).open(&index_path).unwrap();
     fs::rename(trash_dir(root), outside.path().join("trash")).unwrap();

@@ -4,14 +4,18 @@
 //! displaced, kept for [`TRASH_RETENTION`] or until the caller's size cap
 //! evicts it, whichever comes first.
 //!
-//! The trash keeps its own index of each entry's size and ctime when it
-//! entered, in `.flarebox/trash.json`. A process that held a descriptor open
-//! across the effect can still write to a trashed file, so before reclaiming
-//! an entry the collector compares it with the index and turns an entry that
-//! changed into a recovered file at the sync root instead. That check is best
-//! effort: a write between the check and the unlink is lost. An entry with no
-//! recorded values, such as one moved in just before a crash, is never
-//! deleted: it becomes a recovered file when it is due.
+//! The trash keeps its own index of each entry's size when it entered, with
+//! the content the caller says a file holds, in `.flarebox/trash.json`. The
+//! index is written before the entry moves in, so a crash never leaves an
+//! entry the index does not know. A process that held a descriptor open across
+//! the effect can still write to a trashed file, so before reclaiming a file
+//! the collector compares its size and content with the index and turns a
+//! file that changed into a recovered file at the sync root instead. A change
+//! of metadata alone, such as `chmod -R` on the linked folder, does not count.
+//! A folder is reclaimed only while it is empty. That check is best effort: a
+//! write between the check and the unlink is lost. An entry with no recorded
+//! values, which only an older version or a hand could have put there, is
+//! never deleted: it becomes a recovered file when it is due.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -49,6 +53,11 @@ struct Kept {
     folder: bool,
     size: u64,
     ctime_ns: i64,
+    /// What the caller identifies a file's content by. A file without it, which
+    /// only an older version indexed, is compared by `ctime_ns`, which that
+    /// version took after the move.
+    #[serde(default)]
+    content: Option<Vec<u8>>,
     trashed_s: u64,
     /// Whether `size` and `ctime_ns` were taken when the entry entered. An
     /// entry found later has no such evidence and is never deleted.
@@ -68,44 +77,76 @@ pub struct Reclaimed {
 
 impl Space {
     /// Moves `name` in `from` into the local trash as `entry`, never
-    /// replacing anything there, flushes both folders, and records the entry's
-    /// size and ctime with `original`, the name it had before it was
-    /// displaced. All three must be single file names. `from` and the trash
-    /// are checked from the root again first.
+    /// replacing anything there, and flushes both folders. Before it moves, the
+    /// entry's size and ctime are recorded with `original`, the name it had
+    /// before it was displaced, and with `content`, what the caller identifies
+    /// a file's content by. All three names must be single file names. `from`
+    /// and the trash are checked from the root again first.
     pub fn trash(
         &self,
         from: &Folder,
         name: &OsStr,
         entry: &str,
         original: &OsStr,
+        content: Option<&[u8]>,
         now: SystemTime,
+    ) -> io::Result<()> {
+        self.trash_with(from, name, entry, original, content, now, &mut || {})
+    }
+
+    /// [`Space::trash`], calling `cut` where a crash would leave the entry
+    /// and the index out of step.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn trash_with(
+        &self,
+        from: &Folder,
+        name: &OsStr,
+        entry: &str,
+        original: &OsStr,
+        content: Option<&[u8]>,
+        now: SystemTime,
+        cut: &mut dyn FnMut(),
     ) -> io::Result<()> {
         for name in [name, OsStr::new(entry), original] {
             check_name(name)?;
         }
         let trash = self.private(&[TRASH_DIR])?;
-        self.recheck(from)?;
         self.recheck(&trash)?;
-        rename_no_replace(from.fd(), name, trash.fd(), OsStr::new(entry))?;
-        let kept = kept(trash.fd(), entry, &original.to_string_lossy(), now, true)?;
-        flush(from.fd())?;
-        flush(trash.fd())?;
+        if stat_at(trash.fd(), OsStr::new(entry)).is_ok() {
+            return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+        }
+        self.recheck(from)?;
+        let original = original.to_string_lossy();
+        let kept = kept(from.fd(), name, &original, content, now, true)?;
         let private = self.private(&[])?;
         let mut index = read_index(private.fd())?;
         index.entries.insert(entry.to_owned(), kept);
         self.recheck(&private)?;
-        write_index(private.fd(), &index)
+        write_index(private.fd(), &index)?;
+        cut();
+        self.recheck(from)?;
+        self.recheck(&trash)?;
+        rename_no_replace(from.fd(), name, trash.fd(), OsStr::new(entry))?;
+        flush(from.fd())?;
+        flush(trash.fd())
     }
 
     /// Reclaims the local trash at `now`: entries older than
     /// [`TRASH_RETENTION`], then the oldest entries until the recorded sizes
-    /// of those left add up to at most `cap` bytes. An entry whose size or
-    /// ctime differs from the index, or a folder that is no longer empty, is
-    /// recovered at the sync root instead of deleted. An entry the index does
-    /// not know, such as one moved in just before a crash, is indexed now,
-    /// counted as entering now, and recovered rather than deleted when it is
-    /// due. The trash folder is checked from the root again before each entry.
-    pub fn reclaim_trash(&self, now: SystemTime, cap: u64) -> io::Result<Reclaimed> {
+    /// of those left add up to at most `cap` bytes. A file whose size differs
+    /// from the index, or that `holds` does not find holding the recorded
+    /// content, or a folder that is no longer empty, is recovered at the sync
+    /// root instead of deleted. An entry the index does not know is indexed
+    /// now, counted as entering now, and recovered rather than deleted when it
+    /// is due. An index entry with no entry, left by a crash before the move,
+    /// is dropped. The trash folder is checked from the root again before each
+    /// entry.
+    pub fn reclaim_trash(
+        &self,
+        now: SystemTime,
+        cap: u64,
+        holds: &mut dyn FnMut(&File, &[u8]) -> io::Result<bool>,
+    ) -> io::Result<Reclaimed> {
         let trash = self.private(&[TRASH_DIR])?;
         let private = self.private(&[])?;
         let root = self.root_folder()?;
@@ -118,7 +159,7 @@ impl Space {
             if let Some(entry) = name.to_str()
                 && !index.entries.contains_key(entry)
             {
-                let kept = kept(trash.fd(), entry, entry, now, false)?;
+                let kept = kept(trash.fd(), name, entry, None, now, false)?;
                 index.entries.insert(entry.to_owned(), kept);
             }
         }
@@ -139,7 +180,7 @@ impl Space {
             }
             total -= kept.size;
             self.recheck(&trash)?;
-            if kept.recorded && remove_unchanged(trash.fd(), &entry, &kept)? {
+            if kept.recorded && remove_unchanged(trash.fd(), &entry, &kept, holds)? {
                 reclaimed.removed.push(entry.clone());
             } else {
                 let original = match check_name(OsStr::new(&kept.name)) {
@@ -164,16 +205,32 @@ impl Space {
     }
 }
 
-/// Deletes a trash entry that still matches the index. Returns false,
-/// leaving it in place, when it changed.
-fn remove_unchanged(trash: BorrowedFd<'_>, entry: &str, kept: &Kept) -> io::Result<bool> {
+/// Deletes a trash entry that still matches the index: a file with the
+/// recorded size and content, or an empty folder. Returns false, leaving it in
+/// place, when it changed.
+fn remove_unchanged(
+    trash: BorrowedFd<'_>,
+    entry: &str,
+    kept: &Kept,
+    holds: &mut dyn FnMut(&File, &[u8]) -> io::Result<bool>,
+) -> io::Result<bool> {
     let stat = stat_at(trash, OsStr::new(entry))?;
     let folder = stat.file_type == FileType::Directory;
-    if folder != kept.folder
-        || stat.size != kept.size && !folder
-        || ctime(stat.ctime_ns) != kept.ctime_ns
-    {
+    if folder != kept.folder || !folder && stat.size != kept.size {
         return Ok(false);
+    }
+    if !folder {
+        let unchanged = match &kept.content {
+            Some(content) => {
+                let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+                let file = rustix::fs::openat(trash, entry, flags, Mode::empty())?;
+                holds(&File::from(file), content)?
+            }
+            None => ctime(stat.ctime_ns) == kept.ctime_ns,
+        };
+        if !unchanged {
+            return Ok(false);
+        }
     }
     let flags = if folder {
         AtFlags::REMOVEDIR
@@ -187,20 +244,24 @@ fn remove_unchanged(trash: BorrowedFd<'_>, entry: &str, kept: &Kept) -> io::Resu
     }
 }
 
+/// What to record about the entry `entry` of `dir`, which had the name
+/// `name` before it was displaced and, for a file, holds `content`.
 fn kept(
-    trash: BorrowedFd<'_>,
-    entry: &str,
+    dir: BorrowedFd<'_>,
+    entry: &OsStr,
     name: &str,
+    content: Option<&[u8]>,
     now: SystemTime,
     recorded: bool,
 ) -> io::Result<Kept> {
-    let stat = stat_at(trash, OsStr::new(entry))?;
+    let stat = stat_at(dir, entry)?;
     let folder = stat.file_type == FileType::Directory;
     Ok(Kept {
         name: name.to_owned(),
         folder,
         size: if folder { 0 } else { stat.size },
         ctime_ns: ctime(stat.ctime_ns),
+        content: content.filter(|_| !folder).map(<[u8]>::to_vec),
         trashed_s: seconds(now),
         recorded,
     })

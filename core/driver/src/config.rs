@@ -12,12 +12,39 @@ use serde::Deserialize;
 /// [sync]
 /// include = ["Projects/", "Notes/2026"]
 /// exclude = ["*.iso", "build/"]
+///
+/// [trash]
+/// max_size_mb = 2048
 /// ```
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub sync: SyncRules,
+    #[serde(default)]
+    pub trash: LocalTrash,
+}
+
+/// The local trash of every folder the profile links (design §5.2), which holds what sync effects displaced. An
+/// entry leaves it after [`flarebox_fs::TRASH_RETENTION`], or earlier, oldest first, while the folder's trash holds
+/// more than `max_size_mb` megabytes (2048 when unset).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LocalTrash {
+    pub max_size_mb: u64,
+}
+
+impl Default for LocalTrash {
+    fn default() -> Self {
+        LocalTrash { max_size_mb: 2048 }
+    }
+}
+
+impl LocalTrash {
+    /// The cap in bytes.
+    pub fn cap(&self) -> u64 {
+        self.max_size_mb.saturating_mul(1_000_000)
+    }
 }
 
 /// This device's own selective sync (H13 of reports/BOX-71), applied to every folder the profile links. It saves
@@ -246,6 +273,15 @@ mod tests {
         ));
 
         std::fs::write(&path, "[sync]\ninclude = [\"../outside\"]\n").unwrap();
+        assert!(matches!(
+            Config::load(&path),
+            Err(ConfigError::Invalid { .. })
+        ));
+
+        assert_eq!(Config::default().trash.cap(), 2_048_000_000);
+        std::fs::write(&path, "[trash]\nmax_size_mb = 10\n").unwrap();
+        assert_eq!(Config::load(&path).unwrap().trash.cap(), 10_000_000);
+        std::fs::write(&path, "[trash]\nmax_size_gb = 10\n").unwrap();
         assert!(matches!(
             Config::load(&path),
             Err(ConfigError::Invalid { .. })

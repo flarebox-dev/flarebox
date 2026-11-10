@@ -60,6 +60,15 @@ impl Contents for Bytes {
     fn written(&mut self, file: &File) -> std::io::Result<bool> {
         Ok(read(file) == REMOTE)
     }
+
+    fn displaced_content(&self) -> Option<Vec<u8>> {
+        Some(SYNCED.to_vec())
+    }
+}
+
+/// Whether a trashed file holds `content`, its bytes as recorded.
+pub fn same(file: &File, content: &[u8]) -> std::io::Result<bool> {
+    Ok(read(file) == content)
 }
 
 /// A space bound to a descriptor of `root` opened here, the way the driver

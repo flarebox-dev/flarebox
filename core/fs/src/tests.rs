@@ -1055,3 +1055,37 @@ fn a_failed_scan_leaves_the_rules_as_they_were() {
         ]
     );
 }
+
+/// A crash inside [`Space::trash`] leaves nothing that reclamation brings
+/// back to the sync root.
+#[test]
+fn a_crash_while_trashing_brings_nothing_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("report.txt"), "synced").unwrap();
+    let space = Space::bind(fs::File::open(root).unwrap().into(), root).unwrap();
+    let location = Location::At {
+        base: Base::Root,
+        dirs: Vec::new(),
+        name: "report.txt".into(),
+    };
+    let (folder, name) = space.parent(&location).unwrap();
+    let now = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = space.trash_with(&folder, name, "e1", name, None, now, &mut || {
+            panic!("crash")
+        });
+    }));
+    assert!(crash.is_err());
+
+    let mut recovered = Vec::new();
+    for later in [now, now + TRASH_RETENTION, now + 2 * TRASH_RETENTION] {
+        recovered.extend(
+            space
+                .reclaim_trash(later, u64::MAX, &mut |_, _| Ok(true))
+                .unwrap()
+                .recovered,
+        );
+    }
+    assert_eq!(recovered, Vec::<OsString>::new());
+}

@@ -2171,3 +2171,28 @@ fn a_file_moved_into_an_ignored_folder_keeps_its_entry_in_l() {
     let planned = running.disk.next(&mut running.engine, &mut running.store);
     assert!(planned.unwrap().is_none());
 }
+
+/// A file the disk trashed whose metadata alone changed afterwards, as `chmod -R` on the folder does, still holds
+/// the content its effect recorded, so reclamation deletes it when it is due instead of bringing it back.
+#[test]
+fn a_trashed_file_whose_metadata_alone_changed_is_reclaimed_when_due() {
+    use std::os::unix::fs::PermissionsExt;
+    let folder = Folder::new();
+    let mut server = Server::default();
+    (SCENARIOS[2].setup)(&folder, &mut server);
+    let mut running = folder.start(no_hook()).unwrap();
+    assert_eq!(running.step(&server), Some(Settled::Done));
+    let entries: Vec<PathBuf> = fs::read_dir(folder.private(TRASH_DIR))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(entries.len(), 1);
+    std::thread::sleep(Duration::from_millis(50));
+    let mode = fs::metadata(&entries[0]).unwrap().permissions().mode();
+    fs::set_permissions(&entries[0], fs::Permissions::from_mode(mode ^ 0o004)).unwrap();
+
+    let due = SystemTime::now() + flarebox_fs::TRASH_RETENTION + Duration::from_secs(60);
+    let reclaimed = running.disk.reclaim_trash(due, u64::MAX).unwrap();
+    assert_eq!(reclaimed.removed.len(), 1, "{reclaimed:?}");
+    assert!(reclaimed.recovered.is_empty(), "{reclaimed:?}");
+}

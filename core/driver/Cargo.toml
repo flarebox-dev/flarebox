@@ -18,6 +18,7 @@ flarebox-ignore = { path = "../ignore" }
 flarebox-net = { path = "../net" }
 flarebox-proto = { path = "../proto" }
 flarebox-store = { path = "../store" }
+prost.workspace = true
 rustix = { version = "1.1.6", features = ["fs", "process"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -29,7 +30,6 @@ url = "2.5.8"
 
 [dev-dependencies]
 flarebox-sim = { path = "../sim" }
-prost.workspace = true
 reqwest = { version = "0.13.5", default-features = false }
 tempfile = "3.27.0"
 tokio = { version = "1.48", features = ["full", "test-util"] }

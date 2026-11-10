@@ -625,3 +625,70 @@ async fn two_edits_of_one_file_keep_both_contents() {
     a.stop().await;
     b.stop().await;
 }
+
+/// Moves the file `name` at the root of a stopped device's folder into its local trash as `entry`, as an effect
+/// trashed at `when` records it.
+fn put_in_trash(device: &Device, name: &str, entry: &str, when: std::time::SystemTime) {
+    let root = device.folder();
+    let space = flarebox_fs::Space::bind(fs::File::open(&root).unwrap().into(), &root).unwrap();
+    let location = flarebox_fs::Location::At {
+        base: flarebox_fs::Base::Root,
+        dirs: Vec::new(),
+        name: name.into(),
+    };
+    let (folder, name) = space.parent(&location).unwrap();
+    let config = ChunkerConfig::V0;
+    let refs = flarebox_chunk::chunks(fs::read(root.join(name)).unwrap().as_slice(), config)
+        .map(|chunk| chunk.unwrap().chunk_ref())
+        .collect();
+    let content = flarebox_chunk::content(refs, 0, false, &config);
+    let content = prost::Message::encode_to_vec(&content);
+    space
+        .trash(&folder, name, entry, name, Some(&content), when)
+        .unwrap();
+}
+
+/// Waits until the local trash of `device` no longer holds `entry`.
+async fn reclaimed(device: &Device, entry: &str) {
+    let path = device.folder().join(".flarebox/trash").join(entry);
+    let started = Instant::now();
+    while path.exists() {
+        assert!(
+            started.elapsed() < WAIT,
+            "{entry} is still in the local trash"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a local Worker; run core/driver/scripts/integration-test.sh"]
+async fn a_started_folder_reclaims_its_local_trash_by_age_and_by_the_configured_cap() {
+    log();
+    let owner = owner().await;
+    let space = new_space(&owner, "local trash").await;
+    let mut a = Device::linked(&owner, &space, "a").await;
+    a.stop().await;
+    fs::write(a.folder().join("old.txt"), b"old\n").unwrap();
+    let week_ago = std::time::SystemTime::now() - flarebox_fs::TRASH_RETENTION;
+    put_in_trash(&a, "old.txt", "e1", week_ago);
+    a.start();
+    reclaimed(&a, "e1").await;
+
+    a.stop().await;
+    fs::write(a.folder().join("new.txt"), b"new\n").unwrap();
+    put_in_trash(&a, "new.txt", "e2", std::time::SystemTime::now());
+    fs::write(
+        a.home.path().join("profile/config.toml"),
+        "[trash]\nmax_size_mb = 0\n",
+    )
+    .unwrap();
+    a.start();
+    reclaimed(&a, "e2").await;
+    let names: Vec<_> = fs::read_dir(a.folder())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names, [".flarebox"], "nothing came back to the root");
+    a.stop().await;
+}

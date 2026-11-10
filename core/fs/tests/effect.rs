@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use common::{
     Bytes, EDITED, ID, REMOTE, SCENARIOS, SYNCED, assert_settled, at, bind, contents, entries,
-    marker, now, prepare, private_names, rewrite_keeping_mtime, stage, trashed,
+    marker, now, prepare, private_names, rewrite_keeping_mtime, same, stage, trashed,
 };
 use flarebox_fs::{
     Action, Base, Displaced, Effect, Location, Outcome, PARKED_DIR, PRIVATE_DIR, QUARANTINE_DIR,
@@ -309,7 +309,7 @@ fn folder_that_holds_only_platform_files_enters_the_trash_empty() {
     assert_settled(root);
 
     let reclaimed = bind(root)
-        .reclaim_trash(now() + TRASH_RETENTION, u64::MAX)
+        .reclaim_trash(now() + TRASH_RETENTION, u64::MAX, &mut same)
         .unwrap();
     assert_eq!(reclaimed.removed, [ID], "an empty folder is deleted");
     assert_eq!(reclaimed.recovered, Vec::<std::ffi::OsString>::new());
@@ -703,7 +703,7 @@ fn space_changes_nothing_once_its_root_is_moved_away() {
         space.finish_staged(ID, true),
         space.clear_staging(None).map(drop),
         space.probe_no_replace().map(drop),
-        space.reclaim_trash(now(), 0).map(drop),
+        space.reclaim_trash(now(), 0, &mut same).map(drop),
     ];
     for result in results {
         let err = result.unwrap_err();
