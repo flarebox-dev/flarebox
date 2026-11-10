@@ -32,7 +32,8 @@ use flarebox_net::{
 use flarebox_proto::v1::error::Code;
 use flarebox_proto::v1::resync_required::Reason;
 use flarebox_proto::v1::{
-    ChunkRef, Commit, CommitRecord, CommitResult, TreePage, UploadReceipt, Welcome,
+    ChunkRef, Commit, CommitRecord, CommitResult, Error as ProtoError, TreePage, UploadReceipt,
+    Welcome,
 };
 use flarebox_store::{Link, Store, Tx};
 use tokio::sync::{Notify, mpsc, watch};
@@ -509,7 +510,15 @@ impl Folder {
                     "a commit was not sent again after reconnecting: {why}"
                 )));
             }
-            Err(error @ (CallError::TooLarge { .. } | CallError::UnexpectedResult)) => {
+            Err(CallError::TooLarge { bytes }) => {
+                let refusal = ServerError(ProtoError {
+                    code: Code::LimitExceeded as i32,
+                    message: format!("the commit is {bytes} bytes, more than a message may hold"),
+                    ..ProtoError::default()
+                });
+                self.refused(commit, &refusal, &mut work)?;
+            }
+            Err(error @ CallError::UnexpectedResult) => {
                 return Err(Stop::Protocol(format!("sending a commit failed: {error}")));
             }
         }
