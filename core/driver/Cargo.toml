@@ -14,6 +14,7 @@ bytes = "1.12.1"
 flarebox-chunk = { path = "../chunk" }
 flarebox-engine = { path = "../engine" }
 flarebox-fs = { path = "../fs" }
+flarebox-ignore = { path = "../ignore" }
 flarebox-net = { path = "../net" }
 flarebox-proto = { path = "../proto" }
 flarebox-store = { path = "../store" }

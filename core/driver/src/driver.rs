@@ -19,7 +19,7 @@ use crate::claim::{self, Flock, Owner};
 use crate::config::{Config, ConfigError};
 use crate::credential::{Credential, CredentialError, NewCredentialFile, api_for};
 use crate::folder::FolderTask;
-use crate::ignore::{IgnoreInput, Matcher, RuleFile, RuleSource, matcher};
+use crate::ignore::{Matcher, matcher};
 use crate::paths::{Paths, PathsError};
 use crate::question::{Answer, Question};
 use crate::restore::{self, RestoreRequest, RestoreStatus};
@@ -230,18 +230,10 @@ impl Driver {
             return Err(DriverError::Busy(lock_path));
         };
         let config = Config::load(&paths.config_file)?;
-        let lines = config.sync.lines().expect("Config::load checked the rules");
-        let mut input = IgnoreInput::default();
-        if !lines.is_empty() {
-            tracing::warn!(
-                "the [sync] rules of the configuration are read, but no matcher applies them yet (GUN-270)"
-            );
-            input.files.push(RuleFile {
-                dir: PathBuf::new(),
-                source: RuleSource::Device,
-                lines,
-            });
-        }
+        let matcher = matcher(&config.sync).map_err(|error| ConfigError::Invalid {
+            path: paths.config_file.clone(),
+            reason: error.to_string(),
+        })?;
         let credential = Credential::load(&paths.credential())?;
         if credential.is_some() {
             Credential::keep_out_of_backups(&paths.credential())?;
@@ -249,7 +241,7 @@ impl Driver {
         let folders = load_folders(&paths)?;
         Ok(Driver {
             inner: Arc::new(Inner {
-                matcher: matcher(&input),
+                matcher,
                 paths,
                 _lock: lock,
                 lifecycle: tokio::sync::Mutex::new(()),

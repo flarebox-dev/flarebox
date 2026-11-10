@@ -76,7 +76,9 @@
 mod matcher;
 mod pattern;
 
-pub use matcher::{Change, Kind, LocalRules, LocalRulesError, Matcher, Reason, Scope, Status};
+pub use matcher::{
+    Change, Kind, LocalRules, LocalRulesError, Matcher, PLATFORM_FILES, Reason, Scope, Status,
+};
 pub use pattern::{InvalidLine, LineError, RuleFile};
 
 /// The name of a rules file, compared by key.

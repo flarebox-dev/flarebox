@@ -118,8 +118,16 @@ impl Folder {
         (store, engine)
     }
 
-    /// Starts the disk, with `hook` at every cut when there is one.
+    /// Starts the disk, with `hook` at every cut when there is one, as after the observer's first batch of a folder
+    /// without rules files: the engine plans.
     fn start(&self, hook: Option<Hook>) -> Result<Running, Stop> {
+        let mut running = self.start_unobserved(hook)?;
+        running.engine.rules(Vec::new());
+        Ok(running)
+    }
+
+    /// Starts the disk before any observation.
+    fn start_unobserved(&self, hook: Option<Hook>) -> Result<Running, Stop> {
         let (mut store, mut engine) = self.open();
         let lock = claim::lock(&self.root)
             .unwrap()
@@ -1170,16 +1178,18 @@ fn observe_until(
     done: impl Fn(&[Observed]) -> bool,
 ) -> Batch {
     let deadline = Instant::now() + Duration::from_secs(10);
-    let mut seen = Vec::new();
+    let (mut seen, mut rules) = (Vec::new(), Vec::new());
     loop {
         assert!(Instant::now() < deadline, "not observed in time: {seen:?}");
         if let Some(observation) = observer.observe(Duration::from_millis(200)).unwrap() {
             seen.extend(observation.changes.iter().cloned());
+            rules.extend(observation.rules.iter().cloned());
             if done(&seen) {
                 return Batch {
                     stamp,
                     observation: Observation {
                         changes: seen,
+                        rules,
                         ..observation
                     },
                 };
@@ -1917,4 +1927,74 @@ fn l_resets_to_the_kinds_and_identities_the_scan_saw() {
     assert_eq!(held(&running), local);
     assert_eq!(settle(&mut watching), vec![]);
     assert_eq!(watching.snapshot().entries, scanned);
+}
+
+#[test]
+fn nothing_is_planned_before_the_first_batch_and_its_rules_keep_a_match_from_being_written() {
+    const LOG: &str = "0190f0a0-0000-7000-8000-0000000000a2";
+    let folder = Folder::new();
+    let mut server = Server::default();
+    let content = server.hold(REMOTE, ChunkerConfig::V0);
+    fs::write(folder.root.join(".fbignore"), "*.log\n").unwrap();
+    folder.seed(
+        &[
+            remote(LOG, "build.log", Some(content.clone())),
+            remote(NODE, "report.txt", Some(content)),
+        ],
+        &[],
+        0,
+    );
+    let mut running = folder.start_unobserved(no_hook()).unwrap();
+    let planned = running.disk.next(&mut running.engine, &mut running.store);
+    assert!(planned.unwrap().is_none(), "the rules are not known yet");
+
+    let sections = running.disk.sections();
+    let mut watching = observer(&folder.root, Snapshot::default());
+    let first = observe_until(&mut watching, sections.stamp(), |_| true);
+    assert_eq!(first.observation.rules.len(), 1);
+    running
+        .disk
+        .observed(first, &mut running.engine, &mut running.store)
+        .unwrap();
+    assert_eq!(running.step(&server), Some(Settled::Done));
+    assert_eq!(running.step(&server), None);
+    assert_eq!(fs::read(folder.root.join("report.txt")).unwrap(), REMOTE);
+    assert!(!folder.root.join("build.log").exists());
+}
+
+#[test]
+fn a_file_moved_into_an_ignored_folder_keeps_its_entry_in_l() {
+    let folder = Folder::new();
+    let report = folder.root.join("report.txt");
+    fs::write(&report, SYNCED).unwrap();
+    fs::write(folder.root.join(".fbignore"), "/build/\n").unwrap();
+    fs::create_dir(folder.root.join("build")).unwrap();
+    folder.seed(
+        &[remote(NODE, "report.txt", Some(disk_content(&report)))],
+        &[(NODE, SPACE, "report.txt")],
+        0,
+    );
+    let mut running = folder.start_unobserved(no_hook()).unwrap();
+    let sections = running.disk.sections();
+    let mut watching = observer(&folder.root, Snapshot::default());
+    let first = observe_until(&mut watching, sections.stamp(), |_| true);
+    running
+        .disk
+        .observed(first, &mut running.engine, &mut running.store)
+        .unwrap();
+    let synced = running.local(NODE).cloned().expect("the synced file");
+
+    fs::rename(&report, folder.root.join("build/report.txt")).unwrap();
+    let moved = observe_until(&mut watching, sections.stamp(), |seen| {
+        renamed(seen, "report.txt", "build/report.txt")
+    });
+    assert!(!removed(&moved.observation.changes, "report.txt"));
+    running
+        .disk
+        .observed(moved, &mut running.engine, &mut running.store)
+        .unwrap();
+    assert_eq!(running.local(NODE), Some(&synced), "L has no place for it");
+    assert!(running.engine.trees.ignored_local().contains(NODE));
+    let planned = running.disk.next(&mut running.engine, &mut running.store);
+    assert!(planned.unwrap().is_none());
 }

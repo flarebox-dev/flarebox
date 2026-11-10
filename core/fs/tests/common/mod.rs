@@ -17,6 +17,7 @@ use flarebox_fs::{
     Outcome, PRIVATE_DIR, QUARANTINE_DIR, STAGING_DIR, Snapshot, Space, Step, TRASH_DIR,
     read_marker,
 };
+use flarebox_ignore::PLATFORM_FILES;
 
 pub const SPACE: &str = "space-1";
 pub const COUNTER: u64 = 5;
@@ -195,6 +196,17 @@ fn replacement(entries: &[Entry]) -> Effect {
     }
 }
 
+/// Removing the folder `docs/empty`.
+fn folder_removal(entries: &[Entry]) -> Effect {
+    Effect {
+        id: ID.into(),
+        action: Action::RemoveDir {
+            at: at(vec![dir("docs", &entries[0])], "empty"),
+            id: entries[1].id,
+        },
+    }
+}
+
 /// A user creating `docs/report.txt` when that name is free.
 fn take_report(root: &Path) {
     let path = root.join("docs/report.txt");
@@ -203,7 +215,7 @@ fn take_report(root: &Path) {
     }
 }
 
-pub const SCENARIOS: [Scenario; 6] = [
+pub const SCENARIOS: [Scenario; 7] = [
     Scenario {
         name: "replace",
         paths: &["docs", "docs/report.txt"],
@@ -330,13 +342,7 @@ pub const SCENARIOS: [Scenario; 6] = [
         name: "remove_dir",
         paths: &["docs", "docs/empty"],
         setup: |root, _| fs::create_dir_all(root.join("docs/empty")).unwrap(),
-        build: |entries| Effect {
-            id: ID.into(),
-            action: Action::RemoveDir {
-                at: at(vec![dir("docs", &entries[0])], "empty"),
-                id: entries[1].id,
-            },
-        },
+        build: folder_removal,
         disturb: |_| {},
         check: |root, outcome| {
             assert_identity(root, outcome, None);
@@ -344,6 +350,35 @@ pub const SCENARIOS: [Scenario; 6] = [
             assert_eq!(root.join("docs/empty").is_dir(), !done);
             let trashed_dirs = private_names(root, TRASH_DIR).len();
             assert_eq!(trashed_dirs, usize::from(done));
+        },
+        done_from: Some(Step::Quarantined),
+    },
+    Scenario {
+        name: "remove_dir_with_platform_files",
+        paths: &["docs", "docs/empty"],
+        setup: |root, _| {
+            fs::create_dir_all(root.join("docs/empty")).unwrap();
+            for name in PLATFORM_FILES {
+                fs::write(root.join("docs/empty").join(name), "view").unwrap();
+            }
+        },
+        build: folder_removal,
+        disturb: |_| {},
+        check: |root, outcome| {
+            assert_identity(root, outcome, None);
+            let trash = private_names(root, TRASH_DIR);
+            if matches!(outcome, Outcome::Done { .. }) {
+                assert!(!root.join("docs/empty").exists());
+                let [folder] = &trash[..] else {
+                    panic!("one trashed folder: {trash:?}");
+                };
+                let folder = root.join(PRIVATE_DIR).join(TRASH_DIR).join(folder);
+                assert_eq!(fs::read_dir(folder).unwrap().count(), 0);
+            } else {
+                let left = fs::read_dir(root.join("docs/empty")).unwrap().count();
+                assert_eq!(left, PLATFORM_FILES.len());
+                assert!(trash.is_empty());
+            }
         },
         done_from: Some(Step::Quarantined),
     },

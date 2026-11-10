@@ -1,30 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::fs;
-use std::process::Command;
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
 
 /// Logs written to anything but a terminal, such as the journal of the systemd unit, carry no ANSI escapes.
 #[test]
 fn logs_to_a_pipe_are_plain_text() {
     let home = tempfile::tempdir().unwrap();
-    let config = home.path().join("config");
-    fs::create_dir_all(config.join("flarebox")).unwrap();
-    fs::write(
-        config.join("flarebox/config.toml"),
-        "[sync]\nexclude = [\"*.tmp\"]\n",
-    )
-    .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_flarebox"))
-        .arg("status")
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_flarebox"))
+        .arg("daemon")
         .env("HOME", home.path())
-        .env("XDG_CONFIG_HOME", &config)
+        .env("XDG_CONFIG_HOME", home.path().join("config"))
         .env("XDG_STATE_HOME", home.path().join("state"))
-        .env_remove("XDG_RUNTIME_DIR")
+        .env("XDG_RUNTIME_DIR", home.path().join("run"))
         .env_remove("NO_COLOR")
         .env_remove("FLAREBOX_LOG")
-        .output()
+        .stderr(Stdio::piped())
+        .spawn()
         .expect("run flarebox");
-    let log = String::from_utf8(output.stderr).unwrap();
-    assert!(log.contains("no matcher applies them yet"), "{log}");
+    let mut log = String::new();
+    BufReader::new(daemon.stderr.take().unwrap())
+        .read_line(&mut log)
+        .unwrap();
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    assert!(log.contains("the daemon is running"), "{log}");
     assert!(!log.contains('\u{1b}'), "{log:?}");
 }

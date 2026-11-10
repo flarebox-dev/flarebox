@@ -9,8 +9,9 @@ use std::fmt;
 use crate::pattern::{LineError, RuleFile, key};
 use crate::{NameKey, RULES_FILE};
 
-/// Platform files excluded in every directory (design §5.1).
-const PLATFORM_FILES: [&str; 4] = [".DS_Store", "Thumbs.db", "desktop.ini", "Icon\r"];
+/// Platform files excluded in every directory (design §5.1). `core/fs` deletes the files with exactly these names
+/// that a folder still holds when an effect removes it (design §5.2).
+pub const PLATFORM_FILES: [&str; 4] = [".DS_Store", "Thumbs.db", "desktop.ini", "Icon\r"];
 /// The engine's state directory, excluded at the root (RFC 0001 §2).
 const STATE_DIR: &str = ".flarebox";
 
@@ -105,6 +106,12 @@ impl<K> Clone for LocalRules<K> {
     }
 }
 
+impl<K> PartialEq for LocalRules<K> {
+    fn eq(&self, other: &Self) -> bool {
+        self.include == other.include && self.exclude == other.exclude
+    }
+}
+
 impl<K> fmt::Debug for LocalRules<K> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LocalRules")
@@ -123,7 +130,7 @@ impl<K> Default for LocalRules<K> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct IncludePath {
     keys: Vec<String>,
     dir_only: bool,
@@ -201,6 +208,25 @@ pub struct Matcher<K> {
     platform_files: Vec<String>,
     state_dir: String,
     rules_file: String,
+}
+
+impl<K> Clone for Matcher<K> {
+    fn clone(&self) -> Self {
+        Self {
+            local: self.local.clone(),
+            files: self.files.clone(),
+            platform_files: self.platform_files.clone(),
+            state_dir: self.state_dir.clone(),
+            rules_file: self.rules_file.clone(),
+        }
+    }
+}
+
+/// Two matchers are equal when they hold the same device-local list and the same rules files.
+impl<K> PartialEq for Matcher<K> {
+    fn eq(&self, other: &Self) -> bool {
+        self.local == other.local && self.files == other.files
+    }
 }
 
 impl<K> fmt::Debug for Matcher<K> {

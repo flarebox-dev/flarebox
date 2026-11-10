@@ -4,10 +4,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use flarebox_ignore::Status;
+
+use crate::ignore::{LocalRules, Matcher, RuleFile};
 use crate::names::name_key;
 use crate::state::{StateError, TreesState};
 use crate::tree::{
-    Kind, LocalNode, Names, NodeId, RemoteNode, Shape, Tree, TreeError, same, same_content,
+    Kind, LocalNode, Names, Node, NodeId, RemoteNode, Shape, Tree, TreeError, same, same_content,
 };
 
 /// The most mutually dependent [`Class::Same`] updates [`Trees::settle`] searches as one group.
@@ -41,8 +44,35 @@ pub fn classify(l: Option<&Shape>, s: Option<&Shape>, r: Option<&Shape>) -> Clas
     }
 }
 
+/// The names from the root to `id` in `tree` with the node's kind, or `None` when the tree does not
+/// hold the node live and placed under live, placed folders.
+fn path<'a, N: Node>(tree: &'a Tree<N>, id: &str) -> Option<(Vec<&'a str>, Kind)> {
+    let held = |id: &str| {
+        tree.get(id)
+            .filter(|node| node.is_live() && node.is_placed())
+    };
+    let shape = held(id)?.shape();
+    let mut names = vec![shape.name.as_str()];
+    let mut current = shape.parent.as_str();
+    for _ in 0..=tree.len() {
+        if current == tree.root {
+            names.reverse();
+            return Some((names, shape.kind));
+        }
+        let parent = held(current)?.shape();
+        names.push(&parent.name);
+        current = &parent.parent;
+    }
+    None
+}
+
 /// R, L and S of one space, and the nodes whose entries changed since they were last found in sync.
 /// Every mutation goes through these methods, so a change in any tree marks its node dirty.
+///
+/// The trees also own the ignore rules of this device (section 5.10) and decide with them which
+/// nodes are excluded here ([`Trees::excluded`]). The rules are not part of the stored state: the
+/// driver passes them again after a restart, and nothing is planned until it has
+/// ([`Trees::rules_known`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Trees {
     r: Tree<RemoteNode>,
@@ -53,6 +83,12 @@ pub struct Trees {
     reverted: BTreeSet<NodeId>,
     parked_as: BTreeMap<NodeId, NodeId>,
     waiting: BTreeMap<NodeId, Option<Shape>>,
+    ignore: Matcher,
+    /// Nodes whose local copy the user moved into an ignored folder that is no node. L keeps the
+    /// entry each had before the move.
+    outside: BTreeSet<NodeId>,
+    /// False from a restore until the rules of a full scan are in force.
+    rules_known: bool,
 }
 
 impl Trees {
@@ -67,6 +103,9 @@ impl Trees {
             reverted: BTreeSet::new(),
             parked_as: BTreeMap::new(),
             waiting: BTreeMap::new(),
+            ignore: Matcher::new(LocalRules::default()),
+            outside: BTreeSet::new(),
+            rules_known: true,
         }
     }
 
@@ -101,15 +140,140 @@ impl Trees {
         if !node.parked {
             self.parked_as.remove(&id);
         }
+        self.outside.remove(&id);
         self.dirty.insert(id.clone());
         self.l.insert(id, node);
     }
 
     pub fn remove_local(&mut self, id: &str) {
         self.parked_as.remove(id);
+        self.outside.remove(id);
         if self.l.remove(id).is_some() {
             self.dirty.insert(id.to_owned());
         }
+    }
+
+    /// The rules in force on this device. New trees hold the built-in exclusions only.
+    pub fn ignore(&self) -> &Matcher {
+        &self.ignore
+    }
+
+    /// Replaces this device's include and exclude lists, which are never synced.
+    pub fn set_local_rules(&mut self, local: LocalRules) {
+        self.ignore.set_local(local, std::iter::empty());
+    }
+
+    /// Sets the rules of the `.fbignore` file in the folder at `dir`, the names from the root to
+    /// it, or removes them with `None`. The driver parses each rules file it observes on this
+    /// device's disk and passes the rules here with the observation.
+    pub fn set_rules<S: AsRef<str>>(&mut self, dir: &[S], rules: Option<RuleFile>) {
+        self.ignore.set_rules(dir, rules, std::iter::empty());
+    }
+
+    /// The caller has passed the rules files of a full scan made since the last restore, and the
+    /// device-local list. Planning starts again.
+    pub fn rules_scanned(&mut self) {
+        self.rules_known = true;
+    }
+
+    /// False from [`Trees::restore`] until [`Trees::rules_scanned`]. The stored state does not hold
+    /// the rules, so until the first full scan has reported them an excluded node would look
+    /// like any other; meanwhile no effect and no commit is planned.
+    pub fn rules_known(&self) -> bool {
+        self.rules_known
+    }
+
+    /// Records that the user moved the local copy of `id` into an ignored folder that is no node,
+    /// so L cannot hold its new position. L keeps the entry as it was, and the node is excluded
+    /// until an observation places it again or removes it. This is not part of the stored state:
+    /// after a restart the entry is missing from its path again, and the scan that finds it
+    /// under the ignored folder reports the move once more.
+    pub fn ignore_local(&mut self, id: &str) {
+        if self.l.get(id).is_some() {
+            self.outside.insert(id.to_owned());
+        }
+    }
+
+    /// What S becomes for an excluded node whose S position neither L nor R holds any more, or
+    /// `None` when the node is not one. Nothing is planned for the node, so no op would ever
+    /// move its S entry, and the name it holds in S would keep every other node from being
+    /// acknowledged there. With the node in L and live in R, S takes R's position and keeps its
+    /// content, so the content is still compared with the last synced one when the node is
+    /// included again. Otherwise, or when S cannot hold the node at R's position, S drops the
+    /// node, which is then resolved like a node never synced: what R holds is downloaded, and
+    /// what only L holds is uploaded.
+    fn released(&self, id: &str) -> Option<Option<Shape>> {
+        let synced = self.s.live(id)?;
+        let local = self.l.get(id).map(|node| &node.shape);
+        let remote = self.r.live(id);
+        let held = |shape: Option<&Shape>| shape.is_some_and(|shape| shape.same_position(synced));
+        if held(local) || held(remote) || !self.excluded(id) {
+            return None;
+        }
+        Some(match (local, remote) {
+            (Some(_), Some(remote)) => Some(Shape {
+                parent: remote.parent.clone(),
+                name: remote.name.clone(),
+                ..synced.clone()
+            }),
+            _ => None,
+        })
+    }
+
+    /// The nodes recorded by [`Trees::ignore_local`] that no observation has placed or removed
+    /// since.
+    pub fn ignored_local(&self) -> &BTreeSet<NodeId> {
+        &self.outside
+    }
+
+    /// Whether the rules exclude the entry of `kind` at `path`, the names from the root to it.
+    pub fn ignores<S: AsRef<str>>(&self, path: &[S], kind: Kind) -> bool {
+        let kind = match kind {
+            Kind::Dir => flarebox_ignore::Kind::Dir,
+            Kind::File => flarebox_ignore::Kind::File,
+        };
+        self.ignore.status(path, kind) != Status::Included
+    }
+
+    /// Whether the node is excluded on this device (section 5.10): its position in R, S or L
+    /// matches the rules, or its local copy, or a folder L holds it under, was moved into an
+    /// ignored folder. Nothing is planned for an excluded node, in either direction. Its S entry
+    /// stays the merge base it was: S takes only what L and R both hold, and gives up a position
+    /// neither holds any more, so that the entry never keeps another node out of S. A node that L holds at an included position
+    /// different from S's is not excluded: the user moved it out, and the move is planned like
+    /// any local move. A parked node is not excluded either until the effects have placed it
+    /// again, since it must not stay in the parked directory ([`Trees::ignored`]).
+    pub fn excluded(&self, id: &str) -> bool {
+        !self.l.get(id).is_some_and(|node| node.parked) && self.ignored(id)
+    }
+
+    /// Whether the node is outside the sync tree on this device, as [`Trees::excluded`] decides
+    /// it, also when the node is parked. The effects move a parked node that is ignored back to
+    /// the position L keeps for it, and it is excluded from then on.
+    pub fn ignored(&self, id: &str) -> bool {
+        let mut above = id;
+        for _ in 0..=self.l.len() {
+            if self.outside.contains(above) {
+                return true;
+            }
+            match self.l.get(above) {
+                Some(node) => above = &node.shape.parent,
+                None => break,
+            }
+        }
+        let ignored =
+            |path: Option<(Vec<&str>, Kind)>| path.map(|(names, kind)| self.ignores(&names, kind));
+        let local = ignored(path(&self.l, id));
+        let moved = match (self.l.get(id), self.s.live(id)) {
+            (Some(local), Some(synced)) => !local.shape.same_position(synced),
+            _ => false,
+        };
+        if local == Some(false) && moved {
+            return false;
+        }
+        local == Some(true)
+            || ignored(path(&self.s, id)) == Some(true)
+            || ignored(path(&self.r, id)) == Some(true)
     }
 
     /// The name of a parked node's entry in the parked directory: its ID, or, for a node re-keyed
@@ -177,7 +341,9 @@ impl Trees {
     }
 
     /// Settles what needs no decision: a node changed the same way on both sides takes S := R, and
-    /// a node in sync leaves the dirty set unless it is parked. S stays a valid tree, so an update that would orphan a
+    /// a node in sync leaves the dirty set unless it is parked. An excluded node that is not in
+    /// sync stays dirty, and its S entry takes no change that only one side made, except that it
+    /// gives up a position neither side holds any more (see [`Trees::excluded`]). S stays a valid tree, so an update that would orphan a
     /// child, put a node under a missing or non-directory parent, close a cycle or take a sibling's
     /// `name_key` is made only together with the updates it depends on. Settling stops only when no
     /// non-empty set of the remaining [`Class::Same`] updates can be made together with S still valid,
@@ -194,6 +360,14 @@ impl Trees {
         let mut pending = Vec::new();
         let mut work = Vec::new();
         for id in std::mem::take(&mut self.dirty) {
+            if let Some(next) = self.released(&id) {
+                let fitting = [next, None]
+                    .into_iter()
+                    .find(|next| self.fits_synced(&id, next.as_ref()));
+                if let Some(next) = fitting {
+                    self.set_synced_unmarked(&id, next);
+                }
+            }
             match self.class(&id) {
                 Class::InSync if !self.l.get(&id).is_some_and(|node| node.parked) => {}
                 Class::Same => pending.push(id),
@@ -500,7 +674,8 @@ impl Trees {
     }
 
     /// Replaces the dirty, unsearched, reverted, parked and waiting nodes with `state`, once the
-    /// store has loaded every node. Refuses trees that break section 2.2, a node that is not dirty
+    /// store has loaded every node. The rules are unknown from here until [`Trees::rules_scanned`].
+    /// Refuses trees that break section 2.2, a node that is not dirty
     /// although it is parked or not in sync, an unsearched node that is not dirty, and a parked
     /// name for a node L does not hold as parked.
     pub fn restore(&mut self, state: TreesState) -> Result<(), StateError> {
@@ -537,6 +712,7 @@ impl Trees {
         self.reverted = reverted;
         self.parked_as = parked_as;
         self.waiting = waiting;
+        self.rules_known = false;
         Ok(())
     }
 }

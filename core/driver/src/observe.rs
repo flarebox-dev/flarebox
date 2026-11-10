@@ -8,9 +8,10 @@
 //! [`FsObserver`] runs the watchers of `core/fs`: inotify on Linux and FSEvents on macOS, which only choose what to
 //! rescan, with a periodic full rescan when the platform watcher cannot cover the tree (design §5.1).
 //!
-//! Excluded paths (design §5.10) are left out, except where a rename crosses the boundary: a rename into an excluded
-//! path is reported so the engine can freeze the node at its synced position, and a rename out of one is reported
-//! with the content of every file it brings into the sync tree.
+//! The scans leave out excluded paths (design §5.10) and read the `.fbignore` files, whose rules each batch passes
+//! on. A move across the boundary still reaches the engine: a move into an excluded path is reported as a rename, so
+//! the engine can freeze the node at its synced position, and what a move out of one brings into the sync tree is
+//! reported as created, each entry with its identity and every file with its content.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -22,6 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use flarebox_chunk::ChunkerConfig;
+use flarebox_engine::ignore::RuleFile;
 use flarebox_fs::{
     Change, Entry, EntryKind, Error as FsError, FileId, Known, NativeWatcher, RescanWatcher,
     RootProblem, Snapshot, Watcher, check_root,
@@ -29,7 +31,7 @@ use flarebox_fs::{
 use flarebox_proto::v1::{ChunkRef, Content};
 use rustix::fs::{Mode, OFlags};
 
-use crate::ignore::Matcher;
+use crate::ignore::{Matcher, scan_rules};
 
 /// How often the fallback watcher rescans the whole tree.
 const RESCAN_INTERVAL: Duration = Duration::from_secs(30);
@@ -55,6 +57,18 @@ pub struct Observation {
     /// reports a `Modified` with the content once a read succeeds, unless a later change to the path replaces it
     /// (design §5.8).
     pub busy: Vec<PathBuf>,
+    /// The folders whose `.fbignore` file the scans of this batch found changed, each with the rules it holds now.
+    /// The engine takes them before the changes of the batch. The first batch of an observer follows its scan of the
+    /// whole tree and lists every rules file there is, also when nothing else changed.
+    pub rules: Vec<RulesChange>,
+}
+
+/// The rules of the `.fbignore` file in `dir`, a folder relative to the root and empty for the root, or `None` when
+/// the folder has no rules file any more. A line the file cannot use is among [`RuleFile::invalid_lines`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct RulesChange {
+    pub dir: PathBuf,
+    pub rules: Option<RuleFile>,
 }
 
 /// One change, in the terms of `core/fs` (paths relative to the root, previous-state paths first).
@@ -112,6 +126,8 @@ pub struct FsObserver {
     matcher: Arc<dyn Matcher>,
     /// The root folder the latest scan opened.
     scanned: Option<FileId>,
+    /// Whether the batch that follows the first scan of the whole tree is still to be returned.
+    first: bool,
     /// Files whose content could not be read, with when to read them again.
     unread: BTreeMap<PathBuf, Retry>,
 }
@@ -136,7 +152,8 @@ impl Retry {
 
 impl FsObserver {
     /// Starts watching the folder of space `space_id` on device `dev`. The first observation compares the whole tree
-    /// with `previous`.
+    /// with `previous`. The scans leave out what `matcher`, the built-in exclusions and the `.fbignore` files of the
+    /// folder exclude.
     pub fn start(
         root: &Path,
         space_id: &str,
@@ -144,20 +161,24 @@ impl FsObserver {
         previous: Snapshot,
         matcher: Arc<dyn Matcher>,
     ) -> Result<Self, FsError> {
-        let (watcher, native): (Box<dyn Watcher + Send>, bool) = match NativeWatcher::start(
-            root,
-            previous.clone(),
-        ) {
-            Ok(watcher) => (Box::new(watcher), true),
-            Err(FsError::Watch(error)) => {
-                tracing::warn!(%error, "the platform watcher is unavailable; rescanning periodically");
-                (
-                    Box::new(RescanWatcher::new(root, previous, RESCAN_INTERVAL)?),
-                    false,
-                )
-            }
-            Err(error) => return Err(error),
-        };
+        let (watcher, native): (Box<dyn Watcher + Send>, bool) =
+            match NativeWatcher::start_with_rules(root, previous.clone(), scan_rules(&matcher)) {
+                Ok(watcher) => (Box::new(watcher), true),
+                Err(FsError::Watch(error)) => {
+                    tracing::warn!(%error, "the platform watcher is unavailable; rescanning periodically");
+                    let rules = scan_rules(&matcher);
+                    (
+                        Box::new(RescanWatcher::with_rules(
+                            root,
+                            previous,
+                            RESCAN_INTERVAL,
+                            rules,
+                        )?),
+                        false,
+                    )
+                }
+                Err(error) => return Err(error),
+            };
         Ok(FsObserver {
             root: std::fs::canonicalize(root)?,
             space_id: space_id.to_owned(),
@@ -166,6 +187,7 @@ impl FsObserver {
             native,
             matcher,
             scanned: None,
+            first: true,
             unread: BTreeMap::new(),
         })
     }
@@ -187,19 +209,13 @@ impl FsObserver {
         }
     }
 
-    fn excluded(&self, path: &Path, kind: EntryKind) -> bool {
-        self.matcher.is_excluded(path, kind == EntryKind::Dir)
-    }
-
-    /// Adds what `change` means for the engine to `out`.
+    /// Adds what `change` means for the engine to `out`. The scans leave out excluded paths, so every path here is
+    /// one this device syncs, except the target of a move into an excluded path.
     fn observed(&self, change: Change, out: &mut Vec<Observed>, busy: &mut Vec<PathBuf>) {
         let entry = |path: &Path| self.watcher.snapshot().entries.get(path).copied();
         match change {
             Change::Created { path, kind } => {
                 let Some(entry) = entry(&path) else { return };
-                if self.excluded(&path, kind) {
-                    return;
-                }
                 let content = (kind == EntryKind::File)
                     .then(|| self.content(&path, &entry, busy))
                     .flatten();
@@ -212,7 +228,7 @@ impl FsObserver {
             }
             Change::Modified { path } => {
                 let Some(entry) = entry(&path) else { return };
-                if entry.kind != EntryKind::File || self.excluded(&path, entry.kind) {
+                if entry.kind != EntryKind::File {
                     return;
                 }
                 let content = self.content(&path, &entry, busy);
@@ -224,59 +240,17 @@ impl FsObserver {
             }
             Change::Renamed { from, to, kind } => {
                 let Some(entry) = entry(&to) else { return };
-                let leaves = self.excluded(&from, kind);
-                if leaves && self.excluded(&to, kind) {
-                    return;
-                }
                 out.push(Observed::Renamed {
                     from,
-                    to: to.clone(),
+                    to,
                     kind,
                     id: entry.id,
                 });
-                if leaves {
-                    self.brought_in(&to, out, busy);
-                }
             }
-            Change::Removed { path, kind } => {
-                if !self.excluded(&path, kind) {
-                    out.push(Observed::Removed { path, kind });
-                }
+            Change::Ignored { from, to, kind, id } => {
+                out.push(Observed::Renamed { from, to, kind, id })
             }
-        }
-    }
-
-    /// Reports what a rename out of an excluded path brought into the sync tree at `to`: the content of a file, or
-    /// every included entry under a folder. Nothing was observed there while it was excluded, so edits made in the
-    /// meantime arrive this way.
-    fn brought_in(&self, to: &Path, out: &mut Vec<Observed>, busy: &mut Vec<PathBuf>) {
-        let entries = &self.watcher.snapshot().entries;
-        for (path, entry) in entries
-            .range(to.to_path_buf()..)
-            .take_while(|(path, _)| path.starts_with(to))
-        {
-            if self.excluded(path, entry.kind) {
-                continue;
-            }
-            let content = (entry.kind == EntryKind::File)
-                .then(|| self.content(path, entry, busy))
-                .flatten();
-            if path == to {
-                if entry.kind == EntryKind::File {
-                    out.push(Observed::Modified {
-                        path: path.clone(),
-                        id: entry.id,
-                        content,
-                    });
-                }
-                continue;
-            }
-            out.push(Observed::Created {
-                path: path.clone(),
-                kind: entry.kind,
-                id: entry.id,
-                content,
-            });
+            Change::Removed { path, kind } => out.push(Observed::Removed { path, kind }),
         }
     }
 
@@ -301,7 +275,7 @@ impl FsObserver {
             Change::Created { path, .. } | Change::Modified { path } => {
                 self.unread.remove(path);
             }
-            Change::Removed { path, .. } => {
+            Change::Removed { path, .. } | Change::Ignored { from: path, .. } => {
                 take(&mut self.unread, path);
             }
             Change::Renamed { from, to, .. } => {
@@ -312,9 +286,7 @@ impl FsObserver {
                     } else {
                         to.join(rest)
                     };
-                    if !self.excluded(&moved, EntryKind::File) {
-                        self.unread.insert(moved, retry);
-                    }
+                    self.unread.insert(moved, retry);
                 }
             }
         }
@@ -378,7 +350,12 @@ impl Observer for FsObserver {
             Err(FsError::Watch(error)) if self.native => {
                 tracing::warn!(%error, "the platform watcher failed; rescanning periodically");
                 let snapshot = self.watcher.snapshot().clone();
-                self.watcher = Box::new(RescanWatcher::new(&self.root, snapshot, RESCAN_INTERVAL)?);
+                self.watcher = Box::new(RescanWatcher::with_rules(
+                    &self.root,
+                    snapshot,
+                    RESCAN_INTERVAL,
+                    scan_rules(&self.matcher),
+                )?);
                 self.native = false;
                 return Ok(None);
             }
@@ -399,9 +376,22 @@ impl Observer for FsObserver {
         for path in &busy {
             self.unread.insert(path.clone(), Retry::after(0, now));
         }
-        if !observed && changes.is_empty() && poll.unreadable.is_empty() {
+        let rules: Vec<RulesChange> = (poll.rules.into_iter())
+            .map(|(dir, bytes)| RulesChange {
+                dir,
+                rules: bytes.as_deref().map(RuleFile::parse),
+            })
+            .collect();
+        let first = self.first && poll.root.is_some();
+        if !first
+            && !observed
+            && changes.is_empty()
+            && poll.unreadable.is_empty()
+            && rules.is_empty()
+        {
             return Ok(None);
         }
+        self.first &= !first;
         let root = check_root(&self.root, &self.space_id, self.dev).map(|_| ());
         Ok(Some(Observation {
             changes,
@@ -409,6 +399,7 @@ impl Observer for FsObserver {
             unreadable: poll.unreadable,
             scanned: self.scanned,
             busy,
+            rules,
         }))
     }
 
@@ -746,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn renames_across_an_exclusion_reach_the_engine_both_ways() {
+    fn moves_across_an_exclusion_reach_the_engine_both_ways() {
         struct IgnoredFolder;
         impl Matcher for IgnoredFolder {
             fn is_excluded(&self, path: &Path, _dir: bool) -> bool {
@@ -758,6 +749,7 @@ mod tests {
         fs::create_dir_all(root.join("ignored/folder")).unwrap();
         fs::write(root.join("ignored/folder/inner"), b"inner").unwrap();
         fs::write(root.join("tracked"), b"one").unwrap();
+        let tracked = fs::metadata(root.join("tracked")).unwrap().ino();
         let dev = fs::metadata(root).unwrap().dev();
         let mut observer = FsObserver::start(
             root,
@@ -770,42 +762,210 @@ mod tests {
         let (seen, _) = observe_until(&mut observer, |seen| !seen.is_empty());
         assert_eq!(seen.len(), 1, "{seen:?}");
 
-        let renamed = |seen: &[Observed], from: &str, to: &str| {
-            seen.iter().any(|change| {
-                matches!(change, Observed::Renamed { from: f, to: t, .. } if f == Path::new(from) && t == Path::new(to))
-            })
-        };
         fs::rename(root.join("tracked"), root.join("ignored/tracked")).unwrap();
-        let (seen, _) = observe_until(&mut observer, |seen| {
-            renamed(seen, "tracked", "ignored/tracked")
-        });
-        assert_eq!(seen.len(), 1, "{seen:?}");
+        let (seen, _) = observe_until(&mut observer, |seen| !seen.is_empty());
+        let [Observed::Renamed { from, to, id, .. }] = &seen[..] else {
+            panic!("a move into an excluded path is one rename: {seen:?}");
+        };
+        assert_eq!(
+            (from.as_path(), to.as_path()),
+            (Path::new("tracked"), Path::new("ignored/tracked"))
+        );
+        assert_eq!(id.ino, tracked);
 
         fs::write(root.join("ignored/tracked"), b"edited").unwrap();
         fs::rename(root.join("ignored/tracked"), root.join("back")).unwrap();
         fs::rename(root.join("ignored/folder"), root.join("folder")).unwrap();
-        let (seen, _) = observe_until(&mut observer, |seen| {
-            renamed(seen, "ignored/tracked", "back") && renamed(seen, "ignored/folder", "folder")
-        });
-        let content = |name: &str| {
-            seen.iter()
-                .find_map(|change| match change {
-                    Observed::Modified { path, content, .. }
-                    | Observed::Created { path, content, .. }
-                        if path == Path::new(name) =>
-                    {
-                        content.clone()
-                    }
-                    _ => None,
-                })
-                .unwrap_or_else(|| panic!("no content for {name} in {seen:?}"))
+        let created = |seen: &[Observed], name: &str| {
+            seen.iter().find_map(|change| match change {
+                Observed::Created {
+                    path, id, content, ..
+                } if path == Path::new(name) => Some((*id, content.clone())),
+                _ => None,
+            })
         };
-        assert_eq!(content("back").size, 6);
-        assert_eq!(content("folder/inner").size, 5);
+        let (seen, _) = observe_until(&mut observer, |seen| {
+            ["back", "folder", "folder/inner"]
+                .iter()
+                .all(|name| created(seen, name).is_some())
+        });
+        let (id, content) = created(&seen, "back").unwrap();
+        assert_eq!(id.ino, tracked, "the entry that returns keeps its identity");
+        assert_eq!(
+            content.unwrap().size,
+            6,
+            "with the edit made while it was excluded"
+        );
+        assert_eq!(created(&seen, "folder/inner").unwrap().1.unwrap().size, 5);
         assert!(
             seen.iter()
                 .all(|change| !matches!(change, Observed::Removed { .. })),
             "{seen:?}"
+        );
+    }
+
+    fn paths(seen: &[Observed]) -> Vec<&Path> {
+        let mut paths: Vec<&Path> = seen
+            .iter()
+            .map(|change| match change {
+                Observed::Created { path, .. }
+                | Observed::Modified { path, .. }
+                | Observed::Removed { path, .. } => path.as_path(),
+                Observed::Renamed { to, .. } => to.as_path(),
+            })
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn the_first_observation_lists_the_rules_files_and_leaves_out_what_they_exclude() {
+        let dir = marked();
+        let root = dir.path();
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(root.join(".fbignore"), b"*.log\nbroken[\n").unwrap();
+        fs::write(root.join("sub/.fbignore"), b"/secret\n").unwrap();
+        for name in [
+            "a.log",
+            "b.txt",
+            "sub/c.log",
+            "sub/secret",
+            "sub/d.txt",
+            ".DS_Store",
+        ] {
+            fs::write(root.join(name), b"x").unwrap();
+        }
+        let observation = observer(root)
+            .observe(Duration::from_secs(10))
+            .unwrap()
+            .expect("the batch of the first scan");
+        let expected = [".fbignore", "b.txt", "sub", "sub/.fbignore", "sub/d.txt"];
+        assert_eq!(paths(&observation.changes), expected.map(Path::new));
+        let dirs: Vec<&Path> = (observation.rules.iter())
+            .map(|change| change.dir.as_path())
+            .collect();
+        assert_eq!(dirs, [Path::new(""), Path::new("sub")]);
+        let root_rules = observation.rules[0].rules.as_ref().unwrap();
+        assert_eq!(
+            root_rules.invalid_lines().len(),
+            1,
+            "the line no pattern can use"
+        );
+    }
+
+    #[test]
+    fn the_first_observation_is_returned_when_the_folder_is_as_it_was() {
+        let dir = marked();
+        let mut observer = observer(dir.path());
+        let observation = observer
+            .observe(Duration::from_secs(10))
+            .unwrap()
+            .expect("the batch of the first scan, with nothing in it");
+        assert!(observation.changes.is_empty() && observation.rules.is_empty());
+        assert!(
+            observer
+                .observe(Duration::from_millis(200))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_rule_that_starts_to_match_removes_nothing_and_one_that_stops_brings_the_entry_back() {
+        let dir = marked();
+        let root = dir.path();
+        fs::create_dir(root.join("build")).unwrap();
+        fs::write(root.join("build/out.bin"), b"out").unwrap();
+        fs::write(root.join("notes.txt"), b"notes").unwrap();
+        let mut observer = observer(root);
+        let (seen, _) = observe_until(&mut observer, |seen| seen.len() == 3);
+        assert_eq!(
+            paths(&seen),
+            ["build", "build/out.bin", "notes.txt"].map(Path::new)
+        );
+
+        fs::write(root.join(".fbignore"), b"/build/\n").unwrap();
+        let mut rules = Vec::new();
+        let mut seen = Vec::new();
+        while rules.is_empty() {
+            let observation = observer.observe(Duration::from_secs(10)).unwrap().unwrap();
+            seen.extend(observation.changes);
+            rules.extend(observation.rules);
+        }
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].dir, Path::new(""));
+        assert!(rules[0].rules.is_some());
+        assert!(
+            seen.iter()
+                .all(|change| !matches!(change, Observed::Removed { .. })),
+            "becoming ignored is not a removal: {seen:?}"
+        );
+        assert!(!observer.snapshot().entries.contains_key(Path::new("build")));
+
+        fs::remove_file(root.join(".fbignore")).unwrap();
+        let (seen, observation) = observe_until(&mut observer, |seen| {
+            paths(seen).contains(&Path::new("build/out.bin"))
+        });
+        assert!(paths(&seen).contains(&Path::new("build")), "{seen:?}");
+        assert_eq!(observation.rules.len(), 1);
+        assert!(
+            observation.rules[0].rules.is_none(),
+            "the folder has no rules file now"
+        );
+    }
+
+    #[test]
+    fn an_observer_started_again_finds_a_file_that_was_moved_into_an_ignored_folder() {
+        let dir = marked();
+        let root = dir.path();
+        fs::write(root.join(".fbignore"), b"/build/\n").unwrap();
+        fs::create_dir(root.join("build")).unwrap();
+        fs::write(root.join("notes.txt"), b"notes").unwrap();
+        let mut stopped = observer(root);
+        stopped.observe(Duration::from_secs(10)).unwrap().unwrap();
+        let previous = stopped.snapshot().clone();
+        drop(stopped);
+        fs::rename(root.join("notes.txt"), root.join("build/notes.txt")).unwrap();
+
+        let dev = fs::metadata(root).unwrap().dev();
+        let mut observer =
+            FsObserver::start(root, SPACE, dev, previous, Arc::new(Unfiltered)).unwrap();
+        let observation = observer.observe(Duration::from_secs(10)).unwrap().unwrap();
+        let [Observed::Renamed { from, to, .. }] = &observation.changes[..] else {
+            panic!("one move, no removal: {:?}", observation.changes);
+        };
+        assert_eq!(
+            (from.as_path(), to.as_path()),
+            (Path::new("notes.txt"), Path::new("build/notes.txt"))
+        );
+        assert_eq!(
+            observation.rules.len(),
+            1,
+            "a new observer lists every rules file"
+        );
+    }
+
+    #[test]
+    fn the_device_include_list_narrows_what_is_observed() {
+        let dir = marked();
+        let root = dir.path();
+        for name in ["Work", "Photos"] {
+            fs::create_dir(root.join(name)).unwrap();
+            fs::write(root.join(name).join("file"), b"x").unwrap();
+        }
+        fs::write(root.join("top.txt"), b"x").unwrap();
+        let sync = crate::SyncRules {
+            include: vec!["Work/".into()],
+            exclude: vec![],
+        };
+        let dev = fs::metadata(root).unwrap().dev();
+        let matcher = crate::ignore::matcher(&sync).unwrap();
+        let mut observer =
+            FsObserver::start(root, SPACE, dev, Snapshot::default(), matcher).unwrap();
+        let observation = observer.observe(Duration::from_secs(10)).unwrap().unwrap();
+        assert_eq!(
+            paths(&observation.changes),
+            ["Work", "Work/file"].map(Path::new)
         );
     }
 }

@@ -27,7 +27,7 @@ use flarebox_proto::v1::{
 use flarebox_store::{Cursor, EngineState, Error, SyncedNode, Tx};
 
 use crate::disk::Stop;
-use crate::observe::{Observed, Reset};
+use crate::observe::{Observed, Reset, RulesChange};
 
 pub(crate) struct Engine {
     pub trees: Trees,
@@ -316,11 +316,26 @@ impl Engine {
         Some(names.into_iter().rev().collect())
     }
 
+    /// Gives the trees the rules files a batch lists, before the changes of that batch. An observer's first batch
+    /// follows its scan of the whole tree and lists every rules file, so from the first call on the trees know the
+    /// rules, and the engine plans again (design §5.10). The rules of a folder whose path L cannot hold are left out,
+    /// since no node is below it.
+    pub fn rules(&mut self, rules: Vec<RulesChange>) {
+        for RulesChange { dir, rules } in rules {
+            if let Some(dir) = names(&dir) {
+                self.trees.set_rules(&dir, rules);
+            }
+        }
+        self.trees.rules_scanned();
+    }
+
     /// Puts `changes` into L and returns the nodes whose L entry changed. Paths a change names in the previous state
     /// (`Removed::path`, `Renamed::from`) are resolved before any change applies. A created entry with the identity of
     /// a node L holds is that node, wherever L had it; any other created entry is a new node. A node that held the
     /// name a change puts an entry at is gone from there, so it leaves L with everything under it. A file whose
-    /// content could not be read is left out until the observer reports it with its content.
+    /// content could not be read is left out until the observer reports it with its content. A rename to a path the
+    /// rules exclude is a move out of what this device syncs: the node takes that position when its folder is in L,
+    /// and keeps its entry otherwise ([`Trees::ignore_local`]); an entry L never held stays out.
     pub fn observe(&mut self, changes: &[Observed], now_ms: u64) -> BTreeSet<NodeId> {
         let mut index = Index::new(&self.trees);
         let before: Vec<Option<NodeId>> = changes
@@ -342,6 +357,17 @@ impl Engine {
                     }
                 }
                 Observed::Renamed { to, kind, id, .. } => {
+                    let node_kind = match kind {
+                        EntryKind::File => Kind::File,
+                        EntryKind::Dir => Kind::Dir,
+                    };
+                    if names(to).is_some_and(|to| self.trees.ignores(&to, node_kind)) {
+                        let Some(node) = &before else { continue };
+                        if to.parent().and_then(|dir| index.at(dir)).is_none() {
+                            self.trees.ignore_local(node);
+                            continue;
+                        }
+                    }
                     let identity = file_identity(*id);
                     let content = before
                         .as_ref()
@@ -645,6 +671,16 @@ impl Index {
             .insert((shape.parent.clone(), shape.name.clone()), id.clone());
         self.identities.insert(identity, id.clone());
     }
+}
+
+/// The names from the root to `path`, or `None` when one of them is not a name L can hold.
+fn names(path: &Path) -> Option<Vec<&str>> {
+    path.components()
+        .map(|component| match component {
+            Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect()
 }
 
 fn invalid(what: String) -> Error {

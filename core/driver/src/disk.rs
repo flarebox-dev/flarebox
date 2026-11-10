@@ -444,8 +444,10 @@ impl Disk {
         })
     }
 
-    /// Puts an observation batch into L in one transaction. Refuses a batch scanned from another folder than the
-    /// locked one, a root that is no longer held, and a batch whose root check failed. Drops the changes at or below
+    /// Puts an observation batch into L in one transaction, after giving the trees the rules files it lists. Refuses
+    /// a batch scanned from another folder than the locked one, a root that is no longer held, and a batch whose root
+    /// check failed. The rules of a batch are taken even when its changes are dropped: the scans report a rules file
+    /// only when it changed. Drops the changes at or below
     /// the paths of every effect section that ended after the batch's stamp, and a whole batch older than the
     /// sections remembered. The observer then resets every path a dropped change names, both ends of a rename, or
     /// the whole tree for a dropped batch, to L as it is after the batch, so a later batch reports what was lost.
@@ -463,6 +465,7 @@ impl Disk {
             return Err(Stop::Withdrawn(self.path.clone()));
         }
         observation.root.map_err(Stop::Root)?;
+        engine.rules(observation.rules);
         if stamp.0 < self.forgotten {
             self.sections.request(engine.resets([PathBuf::new()]));
             return Ok(());

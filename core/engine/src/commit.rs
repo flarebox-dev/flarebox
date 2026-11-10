@@ -313,6 +313,12 @@ impl Commits {
     /// waits while its node is not settled: a node left out of planning (a problem node, a node
     /// whose S update waits, a parked one), and a node L and R agree on while S lags
     /// ([`Class::Same`]). A folder is not deleted in the commit that restores a node into it.
+    ///
+    /// An excluded node ([`Trees::excluded`]) gets no op and is not forked, and nothing is built
+    /// while the rules are unknown ([`Trees::rules_known`]). A folder L deleted that still holds
+    /// an excluded node in R is not deleted, since that would trash the excluded node on the
+    /// server: each topmost deleted node below it with no excluded node in its subtree gets its
+    /// own delete, and the folder stays (section 5.10).
     pub fn build(
         &mut self,
         trees: &mut Trees,
@@ -325,11 +331,11 @@ impl Commits {
             return None;
         }
         self.retry_waiting(trees, BTreeSet::new(), Vec::new());
-        if self.halted.is_some() {
+        if self.halted.is_some() || !trees.rules_known() {
             return None;
         }
         let parked = trees.local().iter().filter(|(_, node)| node.parked);
-        let skip: BTreeSet<NodeId> = self
+        let mut skip: BTreeSet<NodeId> = self
             .problems
             .iter()
             .chain(trees.waiting().keys())
@@ -337,6 +343,11 @@ impl Commits {
             .cloned()
             .collect();
         let (needed, agreed) = rebase(trees, ids, now_ms, &skip);
+        let excluded: Vec<NodeId> = (trees.dirty().iter())
+            .filter(|id| trees.excluded(id))
+            .cloned()
+            .collect();
+        skip.extend(excluded);
         let needed = self.retry_waiting(trees, needed, agreed);
         self.split.retain(|id| trees.synced().live(id).is_some());
         self.aliases.retain(|id, _| trees.local().get(id).is_some());
@@ -791,7 +802,8 @@ fn rekey(trees: &mut Trees, from: &str, to: &str) {
 /// The rebase of section 2.4, before ops are planned. A reverted file that R no longer has but that
 /// holds an edit not uploaded yet becomes a new node, so the edit is uploaded as a create instead
 /// of being removed with the node. Nodes in `skip` are not rebased otherwise, though what they changed
-/// remotely still keeps their ancestors. Returns the nodes the keep rule could
+/// remotely still keeps their ancestors. An excluded node is not rebased and keeps nothing; S
+/// still takes what both sides agree on for it. Returns the nodes the keep rule could
 /// not clear from S yet, and the S updates both sides agree on, which are made together with the
 /// waiting ones.
 fn rebase(
@@ -803,12 +815,15 @@ fn rebase(
     let dirty: Vec<NodeId> = trees.dirty().iter().cloned().collect();
     for id in &dirty {
         let held = trees.reverted().contains(id) || trees.waiting().contains_key(id);
-        if held && trees.remote().live(id).is_none() && trees.edited(id) {
+        if held && trees.remote().live(id).is_none() && trees.edited(id) && !trees.excluded(id) {
             rekey(trees, id, &ids.uuid_v7(now_ms));
         }
     }
     for id in dirty.iter().filter(|id| !skip.contains(*id)) {
-        if trees.class(id) != Class::Concurrent || !edited_on_both_sides(trees, id) {
+        if trees.class(id) != Class::Concurrent
+            || !edited_on_both_sides(trees, id)
+            || trees.excluded(id)
+        {
             continue;
         }
         let local = trees.local().get(id).cloned().expect("a local edit");
@@ -818,7 +833,9 @@ fn rebase(
     let mut needed = BTreeSet::new();
     let mut agreed = Vec::new();
     for id in &dirty {
-        keep(trees, id, &mut needed);
+        if !trees.excluded(id) {
+            keep(trees, id, &mut needed);
+        }
         if skip.contains(id) {
             continue;
         }
@@ -1122,6 +1139,7 @@ fn plan(
             });
         }
     }
+    let mut scratch = Scratch::new(trees);
     let mut tops = Vec::new();
     let mut children: BTreeMap<&str, Vec<&NodeId>> = BTreeMap::new();
     for id in &deleted {
@@ -1143,8 +1161,12 @@ fn plan(
             .iter()
             .map(|node| record_cost(trees.synced().live(node)))
             .sum();
+        let kept = (scratch.subtree(id).iter()).any(|node| trees.excluded(node));
         match children.get(id.as_str()) {
-            Some(kids) if bytes > MAX_COMMIT_BYTES || split.contains(id) => tops.extend(kids),
+            Some(kids) if kept || bytes > MAX_COMMIT_BYTES || split.contains(id) => {
+                tops.extend(kids)
+            }
+            _ if kept => {}
             _ => wants.push(Want::Delete {
                 id: id.clone(),
                 members,
@@ -1152,7 +1174,6 @@ fn plan(
         }
     }
 
-    let mut scratch = Scratch::new(trees);
     let restored: BTreeSet<&str> = restores.values().map(RestoreIntent::node).collect();
     for node in wants.iter().flat_map(Want::nodes) {
         if restored.contains(node.as_str()) {
