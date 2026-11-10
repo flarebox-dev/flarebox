@@ -459,14 +459,14 @@ async function teardown(account: Account): Promise<void> {
     const left = await attempt("checking the Durable Object namespaces", () => namespacesOf(account, name));
     if (left?.length) problems.push("Durable Object namespaces of " + name + " remain: " + left.map((namespace) => namespace.class + " " + namespace.id).join(", "));
     else if (left) console.log("No Durable Object namespace of " + name + " remains (" + (namespaces.map((namespace) => namespace.class).join(", ") || "none") + " deleted with the Worker)");
-  } else if (worker && tag) {
+  } else if (worker && tag && tagged === false) {
     problems.push(
       "a Worker named " + name + " (id " + worker.id + ") exists, but none of its versions carries the tag of this run's deploy, so this run cannot prove it created the Worker and left it alone. " +
         "If this run's deploy created it, delete the Worker " + name + " by hand under Workers & Pages, which also deletes its Durable Objects",
     );
-  } else if (worker) {
+  } else if (worker && !tag) {
     problems.push("a Worker named " + name + " (id " + worker.id + ") exists, but this run did not record creating it, so it was left alone");
-  } else if (tag) {
+  } else if (!worker && tag) {
     console.log("No Worker named " + name + " exists, so this run's deploy left none to delete");
   }
 

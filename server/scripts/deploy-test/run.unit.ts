@@ -257,6 +257,18 @@ describe("a deploy that fails after creating the Worker", () => {
     expect(mock.buckets.has(NAME)).toBe(false);
   });
 
+  it("leaves the Worker alone and reports only the error when its versions cannot be read", async () => {
+    fakePnpm({ install: { createsWorker: false, status: 0 }, deploy: { createsWorker: true, status: 1 } });
+    expect((await runTs("deploy", "HEAD")).status).toBe(1);
+    mock.versionsStatus = 403;
+    const tornDown = await runTs("teardown");
+    expect(tornDown.status).toBe(1);
+    expect(mock.deletes().filter((request) => request.includes("/workers/"))).toEqual([]);
+    expect(tornDown.output).toContain("::error::teardown: reading the Worker's version tags: GET");
+    expect(tornDown.output).not.toContain("none of its versions carries");
+    expect(tornDown.output).not.toContain("did not record creating it");
+  });
+
   it("fails teardown loudly and names the Worker to delete by hand when no upload of this run's deploy is on it", async () => {
     fakePnpm({ install: { createsWorker: false, status: 0 }, deploy: { createsWorker: true, tagged: false, status: 1 } });
     expect((await runTs("deploy", "HEAD")).status).toBe(1);

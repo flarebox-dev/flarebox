@@ -30,6 +30,8 @@ export class MockCloudflare {
   /** The status of a bucket creation; 409 also creates the bucket, as a concurrent creator would. */
   createBucketStatus = 200;
   claimStatus = 200;
+  /** The status of listing a Worker's versions. */
+  versionsStatus = 200;
   readonly claimCode = "ZQ7K-M2XR-9WPD";
   url = "";
   private server: Server | undefined;
@@ -146,6 +148,7 @@ export class MockCloudflare {
       if ((match = /^\/workers\/scripts\/([^/]+)\/versions$/.exec(api)) && method === "GET") {
         const worker = this.workers.get(match[1]!);
         if (!worker) return missing();
+        if (this.versionsStatus !== 200) return send(this.versionsStatus, { success: false, errors: [{ code: 10000, message: "Authentication error" }], messages: [], result: null });
         const page = Number(new URL(request.url ?? "/", this.url).searchParams.get("page") ?? "1");
         return ok({ items: page === 1 ? worker.versions.map((version, i) => ({ id: version.id, number: worker.versions.length - i })) : [] });
       }
