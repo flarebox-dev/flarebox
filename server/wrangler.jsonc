@@ -4,6 +4,7 @@
   "name": "flarebox",
   "main": "src/worker.ts",
   "compatibility_date": "2026-11-01",
+  "observability": { "enabled": true, "redact_query_string": true },
   "durable_objects": {
     "bindings": [
       { "name": "ACCOUNT", "class_name": "AccountDO" },

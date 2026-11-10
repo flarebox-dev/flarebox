@@ -56,6 +56,25 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test --reporter=verbose
 
+  server-deploy:
+    name: server deploy check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          package_json_file: server/package.json
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: server/pnpm-lock.yaml
+      - name: Deploy a copy of server/ on its own (dry run, then wrangler dev and a claim)
+        run: node server/scripts/check-deploy.mjs
+
   net-integration:
     name: net integration (ubuntu-latest)
     runs-on: ubuntu-latest
@@ -186,20 +205,21 @@ jobs:
   ci-report:
     name: ci-report
     if: always()
-    needs: [rust, server, net-integration, spec, macos-app]
+    needs: [rust, server, server-deploy, net-integration, spec, macos-app]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any CI job failed or was cancelled
         env:
           RUST: ${{ needs.rust.result }}
           SERVER: ${{ needs.server.result }}
+          SERVER_DEPLOY: ${{ needs.server-deploy.result }}
           NET_INTEGRATION: ${{ needs.net-integration.result }}
           SPEC: ${{ needs.spec.result }}
           MACOS_APP: ${{ needs.macos-app.result }}
           FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
         run: |
-          echo "rust: $RUST, server: $SERVER, net-integration: $NET_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP"
+          echo "rust: $RUST, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP"
           if [ "$FAILED" = "true" ]; then
-            echo "::error::At least one CI job failed or was cancelled (rust: $RUST, server: $SERVER, net-integration: $NET_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP). Open that job's log for the cause."
+            echo "::error::At least one CI job failed or was cancelled (rust: $RUST, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP). Open that job's log for the cause."
             exit 1
           fi
