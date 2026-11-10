@@ -11,6 +11,7 @@ publish.workspace = true
 
 [dependencies]
 flarebox-proto = { path = "../proto" }
+prost.workspace = true
 unicode-normalization = "0.1"
 
 [dev-dependencies]

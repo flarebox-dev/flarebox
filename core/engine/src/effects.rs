@@ -268,9 +268,12 @@ impl Effects {
     }
 }
 
-/// A node the planner considers: one whose only change is remote, or one that is parked.
+/// A node the planner considers: one whose only change is remote, one that is parked, or one whose
+/// local move is reverted.
 fn candidate(trees: &Trees, id: &str) -> bool {
-    trees.class(id) == Class::Remote || trees.local().get(id).is_some_and(|node| node.parked)
+    trees.class(id) == Class::Remote
+        || trees.local().get(id).is_some_and(|node| node.parked)
+        || trees.reverted().contains(id)
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -336,7 +339,9 @@ impl<'a> View<'a> {
             return Step::Skip;
         }
         let rewrite = match (&local.shape.content, &remote.content) {
-            (Some(old), Some(new)) => !same_content(old, new),
+            (Some(old), Some(new)) => {
+                !same_content(old, new) && self.trees.class(id) == Class::Remote
+            }
             _ => false,
         };
         let moved = local.parked || !local.shape.same_position(remote);
