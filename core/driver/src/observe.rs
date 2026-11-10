@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 
 use flarebox_chunk::ChunkerConfig;
 use flarebox_fs::{
-    Change, Entry, EntryKind, Error as FsError, FileId, NativeWatcher, RescanWatcher, RootProblem,
-    Snapshot, Watcher, check_root,
+    Change, Entry, EntryKind, Error as FsError, FileId, Known, NativeWatcher, RescanWatcher,
+    RootProblem, Snapshot, Watcher, check_root,
 };
 use flarebox_proto::v1::{ChunkRef, Content};
 use rustix::fs::{Mode, OFlags};
@@ -85,11 +85,12 @@ pub enum Observed {
 }
 
 /// What the observer is to believe about one scope, a path relative to the root, before it scans the scope again:
-/// the entries L holds at and below it. The scan then reports how the disk differs from L there.
+/// the entries L holds at and below it, by kind and identity. The scan then reports how the disk differs from L
+/// there, and reads every file L holds there again, since L's content for a file does not prove what the disk holds.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Reset {
     pub scope: PathBuf,
-    pub known: BTreeMap<PathBuf, Entry>,
+    pub known: BTreeMap<PathBuf, Known>,
 }
 
 /// A source of observations for one linked folder.
@@ -170,8 +171,9 @@ impl FsObserver {
     }
 
     /// Resets the snapshot at each scope of `resets`, in order, to the entries L holds there, so the next observation
-    /// reports how the disk differs from L in those scopes: what L lacks as created, with the content of every file,
-    /// and what the disk lacks as removed. Nothing outside the scopes is reported again unless it changed.
+    /// reports how the disk differs from L in those scopes: what L lacks as created, what the disk lacks as removed,
+    /// and every file both hold as modified, each file with the content read from the disk. Nothing outside the
+    /// scopes is reported again unless it changed.
     pub fn reset(&mut self, resets: Vec<Reset>) {
         for Reset { scope, known } in resets {
             self.unread.retain(|path, _| !path.starts_with(&scope));

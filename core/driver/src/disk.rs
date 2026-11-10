@@ -20,7 +20,7 @@
 //! was scanned or waited. Such a change can predate the effect, and applying it would undo the acknowledged L.
 //! After each section, and for every path of a dropped change, the observer resets its snapshot there to L's view and
 //! scans the path again ([`Sections::take_resets`]). The next batch then reports how the disk differs from L there,
-//! removals and moves included.
+//! removals and moves included, and carries the content of every file L holds there, read from the disk again.
 //!
 //! A [`Stop`] ends the task. The engine in memory may then be ahead of the store; the next start loads it again and
 //! recovers the effect in flight. A root that is no longer at its linked path is never treated as a missing parent.

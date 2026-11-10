@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use flarebox_fs::{
-    Change, Entry, EntryKind, Error, FileId, NativeWatcher, Poll, Rescan, RescanWatcher, Snapshot,
-    Space, Watcher,
+    Change, Entry, EntryKind, Error, FileId, Known, NativeWatcher, Poll, Rescan, RescanWatcher,
+    Snapshot, Space, Watcher,
 };
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -693,7 +693,7 @@ fn rescan_watcher_reports_only_a_forgotten_scope() {
 
 /// A tree as `two_folders` makes it, and what was under `d` before
 /// `d/gone` was deleted from it.
-fn tree_that_lost_a_file() -> (tempfile::TempDir, PathBuf, BTreeMap<PathBuf, Entry>) {
+fn tree_that_lost_a_file() -> (tempfile::TempDir, PathBuf, BTreeMap<PathBuf, Known>) {
     let dir = two_folders();
     let root = fs::canonicalize(dir.path()).unwrap();
     fs::write(root.join("d/gone"), "gone").unwrap();
@@ -702,18 +702,20 @@ fn tree_that_lost_a_file() -> (tempfile::TempDir, PathBuf, BTreeMap<PathBuf, Ent
         .entries
         .into_iter()
         .filter(|(path, _)| path.starts_with("d"))
+        .map(|(path, Entry { kind, id, .. })| (path, Known { kind, id }))
         .collect();
     fs::remove_file(root.join("d/gone")).unwrap();
     (dir, root, known)
 }
 
 /// Resets `d` to entries that include `d/gone`, which the disk lacks, in a
-/// watcher that has caught up with the tree. The next poll reports only that
-/// removal.
+/// watcher that has caught up with the tree. The next poll reports that
+/// removal, and the two files `d` still holds as modified although nothing
+/// changed them: the reset does not say what they hold.
 fn reset_entry_the_disk_lacks_is_removed(
     watcher: &mut dyn Watcher,
     root: &Path,
-    known: BTreeMap<PathBuf, Entry>,
+    known: BTreeMap<PathBuf, Known>,
 ) {
     assert_eq!(
         watcher.poll(Duration::from_millis(300)).unwrap(),
@@ -724,11 +726,20 @@ fn reset_entry_the_disk_lacks_is_removed(
     assert_eq!(
         watcher.poll(Duration::ZERO).unwrap(),
         Poll {
-            changes: vec![removed("d/gone", File)],
+            changes: vec![
+                removed("d/gone", File),
+                modified("d/sub/y"),
+                modified("d/x")
+            ],
             ..quiet(root)
         }
     );
     assert_eq!(watcher.snapshot(), &Snapshot::scan(root).unwrap());
+    assert_eq!(
+        watcher.poll(Duration::from_millis(300)).unwrap().changes,
+        [],
+        "a file is reported once per reset"
+    );
 }
 
 #[test]

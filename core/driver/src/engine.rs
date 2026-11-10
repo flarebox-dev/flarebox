@@ -18,7 +18,7 @@ use flarebox_engine::state::CommitsState;
 use flarebox_engine::tree::{
     Content, FileIdentity, Kind, LocalNode, NodeId, RemoteNode, Shape, same_content,
 };
-use flarebox_fs::{Entry, EntryKind, FileId};
+use flarebox_fs::{EntryKind, FileId, Known};
 use flarebox_proto::v1::NodeKind;
 use flarebox_store::{EngineState, Error, Tx};
 
@@ -192,10 +192,9 @@ impl Engine {
         touched
     }
 
-    /// L's view of each of `scopes`, relative paths, as `core/fs` entries: the placed node at the scope and every
-    /// placed node under it. The empty path covers all of L, and a path L does not hold gets no entries. A folder has
-    /// the zero size and time `core/fs` gives every folder; a file has the size, time and executable bit of its
-    /// content. A disk that matches L therefore rescans to no changes.
+    /// L's view of each of `scopes`, relative paths, for the observer: the kind and identity of the placed node at
+    /// the scope and of every placed node under it. The empty path covers all of L, and a path L does not hold gets
+    /// no entries. L's content for a file is left out, because it does not prove what the disk holds.
     pub fn resets(&self, scopes: impl IntoIterator<Item = PathBuf>) -> Vec<Reset> {
         let index = Index::new(&self.trees);
         let local = self.trees.local();
@@ -212,7 +211,12 @@ impl Engine {
                     if let Some(node) = local.get(&id)
                         && !path.as_os_str().is_empty()
                     {
-                        known.insert(path.clone(), entry(node));
+                        let kind = match node.shape.kind {
+                            Kind::Dir => EntryKind::Dir,
+                            Kind::File => EntryKind::File,
+                        };
+                        let id = file_id(node.identity);
+                        known.insert(path.clone(), Known { kind, id });
                     }
                     for child in index.children_of(&id) {
                         if let Some(node) = local.get(&child) {
@@ -430,27 +434,6 @@ fn stored(id: &NodeId, node: &LocalNode) -> flarebox_store::LocalNode {
         },
         identity: file_id(node.identity),
         parked: node.parked,
-    }
-}
-
-/// A node as the `core/fs` entry a scan of it makes.
-fn entry(node: &LocalNode) -> Entry {
-    let (kind, size, mtime_ns, executable) = match (&node.shape.kind, &node.shape.content) {
-        (Kind::Dir, _) => (EntryKind::Dir, 0, 0, false),
-        (Kind::File, None) => (EntryKind::File, 0, 0, false),
-        (Kind::File, Some(content)) => (
-            EntryKind::File,
-            content.size,
-            i128::from(content.mtime_ns),
-            content.executable,
-        ),
-    };
-    Entry {
-        kind,
-        id: file_id(node.identity),
-        size,
-        mtime_ns,
-        executable,
     }
 }
 

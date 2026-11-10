@@ -21,7 +21,7 @@ use flarebox_engine::effects::{Base as EngineBase, Dir as EngineDir};
 use flarebox_engine::state::{EffectsState, TreesState};
 use flarebox_engine::tree::{FileIdentity, LocalNode};
 use flarebox_fs::{
-    FileId, PRIVATE_DIR, QUARANTINE_DIR, STAGING_DIR, Snapshot, TRASH_DIR, read_marker,
+    FileId, Known, PRIVATE_DIR, QUARANTINE_DIR, STAGING_DIR, Snapshot, TRASH_DIR, read_marker,
     write_marker,
 };
 use flarebox_proto::v1::{NodeKind, NodeState, NodeStatus, VersionInfo};
@@ -970,11 +970,13 @@ fn a_stale_batch_does_not_undo_an_effect_and_the_rescan_reports_its_result() {
         "a change outside the effect's paths is kept"
     );
 
-    let on_disk = Snapshot::scan(&folder.root).unwrap().entries[Path::new("report.txt")];
-    assert_eq!(on_disk.id, file_id(written.identity));
+    let known = Known {
+        kind: EntryKind::File,
+        id: file_id(written.identity),
+    };
     let reset = Reset {
         scope: "report.txt".into(),
-        known: BTreeMap::from([(PathBuf::from("report.txt"), on_disk)]),
+        known: BTreeMap::from([(PathBuf::from("report.txt"), known)]),
     };
     let resets = catch_up(&mut watching, &sections);
     assert_eq!(
@@ -982,11 +984,21 @@ fn a_stale_batch_does_not_undo_an_effect_and_the_rescan_reports_its_result() {
         vec![reset.clone(), reset],
         "the effect and the dropped creation each reset report.txt to L"
     );
+    let fresh = observe_until(&mut watching, sections.stamp(), |seen| !seen.is_empty());
     assert_eq!(
-        settle(&mut watching),
-        vec![],
-        "the disk holds what L holds, so the rescan reports nothing"
+        fresh.observation.changes,
+        vec![Observed::Modified {
+            path: "report.txt".into(),
+            id: known.id,
+            content: written.shape.content.clone(),
+        }],
+        "the rescan reads the written file again and reports nothing else"
     );
+    running
+        .disk
+        .observed(fresh, &mut running.engine, &mut running.store)
+        .unwrap();
+    assert_eq!(settle(&mut watching), vec![]);
     assert_eq!(watching.snapshot(), &Snapshot::scan(&folder.root).unwrap());
     assert_eq!(running.local(NODE), Some(&written));
     drop(running);
@@ -1488,7 +1500,50 @@ fn a_reset_built_from_an_older_l_repeats_a_change_harmlessly() {
 }
 
 #[test]
-fn l_resets_to_exactly_what_the_scan_saw() {
+fn an_edit_that_keeps_size_and_mtime_while_a_file_is_placed_reaches_l_after_the_rescan() {
+    let folder = Folder::new();
+    let mut server = Server::default();
+    (SCENARIOS[2].setup)(&folder, &mut server);
+    let path = folder.root.join("report.txt");
+    let edit: Hook = Box::new({
+        let path = path.clone();
+        move |cut| {
+            if cut == Cut::Step(Step::Placed) {
+                let placed = fs::metadata(&path).unwrap();
+                let mut edited = fs::read(&path).unwrap();
+                edited[0] ^= 1;
+                fs::write(&path, edited).unwrap();
+                let times = fs::FileTimes::new().set_modified(placed.modified().unwrap());
+                let file = fs::File::options().write(true).open(&path).unwrap();
+                file.set_times(times).unwrap();
+            }
+        }
+    });
+    let mut running = folder.start(Some(edit)).unwrap();
+    let sections = running.disk.sections();
+    let mut watching = observer(&folder.root, Snapshot::scan(&folder.root).unwrap());
+    assert_eq!(running.step(&server), Some(Settled::Done));
+    let acknowledged = running.local(NODE).unwrap().shape.content.clone().unwrap();
+    let edited = disk_content(&path);
+    assert_eq!(edited.size, acknowledged.size);
+    assert_eq!(edited.mtime_ns, acknowledged.mtime_ns);
+    assert_ne!(edited.manifest_digest, acknowledged.manifest_digest);
+
+    catch_up(&mut watching, &sections);
+    let fresh = observe_until(&mut watching, sections.stamp(), |seen| !seen.is_empty());
+    running
+        .disk
+        .observed(fresh, &mut running.engine, &mut running.store)
+        .unwrap();
+    let held = running.local(NODE).unwrap().shape.content.clone().unwrap();
+    assert_eq!(
+        held.manifest_digest, edited.manifest_digest,
+        "L keeps the downloaded content for a file the user edited"
+    );
+}
+
+#[test]
+fn l_resets_to_the_kinds_and_identities_the_scan_saw() {
     use std::os::unix::fs::PermissionsExt;
 
     let folder = Folder::new();
@@ -1510,19 +1565,52 @@ fn l_resets_to_exactly_what_the_scan_saw() {
         .unwrap();
 
     let scanned = watching.snapshot().entries.clone();
+    let known = |under: &str| -> BTreeMap<PathBuf, Known> {
+        scanned
+            .iter()
+            .filter(|(path, _)| path.starts_with(under))
+            .map(|(path, &Entry { kind, id, .. })| (path.clone(), Known { kind, id }))
+            .collect()
+    };
     let resets = running
         .engine
         .resets([PathBuf::new(), PathBuf::from("docs")]);
-    assert_eq!(resets[0].known, scanned);
-    let docs: BTreeMap<PathBuf, Entry> = scanned
-        .iter()
-        .filter(|(path, _)| path.starts_with("docs"))
-        .map(|(path, entry)| (path.clone(), *entry))
-        .collect();
-    assert_eq!(resets[1].known, docs);
-    assert!(resets[0].known[Path::new("run.sh")].executable);
+    assert_eq!(resets[0].known, known(""));
+    assert_eq!(resets[1].known, known("docs"));
 
+    let held = |running: &Running| -> Vec<(String, LocalNode)> {
+        let local = running.engine.trees.local();
+        local
+            .iter()
+            .map(|(id, node)| (id.clone(), node.clone()))
+            .collect()
+    };
+    let local = held(&running);
     watching.reset(resets);
+    let fresh = observe_until(&mut watching, sections.stamp(), |seen| seen.len() >= 4);
+    let read: Vec<&Path> = fresh
+        .observation
+        .changes
+        .iter()
+        .map(|change| match change {
+            Observed::Modified {
+                path,
+                content: Some(_),
+                ..
+            } => path.as_path(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        read,
+        ["docs/a.txt", "docs/deep/b.txt", "empty", "run.sh"].map(Path::new),
+        "every file L holds is read again, and no folder is reported"
+    );
+    running
+        .disk
+        .observed(fresh, &mut running.engine, &mut running.store)
+        .unwrap();
+    assert_eq!(held(&running), local);
     assert_eq!(settle(&mut watching), vec![]);
     assert_eq!(watching.snapshot().entries, scanned);
 }
