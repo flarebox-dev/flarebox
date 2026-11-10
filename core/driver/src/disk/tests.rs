@@ -25,6 +25,7 @@ use flarebox_fs::{
     FileId, Known, PRIVATE_DIR, QUARANTINE_DIR, STAGING_DIR, Snapshot, TRASH_DIR, read_marker,
     write_marker,
 };
+use flarebox_net::ServerError;
 use flarebox_proto::v1::{NodeKind, NodeState, NodeStatus, VersionInfo};
 use flarebox_store::{EngineState, SyncedNode};
 
@@ -358,6 +359,8 @@ pub(crate) struct Server {
     corrupt: bool,
     /// How many more downloads fail for now before one goes through.
     pub unavailable: Mutex<u32>,
+    /// While set, every download is refused with this error.
+    pub refusal: Mutex<Option<ServerError>>,
     /// Runs once, before the first chunk is handed over.
     during: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
@@ -387,6 +390,13 @@ impl Fetch for Server {
         chunks: &[ChunkRef],
         write: &mut (dyn FnMut(&ChunkRef, &[u8]) -> io::Result<()> + Send),
     ) -> Result<(), ChunkError> {
+        if let Some(error) = self.refusal.lock().unwrap().clone() {
+            return Err(ChunkError::Refused {
+                hash: chunks[0].hash.clone(),
+                status: 429,
+                error: Some(error),
+            });
+        }
         {
             let mut unavailable = self.unavailable.lock().unwrap();
             if *unavailable > 0 {
@@ -1506,7 +1516,7 @@ fn a_download_that_fails_for_now_keeps_the_effect_and_stages_again() {
         .unwrap()
         .unwrap();
     match ready(pending.stage(&server)) {
-        Err(Stall::Later(wait)) => assert_eq!(wait, STAGE_AGAIN),
+        Err(Stall::Later { wait, .. }) => assert_eq!(wait, STAGE_AGAIN),
         other => panic!("{:?}", other.map(|_| ())),
     }
     assert!(running.engine.effects.in_flight().is_some());

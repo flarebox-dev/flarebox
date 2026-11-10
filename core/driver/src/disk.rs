@@ -53,7 +53,7 @@ use flarebox_fs::{
     Action, Base, Contents, Dir, Displaced, Effect, Entry, EntryKind, FileId, Location, Marker,
     Outcome, Reason, RootProblem, Space, Step,
 };
-use flarebox_net::{ChunkError, Session, StopReason, Transfer};
+use flarebox_net::{CallError, ChunkError, Session, StopReason, Transfer};
 use flarebox_proto::v1::{ChunkRef, Commit, op};
 use flarebox_store::{Link, Store, Tx};
 
@@ -112,8 +112,8 @@ pub(crate) enum Stop {
 /// Why [`Pending::stage`] returned without a staged file. The effect stays in flight.
 #[derive(Debug)]
 pub(crate) enum Stall {
-    /// The transfer failed for now. Stage again after this wait.
-    Later(Duration),
+    /// The transfer failed for now with `why`. Stage again after `wait`.
+    Later { wait: Duration, why: String },
     /// Staging cannot go on: the root was withdrawn, a staged file could not be written, or the session ended.
     Halt(Stop),
 }
@@ -807,10 +807,22 @@ impl Pending {
             }
             ChunkError::SourceChanged { .. } | ChunkError::Io { .. } => Some(Disposition::Halt),
         };
+        let why = match &error {
+            ChunkError::Refused {
+                error: Some(refusal),
+                ..
+            }
+            | ChunkError::Call(CallError::Server(refusal)) => policy::describe(refusal),
+            other => other.to_string(),
+        };
+        let later = |wait| Stall::Later {
+            wait,
+            why: format!("downloading a file's content failed: {why}"),
+        };
         match disposition {
             None => Ok(self.staged(Some(format!("its content cannot be downloaded: {error}")))),
-            Some(Disposition::RetryAfter(wait)) => Err(Stall::Later(wait)),
-            Some(Disposition::Backoff) => Err(Stall::Later(STAGE_AGAIN)),
+            Some(Disposition::RetryAfter(wait)) => Err(later(wait)),
+            Some(Disposition::Backoff) => Err(later(STAGE_AGAIN)),
             Some(Disposition::Halt) => Err(Stall::Halt(Stop::Record {
                 effect_id: self.record.effect_id.clone(),
                 what: format!("its content could not be downloaded: {error}"),
