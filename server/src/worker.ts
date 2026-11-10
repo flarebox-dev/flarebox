@@ -258,7 +258,8 @@ async function route(request: Request, env: Env): Promise<Response> {
   if (path === "/v1/spaces") {
     if (method === "GET") {
       const cursor = url.searchParams.get("cursor") ?? "";
-      return reply(request, SpaceListSchema, await account(env).listSpaces({ userId: identity.userId, cursor }));
+      if (!/^\d{0,15}$/.test(cursor)) throw new BadRequest("malformed cursor");
+      return reply(request, SpaceListSchema, await account(env).listSpaces({ userId: identity.userId, after: Number(cursor) }));
     }
     if (method === "POST") {
       const refused = refuseWithout(request, identity, "space.create");

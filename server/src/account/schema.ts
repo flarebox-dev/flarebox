@@ -57,6 +57,13 @@ export const MIGRATIONS: readonly Migration[] = [
   CREATE TABLE IF NOT EXISTS revocation_notices (device_id TEXT NOT NULL, space_id TEXT NOT NULL, next_try_ms INTEGER NOT NULL,
     PRIMARY KEY (device_id, space_id));
   `,
+  // RFC 0007 section 2: spaces are listed in the order their rows were stored, which a space id does not give.
+  (sql) => {
+    const columns = sql.exec("SELECT name FROM pragma_table_info('spaces')").toArray().map((row) => row.name);
+    if (!columns.includes("list_seq")) sql.exec("ALTER TABLE spaces ADD COLUMN list_seq INTEGER");
+    sql.exec("UPDATE spaces SET list_seq = rowid WHERE list_seq IS NULL");
+    sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS spaces_list_seq ON spaces(list_seq)");
+  },
 ];
 
 export function migrate(sql: SqlStorage): void {

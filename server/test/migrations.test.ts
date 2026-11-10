@@ -30,6 +30,7 @@ const ACCOUNT_SCHEMA_DIGESTS = [
   "b67a86b2ae0d362375f2879afc44654cdf43a636f02849f823296d467777e3e0",
   "81a059462fcc85e8d79e39486df0357cd8d2ca2b06c5ec5cc11b35f484b33185",
   "b6c36eba27d26386f256dc8d64bc63f97cd5d47c47b4f328fb608a1e21b6b0f8",
+  "d1acc17396a3ec9113232584f4f72afeded27e49556b0dabe3fd241db9458ec4",
 ];
 
 type Stub = DurableObjectStub<SpaceDO> | DurableObjectStub<AccountDO>;
@@ -214,6 +215,22 @@ describe("upgraded objects keep working", () => {
       expect(await stub.isClaimed()).toBe(true);
     });
   }
+
+  it("lists the spaces stored before RFC 0007 in the order they were stored, and a new space after them", async () => {
+    const stub = ACCOUNT.stub("space-list") as DurableObjectStub<AccountDO>;
+    const older = [uuidv7(), uuidv7()].sort().reverse();
+    await inObject(stub, (sql) => {
+      rewrite(sql, ACCOUNT, { label: "", applied: 5, versioned: true });
+      for (const spaceId of older) {
+        sql.exec("INSERT INTO spaces (space_id, name, owner_id, created_at_ms, format_version) VALUES (?, 'Old', ?, 1, 1)", spaceId, OWNER);
+      }
+    });
+    await evictDurableObject(stub);
+    const created = await stub.createSpace({ userId: OWNER, name: "New" });
+    const listed = await stub.listSpaces({ userId: OWNER, after: 0 });
+    expect(listed.spaces.map((space) => space.spaceId)).toEqual([...older, created.spaceId]);
+    expect(listed.nextCursor).toBe("");
+  });
 
   it("makes every device stored before RFC 0006 a full-scope device that never expires", async () => {
     const stub = ACCOUNT.stub("principals") as DurableObjectStub<AccountDO>;

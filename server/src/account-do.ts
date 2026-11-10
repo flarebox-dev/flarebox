@@ -446,7 +446,7 @@ export class AccountDO extends DurableObject<Env> {
     const spaceKey = await deriveSpaceKey((await this.serverKey()).secret, spaceId);
     await this.env.SPACE.get(this.env.SPACE.idFromName(spaceId)).init({ spaceId, name, ownerUserId: args.userId, spaceKey });
     this.sql.exec(
-      "INSERT INTO spaces (space_id, name, owner_id, created_at_ms, format_version) VALUES (?, ?, ?, ?, ?)",
+      "INSERT INTO spaces (space_id, name, owner_id, created_at_ms, format_version, list_seq) VALUES (?, ?, ?, ?, ?, (SELECT COALESCE(MAX(list_seq), 0) + 1 FROM spaces))",
       spaceId,
       name,
       args.userId,
@@ -704,15 +704,18 @@ export class AccountDO extends DurableObject<Env> {
     await this.deliverNotices();
   }
 
-  /** GET /v1/spaces: the user's spaces in creation order, one page at a time (RFC 0007 section 2). */
-  async listSpaces(args: { userId: string; cursor: string }): Promise<SpaceList> {
+  /**
+   * GET /v1/spaces: the user's spaces in the order their rows were stored, one page at a time (RFC 0007 section 2). A
+   * space stored after a listing passed newer ones gets the highest list_seq, so a later page still lists it.
+   */
+  async listSpaces(args: { userId: string; after: number }): Promise<SpaceList> {
     const found = this.sql
-      .exec("SELECT * FROM spaces WHERE owner_id = ? AND space_id > ? ORDER BY space_id LIMIT ?", args.userId, args.cursor, SPACE_PAGE + 1)
-      .toArray() as unknown as SpaceRow[];
+      .exec("SELECT * FROM spaces WHERE owner_id = ? AND list_seq > ? ORDER BY list_seq LIMIT ?", args.userId, args.after, SPACE_PAGE + 1)
+      .toArray() as unknown as (SpaceRow & { list_seq: number })[];
     const page = found.slice(0, SPACE_PAGE);
     return create(SpaceListSchema, {
       spaces: page.map(spaceInfo),
-      nextCursor: found.length > SPACE_PAGE ? page[page.length - 1]!.space_id : "",
+      nextCursor: found.length > SPACE_PAGE ? String(page[page.length - 1]!.list_seq) : "",
     });
   }
 

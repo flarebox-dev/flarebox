@@ -28,11 +28,13 @@ Known limitation: a deployment that stored a longer name before this rule keeps 
 
 ## 2. Space list pages (spec v0 §15)
 
-`GET /v1/spaces?cursor=` returns the spaces of the caller's user in creation order, by `space_id`. A page holds at most 100. `next_cursor` is empty on the last page, and the client passes it back as `cursor` to get the next. A client that ignores `next_cursor` sees only the first 100 spaces.
+`GET /v1/spaces?cursor=` returns the spaces of the caller's user in the order the server stored them. A page holds at most 100. `next_cursor` is empty on the last page, and the client passes it back as `cursor` to get the next. A client that ignores `next_cursor` sees only the first 100 spaces.
+
+The cursor is opaque to clients. The server orders by a sequence number it assigns when it stores a space, not by `space_id`. A create can pick its `space_id`, then store the space after a listing has already passed newer spaces. That space still gets the highest sequence number, so a later page of the same listing returns it. A listing that started before a space was stored and had already reached its last page does not return that space. A malformed cursor is refused with `INVALID_ARGUMENT`.
 
 ## 3. Answer sizes
 
-With sections 1 and 2, the answers of these endpoints have fixed upper bounds, as long as every stored name follows section 1:
+With sections 1 and 2, the answers of these endpoints have fixed upper bounds in binary protobuf, as long as every stored name follows section 1:
 
 | Answer | At most |
 |---|---|
@@ -41,5 +43,7 @@ With sections 1 and 2, the answers of these endpoints have fixed upper bounds, a
 | `DeviceList` page (RFC 0006 section 7) | 64 KiB |
 
 The largest fixed-shape answer is `DeviceCredentials`. Its access token carries the device name JSON-escaped, where a control character takes six bytes, inside claims encoded as base64url, which takes four bytes for every three. A 255-byte device name therefore adds at most 2,040 bytes to the token. In a list, a `SpaceInfo` takes at most 316 bytes and a `DeviceInfo` at most 643, because both carry the names of section 1.
+
+The bounds are for binary protobuf only. The server also answers in JSON when a request asks for it, and a JSON answer is larger. JSON writes each control character in a name as six bytes, and every field carries its name. This RFC sets no bound for JSON answers, so a client that reads JSON must not use these caps.
 
 A client that caps its reads at these bounds cannot read an answer that carries an older, longer name. It reports such an answer as too large and does not misread it. Until deployments from before this rule are gone, a client that must still list their spaces keeps a larger cap.

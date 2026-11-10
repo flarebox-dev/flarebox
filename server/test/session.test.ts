@@ -834,9 +834,9 @@ describe("RFC 0007 name limits and space list pages", () => {
     return call("/v1/spaces" + (cursor ? "?cursor=" + cursor : ""), { method: "GET", token }, SpaceListSchema);
   }
 
-  async function spacePages(token: string): Promise<SpaceList[]> {
+  async function spacePages(token: string, from = ""): Promise<SpaceList[]> {
     const pages: SpaceList[] = [];
-    let cursor = "";
+    let cursor = from;
     do {
       const page = await listSpaces(token, cursor);
       expect(page.status).toBe(200);
@@ -885,15 +885,51 @@ describe("RFC 0007 name limits and space list pages", () => {
     expect(created.message!.name).toBe(longest);
   });
 
+  it("lists a space whose create was still storing it when a listing passed newer spaces", async () => {
+    const owner = await getOwner();
+    const token = owner.access!.token;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let gated: Promise<void> | undefined;
+    await runInDurableObject(account(), (instance) => {
+      const spaces = (instance as unknown as { env: Env }).env.SPACE;
+      const get = spaces.get.bind(spaces);
+      vi.spyOn(spaces, "get").mockImplementationOnce((id) => {
+        const stub = get(id);
+        return {
+          init: (args: Parameters<typeof stub.init>[0]) => {
+            gated = Promise.resolve();
+            return gate.then(() => stub.init(args));
+          },
+        } as unknown as typeof stub;
+      });
+    });
+    const pending = call("/v1/spaces", { token, body: body(CreateSpaceRequestSchema, { name: "Slow" }) }, SpaceInfoSchema);
+    await vi.waitFor(() => expect(gated).toBeDefined());
+    const newer: string[] = [];
+    for (let i = 0; i < 101; i++) newer.push(await createSpace(owner));
+    const first = await listSpaces(token);
+    expect(first.message!.nextCursor).not.toBe("");
+    release();
+    const created = await pending;
+    expect(created.status).toBe(201);
+    const later = await spacePages(token, first.message!.nextCursor);
+    const listed = [...first.message!.spaces, ...later.flatMap((page) => page.spaces)].map((space) => space.spaceId);
+    expect(listed).toContain(created.message!.spaceId);
+    expect(listed).toEqual(expect.arrayContaining(newer));
+    expect(new Set(listed).size).toBe(listed.length);
+  });
+
   it("lists the user's spaces in creation order and pages them by cursor, each page within 32 KiB", async () => {
     const owner = await getOwner();
     const token = owner.access!.token;
+    expect(await send("/v1/spaces?cursor=" + uuidv7(), { method: "GET", token })).toEqual(refused);
     const before = (await spacePages(token)).flatMap((page) => page.spaces.map((space) => space.spaceId));
     const extra = Array.from({ length: 150 }, () => uuidv7());
     await runInDurableObject(account(), (_instance, state) => {
       for (const id of extra) {
         state.storage.sql.exec(
-          "INSERT INTO spaces (space_id, name, owner_id, created_at_ms, format_version) VALUES (?, ?, ?, ?, 1)",
+          "INSERT INTO spaces (space_id, name, owner_id, created_at_ms, format_version, list_seq) VALUES (?, ?, ?, ?, 1, (SELECT MAX(list_seq) + 1 FROM spaces))",
           id,
           "\u0001".repeat(255),
           owner.userId,
@@ -904,7 +940,7 @@ describe("RFC 0007 name limits and space list pages", () => {
     try {
       const pages = await spacePages(token);
       expect(pages[0]!.spaces).toHaveLength(100);
-      expect(pages.flatMap((page) => page.spaces.map((space) => space.spaceId))).toEqual([...before, ...extra].sort());
+      expect(pages.flatMap((page) => page.spaces.map((space) => space.spaceId))).toEqual([...before, ...extra]);
       for (const page of pages) expect(toBinary(SpaceListSchema, page).length).toBeLessThanOrEqual(32 * 1024);
     } finally {
       await runInDurableObject(account(), (_instance, state) => {
