@@ -319,8 +319,9 @@ impl Engine {
     /// Puts `changes` into L and returns the nodes whose L entry changed. Paths a change names in the previous state
     /// (`Removed::path`, `Renamed::from`) are resolved before any change applies. A renamed or modified entry is the
     /// node L holds at its path with its identity, else the node with its identity, else the node at its path. A
-    /// created entry with the identity of a node L holds is that node, wherever L had it, unless another path links
-    /// the same file: a hard link is a file of its own (design §5.6). Any other created entry is a new node.
+    /// created entry with the identity of a node L holds is that node, wherever L had it. Any other created entry is a
+    /// new node. An entry that another path also links is a hard link, a file of its own (design §5.6), so its
+    /// identity never takes a node from another path.
     ///
     /// A node that held the name a change puts an entry at is gone from there, so it leaves L with everything under
     /// it. A file that arrives over a file keeps the node of the file it replaces when L's own node for the arriving
@@ -332,9 +333,9 @@ impl Engine {
             .iter()
             .map(|change| match change {
                 Observed::Removed { path, .. } => index.at(path),
-                Observed::Renamed { from, id, .. } => {
-                    index.resolve(&self.trees, from, &file_identity(*id))
-                }
+                Observed::Renamed {
+                    from, id, linked, ..
+                } => index.resolve(&self.trees, from, &file_identity(*id), *linked),
                 Observed::Created { .. } | Observed::Modified { .. } => None,
             })
             .collect();
@@ -386,10 +387,15 @@ impl Engine {
                         &mut touched,
                     );
                 }
-                Observed::Modified { path, id, content } => {
+                Observed::Modified {
+                    path,
+                    id,
+                    linked,
+                    content,
+                } => {
                     let Some(content) = content else { continue };
                     let identity = file_identity(*id);
-                    let node = index.resolve(&self.trees, path, &identity);
+                    let node = index.resolve(&self.trees, path, &identity, *linked);
                     self.place(
                         &mut index,
                         node,
@@ -640,9 +646,16 @@ impl Index {
         self.identities.get(identity).cloned()
     }
 
-    /// The node at `path` when it has `identity`, else the node with `identity`, else the node at `path`. Two hard
-    /// links share an identity, and the path tells them apart.
-    fn resolve(&self, trees: &Trees, path: &Path, identity: &FileIdentity) -> Option<NodeId> {
+    /// The node at `path` when it has `identity`, else the node with `identity`, else the node at `path`. The
+    /// identity of a file with several links (`linked`) names no single path, so it never takes a node from another
+    /// path, where the other link may still be.
+    fn resolve(
+        &self,
+        trees: &Trees,
+        path: &Path,
+        identity: &FileIdentity,
+        linked: bool,
+    ) -> Option<NodeId> {
         let at = self.at(path);
         at.clone()
             .filter(|id| {
@@ -651,7 +664,7 @@ impl Index {
                     .get(id)
                     .is_some_and(|node| node.identity == *identity)
             })
-            .or_else(|| self.by_identity(identity))
+            .or_else(|| self.by_identity(identity).filter(|_| !linked))
             .or(at)
     }
 
@@ -1488,12 +1501,13 @@ mod tests {
         }
     }
 
-    fn renamed(from: &str, to: &str, id: FileId) -> Observed {
+    fn renamed(from: &str, to: &str, id: FileId, linked: bool) -> Observed {
         Observed::Renamed {
             from: from.into(),
             to: to.into(),
             kind: EntryKind::File,
             id,
+            linked,
         }
     }
 
@@ -1519,7 +1533,7 @@ mod tests {
         engine.trees.set_synced(notes.clone(), Some(shape));
 
         engine.observe(&[created(".notes.txt.swp", ino(2), false, 2)], 0);
-        engine.observe(&[renamed(".notes.txt.swp", "notes.txt", ino(2))], 0);
+        engine.observe(&[renamed(".notes.txt.swp", "notes.txt", ino(2), false)], 0);
         assert_eq!(
             holding(&engine, "notes.txt"),
             Some((notes.clone(), file_identity(ino(2)), 2))
@@ -1531,7 +1545,7 @@ mod tests {
         let (draft, _, _) = holding(&engine, "draft.txt").unwrap();
         let shape = engine.trees.local().get(&draft).unwrap().shape.clone();
         engine.trees.set_synced(draft.clone(), Some(shape));
-        engine.observe(&[renamed("draft.txt", "notes.txt", ino(3))], 0);
+        engine.observe(&[renamed("draft.txt", "notes.txt", ino(3), false)], 0);
         assert_eq!(
             holding(&engine, "notes.txt"),
             Some((draft, file_identity(ino(3)), 3)),
@@ -1557,9 +1571,10 @@ mod tests {
         let edited = Observed::Modified {
             path: "one.txt".into(),
             id: ino(1),
+            linked: true,
             content: Some(bytes(4)),
         };
-        engine.observe(&[edited, renamed("two.txt", "three.txt", ino(1))], 0);
+        engine.observe(&[edited, renamed("two.txt", "three.txt", ino(1), true)], 0);
         assert_eq!(
             holding(&engine, "one.txt"),
             Some((one, file_identity(ino(1)), 4))
@@ -1579,5 +1594,93 @@ mod tests {
             "a created entry of one link with a known identity is that node"
         );
         assert_eq!(holding(&engine, "four.txt"), None);
+    }
+
+    #[test]
+    fn a_file_replaced_by_a_hard_link_to_another_keeps_its_node() {
+        let (_dir, mut engine) = mapper();
+        engine.observe(
+            &[
+                created("one.txt", ino(1), false, 1),
+                created("two.txt", ino(2), false, 2),
+            ],
+            0,
+        );
+        let (one, _, _) = holding(&engine, "one.txt").unwrap();
+        let (two, _, _) = holding(&engine, "two.txt").unwrap();
+        let replaced = Observed::Modified {
+            path: "two.txt".into(),
+            id: ino(1),
+            linked: true,
+            content: Some(bytes(1)),
+        };
+        engine.observe(&[replaced], 0);
+        assert_eq!(
+            holding(&engine, "one.txt"),
+            Some((one, file_identity(ino(1)), 1))
+        );
+        assert_eq!(
+            holding(&engine, "two.txt"),
+            Some((two, file_identity(ino(1)), 1))
+        );
+    }
+
+    #[test]
+    fn the_last_link_of_a_file_keeps_its_node_as_it_is_edited_and_moved() {
+        let (_dir, mut engine) = mapper();
+        engine.observe(
+            &[
+                created("one", ino(1), false, 1),
+                created("two", ino(1), true, 1),
+            ],
+            0,
+        );
+        let (one, _, _) = holding(&engine, "one").unwrap();
+        let (two, _, _) = holding(&engine, "two").unwrap();
+        let edited = Observed::Modified {
+            path: "two".into(),
+            id: ino(1),
+            linked: false,
+            content: Some(bytes(2)),
+        };
+        let removed = Observed::Removed {
+            path: "one".into(),
+            kind: EntryKind::File,
+        };
+        engine.observe(&[removed, edited], 0);
+        assert!(engine.trees.local().get(&one).is_none());
+        assert_eq!(
+            holding(&engine, "two"),
+            Some((two.clone(), file_identity(ino(1)), 2))
+        );
+        engine.observe(&[created("three", ino(1), false, 2)], 0);
+        assert_eq!(
+            holding(&engine, "three"),
+            Some((two, file_identity(ino(1)), 2))
+        );
+        assert_eq!(holding(&engine, "two"), None);
+    }
+
+    #[test]
+    fn two_links_renamed_in_one_batch_keep_their_nodes() {
+        let (_dir, mut engine) = mapper();
+        engine.observe(
+            &[
+                created("one", ino(1), false, 1),
+                created("two", ino(1), true, 1),
+            ],
+            0,
+        );
+        let one = holding(&engine, "one").unwrap();
+        let two = holding(&engine, "two").unwrap();
+        engine.observe(
+            &[
+                renamed("one", "three", ino(1), true),
+                renamed("two", "four", ino(1), true),
+            ],
+            0,
+        );
+        assert_eq!(holding(&engine, "three"), Some(one));
+        assert_eq!(holding(&engine, "four"), Some(two));
     }
 }

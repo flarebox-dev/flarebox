@@ -60,8 +60,8 @@ pub struct Observation {
 /// One change, in the terms of `core/fs` (paths relative to the root, previous-state paths first).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Observed {
-    /// `content` is set for a file that could be read whole. `linked` is set for a file that another path also
-    /// links, a hard link.
+    /// `content` is set for a file that could be read whole. `linked` is set, here and on the other changes, for a
+    /// file that another path also links, a hard link, whose identity therefore names no single path.
     Created {
         path: PathBuf,
         kind: EntryKind,
@@ -72,6 +72,7 @@ pub enum Observed {
     Modified {
         path: PathBuf,
         id: FileId,
+        linked: bool,
         content: Option<Content>,
     },
     Renamed {
@@ -79,6 +80,7 @@ pub enum Observed {
         to: PathBuf,
         kind: EntryKind,
         id: FileId,
+        linked: bool,
     },
     Removed {
         path: PathBuf,
@@ -222,6 +224,7 @@ impl FsObserver {
                 out.push(Observed::Modified {
                     content,
                     id: entry.id,
+                    linked: self.linked(&path, entry.kind),
                     path,
                 });
             }
@@ -236,6 +239,7 @@ impl FsObserver {
                     to: to.clone(),
                     kind,
                     id: entry.id,
+                    linked: self.linked(&to, kind),
                 });
                 if leaves {
                     self.brought_in(&to, out, busy);
@@ -269,6 +273,7 @@ impl FsObserver {
                     out.push(Observed::Modified {
                         path: path.clone(),
                         id: entry.id,
+                        linked: self.linked(path, entry.kind),
                         content,
                     });
                 }
@@ -342,6 +347,7 @@ impl FsObserver {
                 Ok(Some(content)) => {
                     self.unread.remove(&path);
                     out.push(Observed::Modified {
+                        linked: self.linked(&path, entry.kind),
                         path,
                         id: entry.id,
                         content: Some(content),
