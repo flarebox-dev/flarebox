@@ -101,6 +101,9 @@ enum Rotation {
 struct State {
     token: Option<AccessToken>,
     stored: Stored,
+    /// A credential the server stored that the store could not make current. The store still holds it in the staged
+    /// slot, so it stays there until a retried promotion succeeds.
+    unstored_promotion: Option<Staged>,
 }
 
 /// Hands out access tokens for one device, refreshing them through `POST /v1/token` before they expire. One refresh
@@ -120,6 +123,7 @@ impl Auth {
             credentials: std::sync::Mutex::new(credentials.clone()),
             state: Mutex::new(State {
                 token: None,
+                unstored_promotion: None,
                 stored: Stored {
                     current: credentials,
                     staged: None,
@@ -212,6 +216,14 @@ impl Auth {
         store: &dyn CredentialStore,
         period: Duration,
     ) -> Result<AccessToken, ApiError> {
+        if let Some(promotion) = state.unstored_promotion.clone() {
+            if let Err(error) = store.promote(&promotion) {
+                tracing::warn!(%error, "the rotated refresh credential is still not stored as current; not rotating again until it is");
+                let current = state.stored.current.refresh_credential.clone();
+                return self.request(&current, None, true).await;
+            }
+            state.unstored_promotion = None;
+        }
         if let Some(staged) = state.stored.staged.clone() {
             return self.settle(state, store, &staged).await;
         }
@@ -270,12 +282,18 @@ impl Auth {
         }
     }
 
-    /// The server stores `staged` now, whether or not the store can record it. A store that could not keeps the staged
-    /// slot, and the next start presents the old credential, is refused, and promotes the staged one again.
+    /// The server stores `staged` now, whether or not the store can record it. A store that could not keeps it in the
+    /// staged slot. This process presents it from now on and retries the promotion before every refresh, and it stages
+    /// no other credential until the promotion succeeds. A restart before then presents the old credential, is refused,
+    /// and promotes the staged one again.
     fn promote(&self, state: &mut State, store: &dyn CredentialStore, staged: &Staged) {
-        if let Err(error) = store.promote(staged) {
-            tracing::warn!(%error, "could not store the rotated refresh credential as current");
-        }
+        state.unstored_promotion = match store.promote(staged) {
+            Ok(()) => None,
+            Err(error) => {
+                tracing::warn!(%error, "could not store the rotated refresh credential as current");
+                Some(staged.clone())
+            }
+        };
         state.stored.current.refresh_credential = staged.refresh_credential.clone();
         state.stored.staged = None;
         state.stored.changed_at = SystemTime::now();

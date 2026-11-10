@@ -176,6 +176,7 @@ struct Slots {
     staged: Option<Staged>,
     promoted: Vec<String>,
     fail_stage: bool,
+    failing_promotions: usize,
 }
 
 #[derive(Default)]
@@ -193,6 +194,10 @@ impl CredentialStore for MemoryStore {
 
     fn promote(&self, staged: &Staged) -> io::Result<()> {
         let mut slots = self.0.lock().unwrap();
+        if slots.failing_promotions > 0 {
+            slots.failing_promotions -= 1;
+            return Err(io::Error::other("injected promotion failure"));
+        }
         slots.promoted.push(staged.refresh_credential.clone());
         slots.staged = None;
         Ok(())
@@ -238,6 +243,92 @@ fn proposals(stub: &Stub) -> Vec<String> {
         .map(|request| request.next_refresh_credential.clone())
         .filter(|proposal| !proposal.is_empty())
         .collect()
+}
+
+#[tokio::test]
+async fn a_failed_promotion_is_stored_before_the_next_rotation_and_survives_a_lost_proposal_and_a_restart()
+ {
+    struct FailingStore {
+        stored: Mutex<Stored>,
+        fail_once: std::sync::atomic::AtomicBool,
+    }
+    impl CredentialStore for FailingStore {
+        fn stage(&self, staged: &Staged) -> io::Result<()> {
+            self.stored.lock().unwrap().staged = Some(staged.clone());
+            Ok(())
+        }
+        fn promote(&self, staged: &Staged) -> io::Result<()> {
+            if self
+                .fail_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(io::Error::other("injected current-file write failure"));
+            }
+            let mut stored = self.stored.lock().unwrap();
+            stored.current.refresh_credential = staged.refresh_credential.clone();
+            stored.staged = None;
+            stored.changed_at = SystemTime::now();
+            Ok(())
+        }
+        fn clear_staged(&self) -> io::Result<()> {
+            self.stored.lock().unwrap().staged = None;
+            Ok(())
+        }
+    }
+    let (stub, api) = Stub::start("old").await;
+    let initial = Stored {
+        current: Credentials {
+            user_id: "u".into(),
+            device_id: "d".into(),
+            refresh_credential: "old".into(),
+        },
+        staged: None,
+        changed_at: UNIX_EPOCH,
+    };
+    let store = Arc::new(FailingStore {
+        stored: Mutex::new(initial.clone()),
+        fail_once: std::sync::atomic::AtomicBool::new(true),
+    });
+    let auth = Auth::rotating(api.clone(), initial, store.clone(), ROTATION_PERIOD)
+        .with_refresh_margin(Duration::from_secs(3600));
+    auth.access_token().await.unwrap();
+    assert!(store.stored.lock().unwrap().staged.is_some());
+    auth.state.lock().await.stored.changed_at = UNIX_EPOCH;
+    stub.plan(Plan::Answer);
+    stub.plan(Plan::Drop);
+    auth.access_token().await.unwrap();
+    drop(auth);
+    let disk = store.stored.lock().unwrap().clone();
+    let restarted = Auth::rotating(api, disk, store, ROTATION_PERIOD)
+        .with_refresh_margin(Duration::from_secs(3600));
+    assert!(
+        restarted.access_token().await.is_ok(),
+        "the durable slots must retain the credential the server accepts"
+    );
+}
+
+#[tokio::test]
+async fn no_credential_is_staged_while_the_promotion_of_the_last_one_keeps_failing() {
+    let (stub, api) = Stub::start("old").await;
+    let store = Arc::new(MemoryStore::default());
+    store.0.lock().unwrap().failing_promotions = 2;
+    let auth = rotating(api, &store);
+    auth.access_token().await.unwrap();
+    let first = stub.server().current.clone();
+    assert_ne!(first, "old");
+    auth.state.lock().await.stored.changed_at = UNIX_EPOCH;
+    auth.access_token().await.unwrap();
+    assert_eq!(proposals(&stub), std::slice::from_ref(&first));
+    assert_eq!(
+        store.staged().map(|staged| staged.refresh_credential),
+        Some(first.clone()),
+        "the credential the server holds stays in the staged slot"
+    );
+    auth.access_token().await.unwrap();
+    let second = stub.server().current.clone();
+    assert_ne!(second, first);
+    assert_eq!(store.0.lock().unwrap().promoted, [first, second]);
+    settled(&auth, &stub, &store);
 }
 
 #[tokio::test]
