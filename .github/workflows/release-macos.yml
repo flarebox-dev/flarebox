@@ -2,8 +2,9 @@
 #
 # Builds the macOS app as a disk image. On a version tag or a manual run, it signs the app with a
 # Developer ID certificate and the hardened runtime, notarizes and staples the app and the disk
-# image, verifies them and uploads the disk image as a workflow artifact. Without the signing
-# secrets it builds an unsigned disk image and says so. Pull requests and the merge queue build
+# image, verifies them and uploads the disk image as a workflow artifact. It refuses a tag or a
+# manual run whose commit is not on main before the job that holds the secrets starts. Without
+# the signing secrets it builds an unsigned disk image and says so. Pull requests and the merge queue build
 # the unsigned disk image only. This workflow never creates a GitHub release or publishes
 # anything. Setup and secrets: docs/release-macos.md.
 
@@ -97,8 +98,36 @@ jobs:
           compression-level: 0
           retention-days: 7
 
+  release-ref:
+    name: macos release (commit on main)
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Refuse unless the commit is on main
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          if [ "$EVENT" = workflow_dispatch ] && [ "$REF" != refs/heads/main ]; then
+            echo "::error::Manual release runs must start from main, not $REF. Choose main under 'Use workflow from'."
+            exit 1
+          fi
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          commit="$(git rev-parse HEAD)"
+          if ! git merge-base --is-ancestor "$commit" origin/main; then
+            echo "::error::$REF points to $commit, which is not on main. Release builds sign only commits that were merged to main."
+            exit 1
+          fi
+          echo "$REF ($commit) is on main."
+
   release:
     name: macos release
+    needs: release-ref
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: macos-26
     timeout-minutes: 120

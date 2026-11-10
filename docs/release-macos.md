@@ -4,24 +4,60 @@ The [macOS release](../.github/workflows/release-macos.yml) workflow builds the 
 
 | Trigger | What it builds |
 |---|---|
-| A tag like `v0.1.0` | The app at version 0.1.0, signed and notarized if the signing secrets are set |
-| **Run workflow** (manual) | The same, at the version you enter, or `MARKETING_VERSION` from `apps/macos/project.yml` when you leave it empty |
+| A tag like `v0.1.0` on a commit that is on `main` | The app at version 0.1.0, signed and notarized if the signing secrets are set |
+| **Run workflow** (manual) from `main` | The same, at the version you enter, or `MARKETING_VERSION` from `apps/macos/project.yml` when you leave it empty |
 | Pull requests and the merge queue | An unsigned DMG, to check that the build, packaging and verification still work. These runs never see the signing secrets. |
 
 ## What a signed run does
 
-1. Builds the Release app with Xcode 26.6 on a `macos-26` runner, without signing.
-2. Creates a temporary keychain with a random password, imports the Developer ID certificate into it, and writes the notary key to a file readable only by the runner user.
-3. Signs the app with the Developer ID Application identity, the hardened runtime, a secure timestamp and [`apps/macos/Flarebox.entitlements`](../apps/macos/Flarebox.entitlements).
-4. Notarizes the app with `notarytool` and the App Store Connect API key, then staples the ticket to the app.
-5. Packages the stapled app in a DMG, signs the DMG, notarizes it and staples it.
-6. Verifies the DMG and the app inside it with `codesign --verify --deep --strict`, `xcrun stapler validate` and `spctl --assess`, and checks for the hardened runtime, the Developer ID authority and the absence of `get-task-allow`.
-7. Uploads `Flarebox-<version>-arm64.dmg` as an artifact and writes its SHA-256 to the run summary.
-8. Deletes the keychain and the key files, even when a step failed.
+1. Checks, in a job without access to the secrets, that the tagged or dispatched commit is on `main` and that a manual run started from `main`. Otherwise the run stops before the signing job starts.
+2. Waits for a required reviewer to approve the `macos-release` environment, which releases the secrets to the signing job.
+3. Builds the Release app with Xcode 26.6 on a `macos-26` runner, without signing.
+4. Creates a temporary keychain with a random password, imports the Developer ID certificate into it, and writes the notary key to a file readable only by the runner user.
+5. Signs the app with the Developer ID Application identity, the hardened runtime, a secure timestamp and [`apps/macos/Flarebox.entitlements`](../apps/macos/Flarebox.entitlements).
+6. Notarizes the app with `notarytool` and the App Store Connect API key, then staples the ticket to the app.
+7. Packages the stapled app in a DMG, signs the DMG, notarizes it and staples it.
+8. Verifies the DMG and the app inside it with `codesign --verify --deep --strict`, `xcrun stapler validate` and `spctl --assess`, and checks for the hardened runtime, the Developer ID authority and the absence of `get-task-allow`.
+9. Uploads `Flarebox-<version>-arm64.dmg` as an artifact and writes its SHA-256 to the run summary.
+10. Deletes the keychain and the key files, even when a step failed.
 
 If notarization fails, the log shows Apple's notarization log for the submission.
 
 When none of the signing secrets are set, the run still builds the DMG but signs it ad hoc only, names it `Flarebox-<version>-arm64-unsigned.dmg`, and says "Signing skipped" in a warning and in the run summary. Gatekeeper blocks such a DMG on other Macs. When only some of the secrets are set, the run fails and names the missing ones.
+
+## Before you add any secret
+
+A Developer ID certificate signs software as you, so the secrets must reach only code that was reviewed and merged to `main`, and only when you approve. Set up these three things first. They are repository settings; the workflow cannot apply them itself.
+
+The trust boundary is your approval of the environment. A deployment rule like `v*` only checks a tag's name, not whether its commit was reviewed, and the workflow's own check that the commit is on `main` runs code from that same commit, so it is a second line of defense, not the boundary ([Deployment branches and tags](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments#deployment-branches-and-tags)).
+
+### 1. Restrict who can create version tags
+
+1. Open the repository on GitHub and click **Settings**.
+2. In the left sidebar, under "Code, planning, and automation", click **Rules**, then **Rulesets**.
+3. Click **New ruleset**, then **New tag ruleset**.
+4. Under "Ruleset name", type `Release tags`.
+5. Set "Enforcement status" to **Active**.
+6. Under "Bypass list", click **Add bypass**, select **Repository admin**, and click **Add selected**.
+7. Under "Target tags", click **Add target**, choose **Include by pattern**, type `v*`, and add the pattern.
+8. Under "Tag protections", select **Restrict creations**, **Restrict updates** and **Restrict deletions**, and keep **Block force pushes** selected.
+9. Click **Create**.
+
+Only repository admins can then create, move or delete `v*` tags; everyone else, including apps with write access, is refused ([Available rules for rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets)).
+
+### 2. Create the `macos-release` environment with a required reviewer
+
+1. In **Settings**, click **Environments** in the left sidebar, then **New environment**.
+2. Type `macos-release` and click **Configure environment**.
+3. Select **Required reviewers**, add `gunwooterry`, and leave **Prevent self-review** unselected, because you both start and approve release runs. Click **Save protection rules**.
+4. Deselect **Allow administrators to bypass configured protection rules** and click **Save protection rules**.
+5. Under "Deployment branches and tags", choose **Selected branches and tags**. Click **Add deployment branch or tag rule**, choose **Branch** as the ref type, type `main` and click **Add rule**. Click it again, choose **Tag**, type `v*` and click **Add rule**.
+
+Each signed run then waits on its run page until you click **Review deployments**, select `macos-release` and **Approve and deploy**. Approve only runs for a commit and version you meant to release ([Managing environments for deployment](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments)).
+
+### 3. Keep the secrets in the environment only
+
+Add the five secrets below under **Environment secrets** of `macos-release` (**Add secret**), or from a terminal with `gh secret set <NAME> --env macos-release`, which reads the value from standard input. Never add them as repository or organization secrets: workflows that run for a pull request from a branch of this repository receive those, so anyone who can push a branch could change a workflow to read them. Environment secrets reach a job only after the environment's rules pass.
 
 ## Secrets
 
@@ -36,17 +72,6 @@ Five secrets, all required for a signed build:
 | `APP_STORE_CONNECT_API_KEY_P8_BASE64` | The API key's private key, the `.p8` file, base64-encoded |
 
 The keychain password is generated for each run, so it is not a secret you set.
-
-### Put the secrets in the `macos-release` environment
-
-The signing job runs in a GitHub environment named `macos-release`. Store the secrets there rather than as repository secrets, and limit the environment to the main branch and version tags. Workflows that run for a pull request from a branch of this repository receive repository secrets, so anyone who can push a branch could change a workflow to read them; environment secrets reach only jobs that run for the allowed branches and tags ([Managing environments for deployment](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments)).
-
-1. Open the repository's **Settings**, **Environments**, **New environment**, and name it `macos-release`.
-2. Under **Deployment branches and tags**, choose **Selected branches and tags** and add the branch rule `main` and the tag rule `v*`.
-3. Optionally add yourself under **Required reviewers**, so each signed run waits for your approval.
-4. Add the five secrets under **Environment secrets**, or from a terminal with `gh secret set <NAME> --env macos-release`, which reads the value from standard input.
-
-A manual run from any other branch then fails before it starts, because the environment does not allow it.
 
 ### Create the Developer ID certificate and its `.p12`
 
@@ -83,8 +108,10 @@ GitHub never shows a secret again after you save it. If the secret is lost, crea
 
 ## Run a release build
 
-- **Manually:** open **Actions**, **macOS release**, **Run workflow**, keep the branch `main`, and enter a version such as `0.1.0` or leave it empty.
-- **From a tag:** push a tag such as `v0.1.0`. The tag must be three numbers after the `v`.
+- **Manually:** open **Actions**, **macOS release**, **Run workflow**, keep `main` under "Use workflow from", and enter a version such as `0.1.0` or leave it empty. A run from any other branch fails in the "commit on main" job.
+- **From a tag:** merge the release to `main`, then tag a commit on `main`, for example `git tag v0.1.0 origin/main && git push origin v0.1.0`. The tag must be three numbers after the `v`, and a tag on a commit that is not on `main` fails in the "commit on main" job.
+
+Either way, approve the deployment to `macos-release` on the run page when it asks.
 
 Download the DMG from the **Artifacts** section of the run's page. To check it on your Mac:
 
