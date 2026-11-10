@@ -156,13 +156,14 @@ async function route(request: Request, env: Env): Promise<Response> {
     if (code) console.log("Flarebox claim code (valid for 1 hour): " + code);
     const text = (await account(env).isClaimed())
       ? "This Flarebox server already has an owner.\n"
-      : "A one-time claim code is in this Worker's logs. Run `flarebox server claim`, or read it with `wrangler tail`.\n";
+      : "A one-time claim code, valid for one hour, is in this Worker's logs. Find it under this Worker's Observability tab in the dashboard by searching for \"Flarebox claim code\", run `flarebox server claim`, or read it with `wrangler tail`.\n";
     return new Response(text + "\nFlarebox is not affiliated with Cloudflare, Inc.\n", { headers: { "Content-Type": "text/plain; charset=utf-8" } });
   }
 
   if (method === "POST" && path === "/v1/claim") {
     const body = await readMessage(request, ClaimRequestSchema);
-    const outcome = await account(env).claim(body);
+    const recoveryKey = (env as Env & { FLAREBOX_RECOVERY_KEY?: string }).FLAREBOX_RECOVERY_KEY;
+    const outcome = await account(env).claim(body, request.headers.get("CF-Connecting-IP") ?? "", recoveryKey);
     if (!outcome.ok) return errorReply(request, outcome.code, outcome.message);
     return reply(request, DeviceCredentialsSchema, create(DeviceCredentialsSchema, outcome.value));
   }

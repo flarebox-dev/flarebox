@@ -2,6 +2,7 @@
 
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { DurableObject } from "cloudflare:workers";
+import { type ClaimAttempt, MIN_RECOVERY_KEY_LENGTH, redeemClaim, storeClaimCode } from "./account/claim";
 import { migrate } from "./account/schema";
 import { ACCESS_TOKEN_MS, type ServerKey, signAccessToken } from "./auth";
 import { base64url, deriveSpaceKey, sha256 } from "./crypto";
@@ -20,7 +21,6 @@ import { isUuidV7, uuidv7 } from "./ids";
 import { FORMAT_VERSION } from "./space-do";
 
 const CLAIM_CODE_MS = 3_600_000;
-const CLAIM_ATTEMPTS = 10;
 const PAIRING_CODE_MS = 10 * 60_000;
 const PAIRING_FAILURES_PER_WINDOW = 20;
 /** Highest PBKDF2 iteration count workerd accepts; see cloudflare/workerd#1346. */
@@ -186,28 +186,35 @@ export class AccountDO extends DurableObject<Env> {
    */
   async issueClaimCode(): Promise<string | undefined> {
     const nowMs = Date.now();
-    if (await this.isClaimed()) return undefined;
-    this.sql.exec("DELETE FROM claim_codes WHERE expires_at_ms <= ? OR attempts >= ?", nowMs, CLAIM_ATTEMPTS);
-    if (this.sql.exec("SELECT 1 FROM claim_codes").toArray().length > 0) return undefined;
     const code = randomCode(12);
-    this.sql.exec("INSERT INTO claim_codes (code_hash, expires_at_ms) VALUES (?, ?)", await codeHash(code), nowMs + CLAIM_CODE_MS);
-    return `${code.slice(0, 4)}-${code.slice(4, 8)}-${code.slice(8)}`;
+    const hash = await codeHash(code);
+    const stored = this.ctx.storage.transactionSync(() => storeClaimCode(this.sql, hash, nowMs, nowMs + CLAIM_CODE_MS));
+    return stored ? `${code.slice(0, 4)}-${code.slice(4, 8)}-${code.slice(8)}` : undefined;
   }
 
-  async claim(args: { code: string; userName: string; deviceName: string; platform: string }): Promise<Outcome<DeviceCredentials>> {
+  /**
+   * Redeems a claim code, which makes the first caller the owner, or on a claimed deployment the recovery key the
+   * Worker is configured with, which adds a device for the owner. client is the caller's address, for failure counts.
+   */
+  async claim(
+    args: { code: string; userName: string; deviceName: string; platform: string },
+    client = "",
+    recoveryKey?: string,
+  ): Promise<Outcome<DeviceCredentials>> {
     const nowMs = Date.now();
-    if (await this.isClaimed()) return failure(Error_Code.FORBIDDEN, "this deployment already has an owner");
-    const hash = await codeHash(args.code);
-    const row = this.sql.exec("SELECT code_hash FROM claim_codes WHERE expires_at_ms > ? AND attempts < ?", nowMs, CLAIM_ATTEMPTS).toArray()[0];
-    if (!row) return failure(Error_Code.FORBIDDEN, "no valid claim code; open /setup to issue one");
-    if (!sameBytes(row.code_hash as ArrayBuffer, hash)) {
-      this.sql.exec("UPDATE claim_codes SET attempts = attempts + 1");
-      return failure(Error_Code.FORBIDDEN, "wrong claim code");
-    }
-    const userId = uuidv7(nowMs);
-    this.sql.exec("DELETE FROM claim_codes");
-    this.sql.exec("INSERT INTO users (user_id, name, created_at_ms) VALUES (?, ?, ?)", userId, args.userName || "Owner", nowMs);
-    return ok(await this.addDevice(userId, args.deviceName, args.platform, nowMs));
+    const attempt: ClaimAttempt = {
+      codeHash: await codeHash(args.code),
+      rawHash: (await sha256(encoder.encode(args.code))).slice().buffer,
+      recoveryKeyHash:
+        recoveryKey && recoveryKey.length >= MIN_RECOVERY_KEY_LENGTH ? (await sha256(encoder.encode(recoveryKey))).slice().buffer : undefined,
+      client,
+      nowMs,
+      newUserId: uuidv7(nowMs),
+      userName: args.userName,
+    };
+    const outcome = this.ctx.storage.transactionSync(() => redeemClaim(this.sql, attempt));
+    if (!outcome.ok) return outcome;
+    return ok(await this.addDevice(outcome.userId, args.deviceName, args.platform, nowMs));
   }
 
   private async addDevice(userId: string, deviceName: string, platform: string, nowMs: number): Promise<DeviceCredentials> {
