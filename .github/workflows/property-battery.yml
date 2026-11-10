@@ -2,15 +2,11 @@
 
 name: Property battery
 
-run-name: Property battery on ${{ inputs.ref || github.ref_name }} (${{ inputs.shards || '24' }} shards x ${{ inputs.cases || '8192' }} cases)
+run-name: Property battery on ${{ github.ref_name }} (${{ inputs.shards || '24' }} shards x ${{ inputs.cases || '8192' }} cases)
 
 on:
   workflow_dispatch:
     inputs:
-      ref:
-        description: Branch, tag or commit to test (empty tests the branch the workflow runs from)
-        type: string
-        default: ''
       filter:
         description: Test name filter passed to every property test binary (empty runs all their tests)
         type: string
@@ -56,13 +52,7 @@ jobs:
       mutation_shards: ${{ steps.plan.outputs.mutation_shards }}
     steps:
       - name: Check the inputs
-        env:
-          REF: ${{ inputs.ref }}
         run: |
-          if [ -n "$REF" ] && ! [[ "$REF" =~ ^[0-9a-f]{40}$ ]] && ! git ls-remote --exit-code "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$REF" > /dev/null; then
-            echo "::error::ref '$REF' is not a branch or tag on $GITHUB_REPOSITORY (deleted, misspelled or not pushed). Pass a pushed branch, a tag or a full commit SHA."
-            exit 1
-          fi
           if [[ "$FILTER" == -* ]]; then
             echo "::error::filter must be a test name, not an option: '$FILTER' starts with '-', which the test binaries would read as a flag."
             exit 1
@@ -77,14 +67,12 @@ jobs:
           fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref }}
           persist-credentials: false
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: property-battery
-          save-if: ${{ !inputs.ref }}
       - name: Build the property test binaries
         run: |
           cargo metadata --format-version 1 --locked --no-deps > "$RUNNER_TEMP/metadata.json"
@@ -352,7 +340,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ needs.build.outputs.sha }}
-          REF: ${{ inputs.ref || github.ref_name }}
+          REF: ${{ github.ref_name }}
           BUILD: ${{ needs.build.result }}
           SHARD_RESULT: ${{ needs.shard.result }}
           MUTATIONS_RESULT: ${{ needs.mutations.result }}

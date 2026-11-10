@@ -27,13 +27,13 @@ It prints the run URL and returns; with `--wait` it follows the run and exits wi
 
 | Option | Workflow input | Default |
 |---|---|---|
-| `REF` | `ref`: the branch, tag or commit to test | the current branch |
+| `REF` | the branch or tag the workflow runs on, which is the code it tests | the current branch |
 | `--cases N` | `cases`: `PROPTEST_CASES` on each shard | 8192 |
 | `--shards N` | `shards`: the number of shards, at most 256 | 24 |
 | `--filter TEXT` | `filter`: a test name filter, as for `cargo test` | none |
 | `--mutations` | `mutations`: also run the mutation set | off |
 
-The workflow file is read from `main`. To try a changed workflow from another branch, set `BATTERY_WORKFLOW_REF` to that branch. A run started with a `ref` restores the dependency cache of the branch the workflow runs from but never saves to it; only runs that test that branch's own code (the nightly run, or a dispatch without `ref`) save it.
+The workflow always runs on the branch or tag it tests, using that ref's own copy of the workflow file, so the ref must contain it. This keeps untrusted code out of other branches' caches: any job can write the Actions cache of the ref its run belongs to, so a branch's battery can only write that branch's cache, never `main`'s.
 
 ### When a shard fails
 
