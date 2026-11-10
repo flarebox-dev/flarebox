@@ -8,6 +8,7 @@ members = [
     "core/engine",
     "core/ffi",
     "core/fs",
+    "core/ignore",
     "core/net",
     "core/proto",
     "core/sim",
