@@ -279,7 +279,7 @@ private struct MenuButton: View {
 
 #Preview("Questions and problems") {
     let model = AppModel.preview(.massDelete)
-    _ = model.session.fakeCore()?.reportProblem(spaceId: nil, path: nil, kind: .signInRequired)
+    _ = try? model.session.fakeCore()?.reportProblem(spaceId: nil, path: nil, kind: .signInRequired)
     return MenuContent().environment(model)
 }
 

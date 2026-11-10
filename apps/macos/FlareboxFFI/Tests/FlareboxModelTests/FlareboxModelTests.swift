@@ -88,11 +88,11 @@ private func item(_ path: String) -> HeldItem {
         model.markQuestionsSeen()
         let old = try #require(model.state.questions.first)
 
-        let new = fake.ask(spaceId: old.spaceId, kind: .ambiguousDisappearance, items: [item("a")])
+        let new = try fake.ask(spaceId: old.spaceId, kind: .ambiguousDisappearance, items: [item("a")])
         model.apply(.questions(questions: model.session.state().questions))
         #expect(model.unseenQuestionIDs == [new])
 
-        fake.withdrawQuestion(questionId: new)
+        try fake.withdrawQuestion(questionId: new)
         model.apply(.questions(questions: model.session.state().questions))
         #expect(!model.hasUnseenQuestions)
     }

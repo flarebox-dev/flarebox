@@ -29,11 +29,12 @@ public final class AppModel {
     }
 
     /// A model backed by the fake core. With `stateDirectory`, the fake keeps its state there;
-    /// with `scenario`, it starts from that scenario instead of the saved state.
+    /// with `scenario`, it starts from that scenario instead of the saved state. A scenario that
+    /// cannot be saved is not loaded, and the state's problems say why.
     public static func fake(stateDirectory: URL? = nil, scenario: FakeScenario? = nil) -> AppModel {
         let (session, events) = SyncSession.fakeWithEventStream(stateDirectory: stateDirectory)
         if let scenario {
-            session.fakeCore()?.loadScenario(scenario: scenario)
+            _ = try? session.fakeCore()?.loadScenario(scenario: scenario)
         }
         return AppModel(session: session, events: events)
     }
