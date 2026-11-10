@@ -1579,20 +1579,22 @@ describe("platform limits", () => {
   const DAY_MS = 86_400_000;
   const DAILY = "Exceeded allowed rows written in Durable Objects free tier.";
   const DAILY_MESSAGE = "the server reached a Workers Free daily limit; it resets at 00:00 UTC";
-  const untilMidnight = (nowMs: number) => BigInt(DAY_MS - (nowMs % DAY_MS));
+  const HOUR_MS = 3_600_000;
+  /** The wait RFC 0001 section 9 gives at nowMs: 5 minutes in the first 30 minutes after 00:00 UTC, else until the next one. */
+  const wait = (nowMs: number) => BigInt(nowMs % DAY_MS < HOUR_MS / 2 ? 300_000 : DAY_MS - (nowMs % DAY_MS));
 
-  async function connected() {
+  /** A started session whose Space DO clock reads sinceMidnightMs after yesterday's 00:00 UTC, so it is never ahead of the token. */
+  async function connected(sinceMidnightMs = HOUR_MS) {
     const a = await getOwner();
     const spaceId = await createSpace(a);
     const stub = env.SPACE.get(env.SPACE.idFromName(spaceId));
     const socket = await Socket.connect(spaceId, a);
     await socket.start();
-    const midnight = await runInDurableObject(stub, (instance: SpaceDO) => {
+    await runInDurableObject(stub, (instance: SpaceDO) => {
       const now = Date.now();
-      instance.clock = () => now - (now % DAY_MS) + 1000;
-      return now - (now % DAY_MS);
+      instance.clock = () => now - (now % DAY_MS) - DAY_MS + sinceMidnightMs;
     });
-    return { a, spaceId, stub, socket, retryAfterMs: untilMidnight(midnight + 1000) };
+    return { a, spaceId, stub, socket, retryAfterMs: wait(sinceMidnightMs) };
   }
 
   function failNextSpaceQuery(stub: DurableObjectStub<SpaceDO>, error: Error) {
@@ -1618,6 +1620,21 @@ describe("platform limits", () => {
     expect(await socket.rpc(request)).toMatchObject(quota);
     expect(socket.closed).toBeUndefined();
     expect(logged.mock.calls.filter(([what]) => what === "space rpc failed").map(([, error]) => (error as Error).message)).toEqual([DAILY, DAILY]);
+  });
+
+  it.each([
+    [10 * 60_000, 300_000n],
+    [HOUR_MS / 2 - 1, 300_000n],
+    [HOUR_MS / 2, BigInt(DAY_MS - HOUR_MS / 2)],
+  ])("waits 5 minutes instead of a day in the first 30 minutes after 00:00 UTC: %i ms after it, %i ms", async (sinceMidnightMs, retryAfterMs) => {
+    const { stub, socket } = await connected(sinceMidnightMs);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    await runInDurableObject(stub, (instance: SpaceDO) => {
+      (instance as unknown as { listTree: () => never }).listTree = () => {
+        throw new Error(DAILY);
+      };
+    });
+    expect(await socket.rpc({ case: "listTree", value: {} })).toMatchObject({ case: "error", value: { code: Error_Code.QUOTA_EXCEEDED, retryAfterMs } });
   });
 
   it("keeps any other error of an RPC an INTERNAL error without a wait", async () => {
@@ -1681,8 +1698,9 @@ describe("platform limits", () => {
       const response = await exports.default.fetch(BASE + path, init);
       const after = Date.now();
       const error = fromBinary(ErrorSchema, new Uint8Array(await response.arrayBuffer()));
-      expect(error.retryAfterMs).toBeGreaterThanOrEqual(untilMidnight(after));
-      expect(error.retryAfterMs).toBeLessThanOrEqual(untilMidnight(before));
+      const bounds = [wait(before), wait(after)].sort((x, y) => (x < y ? -1 : 1));
+      expect(error.retryAfterMs).toBeGreaterThanOrEqual(bounds[0]!);
+      expect(error.retryAfterMs).toBeLessThanOrEqual(bounds[1]!);
       return { status: response.status, code: error.code, message: error.message };
     };
     try {

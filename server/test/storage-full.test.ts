@@ -20,7 +20,7 @@ async function post(path: string, body: Uint8Array, token?: string): Promise<Res
   return exports.default.fetch(BASE + path, { method: "POST", headers, body });
 }
 
-it("answers a commit that fills the space's storage with 429 QUOTA_EXCEEDED and a wait until 00:00 UTC", async () => {
+it("answers a commit that fills the space's storage with 429 QUOTA_EXCEEDED and the RFC 0001 section 9 wait", async () => {
   const log = vi.spyOn(console, "log");
   await exports.default.fetch(BASE + "/setup");
   const code = log.mock.calls.map((args) => String(args[0])).find((text) => text.startsWith("Flarebox claim code"))!.split(": ")[1]!;
@@ -45,8 +45,10 @@ it("answers a commit that fills the space's storage with 429 QUOTA_EXCEEDED and 
   expect(response.status).toBe(429);
   const error = fromBinary(ErrorSchema, new Uint8Array(await response.arrayBuffer()));
   expect(error).toMatchObject({ code: Error_Code.QUOTA_EXCEEDED, message: "the server's storage is full" });
-  expect(error.retryAfterMs).toBeGreaterThanOrEqual(BigInt(DAY_MS - (after % DAY_MS)));
-  expect(error.retryAfterMs).toBeLessThanOrEqual(BigInt(DAY_MS - (before % DAY_MS)));
+  const wait = (nowMs: number) => (nowMs % DAY_MS < 30 * 60_000 ? 300_000 : DAY_MS - (nowMs % DAY_MS));
+  const bounds = [wait(before), wait(after)].sort((x, y) => x - y);
+  expect(error.retryAfterMs).toBeGreaterThanOrEqual(BigInt(bounds[0]!));
+  expect(error.retryAfterMs).toBeLessThanOrEqual(BigInt(bounds[1]!));
   const original = logged.mock.calls.find(([what]) => what === "request stopped at a platform limit")?.[1];
   expect(String(original)).toMatch(/^Error: database or disk is full: SQLITE_FULL/);
 });

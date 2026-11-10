@@ -96,3 +96,14 @@ Each protected link keeps `failed_attempts` and `locked_until`. This state belon
 5. When the lock expires, the counter is already 0, so five more failures are needed to lock the link again.
 
 The Account DO applies attempts on one link one at a time. After deriving the key, it re-reads the link, then checks the lock and updates the counter in one step with no other work in between. Concurrent attempts are therefore counted one by one, and any attempt that finishes after the lock is set gets `RETRY_LATER`. Because the counter is per link, anyone who knows a link can lock it for its legitimate users. v0 accepts this trade-off.
+
+## 9. Wait after a platform limit (§13)
+
+§13 gives `QUOTA_EXCEEDED` for a platform daily limit a `retry_after_ms` until the next 00:00 UTC, when the Workers Free daily limits reset. Users report that Durable Objects free-tier errors can continue for some minutes after the reset. In two reports they lasted until about 00:20 UTC ([summary](https://billflare.dev/guides/community-durable-objects-free-sql-quota-after-reset)). A client that retries in that window would get a wait until the next midnight and stop syncing for almost another day.
+
+So the server sets `retry_after_ms` from the time it sends `QUOTA_EXCEEDED`:
+
+- less than 30 minutes after 00:00 UTC: 5 minutes;
+- at any other time: the time until the next 00:00 UTC.
+
+The rule covers every `QUOTA_EXCEEDED` the server sends for a platform limit, a full Durable Object storage included.
