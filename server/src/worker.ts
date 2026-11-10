@@ -88,7 +88,7 @@ async function devices(request: Request, env: Env, deviceId: string | undefined)
   if (refused) return refused;
   if (deviceId === undefined && request.method === "GET") {
     const after = listCursor(new URL(request.url));
-    return reply(request, DeviceListSchema, await account(env).listDevices({ userId: identity.userId, callerId: identity.deviceId, after }));
+    return reply(request, DeviceListSchema, await account(env).listDevices({ userId: identity.userId, callerId: identity.deviceId, cursor: after ? String(after) : "" }));
   }
   if (deviceId !== undefined && request.method === "DELETE") {
     const outcome = await account(env).revokeUserDevice({ userId: identity.userId, callerId: identity.deviceId, deviceId });

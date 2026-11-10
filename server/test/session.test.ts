@@ -526,6 +526,8 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
       expect(pages[0]).toHaveLength(100);
       expect(pages.flat()).toEqual([...ids, ...extra]);
       expect((await send("/v1/devices?cursor=" + extra[0], { method: "GET", token: pad.access!.token })).status).toBe(400);
+      const fromOlderWorker = await account().listDevices({ userId: owner.userId, callerId: pad.deviceId, cursor: pages[0]!.at(-1)! });
+      expect(fromOlderWorker.devices.map((device) => device.deviceId)).toEqual(pages[1]);
     } finally {
       await runInDurableObject(account(), (_instance, state) => {
         for (const id of extra) state.storage.sql.exec("DELETE FROM devices WHERE device_id = ?", id);

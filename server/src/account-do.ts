@@ -359,10 +359,16 @@ export class AccountDO extends DurableObject<Env> {
   /**
    * GET /v1/devices: the user's principals in the order their rows were stored, revoked ones included (RFC 0006
    * section 7). A device stored after a listing passed newer ones gets the highest list_seq, so a later page lists it.
+   * A cursor of digits is the list_seq the page starts after. Any other cursor is a device_id, which an AccountDO from
+   * before the list_seq step returned and a Worker from that release still passes during a deploy, so the page starts
+   * after that device.
    */
-  async listDevices(args: { userId: string; callerId: string; after: number }): Promise<DeviceList> {
+  async listDevices(args: { userId: string; callerId: string; cursor: string }): Promise<DeviceList> {
+    const after = /^\d{1,15}$/.test(args.cursor)
+      ? Number(args.cursor)
+      : Number(this.sql.exec("SELECT list_seq FROM devices WHERE user_id = ? AND device_id = ?", args.userId, args.cursor).toArray()[0]?.list_seq ?? 0);
     const found = this.sql
-      .exec("SELECT * FROM devices WHERE user_id = ? AND list_seq > ? ORDER BY list_seq LIMIT ?", args.userId, args.after, DEVICE_PAGE + 1)
+      .exec("SELECT * FROM devices WHERE user_id = ? AND list_seq > ? ORDER BY list_seq LIMIT ?", args.userId, after, DEVICE_PAGE + 1)
       .toArray() as unknown as (DeviceRow & { list_seq: number })[];
     const page = found.slice(0, DEVICE_PAGE);
     return create(DeviceListSchema, {

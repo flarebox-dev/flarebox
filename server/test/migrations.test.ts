@@ -248,7 +248,7 @@ describe("upgraded objects keep working", () => {
       }
     });
     await evictDurableObject(stub);
-    const listed = await stub.listDevices({ userId: OWNER, callerId: "", after: 0 });
+    const listed = await stub.listDevices({ userId: OWNER, callerId: "", cursor: "" });
     expect(listed.devices.map((device) => device.deviceId)).toEqual(older);
     expect(listed.nextCursor).toBe("");
   });
