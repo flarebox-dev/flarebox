@@ -366,7 +366,7 @@ A **recovered** file is a quarantined entry that cannot go back to its name. The
 
 **Ordering.** The staged file is flushed before it is renamed into place. After every rename, the driver flushes both the source and the destination directory, in that order, since a cross-directory rename changes both ([Pillai et al. 2014](#ref-pillai)); the store transaction that acknowledges the effect comes after the last flush. On macOS, `fsync` does not ask the drive to write its cache, so power-loss durability needs `F_FULLFSYNC` ([Apple fsync(2)](#ref-fsync-apple)); the driver uses it for the staged file and both directories, at the cost of slower applies. Process-crash recovery needs none of this, only the order of the steps and the record.
 
-The **local trash** (`.flarebox/trash/`) holds every entry the engine displaced, for a configurable period (proposed default 7 days) or until a size cap, whichever comes first; the cap can evict an entry earlier, so the period is a maximum, not a promise. It is a client-side safety net; the server's trash and version history remain the primary recovery path.
+The **local trash** (`.flarebox/trash/`) holds every entry the engine displaced, for a configurable period (proposed default 7 days) or until a size cap, whichever comes first; the cap can evict an entry earlier, so the period is a maximum, not a promise. It is a client-side safety net; the server's trash and version history remain the primary recovery path. A changed entry found at reclamation is recovered at the sync root rather than in its old folder, which may be gone by then, and an empty folder takes no room under the cap, so only the period reclaims it.
 
 ### 5.3 Recovery, partial downloads and uploads
 

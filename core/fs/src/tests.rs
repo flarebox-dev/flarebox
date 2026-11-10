@@ -710,3 +710,21 @@ fn a_new_folder_that_vanishes_before_its_watch_is_not_a_watch_failure() {
         Poll::default()
     );
 }
+
+#[test]
+fn utc_dates_follow_the_calendar() {
+    let date = |secs: i64| {
+        let time = if secs < 0 {
+            std::time::UNIX_EPOCH - Duration::from_secs(secs.unsigned_abs())
+        } else {
+            std::time::UNIX_EPOCH + Duration::from_secs(secs as u64)
+        };
+        recovered::utc_date(time)
+    };
+    assert_eq!(date(0), "1970-01-01");
+    assert_eq!(date(-1), "1969-12-31");
+    assert_eq!(date(951_782_400), "2000-02-29");
+    assert_eq!(date(951_868_800), "2000-03-01");
+    assert_eq!(date(4_107_456_000), "2100-02-28");
+    assert_eq!(date(4_107_542_400), "2100-03-01");
+}

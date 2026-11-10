@@ -56,7 +56,10 @@
 //! Effects change the disk through a [`Space`]: a descriptor of the root from
 //! which every [`Location`] is resolved one folder at a time, without following
 //! links and checking each folder's identity, and resolved again before each
-//! rename ([`Space::recheck`]).
+//! rename ([`Space::recheck`]). Displaced entries go to the local trash
+//! ([`Space::trash`]), which [`Space::reclaim_trash`] empties by age and size,
+//! turning an entry written to after it entered into a recovered file
+//! ([`recovered_name`]).
 //!
 //! Symbolic links and special files are not synced in v0 (spec §5.1) and are
 //! skipped.
@@ -131,6 +134,8 @@ struct Stat {
     id: FileId,
     size: u64,
     mtime_ns: i128,
+    /// When the entry's metadata last changed; no process can set it back.
+    ctime_ns: i128,
     mode: u32,
 }
 
@@ -182,6 +187,7 @@ fn statx(dir: BorrowedFd<'_>, name: &OsStr, flags: rustix::fs::AtFlags) -> io::R
         },
         size: st.stx_size,
         mtime_ns: nanos(st.stx_mtime.tv_sec, st.stx_mtime.tv_nsec),
+        ctime_ns: nanos(st.stx_ctime.tv_sec, st.stx_ctime.tv_nsec),
         mode: u32::from(st.stx_mode),
     })
 }
@@ -209,6 +215,7 @@ fn from_stat(st: rustix::fs::Stat) -> Stat {
         },
         size: st.st_size as u64,
         mtime_ns: nanos(st.st_mtime, st.st_mtime_nsec),
+        ctime_ns: nanos(st.st_ctime, st.st_ctime_nsec),
         mode: u32::from(st.st_mode),
     }
 }
@@ -1312,13 +1319,17 @@ fn watch_error(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Erro
     Error::Watch(err.into())
 }
 
+mod recovered;
 mod resolve;
 mod root;
 #[cfg(test)]
 mod tests;
+mod trash;
 
+pub use recovered::recovered_name;
 pub use resolve::{Base, Dir, Folder, Location, PARKED_DIR, Space, Unresolved};
 pub use root::{
     Marker, PRIVATE_DIR, RootProblem, check_root, probe_no_replace, read_marker, rename_no_replace,
     write_marker,
 };
+pub use trash::{Reclaimed, TRASH_DIR, TRASH_RETENTION};

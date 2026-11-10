@@ -116,18 +116,35 @@ fn read_marker_at(root: BorrowedFd<'_>) -> io::Result<Option<Marker>> {
 pub fn write_marker(root: &Path, marker: &Marker) -> io::Result<()> {
     let root = open_root(root)?;
     let private = private_dir(root.as_fd())?;
-    remove_if_present(private.as_fd(), MARKER_TEMP)?;
+    replace_file(
+        private.as_fd(),
+        MARKER,
+        MARKER_TEMP,
+        &serde_json::to_vec_pretty(marker)?,
+    )
+}
+
+/// Replaces the private file `name` in `dir` with `bytes` through the
+/// temporary file `temp`, flushing the file and then `dir`, so a crash leaves
+/// the old contents or the new ones.
+pub(crate) fn replace_file(
+    dir: BorrowedFd<'_>,
+    name: &str,
+    temp: &str,
+    bytes: &[u8],
+) -> io::Result<()> {
+    remove_if_present(dir, temp)?;
     let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let mut file = File::from(rustix::fs::openat(
-        &private,
-        MARKER_TEMP,
+        dir,
+        temp,
         flags,
         Mode::from_raw_mode(0o644),
     )?);
-    file.write_all(&serde_json::to_vec_pretty(marker)?)?;
+    file.write_all(bytes)?;
     file.sync_all()?;
-    rustix::fs::renameat(&private, MARKER_TEMP, &private, MARKER)?;
-    sync_dir(private)
+    rustix::fs::renameat(dir, temp, dir, name)?;
+    flush(dir)
 }
 
 /// Whether the file system under `root` has a rename that fails instead of
@@ -214,24 +231,34 @@ fn unsupported(err: &io::Error) -> bool {
 
 /// Opens the private folder at the root, creating it, and flushing the root
 /// after creating it, when it is missing.
-fn private_dir(root: BorrowedFd<'_>) -> io::Result<OwnedFd> {
-    match rustix::fs::mkdirat(root, PRIVATE_DIR, Mode::from_raw_mode(0o755)) {
-        Ok(()) => sync_dir(root.try_clone_to_owned()?)?,
+pub(crate) fn private_dir(root: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+    make_dir(root, PRIVATE_DIR)
+}
+
+/// Opens the folder `name` in `dir` without following a link, creating it, and
+/// flushing `dir` after creating it, when it is missing.
+pub(crate) fn make_dir(dir: BorrowedFd<'_>, name: &str) -> io::Result<OwnedFd> {
+    match rustix::fs::mkdirat(dir, name, Mode::from_raw_mode(0o755)) {
+        Ok(()) => flush(dir)?,
         Err(Errno::EXIST) => {}
         Err(err) => return Err(err.into()),
     }
-    open_dir_at(root, OsStr::new(PRIVATE_DIR))
+    open_dir_at(dir, OsStr::new(name))
 }
 
-fn remove_if_present(dir: BorrowedFd<'_>, name: &str) -> io::Result<()> {
+pub(crate) fn remove_if_present(dir: BorrowedFd<'_>, name: &str) -> io::Result<()> {
     match rustix::fs::unlinkat(dir, name, AtFlags::empty()) {
         Ok(()) | Err(Errno::NOENT) => Ok(()),
         Err(err) => Err(err.into()),
     }
 }
 
-/// Flushes a folder's entries; on macOS, `sync_all` asks the drive to write
-/// its cache as well.
-fn sync_dir(dir: OwnedFd) -> io::Result<()> {
-    File::from(dir).sync_all()
+/// Flushes a file or a folder's entries. On macOS `fsync` does not ask the
+/// drive to write its cache, so this uses `F_FULLFSYNC` there (design §5.2).
+pub(crate) fn flush(fd: BorrowedFd<'_>) -> io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    rustix::fs::fcntl_fullfsync(fd)?;
+    #[cfg(not(target_vendor = "apple"))]
+    rustix::fs::fsync(fd)?;
+    Ok(())
 }
