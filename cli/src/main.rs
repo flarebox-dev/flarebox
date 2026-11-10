@@ -372,7 +372,7 @@ async fn usage(paths: Paths, json: bool) -> Result<(), String> {
                 .collect::<Vec<_>>(),
         )?;
     } else {
-        print!("{}", usage_report(&usages));
+        print!("{}", usage_report(&usages, refused.len()));
     }
     if refused.is_empty() {
         Ok(())
@@ -401,9 +401,10 @@ fn total_bytes(usage: &SpaceUsage) -> u64 {
 }
 
 /// One block per space: its live files, trash, old versions and unreferenced chunks, then a note on how they count.
-fn usage_report(usages: &[(SpaceInfo, SpaceUsage)]) -> String {
+/// Nothing when every space refused, since the error that follows names them.
+fn usage_report(usages: &[(SpaceInfo, SpaceUsage)], refused: usize) -> String {
     if usages.is_empty() {
-        return "No spaces.\n".to_owned();
+        return if refused == 0 { "No spaces.\n" } else { "" }.to_owned();
     }
     let mut report = String::new();
     for (space, usage) in usages {
@@ -751,7 +752,7 @@ mod tests {
             unreferenced_bytes: 1_500_000,
         };
         assert_eq!(
-            usage_report(&[(space.clone(), usage)]),
+            usage_report(&[(space.clone(), usage)], 1),
             format!(
                 "Home\\u{{1b}}[2J ({ID})\n\
                  \x20 Live files        1204 files     3.2 GB\n\
@@ -764,7 +765,8 @@ mod tests {
                  Unreferenced chunks are uploads not committed yet and chunks waiting out the grace period before deletion.\n"
             )
         );
-        assert_eq!(usage_report(&[]), "No spaces.\n");
+        assert_eq!(usage_report(&[], 0), "No spaces.\n");
+        assert_eq!(usage_report(&[], 2), "", "every space refused");
         let json = usage_json(&space, &usage);
         assert_eq!(json["total_bytes"], 3_253_600_000u64);
         assert_eq!(json["trashed_files"], 1);
