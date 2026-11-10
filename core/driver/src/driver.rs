@@ -17,6 +17,7 @@ use rustix::fs::FlockOperation;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use crate::claim::{self, Owner};
 use crate::config::{Config, ConfigError};
 use crate::credential::{Credential, CredentialError, api_for};
 use crate::folder::FolderTask;
@@ -59,6 +60,12 @@ pub enum DriverError {
     FolderHoldsProfile(PathBuf),
     #[error("the folder overlaps the linked folder {0}")]
     FolderOverlaps(PathBuf),
+    #[error("another Flarebox process is syncing {0}; stop it, or unlink the folder there")]
+    FolderInUse(PathBuf),
+    #[error(
+        "the folder is linked by device {device_id} of {server}; unlink it there first, or remove its .flarebox/device.json"
+    )]
+    FolderOfOtherDevice { device_id: String, server: String },
     #[error("the space is already linked to {0} on this device")]
     SpaceAlreadyLinked(PathBuf),
     #[error(
@@ -275,6 +282,25 @@ impl Driver {
             return Err(DriverError::NotAFolder(root));
         }
         self.check_placement(&root, &self.inner.folders.lock().unwrap())?;
+        if !probe_no_replace(&root).map_err(io_error(&root))? {
+            return Err(DriverError::UnsupportedFileSystem);
+        }
+        let owner = Owner {
+            server: credential.server.clone(),
+            device_id: credential.device_id.clone(),
+        };
+        let lock = claim::lock(&root)
+            .map_err(io_error(&root))?
+            .ok_or_else(|| DriverError::FolderInUse(root.clone()))?;
+        match claim::owner(&root).map_err(io_error(&root))? {
+            Some(other) if other != owner => {
+                return Err(DriverError::FolderOfOtherDevice {
+                    device_id: other.device_id,
+                    server: other.server,
+                });
+            }
+            _ => {}
+        }
         let api = credential.api()?;
         let auth = Auth::new(api.clone(), credential.net());
         let space = resolve_space(api.list_spaces(&auth).await?.spaces, space)?;
@@ -283,9 +309,6 @@ impl Driver {
         self.check_placement(&root, &folders)?;
         if let Some(linked) = folders.get(&space.space_id) {
             return Err(DriverError::SpaceAlreadyLinked(linked.link.root.clone()));
-        }
-        if !probe_no_replace(&root).map_err(io_error(&root))? {
-            return Err(DriverError::UnsupportedFileSystem);
         }
         match read_marker(&root).map_err(io_error(&root))? {
             Some(marker) if marker.space_id != space.space_id => {
@@ -301,6 +324,7 @@ impl Driver {
             )
             .map_err(io_error(&root))?,
         }
+        claim::set_owner(&root, &owner).map_err(io_error(&root))?;
         let link = Link {
             space_id: space.space_id.clone(),
             space_name: space.name.clone(),
@@ -322,13 +346,15 @@ impl Driver {
             .map_err(store_error(&store_path))?;
         tracing::info!(space_id = link.space_id, path = %link.root.display(), "linked a folder");
         let status = Arc::new(Mutex::new(folder_status(&link, None, 0, 0)));
+        let linked = roots(&folders);
         let mut folder = Folder {
             link,
             status: status.clone(),
             run: None,
         };
+        drop(lock);
         if self.inner.running.load(Ordering::SeqCst) {
-            self.spawn(&mut folder, &credential);
+            self.spawn(&mut folder, &credential, linked);
         }
         folders.insert(space.space_id, folder);
         let status = status.lock().unwrap().clone();
@@ -363,6 +389,13 @@ impl Driver {
             .expect("a store path has a parent")
             .to_path_buf();
         fs::remove_dir_all(&store_dir).map_err(io_error(&store_dir))?;
+        let owner = Owner {
+            server: removed.link.server_url.clone(),
+            device_id: removed.link.device_id.clone(),
+        };
+        if let Err(error) = claim::release(&removed.link.root, &owner) {
+            tracing::warn!(path = %removed.link.root.display(), %error, "the folder's owner record was not removed");
+        }
         tracing::info!(space_id = removed.link.space_id, path = %removed.link.root.display(), "unlinked a folder");
         Ok(removed.link)
     }
@@ -437,9 +470,15 @@ impl Driver {
         }
         let credential = self.inner.credential.lock().unwrap().clone();
         let mut folders = self.inner.folders.lock().unwrap();
+        let all = roots(&folders);
         for folder in folders.values_mut() {
+            let linked = all
+                .iter()
+                .filter(|root| **root != folder.link.root)
+                .cloned()
+                .collect();
             match &credential {
-                Some(credential) => self.spawn(folder, credential),
+                Some(credential) => self.spawn(folder, credential, linked),
                 None => halt(
                     folder,
                     "this device is not paired; run flarebox pair".into(),
@@ -470,7 +509,8 @@ impl Driver {
         }
     }
 
-    fn spawn(&self, folder: &mut Folder, credential: &Credential) {
+    /// Starts the task of `folder`. `linked` are the roots of the profile's other folders, which it must not overlap.
+    fn spawn(&self, folder: &mut Folder, credential: &Credential, linked: Vec<PathBuf>) {
         if folder.link.device_id != credential.device_id
             || folder.link.server_url != credential.server
         {
@@ -496,6 +536,13 @@ impl Driver {
             auth: Arc::new(Auth::new(api, credential.net())),
             status: folder.status.clone(),
             matcher: self.inner.matcher.clone(),
+            private_dirs: self.inner.paths.private_dirs(),
+            linked,
+            owner: Owner {
+                server: credential.server.clone(),
+                device_id: credential.device_id.clone(),
+            },
+            observer: Mutex::default(),
         };
         let (stop, stopped) = watch::channel(false);
         folder.status.lock().unwrap().state = FolderState::Connecting;
@@ -525,26 +572,61 @@ impl Driver {
             .map_err(store_error(&path))
     }
 
-    /// Refuses a folder that holds or sits inside the profile's own files or another linked folder.
     fn check_placement(
         &self,
         root: &Path,
         folders: &BTreeMap<String, Folder>,
     ) -> Result<(), DriverError> {
-        let overlaps = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
-        for dir in self.inner.paths.private_dirs() {
-            let dir = fs::canonicalize(&dir).unwrap_or(dir);
-            if overlaps(root, &dir) {
-                return Err(DriverError::FolderHoldsProfile(dir));
-            }
-        }
-        for folder in folders.values() {
-            if overlaps(root, &folder.link.root) {
-                return Err(DriverError::FolderOverlaps(folder.link.root.clone()));
-            }
-        }
-        Ok(())
+        check_placement(root, &self.inner.paths.private_dirs(), &roots(folders))
     }
+}
+
+fn roots(folders: &BTreeMap<String, Folder>) -> Vec<PathBuf> {
+    folders
+        .values()
+        .map(|folder| folder.link.root.clone())
+        .collect()
+}
+
+/// Refuses a folder that holds or sits inside one of the profile's private directories or another linked folder.
+/// Folders are compared by the identity of each folder and its ancestors as well as by path, so a symbolic link or a
+/// bind mount does not hide an overlap. Linking checks this, and so does each folder task before it observes the
+/// folder or connects, because a profile can be moved after its folders were linked.
+pub(crate) fn check_placement(
+    root: &Path,
+    private_dirs: &[PathBuf],
+    linked: &[PathBuf],
+) -> Result<(), DriverError> {
+    let canonical = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let root = canonical(root);
+    for dir in private_dirs {
+        let dir = canonical(dir);
+        if holds(&root, &dir) || holds(&dir, &root) {
+            return Err(DriverError::FolderHoldsProfile(dir));
+        }
+    }
+    for other in linked {
+        let canonical = canonical(other);
+        if holds(&root, &canonical) || holds(&canonical, &root) {
+            return Err(DriverError::FolderOverlaps(other.clone()));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `inner` is `outer` or lies under it: by path, or because one of `inner`'s existing ancestors is the same
+/// folder as `outer`.
+fn holds(outer: &Path, inner: &Path) -> bool {
+    if inner.starts_with(outer) {
+        return true;
+    }
+    let Ok(outer) = fs::metadata(outer) else {
+        return false;
+    };
+    inner
+        .ancestors()
+        .filter_map(|dir| fs::metadata(dir).ok())
+        .any(|dir| dir.dev() == outer.dev() && dir.ino() == outer.ino())
 }
 
 fn halt(folder: &mut Folder, problem: String) {
@@ -675,6 +757,8 @@ fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use crate::question::{HeldItem, QuestionKind};
 
     use super::*;
@@ -815,6 +899,187 @@ mod tests {
         );
         driver.stop().await;
         assert_eq!(driver.status().folders[0].state, FolderState::Stopped);
+    }
+
+    /// A server address nobody answers.
+    const NOWHERE: &str = "http://127.0.0.1:9/";
+
+    /// Pairs the profile at `paths` as `device_id` with a server nobody answers.
+    fn paired(paths: &Paths, device_id: &str) {
+        Credential {
+            server: NOWHERE.into(),
+            ..credential(device_id)
+        }
+        .save_new(&paths.credential())
+        .unwrap();
+    }
+
+    /// Pairs the profile at `paths` as `device_id` and links `root` as a folder that passes its root check.
+    fn linked(paths: &Paths, root: &Path, device_id: &str) {
+        paired(paths, device_id);
+        fs::create_dir_all(root).unwrap();
+        write_marker(
+            root,
+            &Marker {
+                space_id: SPACE.into(),
+                effects: 0,
+            },
+        )
+        .unwrap();
+        let store_path = paths.store(SPACE).unwrap();
+        fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+        let link = Link {
+            space_id: SPACE.into(),
+            space_name: "Projects".into(),
+            root: root.to_path_buf(),
+            root_dev: fs::metadata(root).unwrap().dev(),
+            server_url: NOWHERE.into(),
+            device_id: device_id.into(),
+            linked_at_ms: 1,
+        };
+        Store::open(&store_path)
+            .unwrap()
+            .transaction(|tx| tx.set_link(&link))
+            .unwrap();
+    }
+
+    async fn eventually(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "not in time: {what}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Waits until the folder of `driver` halts, and returns its problem.
+    async fn halted(driver: &Driver) -> String {
+        eventually("the folder halts", || {
+            driver.status().folders[0].state == FolderState::Halted
+        })
+        .await;
+        driver.status().folders[0].problem.clone().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_folder_that_holds_a_reopened_profile_halts_before_it_is_observed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap().join("Flarebox");
+        let paths = Paths::under(&root.join("moved-profile"));
+        linked(&paths, &root, "d1");
+        fs::write(root.join("file"), b"synced").unwrap();
+
+        let driver = Driver::open(paths).unwrap();
+        driver.start();
+        let problem = halted(&driver).await;
+        assert!(
+            problem.contains("overlaps Flarebox's own files"),
+            "{problem}"
+        );
+        assert_eq!(driver.status().folders[0].local_entries, None);
+        assert_eq!(claim::owner(&root).unwrap(), None);
+        driver.stop().await;
+    }
+
+    #[test]
+    fn an_overlap_is_found_through_a_symbolic_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        let state = root.join("profile/state");
+        fs::create_dir_all(&state).unwrap();
+        let alias = base.join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        assert!(matches!(
+            check_placement(&alias, &[state], &[]),
+            Err(DriverError::FolderHoldsProfile(_))
+        ));
+        assert!(matches!(
+            check_placement(&root.join("profile"), &[], &[alias]),
+            Err(DriverError::FolderOverlaps(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn two_profiles_never_sync_one_folder_at_once_or_in_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        let (a, b) = (Paths::under(&base.join("a")), Paths::under(&base.join("b")));
+        linked(&a, &root, "d1");
+        linked(&b, &root, "d2");
+        fs::write(root.join("one"), b"1").unwrap();
+        let first = Driver::open(a).unwrap();
+        let second = Driver::open(b).unwrap();
+        let entries = |driver: &Driver| driver.status().folders[0].local_entries;
+
+        first.start();
+        eventually("the first profile observes the folder", || {
+            entries(&first) == Some(1)
+        })
+        .await;
+        second.start();
+        let problem = halted(&second).await;
+        assert!(problem.contains("another Flarebox process"), "{problem}");
+        second.stop().await;
+
+        first.stop().await;
+        drop(
+            claim::lock(&root)
+                .unwrap()
+                .expect("stopping releases the folder's lock"),
+        );
+        fs::write(root.join("two"), b"2").unwrap();
+        first.start();
+        eventually("the restarted profile observes the folder", || {
+            entries(&first) == Some(2)
+        })
+        .await;
+        assert_ne!(first.status().folders[0].state, FolderState::Halted);
+        second.start();
+        let problem = halted(&second).await;
+        assert!(problem.contains("another Flarebox process"), "{problem}");
+        second.stop().await;
+        first.stop().await;
+
+        second.start();
+        let problem = halted(&second).await;
+        assert!(problem.contains("linked by device d1"), "{problem}");
+        second.stop().await;
+        assert!(claim::lock(&root).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn linking_refuses_a_folder_of_another_device_or_another_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        fs::create_dir(&root).unwrap();
+        let paths = Paths::under(&base.join("profile"));
+        paired(&paths, "d2");
+        let driver = Driver::open(paths).unwrap();
+        fs::create_dir(root.join(flarebox_fs::PRIVATE_DIR)).unwrap();
+        let first = Owner {
+            server: NOWHERE.into(),
+            device_id: "d1".into(),
+        };
+        claim::set_owner(&root, &first).unwrap();
+        assert!(matches!(
+            driver.link(&root, "Projects").await,
+            Err(DriverError::FolderOfOtherDevice { device_id, .. }) if device_id == "d1"
+        ));
+
+        claim::release(&root, &first).unwrap();
+        let held = claim::lock(&root).unwrap().unwrap();
+        assert!(matches!(
+            driver.link(&root, "Projects").await,
+            Err(DriverError::FolderInUse(_))
+        ));
+        drop(held);
+        assert!(matches!(
+            driver.link(&root, "Projects").await,
+            Err(DriverError::Api(_))
+        ));
+        assert!(driver.status().folders.is_empty());
     }
 
     #[tokio::test]

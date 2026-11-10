@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The task that syncs one linked folder: it checks the root, observes the disk, and keeps the session with the
-//! space, applying the server's log to the remote tree in the store.
+//! The task that syncs one linked folder: it checks the root, claims the folder, observes the disk, and keeps the
+//! session with the space, applying the server's log to the remote tree in the store.
 
+use std::fs::File;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use flarebox_fs::{Snapshot, check_root};
@@ -13,6 +15,8 @@ use flarebox_proto::v1::{CommitRecord, NodeState, change_record, resync_required
 use flarebox_store::{Cursor, Link, Store, Tx};
 use tokio::sync::{mpsc, watch};
 
+use crate::claim::{self, Owner};
+use crate::driver::check_placement;
 use crate::ignore::Matcher;
 use crate::observe::{FsObserver, Observer};
 use crate::policy::{self, Disposition};
@@ -31,6 +35,14 @@ pub(crate) struct FolderTask {
     pub auth: Arc<Auth>,
     pub status: Arc<Mutex<FolderStatus>>,
     pub matcher: Arc<dyn Matcher>,
+    /// The profile's private directories, which the folder must neither hold nor sit inside.
+    pub private_dirs: Vec<PathBuf>,
+    /// The roots of the profile's other linked folders.
+    pub linked: Vec<PathBuf>,
+    /// This profile's device, which must be the one that linked the folder.
+    pub owner: Owner,
+    /// The observer's thread, joined before the task ends so the folder's lock is released with it.
+    pub observer: Mutex<Option<JoinHandle<()>>>,
 }
 
 /// Why the task stopped syncing before it was asked to.
@@ -40,15 +52,28 @@ impl FolderTask {
     pub async fn run(self, mut stop: watch::Receiver<bool>) {
         let space_id = self.link.space_id.clone();
         let halted = tokio::select! {
-            halted = self.sync() => halted,
-            _ = stop.wait_for(|stop| *stop) => return,
+            halted = self.sync() => Some(halted),
+            _ = stop.wait_for(|stop| *stop) => None,
+        };
+        let Some(halted) = halted else {
+            self.join_observer().await;
+            return;
         };
         tracing::warn!(space_id, reason = %halted, "sync of a folder halted");
         self.update(|status| {
             status.state = FolderState::Halted;
             status.problem = Some(halted);
         });
+        self.join_observer().await;
         let _ = stop.wait_for(|stop| *stop).await;
+    }
+
+    /// Waits for the observer's thread, which ends within one observation once `sync` has dropped its receiver.
+    async fn join_observer(&self) {
+        let thread = self.observer.lock().unwrap().take();
+        if let Some(thread) = thread {
+            let _ = tokio::task::spawn_blocking(move || thread.join()).await;
+        }
     }
 
     async fn sync(&self) -> Halt {
@@ -57,7 +82,14 @@ impl FolderTask {
             Err(error) => return format!("the folder's sync state cannot be opened: {error}"),
         };
         self.wait_for_root().await;
-        let mut observations = self.observe();
+        if let Err(error) = check_placement(&self.link.root, &self.private_dirs, &self.linked) {
+            return error.to_string();
+        }
+        let lock = match self.claim() {
+            Ok(lock) => Arc::new(lock),
+            Err(halt) => return halt,
+        };
+        let mut observations = self.observe(lock.clone());
         let mut config = SessionConfig::new(
             &self.link.space_id,
             "flarebox",
@@ -114,13 +146,34 @@ impl FolderTask {
         }
     }
 
+    /// Takes the folder's lock and checks that this profile's device linked it, recording the device if no record
+    /// is there. Another process that syncs the folder, or a record of another device, halts the folder.
+    fn claim(&self) -> Result<File, Halt> {
+        let root = &self.link.root;
+        let lock = claim::lock(root)
+            .map_err(|error| format!("the folder's lock cannot be taken: {error}"))?
+            .ok_or("another Flarebox process is syncing this folder; stop it, or unlink the folder there")?;
+        match claim::owner(root) {
+            Ok(Some(owner)) if owner != self.owner => Err(format!(
+                "the folder is linked by device {} of {}; unlink it there first, or remove its .flarebox/device.json",
+                owner.device_id, owner.server
+            )),
+            Ok(Some(_)) => Ok(lock),
+            Ok(None) => claim::set_owner(root, &self.owner)
+                .map(|()| lock)
+                .map_err(|error| format!("the folder's owner cannot be recorded: {error}")),
+            Err(error) => Err(format!("the folder's owner record cannot be read: {error}")),
+        }
+    }
+
     /// Observes the disk on a thread of its own and reports how many entries the folder holds after each batch.
-    /// The thread ends with the first batch after the receiver is dropped.
-    fn observe(&self) -> mpsc::UnboundedReceiver<u64> {
+    /// The thread holds the folder's `lock` and ends with the first batch after the receiver is dropped.
+    fn observe(&self, lock: Arc<File>) -> mpsc::UnboundedReceiver<u64> {
         let (sender, receiver) = mpsc::unbounded_channel();
         let link = self.link.clone();
         let matcher = self.matcher.clone();
-        std::thread::spawn(move || {
+        let thread = std::thread::spawn(move || {
+            let _lock = lock;
             let mut observer = match FsObserver::start(
                 &link.root,
                 &link.space_id,
@@ -155,6 +208,7 @@ impl FolderTask {
                 }
             }
         });
+        *self.observer.lock().unwrap() = Some(thread);
         receiver
     }
 

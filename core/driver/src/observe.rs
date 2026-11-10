@@ -7,14 +7,19 @@
 //!
 //! [`FsObserver`] runs the watchers of `core/fs`: inotify on Linux and FSEvents on macOS, which only choose what to
 //! rescan, with a periodic full rescan when the platform watcher cannot cover the tree (design §5.1).
+//!
+//! Excluded paths (design §5.10) are left out, except where a rename crosses the boundary: a rename into an excluded
+//! path is reported so the engine can freeze the node at its synced position, and a rename out of one is reported
+//! with the content of every file it brings into the sync tree.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flarebox_chunk::ChunkerConfig;
 use flarebox_fs::{
@@ -28,6 +33,10 @@ use crate::ignore::Matcher;
 
 /// How often the fallback watcher rescans the whole tree.
 const RESCAN_INTERVAL: Duration = Duration::from_secs(30);
+/// The wait before a file whose content could not be read is read again; it doubles with each failure.
+const RETRY_FIRST: Duration = Duration::from_millis(250);
+/// The longest wait between two reads of such a file.
+const RETRY_MAX: Duration = Duration::from_secs(30);
 
 /// One batch of observations.
 #[derive(Debug)]
@@ -38,8 +47,10 @@ pub struct Observation {
     pub root: Result<(), RootProblem>,
     /// Folders the scans may not read. What is below them is unknown, not absent.
     pub unreadable: Vec<PathBuf>,
-    /// Files that changed while they were chunked, or that could not be opened as the entry the scan saw. Their
-    /// changes carry no content; the next observation reports them again once they are quiet (design §5.8).
+    /// Files that changed while they were chunked, or that could not be opened or read as the entry the scan saw.
+    /// Their changes carry no content. The observer keeps reading them, waiting longer after each failure, and
+    /// reports a `Modified` with the content once a read succeeds, unless a later change to the path replaces it
+    /// (design §5.8).
     pub busy: Vec<PathBuf>,
 }
 
@@ -87,6 +98,26 @@ pub struct FsObserver {
     watcher: Box<dyn Watcher + Send>,
     native: bool,
     matcher: Arc<dyn Matcher>,
+    /// Files whose content could not be read, with when to read them again.
+    unread: BTreeMap<PathBuf, Retry>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Retry {
+    failures: u32,
+    due: Instant,
+}
+
+impl Retry {
+    fn after(failures: u32, now: Instant) -> Self {
+        let wait = RETRY_FIRST
+            .saturating_mul(1 << failures.min(16))
+            .min(RETRY_MAX);
+        Retry {
+            failures,
+            due: now + wait,
+        }
+    }
 }
 
 impl FsObserver {
@@ -120,52 +151,165 @@ impl FsObserver {
             watcher,
             native,
             matcher,
+            unread: BTreeMap::new(),
         })
     }
 
-    fn observed(&self, change: Change, busy: &mut Vec<PathBuf>) -> Option<Observed> {
+    fn excluded(&self, path: &Path, kind: EntryKind) -> bool {
+        self.matcher.is_excluded(path, kind == EntryKind::Dir)
+    }
+
+    /// Adds what `change` means for the engine to `out`.
+    fn observed(&self, change: Change, out: &mut Vec<Observed>, busy: &mut Vec<PathBuf>) {
         let entry = |path: &Path| self.watcher.snapshot().entries.get(path).copied();
-        let excluded =
-            |path: &Path, kind: EntryKind| self.matcher.is_excluded(path, kind == EntryKind::Dir);
         match change {
             Change::Created { path, kind } => {
-                let entry = entry(&path)?;
-                if excluded(&path, kind) {
-                    return None;
+                let Some(entry) = entry(&path) else { return };
+                if self.excluded(&path, kind) {
+                    return;
                 }
                 let content = (kind == EntryKind::File)
                     .then(|| self.content(&path, &entry, busy))
                     .flatten();
-                Some(Observed::Created {
+                out.push(Observed::Created {
                     path,
                     kind,
                     id: entry.id,
                     content,
-                })
+                });
             }
             Change::Modified { path } => {
-                let entry = entry(&path)?;
-                if entry.kind != EntryKind::File || excluded(&path, entry.kind) {
-                    return None;
+                let Some(entry) = entry(&path) else { return };
+                if entry.kind != EntryKind::File || self.excluded(&path, entry.kind) {
+                    return;
                 }
                 let content = self.content(&path, &entry, busy);
-                Some(Observed::Modified {
+                out.push(Observed::Modified {
                     content,
                     id: entry.id,
                     path,
-                })
+                });
             }
             Change::Renamed { from, to, kind } => {
-                let entry = entry(&to)?;
-                (!excluded(&to, kind)).then_some(Observed::Renamed {
+                let Some(entry) = entry(&to) else { return };
+                let leaves = self.excluded(&from, kind);
+                if leaves && self.excluded(&to, kind) {
+                    return;
+                }
+                out.push(Observed::Renamed {
                     from,
-                    to,
+                    to: to.clone(),
                     kind,
                     id: entry.id,
-                })
+                });
+                if leaves {
+                    self.brought_in(&to, out, busy);
+                }
             }
             Change::Removed { path, kind } => {
-                (!excluded(&path, kind)).then_some(Observed::Removed { path, kind })
+                if !self.excluded(&path, kind) {
+                    out.push(Observed::Removed { path, kind });
+                }
+            }
+        }
+    }
+
+    /// Reports what a rename out of an excluded path brought into the sync tree at `to`: the content of a file, or
+    /// every included entry under a folder. Nothing was observed there while it was excluded, so edits made in the
+    /// meantime arrive this way.
+    fn brought_in(&self, to: &Path, out: &mut Vec<Observed>, busy: &mut Vec<PathBuf>) {
+        let entries = &self.watcher.snapshot().entries;
+        for (path, entry) in entries
+            .range(to.to_path_buf()..)
+            .take_while(|(path, _)| path.starts_with(to))
+        {
+            if self.excluded(path, entry.kind) {
+                continue;
+            }
+            let content = (entry.kind == EntryKind::File)
+                .then(|| self.content(path, entry, busy))
+                .flatten();
+            if path == to {
+                if entry.kind == EntryKind::File {
+                    out.push(Observed::Modified {
+                        path: path.clone(),
+                        id: entry.id,
+                        content,
+                    });
+                }
+                continue;
+            }
+            out.push(Observed::Created {
+                path: path.clone(),
+                kind: entry.kind,
+                id: entry.id,
+                content,
+            });
+        }
+    }
+
+    /// Forgets or moves the unread files that `change` replaces: a new change to a path is read afresh, and a rename
+    /// carries the files under it along unless it moves them into an excluded path.
+    fn supersede(&mut self, change: &Change) {
+        let take = |unread: &mut BTreeMap<PathBuf, Retry>, under: &Path| {
+            let paths: Vec<PathBuf> = unread
+                .range(under.to_path_buf()..)
+                .take_while(|(path, _)| path.starts_with(under))
+                .map(|(path, _)| path.clone())
+                .collect();
+            paths
+                .into_iter()
+                .map(|path| {
+                    let retry = unread.remove(&path).expect("listed above");
+                    (path, retry)
+                })
+                .collect::<Vec<_>>()
+        };
+        match change {
+            Change::Created { path, .. } | Change::Modified { path } => {
+                self.unread.remove(path);
+            }
+            Change::Removed { path, .. } => {
+                take(&mut self.unread, path);
+            }
+            Change::Renamed { from, to, .. } => {
+                for (path, retry) in take(&mut self.unread, from) {
+                    let moved = to.join(path.strip_prefix(from).expect("taken under from"));
+                    if !self.excluded(&moved, EntryKind::File) {
+                        self.unread.insert(moved, retry);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reads again the unread files that are due, and reports each one that can now be read.
+    fn retry(&mut self, now: Instant, out: &mut Vec<Observed>) {
+        let due: Vec<PathBuf> = self
+            .unread
+            .iter()
+            .filter(|(_, retry)| retry.due <= now)
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in due {
+            let entry = self.watcher.snapshot().entries.get(&path).copied();
+            let Some(entry) = entry.filter(|entry| entry.kind == EntryKind::File) else {
+                self.unread.remove(&path);
+                continue;
+            };
+            match read_content(&self.root, &path, &entry) {
+                Ok(Some(content)) => {
+                    self.unread.remove(&path);
+                    out.push(Observed::Modified {
+                        path,
+                        id: entry.id,
+                        content: Some(content),
+                    });
+                }
+                _ => {
+                    let failures = self.unread[&path].failures + 1;
+                    self.unread.insert(path, Retry::after(failures, now));
+                }
             }
         }
     }
@@ -189,6 +333,10 @@ impl FsObserver {
 
 impl Observer for FsObserver {
     fn observe(&mut self, timeout: Duration) -> Result<Option<Observation>, FsError> {
+        let timeout = match self.unread.values().map(|retry| retry.due).min() {
+            Some(due) => timeout.min(due.saturating_duration_since(Instant::now())),
+            None => timeout,
+        };
         let poll = match self.watcher.poll(timeout) {
             Err(FsError::Watch(error)) if self.native => {
                 tracing::warn!(%error, "the platform watcher failed; rescanning periodically");
@@ -199,16 +347,22 @@ impl Observer for FsObserver {
             }
             poll => poll?,
         };
-        if poll.changes.is_empty() && poll.unreadable.is_empty() {
+        let now = Instant::now();
+        let mut changes = Vec::new();
+        let mut busy = Vec::new();
+        let observed = !poll.changes.is_empty();
+        for change in poll.changes {
+            self.supersede(&change);
+            self.observed(change, &mut changes, &mut busy);
+        }
+        self.retry(now, &mut changes);
+        for path in &busy {
+            self.unread.insert(path.clone(), Retry::after(0, now));
+        }
+        if !observed && changes.is_empty() && poll.unreadable.is_empty() {
             return Ok(None);
         }
         let root = check_root(&self.root, &self.space_id, self.dev).map(|_| ());
-        let mut busy = Vec::new();
-        let changes = poll
-            .changes
-            .into_iter()
-            .filter_map(|change| self.observed(change, &mut busy))
-            .collect();
         Ok(Some(Observation {
             changes,
             root,
@@ -459,5 +613,114 @@ mod tests {
         std::os::unix::fs::symlink(outside.path().join("secret"), dir.path().join("file")).unwrap();
         assert!(open_beneath(dir.path(), Path::new("file")).is_err());
         assert!(open_beneath(dir.path(), Path::new("../x")).is_err());
+    }
+    #[test]
+    fn a_file_that_could_not_be_read_is_read_again_once_it_can_be() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = marked();
+        let file = dir.path().join("locked");
+        fs::write(&file, b"content").unwrap();
+        fs::write(dir.path().join("gone"), b"x").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+        fs::set_permissions(dir.path().join("gone"), fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&file).is_ok() {
+            assert!(rustix::process::geteuid().is_root());
+            eprintln!("SKIPPED: running as root, so permissions do not block reads");
+            return;
+        }
+        let mut observer = observer(dir.path());
+        let (seen, _) = observe_until(&mut observer, |seen| seen.len() >= 2);
+        assert!(
+            seen.iter()
+                .all(|change| matches!(change, Observed::Created { content: None, .. })),
+            "{seen:?}"
+        );
+        assert_eq!(observer.unread.len(), 2);
+
+        fs::remove_file(dir.path().join("gone")).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        let (seen, _) = observe_until(&mut observer, |seen| {
+            seen.iter()
+                .any(|change| matches!(change, Observed::Modified { .. }))
+                && seen
+                    .iter()
+                    .any(|change| matches!(change, Observed::Removed { .. }))
+        });
+        let content = seen
+            .iter()
+            .find_map(|change| match change {
+                Observed::Modified { path, content, .. } if path == Path::new("locked") => {
+                    content.clone()
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no content in {seen:?}"));
+        assert_eq!(content.size, 7);
+        assert!(observer.unread.is_empty());
+    }
+
+    #[test]
+    fn renames_across_an_exclusion_reach_the_engine_both_ways() {
+        struct IgnoredFolder;
+        impl Matcher for IgnoredFolder {
+            fn is_excluded(&self, path: &Path, _dir: bool) -> bool {
+                path.starts_with("ignored")
+            }
+        }
+        let dir = marked();
+        let root = dir.path();
+        fs::create_dir_all(root.join("ignored/folder")).unwrap();
+        fs::write(root.join("ignored/folder/inner"), b"inner").unwrap();
+        fs::write(root.join("tracked"), b"one").unwrap();
+        let dev = fs::metadata(root).unwrap().dev();
+        let mut observer = FsObserver::start(
+            root,
+            SPACE,
+            dev,
+            Snapshot::default(),
+            Arc::new(IgnoredFolder),
+        )
+        .unwrap();
+        let (seen, _) = observe_until(&mut observer, |seen| !seen.is_empty());
+        assert_eq!(seen.len(), 1, "{seen:?}");
+
+        let renamed = |seen: &[Observed], from: &str, to: &str| {
+            seen.iter().any(|change| {
+                matches!(change, Observed::Renamed { from: f, to: t, .. } if f == Path::new(from) && t == Path::new(to))
+            })
+        };
+        fs::rename(root.join("tracked"), root.join("ignored/tracked")).unwrap();
+        let (seen, _) = observe_until(&mut observer, |seen| {
+            renamed(seen, "tracked", "ignored/tracked")
+        });
+        assert_eq!(seen.len(), 1, "{seen:?}");
+
+        fs::write(root.join("ignored/tracked"), b"edited").unwrap();
+        fs::rename(root.join("ignored/tracked"), root.join("back")).unwrap();
+        fs::rename(root.join("ignored/folder"), root.join("folder")).unwrap();
+        let (seen, _) = observe_until(&mut observer, |seen| {
+            renamed(seen, "ignored/tracked", "back") && renamed(seen, "ignored/folder", "folder")
+        });
+        let content = |name: &str| {
+            seen.iter()
+                .find_map(|change| match change {
+                    Observed::Modified { path, content, .. }
+                    | Observed::Created { path, content, .. }
+                        if path == Path::new(name) =>
+                    {
+                        content.clone()
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no content for {name} in {seen:?}"))
+        };
+        assert_eq!(content("back").size, 6);
+        assert_eq!(content("folder/inner").size, 5);
+        assert!(
+            seen.iter()
+                .all(|change| !matches!(change, Observed::Removed { .. })),
+            "{seen:?}"
+        );
     }
 }

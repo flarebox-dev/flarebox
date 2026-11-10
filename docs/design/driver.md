@@ -29,14 +29,15 @@ A profile is one device credential and the stores it writes. The CLI uses the XD
 | `…/lock` | The profile lock (`flock`), held by the one process that writes the profile |
 | `…/spaces/<space_id>/store.sqlite` | One `core/store` per linked space: R, S, L, the cursor, the link and the questions |
 | `$XDG_RUNTIME_DIR/flarebox/daemon.sock` (mode 0600) | The daemon's socket; in the state directory when `XDG_RUNTIME_DIR` is unset |
-| `<folder>/.flarebox/` | Inside each linked folder: the root marker `space.json` and, from part 2, staging, quarantine, parked entries and the local trash |
+| `<folder>/.flarebox/` | Inside each linked folder: the root marker `space.json`, the owner record `device.json`, the folder lock `lock` and, from part 2, staging, quarantine, parked entries and the local trash |
 
-**One credential, one writer (H6 of reports/BOX-71).** Same-device changes never count as unseen on the server, and `device_seq` is strict, so two writers sharing a credential would overwrite each other silently or refuse each other's commits. The driver keeps the rule in four places:
+**One credential, one writer (H6 of reports/BOX-71).** Same-device changes never count as unseen on the server, and `device_seq` is strict, so two writers sharing a credential would overwrite each other silently or refuse each other's commits. The driver keeps the rule in five places:
 
 1. `pair` refuses to replace a credential: a profile is paired once. The macOS app and the CLI on the same machine are separate profiles and pair separately.
 2. Opening a driver takes the profile lock, so a second daemon, or a command while the daemon is not answering, is refused.
 3. Each store records the device and server that linked it (`Link` in `core/store`). A store whose device is not the profile's halts with a problem instead of syncing.
-4. `link` refuses a folder that holds, or sits inside, the state, runtime or configuration directory, so the credential and the stores are never synced.
+4. `link` refuses a folder that holds, or sits inside, the state, runtime or configuration directory or another linked folder, so the credential and the stores are never synced. Each folder task checks this again before it observes the folder or connects, because a profile can be moved into a folder after linking it. Folders are compared by path and by the identity of each folder and its ancestors, so a symbolic link, a bind mount or a macOS firmlink does not hide an overlap.
+5. A folder is claimed in its own `.flarebox/`, so the claim follows the physical folder whatever path reaches it. `device.json` names the device that linked it: another profile's `link` refuses the folder, and its task halts instead of syncing it, until the folder is unlinked there. A running folder holds `.flarebox/lock` (`flock`) until its task and its observer have stopped, so two processes never sync one folder at once; `link` holds it while it checks and writes the folder.
 
 A profile copied whole to another machine (credential and stores together) passes these checks. RFC 0002 section 6 detects it through `device_seq` once the engine compares the counter in part 2.
 
@@ -59,8 +60,8 @@ The matcher is GUN-270's. Until it lands, `ignore::matcher` returns `Unfiltered`
 | Call | What it does |
 |---|---|
 | `pair(server, code, name)` | `POST /v1/pair/complete` with a code from a paired device, then writes the credential. Headless: no browser |
-| `link(folder, space)` | Resolves the space by id, then by unique name (`GET /v1/spaces`); checks the folder (exists, no overlap with the profile or another linked folder, no marker of another space, a no-replace rename, design §5.2); writes the root marker if missing; creates the store with its `Link`. Starts the folder if the driver runs |
-| `unlink(folder)` | Stops the folder and deletes its store. The files and the folder's `.flarebox/` stay, because the local trash may hold displaced files |
+| `link(folder, space)` | Resolves the space by id, then by unique name (`GET /v1/spaces`); checks the folder (exists, no overlap with the profile or another linked folder, a no-replace rename (design §5.2), no other process syncing it, no record of another device, no marker of another space); writes the root marker if missing and the owner record; creates the store with its `Link`. Starts the folder if the driver runs |
+| `unlink(folder)` | Stops the folder, deletes its store and removes the folder's owner record. The files and the rest of the folder's `.flarebox/` stay, because the local trash may hold displaced files |
 | `status()` | The account and, per folder, state, cursor, head, remote node count, local entry count, unanswered questions and the current problem |
 | `questions()`, `answer(id, answer)` | Lists unanswered questions from the stores and records an answer, refusing one the question does not offer |
 | `start()`, `stop()` | Starts one task per folder on the current runtime; stops them and waits |
@@ -77,8 +78,9 @@ How `core/ffi`'s `Core` trait maps onto it in step D:
 ## A folder's task
 
 1. **Root check** (design §6.2): the folder exists, is readable, is on the device recorded at link time and holds a marker for its space. A folder that fails is halted with the reason and checked again every 30 seconds; nothing else runs for it meanwhile.
-2. **Observation** runs on a thread of its own (below) and reports how many entries the folder holds.
-3. **Session**: `core/net`'s `Session` with one `Auth` built from the credential, which reconnects with backoff on its own. Events are handled in order:
+2. **Placement and claim**: the folder must not overlap the profile's directories or its other folders (H6 rule 4), no other process may hold its lock, and its owner record must name this device; a folder linked before the record existed gets one. Any failure halts the folder before it is observed or connected.
+3. **Observation** runs on a thread of its own (below) and reports how many entries the folder holds. The task waits for the thread to end before it stops, so the folder's lock is free once `stop` returns.
+4. **Session**: `core/net`'s `Session` with one `Auth` built from the credential, which reconnects with backoff on its own. Events are handled in order:
 
 | Event | Part 1 |
 |---|---|
@@ -109,7 +111,8 @@ How `core/ffi`'s `Core` trait maps onto it in step D:
 `FsObserver` implements the `Observer` trait over `core/fs`'s `NativeWatcher` (inotify on Linux, FSEvents on macOS), falling back to a full rescan every 30 seconds when the platform watcher cannot cover the tree. Each batch is an `Observation`, the input the engine's `Observed(changes, root_check)` needs (design §1, §9):
 
 - `Observed::Created`, `Modified`, `Renamed` and `Removed`, with paths relative to the root and the file identity of every entry;
-- the `Content` of every created or modified file, chunked with `core/chunk`'s V0 profile. The file is opened one folder at a time without following links, must still be the entry the scan saw, and must not change while it is read; otherwise the change carries no content and the path is listed in `busy` (design §5.8);
+- the `Content` of every created or modified file, chunked with `core/chunk`'s V0 profile. The file is opened one folder at a time without following links, must still be the entry the scan saw, and must not change while it is read; otherwise the change carries no content and the path is listed in `busy` (design §5.8). The observer keeps such a file and reads it again after 250 ms, doubling the wait after each failure up to 30 seconds, until a read succeeds, which it reports as a `Modified` with the content, or a later change to the path replaces it. The watcher's snapshot has already moved past the change, so nothing else would report the file again;
+- renames across the exclusion boundary (design §5.10), the one exception to the rule below. A rename into an excluded path is reported, without reading the file, so the engine can freeze the node at its synced position instead of seeing it disappear. A rename out of one is followed by the content of the file, or by a `Created` with content for every included entry under the folder, because nothing was observed there while it was excluded;
 - the root check made after the batch's scans, and the folders the scans could not read.
 
 Changes whose path the matcher excludes are dropped. In part 1 the driver starts each observer from an empty snapshot, so its first batch lists the whole folder, and it only counts the entries.
@@ -120,7 +123,7 @@ Once #28 is merged, part 2 puts the engine between the inputs and outputs part 1
 
 1. **Engine state.** Build the engine from the store (R with the cursor, S, L with identities, the commit in flight, the ID generator, the accepted device counter and the effect counter) and run its `handle(now_ms, input)` loop in the folder task. After each input, write the engine's row changes in one store transaction, then execute its outputs (design §1).
 2. **Server log.** Replace `folder::apply_changes` and `folder::replace_tree` with the engine inputs `Changes`, `TreePage`, `CaughtUp` and `ResyncRequired`, and the engine's `Resume` and `ListTree` outputs. `Connected(Welcome)` goes to the engine, which compares `history_id` and `device_seq` with the store (design §2.8, RFC 0002 §2); the halts on another history, `HISTORY_CHANGED` and `AHEAD_OF_SERVER` become recovery (§6.4).
-3. **Observations.** Feed each `Observation` to the engine as `Observed`, with its root check. Start the observer from a snapshot rebuilt from L instead of an empty one, after recovering the effect in flight and checking the marker's effect counter against the store (§2.8, §5.3). Read `.fbignore` files into `IgnoreInput` with the device rules.
+3. **Observations.** Feed each `Observation` to the engine as `Observed`, with its root check. Start the observer from a snapshot rebuilt from L instead of an empty one, leaving out files whose content the engine never received (their reads were still pending when the last observer stopped) so the new observer reports them again, after recovering the effect in flight and checking the marker's effect counter against the store (§2.8, §5.3). Read `.fbignore` files into `IgnoreInput` with the device rules.
 4. **Effects.** Execute `ApplyEffect` through `core/fs`'s `Space::apply` with the quarantine protocol, writing the marker counter first, and report `EffectDone` or `EffectFailed`. File contents come from `GetDownloadTargets` and `Transfer::download` into staging, through the chunk cache in the store.
 5. **Commits.** Execute `SendCommit`: `PrepareUpload` and `Transfer::upload` for the chunks it references, then `Session::commit`. Report `CommitResult` or `CommitFailed` with the refusal disposition of `policy`.
 6. **Questions and problems.** Store each `AskUser` as a question row whose body is a `Question`; give recorded answers to the engine as `UserDecision` and delete the rows it has consumed. Show `Problem` outputs in the folder's status.
