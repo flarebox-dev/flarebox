@@ -55,11 +55,16 @@ function problem(status, error) {
 }
 
 async function request(path, init = {}) {
-  const response = await fetch(api + path, {
-    ...init,
-    credentials: "same-origin",
-    headers: { Accept: "application/json", ...(init.body ? { "Content-Type": "application/json" } : {}) },
-  });
+  let response;
+  try {
+    response = await fetch(api + path, {
+      ...init,
+      credentials: "same-origin",
+      headers: { Accept: "application/json", ...(init.body ? { "Content-Type": "application/json" } : {}) },
+    });
+  } catch {
+    return { status: 0, body: null };
+  }
   let body = null;
   if (response.status !== 204) {
     try {
