@@ -53,6 +53,11 @@
 //! never replaces its target ([`rename_no_replace`], [`probe_no_replace`])
 //! live next to the scans.
 //!
+//! Effects change the disk through a [`Space`]: a descriptor of the root from
+//! which every [`Location`] is resolved one folder at a time, without following
+//! links and checking each folder's identity, and resolved again before each
+//! rename ([`Space::recheck`]).
+//!
 //! Symbolic links and special files are not synced in v0 (spec §5.1) and are
 //! skipped.
 
@@ -1307,10 +1312,12 @@ fn watch_error(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Erro
     Error::Watch(err.into())
 }
 
+mod resolve;
 mod root;
 #[cfg(test)]
 mod tests;
 
+pub use resolve::{Base, Dir, Folder, Location, PARKED_DIR, Space, Unresolved};
 pub use root::{
     Marker, PRIVATE_DIR, RootProblem, check_root, probe_no_replace, read_marker, rename_no_replace,
     write_marker,
