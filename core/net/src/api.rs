@@ -21,10 +21,17 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bounds a whole call to an HTTP endpoint.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-/// The most bytes read of an answer whose message has a fixed shape (a few ids, a token, a code), and of an error.
-const MAX_ANSWER: usize = 64 << 10;
-/// The most bytes read of a `SpaceList`, whose length the spec does not bound.
-const MAX_LIST_ANSWER: usize = 1 << 20;
+/// The most bytes read of a single answer. Like the other two limits, this is a memory ceiling, not a check of the
+/// answer's shape, set well above what the server can send until it bounds names (GUN-289). It stores a space or device
+/// name in one SQLite row of a Durable Object, which holds at most 8 MB. The largest answer is an access token, which
+/// carries the device name base64url-encoded, so about 10.7 MB.
+const MAX_ANSWER: usize = 32 << 20;
+/// The most bytes read of a `SpaceList`, which the server neither bounds nor pages yet (GUN-289). The Worker builds the
+/// whole answer in memory, and a Worker isolate has at most 128 MB, so it cannot send a larger one.
+const MAX_LIST_ANSWER: usize = 128 << 20;
+/// The most bytes read of an error. The server's error messages are sentences it writes itself, without names or other
+/// text from clients.
+const MAX_ERROR: usize = 1 << 20;
 
 /// The HTTP endpoints of one Flarebox deployment (spec v0 section 15.1). Bodies are binary protobuf.
 ///
@@ -231,7 +238,7 @@ impl Api {
         }
     }
 
-    /// Sends a request and reads its answer, a `what` of at most `limit` bytes or an error of at most `MAX_ANSWER`.
+    /// Sends a request and reads its answer, a `what` of at most `limit` bytes or an error of at most `MAX_ERROR`.
     async fn send<M: Message + Default>(
         &self,
         request: RequestBuilder,
@@ -253,12 +260,17 @@ impl Api {
         let limit = if status.is_success() {
             limit
         } else {
-            MAX_ANSWER
+            MAX_ERROR
         };
         let mut body = Vec::new();
         while let Some(part) = response.chunk().await.map_err(ApiError::Transport)? {
             if body.len() + part.len() > limit {
-                return Err(ApiError::TooLarge { limit });
+                return Err(match status.is_success() {
+                    true => ApiError::TooLarge { limit },
+                    false => ApiError::Unreadable {
+                        status: status.as_u16(),
+                    },
+                });
             }
             body.extend_from_slice(&part);
         }
@@ -450,7 +462,10 @@ mod tests {
                 .await
                 .expect("the read stops at the limit");
             assert!(
-                matches!(outcome, Err(ApiError::TooLarge { limit: MAX_ANSWER })),
+                match status {
+                    200 => matches!(outcome, Err(ApiError::TooLarge { limit: MAX_ANSWER })),
+                    _ => matches!(outcome, Err(ApiError::Unreadable { status: 500 })),
+                },
                 "{status}: {outcome:?}"
             );
             drop(api);
@@ -464,12 +479,10 @@ mod tests {
     #[tokio::test]
     async fn a_space_list_may_be_longer_than_a_fixed_shape_answer() {
         let spaces = SpaceList {
-            spaces: (0..2000)
-                .map(|n| SpaceInfo {
-                    space_id: format!("{n:0>100}"),
-                    ..Default::default()
-                })
-                .collect(),
+            spaces: vec![SpaceInfo {
+                name: "n".repeat(MAX_ANSWER),
+                ..Default::default()
+            }],
         }
         .encode_to_vec();
         assert!(spaces.len() > MAX_ANSWER && spaces.len() <= MAX_LIST_ANSWER);
@@ -489,7 +502,7 @@ mod tests {
         };
         let auth = Auth::new(Api::local_development(base).unwrap(), credentials).with_token(token);
         let list = auth.api().list_spaces(&auth).await.unwrap();
-        assert_eq!(list.spaces.len(), 2000);
+        assert_eq!(list.spaces[0].name.len(), MAX_ANSWER);
 
         let (base, _server) = answering(200, Some(spaces)).await;
         let outcome = Api::local_development(base).unwrap().server_info().await;

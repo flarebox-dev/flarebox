@@ -573,6 +573,9 @@ impl Task {
                 return Err(Exit::Stop(StopReason::CredentialsRefused));
             }
             Err(error) => {
+                if let Some(status) = error.status() {
+                    self.count_refusal(status, !matches!(error, ApiError::Unreadable { .. }))?;
+                }
                 if let Some(server) = error.server()
                     && let Some(exit) = self.refused_with(server)
                 {
@@ -635,7 +638,6 @@ impl Task {
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.starts_with(PROTOBUF));
-        let unreadable = std::mem::take(&mut self.unreadable_refusals);
         if protobuf {
             let (head, tail) = response.into_parts();
             let error = refusal_body(&head, tail.unwrap_or_default(), kept)
@@ -645,25 +647,33 @@ impl Task {
                     None if body.is_empty() => Some(None),
                     None => None,
                 });
-            match error {
-                Some(Some(server)) => {
-                    if let Some(exit) = self.refused_with(&server) {
-                        return Err(exit);
-                    }
-                }
-                Some(None) => {}
-                None => {
-                    self.unreadable_refusals = unreadable + 1;
-                    if self.unreadable_refusals >= MAX_UNREADABLE_REFUSALS {
-                        return Err(Exit::Stop(StopReason::Refused(format!(
-                            "HTTP {status}, {} times in a row, with an error that could not be read",
-                            self.unreadable_refusals
-                        ))));
-                    }
-                }
+            self.count_refusal(status, error.is_some())?;
+            if let Some(Some(server)) = error
+                && let Some(exit) = self.refused_with(&server)
+            {
+                return Err(exit);
             }
+        } else {
+            self.count_refusal(status, true)?;
         }
         Err(self.refused(status, &token.token).await)
+    }
+
+    /// Counts refusals in a row whose error could not be read: `MAX_UNREADABLE_REFUSALS` of them stop the session (H1),
+    /// and one whose error could be read starts the count again.
+    fn count_refusal(&mut self, status: u16, readable: bool) -> Result<(), Exit> {
+        if readable {
+            self.unreadable_refusals = 0;
+            return Ok(());
+        }
+        self.unreadable_refusals += 1;
+        if self.unreadable_refusals < MAX_UNREADABLE_REFUSALS {
+            return Ok(());
+        }
+        Err(Exit::Stop(StopReason::Refused(format!(
+            "HTTP {status}, {} times in a row, with an error that could not be read",
+            self.unreadable_refusals
+        ))))
     }
 
     /// Applies H1 to a refusal while connecting: one the client may not resend stops the session, and one it may
@@ -831,6 +841,9 @@ impl Task {
                         reauth.as_mut().reset(Instant::now() + self.config.backoff.delay(0));
                         continue;
                     };
+                    if refreshed.is_ok() {
+                        self.unreadable_refusals = 0;
+                    }
                     match refreshed {
                         Ok(fresh) if fresh.token != token.token => {
                             let message = client_message::Msg::Reauth(Reauth { access_token: fresh.token.clone() });
@@ -844,6 +857,11 @@ impl Task {
                         Ok(_) => reauth.as_mut().reset(Instant::now() + MIN_REAUTH_WAIT),
                         Err(error) if error.is_unauthenticated() => return Exit::Stop(StopReason::CredentialsRefused),
                         Err(error) => {
+                            if let Some(status) = error.status()
+                                && let Err(exit) = self.count_refusal(status, !matches!(error, ApiError::Unreadable { .. }))
+                            {
+                                return exit;
+                            }
                             let server = error.server();
                             if let Some(server) = server && server.resend() == Resend::Never {
                                 return Exit::Stop(StopReason::Refused(server.to_string()));
