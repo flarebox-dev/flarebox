@@ -5,7 +5,7 @@ The server keeps what you delete and the earlier contents of files you change, f
 - A deleted file or folder stays in the space's trash for 30 days.
 - When a file's content changes, the earlier version stays for 30 days after it was replaced. The current version of a file never expires.
 
-After that, they can't be restored. These commands read the server, so the device must be online. They don't need the daemon.
+After that, the server removes them the next time it cleans up, so don't count on restoring them later. These commands read the server, so the device must be online. They don't need the daemon.
 
 ## See what is in the trash
 
