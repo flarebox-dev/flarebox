@@ -2,7 +2,7 @@
 
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { DurableObject } from "cloudflare:workers";
-import { type ClaimAttempt, MIN_RECOVERY_KEY_LENGTH, ownerOf, redeemClaim, storeClaimCode, wrongCode } from "./account/claim";
+import { type ClaimAttempt, MAX_SETUP_ATTEMPT_LENGTH, MIN_RECOVERY_KEY_LENGTH, ownerOf, redeemClaim, stillUnused, storeClaimCode, wrongCode } from "./account/claim";
 import { migrate } from "./account/schema";
 import { ACCESS_TOKEN_MS, type ServerKey, signAccessToken } from "./auth";
 import { base64url, deriveSpaceKey, sha256 } from "./crypto";
@@ -198,6 +198,11 @@ export class AccountDO extends DurableObject<Env> {
     return this.sql.exec("SELECT 1 FROM users LIMIT 1").toArray().length > 0;
   }
 
+  /** ServerInfo.setup_attempts: an Account DO still on code from before ClaimRequest.setup_attempt lacks this method. */
+  async handlesSetupAttempts(): Promise<boolean> {
+    return true;
+  }
+
   /**
    * Starts an owner claim: returns a fresh one-time code for the Worker to write to its log, or undefined when
    * the deployment is claimed or a code is still valid.
@@ -213,14 +218,16 @@ export class AccountDO extends DurableObject<Env> {
   /**
    * Redeems a claim code or the recovery key the Worker is configured with. On a deployment without an owner either one
    * makes the caller the owner; on a claimed deployment the key adds a device for the owner. client is the caller's
-   * address, for failure counts.
+   * address, for failure counts. A key claim with a setup attempt then revokes that attempt's earlier unused devices.
    * Everything that can fail is prepared first, so the transaction stores the owner, the key's use and the device together.
    */
   async claim(
-    args: { code: string; userName: string; deviceName: string; platform: string },
+    args: { code: string; userName: string; deviceName: string; platform: string; setupAttempt?: string },
     client = "",
     recoveryKey?: string,
   ): Promise<Outcome<DeviceCredentials>> {
+    const setupAttempt = args.setupAttempt ?? "";
+    if (setupAttempt.length > MAX_SETUP_ATTEMPT_LENGTH) return failure(Error_Code.INVALID_ARGUMENT, `setup_attempt is longer than ${MAX_SETUP_ATTEMPT_LENGTH} characters`);
     const nowMs = Date.now();
     const ownerBefore = ownerOf(this.sql);
     const userId = ownerBefore ?? uuidv7(nowMs);
@@ -235,10 +242,24 @@ export class AccountDO extends DurableObject<Env> {
       ownerBefore,
       userId,
       userName: args.userName,
+      deviceId: device.credentials.deviceId,
+      setupAttempt,
       storeDevice: device.store,
     };
     const outcome = this.ctx.storage.transactionSync(() => redeemClaim(this.sql, attempt));
     if (!outcome.ok) return outcome;
+    // Each check runs right before revokeDevice's first transaction, with no await between them, so a device that
+    // refreshed a token while an earlier revocation awaited its notices is kept. The claim has committed, so a failed
+    // revocation must not cost the caller its credentials; that device stays unused, as its credentials reached nobody.
+    for (const deviceId of outcome.revoke) {
+      if (!stillUnused(this.sql, deviceId, setupAttempt, userId)) continue;
+      await this.revokeDevice(deviceId).catch((error: unknown) => console.error("setup attempt cleanup failed", deviceId, error));
+    }
+    // A later claim of the same attempt may have revoked this device while the loop awaited. Its credentials would not
+    // work, so the caller is told instead and claims again with a new key.
+    if (this.activeDevice(device.credentials.deviceId) === undefined) {
+      return failure(Error_Code.FORBIDDEN, "a later claim of this setup attempt replaced this one; set a new recovery key and claim again");
+    }
     return ok(create(DeviceCredentialsSchema, { ...device.credentials, userName: this.userName(userId) }));
   }
 

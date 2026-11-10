@@ -343,6 +343,7 @@ impl Driver {
                 user_name: user_name.to_owned(),
                 device_name: device_name.to_owned(),
                 platform: std::env::consts::OS.to_owned(),
+                setup_attempt: String::new(),
             })
             .await?;
         self.adopt(

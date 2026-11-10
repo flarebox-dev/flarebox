@@ -63,6 +63,7 @@ async fn claim() -> DeviceCredentials {
         user_name: "Owner".into(),
         device_name: "owner".into(),
         platform: "test".into(),
+        setup_attempt: String::new(),
     };
     api().claim(&request).await.expect("the claim succeeds")
 }

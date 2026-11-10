@@ -16,6 +16,10 @@ pub struct ServerInfo {
     /// True once an owner has claimed this deployment.
     #[prost(bool, tag="5")]
     pub claimed: bool,
+    /// True when the Account DO runs code that handles ClaimRequest.setup_attempt. The Account DO, not the Worker, reports
+    /// it, because after an upgrade the Durable Object can keep its old code for up to 300 seconds.
+    #[prost(bool, tag="6")]
+    pub setup_attempts: bool,
 }
 /// Nested message and enum types in `ServerInfo`.
 pub mod server_info {
@@ -63,6 +67,11 @@ pub struct ClaimRequest {
     pub device_name: ::prost::alloc::string::String,
     #[prost(string, tag="4")]
     pub platform: ::prost::alloc::string::String,
+    /// A random id the client keeps for one setup attempt and sends with every recovery-key claim of it, at most 64
+    /// characters. Such a claim revokes the earlier devices of the same attempt that never refreshed a token, so claims
+    /// whose responses were lost leave one device in the end.
+    #[prost(string, tag="5")]
+    pub setup_attempt: ::prost::alloc::string::String,
 }
 /// Response of POST /v1/pair/start, called by an already paired device.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
