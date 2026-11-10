@@ -14,6 +14,7 @@ use tokio_tungstenite::WebSocketStream;
 
 use super::*;
 use crate::{Api, Credentials};
+use flarebox_proto::v1::error::Code;
 
 type Server = WebSocketStream<TcpStream>;
 
@@ -869,4 +870,159 @@ async fn a_token_expiry_close_during_a_refresh_reconnects_with_a_new_token() {
     let closed = tokio::time::timeout(Duration::from_millis(500), session.close()).await;
     assert!(closed.is_ok(), "close does not wait for the token request");
     drop(refresh);
+}
+
+/// Answers one HTTP request on an accepted connection with this status and a protobuf `Error`.
+async fn answer_with_error(tcp: &mut TcpStream, status: u16, error: ProtoError) {
+    let mut request = [0; 4096];
+    assert!(tcp.read(&mut request).await.unwrap() > 0);
+    let body = error.encode_to_vec();
+    let head = format!(
+        "HTTP/1.1 {status} X\r\ncontent-type: application/x-protobuf\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    tcp.write_all(&[head.as_bytes(), &body].concat())
+        .await
+        .unwrap();
+}
+
+fn refusal(code: i32, retry_after_ms: u64) -> ProtoError {
+    ProtoError {
+        code,
+        retry_after_ms,
+        message: "refused".into(),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn unknown_codes_and_quota_without_a_wait_are_returned_not_resent() {
+    let (listener, auth) = listen().await;
+    let (session, _events) = Session::start(auth, config()).unwrap();
+    let server = tokio::spawn(async move {
+        let mut ws = accept(&listener, welcome("h", 0)).await;
+        for code in [999, Code::Unspecified as i32, Code::QuotaExceeded as i32] {
+            let request = recv_rpc(&mut ws).await;
+            assert!(
+                matches!(request.call, Some(Call::ListTree(_))),
+                "a new call, not a resend"
+            );
+            reply(
+                &mut ws,
+                request.req_id,
+                rpc_response::Result::Error(refusal(code, 0)),
+            )
+            .await;
+        }
+        let request = recv_rpc(&mut ws).await;
+        assert!(
+            matches!(request.call, Some(Call::ListTrash(_))),
+            "the refused calls were not resent"
+        );
+        reply(
+            &mut ws,
+            request.req_id,
+            rpc_response::Result::Trash(Default::default()),
+        )
+        .await;
+        ws
+    });
+    for code in [999, Code::Unspecified as i32, Code::QuotaExceeded as i32] {
+        let refused = session.list_tree("", 1).await;
+        assert!(
+            matches!(&refused, Err(CallError::Server(error)) if error.0.code == code),
+            "{refused:?}"
+        );
+    }
+    session.list_trash("", 1).await.unwrap();
+    drop(server.await.unwrap());
+}
+
+#[tokio::test]
+async fn quota_exceeded_with_a_wait_is_resent_after_it() {
+    let (listener, auth) = listen().await;
+    let (session, _events) = Session::start(auth, config()).unwrap();
+    let server = tokio::spawn(async move {
+        let mut ws = accept(&listener, welcome("h", 0)).await;
+        let first = recv_rpc(&mut ws).await;
+        let quota = refusal(Code::QuotaExceeded as i32, 200);
+        reply(&mut ws, first.req_id, rpc_response::Result::Error(quota)).await;
+        let asked = Instant::now();
+        let second = recv_rpc(&mut ws).await;
+        assert!(
+            asked.elapsed() >= Duration::from_millis(200),
+            "{:?}",
+            asked.elapsed()
+        );
+        assert_eq!(first.call, second.call);
+        reply(
+            &mut ws,
+            second.req_id,
+            rpc_response::Result::Trash(Default::default()),
+        )
+        .await;
+        ws
+    });
+    session.list_trash("", 1).await.unwrap();
+    drop(server.await.unwrap());
+}
+
+#[tokio::test]
+async fn a_token_refused_with_an_unknown_code_stops_the_session_without_asking_again() {
+    let (listener, auth) = listen_on("127.0.0.1:0", Duration::ZERO, Some(Duration::ZERO)).await;
+    let (_session, mut events) = Session::start(auth, config()).unwrap();
+    let (mut token_request, _) = listener.accept().await.unwrap();
+    answer_with_error(&mut token_request, 500, refusal(999, 0)).await;
+    assert!(matches!(
+        next(&mut events).await,
+        Event::Stopped(StopReason::Refused(why)) if why.ends_with(": refused")
+    ));
+    let again = tokio::time::timeout(Duration::from_millis(300), listener.accept()).await;
+    assert!(again.is_err(), "no second token request");
+}
+
+#[tokio::test]
+async fn an_upgrade_refused_with_an_unknown_code_stops_the_session_and_a_known_one_reconnects() {
+    let (listener, auth) = listen().await;
+    let (_session, mut events) = Session::start(auth.clone(), config()).unwrap();
+    let (mut upgrade, _) = listener.accept().await.unwrap();
+    answer_with_error(&mut upgrade, 500, refusal(999, 0)).await;
+    assert!(matches!(
+        next(&mut events).await,
+        Event::Stopped(StopReason::Refused(why)) if why.ends_with(": refused")
+    ));
+
+    let (_session, mut events) = Session::start(auth, config()).unwrap();
+    let (mut upgrade, _) = listener.accept().await.unwrap();
+    answer_with_error(&mut upgrade, 500, refusal(Code::Internal as i32, 0)).await;
+    let event = next(&mut events).await;
+    assert!(
+        matches!(
+            event,
+            Event::Disconnected {
+                reason: DisconnectReason::Refused { status: 500 },
+                ..
+            }
+        ),
+        "{event:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_refresh_refused_with_an_unknown_code_stops_the_session() {
+    let (listener, auth) = listen_on(
+        "127.0.0.1:0",
+        Duration::from_millis(300),
+        Some(Duration::ZERO),
+    )
+    .await;
+    let (_session, mut events) = Session::start(auth, config()).unwrap();
+    let _ws = accept(&listener, welcome("h", 0)).await;
+    assert!(matches!(next(&mut events).await, Event::Connected(_)));
+    let (mut refresh, _) = listener.accept().await.unwrap();
+    answer_with_error(&mut refresh, 500, refusal(999, 0)).await;
+    assert!(matches!(
+        next(&mut events).await,
+        Event::Stopped(StopReason::Refused(why)) if why.ends_with(": refused")
+    ));
 }

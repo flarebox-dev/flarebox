@@ -11,10 +11,10 @@ use std::time::{Duration, SystemTime};
 
 use flarebox_proto::v1::{
     AccessToken, ChunkRef, ClientMessage, Commit, CommitResult, DownloadTargets,
-    GetDownloadTargets, GetVersionChunks, Hello, ListTrash, ListTree, ListVersions, PrepareUpload,
-    PrepareUploadResult, Reauth, RpcRequest, RpcResponse, ServerMessage, TrashPage, TreePage,
-    VersionChunks, VersionList, Welcome, client_message, error::Code, rpc_request::Call,
-    rpc_response, server_message::Msg,
+    Error as ProtoError, GetDownloadTargets, GetVersionChunks, Hello, ListTrash, ListTree,
+    ListVersions, PrepareUpload, PrepareUploadResult, Reauth, RpcRequest, RpcResponse,
+    ServerMessage, TrashPage, TreePage, VersionChunks, VersionList, Welcome, client_message,
+    rpc_request::Call, rpc_response, server_message::Msg,
 };
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as _;
@@ -30,14 +30,14 @@ use tokio_rustls::TlsConnector;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
+use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{self, Message as WsMessage};
 use url::Url;
 
 use crate::auth::Auth;
 use crate::backoff::Backoff;
-use crate::error::{ApiError, CallError, NotResent, ServerError, StopReason};
+use crate::error::{ApiError, CallError, NotResent, Resend, ServerError, StopReason};
 use crate::event::{Committed, DisconnectReason, Event};
 use crate::stream::{Fed, Stream};
 
@@ -74,7 +74,8 @@ pub struct SessionConfig {
     pub welcome_timeout: Duration,
     /// Bounds sending one message. A server that stops reading for this long counts as lost.
     pub write_timeout: Duration,
-    /// How many times a call refused with `CODE_RETRY_LATER` is sent again before the error is returned.
+    /// How many times a call refused with `CODE_RETRY_LATER`, or with `CODE_QUOTA_EXCEEDED` and a wait, is sent again
+    /// before the error is returned. Any other refusal is returned at once.
     pub retry_later_attempts: u32,
 }
 
@@ -160,6 +161,7 @@ impl Session {
                     attempt: 0,
                     token: None,
                     expired: None,
+                    asked_wait: None,
                 }
                 .run(),
             ),
@@ -321,7 +323,7 @@ impl Session {
             self.commands.send(command).map_err(|_| self.stopped())?;
             match answer.await.map_err(|_| self.stopped())? {
                 Err(CallError::Server(error))
-                    if error.code() == Code::RetryLater && attempt < self.retry_later_attempts =>
+                    if error.resend() == Resend::Allowed && attempt < self.retry_later_attempts =>
                 {
                     let wait = error
                         .retry_after()
@@ -454,6 +456,8 @@ struct Task {
     /// A token the server closed the connection over, rejected before the next connection gets a token. Not
     /// rejected at once, because a refresh in flight may hold the token lock until the connection is dropped.
     expired: Option<String>,
+    /// The least wait before the next connection, when the server asked for one while refusing this one.
+    asked_wait: Option<Duration>,
 }
 
 impl Task {
@@ -474,7 +478,8 @@ impl Task {
                 Duration::ZERO
             } else {
                 self.config.backoff.delay(self.attempt)
-            };
+            }
+            .max(self.asked_wait.take().unwrap_or_default());
             self.attempt = self.attempt.saturating_add(1);
             tracing::debug!(?reason, ?retry_in, "flarebox session disconnected");
             self.emit(Event::Disconnected { reason, retry_in });
@@ -551,7 +556,14 @@ impl Task {
             Err(error) if error.is_unauthenticated() => {
                 return Err(Exit::Stop(StopReason::CredentialsRefused));
             }
-            Err(error) => return Err(Exit::transport(error)),
+            Err(error) => {
+                if let Some(server) = error.server()
+                    && let Some(exit) = self.refused_with(server)
+                {
+                    return Err(exit);
+                }
+                return Err(Exit::transport(error));
+            }
         };
         self.token = Some(token.token.clone());
         let host = self
@@ -587,9 +599,42 @@ impl Task {
         match tokio_tungstenite::client_async_with_config(request, io, Some(config)).await {
             Ok((socket, _)) => Ok((socket, token)),
             Err(tungstenite::Error::Http(response)) => {
+                let header = |name| {
+                    response
+                        .headers()
+                        .get(name)
+                        .and_then(|value: &HeaderValue| value.to_str().ok())
+                };
+                let protobuf = header(CONTENT_TYPE)
+                    .is_some_and(|value| value.starts_with("application/x-protobuf"));
+                let length = header(CONTENT_LENGTH).and_then(|value| value.parse::<usize>().ok());
+                let server = response
+                    .body()
+                    .as_deref()
+                    .filter(|body| protobuf && length == Some(body.len()))
+                    .and_then(|body| ProtoError::decode(body).ok())
+                    .map(ServerError);
+                if let Some(server) = &server
+                    && let Some(exit) = self.refused_with(server)
+                {
+                    return Err(exit);
+                }
                 Err(self.refused(response.status().as_u16(), &token.token).await)
             }
             Err(error) => Err(Exit::transport(error)),
+        }
+    }
+
+    /// Applies H1 to a refusal while connecting: one the client may not resend stops the session, and one it may
+    /// resend makes the next attempt wait at least as long as the server asked. `None` leaves it to the caller.
+    fn refused_with(&mut self, server: &ServerError) -> Option<Exit> {
+        match server.resend() {
+            Resend::Never => Some(Exit::Stop(StopReason::Refused(server.to_string()))),
+            Resend::Allowed => {
+                self.asked_wait = server.retry_after();
+                None
+            }
+            Resend::ByCode => None,
         }
     }
 
@@ -758,8 +803,13 @@ impl Task {
                         Ok(_) => reauth.as_mut().reset(Instant::now() + MIN_REAUTH_WAIT),
                         Err(error) if error.is_unauthenticated() => return Exit::Stop(StopReason::CredentialsRefused),
                         Err(error) => {
+                            let server = error.server();
+                            if let Some(server) = server && server.resend() == Resend::Never {
+                                return Exit::Stop(StopReason::Refused(server.to_string()));
+                            }
                             tracing::debug!(%error, "flarebox session could not refresh its access token");
-                            reauth.as_mut().reset(Instant::now() + self.config.backoff.delay(0));
+                            let wait = server.and_then(ServerError::retry_after);
+                            reauth.as_mut().reset(Instant::now() + wait.unwrap_or(self.config.backoff.delay(0)));
                         }
                     }
                 }

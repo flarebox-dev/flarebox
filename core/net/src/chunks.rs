@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 
 use crate::api::Api;
 use crate::backoff::Backoff;
-use crate::error::{CallError, ServerError};
+use crate::error::{CallError, Resend, ServerError};
 use crate::session::Session;
 
 /// The most chunks one `PrepareUpload` or `GetDownloadTargets` takes (spec v0 section 13).
@@ -327,6 +327,10 @@ impl Transfer {
                     .and_then(|body| ProtoError::decode(body.as_slice()).ok())
                     .map(ServerError),
             };
+            let refused = match by_code(refused) {
+                Ok(attempt) => return attempt,
+                Err(refused) => refused,
+            };
             match status {
                 StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Attempt::Expired,
                 // The bytes were checked before sending, so a hash mismatch at the server happened on the way.
@@ -361,6 +365,10 @@ impl Transfer {
                     hash: chunk.hash.clone(),
                     status: status.as_u16(),
                     error,
+                };
+                let refused = match by_code(refused) {
+                    Ok(attempt) => return attempt,
+                    Err(refused) => refused,
                 };
                 return match status {
                     StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Attempt::Expired,
@@ -440,6 +448,23 @@ fn expiring(target: &Target) -> bool {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     (now + TARGET_MARGIN).as_millis() >= target.expires_at_ms as u128
+}
+
+/// Applies H1 when the server sent an error: an unknown code, or `QUOTA_EXCEEDED` without a wait, fails the
+/// transfer, and `RETRY_LATER` or `QUOTA_EXCEEDED` with a wait retries it. Any other refusal is given back for its
+/// HTTP status to decide.
+fn by_code<T>(refused: ChunkError) -> Result<Attempt<T>, ChunkError> {
+    let ChunkError::Refused {
+        error: Some(error), ..
+    } = &refused
+    else {
+        return Err(refused);
+    };
+    match error.resend() {
+        Resend::Never => Ok(Attempt::Fail(refused)),
+        Resend::Allowed => Ok(Attempt::Retry(refused)),
+        Resend::ByCode => Err(refused),
+    }
 }
 
 fn retryable(status: StatusCode) -> bool {
