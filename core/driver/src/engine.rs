@@ -14,7 +14,7 @@ use std::path::{Component, Path, PathBuf};
 
 use flarebox_engine::classify::Trees;
 use flarebox_engine::commit::Commits;
-use flarebox_engine::effects::Effects;
+use flarebox_engine::effects::{Effect, EffectRecord, Effects, Location};
 use flarebox_engine::ids::IdGen;
 use flarebox_engine::names::name_key;
 use flarebox_engine::tree::{
@@ -387,6 +387,44 @@ impl Engine {
             }
         }
         touched
+    }
+
+    /// True when L stays a tree (design §2.2) with the outcome of `record` in it. The engine plans an effect for L as
+    /// it is at that time. A later batch may have given the effect's name to another node, taken a folder above the
+    /// effect's position out of L, moved such a folder under the node, or put an entry into a folder the effect
+    /// removes. `Effects::plan` plans none of these either, so an effect that fails for one of them and is unblocked
+    /// is planned again only once L has changed.
+    pub fn takes(&self, record: &EffectRecord) -> bool {
+        let local = self.trees.local();
+        let mut placed = local.iter().filter(|(_, node)| !node.parked);
+        let Some(after) = &record.after else {
+            return !placed.any(|(_, node)| node.shape.parent == record.node);
+        };
+        let parks = matches!(
+            record.effect,
+            Effect::Move {
+                to: Location::Parked(_),
+                ..
+            }
+        );
+        if parks {
+            return true;
+        }
+        let mut above = &after.parent;
+        while *above != local.root {
+            match local.get(above) {
+                Some(node) if node.shape.kind == Kind::Dir && *above != record.node => {
+                    if node.parked {
+                        break;
+                    }
+                    above = &node.shape.parent;
+                }
+                _ => return false,
+            }
+        }
+        !placed.any(|(id, node)| {
+            *id != record.node && node.shape.parent == after.parent && node.shape.name == after.name
+        })
     }
 
     /// L's view of each of `scopes`, relative paths, for the observer: the kind and identity of the placed node at
@@ -772,6 +810,8 @@ pub(crate) fn file_id(identity: FileIdentity) -> FileId {
 
 #[cfg(test)]
 mod tests {
+    use flarebox_engine::effects::Base;
+    use flarebox_engine::state::EffectsState;
     use flarebox_proto::v1::{NodePurged, NodeStatus, SpaceUpdated};
     use flarebox_store::Store;
 
@@ -949,5 +989,426 @@ mod tests {
                 Ok::<_, Stop>(())
             })
             .unwrap();
+    }
+
+    fn file(parent: &str, name: &str, digest: u8) -> Shape {
+        Shape {
+            parent: parent.into(),
+            name: name.into(),
+            kind: Kind::File,
+            content: Some(Content {
+                size: 3,
+                manifest_digest: vec![digest; 32],
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn dir(parent: &str, name: &str) -> Shape {
+        Shape {
+            parent: parent.into(),
+            name: name.into(),
+            kind: Kind::Dir,
+            content: None,
+        }
+    }
+
+    fn held(shape: Shape, ino: u64) -> LocalNode {
+        LocalNode {
+            shape,
+            identity: FileIdentity {
+                dev: 1,
+                ino,
+                birth_ns: Some(0),
+            },
+            parked: false,
+        }
+    }
+
+    /// An effect planned for an L that a batch then changed.
+    struct Case {
+        name: &'static str,
+        kind: &'static str,
+        engine: Engine,
+        record: EffectRecord,
+        /// Whether L as the batch left it still takes the effect.
+        takes: bool,
+    }
+
+    /// L and S hold each node's first shape and R its second. The first `done` effects are applied, the next one
+    /// is planned, and `batch` then changes L.
+    fn case(
+        name: &'static str,
+        kind: &'static str,
+        nodes: &[(&str, Option<Shape>, Option<Shape>)],
+        done: usize,
+        batch: impl FnOnce(&mut Trees),
+        takes: bool,
+    ) -> Case {
+        let mut trees = Trees::new(ROOT);
+        for (at, (id, synced, remote)) in nodes.iter().enumerate() {
+            trees.set_synced((*id).into(), synced.clone());
+            if let Some(shape) = synced {
+                trees.set_local((*id).into(), held(shape.clone(), at as u64 + 1));
+            }
+            if let Some(shape) = remote {
+                let node = RemoteNode {
+                    shape: shape.clone(),
+                    trashed: false,
+                    content_rev: 1,
+                    meta_rev: 1,
+                    trash_group: String::new(),
+                };
+                trees.set_remote((*id).into(), node);
+            }
+        }
+        let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+        let mut plan = |trees: &mut Trees, effects: &mut Effects| {
+            trees.settle();
+            (effects.plan(trees, &mut ids, 0).cloned())
+                .unwrap_or_else(|| panic!("{name}: no effect"))
+        };
+        for _ in 0..done {
+            let record = plan(&mut trees, &mut effects);
+            let identity = held(dir(ROOT, ""), 50).identity;
+            (effects.done(&mut trees, &record.effect_id, Some(identity))).unwrap();
+        }
+        let record = plan(&mut trees, &mut effects);
+        batch(&mut trees);
+        assert_eq!(trees.check(), Ok(()), "{name}: the batch leaves L a tree");
+        let engine = Engine {
+            trees,
+            effects,
+            commits: Commits::default(),
+            ids,
+            cursor: None,
+        };
+        Case {
+            name,
+            kind,
+            engine,
+            record,
+            takes,
+        }
+    }
+
+    fn kind(effect: &Effect) -> &'static str {
+        let parked = |at: &Location| {
+            let base = matches!(at, Location::At { base, .. } if *base != Base::Root);
+            base || matches!(at, Location::Parked(_))
+        };
+        match effect {
+            Effect::CreateDir { .. } => "create a folder",
+            Effect::WriteFile { replaces: None, .. } => "write a file",
+            Effect::WriteFile { .. } => "replace a file",
+            Effect::Move {
+                to: Location::Parked(_),
+                ..
+            } => "park",
+            Effect::Move { from, .. } if parked(from) => "move out of the parked folder",
+            Effect::Move { .. } => "move",
+            Effect::RemoveFile { .. } => "remove a file",
+            Effect::RemoveDir { .. } => "remove a folder",
+        }
+    }
+
+    /// Every kind of effect, each with batches after which L takes it and, where one exists, batches after which
+    /// L does not.
+    fn cases() -> Vec<Case> {
+        let other =
+            |shape: Shape| move |trees: &mut Trees| trees.set_local("u".into(), held(shape, 9));
+        let unchanged = |_: &mut Trees| {};
+        let folder = [("n", None, Some(dir(ROOT, "a")))];
+        let d = ("d", Some(dir(ROOT, "d")), Some(dir(ROOT, "d")));
+        let inside = [d.clone(), ("n", None, Some(file("d", "a", 1)))];
+        let edit = [("n", Some(file(ROOT, "a", 1)), Some(file(ROOT, "a", 2)))];
+        let rename = [("n", Some(file(ROOT, "x", 1)), Some(file(ROOT, "a", 1)))];
+        let into = [d, ("n", Some(dir(ROOT, "n")), Some(dir("d", "n")))];
+        let swap = [
+            ("a", Some(file(ROOT, "x", 1)), Some(file(ROOT, "y", 1))),
+            ("b", Some(file(ROOT, "y", 2)), Some(file(ROOT, "x", 2))),
+        ];
+        let gone_file = [("n", Some(file(ROOT, "a", 1)), None)];
+        let gone_folder = [("n", Some(dir(ROOT, "a")), None)];
+        vec![
+            case(
+                "nothing changed",
+                "create a folder",
+                &folder,
+                0,
+                unchanged,
+                true,
+            ),
+            case(
+                "its name went to another node",
+                "create a folder",
+                &folder,
+                0,
+                other(dir(ROOT, "a")),
+                false,
+            ),
+            case(
+                "a name of another case was taken",
+                "create a folder",
+                &folder,
+                0,
+                other(dir(ROOT, "A")),
+                true,
+            ),
+            case(
+                "nothing changed",
+                "write a file",
+                &inside,
+                0,
+                unchanged,
+                true,
+            ),
+            case(
+                "its name went to another node",
+                "write a file",
+                &inside,
+                0,
+                other(dir("d", "a")),
+                false,
+            ),
+            case(
+                "another name was taken",
+                "write a file",
+                &inside,
+                0,
+                other(file("d", "b", 2)),
+                true,
+            ),
+            case(
+                "its folder left L",
+                "write a file",
+                &inside,
+                0,
+                |trees| trees.remove_local("d"),
+                false,
+            ),
+            case(
+                "its folder became a file",
+                "write a file",
+                &inside,
+                0,
+                |trees| trees.set_local("d".into(), held(file(ROOT, "d", 3), 8)),
+                false,
+            ),
+            case(
+                "its folder was renamed",
+                "write a file",
+                &inside,
+                0,
+                |trees| trees.set_local("d".into(), held(dir(ROOT, "renamed"), 1)),
+                true,
+            ),
+            case(
+                "nothing changed",
+                "replace a file",
+                &edit,
+                0,
+                unchanged,
+                true,
+            ),
+            case(
+                "the file was renamed and its name went to another node",
+                "replace a file",
+                &edit,
+                0,
+                |trees| {
+                    trees.set_local("n".into(), held(file(ROOT, "renamed", 1), 1));
+                    trees.set_local("u".into(), held(file(ROOT, "a", 3), 9));
+                },
+                false,
+            ),
+            case(
+                "the file left L",
+                "replace a file",
+                &edit,
+                0,
+                |trees| trees.remove_local("n"),
+                true,
+            ),
+            case("nothing changed", "move", &rename, 0, unchanged, true),
+            case(
+                "its name went to another node",
+                "move",
+                &rename,
+                0,
+                other(file(ROOT, "a", 2)),
+                false,
+            ),
+            case("nothing changed", "move", &into, 0, unchanged, true),
+            case(
+                "its new folder moved into it",
+                "move",
+                &into,
+                0,
+                |trees| trees.set_local("d".into(), held(dir("n", "d"), 1)),
+                false,
+            ),
+            case(
+                "its new folder left L",
+                "move",
+                &into,
+                0,
+                |trees| trees.remove_local("d"),
+                false,
+            ),
+            case(
+                "its new folder is parked, from a folder that left L",
+                "move",
+                &into,
+                0,
+                |trees| {
+                    let parked = LocalNode {
+                        parked: true,
+                        ..held(dir("gone", "d"), 1)
+                    };
+                    trees.set_local("d".into(), parked);
+                },
+                true,
+            ),
+            case("nothing changed", "park", &swap, 0, unchanged, true),
+            case(
+                "another node took a name beside it",
+                "park",
+                &swap,
+                0,
+                other(file(ROOT, "z", 3)),
+                true,
+            ),
+            case(
+                "the file was renamed and its name went to another node",
+                "park",
+                &swap,
+                0,
+                |trees| {
+                    trees.set_local("a".into(), held(file(ROOT, "renamed", 1), 1));
+                    trees.set_local("u".into(), held(file(ROOT, "x", 3), 9));
+                },
+                true,
+            ),
+            case(
+                "nothing changed",
+                "move out of the parked folder",
+                &swap,
+                2,
+                unchanged,
+                true,
+            ),
+            case(
+                "its name went to another node",
+                "move out of the parked folder",
+                &swap,
+                2,
+                other(file(ROOT, "y", 3)),
+                false,
+            ),
+            case(
+                "nothing changed",
+                "remove a file",
+                &gone_file,
+                0,
+                unchanged,
+                true,
+            ),
+            case(
+                "the file left L",
+                "remove a file",
+                &gone_file,
+                0,
+                |trees| trees.remove_local("n"),
+                true,
+            ),
+            case(
+                "nothing changed",
+                "remove a folder",
+                &gone_folder,
+                0,
+                unchanged,
+                true,
+            ),
+            case(
+                "an entry was put into it",
+                "remove a folder",
+                &gone_folder,
+                0,
+                other(file("n", "new", 2)),
+                false,
+            ),
+            case(
+                "the folder left L",
+                "remove a folder",
+                &gone_folder,
+                0,
+                |trees| trees.remove_local("n"),
+                true,
+            ),
+        ]
+    }
+
+    #[test]
+    fn l_takes_an_effect_exactly_when_it_stays_a_tree_with_the_outcome_recorded() {
+        let mut refused = BTreeSet::new();
+        for case in cases() {
+            let context = format!("{}, {}", case.kind, case.name);
+            assert_eq!(kind(&case.record.effect), case.kind, "{context}");
+            assert_eq!(case.engine.takes(&case.record), case.takes, "{context}");
+            let (mut trees, mut effects) = (case.engine.trees.clone(), case.engine.effects.clone());
+            let identity = held(dir(ROOT, ""), 60).identity;
+            (effects.done(&mut trees, &case.record.effect_id, Some(identity))).unwrap();
+            assert_eq!(
+                trees.check().is_ok(),
+                case.takes,
+                "{context}: {:?}",
+                trees.check()
+            );
+            if !case.takes {
+                refused.insert(case.kind);
+            }
+        }
+        let every = [
+            "create a folder",
+            "move",
+            "move out of the parked folder",
+            "remove a folder",
+            "replace a file",
+            "write a file",
+        ];
+        assert_eq!(refused.into_iter().collect::<Vec<_>>(), every);
+    }
+
+    /// What keeps a refused effect from being planned and refused in a loop: unblocked, with nothing in flight, the
+    /// planner gives its node no effect for that L. The one exception is a folder whose new folder moved into it,
+    /// which the planner parks, and L takes a parked node.
+    #[test]
+    fn an_effect_that_l_does_not_take_is_not_planned_again_for_that_l() {
+        let mut parked = Vec::new();
+        for mut case in cases().into_iter().filter(|case| !case.takes) {
+            let state = EffectsState {
+                in_flight: None,
+                ..case.engine.effects.state()
+            };
+            case.engine.effects = Effects::from_state(state).unwrap();
+            case.engine.trees.settle();
+            let Engine {
+                trees,
+                effects,
+                ids,
+                ..
+            } = &mut case.engine;
+            let planned = (effects.plan(trees, ids, 0).cloned())
+                .filter(|planned| planned.node == case.record.node);
+            let Some(planned) = planned else {
+                continue;
+            };
+            let context = format!("{}, {}: {planned:?}", case.kind, case.name);
+            assert_ne!(planned.effect, case.record.effect, "{context}");
+            assert!(case.engine.takes(&planned), "{context}");
+            parked.push((case.name, kind(&planned.effect)));
+        }
+        assert_eq!(parked, [("its new folder moved into it", "park")]);
     }
 }

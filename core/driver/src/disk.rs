@@ -121,8 +121,8 @@ pub(crate) enum Stall {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Settled {
     Done,
-    /// The node stays blocked until the effect planned for it changes, except after an interrupted effect, which is
-    /// planned again unchanged.
+    /// The node stays blocked until the effect planned for it changes, except after an interrupted effect or one L
+    /// no longer takes, which can be planned again unchanged.
     Failed(String),
 }
 
@@ -385,7 +385,9 @@ impl Disk {
     /// The effect section, which has no await. It checks that `staged` is the effect in flight and that the root is
     /// held, applies the effect with a marker holding the record's counter, acknowledges the outcome in one
     /// transaction, and asks the observer to reset the paths the effect acted on to L as acknowledged. A write whose
-    /// content could not be fetched only writes the marker and drops its staged file, and fails.
+    /// content could not be fetched only writes the marker and drops its staged file, and fails. So does an effect
+    /// that L no longer takes ([`Engine::takes`]), because a batch changed L after the plan. Nothing else under the
+    /// root is touched for it.
     pub fn apply(
         &mut self,
         staged: Staged,
@@ -413,10 +415,11 @@ impl Disk {
         let mut step = |step| hook(Cut::Step(step));
         let now = SystemTime::now();
         let outcome = match &unfetchable {
-            None => self
-                .space
-                .apply(&marker, &effect, &mut contents, now, &mut step)?,
-            Some(_) => self
+            None if engine.takes(&record) => {
+                self.space
+                    .apply(&marker, &effect, &mut contents, now, &mut step)?
+            }
+            _ => self
                 .space
                 .recover(&marker, &effect, &mut contents, now, &mut step)?,
         };
@@ -730,7 +733,9 @@ fn halt(error: io::Error) -> Stall {
 }
 
 /// Records the outcome of the effect in flight in one transaction: done with the identity of the entry it created,
-/// or failed. With `retry`, an interrupted effect is unblocked in the same transaction, so it is planned again.
+/// or failed. With `retry`, an interrupted effect is unblocked in the same transaction, so it is planned again. An
+/// outcome that L no longer takes ([`Engine::takes`]) is never written to L, whatever the disk holds. The effect
+/// fails and is unblocked, and the planner leaves it out until L changes.
 fn acknowledge(
     record: &EffectRecord,
     outcome: &Outcome,
@@ -745,6 +750,11 @@ fn acknowledge(
     };
     let settled = store.transaction(|tx| -> Result<_, Stop> {
         let settled = match outcome {
+            _ if !engine.takes(record) => {
+                engine.effects.failed(&record.effect_id).map_err(refused)?;
+                engine.effects.unblock(&record.node);
+                Settled::Failed("L changed since it was planned".into())
+            }
             Outcome::Done { identity } => {
                 engine
                     .effects
