@@ -5,17 +5,29 @@ use flarebox_proto::v1::{
     PairCompleteRequest, PairStartResponse, RewindRequest, RewindResult, ServerInfo, SpaceInfo,
     SpaceList, TokenRequest,
 };
+use std::time::Duration;
+
 use prost::Message;
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
-use reqwest::{Method, RequestBuilder};
-use url::Url;
+use reqwest::{Method, RequestBuilder, redirect};
+use url::{Host, Url};
 
 use crate::auth::Auth;
 use crate::error::{ApiError, ServerError};
 
 const PROTOBUF: &str = "application/x-protobuf";
+/// Bounds making a connection, including TLS.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Bounds the wait for any single read of a response.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bounds a whole call to an HTTP endpoint.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The HTTP endpoints of one Flarebox deployment (spec v0 section 15.1). Bodies are binary protobuf.
+///
+/// Credentials and tokens travel only over HTTPS, and the WebSocket only over WSS. Plain HTTP is allowed only for
+/// a loopback address, and only through [`Api::local_development`]. Redirects are never followed, so a request
+/// that carries a token or a refresh credential is never resent to another address or downgraded to HTTP.
 #[derive(Clone, Debug)]
 pub struct Api {
     http: reqwest::Client,
@@ -23,10 +35,25 @@ pub struct Api {
 }
 
 impl Api {
-    /// `base` is the deployment's origin, for example `https://files.example.com`. A path is kept as a prefix.
+    /// `base` is the deployment's HTTPS origin, for example `https://files.example.com`. A path is kept as a prefix.
     pub fn new(base: Url) -> Result<Self, ApiError> {
-        if !matches!(base.scheme(), "http" | "https") || base.host_str().is_none() {
-            return Err(ApiError::Url(format!("{base} is not an http or https URL")));
+        Api::build(base, false)
+    }
+
+    /// Like [`Api::new`], but also accepts `http://` on a loopback address (`localhost`, `127.0.0.0/8`, `::1`),
+    /// for a server under `wrangler dev`.
+    pub fn local_development(base: Url) -> Result<Self, ApiError> {
+        Api::build(base, true)
+    }
+
+    fn build(base: Url, local_development: bool) -> Result<Self, ApiError> {
+        if base.host_str().is_none() || !permitted(&base, local_development) {
+            let rule = if local_development {
+                "an https URL, or an http URL on a loopback address"
+            } else {
+                "an https URL; plain http is only for local development on a loopback address"
+            };
+            return Err(ApiError::Url(format!("{base} is not {rule}")));
         }
         let mut base = base;
         base.set_query(None);
@@ -37,6 +64,10 @@ impl Api {
         }
         let http = reqwest::Client::builder()
             .user_agent(concat!("flarebox-net/", env!("CARGO_PKG_VERSION")))
+            .https_only(!local_development)
+            .redirect(redirect::Policy::none())
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
             .build()
             .map_err(ApiError::Transport)?;
         Ok(Api { http, base })
@@ -177,6 +208,7 @@ impl Api {
     ) -> Result<M, ApiError> {
         let response = request
             .header(ACCEPT, PROTOBUF)
+            .timeout(REQUEST_TIMEOUT)
             .send()
             .await
             .map_err(ApiError::Transport)?;
@@ -198,5 +230,91 @@ impl Api {
             }),
             _ => Err(ApiError::Status { status }),
         }
+    }
+}
+
+fn permitted(url: &Url, local_development: bool) -> bool {
+    match url.scheme() {
+        "https" => true,
+        "http" => local_development && loopback(url),
+        _ => false,
+    }
+}
+
+fn loopback(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    #[test]
+    fn plain_http_is_refused_outside_local_development_on_loopback() {
+        let url = |text: &str| text.parse::<Url>().unwrap();
+        for remote in [
+            "http://203.0.113.1",
+            "http://files.example.com",
+            "ws://127.0.0.1",
+            "ftp://127.0.0.1",
+        ] {
+            assert!(Api::new(url(remote)).is_err(), "{remote}");
+            assert!(Api::local_development(url(remote)).is_err(), "{remote}");
+        }
+        for local in [
+            "http://127.0.0.1:8787",
+            "http://127.1.2.3",
+            "http://[::1]:8787",
+            "http://localhost:8787",
+        ] {
+            assert!(Api::new(url(local)).is_err(), "{local} needs the opt-in");
+            assert!(Api::local_development(url(local)).is_ok(), "{local}");
+        }
+        assert!(Api::new(url("https://files.example.com/fb")).is_ok());
+        assert!(Api::local_development(url("https://files.example.com")).is_ok());
+    }
+
+    #[tokio::test]
+    async fn redirects_are_not_followed_with_credentials() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base: Url = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let n = socket.read(&mut request).await.unwrap();
+            let location = "http://203.0.113.1/v1/token";
+            let reply = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nlocation: {location}\r\ncontent-length: 0\r\n\r\n"
+            );
+            socket.write_all(reply.as_bytes()).await.unwrap();
+            let mut rest = Vec::new();
+            let _ = socket.read_to_end(&mut rest).await;
+            String::from_utf8_lossy(&request[..n]).into_owned()
+        });
+        let api = Api::local_development(base).unwrap();
+        let request = TokenRequest {
+            device_id: "d".into(),
+            refresh_credential: "secret".into(),
+        };
+        let outcome = api.token(&request).await;
+        assert!(
+            matches!(outcome, Err(ApiError::Status { status: 307 })),
+            "{outcome:?}"
+        );
+        drop(api);
+        assert!(
+            server.await.unwrap().starts_with("POST /v1/token"),
+            "one request, not followed"
+        );
     }
 }

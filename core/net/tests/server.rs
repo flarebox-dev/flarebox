@@ -233,7 +233,7 @@ async fn a_connection_dropped_mid_rpc_resends_what_rfc_0002_allows() {
     let space = new_space().await;
     let proxy = Proxy::start(&server_url()).await;
     let through_proxy = Arc::new(Auth::new(
-        Api::new(proxy.url.clone()).unwrap(),
+        Api::local_development(proxy.url.clone()).unwrap(),
         owner().await,
     ));
     let (session, mut events) = start(through_proxy, &space);
@@ -305,7 +305,7 @@ async fn a_commit_is_not_resent_when_welcome_cannot_account_for_it() {
     let space = new_space().await;
     let proxy = Proxy::start(&server_url()).await;
     let through_proxy = Arc::new(Auth::new(
-        Api::new(proxy.url.clone()).unwrap(),
+        Api::local_development(proxy.url.clone()).unwrap(),
         new_device("stale").await,
     ));
     let (session, mut events) = start(through_proxy, &space);
@@ -409,7 +409,11 @@ async fn reauth_replaces_the_token_without_dropping_the_connection() {
     let proxy = Proxy::start(&server_url()).await;
     let margin = Duration::from_secs(15 * 60) - Duration::from_secs(2);
     let refreshing = Arc::new(
-        Auth::new(Api::new(proxy.url.clone()).unwrap(), owner().await).with_refresh_margin(margin),
+        Auth::new(
+            Api::local_development(proxy.url.clone()).unwrap(),
+            owner().await,
+        )
+        .with_refresh_margin(margin),
     );
     let (session, mut events) = start(refreshing, &space);
     connected(&mut events).await;

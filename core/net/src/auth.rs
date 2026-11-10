@@ -133,7 +133,7 @@ mod tests {
     use super::*;
 
     fn auth(margin: Duration) -> Auth {
-        let api = Api::new("http://127.0.0.1:9".parse().unwrap()).unwrap();
+        let api = Api::local_development("http://127.0.0.1:9".parse().unwrap()).unwrap();
         let credentials = Credentials {
             user_id: "u".into(),
             device_id: "d".into(),

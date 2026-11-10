@@ -8,6 +8,7 @@ use flarebox_proto::v1::{
     CaughtUp, Changes, CommitRecord, Error as ProtoError, Goodbye, Notice, Resume, ServerMessage,
     TreePage, client_message, server_message,
 };
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio_tungstenite::WebSocketStream;
 
@@ -33,7 +34,7 @@ async fn listen() -> (TcpListener, Arc<Auth>) {
     };
     (
         listener,
-        Arc::new(Auth::new(Api::new(base).unwrap(), credentials).with_token(token)),
+        Arc::new(Auth::new(Api::local_development(base).unwrap(), credentials).with_token(token)),
     )
 }
 
@@ -184,7 +185,10 @@ fn a_commit_is_resent_only_when_welcome_accounts_for_its_slot() {
 fn the_websocket_url_follows_the_base_scheme_and_path() {
     let url = |base: &str| {
         websocket_url(
-            &Api::new(base.parse().unwrap()).unwrap().base().clone(),
+            &Api::local_development(base.parse().unwrap())
+                .unwrap()
+                .base()
+                .clone(),
             "0190-ab",
         )
         .unwrap()
@@ -198,7 +202,7 @@ fn the_websocket_url_follows_the_base_scheme_and_path() {
         url("https://files.example.com/fb"),
         "wss://files.example.com/fb/v1/spaces/0190-ab/ws"
     );
-    let base = Api::new("http://h".parse().unwrap())
+    let base = Api::local_development("http://localhost".parse().unwrap())
         .unwrap()
         .base()
         .clone();
@@ -483,5 +487,127 @@ async fn the_stream_resumes_from_the_last_seq_after_a_reconnect() {
         }
     }
     assert_eq!(changes, [3, 4, 5]);
+    drop(server.await.unwrap());
+}
+
+#[tokio::test]
+async fn a_welcome_with_a_protocol_not_offered_stops_before_anything_is_sent() {
+    let (listener, auth) = listen().await;
+    let (session, mut events) = Session::start(auth, config()).unwrap();
+    session.subscribe("h", 0);
+    let server = tokio::spawn(async move {
+        let mut ws = accept(
+            &listener,
+            Welcome {
+                proto: 999,
+                ..welcome("h", 0)
+            },
+        )
+        .await;
+        let after = tokio::time::timeout(Duration::from_secs(1), ws.next()).await;
+        assert!(
+            !matches!(after, Ok(Some(Ok(WsMessage::Binary(_))))),
+            "no Resume or RPC after an unsupported Welcome: {after:?}"
+        );
+    });
+    let call = session.list_tree("", 1).await;
+    let Err(CallError::Stopped(StopReason::UnsupportedVersion(why))) = call else {
+        panic!("expected UnsupportedVersion, got {call:?}");
+    };
+    assert!(why.contains("1.999"), "{why}");
+    match next(&mut events).await {
+        Event::Stopped(StopReason::UnsupportedVersion(_)) => {}
+        other => panic!("no Connected for an unsupported Welcome, got {other:?}"),
+    }
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_withheld_upgrade_times_out_and_close_does_not_wait_for_it() {
+    let (listener, auth) = listen().await;
+    let mut config = config();
+    config.connect_timeout = Duration::from_millis(30);
+    config.backoff = Backoff {
+        initial: Duration::from_secs(5),
+        max: Duration::from_secs(5),
+    };
+    let (session, mut events) = Session::start(auth.clone(), config).unwrap();
+    let (mut tcp, _) = listener.accept().await.unwrap();
+    let mut buffer = [0; 4096];
+    assert!(
+        tcp.read(&mut buffer).await.unwrap() > 0,
+        "the upgrade request arrived"
+    );
+    let event = tokio::time::timeout(Duration::from_millis(500), events.next()).await;
+    assert!(
+        matches!(
+            event,
+            Ok(Some(Event::Disconnected {
+                reason: DisconnectReason::Timeout,
+                ..
+            }))
+        ),
+        "{event:?}"
+    );
+    let closed = tokio::time::timeout(Duration::from_millis(150), session.close()).await;
+    assert!(
+        closed.is_ok(),
+        "close interrupts the wait before the next attempt"
+    );
+
+    let mut config = self::config();
+    config.connect_timeout = Duration::from_secs(60);
+    let (session, _events) = Session::start(auth, config).unwrap();
+    let (mut tcp, _) = listener.accept().await.unwrap();
+    assert!(tcp.read(&mut buffer).await.unwrap() > 0);
+    let closed = tokio::time::timeout(Duration::from_millis(150), session.close()).await;
+    assert!(closed.is_ok(), "close interrupts a withheld upgrade");
+}
+
+#[tokio::test]
+async fn responses_to_unknown_or_answered_req_ids_are_ignored() {
+    let (listener, auth) = listen().await;
+    let (session, _events) = Session::start(auth, config()).unwrap();
+    let server = tokio::spawn(async move {
+        let mut ws = accept(&listener, welcome("h", 0)).await;
+        let page = |cursor: &str| {
+            rpc_response::Result::Tree(TreePage {
+                next_cursor: cursor.into(),
+                ..Default::default()
+            })
+        };
+        let first = recv_rpc(&mut ws).await;
+        reply(&mut ws, first.req_id + 999, page("unknown")).await;
+        reply(&mut ws, first.req_id, page("first")).await;
+        reply(&mut ws, first.req_id, page("duplicate")).await;
+        let second = recv_rpc(&mut ws).await;
+        reply(&mut ws, second.req_id, page("second")).await;
+        ws
+    });
+    assert_eq!(session.list_tree("", 1).await.unwrap().next_cursor, "first");
+    assert_eq!(
+        session.list_tree("", 1).await.unwrap().next_cursor,
+        "second"
+    );
+    drop(server.await.unwrap());
+}
+
+#[tokio::test]
+async fn a_malformed_server_message_drops_the_connection_as_a_protocol_violation() {
+    let (listener, auth) = listen().await;
+    let (_session, mut events) = Session::start(auth, config()).unwrap();
+    let server = tokio::spawn(async move {
+        let mut ws = accept(&listener, welcome("h", 0)).await;
+        ws.send(WsMessage::Binary(vec![0xff].into())).await.unwrap();
+        (listener, ws)
+    });
+    assert!(matches!(next(&mut events).await, Event::Connected(_)));
+    assert!(matches!(
+        next(&mut events).await,
+        Event::Disconnected {
+            reason: DisconnectReason::ProtocolViolation(_),
+            ..
+        }
+    ));
     drop(server.await.unwrap());
 }

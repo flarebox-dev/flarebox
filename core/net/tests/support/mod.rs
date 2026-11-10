@@ -27,7 +27,7 @@ pub fn server_url() -> Url {
 }
 
 pub fn api() -> Api {
-    Api::new(server_url()).unwrap()
+    Api::local_development(server_url()).unwrap()
 }
 
 static OWNER: OnceCell<DeviceCredentials> = OnceCell::const_new();
@@ -49,12 +49,11 @@ async fn claim() -> DeviceCredentials {
         "GET /setup answered {}",
         setup.status()
     );
-    let marker = "Flarebox claim code (valid for 1 hour): ";
     let started = Instant::now();
     let code = loop {
         let text = std::fs::read_to_string(&log).unwrap_or_default();
-        if let Some(line) = text.lines().rev().find(|line| line.contains(marker)) {
-            break line.split(marker).nth(1).unwrap().trim().to_owned();
+        if let Some(code) = text.lines().rev().find_map(claim_code) {
+            break code;
         }
         assert!(started.elapsed() < WAIT, "no claim code in {log}");
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -66,6 +65,24 @@ async fn claim() -> DeviceCredentials {
         platform: "test".into(),
     };
     api().claim(&request).await.expect("the claim succeeds")
+}
+
+/// The claim code on a Worker log line that mentions one: the last word made of letters and digits in dash-separated
+/// groups, such as `ABCD-EFGH-JKLM`.
+fn claim_code(line: &str) -> Option<String> {
+    if !line.to_ascii_lowercase().contains("claim code") {
+        return None;
+    }
+    line.split_whitespace()
+        .map(|word| word.trim_matches(|c: char| !c.is_ascii_alphanumeric()))
+        .rfind(|word| {
+            word.contains('-')
+                && word.len() >= 8
+                && word.split('-').all(|group| {
+                    !group.is_empty() && group.chars().all(|c| c.is_ascii_alphanumeric())
+                })
+        })
+        .map(str::to_owned)
 }
 
 pub fn auth(credentials: Credentials) -> Arc<Auth> {

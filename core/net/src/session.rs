@@ -20,9 +20,9 @@ use rustls::pki_types::ServerName;
 use rustls_platform_verifier::BuilderVerifierExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, sleep, sleep_until, timeout_at};
+use tokio::time::{Instant, sleep, sleep_until, timeout, timeout_at};
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -61,6 +61,10 @@ pub struct SessionConfig {
     pub backoff: Backoff,
     /// WebSocket ping interval. The connection counts as lost when nothing arrives for two intervals.
     pub ping_interval: Duration,
+    /// Bounds getting an access token, the TCP connection, TLS and the WebSocket upgrade together, and each token
+    /// refresh for `Reauth`.
+    pub connect_timeout: Duration,
+    /// Bounds the wait for `Welcome` after `Hello`.
     pub welcome_timeout: Duration,
     /// How many times a call refused with `CODE_RETRY_LATER` is sent again before the error is returned.
     pub retry_later_attempts: u32,
@@ -85,6 +89,7 @@ impl SessionConfig {
             },
             backoff: Backoff::default(),
             ping_interval: Duration::from_secs(30),
+            connect_timeout: Duration::from_secs(30),
             welcome_timeout: Duration::from_secs(30),
             retry_later_attempts: 5,
         }
@@ -105,6 +110,8 @@ impl Events {
 #[derive(Debug)]
 pub struct Session {
     commands: mpsc::UnboundedSender<Command>,
+    /// Set by `close`; the task drops whatever it is waiting on. Dropping the session has the same effect.
+    closing: watch::Sender<bool>,
     stopped: Arc<OnceLock<StopReason>>,
     commit_lock: Mutex<()>,
     backoff: Backoff,
@@ -119,8 +126,10 @@ impl Session {
         let (commands, command_rx) = mpsc::unbounded_channel();
         let (events, event_rx) = mpsc::unbounded_channel();
         let stopped = Arc::new(OnceLock::new());
+        let (closing, closing_rx) = watch::channel(false);
         let session = Session {
             commands,
+            closing,
             stopped: stopped.clone(),
             commit_lock: Mutex::new(()),
             backoff: config.backoff,
@@ -132,6 +141,7 @@ impl Session {
                     url,
                     tls: None,
                     commands: command_rx,
+                    closing: closing_rx,
                     events,
                     stopped,
                     next_req: 1,
@@ -268,6 +278,7 @@ impl Session {
     /// Closes the connection and waits for the session task to end. Pending calls fail with `StopReason::Closed`.
     pub async fn close(self) {
         let _ = self.commands.send(Command::Close);
+        let _ = self.closing.send(true);
         let _ = self.task.await;
     }
 
@@ -390,6 +401,13 @@ enum Exit {
 }
 
 impl Exit {
+    fn timeout() -> Exit {
+        Exit::Reconnect {
+            reason: DisconnectReason::Timeout,
+            now: false,
+        }
+    }
+
     fn transport(error: impl std::fmt::Display) -> Exit {
         Exit::Reconnect {
             reason: DisconnectReason::Transport(error.to_string()),
@@ -411,6 +429,7 @@ struct Task {
     url: Url,
     tls: Option<Arc<rustls::ClientConfig>>,
     commands: mpsc::UnboundedReceiver<Command>,
+    closing: watch::Receiver<bool>,
     events: mpsc::UnboundedSender<Event>,
     stopped: Arc<OnceLock<StopReason>>,
     next_req: u64,
@@ -473,20 +492,13 @@ impl Task {
     }
 
     async fn connection(&mut self) -> Exit {
-        let token = match self.auth.access_token().await {
-            Ok(token) => token,
-            Err(error) if error.is_unauthenticated() => {
-                return Exit::Stop(StopReason::CredentialsRefused);
-            }
-            Err(error) => return Exit::transport(error),
+        let mut closing = self.closing.clone();
+        let established = tokio::select! {
+            established = self.establish() => established,
+            () = closed(&mut closing) => return Exit::Closed,
         };
-        self.token = Some(token.token.clone());
-        let mut socket = match self.open(&token.token).await {
-            Ok(socket) => socket,
-            Err(exit) => return exit,
-        };
-        let welcome = match self.handshake(&mut socket).await {
-            Ok(welcome) => welcome,
+        let (mut socket, token, welcome) = match established {
+            Ok(established) => established,
             Err(exit) => return exit,
         };
         self.attempt = 0;
@@ -502,7 +514,25 @@ impl Task {
         self.serve(socket, token).await
     }
 
-    async fn open(&mut self, token: &str) -> Result<Socket, Exit> {
+    /// Opens the WebSocket within `connect_timeout` and waits for an acceptable `Welcome`.
+    async fn establish(&mut self) -> Result<(Socket, AccessToken, Welcome), Exit> {
+        let (mut socket, token) = timeout(self.config.connect_timeout, self.open())
+            .await
+            .map_err(|_| Exit::timeout())??;
+        let welcome = self.handshake(&mut socket).await?;
+        Ok((socket, token, welcome))
+    }
+
+    /// Gets a token and opens the WebSocket: TCP, TLS for `wss`, and the upgrade.
+    async fn open(&mut self) -> Result<(Socket, AccessToken), Exit> {
+        let token = match self.auth.access_token().await {
+            Ok(token) => token,
+            Err(error) if error.is_unauthenticated() => {
+                return Err(Exit::Stop(StopReason::CredentialsRefused));
+            }
+            Err(error) => return Err(Exit::transport(error)),
+        };
+        self.token = Some(token.token.clone());
         let host = self.url.host_str().unwrap_or_default().to_owned();
         let port = self.url.port_or_known_default().unwrap_or(80);
         let tcp = TcpStream::connect((host.as_str(), port))
@@ -522,16 +552,16 @@ impl Task {
             .as_str()
             .into_client_request()
             .map_err(|e| Exit::Stop(StopReason::BadUrl(e.to_string())))?;
-        let bearer = HeaderValue::from_str(&format!("Bearer {token}"))
+        let bearer = HeaderValue::from_str(&format!("Bearer {}", token.token))
             .map_err(|_| Exit::violation("an access token that is not a header value"))?;
         request.headers_mut().insert(AUTHORIZATION, bearer);
         let config = WebSocketConfig::default()
             .max_message_size(Some(MAX_SERVER_MESSAGE))
             .max_frame_size(Some(MAX_SERVER_MESSAGE));
         match tokio_tungstenite::client_async_with_config(request, io, Some(config)).await {
-            Ok((socket, _)) => Ok(socket),
+            Ok((socket, _)) => Ok((socket, token)),
             Err(tungstenite::Error::Http(response)) => {
-                Err(self.refused(response.status().as_u16(), token).await)
+                Err(self.refused(response.status().as_u16(), &token.token).await)
             }
             Err(error) => Err(Exit::transport(error)),
         }
@@ -588,7 +618,7 @@ impl Task {
                     now: false,
                 })?;
             match self.frame(item).await? {
-                Some(Msg::Welcome(welcome)) => return Ok(welcome),
+                Some(Msg::Welcome(welcome)) => return self.negotiated(welcome),
                 Some(Msg::Goodbye(goodbye)) => {
                     return Err(self.closed(Some(goodbye.code as u16), goodbye.reason).await);
                 }
@@ -634,6 +664,7 @@ impl Task {
         let mut last_heard = Instant::now();
         let reauth = sleep_until(self.reauth_at(&token));
         tokio::pin!(reauth);
+        let mut closing = self.closing.clone();
         loop {
             tokio::select! {
                 item = socket.next() => {
@@ -677,7 +708,19 @@ impl Task {
                     }
                 }
                 () = &mut reauth => {
-                    match self.auth.access_token().await {
+                    let refreshed = tokio::select! {
+                        refreshed = timeout(self.config.connect_timeout, self.auth.access_token()) => refreshed,
+                        () = closed(&mut closing) => {
+                            let _ = socket.close(None).await;
+                            return Exit::Closed;
+                        }
+                    };
+                    let Ok(refreshed) = refreshed else {
+                        tracing::debug!("flarebox session timed out refreshing its access token");
+                        reauth.as_mut().reset(Instant::now() + self.config.backoff.delay(0));
+                        continue;
+                    };
+                    match refreshed {
                         Ok(fresh) if fresh.token != token.token => {
                             let message = client_message::Msg::Reauth(Reauth { access_token: fresh.token.clone() });
                             if let Err(exit) = send(&mut socket, message).await {
@@ -697,6 +740,18 @@ impl Task {
                 }
             }
         }
+    }
+
+    /// Accepts the `Welcome` only if it chose a protocol version this client offered in `Hello`.
+    fn negotiated(&self, welcome: Welcome) -> Result<Welcome, Exit> {
+        let hello = &self.config.hello;
+        if (hello.proto_min..=hello.proto_max).contains(&welcome.proto) {
+            return Ok(welcome);
+        }
+        Err(Exit::Stop(StopReason::UnsupportedVersion(format!(
+            "the server chose protocol 1.{}, but this client offered 1.{} to 1.{}",
+            welcome.proto, hello.proto_min, hello.proto_max
+        ))))
     }
 
     fn reauth_at(&self, token: &AccessToken) -> Instant {
@@ -830,6 +885,11 @@ impl Task {
     fn emit(&self, event: Event) {
         let _ = self.events.send(event);
     }
+}
+
+/// Resolves once the session is closed or dropped.
+async fn closed(closing: &mut watch::Receiver<bool>) {
+    let _ = closing.wait_for(|closed| *closed).await;
 }
 
 async fn send(socket: &mut Socket, msg: client_message::Msg) -> Result<(), Exit> {

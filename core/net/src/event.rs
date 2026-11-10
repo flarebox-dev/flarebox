@@ -52,6 +52,6 @@ pub enum DisconnectReason {
     Closed { code: Option<u16>, reason: String },
     /// The server broke the protocol, for example with a message larger than 1 MiB.
     ProtocolViolation(String),
-    /// Nothing arrived from the server for two ping intervals, or no `Welcome` in time.
+    /// The connection, its upgrade or its `Welcome` took too long, or nothing arrived for two ping intervals.
     Timeout,
 }
