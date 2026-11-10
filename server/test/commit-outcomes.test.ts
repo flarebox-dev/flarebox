@@ -39,6 +39,21 @@ describe("RFC 0002 commit checks", () => {
     expect((await heads(a)).head).toBe(1);
   });
 
+  it("fences another history before the write checks and the commit_id format, for old clients, viewers and malformed ids alike", async () => {
+    const space = await newSpace();
+    const root = space.spaceId;
+    const old = await client(space, "Old", { maxFormat: 0 });
+    const viewer = await client(space, "Viewer", { role: "viewer" });
+    const historyId = uuidv7();
+    expect(code(await old.commitRaw([op.mkdir(uuidv7(), root, "x")], { historyId }))).toBe(Error_Code.HISTORY_MISMATCH);
+    expect(code(await viewer.commitRaw([op.mkdir(uuidv7(), root, "x")], { historyId }))).toBe(Error_Code.HISTORY_MISMATCH);
+    const a = await client(space, "Laptop A");
+    expect(code(await a.commitRaw([op.mkdir(uuidv7(), root, "x")], { historyId, commitId: "not-a-uuid" }))).toBe(Error_Code.HISTORY_MISMATCH);
+    expect(code(await old.commitRaw([op.mkdir(uuidv7(), root, "x")]))).toBe(Error_Code.READ_ONLY);
+    expect(code(await a.commitRaw([op.mkdir(uuidv7(), root, "x")], { commitId: "not-a-uuid" }))).toBe(Error_Code.INVALID_ARGUMENT);
+    expect((await heads(a)).head).toBe(0);
+  });
+
   it("returns a stored result before the counter and base checks, also once the log no longer holds the commit", async () => {
     const { a, b, root } = await setup();
     const first = uuidv7();

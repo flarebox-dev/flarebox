@@ -323,16 +323,20 @@ export class SpaceDO extends DurableObject<Env> {
     return toBinary(RpcResponseSchema, response);
   }
 
-  /** The HTTP RPC path: the role comes from the member list, the format from the device's last Hello. */
+  /**
+   * The HTTP RPC path: the role comes from the member list, the format from the device's last Hello. The Account DO is
+   * asked again here, because the Worker's check may precede a rewind that closed the space (RFC 0003 section 4).
+   */
   async httpRpc(connect: Connect, request: Uint8Array): Promise<Uint8Array> {
     const req = fromBinary(RpcRequestSchema, request);
     const role = this.memberRole(connect.identity.userId);
-    if (!role || this.revoked(connect.identity.deviceId)) {
-      const error = role
-        ? create(ErrorSchema, { code: Error_Code.UNAUTHENTICATED, message: "device revoked" })
-        : create(ErrorSchema, { code: Error_Code.FORBIDDEN, message: "not a member of this space" });
-      return toBinary(RpcResponseSchema, create(RpcResponseSchema, { reqId: req.reqId, result: { case: "error", value: error } }));
-    }
+    const refuse = (code: Error_Code, message: string) =>
+      toBinary(RpcResponseSchema, create(RpcResponseSchema, { reqId: req.reqId, result: { case: "error", value: create(ErrorSchema, { code, message }) } }));
+    if (!role) return refuse(Error_Code.FORBIDDEN, "not a member of this space");
+    const check = await this.checkDevice(connect.identity.deviceId);
+    if (check === undefined) return refuse(Error_Code.RETRY_LATER, "could not check the device; retry later");
+    if (!check.active) return refuse(Error_Code.UNAUTHENTICATED, "device revoked");
+    if (check.closed) return refuse(Error_Code.RETRY_LATER, "the space is being rewound; retry later");
     const device = this.sql.exec("SELECT max_format FROM devices WHERE device_id = ?", connect.identity.deviceId).toArray()[0];
     const session = this.sessionOf(connect, role, device ? Number(device.max_format) : FORMAT_VERSION);
     const { response, record } = await this.call(session, req);
@@ -347,7 +351,10 @@ export class SpaceDO extends DurableObject<Env> {
     if (!connect) return new Response("missing identity", { status: 401 });
     const role = this.memberRole(connect.identity.userId);
     if (!role) return new Response("not a member of this space", { status: 403 });
-    if (this.revoked(connect.identity.deviceId)) return new Response("device revoked", { status: 401 });
+    const check = await this.checkDevice(connect.identity.deviceId);
+    if (check === undefined) return new Response("could not check the device; retry later", { status: 503 });
+    if (!check.active) return new Response("device revoked", { status: 401 });
+    if (check.closed) return new Response("the space is being rewound; retry later", { status: 503 });
     const [client, server] = Object.values(new WebSocketPair()) as [WebSocket, WebSocket];
     this.ctx.acceptWebSocket(server, [connect.identity.deviceId]);
     const attachment: Attachment = { connId: uuidv7(), identity: connect.identity, origin: connect.origin, role, maxFormat: 0, hello: false, live: false };
@@ -701,10 +708,10 @@ export class SpaceDO extends DurableObject<Env> {
   }
 
   private async commit(session: Session, commit: Commit): Promise<{ result: CommitResult; record?: CommitRecord }> {
-    this.checkCanWrite(session);
-    if (!isUuidV7(commit.commitId)) fail(Error_Code.INVALID_ARGUMENT, "commit_id must be a UUIDv7");
     const stored = this.checkCommitOrder(session.deviceId, commit);
     if (stored) return { result: stored };
+    this.checkCanWrite(session);
+    if (!isUuidV7(commit.commitId)) fail(Error_Code.INVALID_ARGUMENT, "commit_id must be a UUIDv7");
     if (commit.ops.length === 0) fail(Error_Code.INVALID_ARGUMENT, "a commit needs at least one op");
     if (commit.ops.length > MAX_OPS) fail(Error_Code.LIMIT_EXCEEDED, `at most ${MAX_OPS} ops per commit`);
 

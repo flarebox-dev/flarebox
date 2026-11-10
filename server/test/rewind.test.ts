@@ -26,7 +26,7 @@ import {
 } from "../src/gen/flarebox/v1/messages_pb";
 import { ChunkPlan_Action, Error_Code, ErrorSchema } from "../src/gen/flarebox/v1/rpc_pb";
 import { toHex, uuidv7 } from "../src/ids";
-import { Close, type SpaceDO } from "../src/space-do";
+import { Close, CONNECT_HEADER, type SpaceDO } from "../src/space-do";
 import { ChunkState } from "../src/space/schema";
 import { chunkKey } from "../src/space/store";
 import { content, op, TestClient, targetIncarnation } from "./helpers";
@@ -435,6 +435,70 @@ describe("space rewind (RFC 0003)", () => {
     });
     expect(replay).toMatchObject({ state: "completed", receipt: { rewindId, historyId: record.history_id, restoreSeq: 2, completedAtMs } });
     expect(await device().history()).toBe(record.history_id);
+  });
+
+  it("refuses a commit authenticated before the rewind whose body arrives after the restore, at every Space DO entry point", async () => {
+    const { spaceId, createdAtMs, creds, device } = await newSpace();
+    const token = creds.access!.token;
+    const a = device();
+    const history = await a.history();
+    const point = createdAtMs + MINUTE;
+    await snapshot(spaceId, point);
+    await a.commit([op.mkdir(uuidv7(), spaceId, "after the point")]);
+
+    const held = new TransformStream<Uint8Array, Uint8Array>();
+    const writer = held.writable.getWriter();
+    const pending = exports.default.fetch(`${BASE}/v1/spaces/${spaceId}/rpc`, {
+      method: "POST",
+      headers: { Authorization: "Bearer " + token, "Content-Type": "application/x-protobuf" },
+      body: held.readable,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const prototype = await runInDurableObject(space(spaceId), (instance: SpaceDO) => Object.getPrototypeOf(instance) as SpaceDO);
+    const complete = prototype.rewindComplete;
+    prototype.rewindComplete = async () => {
+      throw new Error("injected completion failure");
+    };
+    const rewindId = uuidv7();
+    try {
+      await setAccountClock(createdAtMs + 5 * MINUTE);
+      expect((await rewind(token, spaceId, { restorePointMs: point, expectedHistoryId: history, rewindId })).status).toBe(503);
+      expect(await rewindRecord(rewindId)).toMatchObject({ phase: "arming" });
+      expect(await spaceRows(spaceId, "SELECT * FROM rewind_markers")).toEqual([]);
+      expect(await spaceRows(spaceId, "SELECT value FROM meta WHERE key = 'head_seq'")).toEqual([{ value: 0 }]);
+
+      const late = uuidv7();
+      const commit = body(RpcRequestSchema, {
+        reqId: 1n,
+        call: { case: "commit", value: { commitId: uuidv7(), baseSeq: 0n, historyId: history, deviceSeq: 1n, ops: [op.mkdir(late, spaceId, "late")] } },
+      });
+      await writer.write(commit);
+      await writer.close();
+      const response = await pending;
+      expect(response.status).toBe(200);
+      expect(fromBinary(RpcResponseSchema, new Uint8Array(await response.arrayBuffer())).result).toMatchObject({
+        case: "error",
+        value: { code: Error_Code.RETRY_LATER },
+      });
+
+      const connect = { identity: { userId: creds.userId, deviceId: creds.deviceId, deviceName: "Laptop A", expiresAtMs: Date.now() + MINUTE }, origin: BASE };
+      const direct = fromBinary(RpcResponseSchema, await space(spaceId).httpRpc(connect, commit));
+      expect(direct.result).toMatchObject({ case: "error", value: { code: Error_Code.RETRY_LATER } });
+      const upgrade = await space(spaceId).fetch(
+        new Request(`${BASE}/v1/spaces/${spaceId}/ws`, { headers: { Upgrade: "websocket", [CONNECT_HEADER]: JSON.stringify(connect) } }),
+      );
+      expect(upgrade.status).toBe(503);
+      expect(await spaceRows(spaceId, "SELECT value FROM meta WHERE key = 'head_seq'")).toEqual([{ value: 0 }]);
+      expect(await spaceRows(spaceId, "SELECT node_id FROM nodes WHERE node_id = ?", late)).toEqual([]);
+    } finally {
+      prototype.rewindComplete = complete;
+    }
+
+    await runDurableObjectAlarm(account());
+    const done = await rewind(token, spaceId, { restorePointMs: point, expectedHistoryId: history, rewindId });
+    expect(done.status).toBe(200);
+    expect(done.message).toMatchObject({ restoreSeq: 0n, previousHeadSeq: 1n });
   });
 
   it("writes one marker per attempt however often preparing repeats, and removes them when the rewind fails", async () => {
