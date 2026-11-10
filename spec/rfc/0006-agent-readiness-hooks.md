@@ -38,13 +38,13 @@ A policy halt is not the read-only state of spec v0 §9.2. Read-only follows fro
 |---|---|
 | `UNAUTHENTICATED` | Gets a new access token and sends the same commit again. If `POST /v1/token` refuses, the client is signed out (section 7) and keeps the commit |
 | `FORBIDDEN` | Policy halt |
-| `INVALID_ARGUMENT` | Forgets the commit: nothing was applied, its slot stays free, and its changes are planned again with a new `commit_id` |
+| `INVALID_ARGUMENT` | Policy halt. A client that follows the spec does not get this code for a commit, so it signals a bug or a reused `commit_id` (section 8), and the commit is kept as evidence |
 | `MISSING_CHUNKS` | Uploads the listed chunks and sends the same commit again, with new receipts (spec v0 §8 step 4) |
 | `LIMIT_EXCEEDED` | Forgets the commit and plans its changes again in smaller commits |
 | `QUOTA_EXCEEDED` | With `retry_after_ms` greater than 0, waits that long and sends the same commit again. With 0, policy halt |
 | `READ_ONLY` | Forgets the commit and stops committing until a `Welcome` allows writes (spec v0 §9.2) |
 | `RETRY_LATER` | Waits `retry_after_ms`, or a backoff when it is 0, and sends the same commit again |
-| `UNSUPPORTED_VERSION` | Forgets the commit, as for `INVALID_ARGUMENT` |
+| `UNSUPPORTED_VERSION` | Forgets the commit: nothing was applied, its slot stays free, and its changes are planned again with a new `commit_id` |
 | `INTERNAL` | Sends the same commit again after a backoff, because its outcome is unknown |
 | `HISTORY_MISMATCH`, `STALE_DEVICE_STATE` | Keeps the commit as evidence and enters recovery (RFC 0002 §6) |
 | `HEAD_MOVED` | Forgets the commit (RFC 0002 §4) |
@@ -141,9 +141,26 @@ Two routes, both authenticated with an access token like the other endpoints of 
 
 ## 8. Stored results belong to their principal and their request (spec v0 §8 step 4, RFC 0002 §3)
 
-The Space DO stores a digest of each commit request beside its result, in `commits` and in `device_commits`. The digest is the SHA-256 of the binary encoding of a `Commit` that holds only the request's `base_seq`, `ops`, `device_seq` and `require_head`. The encoding writes the fields the server's schema knows, at every level of nesting, in field-number order, and leaves out unknown fields. The digest is internal to the server and never sent.
+The Space DO stores a digest of each commit request beside its result, in `commits` and in `device_commits`. The digest is internal to the server and never sent.
 
-Protobuf encoding is not canonical across schema versions: a field that one server release drops as unknown, the next release knows and encodes. The server therefore stores a digest version with each digest, starting at 1. A server release that changes what the digest covers, or how it is encoded, including a schema change to any message inside `ops`, raises the version. A stored digest of another version is treated as a missing digest (step 3 below), so an unchanged retry is never refused because the server was upgraded in between.
+**Digest v1.** The digest is the SHA-256 of a fixed projection of the request, encoded as proto3 binary. Its coverage is frozen for format v1: later schema changes do not change it, so every digest a server stores stays comparable for as long as the row exists. The projection keeps exactly these fields and drops every other field, known or unknown, at every level:
+
+| Message | Fields kept |
+|---|---|
+| `Commit` | `base_seq = 2`, `ops = 3`, `device_seq = 6`, `require_head = 7` |
+| `Op` | the oneof `op`, fields 1 to 6 |
+| `CreateDir` | 1, 2, 3 |
+| `CreateFile` | 1, 2, 3, 4 |
+| `UpdateContent` | 1, 2 |
+| `Move` | 1, 2, 3 |
+| `Delete` | 1 |
+| `Restore` | 1, 2, 3, 4 |
+| `Content` | 1 to 7 |
+| `ChunkRef` | 1, 2, 3 |
+
+The encoding writes fields in field-number order. A scalar field that holds its proto3 default is omitted. A message field, and the set member of a oneof, is written when it is present, even when it is empty. Repeated fields keep the request's order: `ops` and `chunks` are never sorted. The projection has no maps, floating-point fields, optional scalars or packed repeated scalars, so it needs no rule for them.
+
+A later field added inside these messages is not covered, so a reuse that differs only in that field is not detected. A later RFC that needs more coverage defines digest v2 and stores the version with each digest. A server then keeps computing v1 for rows stored with v1, so it never loses the check for an older row.
 
 What the digest covers:
 
@@ -154,10 +171,10 @@ What the digest covers:
 RFC 0002 §3 step 2 becomes: if a result is stored for the `commit_id`, in `commits` or in `device_commits`:
 
 1. If the row's `device_id` is not the caller's principal, refuse with `INVALID_ARGUMENT`. A stored result is returned only to the principal that made the commit. Every row has a `device_id`, rows stored before this RFC included, so this check needs no digest. A commit the server made itself, such as a trash purge, has an empty `device_id` and is never returned.
-2. If the row has a digest of the current version and it differs from this request's digest, refuse with `INVALID_ARGUMENT`.
-3. Otherwise return the stored result. A row stored before this RFC has no digest, and a row stored by another server release may have a digest of another version. Its result is returned to its own principal without the body check, because its original body cannot be compared.
+2. If the row has a digest and it differs from this request's digest, refuse with `INVALID_ARGUMENT`.
+3. Otherwise return the stored result. A row stored before this RFC has no digest. Its result is returned to its own principal without the body check, because its original body cannot be known.
 
-Each refusal changes nothing. A client that follows RFC 0002 §2 never gets either refusal: it resends a commit unchanged and never reuses another principal's `commit_id`. A client that does get one, through a bug or a store copied between principals (section 6), forgets the commit as for any `INVALID_ARGUMENT` (section 1). This cannot apply a change twice or hide one. If the commit was accepted from this principal, it already holds the slot, so the re-planned commit is refused with `STALE_DEVICE_STATE` and the client enters recovery (RFC 0002 §3 step 3 and §6). Recovery compares the store with the server and needs neither the original commit nor a separate code.
+Each refusal changes nothing. A client that follows RFC 0002 §2 never gets either refusal: it resends a commit unchanged, and it never reuses a `commit_id`, its own or another principal's. A client that does get one has a bug or a store copied between principals (section 6). It cannot tell this `INVALID_ARGUMENT` from a malformed request, and it does not need to, because `INVALID_ARGUMENT` on a commit puts the commit under a policy halt (section 1). The commit stays in the store, unchanged, as the evidence that recovery needs (RFC 0002 §6), and nothing is planned or sent until the user or a client update acts.
 
 ## 9. Log retention and the commit_id window (spec v0 §4.1, §7.3, §12)
 
