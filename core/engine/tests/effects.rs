@@ -794,6 +794,47 @@ fn a_parked_edit_brings_back_its_deleted_folder_after_a_remote_trash() {
     }));
 }
 
+/// As above, but R moves the file into a folder the rules leave out instead of trashing it. A
+/// parked node that is ignored goes back to its local position, so its deleted folder is created
+/// again for it there too.
+#[test]
+fn a_parked_edit_brings_back_its_deleted_folder_after_a_remote_move_into_an_ignored_folder() {
+    let (mut trees, mut disk) = space(&[
+        ("d", Some(dir(ROOT, "d")), Some(dir(ROOT, "d"))),
+        ("logs", Some(dir(ROOT, "logs")), Some(dir(ROOT, "logs"))),
+        ("f", Some(file("d", "f", 1)), Some(file("logs", "f", 1))),
+    ]);
+    trees.set_rules(
+        &[] as &[&str],
+        Some(flarebox_engine::ignore::RuleFile::parse(b"logs/\n")),
+    );
+    let mut local = trees.local().get("f").unwrap().clone();
+    local.parked = true;
+    local.shape.content = Some(content(2));
+    trees.set_local("f".into(), local);
+    trees.remove_local("d");
+    trees.revert("d".into());
+    disk.entries.remove(&1);
+    let entry = disk.entries.get_mut(&3).unwrap();
+    entry.area = Area::Parked;
+    entry.name = "f".into();
+    entry.content = Some(content(2));
+    trees.check().unwrap();
+    disk.matches(&trees).unwrap();
+    assert!(trees.ignored("f"));
+    let done = converge(&mut trees, &mut disk, 10).unwrap();
+    assert!(
+        matches!(
+            done.as_slice(),
+            [Effect::CreateDir { .. }, Effect::Move { .. }]
+        ),
+        "{done:?}"
+    );
+    let f = trees.local().get("f").unwrap();
+    assert!(!f.parked);
+    assert_eq!(f.shape, file("d", "f", 2));
+}
+
 /// A valid tree over `n0`, `n1`, ... from one [`Draw`] per node, as in tests/trees.rs, where each
 /// node has the kind and file content of `kinds`. S and R are drawn with their own ranks, so their
 /// moves can swap, rotate and nest into each other.

@@ -389,11 +389,19 @@ fn candidate(trees: &Trees, id: &str) -> bool {
 }
 
 /// Whether L holds a node whose way to the root passes `id`. Each node on that way goes to its R
-/// position, or to its local one when R no longer has it, as a parked edit that is moved back.
+/// position, or to its local one when R no longer has it, as a parked edit that is moved back, or
+/// when it is parked and ignored, as [`View::step`] moves it back.
 fn holds_below(trees: &Trees, id: &str) -> bool {
     let (local, remote) = (trees.local(), trees.remote());
     let parent = |node: &str| {
-        (remote.live(node).or_else(|| local.live(node))).map(|shape| shape.parent.as_str())
+        let home = local
+            .get(node)
+            .filter(|held| held.parked && trees.ignored(node))
+            .map(|held| &held.shape);
+        (home
+            .or_else(|| remote.live(node))
+            .or_else(|| local.live(node)))
+        .map(|shape| shape.parent.as_str())
     };
     local.iter().any(|(node, _)| {
         let mut up = parent(node);
