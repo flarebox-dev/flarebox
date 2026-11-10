@@ -10,7 +10,7 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "check:deploy": "node scripts/check-deploy.mjs",
-    "typecheck": "wrangler types && tsc --noEmit && tsc --noEmit -p test && pnpm --filter flarebox-web typecheck",
+    "typecheck": "wrangler types && tsc --noEmit && tsc --noEmit -p test && tsc --noEmit -p scripts/deploy-test && pnpm --filter flarebox-web typecheck",
     "build:web": "pnpm --filter flarebox-web build",
     "test": "pnpm build:web && vitest run"
   },
@@ -32,6 +32,7 @@
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "1.6.0",
+    "@types/node": "24.19.2",
     "typescript": "7.0.2",
     "vitest": "5.1.0",
     "wrangler": "4.158.0"

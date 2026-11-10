@@ -1,0 +1,178 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# Deploys server/ to a real Cloudflare account under a throwaway name, claims it, smoke-tests it over HTTPS and
+# deletes everything again (docs/deploy-test.md). Manual only: it needs the account's scoped API token, and each run
+# uses a little of the account's Workers, Durable Objects and R2 usage. A first job without secrets refuses a run that
+# is not on main of flarebox-dev/flarebox, or whose deploy-test environment lacks the protection the docs require; the
+# secrets live only in that environment, which releases them after a required reviewer approves the run.
+
+name: Deploy test
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "smoke: deploy this commit and test it. upgrade: deploy from_ref, write data, upgrade to this commit and check the data."
+        type: choice
+        options: [smoke, upgrade]
+        default: smoke
+      from_ref:
+        description: "upgrade only: the commit or tag to upgrade from. Empty means the newest tag before this commit."
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-test
+  cancel-in-progress: false
+
+jobs:
+  trusted:
+    name: deploy test (main and protected environment)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Refuse unless the run is for a commit on main of flarebox-dev/flarebox
+        env:
+          REPOSITORY: ${{ github.repository }}
+          REF: ${{ github.ref }}
+        run: |
+          if [ "$REPOSITORY" != flarebox-dev/flarebox ]; then
+            echo "::error::The deploy test runs only in flarebox-dev/flarebox, not in $REPOSITORY."
+            exit 1
+          fi
+          if [ "$REF" != refs/heads/main ]; then
+            echo "::error::The deploy test must start from main, not $REF. Choose main under 'Use workflow from'."
+            exit 1
+          fi
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          commit="$(git rev-parse HEAD)"
+          if ! git merge-base --is-ancestor "$commit" origin/main; then
+            echo "::error::$REF points to $commit, which is not on main. The deploy test runs only commits that were merged to main."
+            exit 1
+          fi
+          echo "$REF ($commit) is on main of $REPOSITORY."
+      - name: Refuse unless the deploy-test environment is protected
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          refuse() {
+            echo "::error::$1 Set up the deploy-test environment as docs/deploy-test.md describes before running the deploy test."
+            exit 1
+          }
+          environment="$(gh api "repos/$REPOSITORY/environments/deploy-test")" || refuse "The deploy-test environment does not exist or cannot be read."
+          reviewers="$(jq -r '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[]?.reviewer.login] | join(" ")' <<<"$environment")"
+          [ "$reviewers" = gunwooterry ] || refuse "The deploy-test environment's required reviewers must be gunwooterry alone, because any one listed reviewer can approve a run (required reviewers: ${reviewers:-none})."
+          [ "$(jq -r '.can_admins_bypass' <<<"$environment")" != true ] || refuse "Administrators can bypass the deploy-test environment's protection rules."
+          [ "$(jq -r '.deployment_branch_policy.custom_branch_policies // false' <<<"$environment")" = true ] || refuse "The deploy-test environment does not limit deployments to selected branches."
+          policies="$(gh api "repos/$REPOSITORY/environments/deploy-test/deployment-branch-policies" --jq '[.branch_policies[] | (.type // "branch") + ":" + .name] | sort | join(",")')" || refuse "The deploy-test environment's branch policies cannot be read."
+          [ "$policies" = "branch:main" ] || refuse "The deploy-test environment must allow the main branch only, but allows: ${policies:-nothing}."
+          echo "The deploy-test environment lists gunwooterry as its only required reviewer, allows main only, and does not report administrator bypass as allowed. These checks are defence in depth: the boundary is the required reviewer's approval of each run, with administrator bypass turned off by hand as docs/deploy-test.md describes."
+
+  deploy-test:
+    name: deploy test (${{ inputs.mode }})
+    needs: trusted
+    runs-on: ubuntu-latest
+    environment: deploy-test
+    timeout-minutes: 60
+    env:
+      FLAREBOX_TEST_NAME: flarebox-test-${{ github.run_id }}-${{ github.run_attempt }}
+      WRANGLER_SEND_METRICS: "false"
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - name: Check the Cloudflare secrets
+        id: secrets
+        working-directory: .
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          missing=""
+          [ -n "$CLOUDFLARE_API_TOKEN" ] || missing="$missing CLOUDFLARE_API_TOKEN"
+          [ -n "$CLOUDFLARE_ACCOUNT_ID" ] || missing="$missing CLOUDFLARE_ACCOUNT_ID"
+          if [ -n "$missing" ]; then
+            echo "::error::The deploy test needs the environment secrets$missing in the deploy-test environment. docs/deploy-test.md lists what each holds and the token's permissions. Nothing was deployed."
+            exit 1
+          fi
+          echo "Both secrets are set. This run deploys and then deletes the Worker and R2 bucket $FLAREBOX_TEST_NAME."
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          package_json_file: server/package.json
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: server/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+
+      - name: Resolve the release to upgrade from
+        id: from
+        if: inputs.mode == 'upgrade'
+        env:
+          FROM_REF: ${{ inputs.from_ref }}
+        run: node scripts/deploy-test/run.ts upgrade-from "$FROM_REF"
+
+      - name: Deploy ${{ inputs.mode == 'upgrade' && 'the earlier release' || 'this commit' }}
+        timeout-minutes: 15
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          REF: ${{ inputs.mode == 'upgrade' && steps.from.outputs.sha || github.sha }}
+        run: node scripts/deploy-test/run.ts deploy "$REF"
+
+      - name: Claim it with the code from its own log
+        timeout-minutes: 5
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node scripts/deploy-test/run.ts claim
+
+      - name: Smoke test over HTTPS
+        if: inputs.mode == 'smoke'
+        timeout-minutes: 25
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: pnpm exec vitest run --config scripts/deploy-test/vitest.config.ts --reporter=verbose smoke
+
+      - name: Write data on the earlier release
+        if: inputs.mode == 'upgrade'
+        timeout-minutes: 5
+        run: pnpm exec vitest run --config scripts/deploy-test/vitest.config.ts --reporter=verbose upgrade-write
+
+      - name: Upgrade to this commit
+        if: inputs.mode == 'upgrade'
+        timeout-minutes: 15
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node scripts/deploy-test/run.ts deploy "$GITHUB_SHA"
+
+      - name: Check that the data survived the upgrade
+        if: inputs.mode == 'upgrade'
+        timeout-minutes: 10
+        run: pnpm exec vitest run --config scripts/deploy-test/vitest.config.ts --reporter=verbose upgrade-verify
+
+      - name: Tear down the Worker, its Durable Objects and the R2 bucket
+        if: always() && steps.secrets.outcome == 'success'
+        timeout-minutes: 10
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node scripts/deploy-test/run.ts teardown
