@@ -701,6 +701,7 @@ fn driver_error(error: DriverError) -> SessionError {
         DriverError::Busy(_) => SessionError::ProfileInUse,
         DriverError::NotPaired => SessionError::NotSignedIn,
         DriverError::LastDevice => SessionError::LastDevice,
+        DriverError::NotRevoked(reason) => SessionError::NotRevoked { reason },
         DriverError::EmptyName | DriverError::EmptyUserName => SessionError::EmptyName,
         DriverError::Api(error) => api_error(error),
         DriverError::SpaceNotFound(_) => SessionError::SpaceNotFound,

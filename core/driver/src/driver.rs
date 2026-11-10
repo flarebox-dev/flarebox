@@ -11,9 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use flarebox_fs::{Marker, probe_no_replace, read_marker, write_marker};
 use flarebox_net::{ApiError, Auth};
-use flarebox_proto::v1::{
-    ClaimRequest, DeviceCredentials, PairCompleteRequest, SpaceInfo, error::Code,
-};
+use flarebox_proto::v1::{ClaimRequest, DeviceCredentials, PairCompleteRequest, SpaceInfo};
 use flarebox_store::{GivenAnswer, Link, Store, StoredQuestion};
 use rustix::fs::FlockOperation;
 use tokio::sync::watch;
@@ -48,6 +46,10 @@ pub enum DriverError {
         "this is the last active device of its user; after it signs out, only owner recovery adds a device again"
     )]
     LastDevice,
+    #[error(
+        "the server did not confirm that it revoked this device ({0}); if this is the last active device of its user, only owner recovery adds a device again after it signs out"
+    )]
+    NotRevoked(String),
     #[error(transparent)]
     Paths(#[from] PathsError),
     #[error(transparent)]
@@ -367,12 +369,14 @@ impl Driver {
     /// working too, unlinks every folder (their files stay) and deletes the credential, so the profile can be paired
     /// or claimed again (RFC 0009 section 5).
     ///
-    /// The revocation is best effort: if the server cannot be reached, the sign-out still finishes, and the device stays
-    /// active there until another device revokes it. The one answer that stops the sign-out is the server's refusal to
-    /// revoke the user's last active device, which it gives unless `confirm_last_device` is set. The sign-out then
-    /// returns [`DriverError::LastDevice`], keeps the credential and the folders, and syncs again if it was syncing, so
-    /// the person can be told and confirm. A folder that cannot be unlinked stops the sign-out with its error and stays
-    /// linked, so signing out again finishes it.
+    /// Unless `confirm_last_device` is set, the sign-out goes on only once the server has revoked the device, or
+    /// answers that another device already did. Otherwise it keeps the credential and the folders, syncs again if it
+    /// was syncing, and returns [`DriverError::LastDevice`] for any HTTP 409, the server's refusal to revoke the
+    /// user's last active device, or [`DriverError::NotRevoked`] when the server cannot be reached or does not
+    /// answer, so the person can be told that this may be their last device and confirm. With `confirm_last_device`
+    /// the revocation is best effort: a sign-out without the server finishes on the device, and the device stays active
+    /// there until another device revokes it. A folder that cannot be unlinked stops the sign-out with its error and
+    /// stays linked, so signing out again finishes it.
     pub async fn sign_out(&self, confirm_last_device: bool) -> Result<(), DriverError> {
         let _lifecycle = self.inner.lifecycle.lock().await;
         let was_running = self.inner.running.load(Ordering::SeqCst);
@@ -985,31 +989,42 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
-/// Revokes the credential's own device on the server. Only the refusal to revoke the user's last active device without
-/// `confirm_last_device` is an error, [`DriverError::LastDevice`]; any other failure is logged, and the device stays
+/// Revokes the credential's own device on the server. An answer that another device already revoked it counts as
+/// revoked. Any HTTP 409 is the server's refusal to revoke the user's last active device, [`DriverError::LastDevice`],
+/// whatever its body. Any other failure, including no answer within [`SERVER_WAIT`], is
+/// [`DriverError::NotRevoked`] unless `confirm_last_device` is set, in which case it is logged and the device stays
 /// active on the server until another device revokes it.
 async fn revoke(credential: &Credential, confirm_last_device: bool) -> Result<(), DriverError> {
     let revoked = async {
         let auth = Auth::new(credential.api()?, credential.net());
         auth.api().revoke_self(&auth, confirm_last_device).await
     };
-    match tokio::time::timeout(SERVER_WAIT, revoked).await {
-        Ok(Ok(())) => tracing::info!(
-            device_id = credential.device_id,
-            "revoked this device on the server"
-        ),
-        Ok(Err(error))
-            if error.server().map(|refusal| refusal.code()) == Some(Code::ConfirmationRequired) =>
-        {
-            return Err(DriverError::LastDevice);
+    let failure = match tokio::time::timeout(SERVER_WAIT, revoked).await {
+        Ok(Ok(())) => {
+            tracing::info!(
+                device_id = credential.device_id,
+                "revoked this device on the server"
+            );
+            return Ok(());
         }
-        Ok(Err(error)) => {
-            tracing::warn!(%error, "the server did not revoke this device; revoke it from another device")
+        Ok(Err(error)) if error.status() == Some(409) => return Err(DriverError::LastDevice),
+        Ok(Err(error)) if error.is_unauthenticated() => {
+            tracing::info!(
+                device_id = credential.device_id,
+                "the server had already revoked this device"
+            );
+            return Ok(());
         }
-        Err(_) => tracing::warn!(
-            "the server did not answer in time; revoke this device from another device"
-        ),
+        Ok(Err(error)) => error.to_string(),
+        Err(_) => format!("no answer within {} seconds", SERVER_WAIT.as_secs()),
+    };
+    if !confirm_last_device {
+        return Err(DriverError::NotRevoked(failure));
     }
+    tracing::warn!(
+        failure,
+        "the server did not revoke this device; revoke it from another device"
+    );
     Ok(())
 }
 
@@ -1616,7 +1631,7 @@ mod tests {
         let mut watch = driver.watch();
         watch.borrow_and_update();
 
-        driver.sign_out(false).await.unwrap();
+        driver.sign_out(true).await.unwrap();
         let status = driver.status();
         assert_eq!(status.account, None);
         assert!(!status.running);
@@ -1675,7 +1690,7 @@ mod tests {
     /// The server's refusal to revoke the user's last active device without a confirmation.
     fn last_device_refused() -> (u16, Vec<u8>) {
         let refusal = flarebox_proto::v1::Error {
-            code: Code::ConfirmationRequired.into(),
+            code: flarebox_proto::v1::error::Code::ConfirmationRequired.into(),
             message: "this is the user's last active device; confirm to revoke it".into(),
             ..Default::default()
         };
@@ -1764,7 +1779,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signing_out_without_the_server_finishes_on_the_device() {
+    async fn signing_out_without_the_server_waits_for_a_confirmation_and_then_finishes_on_the_device()
+     {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
         let root = base.join("Flarebox");
@@ -1772,10 +1788,68 @@ mod tests {
         linked(&paths, &root, "d1");
         let driver = Driver::open(paths.clone()).unwrap();
 
-        driver.sign_out(false).await.unwrap();
+        assert!(matches!(
+            driver.sign_out(false).await,
+            Err(DriverError::NotRevoked(_))
+        ));
+        assert_eq!(driver.status().account.unwrap().device_id, "d1");
+        assert_eq!(driver.status().folders.len(), 1);
+        assert!(paths.credential().exists());
+
+        driver.sign_out(true).await.unwrap();
         assert_eq!(driver.status().account, None);
         assert!(driver.status().folders.is_empty());
         assert!(!paths.credential().exists());
+    }
+
+    /// Answers a token request, then answers the revocation with `raw`, the bytes of an HTTP response, and keeps that
+    /// connection open until the test ends if `hold` is set.
+    async fn revocation_answered_with(raw: &'static [u8], hold: bool) -> String {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = format!("http://{}/", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request(&mut socket).await;
+            write_reply(&mut socket, &access_token().1).await;
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request(&mut socket).await;
+            socket.write_all(raw).await.unwrap();
+            if hold {
+                std::future::pending::<()>().await;
+            }
+        });
+        server
+    }
+
+    #[tokio::test]
+    async fn any_409_or_a_stalled_answer_keeps_the_credential_and_the_folders() {
+        const EMPTY: &[u8] =
+            b"HTTP/1.1 409 Conflict\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+        const HTML: &[u8] = b"HTTP/1.1 409 Conflict\r\ncontent-type: text/html\r\ncontent-length: 13\r\nconnection: close\r\n\r\n<html></html>";
+        const TRUNCATED: &[u8] = b"HTTP/1.1 409 Conflict\r\ncontent-type: application/x-protobuf\r\ncontent-length: 100\r\nconnection: close\r\n\r\n\x08\x10";
+        // The status of a 409 whose body cannot be read may be lost with the body; either refusal keeps everything.
+        let cases = [
+            ("an empty 409", EMPTY, false, true),
+            ("an HTML 409", HTML, false, true),
+            ("a truncated 409", TRUNCATED, false, false),
+            ("a stalled 409", TRUNCATED, true, false),
+        ];
+        for (case, raw, hold, status_kept) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let base = fs::canonicalize(dir.path()).unwrap();
+            let server = revocation_answered_with(raw, hold).await;
+            let paths = linked_with_server(&base, server);
+            let driver = Driver::open(paths.clone()).unwrap();
+
+            let refused = driver.sign_out(false).await.unwrap_err();
+            let expected = matches!(refused, DriverError::LastDevice)
+                || !status_kept && matches!(refused, DriverError::NotRevoked(_));
+            assert!(expected, "{case}: {refused:?}");
+            assert!(paths.credential().exists(), "{case}");
+            assert_eq!(driver.status().folders.len(), 1, "{case}");
+        }
     }
 
     #[tokio::test]
@@ -1791,7 +1865,7 @@ mod tests {
         held.arrived.await.unwrap();
         let sign_out = tokio::spawn({
             let driver = driver.clone();
-            async move { driver.sign_out(false).await }
+            async move { driver.sign_out(true).await }
         });
         assert!(still_waiting(&sign_out).await);
 
@@ -1870,7 +1944,7 @@ mod tests {
         held.arrived.await.unwrap();
         let sign_out = tokio::spawn({
             let driver = driver.clone();
-            async move { driver.sign_out(false).await }
+            async move { driver.sign_out(true).await }
         });
         assert!(still_waiting(&sign_out).await);
 
@@ -1909,7 +1983,7 @@ mod tests {
             return;
         }
 
-        let failed = driver.sign_out(false).await;
+        let failed = driver.sign_out(true).await;
         open_dir(&private);
         assert!(matches!(failed, Err(DriverError::Io { .. })), "{failed:?}");
         assert!(watch.has_changed().unwrap());
@@ -1923,7 +1997,7 @@ mod tests {
         assert!(paths.store(SPACE).unwrap().exists());
         assert!(claim::owner(&root).unwrap().is_some());
 
-        driver.sign_out(false).await.unwrap();
+        driver.sign_out(true).await.unwrap();
         assert!(watch.has_changed().unwrap());
         assert!(driver.status().folders.is_empty());
         assert_eq!(claim::owner(&root).unwrap(), None);
@@ -2045,7 +2119,7 @@ mod tests {
         eventually("the stop begins", || !driver.status().running).await;
         let sign_out = tokio::spawn({
             let driver = driver.clone();
-            async move { driver.sign_out(false).await }
+            async move { driver.sign_out(true).await }
         });
         assert!(still_waiting(&sign_out).await);
         assert!(!lockable(&root));
@@ -2074,7 +2148,7 @@ mod tests {
         assert_eq!(driver.status().folders.len(), 1);
         let sign_out = tokio::spawn({
             let driver = driver.clone();
-            async move { driver.sign_out(false).await }
+            async move { driver.sign_out(true).await }
         });
         assert!(still_waiting(&sign_out).await);
 
@@ -2110,7 +2184,7 @@ mod tests {
             "a task started for a folder whose unlink is unfinished"
         );
         assert!(folder.problem.as_ref().unwrap().contains("unlink it again"));
-        driver.sign_out(false).await.unwrap();
+        driver.sign_out(true).await.unwrap();
         signed_out(&driver, &paths, &root);
     }
 
@@ -2123,7 +2197,7 @@ mod tests {
         let (driver, gate) = paused_driver(&paths, &root).await;
         let sign_out = tokio::spawn({
             let driver = driver.clone();
-            async move { driver.sign_out(false).await }
+            async move { driver.sign_out(true).await }
         });
         eventually("the sign-out stops the driver", || !driver.status().running).await;
         driver.start();

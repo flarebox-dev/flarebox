@@ -146,6 +146,7 @@ private struct AccountSettings: View {
     @State private var pairing: PairingCode?
     @State private var confirmingSignOut = false
     @State private var confirmingLastDevice = false
+    @State private var confirmingOffline = false
     @State private var error: SessionError?
 
     var body: some View {
@@ -219,6 +220,8 @@ private struct AccountSettings: View {
                         try await model.signOut()
                     } catch SessionError.LastDevice {
                         confirmingLastDevice = true
+                    } catch SessionError.NotRevoked(_) {
+                        confirmingOffline = true
                     }
                 }
             }
@@ -231,6 +234,13 @@ private struct AccountSettings: View {
             }
         } message: {
             Text("No other device is signed in to this server. After this Mac signs out, you can't sign back in from the Flarebox app. Getting back in needs the owner recovery steps from the deployment guide, run outside the app with administrator access to the server's deployment.")
+        }
+        .confirmationDialog("Sign out without the server?", isPresented: $confirmingOffline) {
+            Button("Sign Out", role: .destructive) {
+                perform { try await model.signOut(confirmLastDevice: true) }
+            }
+        } message: {
+            Text("Flarebox can't reach the server, so it can't tell whether another device is still signed in, and the server keeps this Mac listed until another device removes it. If this Mac is the last one, after it signs out you can't sign back in from the Flarebox app. Getting back in needs the owner recovery steps from the deployment guide, run outside the app with administrator access to the server's deployment.")
         }
     }
 
