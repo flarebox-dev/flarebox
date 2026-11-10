@@ -5,6 +5,7 @@
 
 use std::fs;
 
+use notify::Watcher as _;
 use notify::event::Flag;
 
 use super::*;
@@ -409,6 +410,185 @@ fn idle_native_poll_reports_an_unreadable_folder() {
         }
     );
     assert_eq!(second.unwrap(), Poll::default());
+}
+
+/// A watcher that records each registration and fails the ones a test names,
+/// the way notify's backends fail them.
+/// Makes a registration of the folder it is given fail.
+type Fail = fn(&Path) -> notify::Error;
+
+/// A watcher that registers folders the way notify's inotify backend does: a
+/// recursive registration walks the tree and registers one folder at a time,
+/// stopping at the first folder that fails, and the folders before it stay
+/// registered.
+#[derive(Default)]
+struct Registrations {
+    fail: Vec<(PathBuf, Fail)>,
+    watched: BTreeSet<PathBuf>,
+}
+
+impl Registrations {
+    fn register(&mut self, path: &Path) -> notify::Result<()> {
+        if let Some((_, error)) = self.fail.iter().find(|(at, _)| at == path) {
+            return Err(error(path));
+        }
+        self.watched.insert(path.to_path_buf());
+        Ok(())
+    }
+
+    fn register_tree(&mut self, path: &Path) -> notify::Result<()> {
+        self.register(path)?;
+        let mut folders: Vec<PathBuf> = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_dir())
+            .collect();
+        folders.sort();
+        folders
+            .iter()
+            .try_for_each(|folder| self.register_tree(folder))
+    }
+}
+
+impl notify::Watcher for Registrations {
+    fn new<F: notify::EventHandler>(_: F, _: notify::Config) -> notify::Result<Self> {
+        Ok(Self::default())
+    }
+
+    fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
+        match mode {
+            RecursiveMode::Recursive => self.register_tree(path),
+            RecursiveMode::NonRecursive => self.register(path),
+        }
+    }
+
+    fn unwatch(&mut self, _: &Path) -> notify::Result<()> {
+        Ok(())
+    }
+
+    fn kind() -> notify::WatcherKind {
+        notify::WatcherKind::NullWatcher
+    }
+}
+
+/// The reviewer's registration probe: a recursive registration can fail on a
+/// folder deep inside the one it was asked for, here `a/gone` inside `a`, which
+/// disappears while it is registered. The rest of `a` still needs its watches,
+/// whether the registration first fell back because of an unreadable folder or
+/// because of that failure itself. Only folders that may not be watched or are
+/// gone stay unwatched. A not-found error for a folder that is still there or
+/// that cannot be looked up because its parent may no longer be searched, a
+/// requested folder that is gone, and any other error, such as the watch limit,
+/// are returned.
+#[test]
+fn registration_covers_the_tree_around_a_failed_folder() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let denied: Fail = |_| notify::Error::io(io::Error::from(io::ErrorKind::PermissionDenied));
+    let vanishing: Fail = |path| {
+        fs::remove_dir_all(path).unwrap();
+        notify::Error::new(notify::ErrorKind::PathNotFound)
+    };
+    let not_found: Fail = |_| notify::Error::new(notify::ErrorKind::PathNotFound);
+    let full: Fail = |_| notify::Error::new(notify::ErrorKind::MaxFilesWatch);
+    let unsearchable: Fail = |path| {
+        let parent = path.parent().unwrap();
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o000)).unwrap();
+        notify::Error::new(notify::ErrorKind::PathNotFound)
+    };
+    let register = |fail: &[(&str, Fail)]| {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        for folder in ["0-locked", "a/gone", "a/still/deep", "b"] {
+            fs::create_dir_all(root.join(folder)).unwrap();
+        }
+        let mut watcher = Registrations {
+            fail: fail
+                .iter()
+                .map(|(name, error)| (root.join(name), *error))
+                .collect(),
+            ..Registrations::default()
+        };
+        let result = watch_tree(&mut watcher, &root);
+        let _ = fs::set_permissions(root.join("a"), fs::Permissions::from_mode(0o755));
+        let watched: BTreeSet<String> = watcher
+            .watched
+            .iter()
+            .map(|path| path.strip_prefix(&root).unwrap().display().to_string())
+            .collect();
+        (result, watched)
+    };
+    let names = |names: &[&str]| -> BTreeSet<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    };
+
+    let (result, watched) = register(&[("0-locked", denied), ("a/gone", vanishing)]);
+    result.unwrap();
+    assert_eq!(watched, names(&["", "a", "a/still", "a/still/deep", "b"]));
+
+    let (result, watched) = register(&[("a/gone", vanishing)]);
+    result.unwrap();
+    assert_eq!(
+        watched,
+        names(&["", "0-locked", "a", "a/still", "a/still/deep", "b"])
+    );
+
+    for fail in [
+        &[("0-locked", denied), ("a/gone", not_found)][..],
+        &[("a/gone", not_found)][..],
+        &[("0-locked", denied), ("a/still", unsearchable)][..],
+    ] {
+        let (result, _) = register(fail);
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err.kind, notify::ErrorKind::PathNotFound),
+            "{err:?}"
+        );
+    }
+
+    let (result, _) = register(&[("", vanishing)]);
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err.kind, notify::ErrorKind::PathNotFound),
+        "{err:?}"
+    );
+
+    let (result, _) = register(&[("0-locked", denied), ("b", full)]);
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err.kind, notify::ErrorKind::MaxFilesWatch),
+        "{err:?}"
+    );
+}
+
+/// The reviewer's lookup probe: a folder behind a parent that may not be
+/// searched cannot be looked up, which says nothing about whether it is gone.
+/// Only a lookup that finds nothing, or finds something other than a folder,
+/// does.
+#[test]
+fn folder_behind_an_unsearchable_parent_is_not_gone() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().join("a");
+    let child = parent.join("child");
+    fs::create_dir_all(&child).unwrap();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o000)).unwrap();
+    let blocked = blocks_reads(
+        "folder_behind_an_unsearchable_parent_is_not_gone",
+        fs::symlink_metadata(&child),
+    );
+    let unknown = gone(&child);
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+    if blocked {
+        assert!(!unknown);
+    }
+    assert!(!gone(&child));
+    fs::remove_dir(&child).unwrap();
+    assert!(gone(&child));
+    fs::write(&child, "f").unwrap();
+    assert!(gone(&child));
+    assert!(gone(&child.join("below")));
 }
 
 fn wait_for(watcher: &mut NativeWatcher, expected: &[Change]) -> Vec<Change> {

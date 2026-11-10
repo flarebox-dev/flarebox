@@ -61,7 +61,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use notify::event::{AccessKind, AccessMode, EventKind};
-use notify::{RecommendedWatcher, RecursiveMode, Watcher as _};
+use notify::{RecommendedWatcher, RecursiveMode};
 use rustix::fs::{FileType, Mode, OFlags, RawMode};
 
 /// How long native events must be quiet before the watcher rescans, so both
@@ -1075,8 +1075,7 @@ impl NativeWatcher {
         for dir in &dirs {
             let path = self.root.join(dir);
             if let Err(err) = watch_tree(&mut self.watcher, &path) {
-                let still_a_dir = std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir());
-                if still_a_dir {
+                if !gone(&path) {
                     self.failed = Some(watch_error(err));
                 }
             }
@@ -1123,38 +1122,70 @@ fn watch_root(
 
 /// Registers `path` and every folder below it that may be watched. The
 /// platform's recursive registration stops at the first folder it may not
-/// watch, so after a permission error the readable folders are registered one
-/// at a time, skipping a subfolder that disappears in the meantime. A folder
-/// that may not be read is left to the scans, which report it as unreadable.
-fn watch_tree(watcher: &mut RecommendedWatcher, path: &Path) -> notify::Result<()> {
-    let refused =
-        |err: &notify::Error| matches!(&err.kind, notify::ErrorKind::Io(err) if denied(err));
-    let vanished = |err: &notify::Error| match &err.kind {
-        notify::ErrorKind::PathNotFound => true,
-        notify::ErrorKind::Io(err) => err.kind() == io::ErrorKind::NotFound,
-        _ => false,
-    };
+/// watch, or at one that disappears while it registers the tree, and the error
+/// can name a folder deep inside it. After such an error every folder is
+/// registered on its own instead, so each error names the folder it was asked
+/// for. A folder that may not be read is left to the scans, which report it as
+/// unreadable. A not-found error is skipped only once the folder it names is
+/// checked again and is gone; if `path` itself is gone, the error is returned.
+fn watch_tree<W: notify::Watcher>(watcher: &mut W, path: &Path) -> notify::Result<()> {
     match watcher.watch(path, RecursiveMode::Recursive) {
-        Err(err) if refused(&err) => {}
-        other => return other,
+        Err(err) if refused(&err) || (vanished(&err) && !gone(path)) => watch_each(watcher, path),
+        other => other,
     }
+}
+
+/// Registers `path` and every folder below it one at a time, skipping a
+/// folder that may not be watched or that is gone.
+fn watch_each<W: notify::Watcher>(watcher: &mut W, path: &Path) -> notify::Result<()> {
     match watcher.watch(path, RecursiveMode::NonRecursive) {
-        Err(err) if refused(&err) => return Ok(()),
+        Err(err) if refused(&err) || (vanished(&err) && gone(path)) => return Ok(()),
         other => other?,
     }
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return Ok(());
-    };
-    for entry in entries.flatten() {
-        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            continue;
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(err) if denied(&err) || (err.kind() == io::ErrorKind::NotFound && gone(path)) => {
+            return Ok(());
         }
-        match watch_tree(watcher, &entry.path()) {
-            Err(err) if vanished(&err) => {}
-            other => other?,
+        Err(err) => return Err(notify::Error::io(err).add_path(path.to_path_buf())),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|err| notify::Error::io(err).add_path(path.to_path_buf()))?;
+        let folder = entry.path();
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => watch_each(watcher, &folder)?,
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound && gone(&folder) => {}
+            Err(err) => return Err(notify::Error::io(err).add_path(folder)),
         }
     }
     Ok(())
+}
+
+/// Whether a lookup shows that `path` is no longer a folder: it is missing,
+/// something other than a folder is there, or a path component is not a
+/// folder. A lookup that fails for any other reason, such as a parent that may
+/// not be searched, says nothing, so the folder is not taken to be gone.
+fn gone(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => !meta.is_dir(),
+        Err(err) => matches!(
+            err.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+        ),
+    }
+}
+
+fn refused(err: &notify::Error) -> bool {
+    matches!(&err.kind, notify::ErrorKind::Io(err) if denied(err))
+}
+
+fn vanished(err: &notify::Error) -> bool {
+    match &err.kind {
+        notify::ErrorKind::PathNotFound => true,
+        notify::ErrorKind::Io(err) => err.kind() == io::ErrorKind::NotFound,
+        _ => false,
+    }
 }
 
 impl Watcher for NativeWatcher {
