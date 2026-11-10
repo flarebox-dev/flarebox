@@ -306,6 +306,10 @@ struct Run {
     devices: HashMap<String, Session>,
     contents: HashMap<String, Content>,
     wallets: HashMap<(String, String), Vec<UploadReceipt>>,
+    /// Per device and space, the `device_seq` of the device's last commit there that was applied.
+    slots: HashMap<(String, String), u64>,
+    /// Per space, the highest seq a commit returned.
+    top_seq: HashMap<String, u64>,
     last_missing: HashMap<(String, String), Vec<Vec<u8>>>,
     symbols: HashMap<String, String>,
     values: HashMap<String, String>,
@@ -398,6 +402,8 @@ impl Run {
             devices,
             contents,
             wallets: HashMap::new(),
+            slots: HashMap::new(),
+            top_seq: HashMap::new(),
             last_missing: HashMap::new(),
             symbols: HashMap::new(),
             values: HashMap::new(),
@@ -801,6 +807,9 @@ impl Run {
             &[
                 "commit_id",
                 "base_seq",
+                "history_id",
+                "device_seq",
+                "require_head",
                 "ops",
                 "upload",
                 "receipts_from",
@@ -838,12 +847,23 @@ impl Run {
             }
             self.upload(space, &session, at_ms, chunks)?
         };
+        let history_id = match opt_str(body, "history_id")? {
+            Some(symbol) => self.id(space, symbol)?,
+            None => self.space(space)?.history_id().to_owned(),
+        };
+        let slot = (session.device_id.clone(), space.to_owned());
+        let device_seq = match opt_u64(body, "device_seq")? {
+            Some(device_seq) => device_seq,
+            None => self.slots.get(&slot).copied().unwrap_or(0) + 1,
+        };
         let commit = Commit {
             commit_id,
             base_seq: req(opt_u64(body, "base_seq"), "base_seq")?,
             ops,
             receipts,
-            ..Default::default()
+            history_id,
+            device_seq,
+            require_head: opt_bool(body, "require_head")?.unwrap_or(false),
         };
         let expect = expectation(
             step,
@@ -910,6 +930,11 @@ impl Run {
                 e.message
             )),
             (rpc_response::Result::Commit(result), None) => {
+                let top = self.top_seq.entry(space.to_owned()).or_default();
+                if result.seq > *top {
+                    *top = result.seq;
+                    self.slots.insert(slot, device_seq);
+                }
                 if let Some(seq) = opt_u64(expect, "seq")?
                     && result.seq != seq
                 {

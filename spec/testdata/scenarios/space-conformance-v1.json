@@ -1,23 +1,23 @@
 {
   "format": "flarebox.space-conformance",
   "version": 1,
-  "spec": "Flarebox spec v0 with RFC 0001 and RFC 0002 section 11",
+  "spec": "Flarebox spec v0 with RFC 0001 and RFC 0002 sections 1 to 4 and 11",
   "unicode": "18.0.0",
   "now_ms": 1794268740000,
   "mtime_ns": "1794268740123456789",
   "conventions": [
     "Each scenario starts from empty spaces (one named main unless the scenario lists spaces) and runs its steps in order. A step runs in the space named by its space field, main by default, at at_ms, or now_ms when absent; the runner pins the server clock to that time.",
-    "A scenario or step with reference_only checks behaviour that the server and the reference share but spec v0 and RFC 0001 do not define; its value says what is undefined. A runner for another implementation may skip it, and no later step depends on it. Every other expectation follows from the spec, RFC 0001 and RFC 0002 section 11.",
+    "A scenario or step with reference_only checks behaviour that the server and the reference share but spec v0 and RFC 0001 do not define; its value says what is undefined. A runner for another implementation may skip it, and no later step depends on it. Every other expectation follows from the spec, RFC 0001 and RFC 0002 sections 1 to 4 and 11.",
     "devices maps a device symbol to its session: name (the device name used in conflict names), role (owner by default, editor or viewer) and max_format (the newest space format the client supports, 1 by default).",
     "Every ID in a scenario is a symbol. root is the space's root (its space_id). A symbol that starts with = is the literal text after it. An op symbol not seen before is bound to a fresh UUIDv7 that the runner mints. A symbol in an expectation that is not bound yet is bound to the value the server returned; one already bound must equal it. Two different symbols never bind the same value.",
     "contents maps a content symbol to a file content. chunks lists its chunks: {text} is a chunk of those UTF-8 bytes, {counter_le32: n} is n chunks whose bytes are the 4-byte little-endian encodings of 0 to n-1. A chunk's hash is the SHA-256 of its bytes and its size is its byte length unless size overrides it. The content's size is the sum of its chunk sizes unless size overrides it; mtime_ns is the file-level mtime_ns (an int64 written as a string, as in proto3 JSON), executable is false, encoding is 0, chunker is fastcdc2020-1m-4m-16m, and manifest_digest follows spec v0 section 5.1 over the listed (hash, size) pairs.",
     "Ops: create_dir {node, parent, name}; create_file {node, parent, name, content}; update_content {node, content}; move {node, parent, name}; delete {node}; restore {node, version?, parent?, name?} where absent fields are empty; empty {} is an Op with no op set. Two macros expand in place: {repeat: n, op} is n copies of op, and create_dir_chain {prefix, parent, count} creates directories prefix1 to prefixN, each named after its symbol and each inside the previous one, the first inside parent.",
-    "commit: commit_id is a symbol (a fresh ID when absent), base_seq is sent as given. Unless upload is false, the runner first uploads every chunk of the contents the ops reference (PrepareUpload in batches of at most 1,000 distinct chunks, then a PUT for each chunk the plan says to upload) and sends the receipts it got. With upload false it sends the receipts that the device's earlier upload steps got in the space named by receipts_from (the step's space by default), each with its size increased by receipt_size_delta when that is set.",
+    "commit: commit_id is a symbol (a fresh ID when absent), base_seq is sent as given. Unless upload is false, the runner first uploads every chunk of the contents the ops reference (PrepareUpload in batches of at most 1,000 distinct chunks, then a PUT for each chunk the plan says to upload) and sends the receipts it got. With upload false it sends the receipts that the device's earlier upload steps got in the space named by receipts_from (the step's space by default), each with its size increased by receipt_size_delta when that is set. history_id is a symbol (one not seen before is a fresh UUIDv7, so it names another history) and is the space's current history_id, as Welcome gives it, when absent. device_seq is sent as given; when absent it is one more than the device_seq of the device's last commit in that space that was applied, that is, that returned a seq above every seq a commit returned in that space before (1 when there is none). require_head is sent as given, false when absent.",
     "upload {contents}: PrepareUpload and PUT for those contents' chunks; the receipts are kept for the device in that space. upload {last_missing: true} does the same for the chunks that the device's last MISSING_CHUNKS error from a commit in that space listed, each a chunk of some content. prepare_upload {chunks} or {contents} sends one PrepareUpload; expect.actions lists the action of each distinct chunk in order.",
     "Commit expectations: error is the whole-call error code; missing lists content symbols whose chunk hashes must be exactly the error's missing_chunks; missing_some {contents, count, total} requires that missing_chunks holds exactly count hashes, each a chunk of those contents, and that the first decimal number in the error's message is total. Otherwise seq, results (one per op, in order; code, and where given node, name and reason, compared exactly) and changed (the node symbols with a NodeState in the result's changes, compared as a set).",
     "list_versions {node, cursor, limit}: cursor is absent (empty), a literal written with =, or {returned: k}, the next_cursor an earlier step bound to k; limit is 0 when absent. Expectations: error, count (the number of versions), versions (each with version symbol, seq and content) and next_cursor, which is either empty (the last page) or {bind: k}, which requires another page and keeps its cursor as k without looking inside it.",
     "nodes: each entry names a node and the fields it must have: parent, name, kind (DIR or FILE), status (LIVE or TRASHED), content_rev, meta_rev, trash_group (a symbol, or null for none), content (a content symbol, compared by size, manifest digest, executable bit and mtime_ns), or absent: true when the server must not know the node. live lists every live node other than the root, as a set. head is the space's head_seq.",
-    "Expected values are written by hand from the spec, RFC 0001 and RFC 0002 section 11, not produced by either implementation.",
+    "Expected values are written by hand from the spec, RFC 0001 and RFC 0002 sections 1 to 4 and 11, not produced by either implementation.",
     "Every field a scenario uses is listed here. A runner fails a scenario that has an unknown field, or a field of the wrong type, rather than skipping the check."
   ],
   "scenarios": [
@@ -2783,7 +2783,8 @@
     {
       "name": "whole-commit-errors-change-nothing",
       "covers": [
-        "spec 6.3"
+        "spec 6.3",
+        "RFC 0002 section 3"
       ],
       "devices": {
         "a": {
@@ -2814,6 +2815,13 @@
             }
           ],
           "size": 4
+        },
+        "c2": {
+          "chunks": [
+            {
+              "text": "never uploaded"
+            }
+          ]
         }
       },
       "steps": [
@@ -2912,7 +2920,112 @@
             ]
           },
           "expect": {
-            "error": "INVALID_ARGUMENT"
+            "error": "AHEAD_OF_SERVER"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 5,
+            "commit_id": "=not-a-uuid",
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "x",
+                  "parent": "root",
+                  "name": "X"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "AHEAD_OF_SERVER"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 5,
+            "ops": []
+          },
+          "expect": {
+            "error": "AHEAD_OF_SERVER"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 5,
+            "ops": [
+              {
+                "repeat": 1001,
+                "op": {
+                  "delete": {
+                    "node": "root"
+                  }
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "AHEAD_OF_SERVER"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 5,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "=not-a-uuid",
+                  "parent": "root",
+                  "name": "x"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "AHEAD_OF_SERVER"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 5,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "bad",
+                  "content": "bad"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "AHEAD_OF_SERVER"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 5,
+            "upload": false,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "g",
+                  "parent": "root",
+                  "name": "g",
+                  "content": "c2"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "AHEAD_OF_SERVER"
           }
         },
         {
@@ -2949,6 +3062,42 @@
           },
           "expect": {
             "error": "READ_ONLY"
+          }
+        },
+        {
+          "device": "v",
+          "commit": {
+            "base_seq": 5,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "x",
+                  "parent": "root",
+                  "name": "X"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "AHEAD_OF_SERVER"
+          }
+        },
+        {
+          "device": "old",
+          "commit": {
+            "base_seq": 5,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "x",
+                  "parent": "root",
+                  "name": "X"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "AHEAD_OF_SERVER"
           }
         },
         {
@@ -3064,6 +3213,1201 @@
           "live": [
             "f",
             "d"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "rfc0002-the-history-fence-comes-first",
+      "covers": [
+        "RFC 0002 section 1",
+        "RFC 0002 section 3"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "v": {
+          "name": "Viewer",
+          "role": "viewer"
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "commit_id": "k",
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": "D"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "d"
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "commit_id": "k",
+            "history_id": "other",
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": "D"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "HISTORY_MISMATCH"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "history_id": "=",
+            "base_seq": 1,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "x",
+                  "parent": "root",
+                  "name": "X"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "HISTORY_MISMATCH"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "history_id": "other",
+            "device_seq": 0,
+            "base_seq": 1,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "x",
+                  "parent": "root",
+                  "name": "X"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "HISTORY_MISMATCH"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "history_id": "other",
+            "device_seq": 1,
+            "base_seq": 1,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "x",
+                  "parent": "root",
+                  "name": "X"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "HISTORY_MISMATCH"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "history_id": "other",
+            "device_seq": 3,
+            "base_seq": 1,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "x",
+                  "parent": "root",
+                  "name": "X"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "HISTORY_MISMATCH"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "history_id": "other",
+            "base_seq": 5,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "x",
+                  "parent": "root",
+                  "name": "X"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "HISTORY_MISMATCH"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "history_id": "other",
+            "require_head": true,
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "x",
+                  "parent": "root",
+                  "name": "X"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "HISTORY_MISMATCH"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "history_id": "other",
+            "base_seq": 1,
+            "ops": []
+          },
+          "expect": {
+            "error": "HISTORY_MISMATCH"
+          }
+        },
+        {
+          "device": "v",
+          "commit": {
+            "history_id": "other",
+            "base_seq": 1,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "x",
+                  "parent": "root",
+                  "name": "X"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "HISTORY_MISMATCH"
+          }
+        },
+        {
+          "head": 1,
+          "live": [
+            "d"
+          ]
+        },
+        {
+          "device": "a",
+          "commit": {
+            "device_seq": 2,
+            "base_seq": 1,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "x",
+                  "parent": "root",
+                  "name": "X"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "x"
+            ]
+          }
+        },
+        {
+          "head": 2,
+          "live": [
+            "d",
+            "x"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "rfc0002-a-stored-result-comes-before-the-counter-base-precondition-and-validation",
+      "covers": [
+        "RFC 0002 section 3"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "v": {
+          "name": "Viewer",
+          "role": "viewer"
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "commit_id": "k",
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": "D"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "d"
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "e",
+                  "parent": "root",
+                  "name": "E"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "e"
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "commit_id": "k",
+            "device_seq": 1,
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": "D"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "d"
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "commit_id": "k",
+            "device_seq": 0,
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": "D"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "d"
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "commit_id": "k",
+            "device_seq": 9,
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": "D"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "d"
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "commit_id": "k",
+            "base_seq": 9,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": "D"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "d"
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "commit_id": "k",
+            "require_head": true,
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": "D"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "d"
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "commit_id": "k",
+            "base_seq": 0,
+            "ops": []
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "d"
+            ]
+          }
+        },
+        {
+          "device": "v",
+          "commit": {
+            "commit_id": "k",
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": "D"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "d"
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "device_seq": 3,
+            "base_seq": 2,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "g",
+                  "parent": "root",
+                  "name": "G"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "g"
+            ]
+          }
+        },
+        {
+          "head": 3,
+          "live": [
+            "d",
+            "e",
+            "g"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "rfc0002-the-device-counter-takes-only-the-next-slot",
+      "covers": [
+        "RFC 0002 section 2",
+        "RFC 0002 section 3"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        },
+        "v": {
+          "name": "Viewer",
+          "role": "viewer"
+        }
+      },
+      "contents": {
+        "c2": {
+          "chunks": [
+            {
+              "text": "never uploaded"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "device_seq": 0,
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": "D"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "device_seq": 2,
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": "D"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "head": 0,
+          "live": []
+        },
+        {
+          "device": "a",
+          "commit": {
+            "device_seq": 1,
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": "D"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "d"
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "device_seq": 1,
+            "base_seq": 1,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "e",
+                  "parent": "root",
+                  "name": "E"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "STALE_DEVICE_STATE"
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "device_seq": 1,
+            "base_seq": 1,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "e",
+                  "parent": "root",
+                  "name": "E"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "e"
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "device_seq": 2,
+            "upload": false,
+            "base_seq": 2,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "f",
+                  "content": "c2"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "MISSING_CHUNKS",
+            "missing": [
+              "c2"
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "device_seq": 2,
+            "base_seq": 2,
+            "ops": [
+              {
+                "delete": {
+                  "node": "root"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "REJECTED",
+                "reason": "ROOT"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "device_seq": 2,
+            "base_seq": 3,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "g",
+                  "parent": "root",
+                  "name": "G"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "STALE_DEVICE_STATE"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "device_seq": 3,
+            "base_seq": 3,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "g",
+                  "parent": "root",
+                  "name": "G"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 4,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "g"
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "device_seq": 0,
+            "base_seq": 9,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "x",
+                  "parent": "root",
+                  "name": "X"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "device_seq": 3,
+            "base_seq": 9,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "x",
+                  "parent": "root",
+                  "name": "X"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "STALE_DEVICE_STATE"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "device_seq": 5,
+            "base_seq": 9,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "x",
+                  "parent": "root",
+                  "name": "X"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "device_seq": 3,
+            "require_head": true,
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "x",
+                  "parent": "root",
+                  "name": "X"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "STALE_DEVICE_STATE"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "device_seq": 5,
+            "require_head": true,
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "x",
+                  "parent": "root",
+                  "name": "X"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "device_seq": 0,
+            "base_seq": 4,
+            "ops": [
+              {
+                "repeat": 1001,
+                "op": {
+                  "delete": {
+                    "node": "root"
+                  }
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "device_seq": 3,
+            "base_seq": 4,
+            "ops": [
+              {
+                "repeat": 1001,
+                "op": {
+                  "delete": {
+                    "node": "root"
+                  }
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "STALE_DEVICE_STATE"
+          }
+        },
+        {
+          "device": "v",
+          "commit": {
+            "device_seq": 0,
+            "base_seq": 4,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "x",
+                  "parent": "root",
+                  "name": "X"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "device": "v",
+          "commit": {
+            "device_seq": 2,
+            "base_seq": 4,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "x",
+                  "parent": "root",
+                  "name": "X"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "INVALID_ARGUMENT"
+          }
+        },
+        {
+          "head": 4,
+          "live": [
+            "d",
+            "e",
+            "g"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "rfc0002-require-head-refuses-a-moved-head-whole",
+      "covers": [
+        "RFC 0002 section 3",
+        "RFC 0002 section 4"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        },
+        "v": {
+          "name": "Viewer",
+          "role": "viewer"
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "require_head": true,
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": "D"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "d"
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "e",
+                  "parent": "root",
+                  "name": "E"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "e"
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "require_head": true,
+            "base_seq": 1,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "x",
+                  "parent": "root",
+                  "name": "X"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "HEAD_MOVED"
+          }
+        },
+        {
+          "head": 2,
+          "live": [
+            "d",
+            "e"
+          ]
+        },
+        {
+          "device": "a",
+          "commit": {
+            "require_head": true,
+            "base_seq": 1,
+            "ops": []
+          },
+          "expect": {
+            "error": "HEAD_MOVED"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "require_head": true,
+            "base_seq": 1,
+            "ops": [
+              {
+                "repeat": 1001,
+                "op": {
+                  "delete": {
+                    "node": "root"
+                  }
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "HEAD_MOVED"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "require_head": true,
+            "base_seq": 1,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "=not-a-uuid",
+                  "parent": "root",
+                  "name": "x"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "HEAD_MOVED"
+          }
+        },
+        {
+          "device": "v",
+          "commit": {
+            "require_head": true,
+            "base_seq": 1,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "x",
+                  "parent": "root",
+                  "name": "X"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "HEAD_MOVED"
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "require_head": true,
+            "base_seq": 9,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "x",
+                  "parent": "root",
+                  "name": "X"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "error": "AHEAD_OF_SERVER"
+          }
+        },
+        {
+          "head": 2,
+          "live": [
+            "d",
+            "e"
+          ]
+        },
+        {
+          "device": "a",
+          "commit": {
+            "device_seq": 2,
+            "require_head": true,
+            "base_seq": 2,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "x",
+                  "parent": "root",
+                  "name": "X"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "x"
+            ]
+          }
+        },
+        {
+          "head": 3,
+          "live": [
+            "d",
+            "e",
+            "x"
           ]
         }
       ]
@@ -4204,7 +5548,8 @@
       "name": "a-commit-whose-log-row-is-too-large-is-refused-whole",
       "covers": [
         "regression 7",
-        "RFC 0001 section 7"
+        "RFC 0001 section 7",
+        "spec 7.2"
       ],
       "devices": {
         "a": {
@@ -4358,10 +5703,6 @@
           }
         },
         {
-          "head": 0,
-          "live": []
-        },
-        {
           "device": "a",
           "commit": {
             "base_seq": 0,
@@ -4381,12 +5722,27 @@
                   "name": "f1",
                   "content": "big"
                 }
-              },
+              }
+            ]
+          },
+          "expect": {
+            "error": "LIMIT_EXCEEDED"
+          }
+        },
+        {
+          "head": 0,
+          "live": []
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
               {
                 "create_file": {
-                  "node": "f2",
+                  "node": "f0",
                   "parent": "root",
-                  "name": "f2",
+                  "name": "f0",
                   "content": "big"
                 }
               }
@@ -4395,12 +5751,6 @@
           "expect": {
             "seq": 1,
             "results": [
-              {
-                "code": "APPLIED"
-              },
-              {
-                "code": "APPLIED"
-              },
               {
                 "code": "APPLIED"
               }

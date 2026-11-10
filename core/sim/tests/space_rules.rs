@@ -97,6 +97,8 @@ impl Space {
             base_seq,
             ops,
             receipts,
+            history_id: self.space.history_id().into(),
+            device_seq: self.space.device_seq(&c.session.device_id) + 1,
             ..Default::default()
         };
         self.space
@@ -300,7 +302,7 @@ fn rejects_a_base_ahead_of_the_server_and_commits_from_viewers_or_old_clients() 
     let x = s.id();
     assert_eq!(
         error_code(s.commit_raw(&a, vec![mkdir(&x, &root, "X")], 5, vec![], None)),
-        error::Code::InvalidArgument
+        error::Code::AheadOfServer
     );
     let viewer = s.client_with("Viewer", Role::Viewer, 1);
     assert_eq!(
@@ -314,6 +316,25 @@ fn rejects_a_base_ahead_of_the_server_and_commits_from_viewers_or_old_clients() 
     );
     assert!(s.space.welcome(&old.session).read_only);
     assert!(!s.space.welcome(&a.session).read_only);
+}
+
+#[test]
+fn welcome_reports_the_devices_highest_accepted_device_seq() {
+    let mut s = Space::new();
+    let root = s.root();
+    let (mut a, b) = (s.client("A"), s.client("B"));
+    assert_eq!(s.space.welcome(&a.session).device_seq, 0);
+    for name in ["X", "Y"] {
+        let id = s.id();
+        s.commit(&mut a, vec![mkdir(&id, &root, name)], vec![]);
+    }
+    let refused = s.id();
+    assert_eq!(
+        error_code(s.commit_raw(&a, vec![mkdir(&refused, &root, "Z")], 9, vec![], None)),
+        error::Code::AheadOfServer
+    );
+    assert_eq!(s.space.welcome(&a.session).device_seq, 2);
+    assert_eq!(s.space.welcome(&b.session).device_seq, 0);
 }
 
 #[test]
@@ -905,7 +926,8 @@ fn answers_rpcs_and_returns_the_record_only_for_a_new_commit() {
         commit_id,
         base_seq: 0,
         ops: vec![mkdir(&dir, &root, "D")],
-        receipts: vec![],
+        history_id: s.space.history_id().into(),
+        device_seq: 1,
         ..Default::default()
     };
     let request = RpcRequest {
@@ -1330,8 +1352,10 @@ fn a_commit_whose_log_row_is_too_large_is_refused_whole() {
         assert_eq!(s.space.head_seq(), 0);
         assert!(s.space.node(&files[0]).is_none());
     }
-    let smaller = s.commit_raw(&a, ops(3), 0, receipts, None).unwrap();
-    assert_eq!(smaller.seq, 1);
+    let two = s.commit_raw(&a, ops(2), 0, receipts.clone(), None);
+    assert_eq!(error_code(two), error::Code::LimitExceeded);
+    let one = s.commit_raw(&a, ops(1), 0, receipts, None).unwrap();
+    assert_eq!(one.seq, 1);
 }
 
 #[test]
@@ -1359,6 +1383,8 @@ fn a_receipt_holds_only_for_its_space_and_size_and_a_stored_object_outlasts_it()
             base_seq: 0,
             ops: vec![create_file(&s.id(), &root, "f", content.clone())],
             receipts,
+            history_id: s.space.history_id().into(),
+            device_seq: s.space.device_seq(&a.session.device_id) + 1,
             ..Default::default()
         };
         s.space
