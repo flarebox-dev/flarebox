@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "flarebox-cloudflare"
+description = "Cloudflare OAuth login and the Workers and R2 API calls that deploy a Flarebox server. Not affiliated with Cloudflare, Inc."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64 = "0.23.1"
+getrandom = "0.4.3"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2", "json", "form", "multipart"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+thiserror = "2.0.21"
+tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt", "time"] }
+tracing = "0.1.41"
+url = "2.5.8"
+
+[dev-dependencies]
+tokio = { version = "1.48", features = ["full"] }
