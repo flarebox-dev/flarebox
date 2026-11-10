@@ -374,8 +374,8 @@ impl Effects {
 /// local position is reverted, or one whose S update waits and that R no longer has. A reverted or
 /// waiting node that R no longer has is removed only when it holds no unuploaded edit; otherwise
 /// the commit layer makes it a new node, so the edit is uploaded. A reverted node that L does not
-/// hold is created only as a folder that a node L holds needs on its R path: otherwise the user
-/// deleted it, and that delete is committed instead. An excluded node is never one.
+/// hold is created only as a folder that a node L holds needs on its way to the root: otherwise the
+/// user deleted it, and that delete is committed instead. An excluded node is never one.
 fn candidate(trees: &Trees, id: &str) -> bool {
     let changed = remote_only(trees, id)
         || trees.local().get(id).is_some_and(|node| node.parked)
@@ -388,15 +388,19 @@ fn candidate(trees: &Trees, id: &str) -> bool {
     changed && !trees.excluded(id)
 }
 
-/// Whether L holds a node that R places below `id`.
+/// Whether L holds a node whose way to the root passes `id`. Each node on that way goes to its R
+/// position, or to its local one when R no longer has it, as a parked edit that is moved back.
 fn holds_below(trees: &Trees, id: &str) -> bool {
-    let remote = trees.remote();
-    trees.local().iter().any(|(node, _)| {
-        let mut up = remote.live(node).map(|shape| shape.parent.as_str());
-        for _ in 0..=remote.len() {
+    let (local, remote) = (trees.local(), trees.remote());
+    let parent = |node: &str| {
+        (remote.live(node).or_else(|| local.live(node))).map(|shape| shape.parent.as_str())
+    };
+    local.iter().any(|(node, _)| {
+        let mut up = parent(node);
+        for _ in 0..=remote.len() + local.len() {
             match up {
                 Some(parent) if parent == id => return true,
-                Some(parent) => up = remote.live(parent).map(|shape| shape.parent.as_str()),
+                Some(next) => up = parent(next),
                 None => return false,
             }
         }
