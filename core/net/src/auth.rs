@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fmt;
+use std::io;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
 use flarebox_proto::v1::{AccessToken, DeviceCredentials, TokenRequest};
 use tokio::sync::Mutex;
 
@@ -11,6 +14,12 @@ use crate::error::ApiError;
 
 /// How long before its expiry an access token is replaced. Tokens live 15 minutes (spec v0 section 15.2).
 pub const DEFAULT_REFRESH_MARGIN: Duration = Duration::from_secs(120);
+
+/// How old a refresh credential gets before the process that owns it replaces it (RFC 0011 section 2).
+pub const ROTATION_PERIOD: Duration = Duration::from_secs(24 * 3600);
+
+/// How long after the server time S a proposed credential may still be stored: its deadline is S plus this.
+const ROTATION_DEADLINE_MS: i64 = 60_000;
 
 /// A device's long-lived credentials from `POST /v1/claim` or `POST /v1/pair/complete`. The caller stores them.
 #[derive(Clone, PartialEq, Eq)]
@@ -39,11 +48,68 @@ impl fmt::Debug for Credentials {
     }
 }
 
-/// Hands out access tokens for one device, refreshing them through `POST /v1/token` before they expire.
+/// A refresh credential the device proposed, kept with its deadline until the server's answer settles whether it was
+/// stored (RFC 0011 section 2).
+#[derive(Clone, PartialEq, Eq)]
+pub struct Staged {
+    pub refresh_credential: String,
+    pub rotate_before_ms: i64,
+}
+
+impl fmt::Debug for Staged {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Staged")
+            .field("rotate_before_ms", &self.rotate_before_ms)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The stored credential as one state: the current credential and, while a rotation's outcome is unknown, the staged
+/// one. `changed_at` is when the current credential was stored, which gives its age.
+#[derive(Clone, Debug)]
+pub struct Stored {
+    pub current: Credentials,
+    pub staged: Option<Staged>,
+    pub changed_at: SystemTime,
+}
+
+/// Where the process that owns the credential keeps its two slots. Each operation returns once its write is durable.
+pub trait CredentialStore: Send + Sync {
+    /// Stores `staged` in the staged slot.
+    fn stage(&self, staged: &Staged) -> io::Result<()>;
+    /// Makes `staged` the current credential and clears the staged slot.
+    fn promote(&self, staged: &Staged) -> io::Result<()>;
+    /// Clears the staged slot.
+    fn clear_staged(&self) -> io::Result<()>;
+}
+
+/// Reads the stored credential again, for a process that does not own it.
+pub type Reload = Arc<dyn Fn() -> io::Result<Stored> + Send + Sync>;
+
+enum Rotation {
+    /// Presents the credential it was given and nothing else.
+    Off,
+    /// Owns the stored credential and rotates it (RFC 0011 section 2, the process that rotates).
+    Owner {
+        store: Arc<dyn CredentialStore>,
+        period: Duration,
+    },
+    /// Reads the stored credential again when it is refused (RFC 0011 section 2, processes that only read).
+    Reader(Reload),
+}
+
+struct State {
+    token: Option<AccessToken>,
+    stored: Stored,
+}
+
+/// Hands out access tokens for one device, refreshing them through `POST /v1/token` before they expire. One refresh
+/// runs at a time, and it alone reads or changes the credential slots.
 pub struct Auth {
     api: Api,
-    credentials: Credentials,
-    token: Mutex<Option<AccessToken>>,
+    state: Mutex<State>,
+    credentials: std::sync::Mutex<Credentials>,
+    rotation: Rotation,
     margin: Duration,
 }
 
@@ -51,18 +117,55 @@ impl Auth {
     pub fn new(api: Api, credentials: Credentials) -> Self {
         Auth {
             api,
-            credentials,
-            token: Mutex::new(None),
+            credentials: std::sync::Mutex::new(credentials.clone()),
+            state: Mutex::new(State {
+                token: None,
+                stored: Stored {
+                    current: credentials,
+                    staged: None,
+                    changed_at: SystemTime::now(),
+                },
+            }),
+            rotation: Rotation::Off,
             margin: DEFAULT_REFRESH_MARGIN,
+        }
+    }
+
+    /// An `Auth` for the process that owns the stored credential: it rotates the credential once it is older than
+    /// `period` and keeps both slots in `store`.
+    pub fn rotating(
+        api: Api,
+        stored: Stored,
+        store: Arc<dyn CredentialStore>,
+        period: Duration,
+    ) -> Self {
+        let auth = Auth::new(api, stored.current.clone());
+        auth.state
+            .try_lock()
+            .expect("a new Auth is not shared")
+            .stored = stored;
+        Auth {
+            rotation: Rotation::Owner { store, period },
+            ..auth
+        }
+    }
+
+    /// An `Auth` for a process that only reads the stored credential: when the server refuses it, it reads the
+    /// credential again with `reload`, once, and presents what it holds.
+    pub fn reloading(api: Api, credentials: Credentials, reload: Reload) -> Self {
+        Auth {
+            rotation: Rotation::Reader(reload),
+            ..Auth::new(api, credentials)
         }
     }
 
     /// Starts with a token the caller already holds, such as the one in `DeviceCredentials`.
     pub fn with_token(self, token: AccessToken) -> Self {
-        Auth {
-            token: Mutex::new(Some(token)),
-            ..self
-        }
+        self.state
+            .try_lock()
+            .expect("a new Auth is not shared")
+            .token = Some(token);
+        self
     }
 
     /// Replaces tokens this long before they expire. A session also sends `Reauth` at that point.
@@ -70,8 +173,9 @@ impl Auth {
         Auth { margin, ..self }
     }
 
-    pub fn credentials(&self) -> &Credentials {
-        &self.credentials
+    /// The credentials the last refresh presented successfully, or the ones it started with.
+    pub fn credentials(&self) -> Credentials {
+        self.credentials.lock().unwrap().clone()
     }
 
     pub fn api(&self) -> &Api {
@@ -80,20 +184,155 @@ impl Auth {
 
     /// A token valid for at least the refresh margin, fetching a new one when needed.
     pub async fn access_token(&self) -> Result<AccessToken, ApiError> {
-        let mut cached = self.token.lock().await;
-        if let Some(token) = cached.as_ref()
+        let mut state = self.state.lock().await;
+        if let Some(token) = state.token.as_ref()
             && !self.due(token)
         {
             return Ok(token.clone());
         }
-        let request = TokenRequest {
-            device_id: self.credentials.device_id.clone(),
-            refresh_credential: self.credentials.refresh_credential.clone(),
-            ..Default::default()
+        let token = match &self.rotation {
+            Rotation::Off => {
+                let current = state.stored.current.refresh_credential.clone();
+                self.request(&current, None, false).await?
+            }
+            Rotation::Owner { store, period } => {
+                self.refresh_rotating(&mut state, store.as_ref(), *period)
+                    .await?
+            }
+            Rotation::Reader(reload) => self.refresh_reading(&mut state, reload).await?,
         };
-        let token = self.api.token(&request).await?;
-        *cached = Some(token.clone());
+        state.token = Some(token.clone());
         Ok(token)
+    }
+
+    /// RFC 0011 section 2, steps 1 to 6.
+    async fn refresh_rotating(
+        &self,
+        state: &mut State,
+        store: &dyn CredentialStore,
+        period: Duration,
+    ) -> Result<AccessToken, ApiError> {
+        if let Some(staged) = state.stored.staged.clone() {
+            return self.settle(state, store, &staged).await;
+        }
+        let current = state.stored.current.refresh_credential.clone();
+        let token = self.request(&current, None, true).await?;
+        let age = state.stored.changed_at.elapsed().unwrap_or_default();
+        if token.server_time_ms == 0 || age < period {
+            return Ok(token);
+        }
+        let staged = Staged {
+            refresh_credential: new_refresh_credential(),
+            rotate_before_ms: token.server_time_ms + ROTATION_DEADLINE_MS,
+        };
+        if let Err(error) = store.stage(&staged) {
+            tracing::warn!(%error, "could not store a new refresh credential; rotating at a later refresh");
+            return Ok(token);
+        }
+        state.stored.staged = Some(staged.clone());
+        match self.settle(state, store, &staged).await {
+            Err(error) if !error.is_unauthenticated() => {
+                tracing::info!(%error, "the rotation's outcome is unknown; keeping both credentials");
+                Ok(token)
+            }
+            settled => settled,
+        }
+    }
+
+    /// Proposes `staged` with the current credential and acts on the answer.
+    async fn settle(
+        &self,
+        state: &mut State,
+        store: &dyn CredentialStore,
+        staged: &Staged,
+    ) -> Result<AccessToken, ApiError> {
+        let current = state.stored.current.refresh_credential.clone();
+        match self.request(&current, Some(staged), true).await {
+            Ok(token) if token.rotated => {
+                self.promote(state, store, staged);
+                Ok(token)
+            }
+            Ok(token) => {
+                if token.server_time_ms > staged.rotate_before_ms {
+                    if let Err(error) = store.clear_staged() {
+                        tracing::warn!(%error, "could not clear the staged refresh credential");
+                    }
+                    state.stored.staged = None;
+                }
+                Ok(token)
+            }
+            Err(error) if error.is_unauthenticated() => {
+                let token = self.request(&staged.refresh_credential, None, true).await?;
+                self.promote(state, store, staged);
+                Ok(token)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The server stores `staged` now, whether or not the store can record it. A store that could not keeps the staged
+    /// slot, and the next start presents the old credential, is refused, and promotes the staged one again.
+    fn promote(&self, state: &mut State, store: &dyn CredentialStore, staged: &Staged) {
+        if let Err(error) = store.promote(staged) {
+            tracing::warn!(%error, "could not store the rotated refresh credential as current");
+        }
+        state.stored.current.refresh_credential = staged.refresh_credential.clone();
+        state.stored.staged = None;
+        state.stored.changed_at = SystemTime::now();
+        *self.credentials.lock().unwrap() = state.stored.current.clone();
+        tracing::info!("rotated the refresh credential");
+    }
+
+    /// RFC 0011 section 2, processes that only read.
+    async fn refresh_reading(
+        &self,
+        state: &mut State,
+        reload: &Reload,
+    ) -> Result<AccessToken, ApiError> {
+        let presented = state.stored.current.refresh_credential.clone();
+        let refused = match self.request(&presented, None, false).await {
+            Err(error) if error.is_unauthenticated() => error,
+            answer => return answer,
+        };
+        let stored = reload().map_err(ApiError::Credential)?;
+        let candidates = [
+            Some(stored.current.refresh_credential.clone()),
+            stored.staged.map(|staged| staged.refresh_credential),
+        ];
+        let mut last = refused;
+        for candidate in candidates.into_iter().flatten() {
+            if candidate == presented {
+                continue;
+            }
+            match self.request(&candidate, None, false).await {
+                Ok(token) => {
+                    state.stored.current.refresh_credential = candidate;
+                    *self.credentials.lock().unwrap() = state.stored.current.clone();
+                    return Ok(token);
+                }
+                Err(error) if error.is_unauthenticated() => last = error,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last)
+    }
+
+    async fn request(
+        &self,
+        refresh_credential: &str,
+        proposal: Option<&Staged>,
+        rotation: bool,
+    ) -> Result<AccessToken, ApiError> {
+        let request = TokenRequest {
+            device_id: self.credentials.lock().unwrap().device_id.clone(),
+            refresh_credential: refresh_credential.to_owned(),
+            rotation,
+            next_refresh_credential: proposal
+                .map(|staged| staged.refresh_credential.clone())
+                .unwrap_or_default(),
+            rotate_before_ms: proposal.map_or(0, |staged| staged.rotate_before_ms),
+        };
+        self.api.token(&request).await
     }
 
     /// When the token should be replaced: the refresh margin before it expires.
@@ -110,24 +349,38 @@ impl Auth {
 
     /// Drops the cached token if it is the one the server refused, so the next call fetches a new one.
     pub(crate) async fn reject(&self, token: &str) {
-        let mut cached = self.token.lock().await;
-        if cached
+        let mut state = self.state.lock().await;
+        if state
+            .token
             .as_ref()
             .is_some_and(|current| current.token == token)
         {
-            *cached = None;
+            state.token = None;
         }
     }
+}
+
+/// A refresh credential as the server generates one at pairing: 32 random bytes, base64url without padding.
+fn new_refresh_credential() -> String {
+    let mut bytes = [0u8; 32];
+    rustls::crypto::aws_lc_rs::default_provider()
+        .secure_random
+        .fill(&mut bytes)
+        .expect("the system random source works");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
 impl fmt::Debug for Auth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Auth")
-            .field("credentials", &self.credentials)
+            .field("credentials", &self.credentials())
             .field("margin", &self.margin)
             .finish_non_exhaustive()
     }
 }
+
+#[cfg(test)]
+mod rotation_tests;
 
 #[cfg(test)]
 mod tests {

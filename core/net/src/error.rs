@@ -92,6 +92,9 @@ pub enum ApiError {
     Decode(&'static str),
     #[error("the server URL cannot be used: {0}")]
     Url(String),
+    /// The stored credential could not be read again after the server refused the one this process held.
+    #[error("could not read the stored credential")]
+    Credential(#[source] std::io::Error),
 }
 
 impl ApiError {

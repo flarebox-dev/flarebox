@@ -5,8 +5,10 @@ use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
 
-use flarebox_net::{Api, ApiError, Credentials};
+use flarebox_net::{Api, ApiError, CredentialStore, Credentials, Staged, Stored};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -96,39 +98,53 @@ impl Credential {
     /// Reads the credential, or returns `None` when there is none. A file that another user owns or may read is
     /// refused rather than used.
     pub fn load(path: &Path) -> Result<Option<Self>, CredentialError> {
-        let io = |source| CredentialError::Io {
+        read_private(path)?
+            .map(|(text, _)| parse(path, &text))
+            .transpose()
+    }
+
+    /// Reads the credential and its staged slot as one state that the process owning them stored at some moment,
+    /// even while it changes them (RFC 0011 section 2): it notes the identity of `credential.next`, reads it, reads
+    /// `credential.json`, and starts over if either file was replaced or removed in between. Every change renames a
+    /// new file into place or removes one, so unchanged identities mean the two files held what was read. Returns
+    /// `None` when there is no credential.
+    pub fn load_stored(path: &Path) -> Result<Option<StoredCredential>, CredentialError> {
+        let next_path = next_path(path);
+        for _ in 0..READ_ATTEMPTS {
+            let next = read_private(&next_path)?;
+            #[cfg(test)]
+            tests::between_reads();
+            let Some((text, meta)) = read_private(path)? else {
+                return Ok(None);
+            };
+            if identity_at(&next_path)? != next.as_ref().map(|(_, meta)| identity(meta))
+                || identity_at(path)? != Some(identity(&meta))
+            {
+                continue;
+            }
+            let staged = next
+                .map(|(text, _)| {
+                    serde_json::from_str::<NextFile>(&text)
+                        .map(|next| Staged {
+                            refresh_credential: next.refresh_credential,
+                            rotate_before_ms: next.rotate_before_ms,
+                        })
+                        .map_err(|err| CredentialError::Invalid {
+                            path: next_path.clone(),
+                            reason: err.to_string(),
+                        })
+                })
+                .transpose()?;
+            return Ok(Some(StoredCredential {
+                credential: parse(path, &text)?,
+                staged,
+                changed_at: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            }));
+        }
+        Err(CredentialError::Io {
             path: path.to_path_buf(),
-            source,
-        };
-        let mut file = match OpenOptions::new()
-            .read(true)
-            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-            .open(path)
-        {
-            Ok(file) => file,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(io(err)),
-        };
-        let meta = file.metadata().map_err(io)?;
-        if meta.uid() != rustix::process::getuid().as_raw() {
-            return Err(CredentialError::NotOwned {
-                path: path.to_path_buf(),
-            });
-        }
-        if meta.mode() & 0o077 != 0 {
-            return Err(CredentialError::Exposed {
-                path: path.to_path_buf(),
-                mode: meta.mode() & 0o777,
-            });
-        }
-        let mut text = String::new();
-        file.read_to_string(&mut text).map_err(io)?;
-        serde_json::from_str(&text)
-            .map(Some)
-            .map_err(|err| CredentialError::Invalid {
-                path: path.to_path_buf(),
-                reason: err.to_string(),
-            })
+            source: io::Error::other("the credential files kept changing while they were read"),
+        })
     }
 
     /// Writes the credential to a new file readable only by its owner, creating the directory with mode 0700. Fails
@@ -183,7 +199,8 @@ impl NewCredentialFile {
                 path: path.to_path_buf(),
                 source,
             })?;
-        let temp = dir.join(format!(".credential.{}.tmp", std::process::id()));
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let temp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
         let _ = fs::remove_file(&temp);
         let file = create_excluded(&temp, path).inspect_err(|_| {
             let _ = fs::remove_file(&temp);
@@ -197,16 +214,29 @@ impl NewCredentialFile {
 
     /// Writes `credential` and moves it into place. Fails with [`CredentialError::Exists`] instead of replacing a
     /// credential. The file appears whole or not at all.
-    pub fn write(mut self, credential: &Credential) -> Result<(), CredentialError> {
+    pub fn write(self, credential: &Credential) -> Result<(), CredentialError> {
+        let bytes = serde_json::to_vec_pretty(credential).map_err(io::Error::from);
+        self.finish(bytes, false)
+    }
+
+    /// Writes `bytes` and renames the file over the one at its path, which may exist.
+    fn replace(self, bytes: Vec<u8>) -> Result<(), CredentialError> {
+        self.finish(Ok(bytes), true)
+    }
+
+    fn finish(mut self, bytes: io::Result<Vec<u8>>, replace: bool) -> Result<(), CredentialError> {
         let io = |source| CredentialError::Io {
             path: self.path.clone(),
             source,
         };
         let written = (|| {
-            self.file
-                .write_all(&serde_json::to_vec_pretty(credential)?)?;
+            self.file.write_all(&bytes?)?;
             self.file.sync_all()?;
-            fs::hard_link(&self.temp, &self.path)
+            if replace {
+                fs::rename(&self.temp, &self.path)
+            } else {
+                fs::hard_link(&self.temp, &self.path)
+            }
         })();
         let _ = fs::remove_file(&self.temp);
         match written {
@@ -225,6 +255,155 @@ impl NewCredentialFile {
 impl Drop for NewCredentialFile {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.temp);
+    }
+}
+
+/// How often [`Credential::load_stored`] reads the two files before it gives up on a writer that keeps changing them.
+const READ_ATTEMPTS: usize = 10;
+
+/// The staged slot: the file beside the credential file that holds a proposed credential while a rotation's outcome
+/// is unknown. A build from before rotation ignores it and keeps reading `credential.json`, whose format is unchanged.
+pub fn next_path(path: &Path) -> PathBuf {
+    path.with_file_name("credential.next")
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NextFile {
+    refresh_credential: String,
+    rotate_before_ms: i64,
+}
+
+/// The credential with its staged slot, read as one state. `changed_at` is when `credential.json` was last written.
+#[derive(Clone, Debug)]
+pub struct StoredCredential {
+    pub credential: Credential,
+    pub staged: Option<Staged>,
+    pub changed_at: SystemTime,
+}
+
+impl StoredCredential {
+    pub fn net(&self) -> Stored {
+        Stored {
+            current: self.credential.net(),
+            staged: self.staged.clone(),
+            changed_at: self.changed_at,
+        }
+    }
+}
+
+/// Reads a file of the profile's state that only its owner may read, with the metadata of the file it opened, or
+/// `None` when there is none. A file that another user owns or may read is refused rather than used.
+fn read_private(path: &Path) -> Result<Option<(String, fs::Metadata)>, CredentialError> {
+    let io = |source| CredentialError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(io(err)),
+    };
+    let meta = file.metadata().map_err(io)?;
+    if meta.uid() != rustix::process::getuid().as_raw() {
+        return Err(CredentialError::NotOwned {
+            path: path.to_path_buf(),
+        });
+    }
+    if meta.mode() & 0o077 != 0 {
+        return Err(CredentialError::Exposed {
+            path: path.to_path_buf(),
+            mode: meta.mode() & 0o777,
+        });
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text).map_err(io)?;
+    Ok(Some((text, meta)))
+}
+
+fn parse(path: &Path, text: &str) -> Result<Credential, CredentialError> {
+    serde_json::from_str(text).map_err(|err| CredentialError::Invalid {
+        path: path.to_path_buf(),
+        reason: err.to_string(),
+    })
+}
+
+type Identity = (u64, u64, i64, i64);
+
+fn identity(meta: &fs::Metadata) -> Identity {
+    (meta.dev(), meta.ino(), meta.mtime(), meta.mtime_nsec())
+}
+
+fn identity_at(path: &Path) -> Result<Option<Identity>, CredentialError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => Ok(Some(identity(&meta))),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CredentialError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// The two credential files of a profile, written by the one process that holds the profile lock (RFC 0011 section 2).
+/// Each write goes to a new file excluded from backups, is synced and renamed into place, and the directory is synced.
+/// Promoting writes `credential.json` first and removes `credential.next` second, so a crash in between leaves both
+/// files with the same credential, which the next refresh settles.
+pub struct CredentialFiles {
+    path: PathBuf,
+    credential: Mutex<Credential>,
+}
+
+impl CredentialFiles {
+    pub fn new(path: &Path, credential: Credential) -> Self {
+        CredentialFiles {
+            path: path.to_path_buf(),
+            credential: Mutex::new(credential),
+        }
+    }
+
+    fn write(path: &Path, bytes: Vec<u8>) -> io::Result<()> {
+        NewCredentialFile::create(path)
+            .and_then(|file| file.replace(bytes))
+            .map_err(io::Error::other)
+    }
+
+    fn remove_next(&self) -> io::Result<()> {
+        match fs::remove_file(next_path(&self.path)) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        File::open(self.path.parent().unwrap_or(Path::new(".")))?.sync_all()
+    }
+}
+
+impl CredentialStore for CredentialFiles {
+    fn stage(&self, staged: &Staged) -> io::Result<()> {
+        let next = NextFile {
+            refresh_credential: staged.refresh_credential.clone(),
+            rotate_before_ms: staged.rotate_before_ms,
+        };
+        Self::write(&next_path(&self.path), serde_json::to_vec_pretty(&next)?)
+    }
+
+    fn promote(&self, staged: &Staged) -> io::Result<()> {
+        let mut credential = self.credential.lock().unwrap();
+        let promoted = Credential {
+            refresh_credential: staged.refresh_credential.clone(),
+            ..credential.clone()
+        };
+        Self::write(&self.path, serde_json::to_vec_pretty(&promoted)?)?;
+        *credential = promoted;
+        self.remove_next()
+    }
+
+    fn clear_staged(&self) -> io::Result<()> {
+        self.remove_next()
     }
 }
 
@@ -287,7 +466,8 @@ pub fn api_for(server: &str) -> Result<Api, ApiError> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
@@ -295,6 +475,14 @@ pub(crate) mod tests {
     thread_local! {
         /// Makes this thread's backup exclusions fail, as on storage without extended attributes.
         pub(crate) static REFUSE_EXCLUSION: Cell<bool> = const { Cell::new(false) };
+        /// Changes to make between the two reads of [`Credential::load_stored`], one per pass, in order.
+        static BETWEEN_READS: RefCell<VecDeque<Box<dyn FnOnce()>>> = RefCell::default();
+    }
+
+    pub(super) fn between_reads() {
+        if let Some(change) = BETWEEN_READS.with_borrow_mut(VecDeque::pop_front) {
+            change();
+        }
     }
 
     /// Whether `tmutil isexcluded` reports that Time Machine leaves `path` out. The temporary directory is excluded
@@ -416,5 +604,110 @@ pub(crate) mod tests {
 
         Credential::keep_out_of_backups(&path).unwrap();
         assert!(time_machine_excludes(&path));
+    }
+
+    fn files(path: &Path) -> CredentialFiles {
+        CredentialFiles::new(path, credential())
+    }
+
+    fn staged(refresh_credential: &str) -> Staged {
+        Staged {
+            refresh_credential: refresh_credential.into(),
+            rotate_before_ms: 7,
+        }
+    }
+
+    /// What the two files hold, as `load_stored` reads them.
+    fn slots(path: &Path) -> (String, Option<String>) {
+        let stored = Credential::load_stored(path).unwrap().unwrap();
+        (
+            stored.credential.refresh_credential,
+            stored.staged.map(|staged| staged.refresh_credential),
+        )
+    }
+
+    #[test]
+    fn the_age_of_a_credential_is_when_its_file_was_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credential.json");
+        credential().save_new(&path).unwrap();
+        let written = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(written)
+            .unwrap();
+        assert_eq!(
+            Credential::load_stored(&path).unwrap().unwrap().changed_at,
+            written
+        );
+    }
+
+    #[test]
+    fn staging_and_promoting_keep_both_files_private_and_end_with_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credential.json");
+        credential().save_new(&path).unwrap();
+        let files = files(&path);
+
+        files.stage(&staged("next")).unwrap();
+        assert_eq!(slots(&path), ("secret-refresh".into(), Some("next".into())));
+        let mode = fs::metadata(next_path(&path)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        files.promote(&staged("next")).unwrap();
+        assert_eq!(slots(&path), ("next".into(), None));
+        assert!(!next_path(&path).exists());
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["credential.json"]);
+
+        files.stage(&staged("later")).unwrap();
+        files.clear_staged().unwrap();
+        assert_eq!(slots(&path), ("next".into(), None));
+    }
+
+    #[test]
+    fn reading_starts_over_when_a_promotion_and_a_staging_happen_between_its_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credential.json");
+        credential().save_new(&path).unwrap();
+        files(&path).stage(&staged("first")).unwrap();
+        let changing = path.clone();
+        BETWEEN_READS.with_borrow_mut(|changes| {
+            changes.push_back(Box::new(move || {
+                let files = files(&changing);
+                files.promote(&staged("first")).unwrap();
+                files.stage(&staged("second")).unwrap();
+            }))
+        });
+        assert_eq!(slots(&path), ("first".into(), Some("second".into())));
+    }
+
+    #[test]
+    fn reading_gives_up_on_files_that_keep_changing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credential.json");
+        credential().save_new(&path).unwrap();
+        for round in 0..READ_ATTEMPTS {
+            let changing = path.clone();
+            BETWEEN_READS.with_borrow_mut(|changes| {
+                changes.push_back(Box::new(move || {
+                    files(&changing).stage(&staged(&round.to_string())).unwrap()
+                }))
+            });
+        }
+        assert!(matches!(
+            Credential::load_stored(&path),
+            Err(CredentialError::Io { .. })
+        ));
+        BETWEEN_READS.with_borrow_mut(VecDeque::clear);
     }
 }
