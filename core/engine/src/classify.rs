@@ -290,8 +290,16 @@ impl Trees {
         &self.remote_rules_files
     }
 
+    /// Sets L. A reverted node that L now holds at a position other than its old one and R's was
+    /// moved by the user, and is no longer reverted: that move is committed instead.
     pub fn set_local(&mut self, id: NodeId, node: LocalNode) {
         if let Some(old) = self.l.get(&id) {
+            let moved = !old.parked && !node.parked && !old.shape.same_position(&node.shape);
+            let to_remote =
+                (self.r.live(&id)).is_some_and(|remote| node.shape.same_position(remote));
+            if moved && !to_remote {
+                self.reverted.remove(&id);
+            }
             if !old.parked {
                 self.l_names.remove(&id, &old.shape);
             }
@@ -724,7 +732,9 @@ impl Trees {
     /// nodes created in it, and folders L deleted on the way from such a node to the root. The
     /// commit planner sends no position change for them but still sends their content edits and deletes; the
     /// effects put each at its R position without replacing its content, and [`Trees::settle`]
-    /// forgets it once L has it there.
+    /// forgets it once L has it there. A node the user moves anywhere else stops being reverted
+    /// ([`Trees::set_local`]), and so does a create or move the server renamed when L has left the
+    /// position the commit sent before the result arrives.
     pub fn reverted(&self) -> &BTreeSet<NodeId> {
         &self.reverted
     }
