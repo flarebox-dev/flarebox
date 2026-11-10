@@ -494,13 +494,14 @@ export class CommitApplier {
 
   /**
    * R7 and RFC 0002 section 9: trashes the part of the subtree whose placement this commit's device has seen. Nodes with
-   * unseen changes stay with their ancestors, and a child with an unseen placement stays with its whole subtree. Returns
+   * unseen changes stay with their ancestors, and a node with an unseen placement stays with its whole subtree. Returns
    * true when node stays.
    */
   private trashSubtree(node: NodeRow, group: string): boolean {
+    if (this.unseenParent(node)) return true;
     let keep = this.unseenContent(node) || this.unseenMeta(node);
     const children = rows<NodeRow>(this.sql.exec("SELECT * FROM nodes WHERE parent_id = ? AND status = 1", node.node_id));
-    for (const child of children) keep = this.unseenParent(child) || this.trashSubtree(child, group) || keep;
+    for (const child of children) keep = this.trashSubtree(child, group) || keep;
     if (keep) return true;
     this.sql.exec(
       "UPDATE nodes SET status = 2, trash_group = ?, trashed_at_ms = ?, meta_rev = ?, meta_dev = ? WHERE node_id = ?",

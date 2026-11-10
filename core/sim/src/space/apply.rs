@@ -591,12 +591,15 @@ impl<'a> Applier<'a> {
     }
 
     /// R7 and RFC 0002 section 9: trashes the part of the subtree whose placement this commit's device
-    /// has seen. Nodes with unseen changes stay with their ancestors, and a child with an unseen
+    /// has seen. Nodes with unseen changes stay with their ancestors, and a node with an unseen
     /// placement stays with its whole subtree. Returns true when the node stays.
     fn trash_subtree(&mut self, node: &Node, group: &str) -> bool {
+        if self.unseen_parent(node) {
+            return true;
+        }
         let mut keep = self.unseen_content(node) || self.unseen_meta(node);
         for child in self.st.children(&node.node_id, NodeStatus::Live) {
-            keep = self.unseen_parent(&child) || self.trash_subtree(&child, group) || keep;
+            keep = self.trash_subtree(&child, group) || keep;
         }
         if keep {
             return true;

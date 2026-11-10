@@ -2847,6 +2847,202 @@
       ]
     },
     {
+      "name": "r7-a-delete-keeps-the-file-it-names-when-its-commit-brought-it-back-with-a-trash-group-it-never-saw-there",
+      "covers": [
+        "R7",
+        "R8"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "1"
+            }
+          ]
+        },
+        "c2": {
+          "chunks": [
+            {
+              "text": "2"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "o",
+                  "parent": "root",
+                  "name": "o"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "k",
+                  "parent": "o",
+                  "name": "k",
+                  "content": "c1"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": "d"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "t",
+                  "parent": "d",
+                  "name": "t"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "move": {
+                  "node": "k",
+                  "parent": "t",
+                  "name": "k"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 2,
+            "ops": [
+              {
+                "delete": {
+                  "node": "t"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "t",
+              "k"
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "move": {
+                  "node": "t",
+                  "parent": "d",
+                  "name": "u"
+                }
+              },
+              {
+                "delete": {
+                  "node": "k"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 4,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "SUPERSEDED"
+              }
+            ],
+            "changed": [
+              "t",
+              "k"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "d",
+              "status": "LIVE"
+            },
+            {
+              "node": "t",
+              "status": "LIVE",
+              "parent": "d",
+              "name": "u"
+            },
+            {
+              "node": "k",
+              "status": "LIVE",
+              "parent": "t",
+              "content": "c1"
+            }
+          ],
+          "live": [
+            "o",
+            "d",
+            "t",
+            "k"
+          ]
+        }
+      ]
+    },
+    {
       "name": "r8-an-unseen-edit-revives-a-deleted-file",
       "covers": [
         "R8"
