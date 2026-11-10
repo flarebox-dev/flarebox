@@ -8,6 +8,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use flarebox_driver as driver;
@@ -400,12 +401,29 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
         .link_folder(space.space_id, path_str(&again))
         .unwrap();
     mac.until("the second link's sync", |m| m.status == SyncStatus::Idle);
+    let spare = Device::new();
+    spare.session().connect(server).unwrap();
+    let pairing = mac.session().start_pairing().unwrap();
+    spare.session().pair(pairing.code, "Spare".into()).unwrap();
     let kept = mac.path("credential");
     keep_credential(&mac.profile(), &kept);
-    assert_eq!(mac.session().sign_out(false), Err(SessionError::LastDevice));
-    assert!(mac.session().state().account.is_some());
-    assert!(accepted(&kept));
-    mac.session().sign_out(true).unwrap();
+    let spare_kept = spare.path("credential");
+    keep_credential(&spare.profile(), &spare_kept);
+    let (mac_out, spare_out) = thread::scope(|scope| {
+        let spare_out = scope.spawn(|| spare.session().sign_out(false));
+        (mac.session().sign_out(false), spare_out.join().unwrap())
+    });
+    let (last, last_kept) = match (&mac_out, &spare_out) {
+        (Err(SessionError::LastDevice), Ok(())) => (&mac, &kept),
+        (Ok(()), Err(SessionError::LastDevice)) => (&spare, &spare_kept),
+        outcomes => {
+            panic!("one of the last two devices signs out and the other must confirm: {outcomes:?}")
+        }
+    };
+    assert!(last.session().state().account.is_some());
+    assert!(accepted(last_kept));
+    last.session().sign_out(true).unwrap();
+    assert!(!accepted(&spare_kept));
     let signed_out = mac.until("the sign-out", |m| {
         !m.signed_in && m.folders.is_empty() && m.status == SyncStatus::NeedsSetup
     });

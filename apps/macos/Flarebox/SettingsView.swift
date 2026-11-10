@@ -230,7 +230,7 @@ private struct AccountSettings: View {
                 perform { try await model.signOut(confirmLastDevice: true) }
             }
         } message: {
-            Text("No other device is signed in to this server. After this Mac signs out, you can only add a device again with the server's recovery key.")
+            Text("No other device is signed in to this server. After this Mac signs out, you can't sign back in from the Flarebox app. Getting back in needs the owner recovery steps from the deployment guide, run outside the app with administrator access to the server's deployment.")
         }
     }
 

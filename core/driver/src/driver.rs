@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use flarebox_fs::{Marker, probe_no_replace, read_marker, write_marker};
 use flarebox_net::{ApiError, Auth};
 use flarebox_proto::v1::{
-    ClaimRequest, DeviceCredentials, PairCompleteRequest, SpaceInfo, device_info::Kind,
+    ClaimRequest, DeviceCredentials, PairCompleteRequest, SpaceInfo, error::Code,
 };
 use flarebox_store::{GivenAnswer, Link, Store, StoredQuestion};
 use rustix::fs::FlockOperation;
@@ -363,25 +363,29 @@ impl Driver {
         )
     }
 
-    /// Signs this device out: stops syncing, unlinks every folder (their files stay), deletes the credential so the
-    /// profile can be paired or claimed again, and last revokes the device on the server, so that a copy of the
-    /// credential stops working too (RFC 0009 section 5). The revocation is best effort: without the server the
-    /// sign-out still finishes, and the device stays active there until another device revokes it. A folder that
-    /// cannot be unlinked stops the sign-out with its error and stays linked, so signing out again finishes it.
+    /// Signs this device out: stops syncing, revokes the device on the server so that a copy of the credential stops
+    /// working too, unlinks every folder (their files stay) and deletes the credential, so the profile can be paired
+    /// or claimed again (RFC 0009 section 5).
     ///
-    /// If the server lists no other active device of the user, the sign-out changes nothing and returns
-    /// [`DriverError::LastDevice`] unless `confirm_last_device` is set, so the person is told first. If the server
-    /// cannot be asked, the sign-out goes ahead, and the server refuses to revoke a last device unconfirmed.
+    /// The revocation is best effort: if the server cannot be reached, the sign-out still finishes, and the device stays
+    /// active there until another device revokes it. The one answer that stops the sign-out is the server's refusal to
+    /// revoke the user's last active device, which it gives unless `confirm_last_device` is set. The sign-out then
+    /// returns [`DriverError::LastDevice`], keeps the credential and the folders, and syncs again if it was syncing, so
+    /// the person can be told and confirm. A folder that cannot be unlinked stops the sign-out with its error and stays
+    /// linked, so signing out again finishes it.
     pub async fn sign_out(&self, confirm_last_device: bool) -> Result<(), DriverError> {
         let _lifecycle = self.inner.lifecycle.lock().await;
+        let was_running = self.inner.running.load(Ordering::SeqCst);
+        self.stop().await;
         let signed_in = self.inner.credential.lock().unwrap().clone();
         if let Some(credential) = &signed_in
-            && !confirm_last_device
-            && is_last_device(credential).await
+            && let Err(refused) = revoke(credential, confirm_last_device).await
         {
-            return Err(DriverError::LastDevice);
+            if was_running {
+                self.start();
+            }
+            return Err(refused);
         }
-        self.stop().await;
         let roots = roots(&self.inner.folders.lock().unwrap());
         for root in roots {
             self.unlink_folder(&root).await?;
@@ -396,9 +400,6 @@ impl Driver {
         self.inner.running.store(false, Ordering::SeqCst);
         tracing::info!("signed out");
         self.changed();
-        if let Some(credential) = signed_in {
-            revoke(&credential, confirm_last_device).await;
-        }
         Ok(())
     }
 
@@ -984,47 +985,10 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
-/// Whether the server lists no other active device of the credential's user. False if the server cannot be asked
-/// within [`SERVER_WAIT`].
-async fn is_last_device(credential: &Credential) -> bool {
-    let listed = async {
-        let auth = Auth::new(credential.api()?, credential.net());
-        let mut devices = Vec::new();
-        let mut cursor = String::new();
-        loop {
-            let page = auth.api().list_devices(&auth, &cursor).await?;
-            devices.extend(page.devices);
-            if page.next_cursor.is_empty() {
-                return Ok::<_, ApiError>(devices);
-            }
-            cursor = page.next_cursor;
-        }
-    };
-    let devices = match tokio::time::timeout(SERVER_WAIT, listed).await {
-        Ok(Ok(devices)) => devices,
-        Ok(Err(error)) => {
-            tracing::warn!(%error, "the devices cannot be listed; signing out without knowing whether this is the last one");
-            return false;
-        }
-        Err(_) => {
-            tracing::warn!(
-                "the server did not list the devices in time; signing out without knowing whether this is the last one"
-            );
-            return false;
-        }
-    };
-    let now = now_ms();
-    !devices.iter().any(|device| {
-        !device.current
-            && device.kind() == Kind::Device
-            && device.revoked_at_ms == 0
-            && (device.credential_expires_at_ms == 0 || device.credential_expires_at_ms > now)
-    })
-}
-
-/// Revokes the credential's own device on the server, best effort: if it fails, the device stays active there until
-/// another device revokes it.
-async fn revoke(credential: &Credential, confirm_last_device: bool) {
+/// Revokes the credential's own device on the server. Only the refusal to revoke the user's last active device without
+/// `confirm_last_device` is an error, [`DriverError::LastDevice`]; any other failure is logged, and the device stays
+/// active on the server until another device revokes it.
+async fn revoke(credential: &Credential, confirm_last_device: bool) -> Result<(), DriverError> {
     let revoked = async {
         let auth = Auth::new(credential.api()?, credential.net());
         auth.api().revoke_self(&auth, confirm_last_device).await
@@ -1034,6 +998,11 @@ async fn revoke(credential: &Credential, confirm_last_device: bool) {
             device_id = credential.device_id,
             "revoked this device on the server"
         ),
+        Ok(Err(error))
+            if error.server().map(|refusal| refusal.code()) == Some(Code::ConfirmationRequired) =>
+        {
+            return Err(DriverError::LastDevice);
+        }
         Ok(Err(error)) => {
             tracing::warn!(%error, "the server did not revoke this device; revoke it from another device")
         }
@@ -1041,6 +1010,7 @@ async fn revoke(credential: &Credential, confirm_last_device: bool) {
             "the server did not answer in time; revoke this device from another device"
         ),
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1666,63 +1636,56 @@ mod tests {
         assert!(reopened.folders.is_empty());
     }
 
-    /// Serves one request per entry of `replies` on a loopback port, in order, and returns each request's path with
-    /// whether `credential` still existed when the request arrived.
+    /// Serves one request per entry of `replies`, an HTTP status and a protobuf body, on a loopback port, in order,
+    /// and returns each request's path with whether `credential` still existed when the request arrived.
     async fn serve_each(
-        replies: Vec<Vec<u8>>,
+        replies: Vec<(u16, Vec<u8>)>,
         credential: PathBuf,
     ) -> (String, tokio::task::JoinHandle<Vec<(String, bool)>>) {
+        use tokio::io::AsyncWriteExt;
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server = format!("http://{}/", listener.local_addr().unwrap());
         let served = tokio::spawn(async move {
             let mut requests = Vec::new();
-            for reply in replies {
+            for (status, body) in replies {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let (path, _) = read_request(&mut socket).await;
                 requests.push((path, credential.exists()));
-                write_reply(&mut socket, &reply).await;
+                let head = format!(
+                    "HTTP/1.1 {status} Reply\r\ncontent-type: application/x-protobuf\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(head.as_bytes()).await.unwrap();
+                socket.write_all(&body).await.unwrap();
             }
             requests
         });
         (server, served)
     }
 
-    fn access_token() -> Vec<u8> {
-        prost::Message::encode_to_vec(&flarebox_proto::v1::AccessToken {
+    fn access_token() -> (u16, Vec<u8>) {
+        let token = flarebox_proto::v1::AccessToken {
             token: "token".into(),
             expires_at_ms: i64::MAX,
-        })
+        };
+        (200, prost::Message::encode_to_vec(&token))
     }
 
-    #[tokio::test]
-    async fn the_last_active_device_signs_out_only_once_confirmed_and_revokes_itself_last() {
-        use flarebox_proto::v1::{DeviceInfo, DeviceList};
-
-        let dir = tempfile::tempdir().unwrap();
-        let base = fs::canonicalize(dir.path()).unwrap();
-        let root = base.join("Flarebox");
-        let paths = Paths::under(&base.join("profile"));
-        linked(&paths, &root, "d1");
-        let device = |device_id: &str, kind: Kind, revoked_at_ms: i64, current: bool| DeviceInfo {
-            device_id: device_id.into(),
-            kind: kind.into(),
-            revoked_at_ms,
-            current,
+    /// The server's refusal to revoke the user's last active device without a confirmation.
+    fn last_device_refused() -> (u16, Vec<u8>) {
+        let refusal = flarebox_proto::v1::Error {
+            code: Code::ConfirmationRequired.into(),
+            message: "this is the user's last active device; confirm to revoke it".into(),
             ..Default::default()
         };
-        let listed = prost::Message::encode_to_vec(&DeviceList {
-            devices: vec![
-                device("d1", Kind::Device, 0, true),
-                device("d2", Kind::Device, 5, false),
-                device("d3", Kind::Agent, 0, false),
-            ],
-            ..Default::default()
-        });
-        let (server, served) = serve_each(
-            vec![access_token(), listed, access_token(), Vec::new()],
-            paths.credential(),
-        )
-        .await;
+        (409, prost::Message::encode_to_vec(&refusal))
+    }
+
+    /// A profile in `base` paired as `d1` with the server at `server`, with a folder linked at `base/Flarebox`.
+    fn linked_with_server(base: &Path, server: String) -> Paths {
+        let paths = Paths::under(&base.join("profile"));
+        linked(&paths, &base.join("Flarebox"), "d1");
         fs::remove_file(paths.credential()).unwrap();
         Credential {
             server,
@@ -1730,7 +1693,27 @@ mod tests {
         }
         .save_new(&paths.credential())
         .unwrap();
+        paths
+    }
+
+    #[tokio::test]
+    async fn a_refused_last_device_keeps_its_credential_and_folders_until_it_confirms() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let credential_path = Paths::under(&base.join("profile")).credential();
+        let (server, served) = serve_each(
+            vec![
+                access_token(),
+                last_device_refused(),
+                access_token(),
+                (204, Vec::new()),
+            ],
+            credential_path,
+        )
+        .await;
+        let paths = linked_with_server(&base, server);
         let driver = Driver::open(paths.clone()).unwrap();
+        driver.start();
 
         assert!(matches!(
             driver.sign_out(false).await,
@@ -1739,69 +1722,45 @@ mod tests {
         let status = driver.status();
         assert_eq!(status.account.unwrap().device_id, "d1");
         assert_eq!(status.folders.len(), 1);
+        assert!(status.running);
         assert!(paths.credential().exists());
 
         driver.sign_out(true).await.unwrap();
-        assert_eq!(driver.status().account, None);
-        assert!(driver.status().folders.is_empty());
+        let status = driver.status();
+        assert_eq!(status.account, None);
+        assert!(status.folders.is_empty());
+        assert!(!paths.credential().exists());
         assert_eq!(
             served.await.unwrap(),
             [
                 ("/v1/token".to_owned(), true),
-                ("/v1/devices".to_owned(), true),
-                ("/v1/token".to_owned(), false),
-                ("/v1/devices/d1?confirm=last-device".to_owned(), false),
+                ("/v1/devices/d1".to_owned(), true),
+                ("/v1/token".to_owned(), true),
+                ("/v1/devices/d1?confirm=last-device".to_owned(), true),
             ]
         );
     }
 
     #[tokio::test]
     async fn a_device_that_is_not_the_last_revokes_itself_without_confirming() {
-        use flarebox_proto::v1::{DeviceInfo, DeviceList};
-
         let dir = tempfile::tempdir().unwrap();
-        let paths = Paths::under(dir.path());
-        let listed = prost::Message::encode_to_vec(&DeviceList {
-            devices: vec![
-                DeviceInfo {
-                    device_id: "d1".into(),
-                    kind: Kind::Device.into(),
-                    current: true,
-                    ..Default::default()
-                },
-                DeviceInfo {
-                    device_id: "d2".into(),
-                    kind: Kind::Device.into(),
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        });
-        let (server, served) = serve_each(
-            vec![access_token(), listed, access_token(), Vec::new()],
-            paths.credential(),
-        )
-        .await;
-        Credential {
-            server,
-            ..credential("d1")
-        }
-        .save_new(&paths.credential())
-        .unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let credential_path = Paths::under(&base.join("profile")).credential();
+        let (server, served) =
+            serve_each(vec![access_token(), (204, Vec::new())], credential_path).await;
+        let paths = linked_with_server(&base, server);
         let driver = Driver::open(paths.clone()).unwrap();
 
         driver.sign_out(false).await.unwrap();
         assert_eq!(driver.status().account, None);
-        let paths_served: Vec<String> = served
+        assert!(!paths.credential().exists());
+        let requested: Vec<String> = served
             .await
             .unwrap()
             .into_iter()
             .map(|(path, _)| path)
             .collect();
-        assert_eq!(
-            paths_served,
-            ["/v1/token", "/v1/devices", "/v1/token", "/v1/devices/d1"]
-        );
+        assert_eq!(requested, ["/v1/token", "/v1/devices/d1"]);
     }
 
     #[tokio::test]
