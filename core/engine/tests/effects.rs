@@ -549,6 +549,52 @@ fn a_failed_effect_is_not_emitted_again_unchanged() {
     assert_ne!(again.effect_id, id);
 }
 
+/// File d moves to e on the server, and new file z takes d's old name, but d's entry is gone from
+/// the disk, so every effect for d fails. Once the park out of z's way has failed too, d gets no
+/// effect until L changes or the caller unblocks it.
+#[test]
+fn a_node_whose_park_failed_gets_no_effect_until_l_changes() {
+    let (mut trees, _) = space(&[
+        ("d", Some(file(ROOT, "d", 1)), Some(file(ROOT, "e", 1))),
+        ("z", None, Some(file(ROOT, "d", 2))),
+    ]);
+    trees.settle();
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    let mut planned = Vec::new();
+    while let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() {
+        effects.failed(&record.effect_id).unwrap();
+        planned.push(record.effect);
+        if planned.len() == 6 {
+            break;
+        }
+    }
+    assert!(
+        matches!(
+            planned.as_slice(),
+            [
+                Effect::Move {
+                    to: Location::At { .. },
+                    ..
+                },
+                Effect::Move {
+                    to: Location::Parked(_),
+                    ..
+                }
+            ]
+        ),
+        "{planned:?}"
+    );
+    let mut found = trees.local().get("d").unwrap().clone();
+    found.identity = identity(7);
+    trees.set_local("d".into(), found);
+    let again = effects.plan(&trees, &mut ids, NOW).unwrap();
+    assert!(
+        matches!(again.effect, Effect::Move { to: Location::At { .. }, identity: moved, .. } if moved == identity(7)),
+        "{:?}",
+        again.effect
+    );
+}
+
 #[test]
 fn a_blocked_node_can_be_unblocked_by_the_caller() {
     let (mut trees, _) = space(&[("f", Some(file(ROOT, "f", 1)), Some(file(ROOT, "f", 2)))]);

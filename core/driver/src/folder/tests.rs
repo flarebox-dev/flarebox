@@ -408,6 +408,34 @@ fn a_file_replaced_by_a_hard_link_to_another_leaves_the_other_on_the_server() {
     assert_eq!(names(&site.root), ["one.txt", "two.txt"]);
 }
 
+/// Device b holds an untracked symlink at e. The server moves d to e and creates another file at d.
+/// The move fails because e is taken, but d is parked out of the way, so the new file arrives at d
+/// and the symlink stays.
+#[test]
+fn a_move_onto_a_name_a_symlink_holds_still_lets_the_new_file_take_the_old_name() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("d"), b"original");
+    let (site, mut b) = linked(&mut remote, "b");
+    std::os::unix::fs::symlink("untouched", site.root.join("e")).unwrap();
+    fs::rename(site_a.root.join("d"), site_a.root.join("e")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(&mut remote);
+    a.create(&mut remote, &site_a.root.join("d"), b"new remote file");
+    b.pull(&remote);
+    for _ in 0..24 {
+        if let Some(work) = b.work.pop_front() {
+            b.perform(work, &mut remote).unwrap();
+        }
+        b.scan(Duration::ZERO);
+    }
+    assert_eq!(
+        fs::read_link(site.root.join("e")).unwrap(),
+        PathBuf::from("untouched")
+    );
+    assert_eq!(fs::read(site.root.join("d")).unwrap(), b"new remote file");
+}
+
 /// The names in a folder besides `.flarebox`, in order.
 fn names(root: &Path) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(root)
