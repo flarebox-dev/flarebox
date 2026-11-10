@@ -21,7 +21,7 @@ The server in [server/](server/) is licensed under the GNU Affero General Public
 
 ## Contributing
 
-Contributions are accepted under the Developer Certificate of Origin: sign off every commit with `git commit -s`. See [CONTRIBUTING.md](CONTRIBUTING.md).
+Issues are open to everyone, and until 1.0 only the project owner and invited maintainers open pull requests. See [CONTRIBUTING.md](CONTRIBUTING.md), and report vulnerabilities privately as [SECURITY.md](SECURITY.md) describes.
 
 ## Trademarks
 
