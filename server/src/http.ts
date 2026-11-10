@@ -29,6 +29,7 @@ export function reply<S extends DescMessage>(request: Request, schema: S, messag
 const STATUS: Partial<Record<Error_Code, number>> = {
   [Error_Code.UNAUTHENTICATED]: 401,
   [Error_Code.FORBIDDEN]: 403,
+  [Error_Code.NOT_FOUND]: 404,
   [Error_Code.INVALID_ARGUMENT]: 400,
   [Error_Code.LIMIT_EXCEEDED]: 413,
   [Error_Code.RETRY_LATER]: 429,

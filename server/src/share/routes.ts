@@ -1,0 +1,262 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+import { create, type DescMessage, type MessageShape } from "@bufbuild/protobuf";
+import type { Identity } from "../auth";
+import { Error_Code, ErrorSchema } from "../gen/flarebox/v1/rpc_pb";
+import { CreateShareLinkRequestSchema, ShareInfoSchema, ShareLinkListSchema, ShareLinkSchema, ShareListingSchema, ShareUnlockRequestSchema } from "../gen/flarebox/v1/share_pb";
+import { BadRequest, errorReply, readMessage, reply } from "../http";
+import { isUuidV7, toHex } from "../ids";
+import { clientKey } from "./limiter";
+import { LINK_ID, SESSION_MS, type ShareOutcome } from "./links";
+import type { ShareFile } from "./space";
+
+/** Headers on every public API reply (RFC 0005 section 3). */
+export const PUBLIC_HEADERS: Record<string, string> = {
+  "Cache-Control": "no-store",
+  "X-Robots-Tag": "noindex, nofollow",
+  "Referrer-Policy": "no-referrer",
+  "X-Content-Type-Options": "nosniff",
+};
+
+const SESSION_COOKIE = "fb_share";
+
+type Failure = Extract<ShareOutcome<unknown>, { ok: false }>;
+
+function account(env: Env) {
+  return env.ACCOUNT.get(env.ACCOUNT.idFromName("account"));
+}
+
+function space(env: Env, spaceId: string) {
+  return env.SPACE.get(env.SPACE.idFromName(spaceId));
+}
+
+export function withHeaders(response: Response, headers: Record<string, string>): Response {
+  for (const [name, value] of Object.entries(headers)) response.headers.set(name, value);
+  return response;
+}
+
+function refusal(request: Request, failure: Failure): Response {
+  const error = create(ErrorSchema, { code: failure.code, message: failure.message, retryAfterMs: BigInt(failure.retryAfterMs ?? 0) });
+  const response = reply(request, ErrorSchema, error, failure.status);
+  if (failure.retryAfterMs !== undefined) response.headers.set("Retry-After", String(Math.ceil(failure.retryAfterMs / 1000)));
+  return response;
+}
+
+/** A refusal of the download route, as plain text, because a browser shows it as a page. */
+function textRefusal(failure: Failure): Response {
+  const response = new Response(failure.message + "\n", { status: failure.status, headers: { "Content-Type": "text/plain; charset=utf-8" } });
+  if (failure.retryAfterMs !== undefined) response.headers.set("Retry-After", String(Math.ceil(failure.retryAfterMs / 1000)));
+  return response;
+}
+
+function answer<S extends DescMessage>(request: Request, schema: S, outcome: ShareOutcome<MessageShape<S>>, status = 200): Response {
+  return outcome.ok ? reply(request, schema, outcome.value, status) : refusal(request, outcome);
+}
+
+function sessionCookie(request: Request): string | undefined {
+  for (const part of (request.headers.get("Cookie") ?? "").split(";")) {
+    const [name, ...value] = part.trim().split("=");
+    if (name === SESSION_COOKIE) return value.join("=");
+  }
+  return undefined;
+}
+
+/** The ASCII fallback and the RFC 6266 UTF-8 form of a download's file name. */
+function contentDisposition(name: string): string {
+  const fallback = name.replace(/[^\x20-\x7e]|["\\%;]/g, "_");
+  const encoded = encodeURIComponent(name).replace(/['()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
+  return `attachment; filename="${fallback}"; filename*=UTF-8''${encoded}`;
+}
+
+class ChunkCheckFailed extends Error {}
+
+/**
+ * Opens one chunk object in R2 after checking that it exists, has the chunk's size, and, when R2 holds a SHA-256
+ * checksum for it, that the checksum is the chunk's hash (RFC 0005 section 7).
+ */
+async function openChunk(env: Env, chunk: ShareFile["chunks"][number]): Promise<ReadableStream<Uint8Array>> {
+  const object = await env.BUCKET.get(chunk.key);
+  if (!object) throw new ChunkCheckFailed(`chunk object ${chunk.key} is missing`);
+  const stored = object.checksums.sha256;
+  const problem =
+    object.size !== chunk.size
+      ? `chunk object ${chunk.key} has ${object.size} bytes, expected ${chunk.size}`
+      : stored && toHex(new Uint8Array(stored)) !== chunk.hashHex
+        ? `chunk object ${chunk.key} has a stored SHA-256 other than its hash`
+        : undefined;
+  if (problem) {
+    await object.body.cancel();
+    throw new ChunkCheckFailed(problem);
+  }
+  return object.body;
+}
+
+function attachmentHeaders(name: string): Record<string, string> {
+  return {
+    "Content-Type": "application/octet-stream",
+    "Content-Disposition": contentDisposition(name),
+    "Content-Security-Policy": "default-src 'none'; sandbox",
+  };
+}
+
+/**
+ * Streams a file chunk by chunk (RFC 0005 section 7). The first chunk is opened and checked before the headers go out.
+ * Each later chunk is opened only when the recipient has taken the previous one, and only after the fence check passes.
+ * A failed check aborts the stream; the response never switches to a chunk list read after it started.
+ */
+async function download(request: Request, env: Env, file: ShareFile, fenceCheck: () => Promise<Failure | undefined>): Promise<Response> {
+  if (file.chunks.length === 0) return new Response(new Uint8Array(0), { headers: { ...attachmentHeaders(file.name), "Content-Length": "0" } });
+  let current: ReadableStreamDefaultReader<Uint8Array>;
+  try {
+    current = (await openChunk(env, file.chunks[0]!)).getReader();
+  } catch (error) {
+    if (!(error instanceof ChunkCheckFailed)) throw error;
+    console.error("share download refused", error.message);
+    return textRefusal({ ok: false, code: Error_Code.INTERNAL, message: "This file failed its integrity check and cannot be downloaded.", status: 502 });
+  }
+  let next = 1;
+  const chunks = new ReadableStream<Uint8Array>(
+    {
+      async pull(controller) {
+        for (;;) {
+          const { done, value } = await current.read();
+          if (!done) {
+            controller.enqueue(value);
+            return;
+          }
+          if (next >= file.chunks.length) {
+            controller.close();
+            return;
+          }
+          const failed = await fenceCheck();
+          if (failed) {
+            console.error("share download stopped", failed.message);
+            controller.error(new Error(failed.message));
+            return;
+          }
+          try {
+            current = (await openChunk(env, file.chunks[next++]!)).getReader();
+          } catch (error) {
+            console.error("share download aborted", error instanceof Error ? error.message : String(error));
+            controller.error(error);
+            return;
+          }
+        }
+      },
+      cancel(reason) {
+        return current.cancel(reason);
+      },
+    },
+    { highWaterMark: 0 },
+  );
+  const { readable, writable } = new FixedLengthStream(file.size);
+  chunks.pipeTo(writable).catch(() => {});
+  return new Response(readable, { headers: { ...attachmentHeaders(file.name), "Content-Length": String(file.size) } });
+}
+
+/** The public API of RFC 0005 section 3. */
+async function publicApi(request: Request, env: Env, linkId: string, rest: string): Promise<Response> {
+  if (!LINK_ID.test(linkId)) {
+    return refusal(request, { ok: false, code: Error_Code.NOT_FOUND, message: "this link does not exist, has expired or was revoked", status: 404 });
+  }
+  const client = clientKey(request);
+  const method = request.method;
+  const url = new URL(request.url);
+
+  if (rest === "/unlock" && method === "POST") {
+    const body = await readMessage(request, ShareUnlockRequestSchema);
+    const outcome = await account(env).shareUnlock({ linkId, client, password: body.password });
+    if (!outcome.ok) return refusal(request, outcome);
+    const response = new Response(null, { status: 204 });
+    if (outcome.value.session) {
+      response.headers.set(
+        "Set-Cookie",
+        `${SESSION_COOKIE}=${outcome.value.session}; Path=/v1/share/${linkId}; Max-Age=${SESSION_MS / 1000}; HttpOnly; Secure; SameSite=Strict`,
+      );
+    }
+    return response;
+  }
+
+  if (method !== "GET") return new Response("Method Not Allowed", { status: 405 });
+  const fileRoute = /^\/file\/([^/]+)$/.exec(rest);
+  if (rest !== "" && rest !== "/list" && !fileRoute) return new Response("Not Found", { status: 404 });
+
+  const session = sessionCookie(request);
+  const resolved = await account(env).shareResolve({ linkId, client, session, counted: true });
+  if (!resolved.ok) {
+    if (rest === "" && resolved.code === Error_Code.UNAUTHENTICATED) return reply(request, ShareInfoSchema, create(ShareInfoSchema, { passwordRequired: true }), 401);
+    return fileRoute ? textRefusal(resolved) : refusal(request, resolved);
+  }
+  const { spaceId, nodeId: rootId, expiresAtMs } = resolved.value;
+  const stub = space(env, spaceId);
+
+  if (rest === "") return answer(request, ShareInfoSchema, await stub.shareInfo(rootId, expiresAtMs));
+  if (rest === "/list") {
+    const dir = url.searchParams.get("dir") ?? "";
+    return answer(request, ShareListingSchema, await stub.shareList(rootId, dir, url.searchParams.get("cursor") ?? ""));
+  }
+  const nodeId = fileRoute![1]!;
+  if (!isUuidV7(nodeId)) return textRefusal({ ok: false, code: Error_Code.NOT_FOUND, message: "this item is not available through this link", status: 404 });
+  const file = await stub.shareFile(rootId, nodeId);
+  if (!file.ok) return textRefusal(file);
+  const fence = { historyId: file.value.historyId, generation: resolved.value.generation };
+  return download(request, env, file.value, async () => {
+    try {
+      const checked = await space(env, spaceId).shareContinue({ linkId, client, session }, fence);
+      return checked.ok ? undefined : checked;
+    } catch (error) {
+      return { ok: false, code: Error_Code.RETRY_LATER, message: `the fence check failed: ${error instanceof Error ? error.message : String(error)}`, status: 503 };
+    }
+  });
+}
+
+/** The owner API of RFC 0005 section 2. */
+async function ownerApi(request: Request, env: Env, spaceId: string, linkId: string | undefined, identity: Identity): Promise<Response> {
+  const url = new URL(request.url);
+  const method = request.method;
+  if (linkId === undefined && method === "POST") {
+    const body = await readMessage(request, CreateShareLinkRequestSchema);
+    const outcome = await account(env).shareCreate({
+      userId: identity.userId,
+      spaceId,
+      nodeId: body.nodeId,
+      expiresAtMs: Number(body.expiresAtMs),
+      noExpiry: body.noExpiry,
+      password: body.password,
+      origin: url.origin,
+    });
+    return answer(request, ShareLinkSchema, outcome, 201);
+  }
+  if (linkId === undefined && method === "GET") {
+    const outcome = await account(env).shareList({ userId: identity.userId, spaceId, cursor: url.searchParams.get("cursor") ?? "", origin: url.origin });
+    return answer(request, ShareLinkListSchema, outcome);
+  }
+  if (linkId !== undefined && method === "DELETE") {
+    const outcome = await account(env).shareRevoke({ userId: identity.userId, spaceId, linkId });
+    return outcome.ok ? new Response(null, { status: 204 }) : refusal(request, outcome);
+  }
+  return new Response("Method Not Allowed", { status: 405 });
+}
+
+/** Routes share-link requests, or returns undefined for any other path. authenticate checks a device access token. */
+export async function shareRoute(request: Request, env: Env, authenticate: () => Promise<Identity | Response>): Promise<Response | undefined> {
+  const path = new URL(request.url).pathname;
+
+  const shared = /^\/v1\/share\/([^/]*)(\/.*)?$/.exec(path);
+  if (shared) {
+    try {
+      return withHeaders(await publicApi(request, env, shared[1]!, shared[2] ?? ""), PUBLIC_HEADERS);
+    } catch (error) {
+      if (error instanceof BadRequest) return withHeaders(errorReply(request, Error_Code.INVALID_ARGUMENT, error.message), PUBLIC_HEADERS);
+      throw error;
+    }
+  }
+
+  const owned = /^\/v1\/spaces\/([0-9a-f-]{36})\/links(?:\/([^/]+))?$/.exec(path);
+  if (owned && isUuidV7(owned[1]!)) {
+    const identity = await authenticate();
+    if (identity instanceof Response) return identity;
+    return ownerApi(request, env, owned[1]!, owned[2], identity);
+  }
+  return undefined;
+}
