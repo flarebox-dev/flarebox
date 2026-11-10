@@ -379,6 +379,26 @@ fn linked(remote: &mut Remote, name: &str) -> (Site, Device) {
     (site, device)
 }
 
+/// A file replaced by a hard link to another file takes that file's content and keeps its own node, so the other
+/// path stays on the server.
+#[test]
+fn a_file_replaced_by_a_hard_link_to_another_leaves_the_other_on_the_server() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("one.txt"), b"one");
+    a.create(&mut remote, &site_a.root.join("two.txt"), b"two");
+    let (site, mut b) = linked(&mut remote, "b");
+    b.settle();
+    fs::remove_file(site.root.join("two.txt")).unwrap();
+    fs::hard_link(site.root.join("one.txt"), site.root.join("two.txt")).unwrap();
+    b.scan_until(|b| !b.work.is_empty());
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    assert_eq!(remote.names(), ["one.txt", "two.txt"]);
+    assert_eq!(names(&site.root), ["one.txt", "two.txt"]);
+}
+
 /// The names in a folder besides `.flarebox`, in order.
 fn names(root: &Path) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(root)
