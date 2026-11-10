@@ -433,8 +433,8 @@ pub struct Rescan {
     /// Report them, and rescan them once they can be read.
     pub unreadable: Vec<PathBuf>,
     /// The identity of the root folder the scan opened. A scan that reached
-    /// another folder than the caller's root reports everything the snapshot
-    /// knows as removed, so refuse its changes.
+    /// another folder than the caller's root has already applied that folder
+    /// to the snapshot, so stop using the snapshot, not only its changes.
     pub root: FileId,
 }
 
@@ -470,7 +470,7 @@ impl Snapshot {
         root: impl AsRef<Path>,
         paths: impl IntoIterator<Item = PathBuf>,
     ) -> Result<Rescan> {
-        self.rescan_with(root.as_ref(), paths, &mut |_| {})
+        self.rescan_with(root.as_ref(), paths, None, &mut |_| {})
     }
 
     /// Drops what the snapshot knows at and below `scope`, a relative path,
@@ -488,14 +488,20 @@ impl Snapshot {
         }
     }
 
+    /// [`Snapshot::rescan`], failing with [`Error::RootReplaced`] and
+    /// changing nothing when `root` opens a folder other than `expected`.
     fn rescan_with(
         &mut self,
         root: &Path,
         paths: impl IntoIterator<Item = PathBuf>,
+        expected: Option<FileId>,
         cut: &mut dyn FnMut(Cut<'_>),
     ) -> Result<Rescan> {
         let root_dir = open_root(root)?;
         let root_stat = stat_fd(root_dir.as_fd())?;
+        if expected.is_some_and(|expected| !root_stat.same_inode(&expected)) {
+            return Err(Error::RootReplaced);
+        }
         cut(Cut::RootOpened);
 
         let mut scopes = Vec::new();
@@ -1123,7 +1129,8 @@ impl NativeWatcher {
     /// the blocked folders that became `readable`, then rescans them, so
     /// anything written before the watch existed is seen. A rescan that opens
     /// another root folder than `root`, the one the changes came from, fails
-    /// the watcher with [`Error::RootReplaced`] and returns nothing.
+    /// the watcher with [`Error::RootReplaced`], returns nothing and leaves
+    /// the snapshot as it was.
     #[cfg(target_os = "linux")]
     fn cover(&mut self, changes: &[Change], readable: Vec<PathBuf>, root: FileId) -> Vec<Change> {
         let dirs = outermost(
@@ -1159,11 +1166,10 @@ impl NativeWatcher {
                 self.failed = Some(watch_error(err));
             }
         }
-        match self.snapshot.rescan(&self.root, dirs.iter().cloned()) {
-            Ok(rescan) if rescan.root != root => {
-                self.failed = Some(Error::RootReplaced);
-                Vec::new()
-            }
+        match self
+            .snapshot
+            .rescan_with(&self.root, dirs.iter().cloned(), Some(root), &mut |_| {})
+        {
             Ok(rescan) => {
                 self.dirty.extend(rescan.unsettled);
                 self.blocked.extend(rescan.unreadable.iter().cloned());

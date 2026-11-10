@@ -65,7 +65,7 @@ fn root_moved_after_opening_publishes_nothing() {
         let mut snapshot = Snapshot::scan(&root).unwrap();
         let before = snapshot.clone();
         let moved = dir.path().join("moved");
-        let result = snapshot.rescan_with(&root, paths, &mut |cut| {
+        let result = snapshot.rescan_with(&root, paths, None, &mut |cut| {
             if let Cut::RootOpened = cut {
                 fs::rename(&root, &moved).unwrap();
             }
@@ -87,7 +87,7 @@ fn root_removed_after_opening_publishes_nothing() {
         tree(&root, 200);
         let mut snapshot = Snapshot::scan(&root).unwrap();
         let before = snapshot.clone();
-        let result = snapshot.rescan_with(&root, paths, &mut |cut| {
+        let result = snapshot.rescan_with(&root, paths, None, &mut |cut| {
             if let Cut::RootOpened = cut {
                 fs::remove_dir_all(&root).unwrap();
             }
@@ -107,7 +107,7 @@ fn root_replaced_after_opening_publishes_nothing() {
     tree(&root, 20);
     let mut snapshot = Snapshot::scan(&root).unwrap();
     let before = snapshot.clone();
-    let result = snapshot.rescan_with(&root, [PathBuf::new()], &mut |cut| {
+    let result = snapshot.rescan_with(&root, [PathBuf::new()], None, &mut |cut| {
         if let Cut::RootOpened = cut {
             fs::rename(&root, dir.path().join("moved")).unwrap();
             fs::create_dir(&root).unwrap();
@@ -128,7 +128,7 @@ fn folder_replaced_during_traversal_publishes_nothing() {
         tree(&root, 0);
         let mut snapshot = Snapshot::scan(&root).unwrap();
         let before = snapshot.clone();
-        let result = snapshot.rescan_with(&root, [PathBuf::new()], &mut |cut| {
+        let result = snapshot.rescan_with(&root, [PathBuf::new()], None, &mut |cut| {
             if let Cut::OpeningDir(path) = cut
                 && path == Path::new("d")
             {
@@ -173,7 +173,7 @@ fn ancestor_replaced_after_opening_publishes_nothing() {
             let mut snapshot = Snapshot::scan(&root).unwrap();
             let before = snapshot.clone();
 
-            let result = snapshot.rescan_with(&root, paths.clone(), &mut |cut| {
+            let result = snapshot.rescan_with(&root, paths.clone(), None, &mut |cut| {
                 if let Cut::OpeningDir(path) = cut
                     && path == Path::new("d/a-trigger")
                 {
@@ -233,7 +233,7 @@ fn ancestor_swapped_out_and_back_publishes_no_removal() {
         let mut snapshot = Snapshot::scan(&root).unwrap();
         let before = snapshot.clone();
 
-        let result = snapshot.rescan_with(&root, paths.clone(), &mut |cut| {
+        let result = snapshot.rescan_with(&root, paths.clone(), None, &mut |cut| {
             let Cut::OpeningDir(path) = cut else { return };
             if path == Path::new("d/a-trigger") {
                 fs::rename(root.join("d"), &detached).unwrap();
@@ -276,7 +276,7 @@ fn parent_swapped_during_confirmation_publishes_no_removal() {
         fs::remove_file(root.join("d/sub/victim")).unwrap();
 
         let mut swapped = false;
-        let result = snapshot.rescan_with(&root, paths.clone(), &mut |cut| {
+        let result = snapshot.rescan_with(&root, paths.clone(), None, &mut |cut| {
             let at_d = matches!(cut, Cut::Confirming(path) if path == Path::new("d"));
             if swapped || !at_d {
                 return;
@@ -328,7 +328,7 @@ fn sibling_recreated_after_its_parent_was_listed_publishes_no_removal() {
         }
 
         let mut recreated = false;
-        let result = snapshot.rescan_with(&root, paths.clone(), &mut |cut| {
+        let result = snapshot.rescan_with(&root, paths.clone(), None, &mut |cut| {
             let at_m = matches!(cut, Cut::Confirming(path) if path == Path::new("d/m"));
             if recreated || !at_m {
                 return;
@@ -753,6 +753,7 @@ fn a_new_folder_rescan_that_reaches_another_root_fails_the_watcher() {
     watcher.before_register = Some(Box::new(move || {
         fs::rename(&path, &moved).unwrap();
         fs::create_dir_all(path.join("sub")).unwrap();
+        fs::write(path.join("sub").join("theirs"), b"replacement").unwrap();
     }));
     fs::create_dir(root.join("sub")).unwrap();
     let poll = watcher.poll(WAIT).unwrap();
@@ -763,6 +764,13 @@ fn a_new_folder_rescan_that_reaches_another_root_fails_the_watcher() {
         watcher.poll(Duration::from_millis(300)),
         Err(Error::RootReplaced)
     ));
+    assert!(
+        !watcher
+            .snapshot()
+            .entries
+            .contains_key(Path::new("sub/theirs")),
+        "the snapshot took entries from the replacement root"
+    );
 }
 
 #[test]
