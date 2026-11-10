@@ -407,6 +407,18 @@ jobs:
             echo "::error::At least one CI job failed or was cancelled (changes: $CHANGES, rust: $RUST, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, cli-integration: $CLI_INTEGRATION, ffi-integration: $FFI_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP, runner-hook: $RUNNER_HOOK). Open that job's log for the cause."
             exit 1
           fi
+      - name: Fail unless the build and test jobs ran for a change outside site/
+        if: needs.changes.outputs.site_only != 'true'
+        env:
+          RESULTS: rust=${{ needs.rust.result }} server=${{ needs.server.result }} server-deploy=${{ needs.server-deploy.result }} net-integration=${{ needs.net-integration.result }} cli-integration=${{ needs.cli-integration.result }} ffi-integration=${{ needs.ffi-integration.result }} spec=${{ needs.spec.result }} runner-hook=${{ needs.runner-hook.result }}
+        run: |
+          echo "Build and test jobs for a change outside site/: $RESULTS"
+          for r in $RESULTS; do
+            if [ "${r#*=}" != success ]; then
+              echo "::error::A change outside site/ must run and pass every build and test job, but ${r%%=*} is ${r#*=}. Only a change whose files are all under site/ may skip them."
+              exit 1
+            fi
+          done
       - name: Fail unless every macOS job ran on a push to main
         if: github.event_name == 'push'
         env:
