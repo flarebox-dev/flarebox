@@ -14,17 +14,18 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use flarebox_driver::{
     self as driver, Credential, Driver, DriverError, FolderState as DriverFolderState, Paths,
     Status, api_for,
 };
 use flarebox_net::{Api, ApiError, Auth, PROTO_MAX, PROTO_MIN};
-use flarebox_proto::v1::{ClaimRequest, CreateSpaceRequest, error::Code};
-use tokio::runtime::Runtime;
+use flarebox_proto::v1::{CreateSpaceRequest, error::Code};
+use tokio::runtime::{Handle, Runtime};
+use tokio::sync::watch;
 
 use crate::core::{Core, Events};
 use crate::types::{
@@ -34,27 +35,23 @@ use crate::types::{
     SyncStatus,
 };
 
-/// How often the state is read again for changes the driver makes on its own.
-const POLL: Duration = Duration::from_millis(500);
-
-/// The platform this app reports to the server for its device.
-const PLATFORM: &str = "macos";
-
 pub(crate) struct DriverCore {
     runtime: Runtime,
     paths: Paths,
     events: Events,
     inner: Mutex<Inner>,
-    /// Taken by the calls that sign in or change the linked folders, one at a time, so that a claim
-    /// never opens the profile again while another call still holds the driver. The calls the app
-    /// makes on its main thread never take it, and no call holds `inner` while it waits on the network.
+    /// Taken by the calls that sign in, sign out, answer a question or change the linked folders,
+    /// so that they run one at a time: an answer is written to a store that an unlink or a sign-out
+    /// may be removing. The questions are not read while one runs, because reading them opens the
+    /// stores too. The calls the app makes on its main thread never wait for it, and no
+    /// call holds `inner` while it waits on the network.
     changes: Mutex<()>,
     closed: AtomicBool,
-    poller: Mutex<Option<JoinHandle<()>>>,
+    watcher: Mutex<Option<JoinHandle<()>>>,
 }
 
 struct Inner {
-    /// None only if opening the profile again after a claim failed.
+    /// None once the core has closed.
     driver: Option<Driver>,
     /// The server [`Core::connect`] found, for signing in.
     server: Option<Api>,
@@ -80,6 +77,7 @@ impl DriverCore {
             })?;
         let paths = Paths::under(dir);
         let driver = Driver::open(paths.clone()).map_err(driver_error)?;
+        let changes = driver.watch();
         let paused = paused_file(&paths).exists();
         let core = Arc::new(DriverCore {
             runtime,
@@ -104,13 +102,17 @@ impl DriverCore {
             }),
             changes: Mutex::new(()),
             closed: AtomicBool::new(false),
-            poller: Mutex::new(None),
+            watcher: Mutex::new(None),
         });
         {
             let mut inner = core.lock();
             inner.sent = core.read(&mut inner);
         }
-        *core.poller.lock().unwrap() = poll(Arc::downgrade(&core));
+        *core.watcher.lock().unwrap() = follow(
+            Arc::downgrade(&core),
+            changes,
+            core.runtime.handle().clone(),
+        );
         Ok(core)
     }
 
@@ -165,12 +167,19 @@ impl DriverCore {
             };
         };
         let status = driver.status();
-        let questions = match driver.questions() {
-            Ok(questions) => questions.into_iter().map(question).collect(),
-            Err(error) => {
+        // Reading the questions opens each folder's store, which a change may be removing.
+        let unchanging = match self.changes.try_lock() {
+            Ok(unchanging) => Some(unchanging),
+            Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        };
+        let questions = match unchanging.map(|_unchanging| driver.questions()) {
+            Some(Ok(questions)) => questions.into_iter().map(question).collect(),
+            Some(Err(error)) => {
                 tracing::warn!(%error, "the questions cannot be read");
                 inner.sent.questions.clone()
             }
+            None => inner.sent.questions.clone(),
         };
         SessionState {
             status: sync_status(&status, inner.started, inner.paused),
@@ -186,14 +195,26 @@ impl DriverCore {
 
     fn driver<'a>(&self, inner: &'a Inner) -> Result<&'a Driver, SessionError> {
         inner.driver.as_ref().ok_or_else(|| SessionError::Failed {
-            reason: "this device's sync state could not be opened again; relaunch Flarebox".into(),
+            reason: "the session has closed".into(),
         })
     }
 
-    fn change(&self) -> MutexGuard<'_, ()> {
-        self.changes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// Runs `change` while no other change runs, then sends the state it left. The state is read
+    /// after `changes` is released, so that it includes the questions.
+    fn change<T>(
+        &self,
+        change: impl FnOnce(&Driver) -> Result<T, SessionError>,
+    ) -> Result<T, SessionError> {
+        let changed = {
+            let _change = self
+                .changes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let driver = self.driver(&self.lock())?.clone();
+            change(&driver)
+        };
+        self.refresh(&mut self.lock(), false);
+        changed
     }
 
     /// The stored credential's API and authentication, for the calls the driver does not make.
@@ -220,15 +241,17 @@ impl Drop for DriverCore {
     }
 }
 
-/// Reads the state every [`POLL`] until the core closes, so changes the driver makes on its own
-/// reach the listener.
-// interim until driver Driver::watch: wake on the driver's change notification instead of polling.
-fn poll(core: Weak<DriverCore>) -> Option<JoinHandle<()>> {
+/// Reads the state each time the driver marks `changes`, until the core closes, so changes the
+/// driver makes on its own reach the listener.
+fn follow(
+    core: Weak<DriverCore>,
+    mut changes: watch::Receiver<()>,
+    runtime: Handle,
+) -> Option<JoinHandle<()>> {
     let spawned = thread::Builder::new()
         .name("flarebox-state".into())
         .spawn(move || {
-            loop {
-                thread::park_timeout(POLL);
+            while runtime.block_on(changes.changed()).is_ok() {
                 let Some(core) = core.upgrade() else { return };
                 if core.closed.load(Ordering::SeqCst) {
                     return;
@@ -329,84 +352,46 @@ impl Core for DriverCore {
         Ok(server)
     }
 
-    // interim until driver Driver::claim: claims through core/net, saves the credential as
-    // Driver::pair does, and opens the driver again so that it reads the credential.
     fn claim(
         &self,
         code: &str,
         user_name: &str,
         device_name: &str,
     ) -> Result<Account, SessionError> {
-        if user_name.trim().is_empty() || device_name.trim().is_empty() {
-            return Err(SessionError::EmptyName);
-        }
-        let _change = self.change();
-        let (api, signed_in) = {
-            let inner = self.lock();
-            let api = inner.server.clone().ok_or(SessionError::NoServer)?;
-            (api, self.driver(&inner)?.status().account)
-        };
-        if let Some(account) = signed_in {
-            return Err(SessionError::Failed {
-                reason: format!("this device is already signed in as {}", account.device_id),
-            });
-        }
-        let issued = self
-            .runtime
-            .block_on(api.claim(&ClaimRequest {
-                code: code.trim().to_owned(),
-                user_name: user_name.to_owned(),
-                device_name: device_name.to_owned(),
-                platform: PLATFORM.to_owned(),
-            }))
-            .map_err(code_error)?;
-        Credential {
-            server: api.base().to_string(),
-            user_id: issued.user_id,
-            user_name: Some(user_name.to_owned()),
-            device_id: issued.device_id,
-            device_name: device_name.to_owned(),
-            refresh_credential: issued.refresh_credential,
-        }
-        .save_new(&self.paths.credential())
-        .map_err(|error| SessionError::NotSaved {
-            reason: error.to_string(),
-        })?;
-        let mut inner = self.lock();
-        if let Some(driver) = inner.driver.take() {
-            self.runtime.block_on(driver.stop());
-        }
-        let driver = Driver::open(self.paths.clone()).map_err(driver_error)?;
-        if inner.started && !inner.paused {
-            self.start_driver(&driver);
-        }
-        inner.driver = Some(driver);
-        self.refresh(&mut inner, false);
-        inner.sent.account.clone().ok_or(SessionError::NotSignedIn)
+        self.change(|driver| {
+            let api = self.lock().server.clone().ok_or(SessionError::NoServer)?;
+            let claimed = self
+                .runtime
+                .block_on(driver.claim(api.base().as_str(), code.trim(), user_name, device_name))
+                .map_err(sign_in_error)?;
+            Ok(account(&claimed))
+        })
     }
 
     fn pair(&self, code: &str, device_name: &str) -> Result<Account, SessionError> {
-        let _change = self.change();
-        let (api, driver) = {
-            let inner = self.lock();
-            let api = inner.server.clone().ok_or(SessionError::NoServer)?;
-            (api, self.driver(&inner)?.clone())
-        };
-        let paired = self
-            .runtime
-            .block_on(driver.pair(api.base().as_str(), code.trim(), device_name))
-            .map_err(|error| match error {
-                DriverError::Api(error) => code_error(error),
-                other => driver_error(other),
-            })?;
-        self.refresh(&mut self.lock(), false);
-        Ok(account(&paired))
+        self.change(|driver| {
+            let api = self.lock().server.clone().ok_or(SessionError::NoServer)?;
+            let paired = self
+                .runtime
+                .block_on(driver.pair(api.base().as_str(), code.trim(), device_name))
+                .map_err(sign_in_error)?;
+            Ok(account(&paired))
+        })
     }
 
-    // interim until driver Driver::sign_out.
+    /// Signing out stops the driver. It starts again here if the session runs, so that a sign-in
+    /// that follows syncs the folders it links, but not after a failed sign-out: the folders it
+    /// could not unlink stay stopped until the person signs out again or resumes.
     fn sign_out(&self) -> Result<(), SessionError> {
-        Err(SessionError::Failed {
-            reason: "signing out is not available yet".into(),
+        self.change(|driver| {
+            self.runtime
+                .block_on(driver.sign_out())
+                .map_err(driver_error)?;
+            let inner = self.lock();
+            if inner.started && !inner.paused {
+                self.start_driver(driver);
+            }
+            Ok(())
         })
     }
 
@@ -464,40 +449,37 @@ impl Core for DriverCore {
     }
 
     fn link_folder(&self, space_id: &str, path: &str) -> Result<LinkedFolder, SessionError> {
-        let _change = self.change();
-        let driver = self.driver(&self.lock())?.clone();
-        let linked = self
-            .runtime
-            .block_on(driver.link(Path::new(path), space_id))
-            .map_err(driver_error)?;
-        self.refresh(&mut self.lock(), false);
-        Ok(folder(&linked))
+        self.change(|driver| {
+            let linked = self
+                .runtime
+                .block_on(driver.link(Path::new(path), space_id))
+                .map_err(driver_error)?;
+            Ok(folder(&linked))
+        })
     }
 
     fn unlink_folder(&self, space_id: &str) -> Result<(), SessionError> {
-        let _change = self.change();
-        let driver = self.driver(&self.lock())?.clone();
-        let path = driver
-            .status()
-            .folders
-            .into_iter()
-            .find(|folder| folder.space_id == space_id)
-            .map(|folder| PathBuf::from(folder.path))
-            .ok_or(SessionError::FolderNotLinked)?;
-        self.runtime
-            .block_on(driver.unlink(&path))
-            .map_err(driver_error)?;
-        self.refresh(&mut self.lock(), false);
-        Ok(())
+        self.change(|driver| {
+            let path = driver
+                .status()
+                .folders
+                .into_iter()
+                .find(|folder| folder.space_id == space_id)
+                .map(|folder| PathBuf::from(folder.path))
+                .ok_or(SessionError::FolderNotLinked)?;
+            self.runtime
+                .block_on(driver.unlink(&path))
+                .map_err(driver_error)?;
+            Ok(())
+        })
     }
 
     fn answer(&self, question_id: &str, answer: Answer) -> Result<(), SessionError> {
-        let mut inner = self.lock();
-        self.driver(&inner)?
-            .answer(question_id, driver_answer(answer))
-            .map_err(driver_error)?;
-        self.refresh(&mut inner, false);
-        Ok(())
+        self.change(|driver| {
+            driver
+                .answer(question_id, driver_answer(answer))
+                .map_err(driver_error)
+        })
     }
 
     fn dismiss_notice(&self, _notice_id: &str) -> Result<(), SessionError> {
@@ -508,16 +490,15 @@ impl Core for DriverCore {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
-        let poller = self.poller.lock().unwrap().take();
-        if let Some(poller) = poller
-            && poller.thread().id() != thread::current().id()
-        {
-            poller.thread().unpark();
-            let _ = poller.join();
-        }
         let driver = self.lock().driver.take();
         if let Some(driver) = driver {
             self.runtime.block_on(driver.stop());
+        }
+        let watcher = self.watcher.lock().unwrap().take();
+        if let Some(watcher) = watcher
+            && watcher.thread().id() != thread::current().id()
+        {
+            let _ = watcher.join();
         }
     }
 }
@@ -543,8 +524,8 @@ fn not_saved(path: &Path) -> impl FnOnce(io::Error) -> SessionError + '_ {
     }
 }
 
-/// The session's status: what its folders are doing, unless the session is stopped, paused or
-/// has nothing to sync. A halted folder outranks the others, and the session is idle only when
+/// The session's status: what its folders are doing, unless the session is stopped (also by a
+/// sign-out that failed), paused or has nothing to sync. A halted folder outranks the others, and the session is idle only when
 /// every folder is up to date.
 fn sync_status(status: &Status, started: bool, paused: bool) -> SyncStatus {
     if !started {
@@ -552,6 +533,9 @@ fn sync_status(status: &Status, started: bool, paused: bool) -> SyncStatus {
     }
     if paused {
         return SyncStatus::Paused;
+    }
+    if !status.running {
+        return SyncStatus::Stopped;
     }
     if status.account.is_none() || status.folders.is_empty() {
         return SyncStatus::NeedsSetup;
@@ -716,7 +700,7 @@ fn driver_error(error: DriverError) -> SessionError {
     match error {
         DriverError::Busy(_) => SessionError::ProfileInUse,
         DriverError::NotPaired => SessionError::NotSignedIn,
-        DriverError::EmptyName => SessionError::EmptyName,
+        DriverError::EmptyName | DriverError::EmptyUserName => SessionError::EmptyName,
         DriverError::Api(error) => api_error(error),
         DriverError::SpaceNotFound(_) => SessionError::SpaceNotFound,
         DriverError::FolderNotFound(_) => SessionError::FolderNotFound,
@@ -761,6 +745,14 @@ fn api_error(error: ApiError) -> SessionError {
 }
 
 /// The error of a call that redeems a claim or pairing code.
+/// A refused claim or pairing is the code's fault unless the server failed.
+fn sign_in_error(error: DriverError) -> SessionError {
+    match error {
+        DriverError::Api(error) => code_error(error),
+        other => driver_error(other),
+    }
+}
+
 fn code_error(error: ApiError) -> SessionError {
     match &error {
         ApiError::Server { error: refusal, .. } => match refusal.code() {
@@ -786,6 +778,7 @@ fn error_chain(error: &dyn std::error::Error) -> String {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
 
     use flarebox_net::ServerError;
     use flarebox_proto::v1::Error as ProtoError;
