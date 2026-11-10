@@ -228,7 +228,8 @@ impl Effects {
             (remote.kind == Kind::File && is_rules_file(&remote.name))
                 .then_some(remote.parent.as_str())
         };
-        let gates: BTreeSet<&str> = (trees.dirty().iter())
+        let gates: BTreeSet<&str> = (trees.remote_rules_files().iter())
+            .filter(|id| trees.dirty().contains(*id))
             .filter_map(|id| writes_rules(id).filter(|_| candidate(trees, id)))
             .collect();
         let gated = |id: &str| {
@@ -460,16 +461,11 @@ enum Step {
 /// L as the disk holds it: parked nodes sit in the parked directory and hold no name.
 struct View<'a> {
     trees: &'a Trees,
-    children: BTreeMap<&'a str, Vec<&'a str>>,
 }
 
 impl<'a> View<'a> {
     fn new(trees: &'a Trees) -> Self {
-        let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        for (id, node) in trees.local().iter().filter(|(_, node)| !node.parked) {
-            children.entry(&node.shape.parent).or_default().push(id);
-        }
-        Self { trees, children }
+        Self { trees }
     }
 
     fn root(&self) -> &'a str {
@@ -613,7 +609,7 @@ impl<'a> View<'a> {
     }
 
     fn remove(&self, id: &str, local: &LocalNode) -> Step {
-        if self.children.get(id).is_some_and(|c| !c.is_empty()) {
+        if self.trees.local_children(id).next().is_some() {
             return Step::Blocked(None);
         }
         let Some(at) = self.location(id) else {
@@ -644,20 +640,10 @@ impl<'a> View<'a> {
                 return Some(Step::Blocked((!stays).then(|| id.to_owned())));
             }
         }
-        let key = name_key(&remote.name);
-        self.children
-            .get(remote.parent.as_str())
-            .into_iter()
-            .flatten()
-            .find(|other| {
-                **other != id
-                    && self
-                        .trees
-                        .local()
-                        .get(other)
-                        .is_some_and(|node| name_key(&node.shape.name) == key)
-            })
-            .map(|holder| Step::Blocked(Some((*holder).to_owned())))
+        self.trees
+            .local_holders(&remote.parent, &remote.name)
+            .find(|other| *other != id)
+            .map(|holder| Step::Blocked(Some(holder.clone())))
     }
 
     /// True when an excluded node is on the way up from `inner` to `id`, which holds it on disk.

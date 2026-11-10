@@ -1175,7 +1175,8 @@ fn run_ignoring(
         "every restore asked for ends, and its op is sent once"
     );
 
-    let unsettled: Vec<String> = (device.trees.settle().into_iter())
+    device.trees.settle();
+    let unsettled: Vec<String> = (device.trees.work().into_iter())
         .map(|(id, _)| id)
         .filter(|id| !device.trees.ignored(id))
         .collect();

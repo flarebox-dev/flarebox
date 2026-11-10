@@ -8,7 +8,7 @@
 //! tree. [`Engine::observe`] puts an observation batch into L: each change goes to the node with the entry's
 //! identity, or to the node at the change's path, and a change that leaves a node as L has it changes nothing.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::BuildHasher;
 use std::path::{Component, Path, PathBuf};
 
@@ -77,6 +77,7 @@ impl Engine {
         trees
             .restore(stored.trees.clone())
             .map_err(|error| invalid(format!("{error:?}")))?;
+        trees.take_changed();
         let commits = Commits::from_state(stored.commits.clone())
             .map_err(|error| invalid(format!("{error:?}")))?;
         let effects = Effects::from_state(stored.effects.clone())
@@ -104,15 +105,12 @@ impl Engine {
     }
 
     /// Ends a step that changed the engine, inside the step's transaction. It settles the trees, then writes the L
-    /// row and the S row of every node that was dirty before settling, what changed in the engine state since the
-    /// last checkpoint, and the ID generator. A row of a node the tree no longer holds is removed.
-    ///
-    /// The dirty set names every changed row: each setter of [`Trees`] marks its node, and [`Trees::settle`] changes
-    /// S only for nodes it took from the dirty set.
+    /// row and the S row of every node whose entry changed since the last checkpoint ([`Trees::take_changed`]), what
+    /// changed in the engine state, and the ID generator. A row of a node the tree no longer holds is removed. A
+    /// transaction that fails ends the task, which loads the engine again from the store.
     pub fn checkpoint(&mut self, tx: &Tx<'_>) -> Result<(), Error> {
-        let touched: Vec<NodeId> = self.trees.dirty().iter().cloned().collect();
         self.trees.settle();
-        for id in &touched {
+        for id in &self.trees.take_changed() {
             match self.trees.local().get(id) {
                 Some(node) => tx.put_local_node(&stored(id, node))?,
                 None => {
@@ -262,13 +260,12 @@ impl Engine {
     /// folder, a file with the size, time and executable bit of its content. The first scan then reports what
     /// changed while nothing observed the folder, removals included, and reads only the files that differ.
     pub fn snapshot(&self) -> Snapshot {
-        let index = Index::new(&self.trees);
         let local = self.trees.local();
         let mut entries = BTreeMap::new();
         let mut pending = vec![(PathBuf::new(), local.root.clone())];
         while let Some((path, id)) = pending.pop() {
-            for child in index.children_of(&id) {
-                let Some(node) = local.get(&child) else {
+            for child in self.trees.local_children(&id) {
+                let Some(node) = local.get(child) else {
                     continue;
                 };
                 let (kind, size, mtime_ns, executable) =
@@ -293,7 +290,7 @@ impl Engine {
                         executable,
                     },
                 );
-                pending.push((at, child));
+                pending.push((at, child.clone()));
             }
         }
         Snapshot { entries }
@@ -346,11 +343,16 @@ impl Engine {
         if read.is_empty() && unreadable.is_empty() {
             return;
         }
-        let index = Index::new(&self.trees);
-        for id in read.iter().filter_map(|dir| index.at(dir)) {
+        let read: Vec<NodeId> = (read.iter())
+            .filter_map(|dir| local_at(&self.trees, dir))
+            .collect();
+        let unreadable: Vec<NodeId> = (unreadable.iter())
+            .filter_map(|dir| local_at(&self.trees, dir))
+            .collect();
+        for id in read {
             self.trees.set_rules_known(&id);
         }
-        for id in unreadable.iter().filter_map(|dir| index.at(dir)) {
+        for id in unreadable {
             self.trees.set_rules_unknown(&id);
         }
     }
@@ -370,14 +372,13 @@ impl Engine {
     /// when its folder is in L, and keeps its entry otherwise ([`Trees::ignore_local`]); an entry L never held stays
     /// out.
     pub fn observe(&mut self, changes: &[Observed], now_ms: u64) -> BTreeSet<NodeId> {
-        let mut index = Index::new(&self.trees);
         let before: Vec<Option<NodeId>> = changes
             .iter()
             .map(|change| match change {
-                Observed::Removed { path, .. } => index.at(path),
+                Observed::Removed { path, .. } => local_at(&self.trees, path),
                 Observed::Renamed {
                     from, id, linked, ..
-                } => index.resolve(&self.trees, from, &file_identity(*id), *linked),
+                } => resolve(&self.trees, from, &file_identity(*id), *linked),
                 Observed::Created { .. } | Observed::Modified { .. } => None,
             })
             .collect();
@@ -386,7 +387,7 @@ impl Engine {
             match change {
                 Observed::Removed { .. } => {
                     if let Some(id) = before {
-                        self.remove(&mut index, &id, &mut touched);
+                        self.remove(&id, &mut touched);
                     }
                 }
                 Observed::Renamed { to, kind, id, .. } => {
@@ -396,7 +397,11 @@ impl Engine {
                     };
                     if names(to).is_some_and(|to| self.trees.ignores(&to, node_kind)) {
                         let Some(node) = &before else { continue };
-                        if to.parent().and_then(|dir| index.at(dir)).is_none() {
+                        if to
+                            .parent()
+                            .and_then(|dir| local_at(&self.trees, dir))
+                            .is_none()
+                        {
                             self.trees.ignore_local(node);
                             continue;
                         }
@@ -406,16 +411,7 @@ impl Engine {
                         .as_ref()
                         .and_then(|id| self.trees.local().get(id))
                         .and_then(|node| node.shape.content.clone());
-                    self.place(
-                        &mut index,
-                        before,
-                        to,
-                        *kind,
-                        identity,
-                        content,
-                        now_ms,
-                        &mut touched,
-                    );
+                    self.place(before, to, *kind, identity, content, now_ms, &mut touched);
                 }
                 Observed::Created {
                     path,
@@ -428,9 +424,10 @@ impl Engine {
                         continue;
                     }
                     let identity = file_identity(*id);
-                    let node = index.by_identity(&identity).filter(|_| !linked);
+                    let node = (self.trees.local_with_identity(&identity))
+                        .filter(|_| !linked)
+                        .cloned();
                     self.place(
-                        &mut index,
                         node,
                         path,
                         *kind,
@@ -448,9 +445,8 @@ impl Engine {
                 } => {
                     let Some(content) = content else { continue };
                     let identity = file_identity(*id);
-                    let node = index.resolve(&self.trees, path, &identity, *linked);
+                    let node = resolve(&self.trees, path, &identity, *linked);
                     self.place(
-                        &mut index,
                         node,
                         path,
                         EntryKind::File,
@@ -472,9 +468,8 @@ impl Engine {
     /// is planned again only once L has changed.
     pub fn takes(&self, record: &EffectRecord) -> bool {
         let local = self.trees.local();
-        let mut placed = local.iter().filter(|(_, node)| !node.parked);
         let Some(after) = &record.after else {
-            return !placed.any(|(_, node)| node.shape.parent == record.node);
+            return self.trees.local_children(&record.node).next().is_none();
         };
         let parks = matches!(
             record.effect,
@@ -498,8 +493,11 @@ impl Engine {
                 _ => return false,
             }
         }
-        !placed.any(|(id, node)| {
-            *id != record.node && node.shape.parent == after.parent && node.shape.name == after.name
+        !(self.trees.local_holders(&after.parent, &after.name)).any(|id| {
+            *id != record.node
+                && local
+                    .get(id)
+                    .is_some_and(|node| node.shape.name == after.name)
         })
     }
 
@@ -507,14 +505,12 @@ impl Engine {
     /// the scope and of every placed node under it. The empty path covers all of L, and a path L does not hold gets
     /// no entries. L's content for a file is left out, because it does not prove what the disk holds.
     pub fn resets(&self, scopes: impl IntoIterator<Item = PathBuf>) -> Vec<Reset> {
-        let index = Index::new(&self.trees);
         let local = self.trees.local();
         scopes
             .into_iter()
             .map(|scope| {
                 let mut known = BTreeMap::new();
-                let mut pending: Vec<(PathBuf, NodeId)> = index
-                    .at(&scope)
+                let mut pending: Vec<(PathBuf, NodeId)> = local_at(&self.trees, &scope)
                     .map(|id| (scope.clone(), id))
                     .into_iter()
                     .collect();
@@ -529,7 +525,7 @@ impl Engine {
                         let id = file_id(node.identity);
                         known.insert(path.clone(), Known { kind, id });
                     }
-                    for child in index.children_of(&id) {
+                    for child in self.trees.local_children(&id).cloned().collect::<Vec<_>>() {
                         if let Some(node) = local.get(&child) {
                             pending.push((path.join(&node.shape.name), child));
                         }
@@ -546,7 +542,6 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     fn place(
         &mut self,
-        index: &mut Index,
         node: Option<NodeId>,
         path: &Path,
         kind: EntryKind,
@@ -556,7 +551,8 @@ impl Engine {
         touched: &mut BTreeSet<NodeId>,
     ) {
         let (Some(parent), Some(name)) = (
-            path.parent().and_then(|parent| index.at(parent)),
+            path.parent()
+                .and_then(|parent| local_at(&self.trees, parent)),
             path.file_name().and_then(|name| name.to_str()),
         ) else {
             return;
@@ -601,22 +597,22 @@ impl Engine {
             return;
         }
         let mut id = node.unwrap_or_else(|| self.ids.uuid_v7(now_ms));
-        if let Some(holder) = index.child(&parent, name).filter(|holder| **holder != id) {
+        if let Some(holder) =
+            (self.trees.local_child(&parent, name)).filter(|holder| **holder != id)
+        {
             let holder = holder.clone();
             let replaced = self.trees.local().get(&holder).map(|node| node.shape.kind);
             let synced =
                 self.trees.synced().get(&id).is_some() || self.trees.remote().get(&id).is_some();
             if kind == Kind::File && replaced == Some(Kind::File) && !synced {
                 if self.trees.local().get(&id).is_some() {
-                    self.remove(index, &id, touched);
+                    self.remove(&id, touched);
                 }
                 id = holder;
             } else {
-                self.remove(index, &holder, touched);
+                self.remove(&holder, touched);
             }
         }
-        index.forget(&self.trees, &id);
-        index.insert(&id, &shape, identity);
         self.trees.set_local(
             id.clone(),
             LocalNode {
@@ -629,119 +625,46 @@ impl Engine {
     }
 
     /// Removes `id` and every node placed under it from L.
-    fn remove(&mut self, index: &mut Index, id: &NodeId, touched: &mut BTreeSet<NodeId>) {
+    fn remove(&mut self, id: &NodeId, touched: &mut BTreeSet<NodeId>) {
         let mut doomed = vec![id.clone()];
         let mut next = 0;
         while let Some(current) = doomed.get(next).cloned() {
-            doomed.extend(index.children_of(&current));
+            doomed.extend(self.trees.local_children(&current).cloned());
             next += 1;
         }
         for id in doomed {
-            index.forget(&self.trees, &id);
             self.trees.remove_local(&id);
             touched.insert(id);
         }
     }
 }
 
-/// L's placed nodes by parent and name, and all of its nodes by identity.
-struct Index {
-    root: NodeId,
-    children: BTreeMap<(NodeId, String), NodeId>,
-    identities: HashMap<FileIdentity, NodeId>,
+/// The placed node of L at `path`, or the root for the empty path.
+fn local_at(trees: &Trees, path: &Path) -> Option<NodeId> {
+    let mut current = trees.local().root.clone();
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            return None;
+        };
+        current = trees.local_child(&current, name.to_str()?)?.clone();
+    }
+    Some(current)
 }
 
-impl Index {
-    fn new(trees: &Trees) -> Self {
-        let local = trees.local();
-        let mut index = Index {
-            root: local.root.clone(),
-            children: BTreeMap::new(),
-            identities: HashMap::new(),
-        };
-        for (id, node) in local.iter() {
-            index.identities.insert(node.identity, id.clone());
-            if !node.parked {
-                index.children.insert(
-                    (node.shape.parent.clone(), node.shape.name.clone()),
-                    id.clone(),
-                );
-            }
-        }
-        index
-    }
-
-    /// The node at `path`, or the root for the empty path.
-    fn at(&self, path: &Path) -> Option<NodeId> {
-        let mut current = self.root.clone();
-        for component in path.components() {
-            let Component::Normal(name) = component else {
-                return None;
-            };
-            current = self.child(&current, name.to_str()?)?.clone();
-        }
-        Some(current)
-    }
-
-    fn child(&self, parent: &str, name: &str) -> Option<&NodeId> {
-        self.children.get(&(parent.to_owned(), name.to_owned()))
-    }
-
-    fn children_of(&self, parent: &str) -> Vec<NodeId> {
-        self.children
-            .range((parent.to_owned(), String::new())..)
-            .take_while(|((holder, _), _)| holder == parent)
-            .map(|(_, id)| id.clone())
-            .collect()
-    }
-
-    fn by_identity(&self, identity: &FileIdentity) -> Option<NodeId> {
-        self.identities.get(identity).cloned()
-    }
-
-    /// The node at `path` when it has `identity`, else the node with `identity`, else the node at `path`. The
-    /// identity of a file with several links (`linked`) names no single path, so it never takes a node from another
-    /// path, where the other link may still be.
-    fn resolve(
-        &self,
-        trees: &Trees,
-        path: &Path,
-        identity: &FileIdentity,
-        linked: bool,
-    ) -> Option<NodeId> {
-        let at = self.at(path);
-        at.clone()
-            .filter(|id| {
-                trees
-                    .local()
-                    .get(id)
-                    .is_some_and(|node| node.identity == *identity)
-            })
-            .or_else(|| self.by_identity(identity).filter(|_| !linked))
-            .or(at)
-    }
-
-    fn forget(&mut self, trees: &Trees, id: &str) {
-        if let Some(node) = trees.local().get(id) {
-            let key = (node.shape.parent.clone(), node.shape.name.clone());
-            if self.children.get(&key).is_some_and(|held| held == id) {
-                self.children.remove(&key);
-            }
-            if self
-                .identities
-                .get(&node.identity)
-                .is_some_and(|held| held == id)
-            {
-                self.identities.remove(&node.identity);
-            }
-        }
-    }
-
-    fn insert(&mut self, id: &NodeId, shape: &Shape, identity: FileIdentity) {
-        self.children
-            .insert((shape.parent.clone(), shape.name.clone()), id.clone());
-        self.identities.insert(identity, id.clone());
-    }
+/// The node at `path` when it has `identity`, else the node with `identity`, else the node at `path`. The identity of
+/// a file with several links (`linked`) names no single path, so it never takes a node from another path, where the
+/// other link may still be.
+fn resolve(trees: &Trees, path: &Path, identity: &FileIdentity, linked: bool) -> Option<NodeId> {
+    let at = local_at(trees, path);
+    at.clone()
+        .filter(|id| (trees.local().get(id)).is_some_and(|node| node.identity == *identity))
+        .or_else(|| {
+            trees
+                .local_with_identity(identity)
+                .filter(|_| !linked)
+                .cloned()
+        })
+        .or(at)
 }
 
 /// The names from the root to `path`, or `None` when one of them is not a name L can hold.
@@ -1576,8 +1499,7 @@ mod tests {
 
     /// The node L holds at `path`, with its identity and content size.
     fn holding(engine: &Engine, path: &str) -> Option<(NodeId, FileIdentity, u64)> {
-        let index = Index::new(&engine.trees);
-        let id = index.at(Path::new(path))?;
+        let id = local_at(&engine.trees, Path::new(path))?;
         let node = engine.trees.local().get(&id)?;
         let size = node
             .shape

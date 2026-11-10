@@ -429,7 +429,8 @@ fn a_reverted_move_brings_back_the_folders_l_deleted_on_its_way() {
             "{id}"
         );
     }
-    assert!(trees.settle().is_empty());
+    trees.settle();
+    assert!(trees.work().is_empty());
 }
 
 #[test]
@@ -571,7 +572,8 @@ fn a_reverted_file_deleted_remotely_keeps_its_unuploaded_edit_as_a_new_file() {
         vec![outcome(op_result::Code::Applied)],
     );
     trees.set_remote(create.node_id.clone(), remote(file(ROOT, "x", 2)));
-    assert_eq!(trees.settle(), vec![]);
+    trees.settle();
+    assert_eq!(trees.work(), vec![]);
     assert!(trees.reverted().is_empty());
 }
 
@@ -673,7 +675,8 @@ fn a_folder_deleted_around_a_parked_node_is_brought_back_for_it() {
                 .done(&mut trees, &record.effect_id, Some(identity))
                 .unwrap();
         }
-        assert_eq!(trees.settle(), vec![], "{name}");
+        trees.settle();
+        assert_eq!(trees.work(), vec![], "{name}");
         assert_eq!(trees.local().get("d").unwrap().shape, dir(ROOT, "d"));
         let f = trees.local().get("f").unwrap();
         assert_eq!((&f.shape, f.parked), (&file("d", name, 1), false));
@@ -763,7 +766,8 @@ fn a_parked_file_rekeyed_for_its_edit_is_moved_out_from_where_it_was_parked() {
             .unwrap();
     }
     assert!(unparked);
-    assert_eq!(trees.settle(), vec![]);
+    trees.settle();
+    assert_eq!(trees.work(), vec![]);
     let node = trees.local().get(&rekeyed).unwrap();
     assert_eq!((&node.shape, node.parked), (&file(ROOT, "x", 2), false));
     assert_eq!(trees.parked_name(&rekeyed), rekeyed);
@@ -873,7 +877,8 @@ fn a_parked_reverted_folder_the_server_lacks_is_removed_even_when_its_name_is_ta
         "{record:?}"
     );
     effects.done(&mut trees, &record.effect_id, None).unwrap();
-    assert_eq!(trees.settle(), vec![]);
+    trees.settle();
+    assert_eq!(trees.work(), vec![]);
     assert!(trees.local().get("n").is_none());
     assert!(trees.reverted().is_empty());
 }
@@ -1197,7 +1202,8 @@ fn a_folder_merged_into_one_l_holds_elsewhere_is_removed_once_its_files_follow_i
     let b = trees.local().get("b").unwrap();
     assert_eq!((&b.shape, b.identity.ino), (&dir(ROOT, "e"), 2));
     assert!(trees.reverted().is_empty());
-    assert!(trees.settle().is_empty());
+    trees.settle();
+    assert!(trees.work().is_empty());
 }
 
 #[test]
@@ -1276,7 +1282,8 @@ fn a_conflict_copy_downloaded_before_its_result_is_kept_once() {
     );
     assert_eq!(trees.local().get("f").unwrap().shape, file(ROOT, "f", 3));
     assert_eq!(trees.local().iter().count(), 2);
-    assert!(trees.settle().is_empty());
+    trees.settle();
+    assert!(trees.work().is_empty());
     assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
 }
 

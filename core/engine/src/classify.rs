@@ -2,15 +2,16 @@
 
 //! Classifying a node (docs/design/sync-engine.md section 2.3) and the dirty set the planner reads.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use flarebox_ignore::Status;
 
-use crate::ignore::{LocalRules, Matcher, RuleFile};
+use crate::ignore::{LocalRules, Matcher, RuleFile, is_rules_file};
 use crate::names::name_key;
 use crate::state::{StateError, TreesState};
 use crate::tree::{
-    Kind, LocalNode, Names, Node, NodeId, RemoteNode, Shape, Tree, TreeError, same, same_content,
+    FileIdentity, Kind, LocalNode, Names, Node, NodeId, RemoteNode, Shape, Tree, TreeError, same,
+    same_content,
 };
 
 /// The most mutually dependent [`Class::Same`] updates [`Trees::settle`] searches as one group.
@@ -91,14 +92,49 @@ fn path<'a, N: Node>(tree: &'a Tree<N>, id: &str) -> Option<(Vec<&'a str>, Kind)
     None
 }
 
+/// The nodes of a tree by parent and the `name_key` of their name.
+#[derive(Clone, Debug, Default)]
+struct ByName(BTreeMap<(NodeId, String), BTreeSet<NodeId>>);
+
+impl ByName {
+    fn insert(&mut self, id: &str, shape: &Shape) {
+        let key = (shape.parent.clone(), name_key(&shape.name));
+        self.0.entry(key).or_default().insert(id.to_owned());
+    }
+
+    fn remove(&mut self, id: &str, shape: &Shape) {
+        let key = (shape.parent.clone(), name_key(&shape.name));
+        if let Some(ids) = self.0.get_mut(&key) {
+            ids.remove(id);
+            if ids.is_empty() {
+                self.0.remove(&key);
+            }
+        }
+    }
+
+    /// The nodes under `parent` whose name has the `name_key` of `name`.
+    fn holders<'a>(&'a self, parent: &str, name: &str) -> impl Iterator<Item = &'a NodeId> + 'a {
+        let key = (parent.to_owned(), name_key(name));
+        self.0.get(&key).into_iter().flatten()
+    }
+
+    fn children<'a>(&'a self, parent: &'a str) -> impl Iterator<Item = &'a NodeId> + 'a {
+        self.0
+            .range((parent.to_owned(), String::new())..)
+            .take_while(move |((of, _), _)| of == parent)
+            .flat_map(|(_, ids)| ids)
+    }
+}
+
 /// R, L and S of one space, and the nodes whose entries changed since they were last found in sync.
-/// Every mutation goes through these methods, so a change in any tree marks its node dirty.
+/// Every mutation goes through these methods, so a change in any tree marks its node dirty, and
+/// [`Trees::settle`] and the planner look only at what changed.
 ///
 /// The trees also own the ignore rules of this device (section 5.10) and decide with them which
 /// nodes are excluded here ([`Trees::excluded`]). The rules are not part of the stored state: the
 /// driver passes them again after a restart, and nothing is planned until it has
 /// ([`Trees::rules_known`]).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Trees {
     r: Tree<RemoteNode>,
     l: Tree<LocalNode>,
@@ -117,6 +153,38 @@ pub struct Trees {
     /// The folders whose rules the last scan of each could not read, by node: a folder renamed is the same folder,
     /// and two folders whose names differ only in case are two folders.
     unknown_rules: BTreeSet<NodeId>,
+    /// Dirty nodes marked since the last settle, the only ones whose class can have changed.
+    unsettled: BTreeSet<NodeId>,
+    /// Dirty nodes the last settle left as [`Class::Same`], which the next one tries again.
+    same: BTreeSet<NodeId>,
+    /// Nodes whose entry in R, L or S changed since [`Trees::take_changed`].
+    changed: BTreeSet<NodeId>,
+    /// The placed nodes of L.
+    l_names: ByName,
+    /// Every node of L, placed or parked, by its identity.
+    l_identities: HashMap<FileIdentity, BTreeSet<NodeId>>,
+    /// The nodes of S.
+    s_names: ByName,
+    /// Nodes whose S position neither placed L nor R holds, which [`Trees::settle`] tries to
+    /// release every time, since whether it may depends on the rules and on other nodes.
+    orphaned: BTreeSet<NodeId>,
+    /// The live files of R that are rules files.
+    remote_rules_files: BTreeSet<NodeId>,
+}
+
+/// Equal when R, L, S and the state the store keeps are equal. What the trees track only until the
+/// next settle or checkpoint is left out.
+impl PartialEq for Trees {
+    fn eq(&self, other: &Self) -> bool {
+        self.r == other.r
+            && self.l == other.l
+            && self.s == other.s
+            && self.state() == other.state()
+            && self.ignore == other.ignore
+            && self.outside == other.outside
+            && self.rules_known == other.rules_known
+            && self.unknown_rules == other.unknown_rules
+    }
 }
 
 impl Trees {
@@ -135,6 +203,14 @@ impl Trees {
             outside: BTreeSet::new(),
             rules_known: true,
             unknown_rules: BTreeSet::new(),
+            unsettled: BTreeSet::new(),
+            same: BTreeSet::new(),
+            changed: BTreeSet::new(),
+            l_names: ByName::default(),
+            l_identities: HashMap::new(),
+            s_names: ByName::default(),
+            orphaned: BTreeSet::new(),
+            remote_rules_files: BTreeSet::new(),
         }
     }
 
@@ -154,23 +230,81 @@ impl Trees {
         &self.dirty
     }
 
+    /// The nodes whose entry in R, L or S changed since the last call, which empties the set. Each
+    /// mutation adds its node, and so does [`Trees::settle`] for each node whose S it updates.
+    pub fn take_changed(&mut self) -> BTreeSet<NodeId> {
+        std::mem::take(&mut self.changed)
+    }
+
+    /// The placed nodes of L under `parent`, by the `name_key` of their names.
+    pub fn local_children<'a>(&'a self, parent: &'a str) -> impl Iterator<Item = &'a NodeId> + 'a {
+        self.l_names.children(parent)
+    }
+
+    /// The placed node of L under `parent` named exactly `name`.
+    pub fn local_child(&self, parent: &str, name: &str) -> Option<&NodeId> {
+        (self.l_names.holders(parent, name))
+            .filter(|id| self.l.get(id).is_some_and(|node| node.shape.name == name))
+            .last()
+    }
+
+    /// A node of L, placed or parked, with `identity`: the greatest ID when several have it.
+    pub fn local_with_identity(&self, identity: &FileIdentity) -> Option<&NodeId> {
+        self.l_identities.get(identity).and_then(|ids| ids.last())
+    }
+
+    /// The placed nodes of L under `parent` whose name has the `name_key` of `name`.
+    pub fn local_holders<'a>(
+        &'a self,
+        parent: &str,
+        name: &str,
+    ) -> impl Iterator<Item = &'a NodeId> + 'a {
+        self.l_names.holders(parent, name)
+    }
+
+    fn mark(&mut self, id: &str) {
+        self.dirty.insert(id.to_owned());
+        self.unsettled.insert(id.to_owned());
+        self.changed.insert(id.to_owned());
+    }
+
     pub fn set_remote(&mut self, id: NodeId, node: RemoteNode) {
-        self.dirty.insert(id.clone());
+        self.mark(&id);
+        if node.is_live() && node.shape.kind == Kind::File && is_rules_file(&node.shape.name) {
+            self.remote_rules_files.insert(id.clone());
+        } else {
+            self.remote_rules_files.remove(&id);
+        }
         self.r.insert(id, node);
     }
 
     pub fn remove_remote(&mut self, id: &str) {
+        self.remote_rules_files.remove(id);
         if self.r.remove(id).is_some() {
-            self.dirty.insert(id.to_owned());
+            self.mark(id);
         }
     }
 
+    /// The live files of R that are rules files ([`is_rules_file`]).
+    pub fn remote_rules_files(&self) -> &BTreeSet<NodeId> {
+        &self.remote_rules_files
+    }
+
     pub fn set_local(&mut self, id: NodeId, node: LocalNode) {
+        if let Some(old) = self.l.get(&id) {
+            if !old.parked {
+                self.l_names.remove(&id, &old.shape);
+            }
+            let identity = old.identity;
+            self.forget_identity(&id, &identity);
+        }
         if !node.parked {
             self.parked_as.remove(&id);
+            self.l_names.insert(&id, &node.shape);
         }
         self.outside.remove(&id);
-        self.dirty.insert(id.clone());
+        (self.l_identities.entry(node.identity).or_default()).insert(id.clone());
+        self.mark(&id);
         self.l.insert(id, node);
     }
 
@@ -178,8 +312,21 @@ impl Trees {
         self.parked_as.remove(id);
         self.unknown_rules.remove(id);
         self.outside.remove(id);
-        if self.l.remove(id).is_some() {
-            self.dirty.insert(id.to_owned());
+        if let Some(old) = self.l.remove(id) {
+            if !old.parked {
+                self.l_names.remove(id, &old.shape);
+            }
+            self.forget_identity(id, &old.identity);
+            self.mark(id);
+        }
+    }
+
+    fn forget_identity(&mut self, id: &str, identity: &FileIdentity) {
+        if let Some(ids) = self.l_identities.get_mut(identity) {
+            ids.remove(id);
+            if ids.is_empty() {
+                self.l_identities.remove(identity);
+            }
         }
     }
 
@@ -255,6 +402,19 @@ impl Trees {
         if self.l.get(id).is_some() {
             self.outside.insert(id.to_owned());
         }
+    }
+
+    /// Whether S holds the node at a position that neither placed L nor R holds, the nodes
+    /// [`Trees::released`] may give that position up for.
+    fn orphaned_in_s(&self, id: &str) -> bool {
+        let Some(synced) = self.s.live(id) else {
+            return false;
+        };
+        let held = |shape: Option<&Shape>| shape.is_some_and(|shape| shape.same_position(synced));
+        let placed = (self.l.get(id))
+            .filter(|node| !node.parked)
+            .map(|node| &node.shape);
+        !held(placed) && !held(self.r.live(id))
     }
 
     /// What S may become for an excluded node whose S position neither L nor R holds any more,
@@ -398,14 +558,14 @@ impl Trees {
     }
 
     pub(crate) fn wait(&mut self, id: NodeId, shape: Option<Shape>) {
-        self.dirty.insert(id.clone());
+        self.mark(&id);
         self.waiting.insert(id, shape);
     }
 
     /// Sets S, or clears it with `None` (S := ⊥).
     pub fn set_synced(&mut self, id: NodeId, shape: Option<Shape>) {
         self.set_synced_unmarked(&id, shape);
-        self.dirty.insert(id);
+        self.mark(&id);
     }
 
     /// Sets S for one node, or clears it, only when S stays a valid tree. Returns whether it did.
@@ -438,26 +598,32 @@ impl Trees {
     /// Settles what needs no decision: a node changed the same way on both sides takes S := R, and
     /// a node in sync leaves the dirty set unless it is parked. An excluded node that is not in
     /// sync stays dirty, and its S entry takes no change that only one side made, except that it
-    /// gives up a position neither side holds any more (see [`Trees::excluded`]). S stays a valid tree, so an update that would orphan a
+    /// gives up a position neither side holds any more (see [`Trees::excluded`]). Only the nodes
+    /// marked since the last settle are classified again, since a node's class changes only with
+    /// its own entries. The [`Class::Same`] nodes the last settle left, and the nodes whose S
+    /// position neither side holds, are tried again. S stays a valid tree, so an update that would orphan a
     /// child, put a node under a missing or non-directory parent, close a cycle or take a sibling's
     /// `name_key` is made only together with the updates it depends on. Settling stops only when no
     /// non-empty set of the remaining [`Class::Same`] updates can be made together with S still valid,
     /// searching each group of updates that depend on each other exhaustively. A group of more
     /// than [`SETTLE_GROUP_LIMIT`] updates is not searched: its nodes stay dirty as [`Class::Same`] and
-    /// [`Trees::unsearched`] lists them. Returns every dirty node that is left, with its class, in
-    /// `node_id` order.
-    pub fn settle(&mut self) -> Vec<(NodeId, Class)> {
+    /// [`Trees::unsearched`] lists them. [`Trees::work`] gives the dirty nodes that are left.
+    pub fn settle(&mut self) {
         self.reverted
             .retain(|id| match (self.l.get(id), self.r.live(id)) {
                 (Some(local), Some(remote)) => !local.shape.same_position(remote),
                 (local, remote) => local.is_some() || remote.is_some(),
             });
-        let mut pending = Vec::new();
-        let mut work = Vec::new();
-        let mut dirty: Vec<NodeId> = std::mem::take(&mut self.dirty).into_iter().collect();
-        let mut visited = BTreeSet::new();
+        let mut pending = std::mem::take(&mut self.same);
+        let mut unsettled = std::mem::take(&mut self.unsettled);
+        unsettled.extend(
+            (self.orphaned.iter())
+                .filter(|id| self.dirty.contains(*id))
+                .cloned(),
+        );
+        let mut queue: Vec<NodeId> = unsettled.into_iter().collect();
         let mut next = 0;
-        while let Some(id) = dirty.get(next).cloned() {
+        while let Some(id) = queue.get(next).cloned() {
             next += 1;
             let released: Vec<Option<Shape>> = self.released(&id).into_iter().flatten().collect();
             let fitting = (released.iter()).find(|next| self.fits_synced(&id, next.as_ref()));
@@ -465,49 +631,75 @@ impl Trees {
                 Some(next) => self.set_synced_unmarked(&id, next.clone()),
                 None if !released.is_empty() => {
                     for node in self.release_subtree(&id) {
-                        if !dirty[next..].contains(&node) {
-                            dirty.push(node);
+                        if !queue[next..].contains(&node) {
+                            queue.push(node);
                         }
                     }
                 }
                 None => {}
             }
-            if !visited.insert(id.clone()) {
-                pending.retain(|other| *other != id);
-                work.retain(|(other, _)| *other != id);
+            if self.orphaned_in_s(&id) {
+                self.orphaned.insert(id.clone());
+            } else {
+                self.orphaned.remove(&id);
             }
+            pending.remove(&id);
             match self.class(&id) {
-                Class::InSync if !self.l.get(&id).is_some_and(|node| node.parked) => {}
-                Class::Same => pending.push(id),
-                class => work.push((id, class)),
+                Class::InSync if !self.parked(&id) => {
+                    self.dirty.remove(&id);
+                }
+                Class::Same => {
+                    self.dirty.insert(id.clone());
+                    pending.insert(id);
+                }
+                _ => {
+                    self.dirty.insert(id);
+                }
             }
         }
-        let parked: Vec<NodeId> = pending
-            .iter()
-            .filter(|id| self.l.get(id).is_some_and(|node| node.parked))
-            .cloned()
-            .collect();
         self.unsearched.clear();
+        let mut taken = Vec::new();
         loop {
             let before = pending.len();
-            pending.retain(|id| !self.take_remote(id));
+            pending.retain(|id| {
+                let fits = self.take_remote(id);
+                if fits {
+                    taken.push(id.clone());
+                }
+                !fits
+            });
+            if pending.is_empty() {
+                break;
+            }
             if pending.len() < before {
                 continue;
             }
-            let taken = self.take_remote_together(&pending);
-            if taken.is_empty() {
+            let list: Vec<NodeId> = pending.iter().cloned().collect();
+            let together = self.take_remote_together(&list);
+            if together.is_empty() {
                 break;
             }
-            pending.retain(|id| !taken.contains(id));
+            pending.retain(|id| !together.contains(id));
+            taken.extend(together);
         }
-        for id in parked.into_iter().filter(|id| !pending.contains(id)) {
-            let class = self.class(&id);
-            work.push((id, class));
+        for id in taken {
+            if !self.parked(&id) {
+                self.dirty.remove(&id);
+            }
         }
-        work.extend(pending.into_iter().map(|id| (id, Class::Same)));
-        work.sort_by(|a, b| a.0.cmp(&b.0));
-        self.dirty = work.iter().map(|(id, _)| id.clone()).collect();
-        work
+        self.same = pending;
+    }
+
+    /// Every dirty node with its class, in `node_id` order. This reads the whole dirty set.
+    pub fn work(&self) -> Vec<(NodeId, Class)> {
+        self.dirty
+            .iter()
+            .map(|id| (id.clone(), self.class(id)))
+            .collect()
+    }
+
+    fn parked(&self, id: &str) -> bool {
+        self.l.get(id).is_some_and(|node| node.parked)
     }
 
     /// Nodes whose local position the server will not take: a move that closes a cycle against R,
@@ -521,7 +713,7 @@ impl Trees {
     }
 
     pub fn revert(&mut self, id: NodeId) {
-        self.dirty.insert(id.clone());
+        self.mark(&id);
         self.reverted.insert(id);
     }
 
@@ -557,15 +749,6 @@ impl Trees {
     /// each group, up to [`SETTLE_GROUP_LIMIT`] members, finds a valid set whenever one exists.
     fn search_together(&self, pending: &[NodeId]) -> (BTreeSet<NodeId>, BTreeSet<NodeId>) {
         let root = self.s.root.as_str();
-        let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        let mut holders: BTreeMap<(&str, String), Vec<&str>> = BTreeMap::new();
-        for (id, shape) in self.s.iter() {
-            children.entry(&shape.parent).or_default().push(id);
-            holders
-                .entry((&shape.parent, name_key(&shape.name)))
-                .or_default()
-                .push(id);
-        }
         let mut candidates: BTreeSet<&str> = pending.iter().map(String::as_str).collect();
         loop {
             let never: Vec<&str> = candidates
@@ -573,7 +756,7 @@ impl Trees {
                 .copied()
                 .filter(|&id| {
                     let fixed = |other: &&str| !candidates.contains(other);
-                    let fixed_child = children.get(id).is_some_and(|c| c.iter().any(fixed));
+                    let fixed_child = self.s_names.children(id).any(|c| fixed(&c.as_str()));
                     let Some(shape) = self.r.live(id) else {
                         return fixed_child;
                     };
@@ -584,9 +767,10 @@ impl Trees {
                                 .s
                                 .live(&shape.parent)
                                 .is_some_and(|p| p.kind == Kind::Dir))
-                        || holders
-                            .get(&(shape.parent.as_str(), name_key(&shape.name)))
-                            .is_some_and(|h| h.iter().any(|h| *h != id && fixed(h)))
+                        || self
+                            .s_names
+                            .holders(&shape.parent, &shape.name)
+                            .any(|h| h != id && fixed(&h.as_str()))
                         || self
                             .above(&shape.parent, &candidates)
                             .is_none_or(|up| up == id)
@@ -614,8 +798,8 @@ impl Trees {
                 links.entry(up).or_default().push(id);
             }
             if let Some(shape) = self.r.live(id) {
-                let key = (shape.parent.as_str(), name_key(&shape.name));
-                for &other in holders.get(&key).into_iter().flatten() {
+                for other in self.s_names.holders(&shape.parent, &shape.name) {
+                    let other = other.as_str();
                     if other != id && candidates.contains(other) {
                         links.entry(id).or_default().push(other);
                         links.entry(other).or_default().push(id);
@@ -667,9 +851,10 @@ impl Trees {
                         return false;
                     }
                     if taken(id)
-                        && holders
-                            .get(&(shape.parent.as_str(), name_key(&shape.name)))
-                            .is_some_and(|h| h.iter().any(|h| *h != id && !taken(h)))
+                        && self
+                            .s_names
+                            .holders(&shape.parent, &shape.name)
+                            .any(|h| h != id && !taken(h))
                     {
                         return false;
                     }
@@ -716,7 +901,7 @@ impl Trees {
 
     /// True when S stays a valid tree with `next` as the node's shape.
     fn fits_synced(&self, id: &str, next: Option<&Shape>) -> bool {
-        let has_children = self.s.iter().any(|(_, shape)| shape.parent == id);
+        let has_children = self.s_names.children(id).next().is_some();
         let Some(shape) = next else {
             return !has_children;
         };
@@ -745,10 +930,10 @@ impl Trees {
         if ancestor != self.s.root {
             return false;
         }
-        let key = name_key(&shape.name);
-        !self.s.iter().any(|(other, sibling)| {
-            other != id && sibling.parent == shape.parent && name_key(&sibling.name) == key
-        })
+        !self
+            .s_names
+            .holders(&shape.parent, &shape.name)
+            .any(|other| other != id)
     }
 
     /// Drops the folder `id` from S with every node S holds below it, when S can hold the folder nowhere else and
@@ -760,11 +945,7 @@ impl Trees {
         let mut next = 0;
         while let Some(folder) = below.get(next).cloned() {
             next += 1;
-            below.extend(
-                (self.s.iter())
-                    .filter(|(_, shape)| shape.parent == folder)
-                    .map(|(child, _)| child.clone()),
-            );
+            below.extend(self.s_names.children(&folder).cloned());
         }
         if !below.iter().all(|node| self.ignored(node)) {
             return Vec::new();
@@ -777,12 +958,20 @@ impl Trees {
 
     fn set_synced_unmarked(&mut self, id: &str, shape: Option<Shape>) {
         self.waiting.remove(id);
-        match shape {
+        self.changed.insert(id.to_owned());
+        let old = match shape {
             Some(shape) => {
-                self.s.insert(id.to_owned(), shape);
+                self.s_names.insert(id, &shape);
+                self.s.insert(id.to_owned(), shape)
             }
-            None => {
-                self.s.remove(id);
+            None => self.s.remove(id),
+        };
+        if let Some(old) = old {
+            let kept = self.s.get(id).is_some_and(|new| {
+                new.parent == old.parent && name_key(&new.name) == name_key(&old.name)
+            });
+            if !kept {
+                self.s_names.remove(id, &old);
             }
         }
     }
@@ -839,6 +1028,9 @@ impl Trees {
             parked_as,
             waiting,
         } = state;
+        self.unsettled = dirty.clone();
+        self.same.clear();
+        self.orphaned.clear();
         self.dirty = dirty;
         self.unsearched = unsearched;
         self.reverted = reverted;
