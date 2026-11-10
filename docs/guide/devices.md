@@ -20,7 +20,7 @@ A revoked device can't sync any more. To use that machine again, remove Flarebox
 
 ## If you lose every device
 
-Your files stay on the server. Add a new device with:
+Your files stay on the server. Add a new device with a `flarebox` [built with the server inside it](install.md#build):
 
 ```sh
 flarebox server add-device

@@ -21,7 +21,7 @@ FLAREBOX_SERVER_BUNDLE="$PWD/target/server-bundle" cargo install --locked --path
 
 `pack-bundle.mjs` writes the server's Worker code, its static files and a manifest into `target/server-bundle`. It needs no Cloudflare account. `cargo install` builds the command with that server inside it and puts `flarebox` in `~/.cargo/bin`. Check it with `flarebox --version`.
 
-A build without `FLAREBOX_SERVER_BUNDLE` works for everything except deploying and upgrading a server. Those commands stop with "this flarebox was built without a server bundle".
+A build without `FLAREBOX_SERVER_BUNDLE` can't find or deploy a server in your Cloudflare account. `flarebox setup` with the Cloudflare login, `server deploy`, `server add-device`, `server upgrade` and `server uninstall` without `--bucket` stop with "this flarebox was built without a server bundle". Everything else works.
 
 ## Run the sync daemon
 
@@ -31,7 +31,7 @@ Folders sync only while the daemon runs:
 flarebox daemon
 ```
 
-It runs in the foreground until you press Ctrl-C or send it SIGTERM. Every other command talks to the daemon through a socket when it runs, and opens the profile itself when it doesn't. So `flarebox link` works without the daemon, and the folder starts syncing when the daemon starts.
+It runs in the foreground until you press Ctrl-C or send it SIGTERM. Commands that change this device's folders, such as `link`, `restart` and `lift`, talk to the daemon through a socket when it runs, and open the profile themselves when it doesn't. So `flarebox link` works without the daemon, and the folder starts syncing when the daemon starts. The `device`, `space`, `usage`, `trash` and `versions` commands talk to the server directly.
 
 The daemon logs at the `info` level. Set `FLAREBOX_LOG` to change it, for example `FLAREBOX_LOG=debug`. `--log-format json` writes one JSON object per line.
 
@@ -56,4 +56,4 @@ Read its log with `journalctl --user -u flarebox`. To keep syncing while you are
 | `~/.local/state/flarebox/spaces/` | The sync state of each linked folder |
 | `.flarebox/` in each linked folder | The folder's marker, the record of the device that linked it, and the local trash |
 
-`XDG_CONFIG_HOME` and `XDG_STATE_HOME` replace `~/.config` and `~/.local/state` when they are set, on macOS too. The daemon's socket is in `$XDG_RUNTIME_DIR/flarebox/`, or in the state folder when `XDG_RUNTIME_DIR` is unset.
+`XDG_CONFIG_HOME` and `XDG_STATE_HOME` replace `~/.config` and `~/.local/state` when they are set to absolute paths, on macOS too. Flarebox ignores a relative value. The daemon's socket is in `$XDG_RUNTIME_DIR/flarebox/`, or in the state folder when `XDG_RUNTIME_DIR` isn't set to an absolute path.
