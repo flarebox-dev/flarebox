@@ -2935,3 +2935,190 @@ fn a_commit_the_server_is_behind_for_sends_what_it_lost_after_a_crash_right_afte
     b.run(&mut remote);
     caught_up(&site, &b, &remote, &["two"]);
 }
+
+/// The user moves `source/file` into the ignored folder `ignored` and removes `source`, and one batch reports both,
+/// in either order. The file is outside what this device syncs, so it stays on the server, and so does `source`.
+#[test]
+fn a_file_moved_into_an_ignored_folder_stays_on_the_server_when_its_folder_is_removed_in_the_same_batch()
+ {
+    for removed_first in [false, true] {
+        let mut remote = Remote::new();
+        let (site, mut a) = linked(&mut remote, "a");
+        fs::create_dir(site.root.join("source")).unwrap();
+        a.create(&mut remote, &site.root.join("source/file"), b"kept");
+        a.create(&mut remote, &site.root.join(".fbignore"), b"ignored/\n");
+        let id = a.observer.snapshot().entries[Path::new("source/file")].id;
+        fs::create_dir(site.root.join("ignored")).unwrap();
+        fs::rename(
+            site.root.join("source/file"),
+            site.root.join("ignored/file"),
+        )
+        .unwrap();
+        fs::remove_dir(site.root.join("source")).unwrap();
+        let renamed = Observed::Renamed {
+            from: "source/file".into(),
+            to: "ignored/file".into(),
+            kind: EntryKind::File,
+            id,
+            linked: false,
+        };
+        let removed = Observed::Removed {
+            path: "source".into(),
+            kind: EntryKind::Dir,
+        };
+        let changes = match removed_first {
+            false => vec![renamed, removed],
+            true => vec![removed, renamed],
+        };
+        let sections = a.folder.sections();
+        let batch = Batch {
+            stamp: sections.stamp(),
+            answered: None,
+            observation: crate::observe::Observation {
+                changes,
+                root: Ok(()),
+                unreadable: Vec::new(),
+                read: vec![PathBuf::new()],
+                scanned: a.observer.scanned(),
+                busy: Vec::new(),
+                rules: Vec::new(),
+                all_rules: false,
+            },
+        };
+        let step = a.folder.observed(batch, 1);
+        a.take(step).unwrap();
+        a.run(&mut remote);
+        assert_eq!(fs::read(site.root.join("ignored/file")).unwrap(), b"kept");
+        assert_eq!(
+            remote.names(),
+            [".fbignore", "file", "source"],
+            "{removed_first}"
+        );
+        assert_eq!(a.folder.engine.trees.check(), Ok(()));
+    }
+}
+
+/// As above, with the move and the removal in two batches, and a restart after them: the restart scans the folder
+/// again from L, which still holds `source/file`, and finds the file in the ignored folder again.
+#[test]
+fn a_file_moved_into_an_ignored_folder_stays_on_the_server_when_its_folder_is_removed_later_and_after_a_restart()
+ {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site.root.join("source")).unwrap();
+    a.create(&mut remote, &site.root.join("source/file"), b"kept");
+    a.create(&mut remote, &site.root.join(".fbignore"), b"ignored/\n");
+    fs::create_dir(site.root.join("ignored")).unwrap();
+    fs::rename(
+        site.root.join("source/file"),
+        site.root.join("ignored/file"),
+    )
+    .unwrap();
+    a.scan_until(|a| !a.folder.engine.trees.ignored_local().is_empty());
+    a.run(&mut remote);
+    fs::remove_dir(site.root.join("source")).unwrap();
+    a.scan_until(|a| (a.folder.engine.trees.ignored_local().len()) == 2);
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    assert_eq!(remote.names(), [".fbignore", "file", "source"]);
+    assert_eq!(a.folder.engine.trees.check(), Ok(()));
+    drop(a);
+
+    let mut a = site.start();
+    a.connect(&remote);
+    a.scan_until(|a| a.folder.scanned);
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    assert_eq!(fs::read(site.root.join("ignored/file")).unwrap(), b"kept");
+    assert_eq!(remote.names(), [".fbignore", "file", "source"]);
+    assert_eq!(a.folder.engine.trees.check(), Ok(()));
+}
+
+/// The user hard-links `source/file` into the ignored folder, moves the file itself to `moved`, and removes
+/// `source`. The file is still synced at `moved`, so the server follows the move; the link stays out.
+#[test]
+#[ignore = "GUN-368"]
+fn a_file_moved_out_of_a_removed_folder_with_a_link_in_an_ignored_folder_is_moved_on_the_server() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site.root.join("source")).unwrap();
+    a.create(&mut remote, &site.root.join("source/file"), b"kept");
+    a.create(&mut remote, &site.root.join(".fbignore"), b"ignored/\n");
+    fs::create_dir(site.root.join("ignored")).unwrap();
+    fs::hard_link(
+        site.root.join("source/file"),
+        site.root.join("ignored/alias"),
+    )
+    .unwrap();
+    fs::rename(site.root.join("source/file"), site.root.join("moved")).unwrap();
+    fs::remove_dir(site.root.join("source")).unwrap();
+    a.scan_until(|a| (a.observer.snapshot().entries).contains_key(Path::new("moved")));
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    assert_eq!(remote.names(), [".fbignore", "moved"]);
+    assert_eq!(fs::read(site.root.join("moved")).unwrap(), b"kept");
+    assert_eq!(fs::read(site.root.join("ignored/alias")).unwrap(), b"kept");
+    assert_eq!(a.folder.engine.trees.check(), Ok(()));
+}
+
+/// The file moved into an ignored folder has a synced link, `also`, that stays. The file is still left out, so
+/// the server keeps it and its folder.
+#[test]
+fn a_file_moved_into_an_ignored_folder_out_of_a_removed_folder_with_an_included_link_that_stays_is_kept_on_the_server()
+ {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site.root.join("source")).unwrap();
+    a.create(&mut remote, &site.root.join("source/file"), b"kept");
+    a.create(&mut remote, &site.root.join(".fbignore"), b"ignored/\n");
+    fs::hard_link(site.root.join("source/file"), site.root.join("also")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(&mut remote);
+    assert_eq!(remote.names(), [".fbignore", "also", "file", "source"]);
+    fs::create_dir(site.root.join("ignored")).unwrap();
+    fs::rename(
+        site.root.join("source/file"),
+        site.root.join("ignored/file"),
+    )
+    .unwrap();
+    fs::remove_dir(site.root.join("source")).unwrap();
+    a.scan_until(|a| !(a.observer.snapshot().entries).contains_key(Path::new("source")));
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    assert_eq!(remote.names(), [".fbignore", "also", "file", "source"]);
+    assert_eq!(fs::read(site.root.join("ignored/file")).unwrap(), b"kept");
+    assert_eq!(fs::read(site.root.join("also")).unwrap(), b"kept");
+    assert_eq!(a.folder.engine.trees.check(), Ok(()));
+}
+
+/// The file is moved into an ignored folder, its own folder is removed, and the folder above that is moved to
+/// `dest`. The move of that folder does not carry the file, so the server keeps it.
+#[test]
+fn a_file_moved_into_an_ignored_folder_before_a_folder_above_it_was_moved_is_kept_on_the_server() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::create_dir_all(site.root.join("d/a/b")).unwrap();
+    fs::create_dir(site.root.join("dest")).unwrap();
+    a.create(&mut remote, &site.root.join("d/a/b/file"), b"kept");
+    a.create(&mut remote, &site.root.join(".fbignore"), b"ig/\n");
+    fs::create_dir(site.root.join("ig")).unwrap();
+    fs::rename(site.root.join("d/a/b/file"), site.root.join("ig/file")).unwrap();
+    fs::remove_dir(site.root.join("d/a/b")).unwrap();
+    fs::rename(site.root.join("d/a"), site.root.join("dest/a")).unwrap();
+    fs::remove_dir(site.root.join("d")).unwrap();
+    a.scan_until(|a| (a.observer.snapshot().entries).contains_key(Path::new("dest/a")));
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    assert!(
+        remote.names().contains(&"file".to_owned()),
+        "{:?}",
+        remote.names()
+    );
+    assert_eq!(fs::read(site.root.join("ig/file")).unwrap(), b"kept");
+    assert_eq!(a.folder.engine.trees.check(), Ok(()));
+}

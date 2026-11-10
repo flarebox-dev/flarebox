@@ -1136,38 +1136,63 @@ fn take_left_out(
 
 /// Turns each removal whose entry now sits at or below an entry the rules
 /// leave out into [`Change::Ignored`] (design §5.10). A folder is looked for
-/// by its own identity. A removal the search does not find stands.
+/// by its own identity, and so is each entry it held. Such an entry found
+/// there, and not inside a folder that was found, was moved out before its
+/// folder went, and is reported as ignored beside the folder's removal. A
+/// removal the search does not find stands.
 fn find_ignored(
-    changes: &mut [Change],
+    changes: &mut Vec<Change>,
     old: &BTreeMap<PathBuf, Entry>,
     rules: &mut Pending<'_>,
     root: BorrowedFd<'_>,
 ) {
-    let mut wanted: Wanted = changes
+    let removed: Vec<&PathBuf> = changes
         .iter()
         .filter_map(|change| match change {
-            Change::Removed { path, kind } => Some(((old[path].id, *kind), None)),
+            Change::Removed { path, .. } => Some(path),
             _ => None,
         })
         .collect();
-    if wanted.is_empty() {
+    if removed.is_empty() {
         return;
     }
+    let held: Vec<&PathBuf> = (removed.iter().copied())
+        .filter(|dir| old[*dir].kind == EntryKind::Dir)
+        .flat_map(|dir| {
+            (old.range(dir.clone()..).skip(1))
+                .take_while(move |(path, _)| path.starts_with(dir))
+                .map(|(path, _)| path)
+        })
+        .collect();
+    let mut wanted: Wanted = (removed.iter().chain(&held))
+        .map(|path| ((old[*path].id, old[*path].kind), None))
+        .collect();
     rules.find(root, &mut wanted);
-    for change in changes {
-        let Change::Removed { path, kind } = &*change else {
-            continue;
-        };
-        let (id, kind) = (old[path].id, *kind);
-        if let Some(Some(to)) = wanted.get(&(id, kind)) {
-            *change = Change::Ignored {
-                from: path.clone(),
-                to: to.clone(),
-                kind,
-                id,
-            };
+    let found = |path: &Path| {
+        let entry = &old[path];
+        (wanted.get(&(entry.id, entry.kind)).cloned().flatten()).map(|to| Change::Ignored {
+            from: path.to_owned(),
+            to,
+            kind: entry.kind,
+            id: entry.id,
+        })
+    };
+    let moved: Vec<Change> = (held.iter())
+        .filter(|path| {
+            !(path.ancestors().skip(1))
+                .take_while(|above| old.contains_key(*above))
+                .any(|above| found(above).is_some())
+        })
+        .filter_map(|path| found(path))
+        .collect();
+    for change in changes.iter_mut() {
+        if let Change::Removed { path, .. } = &*change
+            && let Some(ignored) = found(path)
+        {
+            *change = ignored;
         }
     }
+    changes.extend(moved);
 }
 
 /// Sorts the paths and drops every path inside another one.
