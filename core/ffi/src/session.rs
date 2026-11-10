@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use crate::core::{Core, Events, SessionListener};
+use crate::driver::DriverCore;
 use crate::fake::FakeCore;
 use crate::types::{
     Account, Answer, DeviceList, LinkedFolder, PairingCode, ServerInfo, SessionError, SessionState,
@@ -21,18 +22,37 @@ pub struct SyncSession {
     _listener: Arc<Box<dyn SessionListener>>,
 }
 
+impl Drop for SyncSession {
+    fn drop(&mut self) {
+        self.core.close();
+    }
+}
+
 #[uniffi::export]
 impl SyncSession {
-    /// Creates a stopped session backed by [`FakeCore`]. With `state_dir`, the fake keeps
-    /// its state in that directory, so questions, folders and the account survive a relaunch as
-    /// they will with the engine; without it, the state lives in memory.
+    /// Opens the sync profile in `profile_dir` with the sync driver (docs/design/driver.md): the
+    /// device credential, the linked folders and their sync state, kept across relaunches. One
+    /// process at a time can open a profile. The session is stopped until [`SyncSession::start`].
     #[uniffi::constructor]
-    pub fn fake(listener: Box<dyn SessionListener>, state_dir: Option<String>) -> Arc<Self> {
+    pub fn open(
+        listener: Box<dyn SessionListener>,
+        profile_dir: String,
+    ) -> Result<Arc<Self>, SessionError> {
         let listener = Arc::new(listener);
-        let fake = Arc::new(FakeCore::new(
-            Events::new(&listener),
-            state_dir.map(Into::into),
-        ));
+        let core = DriverCore::open(profile_dir.as_ref(), Events::new(&listener))?;
+        Ok(Arc::new(Self {
+            core,
+            fake: None,
+            _listener: listener,
+        }))
+    }
+
+    /// Creates a stopped session backed by [`FakeCore`], which keeps a scripted state in memory,
+    /// for previews and tests.
+    #[uniffi::constructor]
+    pub fn fake(listener: Box<dyn SessionListener>) -> Arc<Self> {
+        let listener = Arc::new(listener);
+        let fake = Arc::new(FakeCore::new(Events::new(&listener)));
         Arc::new(Self {
             core: fake.clone(),
             fake: Some(fake),

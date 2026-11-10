@@ -183,6 +183,7 @@ extension ProblemKind {
         case .ignoreRuleInvalid: String(localized: "An ignore rule can't be read")
         case .signInRequired: String(localized: "Sign in again")
         case .stateNotWritable: String(localized: "Flarebox can't save its sync state")
+        case .folderHalted: String(localized: "Sync for this folder stopped")
         }
     }
 
@@ -226,6 +227,8 @@ extension ProblemKind {
             String(localized: "The server no longer accepts this Mac. Sign out in the Account settings and sign in again.")
         case .stateNotWritable(let reason):
             String(localized: "Nothing syncs until Flarebox can save again: \(reason). Check that your disk has free space.")
+        case .folderHalted(let reason):
+            String(localized: "Flarebox stopped syncing this folder: \(reason)")
         }
     }
 }
@@ -265,6 +268,13 @@ extension SessionError {
         case .AnswerNotAllowed: String(localized: "This question doesn't take that answer.")
         case .NoticeNotFound: String(localized: "This notice was already dismissed.")
         case .NotSaved(let reason): String(localized: "Flarebox couldn't save this change, so it wasn't made: \(reason)")
+        case .ProfileInUse: String(localized: "Another Flarebox process is already using this Mac's sync state.")
+        case .NotAFolder: String(localized: "Choose a folder, not a file.")
+        case .FolderInUse: String(localized: "Another Flarebox process is syncing this folder.")
+        case .FolderOfOtherDevice(let deviceID): String(localized: "Another device (\(deviceID)) syncs this folder. Unlink it there first.")
+        case .MarkerOfOtherSpace: String(localized: "This folder belongs to another space. Unlink it there first.")
+        case .UnsupportedFileSystem: String(localized: "This folder's file system can't rename files safely. Choose a folder on your Mac's disk.")
+        case .Failed(let reason): reason
         }
     }
 }

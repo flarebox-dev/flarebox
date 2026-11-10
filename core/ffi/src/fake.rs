@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! A [`Core`] that syncs nothing and plays back a scripted state, so the app's windows can be
-//! built and tested before the driver exists. It enforces the same rules the real core will:
-//! codes have the server's lengths, folders must exist and must not overlap, a question only
-//! takes one of its own answers, and a change that cannot be saved is not made.
+//! A [`Core`] that syncs nothing and plays back a scripted state in memory, for the app's previews
+//! and tests and for showing on demand a state the driver cannot reach yet. It enforces the same
+//! rules the driver does: codes have the server's lengths, folders must exist and must not
+//! overlap, a question only takes one of its own answers, and a change that cannot be saved (when
+//! [`FakeCore::fail_saves`] scripts it) is not made.
 
-use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use serde::{Deserialize, Serialize};
 
 use crate::core::{Core, Events};
 use crate::types::{
@@ -22,7 +19,6 @@ use crate::types::{
     SyncProgress, SyncStatus,
 };
 
-const STATE_FILE: &str = "fake-core.json";
 const CLAIM_CODE_LEN: usize = 12;
 const PAIRING_CODE_LEN: usize = 8;
 const PAIRING_CODE_MS: i64 = 10 * 60_000;
@@ -81,7 +77,7 @@ pub struct GivenAnswer {
 }
 
 /// The part of the fake's state the engine would keep in its store.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default)]
 struct Saved {
     server: Option<ServerInfo>,
     claimed: bool,
@@ -196,23 +192,15 @@ const ALL_PARTS: [Part; 7] = [
 pub struct FakeCore {
     state: Mutex<State>,
     events: Events,
-    state_file: Option<PathBuf>,
 }
 
 impl FakeCore {
-    /// Creates a stopped fake. With `state_dir`, it loads its saved state from that directory
-    /// and saves every change there; a missing or unreadable state file starts a first run.
-    /// Without it, saves always succeed in memory unless [`FakeCore::fail_saves`] says otherwise.
-    pub fn new(events: Events, state_dir: Option<PathBuf>) -> Self {
-        let state_file = state_dir.map(|dir| dir.join(STATE_FILE));
-        let saved = state_file
-            .as_deref()
-            .and_then(|path| fs::read(path).ok())
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
+    /// Creates a stopped fake in a first run. Saves succeed unless [`FakeCore::fail_saves`] says
+    /// otherwise.
+    pub fn new(events: Events) -> Self {
         Self {
             state: Mutex::new(State {
-                saved,
+                saved: Saved::default(),
                 running: false,
                 activity: FakeActivity::Idle,
                 progress: None,
@@ -224,7 +212,6 @@ impl FakeCore {
                 status: SyncStatus::Stopped,
             }),
             events,
-            state_file,
         }
     }
 
@@ -245,25 +232,14 @@ impl FakeCore {
     /// [`ProblemKind::StateNotWritable`] was cleared. If saving fails, the state stays as it
     /// was and only the problem list is sent.
     fn store(&self, state: &mut State, next: Saved) -> Result<bool, SessionError> {
-        let saved = if state.fail_saves {
-            Err("saving is scripted to fail".to_owned())
-        } else {
-            match &self.state_file {
-                Some(path) => save(path, &next).map_err(|e| e.to_string()),
-                None => Ok(()),
-            }
-        };
-        match saved {
-            Ok(()) => {
-                state.saved = next;
-                Ok(state.set_save_failure(None))
-            }
-            Err(reason) => {
-                let problems = state.set_save_failure(Some(reason.clone()));
-                self.publish(state, &[], problems);
-                Err(SessionError::NotSaved { reason })
-            }
+        if state.fail_saves {
+            let reason = "saving is scripted to fail".to_owned();
+            let problems = state.set_save_failure(Some(reason.clone()));
+            self.publish(state, &[], problems);
+            return Err(SessionError::NotSaved { reason });
         }
+        state.saved = next;
+        Ok(state.set_save_failure(None))
     }
 
     /// Builds the next saved state with `change` from a copy, then [commits](Self::commit) it.
@@ -314,16 +290,6 @@ impl FakeCore {
             self.events.send(SessionEvent::Status { status });
         }
     }
-}
-
-fn save(path: &Path, saved: &Saved) -> io::Result<()> {
-    let bytes = serde_json::to_vec_pretty(saved)?;
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    let partial = path.with_extension("json.partial");
-    fs::write(&partial, bytes)?;
-    fs::rename(&partial, path)
 }
 
 fn now_ms() -> i64 {
@@ -836,6 +802,7 @@ mod tests {
     use super::scenario::{DOCUMENTS, PHOTOS};
     use super::*;
     use crate::core::SessionListener;
+    use std::fs;
     use std::sync::Arc;
 
     struct Recorder(Arc<Mutex<Vec<SessionEvent>>>);
@@ -853,11 +820,11 @@ mod tests {
     }
 
     impl Harness {
-        fn new(dir: Option<&Path>) -> Self {
+        fn new() -> Self {
             let seen = Arc::new(Mutex::new(Vec::new()));
             let listener: Arc<Box<dyn SessionListener>> =
                 Arc::new(Box::new(Recorder(seen.clone())));
-            let core = FakeCore::new(Events::new(&listener), dir.map(Path::to_path_buf));
+            let core = FakeCore::new(Events::new(&listener));
             Self {
                 core,
                 seen,
@@ -899,7 +866,7 @@ mod tests {
 
     #[test]
     fn lifecycle_reports_each_status_once() {
-        let h = Harness::new(None);
+        let h = Harness::new();
         assert_eq!(h.core.state().status, SyncStatus::Stopped);
         h.core.start();
         h.core.start();
@@ -928,7 +895,7 @@ mod tests {
 
     #[test]
     fn pause_needs_a_running_session_and_outlives_a_restart() {
-        let h = Harness::new(None);
+        let h = Harness::new();
         h.core.load_scenario(FakeScenario::UpToDate).unwrap();
         h.core.pause().unwrap();
         h.core.start();
@@ -942,7 +909,7 @@ mod tests {
 
     #[test]
     fn claiming_signs_in_the_owner() {
-        let h = Harness::new(None);
+        let h = Harness::new();
         h.core.start();
         assert_eq!(
             h.core.claim("ABCD-EFGH-JKLM", "Ada", "Mac"),
@@ -985,7 +952,7 @@ mod tests {
 
     #[test]
     fn pairing_signs_in_another_device() {
-        let h = Harness::new(None);
+        let h = Harness::new();
         h.core.set_server_claimed(true).unwrap();
         h.core.connect("https://box.example.com").unwrap();
         assert_eq!(
@@ -1008,7 +975,7 @@ mod tests {
 
     #[test]
     fn scripted_failures_apply_to_the_next_call_only() {
-        let h = Harness::new(None);
+        let h = Harness::new();
         let unreachable = SessionError::ServerUnreachable {
             reason: "timed out".to_owned(),
         };
@@ -1022,7 +989,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let inside = dir.path().join("inside");
         fs::create_dir(&inside).unwrap();
-        let h = Harness::new(None);
+        let h = Harness::new();
         h.core.start();
         assert_eq!(h.core.spaces(), Err(SessionError::NotSignedIn));
         h.core.connect("https://box.example.com").unwrap();
@@ -1083,7 +1050,7 @@ mod tests {
 
     #[test]
     fn signing_out_unlinks_everything() {
-        let h = Harness::new(None);
+        let h = Harness::new();
         h.core.load_scenario(FakeScenario::MassDelete).unwrap();
         h.core.start();
         h.core.sign_out().unwrap();
@@ -1095,7 +1062,7 @@ mod tests {
 
     #[test]
     fn every_question_kind_takes_only_its_own_answers() {
-        let h = Harness::new(None);
+        let h = Harness::new();
         h.core.load_scenario(FakeScenario::ManyQuestions).unwrap();
         let questions = h.core.state().questions;
         assert_eq!(questions.len(), 31);
@@ -1134,7 +1101,7 @@ mod tests {
 
     #[test]
     fn scenarios_hold_long_lists() {
-        let h = Harness::new(None);
+        let h = Harness::new();
         h.core.load_scenario(FakeScenario::ManyQuestions).unwrap();
         let questions = h.core.state().questions;
         assert_eq!(questions[0].items.len(), 1_500);
@@ -1158,7 +1125,7 @@ mod tests {
 
     #[test]
     fn answering_the_last_recovery_question_ends_the_recovery() {
-        let h = Harness::new(None);
+        let h = Harness::new();
         h.core.load_scenario(FakeScenario::Recovery).unwrap();
         assert_eq!(folder_of(&h.core, PHOTOS).state, FolderState::Recovering);
         let ids = h.question_ids();
@@ -1183,7 +1150,7 @@ mod tests {
 
     #[test]
     fn a_replaced_question_refuses_answers() {
-        let h = Harness::new(None);
+        let h = Harness::new();
         h.core.load_scenario(FakeScenario::UpToDate).unwrap();
         let kind = QuestionKind::AmbiguousDisappearance;
         let item = |p: &str| HeldItem {
@@ -1218,59 +1185,40 @@ mod tests {
     }
 
     #[test]
-    fn unanswered_questions_are_asked_again_after_a_relaunch() {
-        let dir = tempfile::tempdir().unwrap();
-        let first = Harness::new(Some(dir.path()));
-        first.core.load_scenario(FakeScenario::Recovery).unwrap();
-        first.core.start();
-        first.core.pause().unwrap();
-        let answered = first.core.state().questions[0].clone();
-        first
-            .core
-            .answer(&answered.id, answered.answers[0])
-            .unwrap();
-        let open = first.core.state().questions;
+    fn unanswered_questions_are_asked_again_after_a_restart() {
+        let h = Harness::new();
+        h.core.load_scenario(FakeScenario::Recovery).unwrap();
+        h.core.start();
+        h.core.pause().unwrap();
+        let answered = h.core.state().questions[0].clone();
+        h.core.answer(&answered.id, answered.answers[0]).unwrap();
+        let open = h.core.state().questions;
         assert_eq!(open.len(), 4);
-        drop(first);
+        h.core.stop();
+        h.take();
 
-        let second = Harness::new(Some(dir.path()));
-        assert_eq!(second.core.state().questions, open);
-        assert_eq!(second.core.state().status, SyncStatus::Stopped);
-        second.core.start();
+        assert_eq!(h.core.state().status, SyncStatus::Stopped);
+        h.core.start();
         assert_eq!(
-            second.take(),
+            h.take(),
             [
                 SessionEvent::Questions {
                     questions: open.clone()
                 },
                 SessionEvent::Notices {
-                    notices: second.core.state().notices
+                    notices: h.core.state().notices
                 },
                 SessionEvent::Status {
                     status: SyncStatus::Paused
                 },
             ]
         );
-        assert_eq!(
-            folder_of(&second.core, PHOTOS).state,
-            FolderState::Recovering
-        );
-    }
-
-    #[test]
-    fn a_missing_or_corrupt_state_file_starts_a_first_run() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join(STATE_FILE), b"not json").unwrap();
-        let h = Harness::new(Some(dir.path()));
-        assert!(h.core.state().account.is_none());
-        h.core.load_scenario(FakeScenario::UpToDate).unwrap();
-        let h = Harness::new(Some(dir.path()));
-        assert!(h.core.state().account.is_some());
+        assert_eq!(folder_of(&h.core, PHOTOS).state, FolderState::Recovering);
     }
 
     #[test]
     fn recent_changes_keep_the_newest() {
-        let h = Harness::new(None);
+        let h = Harness::new();
         for i in 0..(RECENT_CHANGES + 5) {
             h.core.add_recent_change(RecentChange {
                 space_id: DOCUMENTS.to_owned(),
@@ -1288,7 +1236,7 @@ mod tests {
 
     #[test]
     fn problems_scenario_has_every_kind_and_halts_the_missing_folder() {
-        let h = Harness::new(None);
+        let h = Harness::new();
         h.core.load_scenario(FakeScenario::Problems).unwrap();
         let problems = h.core.state().problems;
         assert_eq!(problems.len(), 19);
@@ -1308,7 +1256,7 @@ mod tests {
     fn events_stop_after_the_listener_is_gone() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let listener: Arc<Box<dyn SessionListener>> = Arc::new(Box::new(Recorder(seen.clone())));
-        let core = FakeCore::new(Events::new(&listener), None);
+        let core = FakeCore::new(Events::new(&listener));
         core.start();
         drop(listener);
         core.load_scenario(FakeScenario::UpToDate).unwrap();
@@ -1326,7 +1274,7 @@ mod tests {
 
     #[test]
     fn the_device_list_is_an_optional_capability() {
-        let h = Harness::new(None);
+        let h = Harness::new();
         h.core.load_scenario(FakeScenario::UpToDate).unwrap();
         assert_eq!(h.core.devices(), Ok(DeviceList::Unavailable));
         let device = Device {
@@ -1347,7 +1295,7 @@ mod tests {
 
     #[test]
     fn a_recovery_without_questions_still_has_a_notice() {
-        let h = Harness::new(None);
+        let h = Harness::new();
         h.core
             .load_scenario(FakeScenario::RecoveredWithoutQuestions)
             .unwrap();
@@ -1373,8 +1321,7 @@ mod tests {
 
     #[test]
     fn a_remote_mass_delete_is_reported_without_asking() {
-        let dir = tempfile::tempdir().unwrap();
-        let h = Harness::new(Some(dir.path()));
+        let h = Harness::new();
         h.core
             .load_scenario(FakeScenario::RemoteMassDelete)
             .unwrap();
@@ -1390,10 +1337,7 @@ mod tests {
                 exceeded: vec![MassDeleteLimit::ShareOfSpace { percent: 50 }],
             }
         );
-        drop(h);
-
-        let h = Harness::new(Some(dir.path()));
-        assert_eq!(h.core.state().notices, std::slice::from_ref(&notice));
+        h.take();
         h.core.dismiss_notice(&notice.id).unwrap();
         assert!(h.core.state().notices.is_empty());
         assert_eq!(h.take(), [SessionEvent::Notices { notices: vec![] }]);
@@ -1414,10 +1358,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(
-            Harness::new(Some(dir.path())).core.state().notices[0].id,
-            id
-        );
+        assert_eq!(h.core.state().notices[0].id, id);
     }
 
     fn not_writable(core: &FakeCore) -> Option<ProblemKind> {
@@ -1430,8 +1371,7 @@ mod tests {
 
     #[test]
     fn an_answer_that_cannot_be_saved_is_not_taken() {
-        let dir = tempfile::tempdir().unwrap();
-        let h = Harness::new(Some(dir.path()));
+        let h = Harness::new();
         h.core.load_scenario(FakeScenario::MassDelete).unwrap();
         h.core.start();
         let question = h.core.state().questions[0].clone();
@@ -1461,24 +1401,16 @@ mod tests {
             h.core.dismiss_notice("none"),
             Err(SessionError::NoticeNotFound)
         ));
-        drop(h);
 
-        let h = Harness::new(Some(dir.path()));
-        assert_eq!(h.core.state().questions, std::slice::from_ref(&question));
-        assert_eq!(not_writable(&h.core), None);
+        h.core.fail_saves(false);
         h.core.answer(&question.id, Answer::Delete).unwrap();
-        assert!(
-            Harness::new(Some(dir.path()))
-                .core
-                .state()
-                .questions
-                .is_empty()
-        );
+        assert_eq!(not_writable(&h.core), None);
+        assert!(h.core.state().questions.is_empty());
     }
 
     #[test]
     fn a_scripted_change_that_cannot_be_saved_changes_nothing() {
-        let h = Harness::new(None);
+        let h = Harness::new();
         h.core.load_scenario(FakeScenario::UpToDate).unwrap();
         h.take();
         h.core.fail_saves(true);
@@ -1513,71 +1445,8 @@ mod tests {
     }
 
     #[test]
-    fn memory_matches_disk_after_failed_script_and_answer_saves() {
-        let dir = tempfile::tempdir().unwrap();
-        let h = Harness::new(Some(dir.path()));
-        h.core.load_scenario(FakeScenario::UpToDate).unwrap();
-        h.core.fail_saves(true);
-        assert!(matches!(
-            h.core.ask(
-                DOCUMENTS.to_owned(),
-                QuestionKind::AmbiguousDisappearance,
-                vec![],
-            ),
-            Err(SessionError::NotSaved { .. })
-        ));
-        let in_memory = h.core.state().questions;
-        drop(h);
-
-        let persisted = Harness::new(Some(dir.path())).core.state().questions;
-        assert_eq!(in_memory, persisted);
-        assert!(persisted.is_empty());
-
-        let h = Harness::new(Some(dir.path()));
-        let id = h
-            .core
-            .ask(
-                DOCUMENTS.to_owned(),
-                QuestionKind::AmbiguousDisappearance,
-                vec![],
-            )
-            .unwrap();
-        h.core.fail_saves(true);
-        assert!(matches!(
-            h.core.answer(&id, Answer::Delete),
-            Err(SessionError::NotSaved { .. })
-        ));
-        let in_memory = h.core.state().questions;
-        drop(h);
-        assert_eq!(
-            Harness::new(Some(dir.path())).core.state().questions,
-            in_memory
-        );
-        assert_eq!(in_memory.len(), 1);
-    }
-
-    #[test]
-    fn an_unwritable_state_directory_refuses_changes() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("not-a-directory");
-        fs::write(&file, b"").unwrap();
-        let h = Harness::new(Some(&file));
-        h.core.start();
-        let error = h.core.connect("https://box.example.com").unwrap_err();
-        assert!(matches!(error, SessionError::NotSaved { .. }), "{error:?}");
-        assert!(matches!(
-            not_writable(&h.core),
-            Some(ProblemKind::StateNotWritable { .. })
-        ));
-        assert_eq!(
-            h.core.claim("ABCDEFGHJKLM", "Ada", "Mac"),
-            Err(SessionError::NoServer)
-        );
-    }
-
-    #[test]
     fn scenario_and_sign_out_events_follow_the_state() {
-        let h = Harness::new(None);
+        let h = Harness::new();
         h.core.start();
         h.take();
         h.core.load_scenario(FakeScenario::Syncing).unwrap();
@@ -1605,7 +1474,7 @@ mod tests {
 
     #[test]
     fn a_sign_out_that_cannot_be_saved_keeps_progress_and_recent_changes() {
-        let h = Harness::new(None);
+        let h = Harness::new();
         h.core.load_scenario(FakeScenario::Syncing).unwrap();
         h.core.fail_saves(true);
         assert!(h.core.sign_out().is_err());
@@ -1616,7 +1485,7 @@ mod tests {
 
     #[test]
     fn scenario_lists_keep_their_documented_order() {
-        let h = Harness::new(None);
+        let h = Harness::new();
         h.core.load_scenario(FakeScenario::ManyQuestions).unwrap();
         for question in h.core.state().questions {
             assert!(
