@@ -1900,6 +1900,30 @@ fn a_waiting_update_is_made_while_committing_is_halted() {
     assert_eq!(effects_for(&mut trees, &mut ids, "n"), []);
 }
 
+/// As above, with an edit the user made after the commit: L leaves the waiting shape, so nothing
+/// but building makes the update. Once it fits, building makes it while committing is halted,
+/// and the edit stays the user's.
+#[test]
+fn a_waiting_update_is_made_while_committing_is_halted_under_a_local_edit() {
+    let (mut trees, mut commits, mut ids) = a_move_and_edit_whose_s_update_waits();
+    trees.set_local("n".into(), local(file(ROOT, "x", 2), 2));
+    trees.set_local("p".into(), local(file(ROOT, "p", 3), 3));
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id == "p"));
+    assert_eq!(
+        commits.failed(&refusal(error::Code::ReadOnly, 0)),
+        Ok(Failure::Halted(Halt::ReadOnly))
+    );
+    effects_for(&mut trees, &mut ids, "");
+    assert_eq!(trees.synced().live("h"), Some(&file(ROOT, "y", 9)));
+    assert!(trees.waiting().contains_key("n"));
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    assert!(trees.waiting().is_empty());
+    assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "x", 1)));
+    assert_eq!(trees.local().live("n"), Some(&file(ROOT, "x", 2)));
+}
+
 /// The other device moves n on while n's update waits behind h. Against the waiting shape that is
 /// a remote change, so the effects move n at once, and the update then takes R's position.
 #[test]
