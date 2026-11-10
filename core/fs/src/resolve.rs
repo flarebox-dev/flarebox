@@ -196,7 +196,7 @@ impl Space {
         Ok(())
     }
 
-    fn root_folder(&self) -> Result<Folder, Unresolved> {
+    pub(crate) fn root_folder(&self) -> Result<Folder, Unresolved> {
         let io = |err| Unresolved::Io {
             path: PathBuf::new(),
             err,

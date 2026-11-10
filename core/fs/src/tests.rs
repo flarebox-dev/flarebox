@@ -728,3 +728,71 @@ fn utc_dates_follow_the_calendar() {
     assert_eq!(date(4_107_456_000), "2100-02-28");
     assert_eq!(date(4_107_542_400), "2100-03-01");
 }
+
+#[test]
+fn a_recovered_name_is_not_given_in_a_folder_moved_out_of_the_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::create_dir(&outside).unwrap();
+    let space = Space::open(&root).unwrap();
+    let held = space.private(&["held"]).unwrap();
+    fs::write(root.join(PRIVATE_DIR).join("held/e1"), "kept").unwrap();
+    let id = Snapshot::scan(&root).unwrap().entries[Path::new("docs")].id;
+    let docs = space
+        .folder(
+            &Base::Root,
+            &[Dir {
+                name: "docs".into(),
+                id,
+            }],
+        )
+        .unwrap();
+    fs::rename(root.join("docs"), outside.join("docs")).unwrap();
+
+    let now = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let original = std::ffi::OsStr::new("report.txt");
+    let path = space
+        .move_to_recovered_name(
+            &held,
+            std::ffi::OsStr::new("e1"),
+            &docs,
+            original,
+            false,
+            now,
+        )
+        .unwrap();
+
+    let name = recovered::recovered_name(original, false, "2023-11-14", 1);
+    assert_eq!(path, PathBuf::from(&name));
+    assert_eq!(fs::read(root.join(&name)).unwrap(), b"kept");
+    assert_eq!(fs::read_dir(outside.join("docs")).unwrap().count(), 0);
+}
+
+#[test]
+fn nothing_is_recovered_from_a_folder_moved_out_of_the_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir(&outside).unwrap();
+    let space = Space::open(&root).unwrap();
+    let held = space.private(&["held"]).unwrap();
+    fs::write(root.join(PRIVATE_DIR).join("held/e1"), "kept").unwrap();
+    fs::rename(root.join(PRIVATE_DIR).join("held"), outside.join("held")).unwrap();
+
+    let now = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let to = space.root_folder().unwrap();
+    let original = std::ffi::OsStr::new("report.txt");
+    space
+        .move_to_recovered_name(&held, std::ffi::OsStr::new("e1"), &to, original, false, now)
+        .unwrap_err();
+
+    assert_eq!(fs::read(outside.join("held/e1")).unwrap(), b"kept");
+    let names: Vec<_> = fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names, [PRIVATE_DIR]);
+}

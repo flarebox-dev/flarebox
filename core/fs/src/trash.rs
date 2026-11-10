@@ -24,7 +24,6 @@ use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
-use crate::recovered::recover;
 use crate::resolve::{Folder, Space, check_name};
 use crate::root::{flush, rename_no_replace, replace_file};
 use crate::{FileType, list, stat_at};
@@ -109,6 +108,7 @@ impl Space {
     pub fn reclaim_trash(&self, now: SystemTime, cap: u64) -> io::Result<Reclaimed> {
         let trash = self.private(&[TRASH_DIR])?;
         let private = self.private(&[])?;
+        let root = self.root_folder()?;
         let mut index = read_index(private.fd())?;
         let names = list(trash.fd())?;
         index
@@ -146,15 +146,15 @@ impl Space {
                     Ok(()) => &kept.name,
                     Err(_) => &entry,
                 };
-                let name = recover(
-                    trash.fd(),
+                let path = self.move_to_recovered_name(
+                    &trash,
                     OsStr::new(&entry),
-                    self.root(),
+                    &root,
                     OsStr::new(original),
                     kept.folder,
                     now,
                 )?;
-                reclaimed.recovered.push(name);
+                reclaimed.recovered.push(path.into_os_string());
             }
             index.entries.remove(&entry);
         }

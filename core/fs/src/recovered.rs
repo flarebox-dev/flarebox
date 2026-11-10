@@ -5,10 +5,11 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::os::fd::BorrowedFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::resolve::{Folder, Space, Unresolved};
 use crate::root::{flush, rename_no_replace};
 
 /// The longest file name most file systems accept, in bytes.
@@ -43,34 +44,57 @@ pub fn recovered_name(original: &OsStr, folder: bool, date: &str, n: u32) -> OsS
     OsString::from_vec(name)
 }
 
-/// Renames `name` in `from` to the first free recovered name for
-/// `original` in `to`, never replacing an entry, flushes both folders and
-/// returns the name it took.
-pub(crate) fn recover(
-    from: BorrowedFd<'_>,
-    name: &OsStr,
-    to: BorrowedFd<'_>,
-    original: &OsStr,
-    folder: bool,
-    now: SystemTime,
-) -> io::Result<OsString> {
-    let date = utc_date(now);
-    for n in 1..=ATTEMPTS {
-        let candidate = recovered_name(original, folder, &date, n);
-        match rename_no_replace(from, name, to, &candidate) {
-            Ok(()) => {
-                flush(from)?;
-                flush(to)?;
-                return Ok(candidate);
+impl Space {
+    /// Renames `name` in `from` to the first free recovered name for
+    /// `original` in `to`, never replacing an entry, flushes both folders and
+    /// returns the new path from the root. Both folders are checked from the
+    /// root again before every attempt. When `to` no longer leads to the folder
+    /// it was, the entry is recovered at the sync root instead; when `from`
+    /// does not, nothing is renamed and the error is returned.
+    pub(crate) fn move_to_recovered_name(
+        &self,
+        from: &Folder,
+        name: &OsStr,
+        to: &Folder,
+        original: &OsStr,
+        folder: bool,
+        now: SystemTime,
+    ) -> io::Result<PathBuf> {
+        let date = utc_date(now);
+        let root = self.root_folder()?;
+        let mut to = to;
+        let mut n = 1;
+        while n <= ATTEMPTS {
+            self.recheck(from)?;
+            match self.recheck(to) {
+                Ok(()) => {}
+                Err(
+                    Unresolved::Missing(_)
+                    | Unresolved::NotAFolder(_)
+                    | Unresolved::Replaced { .. },
+                ) => {
+                    to = &root;
+                    n = 1;
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
             }
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(err) => return Err(err),
+            let candidate = recovered_name(original, folder, &date, n);
+            match rename_no_replace(from.fd(), name, to.fd(), &candidate) {
+                Ok(()) => {
+                    flush(from.fd())?;
+                    flush(to.fd())?;
+                    return Ok(to.path().join(candidate));
+                }
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => n += 1,
+                Err(err) => return Err(err),
+            }
         }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{ATTEMPTS} recovered names for {original:?} are taken"),
+        ))
     }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        format!("{ATTEMPTS} recovered names for {original:?} are taken"),
-    ))
 }
 
 /// The UTC calendar date of `time` as `YYYY-MM-DD`.
