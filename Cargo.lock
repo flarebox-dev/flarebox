@@ -525,6 +525,7 @@ dependencies = [
  "flarebox-driver",
  "flarebox-net",
  "flarebox-proto",
+ "getrandom 0.4.3",
  "http-body-util",
  "hyper",
  "hyper-util",

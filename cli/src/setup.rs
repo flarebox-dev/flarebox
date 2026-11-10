@@ -642,7 +642,7 @@ impl Session {
         self.add_device(paths, server, device_name, true).await
     }
 
-    /// Picks free names, then deploys and claims a new server (sections 4.3 and 4.4).
+    /// Picks a free Worker name and a new bucket name, then deploys and claims a new server (sections 4.3 and 4.4).
     async fn deploy(&mut self, paths: &Paths, device_name: &str) -> Result<(), String> {
         let bundle = embedded_bundle()?;
         self.require_r2().await?;
@@ -654,15 +654,11 @@ impl Session {
             .into_iter()
             .map(|script| script.id)
             .collect();
-        let buckets = api
-            .buckets(self.account(), Jurisdiction::Default)
-            .await
-            .map_err(|error| format!("cannot list the account's R2 buckets: {error}"))?;
         let base = &bundle.manifest.default_bucket;
         let state = SetupState {
             account: self.account().to_owned(),
             script: free_name(base, &scripts),
-            bucket: free_name(base, &buckets),
+            bucket: new_bucket_name(base),
             ..SetupState::default()
         };
         StateFile::new(paths).save(&state)?;
@@ -680,7 +676,7 @@ impl Session {
         let bundle = embedded_bundle()?;
         let mut key = None;
         if state.step < Step::BucketCreated {
-            create_bucket(self, &file, &mut state, &bundle.manifest.default_bucket).await?;
+            create_bucket(self, &file, &mut state).await?;
         }
         if state.step < Step::ScriptUploaded {
             keep_script_name(
@@ -971,146 +967,41 @@ fn embedded_bundle() -> Result<Bundle, String> {
     Bundle::from_dir(dir.path()).map_err(|error| broken(&error))
 }
 
-/// Creates the bucket `state.bucket`, or moves to the next free name after `base` while the name belongs to someone
-/// else, then records the step. Uninstall empties and deletes the bucket the state file names, so the deploy adopts a
-/// bucket that already exists only when `created_by_this_deploy` shows it is its own.
+/// Creates the bucket `state.bucket` and records the step. `deploy` saved that name, which only this deploy produces, before
+/// the first try, so a 409 for it means an earlier try of this deploy created the bucket and its answer was lost.
 async fn create_bucket(
     cloud: &mut impl Cloud,
     file: &StateFile,
     state: &mut SetupState,
-    base: &str,
 ) -> Result<(), String> {
-    if state.bucket_create_started_ms.is_none() {
-        state.bucket_create_started_ms = Some(now_ms());
-        file.save(state)?;
-    }
+    println!("Creating the R2 bucket {}...", state.bucket);
     let account = cloud.account().to_owned();
-    let mut refused = Vec::new();
-    loop {
-        println!("Creating the R2 bucket {}...", state.bucket);
-        let api = cloud.fresh().await?;
-        match api
-            .create_bucket(&account, &state.bucket, state.jurisdiction)
-            .await
-        {
-            Ok(()) => break,
-            Err(error) if error.status() == Some(409) => {
-                if created_by_this_deploy(cloud, state).await? {
-                    break;
-                }
-            }
-            Err(error) => {
-                return Err(format!(
-                    "cannot create the bucket {}: {error}",
-                    state.bucket
-                ));
-            }
+    match cloud
+        .fresh()
+        .await?
+        .create_bucket(&account, &state.bucket, state.jurisdiction)
+        .await
+    {
+        Ok(()) => {}
+        Err(error) if error.status() == Some(409) => {}
+        Err(error) => {
+            return Err(format!(
+                "cannot create the bucket {}: {error}",
+                state.bucket
+            ));
         }
-        refused.push(state.bucket.clone());
-        let mut taken = cloud
-            .fresh()
-            .await?
-            .buckets(&account, state.jurisdiction)
-            .await
-            .map_err(|error| format!("cannot list the account's R2 buckets: {error}"))?;
-        taken.extend(refused.iter().cloned());
-        let free = free_name(base, &taken);
-        println!(
-            "The bucket {} belongs to someone else, so the server uses the bucket {free}.",
-            state.bucket
-        );
-        state.bucket = free;
-        file.save(state)?;
     }
     state.step = Step::BucketCreated;
     file.save(state)
 }
 
-/// How far this machine's clock may run ahead of R2's before a bucket this deploy created looks older than the deploy.
-const CLOCK_SKEW_MS: i64 = 5 * 60 * 1000;
-
-/// Whether the existing bucket `state.bucket` is one this deploy created before it could record that: R2 dates it
-/// after the deploy's first create, no Worker binds it, and it holds no key outside `spaces/`.
-async fn created_by_this_deploy(
-    cloud: &mut impl Cloud,
-    state: &SetupState,
-) -> Result<bool, String> {
-    let Some(started) = state.bucket_create_started_ms else {
-        return Ok(false);
-    };
-    let account = cloud.account().to_owned();
-    let found = match cloud
-        .fresh()
-        .await?
-        .bucket(&account, &state.bucket, state.jurisdiction)
-        .await
-    {
-        Ok(found) => found,
-        Err(error) if error.status() == Some(404) => return Ok(false),
-        Err(error) => {
-            return Err(format!("cannot read the bucket {}: {error}", state.bucket));
-        }
-    };
-    if !utc_ms(&found.creation_date).is_some_and(|created| created >= started - CLOCK_SKEW_MS)
-        || found
-            .jurisdiction
-            .is_some_and(|other| other != state.jurisdiction)
-    {
-        return Ok(false);
-    }
-    if uninstall::binder(cloud, &state.bucket, state.jurisdiction)
-        .await?
-        .is_some()
-    {
-        return Ok(false);
-    }
-    Ok(uninstall::scan(cloud, &state.bucket, state.jurisdiction)
-        .await?
-        .is_some_and(|contents| contents.foreign.is_none()))
-}
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_millis() as i64)
-}
-
-/// Milliseconds since the Unix epoch of an RFC 3339 time in UTC, such as R2's `2026-11-10T01:02:03.456Z`. Any other
-/// form is `None`.
-fn utc_ms(text: &str) -> Option<i64> {
-    let (date, time) = text.strip_suffix('Z')?.split_once('T')?;
-    let (clock, fraction) = time.split_once('.').unwrap_or((time, ""));
-    let number = |part: &str| -> Option<i64> {
-        (!part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
-            .then(|| part.parse().ok())
-            .flatten()
-    };
-    let date: Vec<i64> = date.split('-').map(number).collect::<Option<_>>()?;
-    let clock: Vec<i64> = clock.split(':').map(number).collect::<Option<_>>()?;
-    let [year, month, day] = <[i64; 3]>::try_from(date).ok()?;
-    let [hour, minute, second] = <[i64; 3]>::try_from(clock).ok()?;
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
-        return None;
-    }
-    let millis = match fraction {
-        "" => 0,
-        fraction => {
-            number(fraction)?;
-            number(&format!("{fraction:0<3}")[..3])?
-        }
-    };
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = year.div_euclid(400);
-    let year_of_era = year - era * 400;
-    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    let days = era * 146_097 + day_of_era - 719_468;
-    Some(((days * 24 + hour) * 60 + minute) * 60_000 + second * 1000 + millis)
+/// A bucket name only this deploy produces: `base`, a hyphen and 16 random hex digits (64 bits). Another
+/// application cannot hold it unless it guesses it, so the deploy never takes over someone else's bucket.
+fn new_bucket_name(base: &str) -> String {
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes).expect("the operating system provides random bytes");
+    let suffix: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("{base}-{suffix}")
 }
 
 /// Keeps `state.script` while no other application holds the name. A Worker under it that has the tag and binds
@@ -1330,114 +1221,99 @@ mod tests {
     }
 
     #[test]
-    fn utc_times_read_as_milliseconds_since_the_epoch() {
-        assert_eq!(utc_ms("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(utc_ms("2026-11-10T01:02:03.456Z"), Some(1_794_272_523_456));
-        assert_eq!(utc_ms("2026-11-10T01:02:03Z"), Some(1_794_272_523_000));
-        assert_eq!(utc_ms("2026-11-10T01:02:03.4567Z"), Some(1_794_272_523_456));
-        assert_eq!(utc_ms("2026-11-10T01:02:03.4Z"), Some(1_794_272_523_400));
-        assert_eq!(utc_ms("2026-11-10T01:02:03+00:00"), None);
-        assert_eq!(utc_ms("2026-11-10 01:02:03Z"), None);
-        assert_eq!(utc_ms("2026-13-10T01:02:03Z"), None);
-        assert_eq!(utc_ms("2026-11-10T01:02:03.4é5Z"), None);
+    fn a_deploy_names_its_bucket_with_a_random_suffix() {
+        let first = new_bucket_name("flarebox");
+        let suffix = first.strip_prefix("flarebox-").unwrap();
+        assert_eq!(suffix.len(), 16);
+        assert!(
+            suffix
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        );
+        assert_ne!(first, new_bucket_name("flarebox"));
+    }
+
+    /// The bucket names of the creates `fake` received.
+    fn created(fake: &Fake) -> Vec<String> {
+        fake.seen()
+            .iter()
+            .filter(|seen| seen.method == "POST" && seen.path.ends_with("/r2/buckets"))
+            .map(|seen| {
+                let body: serde_json::Value = serde_json::from_slice(&seen.body).unwrap();
+                body["name"].as_str().unwrap().to_owned()
+            })
+            .collect()
+    }
+
+    fn create_answer(status: u16) -> Reply {
+        Reply {
+            method: "POST",
+            path: format!("/client/v4/accounts/{ACCOUNT}/r2/buckets"),
+            status,
+            content_type: "application/json",
+            body: json!({ "success": status == 200, "errors": [], "result": {} })
+                .to_string()
+                .into_bytes(),
+        }
     }
 
     #[tokio::test]
-    async fn a_bucket_name_someone_else_holds_moves_the_deploy_to_the_next_name() {
-        let conflict = Reply {
-            method: "POST",
-            path: format!("/client/v4/accounts/{ACCOUNT}/r2/buckets"),
-            status: 409,
-            content_type: "application/json",
-            body: json!({ "success": false, "errors": [{ "code": 10004, "message": "The bucket you tried to create already exists." }], "result": null })
-                .to_string()
-                .into_bytes(),
+    async fn a_lost_create_answer_is_adopted_under_the_saved_name_on_the_next_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = StateFile::new(&Paths::under(dir.path()));
+        let name = new_bucket_name("flarebox");
+        let planned = SetupState {
+            account: ACCOUNT.into(),
+            script: "flarebox".into(),
+            bucket: name.clone(),
+            ..SetupState::default()
         };
-        let found = |date: &str| {
-            cf(
-                "GET",
-                "/r2/buckets/flarebox",
-                json!({ "name": "flarebox", "creation_date": date }),
-            )
-        };
-        let objects = |key: &str| {
-            Reply {
-            method: "GET",
-            path: format!("/client/v4/accounts/{ACCOUNT}/r2/buckets/flarebox/objects?per_page=1000"),
-            status: 200,
-            content_type: "application/json",
-            body: json!({ "success": true, "errors": [], "result": [{ "key": key }], "result_info": { "cursor": "", "is_truncated": false } })
-                .to_string()
-                .into_bytes(),
-        }
-        };
-        let no_workers = || cf("GET", "/workers/scripts", json!([]));
-        let next_name = || {
-            vec![
-                cf(
-                    "GET",
-                    "/r2/buckets?per_page=1000",
-                    json!({ "buckets": [{ "name": "flarebox" }] }),
-                ),
-                cf("POST", "/r2/buckets", json!({})),
-            ]
-        };
-        let older = "2026-11-09T23:00:00.000Z";
-        let newer = "2026-11-10T01:00:05.000Z";
-        let cases = [
-            (vec![found(older)], next_name(), "flarebox-2"),
-            (
-                vec![found(newer), no_workers(), objects("photos/cat.jpg")],
-                next_name(),
-                "flarebox-2",
-            ),
-            (
-                vec![
-                    found(newer),
-                    cf(
-                        "GET",
-                        "/workers/scripts",
-                        json!([{ "id": "photos", "tags": [] }]),
-                    ),
-                    cf(
-                        "GET",
-                        "/workers/scripts/photos/settings",
-                        json!({ "bindings": [{ "type": "r2_bucket", "name": "PHOTOS", "bucket_name": "flarebox" }] }),
-                    ),
-                ],
-                next_name(),
-                "flarebox-2",
-            ),
-            (
-                vec![found(newer), no_workers(), objects("spaces/0194f8a2/chunk")],
-                Vec::new(),
-                "flarebox",
-            ),
-        ];
-        for (checks, after, expected) in cases {
-            let mut replies = vec![tokens(), conflict.clone()];
-            replies.extend(checks);
-            replies.extend(after);
-            let fake = Fake::start(replies).await;
-            let mut session = fake::session(&fake).await;
-            let dir = tempfile::tempdir().unwrap();
-            let file = StateFile::new(&Paths::under(dir.path()));
-            let mut state = SetupState {
-                account: ACCOUNT.into(),
-                script: "flarebox".into(),
-                bucket: "flarebox".into(),
-                bucket_create_started_ms: utc_ms("2026-11-10T01:00:00Z"),
-                ..SetupState::default()
-            };
+        file.save(&planned).unwrap();
 
-            create_bucket(&mut session, &file, &mut state, "flarebox")
-                .await
-                .unwrap();
+        let lost = Fake::start(vec![tokens(), create_answer(502)]).await;
+        let mut state = file.load().unwrap().unwrap();
+        let error = create_bucket(&mut fake::session(&lost).await, &file, &mut state)
+            .await
+            .unwrap_err();
+        assert!(error.contains("cannot create the bucket"), "{error}");
+        assert_eq!(file.load().unwrap(), Some(planned));
 
-            assert_eq!(state.bucket, expected);
-            assert_eq!(state.step, Step::BucketCreated);
-            assert_eq!(file.load().unwrap(), Some(state));
-        }
+        let retry = Fake::start(vec![tokens(), create_answer(409)]).await;
+        let mut state = file.load().unwrap().unwrap();
+        create_bucket(&mut fake::session(&retry).await, &file, &mut state)
+            .await
+            .unwrap();
+
+        assert_eq!(created(&lost), [name.as_str()]);
+        assert_eq!(created(&retry), [name.as_str()]);
+        let saved = file.load().unwrap().unwrap();
+        assert_eq!((saved.bucket, saved.step), (name, Step::BucketCreated));
+    }
+
+    #[tokio::test]
+    async fn a_bucket_named_like_the_default_is_never_created_read_or_deleted() {
+        let fake = Fake::start(vec![tokens(), create_answer(200)]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = StateFile::new(&Paths::under(dir.path()));
+        let mut state = SetupState {
+            account: ACCOUNT.into(),
+            script: "flarebox".into(),
+            bucket: new_bucket_name("flarebox"),
+            ..SetupState::default()
+        };
+
+        create_bucket(&mut fake::session(&fake).await, &file, &mut state)
+            .await
+            .unwrap();
+
+        assert_eq!(created(&fake), [state.bucket.as_str()]);
+        assert_ne!(state.bucket, "flarebox");
+        assert!(
+            !fake
+                .seen()
+                .iter()
+                .any(|seen| seen.path.contains("/r2/buckets/flarebox") || seen.method == "DELETE")
+        );
     }
 
     #[tokio::test]

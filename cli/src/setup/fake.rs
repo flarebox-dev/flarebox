@@ -6,7 +6,7 @@
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -19,7 +19,6 @@ use flarebox_cloudflare::{Account, CLIENT_ID, Endpoints, Login};
 
 use super::Session;
 
-#[derive(Clone)]
 pub struct Reply {
     pub method: &'static str,
     pub path: String,
@@ -28,12 +27,13 @@ pub struct Reply {
     pub body: Vec<u8>,
 }
 
-/// A request the fake received: method, path with query, and its `cf-r2-jurisdiction` header.
+/// A request the fake received: method, path with query, its `cf-r2-jurisdiction` header and its body.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Seen {
     pub method: String,
     pub path: String,
     pub jurisdiction: Option<String>,
+    pub body: Vec<u8>,
 }
 
 pub struct Fake {
@@ -185,10 +185,18 @@ async fn answer(
         .headers()
         .get("cf-r2-jurisdiction")
         .map(|value| value.to_str().unwrap().to_owned());
+    let body = request
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
     seen.lock().unwrap().push(Seen {
         method: method.clone(),
         path: path.clone(),
         jurisdiction,
+        body,
     });
     let mut replies = replies.lock().unwrap();
     let reply = match replies
