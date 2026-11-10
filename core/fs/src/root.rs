@@ -114,8 +114,11 @@ fn read_marker_at(root: BorrowedFd<'_>) -> io::Result<Option<Marker>> {
 /// it, before returning. The marker is replaced in one rename, so a crash
 /// leaves the old marker or the new one.
 pub fn write_marker(root: &Path, marker: &Marker) -> io::Result<()> {
-    let root = open_root(root)?;
-    let private = private_dir(root.as_fd())?;
+    write_marker_at(open_root(root)?.as_fd(), marker)
+}
+
+pub(crate) fn write_marker_at(root: BorrowedFd<'_>, marker: &Marker) -> io::Result<()> {
+    let private = private_dir(root)?;
     replace_file(
         private.as_fd(),
         MARKER,

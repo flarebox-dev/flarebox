@@ -61,6 +61,11 @@
 //! turning an entry written to after it entered into a recovered file
 //! ([`recovered_name`]).
 //!
+//! [`Space::apply`] carries out one [`Effect`] with the quarantine protocol of
+//! design §5.2, writing the root marker first and calling a hook at every
+//! [`Step`], and [`Space::recover`] finishes or undoes the effect in flight
+//! after a crash (design §5.3).
+//!
 //! Symbolic links and special files are not synced in v0 (spec §5.1) and are
 //! skipped.
 
@@ -1319,6 +1324,7 @@ fn watch_error(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Erro
     Error::Watch(err.into())
 }
 
+mod effect;
 mod recovered;
 mod resolve;
 mod root;
@@ -1326,6 +1332,9 @@ mod root;
 mod tests;
 mod trash;
 
+pub use effect::{
+    Action, Contents, Displaced, Effect, Outcome, QUARANTINE_DIR, Reason, STAGING_DIR, Step,
+};
 pub use recovered::recovered_name;
 pub use resolve::{Base, Dir, Folder, Location, PARKED_DIR, Space, Unresolved};
 pub use root::{
