@@ -514,6 +514,38 @@ pub struct CommitResult {
     #[prost(message, repeated, tag="3")]
     pub changes: ::prost::alloc::vec::Vec<ChangeRecord>,
 }
+/// The first record of every R2 export file (spec v0 section 11, RFC 0004).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExportHeader {
+    /// "flarebox.log" for a log segment, "flarebox.snapshot" for a snapshot page.
+    #[prost(string, tag="1")]
+    pub format: ::prost::alloc::string::String,
+    #[prost(uint32, tag="2")]
+    pub format_version: u32,
+    #[prost(string, tag="3")]
+    pub space_id: ::prost::alloc::string::String,
+    #[prost(string, tag="4")]
+    pub history_id: ::prost::alloc::string::String,
+}
+/// One node in a snapshot page. Every chunk list is complete, with no 16,384-chunk cap.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NodeSnapshot {
+    #[prost(message, optional, tag="1")]
+    pub node: ::core::option::Option<NodeState>,
+    /// Retained versions other than node.current.
+    #[prost(message, repeated, tag="2")]
+    pub previous: ::prost::alloc::vec::Vec<RetainedVersion>,
+    /// When the node was trashed; 0 when it is not trashed.
+    #[prost(int64, tag="3")]
+    pub trashed_at_ms: i64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RetainedVersion {
+    #[prost(message, optional, tag="1")]
+    pub version: ::core::option::Option<VersionInfo>,
+    #[prost(int64, tag="2")]
+    pub superseded_at_ms: i64,
+}
 /// A call-level failure. Op-level outcomes are in OpResult instead.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Error {
