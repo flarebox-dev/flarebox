@@ -39,7 +39,7 @@ use flarebox_proto::v1::{
 use flarebox_store::{Link, Store, Tx};
 use tokio::sync::{Notify, mpsc, watch};
 
-use crate::claim::{self, Flock, Owner};
+use crate::claim::{self, Flock, Identity, Owner};
 use crate::disk::{Batch, Disk, Pending, Sections, Settled, Staged, Stall, Stop, Upload};
 use crate::driver::check_placement;
 use crate::engine::{Applied, Engine, Staging};
@@ -54,6 +54,9 @@ pub const MAX_FORMAT: u32 = 1;
 const TREE_PAGE: u32 = 5_000;
 /// How often a folder that failed its root check is checked again.
 const ROOT_RECHECK: Duration = Duration::from_secs(30);
+/// The first wait before a folder that halted for its root syncs again. Each such halt doubles it, up to
+/// [`ROOT_RECHECK`].
+const ROOT_AGAIN: Duration = Duration::from_secs(1);
 /// How often a running folder checks that its path still names the folder it locked.
 const CLAIM_RECHECK: Duration = Duration::from_secs(2);
 /// The wait before a commit is built again after a file changed while its content was uploaded. The observer
@@ -68,7 +71,11 @@ const EFFECT_RETRY: Backoff = Backoff {
 
 /// Why a folder halts once its path no longer leads to the folder its task locked.
 const REPLACED: &str = "the folder at this path is no longer the folder this task locked (it was moved, replaced or \
-                        removed); restart to sync it again";
+                        removed)";
+
+/// Why a folder halts when the folder at its path after a root halt is not the one the task locked before.
+const OTHER_FOLDER: &str = "the folder at this path is not the one this device synced before (it was replaced); run \
+                            flarebox restart to sync the folder that is there now";
 
 /// One linked folder while it syncs.
 pub(crate) struct Folder {
@@ -988,7 +995,25 @@ pub(crate) struct FolderTask {
 }
 
 /// Why the task stopped syncing before it was asked to.
-type Halt = String;
+#[derive(Debug, thiserror::Error)]
+enum Halt {
+    /// The folder at the path is not the one the task locked, or it fails its root check. The task syncs again on
+    /// its own once the root passes the check, and only when the path leads to the folder it locked before.
+    #[error("{0}")]
+    Root(String),
+    /// Only a person can fix it. The task waits for a restart.
+    #[error("{0}")]
+    Person(String),
+}
+
+impl From<Stop> for Halt {
+    fn from(stop: Stop) -> Self {
+        match stop {
+            Stop::Withdrawn(_) | Stop::Root(_) | Stop::OtherRoot => Halt::Root(stop.to_string()),
+            stop => Halt::Person(stop.to_string()),
+        }
+    }
+}
 
 /// Work that is running, or nothing.
 type Slot<'a, T> = Option<Pin<Box<dyn Future<Output = T> + Send + 'a>>>;
@@ -1006,23 +1031,42 @@ async fn finished<T>(slot: &mut Slot<'_, T>) -> T {
 }
 
 impl FolderTask {
+    /// Syncs the folder until `stop` is set. After a [`Halt::Root`] it syncs again, waiting longer after each one up
+    /// to [`ROOT_RECHECK`]; after a [`Halt::Person`] it waits for `stop`. A sync after the first takes only the
+    /// folder the first one locked: another one at the path, even with the space's marker, waits for a restart.
     pub async fn run(self, mut stop: watch::Receiver<bool>) {
         let space_id = self.link.space_id.clone();
-        let halted = tokio::select! {
-            halted = self.sync() => Some(halted),
-            _ = stop.wait_for(|stop| *stop) => None,
-        };
-        let Some(halted) = halted else {
+        let mut again = ROOT_AGAIN;
+        let mut locked = None;
+        loop {
+            let halted = tokio::select! {
+                halted = self.sync(&mut locked) => Some(halted),
+                _ = stop.wait_for(|stop| *stop) => None,
+            };
+            let Some(halted) = halted else {
+                self.join_observer().await;
+                return;
+            };
+            tracing::warn!(space_id, reason = %halted, "sync of a folder halted");
+            let problem = match &halted {
+                Halt::Root(problem) => format!("{problem}; checking the folder again"),
+                Halt::Person(problem) => problem.clone(),
+            };
+            self.update(|status| {
+                status.state = FolderState::Halted;
+                status.problem = Some(problem);
+            });
             self.join_observer().await;
-            return;
-        };
-        tracing::warn!(space_id, reason = %halted, "sync of a folder halted");
-        self.update(|status| {
-            status.state = FolderState::Halted;
-            status.problem = Some(halted);
-        });
-        self.join_observer().await;
-        let _ = stop.wait_for(|stop| *stop).await;
+            if let Halt::Person(_) = halted {
+                let _ = stop.wait_for(|stop| *stop).await;
+                return;
+            }
+            tokio::select! {
+                () = tokio::time::sleep(again) => {}
+                _ = stop.wait_for(|stop| *stop) => return,
+            }
+            again = (again * 2).min(ROOT_RECHECK);
+        }
     }
 
     /// Waits for the observer's thread, which ends soon after `sync` has dropped its receiver.
@@ -1036,20 +1080,21 @@ impl FolderTask {
     /// Syncs the folder until something stops it. In order: the root check, the placement check, the claim, the
     /// store with the engine and the disk, the observer, the session, and then the loop that takes one input at a
     /// time. Dropping this future, which is how the task is stopped, drops every transfer with it. The store
-    /// holds the effect and the commit in flight, so the next start goes on from them.
-    async fn sync(&self) -> Halt {
+    /// holds the effect and the commit in flight, so the next start goes on from them. `locked` is the folder an
+    /// earlier sync of this task locked, which the claim requires and otherwise records.
+    async fn sync(&self, locked: &mut Option<Identity>) -> Halt {
         self.wait_for_root().await;
         if let Err(error) = check_placement(&self.link.root, &self.private_dirs, &self.linked) {
-            return error.to_string();
+            return Halt::Person(error.to_string());
         }
-        let lock = match self.claim() {
+        let lock = match self.claim(locked) {
             Ok(lock) => Arc::new(lock),
-            Err(halt) => return halt,
+            Err(problem) => return Halt::Person(problem),
         };
         let local = self.local.clone();
         let mut folder = match Folder::open(self.link.clone(), &lock, &self.store, local) {
             Ok(folder) => folder,
-            Err(stop) => return stop.to_string(),
+            Err(stop) => return stop.into(),
         };
         let mut from_disk = self.observe(lock.clone(), folder.sections(), folder.snapshot());
         let mut config = SessionConfig::new(
@@ -1061,7 +1106,7 @@ impl FolderTask {
         config.backoff = Backoff::default();
         let (session, mut events) = match Session::start(self.auth.clone(), config) {
             Ok(started) => started,
-            Err(reason) => return reason.to_string(),
+            Err(reason) => return Halt::Person(reason.to_string()),
         };
         let transfer = Transfer::new(self.auth.api());
         self.publish(&folder);
@@ -1085,13 +1130,13 @@ impl FolderTask {
                         // first scan is scanned or fails there before the recheck below sees it.
                         FromDisk::Batch(batch, entries) => match folder.observed(batch, entries) {
                             Err(Stop::OtherRoot) if !claim::still_locked(&lock, &self.link.root) => {
-                                break REPLACED.to_owned();
+                                break Halt::Root(REPLACED.to_owned());
                             }
                             step => step,
                         },
                         FromDisk::Scanned => folder.scanned(),
                         FromDisk::Failed(_) if !claim::still_locked(&lock, &self.link.root) => {
-                            break REPLACED.to_owned();
+                            break Halt::Root(REPLACED.to_owned());
                         }
                         FromDisk::Failed(why) => Err(Stop::Io(io::Error::other(why))),
                     },
@@ -1104,14 +1149,14 @@ impl FolderTask {
                     () = self.requests.notified() => folder.requested(),
                     _ = recheck.tick() => {
                         if !claim::still_locked(&lock, &self.link.root) {
-                            break REPLACED.to_owned();
+                            break Halt::Root(REPLACED.to_owned());
                         }
                         Ok(Vec::new())
                     }
                 };
                 let work = match step {
                     Ok(work) => work,
-                    Err(stop) => break stop.to_string(),
+                    Err(stop) => break stop.into(),
                 };
                 for work in work {
                     match work {
@@ -1174,12 +1219,23 @@ impl FolderTask {
     }
 
     /// Takes the folder's lock and checks that this profile's device linked it, recording the device if no record
-    /// is there. Another process that syncs the folder, or a record of another device, halts the folder.
-    fn claim(&self) -> Result<Flock, Halt> {
+    /// is there. Another process that syncs the folder, or a record of another device, halts the folder. So does a
+    /// folder other than `locked`, the one an earlier sync of this task locked, before anything is recorded in it.
+    /// `locked` is then set to the folder this claim locked.
+    fn claim(&self, locked: &mut Option<Identity>) -> Result<Flock, String> {
         let root = &self.link.root;
         let lock = claim::lock(root)
             .map_err(|error| format!("the folder's lock cannot be taken: {error}"))?
             .ok_or("another Flarebox process is syncing this folder; stop it, or unlink the folder there")?;
+        let found = Identity::of(
+            &lock
+                .metadata()
+                .map_err(|error| format!("the folder cannot be read: {error}"))?,
+        );
+        if locked.is_some_and(|locked| locked != found) {
+            return Err(OTHER_FOLDER.to_owned());
+        }
+        *locked = Some(found);
         match claim::owner(root) {
             Ok(Some(owner)) if owner != self.owner => Err(format!(
                 "the folder is linked by device {} of {}; unlink it there first, or remove its .flarebox/device.json",

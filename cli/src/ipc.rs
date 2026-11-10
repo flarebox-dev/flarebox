@@ -46,6 +46,9 @@ pub enum Request {
     Unlink {
         folder: PathBuf,
     },
+    Restart {
+        folder: PathBuf,
+    },
     Questions,
     Answer {
         question_id: String,
@@ -60,6 +63,7 @@ pub enum Response {
     Paired { account: Account },
     Linked { folder: FolderStatus },
     Unlinked { space_id: String, path: PathBuf },
+    Restarted { folder: FolderStatus },
     Questions { questions: Vec<Question> },
     Answered,
     SignedOut,
@@ -92,6 +96,10 @@ pub async fn handle(driver: &Driver, request: Request) -> Response {
             space_id: link.space_id,
             path: link.root,
         }),
+        Request::Restart { folder } => driver
+            .restart(&folder)
+            .await
+            .map(|folder| Response::Restarted { folder }),
         Request::Questions => driver
             .questions()
             .map(|questions| Response::Questions { questions }),

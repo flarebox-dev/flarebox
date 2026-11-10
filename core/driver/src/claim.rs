@@ -16,6 +16,7 @@ use std::ops::Deref;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::time::SystemTime;
 
 use flarebox_fs::PRIVATE_DIR;
 use rustix::fs::{FlockOperation, Mode, OFlags};
@@ -94,6 +95,25 @@ impl Drop for Flock {
 pub(crate) fn lock(root: &Path) -> io::Result<Option<Flock>> {
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
     Flock::take(File::from(rustix::fs::open(root, flags, Mode::empty())?))
+}
+
+/// What tells one folder from another whatever path reaches it: its device, its inode and, where the file system
+/// reports it, its birth time, which tells a reused inode number apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Identity {
+    dev: u64,
+    ino: u64,
+    born: Option<SystemTime>,
+}
+
+impl Identity {
+    pub(crate) fn of(meta: &fs::Metadata) -> Self {
+        Identity {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            born: meta.created().ok(),
+        }
+    }
 }
 
 /// Whether `root` still names the folder `lock` was taken on. A folder that was moved, replaced or removed is not.
