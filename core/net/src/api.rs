@@ -589,6 +589,7 @@ mod tests {
                 name: "n".repeat(MAX_ANSWER),
                 ..Default::default()
             }],
+            ..Default::default()
         }
         .encode_to_vec();
         assert!(spaces.len() > MAX_ANSWER && spaces.len() <= MAX_LIST_ANSWER);

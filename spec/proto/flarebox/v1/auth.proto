@@ -23,7 +23,7 @@ message ServerInfo {
   bool claimed = 5;
 }
 
-// POST /v1/claim
+// POST /v1/claim. user_name, device_name and platform are at most 255 bytes of UTF-8 each (RFC 0007 section 1).
 message ClaimRequest {
   // The one-time claim code from the Worker log.
   string code = 1;
@@ -38,7 +38,8 @@ message PairStartResponse {
   int64 expires_at_ms = 2;
 }
 
-// POST /v1/pair/complete, called by the new device.
+// POST /v1/pair/complete, called by the new device. device_name and platform are at most 255 bytes of UTF-8 each
+// (RFC 0007 section 1).
 message PairCompleteRequest {
   string code = 1;
   string device_name = 2;
@@ -75,14 +76,16 @@ message SpaceInfo {
   int64 created_at_ms = 4;
 }
 
-// POST /v1/spaces
+// POST /v1/spaces. name is at most 255 bytes of UTF-8 (RFC 0007 section 1).
 message CreateSpaceRequest {
   string name = 1;
 }
 
-// Response of GET /v1/spaces.
+// Response of GET /v1/spaces?cursor=, at most 100 spaces per page (RFC 0007 section 2).
 message SpaceList {
   repeated SpaceInfo spaces = 1;
+  // Empty on the last page; otherwise pass it back as ?cursor=.
+  string next_cursor = 2;
 }
 
 // One principal of the caller's user, as GET /v1/devices lists it (RFC 0006 section 7).

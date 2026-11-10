@@ -19,6 +19,8 @@ import {
   RewindResultSchema,
   type SpaceInfo,
   SpaceInfoSchema,
+  type SpaceList,
+  SpaceListSchema,
 } from "./gen/flarebox/v1/auth_pb";
 import { Error_Code } from "./gen/flarebox/v1/rpc_pb";
 import type { ShareLink, ShareLinkList } from "./gen/flarebox/v1/share_pb";
@@ -34,6 +36,8 @@ const PAIRING_CODE_MS = 10 * 60_000;
 const PAIRING_FAILURES_PER_WINDOW = 20;
 /** Principals per page of GET /v1/devices (RFC 0006 section 7). */
 const DEVICE_PAGE = 100;
+/** Spaces per page of GET /v1/spaces (RFC 0007 section 2). */
+const SPACE_PAGE = 100;
 const BASE32 = "ABCDEFGHJKMNPQRSTVWXYZ0123456789";
 const DAY_MS = 24 * 3_600_000;
 /** How long a chunk retirement record is kept: PITR cannot restore a state older than 30 days (RFC 0003 section 5, rule 10). */
@@ -700,9 +704,16 @@ export class AccountDO extends DurableObject<Env> {
     await this.deliverNotices();
   }
 
-  async listSpaces(userId: string): Promise<SpaceInfo[]> {
-    const found = this.sql.exec("SELECT * FROM spaces WHERE owner_id = ? ORDER BY created_at_ms", userId).toArray();
-    return (found as unknown as SpaceRow[]).map(spaceInfo);
+  /** GET /v1/spaces: the user's spaces in creation order, one page at a time (RFC 0007 section 2). */
+  async listSpaces(args: { userId: string; cursor: string }): Promise<SpaceList> {
+    const found = this.sql
+      .exec("SELECT * FROM spaces WHERE owner_id = ? AND space_id > ? ORDER BY space_id LIMIT ?", args.userId, args.cursor, SPACE_PAGE + 1)
+      .toArray() as unknown as SpaceRow[];
+    const page = found.slice(0, SPACE_PAGE);
+    return create(SpaceListSchema, {
+      spaces: page.map(spaceInfo),
+      nextCursor: found.length > SPACE_PAGE ? page[page.length - 1]!.space_id : "",
+    });
   }
 
   /** Records a read-only share link with a 128-bit random id. */
