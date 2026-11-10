@@ -11,8 +11,8 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use common::{
-    Bytes, ID, REMOTE, SCENARIOS, SYNCED, assert_settled, at, contents, entries, marker, now,
-    prepare, private_names, stage, trashed,
+    Bytes, EDITED, ID, REMOTE, SCENARIOS, SYNCED, assert_settled, at, contents, entries, marker,
+    now, prepare, private_names, rewrite_keeping_mtime, stage, trashed,
 };
 use flarebox_fs::{
     Action, Base, Displaced, Effect, Location, Outcome, PARKED_DIR, PRIVATE_DIR, Reason,
@@ -137,6 +137,40 @@ fn write_through_an_old_descriptor_before_the_comparison_is_put_back() {
     assert_eq!(outcome, failed(Reason::Changed));
     assert_eq!(fs::read(root.join("docs/report.txt")).unwrap(), b"SYNCED");
     assert_settled(root);
+}
+
+#[test]
+fn edit_only_the_content_shows_is_put_back() {
+    for scenario in [&SCENARIOS[0], &SCENARIOS[4]] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let effect = prepare(scenario, root);
+        let report = root.join("docs/report.txt");
+        rewrite_keeping_mtime(&report, EDITED);
+        let displaced = match &effect.action {
+            Action::WriteFile {
+                replaces: Some(displaced),
+                ..
+            }
+            | Action::RemoveFile { displaced } => displaced.entry,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            entries(root, &["docs/report.txt"]),
+            [displaced],
+            "{}",
+            scenario.name
+        );
+        assert_eq!(
+            apply(root, &effect, |_| {}),
+            failed(Reason::Changed),
+            "{}",
+            scenario.name
+        );
+        assert_eq!(fs::read(&report).unwrap(), EDITED, "{}", scenario.name);
+        assert!(trashed(root).is_empty(), "{}", scenario.name);
+        assert_settled(root);
+    }
 }
 
 #[test]

@@ -6,8 +6,9 @@
 
 #![allow(dead_code)]
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -22,6 +23,10 @@ pub const COUNTER: u64 = 5;
 pub const ID: &str = "e1";
 pub const SYNCED: &[u8] = b"synced";
 pub const REMOTE: &[u8] = b"remote";
+/// A user edit of the same length as [`SYNCED`].
+pub const EDITED: &[u8] = b"edited";
+pub const OTHER: &[u8] = b"someone else";
+pub const RECOVERED: &str = "docs/report (recovered 2023-11-14).txt";
 /// 2023-11-14T22:13:20Z.
 pub const NOW: u64 = 1_700_000_000;
 
@@ -86,6 +91,17 @@ pub fn stage(space: &Space, bytes: &[u8]) {
     space.finish_staged(ID, false).unwrap();
 }
 
+/// Writes `bytes`, of the file's own length, over the file at `path` in
+/// place and sets its modification time back, so that only its content
+/// shows the change.
+pub fn rewrite_keeping_mtime(path: &Path, bytes: &[u8]) {
+    let before = fs::metadata(path).unwrap();
+    assert_eq!(before.len(), bytes.len() as u64);
+    let file = OpenOptions::new().write(true).open(path).unwrap();
+    file.write_all_at(bytes, 0).unwrap();
+    file.set_modified(before.modified().unwrap()).unwrap();
+}
+
 /// The names in `.flarebox/<folder>`, or none when it does not exist.
 pub fn private_names(root: &Path, folder: &str) -> Vec<String> {
     let Ok(listing) = fs::read_dir(root.join(PRIVATE_DIR).join(folder)) else {
@@ -122,38 +138,63 @@ pub fn assert_settled(root: &Path) {
 }
 
 /// One effect on a small tree, with the paths whose observed entries it
-/// needs, and the step from which recovery after a crash completes it.
+/// needs, what a user does to the tree while the process that ran the effect
+/// is down, and the step from which recovery after a crash completes it, if
+/// any.
 pub struct Scenario {
     pub name: &'static str,
     pub paths: &'static [&'static str],
     pub setup: fn(&Path, &Space),
     pub build: fn(&[Entry]) -> Effect,
+    pub disturb: fn(&Path),
     pub check: fn(&Path, &Outcome),
-    pub done_from: Step,
+    pub done_from: Option<Step>,
+}
+
+/// `docs/report.txt` holding the synced content, and the remote content
+/// staged.
+fn report(root: &Path, space: &Space) {
+    fs::create_dir(root.join("docs")).unwrap();
+    fs::write(root.join("docs/report.txt"), SYNCED).unwrap();
+    stage(space, REMOTE);
+}
+
+/// [`report`] edited by the user in a way only its content shows.
+fn edited_report(root: &Path, space: &Space) {
+    report(root, space);
+    rewrite_keeping_mtime(&root.join("docs/report.txt"), EDITED);
+}
+
+/// The staged file replacing `docs/report.txt`.
+fn replacement(entries: &[Entry]) -> Effect {
+    let at = at(vec![dir("docs", &entries[0])], "report.txt");
+    Effect {
+        id: ID.into(),
+        action: Action::WriteFile {
+            at: at.clone(),
+            replaces: Some(Displaced {
+                at,
+                entry: entries[1],
+            }),
+        },
+    }
+}
+
+/// A user creating `docs/report.txt` when that name is free.
+fn take_report(root: &Path) {
+    let path = root.join("docs/report.txt");
+    if contents(path.clone()).is_none() {
+        fs::write(path, OTHER).unwrap();
+    }
 }
 
 pub const SCENARIOS: [Scenario; 6] = [
     Scenario {
         name: "replace",
         paths: &["docs", "docs/report.txt"],
-        setup: |root, space| {
-            fs::create_dir(root.join("docs")).unwrap();
-            fs::write(root.join("docs/report.txt"), SYNCED).unwrap();
-            stage(space, REMOTE);
-        },
-        build: |entries| {
-            let at = at(vec![dir("docs", &entries[0])], "report.txt");
-            Effect {
-                id: ID.into(),
-                action: Action::WriteFile {
-                    at: at.clone(),
-                    replaces: Some(Displaced {
-                        at,
-                        entry: entries[1],
-                    }),
-                },
-            }
-        },
+        setup: report,
+        build: replacement,
+        disturb: |_| {},
         check: |root, outcome| {
             let target = contents(root.join("docs/report.txt"));
             if *outcome == Outcome::Done {
@@ -164,7 +205,7 @@ pub const SCENARIOS: [Scenario; 6] = [
                 assert!(trashed(root).is_empty());
             }
         },
-        done_from: Step::Quarantined,
+        done_from: Some(Step::Quarantined),
     },
     Scenario {
         name: "write_new",
@@ -180,11 +221,12 @@ pub const SCENARIOS: [Scenario; 6] = [
                 replaces: None,
             },
         },
+        disturb: |_| {},
         check: |root, outcome| {
             let expected = (*outcome == Outcome::Done).then_some(REMOTE);
             assert_eq!(contents(root.join("docs/new.txt")).as_deref(), expected);
         },
-        done_from: Step::Placed,
+        done_from: Some(Step::Placed),
     },
     Scenario {
         name: "create_dir",
@@ -196,10 +238,11 @@ pub const SCENARIOS: [Scenario; 6] = [
                 at: at(vec![dir("docs", &entries[0])], "sub"),
             },
         },
+        disturb: |_| {},
         check: |root, outcome| {
             assert_eq!(root.join("docs/sub").is_dir(), *outcome == Outcome::Done);
         },
-        done_from: Step::Placed,
+        done_from: Some(Step::Placed),
     },
     Scenario {
         name: "move",
@@ -217,6 +260,7 @@ pub const SCENARIOS: [Scenario; 6] = [
                 to: at(vec![dir("other", &entries[2])], "b.txt"),
             },
         },
+        disturb: |_| {},
         check: |root, outcome| {
             let (from, to) = (
                 contents(root.join("docs/a.txt")),
@@ -228,7 +272,7 @@ pub const SCENARIOS: [Scenario; 6] = [
                 assert_eq!((from.as_deref(), to), (Some(SYNCED), None));
             }
         },
-        done_from: Step::Placed,
+        done_from: Some(Step::Placed),
     },
     Scenario {
         name: "remove_file",
@@ -246,6 +290,7 @@ pub const SCENARIOS: [Scenario; 6] = [
                 },
             },
         },
+        disturb: |_| {},
         check: |root, outcome| {
             let target = contents(root.join("docs/report.txt"));
             if *outcome == Outcome::Done {
@@ -256,7 +301,7 @@ pub const SCENARIOS: [Scenario; 6] = [
                 assert!(trashed(root).is_empty());
             }
         },
-        done_from: Step::Quarantined,
+        done_from: Some(Step::Quarantined),
     },
     Scenario {
         name: "remove_dir",
@@ -269,18 +314,117 @@ pub const SCENARIOS: [Scenario; 6] = [
                 id: entries[1].id,
             },
         },
+        disturb: |_| {},
         check: |root, outcome| {
             assert_eq!(root.join("docs/empty").is_dir(), *outcome != Outcome::Done);
             let trashed_dirs = private_names(root, TRASH_DIR).len();
             assert_eq!(trashed_dirs, usize::from(*outcome == Outcome::Done));
         },
-        done_from: Step::Quarantined,
+        done_from: Some(Step::Quarantined),
+    },
+];
+
+/// Replacements recovered after a crash whose quarantined entry is put back
+/// or recovered, or whose target name is taken.
+pub const RETURNS: [Scenario; 4] = [
+    Scenario {
+        name: "edited",
+        paths: &["docs", "docs/report.txt"],
+        setup: edited_report,
+        build: replacement,
+        disturb: |_| {},
+        check: |root, _| {
+            assert_eq!(
+                contents(root.join("docs/report.txt")).as_deref(),
+                Some(EDITED)
+            );
+            assert!(trashed(root).is_empty());
+        },
+        done_from: None,
+    },
+    Scenario {
+        name: "edited_name_taken",
+        paths: &["docs", "docs/report.txt"],
+        setup: edited_report,
+        build: replacement,
+        disturb: take_report,
+        check: |root, outcome| {
+            let report = contents(root.join("docs/report.txt"));
+            let recovered = contents(root.join(RECOVERED));
+            if report.as_deref() == Some(EDITED) {
+                assert_eq!(recovered, None);
+            } else {
+                assert_eq!(report.as_deref(), Some(OTHER));
+                assert_eq!(recovered.as_deref(), Some(EDITED));
+            }
+            if let Outcome::Failed {
+                recovered: Some(path),
+                ..
+            } = outcome
+            {
+                assert_eq!(path, Path::new(RECOVERED));
+            }
+            assert!(trashed(root).is_empty());
+        },
+        done_from: None,
+    },
+    Scenario {
+        name: "edited_folder_moved",
+        paths: &["docs", "docs/report.txt"],
+        setup: edited_report,
+        build: replacement,
+        disturb: |root| fs::rename(root.join("docs"), root.join("moved")).unwrap(),
+        check: |root, outcome| {
+            let name = Path::new(RECOVERED).file_name().unwrap();
+            let moved = contents(root.join("moved/report.txt"));
+            let recovered = contents(root.join(name));
+            if moved.is_some() {
+                assert_eq!((moved.as_deref(), recovered), (Some(EDITED), None));
+            } else {
+                assert_eq!(recovered.as_deref(), Some(EDITED));
+            }
+            if let Outcome::Failed {
+                recovered: Some(path),
+                ..
+            } = outcome
+            {
+                assert_eq!(path, Path::new(name));
+            }
+            assert!(!root.join("docs").exists());
+            assert_eq!(
+                fs::read_dir(root.join("moved")).unwrap().count(),
+                usize::from(moved.is_some())
+            );
+            assert!(trashed(root).is_empty());
+        },
+        done_from: None,
+    },
+    Scenario {
+        name: "name_taken",
+        paths: &["docs", "docs/report.txt"],
+        setup: report,
+        build: replacement,
+        disturb: take_report,
+        check: |root, outcome| {
+            let report = contents(root.join("docs/report.txt"));
+            if *outcome == Outcome::Done {
+                assert_eq!(report.as_deref(), Some(REMOTE));
+                assert_eq!(trashed(root), [SYNCED]);
+            } else if report.as_deref() == Some(SYNCED) {
+                assert!(trashed(root).is_empty());
+            } else {
+                assert_eq!(report.as_deref(), Some(OTHER));
+                assert_eq!(trashed(root), [SYNCED]);
+            }
+        },
+        done_from: Some(Step::Placed),
     },
 ];
 
 pub fn scenario(name: &str) -> &'static Scenario {
     SCENARIOS
         .iter()
+        .chain(&RETURNS)
         .find(|scenario| scenario.name == name)
         .unwrap()
 }
