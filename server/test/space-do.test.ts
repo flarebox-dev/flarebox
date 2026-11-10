@@ -11,7 +11,7 @@ import { toHex, uuidv7 } from "../src/ids";
 import type { SpaceDO } from "../src/space-do";
 import { conflictName, nameKey } from "../src/space/names";
 import { chunkKey } from "../src/space/store";
-import { client, content, newSpace, op, type TestClient } from "./helpers";
+import { client, content, newSpace, op, storedObjects, type TestClient } from "./helpers";
 
 const DAY = 24 * 3_600_000;
 
@@ -65,10 +65,10 @@ describe("Space DO commits", () => {
     expect([...(await a.tree()).values()].map((node) => node.name)).not.toContain("Twice");
   });
 
-  it("rejects a base_seq ahead of the server and commits from viewers or old clients", async () => {
+  it("refuses a base_seq ahead of the server with AHEAD_OF_SERVER, and commits from viewers or old clients", async () => {
     const space = await setup();
     const ahead = await space.a.commitRaw([op.mkdir(uuidv7(), space.root, "X")], { baseSeq: 5n });
-    expect(ahead.case === "error" && ahead.value.code).toBe(Error_Code.INVALID_ARGUMENT);
+    expect(ahead.case === "error" && ahead.value.code).toBe(Error_Code.AHEAD_OF_SERVER);
     const viewer = await client(space, "Viewer", { role: "viewer" });
     const denied = await viewer.commitRaw([op.mkdir(uuidv7(), space.root, "X")]);
     expect(denied.case === "error" && denied.value.code).toBe(Error_Code.FORBIDDEN);
@@ -77,10 +77,12 @@ describe("Space DO commits", () => {
     expect(readOnly.case === "error" && readOnly.value.code).toBe(Error_Code.READ_ONLY);
   });
 
-  it("requires every pending chunk to carry an upload receipt", async () => {
+  it("accepts a pending chunk only with a valid receipt or an object R2 holds under the row's incarnation", async () => {
     const { a, b, root } = await setup();
     const parts = await content("chunk bytes");
     const receipts = await a.uploadParts(parts);
+    const [key] = await storedObjects(a.spaceId, parts.content.chunks[0]!.hash);
+    await env.BUCKET.delete(key!);
     const missing = await a.commitRaw([op.create(uuidv7(), root, "f.bin", parts.content)]);
     expect(missing.case).toBe("error");
     if (missing.case === "error") {
@@ -91,7 +93,8 @@ describe("Space DO commits", () => {
       receipts: [{ ...receipts[0]!, token: receipts[0]!.token.slice(0, -2) + "AA" }],
     });
     expect(forged.case === "error" && forged.value.code).toBe(Error_Code.MISSING_CHUNKS);
-    await a.commit([op.create(uuidv7(), root, "f.bin", parts.content)], { receipts });
+    await env.BUCKET.put(key!, parts.bytes[0]!);
+    await a.commit([op.create(uuidv7(), root, "f.bin", parts.content)]);
 
     const plan = await b.call({ case: "prepareUpload", value: { chunks: parts.content.chunks } });
     expect(plan.case === "prepareUpload" && plan.value.chunks[0]!.action).toBe(ChunkPlan_Action.PRESENT);
@@ -173,7 +176,7 @@ describe("RFC 0001 name and move rules", () => {
       [op.mkdir(uuidv7(), dir, "child"), op.update(updated.nodeId, parts.content), op.restore(restored.nodeId, { versionId })],
       { receipts: await a.uploadParts(parts) },
     );
-    expect(result.results.map((r) => r.code)).toEqual([OpResult_Code.APPLIED, OpResult_Code.APPLIED, OpResult_Code.APPLIED]);
+    expect(result.results.map((r) => r.code)).toEqual([OpResult_Code.APPLIED, OpResult_Code.APPLIED_RENAMED, OpResult_Code.APPLIED_RENAMED]);
     const tree = await a.tree();
     expect(tree.get(dir)!.name).toMatch(/^\.FlareBox \(conflict from Laptop A \d{4}-\d{2}-\d{2}\)$/);
     expect(tree.get(updated.nodeId)!.name).toMatch(/^\.flarebox \(conflict from Laptop A \d{4}-\d{2}-\d{2} 2\)$/);
@@ -482,7 +485,7 @@ describe("garbage collection", () => {
   }
 
   async function stored(spaceId: string, hash: Uint8Array): Promise<boolean> {
-    return (await env.BUCKET.head(chunkKey(spaceId, toHex(hash)))) !== null;
+    return (await storedObjects(spaceId, hash)).length > 0;
   }
 
   it("never deletes a pending chunk inside its hold, or a referenced chunk", async () => {

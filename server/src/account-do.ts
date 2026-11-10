@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { create } from "@bufbuild/protobuf";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { DurableObject } from "cloudflare:workers";
 import { ACCESS_TOKEN_MS, type ServerKey, signAccessToken } from "./auth";
 import { base64url, deriveSpaceKey, sha256 } from "./crypto";
@@ -9,11 +9,13 @@ import {
   AccessTokenSchema,
   type DeviceCredentials,
   DeviceCredentialsSchema,
+  type RewindResult,
+  RewindResultSchema,
   type SpaceInfo,
   SpaceInfoSchema,
 } from "./gen/flarebox/v1/auth_pb";
 import { Error_Code } from "./gen/flarebox/v1/rpc_pb";
-import { uuidv7 } from "./ids";
+import { isUuidV7, uuidv7 } from "./ids";
 import { FORMAT_VERSION } from "./space-do";
 
 const CLAIM_CODE_MS = 3_600_000;
@@ -26,6 +28,48 @@ const SHARE_PASSWORD_KDF = "pbkdf2-sha256";
 const SHARE_FAILURES_BEFORE_LOCK = 5;
 const SHARE_LOCK_MS = 15 * 60_000;
 const BASE32 = "ABCDEFGHJKMNPQRSTVWXYZ0123456789";
+const DAY_MS = 24 * 3_600_000;
+/** How long a chunk retirement record is kept: PITR cannot restore a state older than 30 days (RFC 0003 section 5, rule 10). */
+const RETIREMENT_KEEP_MS = 30 * DAY_MS;
+/** PITR restores any point in the past 30 days. */
+const PITR_WINDOW_MS = 30 * DAY_MS;
+/** Admissible restore points lie from one minute to 29 days back (RFC 0003 section 2). */
+const REWIND_MIN_AGE_MS = 60_000;
+const REWIND_MAX_AGE_MS = 29 * DAY_MS;
+/** The Account DO alarm retries a rewind phase with backoff from one second up to ten minutes (RFC 0003 section 3). */
+const REWIND_RETRY_MIN_MS = 1000;
+const REWIND_RETRY_MAX_MS = 10 * 60_000;
+
+/** The phases of a rewind record (RFC 0003 section 3). */
+type RewindPhase = "admitted" | "prepared" | "arming" | "completed" | "failed";
+
+interface RewindRow {
+  rewind_id: string;
+  space_id: string;
+  restore_point_ms: number;
+  expected_history_id: string;
+  bookmark: string;
+  history_id: string;
+  rewind_number: number;
+  previous_history_id: string | null;
+  previous_head_seq: number | null;
+  attempt: number;
+  phase: RewindPhase;
+  result: ArrayBuffer | null;
+  error_code: number | null;
+  error: string | null;
+  admitted_at_ms: number;
+  ended_at_ms: number | null;
+  tries: number;
+}
+
+export interface RewindArgs {
+  userId: string;
+  spaceId: string;
+  rewindId: string;
+  restorePointMs: number;
+  expectedHistoryId: string;
+}
 const encoder = new TextEncoder();
 
 export type Outcome<T> = { ok: true; value: T } | { ok: false; code: Error_Code; message: string };
@@ -81,6 +125,15 @@ const SCHEMA = `
   CREATE TABLE IF NOT EXISTS server_keys (kid TEXT PRIMARY KEY, secret BLOB NOT NULL, created_at_ms INTEGER NOT NULL,
     status TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS chunk_retirements (space_id TEXT NOT NULL, hash_hex TEXT NOT NULL, incarnation TEXT NOT NULL,
+    retired_at_ms INTEGER NOT NULL, PRIMARY KEY (space_id, hash_hex, incarnation));
+  CREATE TABLE IF NOT EXISTS rewinds (rewind_id TEXT PRIMARY KEY, space_id TEXT NOT NULL, restore_point_ms INTEGER NOT NULL,
+    expected_history_id TEXT NOT NULL, bookmark TEXT NOT NULL, history_id TEXT NOT NULL, rewind_number INTEGER NOT NULL,
+    previous_history_id TEXT, previous_head_seq INTEGER, attempt INTEGER NOT NULL, phase TEXT NOT NULL, result BLOB,
+    error_code INTEGER, error TEXT, admitted_at_ms INTEGER NOT NULL, ended_at_ms INTEGER, tries INTEGER NOT NULL DEFAULT 0,
+    next_try_ms INTEGER);
+  CREATE INDEX IF NOT EXISTS rewinds_space ON rewinds(space_id);
+  CREATE TABLE IF NOT EXISTS space_rewinds (space_id TEXT PRIMARY KEY, rewind_count INTEGER NOT NULL, completed_at_ms INTEGER);
 `;
 
 interface DeviceRow {
@@ -126,6 +179,10 @@ function spaceInfo(row: SpaceRow): SpaceInfo {
 export class AccountDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
   private keyCache: ServerKey | undefined;
+  /** Rewinds this instance is driving now, so a retry and the alarm do not run the same phase at once. */
+  private readonly driving = new Set<string>();
+  /** The time rewinds are admitted, completed and timed out against. Tests replace it to move through days. */
+  clock: () => number = () => Date.now();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -283,6 +340,233 @@ export class AccountDO extends DurableObject<Env> {
       FORMAT_VERSION,
     );
     return spaceInfo({ space_id: spaceId, name, owner_id: args.userId, created_at_ms: nowMs, format_version: FORMAT_VERSION });
+  }
+
+  /**
+   * Records chunk key incarnations as retired before the space deletes their objects (RFC 0003 section 5, rule 8).
+   * The records live here, out of the Space DO's PITR, and are kept for at least RETIREMENT_KEEP_MS.
+   */
+  async retireChunks(spaceId: string, objects: { hashHex: string; incarnation: string }[]): Promise<Outcome<null>> {
+    const nowMs = Date.now();
+    if (this.spaceClosed(spaceId)) return failure(Error_Code.RETRY_LATER, "the space is being rewound");
+    this.sql.exec("DELETE FROM chunk_retirements WHERE space_id = ? AND retired_at_ms < ?", spaceId, nowMs - RETIREMENT_KEEP_MS);
+    for (const { hashHex, incarnation } of objects) {
+      this.sql.exec(
+        "INSERT INTO chunk_retirements (space_id, hash_hex, incarnation, retired_at_ms) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+        spaceId,
+        hashHex,
+        incarnation,
+        nowMs,
+      );
+    }
+    return ok(null);
+  }
+
+  /** Whether the device is active, and whether a rewind holds the space, if one is named, closed (RFC 0003 section 4). */
+  async checkSession(deviceId: string, spaceId?: string): Promise<{ active: boolean; closed: boolean }> {
+    return { active: this.activeDevice(deviceId) !== undefined, closed: spaceId !== undefined && this.spaceClosed(spaceId) };
+  }
+
+  async isSpaceClosed(spaceId: string): Promise<boolean> {
+    return this.spaceClosed(spaceId);
+  }
+
+  private spaceClosed(spaceId: string): boolean {
+    return this.sql.exec("SELECT 1 FROM rewinds WHERE space_id = ? AND phase NOT IN ('completed', 'failed')", spaceId).toArray().length > 0;
+  }
+
+  private rewindRow(rewindId: string): RewindRow | undefined {
+    return this.sql.exec("SELECT * FROM rewinds WHERE rewind_id = ?", rewindId).toArray()[0] as unknown as RewindRow | undefined;
+  }
+
+  private spaceStub(spaceId: string) {
+    return this.env.SPACE.get(this.env.SPACE.idFromName(spaceId));
+  }
+
+  /**
+   * POST /v1/spaces/{space_id}/rewind (RFC 0003 section 1). A known rewind_id answers with that rewind's state; a new one
+   * is checked, admitted and driven as far as it goes now. The alarm drives the rest.
+   */
+  async rewind(args: RewindArgs): Promise<Outcome<RewindResult>> {
+    if (!isUuidV7(args.rewindId)) return failure(Error_Code.INVALID_ARGUMENT, "rewind_id must be a UUIDv7");
+    const known = this.rewindRow(args.rewindId);
+    if (known) {
+      if (known.space_id !== args.spaceId || known.restore_point_ms !== args.restorePointMs || known.expected_history_id !== args.expectedHistoryId) {
+        return failure(Error_Code.INVALID_ARGUMENT, "this rewind_id was used with other fields");
+      }
+      await this.drive(args.rewindId);
+      return this.rewindOutcome(args.rewindId);
+    }
+
+    const nowMs = this.clock();
+    const space = this.sql.exec("SELECT owner_id, created_at_ms FROM spaces WHERE space_id = ?", args.spaceId).toArray()[0];
+    if (!space || space.owner_id !== args.userId) return failure(Error_Code.FORBIDDEN, "only the space's owner can rewind it");
+    const point = args.restorePointMs;
+    if (point > nowMs - REWIND_MIN_AGE_MS || point < nowMs - REWIND_MAX_AGE_MS) {
+      return failure(Error_Code.INVALID_ARGUMENT, "restore_point_ms must be one minute to 29 days in the past");
+    }
+    if (point < Number(space.created_at_ms)) return failure(Error_Code.INVALID_ARGUMENT, "restore_point_ms is before the space was created");
+    const closedBefore = this.sql
+      .exec("SELECT 1 FROM rewinds WHERE space_id = ? AND ended_at_ms IS NOT NULL AND admitted_at_ms <= ? AND ended_at_ms >= ?", args.spaceId, point, point)
+      .toArray();
+    if (closedBefore.length > 0) return failure(Error_Code.INVALID_ARGUMENT, "restore_point_ms lies inside an earlier rewind of this space");
+    if (this.spaceClosed(args.spaceId)) return failure(Error_Code.RETRY_LATER, "another rewind of this space has not ended");
+
+    let info;
+    try {
+      info = await this.spaceStub(args.spaceId).rewindInfo(point);
+    } catch (error) {
+      console.error("rewind admission failed", error);
+      return failure(Error_Code.RETRY_LATER, "the space could not be read; retry the rewind");
+    }
+    if (!info.descriptorDurable) return failure(Error_Code.RETRY_LATER, "the space's current history is not exported yet");
+    if (info.historyId !== args.expectedHistoryId) return failure(Error_Code.HISTORY_MISMATCH, "expected_history_id is not the space's current history");
+    if (this.rewindRow(args.rewindId) || this.spaceClosed(args.spaceId)) return failure(Error_Code.RETRY_LATER, "another rewind of this space has not ended");
+
+    const count = Number(this.sql.exec("SELECT rewind_count FROM space_rewinds WHERE space_id = ?", args.spaceId).toArray()[0]?.rewind_count ?? 0) + 1;
+    this.sql.exec(
+      "INSERT INTO space_rewinds (space_id, rewind_count) VALUES (?, ?) ON CONFLICT (space_id) DO UPDATE SET rewind_count = excluded.rewind_count",
+      args.spaceId,
+      count,
+    );
+    this.sql.exec(
+      `INSERT INTO rewinds (rewind_id, space_id, restore_point_ms, expected_history_id, bookmark, history_id, rewind_number, attempt,
+         phase, admitted_at_ms, next_try_ms) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'admitted', ?, ?)`,
+      args.rewindId,
+      args.spaceId,
+      point,
+      args.expectedHistoryId,
+      info.bookmark,
+      uuidv7(),
+      count,
+      nowMs,
+      Date.now() + REWIND_RETRY_MIN_MS,
+    );
+    await this.armRewindAlarm();
+    await this.drive(args.rewindId);
+    return this.rewindOutcome(args.rewindId);
+  }
+
+  private rewindOutcome(rewindId: string): Outcome<RewindResult> {
+    const row = this.rewindRow(rewindId)!;
+    if (row.phase === "completed") return ok(fromBinary(RewindResultSchema, new Uint8Array(row.result!)));
+    if (row.phase === "failed") return failure(row.error_code ?? Error_Code.INTERNAL, row.error ?? "the rewind failed");
+    return failure(Error_Code.RETRY_LATER, "the rewind is running" + (row.error ? "; last error: " + row.error : ""));
+  }
+
+  /**
+   * Moves a rewind through its phases (RFC 0003 section 3). Each phase is recorded before the call it starts; an error
+   * leaves the recorded phase and schedules the alarm with backoff.
+   */
+  private async drive(rewindId: string): Promise<void> {
+    if (this.driving.has(rewindId)) return;
+    this.driving.add(rewindId);
+    try {
+      for (;;) {
+        const row = this.rewindRow(rewindId);
+        if (!row || row.phase === "completed" || row.phase === "failed") return;
+        if (row.phase === "admitted") {
+          const prepared = await this.spaceStub(row.space_id).rewindPrepare({ rewindId, attempt: row.attempt, bookmark: row.bookmark });
+          if (!prepared.earlier) return await this.failRewind(row, "the selected restore point is not earlier than the space's current state");
+          this.sql.exec(
+            `UPDATE rewinds SET phase = 'prepared', previous_history_id = COALESCE(previous_history_id, ?),
+               previous_head_seq = COALESCE(previous_head_seq, ?) WHERE rewind_id = ?`,
+            prepared.historyId,
+            prepared.headSeq,
+            rewindId,
+          );
+        } else if (row.phase === "prepared") {
+          this.sql.exec("UPDATE rewinds SET phase = 'arming' WHERE rewind_id = ?", rewindId);
+          try {
+            await this.spaceStub(row.space_id).rewindArm(row.bookmark);
+          } catch {
+            // Arming restarts the Space DO, so the call ends in an error either way; settling decides what happened.
+          }
+        } else {
+          try {
+            await this.spaceStub(row.space_id).restart();
+          } catch {
+            // The restart ends the call; any pending restore has applied once the object starts again.
+          }
+          const nowMs = this.clock();
+          const completion = await this.spaceStub(row.space_id).rewindComplete({
+            rewindId,
+            attempt: row.attempt,
+            historyId: row.history_id,
+            rewindNumber: row.rewind_number,
+            restorePointMs: row.restore_point_ms,
+            completedAtMs: nowMs,
+            revokedDevices: this.sql.exec("SELECT device_id FROM devices WHERE revoked_at_ms IS NOT NULL").toArray().map((r) => String(r.device_id)),
+            retired: this.sql
+              .exec("SELECT hash_hex, incarnation FROM chunk_retirements WHERE space_id = ?", row.space_id)
+              .toArray()
+              .map((r) => ({ hashHex: String(r.hash_hex), incarnation: String(r.incarnation) })),
+          });
+          if (completion.state === "marker") {
+            if (nowMs > row.restore_point_ms + PITR_WINDOW_MS) {
+              return await this.failRewind(row, "the restore point left the PITR window before the restore ran");
+            }
+            this.sql.exec("UPDATE rewinds SET phase = 'admitted', attempt = attempt + 1 WHERE rewind_id = ?", rewindId);
+            throw new Error("the restore did not run; preparing another attempt");
+          }
+          const result = create(RewindResultSchema, {
+            historyId: row.history_id,
+            restoreSeq: BigInt(completion.receipt.restoreSeq),
+            restorePointMs: BigInt(row.restore_point_ms),
+            previousHistoryId: row.previous_history_id ?? "",
+            previousHeadSeq: BigInt(row.previous_head_seq ?? 0),
+          });
+          this.sql.exec(
+            "UPDATE rewinds SET phase = 'completed', result = ?, error = NULL, ended_at_ms = ?, next_try_ms = NULL WHERE rewind_id = ?",
+            toBinary(RewindResultSchema, result),
+            nowMs,
+            rewindId,
+          );
+          this.sql.exec("UPDATE space_rewinds SET completed_at_ms = ? WHERE space_id = ?", completion.receipt.completedAtMs, row.space_id);
+          return;
+        }
+      }
+    } catch (error) {
+      const row = this.rewindRow(rewindId)!;
+      const delay = Math.min(REWIND_RETRY_MAX_MS, REWIND_RETRY_MIN_MS * 2 ** Math.min(row.tries, 20));
+      console.error("rewind phase failed", rewindId, row.phase, error);
+      this.sql.exec(
+        "UPDATE rewinds SET tries = tries + 1, error = ?, next_try_ms = ? WHERE rewind_id = ?",
+        error instanceof Error ? error.message : String(error),
+        Date.now() + delay,
+        rewindId,
+      );
+    } finally {
+      this.driving.delete(rewindId);
+      await this.armRewindAlarm();
+    }
+  }
+
+  /** Step 6: only when no restore can have happened or be pending. Removes the markers and reopens the space unchanged. */
+  private async failRewind(row: RewindRow, reason: string): Promise<void> {
+    await this.spaceStub(row.space_id).rewindAbort(row.rewind_id);
+    this.sql.exec(
+      "UPDATE rewinds SET phase = 'failed', error_code = ?, error = ?, ended_at_ms = ?, next_try_ms = NULL WHERE rewind_id = ?",
+      Error_Code.INVALID_ARGUMENT,
+      reason,
+      this.clock(),
+      row.rewind_id,
+    );
+  }
+
+  /** Sets the alarm for the next due rewind, at least a second ahead so that a rewind driven right now is not retried in a loop. */
+  private async armRewindAlarm(): Promise<void> {
+    const next = this.sql.exec("SELECT MIN(next_try_ms) AS due FROM rewinds WHERE phase NOT IN ('completed', 'failed')").one().due;
+    if (next === null) await this.ctx.storage.deleteAlarm();
+    else await this.ctx.storage.setAlarm(Math.max(Number(next), Date.now() + REWIND_RETRY_MIN_MS));
+  }
+
+  override async alarm(): Promise<void> {
+    const due = this.sql
+      .exec("SELECT rewind_id FROM rewinds WHERE phase NOT IN ('completed', 'failed') AND (next_try_ms IS NULL OR next_try_ms <= ?)", Date.now())
+      .toArray();
+    for (const { rewind_id } of due) await this.drive(String(rewind_id));
+    await this.armRewindAlarm();
   }
 
   async listSpaces(userId: string): Promise<SpaceInfo[]> {

@@ -1,0 +1,531 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+import { create, type DescMessage, fromBinary, type MessageInitShape, type MessageShape, toBinary } from "@bufbuild/protobuf";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { env, exports } from "cloudflare:workers";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { AccountDO } from "../src/account-do";
+import {
+  ClaimRequestSchema,
+  CreateSpaceRequestSchema,
+  type DeviceCredentials,
+  DeviceCredentialsSchema,
+  PairCompleteRequestSchema,
+  PairStartResponseSchema,
+  RewindRequestSchema,
+  RewindResultSchema,
+  SpaceInfoSchema,
+} from "../src/gen/flarebox/v1/auth_pb";
+import {
+  ClientMessageSchema,
+  ResyncRequired_Reason,
+  RpcRequestSchema,
+  RpcResponseSchema,
+  type ServerMessage,
+  ServerMessageSchema,
+} from "../src/gen/flarebox/v1/messages_pb";
+import { ChunkPlan_Action, Error_Code, ErrorSchema } from "../src/gen/flarebox/v1/rpc_pb";
+import { toHex, uuidv7 } from "../src/ids";
+import { Close, CONNECT_HEADER, type SpaceDO } from "../src/space-do";
+import { ChunkState } from "../src/space/schema";
+import { chunkKey } from "../src/space/store";
+import { content, op, TestClient, targetIncarnation } from "./helpers";
+import { simulatedPitr } from "./pitr";
+
+simulatedPitr.install();
+
+const BASE = "https://flarebox.test";
+const MINUTE = 60_000;
+const DAY = 24 * 3_600_000;
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  simulatedPitr.dropArms = false;
+  simulatedPitr.bookmarkFor = undefined;
+});
+
+function account() {
+  return env.ACCOUNT.get(env.ACCOUNT.idFromName("account"));
+}
+
+/** A new stub each time: a rewind restarts the Space DO, and a stub of the ended instance keeps failing. */
+function space(spaceId: string) {
+  return env.SPACE.get(env.SPACE.idFromName(spaceId));
+}
+
+async function call<Res extends DescMessage>(
+  path: string,
+  init: { token?: string; body?: Uint8Array; headers?: Record<string, string> },
+  schema: Res,
+) {
+  const headers: Record<string, string> = { "Content-Type": "application/x-protobuf", ...init.headers };
+  if (init.token) headers.Authorization = "Bearer " + init.token;
+  const response = await exports.default.fetch(BASE + path, { method: init.headers?.Upgrade ? "GET" : "POST", headers, body: init.body });
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  return {
+    status: response.status,
+    message: response.ok ? (fromBinary(schema, bytes) as MessageShape<Res>) : undefined,
+    error: response.ok || bytes.length === 0 ? undefined : fromBinary(ErrorSchema, bytes),
+  };
+}
+
+function body<S extends DescMessage>(schema: S, init: MessageInitShape<S>): Uint8Array {
+  return toBinary(schema, create(schema, init));
+}
+
+let owner: DeviceCredentials | undefined;
+
+/** Durable Object storage is shared by the tests in this file, so the deployment is claimed once. */
+async function getOwner(): Promise<DeviceCredentials> {
+  if (owner) return owner;
+  const log = vi.spyOn(console, "log");
+  await exports.default.fetch(BASE + "/setup");
+  const line = log.mock.calls.map((args) => String(args[0])).find((text) => text.startsWith("Flarebox claim code"));
+  const claimed = await call(
+    "/v1/claim",
+    { body: body(ClaimRequestSchema, { code: line!.split(": ")[1]!, userName: "Owner", deviceName: "Laptop A", platform: "macos" }) },
+    DeviceCredentialsSchema,
+  );
+  owner = claimed.message!;
+  return owner;
+}
+
+async function pairDevice(inviter: DeviceCredentials, deviceName: string): Promise<DeviceCredentials> {
+  const started = await call("/v1/pair/start", { token: inviter.access!.token }, PairStartResponseSchema);
+  const paired = await call(
+    "/v1/pair/complete",
+    { body: body(PairCompleteRequestSchema, { code: started.message!.code, deviceName, platform: "linux" }) },
+    DeviceCredentialsSchema,
+  );
+  return paired.message!;
+}
+
+/** A space created through the Account DO, with a client of the owner's device and the time it was created. */
+async function newSpace() {
+  const creds = await getOwner();
+  const createdAtMs = Date.now();
+  const created = await call("/v1/spaces", { token: creds.access!.token, body: body(CreateSpaceRequestSchema, { name: "Home" }) }, SpaceInfoSchema);
+  const spaceId = created.message!.spaceId;
+  const device = () =>
+    new TestClient(space(spaceId), spaceId, {
+      deviceId: creds.deviceId,
+      userId: creds.userId,
+      deviceName: "Laptop A",
+      role: "owner",
+      maxFormat: 1,
+      origin: BASE,
+    });
+  return { spaceId, createdAtMs, creds, device };
+}
+
+function setAccountClock(atMs: number) {
+  return runInDurableObject(account(), (instance: AccountDO) => {
+    instance.clock = () => atMs;
+  });
+}
+
+function snapshot(spaceId: string, atMs: number) {
+  return runInDurableObject(space(spaceId), (_instance, state) => simulatedPitr.snapshot(state, atMs));
+}
+
+function spaceRows(spaceId: string, query: string, ...bindings: SqlStorageValue[]) {
+  return runInDurableObject(space(spaceId), (_instance, state) => state.storage.sql.exec(query, ...bindings).toArray());
+}
+
+function rewindRecord(rewindId: string) {
+  return runInDurableObject(
+    account(),
+    (_instance, state) => state.storage.sql.exec("SELECT * FROM rewinds WHERE rewind_id = ?", rewindId).toArray()[0],
+  );
+}
+
+function rewind(token: string, spaceId: string, init: { restorePointMs: number; expectedHistoryId: string; rewindId?: string }) {
+  const request = body(RewindRequestSchema, {
+    restorePointMs: BigInt(init.restorePointMs),
+    expectedHistoryId: init.expectedHistoryId,
+    rewindId: init.rewindId ?? uuidv7(),
+  });
+  return call(`/v1/spaces/${spaceId}/rewind`, { token, body: request }, RewindResultSchema);
+}
+
+async function rpc(token: string, spaceId: string, init: MessageInitShape<typeof RpcRequestSchema>["call"]) {
+  const response = await exports.default.fetch(`${BASE}/v1/spaces/${spaceId}/rpc`, {
+    method: "POST",
+    headers: { Authorization: "Bearer " + token, "Content-Type": "application/x-protobuf" },
+    body: body(RpcRequestSchema, { reqId: 1n, call: init }),
+  });
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  return { status: response.status, result: response.ok ? fromBinary(RpcResponseSchema, bytes).result : undefined };
+}
+
+/** Opens a socket, sends Hello, and collects what the server sends. */
+async function socket(spaceId: string, token: string) {
+  const response = await exports.default.fetch(`${BASE}/v1/spaces/${spaceId}/ws`, {
+    headers: { Upgrade: "websocket", Authorization: "Bearer " + token },
+  });
+  const ws = response.webSocket!;
+  ws.binaryType = "arraybuffer";
+  ws.accept();
+  const received: ServerMessage["msg"][] = [];
+  const state: { closed?: number } = {};
+  ws.addEventListener("message", (event) => received.push(fromBinary(ServerMessageSchema, new Uint8Array(event.data as ArrayBuffer)).msg));
+  ws.addEventListener("close", (event) => {
+    state.closed = event.code;
+  });
+  const send = (msg: MessageInitShape<typeof ClientMessageSchema>["msg"]) =>
+    ws.send(toBinary(ClientMessageSchema, create(ClientMessageSchema, { msg } as MessageInitShape<typeof ClientMessageSchema>)));
+  const until = async <T>(take: () => T | undefined): Promise<T> => {
+    for (let i = 0; i < 60; i++) {
+      const value = take();
+      if (value !== undefined) return value;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw new Error("timed out");
+  };
+  send({ case: "hello", value: { clientName: "test", clientVersion: "0", protoMin: 1, protoMax: 1, maxFormat: 1 } });
+  const welcome = await until(() => received.find((msg) => msg.case === "welcome"));
+  return { ws, received, state, send, until, welcome: welcome.value };
+}
+
+async function createFile(device: TestClient, parentId: string, name: string, text: string) {
+  const parts = await content(text);
+  const nodeId = uuidv7();
+  await device.commit([op.create(nodeId, parentId, name, parts.content)], { receipts: await device.uploadParts(parts) });
+  return { nodeId, parts };
+}
+
+describe("space rewind (RFC 0003)", () => {
+  it("restores the state at the restore point under a new history, and answers a retried rewind_id with the stored result", async () => {
+    const { spaceId, createdAtMs, creds, device } = await newSpace();
+    const token = creds.access!.token;
+    const a = device();
+    const file = await createFile(a, spaceId, "notes.txt", "first");
+    const p1 = createdAtMs + MINUTE;
+    await snapshot(spaceId, p1);
+    await a.commit([op.update(file.nodeId, (await content("second")).content)], { receipts: await a.upload((await content("second")).content) });
+    const previous = await a.history();
+    const before = await socket(spaceId, token);
+
+    await setAccountClock(createdAtMs + 5 * MINUTE);
+    const rewindId = uuidv7();
+    const done = await rewind(token, spaceId, { restorePointMs: p1, expectedHistoryId: previous, rewindId });
+    expect(done.status).toBe(200);
+    const result = done.message!;
+    expect(result).toMatchObject({ restoreSeq: 1n, restorePointMs: BigInt(p1), previousHistoryId: previous, previousHeadSeq: 2n });
+    expect(result.historyId).not.toBe(previous);
+    await before.until(() => before.state.closed);
+    expect(before.state.closed).toBe(Close.SPACE_REWOUND);
+    expect(before.received.at(-1)).toMatchObject({ case: "goodbye", value: { code: Close.SPACE_REWOUND } });
+
+    const restored = await device().tree();
+    expect(restored.get(file.nodeId)?.current?.content?.size).toBe(5n);
+    const meta = Object.fromEntries((await spaceRows(spaceId, "SELECT key, value FROM meta")).map((row) => [row.key, row.value]));
+    expect(meta).toMatchObject({ history_id: result.historyId, head_seq: 1, rewind_number: 1, restore_seq: 1, restore_point_ms: p1 });
+    expect(await spaceRows(spaceId, "SELECT * FROM rewind_markers")).toEqual([]);
+    expect(await rewindRecord(rewindId)).toMatchObject({ phase: "completed", attempt: 1, rewind_number: 1 });
+
+    const again = await rewind(token, spaceId, { restorePointMs: p1, expectedHistoryId: previous, rewindId });
+    expect(again.status).toBe(200);
+    expect(again.message).toEqual(result);
+    const changed = await rewind(token, spaceId, { restorePointMs: p1 + 1, expectedHistoryId: previous, rewindId });
+    expect([changed.status, changed.error?.code]).toEqual([400, Error_Code.INVALID_ARGUMENT]);
+    const stale = await rewind(token, spaceId, { restorePointMs: p1, expectedHistoryId: previous });
+    expect([stale.status, stale.error?.code]).toEqual([409, Error_Code.HISTORY_MISMATCH]);
+
+    const old = await device().commitRaw([op.mkdir(uuidv7(), spaceId, "late")], { historyId: previous });
+    expect(old).toMatchObject({ case: "error", value: { code: Error_Code.HISTORY_MISMATCH } });
+    const after = await socket(spaceId, token);
+    expect(after.welcome.historyId).toBe(result.historyId);
+    after.send({ case: "resume", value: { historyId: previous, sinceSeq: 2n } });
+    const resync = await after.until(() => after.received.find((msg) => msg.case === "resyncRequired"));
+    expect(resync.value).toMatchObject({ reason: ResyncRequired_Reason.HISTORY_CHANGED, restoreSeq: 1n, restorePointMs: BigInt(p1) });
+    after.ws.close();
+
+    const plan = await rpc(token, spaceId, { case: "prepareUpload", value: { chunks: (await content("third " + uuidv7())).content.chunks } });
+    if (plan.result?.case !== "prepareUpload") throw new Error("prepareUpload failed");
+    expect(targetIncarnation(plan.result.value.chunks[0]!.target!.url)).toMatch(/^1\./);
+
+    const b = device();
+    b.acceptedSeq = 1n;
+    await b.commit([op.mkdir(uuidv7(), spaceId, "after first rewind")], { baseSeq: 1n });
+    const p2 = createdAtMs + 6 * MINUTE;
+    await snapshot(spaceId, p2);
+    await b.commit([op.mkdir(uuidv7(), spaceId, "discarded")]);
+    await setAccountClock(createdAtMs + 10 * MINUTE);
+    const inside = await rewind(token, spaceId, { restorePointMs: createdAtMs + 5 * MINUTE, expectedHistoryId: result.historyId });
+    expect([inside.status, inside.error?.code]).toEqual([400, Error_Code.INVALID_ARGUMENT]);
+    const second = await rewind(token, spaceId, { restorePointMs: p2, expectedHistoryId: result.historyId });
+    expect(second.status).toBe(200);
+    expect(second.message).toMatchObject({ restoreSeq: 2n, previousHistoryId: result.historyId, previousHeadSeq: 3n });
+    expect(await spaceRows(spaceId, "SELECT value FROM meta WHERE key = 'rewind_number'")).toEqual([{ value: 2 }]);
+  });
+
+  it("refuses a revoked device, a caller who is not the owner, and restore points outside the admissible range, recording nothing", async () => {
+    const { spaceId, createdAtMs, creds, device } = await newSpace();
+    const history = await device().history();
+    const lost = await pairDevice(creds, "Lost phone");
+    await account().revokeDevice(lost.deviceId);
+    await setAccountClock(createdAtMs + 2 * DAY);
+    expect((await rewind(lost.access!.token, spaceId, { restorePointMs: createdAtMs + DAY, expectedHistoryId: history })).status).toBe(401);
+    const stranger = await account().rewind({
+      userId: uuidv7(),
+      spaceId,
+      rewindId: uuidv7(),
+      restorePointMs: createdAtMs + DAY,
+      expectedHistoryId: history,
+    });
+    expect(stranger).toMatchObject({ ok: false, code: Error_Code.FORBIDDEN });
+
+    const token = creds.access!.token;
+    for (const restorePointMs of [createdAtMs + 2 * DAY - 30_000, createdAtMs - 1]) {
+      const refused = await rewind(token, spaceId, { restorePointMs, expectedHistoryId: history });
+      expect([refused.status, refused.error?.code]).toEqual([400, Error_Code.INVALID_ARGUMENT]);
+    }
+    await setAccountClock(createdAtMs + 30 * DAY);
+    const tooOld = await rewind(token, spaceId, { restorePointMs: createdAtMs + DAY - MINUTE, expectedHistoryId: history });
+    expect([tooOld.status, tooOld.error?.code]).toEqual([400, Error_Code.INVALID_ARGUMENT]);
+    const malformed = await rewind(token, spaceId, { restorePointMs: createdAtMs + 2 * DAY, expectedHistoryId: history, rewindId: "not-a-uuid" });
+    expect(malformed.status).toBe(400);
+    const recorded = await runInDurableObject(account(), (_instance, state) =>
+      state.storage.sql.exec("SELECT * FROM rewinds WHERE space_id = ?", spaceId).toArray(),
+    );
+    expect(recorded).toEqual([]);
+  });
+
+  it("holds the space closed until a restore that did not run is retried as a new attempt and completes", async () => {
+    const { spaceId, createdAtMs, creds, device } = await newSpace();
+    const token = creds.access!.token;
+    const a = device();
+    await createFile(a, spaceId, "kept.txt", "kept");
+    const point = createdAtMs + MINUTE;
+    await snapshot(spaceId, point);
+    await a.commit([op.mkdir(uuidv7(), spaceId, "dropped")]);
+    const history = await a.history();
+    const open = await socket(spaceId, token);
+
+    simulatedPitr.dropArms = true;
+    await setAccountClock(createdAtMs + 5 * MINUTE);
+    const rewindId = uuidv7();
+    const running = await rewind(token, spaceId, { restorePointMs: point, expectedHistoryId: history, rewindId });
+    expect([running.status, running.error?.code]).toEqual([503, Error_Code.RETRY_LATER]);
+    expect(running.error?.message).toMatch(/restore did not run/);
+    await open.until(() => open.state.closed);
+    expect(open.state.closed).toBe(Close.SPACE_REWOUND);
+    expect((await rewindRecord(rewindId))!.attempt).toBeGreaterThanOrEqual(2);
+
+    expect((await rpc(token, spaceId, { case: "listTree", value: {} })).status).toBe(503);
+    expect((await call(`/v1/spaces/${spaceId}/ws`, { token, headers: { Upgrade: "websocket" } }, ErrorSchema)).status).toBe(503);
+    expect(await account().retireChunks(spaceId, [{ hashHex: "00".repeat(32), incarnation: "0.1" }])).toMatchObject({
+      ok: false,
+      code: Error_Code.RETRY_LATER,
+    });
+    const another = await rewind(token, spaceId, { restorePointMs: point, expectedHistoryId: history });
+    expect([another.status, another.error?.code]).toEqual([503, Error_Code.RETRY_LATER]);
+
+    const schedule = await spaceRows(spaceId, "SELECT task, due_ms FROM schedule");
+    const ran = await runInDurableObject(space(spaceId), async (instance: SpaceDO, state) => {
+      instance.clock = () => Date.now() + 2 * DAY;
+      await instance.alarm();
+      return state.storage.getAlarm();
+    });
+    expect(ran).toBeLessThanOrEqual(Date.now() + 2 * DAY + 10 * MINUTE);
+    expect(await spaceRows(spaceId, "SELECT task, due_ms FROM schedule")).toEqual(schedule);
+
+    simulatedPitr.dropArms = false;
+    await runDurableObjectAlarm(account());
+    const done = await rewind(token, spaceId, { restorePointMs: point, expectedHistoryId: history, rewindId });
+    expect(done.status).toBe(200);
+    expect(done.message).toMatchObject({ restoreSeq: 1n, previousHeadSeq: 2n });
+    expect(await rewindRecord(rewindId)).toMatchObject({ phase: "completed" });
+    expect(await spaceRows(spaceId, "SELECT * FROM rewind_markers")).toEqual([]);
+    expect((await rpc(token, spaceId, { case: "listTree", value: {} })).status).toBe(200);
+  });
+
+  it("fails without changing the space when the bookmark is not earlier than the marker, or the restore point leaves the PITR window", async () => {
+    const { spaceId, createdAtMs, creds, device } = await newSpace();
+    const token = creds.access!.token;
+    const a = device();
+    await createFile(a, spaceId, "a.txt", "a");
+    const point = createdAtMs + MINUTE;
+    await snapshot(spaceId, point);
+    const history = await a.history();
+    await setAccountClock(createdAtMs + 5 * MINUTE);
+
+    simulatedPitr.bookmarkFor = () => "~ later than every marker";
+    const late = await rewind(token, spaceId, { restorePointMs: point, expectedHistoryId: history });
+    expect([late.status, late.error?.code]).toEqual([400, Error_Code.INVALID_ARGUMENT]);
+    simulatedPitr.bookmarkFor = undefined;
+    expect(await spaceRows(spaceId, "SELECT * FROM rewind_markers")).toEqual([]);
+    expect(await a.history()).toBe(history);
+
+    simulatedPitr.dropArms = true;
+    const rewindId = uuidv7();
+    expect((await rewind(token, spaceId, { restorePointMs: point, expectedHistoryId: history, rewindId })).status).toBe(503);
+    await setAccountClock(point + 30 * DAY + 1);
+    await runDurableObjectAlarm(account());
+    const expired = await rewind(token, spaceId, { restorePointMs: point, expectedHistoryId: history, rewindId });
+    expect([expired.status, expired.error?.message]).toEqual([400, "the restore point left the PITR window before the restore ran"]);
+    expect(await rewindRecord(rewindId)).toMatchObject({ phase: "failed" });
+    expect(await spaceRows(spaceId, "SELECT * FROM rewind_markers")).toEqual([]);
+    expect(await device().history()).toBe(history);
+    expect((await rpc(token, spaceId, { case: "listTree", value: {} })).status).toBe(200);
+  });
+
+  it("applies the chunk rules and the revocations at completion, and replays the receipt on a repeated completion", async () => {
+    const { spaceId, createdAtMs, creds, device } = await newSpace();
+    const token = creds.access!.token;
+    const a = device();
+    const retired = await createFile(a, spaceId, "retired.txt", "retired " + uuidv7());
+    const deleting = await createFile(a, spaceId, "deleting.txt", "deleting " + uuidv7());
+    const spare = await content("spare " + uuidv7());
+    await a.upload(spare.content);
+    const hashOf = (parts: { content: { chunks: { hash: Uint8Array }[] } }) => parts.content.chunks[0]!.hash;
+    const key = (parts: { content: { chunks: { hash: Uint8Array }[] } }) => hashOf(parts).slice().buffer;
+    const [retiredRow] = await spaceRows(spaceId, "SELECT incarnation FROM chunks WHERE hash = ?", key(retired.parts));
+    await spaceRows(spaceId, "UPDATE chunks SET state = ? WHERE hash = ?", ChunkState.DELETING, key(deleting.parts));
+    const point = createdAtMs + MINUTE;
+    await snapshot(spaceId, point);
+    await spaceRows(spaceId, "UPDATE chunks SET state = ? WHERE hash = ?", ChunkState.LIVE, key(deleting.parts));
+    expect(
+      await account().retireChunks(spaceId, [{ hashHex: toHex(hashOf(retired.parts)), incarnation: String(retiredRow!.incarnation) }]),
+    ).toMatchObject({ ok: true });
+    const phone = await pairDevice(creds, "Old phone");
+    await account().revokeDevice(phone.deviceId);
+    const history = await a.history();
+
+    const completedAtMs = Date.now() + 2 * DAY;
+    await setAccountClock(completedAtMs);
+    const rewindId = uuidv7();
+    expect((await rewind(token, spaceId, { restorePointMs: point, expectedHistoryId: history, rewindId })).status).toBe(200);
+
+    const chunk = async (parts: { content: { chunks: { hash: Uint8Array }[] } }) =>
+      (await spaceRows(spaceId, "SELECT state, refcount, incarnation, hold_until_ms FROM chunks WHERE hash = ?", key(parts)))[0];
+    expect(await chunk(retired.parts)).toMatchObject({ state: ChunkState.PENDING, refcount: 1, incarnation: null });
+    expect(await chunk(deleting.parts)).toMatchObject({ state: ChunkState.PENDING, refcount: 1, incarnation: null });
+    expect(await chunk(spare)).toMatchObject({ state: ChunkState.PENDING, refcount: 0, hold_until_ms: completedAtMs + 30 * DAY });
+    expect((await chunk(spare))!.incarnation).toMatch(/^0\./);
+    expect(await spaceRows(spaceId, "SELECT device_id FROM revoked_devices WHERE device_id = ?", phone.deviceId)).toHaveLength(1);
+
+    const download = await rpc(token, spaceId, { case: "getDownloadTargets", value: { hashes: [hashOf(retired.parts)] } });
+    expect(download.result).toMatchObject({ case: "error", value: { code: Error_Code.MISSING_CHUNKS } });
+    const plan = await rpc(token, spaceId, { case: "prepareUpload", value: { chunks: retired.parts.content.chunks } });
+    if (plan.result?.case !== "prepareUpload") throw new Error("prepareUpload failed");
+    expect(plan.result.value.chunks[0]).toMatchObject({ action: ChunkPlan_Action.UPLOAD });
+    const fresh = targetIncarnation(plan.result.value.chunks[0]!.target!.url);
+    expect(fresh).toMatch(/^1\./);
+    expect(fresh).not.toBe(retiredRow!.incarnation);
+
+    const orphan = chunkKey(spaceId, "ab".repeat(32), "0.424242");
+    await env.BUCKET.put(orphan, "orphan");
+    const sweep = (atMs: number) => runInDurableObject(space(spaceId), (instance: SpaceDO) => instance.collectGarbage(atMs));
+    expect((await sweep(Date.now() + 31 * DAY)).sweptChunks).toBe(0);
+    await spaceRows(spaceId, "DELETE FROM meta WHERE key = 'orphan_sweep_due_ms'");
+    expect((await sweep(completedAtMs + 31 * DAY)).sweptChunks).toBe(3);
+
+    const record = (await rewindRecord(rewindId))!;
+    const replay = await space(spaceId).rewindComplete({
+      rewindId,
+      attempt: Number(record.attempt),
+      historyId: "replayed",
+      rewindNumber: 9,
+      restorePointMs: point,
+      completedAtMs: completedAtMs + DAY,
+      revokedDevices: [],
+      retired: [],
+    });
+    expect(replay).toMatchObject({ state: "completed", receipt: { rewindId, historyId: record.history_id, restoreSeq: 2, completedAtMs } });
+    expect(await device().history()).toBe(record.history_id);
+  });
+
+  it("refuses a commit authenticated before the rewind whose body arrives after the restore, at every Space DO entry point", async () => {
+    const { spaceId, createdAtMs, creds, device } = await newSpace();
+    const token = creds.access!.token;
+    const a = device();
+    const history = await a.history();
+    const point = createdAtMs + MINUTE;
+    await snapshot(spaceId, point);
+    await a.commit([op.mkdir(uuidv7(), spaceId, "after the point")]);
+
+    const held = new TransformStream<Uint8Array, Uint8Array>();
+    const writer = held.writable.getWriter();
+    const pending = exports.default.fetch(`${BASE}/v1/spaces/${spaceId}/rpc`, {
+      method: "POST",
+      headers: { Authorization: "Bearer " + token, "Content-Type": "application/x-protobuf" },
+      body: held.readable,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const prototype = await runInDurableObject(space(spaceId), (instance: SpaceDO) => Object.getPrototypeOf(instance) as SpaceDO);
+    const complete = prototype.rewindComplete;
+    prototype.rewindComplete = async () => {
+      throw new Error("injected completion failure");
+    };
+    const rewindId = uuidv7();
+    try {
+      await setAccountClock(createdAtMs + 5 * MINUTE);
+      expect((await rewind(token, spaceId, { restorePointMs: point, expectedHistoryId: history, rewindId })).status).toBe(503);
+      expect(await rewindRecord(rewindId)).toMatchObject({ phase: "arming" });
+      expect(await spaceRows(spaceId, "SELECT * FROM rewind_markers")).toEqual([]);
+      expect(await spaceRows(spaceId, "SELECT value FROM meta WHERE key = 'head_seq'")).toEqual([{ value: 0 }]);
+
+      const late = uuidv7();
+      const commit = body(RpcRequestSchema, {
+        reqId: 1n,
+        call: {
+          case: "commit",
+          value: { commitId: uuidv7(), baseSeq: 0n, historyId: history, deviceSeq: 1n, ops: [op.mkdir(late, spaceId, "late")] },
+        },
+      });
+      await writer.write(commit);
+      await writer.close();
+      const response = await pending;
+      expect(response.status).toBe(200);
+      expect(fromBinary(RpcResponseSchema, new Uint8Array(await response.arrayBuffer())).result).toMatchObject({
+        case: "error",
+        value: { code: Error_Code.RETRY_LATER },
+      });
+
+      const connect = {
+        identity: { userId: creds.userId, deviceId: creds.deviceId, deviceName: "Laptop A", expiresAtMs: Date.now() + MINUTE },
+        origin: BASE,
+      };
+      const direct = fromBinary(RpcResponseSchema, await space(spaceId).httpRpc(connect, commit));
+      expect(direct.result).toMatchObject({ case: "error", value: { code: Error_Code.RETRY_LATER } });
+      const upgrade = await space(spaceId).fetch(
+        new Request(`${BASE}/v1/spaces/${spaceId}/ws`, { headers: { Upgrade: "websocket", [CONNECT_HEADER]: JSON.stringify(connect) } }),
+      );
+      expect(upgrade.status).toBe(503);
+      expect(await spaceRows(spaceId, "SELECT value FROM meta WHERE key = 'head_seq'")).toEqual([{ value: 0 }]);
+      expect(await spaceRows(spaceId, "SELECT node_id FROM nodes WHERE node_id = ?", late)).toEqual([]);
+    } finally {
+      prototype.rewindComplete = complete;
+    }
+
+    await runDurableObjectAlarm(account());
+    const done = await rewind(token, spaceId, { restorePointMs: point, expectedHistoryId: history, rewindId });
+    expect(done.status).toBe(200);
+    expect(done.message).toMatchObject({ restoreSeq: 0n, previousHeadSeq: 1n });
+  });
+
+  it("writes one marker per attempt however often preparing repeats, and removes them when the rewind fails", async () => {
+    const { spaceId } = await newSpace();
+    const rewindId = uuidv7();
+    for (let i = 0; i < 2; i++) await space(spaceId).rewindPrepare({ rewindId, attempt: 1, bookmark: "" });
+    expect(await spaceRows(spaceId, "SELECT rewind_id, attempt FROM rewind_markers")).toEqual([{ rewind_id: rewindId, attempt: 1 }]);
+    const refused = await device(spaceId).call({ case: "listTree", value: {} });
+    expect(refused).toMatchObject({ case: "error", value: { code: Error_Code.RETRY_LATER } });
+    await space(spaceId).rewindAbort(rewindId);
+    expect(await spaceRows(spaceId, "SELECT * FROM rewind_markers")).toEqual([]);
+  });
+});
+
+function device(spaceId: string) {
+  return new TestClient(space(spaceId), spaceId, {
+    deviceId: uuidv7(),
+    userId: owner!.userId,
+    deviceName: "Probe",
+    role: "owner",
+    maxFormat: 1,
+    origin: BASE,
+  });
+}

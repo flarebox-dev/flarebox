@@ -2,7 +2,7 @@
 
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { DurableObject } from "cloudflare:workers";
-import { type Commit, type CommitResult, CommitResultSchema, type Op } from "./gen/flarebox/v1/commit_pb";
+import { type Commit, type CommitResult, CommitResultSchema, type Op, type UploadReceipt } from "./gen/flarebox/v1/commit_pb";
 import {
   CaughtUpSchema,
   ChangesSchema,
@@ -52,13 +52,15 @@ import {
   VersionListSchema,
 } from "./gen/flarebox/v1/rpc_pb";
 import { type Identity, verifyAccessToken } from "./auth";
-import { sha256, signChunkGrant, verifyChunkGrant } from "./crypto";
+import { type ChunkObject, sha256, signChunkGrant, verifyChunkGrant } from "./crypto";
 import { fromHex, isUuidV7, toHex, uuidv7 } from "./ids";
 import { type ApplyContext, CallFailure, CommitApplier } from "./space/commit";
+import { type Pitr, pitrBackend } from "./space/pitr";
 import { ChunkState, migrate } from "./space/schema";
 import {
   chunkKey,
   encodeChunkList,
+  parseChunkKey,
   getMeta,
   getNode,
   getVersion,
@@ -83,6 +85,13 @@ export const HOLD_MS = DAY_MS;
 export const GRANT_MS = HOUR_MS;
 const MAX_OPS = 1000;
 const MAX_CHUNKS_PER_CALL = 1000;
+/**
+ * Pending chunks without a valid receipt that one commit call checks in R2, so a call stays well inside a Worker
+ * invocation's subrequest limit; the rest are listed as missing and checked on the retry (RFC 0002 section 11).
+ */
+export const MAX_HEAD_CHECKS = 50;
+/** chunk_grace_days cannot be set lower (RFC 0003 section 5, rule 4). */
+const MIN_CHUNK_GRACE_DAYS = 30;
 /** A MISSING_CHUNKS error lists at most this many hashes, the most one PrepareUpload takes; a retry after uploading them lists the rest. */
 export const MAX_MISSING_LISTED = MAX_CHUNKS_PER_CALL;
 export const MAX_CHUNK_BYTES = 16 * 1024 * 1024;
@@ -97,6 +106,8 @@ const GC_BATCH = 1000;
 const GC_RETRY_MS = 10 * 60_000;
 const R2_DELETE_BATCH = 1000;
 const ORPHAN_SWEEP_MS = 7 * DAY_MS;
+/** While a rewind holds the space closed, the alarm runs no work and checks again this much later (RFC 0003 section 4). */
+const CLOSED_RECHECK_MS = 10 * 60_000;
 
 export type Role = "owner" | "editor" | "viewer";
 
@@ -106,7 +117,14 @@ export const CONNECT_HEADER = "X-Flarebox-Connect";
 export const TOKEN_GRACE_MS = 60_000;
 
 /** WebSocket close codes. */
-export const Close = { TRY_AGAIN_LATER: 1013, PROTOCOL: 4000, TOKEN_EXPIRED: 4001, UNSUPPORTED_VERSION: 4002, DEVICE_REVOKED: 4003 } as const;
+export const Close = {
+  TRY_AGAIN_LATER: 1013,
+  PROTOCOL: 4000,
+  TOKEN_EXPIRED: 4001,
+  UNSUPPORTED_VERSION: 4002,
+  DEVICE_REVOKED: 4003,
+  SPACE_REWOUND: 4004,
+} as const;
 
 export interface Connect {
   identity: Identity;
@@ -142,6 +160,26 @@ export interface SpaceSettings {
 }
 
 const DEFAULT_SETTINGS: SpaceSettings = { version_retention_days: 30, trash_retention_days: 30, chunk_grace_days: 30 };
+
+/** What the Account DO hands the Space DO to complete a rewind (RFC 0003 section 3, step 4). */
+export interface RewindCompletion {
+  rewindId: string;
+  attempt: number;
+  historyId: string;
+  rewindNumber: number;
+  restorePointMs: number;
+  completedAtMs: number;
+  revokedDevices: string[];
+  retired: { hashHex: string; incarnation: string }[];
+}
+
+/** Stored in meta when a rewind completes, so a repeated completion call returns it again. */
+export interface RewindReceipt {
+  rewindId: string;
+  historyId: string;
+  restoreSeq: number;
+  completedAtMs: number;
+}
 
 export interface GcReport {
   expiredVersions: number;
@@ -240,6 +278,7 @@ function fitPage<R, T>(rows: R[], build: (row: R) => T, encodedSize: (item: T) =
 /** One per space: tree, versions, chunks and the commit log. */
 export class SpaceDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
+  private readonly pitr: Pitr;
   private spaceKeyCache: Uint8Array | undefined;
   /** The time source for holds, retention and tickets. Tests replace it to move through days. */
   clock: () => number = () => Date.now();
@@ -247,6 +286,7 @@ export class SpaceDO extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
+    this.pitr = pitrBackend.open(ctx);
     ctx.storage.transactionSync(() => migrate(this.sql));
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
@@ -283,16 +323,20 @@ export class SpaceDO extends DurableObject<Env> {
     return toBinary(RpcResponseSchema, response);
   }
 
-  /** The HTTP RPC path: the role comes from the member list, the format from the device's last Hello. */
+  /**
+   * The HTTP RPC path: the role comes from the member list, the format from the device's last Hello. The Account DO is
+   * asked again here, because the Worker's check may precede a rewind that closed the space (RFC 0003 section 4).
+   */
   async httpRpc(connect: Connect, request: Uint8Array): Promise<Uint8Array> {
     const req = fromBinary(RpcRequestSchema, request);
     const role = this.memberRole(connect.identity.userId);
-    if (!role || this.revoked(connect.identity.deviceId)) {
-      const error = role
-        ? create(ErrorSchema, { code: Error_Code.UNAUTHENTICATED, message: "device revoked" })
-        : create(ErrorSchema, { code: Error_Code.FORBIDDEN, message: "not a member of this space" });
-      return toBinary(RpcResponseSchema, create(RpcResponseSchema, { reqId: req.reqId, result: { case: "error", value: error } }));
-    }
+    const refuse = (code: Error_Code, message: string) =>
+      toBinary(RpcResponseSchema, create(RpcResponseSchema, { reqId: req.reqId, result: { case: "error", value: create(ErrorSchema, { code, message }) } }));
+    if (!role) return refuse(Error_Code.FORBIDDEN, "not a member of this space");
+    const check = await this.checkDevice(connect.identity.deviceId);
+    if (check === undefined) return refuse(Error_Code.RETRY_LATER, "could not check the device; retry later");
+    if (!check.active) return refuse(Error_Code.UNAUTHENTICATED, "device revoked");
+    if (check.closed) return refuse(Error_Code.RETRY_LATER, "the space is being rewound; retry later");
     const device = this.sql.exec("SELECT max_format FROM devices WHERE device_id = ?", connect.identity.deviceId).toArray()[0];
     const session = this.sessionOf(connect, role, device ? Number(device.max_format) : FORMAT_VERSION);
     const { response, record } = await this.call(session, req);
@@ -307,7 +351,10 @@ export class SpaceDO extends DurableObject<Env> {
     if (!connect) return new Response("missing identity", { status: 401 });
     const role = this.memberRole(connect.identity.userId);
     if (!role) return new Response("not a member of this space", { status: 403 });
-    if (this.revoked(connect.identity.deviceId)) return new Response("device revoked", { status: 401 });
+    const check = await this.checkDevice(connect.identity.deviceId);
+    if (check === undefined) return new Response("could not check the device; retry later", { status: 503 });
+    if (!check.active) return new Response("device revoked", { status: 401 });
+    if (check.closed) return new Response("the space is being rewound; retry later", { status: 503 });
     const [client, server] = Object.values(new WebSocketPair()) as [WebSocket, WebSocket];
     this.ctx.acceptWebSocket(server, [connect.identity.deviceId]);
     const attachment: Attachment = { connId: uuidv7(), identity: connect.identity, origin: connect.origin, role, maxFormat: 0, hello: false, live: false };
@@ -322,9 +369,10 @@ export class SpaceDO extends DurableObject<Env> {
     if (message.byteLength > MAX_CLIENT_FRAME) return this.goodbye(ws, Close.PROTOCOL, "message larger than 8 MiB");
     const attachment = ws.deserializeAttachment() as Attachment;
     if (this.clock() > attachment.identity.expiresAtMs + TOKEN_GRACE_MS) return this.goodbye(ws, Close.TOKEN_EXPIRED, "access token expired");
-    const active = await this.deviceActive(attachment.identity.deviceId);
-    if (active === undefined) return this.goodbye(ws, Close.TRY_AGAIN_LATER, "could not check the device; reconnect later");
-    if (!active) return this.goodbye(ws, Close.DEVICE_REVOKED, "device revoked");
+    const check = await this.checkDevice(attachment.identity.deviceId);
+    if (check === undefined) return this.goodbye(ws, Close.TRY_AGAIN_LATER, "could not check the device; reconnect later");
+    if (!check.active) return this.goodbye(ws, Close.DEVICE_REVOKED, "device revoked");
+    if (check.closed) return this.goodbye(ws, Close.SPACE_REWOUND, "the space is being rewound");
     if (ws.readyState !== WebSocket.OPEN) return;
     let msg;
     try {
@@ -351,6 +399,10 @@ export class SpaceDO extends DurableObject<Env> {
     for (const ws of this.ctx.getWebSockets(deviceId)) this.goodbye(ws, Close.DEVICE_REVOKED, "device revoked");
   }
 
+  private account() {
+    return this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName("account"));
+  }
+
   private recordRevoked(deviceId: string): void {
     this.sql.exec("INSERT INTO revoked_devices (device_id, revoked_at_ms) VALUES (?, ?) ON CONFLICT DO NOTHING", deviceId, Date.now());
   }
@@ -361,23 +413,30 @@ export class SpaceDO extends DurableObject<Env> {
 
   /**
    * Asks the Account DO whether the device is still active, so a revocation stops the device even before its notice
-   * reaches this space, and remembers a refusal. Other events wait, so messages of one connection keep their order.
-   * Returns undefined when the Account DO cannot answer; the error is caught inside the callback, because an
-   * exception there would reset this object and drop every connection.
+   * reaches this space, and remembers a refusal. It also says whether a rewind holds the space closed (RFC 0003
+   * section 4). Other events wait, so messages of one connection keep their order. Returns undefined when the Account
+   * DO cannot answer; the error is caught inside the callback, because an exception there would reset this object and
+   * drop every connection.
    */
-  private async deviceActive(deviceId: string): Promise<boolean | undefined> {
-    if (this.revoked(deviceId)) return false;
-    const account = this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName("account"));
-    const active = await this.ctx.blockConcurrencyWhile(async () => {
+  private async checkDevice(deviceId: string): Promise<{ active: boolean; closed: boolean } | undefined> {
+    if (this.revoked(deviceId)) return { active: false, closed: false };
+    const account = this.account();
+    const spaceId = String(getMeta(this.sql, "space_id"));
+    const check = await this.ctx.blockConcurrencyWhile(async () => {
       try {
-        return await account.isDeviceActive(deviceId);
+        return await account.checkSession(deviceId, spaceId);
       } catch (error) {
         console.error("account device check failed", error);
         return undefined;
       }
     });
-    if (active === false) this.recordRevoked(deviceId);
-    return active;
+    if (check?.active === false) this.recordRevoked(deviceId);
+    return check;
+  }
+
+  /** A rewind of this space has written its marker and not yet restored or aborted (RFC 0003 section 3). */
+  private checkOpen(): void {
+    if (this.sql.exec("SELECT 1 FROM rewind_markers LIMIT 1").toArray().length > 0) fail(Error_Code.RETRY_LATER, "the space is being rewound");
   }
 
   /** Closes connections whose access token expired more than a minute ago; returns when to check next. */
@@ -456,6 +515,7 @@ export class SpaceDO extends DurableObject<Env> {
       historyId: String(getMeta(this.sql, "history_id")),
       headSeq: BigInt(this.headSeq),
       logFloorSeq: BigInt(Number(getMeta(this.sql, "log_floor_seq"))),
+      deviceSeq: this.acceptedDeviceSeq(identity.deviceId),
       readOnly: attachment.role === "viewer" || hello.maxFormat < formatVersion,
     });
     this.send(ws, { case: "welcome", value: welcome });
@@ -468,7 +528,14 @@ export class SpaceDO extends DurableObject<Env> {
     if (resume.historyId !== getMeta(this.sql, "history_id")) reason = ResyncRequired_Reason.HISTORY_CHANGED;
     else if (resume.sinceSeq > BigInt(head)) reason = ResyncRequired_Reason.AHEAD_OF_SERVER;
     else if (resume.sinceSeq < BigInt(Number(getMeta(this.sql, "log_floor_seq")))) reason = ResyncRequired_Reason.LOG_TRUNCATED;
-    if (reason !== undefined) return this.send(ws, { case: "resyncRequired", value: create(ResyncRequiredSchema, { reason }) });
+    if (reason !== undefined) {
+      const resync = create(ResyncRequiredSchema, { reason });
+      if (reason === ResyncRequired_Reason.HISTORY_CHANGED) {
+        resync.restoreSeq = BigInt(Number(getMeta(this.sql, "restore_seq") ?? 0));
+        resync.restorePointMs = BigInt(Number(getMeta(this.sql, "restore_point_ms") ?? 0));
+      }
+      return this.send(ws, { case: "resyncRequired", value: resync });
+    }
 
     let batch: CommitRecord[] = [];
     let bytes = 0;
@@ -491,14 +558,15 @@ export class SpaceDO extends DurableObject<Env> {
   }
 
   private async reauth(ws: WebSocket, attachment: Attachment, token: string): Promise<void> {
-    const account = this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName("account"));
+    const account = this.account();
     const identity = await verifyAccessToken(await account.serverKey(), token, this.clock());
     if (!identity || identity.deviceId !== attachment.identity.deviceId || identity.userId !== attachment.identity.userId) {
       return this.goodbye(ws, Close.TOKEN_EXPIRED, "invalid access token");
     }
-    const active = await this.deviceActive(identity.deviceId);
-    if (active === undefined) return this.goodbye(ws, Close.TRY_AGAIN_LATER, "could not check the device; reconnect later");
-    if (!active) return this.goodbye(ws, Close.DEVICE_REVOKED, "device revoked");
+    const check = await this.checkDevice(identity.deviceId);
+    if (check === undefined) return this.goodbye(ws, Close.TRY_AGAIN_LATER, "could not check the device; reconnect later");
+    if (!check.active) return this.goodbye(ws, Close.DEVICE_REVOKED, "device revoked");
+    if (check.closed) return this.goodbye(ws, Close.SPACE_REWOUND, "the space is being rewound");
     const current = ws.deserializeAttachment() as Attachment;
     current.identity = identity;
     ws.serializeAttachment(current);
@@ -513,6 +581,7 @@ export class SpaceDO extends DurableObject<Env> {
   async call(session: Session, request: RpcRequest): Promise<{ response: RpcResponse; record?: CommitRecord }> {
     const reqId = request.reqId;
     try {
+      this.checkOpen();
       const call = request.call;
       switch (call.case) {
         case "commit": {
@@ -569,7 +638,9 @@ export class SpaceDO extends DurableObject<Env> {
   }
 
   private settings(): SpaceSettings {
-    return { ...DEFAULT_SETTINGS, ...JSON.parse(String(getMeta(this.sql, "settings"))) };
+    const settings: SpaceSettings = { ...DEFAULT_SETTINGS, ...JSON.parse(String(getMeta(this.sql, "settings"))) };
+    settings.chunk_grace_days = Math.max(MIN_CHUNK_GRACE_DAYS, settings.chunk_grace_days);
+    return settings;
   }
 
   private checkCanWrite(session: Session): void {
@@ -579,9 +650,37 @@ export class SpaceDO extends DurableObject<Env> {
     }
   }
 
+  /** The result stored for a commit, in the log or as its device's latest accepted commit (RFC 0002 section 2). */
   private storedResult(commitId: string): CommitResult | undefined {
-    const row = this.sql.exec("SELECT results FROM commits WHERE commit_id = ?", commitId).toArray()[0];
+    const row =
+      this.sql.exec("SELECT results FROM commits WHERE commit_id = ?", commitId).toArray()[0] ??
+      this.sql.exec("SELECT results FROM device_commits WHERE commit_id = ?", commitId).toArray()[0];
     return row ? fromBinary(CommitResultSchema, new Uint8Array(row.results as ArrayBuffer)) : undefined;
+  }
+
+  private acceptedDeviceSeq(deviceId: string): bigint {
+    const row = this.sql.exec("SELECT device_seq FROM device_commits WHERE device_id = ?", deviceId).toArray()[0];
+    return BigInt(Number(row?.device_seq ?? 0));
+  }
+
+  /**
+   * RFC 0002 section 3, steps 1 to 4: the history fence, the stored result, the device counter and the base.
+   * Returns the stored result of a commit that was already accepted; throws for a refused one.
+   */
+  private checkCommitOrder(deviceId: string, commit: Commit): CommitResult | undefined {
+    if (commit.historyId !== getMeta(this.sql, "history_id")) fail(Error_Code.HISTORY_MISMATCH, "the commit was built in another history of this space");
+    const stored = this.storedResult(commit.commitId);
+    if (stored) return stored;
+    const accepted = this.acceptedDeviceSeq(deviceId);
+    if (commit.deviceSeq === 0n) fail(Error_Code.INVALID_ARGUMENT, "device_seq is required");
+    if (commit.deviceSeq <= accepted) {
+      fail(Error_Code.STALE_DEVICE_STATE, `device_seq ${commit.deviceSeq} is at or below this device's highest accepted one, ${accepted}`);
+    }
+    if (commit.deviceSeq > accepted + 1n) fail(Error_Code.INVALID_ARGUMENT, `device_seq must be ${accepted + 1n}`);
+    const head = BigInt(this.headSeq);
+    if (commit.baseSeq > head) fail(Error_Code.AHEAD_OF_SERVER, "base_seq is ahead of the server");
+    if (commit.requireHead && commit.baseSeq < head) fail(Error_Code.HEAD_MOVED, "the space changed after base_seq");
+    return undefined;
   }
 
   private appendCommit(record: CommitRecord, result: CommitResult): void {
@@ -609,12 +708,12 @@ export class SpaceDO extends DurableObject<Env> {
   }
 
   private async commit(session: Session, commit: Commit): Promise<{ result: CommitResult; record?: CommitRecord }> {
+    const stored = this.checkCommitOrder(session.deviceId, commit);
+    if (stored) return { result: stored };
     this.checkCanWrite(session);
     if (!isUuidV7(commit.commitId)) fail(Error_Code.INVALID_ARGUMENT, "commit_id must be a UUIDv7");
     if (commit.ops.length === 0) fail(Error_Code.INVALID_ARGUMENT, "a commit needs at least one op");
     if (commit.ops.length > MAX_OPS) fail(Error_Code.LIMIT_EXCEEDED, `at most ${MAX_OPS} ops per commit`);
-    const stored = this.storedResult(commit.commitId);
-    if (stored) return { result: stored };
 
     commit.ops.forEach(checkIds);
     const referenced = new Map<string, ChunkRef>();
@@ -627,28 +726,23 @@ export class SpaceDO extends DurableObject<Env> {
         referenced.set(hex, chunk);
       }
     }
-    const spaceId = this.spaceId;
     const nowMs = this.clock();
-    const receipted = new Set<string>();
-    for (const receipt of commit.receipts) {
-      const hex = toHex(receipt.hash);
-      const chunk = referenced.get(hex);
-      if (chunk && chunk.size === receipt.size && (await verifyChunkGrant(this.spaceKey, "receipt", spaceId, hex, receipt.size, receipt.token, nowMs))) {
-        receipted.add(hex);
-      }
-    }
+    const confirmed = await this.confirmUploads(referenced, commit.receipts, nowMs);
 
     return this.ctx.storage.transactionSync(() => {
       if (this.revoked(session.deviceId)) fail(Error_Code.UNAUTHENTICATED, "device revoked");
-      const again = this.storedResult(commit.commitId);
+      this.checkOpen();
+      const again = this.checkCommitOrder(session.deviceId, commit);
       if (again) return { result: again };
       const head = this.headSeq;
-      if (commit.baseSeq > BigInt(head)) fail(Error_Code.INVALID_ARGUMENT, "base_seq is ahead of the server");
 
       const missing: Uint8Array[] = [];
       for (const [hex, chunk] of referenced) {
-        const row = this.sql.exec("SELECT size, state FROM chunks WHERE hash = ?", chunk.hash).toArray()[0];
-        const ready = row && row.size === chunk.size && (row.state === ChunkState.LIVE || (row.state === ChunkState.PENDING && receipted.has(hex)));
+        const row = this.sql.exec("SELECT size, state, incarnation FROM chunks WHERE hash = ?", chunk.hash).toArray()[0];
+        const ready =
+          row &&
+          row.size === chunk.size &&
+          (row.state === ChunkState.LIVE || (row.state === ChunkState.PENDING && row.incarnation !== null && confirmed.get(hex) === row.incarnation));
         if (!ready) missing.push(chunk.hash);
       }
       if (missing.length > 0) {
@@ -673,12 +767,73 @@ export class SpaceDO extends DurableObject<Env> {
       });
       const result = create(CommitResultSchema, { seq: BigInt(ctx.seq), results, changes });
       this.appendCommit(record, result);
+      this.sql.exec(
+        `INSERT INTO device_commits (device_id, device_seq, commit_id, results) VALUES (?, ?, ?, ?)
+         ON CONFLICT (device_id) DO UPDATE SET device_seq = excluded.device_seq, commit_id = excluded.commit_id, results = excluded.results`,
+        session.deviceId,
+        Number(commit.deviceSeq),
+        commit.commitId,
+        toBinary(CommitResultSchema, result),
+      );
       return { result, record };
     });
   }
 
-  private chunkUrl(session: Session, hex: string, ticket: string): string {
-    return `${session.origin}/v1/spaces/${this.spaceId}/chunks/${hex}?ticket=${ticket}`;
+  /**
+   * Finds which pending chunks a commit may use, and under which incarnation: those with a valid receipt for the row's
+   * incarnation, those an earlier head check found, and, for up to MAX_HEAD_CHECKS others, those whose object R2 holds
+   * with the right size (RFC 0002 section 11). A found chunk is recorded on its row and its hold extended, so a retry
+   * checks the next ones. The commit transaction checks the row again.
+   */
+  private async confirmUploads(referenced: Map<string, ChunkRef>, receipts: readonly UploadReceipt[], nowMs: number): Promise<Map<string, string>> {
+    const spaceId = this.spaceId;
+    const confirmed = new Map<string, string>();
+    const unconfirmed: { object: ChunkObject; size: number }[] = [];
+    const receiptsByHash = Map.groupBy(receipts, (receipt) => toHex(receipt.hash));
+    for (const [hex, chunk] of referenced) {
+      const row = this.sql.exec("SELECT size, state, incarnation, head_checked FROM chunks WHERE hash = ?", chunk.hash).toArray()[0];
+      if (!row || row.size !== chunk.size || row.state !== ChunkState.PENDING || row.incarnation === null) continue;
+      const object = { spaceId, hashHex: hex, incarnation: String(row.incarnation) };
+      let valid = row.head_checked === 1;
+      for (const receipt of receiptsByHash.get(hex) ?? []) {
+        if (receipt.size !== chunk.size) continue;
+        if (await verifyChunkGrant(this.spaceKey, "receipt", object, receipt.size, receipt.token, nowMs)) valid = true;
+      }
+      if (valid) confirmed.set(hex, object.incarnation);
+      else unconfirmed.push({ object, size: chunk.size });
+    }
+    const checked: ChunkObject[] = [];
+    for (const { object, size } of unconfirmed.slice(0, MAX_HEAD_CHECKS)) {
+      const head = await this.env.BUCKET.head(chunkKey(spaceId, object.hashHex, object.incarnation));
+      if (head?.size !== size) continue;
+      confirmed.set(object.hashHex, object.incarnation);
+      checked.push(object);
+    }
+    if (checked.length > 0) {
+      this.ctx.storage.transactionSync(() => {
+        for (const object of checked) {
+          this.sql.exec(
+            "UPDATE chunks SET hold_until_ms = MAX(hold_until_ms, ?), head_checked = 1 WHERE hash = ? AND state = ? AND incarnation = ?",
+            nowMs + HOLD_MS,
+            fromHex(object.hashHex),
+            ChunkState.PENDING,
+            object.incarnation,
+          );
+        }
+      });
+    }
+    return confirmed;
+  }
+
+  private chunkUrl(session: Session, object: ChunkObject, ticket: string): string {
+    return `${session.origin}/v1/spaces/${object.spaceId}/chunks/${object.hashHex}?inc=${object.incarnation}&ticket=${ticket}`;
+  }
+
+  /** A fresh key incarnation: this history's rewind number and the next value of a counter that only goes up (RFC 0003 section 5, rule 6). */
+  private allocateIncarnation(): string {
+    const next = Number(getMeta(this.sql, "next_incarnation") ?? 1);
+    setMeta(this.sql, "next_incarnation", next + 1);
+    return `${Number(getMeta(this.sql, "rewind_number") ?? 0)}.${next}`;
   }
 
   private async prepareUpload(session: Session, request: PrepareUpload) {
@@ -694,36 +849,43 @@ export class SpaceDO extends DurableObject<Env> {
     const chunks = [...byHash.values()];
     const nowMs = this.clock();
     const holdUntil = nowMs + HOLD_MS;
-    const actions = this.ctx.storage.transactionSync(() =>
-      chunks.map((chunk) => {
-        const row = this.sql.exec("SELECT size, state FROM chunks WHERE hash = ?", chunk.hash).toArray()[0];
+    const actions = this.ctx.storage.transactionSync(() => {
+      this.checkOpen();
+      return chunks.map((chunk): { action: ChunkPlan_Action; incarnation?: string } => {
+        const row = this.sql.exec("SELECT size, state, incarnation FROM chunks WHERE hash = ?", chunk.hash).toArray()[0];
         if (!row) {
+          const incarnation = this.allocateIncarnation();
           this.sql.exec(
-            "INSERT INTO chunks (hash, size, state, refcount, hold_until_ms) VALUES (?, ?, ?, 0, ?)",
+            "INSERT INTO chunks (hash, size, state, refcount, hold_until_ms, incarnation) VALUES (?, ?, ?, 0, ?, ?)",
             chunk.hash,
             chunk.size,
             ChunkState.PENDING,
             holdUntil,
+            incarnation,
           );
-          return ChunkPlan_Action.UPLOAD;
+          return { action: ChunkPlan_Action.UPLOAD, incarnation };
         }
         if (row.size !== chunk.size) fail(Error_Code.INVALID_ARGUMENT, "chunk size differs from the stored chunk");
-        if (row.state === ChunkState.DELETING) return ChunkPlan_Action.RETRY_LATER;
+        if (row.state === ChunkState.DELETING) return { action: ChunkPlan_Action.RETRY_LATER };
         this.sql.exec("UPDATE chunks SET hold_until_ms = MAX(hold_until_ms, ?) WHERE hash = ?", holdUntil, chunk.hash);
-        return row.state === ChunkState.LIVE ? ChunkPlan_Action.PRESENT : ChunkPlan_Action.UPLOAD;
-      }),
-    );
+        if (row.state === ChunkState.LIVE) return { action: ChunkPlan_Action.PRESENT };
+        if (row.incarnation !== null) return { action: ChunkPlan_Action.UPLOAD, incarnation: String(row.incarnation) };
+        const incarnation = this.allocateIncarnation();
+        this.sql.exec("UPDATE chunks SET incarnation = ? WHERE hash = ?", incarnation, chunk.hash);
+        return { action: ChunkPlan_Action.UPLOAD, incarnation };
+      });
+    });
     const expiresAtMs = nowMs + GRANT_MS;
     const spaceId = this.spaceId;
     const plans = [];
     for (const [i, chunk] of chunks.entries()) {
-      const action = actions[i]!;
+      const { action, incarnation } = actions[i]!;
       const plan = create(ChunkPlanSchema, { hash: chunk.hash, action });
       if (action === ChunkPlan_Action.RETRY_LATER) plan.retryAfterMs = BigInt(RETRY_LATER_MS);
-      if (action === ChunkPlan_Action.UPLOAD) {
-        const hex = toHex(chunk.hash);
-        const ticket = await signChunkGrant(this.spaceKey, "put", spaceId, hex, chunk.size, expiresAtMs);
-        plan.target = create(TargetSchema, { url: this.chunkUrl(session, hex, ticket), method: "PUT", expiresAtMs: BigInt(expiresAtMs) });
+      if (incarnation !== undefined) {
+        const object = { spaceId, hashHex: toHex(chunk.hash), incarnation };
+        const ticket = await signChunkGrant(this.spaceKey, "put", object, chunk.size, expiresAtMs);
+        plan.target = create(TargetSchema, { url: this.chunkUrl(session, object, ticket), method: "PUT", expiresAtMs: BigInt(expiresAtMs) });
       }
       plans.push(plan);
     }
@@ -732,18 +894,19 @@ export class SpaceDO extends DurableObject<Env> {
 
   private async downloadTargets(session: Session, request: GetDownloadTargets) {
     if (request.hashes.length > MAX_CHUNKS_PER_CALL) fail(Error_Code.LIMIT_EXCEEDED, `at most ${MAX_CHUNKS_PER_CALL} chunks per call`);
-    const missing = request.hashes.filter((hash) => {
-      const row = this.sql.exec("SELECT state FROM chunks WHERE hash = ?", hash).toArray()[0];
-      return row?.state !== ChunkState.LIVE;
+    const spaceId = this.spaceId;
+    const found = request.hashes.map((hash) => {
+      const row = this.sql.exec("SELECT state, incarnation FROM chunks WHERE hash = ?", hash).toArray()[0];
+      return row?.state === ChunkState.LIVE && row.incarnation !== null ? { spaceId, hashHex: toHex(hash), incarnation: String(row.incarnation) } : undefined;
     });
+    const missing = request.hashes.filter((_hash, i) => !found[i]);
     if (missing.length > 0) throw new CallFailure(Error_Code.MISSING_CHUNKS, "some chunks are not stored", missing);
     const expiresAtMs = this.clock() + GRANT_MS;
-    const spaceId = this.spaceId;
     const targets = [];
-    for (const hash of request.hashes) {
-      const hex = toHex(hash);
-      const ticket = await signChunkGrant(this.spaceKey, "get", spaceId, hex, 0, expiresAtMs);
-      const target = create(TargetSchema, { url: this.chunkUrl(session, hex, ticket), method: "GET", expiresAtMs: BigInt(expiresAtMs) });
+    for (const [i, hash] of request.hashes.entries()) {
+      const object = found[i]!;
+      const ticket = await signChunkGrant(this.spaceKey, "get", object, 0, expiresAtMs);
+      const target = create(TargetSchema, { url: this.chunkUrl(session, object, ticket), method: "GET", expiresAtMs: BigInt(expiresAtMs) });
       targets.push(create(ChunkTargetSchema, { hash, target }));
     }
     return create(DownloadTargetsSchema, { targets });
@@ -875,6 +1038,8 @@ export class SpaceDO extends DurableObject<Env> {
       return hashes.length;
     });
 
+    // RFC 0003 section 5, rule 3: an object whose incarnation no row holds is an orphan once both its upload and the
+    // latest rewind completion are more than chunk_grace_days old.
     let sweptChunks = 0;
     let sweeping = false;
     if (nowMs >= Number(getMeta(this.sql, "orphan_sweep_due_ms") ?? 0)) {
@@ -883,11 +1048,15 @@ export class SpaceDO extends DurableObject<Env> {
         cursor: String(getMeta(this.sql, "orphan_sweep_cursor") ?? "") || undefined,
         limit: GC_BATCH,
       });
+      const graceStart = nowMs - settings.chunk_grace_days * DAY_MS;
+      const rewound = Number(getMeta(this.sql, "rewind_completed_ms") ?? 0) > graceStart;
       this.ctx.storage.transactionSync(() => {
         for (const object of listed.objects) {
-          const hash = fromHex(object.key.slice(object.key.lastIndexOf("/") + 1));
-          if (this.sql.exec("SELECT 1 FROM chunks WHERE hash = ?", hash).toArray().length > 0) continue;
-          this.sql.exec("INSERT INTO chunks (hash, size, state, refcount, hold_until_ms) VALUES (?, ?, ?, 0, ?)", hash, object.size, ChunkState.DELETING, nowMs);
+          const parsed = parseChunkKey(spaceId, object.key);
+          if (!parsed || rewound || object.uploaded.getTime() > graceStart) continue;
+          const hash = fromHex(parsed.hashHex);
+          if (this.sql.exec("SELECT 1 FROM chunks WHERE hash = ? AND incarnation = ?", hash, parsed.incarnation).toArray().length > 0) continue;
+          this.sql.exec("INSERT INTO orphans (key, hash, incarnation) VALUES (?, ?, ?) ON CONFLICT DO NOTHING", object.key, hash, parsed.incarnation);
           sweptChunks++;
         }
         setMeta(this.sql, "orphan_sweep_cursor", listed.truncated ? listed.cursor : "");
@@ -896,18 +1065,32 @@ export class SpaceDO extends DurableObject<Env> {
       sweeping = listed.truncated;
     }
 
+    // RFC 0003 section 5, rule 8: every delete targets one incarnation, after the Account DO recorded it as retired.
     let deletedChunks = 0;
     for (;;) {
-      const batch = this.sql
-        .exec("SELECT hash FROM chunks WHERE state = 3 LIMIT ?", R2_DELETE_BATCH)
+      const rows = this.sql
+        .exec("SELECT hash, incarnation FROM chunks WHERE state = 3 LIMIT ?", R2_DELETE_BATCH)
         .toArray()
-        .map((row) => new Uint8Array(row.hash as ArrayBuffer));
-      if (batch.length === 0) break;
-      await this.env.BUCKET.delete(batch.map((hash) => chunkKey(spaceId, toHex(hash))));
+        .map((row) => ({ hash: new Uint8Array(row.hash as ArrayBuffer), incarnation: row.incarnation as string | null }));
+      const orphans = this.sql
+        .exec("SELECT key, hash, incarnation FROM orphans LIMIT ?", R2_DELETE_BATCH - rows.length)
+        .toArray()
+        .map((row) => ({ key: String(row.key), hash: new Uint8Array(row.hash as ArrayBuffer), incarnation: String(row.incarnation) }));
+      if (rows.length + orphans.length === 0) break;
+      const objects = [
+        ...rows.flatMap(({ hash, incarnation }) => (incarnation === null ? [] : [{ hashHex: toHex(hash), incarnation }])),
+        ...orphans.map(({ hash, incarnation }) => ({ hashHex: toHex(hash), incarnation })),
+      ];
+      if (objects.length > 0) {
+        const retired = await this.account().retireChunks(spaceId, objects);
+        if (!retired.ok) throw new Error(`chunk retirement refused: ${retired.message}`);
+        await this.env.BUCKET.delete(objects.map((object) => chunkKey(spaceId, object.hashHex, object.incarnation)));
+      }
       this.ctx.storage.transactionSync(() => {
-        for (const hash of batch) this.sql.exec("DELETE FROM chunks WHERE hash = ? AND state = 3", hash);
+        for (const { hash } of rows) this.sql.exec("DELETE FROM chunks WHERE hash = ? AND state = 3", hash);
+        for (const { key } of orphans) this.sql.exec("DELETE FROM orphans WHERE key = ?", key);
       });
-      deletedChunks += batch.length;
+      deletedChunks += rows.length + orphans.length;
     }
     const { expiredVersions, purgedNodes } = purge;
     return {
@@ -917,6 +1100,98 @@ export class SpaceDO extends DurableObject<Env> {
       sweptChunks,
       more: expiredVersions === GC_BATCH || purgedNodes === GC_BATCH || marked === GC_BATCH || sweeping,
     };
+  }
+
+  /**
+   * Rewind admission (RFC 0003 section 3, step 1): the current history and head, whether the history's descriptor is
+   * durable, and the bookmark for the restore point. Changes nothing. The R2 metadata export of section 7 is not
+   * implemented yet, so no descriptor is awaited.
+   */
+  async rewindInfo(restorePointMs: number): Promise<{ historyId: string; headSeq: number; descriptorDurable: boolean; bookmark: string }> {
+    const bookmark = await this.pitr.bookmarkForTime(restorePointMs);
+    return { historyId: String(getMeta(this.sql, "history_id")), headSeq: this.headSeq, descriptorDurable: true, bookmark };
+  }
+
+  /**
+   * Step 2: closes every socket with 4004, writes the attempt's marker once, and reports whether the bookmark B to
+   * restore is earlier than the bookmark M read after the marker.
+   */
+  async rewindPrepare(args: { rewindId: string; attempt: number; bookmark: string }): Promise<{ historyId: string; headSeq: number; earlier: boolean }> {
+    for (const ws of this.ctx.getWebSockets()) this.goodbye(ws, Close.SPACE_REWOUND, "the space is being rewound");
+    this.sql.exec("INSERT INTO rewind_markers (rewind_id, attempt) VALUES (?, ?) ON CONFLICT DO NOTHING", args.rewindId, args.attempt);
+    await this.ctx.storage.sync();
+    const marked = await this.pitr.currentBookmark();
+    return { historyId: String(getMeta(this.sql, "history_id")), headSeq: this.headSeq, earlier: args.bookmark < marked };
+  }
+
+  /** Step 3: arms the restore of B and restarts the object, so the call always ends in an error. */
+  async rewindArm(bookmark: string): Promise<void> {
+    await this.pitr.restoreOnNextStart(bookmark);
+    this.ctx.abort("restarting to restore the space");
+  }
+
+  /** Restarts the object, so that a restore armed earlier has applied when it next answers (step 4). */
+  async restart(): Promise<void> {
+    this.ctx.abort("restarting");
+  }
+
+  /** Step 6: removes the markers of a rewind that failed before any restore could run. */
+  async rewindAbort(rewindId: string): Promise<void> {
+    this.sql.exec("DELETE FROM rewind_markers WHERE rewind_id = ?", rewindId);
+  }
+
+  /**
+   * Step 4, after the restart: reports a marker that is still present, returns the receipt of a completion that already
+   * ran, or completes the rewind of the restored database in one transaction. Every call then sets the alarm.
+   */
+  async rewindComplete(args: RewindCompletion): Promise<{ state: "marker" } | { state: "completed"; receipt: RewindReceipt }> {
+    if (this.sql.exec("SELECT 1 FROM rewind_markers WHERE rewind_id = ? AND attempt = ?", args.rewindId, args.attempt).toArray().length > 0) {
+      return { state: "marker" };
+    }
+    const receipt = this.ctx.storage.transactionSync((): RewindReceipt => {
+      const stored = getMeta(this.sql, "rewind_receipt");
+      const previous = stored === undefined ? undefined : (JSON.parse(String(stored)) as RewindReceipt);
+      if (previous?.rewindId === args.rewindId) return previous;
+      const completed: RewindReceipt = { rewindId: args.rewindId, historyId: args.historyId, restoreSeq: this.headSeq, completedAtMs: args.completedAtMs };
+      setMeta(this.sql, "history_id", args.historyId);
+      setMeta(this.sql, "rewind_number", args.rewindNumber);
+      setMeta(this.sql, "restore_seq", completed.restoreSeq);
+      setMeta(this.sql, "restore_point_ms", args.restorePointMs);
+      setMeta(this.sql, "rewind_completed_ms", args.completedAtMs);
+      for (const deviceId of args.revokedDevices) {
+        this.sql.exec("INSERT INTO revoked_devices (device_id, revoked_at_ms) VALUES (?, ?) ON CONFLICT DO NOTHING", deviceId, args.completedAtMs);
+      }
+      // Section 5, rule 9: a retired incarnation or a deleting row counts as absent.
+      for (const { hashHex, incarnation } of args.retired) {
+        this.sql.exec(
+          "UPDATE chunks SET state = ?, incarnation = NULL, head_checked = 0 WHERE hash = ? AND incarnation = ?",
+          ChunkState.PENDING,
+          fromHex(hashHex),
+          incarnation,
+        );
+      }
+      this.sql.exec("UPDATE chunks SET state = ?, incarnation = NULL, head_checked = 0 WHERE state = ?", ChunkState.PENDING, ChunkState.DELETING);
+      // Rule 2: every unreferenced chunk waits a full grace after the completion.
+      const holdUntil = args.completedAtMs + this.settings().chunk_grace_days * DAY_MS;
+      this.sql.exec("UPDATE chunks SET state = ?, hold_until_ms = ? WHERE refcount = 0", ChunkState.PENDING, holdUntil);
+      this.sql.exec("DELETE FROM rewind_markers");
+      setMeta(this.sql, "rewind_receipt", JSON.stringify(completed));
+      return completed;
+    });
+    await this.armAlarm();
+    return { state: "completed", receipt };
+  }
+
+  /** Whether a rewind holds this space closed; an unanswered check counts as closed. */
+  private async closedForRewind(): Promise<boolean> {
+    const spaceId = getMeta(this.sql, "space_id");
+    if (spaceId === undefined) return false;
+    try {
+      return await this.account().isSpaceClosed(String(spaceId));
+    } catch (error) {
+      console.error("account rewind check failed", error);
+      return true;
+    }
   }
 
   private async schedule(task: string, dueMs: number): Promise<void> {
@@ -932,6 +1207,10 @@ export class SpaceDO extends DurableObject<Env> {
 
   override async alarm(): Promise<void> {
     const nowMs = this.clock();
+    if (await this.closedForRewind()) {
+      await this.ctx.storage.setAlarm(nowMs + CLOSED_RECHECK_MS);
+      return;
+    }
     const due = this.sql.exec("SELECT task FROM schedule WHERE due_ms <= ?", nowMs).toArray().map((row) => String(row.task));
     for (const task of due) {
       if (task === "gc") {

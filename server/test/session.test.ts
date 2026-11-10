@@ -34,9 +34,10 @@ import type { ServerKey } from "../src/auth";
 import { sha256 } from "../src/crypto";
 import { toHex, uuidv7 } from "../src/ids";
 import { Close, HOLD_MS, type SpaceDO } from "../src/space-do";
+import { CallFailure } from "../src/space/commit";
 import { chunkKey, encodeChunkList } from "../src/space/store";
 import worker from "../src/worker";
-import { content, op } from "./helpers";
+import { content, op, storedObjects, targetIncarnation } from "./helpers";
 
 const BASE = "https://flarebox.test";
 
@@ -103,6 +104,9 @@ class Socket {
   private wake: (() => void) | undefined;
   private nextReq = 1n;
   closed: { code: number; reason: string } | undefined;
+  /** From the last Welcome: the space's history and this device's highest accepted device_seq (RFC 0002 section 2). */
+  historyId = "";
+  acceptedSeq = 0n;
 
   private constructor(readonly ws: WebSocket) {
     ws.addEventListener("message", (event) => {
@@ -166,6 +170,8 @@ class Socket {
     this.send({ case: "hello", value: { clientName: "test", clientVersion: "0", protoMin: 1, protoMax: 1, maxFormat } });
     const msg = await this.next();
     if (msg.case !== "welcome") throw new Error("expected Welcome, got " + msg.case);
+    this.historyId = msg.value.historyId;
+    this.acceptedSeq = msg.value.deviceSeq;
     return msg.value;
   }
 
@@ -189,9 +195,16 @@ class Socket {
     return msg.value.result;
   }
 
+  /** The history and the next device slot for a new commit. */
+  slot() {
+    return { historyId: this.historyId, deviceSeq: this.acceptedSeq + 1n };
+  }
+
   async commit(baseSeq: bigint, ops: ReturnType<typeof op.mkdir>[], receipts: MessageInitShape<typeof UploadReceiptSchema>[] = []) {
-    const result = await this.rpc({ case: "commit", value: { commitId: uuidv7(), baseSeq, ops, receipts } });
+    const slot = this.slot();
+    const result = await this.rpc({ case: "commit", value: { commitId: uuidv7(), baseSeq, ops, receipts, ...slot } });
     if (result.case !== "commit") throw new Error("commit failed: " + (result.case === "error" ? result.value.message : result.case));
+    this.acceptedSeq = slot.deviceSeq;
     return result.value;
   }
 
@@ -375,8 +388,8 @@ describe("owner claim, pairing and tokens", () => {
     await other.start();
     vi.spyOn(console, "error").mockImplementation(() => {});
     const prototype = await runInDurableObject(account(), (instance: import("../src/account-do").AccountDO) => Object.getPrototypeOf(instance) as import("../src/account-do").AccountDO);
-    const original = prototype.isDeviceActive;
-    prototype.isDeviceActive = async () => {
+    const original = prototype.checkSession;
+    prototype.checkSession = async () => {
       throw new Error("injected Account DO failure");
     };
     try {
@@ -384,7 +397,7 @@ describe("owner claim, pairing and tokens", () => {
       expect(await asking.next()).toMatchObject({ case: "goodbye", value: { code: Close.TRY_AGAIN_LATER } });
       expect((await asking.waitClosed()).code).toBe(Close.TRY_AGAIN_LATER);
     } finally {
-      prototype.isDeviceActive = original;
+      prototype.checkSession = original;
     }
     expect((await other.rpc({ case: "listTree", value: {} })).case).toBe("tree");
     expect(other.closed).toBeUndefined();
@@ -406,7 +419,7 @@ describe("owner claim, pairing and tokens", () => {
       version: state.storage.sql.exec("SELECT value FROM meta WHERE key = 'schema_version'").one().value,
       revoked: state.storage.sql.exec("SELECT device_id FROM revoked_devices").toArray(),
     }));
-    expect(after).toEqual({ version: 2, revoked: [{ device_id: device }] });
+    expect(after).toEqual({ version: 5, revoked: [{ device_id: device }] });
   });
 
   it("adds revoked_devices to a version-one Space database and keeps its data", async () => {
@@ -432,7 +445,7 @@ describe("owner claim, pairing and tokens", () => {
       node: state.storage.sql.exec("SELECT name FROM nodes WHERE node_id = ?", dir).toArray(),
       revoked: state.storage.sql.exec("SELECT device_id FROM revoked_devices").toArray(),
     }));
-    expect(after).toEqual({ version: 2, head: 1, commits: [{ seq: 1 }], node: [{ name: "kept" }], revoked: [{ device_id: device }] });
+    expect(after).toEqual({ version: 5, head: 1, commits: [{ seq: 1 }], node: [{ name: "kept" }], revoked: [{ device_id: device }] });
   });
 });
 
@@ -469,7 +482,7 @@ describe("WebSocket session", () => {
     const before = await snapshot();
     const both = await writer.rpc({
       case: "commit",
-      value: { commitId: uuidv7(), baseSeq: 0n, ops: [op.create(uuidv7(), spaceId, "one", parts.content), op.create(uuidv7(), spaceId, "two", parts.content)], receipts },
+      value: { commitId: uuidv7(), baseSeq: 0n, ops: [op.create(uuidv7(), spaceId, "one", parts.content), op.create(uuidv7(), spaceId, "two", parts.content)], receipts, ...writer.slot() },
     });
     expect(both.case === "error" && both.value.code).toBe(Error_Code.LIMIT_EXCEEDED);
     expect(await snapshot()).toEqual(before);
@@ -562,7 +575,7 @@ describe("WebSocket session", () => {
       return create(ChunkRefSchema, { hash, size: 1 });
     });
     const many = create(ContentSchema, { chunks, chunkCount: chunks.length, size: BigInt(chunks.length), manifestDigest: await sha256(encodeChunkList(chunks)) });
-    const request: MessageInitShape<typeof RpcRequestSchema>["call"] = { case: "commit", value: { commitId: uuidv7(), baseSeq: 0n, ops: [op.create(uuidv7(), spaceId, "missing", many)] } };
+    const request: MessageInitShape<typeof RpcRequestSchema>["call"] = { case: "commit", value: { commitId: uuidv7(), baseSeq: 0n, ops: [op.create(uuidv7(), spaceId, "missing", many)], ...socket.slot() } };
     const requestBytes = body(RpcRequestSchema, { reqId: 1n, call: request });
     expect(requestBytes.length).toBeLessThan(8 * 1024 * 1024);
     const http = await exports.default.fetch(BASE + "/v1/spaces/" + spaceId + "/rpc", { method: "POST", headers: { Authorization: "Bearer " + a.access!.token }, body: requestBytes });
@@ -579,7 +592,7 @@ describe("WebSocket session", () => {
     expect(await runInDurableObject(stub, (_instance, state) => state.storage.sql.exec("SELECT seq FROM commits").toArray())).toEqual([]);
 
     const parts = await content(...Array.from({ length: 1010 }, (_, i) => "chunk " + i));
-    const commit = { commitId: uuidv7(), baseSeq: 0n, ops: [op.create(uuidv7(), spaceId, "big", parts.content)] };
+    const commit = { commitId: uuidv7(), baseSeq: 0n, ops: [op.create(uuidv7(), spaceId, "big", parts.content)], ...socket.slot() };
     const receipts: MessageInitShape<typeof UploadReceiptSchema>[] = [];
     const listed = async () => {
       const result = await socket.rpc({ case: "commit", value: { ...commit, receipts } });
@@ -603,6 +616,37 @@ describe("WebSocket session", () => {
     expect(await listed()).toBe("commit");
   }, 30_000);
 
+  it("replaces an error reply that would exceed 1 MiB with a generic LIMIT_EXCEEDED, over HTTP and WebSocket", async () => {
+    const { a, spaceId, stub } = await twoDevices();
+    const socket = await Socket.connect(spaceId, a);
+    await socket.start();
+    const hashes = Array.from({ length: 40_000 }, (_, i) => {
+      const hash = new Uint8Array(32);
+      new DataView(hash.buffer).setUint32(0, i);
+      return hash;
+    });
+    await runInDurableObject(stub, (instance: SpaceDO) => {
+      (instance as unknown as { listTree: () => never }).listTree = () => {
+        throw new CallFailure(Error_Code.MISSING_CHUNKS, "an error with more missing chunks than one message holds", hashes);
+      };
+    });
+    const request: MessageInitShape<typeof RpcRequestSchema>["call"] = { case: "listTree", value: {} };
+    const http = await exports.default.fetch(BASE + "/v1/spaces/" + spaceId + "/rpc", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + a.access!.token },
+      body: body(RpcRequestSchema, { reqId: 1n, call: request }),
+    });
+    const httpBytes = new Uint8Array(await http.arrayBuffer());
+    const viaSocket = await socket.rpc(request);
+    const wsBytes = toBinary(ServerMessageSchema, create(ServerMessageSchema, { msg: { case: "rpc", value: { reqId: 2n, result: viaSocket } } })).length;
+    for (const result of [fromBinary(RpcResponseSchema, httpBytes).result, viaSocket]) {
+      expect(result).toMatchObject({ case: "error", value: { code: Error_Code.LIMIT_EXCEEDED, message: "the error reply does not fit in one 1 MiB message", missingChunks: [] } });
+    }
+    expect(httpBytes.length).toBeLessThanOrEqual(1024 * 1024);
+    expect(wsBytes).toBeLessThanOrEqual(1024 * 1024);
+    expect(socket.closed).toBeUndefined();
+  });
+
   it("closes a connection on any text message except ping, an oversized one included", async () => {
     const { a, spaceId } = await twoDevices();
     const big = await Socket.connect(spaceId, a);
@@ -615,6 +659,16 @@ describe("WebSocket session", () => {
     const small = await Socket.connect(spaceId, a);
     small.ws.send("hello");
     expect((await small.waitClosed()).code).toBe(Close.PROTOCOL);
+  });
+
+  it("reports each device's highest accepted device_seq in Welcome", async () => {
+    const { a, b, spaceId } = await twoDevices();
+    const sa = await Socket.connect(spaceId, a);
+    expect((await sa.start()).deviceSeq).toBe(0n);
+    await sa.commit(0n, [op.mkdir(uuidv7(), spaceId, "one")]);
+    await sa.commit(1n, [op.mkdir(uuidv7(), spaceId, "two")]);
+    expect((await (await Socket.connect(spaceId, a)).hello()).deviceSeq).toBe(2n);
+    expect((await (await Socket.connect(spaceId, b)).hello()).deviceSeq).toBe(0n);
   });
 
   it("lets two devices commit and receive each other's changes", async () => {
@@ -731,7 +785,7 @@ describe("WebSocket session", () => {
     const { a, b, spaceId } = await twoDevices();
     const sb = await Socket.connect(spaceId, b);
     await sb.start();
-    const commit = body(RpcRequestSchema, { reqId: 1n, call: { case: "commit", value: { commitId: uuidv7(), baseSeq: 0n, ops: [op.mkdir(uuidv7(), spaceId, "via http")] } } });
+    const commit = body(RpcRequestSchema, { reqId: 1n, call: { case: "commit", value: { commitId: uuidv7(), baseSeq: 0n, ops: [op.mkdir(uuidv7(), spaceId, "via http")], historyId: sb.historyId, deviceSeq: 1n } } });
     const response = await call("/v1/spaces/" + spaceId + "/rpc", { token: a.access!.token, body: commit }, RpcResponseSchema);
     expect(response.message!.result.case).toBe("commit");
     expect((await sb.pushed())[0]!.seq).toBe(1n);
@@ -761,7 +815,7 @@ describe("chunk relay", () => {
     const file = await prepared(socket, "the bytes of a small file");
     expect(file.plan.chunks[0]!.target!.url.startsWith(BASE + "/v1/spaces/" + spaceId + "/chunks/")).toBe(true);
     expect(file.receipts).toHaveLength(1);
-    const head = await env.BUCKET.head(chunkKey(spaceId, toHex(file.content.chunks[0]!.hash)));
+    const head = await env.BUCKET.head(chunkKey(spaceId, toHex(file.content.chunks[0]!.hash), targetIncarnation(file.plan.chunks[0]!.target!.url)));
     expect(head?.size).toBe(file.bytes[0]!.length);
     const nodeId = uuidv7();
     await socket.commit(0n, [op.create(nodeId, spaceId, "small.txt", file.content)], file.receipts);
@@ -787,7 +841,7 @@ describe("chunk relay", () => {
     if (plan.case !== "prepareUpload") throw new Error("prepareUpload failed");
     const target = plan.value.chunks[0]!.target!;
     const bytes = parts.bytes[0]!;
-    const key = chunkKey(spaceId, toHex(parts.content.chunks[0]!.hash));
+    const key = chunkKey(spaceId, toHex(parts.content.chunks[0]!.hash), targetIncarnation(target.url));
 
     const tampered = { ...target, url: target.url.slice(0, -3) + "AAA" };
     expect((await put(tampered, bytes)).status).toBe(403);
@@ -814,7 +868,7 @@ describe("chunk relay", () => {
     const url = target.url;
     const request = () => new Request(url, { method: "PUT", body: bytes, headers: { "Content-Length": String(bytes.length) } });
     const stub = env.SPACE.get(env.SPACE.idFromName(spaceId));
-    return { spaceId, socket, parts, target, request, stub, key: chunkKey(spaceId, toHex(parts.content.chunks[0]!.hash)) };
+    return { spaceId, socket, parts, target, request, stub, key: chunkKey(spaceId, toHex(parts.content.chunks[0]!.hash), targetIncarnation(url)) };
   }
 
   function relay(request: Request, put: (key: string, body: ReadableStream | null, options: R2PutOptions) => Promise<R2Object | null>) {
@@ -845,43 +899,38 @@ describe("chunk relay", () => {
 
     const day = 24 * 3_600_000;
     expect(await runInDurableObject(stub, (instance: SpaceDO) => instance.collectGarbage(at + day))).toMatchObject({ sweptChunks: 0 });
-    const sweep = await runInDurableObject(stub, (instance: SpaceDO) => instance.collectGarbage(at + 7 * day + 1));
+    const sweep = await runInDurableObject(stub, (instance: SpaceDO) => instance.collectGarbage(at + 31 * day));
     expect(sweep).toMatchObject({ sweptChunks: 1, deletedChunks: 1 });
     expect(await env.BUCKET.head(key)).toBeNull();
     expect(await rows()).toHaveLength(0);
   });
 
-  it("sweeps only objects without a chunk row and fences them from PrepareUpload while it deletes", async () => {
+  it("sweeps only objects whose incarnation no chunk row holds, once the grace has passed, and retires each before deleting it", async () => {
     const { socket, parts, target, stub, spaceId, key } = await preparedTicket();
-    expect((await put(target, parts.bytes[0]!)).status).toBe(200);
+    const uploaded = await put(target, parts.bytes[0]!);
+    expect(uploaded.status).toBe(200);
+    const receipt = fromBinary(UploadReceiptSchema, new Uint8Array(await uploaded.arrayBuffer()));
+    await socket.commit(0n, [op.create(uuidv7(), spaceId, "kept", parts.content)], [receipt]);
+    const hex = toHex(parts.content.chunks[0]!.hash);
+    const otherIncarnation = chunkKey(spaceId, hex, "0.999999");
+    await env.BUCKET.put(otherIncarnation, parts.bytes[0]!);
     const orphan = await content("orphan " + uuidv7());
-    const orphanHash = orphan.content.chunks[0]!.hash;
-    const orphanKey = chunkKey(spaceId, toHex(orphanHash));
+    const orphanHex = toHex(orphan.content.chunks[0]!.hash);
+    const orphanKey = chunkKey(spaceId, orphanHex, "0.1");
     await env.BUCKET.put(orphanKey, orphan.bytes[0]!);
 
-    const states: unknown[] = [];
-    const report = await runInDurableObject(stub, async (instance: SpaceDO, state) => {
-      const original = (instance as unknown as { env: Env }).env;
-      const bucket = {
-        list: original.BUCKET.list.bind(original.BUCKET),
-        delete: (keys: string[]) => {
-          states.push(...state.storage.sql.exec("SELECT state FROM chunks WHERE hash = ?", orphanHash).toArray().map((row) => row.state));
-          return original.BUCKET.delete(keys);
-        },
-      };
-      (instance as unknown as { env: Env }).env = { ...original, BUCKET: bucket as unknown as R2Bucket };
-      try {
-        return await instance.collectGarbage(Date.now());
-      } finally {
-        (instance as unknown as { env: Env }).env = original;
-      }
-    });
-    expect(states).toEqual([3]);
-    expect(report).toMatchObject({ sweptChunks: 1, deletedChunks: 1 });
-    expect(await env.BUCKET.head(orphanKey)).toBeNull();
-    expect(await env.BUCKET.head(key)).not.toBeNull();
-    const after = await socket.rpc({ case: "prepareUpload", value: { chunks: orphan.content.chunks } });
-    expect(after.case === "prepareUpload" && after.value.chunks[0]!.action).toBe(ChunkPlan_Action.UPLOAD);
+    const gc = (atMs: number) => runInDurableObject(stub, (instance: SpaceDO) => instance.collectGarbage(atMs));
+    expect(await gc(Date.now())).toMatchObject({ sweptChunks: 0, deletedChunks: 0 });
+    expect(await gc(Date.now() + 31 * 24 * 3_600_000)).toMatchObject({ sweptChunks: 2, deletedChunks: 2 });
+    expect(await storedObjects(spaceId, hex)).toEqual([key]);
+    expect(await storedObjects(spaceId, orphanHex)).toEqual([]);
+    const retired = await runInDurableObject(account(), (_instance, state) =>
+      state.storage.sql.exec("SELECT hash_hex, incarnation FROM chunk_retirements WHERE space_id = ? ORDER BY incarnation DESC", spaceId).toArray(),
+    );
+    expect(retired).toEqual([
+      { hash_hex: hex, incarnation: "0.999999" },
+      { hash_hex: orphanHex, incarnation: "0.1" },
+    ]);
   });
 
   it("answers a checksum mismatch with 400 and storage failures with a retryable error", async () => {
@@ -940,7 +989,7 @@ describe("chunk relay", () => {
     const relayEnv = { ...env, ACCOUNT, BUCKET } as unknown as Env;
     const send = (url: string, init?: RequestInit) => worker.fetch(new Request(url, init) as Parameters<typeof worker.fetch>[0], relayEnv, {} as ExecutionContext);
     for (let i = 0; i < 20; i++) {
-      const url = `${BASE}/v1/spaces/${uuidv7()}/chunks/${"ab".repeat(32)}?ticket=v1.9999999999999.AAAA`;
+      const url = `${BASE}/v1/spaces/${uuidv7()}/chunks/${"ab".repeat(32)}?inc=0.1&ticket=v1.9999999999999.AAAA`;
       expect((await send(url, { method: "PUT", body: new Uint8Array(4), headers: { "Content-Length": "4" } })).status).toBe(403);
       expect((await send(url)).status).toBe(403);
     }
