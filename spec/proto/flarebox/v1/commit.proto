@@ -70,6 +70,9 @@ message Commit {
   uint64 device_seq = 6;
   // When true, the commit is refused with CODE_HEAD_MOVED unless head_seq equals base_seq.
   bool require_head = 7;
+  // Reserved for labelling the commits of one automated run (RFC 0006 section 4). Clients leave it empty, and servers
+  // ignore it.
+  string run_id = 8;
 }
 
 message OpResult {

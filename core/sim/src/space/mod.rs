@@ -697,6 +697,7 @@ impl SpaceDo {
             user_id: session.user_id.clone(),
             committed_at_ms: now_ms,
             changes: changes.clone(),
+            run_id: String::new(),
         };
         let result = CommitResult {
             seq,
