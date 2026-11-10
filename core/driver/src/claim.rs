@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Which profile may sync a linked folder. Both facts live in the folder's own `.flarebox/` directory, so they follow
-//! the physical folder whatever path, symbolic link or mount reaches it:
+//! Which profile may sync a linked folder. Both facts belong to the physical folder, whatever path, symbolic link or
+//! mount reaches it:
 //!
 //! - `.flarebox/device.json` names the device that linked the folder. Another device's profile refuses to link or
 //!   sync it until it is unlinked there.
-//! - `.flarebox/lock` is held, as an `flock`, by the process that syncs the folder for as long as its task and
-//!   observer run, so two processes never sync one folder at once.
+//! - The process that syncs the folder holds an `flock` on the folder itself for as long as its task and observer
+//!   run, so two processes never sync one folder at once. Deleting or replacing `.flarebox/` cannot split the lock,
+//!   and the task checks that its path still names the locked folder.
 
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use flarebox_fs::PRIVATE_DIR;
@@ -20,7 +22,6 @@ use serde::{Deserialize, Serialize};
 
 const OWNER: &str = "device.json";
 const OWNER_TEMP: &str = "device.json.tmp";
-const LOCK: &str = "lock";
 
 /// The device that linked a folder.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,21 +42,23 @@ fn private_dir(root: &Path) -> io::Result<OwnedFd> {
     )?)
 }
 
-/// Takes the folder's lock without waiting. Returns `None` while another process, or another open of the lock in
-/// this one, holds it. The lock is released when the returned file is closed.
+/// Takes the folder's lock without waiting. Returns `None` while another process, or another open of the folder in
+/// this one, holds it. The lock is released when the returned folder is closed.
 pub(crate) fn lock(root: &Path) -> io::Result<Option<File>> {
-    let dir = private_dir(root)?;
-    let flags = OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let file = File::from(rustix::fs::openat(
-        &dir,
-        LOCK,
-        flags,
-        Mode::from_raw_mode(0o600),
-    )?);
-    match rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(Some(file)),
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    let folder = File::from(rustix::fs::open(root, flags, Mode::empty())?);
+    match rustix::fs::flock(&folder, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(Some(folder)),
         Err(Errno::WOULDBLOCK) => Ok(None),
         Err(error) => Err(error.into()),
+    }
+}
+
+/// Whether `root` still names the folder `lock` was taken on. A folder that was moved, replaced or removed is not.
+pub(crate) fn still_locked(lock: &File, root: &Path) -> bool {
+    match (lock.metadata(), fs::metadata(root)) {
+        (Ok(held), Ok(now)) => held.dev() == now.dev() && held.ino() == now.ino(),
+        _ => false,
     }
 }
 
@@ -142,6 +145,29 @@ mod tests {
     }
 
     #[test]
+    fn the_lock_survives_the_loss_of_the_private_directory() {
+        let dir = folder();
+        let held = lock(dir.path()).unwrap().unwrap();
+        fs::remove_dir_all(dir.path().join(PRIVATE_DIR)).unwrap();
+        fs::create_dir(dir.path().join(PRIVATE_DIR)).unwrap();
+        assert!(lock(dir.path()).unwrap().is_none());
+        assert!(still_locked(&held, dir.path()));
+    }
+
+    #[test]
+    fn a_moved_or_replaced_folder_is_no_longer_the_locked_one() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let held = lock(&root).unwrap().unwrap();
+        fs::rename(&root, parent.path().join("moved")).unwrap();
+        assert!(!still_locked(&held, &root));
+        fs::create_dir(&root).unwrap();
+        assert!(!still_locked(&held, &root));
+        assert!(lock(&root).unwrap().is_some());
+    }
+
+    #[test]
     fn the_owner_record_is_replaced_and_released_only_by_its_device() {
         let dir = folder();
         assert_eq!(owner(dir.path()).unwrap(), None);
@@ -158,7 +184,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(elsewhere.path(), dir.path().join(PRIVATE_DIR)).unwrap();
-        assert!(lock(dir.path()).is_err());
         assert!(set_owner(dir.path(), &device("d1")).is_err());
         assert!(fs::read_dir(elsewhere.path()).unwrap().next().is_none());
     }

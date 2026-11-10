@@ -1049,6 +1049,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deleting_the_private_directory_does_not_let_another_profile_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        let (a, b) = (Paths::under(&base.join("a")), Paths::under(&base.join("b")));
+        linked(&a, &root, "d1");
+        linked(&b, &root, "d2");
+        fs::write(root.join("one"), b"1").unwrap();
+        let first = Driver::open(a).unwrap();
+        first.start();
+        eventually("the first profile observes the folder", || {
+            first.status().folders[0].local_entries == Some(1)
+        })
+        .await;
+
+        fs::remove_dir_all(root.join(flarebox_fs::PRIVATE_DIR)).unwrap();
+        let third = Paths::under(&base.join("c"));
+        paired(&third, "d3");
+        assert!(matches!(
+            Driver::open(third).unwrap().link(&root, "Projects").await,
+            Err(DriverError::FolderInUse(_))
+        ));
+        write_marker(
+            &root,
+            &Marker {
+                space_id: SPACE.into(),
+                effects: 0,
+            },
+        )
+        .unwrap();
+        let second = Driver::open(b).unwrap();
+        second.start();
+        let problem = halted(&second).await;
+        assert!(problem.contains("another Flarebox process"), "{problem}");
+        assert_ne!(first.status().folders[0].state, FolderState::Halted);
+        second.stop().await;
+        first.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_folder_replaced_under_its_task_halts_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        let paths = Paths::under(&base.join("profile"));
+        linked(&paths, &root, "d1");
+        let driver = Driver::open(paths).unwrap();
+        driver.start();
+        eventually("the folder is claimed", || {
+            claim::owner(&root).unwrap().is_some()
+        })
+        .await;
+
+        fs::rename(&root, base.join("Moved")).unwrap();
+        fs::create_dir(&root).unwrap();
+        let problem = halted(&driver).await;
+        assert!(problem.contains("no longer the folder"), "{problem}");
+        driver.stop().await;
+        assert!(claim::lock(&base.join("Moved")).unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn linking_refuses_a_folder_of_another_device_or_another_process() {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();

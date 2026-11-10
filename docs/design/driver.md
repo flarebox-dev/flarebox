@@ -29,7 +29,7 @@ A profile is one device credential and the stores it writes. The CLI uses the XD
 | `…/lock` | The profile lock (`flock`), held by the one process that writes the profile |
 | `…/spaces/<space_id>/store.sqlite` | One `core/store` per linked space: R, S, L, the cursor, the link and the questions |
 | `$XDG_RUNTIME_DIR/flarebox/daemon.sock` (mode 0600) | The daemon's socket; in the state directory when `XDG_RUNTIME_DIR` is unset |
-| `<folder>/.flarebox/` | Inside each linked folder: the root marker `space.json`, the owner record `device.json`, the folder lock `lock` and, from part 2, staging, quarantine, parked entries and the local trash |
+| `<folder>/.flarebox/` | Inside each linked folder: the root marker `space.json`, the owner record `device.json` and, from part 2, staging, quarantine, parked entries and the local trash |
 
 **One credential, one writer (H6 of reports/BOX-71).** Same-device changes never count as unseen on the server, and `device_seq` is strict, so two writers sharing a credential would overwrite each other silently or refuse each other's commits. The driver keeps the rule in five places:
 
@@ -37,7 +37,7 @@ A profile is one device credential and the stores it writes. The CLI uses the XD
 2. Opening a driver takes the profile lock, so a second daemon, or a command while the daemon is not answering, is refused.
 3. Each store records the device and server that linked it (`Link` in `core/store`). A store whose device is not the profile's halts with a problem instead of syncing.
 4. `link` refuses a folder that holds, or sits inside, the state, runtime or configuration directory or another linked folder, so the credential and the stores are never synced. Each folder task checks this again before it observes the folder or connects, because a profile can be moved into a folder after linking it. Folders are compared by path and by the identity of each folder and its ancestors, so a symbolic link, a bind mount or a macOS firmlink does not hide an overlap.
-5. A folder is claimed in its own `.flarebox/`, so the claim follows the physical folder whatever path reaches it. `device.json` names the device that linked it: another profile's `link` refuses the folder, and its task halts instead of syncing it, until the folder is unlinked there. A running folder holds `.flarebox/lock` (`flock`) until its task and its observer have stopped, so two processes never sync one folder at once; `link` holds it while it checks and writes the folder.
+5. A folder's claim follows the physical folder whatever path reaches it. `.flarebox/device.json` names the device that linked it: another profile's `link` refuses the folder, and its task halts instead of syncing it, until the folder is unlinked there. A running folder holds an `flock` on the folder itself until its task and its observer have stopped, so two processes never sync one folder at once, and deleting or replacing `.flarebox/` (design §6.2) cannot split the lock; `link` holds it while it checks and writes the folder. Every 2 seconds the task checks that the folder's path still names the folder it locked, and halts if the folder was moved, replaced or removed.
 
 A profile copied whole to another machine (credential and stores together) passes these checks. RFC 0002 section 6 detects it through `device_seq` once the engine compares the counter in part 2.
 

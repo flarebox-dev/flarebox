@@ -28,6 +28,8 @@ pub const MAX_FORMAT: u32 = 1;
 const TREE_PAGE: u32 = 5_000;
 /// How often a folder that failed its root check is checked again.
 const ROOT_RECHECK: Duration = Duration::from_secs(30);
+/// How often a running folder checks that its path still names the folder it locked.
+const CLAIM_RECHECK: Duration = Duration::from_secs(2);
 
 pub(crate) struct FolderTask {
     pub link: Link,
@@ -104,10 +106,19 @@ impl FolderTask {
         self.update(|status| status.state = FolderState::Connecting);
         let mut subscribed = false;
         let mut history_id = String::new();
+        let mut recheck = tokio::time::interval(CLAIM_RECHECK);
         loop {
             tokio::select! {
                 Some(entries) = observations.recv() => {
                     self.update(|status| status.local_entries = Some(entries));
+                }
+                _ = recheck.tick() => {
+                    if !claim::still_locked(&lock, &self.link.root) {
+                        session.close().await;
+                        return "the folder at this path is no longer the folder this task locked (it was moved, \
+                                replaced or removed); restart to sync it again"
+                            .into();
+                    }
                 }
                 event = events.next() => {
                     let Some(event) = event else {
