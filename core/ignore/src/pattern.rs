@@ -54,6 +54,12 @@ impl<K> Clone for RuleFile<K> {
     }
 }
 
+impl<K> PartialEq for RuleFile<K> {
+    fn eq(&self, other: &Self) -> bool {
+        self.rules == other.rules && self.invalid == other.invalid
+    }
+}
+
 impl<K> fmt::Debug for RuleFile<K> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RuleFile")
@@ -149,7 +155,7 @@ fn trim_trailing_spaces(line: &[u8]) -> &[u8] {
     &line[..last_space.unwrap_or(line.len())]
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Rule {
     pub(crate) line: u32,
     pub(crate) negated: bool,

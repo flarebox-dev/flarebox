@@ -16,7 +16,7 @@ use common::{
 };
 use flarebox_fs::{
     Action, Base, Displaced, Effect, Location, Outcome, PARKED_DIR, PRIVATE_DIR, QUARANTINE_DIR,
-    Reason, STAGING_DIR, Snapshot, Step, Unresolved, read_marker,
+    Reason, STAGING_DIR, Snapshot, Step, TRASH_RETENTION, Unresolved, read_marker,
 };
 
 fn replace(root: &Path) -> Effect {
@@ -296,6 +296,50 @@ fn folder_that_gained_an_entry_is_put_back() {
     assert_eq!(fs::read(root.join("docs/empty/late.txt")).unwrap(), b"late");
     assert!(private_names(root, "trash").is_empty());
     assert_settled(root);
+}
+
+#[test]
+fn folder_that_holds_only_platform_files_enters_the_trash_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let effect = prepare(&SCENARIOS[6], root);
+    let outcome = apply(root, &effect, |_| {});
+    assert_eq!(outcome, MOVED_OR_REMOVED);
+    (SCENARIOS[6].check)(root, &outcome);
+    assert_settled(root);
+
+    let reclaimed = bind(root)
+        .reclaim_trash(now() + TRASH_RETENTION, u64::MAX)
+        .unwrap();
+    assert_eq!(reclaimed.removed, [ID], "an empty folder is deleted");
+    assert_eq!(reclaimed.recovered, Vec::<std::ffi::OsString>::new());
+}
+
+/// A file a rule leaves out, a folder with a platform file's name and a
+/// symbolic link with one each keep the folder, and nothing in it is deleted.
+#[test]
+fn folder_that_holds_anything_but_platform_files_is_put_back_as_it_was() {
+    let others: [fn(&Path); 3] = [
+        |folder| fs::write(folder.join("build.log"), "log").unwrap(),
+        |folder| fs::create_dir(folder.join("Thumbs.db")).unwrap(),
+        |folder| std::os::unix::fs::symlink("build.log", folder.join("desktop.ini")).unwrap(),
+    ];
+    for other in others {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let effect = prepare(&SCENARIOS[5], root);
+        let folder = root.join("docs/empty");
+        fs::write(folder.join(".DS_Store"), "view").unwrap();
+        other(&folder);
+        let before = listing(&folder);
+        assert_eq!(before.len(), 2);
+
+        assert_eq!(apply(root, &effect, |_| {}), failed(Reason::Changed));
+        assert_eq!(listing(&folder), before);
+        assert_eq!(fs::read(folder.join(".DS_Store")).unwrap(), b"view");
+        assert!(private_names(root, "trash").is_empty());
+        assert_settled(root);
+    }
 }
 
 #[test]

@@ -360,6 +360,7 @@ fn an_identity_without_a_birth_time_round_trips() {
         loaded.set_synced(id.clone(), Some(shape.clone()));
     }
     assert_eq!(loaded.restore(trees.state()), Ok(()));
+    loaded.rules_scanned();
     assert_eq!(loaded, trees);
     assert_eq!(
         loaded.local().get("u").map(|node| node.identity),

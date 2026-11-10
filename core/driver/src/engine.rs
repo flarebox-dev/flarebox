@@ -27,7 +27,7 @@ use flarebox_proto::v1::{
 use flarebox_store::{Cursor, EngineState, Error, SyncedNode, Tx};
 
 use crate::disk::Stop;
-use crate::observe::{Observed, Reset};
+use crate::observe::{Observed, Reset, RulesChange};
 
 pub(crate) struct Engine {
     pub trees: Trees,
@@ -316,6 +316,45 @@ impl Engine {
         Some(names.into_iter().rev().collect())
     }
 
+    /// Gives the trees the rules files a batch lists, before the changes of that batch. An observer's first batch
+    /// follows its scan of the whole tree and lists every rules file, so from the first call on the trees know the
+    /// rules, and the engine plans again (design §5.10), except below a folder that could not be read
+    /// ([`Engine::read`]). The rules of a folder whose path L cannot hold are left out, since no node is below it.
+    /// When `all` is set the batch lists every rules file its scans read, and the trees forget the rules they had.
+    pub fn rules(&mut self, rules: Vec<RulesChange>, all: bool) {
+        if all {
+            self.trees.clear_rules();
+        }
+        for RulesChange { dir, rules } in rules {
+            if let Some(dir) = names(&dir) {
+                self.trees.set_rules(&dir, rules);
+            }
+        }
+        self.trees.rules_scanned();
+    }
+
+    /// Gives the trees, after the changes of a batch, the folders whose rules the batch's scans established (`read`)
+    /// and the folders they could not read, whose rules are unknown until a later scan establishes them. Each path is
+    /// where the scan read the folder, so it names the node L holds there by its exact name: a renamed folder is the
+    /// same node, and two folders whose names differ only in case are two.
+    pub fn read(&mut self, read: &[PathBuf], unreadable: &[PathBuf]) {
+        let read = if self.trees.unknown_rules().is_empty() {
+            &[]
+        } else {
+            read
+        };
+        if read.is_empty() && unreadable.is_empty() {
+            return;
+        }
+        let index = Index::new(&self.trees);
+        for id in read.iter().filter_map(|dir| index.at(dir)) {
+            self.trees.set_rules_known(&id);
+        }
+        for id in unreadable.iter().filter_map(|dir| index.at(dir)) {
+            self.trees.set_rules_unknown(&id);
+        }
+    }
+
     /// Puts `changes` into L and returns the nodes whose L entry changed. Paths a change names in the previous state
     /// (`Removed::path`, `Renamed::from`) are resolved before any change applies. A renamed or modified entry is the
     /// node L holds at its path with its identity, else the node with its identity, else the node at its path. A
@@ -327,6 +366,9 @@ impl Engine {
     /// it. A file that arrives over a file keeps the node of the file it replaces when L's own node for the arriving
     /// file never synced, as when an editor saves by renaming a new file over the old one. The arriving node then
     /// leaves L. A file whose content could not be read is left out until the observer reports it with its content.
+    /// A rename to a path the rules exclude is a move out of what this device syncs: the node takes that position
+    /// when its folder is in L, and keeps its entry otherwise ([`Trees::ignore_local`]); an entry L never held stays
+    /// out.
     pub fn observe(&mut self, changes: &[Observed], now_ms: u64) -> BTreeSet<NodeId> {
         let mut index = Index::new(&self.trees);
         let before: Vec<Option<NodeId>> = changes
@@ -348,6 +390,17 @@ impl Engine {
                     }
                 }
                 Observed::Renamed { to, kind, id, .. } => {
+                    let node_kind = match kind {
+                        EntryKind::File => Kind::File,
+                        EntryKind::Dir => Kind::Dir,
+                    };
+                    if names(to).is_some_and(|to| self.trees.ignores(&to, node_kind)) {
+                        let Some(node) = &before else { continue };
+                        if to.parent().and_then(|dir| index.at(dir)).is_none() {
+                            self.trees.ignore_local(node);
+                            continue;
+                        }
+                    }
                     let identity = file_identity(*id);
                     let content = before
                         .as_ref()
@@ -689,6 +742,16 @@ impl Index {
             .insert((shape.parent.clone(), shape.name.clone()), id.clone());
         self.identities.insert(identity, id.clone());
     }
+}
+
+/// The names from the root to `path`, or `None` when one of them is not a name L can hold.
+fn names(path: &Path) -> Option<Vec<&str>> {
+    path.components()
+        .map(|component| match component {
+            Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect()
 }
 
 fn invalid(what: String) -> Error {
@@ -1522,6 +1585,32 @@ mod tests {
             .as_ref()
             .map_or(0, |content| content.size);
         Some((id, node.identity, size))
+    }
+
+    /// A batch that lists every rules file takes the place of the rules the trees had: a folder it does not list has
+    /// none. Any other batch lists only the rules files that changed.
+    #[test]
+    fn a_batch_with_every_rules_file_drops_the_rules_it_does_not_list() {
+        let (_dir, mut engine) = mapper();
+        let log = || RulesChange {
+            dir: "proj".into(),
+            rules: Some(flarebox_engine::ignore::RuleFile::parse(b"*.log\n")),
+        };
+        engine.rules(vec![log()], true);
+        let proj = Observed::Created {
+            path: "proj".into(),
+            kind: EntryKind::Dir,
+            id: ino(1),
+            linked: false,
+            content: None,
+        };
+        engine.observe(&[proj, created("proj/build.log", ino(2), false, 1)], 0);
+        let (log_id, _, _) = holding(&engine, "proj/build.log").unwrap();
+        assert!(engine.trees.excluded(&log_id));
+        engine.rules(Vec::new(), false);
+        assert!(engine.trees.excluded(&log_id), "no rules file changed");
+        engine.rules(Vec::new(), true);
+        assert!(!engine.trees.excluded(&log_id), "no rules file is left");
     }
 
     #[test]

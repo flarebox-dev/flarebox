@@ -10,6 +10,12 @@
 //! local trash, or back to its name, or, when the name was taken in the
 //! meantime, to a recovered name beside it. After every rename the source
 //! folder and then the destination folder are flushed.
+//!
+//! One kind of file is deleted: the platform files (`.DS_Store` and the others
+//! of [`PLATFORM_FILES`]) that a folder still holds when it is removed. Scans
+//! leave them out, so nothing removes them first, and a folder that is not
+//! empty never leaves the trash. They are deleted in quarantine, after the
+//! comparison.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -18,6 +24,7 @@ use std::os::fd::{AsFd, BorrowedFd};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+use flarebox_ignore::PLATFORM_FILES;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 
@@ -367,6 +374,9 @@ impl Space {
             }
             None => Outcome::Done { identity: None },
         };
+        if displaced.entry.kind == EntryKind::Dir {
+            clear_platform_files(quarantine.fd(), id)?;
+        }
         self.trash(&quarantine, id, &effect.id, name, now)?;
         hook(Step::Trashed);
         Ok(outcome)
@@ -511,6 +521,9 @@ impl Space {
             };
             self.drop_staged(&effect.id)?;
             let original = location_name(&displaced.at);
+            if displaced.entry.kind == EntryKind::Dir {
+                clear_platform_files(quarantine.fd(), id)?;
+            }
             self.trash(&quarantine, id, &effect.id, original, now)?;
             hook(Step::Trashed);
             return Ok(outcome);
@@ -596,7 +609,7 @@ impl Space {
 
 /// Whether the quarantined entry `id` is `expected`: the same identity, kind,
 /// size, modification time and executable bit, and, for a file, the content
-/// the effect displaces, or, for a folder, nothing inside.
+/// the effect displaces, or, for a folder, nothing inside but platform files.
 fn matches(
     quarantine: BorrowedFd<'_>,
     id: &OsStr,
@@ -610,9 +623,28 @@ fn matches(
         EntryKind::File => contents.displaced(&open_file(quarantine, id)?),
         EntryKind::Dir => {
             let dir = rustix::fs::openat(quarantine, id, crate::DIR_FLAGS, Mode::empty())?;
-            Ok(list(rustix::fd::AsFd::as_fd(&dir))?.is_empty())
+            for name in list(dir.as_fd())? {
+                let platform = PLATFORM_FILES.iter().any(|file| name == OsStr::new(file));
+                if !platform || stat_at(dir.as_fd(), &name)?.file_type != FileType::RegularFile {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
         }
     }
+}
+
+/// Deletes the platform files in the quarantined folder `id`, so that the
+/// folder enters the trash empty. [`matches`] has found nothing else in it.
+fn clear_platform_files(quarantine: BorrowedFd<'_>, id: &OsStr) -> io::Result<()> {
+    let dir = rustix::fs::openat(quarantine, id, crate::DIR_FLAGS, Mode::empty())?;
+    if list(dir.as_fd())?.is_empty() {
+        return Ok(());
+    }
+    for name in PLATFORM_FILES {
+        remove_if_present(dir.as_fd(), name)?;
+    }
+    flush(dir.as_fd())
 }
 
 /// What has `name` in `dir`, or `None` when nothing has. Only "not found"

@@ -24,6 +24,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use flarebox_engine::commit::{Commits, Failure, Halt as CommitHalt, Reconnect};
+use flarebox_engine::ignore::LocalRules;
 use flarebox_engine::state::CommitsState;
 use flarebox_fs::{Snapshot, check_root};
 use flarebox_net::{
@@ -172,10 +173,13 @@ impl Folder {
     /// Opens the folder's store, loads the engine and starts the disk through `lock`, the descriptor the task
     /// locked. [`Disk::start`] recovers an effect that was in flight before anything is observed or planned. The
     /// engine then takes the restores asked for while no task ran. Every node whose effect failed is unblocked, so each
-    /// is planned again once after the first scan of this start.
-    pub fn open(link: Link, lock: &File, store: &Path) -> Result<Folder, Stop> {
+    /// is planned again once after the first scan of this start. The trees take `local`, this device's `[sync]` list,
+    /// which the store does not hold; the rules files follow with the observer's first batch, and nothing is planned
+    /// before that (design §5.10).
+    pub fn open(link: Link, lock: &File, store: &Path, local: LocalRules) -> Result<Folder, Stop> {
         let mut store = Store::open(store)?;
         let mut engine = store.transaction(|tx| Engine::load(tx, &link.space_id))?;
+        engine.trees.set_local_rules(local);
         let disk = Disk::start(lock, &link, &mut engine, &mut store)?;
         for node in engine.effects.blocked().clone().into_keys() {
             engine.effects.unblock(&node);
@@ -584,16 +588,20 @@ impl Folder {
     }
 
     /// True when nothing is left to move: R holds the server's head, the folder was scanned, no effect and no
-    /// commit is in flight, every node the trees still differ on is one that cannot be synced as it is, and so is
-    /// the node of every restore that waits.
+    /// commit is in flight, no rules are awaited, every node the trees still differ on is one that cannot be synced
+    /// as it is, that this device leaves out, or a folder the user deleted that stays on the server for what this
+    /// device leaves out, and so is the node of every restore that waits.
     fn settled(&self) -> bool {
         let stuck = |id: &String| {
             self.engine.effects.blocked().contains_key(id)
                 || self.engine.commits.problems().contains(id)
+                || self.engine.trees.excluded(id)
+                || self.engine.trees.kept_for_excluded(id)
         };
         let commits = &self.engine.commits;
         self.caught_up()
             && self.scanned
+            && !self.disk.awaits_rules()
             && self.engine.effects.in_flight().is_none()
             && matches!(self.flight, Flight::Idle)
             && self.engine.commits.in_flight().is_none()
@@ -888,9 +896,12 @@ impl Folder {
     /// building a commit and acknowledging it. A commit is built only when no effect is planned, R is caught up and
     /// the session is connected, and only when a node is dirty or a restore is queued. Building can change the
     /// trees without giving a commit, so the effects are planned once more after it.
+    /// Nothing is planned either while the rules an effect can have changed are awaited ([`Disk::awaits_rules`]);
+    /// the batch that brings them drives the folder again.
     fn drive(&mut self, work: &mut Vec<Work>) -> Result<(), Stop> {
         let staging = self.engine.effects.in_flight().is_some();
-        if !self.scanned || staging || !matches!(self.stream, Stream::Following { .. }) {
+        let held = !self.scanned || staging || self.disk.awaits_rules();
+        if held || !matches!(self.stream, Stream::Following { .. }) {
             return Ok(());
         }
         let commits = &self.engine.commits;
@@ -960,6 +971,8 @@ pub(crate) struct FolderTask {
     pub auth: Arc<Auth>,
     pub status: Arc<Mutex<FolderStatus>>,
     pub matcher: Arc<dyn Matcher>,
+    /// This device's `[sync]` list as the engine's trees take it, the same list `matcher` applies to the scans.
+    pub local: LocalRules,
     /// The profile's private directories, which the folder must neither hold nor sit inside.
     pub private_dirs: Vec<PathBuf>,
     /// The roots of the profile's other linked folders.
@@ -1033,7 +1046,8 @@ impl FolderTask {
             Ok(lock) => Arc::new(lock),
             Err(halt) => return halt,
         };
-        let mut folder = match Folder::open(self.link.clone(), &lock, &self.store) {
+        let local = self.local.clone();
+        let mut folder = match Folder::open(self.link.clone(), &lock, &self.store, local) {
             Ok(folder) => folder,
             Err(stop) => return stop.to_string(),
         };
@@ -1067,10 +1081,15 @@ impl FolderTask {
                         None => Err(Stop::Protocol("the session ended".into())),
                     },
                     Some(seen) = from_disk.recv() => match seen {
-                        FromDisk::Batch(batch, entries) => folder.observed(batch, entries),
+                        // The observer reaches the folder by its path, so a folder replaced before its
+                        // first scan is scanned or fails there before the recheck below sees it.
+                        FromDisk::Batch(batch, entries) => match folder.observed(batch, entries) {
+                            Err(Stop::OtherRoot) if !claim::still_locked(&lock, &self.link.root) => {
+                                break REPLACED.to_owned();
+                            }
+                            step => step,
+                        },
                         FromDisk::Scanned => folder.scanned(),
-                        // The observer reaches the folder by its path, so a folder replaced before the
-                        // observer started fails there before the recheck below sees it.
                         FromDisk::Failed(_) if !claim::still_locked(&lock, &self.link.root) => {
                             break REPLACED.to_owned();
                         }
@@ -1174,10 +1193,8 @@ impl FolderTask {
         }
     }
 
-    /// Observes the disk on a thread of its own, starting from `previous`. Before each observation the thread
-    /// resets the scopes the effect sections asked for, then takes the stamp the batch is sent with, so the stamp
-    /// covers the batch's scans and content reads. The thread holds the folder's `lock` and ends with the first
-    /// observation after the receiver is dropped.
+    /// Observes the disk on a thread of its own, starting from `previous`, one [`Sections::observe`] after another.
+    /// The thread holds the folder's `lock` and ends with the first observation after the receiver is dropped.
     fn observe(
         &self,
         lock: Arc<Flock>,
@@ -1203,21 +1220,18 @@ impl FolderTask {
             };
             let mut scanned = false;
             while !sender.is_closed() {
-                observer.reset(sections.take_resets());
-                let stamp = sections.stamp();
-                match observer.observe(Duration::from_secs(1)) {
+                match sections.observe(&mut observer, Duration::from_secs(1)) {
                     Ok(None) => {}
-                    Ok(Some(observation)) => {
+                    Ok(Some(batch)) => {
                         tracing::debug!(
                             space_id = link.space_id,
-                            changes = observation.changes.len(),
-                            busy = observation.busy.len(),
-                            unreadable = observation.unreadable.len(),
-                            root_ok = observation.root.is_ok(),
+                            changes = batch.observation.changes.len(),
+                            busy = batch.observation.busy.len(),
+                            unreadable = batch.observation.unreadable.len(),
+                            root_ok = batch.observation.root.is_ok(),
                             "observed the folder"
                         );
                         let entries = observer.snapshot().entries.len() as u64;
-                        let batch = Batch { stamp, observation };
                         let _ = sender.send(FromDisk::Batch(batch, entries));
                     }
                     Err(error) => {

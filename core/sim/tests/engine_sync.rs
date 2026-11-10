@@ -13,8 +13,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use flarebox_engine::classify::Trees;
 use flarebox_engine::commit::{Commits, Failure, Halt, MAX_OPS, Reconnect};
-use flarebox_engine::effects::Effects;
+use flarebox_engine::effects::{Effect, Effects};
 use flarebox_engine::ids::IdGen;
+use flarebox_engine::ignore::{LocalRules, RuleFile};
 use flarebox_engine::names::name_key;
 use flarebox_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
 use flarebox_engine::state::StateError;
@@ -454,12 +455,68 @@ fn apply(trees: &mut Trees, changes: &[ChangeRecord]) {
     }
 }
 
+/// A change to what this device ignores, made while it runs (section 5.10).
+#[derive(Clone, Debug)]
+enum Ruling {
+    /// The lines of the `.fbignore` file at the root.
+    File(Vec<&'static str>),
+    /// The device-local exclude list.
+    Exclude(Vec<&'static str>),
+    /// The device-local include list.
+    Include(Vec<&'static str>),
+}
+
+const PATTERNS: &[&str] = &["a", "/b", "*.txt", "ss/", "local-*", "!a", "c.txt"];
+const INCLUDES: &[&str] = &["a", "b/", "ß", "local-1/"];
+
+fn ruling() -> impl Strategy<Value = Ruling> {
+    let lines =
+        |pool: &'static [&'static str]| prop::collection::vec(prop::sample::select(pool), 0..3);
+    prop_oneof![
+        lines(PATTERNS).prop_map(Ruling::File),
+        lines(PATTERNS).prop_map(Ruling::Exclude),
+        lines(INCLUDES).prop_map(Ruling::Include),
+    ]
+}
+
+/// The rules as the disk and the configuration hold them. They are not part of the stored
+/// state, so the device reads them again after every restart.
+#[derive(Clone, Debug, Default)]
+struct Rules {
+    file: Vec<&'static str>,
+    exclude: Vec<&'static str>,
+    include: Vec<&'static str>,
+}
+
+impl Rules {
+    fn read(&self, trees: &mut Trees) {
+        let root: [&str; 0] = [];
+        let file = RuleFile::parse(self.file.join("\n").as_bytes());
+        trees.set_rules(&root, (!self.file.is_empty()).then_some(file));
+        trees.set_local_rules(LocalRules::new(&self.include, &self.exclude).unwrap());
+        trees.rules_scanned();
+    }
+}
+
+/// The names from the root to `id` in L.
+fn local_path(trees: &Trees, id: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut current = id;
+    while let Some(node) = trees.local().get(current) {
+        names.push(node.shape.name.clone());
+        current = &node.shape.parent;
+    }
+    names.reverse();
+    names
+}
+
 struct Device {
     trees: Trees,
     ids: IdGen,
     inos: u64,
     /// Whether the folders the user creates take names nothing else has, so none is merged.
     fresh_dir_names: bool,
+    rules: Rules,
 }
 
 impl Device {
@@ -468,14 +525,33 @@ impl Device {
         identity(self.inos)
     }
 
+    fn rule(&mut self, ruling: &Ruling) {
+        match ruling {
+            Ruling::File(lines) => self.rules.file = lines.clone(),
+            Ruling::Exclude(lines) => self.rules.exclude = lines.clone(),
+            Ruling::Include(paths) => self.rules.include = paths.clone(),
+        }
+        self.rules.read(&mut self.trees);
+    }
+
     /// One change the user makes on disk, as the next rescan reports it. The user sees no parked
-    /// node and nothing under one.
+    /// node and nothing under one. A scan leaves out ignored paths, so a change at one is not
+    /// reported, except a move across the boundary: a node moved to an ignored name keeps its
+    /// identity and is reported at that name, one moved into an ignored folder is found there by
+    /// its identity, and one moved out is reported where it now is. L keeps the entries of
+    /// ignored nodes, so here it still stands for the disk; a node moved into an ignored folder
+    /// is out of the user's reach after that, and the user puts nothing where it was: an entry
+    /// that takes the path of such a node replaces it, which is a deletion the user made.
     fn act(&mut self, action: &Action) {
         let root = self.trees.local().root.clone();
         let local = self.trees.local();
+        let hidden = self.trees.ignored_local();
         let visible = |id: &str| {
             let mut current = id;
             for _ in 0..=local.len() {
+                if hidden.contains(current) {
+                    return false;
+                }
                 match local.get(current) {
                     Some(node) if node.parked => return false,
                     Some(node) => current = &node.shape.parent,
@@ -506,17 +582,30 @@ impl Device {
             NAMES[action.name]
         };
         let taken = |id: &str| {
-            nodes.iter().any(|(other, n)| {
-                other != id && n.shape.parent == parent && name_key(&n.shape.name) == name_key(name)
+            local.iter().any(|(other, n)| {
+                other != id
+                    && !n.parked
+                    && n.shape.parent == parent
+                    && name_key(&n.shape.name) == name_key(name)
             })
         };
         let target = (!nodes.is_empty()).then(|| nodes[action.target % nodes.len()].clone());
+        let unseen = |id: &str, kind| self.trees.ignores(&local_path(&self.trees, id), kind);
+        let into_ignored = parent != root && unseen(&parent, Kind::Dir);
+        let lands_unseen = |kind| {
+            let mut path = local_path(&self.trees, &parent);
+            path.push(name.to_owned());
+            into_ignored || self.trees.ignores(&path, kind)
+        };
         match (action.kind, target) {
             (0 | 1, _) if !taken("") => {
                 let (kind, content) = match action.kind {
                     0 => (Kind::Dir, None),
                     _ => (Kind::File, Some(content(1, action.text))),
                 };
+                if lands_unseen(kind) {
+                    return;
+                }
                 let shape = flarebox_engine::tree::Shape {
                     parent,
                     name: name.into(),
@@ -531,15 +620,25 @@ impl Device {
                 self.trees.set_local(self.ids.uuid_v7(NOW as u64), node);
             }
             (2, Some((id, mut node))) if node.shape.kind == Kind::File => {
+                if unseen(&id, Kind::File) {
+                    return;
+                }
                 node.shape.content = Some(content(1, action.text));
                 self.trees.set_local(id, node);
             }
             (3, Some((id, mut node))) if !taken(&id) && !self.holds(&id, &parent) => {
-                node.shape.parent = parent;
-                node.shape.name = name.into();
-                self.trees.set_local(id, node);
+                let kind = node.shape.kind;
+                match (unseen(&id, kind), lands_unseen(kind)) {
+                    (true, true) => {}
+                    (false, true) if into_ignored => self.trees.ignore_local(&id),
+                    _ => {
+                        node.shape.parent = parent;
+                        node.shape.name = name.into();
+                        self.trees.set_local(id, node);
+                    }
+                }
             }
-            (4, Some((id, _))) => {
+            (4, Some((id, node))) if !unseen(&id, node.shape.kind) => {
                 let doomed: Vec<String> = nodes
                     .iter()
                     .filter(|(other, _)| self.holds(&id, other))
@@ -637,12 +736,14 @@ fn rewritten(
         .collect()
 }
 
-/// Rebuilds the engine state the way the store does after a restart, and checks that each part
-/// comes back equal.
+/// Rebuilds the engine state the way the store does after a restart, with the rules and the moves
+/// into ignored folders that the first scan reports again, and checks that each part comes back
+/// equal.
 fn reload(
     trees: &Trees,
     commits: &Commits,
     effects: &Effects,
+    rules: &Rules,
 ) -> Result<(Trees, Commits, Effects), TestCaseError> {
     let mut loaded = Trees::new(trees.remote().root.clone());
     for (id, node) in trees.remote().iter() {
@@ -656,6 +757,11 @@ fn reload(
     }
     let refused = |error: StateError| TestCaseError::fail(format!("refused: {error:?}"));
     loaded.restore(trees.state()).map_err(refused)?;
+    prop_assert!(!loaded.rules_known());
+    rules.read(&mut loaded);
+    for id in trees.ignored_local() {
+        loaded.ignore_local(id);
+    }
     let restored_commits = Commits::from_state(commits.state()).map_err(refused)?;
     let restored_effects = Effects::from_state(effects.state()).map_err(refused)?;
     prop_assert_eq!(&loaded, trees);
@@ -680,11 +786,19 @@ struct Ran {
     parked_reverted: usize,
     /// The restores this device asked for, as they ended.
     resolved: Vec<Resolved>,
+    /// The `Delete` ops the device sent.
+    deletes: usize,
+    /// The effects that removed a file or a folder from the device's disk, not counting a folder
+    /// the server never held: one created here and merged into another, removed once empty.
+    removals: usize,
+    /// The nodes the server holds trashed at the end.
+    trashed: usize,
     space: SpaceDo,
 }
 
 /// `fits` is the most ops a commit may hold before the server refuses it with `LIMIT_EXCEEDED`,
-/// standing in for the 1 MiB message limit (spec v0 section 7.2).
+/// standing in for the 1 MiB message limit (spec v0 section 7.2). Returns the most reverted nodes
+/// that were parked at once.
 fn run(
     seed: &[Action],
     local: &[Action],
@@ -705,6 +819,60 @@ fn run(
     Ok(ran.parked_reverted)
 }
 
+/// Whether the effects cannot place `id` because of an excluded node: on the way from the node's
+/// R position to the root, a name is held in L by an excluded node, whose local copy stays where
+/// it is, or by a node that waits the same way, or a folder on the way waits itself or is
+/// excluded and not where R has it. A folder R
+/// no longer holds waits when L still holds such a node in it, since only an empty folder is
+/// removed. Such a node stays as it is, and the driver reports it as a problem (section 5.1).
+fn waits_on_excluded(trees: &Trees, id: &str, waiting: &BTreeSet<String>) -> bool {
+    let mut current = id;
+    for _ in 0..=trees.remote().len() {
+        let Some(remote) = trees.remote().live(current) else {
+            let stays = |other: &str| trees.ignored(other) || waiting.contains(other);
+            return current == id
+                && (trees.local().iter())
+                    .any(|(other, node)| node.shape.parent == id && stays(other));
+        };
+        let placed = |node: &LocalNode| !node.parked && node.shape.same_position(remote);
+        let unplaced = !trees.local().get(current).is_some_and(placed);
+        if current != id && (waiting.contains(current) || (unplaced && trees.ignored(current))) {
+            return true;
+        }
+        let key = name_key(&remote.name);
+        let holder = trees.local().iter().find(|(other, node)| {
+            *other != current
+                && !node.parked
+                && node.shape.parent == remote.parent
+                && name_key(&node.shape.name) == key
+        });
+        if holder.is_some_and(|(other, _)| trees.excluded(other) || waiting.contains(other)) {
+            return true;
+        }
+        if remote.parent == trees.remote().root {
+            return false;
+        }
+        current = &remote.parent;
+    }
+    false
+}
+
+/// Whether S cannot take `id` at its R position because the S entry of a node that waits still
+/// holds that name. The entry moves only once its node is placed, which the excluded node keeps
+/// from happening.
+fn waits_on_synced(trees: &Trees, id: &str, waiting: &BTreeSet<String>) -> bool {
+    let Some(remote) = trees.remote().live(id) else {
+        return false;
+    };
+    let key = name_key(&remote.name);
+    trees.synced().iter().any(|(other, shape)| {
+        other != id
+            && waiting.contains(other)
+            && shape.parent == remote.parent
+            && name_key(&shape.name) == key
+    })
+}
+
 /// [`run`], with the process stopping at `cut`. An action of kind 5 or 6 on this device asks its
 /// engine for a restore.
 fn run_cut(
@@ -716,6 +884,24 @@ fn run_cut(
     during: &[(bool, Vec<Action>)],
     cut: Cut,
 ) -> Result<Ran, TestCaseError> {
+    run_ignoring(seed, local, remote, fits, fresh_dir_names, during, cut, &[])
+}
+
+/// [`run_cut`] with changes to the ignore rules: the first of `rulings` is made before the offline
+/// local changes, and one more before each of the `during` changes. At the end a node the device
+/// excludes, or cannot place because of an excluded one ([`waits_on_excluded`]), must have R equal
+/// to the server's node, and every other node L = S = R.
+#[allow(clippy::too_many_arguments)]
+fn run_ignoring(
+    seed: &[Action],
+    local: &[Action],
+    remote: &[Action],
+    fits: usize,
+    fresh_dir_names: bool,
+    during: &[(bool, Vec<Action>)],
+    cut: Cut,
+    rulings: &[Ruling],
+) -> Result<Ran, TestCaseError> {
     let (mut space, mut other) = seeded(seed);
     let root = space.space_id().to_owned();
     let history = space.history_id().to_owned();
@@ -724,6 +910,7 @@ fn run_cut(
         ids: IdGen::new(7),
         inos: 0,
         fresh_dir_names,
+        rules: Rules::default(),
     };
     for state in space.nodes().iter().filter(|n| n.node_id != root) {
         let (id, node) = RemoteNode::from_state(state).unwrap();
@@ -744,6 +931,10 @@ fn run_cut(
 
     let mut commits = Commits::default();
     let (mut requested, mut sent) = (0, 0);
+    let mut rulings = rulings.iter();
+    if let Some(ruling) = rulings.next() {
+        device.rule(ruling);
+    }
     for action in local {
         match action.kind {
             5 | 6 => {
@@ -787,6 +978,7 @@ fn run_cut(
     let me = session("me");
     let mut effects = Effects::default();
     let (mut steps, mut quiet, mut due, mut parked_reverted) = (0, false, false, 0);
+    let (mut deletes, mut removals) = (0, 0);
     let mut during = during.iter();
     while !quiet {
         steps += 1;
@@ -796,6 +988,9 @@ fn run_cut(
             && let Some((on_device, actions)) = during.next()
         {
             due = false;
+            if let Some(ruling) = rulings.next() {
+                device.rule(ruling);
+            }
             if *on_device {
                 let before = held(&device.trees);
                 for action in actions {
@@ -835,7 +1030,8 @@ fn run_cut(
         }
         device.trees.settle();
         prop_assert_eq!(device.trees.check(), Ok(()));
-        (device.trees, commits, effects) = reload(&device.trees, &commits, &effects)?;
+        (device.trees, commits, effects) =
+            reload(&device.trees, &commits, &effects, &device.rules)?;
         let reverted = device.trees.reverted();
         parked_reverted = parked_reverted.max(
             device
@@ -849,8 +1045,17 @@ fn run_cut(
             .plan(&device.trees, &mut device.ids, NOW as u64)
             .cloned()
         {
+            let known = device.trees.remote().get(&record.node).is_some()
+                || device.trees.synced().live(&record.node).is_some();
+            let removes = match record.effect {
+                Effect::RemoveFile { .. } => true,
+                Effect::RemoveDir { .. } => known,
+                _ => false,
+            };
+            removals += usize::from(removes);
             if cut == Cut::Effect {
-                (device.trees, commits, effects) = reload(&device.trees, &commits, &effects)?;
+                (device.trees, commits, effects) =
+                    reload(&device.trees, &commits, &effects, &device.rules)?;
                 prop_assert_eq!(effects.in_flight(), Some(&record));
             }
             let identity = device.identity();
@@ -876,6 +1081,8 @@ fn run_cut(
             quiet = device.trees == before && during.len() == 0;
             continue;
         };
+        let delete = |op: &&Op| matches!(op.op, Some(op::Op::Delete(_)));
+        deletes += commit.ops.iter().filter(delete).count();
         if commit.ops.len() > fits {
             prop_assert_eq!(
                 commits.failed(&Error {
@@ -892,7 +1099,8 @@ fn run_cut(
         let cut = if restores.is_empty() { Cut::None } else { cut };
         let in_flight = |commits: &Commits| commits.in_flight().map(|f| f.commit.clone());
         if cut == Cut::Built {
-            (device.trees, commits, effects) = reload(&device.trees, &commits, &effects)?;
+            (device.trees, commits, effects) =
+                reload(&device.trees, &commits, &effects, &device.rules)?;
             prop_assert_eq!(commits.connected(&space.welcome(&me)), Reconnect::Resend);
             prop_assert_eq!(in_flight(&commits), Some(commit.clone()));
         }
@@ -909,7 +1117,8 @@ fn run_cut(
         if cut == Cut::Applied {
             // The response is lost. The server counts the commit, so the device sends the same
             // commit again and gets the stored result: nothing is applied a second time.
-            (device.trees, commits, effects) = reload(&device.trees, &commits, &effects)?;
+            (device.trees, commits, effects) =
+                reload(&device.trees, &commits, &effects, &device.rules)?;
             prop_assert_eq!(commits.connected(&space.welcome(&me)), Reconnect::Resend);
             prop_assert_eq!(in_flight(&commits), Some(commit.clone()));
             let head = space.head_seq();
@@ -923,7 +1132,8 @@ fn run_cut(
         let ended = commits.resolved().len();
         if cut == Cut::Answered {
             commits.received(result.clone()).unwrap();
-            (device.trees, commits, effects) = reload(&device.trees, &commits, &effects)?;
+            (device.trees, commits, effects) =
+                reload(&device.trees, &commits, &effects, &device.rules)?;
             prop_assert_eq!(commits.connected(&space.welcome(&me)), Reconnect::Idle);
             prop_assert!(!commits.acknowledge(&mut device.trees, last_seq));
             prop_assert_eq!(commits.resolved().len(), ended);
@@ -965,10 +1175,36 @@ fn run_cut(
         "every restore asked for ends, and its op is sent once"
     );
 
-    prop_assert_eq!(device.trees.settle(), vec![]);
+    let unsettled: Vec<String> = (device.trees.settle().into_iter())
+        .map(|(id, _)| id)
+        .filter(|id| !device.trees.ignored(id))
+        .collect();
+    let mut waiting: BTreeSet<String> = BTreeSet::new();
+    loop {
+        let more: Vec<String> = (unsettled.iter())
+            .filter(|id| {
+                !waiting.contains(*id)
+                    && (waits_on_excluded(&device.trees, id, &waiting)
+                        || waits_on_synced(&device.trees, id, &waiting))
+            })
+            .cloned()
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        waiting.extend(more);
+    }
+    let unsettled: Vec<&String> = (unsettled.iter())
+        .filter(|id| !waiting.contains(*id))
+        .collect();
+    prop_assert_eq!(unsettled, Vec::<&String>::new());
     prop_assert!(commits.problems().is_empty(), "{:?}", commits.problems());
     prop_assert!(effects.blocked().is_empty(), "{:?}", effects.blocked());
-    prop_assert!(device.trees.local().iter().all(|(_, n)| !n.parked));
+    let stays_parked = |id: &str| device.trees.ignored(id) || waiting.contains(id);
+    prop_assert!(
+        (device.trees.local().iter()).all(|(id, node)| !node.parked || stays_parked(id)),
+        "a node the rules do not leave out is still parked"
+    );
     let server: Vec<(String, Option<flarebox_engine::tree::Shape>)> = space
         .nodes()
         .iter()
@@ -986,6 +1222,14 @@ fn run_cut(
             .iter()
             .find(|(other, _)| other == id)
             .and_then(|(_, shape)| shape.as_ref());
+        if device.trees.ignored(id) || waiting.contains(id) {
+            prop_assert!(
+                same(device.trees.remote().live(id), on_server),
+                "R of excluded {}",
+                id
+            );
+            continue;
+        }
         let local = device.trees.local().get(id).map(|n| &n.shape);
         prop_assert!(
             same(local, on_server),
@@ -1005,10 +1249,14 @@ fn run_cut(
             id
         );
     }
+    let unsent = (device.trees.local().iter())
+        .filter(|(id, _)| device.trees.ignored(id))
+        .map(|(_, node)| node.shape.content.clone());
     let kept = written(
         server
             .iter()
-            .map(|(_, s)| s.clone().and_then(|s| s.content)),
+            .map(|(_, s)| s.clone().and_then(|s| s.content))
+            .chain(unsent),
         1,
     );
     prop_assert!(local_writes.is_subset(&kept), "a local write was lost");
@@ -1022,6 +1270,9 @@ fn run_cut(
     Ok(Ran {
         parked_reverted,
         resolved: commits.resolved().to_vec(),
+        deletes,
+        removals,
+        trashed: server.iter().filter(|(_, shape)| shape.is_none()).count(),
         space,
     })
 }
@@ -1051,6 +1302,35 @@ proptest! {
         ]),
     ) {
         run_cut(&seed, &local, &remote, fits, fresh_dir_names, &during, cut)?;
+    }
+
+    /// Section 5.10: becoming ignored never deletes anything, on either side. Neither device
+    /// deletes here, so whatever the rules and the moves into and out of ignored paths do, the
+    /// device sends no `Delete`, removes nothing from its disk, and the server trashes nothing,
+    /// across the restart the run makes at every step.
+    #[test]
+    fn a_device_whose_rules_change_deletes_nothing_on_either_side(
+        seed in prop::collection::vec(action(2), 0..12),
+        local in prop::collection::vec(action(4), 0..8),
+        remote in prop::collection::vec(action(4), 0..8),
+        fits in prop_oneof![Just(MAX_OPS), 1usize..4],
+        during in prop::collection::vec(
+            (any::<bool>(), prop::collection::vec(action(4), 1..4)),
+            0..6,
+        ),
+        rulings in prop::collection::vec(ruling(), 0..7),
+    ) {
+        let ran = run_ignoring(
+            &seed,
+            &local,
+            &remote,
+            fits,
+            true,
+            &during,
+            Cut::None,
+            &rulings,
+        )?;
+        prop_assert_eq!((ran.deletes, ran.removals, ran.trashed), (0, 0, 0));
     }
 }
 

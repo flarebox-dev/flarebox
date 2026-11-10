@@ -48,6 +48,22 @@
 //! - Replacing a file with a folder, or a folder with a file, is reported as
 //!   the old entry removed and the new one created at the same path.
 //!
+//! Scans and watchers given [`Rules`] also leave out what the rules name
+//! (design §5.10): the built-in platform files, and every entry a `.fbignore`
+//! file or the device's own list excludes, with everything below it. A scan
+//! reads the [`RULES_FILE`] of each folder it lists and hands the bytes to
+//! the caller's matcher ([`Ignore`]) before it judges the folder's entries.
+//! Being left out is never a removal. An entry a changed rule leaves out
+//! leaves the snapshot without a change, and one a changed rule includes
+//! again is reported as created. An entry that disappeared is looked for by
+//! identity at and below the entries a rule leaves out, with listings and
+//! stats only. Found there, it was moved and nothing was deleted, so it is
+//! reported as [`Change::Ignored`]. A miss is reported as a removal, although
+//! a file saved again after such a move has a new identity and is missed.
+//! Design §5.10 holds a miss for a question to the user while any entry is
+//! left out, and the engine cannot ask that question yet. The search does not
+//! look in [`PRIVATE_DIR`] or in the built-in platform files.
+//!
 //! The engine's private folder [`PRIVATE_DIR`] at the root is never scanned.
 //! The [`check_root`] of design §6.2, the root [`Marker`] and the rename that
 //! never replaces its target ([`rename_no_replace`], [`probe_no_replace`])
@@ -338,6 +354,8 @@ struct Scan<'c> {
     /// Folders the scan may not open or list. What lies below them stays as
     /// it was known.
     unreadable: Vec<PathBuf>,
+    /// The rules that leave entries out, for a scan that applies any.
+    rules: Option<Pending<'c>>,
     cut: &'c mut dyn FnMut(Cut<'_>),
 }
 
@@ -352,6 +370,11 @@ impl Scan<'_> {
         let Some(entry) = stat.entry() else {
             return Ok(());
         };
+        if let Some(rules) = &mut self.rules
+            && rules.leaves_out(&rel, entry.kind)
+        {
+            return Ok(());
+        }
         self.new.insert(rel.clone(), entry);
         if entry.kind == EntryKind::File {
             return Ok(());
@@ -375,12 +398,29 @@ impl Scan<'_> {
 
     fn dir(&mut self, dir: BorrowedFd<'_>, rel: &Path) -> Result<()> {
         let result = list(dir).map_err(Error::from).and_then(|names| {
+            if self.read_rules(dir, rel, &names) == RulesRead::Unknown {
+                self.unreadable.push(rel.to_path_buf());
+                return Ok(());
+            }
             names
                 .iter()
                 .filter(|name| !private(rel, name))
                 .try_for_each(|name| self.entry(dir, name, rel.join(name)))
         });
         self.unless_denied(rel, result)
+    }
+
+    /// Reads the rules file of the folder `dir` at `rel`, which lists `names`,
+    /// before any of its children is judged. A folder whose rules are
+    /// [`RulesRead::Unknown`] is unreadable: the caller records it and judges none
+    /// of its children.
+    fn read_rules(
+        &mut self,
+        dir: BorrowedFd<'_>,
+        rel: &Path,
+        names: &BTreeSet<OsString>,
+    ) -> RulesRead {
+        (self.rules.as_mut()).map_or(RulesRead::Same, |rules| rules.read(dir, rel, names))
     }
 
     /// Records `rel` as unreadable and succeeds when `result` failed because
@@ -397,9 +437,9 @@ impl Scan<'_> {
 }
 
 /// A change between two states of the tree. Paths are relative to the root.
-/// `Removed::path` and `Renamed::from` name the previous state; `Created::path`,
-/// `Modified::path` and `Renamed::to` name the new one. Resolve previous-state
-/// paths before applying any change of the same batch.
+/// `Removed::path`, `Renamed::from` and `Ignored::from` name the previous
+/// state; `Created::path`, `Modified::path` and `Renamed::to` name the new one.
+/// Resolve previous-state paths before applying any change of the same batch.
 ///
 /// Removing or renaming a folder is one change; its contents are not listed
 /// unless they changed on their own. Creating a folder lists every entry in it.
@@ -421,6 +461,14 @@ pub enum Change {
         path: PathBuf,
         kind: EntryKind,
     },
+    /// The entry at `from` now sits at `to`, a path the rules leave out. The
+    /// snapshot no longer holds it or anything below it. Nothing was deleted.
+    Ignored {
+        from: PathBuf,
+        to: PathBuf,
+        kind: EntryKind,
+        id: FileId,
+    },
 }
 
 /// The known state of every entry under a root, keyed by relative path with the
@@ -440,20 +488,40 @@ pub struct Rescan {
     /// The snapshot keeps what it knew about them and everything below them;
     /// rescan them later.
     pub unsettled: Vec<PathBuf>,
-    /// Folders the scan may not open or list. The snapshot keeps what it knew
-    /// below them, so a folder the user cannot read never reads as emptied.
-    /// Report them, and rescan them once they can be read.
+    /// Folders the scan may not open or list, and folders with a rules file
+    /// it cannot read when no earlier scan read one for them, so that what
+    /// they leave out is not known. The snapshot keeps what it knew below
+    /// them, so a folder the user cannot read never reads as emptied, and
+    /// nothing a rules file may leave out is reported as new. Report them,
+    /// and rescan them once they can be read.
     pub unreadable: Vec<PathBuf>,
     /// The identity of the root folder the scan opened. A scan that reached
     /// another folder than the caller's root has already applied that folder
     /// to the snapshot, so stop using the snapshot, not only its changes.
     pub root: FileId,
+    /// The folders whose rules file this scan found changed, each with the
+    /// bytes it holds now, or `None` for a folder that has none any more.
+    /// Empty for a scan without [`Rules`].
+    pub rules: Vec<(PathBuf, Option<Vec<u8>>)>,
+    /// The folders whose rules this scan established, at the paths it listed
+    /// them: it read their rules file, found none, or could not read one and
+    /// kept the rules an earlier scan read. A folder reported unreadable
+    /// before has known rules again once it is here, whatever its rules file
+    /// did meanwhile. Empty for a scan without [`Rules`].
+    pub read: Vec<PathBuf>,
 }
 
 impl Snapshot {
     pub fn scan(root: impl AsRef<Path>) -> Result<Self> {
         let mut snapshot = Self::default();
         snapshot.rescan(root, [PathBuf::new()])?;
+        Ok(snapshot)
+    }
+
+    /// [`Snapshot::scan`], leaving out what `rules` leave out.
+    pub fn scan_with_rules(root: impl AsRef<Path>, rules: &mut Rules) -> Result<Self> {
+        let mut snapshot = Self::default();
+        snapshot.rescan_with_rules(root, [PathBuf::new()], rules)?;
         Ok(snapshot)
     }
 
@@ -483,6 +551,27 @@ impl Snapshot {
         paths: impl IntoIterator<Item = PathBuf>,
     ) -> Result<Rescan> {
         self.rescan_with(root.as_ref(), paths, None, &mut |_| {})
+    }
+
+    /// [`Snapshot::rescan`], leaving out what `rules` leave out, as the crate
+    /// docs describe.
+    ///
+    /// In each folder it lists, the scan reads the rules file before it judges
+    /// the folder's entries, and it returns the folders whose rules changed in
+    /// [`Rescan::rules`]. A changed rules file widens the scan to everything
+    /// below its folder. An entry the rules now leave out leaves the snapshot
+    /// without a change, and one they include again is reported as created.
+    /// A removal whose entry the scan finds under a left-out entry is reported
+    /// as [`Change::Ignored`].
+    ///
+    /// On any error `rules` are unchanged too.
+    pub fn rescan_with_rules(
+        &mut self,
+        root: impl AsRef<Path>,
+        paths: impl IntoIterator<Item = PathBuf>,
+        rules: &mut Rules,
+    ) -> Result<Rescan> {
+        self.rescan_under(root.as_ref(), paths, None, Some(rules), &mut |_| {})
     }
 
     /// Replaces what the snapshot knows at and below `scope`, a relative
@@ -533,12 +622,52 @@ impl Snapshot {
         expected: Option<FileId>,
         cut: &mut dyn FnMut(Cut<'_>),
     ) -> Result<Rescan> {
+        self.rescan_under(root, paths, expected, None, cut)
+    }
+
+    /// [`Snapshot::rescan_with`], leaving out what `rules` leave out. A scan
+    /// that fails takes back what it changed in `rules`.
+    fn rescan_under(
+        &mut self,
+        root: &Path,
+        paths: impl IntoIterator<Item = PathBuf>,
+        expected: Option<FileId>,
+        rules: Option<&mut Rules>,
+        cut: &mut dyn FnMut(Cut<'_>),
+    ) -> Result<Rescan> {
+        let mut scan = Scan {
+            new: BTreeMap::new(),
+            bindings: Vec::new(),
+            replaced: Vec::new(),
+            unreadable: Vec::new(),
+            rules: rules.map(Pending::new),
+            cut,
+        };
+        let result = self.rescan_into(root, paths, expected, &mut scan);
+        if result.is_err()
+            && let Some(rules) = scan.rules
+        {
+            rules.undo();
+        }
+        result
+    }
+
+    /// Scans the given paths into `scan` and applies what it found to the
+    /// snapshot and to the rules of `scan`. Nothing after the last step that
+    /// can fail changes either.
+    fn rescan_into(
+        &mut self,
+        root: &Path,
+        paths: impl IntoIterator<Item = PathBuf>,
+        expected: Option<FileId>,
+        scan: &mut Scan<'_>,
+    ) -> Result<Rescan> {
         let root_dir = open_root(root)?;
         let root_stat = stat_fd(root_dir.as_fd())?;
         if expected.is_some_and(|expected| root_stat.id != expected) {
             return Err(Error::RootReplaced);
         }
-        cut(Cut::RootOpened);
+        (scan.cut)(Cut::RootOpened);
 
         let mut scopes = Vec::new();
         for path in paths {
@@ -562,13 +691,6 @@ impl Snapshot {
             scopes.push(self.anchor(path));
         }
 
-        let mut scan = Scan {
-            new: BTreeMap::new(),
-            bindings: Vec::new(),
-            replaced: Vec::new(),
-            unreadable: Vec::new(),
-            cut,
-        };
         let scopes = outermost(scopes);
         if scopes
             .first()
@@ -603,7 +725,7 @@ impl Snapshot {
                 groups.entry(parent).or_default().insert(name);
             }
             for (parent, focus) in groups {
-                let result = self.scan_children(&mut scan, &root_dir, &parent, &focus);
+                let result = self.scan_children(scan, &root_dir, &parent, &focus);
                 scan.unless_denied(&parent, result)?;
             }
         }
@@ -612,7 +734,7 @@ impl Snapshot {
         if !stat_fd(again.as_fd())?.same_inode(&root_stat.id) {
             return Err(Error::RootReplaced);
         }
-        revalidate(again.as_fd(), scan.bindings)?;
+        revalidate(again.as_fd(), std::mem::take(&mut scan.bindings))?;
 
         let mut old = BTreeMap::new();
         for prefix in &scan.replaced {
@@ -623,6 +745,10 @@ impl Snapshot {
                     .map(|(path, entry)| (path.clone(), *entry)),
             );
         }
+        let left_out = match &scan.rules {
+            Some(rules) => take_left_out(&mut old, &scan.new, rules),
+            None => Vec::new(),
+        };
         let unreadable = std::mem::take(&mut scan.unreadable);
         for blocked in &unreadable {
             scan.new
@@ -642,22 +768,38 @@ impl Snapshot {
             &mut scan.new,
             &mut *scan.cut,
         )?;
-        let changes = diff(&old, &scan.new);
-        for path in old.keys() {
+        let mut changes = diff(&old, &scan.new);
+        for path in old.keys().chain(&left_out) {
             self.entries.remove(path);
         }
-        self.entries.extend(scan.new);
+        self.entries.append(&mut scan.new);
+        let (rules, read) = match scan.rules.take() {
+            Some(mut rules) => {
+                rules.settle();
+                find_ignored(&mut changes, &old, &mut rules, again.as_fd());
+                rules.finish(|dir| {
+                    self.entries
+                        .get(dir)
+                        .is_some_and(|entry| entry.kind == EntryKind::Dir)
+                })
+            }
+            None => (Vec::new(), Vec::new()),
+        };
         Ok(Rescan {
             changes,
             unsettled,
             unreadable,
             root: root_stat.id,
+            rules,
+            read,
         })
     }
 
     /// Rescans the children of the known folder `parent`: every name in
     /// `focus`, every listed name the snapshot does not know, and every known
-    /// child the listing no longer contains.
+    /// child the listing no longer contains. When the folder's rules file
+    /// changed, it rescans every child, because the change can include or
+    /// leave out anything below the folder.
     fn scan_children(
         &self,
         scan: &mut Scan<'_>,
@@ -674,10 +816,17 @@ impl Snapshot {
         };
         let dir = dir.as_fd();
         let mut names = list(dir)?;
+        let widen = match scan.read_rules(dir, parent, &names) {
+            RulesRead::Unknown => {
+                scan.unreadable.push(parent.to_path_buf());
+                return Ok(());
+            }
+            read => read == RulesRead::Changed,
+        };
         names.retain(|name| !private(parent, name));
         for name in &names {
             let child = parent.join(name);
-            if focus.contains(name) || !self.entries.contains_key(&child) {
+            if widen || focus.contains(name) || !self.entries.contains_key(&child) {
                 scan.replaced.push(child.clone());
                 scan.entry(dir, name, child)?;
             }
@@ -925,6 +1074,71 @@ fn open_attached(
     Ok(Some((dir, chain)))
 }
 
+/// Takes out of `old` every entry the rules now leave out, with everything
+/// below it, and returns their paths. Such an entry is still on disk, so it is
+/// neither a removal nor a disappearance to confirm.
+fn take_left_out(
+    old: &mut BTreeMap<PathBuf, Entry>,
+    new: &BTreeMap<PathBuf, Entry>,
+    rules: &Pending<'_>,
+) -> Vec<PathBuf> {
+    let mut left_out = Vec::new();
+    let mut folder: Option<PathBuf> = None;
+    old.retain(|path, entry| {
+        if !folder
+            .as_ref()
+            .is_some_and(|folder| path.starts_with(folder))
+        {
+            // The scan judged what it recorded, so only the rest is asked about.
+            if new.get(path).is_some_and(|after| after.kind == entry.kind)
+                || rules.status(path, entry.kind) == Ignored::No
+            {
+                return true;
+            }
+            folder = (entry.kind == EntryKind::Dir).then(|| path.clone());
+        }
+        left_out.push(path.clone());
+        false
+    });
+    left_out
+}
+
+/// Turns each removal whose entry now sits at or below an entry the rules
+/// leave out into [`Change::Ignored`] (design §5.10). A folder is looked for
+/// by its own identity. A removal the search does not find stands.
+fn find_ignored(
+    changes: &mut [Change],
+    old: &BTreeMap<PathBuf, Entry>,
+    rules: &mut Pending<'_>,
+    root: BorrowedFd<'_>,
+) {
+    let mut wanted: Wanted = changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::Removed { path, kind } => Some(((old[path].id, *kind), None)),
+            _ => None,
+        })
+        .collect();
+    if wanted.is_empty() {
+        return;
+    }
+    rules.find(root, &mut wanted);
+    for change in changes {
+        let Change::Removed { path, kind } = &*change else {
+            continue;
+        };
+        let (id, kind) = (old[path].id, *kind);
+        if let Some(Some(to)) = wanted.get(&(id, kind)) {
+            *change = Change::Ignored {
+                from: path.clone(),
+                to: to.clone(),
+                kind,
+                id,
+            };
+        }
+    }
+}
+
 /// Sorts the paths and drops every path inside another one.
 fn outermost(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
     paths.sort();
@@ -1047,6 +1261,12 @@ pub struct Poll {
     /// The identity of the root folder the scans of this poll opened, or
     /// `None` when the poll scanned nothing; see [`Rescan::root`].
     pub root: Option<FileId>,
+    /// The folders whose rules file the scans of this poll found changed, in
+    /// the order they found them; see [`Rescan::rules`].
+    pub rules: Vec<(PathBuf, Option<Vec<u8>>)>,
+    /// The folders whose rules the scans of this poll established and that no
+    /// later scan of the poll found unreadable; see [`Rescan::read`].
+    pub read: Vec<PathBuf>,
 }
 
 /// A source of changes under one root.
@@ -1086,8 +1306,16 @@ pub struct NativeWatcher {
     snapshot: Snapshot,
     dirty: BTreeSet<PathBuf>,
     unreadable: BTreeSet<PathBuf>,
-    /// Folders a scan could not read that no scan has read since. Their
-    /// subfolders may be unwatched, so they are registered again once readable.
+    rules: Option<Rules>,
+    /// The rules changes of the scans since the last poll returned.
+    changed_rules: Vec<(PathBuf, Option<Vec<u8>>)>,
+    /// The folders whose rules the scans since the last poll established.
+    read: BTreeSet<PathBuf>,
+    /// Folders whose subfolders may be unwatched, which are registered once a
+    /// scan has read them: the folders a scan could not read that no scan has
+    /// read since, the root while it waits for a scan to read the rules, a
+    /// folder a reset made known, which no scan reports as created, and a
+    /// folder that the rescan after a registration found.
     #[cfg(target_os = "linux")]
     blocked: BTreeSet<PathBuf>,
     rewatch: bool,
@@ -1104,16 +1332,38 @@ impl NativeWatcher {
     /// tree with `previous`; pass `Snapshot::default()` on a first run to have
     /// everything reported as created.
     pub fn start(root: impl AsRef<Path>, previous: Snapshot) -> Result<Self> {
+        Self::start_under(root.as_ref(), previous, None)
+    }
+
+    /// [`NativeWatcher::start`], leaving out what `rules` leave out. The scans
+    /// apply the rules, and an event below a left-out folder causes no rescan.
+    /// On Linux no folder at or below a left-out folder is watched. Which
+    /// folders those are is known once a scan has read the rules, so the
+    /// watcher scans the tree, registers the folders the rules include, and
+    /// scans once more for what changed before the watches existed.
+    pub fn start_with_rules(
+        root: impl AsRef<Path>,
+        previous: Snapshot,
+        rules: Rules,
+    ) -> Result<Self> {
+        Self::start_under(root.as_ref(), previous, Some(rules))
+    }
+
+    fn start_under(root: &Path, previous: Snapshot, rules: Option<Rules>) -> Result<Self> {
         let root = std::fs::canonicalize(root)?;
         let (sender, events) = mpsc::channel();
-        let watcher = watch_root(&root, &sender)?;
+        let deferred = cfg!(target_os = "linux") && rules.is_some();
+        let watcher = watch_root(&root, &sender, deferred)?;
         Ok(Self {
             root,
             snapshot: previous,
             dirty: BTreeSet::from([PathBuf::new()]),
             unreadable: BTreeSet::new(),
             #[cfg(target_os = "linux")]
-            blocked: BTreeSet::new(),
+            blocked: BTreeSet::from_iter(deferred.then(PathBuf::new)),
+            rules,
+            changed_rules: Vec::new(),
+            read: BTreeSet::new(),
             rewatch: false,
             failed: None,
             sender,
@@ -1137,7 +1387,15 @@ impl NativeWatcher {
         }
         for path in event.paths {
             let rel = path.strip_prefix(&self.root).unwrap_or(Path::new(""));
-            self.dirty.insert(rel.to_path_buf());
+            // An event for a left-out entry of an included folder is kept: the
+            // rescan of that folder records the name as left out.
+            let below_left_out = self.rules.as_ref().is_some_and(|rules| {
+                rel.parent()
+                    .is_some_and(|parent| rules.status(parent, EntryKind::Dir) != Ignored::No)
+            });
+            if !below_left_out {
+                self.dirty.insert(rel.to_path_buf());
+            }
         }
         Ok(())
     }
@@ -1170,7 +1428,8 @@ impl NativeWatcher {
 
     /// Registers watches on the folders the changes created or moved, and on
     /// the blocked folders that became `readable`, then rescans them, so
-    /// anything written before the watch existed is seen. A rescan that opens
+    /// anything written before the watch existed is seen. With rules, it
+    /// registers no folder they leave out. A rescan that opens
     /// another root folder than `root`, the one the changes came from, fails
     /// the watcher with [`Error::RootReplaced`], returns nothing and leaves
     /// the snapshot as it was.
@@ -1203,20 +1462,51 @@ impl NativeWatcher {
         }
         for dir in &dirs {
             let path = self.root.join(dir);
-            if let Err(err) = watch_tree(&mut self.watcher, &path)
+            let registered = match &self.rules {
+                Some(rules) => watch_each(&mut self.watcher, &path, &|folder| {
+                    folder
+                        .strip_prefix(&self.root)
+                        .is_ok_and(|rel| rules.status(rel, EntryKind::Dir) == Ignored::No)
+                }),
+                None => watch_tree(&mut self.watcher, &path),
+            };
+            if let Err(err) = registered
                 && !gone(&path)
             {
                 self.failed = Some(watch_error(err));
             }
         }
-        match self
-            .snapshot
-            .rescan_with(&self.root, dirs.iter().cloned(), Some(root), &mut |_| {})
-        {
+        match self.snapshot.rescan_under(
+            &self.root,
+            dirs.iter().cloned(),
+            Some(root),
+            self.rules.as_mut(),
+            &mut |_| {},
+        ) {
             Ok(rescan) => {
+                // A folder this rescan found was not there when the folders
+                // were registered, or the rules as they were then left it
+                // out. The next poll rescans it and registers it.
+                let found = rescan.changes.iter().filter_map(|change| match change {
+                    Change::Created {
+                        path,
+                        kind: EntryKind::Dir,
+                    }
+                    | Change::Renamed {
+                        to: path,
+                        kind: EntryKind::Dir,
+                        ..
+                    } => Some(path.clone()),
+                    _ => None,
+                });
+                for dir in outermost(found.collect()) {
+                    self.blocked.insert(dir.clone());
+                    self.dirty.insert(dir);
+                }
+                self.changed_rules.extend(rescan.rules);
                 self.dirty.extend(rescan.unsettled);
                 self.blocked.extend(rescan.unreadable.iter().cloned());
-                self.unreadable.extend(rescan.unreadable);
+                self.learn(rescan.read, &rescan.unreadable);
                 rescan.changes
             }
             Err(Error::Changed) => {
@@ -1233,23 +1523,47 @@ impl NativeWatcher {
 
 impl NativeWatcher {
     /// What a poll returns once it has `changes` from a scan of `root`: the
-    /// scopes still dirty, and the folders its scans could not read.
+    /// scopes still dirty, and the folders its scans could not read or read.
     fn report(&mut self, changes: Vec<Change>, root: Option<FileId>) -> Poll {
         Poll {
             changes,
             pending: self.dirty.iter().cloned().collect(),
             unreadable: std::mem::take(&mut self.unreadable).into_iter().collect(),
             root,
+            rules: std::mem::take(&mut self.changed_rules),
+            read: std::mem::take(&mut self.read).into_iter().collect(),
+        }
+    }
+
+    /// Takes in which folders a scan read and which it could not read. The
+    /// later scan decides for a folder that two scans of a poll judged.
+    fn learn(&mut self, read: Vec<PathBuf>, unreadable: &[PathBuf]) {
+        for dir in read {
+            self.unreadable.remove(&dir);
+            self.read.insert(dir);
+        }
+        for dir in unreadable {
+            self.read.remove(dir);
+            self.unreadable.insert(dir.clone());
         }
     }
 }
 
+/// Starts a platform watcher on `root` and everything below it, or, when the
+/// folders below it are `deferred` to [`NativeWatcher::cover`], on the root
+/// folder alone.
 fn watch_root(
     root: &Path,
     sender: &mpsc::Sender<notify::Result<notify::Event>>,
+    deferred: bool,
 ) -> Result<RecommendedWatcher> {
     let mut watcher = notify::recommended_watcher(sender.clone()).map_err(watch_error)?;
-    watch_tree(&mut watcher, root).map_err(watch_error)?;
+    if deferred {
+        notify::Watcher::watch(&mut watcher, root, RecursiveMode::NonRecursive)
+    } else {
+        watch_tree(&mut watcher, root)
+    }
+    .map_err(watch_error)?;
     Ok(watcher)
 }
 
@@ -1263,14 +1577,24 @@ fn watch_root(
 /// checked again and is gone; if `path` itself is gone, the error is returned.
 fn watch_tree<W: notify::Watcher>(watcher: &mut W, path: &Path) -> notify::Result<()> {
     match watcher.watch(path, RecursiveMode::Recursive) {
-        Err(err) if refused(&err) || (vanished(&err) && !gone(path)) => watch_each(watcher, path),
+        Err(err) if refused(&err) || (vanished(&err) && !gone(path)) => {
+            watch_each(watcher, path, &|_| true)
+        }
         other => other,
     }
 }
 
 /// Registers `path` and every folder below it one at a time, skipping a
-/// folder that may not be watched or that is gone.
-fn watch_each<W: notify::Watcher>(watcher: &mut W, path: &Path) -> notify::Result<()> {
+/// folder that may not be watched or that is gone, and a folder `keep`
+/// refuses with everything below it.
+fn watch_each<W: notify::Watcher>(
+    watcher: &mut W,
+    path: &Path,
+    keep: &dyn Fn(&Path) -> bool,
+) -> notify::Result<()> {
+    if !keep(path) {
+        return Ok(());
+    }
     match watcher.watch(path, RecursiveMode::NonRecursive) {
         Err(err) if refused(&err) || (vanished(&err) && gone(path)) => return Ok(()),
         other => other?,
@@ -1286,7 +1610,7 @@ fn watch_each<W: notify::Watcher>(watcher: &mut W, path: &Path) -> notify::Resul
         let entry = entry.map_err(|err| notify::Error::io(err).add_path(path.to_path_buf()))?;
         let folder = entry.path();
         match entry.file_type() {
-            Ok(kind) if kind.is_dir() => watch_each(watcher, &folder)?,
+            Ok(kind) if kind.is_dir() => watch_each(watcher, &folder, keep)?,
             Ok(_) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound && gone(&folder) => {}
             Err(err) => return Err(notify::Error::io(err).add_path(folder)),
@@ -1337,22 +1661,41 @@ impl Watcher for NativeWatcher {
             }
             let settle_until = Instant::now() + MAX_SETTLE;
             while Instant::now() < settle_until && self.receive(SETTLE)? {}
+            if self.rules.is_some() && self.dirty.is_empty() {
+                // Every event of the batch lay below a left-out folder. Such
+                // events can keep coming, so they must not hold the poll
+                // past its deadline.
+                if Instant::now() >= deadline {
+                    return Ok(self.report(Vec::new(), root));
+                }
+                continue;
+            }
             if self.rewatch {
-                self.watcher = watch_root(&self.root, &self.sender)?;
+                let deferred = cfg!(target_os = "linux") && self.rules.is_some();
+                self.watcher = watch_root(&self.root, &self.sender, deferred)?;
+                #[cfg(target_os = "linux")]
+                self.blocked.extend(deferred.then(PathBuf::new));
                 self.rewatch = false;
             }
             let scopes: Vec<PathBuf> = self.dirty.iter().cloned().collect();
-            let rescan = match self.snapshot.rescan(&self.root, scopes.iter().cloned()) {
+            let rescan = match self.snapshot.rescan_under(
+                &self.root,
+                scopes.iter().cloned(),
+                None,
+                self.rules.as_mut(),
+                &mut |_| {},
+            ) {
                 Ok(rescan) => rescan,
                 Err(Error::Changed) if Instant::now() < deadline => continue,
                 Err(Error::Changed) => return Ok(self.report(Vec::new(), root)),
                 Err(err) => return Err(err),
             };
             root = Some(rescan.root);
+            self.changed_rules.extend(rescan.rules);
             self.dirty = rescan.unsettled.into_iter().collect();
             #[cfg(target_os = "linux")]
             let readable = self.unblock(&scopes, &rescan.unreadable);
-            self.unreadable.extend(rescan.unreadable);
+            self.learn(rescan.read, &rescan.unreadable);
             let changes = rescan.changes;
             #[cfg(target_os = "linux")]
             let changes = {
@@ -1361,7 +1704,7 @@ impl Watcher for NativeWatcher {
                 changes.extend(more);
                 changes
             };
-            if !changes.is_empty() || Instant::now() >= deadline {
+            if !changes.is_empty() || !self.changed_rules.is_empty() || Instant::now() >= deadline {
                 return Ok(self.report(changes, root));
             }
         }
@@ -1372,6 +1715,12 @@ impl Watcher for NativeWatcher {
     }
 
     fn reset(&mut self, scope: &Path, known: BTreeMap<PathBuf, Known>) {
+        #[cfg(target_os = "linux")]
+        if scope.as_os_str().is_empty()
+            || (known.get(scope)).is_some_and(|known| known.kind == EntryKind::Dir)
+        {
+            self.blocked.insert(scope.to_path_buf());
+        }
         self.snapshot.reset(scope, known);
         self.dirty.insert(scope.to_path_buf());
     }
@@ -1383,6 +1732,7 @@ pub struct RescanWatcher {
     root: PathBuf,
     snapshot: Snapshot,
     interval: Duration,
+    rules: Option<Rules>,
 }
 
 impl RescanWatcher {
@@ -1391,6 +1741,21 @@ impl RescanWatcher {
             root: std::fs::canonicalize(root)?,
             snapshot: previous,
             interval,
+            rules: None,
+        })
+    }
+
+    /// [`RescanWatcher::new`], with scans that leave out what `rules` leave
+    /// out.
+    pub fn with_rules(
+        root: impl AsRef<Path>,
+        previous: Snapshot,
+        interval: Duration,
+        rules: Rules,
+    ) -> Result<Self> {
+        Ok(Self {
+            rules: Some(rules),
+            ..Self::new(root, previous, interval)?
         })
     }
 }
@@ -1399,12 +1764,21 @@ impl Watcher for RescanWatcher {
     fn poll(&mut self, timeout: Duration) -> Result<Poll> {
         let deadline = Instant::now() + timeout;
         loop {
-            let poll = match self.snapshot.rescan(&self.root, [PathBuf::new()]) {
+            let rescan = self.snapshot.rescan_under(
+                &self.root,
+                [PathBuf::new()],
+                None,
+                self.rules.as_mut(),
+                &mut |_| {},
+            );
+            let poll = match rescan {
                 Ok(rescan) => Poll {
                     changes: rescan.changes,
                     pending: rescan.unsettled,
                     unreadable: rescan.unreadable,
                     root: Some(rescan.root),
+                    rules: rescan.rules,
+                    read: rescan.read,
                 },
                 Err(Error::Changed) => Poll {
                     pending: vec![PathBuf::new()],
@@ -1413,7 +1787,7 @@ impl Watcher for RescanWatcher {
                 Err(err) => return Err(err),
             };
             let left = deadline.saturating_duration_since(Instant::now());
-            if !poll.changes.is_empty() || left.is_zero() {
+            if !poll.changes.is_empty() || !poll.rules.is_empty() || left.is_zero() {
                 return Ok(poll);
             }
             std::thread::sleep(self.interval.min(left));
@@ -1434,6 +1808,7 @@ fn watch_error(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Erro
 }
 
 mod effect;
+mod ignore;
 mod recovered;
 mod resolve;
 mod root;
@@ -1444,6 +1819,8 @@ mod trash;
 pub use effect::{
     Action, Contents, Displaced, Effect, Outcome, QUARANTINE_DIR, Reason, STAGING_DIR, Step,
 };
+pub use ignore::{Ignore, Ignored, RULES_FILE, Rules};
+use ignore::{Pending, RulesRead, Wanted};
 pub use recovered::recovered_name;
 pub use resolve::{Base, Dir, Folder, Location, PARKED_DIR, Space, Unresolved};
 pub use root::{

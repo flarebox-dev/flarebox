@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use flarebox_engine::ignore::LocalRules;
 use flarebox_fs::{Marker, probe_no_replace, read_marker, write_marker};
+use flarebox_ignore::LocalRulesError;
 use flarebox_net::{ApiError, Auth};
 use flarebox_proto::v1::{ClaimRequest, DeviceCredentials, PairCompleteRequest, SpaceInfo};
 use flarebox_store::{GivenAnswer, Link, Store, StoredQuestion};
@@ -19,7 +21,7 @@ use crate::claim::{self, Flock, Owner};
 use crate::config::{Config, ConfigError};
 use crate::credential::{Credential, CredentialError, NewCredentialFile, api_for};
 use crate::folder::FolderTask;
-use crate::ignore::{IgnoreInput, Matcher, RuleFile, RuleSource, matcher};
+use crate::ignore::{Matcher, local_rules, matcher};
 use crate::paths::{Paths, PathsError};
 use crate::question::{Answer, Question};
 use crate::restore::{self, RestoreRequest, RestoreStatus};
@@ -139,6 +141,8 @@ struct Inner {
     paths: Paths,
     _lock: Flock,
     matcher: Arc<dyn Matcher>,
+    /// The `[sync]` list that `matcher` applies, for the engine of each folder.
+    local: LocalRules,
     /// Held for the whole of a pair, claim, sign-out, link or unlink, so one runs at a time: a sign-out waits for a
     /// claim or a link in flight and then undoes it, and a credential the server issued is always stored.
     lifecycle: tokio::sync::Mutex<()>,
@@ -253,18 +257,12 @@ impl Driver {
             return Err(DriverError::Busy(lock_path));
         };
         let config = Config::load(&paths.config_file)?;
-        let lines = config.sync.lines().expect("Config::load checked the rules");
-        let mut input = IgnoreInput::default();
-        if !lines.is_empty() {
-            tracing::warn!(
-                "the [sync] rules of the configuration are read, but no matcher applies them yet (GUN-270)"
-            );
-            input.files.push(RuleFile {
-                dir: PathBuf::new(),
-                source: RuleSource::Device,
-                lines,
-            });
-        }
+        let invalid = |error: LocalRulesError| ConfigError::Invalid {
+            path: paths.config_file.clone(),
+            reason: error.to_string(),
+        };
+        let local = local_rules(&config.sync).map_err(invalid)?;
+        let matcher = matcher(&config.sync).map_err(invalid)?;
         let credential = Credential::load(&paths.credential())?;
         if credential.is_some() {
             Credential::keep_out_of_backups(&paths.credential())?;
@@ -272,7 +270,8 @@ impl Driver {
         let folders = load_folders(&paths)?;
         Ok(Driver {
             inner: Arc::new(Inner {
-                matcher: matcher(&input),
+                matcher,
+                local,
                 paths,
                 _lock: lock,
                 lifecycle: tokio::sync::Mutex::new(()),
@@ -905,6 +904,7 @@ impl Driver {
             auth: Arc::new(Auth::new(api, credential.net())),
             status: folder.status.clone(),
             matcher: self.inner.matcher.clone(),
+            local: self.inner.local.clone(),
             private_dirs: self.inner.paths.private_dirs(),
             linked,
             owner: Owner {

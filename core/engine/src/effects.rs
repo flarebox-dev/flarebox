@@ -8,6 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::classify::{Class, Trees};
 use crate::ids::IdGen;
+use crate::ignore::is_rules_file;
+
 use crate::names::name_key;
 use crate::state::{EffectsState, StateError};
 use crate::tree::{Content, FileIdentity, Kind, LocalNode, NodeId, Shape, same_content};
@@ -201,17 +203,54 @@ impl Effects {
     /// A parked node with a local change, such as an edit observed in the parked directory, is
     /// only moved out: to its R position, or to the position L keeps for it when R has none. Its
     /// content is never replaced or removed, so the change is planned like any other local one.
+    ///
+    /// An excluded node ([`Trees::excluded`]) gets no effect and is never parked, and neither is a
+    /// node whose own place an excluded node holds. A parked node that the rules now leave out is
+    /// only moved back to the position L keeps for it, and nothing is planned while the rules are
+    /// unknown ([`Trees::rules_known`]), or for a node below a folder whose rules are unknown
+    /// ([`Trees::held`]). A `.fbignore` file that R
+    /// holds and the disk does not yet is written before any other effect below its folder
+    /// (section 5.10). The driver reads the rules of a rules file it wrote and passes them to
+    /// [`Trees::set_rules`] before it asks for the next effect, so the rules are in force before
+    /// the nodes they cover arrive.
     pub fn plan(&mut self, trees: &Trees, ids: &mut IdGen, now_ms: u64) -> Option<&EffectRecord> {
-        if self.in_flight.is_some() {
+        if self.in_flight.is_some() || !trees.rules_known() {
             return None;
         }
         self.failed
             .retain(|id, _| candidate(trees, id) || trees.waiting().contains_key(id));
         let view = View::new(trees);
+        let writes_rules = |id: &str| {
+            let remote = trees.remote().live(id)?;
+            (remote.kind == Kind::File && is_rules_file(&remote.name))
+                .then_some(remote.parent.as_str())
+        };
+        let gates: BTreeSet<&str> = (trees.dirty().iter())
+            .filter_map(|id| writes_rules(id).filter(|_| candidate(trees, id)))
+            .collect();
+        let gated = |id: &str| {
+            let parent = |id: &str| {
+                let remote = trees.remote().live(id);
+                let shape = remote.or(trees.local().get(id).map(|node| &node.shape))?;
+                Some(shape.parent.as_str())
+            };
+            let mut above = parent(id);
+            if writes_rules(id).is_some() {
+                above = above.and_then(parent);
+            }
+            for _ in 0..=trees.remote().len() + trees.local().len() {
+                match above {
+                    Some(dir) if gates.contains(dir) => return true,
+                    Some(dir) => above = parent(dir),
+                    None => return false,
+                }
+            }
+            false
+        };
         let mut blockers = BTreeSet::new();
         let mut chosen = None;
         for id in trees.dirty() {
-            if !candidate(trees, id) {
+            if !candidate(trees, id) || trees.held(id) || (!gates.is_empty() && gated(id)) {
                 continue;
             }
             match view.step(id) {
@@ -230,7 +269,10 @@ impl Effects {
             blockers.into_iter().find_map(|id| {
                 let waiting = trees.waiting().contains_key(&id);
                 if !(candidate(trees, &id) || waiting)
+                    || trees.excluded(&id)
+                    || trees.held(&id)
                     || trees.local().get(&id).is_none_or(|node| node.parked)
+                    || view.stuck(&id, trees.local().len())
                 {
                     return None;
                 }
@@ -331,15 +373,16 @@ impl Effects {
 /// A node the planner considers: one whose only change is remote, one that is parked, one whose
 /// local position is reverted, or one whose S update waits and that R no longer has. A reverted or
 /// waiting node that R no longer has is removed only when it holds no unuploaded edit; otherwise
-/// the commit layer makes it a new node, so the edit is uploaded.
+/// the commit layer makes it a new node, so the edit is uploaded. An excluded node is never one.
 fn candidate(trees: &Trees, id: &str) -> bool {
-    remote_only(trees, id)
+    let changed = remote_only(trees, id)
         || trees.local().get(id).is_some_and(|node| node.parked)
         || (trees.reverted().contains(id)
             && (trees.remote().live(id).is_some() || !trees.edited(id)))
         || (trees.waiting().contains_key(id)
             && trees.remote().live(id).is_none()
-            && !trees.edited(id))
+            && !trees.edited(id));
+    changed && !trees.excluded(id)
 }
 
 /// Whether the node's only change is remote. While its S update waits, [`Class::Remote`] means L
@@ -379,6 +422,9 @@ impl<'a> View<'a> {
     fn step(&self, id: &str) -> Step {
         let local = self.trees.local().get(id);
         let remote = self.trees.remote().live(id);
+        if let Some(local) = local.filter(|local| local.parked && self.trees.ignored(id)) {
+            return self.unpark(id, local, &local.shape);
+        }
         let (local, remote) = match (local, remote) {
             (None, None) => return Step::Skip,
             (Some(local), None)
@@ -537,7 +583,8 @@ impl<'a> View<'a> {
                 _ => return Some(Step::Blocked(None)),
             }
             if self.inside(&remote.parent, id) {
-                return Some(Step::Blocked(Some(id.to_owned())));
+                let stays = self.held_by_excluded(&remote.parent, id);
+                return Some(Step::Blocked((!stays).then(|| id.to_owned())));
             }
         }
         let key = name_key(&remote.name);
@@ -554,6 +601,37 @@ impl<'a> View<'a> {
                         .is_some_and(|node| name_key(&node.shape.name) == key)
             })
             .map(|holder| Step::Blocked(Some((*holder).to_owned())))
+    }
+
+    /// True when an excluded node is on the way up from `inner` to `id`, which holds it on disk.
+    /// No effect moves an excluded node, so parking `id` would never let it move into `inner`.
+    fn held_by_excluded(&self, inner: &str, id: &str) -> bool {
+        let mut current = inner;
+        for _ in 0..=self.trees.local().len() {
+            if current == id {
+                return false;
+            }
+            if self.trees.excluded(current) {
+                return true;
+            }
+            match self.trees.local().get(current) {
+                Some(node) => current = &node.shape.parent,
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// True when `id` could not leave the parked directory again: the name it moves to is held by
+    /// an excluded node, whose local copy no effect moves, or by a node that is stuck the same way.
+    /// Parking it would hide it for as long as the rules stay as they are.
+    fn stuck(&self, id: &str, depth: usize) -> bool {
+        match self.step(id) {
+            Step::Blocked(Some(holder)) if holder != id => {
+                self.trees.excluded(&holder) || (depth > 0 && self.stuck(&holder, depth - 1))
+            }
+            _ => false,
+        }
     }
 
     /// True when `ancestor` is `id` or holds it on disk.

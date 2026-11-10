@@ -573,6 +573,7 @@ dependencies = [
  "flarebox-chunk",
  "flarebox-engine",
  "flarebox-fs",
+ "flarebox-ignore",
  "flarebox-net",
  "flarebox-proto",
  "flarebox-sim",
@@ -595,6 +596,7 @@ dependencies = [
 name = "flarebox-engine"
 version = "0.0.0"
 dependencies = [
+ "flarebox-ignore",
  "flarebox-proto",
  "proptest",
  "prost",
@@ -622,6 +624,8 @@ dependencies = [
 name = "flarebox-fs"
 version = "0.0.0"
 dependencies = [
+ "flarebox-engine",
+ "flarebox-ignore",
  "notify",
  "rustix",
  "serde",

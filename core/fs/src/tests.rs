@@ -370,6 +370,8 @@ fn sibling_recreated_after_its_parent_was_listed_publishes_no_removal() {
                 unsettled: vec![],
                 unreadable: vec![],
                 root: root_id(&root),
+                rules: vec![],
+                read: vec![],
             },
             "{paths:?}"
         );
@@ -692,6 +694,61 @@ fn new_folders_are_registered_before_their_rescan() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn folders_included_by_the_registration_rescan_keep_watch_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir(root.join("ig")).unwrap();
+    fs::write(root.join(RULES_FILE), "ig\n").unwrap();
+    fs::write(root.join("ig/file.txt"), "before").unwrap();
+    let rules = Rules::new(Box::new(Lines::default()));
+    let mut watcher = NativeWatcher::start_with_rules(&root, Snapshot::default(), rules).unwrap();
+    let mut remove = Some(root.join(RULES_FILE));
+    watcher.before_register = Some(Box::new(move || {
+        if let Some(path) = remove.take() {
+            fs::remove_file(path).unwrap();
+        }
+    }));
+
+    let first = watcher.poll(Duration::ZERO).unwrap();
+    watcher.before_register = None;
+    assert_eq!(
+        first.rules,
+        [
+            (PathBuf::new(), Some(b"ig\n".to_vec())),
+            (PathBuf::new(), None),
+        ]
+    );
+    assert!(first.changes.contains(&created("ig", EntryKind::Dir)));
+    assert!(
+        first
+            .changes
+            .contains(&created("ig/file.txt", EntryKind::File))
+    );
+    assert!(
+        watcher
+            .poll(Duration::from_millis(150))
+            .unwrap()
+            .changes
+            .is_empty()
+    );
+
+    fs::write(root.join("ig/file.txt"), "after the rules were removed").unwrap();
+    let expected = Change::Modified {
+        path: "ig/file.txt".into(),
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut seen = Vec::new();
+    while Instant::now() < deadline && !seen.contains(&expected) {
+        seen.extend(watcher.poll(Duration::from_millis(100)).unwrap().changes);
+    }
+    assert!(
+        seen.contains(&expected),
+        "the write inside the newly included folder was not reported; saw {seen:?}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn a_new_folder_that_vanishes_before_its_watch_is_not_a_watch_failure() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
@@ -883,4 +940,118 @@ fn nothing_is_recovered_from_a_folder_moved_out_of_the_root() {
         .map(|entry| entry.unwrap().file_name())
         .collect();
     assert_eq!(names, [PRIVATE_DIR]);
+}
+
+/// A matcher whose rules files name, one per line, the entries their folder
+/// leaves out. It shares the rules it was given with the test.
+#[derive(Clone, Default)]
+struct Lines(std::sync::Arc<std::sync::Mutex<BTreeMap<PathBuf, Vec<u8>>>>);
+
+impl Ignore for Lines {
+    fn set_rules(&mut self, dir: &Path, rules: Option<&[u8]>) {
+        let mut given = self.0.lock().unwrap();
+        match rules {
+            Some(rules) => given.insert(dir.to_path_buf(), rules.to_vec()),
+            None => given.remove(dir),
+        };
+    }
+
+    fn status(&self, path: &Path, _: EntryKind) -> Ignored {
+        let given = self.0.lock().unwrap();
+        let mut dir = PathBuf::new();
+        for name in path {
+            let left_out = given.get(&dir).is_some_and(|rules| {
+                rules
+                    .split(|byte| *byte == b'\n')
+                    .any(|line| line == name.as_bytes())
+            });
+            if left_out {
+                return Ignored::Rule;
+            }
+            dir.push(name);
+        }
+        Ignored::No
+    }
+
+    fn key(&self, name: &OsStr) -> OsString {
+        name.to_os_string()
+    }
+}
+
+/// The scan reads the changed rules of the root and of `a` and then fails in
+/// `m`. Both rules files must count as unread, for the matcher and for the
+/// next scan, which reports them.
+#[test]
+fn a_failed_scan_leaves_the_rules_as_they_were() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("space");
+    for (path, body) in [
+        (".fbignore", "ig\n"),
+        ("a/.fbignore", "long-name\n"),
+        ("a/long-name", "x"),
+        ("a/y", "y"),
+        ("ig/f", "f"),
+        ("m/f", "f"),
+        ("z/f", "f"),
+    ] {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+    let matcher = Lines::default();
+    let mut rules = Rules::new(Box::new(matcher.clone()));
+    let mut snapshot = Snapshot::scan_with_rules(&root, &mut rules).unwrap();
+    let before = snapshot.clone();
+    let given = matcher.0.lock().unwrap().clone();
+    assert_eq!(given.len(), 2);
+
+    fs::write(root.join(".fbignore"), "z\n").unwrap();
+    fs::write(root.join("a/.fbignore"), "y\n").unwrap();
+    let result = snapshot.rescan_under(
+        &root,
+        [PathBuf::new()],
+        None,
+        Some(&mut rules),
+        &mut |cut| {
+            if let Cut::OpeningDir(path) = cut
+                && path == Path::new("m")
+            {
+                assert_ne!(*matcher.0.lock().unwrap(), given);
+                fs::rename(root.join("m"), root.join("m-old")).unwrap();
+                fs::create_dir(root.join("m")).unwrap();
+            }
+        },
+    );
+    assert!(matches!(result, Err(Error::Changed)), "{result:?}");
+    assert_eq!(snapshot, before);
+    assert_eq!(*matcher.0.lock().unwrap(), given);
+    assert_eq!(rules.status(Path::new("ig"), EntryKind::Dir), Ignored::Rule);
+    assert_eq!(rules.status(Path::new("z"), EntryKind::Dir), Ignored::No);
+
+    fs::remove_dir(root.join("m")).unwrap();
+    fs::rename(root.join("m-old"), root.join("m")).unwrap();
+    let rescan = snapshot
+        .rescan_with_rules(&root, [PathBuf::new()], &mut rules)
+        .unwrap();
+    assert_eq!(
+        rescan.rules,
+        [
+            (PathBuf::new(), Some(b"z\n".to_vec())),
+            (PathBuf::from("a"), Some(b"y\n".to_vec())),
+        ]
+    );
+    assert_eq!(
+        rescan.changes,
+        [
+            created("a/long-name", EntryKind::File),
+            created("ig", EntryKind::Dir),
+            created("ig/f", EntryKind::File),
+            Change::Modified {
+                path: ".fbignore".into()
+            },
+            Change::Modified {
+                path: "a/.fbignore".into()
+            },
+        ]
+    );
 }

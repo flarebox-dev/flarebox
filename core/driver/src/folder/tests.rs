@@ -11,14 +11,16 @@ use std::time::Instant;
 
 use flarebox_engine::restore::{Outcome, RestoreIntent};
 use flarebox_engine::tree::{Kind, LocalNode, Tree};
-use flarebox_fs::{Marker, RootProblem, write_marker};
+use flarebox_fs::{EntryKind, Marker, RootProblem, write_marker};
 use flarebox_net::Committed;
 use flarebox_proto::v1::{ListTree, ListVersions, Op, PrepareUpload, Resume, chunk_plan, op};
 use flarebox_sim::space::{Role, Session as Caller, SpaceDo};
 
 use super::*;
+use crate::config::SyncRules;
 use crate::disk::tests::{Server, ready};
-use crate::ignore::Unfiltered;
+use crate::ignore::{local_rules, matcher};
+use crate::observe::Observed;
 
 const NOW: i64 = 1_700_000_000_000;
 
@@ -165,16 +167,22 @@ impl Site {
     /// Starts the folder as the task does once it holds the lock: the store, the engine, the disk, and the observer
     /// from L's snapshot.
     fn start(&self) -> Device {
+        self.start_with(&SyncRules::default())
+    }
+
+    /// [`Site::start`] on a device with a `[sync]` list.
+    fn start_with(&self, sync: &SyncRules) -> Device {
         let lock = claim::lock(&self.root)
             .unwrap()
             .expect("the folder is not locked");
-        let folder = Folder::open(self.link.clone(), &lock, &self.db).unwrap();
+        let local = local_rules(sync).unwrap();
+        let folder = Folder::open(self.link.clone(), &lock, &self.db, local).unwrap();
         let observer = FsObserver::start(
             &self.root,
             &self.link.space_id,
             self.link.root_dev,
             folder.snapshot(),
-            Arc::new(Unfiltered),
+            matcher(sync).unwrap(),
         )
         .unwrap();
         Device {
@@ -240,13 +248,11 @@ impl Device {
     /// One pass of the observer's thread. Returns the folders its batch could not read.
     fn try_scan(&mut self, wait: Duration) -> Result<Vec<PathBuf>, Stop> {
         let sections = self.folder.sections();
-        self.observer.reset(sections.take_resets());
-        let stamp = sections.stamp();
         let mut unreadable = Vec::new();
-        if let Some(observation) = self.observer.observe(wait).unwrap() {
-            unreadable.clone_from(&observation.unreadable);
+        if let Some(batch) = sections.observe(&mut self.observer, wait).unwrap() {
+            unreadable.clone_from(&batch.observation.unreadable);
             let entries = self.observer.snapshot().entries.len() as u64;
-            let step = self.folder.observed(Batch { stamp, observation }, entries);
+            let step = self.folder.observed(batch, entries);
             self.take(step)?;
         }
         if !self.folder.scanned && self.observer.scanned().is_some() {
@@ -1585,6 +1591,311 @@ fn a_folder_with_a_queued_restore_is_not_up_to_date() {
     assert_eq!(a.state(), FolderState::CatchingUp);
 }
 
+#[test]
+fn the_device_list_narrows_what_is_downloaded_and_what_is_uploaded() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("notes.txt"), b"notes");
+    a.create(&mut remote, &site_a.root.join("debug.log"), b"log of a");
+
+    let sync = SyncRules {
+        include: Vec::new(),
+        exclude: vec!["*.log".into()],
+    };
+    let site = Site::new(&remote, "b");
+    let mut b = site.start_with(&sync);
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    assert_eq!(b.run(&mut remote), ["list", "subscribe", "stage"]);
+    assert_eq!(names(&site.root), ["notes.txt"]);
+
+    fs::write(site.root.join("mine.log"), b"log of b").unwrap();
+    b.settle();
+    assert!(b.work.is_empty() && b.sent.is_empty());
+    assert_eq!(remote.names(), ["debug.log", "notes.txt"]);
+    assert_eq!(
+        b.state(),
+        FolderState::UpToDate,
+        "what the device leaves out does not keep the folder catching up"
+    );
+}
+
+#[test]
+fn a_downloaded_rules_file_is_in_force_before_anything_else_is_planned() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("cache.tmp"), b"cache");
+    a.create(&mut remote, &site_a.root.join(".fbignore"), b"*.tmp\n");
+
+    let site = Site::new(&remote, "b");
+    let mut b = site.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    assert_eq!(b.run(&mut remote), ["list", "subscribe", "stage"]);
+    assert_eq!(names(&site.root), [".fbignore"]);
+    assert!(b.folder.disk.awaits_rules());
+    assert_eq!(b.state(), FolderState::CatchingUp);
+
+    b.scan_until(|b| !b.folder.disk.awaits_rules());
+    assert!(
+        b.run(&mut remote).is_empty(),
+        "the rules leave cache.tmp out"
+    );
+    b.settle();
+    assert!(b.work.is_empty() && b.sent.is_empty());
+    assert_eq!(names(&site.root), [".fbignore"]);
+    assert_eq!(remote.names(), [".fbignore", "cache.tmp"]);
+    assert_eq!(b.state(), FolderState::UpToDate);
+}
+
+/// After a restart the scan cannot read a rules file over the size limit, and no earlier scan of this run read it, so
+/// what it leaves out is unknown. Nothing below its folder is planned: the excluded log keeps this device's bytes, and
+/// the new file waits too. Once the file can be read, the log stays out and the new file arrives.
+#[test]
+fn a_rules_file_a_restart_cannot_read_holds_everything_below_its_folder() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("build.log"), b"v1");
+    let (site, mut b) = linked(&mut remote, "b");
+    let (site_c, mut c) = linked(&mut remote, "c");
+    a.create(&mut remote, &site_a.root.join(".fbignore"), b"*.log\n");
+    b.pull(&remote);
+    assert_eq!(b.run(&mut remote), ["stage"]);
+    b.scan_until(|b| !b.folder.disk.awaits_rules());
+    assert!(b.run(&mut remote).is_empty());
+    drop(b);
+    fs::write(site.root.join(".fbignore"), "*.log\n".repeat(200_000)).unwrap();
+    a.create(&mut remote, &site_a.root.join("notes.txt"), b"notes");
+    c.create(&mut remote, &site_c.root.join("build.log"), b"v2 from c");
+
+    let mut b = site.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    assert_eq!(b.run(&mut remote), ["subscribe"]);
+    assert_eq!(fs::read(site.root.join("build.log")).unwrap(), b"v1");
+    assert_eq!(names(&site.root), [".fbignore", "build.log"]);
+
+    fs::write(site.root.join(".fbignore"), "*.log\n").unwrap();
+    b.scan_until(|b| !b.work.is_empty());
+    assert_eq!(b.run(&mut remote), ["stage"]);
+    b.settle();
+    assert!(b.run(&mut remote).is_empty());
+    assert_eq!(names(&site.root), [".fbignore", "build.log", "notes.txt"]);
+    assert_eq!(fs::read(site.root.join("build.log")).unwrap(), b"v1");
+    assert!(b.work.is_empty() && b.sent.is_empty());
+}
+
+/// A restart cannot read the rules file of `proj`, so what is below it is held. The user renames the folder to `PROJ`
+/// and fixes the file, and the rules are known again under the new spelling. Renamed back, the folder is not held:
+/// the hold is by `name_key`, as the rules are, so a later remote edit arrives.
+#[test]
+fn the_rules_hold_of_a_folder_ends_also_after_it_was_renamed_only_in_case() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site_a.root.join("proj")).unwrap();
+    a.create(&mut remote, &site_a.root.join("proj/file.txt"), b"v1");
+    a.create(&mut remote, &site_a.root.join("proj/.fbignore"), b"*.log\n");
+    let (site, mut b) = linked(&mut remote, "b");
+    b.scan_until(|b| !b.folder.disk.awaits_rules());
+    b.run(&mut remote);
+    drop(b);
+    fs::write(site.root.join("proj/.fbignore"), "*.log\n".repeat(200_000)).unwrap();
+    let mut b = site.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    b.run(&mut remote);
+    fs::rename(site.root.join("proj"), site.root.join("PROJ")).unwrap();
+    fs::write(site.root.join("PROJ/.fbignore"), b"*.log\n").unwrap();
+    b.scan_until(|b| !b.work.is_empty());
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    fs::rename(site.root.join("PROJ"), site.root.join("proj")).unwrap();
+    b.scan_until(|b| !b.work.is_empty());
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    a.create(
+        &mut remote,
+        &site_a.root.join("proj/file.txt"),
+        b"v2 from a",
+    );
+    b.pull(&remote);
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    assert_eq!(
+        fs::read(site.root.join("proj/file.txt")).unwrap(),
+        b"v2 from a"
+    );
+}
+
+#[test]
+fn review_removing_unknown_rules_while_renaming_the_folder_does_not_hold_remote_updates_forever() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site_a.root.join("proj")).unwrap();
+    a.create(&mut remote, &site_a.root.join("proj/file.txt"), b"v1");
+    a.create(&mut remote, &site_a.root.join("proj/.fbignore"), b"*.log\n");
+    let (site, mut b) = linked(&mut remote, "b");
+    b.scan_until(|b| !b.folder.disk.awaits_rules());
+    b.run(&mut remote);
+    drop(b);
+    fs::write(site.root.join("proj/.fbignore"), "*.log\n".repeat(200_000)).unwrap();
+    let mut b = site.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    b.run(&mut remote);
+    fs::rename(site.root.join("proj"), site.root.join("PROJ")).unwrap();
+    fs::remove_file(site.root.join("PROJ/.fbignore")).unwrap();
+    b.scan_until(|b| !b.work.is_empty());
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    fs::rename(site.root.join("PROJ"), site.root.join("proj")).unwrap();
+    b.scan_until(|b| !b.work.is_empty());
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    a.create(
+        &mut remote,
+        &site_a.root.join("proj/file.txt"),
+        b"v2 from a",
+    );
+    b.pull(&remote);
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    assert_eq!(
+        fs::read(site.root.join("proj/file.txt")).unwrap(),
+        b"v2 from a"
+    );
+}
+
+/// A restart cannot read the rules file of `proj`, so what is below it is held. The user deletes the file. No rules
+/// were known for the folder, so no rules changed, but the scan that lists the folder without a rules file ends the
+/// hold, and a later remote edit arrives.
+#[test]
+fn deleting_a_rules_file_a_restart_cannot_read_ends_the_hold_of_its_folder() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site_a.root.join("proj")).unwrap();
+    a.create(&mut remote, &site_a.root.join("proj/file.txt"), b"v1");
+    a.create(&mut remote, &site_a.root.join("proj/.fbignore"), b"*.log\n");
+    let (site, mut b) = linked(&mut remote, "b");
+    b.scan_until(|b| !b.folder.disk.awaits_rules());
+    b.run(&mut remote);
+    drop(b);
+    fs::write(site.root.join("proj/.fbignore"), "*.log\n".repeat(200_000)).unwrap();
+    let mut b = site.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    b.run(&mut remote);
+    fs::remove_file(site.root.join("proj/.fbignore")).unwrap();
+    b.scan_until(|b| !b.work.is_empty());
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    a.create(
+        &mut remote,
+        &site_a.root.join("proj/file.txt"),
+        b"v2 from a",
+    );
+    b.pull(&remote);
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    assert_eq!(
+        fs::read(site.root.join("proj/file.txt")).unwrap(),
+        b"v2 from a"
+    );
+}
+
+/// An effect creates the folder `b` from the server. The user then moves `a` into it and puts a rules file that cannot
+/// be read in it. The batch that reports the move began before the effect ended, so its move is dropped and both paths
+/// are read again. The removals the scan reported below `a` belong to the move and are dropped with it, so nothing
+/// below the folder is deleted on the server.
+#[test]
+fn removals_below_a_folder_move_that_is_dropped_are_dropped_with_it() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site_a.root.join("a")).unwrap();
+    a.create(&mut remote, &site_a.root.join("a/x"), b"x");
+    let (site, mut b) = linked(&mut remote, "b");
+    fs::create_dir(site_a.root.join("b")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(&mut remote);
+    b.scan_until(|b| (b.observer.snapshot().entries).contains_key(Path::new("a/x")));
+    let id = b.observer.snapshot().entries[Path::new("a")].id;
+    let sections = b.folder.sections();
+    let stamp = sections.stamp();
+    b.pull(&remote);
+    b.run(&mut remote);
+    assert!(site.root.join("b").is_dir());
+    fs::rename(site.root.join("a"), site.root.join("b/a")).unwrap();
+    fs::write(site.root.join("b/a/.fbignore"), "*.log\n".repeat(200_000)).unwrap();
+    let stale = Batch {
+        stamp,
+        answered: None,
+        observation: crate::observe::Observation {
+            changes: vec![
+                Observed::Removed {
+                    path: "a/x".into(),
+                    kind: EntryKind::File,
+                },
+                Observed::Renamed {
+                    from: "a".into(),
+                    to: "b/a".into(),
+                    kind: EntryKind::Dir,
+                    id,
+                    linked: false,
+                },
+            ],
+            root: Ok(()),
+            unreadable: vec![PathBuf::from("b/a")],
+            scanned: b.observer.scanned(),
+            busy: Vec::new(),
+            rules: Vec::new(),
+            read: Vec::new(),
+            all_rules: false,
+        },
+    };
+    let step = b.folder.observed(stale, 1);
+    b.take(step).unwrap();
+    assert!(!b.run(&mut remote).contains(&"send"));
+    b.settle();
+    b.run(&mut remote);
+    let live = (b.folder.engine.trees.remote().iter())
+        .any(|(_, node)| !node.trashed && node.shape.name == "x");
+    assert!(live, "x stays on the server");
+}
+
+/// A folder the user deletes stays on the server while it holds a file the rules exclude here (design §5.10), so
+/// nothing is left to send for it, and the folder is up to date.
+#[test]
+fn a_deleted_folder_that_keeps_an_excluded_file_on_the_server_leaves_the_folder_up_to_date() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site.root.join("d")).unwrap();
+    a.create(&mut remote, &site.root.join("d/a.log"), b"log");
+    a.create(&mut remote, &site.root.join("d/b.txt"), b"text");
+    a.create(&mut remote, &site.root.join(".fbignore"), b"*.log\n");
+    fs::remove_dir_all(site.root.join("d")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    assert_eq!(a.run(&mut remote), ["send"]);
+    a.pull(&remote);
+    a.run(&mut remote);
+    a.settle();
+    assert!(a.run(&mut remote).is_empty());
+    let mut live: Vec<&str> = (a.folder.engine.trees.remote().iter())
+        .filter(|(_, node)| !node.trashed)
+        .map(|(_, node)| node.shape.name.as_str())
+        .collect();
+    live.sort();
+    assert_eq!(live, [".fbignore", "a.log", "d"]);
+    assert_eq!(a.state(), FolderState::UpToDate);
+}
+
 /// Whether L, as the site's store holds it, has an entry named `name`.
 fn local_holds(site: &Site, name: &str) -> bool {
     (site.stored().trees.local().iter()).any(|(_, node)| node.shape.name == name)
@@ -1682,6 +1993,204 @@ fn a_restart_before_the_upload_of_a_commit_sends_it_once_with_its_chunks() {
     assert_eq!(remote.space.head_seq(), 1);
     assert_eq!(remote.names(), ["notes.txt"]);
     assert_eq!(a.state(), FolderState::UpToDate);
+}
+
+#[test]
+fn a_rules_file_named_in_another_case_is_downloaded_and_in_force_first() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("cache.tmp"), b"cache");
+    a.create(&mut remote, &site_a.root.join(".FBIGNORE"), b"*.tmp\n");
+
+    let site = Site::new(&remote, "b");
+    let mut b = site.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    assert_eq!(b.run(&mut remote), ["list", "subscribe", "stage"]);
+    assert_eq!(names(&site.root), [".FBIGNORE"]);
+    assert!(b.folder.disk.awaits_rules());
+
+    b.scan_until(|b| !b.folder.disk.awaits_rules());
+    assert!(b.run(&mut remote).is_empty());
+    b.settle();
+    assert!(b.work.is_empty() && b.sent.is_empty());
+    assert_eq!(names(&site.root), [".FBIGNORE"]);
+    assert_eq!(b.state(), FolderState::UpToDate);
+}
+
+#[test]
+fn planning_goes_on_after_a_folder_move_once_a_scan_that_found_nothing_is_reported() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site_a.root.join("old")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    assert_eq!(a.run(&mut remote), ["send"]);
+    let (site, mut b) = linked(&mut remote, "b");
+    b.settle();
+    assert_eq!(names(&site.root), ["old"]);
+
+    fs::rename(site_a.root.join("old"), site_a.root.join("new")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    assert_eq!(a.run(&mut remote), ["send"]);
+    b.pull(&remote);
+    assert_eq!(b.run(&mut remote), ["stage"]);
+    assert_eq!(names(&site.root), ["new"]);
+    assert!(
+        b.folder.disk.awaits_rules(),
+        "the trees hold a folder's rules by its path"
+    );
+    assert_eq!(b.state(), FolderState::CatchingUp);
+
+    a.create(&mut remote, &site_a.root.join("later.txt"), b"later");
+    b.pull(&remote);
+    assert!(b.work.is_empty(), "nothing is planned before the scan");
+
+    let sections = b.folder.sections();
+    let batch = (sections
+        .observe(&mut b.observer, Duration::from_secs(10))
+        .unwrap())
+    .expect("a reset is answered");
+    assert!(batch.observation.changes.is_empty() && batch.observation.rules.is_empty());
+    let step = b.folder.observed(batch, 1);
+    b.take(step).unwrap();
+    assert_eq!(b.run(&mut remote), ["stage"]);
+    assert_eq!(names(&site.root), ["later.txt", "new"]);
+}
+
+#[test]
+fn a_remote_edit_of_an_excluded_file_is_not_applied_while_its_folder_moves() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site_a.root.join("proj")).unwrap();
+    a.create(&mut remote, &site_a.root.join("proj/build.log"), b"v1");
+    let (site, mut b) = linked(&mut remote, "b");
+    let (site_c, mut c) = linked(&mut remote, "c");
+    b.settle();
+    c.settle();
+
+    a.create(&mut remote, &site_a.root.join("proj/.fbignore"), b"*.log\n");
+    b.pull(&remote);
+    assert_eq!(b.run(&mut remote), ["stage"]);
+    b.scan_until(|b| !b.folder.disk.awaits_rules());
+    assert!(b.run(&mut remote).is_empty());
+
+    fs::rename(site_a.root.join("proj"), site_a.root.join("work")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    assert_eq!(a.run(&mut remote), ["send"]);
+    c.create(
+        &mut remote,
+        &site_c.root.join("proj/build.log"),
+        b"v2 from c",
+    );
+
+    b.pull(&remote);
+    assert_eq!(
+        b.run(&mut remote),
+        ["stage"],
+        "only the folder moves until its rules file is read at the new path"
+    );
+    b.scan_until(|b| !b.folder.disk.awaits_rules());
+    assert!(b.run(&mut remote).is_empty());
+    b.settle();
+    assert!(b.work.is_empty() && b.sent.is_empty());
+    assert_eq!(fs::read(site.root.join("work/build.log")).unwrap(), b"v1");
+}
+
+#[test]
+fn a_batch_scanned_before_a_rules_file_was_written_does_not_end_the_wait_for_its_rules() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("cache.tmp"), b"cache");
+    a.create(&mut remote, &site_a.root.join(".fbignore"), b"*.tmp\n");
+
+    let site = Site::new(&remote, "b");
+    let mut b = site.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    fs::write(site.root.join("mine.txt"), b"mine").unwrap();
+    let sections = b.folder.sections();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let batch = loop {
+        assert!(Instant::now() < deadline, "not observed in time");
+        let wait = Duration::from_millis(100);
+        if let Some(batch) = sections.observe(&mut b.observer, wait).unwrap() {
+            break batch;
+        }
+    };
+    assert_eq!(b.run(&mut remote), ["list", "subscribe", "stage"]);
+    assert!(b.folder.disk.awaits_rules());
+
+    let step = b.folder.observed(batch, 1);
+    b.take(step).unwrap();
+    assert!(
+        b.folder.disk.awaits_rules(),
+        "the batch was scanned before the rules file was there"
+    );
+    assert!(b.work.is_empty());
+
+    b.scan_until(|b| !b.folder.disk.awaits_rules());
+    assert_eq!(b.run(&mut remote), ["upload", "send"]);
+    assert_eq!(names(&site.root), [".fbignore", "mine.txt"]);
+}
+
+/// The observer's thread takes its resets, and the effect that moves the folder ends before the thread reads its
+/// stamp. The batch that follows began after the effect, but its scans were never asked to read the moved folder.
+#[test]
+fn a_batch_that_was_not_asked_to_scan_a_moved_folder_does_not_end_the_wait_for_its_rules() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site_a.root.join("proj")).unwrap();
+    a.create(&mut remote, &site_a.root.join("proj/build.log"), b"v1");
+    let (site, mut b) = linked(&mut remote, "b");
+    let (site_c, mut c) = linked(&mut remote, "c");
+    b.settle();
+    c.settle();
+    a.create(&mut remote, &site_a.root.join("proj/.fbignore"), b"*.log\n");
+    b.pull(&remote);
+    assert_eq!(b.run(&mut remote), ["stage"]);
+    b.scan_until(|b| !b.folder.disk.awaits_rules());
+    assert!(b.run(&mut remote).is_empty());
+    fs::rename(site_a.root.join("proj"), site_a.root.join("work")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    assert_eq!(a.run(&mut remote), ["send"]);
+    c.create(
+        &mut remote,
+        &site_c.root.join("proj/build.log"),
+        b"v2 from c",
+    );
+
+    let sections = b.folder.sections();
+    let (resets, requests) = sections.take_resets();
+    assert!(resets.is_empty() && b.observer.answered());
+    b.pull(&remote);
+    assert_eq!(b.run(&mut remote), ["stage"]);
+    assert!(b.folder.disk.awaits_rules());
+    let unrelated = Batch {
+        stamp: sections.stamp(),
+        answered: Some(requests),
+        observation: crate::observe::Observation {
+            changes: Vec::new(),
+            root: Ok(()),
+            unreadable: vec![PathBuf::from("unrelated")],
+            scanned: b.observer.scanned(),
+            busy: Vec::new(),
+            rules: Vec::new(),
+            read: Vec::new(),
+            all_rules: false,
+        },
+    };
+    let step = b.folder.observed(unrelated, 1);
+    b.take(step).unwrap();
+    assert!(
+        b.folder.disk.awaits_rules(),
+        "no scan has read the rules file at the new path"
+    );
+    assert!(b.run(&mut remote).is_empty());
+    assert_eq!(fs::read(site.root.join("work/build.log")).unwrap(), b"v1");
+
+    b.scan_until(|b| !b.folder.disk.awaits_rules());
+    assert!(b.run(&mut remote).is_empty());
+    assert_eq!(fs::read(site.root.join("work/build.log")).unwrap(), b"v1");
 }
 
 #[test]

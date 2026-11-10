@@ -47,7 +47,8 @@ use flarebox_engine::effects::{
     Base as EngineBase, Displaced as EngineDisplaced, Effect as EngineEffect, EffectRecord,
     Location as EngineLocation,
 };
-use flarebox_engine::tree::Content;
+use flarebox_engine::ignore::is_rules_file;
+use flarebox_engine::tree::{Content, Kind};
 use flarebox_fs::{
     Action, Base, Contents, Dir, Displaced, Effect, Entry, EntryKind, FileId, Location, Marker,
     Outcome, Reason, RootProblem, Space, Step,
@@ -57,7 +58,7 @@ use flarebox_proto::v1::{ChunkRef, Commit, op};
 use flarebox_store::{Link, Store, Tx};
 
 use crate::engine::{Engine, file_id, file_identity};
-use crate::observe::{Observation, Observed, Reset, open_under};
+use crate::observe::{FsObserver, Observation, Observed, Observer, Reset, open_under};
 use crate::policy::{self, Disposition};
 
 /// How many effect sections [`Disk`] remembers for batches that span them. A batch older than all of them is dropped
@@ -131,9 +132,15 @@ pub(crate) enum Settled {
 pub(crate) struct Sections {
     /// Odd while an effect section runs. Each section adds one when it starts and one when it ends.
     epoch: AtomicU64,
-    /// Scopes the observer resets to L's view and scans again before its next batch, in the order requested.
-    resets: Mutex<Vec<Reset>>,
+    /// Scopes the observer resets to L's view and scans again before its next batch, in the order requested, and
+    /// how many requests there have been.
+    resets: Mutex<(Vec<Reset>, u64)>,
 }
+
+/// A count of the reset requests of the effect sections. The count a request returns names that request and every
+/// one before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Requests(u64);
 
 /// The epoch read before a batch's scans began.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,13 +153,41 @@ impl Sections {
         Stamp(self.epoch.load(Ordering::SeqCst))
     }
 
-    /// The resets to pass to [`FsObserver::reset`](crate::observe::FsObserver::reset) before the next observation.
-    pub fn take_resets(&self) -> Vec<Reset> {
-        std::mem::take(&mut *self.resets.lock().unwrap())
+    /// The resets to pass to [`FsObserver::reset`] before the next observation, with the requests they complete.
+    pub fn take_resets(&self) -> (Vec<Reset>, Requests) {
+        let mut resets = self.resets.lock().unwrap();
+        (std::mem::take(&mut resets.0), Requests(resets.1))
     }
 
-    fn request(&self, resets: Vec<Reset>) {
-        self.resets.lock().unwrap().extend(resets);
+    fn request(&self, resets: Vec<Reset>) -> Requests {
+        let mut requested = self.resets.lock().unwrap();
+        requested.0.extend(resets);
+        requested.1 += 1;
+        Requests(requested.1)
+    }
+
+    /// One pass of the observer's thread. It resets the scopes the effect sections asked for, then takes the stamp,
+    /// so the stamp covers the batch's scans and content reads. After a reset it does not wait for a change, since
+    /// the task may plan nothing until that scan is reported; otherwise it waits up to `idle`.
+    pub fn observe(
+        &self,
+        observer: &mut FsObserver,
+        idle: Duration,
+    ) -> Result<Option<Batch>, flarebox_fs::Error> {
+        let (resets, requests) = self.take_resets();
+        let wait = if resets.is_empty() {
+            idle
+        } else {
+            Duration::ZERO
+        };
+        observer.reset(resets);
+        let stamp = self.stamp();
+        let observation = observer.observe(wait)?;
+        Ok(observation.map(|observation| Batch {
+            stamp,
+            answered: observer.answered().then_some(requests),
+            observation,
+        }))
     }
 }
 
@@ -160,6 +195,11 @@ impl Sections {
 #[derive(Debug)]
 pub(crate) struct Batch {
     pub stamp: Stamp,
+    /// The reset requests this batch answers: the observer was given the resets of each one, and a scan made after
+    /// that settled every scope of them, in this batch or in one sent before it. `None` while a reset the observer
+    /// was given still waits for such a scan. A stamp cannot say this: it tells when the scans of a batch began, not
+    /// which scopes they read.
+    pub answered: Option<Requests>,
     pub observation: Observation,
 }
 
@@ -189,6 +229,10 @@ pub(crate) struct Disk {
     spans: VecDeque<(u64, Vec<PathBuf>)>,
     /// The end epoch of the latest section that `spans` no longer holds.
     forgotten: u64,
+    /// The reset request of the latest effect section that can have changed which rules apply where: it wrote, moved
+    /// or removed a rules file, or it moved a folder, whose rules files the trees hold by path. Set until a batch
+    /// answers that request, and so has passed the rules of a scan of the section's paths.
+    rules_after: Option<Requests>,
     hook: Hook,
 }
 
@@ -292,6 +336,7 @@ impl Disk {
             sections: Arc::default(),
             spans: VecDeque::new(),
             forgotten: 0,
+            rules_after: None,
             hook,
         };
         if !disk.space.held()? {
@@ -431,7 +476,16 @@ impl Disk {
         let settled = acknowledge(&record, &outcome, false, engine, store, hook)?;
         let end = self.sections.epoch.fetch_add(1, Ordering::SeqCst) + 1;
         let scopes = scopes(&effect.action, &outcome);
-        self.sections.request(engine.resets(scopes.iter().cloned()));
+        let moved_folder = matches!(effect.action, Action::Move { .. })
+            && (engine.trees.local().get(&record.node))
+                .is_some_and(|node| node.shape.kind == Kind::Dir);
+        let rules_file = |scope: &PathBuf| {
+            (scope.file_name()).is_some_and(|name| is_rules_file(&name.to_string_lossy()))
+        };
+        let requested = (self.sections).request(engine.resets(scopes.iter().cloned()));
+        if !scopes.is_empty() && (moved_folder || scopes.iter().any(rules_file)) {
+            self.rules_after = Some(requested);
+        }
         self.spans.push_back((end, scopes));
         while self.spans.len() > SPANS {
             if let Some((end, _)) = self.spans.pop_front() {
@@ -444,10 +498,13 @@ impl Disk {
         })
     }
 
-    /// Puts an observation batch into L in one transaction. Refuses a batch scanned from another folder than the
-    /// locked one, a root that is no longer held, and a batch whose root check failed. Drops the changes at or below
+    /// Puts an observation batch into L in one transaction, after giving the trees the rules files it lists. Refuses
+    /// a batch scanned from another folder than the locked one, a root that is no longer held, and a batch whose root
+    /// check failed. The rules of a batch are taken even when its changes are dropped: the scans report a rules file
+    /// only when it changed. Drops the changes at or below
     /// the paths of every effect section that ended after the batch's stamp, and a whole batch older than the
-    /// sections remembered. The observer then resets every path a dropped change names, both ends of a rename, or
+    /// sections remembered. A change at or below a path that a dropped change names is dropped with it: the removals a
+    /// scan reports below a folder it saw move belong to that move. The observer then resets every path a dropped change names, both ends of a rename, or
     /// the whole tree for a dropped batch, to L as it is after the batch, so a later batch reports what was lost.
     pub fn observed(
         &mut self,
@@ -455,7 +512,11 @@ impl Disk {
         engine: &mut Engine,
         store: &mut Store,
     ) -> Result<(), Stop> {
-        let Batch { stamp, observation } = batch;
+        let Batch {
+            stamp,
+            answered,
+            observation,
+        } = batch;
         if observation.scanned != Some(self.space.id()) {
             return Err(Stop::OtherRoot);
         }
@@ -463,28 +524,40 @@ impl Disk {
             return Err(Stop::Withdrawn(self.path.clone()));
         }
         observation.root.map_err(Stop::Root)?;
+        engine.rules(observation.rules, observation.all_rules);
+        if (self.rules_after).is_some_and(|requested| answered >= Some(requested)) {
+            self.rules_after = None;
+        }
         if stamp.0 < self.forgotten {
+            engine.read(&observation.read, &observation.unreadable);
             self.sections.request(engine.resets([PathBuf::new()]));
             return Ok(());
         }
-        let spanned: Vec<&PathBuf> = self
-            .spans
-            .iter()
+        let mut scopes: BTreeSet<PathBuf> = (self.spans.iter())
             .filter(|(end, _)| *end > stamp.0)
-            .flat_map(|(_, scopes)| scopes)
+            .flat_map(|(_, scopes)| scopes.iter().cloned())
             .collect();
-        let mut dropped = BTreeSet::new();
-        let changes: Vec<Observed> = observation
-            .changes
-            .into_iter()
-            .filter(|change| {
-                let stale =
-                    paths(change).any(|path| spanned.iter().any(|scope| path.starts_with(scope)));
-                if stale {
-                    dropped.extend(paths(change).map(Path::to_path_buf));
+        let mut stale = vec![false; observation.changes.len()];
+        let mut grew = true;
+        while grew {
+            grew = false;
+            for (change, stale) in observation.changes.iter().zip(&mut stale) {
+                if !*stale
+                    && paths(change).any(|path| path.ancestors().any(|at| scopes.contains(at)))
+                {
+                    *stale = true;
+                    grew = true;
+                    scopes.extend(paths(change).map(Path::to_path_buf));
                 }
-                !stale
-            })
+            }
+        }
+        let dropped: BTreeSet<PathBuf> = (observation.changes.iter().zip(&stale))
+            .filter(|(_, stale)| **stale)
+            .flat_map(|(change, _)| paths(change).map(Path::to_path_buf))
+            .collect();
+        let changes: Vec<Observed> = (observation.changes.into_iter().zip(stale))
+            .filter(|(_, stale)| !stale)
+            .map(|(change, _)| change)
             .collect();
         if !changes.is_empty() {
             let now_ms = SystemTime::now()
@@ -495,10 +568,23 @@ impl Disk {
                 Ok(engine.checkpoint(tx)?)
             })?;
         }
+        engine.read(&observation.read, &observation.unreadable);
         if !dropped.is_empty() {
             self.sections.request(engine.resets(dropped));
         }
         Ok(())
+    }
+
+    /// True from an effect that can have changed which rules apply where until a batch has passed the rules of a scan
+    /// of that effect's paths: an effect that wrote, moved or removed a rules file, or that moved a folder. The caller
+    /// plans nothing meanwhile (design §5.10). Otherwise what a rules file that was just downloaded excludes would be
+    /// downloaded first, and a remote change would be written into a file that the rules file of a moved folder
+    /// excludes, because the trees hold each rules file by the path of its folder. The wait ends with the batch that
+    /// answers the reset the effect requested ([`Batch::answered`]), never with a batch that only began later: the
+    /// observer may have taken its resets before the effect ended, or may have scanned other paths. The observer
+    /// answers a reset with a batch also when the scan found nothing, so the wait ends without a change on disk.
+    pub fn awaits_rules(&self) -> bool {
+        self.rules_after.is_some()
     }
 
     /// Asks the observer to reset `paths` to L and scan them again.

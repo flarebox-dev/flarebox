@@ -248,6 +248,14 @@ fn kill_during_a_folder_removal_then_recover() {
 }
 
 #[test]
+fn kill_during_the_removal_of_a_folder_that_holds_platform_files_then_recover() {
+    assert_eq!(
+        kill_at_every_step_then_recover(&SCENARIOS[6]),
+        [Step::Marked, Step::Compared, Step::Trashed]
+    );
+}
+
+#[test]
 fn kill_during_an_edited_replacement_then_recover() {
     assert_eq!(
         kill_at_every_step_then_recover(&RETURNS[0]),
