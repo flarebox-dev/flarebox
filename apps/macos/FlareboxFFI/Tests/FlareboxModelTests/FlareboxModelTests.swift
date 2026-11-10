@@ -66,6 +66,17 @@ private func item(_ path: String) -> HeldItem {
         #expect(AppModel.launchScenario(in: defaults) == nil)
     }
 
+    @Test func storageListsEachSpaceWithItsTotal() async throws {
+        let model = AppModel.fake(scenario: .upToDate)
+        let storage = try await model.storage()
+        let spaces = try await model.spaces()
+        #expect(storage.map(\.space) == spaces)
+        let first = try #require(storage.first)
+        let usage = first.usage
+        #expect(first.totalBytes > 0)
+        #expect(first.totalBytes == usage.liveBytes + usage.trashBytes + usage.oldVersionBytes + usage.unreferencedBytes)
+    }
+
     @Test func pauseAndResume() throws {
         let model = AppModel.fake(scenario: .upToDate)
         model.start()

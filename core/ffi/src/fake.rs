@@ -16,7 +16,7 @@ use crate::types::{
     ItemDetail, LinkedFolder, MassDeleteLimit, NodeKind, Notice, NoticeKind, PairingCode, Problem,
     ProblemKind, Question, QuestionKind, RECENT_CHANGES, RecentChange, RecoveryCause,
     RecoveryGroup, RecoveryTrigger, ServerInfo, SessionError, SessionEvent, SessionState, Space,
-    SyncProgress, SyncStatus,
+    SpaceUsage, SyncProgress, SyncStatus,
 };
 
 const CLAIM_CODE_LEN: usize = 12;
@@ -694,6 +694,30 @@ impl Core for FakeCore {
         })
     }
 
+    /// Made-up numbers that grow with the space's place in the list, so that previews show
+    /// spaces of different sizes.
+    fn space_usage(&self, space_id: &str) -> Result<SpaceUsage, SessionError> {
+        let mut state = self.lock();
+        state.take_failure()?;
+        state.saved.account()?;
+        let n = state
+            .saved
+            .spaces
+            .iter()
+            .position(|space| space.space_id == space_id)
+            .ok_or(SessionError::SpaceNotFound)? as u64
+            + 1;
+        Ok(SpaceUsage {
+            live_files: 1_204 * n,
+            live_bytes: 3_200_000_000 * n,
+            trashed_files: 12 * n,
+            trash_bytes: 40_100_000 * n,
+            old_versions: 30 * n,
+            old_version_bytes: 120_000_000 * n,
+            unreferenced_bytes: 1_500_000 * n,
+        })
+    }
+
     fn link_folder(&self, space_id: &str, path: &str) -> Result<LinkedFolder, SessionError> {
         let mut state = self.lock();
         state.take_failure()?;
@@ -1005,6 +1029,14 @@ mod tests {
         let one = h.core.create_space("One").unwrap();
         let two = h.core.create_space("Two").unwrap();
         assert_eq!(h.core.spaces().unwrap(), [one.clone(), two.clone()]);
+        assert!(
+            h.core.space_usage(&two.space_id).unwrap().live_bytes
+                > h.core.space_usage(&one.space_id).unwrap().live_bytes
+        );
+        assert_eq!(
+            h.core.space_usage("no-such-space"),
+            Err(SessionError::SpaceNotFound)
+        );
 
         let path = dir.path().to_str().unwrap();
         assert_eq!(

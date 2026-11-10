@@ -1,6 +1,6 @@
 # Flarebox for macOS
 
-A menu bar app that links the Rust core through [UniFFI](https://mozilla.github.io/uniffi-rs/). It has a menu bar menu (status, progress, recent changes, notices, pause and resume, open folder), a first-run setup window (server, sign-in, folder), a questions window, and settings (linked folders, account, problems, open at login). The session runs the sync driver of `core/driver` in-process through `core/ffi`: it signs this Mac in, links folders, follows each space's log and observes the disk. The driver does not run the sync engine yet, so no file is uploaded or downloaded, and progress, recent changes and notices stay empty until it does. There is no File Provider extension.
+A menu bar app that links the Rust core through [UniFFI](https://mozilla.github.io/uniffi-rs/). It has a menu bar menu (status, progress, recent changes, notices, pause and resume, open folder), a first-run setup window (server, sign-in, folder), a questions window, and settings (linked folders, account, storage used by each space, problems, open at login). The session runs the sync driver of `core/driver` in-process through `core/ffi`: it signs this Mac in, links folders, follows each space's log and observes the disk. The driver does not run the sync engine yet, so no file is uploaded or downloaded, and progress, recent changes and notices stay empty until it does. There is no File Provider extension.
 
 ## Requirements
 

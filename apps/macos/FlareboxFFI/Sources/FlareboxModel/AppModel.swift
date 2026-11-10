@@ -222,12 +222,31 @@ public final class AppModel {
         try await run { try $0.createSpace(name: name) }
     }
 
+    /// What each of the account's spaces stores, in the order the server lists the spaces.
+    public func storage() async throws -> [SpaceStorage] {
+        try await run { session in
+            try session.spaces().map { SpaceStorage(space: $0, usage: try session.spaceUsage(spaceId: $0.spaceId)) }
+        }
+    }
+
     public func linkFolder(spaceID: String, path: String) async throws -> LinkedFolder {
         try await run { try $0.linkFolder(spaceId: spaceID, path: path) }
     }
 
     public func unlinkFolder(spaceID: String) async throws {
         try await run { try $0.unlinkFolder(spaceId: spaceID) }
+    }
+}
+
+/// What one space stores (RFC 0010).
+public struct SpaceStorage: Identifiable, Equatable, Sendable {
+    public var id: String { space.spaceId }
+    public let space: Space
+    public let usage: SpaceUsage
+
+    /// The bytes of every chunk the space holds. Each chunk counts once.
+    public var totalBytes: UInt64 {
+        usage.liveBytes + usage.trashBytes + usage.oldVersionBytes + usage.unreferencedBytes
     }
 }
 

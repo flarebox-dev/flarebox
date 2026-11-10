@@ -7,7 +7,7 @@ import ServiceManagement
 import SwiftUI
 
 enum SettingsTab: String {
-    case folders, account, problems, general
+    case folders, account, storage, problems, general
 
     static let storageKey = "settingsTab"
 }
@@ -24,6 +24,9 @@ struct SettingsView: View {
             AccountSettings()
                 .tabItem { Label("Account", systemImage: "person.crop.circle") }
                 .tag(SettingsTab.account)
+            StorageSettings()
+                .tabItem { Label("Storage", systemImage: "internaldrive") }
+                .tag(SettingsTab.storage)
             ProblemsSettings()
                 .tabItem { Label("Problems", systemImage: "exclamationmark.triangle") }
                 .badge(model.state.problems.count)
@@ -238,6 +241,84 @@ extension DeviceList {
     }
 }
 
+// MARK: Storage
+
+private struct StorageSettings: View {
+    @Environment(AppModel.self) private var model
+    @State private var spaces: [SpaceStorage]?
+    @State private var error: SessionError?
+
+    var body: some View {
+        Group {
+            if let account = model.state.account {
+                Form {
+                    ForEach(spaces ?? []) { storage in
+                        Section(storage.space.name) {
+                            StorageRow(title: "Live files", count: "^[\(storage.usage.liveFiles) file](inflect: true)", bytes: storage.usage.liveBytes)
+                            StorageRow(title: "Trash", count: "^[\(storage.usage.trashedFiles) file](inflect: true)", bytes: storage.usage.trashBytes)
+                            StorageRow(title: "Old versions", count: "^[\(storage.usage.oldVersions) version](inflect: true)", bytes: storage.usage.oldVersionBytes)
+                            StorageRow(title: "Unreferenced", count: nil, bytes: storage.usage.unreferencedBytes)
+                            StorageRow(title: "Total", count: nil, bytes: storage.totalBytes).bold()
+                        }
+                    }
+                    Section {
+                        if spaces?.isEmpty == true {
+                            Text("This account has no spaces yet.").foregroundStyle(.secondary)
+                        }
+                        if let error {
+                            Label(error.message, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red)
+                        }
+                        HStack {
+                            Text("Each stored chunk counts once, under the first of live files, trash and old versions that holds it. Unreferenced chunks are uploads not committed yet and chunks waiting out the grace period before deletion.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            if spaces == nil && error == nil {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                Button("Refresh") { Task { await load() } }
+                            }
+                        }
+                    }
+                }
+                .formStyle(.grouped)
+                .task(id: account.deviceId) { await load() }
+            } else {
+                ContentUnavailableView("Not Signed In", systemImage: "person.crop.circle.badge.questionmark")
+            }
+        }
+    }
+
+    private func load() async {
+        spaces = nil
+        error = nil
+        do {
+            spaces = try await model.storage()
+        } catch let failure as SessionError {
+            error = failure
+        } catch {}
+    }
+}
+
+private struct StorageRow: View {
+    let title: LocalizedStringKey
+    let count: LocalizedStringKey?
+    let bytes: UInt64
+
+    var body: some View {
+        LabeledContent(title) {
+            HStack(spacing: 12) {
+                if let count {
+                    Text(count).foregroundStyle(.secondary)
+                }
+                Text(Int64(clamping: bytes), format: .byteCount(style: .file))
+                    .monospacedDigit()
+                    .frame(minWidth: 70, alignment: .trailing)
+            }
+        }
+    }
+}
+
 // MARK: Problems
 
 private struct ProblemsSettings: View {
@@ -363,6 +444,10 @@ private struct GeneralSettings: View {
 
 #Preview("Problems") {
     ProblemsSettings().environment(AppModel.preview(.problems)).frame(width: 600, height: 440)
+}
+
+#Preview("Storage") {
+    StorageSettings().environment(AppModel.preview(.upToDate)).frame(width: 600, height: 440)
 }
 
 #Preview("Account") {

@@ -234,6 +234,11 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
             .iter()
             .any(|listed| listed.space_id == space.space_id)
     );
+    let usage = mac.session().space_usage(space.space_id.clone()).unwrap();
+    assert_eq!(
+        (usage.live_files, usage.live_bytes, usage.unreferenced_bytes),
+        (0, 0, 0)
+    );
     let folder = mac.path("Documents");
     fs::create_dir_all(&folder).unwrap();
     fs::write(folder.join("notes.txt"), b"notes").unwrap();

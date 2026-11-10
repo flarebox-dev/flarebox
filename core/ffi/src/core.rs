@@ -8,7 +8,7 @@ use std::sync::{Arc, Weak};
 
 use crate::types::{
     Account, Answer, DeviceList, LinkedFolder, PairingCode, ServerInfo, SessionError, SessionEvent,
-    SessionState, Space,
+    SessionState, Space, SpaceUsage,
 };
 
 /// Receives every [`SessionEvent`] of a session, in order.
@@ -97,6 +97,8 @@ pub trait Core: Send + Sync {
     fn spaces(&self) -> Result<Vec<Space>, SessionError>;
     /// Creates a space.
     fn create_space(&self, name: &str) -> Result<Space, SessionError>;
+    /// What a space stores. The server answers only the space's owner.
+    fn space_usage(&self, space_id: &str) -> Result<SpaceUsage, SessionError>;
     /// Links the folder at absolute `path` to a space and starts syncing it.
     fn link_folder(&self, space_id: &str, path: &str) -> Result<LinkedFolder, SessionError>;
     /// Stops syncing a space on this device. Files on disk stay.
