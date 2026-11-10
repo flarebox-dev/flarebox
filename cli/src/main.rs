@@ -346,29 +346,39 @@ async fn device(paths: Paths, action: DeviceAction) -> Result<(), String> {
     }
 }
 
-/// Shows what each space of the account stores (RFC 0010).
+/// Shows what each space of the account stores (RFC 0010). A space the server refuses, such as one a rewind holds
+/// closed, does not hide the others: they are printed, and the command then fails naming the refused ones.
 async fn usage(paths: Paths, json: bool) -> Result<(), String> {
     let auth = signed_in(&paths)?;
     let spaces = auth.api().list_spaces(&auth).await.map_err(refusal)?.spaces;
     let mut usages = Vec::new();
+    let mut refused = Vec::new();
     for space in spaces {
-        let usage = auth
-            .api()
-            .space_usage(&auth, &space.space_id)
-            .await
-            .map_err(refusal)?;
-        usages.push((space, usage));
+        match auth.api().space_usage(&auth, &space.space_id).await {
+            Ok(usage) => usages.push((space, usage)),
+            Err(error) if error.is_unauthenticated() => return Err(refusal(error)),
+            Err(error) => refused.push(format!(
+                "{} ({}): {error}",
+                printable(&space.name),
+                space.space_id
+            )),
+        }
     }
     if json {
-        return print_json(
+        print_json(
             &usages
                 .iter()
                 .map(|(space, usage)| usage_json(space, usage))
                 .collect::<Vec<_>>(),
-        );
+        )?;
+    } else {
+        print!("{}", usage_report(&usages));
     }
-    print!("{}", usage_report(&usages));
-    Ok(())
+    if refused.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("no usage for {}", refused.join("; ")))
+    }
 }
 
 fn usage_json(space: &SpaceInfo, usage: &SpaceUsage) -> serde_json::Value {
