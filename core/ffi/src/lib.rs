@@ -50,7 +50,8 @@ mod tests {
         session
             .fake_core()
             .unwrap()
-            .load_scenario(FakeScenario::MassDelete);
+            .load_scenario(FakeScenario::MassDelete)
+            .unwrap();
         let question = session.state().questions[0].clone();
         assert_eq!(
             session.answer(question.id.clone(), Answer::Keep),
@@ -94,6 +95,6 @@ mod tests {
 
         drop(session);
         assert!(dropped.load(Ordering::SeqCst));
-        fake.load_scenario(FakeScenario::UpToDate);
+        fake.load_scenario(FakeScenario::UpToDate).unwrap();
     }
 }

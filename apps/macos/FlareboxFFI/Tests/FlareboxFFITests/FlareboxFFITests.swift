@@ -81,7 +81,7 @@ private final class Recorder: SessionListener {
 @Test func questionsTakeOnlyTheirOwnAnswers() throws {
     let session = SyncSession.fake(listener: Recorder(), stateDir: nil)
     let fake = try #require(session.fakeCore())
-    fake.loadScenario(scenario: .recovery)
+    try fake.loadScenario(scenario: .recovery)
     let questions = session.state().questions
     #expect(questions.count == 5)
     let created = try #require(questions.first {
@@ -102,7 +102,7 @@ private final class Recorder: SessionListener {
 @Test func noticesDevicesAndSaveFailuresAreTyped() throws {
     let session = SyncSession.fake(listener: Recorder(), stateDir: nil)
     let fake = try #require(session.fakeCore())
-    fake.loadScenario(scenario: .remoteMassDelete)
+    try fake.loadScenario(scenario: .remoteMassDelete)
     #expect(try session.devices() == .unavailable)
     let notice = try #require(session.state().notices.first)
     guard case .remoteMassDelete(_, let affectedFiles, _, _) = notice.kind else {
