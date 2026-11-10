@@ -561,6 +561,7 @@ name = "flarebox-driver"
 version = "0.0.0"
 dependencies = [
  "flarebox-chunk",
+ "flarebox-engine",
  "flarebox-fs",
  "flarebox-net",
  "flarebox-proto",

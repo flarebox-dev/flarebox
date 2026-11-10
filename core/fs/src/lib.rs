@@ -134,6 +134,18 @@ pub struct Entry {
     pub executable: bool,
 }
 
+/// An entry a caller of [`Snapshot::reset`] believes exists: its kind and
+/// identity, and nothing about what a file holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Known {
+    pub kind: EntryKind,
+    pub id: FileId,
+}
+
+/// A modification time no scan reports, so a file reset to it differs from
+/// every scan of it.
+const UNVERIFIED: i128 = i128::MIN;
+
 /// What `stat` reports about one directory entry, before deciding whether it is
 /// something the snapshot records.
 struct Stat {
@@ -473,19 +485,43 @@ impl Snapshot {
         self.rescan_with(root.as_ref(), paths, None, &mut |_| {})
     }
 
-    /// Drops what the snapshot knows at and below `scope`, a relative path,
-    /// so the next rescan of `scope` reports what is there as created. An
-    /// empty path drops everything.
-    pub fn forget(&mut self, scope: &Path) {
-        let known: Vec<PathBuf> = self
+    /// Replaces what the snapshot knows at and below `scope`, a relative
+    /// path, with the entries of `known` there. The next rescan of `scope`
+    /// then reports an entry of `known` the disk lacks as removed, one found
+    /// at another path as renamed, and an entry `known` lacks as created. It
+    /// also reports every file of `known` it finds as modified, changed or
+    /// not: `known` says that a file exists, not what it holds, so the caller
+    /// reads it again. An empty path covers the whole tree. Entries of
+    /// `known` outside `scope` are ignored.
+    pub fn reset(&mut self, scope: &Path, known: BTreeMap<PathBuf, Known>) {
+        let held: Vec<PathBuf> = self
             .entries
             .range(scope.to_path_buf()..)
             .take_while(|(path, _)| path.starts_with(scope))
             .map(|(path, _)| path.clone())
             .collect();
-        for path in known {
+        for path in held {
             self.entries.remove(&path);
         }
+        self.entries.extend(
+            known
+                .into_iter()
+                .filter(|(path, _)| path.starts_with(scope))
+                .map(|(path, Known { kind, id })| {
+                    let mtime_ns = match kind {
+                        EntryKind::File => UNVERIFIED,
+                        EntryKind::Dir => 0,
+                    };
+                    let entry = Entry {
+                        kind,
+                        id,
+                        size: 0,
+                        mtime_ns,
+                        executable: false,
+                    };
+                    (path, entry)
+                }),
+        );
     }
 
     /// [`Snapshot::rescan`], failing with [`Error::RootReplaced`] and
@@ -1025,6 +1061,13 @@ pub trait Watcher {
     /// The state the returned changes lead to. Keep it across restarts and
     /// pass it to the next watcher to catch changes made in between.
     fn snapshot(&self) -> &Snapshot;
+
+    /// Replaces what the snapshot knows at and below `scope` with `known`, as
+    /// [`Snapshot::reset`] does. The next poll rescans `scope` and reports
+    /// how the disk differs from `known` there, and every file of `known` it
+    /// finds as modified. Entries outside `scope` are not reported again
+    /// unless they changed.
+    fn reset(&mut self, scope: &Path, known: BTreeMap<PathBuf, Known>);
 }
 
 /// Watches with FSEvents on macOS and inotify on Linux.
@@ -1327,6 +1370,11 @@ impl Watcher for NativeWatcher {
     fn snapshot(&self) -> &Snapshot {
         &self.snapshot
     }
+
+    fn reset(&mut self, scope: &Path, known: BTreeMap<PathBuf, Known>) {
+        self.snapshot.reset(scope, known);
+        self.dirty.insert(scope.to_path_buf());
+    }
 }
 
 /// Rescans the whole tree every `interval`. Slower than [`NativeWatcher`] on
@@ -1374,6 +1422,10 @@ impl Watcher for RescanWatcher {
 
     fn snapshot(&self) -> &Snapshot {
         &self.snapshot
+    }
+
+    fn reset(&mut self, scope: &Path, known: BTreeMap<PathBuf, Known>) {
+        self.snapshot.reset(scope, known);
     }
 }
 

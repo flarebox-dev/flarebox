@@ -11,6 +11,7 @@ publish.workspace = true
 
 [dependencies]
 flarebox-chunk = { path = "../chunk" }
+flarebox-engine = { path = "../engine" }
 flarebox-fs = { path = "../fs" }
 flarebox-net = { path = "../net" }
 flarebox-proto = { path = "../proto" }

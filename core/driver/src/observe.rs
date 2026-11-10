@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 
 use flarebox_chunk::ChunkerConfig;
 use flarebox_fs::{
-    Change, Entry, EntryKind, Error as FsError, FileId, NativeWatcher, RescanWatcher, RootProblem,
-    Snapshot, Watcher, check_root,
+    Change, Entry, EntryKind, Error as FsError, FileId, Known, NativeWatcher, RescanWatcher,
+    RootProblem, Snapshot, Watcher, check_root,
 };
 use flarebox_proto::v1::{ChunkRef, Content};
 use rustix::fs::{Mode, OFlags};
@@ -47,6 +47,9 @@ pub struct Observation {
     pub root: Result<(), RootProblem>,
     /// Folders the scans may not read. What is below them is unknown, not absent.
     pub unreadable: Vec<PathBuf>,
+    /// The identity of the root folder the observer's scans opened, from the latest poll that scanned. A batch
+    /// whose root is not the folder the task locked describes another folder. `None` only before the first scan.
+    pub scanned: Option<FileId>,
     /// Files that changed while they were chunked, or that could not be opened or read as the entry the scan saw.
     /// Their changes carry no content. The observer keeps reading them, waiting longer after each failure, and
     /// reports a `Modified` with the content once a read succeeds, unless a later change to the path replaces it
@@ -81,6 +84,15 @@ pub enum Observed {
     },
 }
 
+/// What the observer is to believe about one scope, a path relative to the root, before it scans the scope again:
+/// the entries L holds at and below it, by kind and identity. The scan then reports how the disk differs from L
+/// there, and reads every file L holds there again, since L's content for a file does not prove what the disk holds.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Reset {
+    pub scope: PathBuf,
+    pub known: BTreeMap<PathBuf, Known>,
+}
+
 /// A source of observations for one linked folder.
 pub trait Observer: Send {
     /// Waits up to about `timeout` and returns the next batch, or `None` when nothing changed.
@@ -98,6 +110,8 @@ pub struct FsObserver {
     watcher: Box<dyn Watcher + Send>,
     native: bool,
     matcher: Arc<dyn Matcher>,
+    /// The root folder the latest scan opened.
+    scanned: Option<FileId>,
     /// Files whose content could not be read, with when to read them again.
     unread: BTreeMap<PathBuf, Retry>,
 }
@@ -151,8 +165,20 @@ impl FsObserver {
             watcher,
             native,
             matcher,
+            scanned: None,
             unread: BTreeMap::new(),
         })
+    }
+
+    /// Resets the snapshot at each scope of `resets`, in order, to the entries L holds there, so the next observation
+    /// reports how the disk differs from L in those scopes: what L lacks as created, what the disk lacks as removed,
+    /// and every file both hold as modified, each file with the content read from the disk. Nothing outside the
+    /// scopes is reported again unless it changed.
+    pub fn reset(&mut self, resets: Vec<Reset>) {
+        for Reset { scope, known } in resets {
+            self.unread.retain(|path, _| !path.starts_with(&scope));
+            self.watcher.reset(&scope, known);
+        }
     }
 
     fn excluded(&self, path: &Path, kind: EntryKind) -> bool {
@@ -352,6 +378,9 @@ impl Observer for FsObserver {
             }
             poll => poll?,
         };
+        if poll.root.is_some() {
+            self.scanned = poll.root;
+        }
         let now = Instant::now();
         let mut changes = Vec::new();
         let mut busy = Vec::new();
@@ -372,6 +401,7 @@ impl Observer for FsObserver {
             changes,
             root,
             unreadable: poll.unreadable,
+            scanned: self.scanned,
             busy,
         }))
     }
