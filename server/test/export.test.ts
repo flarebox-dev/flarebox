@@ -93,6 +93,23 @@ function failNextAlarm(space: Space) {
   });
 }
 
+/**
+ * Records the seq of every commit record that an RPC hands to its caller, which the WebSocket and HTTP paths push to
+ * the space's live connections.
+ */
+async function recordPushes(space: Space): Promise<bigint[]> {
+  const seqs: bigint[] = [];
+  await runInDurableObject(space.stub, (instance: SpaceDO) => {
+    const call = instance.call.bind(instance);
+    vi.spyOn(instance, "call").mockImplementation(async (...args) => {
+      const answer = await call(...args);
+      if (answer.record) seqs.push(answer.record.seq);
+      return answer;
+    });
+  });
+  return seqs;
+}
+
 const seqName = (seq: number) => String(seq).padStart(20, "0");
 const segmentKey = (prefix: string, first: number, last: number) => `${prefix}log/${seqName(first)}-${seqName(last)}.fblog`;
 
@@ -293,26 +310,31 @@ describe("R2 metadata export (spec v0 section 11, RFC 0004)", () => {
     await expectRestorable(space);
   });
 
-  it("sets the alarm for the export deadline on a retry of an accepted commit whose alarm write failed", async () => {
-    const space = await newSpace();
-    const a = await client(space, "Laptop");
-    await failNextAlarm(space);
-    const commitId = uuidv7();
-    const ops = [op.mkdir(uuidv7(), space.spaceId, "one")];
-    expect((await a.commitRaw(ops, { commitId })).case).toBe("error");
-    vi.restoreAllMocks();
-    const failed = await alarmState(space);
-    expect(failed.alarm).toBeGreaterThan(failed.exportDue);
-    expect((await a.commit(ops, { commitId })).seq).toBe(1n);
-    const retried = await alarmState(space);
-    expect(retried.alarm).toBe(retried.exportDue);
+  it("returns and pushes a stored commit whose alarm write failed, and sets the alarm on its retry or the next commit", async () => {
+    for (const repair of ["retry", "next commit"] as const) {
+      const space = await newSpace();
+      const a = await client(space, "Laptop");
+      const pushed = await recordPushes(space);
+      await failNextAlarm(space);
+      const commitId = uuidv7();
+      const ops = [op.mkdir(uuidv7(), space.spaceId, "one")];
+      expect((await a.commit(ops, { commitId })).seq).toBe(1n);
+      expect(pushed).toEqual([1n]);
+      const failed = await alarmState(space);
+      expect(failed.alarm).toBeGreaterThan(failed.exportDue);
+      if (repair === "retry") expect((await a.commit(ops, { commitId })).seq).toBe(1n);
+      else expect((await a.commit([op.mkdir(uuidv7(), space.spaceId, "two")])).seq).toBe(2n);
+      const repaired = await alarmState(space);
+      expect(repaired.alarm).toBe(repaired.exportDue);
+      vi.restoreAllMocks();
+    }
   });
 
   it("sets the alarm for the earliest deadline when the object opens after an alarm write failed", async () => {
     const space = await newSpace();
     const a = await client(space, "Laptop");
     await failNextAlarm(space);
-    expect((await a.commitRaw([op.mkdir(uuidv7(), space.spaceId, "one")])).case).toBe("error");
+    expect((await a.commit([op.mkdir(uuidv7(), space.spaceId, "one")])).seq).toBe(1n);
     vi.restoreAllMocks();
     const failed = await alarmState(space);
     expect(failed.alarm).toBeGreaterThan(failed.exportDue);

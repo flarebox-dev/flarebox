@@ -287,6 +287,8 @@ export class SpaceDO extends DurableObject<Env> {
   /** Nodes per snapshot page of the R2 export. Tests lower it to write several pages. */
   snapshotPageNodes = 1000;
   private exporting: Promise<void> | undefined;
+  /** A stored commit could not set the alarm, so the next commit sets it. */
+  private alarmStale = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -729,7 +731,7 @@ export class SpaceDO extends DurableObject<Env> {
     const stored = this.checkCommitOrder(session.deviceId, commit);
     if (stored) {
       // The accepted attempt may have failed to set the alarm after its transaction.
-      await this.armAlarm();
+      await this.armAfterCommit();
       return { result: stored };
     }
     this.checkCanWrite(session);
@@ -799,8 +801,22 @@ export class SpaceDO extends DurableObject<Env> {
       );
       return { result, record, rearm: noteCommitted(this.sql, record) };
     });
-    if (done.rearm || !done.record) await this.armAlarm();
+    if (done.rearm || !done.record || this.alarmStale) await this.armAfterCommit();
     return { result: done.result, record: done.record };
+  }
+
+  /**
+   * Sets the alarm after a commit is stored. A failure does not fail the stored commit: it is logged, and the next commit
+   * or the next open sets the alarm from the durable schedule.
+   */
+  private async armAfterCommit(): Promise<void> {
+    try {
+      await this.armAlarm();
+      this.alarmStale = false;
+    } catch (error) {
+      this.alarmStale = true;
+      console.error("space alarm write failed", error);
+    }
   }
 
   /**
