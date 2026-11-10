@@ -28,11 +28,16 @@ public final class AppModel {
         }
     }
 
-    /// A model backed by the fake core. With `stateDirectory`, the fake keeps its state there;
-    /// with `scenario`, it starts from that scenario instead of the saved state. A scenario that
-    /// cannot be saved is not loaded, and the state's problems say why.
-    public static func fake(stateDirectory: URL? = nil, scenario: FakeScenario? = nil) -> AppModel {
-        let (session, events) = SyncSession.fakeWithEventStream(stateDirectory: stateDirectory)
+    /// A model backed by the sync driver, on the sync profile in `profileDirectory`.
+    public static func open(profileDirectory: URL) throws -> AppModel {
+        let (session, events) = try SyncSession.openWithEventStream(profileDirectory: profileDirectory)
+        return AppModel(session: session, events: events)
+    }
+
+    /// A model backed by the fake core, for previews and tests. With `scenario`, it starts from
+    /// that scenario instead of a first run.
+    public static func fake(scenario: FakeScenario? = nil) -> AppModel {
+        let (session, events) = SyncSession.fakeWithEventStream()
         if let scenario {
             _ = try? session.fakeCore()?.loadScenario(scenario: scenario)
         }

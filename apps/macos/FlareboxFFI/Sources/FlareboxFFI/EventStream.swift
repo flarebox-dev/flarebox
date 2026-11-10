@@ -3,17 +3,27 @@
 import Foundation
 
 extension SyncSession {
-    /// Creates a stopped session backed by the fake core, and the stream of its events.
+    /// Opens the sync profile in `profileDirectory` with the sync driver, and the stream of its
+    /// events. The profile keeps this Mac's credential, its linked folders and their sync state
+    /// across relaunches; one process at a time can open it, so a second open throws
+    /// `SessionError.ProfileInUse`.
     ///
-    /// With `stateDirectory`, the fake keeps its state there, so the account, linked folders and
-    /// unanswered questions survive a relaunch. The stream finishes when the Rust session is
-    /// dropped, which happens once the last reference to the returned session is released.
-    public static func fakeWithEventStream(stateDirectory: URL? = nil) -> (SyncSession, AsyncStream<SessionEvent>) {
+    /// The stream finishes when the Rust session is dropped, which happens once the last reference
+    /// to the returned session is released. Dropping it also releases the profile.
+    public static func openWithEventStream(profileDirectory: URL) throws -> (SyncSession, AsyncStream<SessionEvent>) {
         let (events, continuation) = AsyncStream.makeStream(of: SessionEvent.self)
-        let session = SyncSession.fake(
+        let session = try SyncSession.open(
             listener: EventRelay(continuation: continuation),
-            stateDir: stateDirectory?.path(percentEncoded: false)
+            profileDir: profileDirectory.path(percentEncoded: false)
         )
+        return (session, events)
+    }
+
+    /// Creates a stopped session backed by the fake core, which keeps a scripted state in memory,
+    /// and the stream of its events. The stream finishes when the Rust session is dropped.
+    public static func fakeWithEventStream() -> (SyncSession, AsyncStream<SessionEvent>) {
+        let (events, continuation) = AsyncStream.makeStream(of: SessionEvent.self)
+        let session = SyncSession.fake(listener: EventRelay(continuation: continuation))
         return (session, events)
     }
 }

@@ -10,11 +10,28 @@ struct FlareboxApp: App {
     @State private var model: AppModel
 
     init() {
-        let stateDirectory = URL.applicationSupportDirectory.appending(path: "Flarebox", directoryHint: .isDirectory)
-        let scenario = UserDefaults.standard.string(forKey: "FakeScenario").flatMap(FakeScenario.init(name:))
-        let model = AppModel.fake(stateDirectory: stateDirectory, scenario: scenario)
+        let model: AppModel
+        if let scenario = UserDefaults.standard.string(forKey: "FakeScenario").flatMap(FakeScenario.init(name:)) {
+            model = AppModel.fake(scenario: scenario)
+        } else {
+            let profile = URL.applicationSupportDirectory.appending(path: "Flarebox", directoryHint: .isDirectory)
+            do {
+                model = try AppModel.open(profileDirectory: profile)
+            } catch {
+                Self.quit(after: error)
+            }
+        }
         model.start()
         _model = State(initialValue: model)
+    }
+
+    /// Tells the person why the sync profile can't be opened, then quits.
+    private static func quit(after error: any Error) -> Never {
+        let alert = NSAlert()
+        alert.messageText = String(localized: "Flarebox can't start")
+        alert.informativeText = (error as? SessionError)?.message ?? error.localizedDescription
+        alert.runModal()
+        exit(1)
     }
 
     var body: some Scene {

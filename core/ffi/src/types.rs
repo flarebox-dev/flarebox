@@ -7,8 +7,6 @@
 //! Paths inside a linked folder are relative to the folder, use `/` as the separator and never
 //! start with one. Folder paths are absolute. Times are Unix milliseconds.
 
-use serde::{Deserialize, Serialize};
-
 /// What the whole session is doing. The menu bar shows it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum SyncStatus {
@@ -28,6 +26,9 @@ pub enum SyncStatus {
     Paused,
     /// The server cannot be reached. The session keeps retrying on its own.
     Offline,
+    /// A linked folder stopped syncing because of a problem the person has to fix.
+    /// [`SessionState::problems`] says which folder and why. The other folders keep syncing.
+    Halted,
 }
 
 /// How far the current sync has got, across every linked folder.
@@ -46,7 +47,7 @@ pub struct SyncProgress {
 }
 
 /// A path inside a linked folder.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct FolderPath {
     /// The space whose linked folder holds the path.
     pub space_id: String,
@@ -55,7 +56,7 @@ pub struct FolderPath {
 }
 
 /// Whether a node is a file or a folder.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum NodeKind {
     File,
     Folder,
@@ -101,7 +102,7 @@ pub enum Direction {
 }
 
 /// A server the app connected to before signing in (`GET /v1/server`).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct ServerInfo {
     /// The server's base URL, normalized: no trailing slash.
     pub url: String,
@@ -113,7 +114,7 @@ pub struct ServerInfo {
 }
 
 /// The signed-in device and the server it belongs to.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct Account {
     pub server_url: String,
     pub user_id: String,
@@ -125,7 +126,7 @@ pub struct Account {
 }
 
 /// A device signed in to the account.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct Device {
     pub device_id: String,
     pub name: String,
@@ -156,7 +157,7 @@ pub struct PairingCode {
 }
 
 /// A space on the server: one synced tree that devices link a folder to.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct Space {
     pub space_id: String,
     pub name: String,
@@ -164,7 +165,7 @@ pub struct Space {
 
 /// A folder on this device linked to a space. Each space links at most one folder, and linked
 /// folders never contain each other.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct LinkedFolder {
     pub space_id: String,
     pub space_name: String,
@@ -174,7 +175,7 @@ pub struct LinkedFolder {
 }
 
 /// What sync is doing for one linked folder.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum FolderState {
     /// Linked, waiting for its first sync or for the session to start.
     Waiting,
@@ -195,7 +196,7 @@ pub enum FolderState {
 /// A decision the engine needs from the person (`AskUser`, design §1). The engine persists
 /// every question with what it holds and asks it again after a restart (§2.8), so an unanswered
 /// question is in [`SessionState::questions`] until it is answered or withdrawn.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct Question {
     /// Unique per question. A question whose held set changes is replaced by one with a new ID,
     /// so an answer always refers to the set the person saw.
@@ -210,7 +211,7 @@ pub struct Question {
 }
 
 /// Why a question was asked, with what each kind must show.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum QuestionKind {
     /// The mass-delete guard (design §6.1) held local deletions because the commit would cross a
     /// limit. The items are the held topmost deleted nodes; a deleted folder is one deletion and
@@ -242,7 +243,7 @@ pub enum QuestionKind {
 }
 
 /// A limit of the mass-delete guard (design §6.1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum MassDeleteLimit {
     /// More than `limit` deletions in 10 minutes (1,000).
     Deletions { limit: u64 },
@@ -251,7 +252,7 @@ pub enum MassDeleteLimit {
 }
 
 /// What started a recovery and when the space was restored to.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct RecoveryCause {
     pub trigger: RecoveryTrigger,
     /// The point in time the space was rewound to, when the server reports it.
@@ -259,7 +260,7 @@ pub struct RecoveryCause {
 }
 
 /// Why a recovery started (design §6.4, Triggers).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum RecoveryTrigger {
     /// The owner rewound the space, or its server state was restored (`HISTORY_CHANGED`).
     SpaceRewound,
@@ -276,7 +277,7 @@ pub enum RecoveryTrigger {
 }
 
 /// A group of held files in a recovery (design §6.4, What the user sees), with its answers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum RecoveryGroup {
     /// Unchanged here, but created on the server after the restore point, so the rewind removed
     /// them. [`Answer::Keep`] puts them back on the server; [`Answer::Discard`] moves the local
@@ -299,7 +300,7 @@ pub enum RecoveryGroup {
 }
 
 /// One node held by a question.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct HeldItem {
     /// The node's ID, or the request's ID for [`RecoveryGroup::RequestedBeforeReset`].
     pub node_id: String,
@@ -311,7 +312,7 @@ pub struct HeldItem {
 }
 
 /// What happened to a held item, where its group does not already say it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum ItemDetail {
     /// Nothing beyond what the group says.
     Plain,
@@ -329,7 +330,7 @@ pub enum ItemDetail {
 
 /// An answer to a question. Each [`QuestionKind`] accepts two of them, listed in
 /// [`Question::answers`]; the engine refuses any other.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum Answer {
     /// Delete the items on the server and on every device.
     Delete,
@@ -368,7 +369,7 @@ impl QuestionKind {
 
 /// Something the person should know that needs neither an answer nor a fix. The core keeps a
 /// notice, across restarts, until the person dismisses it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct Notice {
     pub id: String,
     pub space_id: String,
@@ -377,7 +378,7 @@ pub struct Notice {
 }
 
 /// What a [`Notice`] reports.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum NoticeKind {
     /// A recovery started for the space (design §6.4, What the user sees): one notice per
     /// recovery, also when nothing is held. Changes the device had not made were applied, and
@@ -400,7 +401,7 @@ pub enum NoticeKind {
 
 /// Something only a person can fix (`Problem`, design §1). A problem stays listed until its
 /// cause goes away; the engine retries on its own.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct Problem {
     pub id: String,
     /// The space it concerns, or none for the whole session.
@@ -413,7 +414,7 @@ pub struct Problem {
 
 /// What a [`Problem`] is. The root checks halt their folder (design §6.2); the others leave
 /// the rest of the folder syncing.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum ProblemKind {
     /// The linked folder is missing, for example on an unmounted disk.
     FolderMissing,
@@ -458,6 +459,8 @@ pub enum ProblemKind {
     /// This device cannot save its sync state or credentials. Every change waits for its state
     /// to be saved first (design §1, §2.8), so nothing syncs until saving works again.
     StateNotWritable { reason: String },
+    /// The folder stopped syncing for the reason the driver gives, which only a person can fix.
+    FolderHalted { reason: String },
 }
 
 /// The whole state the app shows. [`SessionEvent`]s replace one part of it at a time.
@@ -537,4 +540,20 @@ pub enum SessionError {
     NoticeNotFound,
     #[error("the change could not be saved on this device, so it was not made: {reason}")]
     NotSaved { reason: String },
+    #[error("another Flarebox process is using this device's sync state")]
+    ProfileInUse,
+    #[error("the path is not a folder")]
+    NotAFolder,
+    #[error("another Flarebox process is syncing the folder")]
+    FolderInUse,
+    #[error("the folder is linked by device {device_id}; unlink it there first")]
+    FolderOfOtherDevice { device_id: String },
+    #[error("the folder belongs to another space; unlink it there first")]
+    MarkerOfOtherSpace,
+    #[error(
+        "the folder's file system cannot rename without replacing, so files cannot be applied safely"
+    )]
+    UnsupportedFileSystem,
+    #[error("{reason}")]
+    Failed { reason: String },
 }

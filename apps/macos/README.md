@@ -1,6 +1,6 @@
 # Flarebox for macOS
 
-A menu bar app that links the Rust core through [UniFFI](https://mozilla.github.io/uniffi-rs/). It has a menu bar menu (status, progress, recent changes, notices, pause and resume, open folder), a first-run setup window (server, sign-in, folder), a questions window, and settings (linked folders, account, problems, open at login). The session runs against `FakeCore` in `core/ffi`, which plays back scripted states, until the driver that runs the sync engine exists. Nothing is synced yet, and there is no File Provider extension.
+A menu bar app that links the Rust core through [UniFFI](https://mozilla.github.io/uniffi-rs/). It has a menu bar menu (status, progress, recent changes, notices, pause and resume, open folder), a first-run setup window (server, sign-in, folder), a questions window, and settings (linked folders, account, problems, open at login). The session runs the sync driver of `core/driver` in-process through `core/ffi`: it signs this Mac in, links folders, follows each space's log and observes the disk. The driver does not run the sync engine yet, so no file is uploaded or downloaded, and progress, recent changes and notices stay empty until it does. There is no File Provider extension.
 
 ## Requirements
 
@@ -30,7 +30,11 @@ xcodebuild -project Flarebox.xcodeproj -scheme Flarebox -configuration Release \
 open build/DerivedData/Build/Products/Release/Flarebox.app
 ```
 
-The fake keeps its state in `~/Library/Application Support/Flarebox`, so the account, folders and unanswered questions survive a relaunch. To start from a scripted state instead, pass a scenario, which replaces the saved state:
+The app keeps its sync profile in `~/Library/Application Support/Flarebox`: the device credential (`state/credential.json`), one store per linked space (`state/spaces/`) and the pause. One process at a time can open the profile.
+
+To try it against a local server, start the Worker in `server/` with `pnpm exec wrangler dev` (after `pnpm install`), enter `http://127.0.0.1:8787` in the setup window, open `http://127.0.0.1:8787/setup` in a browser, and claim the server with the code that `wrangler dev` prints. Plain `http` is accepted only on a loopback address.
+
+To show a state the driver cannot reach yet, start the app on the fake core in `core/ffi` with a scripted scenario. The fake keeps its state in memory only:
 
 ```sh
 open build/DerivedData/Build/Products/Release/Flarebox.app --args -FakeScenario manyQuestions
@@ -39,6 +43,8 @@ open build/DerivedData/Build/Products/Release/Flarebox.app --args -FakeScenario 
 The scenarios are `firstRun`, `upToDate`, `syncing`, `paused`, `offline`, `massDelete`, `ambiguousDisappearance`, `recovery`, `recoveredWithoutQuestions`, `remoteMassDelete`, `manyQuestions` and `problems`.
 
 You can also open `Flarebox.xcodeproj` in Xcode after step 3 and run the Flarebox scheme; the views have SwiftUI previews for these scenarios. Local builds are signed ad hoc, so no Apple developer account is needed.
+
+`core/ffi/scripts/integration-test.sh`, run from anywhere in the repository, tests the session against the Worker under `wrangler dev`: claiming, pairing, linking, status events, the pause, questions and problems.
 
 Run `scripts/build-ffi.sh` again after every change to `core/ffi`. It rebuilds the Rust library and regenerates the Swift API together. UniFFI checksums stop the app at launch when the library and the bindings disagree on the API, but they do not detect a build that is merely out of date: an old library with its matching bindings still launches.
 

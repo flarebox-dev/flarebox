@@ -569,10 +569,16 @@ dependencies = [
 name = "flarebox-ffi"
 version = "0.0.0"
 dependencies = [
- "serde",
+ "flarebox-driver",
+ "flarebox-net",
+ "flarebox-proto",
+ "flarebox-store",
+ "reqwest",
  "serde_json",
  "tempfile",
  "thiserror",
+ "tokio",
+ "tracing",
  "uniffi",
 ]
 
