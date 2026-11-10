@@ -195,7 +195,9 @@ impl Trees {
     }
 
     /// What S becomes for an excluded node whose S position neither L nor R holds any more, or
-    /// `None` when the node is not one. Nothing is planned for the node, so no op would ever
+    /// `None` when the node is not one. A parked node holds no position in L, so one that the
+    /// rules now leave out gives up its S position too, also while its old name is taken and it
+    /// cannot be moved back. Nothing is planned for the node, so no op would ever
     /// move its S entry, and the name it holds in S would keep every other node from being
     /// acknowledged there. With the node in L and live in R, S takes R's position and keeps its
     /// content, so the content is still compared with the last synced one when the node is
@@ -204,10 +206,11 @@ impl Trees {
     /// what only L holds is uploaded.
     fn released(&self, id: &str) -> Option<Option<Shape>> {
         let synced = self.s.live(id)?;
-        let local = self.l.get(id).map(|node| &node.shape);
+        let local = self.l.get(id);
         let remote = self.r.live(id);
         let held = |shape: Option<&Shape>| shape.is_some_and(|shape| shape.same_position(synced));
-        if held(local) || held(remote) || !self.excluded(id) {
+        let placed = local.filter(|node| !node.parked).map(|node| &node.shape);
+        if held(placed) || held(remote) || !self.ignored(id) {
             return None;
         }
         Some(match (local, remote) {

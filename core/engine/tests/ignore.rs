@@ -490,6 +490,59 @@ fn a_parked_node_the_rules_now_exclude_is_moved_back_to_where_l_keeps_it() {
 }
 
 #[test]
+fn a_node_whose_place_an_excluded_node_holds_is_not_parked_to_make_room() {
+    let mut trees = trees(&[
+        (
+            "old",
+            Some(file(ROOT, "notes.txt", 1)),
+            Some(file(ROOT, "notes.txt", 1)),
+            Some(file(ROOT, "notes.log", 1)),
+        ),
+        (
+            "draft",
+            Some(file(ROOT, "draft.txt", 2)),
+            Some(file(ROOT, "draft.txt", 2)),
+            Some(file(ROOT, "notes.txt", 2)),
+        ),
+        incoming("new", file(ROOT, "draft.txt", 3)),
+    ]);
+    trees.set_rules(&AT_ROOT, rules("*.log\n"));
+    assert!(trees.excluded("old"), "its local copy stays at notes.txt");
+    assert_eq!(effects(&mut trees), []);
+    assert!(!trees.local().get("draft").unwrap().parked);
+    assert_eq!(ops(&mut trees), []);
+}
+
+#[test]
+fn a_parked_node_the_rules_now_exclude_frees_its_name_in_s_for_the_node_that_took_it() {
+    let mut trees = trees(&[
+        (
+            "old",
+            None,
+            Some(dir(ROOT, "docs")),
+            Some(dir(ROOT, "archive")),
+        ),
+        (
+            "new",
+            Some(dir(ROOT, "docs")),
+            None,
+            Some(dir(ROOT, "docs")),
+        ),
+    ]);
+    let parked = LocalNode {
+        parked: true,
+        ..local(dir(ROOT, "docs"), 9)
+    };
+    trees.set_local("old".into(), parked.clone());
+    trees.set_rules(&AT_ROOT, rules("/archive/\n"));
+    assert_eq!(effects(&mut trees), [], "its old name is taken");
+    assert_eq!(ops(&mut trees), []);
+    assert_eq!(trees.synced().live("new"), Some(&dir(ROOT, "docs")));
+    assert_eq!(trees.synced().live("old"), Some(&dir(ROOT, "archive")));
+    assert_eq!(trees.local().get("old"), Some(&parked));
+}
+
+#[test]
 fn a_remote_rules_file_is_written_before_anything_else_below_its_folder() {
     let mut trees = trees(&[
         synced("d", dir(ROOT, "d")),

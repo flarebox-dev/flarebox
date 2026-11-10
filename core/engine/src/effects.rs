@@ -204,9 +204,10 @@ impl Effects {
     /// only moved out: to its R position, or to the position L keeps for it when R has none. Its
     /// content is never replaced or removed, so the change is planned like any other local one.
     ///
-    /// An excluded node ([`Trees::excluded`]) gets no effect and is never parked, a parked node
-    /// that the rules now leave out is only moved back to the position L keeps for it, and nothing is
-    /// planned while the rules are unknown ([`Trees::rules_known`]). A `.fbignore` file that R
+    /// An excluded node ([`Trees::excluded`]) gets no effect and is never parked, and neither is a
+    /// node whose own place an excluded node holds. A parked node that the rules now leave out is
+    /// only moved back to the position L keeps for it, and nothing is planned while the rules are
+    /// unknown ([`Trees::rules_known`]). A `.fbignore` file that R
     /// holds and the disk does not yet is written before any other effect below its folder
     /// (section 5.10). The driver reads the rules of a rules file it wrote and passes them to
     /// [`Trees::set_rules`] before it asks for the next effect, so the rules are in force before
@@ -269,6 +270,7 @@ impl Effects {
                 if !(candidate(trees, &id) || waiting)
                     || trees.excluded(&id)
                     || trees.local().get(&id).is_none_or(|node| node.parked)
+                    || view.stuck(&id, trees.local().len())
                 {
                     return None;
                 }
@@ -616,6 +618,18 @@ impl<'a> View<'a> {
             }
         }
         false
+    }
+
+    /// True when `id` could not leave the parked directory again: the name it moves to is held by
+    /// an excluded node, whose local copy no effect moves, or by a node that is stuck the same way.
+    /// Parking it would hide it for as long as the rules stay as they are.
+    fn stuck(&self, id: &str, depth: usize) -> bool {
+        match self.step(id) {
+            Step::Blocked(Some(holder)) if holder != id => {
+                self.trees.excluded(&holder) || (depth > 0 && self.stuck(&holder, depth - 1))
+            }
+            _ => false,
+        }
     }
 
     /// True when `ancestor` is `id` or holds it on disk.
