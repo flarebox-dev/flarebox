@@ -92,6 +92,9 @@ pub trait Contents {
     fn displaced(&mut self, file: &File) -> io::Result<bool>;
     /// Whether `file` holds the content the effect writes.
     fn written(&mut self, file: &File) -> io::Result<bool>;
+    /// What the local trash records as the displaced file's content, for
+    /// [`Space::reclaim_trash`] to compare the trashed file with later.
+    fn displaced_content(&self) -> Option<Vec<u8>>;
 }
 
 /// The points between the steps of design §5.2 where a hook runs. Each is
@@ -377,7 +380,8 @@ impl Space {
         if displaced.entry.kind == EntryKind::Dir {
             clear_platform_files(quarantine.fd(), id)?;
         }
-        self.trash(&quarantine, id, &effect.id, name, now)?;
+        let content = contents.displaced_content();
+        self.trash(&quarantine, id, &effect.id, name, content.as_deref(), now)?;
         hook(Step::Trashed);
         Ok(outcome)
     }
@@ -524,7 +528,15 @@ impl Space {
             if displaced.entry.kind == EntryKind::Dir {
                 clear_platform_files(quarantine.fd(), id)?;
             }
-            self.trash(&quarantine, id, &effect.id, original, now)?;
+            let content = contents.displaced_content();
+            self.trash(
+                &quarantine,
+                id,
+                &effect.id,
+                original,
+                content.as_deref(),
+                now,
+            )?;
             hook(Step::Trashed);
             return Ok(outcome);
         }

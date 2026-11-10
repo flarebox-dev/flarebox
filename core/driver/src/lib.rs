@@ -32,7 +32,7 @@ mod question;
 mod restore;
 mod status;
 
-pub use config::{Config, ConfigError, SyncRules};
+pub use config::{Config, ConfigError, LocalTrash, SyncRules};
 pub use credential::{Credential, CredentialError, api_for};
 pub use driver::{Driver, DriverError};
 pub use folder::MAX_FORMAT;

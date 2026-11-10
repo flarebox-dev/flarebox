@@ -51,11 +51,12 @@ use flarebox_engine::ignore::is_rules_file;
 use flarebox_engine::tree::{Content, Kind};
 use flarebox_fs::{
     Action, Base, Contents, Dir, Displaced, Effect, Entry, EntryKind, FileId, Location, Marker,
-    Outcome, Reason, RootProblem, Space, Step,
+    Outcome, Reason, Reclaimed, RootProblem, Space, Step,
 };
 use flarebox_net::{ChunkError, Session, StopReason, Transfer};
 use flarebox_proto::v1::{ChunkRef, Commit, op};
 use flarebox_store::{Link, Store, Tx};
+use prost::Message;
 
 use crate::engine::{Engine, file_id, file_identity};
 use crate::observe::{FsObserver, Observation, Observed, Observer, Reset, open_under};
@@ -389,6 +390,17 @@ impl Disk {
     /// returned, since this is where it gets its stamps.
     pub fn sections(&self) -> Arc<Sections> {
         self.sections.clone()
+    }
+
+    /// Reclaims the local trash at `now` with a cap of `cap` bytes ([`Space::reclaim_trash`]). A trashed file is
+    /// compared with the content its effect recorded for it.
+    pub fn reclaim_trash(&self, now: SystemTime, cap: u64) -> io::Result<Reclaimed> {
+        self.space.reclaim_trash(now, cap, &mut |file, content| {
+            let Ok(content) = Content::decode(content) else {
+                return Ok(false);
+            };
+            holds(file, Some(&content), false)
+        })
     }
 
     /// Plans the next effect and records it, with the ID generator, in one store transaction. Returns `None` when
@@ -1151,6 +1163,17 @@ impl Contents for Expected {
 
     fn written(&mut self, file: &File) -> io::Result<bool> {
         holds(file, self.written.as_ref(), true)
+    }
+
+    fn displaced_content(&self) -> Option<Vec<u8>> {
+        let displaced = self.displaced.as_ref()?;
+        let content = Content {
+            size: displaced.size,
+            manifest_digest: displaced.manifest_digest.clone(),
+            chunker: displaced.chunker.clone(),
+            ..Content::default()
+        };
+        Some(content.encode_to_vec())
     }
 }
 

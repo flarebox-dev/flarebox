@@ -143,6 +143,8 @@ struct Inner {
     matcher: Arc<dyn Matcher>,
     /// The `[sync]` list that `matcher` applies, for the engine of each folder.
     local: LocalRules,
+    /// The size cap in bytes of each folder's local trash, from `[trash]`.
+    trash_cap: u64,
     /// Held for the whole of a pair, claim, sign-out, link or unlink, so one runs at a time: a sign-out waits for a
     /// claim or a link in flight and then undoes it, and a credential the server issued is always stored.
     lifecycle: tokio::sync::Mutex<()>,
@@ -272,6 +274,7 @@ impl Driver {
             inner: Arc::new(Inner {
                 matcher,
                 local,
+                trash_cap: config.trash.cap(),
                 paths,
                 _lock: lock,
                 lifecycle: tokio::sync::Mutex::new(()),
@@ -937,6 +940,7 @@ impl Driver {
             status: folder.status.clone(),
             matcher: self.inner.matcher.clone(),
             local: self.inner.local.clone(),
+            trash_cap: self.inner.trash_cap,
             private_dirs: self.inner.paths.private_dirs(),
             linked,
             owner: Owner {

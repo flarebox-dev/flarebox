@@ -57,6 +57,8 @@ const ROOT_RECHECK: Duration = Duration::from_secs(30);
 /// The first wait before a folder that halted for its root syncs again. Each such halt doubles it, up to
 /// [`ROOT_RECHECK`].
 const ROOT_AGAIN: Duration = Duration::from_secs(1);
+/// How often a running folder reclaims its local trash, after the first time when it starts.
+const RECLAIM_TRASH: Duration = Duration::from_secs(24 * 60 * 60);
 /// How often a running folder checks that its path still names the folder it locked.
 const CLAIM_RECHECK: Duration = Duration::from_secs(2);
 /// The wait before a commit is built again after a file changed while its content was uploaded. The observer
@@ -229,6 +231,24 @@ impl Folder {
     /// The snapshot the observer starts from: the disk as L describes it.
     pub fn snapshot(&self) -> Snapshot {
         self.engine.snapshot()
+    }
+
+    /// Reclaims the local trash, evicting the oldest entries while it holds more than `cap` bytes. An entry written
+    /// after it entered comes back at the root as a recovered file, which the observer reports. A failure is logged,
+    /// and the next pass tries again.
+    pub fn reclaim_trash(&self, cap: u64) {
+        let space_id = &self.link.space_id;
+        match self.disk.reclaim_trash(SystemTime::now(), cap) {
+            Ok(reclaimed) => {
+                for name in reclaimed.recovered {
+                    let name = name.to_string_lossy();
+                    tracing::warn!(space_id, %name, "a local trash entry written after it entered was recovered");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(space_id, %error, "the local trash could not be reclaimed")
+            }
+        }
     }
 
     /// One event of the session.
@@ -980,6 +1000,8 @@ pub(crate) struct FolderTask {
     pub matcher: Arc<dyn Matcher>,
     /// This device's `[sync]` list as the engine's trees take it, the same list `matcher` applies to the scans.
     pub local: LocalRules,
+    /// The size cap in bytes of the folder's local trash.
+    pub trash_cap: u64,
     /// The profile's private directories, which the folder must neither hold nor sit inside.
     pub private_dirs: Vec<PathBuf>,
     /// The roots of the profile's other linked folders.
@@ -1119,6 +1141,8 @@ impl FolderTask {
             let mut wait: Slot<'_, ()> = None;
             let mut retry: Slot<'_, ()> = None;
             let mut recheck = tokio::time::interval(CLAIM_RECHECK);
+            let mut reclaim = tokio::time::interval(RECLAIM_TRASH);
+            reclaim.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 let step = tokio::select! {
                     event = events.next() => match event {
@@ -1147,6 +1171,10 @@ impl FolderTask {
                     () = finished(&mut wait) => folder.resend(),
                     () = finished(&mut retry) => folder.retry(),
                     () = self.requests.notified() => folder.requested(),
+                    _ = reclaim.tick() => {
+                        folder.reclaim_trash(self.trash_cap);
+                        Ok(Vec::new())
+                    }
                     _ = recheck.tick() => {
                         if !claim::still_locked(&lock, &self.link.root) {
                             break Halt::Root(REPLACED.to_owned());
