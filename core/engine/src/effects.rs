@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::classify::{Class, Trees};
+use crate::classify::{Class, Trees, classify};
 use crate::ids::IdGen;
 use crate::ignore::is_rules_file;
 
@@ -443,11 +443,16 @@ fn holds_below(trees: &Trees, id: &str) -> bool {
     })
 }
 
-/// Whether the node's only change is remote. While its S update waits, [`Class::Remote`] means L
-/// still matches the S that the update replaces, so L differs from the acknowledged shape: the
-/// change is local, and the node holds an edit ([`Trees::edited`]) whenever the content differs.
+/// Whether the node's only change is remote. While its S update waits, the waiting shape stands
+/// for S: L still holds the shape the server acknowledged, and only R differs from it. The update
+/// may never fit S while L holds that shape, as when its name key is taken in S, so the effects
+/// take R's shape and the update stops waiting once L leaves it.
 fn remote_only(trees: &Trees, id: &str) -> bool {
-    trees.class(id) == Class::Remote && !trees.waiting().contains_key(id)
+    let (local, remote) = (trees.local().live(id), trees.remote().live(id));
+    match trees.waiting().get(id) {
+        Some(waiting) => classify(local, waiting.as_ref(), remote) == Class::Remote,
+        None => trees.class(id) == Class::Remote,
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
