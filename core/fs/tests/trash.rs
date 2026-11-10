@@ -254,6 +254,32 @@ fn a_write_that_keeps_size_and_modification_time_is_recovered_when_due() {
     );
 }
 
+/// A due file the collector cannot read, as after `chmod -R a-r` on the linked
+/// folder, is recovered, and the entries after it are still reclaimed.
+#[test]
+fn an_unreadable_entry_is_recovered_and_the_pass_goes_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("locked.txt"), "synced").unwrap();
+    fs::write(root.join("report.txt"), "synced").unwrap();
+    let space = bind(root);
+    put(root, &space, "locked.txt", "e1", at(T0));
+    put(root, &space, "report.txt", "e2", at(T0 + 1));
+    let locked = trash_dir(root).join("e1");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&locked).is_ok() {
+        eprintln!("skipped: the entry is still readable, as for root");
+        return;
+    }
+
+    let reclaimed = space
+        .reclaim_trash(at(T0 + 1) + TRASH_RETENTION, u64::MAX, &mut same)
+        .unwrap();
+    assert_eq!(reclaimed.removed, ["e2"]);
+    assert_eq!(reclaimed.recovered.len(), 1, "{reclaimed:?}");
+    assert_eq!(names(&trash_dir(root)), Vec::<String>::new());
+}
+
 #[test]
 fn folder_written_into_after_trashing_is_recovered() {
     let dir = tempfile::tempdir().unwrap();

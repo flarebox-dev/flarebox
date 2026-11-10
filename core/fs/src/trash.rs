@@ -207,7 +207,8 @@ impl Space {
 
 /// Deletes a trash entry that still matches the index: a file with the
 /// recorded size and content, or an empty folder. Returns false, leaving it in
-/// place, when it changed.
+/// place, when it changed. A file that cannot be opened or read counts as
+/// changed, so it is recovered rather than deleted, and the pass goes on.
 fn remove_unchanged(
     trash: BorrowedFd<'_>,
     entry: &str,
@@ -223,8 +224,8 @@ fn remove_unchanged(
         let unchanged = match &kept.content {
             Some(content) => {
                 let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-                let file = rustix::fs::openat(trash, entry, flags, Mode::empty())?;
-                holds(&File::from(file), content)?
+                rustix::fs::openat(trash, entry, flags, Mode::empty())
+                    .is_ok_and(|file| holds(&File::from(file), content).unwrap_or(false))
             }
             None => ctime(stat.ctime_ns) == kept.ctime_ns,
         };
