@@ -63,11 +63,15 @@ test("an output inside the assets directory is refused before the dry run, also 
   const dir = mkdtempSync(join(tmpdir(), "pack-bundle-test-"));
   try {
     symlinkSync(assets, join(dir, "link"));
-    for (const output of [join(assets, "bundle"), join(dir, "link", "bundle")]) {
+    for (const [output, created] of [
+      [join(assets, "bundle"), join(assets, "bundle")],
+      [join(dir, "link", "bundle"), join(assets, "bundle")],
+      [join(assets, "..bundle"), join(assets, "..bundle")],
+    ]) {
       const run = spawnSync(process.execPath, [packer, output], { encoding: "utf8" });
       assert.notEqual(run.status, 0, output);
       assert.ok(!run.stdout.includes(DRY_RUN), output);
-      assert.ok(!existsSync(join(assets, "bundle")), output);
+      assert.ok(!existsSync(created), output);
     }
   } finally {
     rmSync(dir, { recursive: true, force: true });
