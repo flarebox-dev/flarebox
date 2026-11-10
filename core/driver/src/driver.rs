@@ -15,7 +15,6 @@ use flarebox_proto::v1::{ClaimRequest, DeviceCredentials, PairCompleteRequest, S
 use flarebox_store::{GivenAnswer, Link, Store, StoredQuestion};
 use rustix::fs::FlockOperation;
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
 
 use crate::claim::{self, Owner};
 use crate::config::{Config, ConfigError};
@@ -130,15 +129,36 @@ struct Inner {
     changed: Arc<watch::Sender<()>>,
 }
 
+/// A linked folder. It stays in the driver's map until unlinking it has finished, so a stop, an unlink or a sign-out
+/// that starts later still finds its task and its cleanup, also after an earlier caller gave up waiting.
 struct Folder {
     link: Link,
     status: Arc<Mutex<FolderStatus>>,
+    /// The folder's task, from its start until a stop has seen it end.
     run: Option<Running>,
 }
 
 struct Running {
     stop: watch::Sender<bool>,
-    task: JoinHandle<()>,
+    /// Closed when the task has ended, its observer and its hold on the folder included.
+    done: watch::Receiver<()>,
+}
+
+impl Running {
+    /// Tells the task to stop and returns what closes once it has.
+    fn stop(&self) -> watch::Receiver<()> {
+        let _ = self.stop.send(true);
+        self.done.clone()
+    }
+
+    fn ended(&self) -> bool {
+        self.done.has_changed().is_err()
+    }
+}
+
+/// Waits until a task that [`Running::stop`] told to stop has ended. Any number of callers can wait for one task.
+async fn ended(mut done: watch::Receiver<()>) {
+    while done.changed().await.is_ok() {}
 }
 
 impl Driver {
@@ -313,6 +333,7 @@ impl Driver {
             Err(error) => return Err(io_error(&path)(error)),
         }
         *self.inner.credential.lock().unwrap() = None;
+        self.inner.running.store(false, Ordering::SeqCst);
         tracing::info!("signed out");
         self.changed();
         Ok(())
@@ -468,37 +489,36 @@ impl Driver {
     async fn unlink_folder(&self, folder: &Path) -> Result<Link, DriverError> {
         let wanted = absolute(folder);
         let canonical = fs::canonicalize(folder).ok();
-        let mut removed = {
-            let mut folders = self.inner.folders.lock().unwrap();
-            let space_id = folders
-                .iter()
-                .find(|(_, linked)| {
+        let (link, done) = {
+            let folders = self.inner.folders.lock().unwrap();
+            let found = folders
+                .values()
+                .find(|linked| {
                     linked.link.root == wanted || Some(&linked.link.root) == canonical.as_ref()
                 })
-                .map(|(space_id, _)| space_id.clone())
                 .ok_or_else(|| DriverError::NotLinked(folder.to_path_buf()))?;
-            folders.remove(&space_id).expect("found above")
+            (found.link.clone(), found.run.as_ref().map(Running::stop))
         };
-        if let Some(run) = removed.run.take() {
-            let _ = run.stop.send(true);
-            let _ = run.task.await;
+        if let Some(done) = done {
+            ended(done).await;
         }
-        if let Err(error) = self.forget(&removed.link) {
-            halt(
-                &mut removed,
-                format!("the folder could not be unlinked: {error}"),
-            );
-            self.inner
-                .folders
-                .lock()
-                .unwrap()
-                .insert(removed.link.space_id.clone(), removed);
-            self.changed();
-            return Err(error);
+        let forgotten = self.forget(&link);
+        let mut folders = self.inner.folders.lock().unwrap();
+        match forgotten {
+            Ok(()) => {
+                folders.remove(&link.space_id);
+                tracing::info!(space_id = link.space_id, path = %link.root.display(), "unlinked a folder");
+            }
+            Err(ref error) => {
+                if let Some(folder) = folders.get_mut(&link.space_id) {
+                    folder.run = None;
+                    halt(folder, format!("the folder could not be unlinked: {error}"));
+                }
+            }
         }
-        tracing::info!(space_id = removed.link.space_id, path = %removed.link.root.display(), "unlinked a folder");
+        drop(folders);
         self.changed();
-        Ok(removed.link)
+        forgotten.map(|()| link)
     }
 
     /// Removes the folder's owner record, then its store. The store records the link, so it goes last: until both are
@@ -600,6 +620,9 @@ impl Driver {
         let mut folders = self.inner.folders.lock().unwrap();
         let all = roots(&folders);
         for folder in folders.values_mut() {
+            if folder.run.as_ref().is_some_and(|run| !run.ended()) {
+                continue;
+            }
             let linked = all
                 .iter()
                 .filter(|root| **root != folder.link.root)
@@ -617,25 +640,26 @@ impl Driver {
         self.changed();
     }
 
-    /// Stops every folder and waits for their tasks to end. State on disk is kept.
+    /// Stops every folder and waits for their tasks to end, also those an earlier stop or unlink is still waiting for.
+    /// State on disk is kept.
     pub async fn stop(&self) {
         self.inner.running.store(false, Ordering::SeqCst);
-        let runs: Vec<Running> = self
+        let stopping: Vec<_> = self
             .inner
             .folders
             .lock()
             .unwrap()
-            .values_mut()
-            .filter_map(|folder| folder.run.take())
+            .values()
+            .filter_map(|folder| folder.run.as_ref().map(Running::stop))
             .collect();
-        for run in &runs {
-            let _ = run.stop.send(true);
+        for done in stopping {
+            ended(done).await;
         }
-        for run in runs {
-            let _ = run.task.await;
-        }
-        for folder in self.inner.folders.lock().unwrap().values() {
-            folder.status.lock().unwrap().state = FolderState::Stopped;
+        for folder in self.inner.folders.lock().unwrap().values_mut() {
+            if folder.run.as_ref().is_none_or(Running::ended) {
+                folder.run = None;
+                folder.status.lock().unwrap().state = FolderState::Stopped;
+            }
         }
         self.changed();
     }
@@ -677,11 +701,13 @@ impl Driver {
             changed: self.inner.changed.clone(),
         };
         let (stop, stopped) = watch::channel(false);
+        let (finished, done) = watch::channel(());
         folder.status.lock().unwrap().state = FolderState::Connecting;
-        folder.run = Some(Running {
-            stop,
-            task: tokio::spawn(task.run(stopped)),
+        tokio::spawn(async move {
+            task.run(stopped).await;
+            drop(finished);
         });
+        folder.run = Some(Running { stop, done });
     }
 
     fn credential(&self) -> Result<Credential, DriverError> {
@@ -1688,6 +1714,149 @@ mod tests {
         assert!(watch.has_changed().unwrap());
         assert!(driver.status().folders.is_empty());
         assert!(!store_dir.exists());
+    }
+
+    /// Holds the observer of a folder inside its first matcher call until it is opened or dropped.
+    struct Gate(Arc<(Mutex<bool>, std::sync::Condvar)>);
+
+    impl Gate {
+        fn open(&self) {
+            *self.0.0.lock().unwrap() = true;
+            self.0.1.notify_all();
+        }
+    }
+
+    impl Drop for Gate {
+        fn drop(&mut self) {
+            self.open();
+        }
+    }
+
+    struct Paused {
+        entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl Matcher for Paused {
+        fn is_excluded(&self, _: &Path, _: bool) -> bool {
+            if let Some(entered) = self.entered.lock().unwrap().take() {
+                let _ = entered.send(());
+            }
+            let (open, opened) = &*self.gate;
+            let _open = opened
+                .wait_while(open.lock().unwrap(), |open| !*open)
+                .unwrap();
+            false
+        }
+    }
+
+    /// A started driver whose one folder's observer is paused, holding the folder's lock, until the gate opens.
+    async fn paused_driver(paths: &Paths, root: &Path) -> (Driver, Gate) {
+        linked(paths, root, "d1");
+        fs::write(root.join("file"), b"mine").unwrap();
+        let mut driver = Driver::open(paths.clone()).unwrap();
+        let (entered, observing) = tokio::sync::oneshot::channel();
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        Arc::get_mut(&mut driver.inner).unwrap().matcher = Arc::new(Paused {
+            entered: Mutex::new(Some(entered)),
+            gate: gate.clone(),
+        });
+        driver.start();
+        tokio::time::timeout(Duration::from_secs(10), observing)
+            .await
+            .unwrap()
+            .unwrap();
+        (driver, Gate(gate))
+    }
+
+    /// Whether this process could lock `root` now, which it cannot while a folder task holds it.
+    fn lockable(root: &Path) -> bool {
+        claim::lock(root).unwrap().is_some()
+    }
+
+    /// Checks that signing out finished: no account, no folders, no running tasks, nothing left in the profile or
+    /// the folder.
+    fn signed_out(driver: &Driver, paths: &Paths, root: &Path) {
+        let status = driver.status();
+        assert_eq!(status.account, None);
+        assert!(status.folders.is_empty());
+        assert!(!status.running);
+        assert!(!paths.credential().exists());
+        assert!(!paths.store(SPACE).unwrap().parent().unwrap().exists());
+        assert_eq!(claim::owner(root).unwrap(), None);
+        assert!(lockable(root));
+        assert_eq!(fs::read(root.join("file")).unwrap(), b"mine");
+    }
+
+    #[tokio::test]
+    async fn signing_out_waits_for_a_stop_already_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        let paths = Paths::under(&base.join("profile"));
+        let (driver, gate) = paused_driver(&paths, &root).await;
+        let stop = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.stop().await }
+        });
+        eventually("the stop begins", || !driver.status().running).await;
+        let sign_out = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.sign_out().await }
+        });
+        assert!(still_waiting(&sign_out).await);
+        assert!(!lockable(&root));
+
+        gate.open();
+        stop.await.unwrap();
+        sign_out.await.unwrap().unwrap();
+        signed_out(&driver, &paths, &root);
+    }
+
+    #[tokio::test]
+    async fn signing_out_finishes_a_cancelled_unlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        let paths = Paths::under(&base.join("profile"));
+        let (driver, gate) = paused_driver(&paths, &root).await;
+        let unlink = tokio::spawn({
+            let driver = driver.clone();
+            let root = root.clone();
+            async move { driver.unlink(&root).await }
+        });
+        assert!(still_waiting(&unlink).await);
+        unlink.abort();
+        assert!(unlink.await.unwrap_err().is_cancelled());
+        assert_eq!(driver.status().folders.len(), 1);
+        let sign_out = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.sign_out().await }
+        });
+        assert!(still_waiting(&sign_out).await);
+
+        gate.open();
+        sign_out.await.unwrap().unwrap();
+        signed_out(&driver, &paths, &root);
+    }
+
+    #[tokio::test]
+    async fn a_start_during_a_sign_out_leaves_the_driver_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        let paths = Paths::under(&base.join("profile"));
+        let (driver, gate) = paused_driver(&paths, &root).await;
+        let sign_out = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.sign_out().await }
+        });
+        eventually("the sign-out stops the driver", || !driver.status().running).await;
+        driver.start();
+
+        gate.open();
+        sign_out.await.unwrap().unwrap();
+        signed_out(&driver, &paths, &root);
     }
 
     #[tokio::test]
