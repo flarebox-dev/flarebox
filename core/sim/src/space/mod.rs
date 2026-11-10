@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! An in-memory Space DO written from spec v0 sections 6 to 8 and checked against the TypeScript
-//! server (flarebox#6): commit idempotency, `base_seq` checks, chunk presence and receipts, rules
-//! R1 to R11, trash groups, revisions and post-image change records, resume and the paged listings.
+//! server (flarebox#6): commit idempotency and the commit checks of RFC 0002 section 3 (history fence,
+//! device counter, `base_seq`, `require_head`), chunk presence and receipts, rules R1 to R11, trash
+//! groups, revisions and post-image change records, resume and the paged listings.
 //! Garbage collection and retention are not modelled.
 
 mod apply;
@@ -11,12 +12,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use flarebox_engine::ids::{IdGen, is_uuid_v7};
 use flarebox_proto::v1::{
-    ChangeRecord, ChunkPlan, ChunkRef, ChunkTarget, Commit, CommitRecord, CommitResult, Content,
-    DownloadTargets, Error, GetDownloadTargets, GetVersionChunks, ListTrash, ListTree,
+    ChangeRecord, Changes, ChunkPlan, ChunkRef, ChunkTarget, Commit, CommitRecord, CommitResult,
+    Content, DownloadTargets, Error, GetDownloadTargets, GetVersionChunks, ListTrash, ListTree,
     ListVersions, NodeKind, NodeState, NodeStatus, Op, PrepareUpload, PrepareUploadResult, Resume,
-    ResyncRequired, RpcRequest, RpcResponse, Target, TrashPage, TreePage, UploadReceipt,
-    VersionChunks, VersionInfo, VersionList, Welcome, chunk_plan, error, op, resync_required,
-    rpc_request, rpc_response,
+    ResyncRequired, RpcRequest, RpcResponse, ServerMessage, Target, TrashPage, TreePage,
+    UploadReceipt, VersionChunks, VersionInfo, VersionList, Welcome, chunk_plan, error, op,
+    resync_required, rpc_request, rpc_response, server_message,
 };
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -30,8 +31,9 @@ pub const MAX_OPS: usize = 1000;
 pub const MAX_CHUNKS_PER_CALL: usize = 1000;
 pub const MAX_CHUNK_BYTES: u32 = 16 * 1024 * 1024;
 pub const INLINE_CHUNKS: u32 = 16_384;
-/// The largest commit log row: the encoded `CommitRecord` and `CommitResult` together.
-pub const MAX_COMMIT_ROW_BYTES: usize = 7_900_000;
+/// The largest `ServerMessage` (spec v0 section 7.2). A commit whose record, pushed in `Changes`, or
+/// whose result, answered in an `RpcResponse`, would not fit in one is refused.
+pub const MAX_SERVER_MESSAGE_BYTES: usize = 1024 * 1024;
 pub const PAGE_CHUNKS: usize = 4096;
 const GRANT_MS: i64 = 3_600_000;
 const PAGE_BYTES: usize = 1024 * 1024;
@@ -352,6 +354,9 @@ pub struct SpaceDo {
     state: State,
     log: Vec<CommitRecord>,
     results: HashMap<String, CommitResult>,
+    /// The highest accepted `device_seq` per device (RFC 0002 section 2). `results` keeps every
+    /// commit's result, so the result of that commit is found there.
+    device_seqs: HashMap<String, u64>,
     receipts: HashMap<String, IssuedReceipt>,
     /// The bucket: the size of every chunk object a `PUT` stored, by hash. A commit counts a
     /// `pending` chunk without a valid receipt as uploaded when its object is here with the row's
@@ -396,6 +401,7 @@ impl SpaceDo {
             space_id,
             log: Vec::new(),
             results: HashMap::new(),
+            device_seqs: HashMap::new(),
             receipts: HashMap::new(),
             objects: HashMap::new(),
             head_seq: 0,
@@ -445,8 +451,14 @@ impl SpaceDo {
             head_seq: self.head_seq,
             log_floor_seq: self.log_floor_seq,
             read_only: session.role == Role::Viewer || session.max_format < self.format_version,
+            device_seq: self.device_seq(&session.device_id),
             ..Default::default()
         }
+    }
+
+    /// The device's highest accepted `device_seq` in this history, 0 if it has none.
+    pub fn device_seq(&self, device_id: &str) -> u64 {
+        self.device_seqs.get(device_id).copied().unwrap_or(0)
     }
 
     /// The backlog after `since_seq` (spec v0 section 7.3), or why the client must bootstrap instead.
@@ -545,12 +557,36 @@ impl SpaceDo {
         now_ms: i64,
         commit: &Commit,
     ) -> Result<Committed, Error> {
-        self.check_can_write(session)?;
+        if commit.history_id != self.history_id {
+            return Err(fail(
+                error::Code::HistoryMismatch,
+                "history_id is not the space's current history",
+            ));
+        }
         if let Some(stored) = self.results.get(&commit.commit_id) {
             return Ok(Committed {
                 result: stored.clone(),
                 record: None,
             });
+        }
+        let next = self.device_seq(&session.device_id) + 1;
+        match commit.device_seq {
+            0 => {
+                return Err(fail(error::Code::InvalidArgument, "device_seq starts at 1"));
+            }
+            slot if slot < next => {
+                return Err(fail(
+                    error::Code::StaleDeviceState,
+                    "device_seq is at or below the device's highest accepted one",
+                ));
+            }
+            slot if slot > next => {
+                return Err(fail(
+                    error::Code::InvalidArgument,
+                    format!("device_seq must be {next}, the device's next slot"),
+                ));
+            }
+            _ => {}
         }
         if commit.base_seq > self.head_seq {
             return Err(fail(
@@ -558,6 +594,13 @@ impl SpaceDo {
                 "base_seq is ahead of the server",
             ));
         }
+        if commit.require_head && commit.base_seq < self.head_seq {
+            return Err(fail(
+                error::Code::HeadMoved,
+                "the space has changed since base_seq",
+            ));
+        }
+        self.check_can_write(session)?;
         if !is_uuid_v7(&commit.commit_id) {
             return Err(fail(
                 error::Code::InvalidArgument,
@@ -660,16 +703,29 @@ impl SpaceDo {
             results,
             changes,
         };
-        if record.encoded_len() + result.encoded_len() > MAX_COMMIT_ROW_BYTES {
+        let pushed = ServerMessage {
+            msg: Some(server_message::Msg::Changes(Changes {
+                commits: vec![record.clone()],
+            })),
+        };
+        let answered = ServerMessage {
+            msg: Some(server_message::Msg::Rpc(RpcResponse {
+                req_id: u64::MAX,
+                result: Some(rpc_response::Result::Commit(result.clone())),
+            })),
+        };
+        if pushed.encoded_len().max(answered.encoded_len()) > MAX_SERVER_MESSAGE_BYTES {
             return Err(fail(
                 error::Code::LimitExceeded,
-                "the commit's change records are too large for one log entry; split the commit",
+                "the commit's change records do not fit in one 1 MiB message; split the commit",
             ));
         }
         self.state = state;
         self.log.push(record.clone());
         self.results
             .insert(commit.commit_id.clone(), result.clone());
+        self.device_seqs
+            .insert(session.device_id.clone(), commit.device_seq);
         self.head_seq = seq;
         Ok(Committed {
             result,
@@ -967,7 +1023,8 @@ mod tests {
                 commit_id: ids.uuid_v7(1),
                 base_seq: space.head_seq(),
                 ops: vec![Op { op: Some(op) }],
-                receipts: vec![],
+                history_id: space.history_id().into(),
+                device_seq: space.device_seq(&session.device_id) + 1,
                 ..Default::default()
             };
             space.commit(&session, 0, &commit).unwrap().result

@@ -179,6 +179,8 @@ fn run(actions: &[Action]) -> Vec<NodeState> {
             base_seq: space.head_seq().saturating_sub(a.lag),
             ops: vec![Op { op: Some(body) }],
             receipts,
+            history_id: space.history_id().into(),
+            device_seq: space.device_seq(&s.device_id) + 1,
             ..Default::default()
         };
         let done = space
