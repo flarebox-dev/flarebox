@@ -1846,7 +1846,7 @@ fn a_move_and_edit_whose_s_update_waits() -> (Trees, Commits, IdGen) {
 }
 
 /// Plans and does every effect, failing none, and returns those planned for `node`. An entry an
-/// effect creates gets inode 100.
+/// effect creates or writes gets inode 100.
 fn effects_for(trees: &mut Trees, ids: &mut IdGen, node: &str) -> Vec<Effect> {
     let mut effects = Effects::default();
     let mut planned = Vec::new();
@@ -1857,8 +1857,9 @@ fn effects_for(trees: &mut Trees, ids: &mut IdGen, node: &str) -> Vec<Effect> {
         if record.node == node {
             planned.push(record.effect.clone());
         }
-        let created = trees.local().get(&record.node).is_none();
-        let identity = created.then_some(FileIdentity {
+        let written = trees.local().get(&record.node).is_none()
+            || matches!(record.effect, Effect::WriteFile { .. });
+        let identity = written.then_some(FileIdentity {
             dev: 1,
             ino: 100,
             birth_ns: Some(0),
@@ -1982,6 +1983,66 @@ fn a_parked_waiting_file_with_the_content_s_still_holds_keeps_it() {
     );
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert_eq!(ops(&commit), [update("n", 0)]);
+}
+
+/// n is parked with the content the server acknowledged, which its waiting update holds, while
+/// the other device moves n to q and changes its content, and committing is halted. Against the
+/// acknowledged update only R changed, so the effects write R's content at q, although no commit
+/// rebases n while committing is halted.
+#[test]
+fn a_parked_waiting_file_takes_remote_content_while_committing_is_halted() {
+    let (mut trees, mut commits, mut ids) = a_move_and_edit_whose_s_update_waits();
+    trees.set_local(
+        "n".into(),
+        LocalNode {
+            parked: true,
+            ..local(file(ROOT, "x", 1), 2)
+        },
+    );
+    trees.set_remote("n".into(), remote(file(ROOT, "q", 3)));
+    trees.set_local("p".into(), local(file(ROOT, "p", 3), 3));
+    trees.settle();
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(
+        commits.failed(&refusal(error::Code::ReadOnly, 0)),
+        Ok(Failure::Halted(Halt::ReadOnly))
+    );
+    effects_for(&mut trees, &mut ids, "n");
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    effects_for(&mut trees, &mut ids, "n");
+    assert_eq!(trees.local().live("n"), Some(&file(ROOT, "q", 3)));
+}
+
+/// As above, but the user edited n while it was parked. That edit is the user's, so n is only
+/// moved to q, with the edited content, and the edit is uploaded as a conflict copy beside R's.
+#[test]
+fn a_parked_waiting_file_the_user_edited_keeps_the_edit_when_the_other_device_moves_it() {
+    let (mut trees, mut commits, mut ids) = a_move_and_edit_whose_s_update_waits();
+    trees.set_local(
+        "n".into(),
+        LocalNode {
+            parked: true,
+            ..local(file(ROOT, "x", 2), 2)
+        },
+    );
+    trees.set_remote("n".into(), remote(file(ROOT, "q", 3)));
+    trees.settle();
+    let effects = effects_for(&mut trees, &mut ids, "n");
+    assert!(
+        effects
+            .iter()
+            .all(|effect| matches!(effect, Effect::Move { .. })),
+        "{effects:?}"
+    );
+    assert_eq!(trees.local().live("n"), Some(&file(ROOT, "q", 2)));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    let [op::Op::CreateFile(copy)] = <[op::Op; 1]>::try_from(ops(&commit)).unwrap() else {
+        panic!("{commit:?}");
+    };
+    assert_eq!(
+        (copy.parent_id.as_str(), copy.content),
+        (ROOT, Some(content(2)))
+    );
 }
 
 /// Both sides move n to z with the same new content while its update waits. Settling makes S
