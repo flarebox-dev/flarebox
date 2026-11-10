@@ -74,6 +74,17 @@ enum Command {
     Unlink { folder: PathBuf },
     /// Sync a linked folder again from the start, after fixing the problem that halted it.
     Restart { folder: PathBuf },
+    /// Sync a folder again whose changes the server refused, after fixing the cause the status names.
+    #[command(group = clap::ArgGroup::new("how").required(true).args(["resend", "replan"]))]
+    Lift {
+        folder: PathBuf,
+        /// Send the refused changes again as they were, for a cause fixed on the server.
+        #[arg(long)]
+        resend: bool,
+        /// Plan the refused changes again into a new commit, for a cause fixed on this device.
+        #[arg(long)]
+        replan: bool,
+    },
     /// Show this device and its linked folders.
     Status {
         #[arg(long)]
@@ -293,6 +304,13 @@ async fn client(paths: Paths, command: Command) -> Result<(), String> {
         Command::Restart { folder } => (
             Request::Restart {
                 folder: absolute(&folder)?,
+            },
+            false,
+        ),
+        Command::Lift { folder, replan, .. } => (
+            Request::Lift {
+                folder: absolute(&folder)?,
+                replan,
             },
             false,
         ),

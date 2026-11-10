@@ -9,6 +9,7 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::time::Instant;
 
+use flarebox_engine::commit::Lift;
 use flarebox_engine::restore::{Outcome, RestoreIntent};
 use flarebox_engine::tree::{Kind, LocalNode, Tree};
 use flarebox_fs::{EntryKind, Marker, RootProblem, write_marker};
@@ -19,6 +20,7 @@ use flarebox_sim::space::{Role, Session as Caller, SpaceDo};
 use super::*;
 use crate::config::SyncRules;
 use crate::disk::tests::{Server, ready};
+use crate::driver::{DriverError, lift_halt};
 use crate::ignore::{local_rules, matcher};
 use crate::observe::Observed;
 
@@ -2352,4 +2354,90 @@ fn a_read_only_device_keeps_downloading() {
         ]
     );
     assert_eq!(remote.names(), ["theirs.txt"]);
+}
+
+/// A device whose first commit, of `notes.txt`, the server refused with `code`. Returns the folder, the refused
+/// commit and why the task stopped. The device is gone, so its folder and store are free.
+fn refused_first_commit(remote: &mut Remote, code: Code) -> (Site, Commit, String) {
+    let (site, mut a) = linked(remote, "a");
+    fs::write(site.root.join("notes.txt"), b"written on a").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    let upload = a.work.pop_front().unwrap();
+    a.perform(upload, remote).unwrap();
+    let Some(Work::Send(commit)) = a.work.pop_front() else {
+        panic!("the commit is sent");
+    };
+    let refusal = ServerError(flarebox_proto::v1::Error {
+        code: code as i32,
+        message: "refused".into(),
+        ..Default::default()
+    });
+    let step = a.folder.sent(Err(CallError::Server(refusal)));
+    let stop = a.take(step).unwrap_err();
+    (site, commit, stop.to_string())
+}
+
+/// Starts the folder again and runs what follows its `Welcome` and its first scan.
+fn restarted(site: &Site, remote: &mut Remote) -> Device {
+    let mut device = site.start();
+    device.connect(remote);
+    device.scan_until(|device| device.folder.scanned);
+    device.run(remote);
+    device
+}
+
+#[test]
+fn a_refused_commit_lifted_to_resend_goes_out_unchanged() {
+    let mut remote = Remote::new();
+    let (site, refused, halt) = refused_first_commit(&mut remote, Code::Forbidden);
+    assert!(halt.contains("flarebox lift"), "{halt}");
+    let a = restarted(&site, &mut remote);
+    assert!(a.sent.is_empty(), "a restart lifts nothing");
+    let problem = a.folder.view().problem.unwrap();
+    assert!(problem.contains("flarebox lift"), "{problem}");
+    drop(a);
+
+    lift_halt(&site.db, Lift::Resend).unwrap();
+    let mut a = restarted(&site, &mut remote);
+    assert_eq!(a.sent[0].commit_id, refused.commit_id);
+    assert_eq!(remote.names(), ["notes.txt"]);
+    a.settle();
+    assert_eq!(a.state(), FolderState::UpToDate);
+    assert_eq!(a.folder.view().problem, None);
+}
+
+#[test]
+fn a_refused_commit_lifted_to_replan_goes_out_as_a_new_commit_in_its_slot() {
+    let mut remote = Remote::new();
+    let (site, refused, _) = refused_first_commit(&mut remote, Code::InvalidArgument);
+    lift_halt(&site.db, Lift::Replan).unwrap();
+    let mut a = restarted(&site, &mut remote);
+    assert!(!a.sent.is_empty());
+    assert!(
+        a.sent
+            .iter()
+            .all(|sent| sent.commit_id != refused.commit_id)
+    );
+    assert_eq!(a.sent[0].device_seq, refused.device_seq);
+    assert_eq!(remote.names(), ["notes.txt"]);
+    a.settle();
+    assert_eq!(a.state(), FolderState::UpToDate);
+}
+
+#[test]
+fn a_commit_that_waits_for_the_owners_confirmation_is_not_lifted() {
+    let mut remote = Remote::new();
+    let (site, refused, halt) = refused_first_commit(&mut remote, Code::ConfirmationRequired);
+    assert!(halt.contains("owner must confirm"), "{halt}");
+    for lift in [Lift::Resend, Lift::Replan] {
+        let lifted = lift_halt(&site.db, lift);
+        assert!(
+            matches!(lifted, Err(DriverError::NeedsConfirmation)),
+            "{lifted:?}"
+        );
+    }
+    let a = restarted(&site, &mut remote);
+    assert!(a.sent.is_empty());
+    let flight = a.folder.engine.commits.in_flight().unwrap();
+    assert_eq!(flight.commit.commit_id, refused.commit_id);
 }

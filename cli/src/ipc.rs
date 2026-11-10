@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use flarebox_driver::{
     Account, Answer, Credential, Driver, DriverError, FolderStatus, Paths, Question, Status,
 };
+use flarebox_engine::commit::Lift;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -48,6 +49,11 @@ pub enum Request {
     },
     Restart {
         folder: PathBuf,
+    },
+    /// `Driver::lift`: `Lift::Replan` when `replan`, else `Lift::Resend`.
+    Lift {
+        folder: PathBuf,
+        replan: bool,
     },
     Questions,
     Answer {
@@ -100,6 +106,10 @@ pub async fn handle(driver: &Driver, request: Request) -> Response {
             .restart(&folder)
             .await
             .map(|folder| Response::Restarted { folder }),
+        Request::Lift { folder, replan } => {
+            let lift = if replan { Lift::Replan } else { Lift::Resend };
+            (driver.lift(&folder, lift).await).map(|folder| Response::Restarted { folder })
+        }
         Request::Questions => driver
             .questions()
             .map(|questions| Response::Questions { questions }),

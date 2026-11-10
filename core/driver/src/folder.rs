@@ -573,12 +573,15 @@ impl Folder {
                 Some("the server takes no changes from this device".into())
             }
             Some(CommitHalt::Policy { code }) => Some(format!(
-                "the server refused this device's changes (code {code}); nothing more is sent"
+                "the server refused this device's changes (code {code}); nothing more is sent{}",
+                lift_hint(code)
             )),
             Some(CommitHalt::Recovery) => {
                 Some("the folder's sync state does not match the server".into())
             }
-            None if stuck > 0 => Some(format!("{stuck} items could not be synced")),
+            None if stuck > 0 => Some(format!(
+                "{stuck} items could not be synced; run flarebox restart once they are fixed"
+            )),
             None => None,
         };
         let last_seq = self.engine.cursor.as_ref().map(|c| c.last_seq);
@@ -874,9 +877,10 @@ impl Folder {
                 )));
             }
             Failure::Halted(CommitHalt::Recovery) => return Err(Stop::Recovery(described)),
-            Failure::Halted(CommitHalt::Policy { .. }) => {
+            Failure::Halted(CommitHalt::Policy { code }) => {
                 return Err(Stop::Refused(format!(
-                    "the server refused this device's changes: {described}"
+                    "the server refused this device's changes: {described}{}",
+                    lift_hint(code)
                 )));
             }
         }
@@ -1017,6 +1021,16 @@ impl From<Stop> for Halt {
 
 /// Work that is running, or nothing.
 type Slot<'a, T> = Option<Pin<Box<dyn Future<Output = T> + Send + 'a>>>;
+
+/// What lifts a halt for a refusal with `code` (RFC 0006 section 1, point 5, and section 10).
+fn lift_hint(code: i32) -> &'static str {
+    if code == Code::ConfirmationRequired as i32 {
+        "; the space's owner must confirm them, which Flarebox cannot ask for yet"
+    } else {
+        "; once the cause is fixed, run flarebox lift <folder> --resend to send them again, or --replan to plan them \
+         again"
+    }
+}
 
 /// Waits for the work in `slot` and empties it. Never returns for an empty slot.
 async fn finished<T>(slot: &mut Slot<'_, T>) -> T {

@@ -4,7 +4,7 @@
 //! sections 2.4, 2.6, 2.7, 2.8 and 4.2, and RFC 0002), on hand-built trees and results.
 
 use flarebox_engine::classify::{Class, Trees};
-use flarebox_engine::commit::{Commits, Failure, Halt, MAX_OPS, Reconnect};
+use flarebox_engine::commit::{Commits, Failure, Halt, Lift, LiftError, MAX_OPS, Reconnect};
 use flarebox_engine::effects::{Effect, Effects, Location};
 use flarebox_engine::ids::IdGen;
 use flarebox_engine::names::{MAX_NAME_BYTES, nfc, normalize_name};
@@ -1522,6 +1522,61 @@ fn a_policy_refusal_keeps_the_commit_and_outlasts_any_welcome() {
             "{error:?}"
         );
     }
+}
+
+#[test]
+fn a_policy_halt_lifted_to_resend_sends_the_same_commit_again() {
+    let mut trees = trees(&[("a", Some(file(ROOT, "x", 1)), None, None)]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let sent = build(&mut commits, &mut trees, &mut ids).unwrap();
+    commits.failed(&refusal(error::Code::Forbidden, 0)).unwrap();
+    assert_eq!(commits.lift(Lift::Resend), Ok(()));
+    assert_eq!(commits.halted(), None);
+    assert_eq!(commits.connected(&welcome(0)), Reconnect::Resend);
+    assert_eq!(commits.in_flight().unwrap().commit, sent);
+}
+
+#[test]
+fn a_policy_halt_lifted_to_replan_plans_the_changes_into_a_new_commit_in_the_same_slot() {
+    let mut trees = trees(&[("a", Some(file(ROOT, "x", 1)), None, None)]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let refused = build(&mut commits, &mut trees, &mut ids).unwrap();
+    commits
+        .failed(&refusal(error::Code::InvalidArgument, 0))
+        .unwrap();
+    assert_eq!(commits.lift(Lift::Replan), Ok(()));
+    assert_eq!((commits.halted(), commits.in_flight()), (None, None));
+    assert_eq!(commits.connected(&welcome(0)), Reconnect::Idle);
+    let planned = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_ne!(planned.commit_id, refused.commit_id);
+    assert_eq!(planned.device_seq, refused.device_seq);
+    assert_eq!(ops(&planned), ops(&refused));
+}
+
+#[test]
+fn a_lift_needs_a_policy_halt_and_leaves_one_that_asks_for_confirmation() {
+    let mut trees = trees(&[("a", Some(file(ROOT, "x", 1)), None, None)]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    assert_eq!(commits.lift(Lift::Resend), Err(LiftError::NotHalted));
+    let sent = build(&mut commits, &mut trees, &mut ids).unwrap();
+    commits
+        .failed(&refusal(error::Code::ConfirmationRequired, 0))
+        .unwrap();
+    let halt = commits.halted();
+    for lift in [Lift::Resend, Lift::Replan] {
+        assert_eq!(commits.lift(lift), Err(LiftError::NeedsConfirmation));
+        assert_eq!(commits.halted(), halt);
+        assert_eq!(commits.in_flight().unwrap().commit, sent);
+    }
+    let read_only = Welcome {
+        read_only: true,
+        ..welcome(0)
+    };
+    let mut commits = Commits::default();
+    commits.connected(&read_only);
+    assert_eq!(commits.halted(), Some(Halt::ReadOnly));
+    assert_eq!(commits.lift(Lift::Replan), Err(LiftError::NotHalted));
+    assert_eq!(commits.halted(), Some(Halt::ReadOnly));
 }
 
 fn welcome(device_seq: u64) -> Welcome {
