@@ -324,6 +324,7 @@ impl Device {
                 self.folder.sent(result)
             }
             Work::ResendAfter(_) => self.folder.resend(),
+            Work::RetryAfter(_) => self.folder.retry(),
         };
         self.take(step)
     }
@@ -340,6 +341,7 @@ impl Device {
                 Work::Upload(_) => "upload",
                 Work::Send(_) => "send",
                 Work::ResendAfter(_) => "wait",
+                Work::RetryAfter(_) => "retry",
             });
             self.perform(work, remote)?;
         }
@@ -972,6 +974,104 @@ fn a_node_the_server_refused_is_committed_again_after_the_scan_of_the_next_start
     assert_eq!(a.run(&mut remote), ["subscribe", "upload", "send"]);
     assert_eq!(remote.names(), ["notes.txt"]);
     assert_eq!(a.state(), FolderState::UpToDate);
+}
+
+/// Device `a` wrote `notes.txt`, and device `b` staged the effect that writes it. A file of the user's then holds the name
+/// on `b`, which no batch has reported, so the effect fails with the name taken and the node is blocked. The user's
+/// file is left as it was.
+fn failed_at_a_taken_name(remote: &mut Remote) -> (Site, Device, Duration) {
+    let (site_a, mut a) = linked(remote, "a");
+    let (site, mut b) = linked(remote, "b");
+    a.create(remote, &site_a.root.join("notes.txt"), b"written on a");
+    b.pull(remote);
+    let Some(Work::Stage(pending)) = b.work.pop_front() else {
+        panic!("the effect that writes notes.txt is staged");
+    };
+    let wait = take_the_name_and_apply(remote, &site, &mut b, pending);
+    (site, b, wait)
+}
+
+/// Puts a file of the user's at `notes.txt`, applies `pending` and returns the wait before its node is unblocked.
+fn take_the_name_and_apply(
+    remote: &Remote,
+    site: &Site,
+    b: &mut Device,
+    pending: Pending,
+) -> Duration {
+    fs::write(site.root.join("notes.txt"), b"the user's").unwrap();
+    let staged = ready(pending.stage(&remote.chunks));
+    let step = b.folder.staged(pending, staged);
+    b.take(step).unwrap();
+    assert_eq!(b.folder.engine.effects.blocked().len(), 1);
+    assert_eq!(
+        fs::read(site.root.join("notes.txt")).unwrap(),
+        b"the user's"
+    );
+    let Some(Work::RetryAfter(wait)) = b.work.pop_front() else {
+        panic!("the node is unblocked after a wait: {:?}", b.work.len());
+    };
+    assert!(b.work.is_empty());
+    wait
+}
+
+/// GUN-318. An effect that failed was never planned again while the engine planned the same effect, so a name that
+/// was taken for a moment kept the node from syncing for good.
+#[test]
+fn an_effect_that_failed_at_a_name_taken_for_a_moment_is_planned_again_after_a_wait() {
+    let mut remote = Remote::new();
+    let (site, mut b, first) = failed_at_a_taken_name(&mut remote);
+    assert!(first <= Duration::from_secs(1), "{first:?}");
+
+    // The user's file is gone before the observer saw it, so L is as it was and the engine plans the same effect.
+    fs::remove_file(site.root.join("notes.txt")).unwrap();
+    b.settle();
+    assert!(b.work.is_empty(), "the node waits");
+    assert_eq!(b.folder.engine.effects.blocked().len(), 1);
+
+    // The name is taken again when the effect is retried, and the next wait is longer.
+    let step = b.folder.retry();
+    b.take(step).unwrap();
+    let Some(Work::Stage(pending)) = b.work.pop_front() else {
+        panic!("the same effect is planned again");
+    };
+    let second = take_the_name_and_apply(&remote, &site, &mut b, pending);
+    assert!(second >= Duration::from_secs(1), "{second:?}");
+
+    fs::remove_file(site.root.join("notes.txt")).unwrap();
+    let step = b.folder.retry();
+    b.take(step).unwrap();
+    assert_eq!(b.run(&mut remote), ["stage"]);
+    assert_eq!(
+        fs::read(site.root.join("notes.txt")).unwrap(),
+        b"written on a"
+    );
+    assert!(b.folder.engine.effects.blocked().is_empty());
+    b.settle();
+    assert!(b.work.is_empty());
+    assert_eq!(b.state(), FolderState::UpToDate);
+}
+
+/// The block was stored, so it outlived the process. A start plans the effect of every blocked node again.
+#[test]
+fn a_start_plans_an_effect_that_failed_before_it_again() {
+    let mut remote = Remote::new();
+    let (site, b, _) = failed_at_a_taken_name(&mut remote);
+    drop(b);
+    fs::remove_file(site.root.join("notes.txt")).unwrap();
+    assert_eq!(site.stored().effects.blocked().len(), 1);
+
+    let mut b = site.start();
+    assert!(b.folder.engine.effects.blocked().is_empty());
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    b.run(&mut remote);
+    assert_eq!(
+        fs::read(site.root.join("notes.txt")).unwrap(),
+        b"written on a"
+    );
+    b.settle();
+    assert!(b.work.is_empty());
+    assert_eq!(b.state(), FolderState::UpToDate);
 }
 
 #[test]
