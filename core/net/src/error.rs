@@ -80,6 +80,14 @@ pub enum ApiError {
     Status { status: u16 },
     #[error("could not reach the server")]
     Transport(#[source] reqwest::Error),
+    /// The answer was larger than the endpoint allows, so reading it stopped there. Like `Transport`, the call may be
+    /// tried again.
+    #[error("the server sent an answer of more than {limit} bytes")]
+    TooLarge { limit: usize },
+    /// The server refused with an error that could not be read: cut short, too large, or not an `Error`. As with `Status`,
+    /// only the status is known, and a caller that tries again bounds how often (H1).
+    #[error("the server answered HTTP {status} with an error that could not be read")]
+    Unreadable { status: u16 },
     #[error("the server sent a body that is not a valid {0}")]
     Decode(&'static str),
     #[error("the server URL cannot be used: {0}")]
@@ -91,6 +99,16 @@ impl ApiError {
     /// the refresh credential is wrong. A 401 with another code is a refusal like any other (H1).
     pub fn is_unauthenticated(&self) -> bool {
         matches!(self, ApiError::Server { status: 401, error } if error.code() == Code::Unauthenticated)
+    }
+
+    /// The HTTP status of a refusal, whether or not its error could be read.
+    pub fn status(&self) -> Option<u16> {
+        match self {
+            ApiError::Server { status, .. }
+            | ApiError::Status { status }
+            | ApiError::Unreadable { status } => Some(*status),
+            _ => None,
+        }
     }
 
     /// The server's error, when it sent one.

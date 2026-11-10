@@ -21,6 +21,26 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bounds a whole call to an HTTP endpoint.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// The longest name the server can store: it keeps a space or device name in one SQLite row of a Durable Object, which
+/// holds at most 8 MB. The server does not bound names yet; once it does (GUN-289), this and `MAX_ANSWER` shrink.
+const MAX_STORED_NAME: usize = 8 << 20;
+/// `JSON.stringify` writes a control character as `\u00XX`, six bytes for one.
+const JSON_ESCAPE_EXPANSION: usize = 6;
+/// Room for everything in a single answer besides its one name: ids, the token's key id and MAC, JSON keys and protobuf
+/// framing, which together take well under 1 KiB.
+const ANSWER_FRAMING: usize = 64 << 10;
+/// The most bytes read of a single answer. Like the other two limits, this is a memory ceiling, not a check of the
+/// answer's shape, so it covers the worst case the server can send today. The largest answer is an access token, which
+/// carries the device name JSON-escaped inside claims encoded as base64url (four bytes for every three): 64 MiB and
+/// framing for a name of control characters. GUN-289 lowers it.
+const MAX_ANSWER: usize =
+    (MAX_STORED_NAME * JSON_ESCAPE_EXPANSION).div_ceil(3) * 4 + ANSWER_FRAMING;
+/// The most bytes read of a `SpaceList`, which the server neither bounds nor pages yet (GUN-289). The Worker builds the
+/// whole answer in memory, and a Worker isolate has at most 128 MB, so it cannot send a larger one.
+const MAX_LIST_ANSWER: usize = 128 << 20;
+/// The most bytes read of an error. The server's error messages are sentences it writes itself, without names or other
+/// text from clients.
+const MAX_ERROR: usize = 1 << 20;
 
 /// The HTTP endpoints of one Flarebox deployment (spec v0 section 15.1). Bodies are binary protobuf.
 ///
@@ -89,14 +109,22 @@ impl Api {
 
     /// `GET /v1/server`.
     pub async fn server_info(&self) -> Result<ServerInfo, ApiError> {
-        self.send(self.http.get(self.url("v1/server")), "ServerInfo")
-            .await
+        self.send(
+            self.http.get(self.url("v1/server")),
+            "ServerInfo",
+            MAX_ANSWER,
+        )
+        .await
     }
 
     /// `POST /v1/claim`: registers the first owner with the one-time claim code from the Worker log.
     pub async fn claim(&self, request: &ClaimRequest) -> Result<DeviceCredentials, ApiError> {
-        self.send(self.post("v1/claim", request), "DeviceCredentials")
-            .await
+        self.send(
+            self.post("v1/claim", request),
+            "DeviceCredentials",
+            MAX_ANSWER,
+        )
+        .await
     }
 
     /// `POST /v1/pair/complete`, called by the new device with the code an already paired device received.
@@ -104,13 +132,17 @@ impl Api {
         &self,
         request: &PairCompleteRequest,
     ) -> Result<DeviceCredentials, ApiError> {
-        self.send(self.post("v1/pair/complete", request), "DeviceCredentials")
-            .await
+        self.send(
+            self.post("v1/pair/complete", request),
+            "DeviceCredentials",
+            MAX_ANSWER,
+        )
+        .await
     }
 
     /// `POST /v1/token`: exchanges the refresh credential for an access token.
     pub async fn token(&self, request: &TokenRequest) -> Result<AccessToken, ApiError> {
-        self.send(self.post("v1/token", request), "AccessToken")
+        self.send(self.post("v1/token", request), "AccessToken", MAX_ANSWER)
             .await
     }
 
@@ -122,14 +154,22 @@ impl Api {
             "v1/pair/start",
             None,
             "PairStartResponse",
+            MAX_ANSWER,
         )
         .await
     }
 
     /// `GET /v1/spaces`.
     pub async fn list_spaces(&self, auth: &Auth) -> Result<SpaceList, ApiError> {
-        self.authed(auth, Method::GET, "v1/spaces", None, "SpaceList")
-            .await
+        self.authed(
+            auth,
+            Method::GET,
+            "v1/spaces",
+            None,
+            "SpaceList",
+            MAX_LIST_ANSWER,
+        )
+        .await
     }
 
     /// `POST /v1/spaces`.
@@ -144,6 +184,7 @@ impl Api {
             "v1/spaces",
             Some(request.encode_to_vec()),
             "SpaceInfo",
+            MAX_ANSWER,
         )
         .await
     }
@@ -162,6 +203,7 @@ impl Api {
             &path,
             Some(request.encode_to_vec()),
             "RewindResult",
+            MAX_ANSWER,
         )
         .await
     }
@@ -182,6 +224,7 @@ impl Api {
         path: &str,
         body: Option<Vec<u8>>,
         what: &'static str,
+        limit: usize,
     ) -> Result<M, ApiError> {
         let mut token = auth.access_token().await?;
         let mut refreshed = false;
@@ -193,7 +236,7 @@ impl Api {
             if let Some(body) = &body {
                 request = request.header(CONTENT_TYPE, PROTOBUF).body(body.clone());
             }
-            match self.send(request, what).await {
+            match self.send(request, what, limit).await {
                 Err(error) if error.is_unauthenticated() && !refreshed => {
                     auth.reject(&token.token).await;
                     token = auth.access_token().await?;
@@ -204,12 +247,14 @@ impl Api {
         }
     }
 
+    /// Sends a request and reads its answer, a `what` of at most `limit` bytes or an error of at most `MAX_ERROR`.
     async fn send<M: Message + Default>(
         &self,
         request: RequestBuilder,
         what: &'static str,
+        limit: usize,
     ) -> Result<M, ApiError> {
-        let response = request
+        let mut response = request
             .header(ACCEPT, PROTOBUF)
             .timeout(REQUEST_TIMEOUT)
             .send()
@@ -221,14 +266,43 @@ impl Api {
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.starts_with(PROTOBUF));
-        let body = response.bytes().await.map_err(ApiError::Transport)?;
+        let limit = if status.is_success() {
+            limit
+        } else {
+            MAX_ERROR
+        };
+        let mut body = Vec::new();
+        while let Some(part) =
+            response
+                .chunk()
+                .await
+                .map_err(|error| match status.is_success() {
+                    true => ApiError::Transport(error),
+                    false => ApiError::Unreadable {
+                        status: status.as_u16(),
+                    },
+                })?
+        {
+            if body.len() + part.len() > limit {
+                return Err(match status.is_success() {
+                    true => ApiError::TooLarge { limit },
+                    false => ApiError::Unreadable {
+                        status: status.as_u16(),
+                    },
+                });
+            }
+            body.extend_from_slice(&part);
+        }
         if status.is_success() {
-            return M::decode(body).map_err(|_| ApiError::Decode(what));
+            return M::decode(body.as_slice()).map_err(|_| ApiError::Decode(what));
         }
         let status = status.as_u16();
-        match is_protobuf.then(|| ServerError::decode(&body)).flatten() {
+        if !is_protobuf || body.is_empty() {
+            return Err(ApiError::Status { status });
+        }
+        match ServerError::decode(&body) {
             Some(error) => Err(ApiError::Server { status, error }),
-            _ => Err(ApiError::Status { status }),
+            None => Err(ApiError::Unreadable { status }),
         }
     }
 }
@@ -365,5 +439,153 @@ mod tests {
             "{outcome:?}"
         );
         server.await.unwrap();
+    }
+    /// Answers one request with `status` and a chunked protobuf `body`, or an endless one when `body` is `None`.
+    /// The task ends once the answer is sent or the client hangs up.
+    async fn answering(status: u16, body: Option<Vec<u8>>) -> (Url, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            let head = format!(
+                "HTTP/1.1 {status} X\r\ncontent-type: {PROTOBUF}\r\ntransfer-encoding: chunked\r\n\r\n"
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            let chunk =
+                |part: &[u8]| [format!("{:x}\r\n", part.len()).as_bytes(), part, b"\r\n"].concat();
+            match body {
+                Some(body) => {
+                    for part in body.chunks(16 << 10) {
+                        socket.write_all(&chunk(part)).await.unwrap();
+                    }
+                    socket.write_all(b"0\r\n\r\n").await.unwrap();
+                    let mut rest = Vec::new();
+                    let _ = socket.read_to_end(&mut rest).await;
+                }
+                None => {
+                    let part = chunk(&[0x0a; 16 << 10]);
+                    while socket.write_all(&part).await.is_ok() {}
+                }
+            }
+        });
+        (base, server)
+    }
+
+    #[tokio::test]
+    async fn an_endless_answer_or_error_is_not_read_past_its_limit() {
+        for status in [200, 500] {
+            let (base, server) = answering(status, None).await;
+            let api = Api::local_development(base).unwrap();
+            let outcome = tokio::time::timeout(Duration::from_secs(5), api.server_info())
+                .await
+                .expect("the read stops at the limit");
+            assert!(
+                match status {
+                    200 => matches!(outcome, Err(ApiError::TooLarge { limit: MAX_ANSWER })),
+                    _ => matches!(outcome, Err(ApiError::Unreadable { status: 500 })),
+                },
+                "{status}: {outcome:?}"
+            );
+            drop(api);
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .expect("the client hung up")
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_single_answer_cap_covers_the_largest_answer_the_server_can_send() {
+        let id = "0190a0b0-0000-7000-8000-000000000001";
+        let claims = {
+            let name = "\\u0000".repeat(MAX_STORED_NAME);
+            format!(r#"{{"u":"{id}","d":"{id}","n":"{name}","e":{}}}"#, i64::MAX).len()
+        };
+        assert!(claims > MAX_STORED_NAME * JSON_ESCAPE_EXPANSION);
+        let token = format!(
+            "v1.{}.{}.{}",
+            "k".repeat(8),
+            "p".repeat(claims.div_ceil(3) * 4),
+            "m".repeat(43)
+        );
+        let credentials = DeviceCredentials {
+            user_id: id.into(),
+            device_id: id.into(),
+            refresh_credential: "r".repeat(43),
+            access: Some(AccessToken {
+                token,
+                expires_at_ms: i64::MAX,
+            }),
+            credential_expires_at_ms: i64::MAX,
+        };
+        assert!(
+            credentials.encoded_len() <= MAX_ANSWER,
+            "{} > {MAX_ANSWER}",
+            credentials.encoded_len()
+        );
+        let space = SpaceInfo {
+            space_id: id.into(),
+            name: "n".repeat(MAX_STORED_NAME),
+            format_version: u32::MAX,
+            created_at_ms: i64::MAX,
+        };
+        assert!(space.encoded_len() <= MAX_ANSWER);
+    }
+
+    #[tokio::test]
+    async fn an_error_that_is_not_an_error_message_is_unreadable_and_an_empty_one_is_left_to_its_status()
+     {
+        let (base, _server) = answering(500, Some(vec![0xff; 3])).await;
+        let outcome = Api::local_development(base).unwrap().server_info().await;
+        assert!(
+            matches!(outcome, Err(ApiError::Unreadable { status: 500 })),
+            "{outcome:?}"
+        );
+        let (base, _server) = answering(500, Some(Vec::new())).await;
+        let outcome = Api::local_development(base).unwrap().server_info().await;
+        assert!(
+            matches!(outcome, Err(ApiError::Status { status: 500 })),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_space_list_may_be_longer_than_a_fixed_shape_answer() {
+        let spaces = SpaceList {
+            spaces: vec![SpaceInfo {
+                name: "n".repeat(MAX_ANSWER),
+                ..Default::default()
+            }],
+        }
+        .encode_to_vec();
+        assert!(spaces.len() > MAX_ANSWER && spaces.len() <= MAX_LIST_ANSWER);
+        let (base, _server) = answering(200, Some(spaces.clone())).await;
+        let credentials = crate::auth::Credentials {
+            user_id: "u".into(),
+            device_id: "d".into(),
+            refresh_credential: "r".into(),
+        };
+        let expires = std::time::SystemTime::now() + Duration::from_secs(3600);
+        let token = AccessToken {
+            token: "token".into(),
+            expires_at_ms: expires
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64,
+        };
+        let auth = Auth::new(Api::local_development(base).unwrap(), credentials).with_token(token);
+        let list = auth.api().list_spaces(&auth).await.unwrap();
+        assert_eq!(list.spaces[0].name.len(), MAX_ANSWER);
+
+        let (base, _server) = answering(200, Some(spaces)).await;
+        let outcome = Api::local_development(base).unwrap().server_info().await;
+        assert!(
+            matches!(outcome, Err(ApiError::TooLarge { limit: MAX_ANSWER })),
+            "{outcome:?}"
+        );
     }
 }

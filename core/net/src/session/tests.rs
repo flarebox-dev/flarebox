@@ -1252,6 +1252,115 @@ async fn malformed_chunked_refusals_are_left_to_their_status() {
     }
 }
 
+/// Answers a request with `status` and an endless protobuf body, until the client hangs up.
+async fn answer_endlessly(mut tcp: TcpStream, status: u16) {
+    let mut request = [0; 4096];
+    assert!(tcp.read(&mut request).await.unwrap() > 0);
+    let head = format!(
+        "HTTP/1.1 {status} X\r\ncontent-type: application/x-protobuf\r\ncontent-length: 1000000000000\r\n\r\n"
+    );
+    tcp.write_all(head.as_bytes()).await.unwrap();
+    let part = [0x0a; 64 << 10];
+    while tcp.write_all(&part).await.is_ok() {}
+}
+
+#[tokio::test]
+async fn an_oversized_token_answer_is_a_transport_failure_and_is_asked_again() {
+    let (listener, auth) = listen_on("127.0.0.1:0", Duration::ZERO, Some(Duration::ZERO)).await;
+    let (_session, mut events) = Session::start(auth, config()).unwrap();
+    let (token_request, _) = listener.accept().await.unwrap();
+    tokio::spawn(answer_endlessly(token_request, 200));
+    let event = next(&mut events).await;
+    assert!(
+        matches!(&event, Event::Disconnected { reason: DisconnectReason::Transport(why), .. } if why.contains("an answer of more than")),
+        "{event:?}"
+    );
+    let again = tokio::time::timeout(Duration::from_secs(2), listener.accept()).await;
+    assert!(again.is_ok(), "the token is asked for again");
+}
+
+/// Answers a request with a whole protobuf error body that is not an `Error`.
+async fn answer_not_an_error(mut tcp: TcpStream) {
+    let mut request = [0; 4096];
+    assert!(tcp.read(&mut request).await.unwrap() > 0);
+    let head =
+        b"HTTP/1.1 500 X\r\ncontent-type: application/x-protobuf\r\ncontent-length: 3\r\n\r\n";
+    tcp.write_all(&[head.as_slice(), &[0xff; 3]].concat())
+        .await
+        .unwrap();
+}
+
+/// Answers a request with a protobuf error that ends before its Content-Length.
+async fn answer_cut_short(mut tcp: TcpStream) {
+    let mut request = [0; 4096];
+    assert!(tcp.read(&mut request).await.unwrap() > 0);
+    let head =
+        b"HTTP/1.1 500 X\r\ncontent-type: application/x-protobuf\r\ncontent-length: 1000\r\n\r\n";
+    tcp.write_all(&[head.as_slice(), &[0x08; 10]].concat())
+        .await
+        .unwrap();
+}
+
+/// The first event that is not a connection coming or going.
+async fn settled(events: &mut Events) -> Event {
+    let settle = async {
+        loop {
+            match next(events).await {
+                Event::Disconnected { .. } | Event::Connected(_) => {}
+                other => return other,
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), settle)
+        .await
+        .expect("the session kept reconnecting for 10 s")
+}
+
+#[tokio::test]
+async fn unreadable_token_errors_stop_the_session_in_a_row() {
+    let unreadable_until_stopped = |listener: TcpListener| async move {
+        let mut attempts = 0;
+        while let Ok(Ok((tcp, _))) =
+            tokio::time::timeout(Duration::from_secs(2), listener.accept()).await
+        {
+            attempts += 1;
+            match attempts % 3 {
+                0 => tokio::spawn(answer_endlessly(tcp, 500)),
+                1 => tokio::spawn(answer_not_an_error(tcp)),
+                _ => tokio::spawn(answer_cut_short(tcp)),
+            };
+        }
+        attempts
+    };
+
+    let (listener, auth) = listen_on("127.0.0.1:0", Duration::ZERO, Some(Duration::ZERO)).await;
+    let (_session, mut events) = Session::start(auth, config()).unwrap();
+    let server = tokio::spawn(unreadable_until_stopped(listener));
+    let event = settled(&mut events).await;
+    assert!(
+        matches!(&event, Event::Stopped(StopReason::Refused(why)) if why.contains("could not be read")),
+        "token: {event:?}"
+    );
+    assert_eq!(server.await.unwrap(), MAX_UNREADABLE_REFUSALS);
+
+    let (listener, auth) = listen_on(
+        "127.0.0.1:0",
+        Duration::from_millis(300),
+        Some(Duration::ZERO),
+    )
+    .await;
+    let (_session, mut events) = Session::start(auth, config()).unwrap();
+    let _ws = accept(&listener, welcome("h", 0)).await;
+    assert!(matches!(next(&mut events).await, Event::Connected(_)));
+    let server = tokio::spawn(unreadable_until_stopped(listener));
+    let event = settled(&mut events).await;
+    assert!(
+        matches!(&event, Event::Stopped(StopReason::Refused(why)) if why.contains("could not be read")),
+        "refresh: {event:?}"
+    );
+    assert_eq!(server.await.unwrap(), MAX_UNREADABLE_REFUSALS);
+}
+
 /// `refusal_body` fed arbitrary and truncated answers.
 mod refusal_reader {
     use proptest::prelude::*;
