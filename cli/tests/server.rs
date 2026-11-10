@@ -536,18 +536,10 @@ async fn usage_lists_what_each_space_stores() {
     let owner = Arc::new(Auth::new(api(), owner().await));
     let machine = Machine::new();
     let unpaired = machine.fails(&["usage"]);
-    assert!(unpaired.contains("not paired"), "{unpaired}");
+    assert!(unpaired.contains("not set up"), "{unpaired}");
     let pairing = owner.api().pair_start(&owner).await.unwrap();
     let server = server_url().to_string();
-    machine.run(&[
-        "pair",
-        "--server",
-        &server,
-        "--code",
-        &pairing.code,
-        "--name",
-        "desk",
-    ]);
+    machine.run(&["join", &pairing.code, "--server", &server, "--name", "desk"]);
     let name = format!("usage {}", uuidv7());
     let space = owner
         .api()
