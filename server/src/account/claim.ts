@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The first-owner claim and owner recovery (docs/design/deploy-and-upgrade.md section 2). Each function runs inside
-// one transactionSync of the Account DO, so a claim either creates the owner and the device or changes nothing but
-// a failure count.
+// The first-owner claim and owner recovery (docs/design/deploy-and-upgrade.md section 2), and the per-address count of
+// wrong codes that pairing shares. Each claim function runs inside one transactionSync of the Account DO, so a claim
+// either creates the owner and the device or changes nothing but a failure count.
 
 import { Error_Code } from "../gen/flarebox/v1/rpc_pb";
 
 /** Wrong codes one client address may send in one window before further wrong codes are refused. */
 export const CLAIM_FAILURES_PER_WINDOW = 10;
 export const CLAIM_FAILURE_WINDOW_MS = 10 * 60_000;
+/** Wrong pairing codes one client address may send in one window before further wrong codes are refused. */
+export const PAIRING_FAILURES_PER_WINDOW = 20;
 /** Failure rows kept at most; the oldest windows are dropped first. */
 export const MAX_FAILURE_ROWS = 10_000;
 /** The failure bucket of requests without CF-Connecting-IP, which no real address can share. */
@@ -48,22 +50,26 @@ function bucket(client: string): string {
   return client || NO_ADDRESS;
 }
 
-function throttled(sql: SqlStorage, scope: string, attempt: ClaimAttempt): boolean {
+/** Wrong codes one client address may send in one window, for each kind of code. */
+const FAILURES_PER_WINDOW = { claim: CLAIM_FAILURES_PER_WINDOW, recovery: CLAIM_FAILURES_PER_WINDOW, pair: PAIRING_FAILURES_PER_WINDOW };
+
+type FailureScope = keyof typeof FAILURES_PER_WINDOW;
+
+function throttled(sql: SqlStorage, scope: FailureScope, client: string, nowMs: number): boolean {
   const row = sql
-    .exec("SELECT failures FROM claim_failures WHERE scope = ? AND client = ? AND window_start_ms > ?", scope, bucket(attempt.client), attempt.nowMs - CLAIM_FAILURE_WINDOW_MS)
+    .exec("SELECT failures FROM claim_failures WHERE scope = ? AND client = ? AND window_start_ms > ?", scope, bucket(client), nowMs - CLAIM_FAILURE_WINDOW_MS)
     .toArray()[0];
-  return Number(row?.failures ?? 0) >= CLAIM_FAILURES_PER_WINDOW;
+  return Number(row?.failures ?? 0) >= FAILURES_PER_WINDOW[scope];
 }
 
 /** Counts a wrong code, dropping expired windows and keeping at most MAX_FAILURE_ROWS rows. */
-function recordFailure(sql: SqlStorage, scope: string, attempt: ClaimAttempt): void {
-  const expired = attempt.nowMs - CLAIM_FAILURE_WINDOW_MS;
-  sql.exec("DELETE FROM claim_failures WHERE window_start_ms <= ?", expired);
+function recordFailure(sql: SqlStorage, scope: FailureScope, client: string, nowMs: number): void {
+  sql.exec("DELETE FROM claim_failures WHERE window_start_ms <= ?", nowMs - CLAIM_FAILURE_WINDOW_MS);
   sql.exec(
     "INSERT INTO claim_failures (scope, client, failures, window_start_ms) VALUES (?, ?, 1, ?) ON CONFLICT (scope, client) DO UPDATE SET failures = failures + 1",
     scope,
-    bucket(attempt.client),
-    attempt.nowMs,
+    bucket(client),
+    nowMs,
   );
   sql.exec(
     "DELETE FROM claim_failures WHERE rowid IN (SELECT rowid FROM claim_failures ORDER BY window_start_ms LIMIT max(0, (SELECT COUNT(*) FROM claim_failures) - ?))",
@@ -71,12 +77,13 @@ function recordFailure(sql: SqlStorage, scope: string, attempt: ClaimAttempt): v
   );
 }
 
-function wrong(sql: SqlStorage, scope: string, attempt: ClaimAttempt, message: string): ClaimOutcome {
-  if (throttled(sql, scope, attempt)) {
+/** Refuses a wrong code and counts it against the client's address, or answers RETRY_LATER once the address sent too many. */
+export function wrongCode(sql: SqlStorage, scope: FailureScope, client: string, nowMs: number, message: string): { ok: false; code: Error_Code; message: string } {
+  if (throttled(sql, scope, client, nowMs)) {
     return { ok: false, code: Error_Code.RETRY_LATER, message: "too many wrong codes from this address; try again in a few minutes" };
   }
-  recordFailure(sql, scope, attempt);
-  return refused(message);
+  recordFailure(sql, scope, client, nowMs);
+  return { ok: false, code: Error_Code.FORBIDDEN, message };
 }
 
 /** Stores a new claim code unless the deployment has an owner or a code is still valid. Returns whether it stored one. */
@@ -112,7 +119,7 @@ export function redeemClaim(sql: SqlStorage, attempt: ClaimAttempt): ClaimOutcom
   } else {
     const live = sql.exec("SELECT code_hash FROM claim_codes WHERE expires_at_ms > ?", attempt.nowMs).toArray();
     if (live.length === 0) return refused("no valid claim code; open /setup to issue one");
-    if (!live.some((row) => sameDigest(row.code_hash as ArrayBuffer, attempt.codeHash))) return wrong(sql, "claim", attempt, "wrong claim code");
+    if (!live.some((row) => sameDigest(row.code_hash as ArrayBuffer, attempt.codeHash))) return wrongCode(sql, "claim", attempt.client, attempt.nowMs, "wrong claim code");
   }
   sql.exec("DELETE FROM claim_codes");
   sql.exec("DELETE FROM claim_failures WHERE scope = 'claim'");
@@ -124,7 +131,7 @@ export function redeemClaim(sql: SqlStorage, attempt: ClaimAttempt): ClaimOutcom
 /** A wrong key counts and throttles the same with or without a configured key, so answers do not reveal whether one is. */
 function recover(sql: SqlStorage, attempt: ClaimAttempt): ClaimOutcome {
   const key = presentedKey(attempt);
-  if (!key) return wrong(sql, "recovery", attempt, "this deployment already has an owner");
+  if (!key) return wrongCode(sql, "recovery", attempt.client, attempt.nowMs, "this deployment already has an owner");
   const spent = spendKey(sql, key, attempt.nowMs);
   if (spent) return spent;
   attempt.storeDevice();
