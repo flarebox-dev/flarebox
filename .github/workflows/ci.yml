@@ -82,7 +82,7 @@ jobs:
       - name: Pack the server bundle that the CLI embeds
         run: node server/scripts/pack-bundle.mjs "$RUNNER_TEMP/server-bundle"
       - name: Check that the packer replaces nothing in its output
-        run: node --test server/scripts/pack-bundle.test.mjs
+        run: node --test server/scripts/check-pack-bundle.mjs
 
   net-integration:
     name: net integration (ubuntu-latest)

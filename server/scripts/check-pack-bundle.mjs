@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // Checks that pack-bundle.mjs replaces nothing in its output, including a file that appears there during the dry run.
-// Usage: node --test scripts/pack-bundle.test.mjs
+// Usage: node --test scripts/check-pack-bundle.mjs
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
