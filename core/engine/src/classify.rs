@@ -370,11 +370,21 @@ impl Trees {
             });
         let mut pending = Vec::new();
         let mut work = Vec::new();
-        for id in std::mem::take(&mut self.dirty) {
-            let released = self.released(&id).into_iter().flatten();
-            let fitting = { released }.find(|next| self.fits_synced(&id, next.as_ref()));
-            if let Some(next) = fitting {
-                self.set_synced_unmarked(&id, next);
+        let mut dirty: Vec<NodeId> = std::mem::take(&mut self.dirty).into_iter().collect();
+        let mut next = 0;
+        while let Some(id) = dirty.get(next).cloned() {
+            next += 1;
+            let released: Vec<Option<Shape>> = self.released(&id).into_iter().flatten().collect();
+            let fitting = (released.iter()).find(|next| self.fits_synced(&id, next.as_ref()));
+            match fitting {
+                Some(next) => self.set_synced_unmarked(&id, next.clone()),
+                None if !released.is_empty() => {
+                    let below: Vec<NodeId> = (self.release_subtree(&id).into_iter())
+                        .filter(|node| !dirty.contains(node))
+                        .collect();
+                    dirty.extend(below);
+                }
+                None => {}
             }
             match self.class(&id) {
                 Class::InSync if !self.l.get(&id).is_some_and(|node| node.parked) => {}
@@ -649,6 +659,30 @@ impl Trees {
         !self.s.iter().any(|(other, sibling)| {
             other != id && sibling.parent == shape.parent && name_key(&sibling.name) == key
         })
+    }
+
+    /// Drops the folder `id` from S with every node S holds below it, when S can hold the folder nowhere else and
+    /// every one of those nodes is ignored too ([`Trees::released`]). Their S entries keep the folder's from
+    /// being dropped, and none of them is ever planned, so without this the folder would keep its name in S for good.
+    /// A node below that is not ignored keeps the whole subtree in S. Returns the nodes below that it dropped.
+    fn release_subtree(&mut self, id: &str) -> Vec<NodeId> {
+        let mut below = vec![id.to_owned()];
+        let mut next = 0;
+        while let Some(folder) = below.get(next).cloned() {
+            next += 1;
+            below.extend(
+                (self.s.iter())
+                    .filter(|(_, shape)| shape.parent == folder)
+                    .map(|(child, _)| child.clone()),
+            );
+        }
+        if !below.iter().all(|node| self.ignored(node)) {
+            return Vec::new();
+        }
+        for node in below.iter().rev() {
+            self.set_synced_unmarked(node, None);
+        }
+        below.split_off(1)
     }
 
     fn set_synced_unmarked(&mut self, id: &str, shape: Option<Shape>) {

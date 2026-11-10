@@ -543,6 +543,39 @@ fn a_parked_node_the_rules_now_exclude_frees_its_name_in_s_for_the_node_that_too
 }
 
 #[test]
+fn a_parked_folder_the_rules_now_exclude_frees_its_name_in_s_with_what_it_holds() {
+    let mut trees = trees(&[
+        (
+            "old",
+            None,
+            Some(dir(ROOT, "docs")),
+            Some(dir("far", "docs")),
+        ),
+        synced("child", file("old", "build.log", 1)),
+        incoming("far", dir(ROOT, "archive")),
+        (
+            "new",
+            Some(dir(ROOT, "docs")),
+            None,
+            Some(dir(ROOT, "docs")),
+        ),
+    ]);
+    let parked = LocalNode {
+        parked: true,
+        ..local(dir(ROOT, "docs"), 9)
+    };
+    trees.set_local("old".into(), parked.clone());
+    trees.set_rules(&AT_ROOT, rules("/archive/\n*.log\n"));
+    assert_eq!(effects(&mut trees), [], "its old name is taken");
+    assert_eq!(ops(&mut trees), []);
+    assert_eq!(trees.synced().live("new"), Some(&dir(ROOT, "docs")));
+    assert_eq!(trees.synced().live("old"), None);
+    assert_eq!(trees.synced().live("child"), None);
+    assert_eq!(trees.local().get("old"), Some(&parked));
+    assert_eq!(trees.check(), Ok(()));
+}
+
+#[test]
 fn an_excluded_folder_s_cannot_follow_to_r_frees_its_name_in_s_all_the_same() {
     let mut trees = trees(&[
         (
