@@ -487,6 +487,8 @@ async fn a_folder_moved_over_an_empty_folder_with_unreadable_rules_keeps_its_fil
     fs::set_permissions(&rules, fs::Permissions::from_mode(0o000)).unwrap();
     if fs::read(&rules).is_ok() {
         eprintln!("skipped: the rules file is still readable, as for root");
+        a.stop().await;
+        b.stop().await;
         return;
     }
     fs::rename(a.folder().join("drafts"), a.folder().join("final")).unwrap();
