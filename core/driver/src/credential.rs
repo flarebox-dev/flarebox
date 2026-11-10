@@ -135,38 +135,7 @@ impl Credential {
     /// with [`CredentialError::Exists`] instead of replacing a credential. The file appears whole or not at all, and on
     /// macOS it is excluded from Time Machine before the credential is written to it.
     pub fn save_new(&self, path: &Path) -> Result<(), CredentialError> {
-        let io = |source| CredentialError::Io {
-            path: path.to_path_buf(),
-            source,
-        };
-        let dir = path.parent().unwrap_or(Path::new("."));
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
-            .map_err(io)?;
-        let temp = dir.join(format!(".credential.{}.tmp", std::process::id()));
-        let _ = fs::remove_file(&temp);
-        let written = create_excluded(&temp, path).and_then(|mut file| {
-            (|| {
-                file.write_all(&serde_json::to_vec_pretty(self)?)?;
-                file.sync_all()?;
-                fs::hard_link(&temp, path)
-            })()
-            .map_err(io)
-        });
-        let _ = fs::remove_file(&temp);
-        match written {
-            Err(CredentialError::Io { source, .. })
-                if source.kind() == io::ErrorKind::AlreadyExists =>
-            {
-                return Err(CredentialError::Exists {
-                    path: path.to_path_buf(),
-                });
-            }
-            other => other?,
-        }
-        File::open(dir).and_then(|dir| dir.sync_all()).map_err(io)
+        NewCredentialFile::create(path)?.write(self)
     }
 
     /// Checks that the credential file at `path` is excluded from backups, and excludes it again if a write dropped
@@ -190,6 +159,72 @@ impl Credential {
             path: path.to_path_buf(),
             source,
         })
+    }
+}
+
+/// A credential file that is ready before the credential exists: a hidden temporary file, readable only by its owner
+/// and excluded from backups. Pairing and claiming create it before they ask the server for a credential, so a profile
+/// that cannot hold a credential fails before the server uses up the code. Dropping it removes the temporary file.
+pub(crate) struct NewCredentialFile {
+    path: PathBuf,
+    temp: PathBuf,
+    file: File,
+}
+
+impl NewCredentialFile {
+    /// Creates the temporary file for the credential file at `path`, creating the directory with mode 0700.
+    pub fn create(path: &Path) -> Result<Self, CredentialError> {
+        let dir = path.parent().unwrap_or(Path::new("."));
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(|source| CredentialError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let temp = dir.join(format!(".credential.{}.tmp", std::process::id()));
+        let _ = fs::remove_file(&temp);
+        let file = create_excluded(&temp, path).inspect_err(|_| {
+            let _ = fs::remove_file(&temp);
+        })?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            temp,
+            file,
+        })
+    }
+
+    /// Writes `credential` and moves it into place. Fails with [`CredentialError::Exists`] instead of replacing a
+    /// credential. The file appears whole or not at all.
+    pub fn write(mut self, credential: &Credential) -> Result<(), CredentialError> {
+        let io = |source| CredentialError::Io {
+            path: self.path.clone(),
+            source,
+        };
+        let written = (|| {
+            self.file
+                .write_all(&serde_json::to_vec_pretty(credential)?)?;
+            self.file.sync_all()?;
+            fs::hard_link(&self.temp, &self.path)
+        })();
+        let _ = fs::remove_file(&self.temp);
+        match written {
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(CredentialError::Exists {
+                    path: self.path.clone(),
+                });
+            }
+            other => other.map_err(io)?,
+        }
+        let dir = self.path.parent().unwrap_or(Path::new("."));
+        File::open(dir).and_then(|dir| dir.sync_all()).map_err(io)
+    }
+}
+
+impl Drop for NewCredentialFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.temp);
     }
 }
 
@@ -223,6 +258,10 @@ fn create_excluded(temp: &Path, path: &Path) -> Result<File, CredentialError> {
 /// Keeps the credential file out of Time Machine, so that a Mac restored from a backup has no credential and pairs as
 /// a new device. Nothing to do on other systems.
 fn exclude_from_backups(file: &File) -> io::Result<()> {
+    #[cfg(test)]
+    if tests::REFUSE_EXCLUSION.get() {
+        return Err(io::Error::from(io::ErrorKind::Unsupported));
+    }
     #[cfg(target_os = "macos")]
     rustix::fs::fsetxattr(
         file,
@@ -248,9 +287,15 @@ pub fn api_for(server: &str) -> Result<Api, ApiError> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::cell::Cell;
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    thread_local! {
+        /// Makes this thread's backup exclusions fail, as on storage without extended attributes.
+        pub(crate) static REFUSE_EXCLUSION: Cell<bool> = const { Cell::new(false) };
+    }
 
     /// Whether `tmutil isexcluded` reports that Time Machine leaves `path` out. The temporary directory is excluded
     /// as a whole, so the tests that call it work under the home directory.

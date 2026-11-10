@@ -18,7 +18,7 @@ use tokio::sync::watch;
 
 use crate::claim::{self, Owner};
 use crate::config::{Config, ConfigError};
-use crate::credential::{Credential, CredentialError, api_for};
+use crate::credential::{Credential, CredentialError, NewCredentialFile, api_for};
 use crate::folder::FolderTask;
 use crate::ignore::{IgnoreInput, Matcher, RuleFile, RuleSource, matcher};
 use crate::paths::{Paths, PathsError};
@@ -316,6 +316,7 @@ impl Driver {
         if device_name.trim().is_empty() {
             return Err(DriverError::EmptyName);
         }
+        let file = NewCredentialFile::create(&self.inner.paths.credential())?;
         self.unlink_folders_of_lost_credential().await?;
         let api = api_for(server)?;
         let issued = api
@@ -326,6 +327,7 @@ impl Driver {
             })
             .await?;
         self.adopt(
+            file,
             api.base().to_string(),
             issued,
             None,
@@ -351,6 +353,7 @@ impl Driver {
         if device_name.trim().is_empty() {
             return Err(DriverError::EmptyName);
         }
+        let file = NewCredentialFile::create(&self.inner.paths.credential())?;
         self.unlink_folders_of_lost_credential().await?;
         let api = api_for(server)?;
         let issued = api
@@ -363,6 +366,7 @@ impl Driver {
             })
             .await?;
         self.adopt(
+            file,
             api.base().to_string(),
             issued,
             Some(user_name.to_owned()),
@@ -434,9 +438,10 @@ impl Driver {
         }
     }
 
-    /// Stores the credential the server issued, unless another one was stored meanwhile.
+    /// Stores the credential the server issued in `file`, unless another one was stored meanwhile.
     fn adopt(
         &self,
+        file: NewCredentialFile,
         server: String,
         issued: DeviceCredentials,
         user_name: Option<String>,
@@ -457,7 +462,7 @@ impl Driver {
                 device_id: existing.device_id.clone(),
             });
         }
-        credential.save_new(&self.inner.paths.credential())?;
+        file.write(&credential)?;
         tracing::info!(
             device_id = credential.device_id,
             server = credential.server,
@@ -2370,6 +2375,45 @@ mod tests {
 
         drop(Driver::open(paths.clone()).unwrap());
         assert!(time_machine_excludes(&paths.credential()));
+    }
+
+    #[tokio::test]
+    async fn a_credential_that_backups_would_copy_is_refused_before_the_server_uses_up_the_code() {
+        use crate::credential::tests::REFUSE_EXCLUSION;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let driver = Driver::open(paths.clone()).unwrap();
+        let (server, served) = serve_once(issued("d1")).await;
+        REFUSE_EXCLUSION.set(true);
+        let claimed = driver.claim(&server, "claim-code", "Ada", "laptop").await;
+        let paired = driver.pair(&server, "pair-code", "laptop").await;
+        REFUSE_EXCLUSION.set(false);
+        for refused in [claimed.err(), paired.err()] {
+            assert!(
+                matches!(
+                    refused,
+                    Some(DriverError::Credential(
+                        CredentialError::NotExcludedFromBackups { .. }
+                    ))
+                ),
+                "{refused:?}"
+            );
+        }
+        let state = fs::read_dir(paths.credential().parent().unwrap()).unwrap();
+        let left: Vec<_> = state.map(|entry| entry.unwrap().file_name()).collect();
+        assert!(
+            !left
+                .iter()
+                .any(|name| name.to_string_lossy().contains("credential")),
+            "{left:?}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), served)
+                .await
+                .is_err(),
+            "the server was asked for a credential"
+        );
     }
 
     #[tokio::test]
