@@ -361,13 +361,13 @@ impl FsObserver {
         }
     }
 
-    /// Chunks the file at `path` if it is still the entry the scan saw and does not change while it is read.
     /// True for a file with more than one link. A file that cannot be read is taken to have one.
     fn linked(&self, path: &Path, kind: EntryKind) -> bool {
         kind == EntryKind::File
             && std::fs::symlink_metadata(self.root.join(path)).is_ok_and(|meta| meta.nlink() > 1)
     }
 
+    /// Chunks the file at `path` if it is still the entry the scan saw and does not change while it is read.
     fn content(&self, path: &Path, entry: &Entry, busy: &mut Vec<PathBuf>) -> Option<Content> {
         match read_content(&self.root, path, entry) {
             Ok(Some(content)) => Some(content),
