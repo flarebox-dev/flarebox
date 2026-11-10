@@ -15,13 +15,13 @@ The [macOS release](../.github/workflows/release-macos.yml) workflow builds the 
 3. Builds the Release app with Xcode 26.6 on a `macos-26` runner, without signing.
 4. Creates a temporary keychain with a random password, imports the Developer ID certificate into it, and writes the notary key to a file readable only by the runner user.
 5. Signs the app with the Developer ID Application identity, the hardened runtime, a secure timestamp and [`apps/macos/Flarebox.entitlements`](../apps/macos/Flarebox.entitlements).
-6. Notarizes the app with `notarytool` and the App Store Connect API key, then staples the ticket to the app.
-7. Packages the stapled app in a DMG, signs the DMG, notarizes it and staples it.
+6. Notarizes the app with `notarytool` and the App Store Connect API key, then staples the ticket to the app. It submits the app without waiting, prints the submission id, and then asks Apple for the submission's status every minute for up to 2.5 hours. When a request fails with a network error, it tries again after 15 seconds, doubling the wait up to 5 minutes.
+7. Packages the stapled app in a DMG, signs the DMG, notarizes it the same way and staples it.
 8. Verifies the DMG and the app inside it with `codesign --verify --deep --strict`, `xcrun stapler validate` and `spctl --assess`, and checks for the hardened runtime, the Developer ID authority and the absence of `get-task-allow`.
 9. Uploads `Flarebox-<version>-arm64.dmg` as an artifact and writes its SHA-256 to the run summary.
 10. Deletes the keychain and the key files, even when a step failed.
 
-If notarization fails, the log shows Apple's notarization log for the submission.
+If Apple reports a submission as Invalid or Rejected, the log shows Apple's notarization log for it. If Apple gives no final answer within 2.5 hours, the step fails and names the submission id.
 
 When none of the signing secrets are set, the run still builds the DMG but signs it ad hoc only, names it `Flarebox-<version>-arm64-unsigned.dmg`, and says "Signing skipped" in a warning and in the run summary. Gatekeeper blocks such a DMG on other Macs. When only some of the secrets are set, the run fails and names the missing ones.
 
@@ -123,6 +123,12 @@ spctl --assess --type execute --verbose=2 /Volumes/Flarebox/Flarebox.app   # exp
 hdiutil detach /Volumes/Flarebox
 ```
 
+### If the app's notarization was interrupted
+
+Each notarization step prints its submission id in the log and as a notice on the run's page. If the run failed while Apple was still processing the app, for example after a network error or at the deadline, you can wait for that submission instead of submitting the app again. `xcrun notarytool info <id>` with the team's API key shows its status. Start a new manual run with the same version, enter the failed run's build number as **build-number** (its "Decide the version" step prints `Version <version>, build <number>.`), and enter the id as **app-submission-id**. The new run rebuilds the same app, waits for that submission and staples its ticket. If the rebuilt app differs from the submitted one, stapling fails, and the step says so; run again with **app-submission-id** empty to submit the app again.
+
+The disk image always goes through a new submission, because a rebuilt disk image is never identical to the one submitted before.
+
 ## Entitlements
 
 `apps/macos/Flarebox.entitlements` is deliberately empty. The app is distributed with Developer ID, not through the Mac App Store, so it is not sandboxed: it syncs folders the person chooses anywhere in their home folder. The hardened runtime needs an entitlement only to turn off one of its protections ([Hardened Runtime](https://developer.apple.com/documentation/security/hardened-runtime)), and the app needs none of them: the Rust core is linked statically, and the app uses no JIT, unsigned executable memory, DYLD environment variables or libraries signed by someone else. Open at login uses `SMAppService.mainApp`, which needs no entitlement outside the sandbox. Apple recommends leaving false entitlements out rather than listing them as false. The File Provider extension planned for a later version will need the sandbox and an app group, and with them a Developer ID provisioning profile, which this workflow does not handle yet.
@@ -131,3 +137,4 @@ hdiutil detach /Volumes/Flarebox
 
 - The DMG runs on Apple silicon only. `scripts/build-ffi.sh` builds the Rust library for the runner's architecture, and the release runners are arm64, so there is no Intel or universal build yet.
 - Nothing is published: no GitHub release, no update feed, no Homebrew cask.
+- A run cannot wait for an earlier submission of the disk image. Every run builds a new disk image and submits it.
