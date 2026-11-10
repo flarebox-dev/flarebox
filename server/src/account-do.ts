@@ -16,18 +16,17 @@ import {
   SpaceInfoSchema,
 } from "./gen/flarebox/v1/auth_pb";
 import { Error_Code } from "./gen/flarebox/v1/rpc_pb";
+import type { ShareLink, ShareLinkList } from "./gen/flarebox/v1/share_pb";
 import { isUuidV7, uuidv7 } from "./ids";
 import { FORMAT_VERSION } from "./space-do";
+import { type Outcome, type ResolvedLink, type ShareOutcome, ShareLinks } from "./share/links";
+
+export type { Outcome } from "./share/links";
 
 const CLAIM_CODE_MS = 3_600_000;
 const CLAIM_ATTEMPTS = 10;
 const PAIRING_CODE_MS = 10 * 60_000;
 const PAIRING_FAILURES_PER_WINDOW = 20;
-/** Highest PBKDF2 iteration count workerd accepts; see cloudflare/workerd#1346. */
-export const SHARE_PASSWORD_ITERATIONS = 100_000;
-const SHARE_PASSWORD_KDF = "pbkdf2-sha256";
-const SHARE_FAILURES_BEFORE_LOCK = 5;
-const SHARE_LOCK_MS = 15 * 60_000;
 const BASE32 = "ABCDEFGHJKMNPQRSTVWXYZ0123456789";
 const DAY_MS = 24 * 3_600_000;
 /** How long a chunk retirement record is kept: PITR cannot restore a state older than 30 days (RFC 0003 section 5, rule 10). */
@@ -73,8 +72,6 @@ export interface RewindArgs {
 }
 const encoder = new TextEncoder();
 
-export type Outcome<T> = { ok: true; value: T } | { ok: false; code: Error_Code; message: string };
-
 function ok<T>(value: T): Outcome<T> {
   return { ok: true, value };
 }
@@ -103,11 +100,6 @@ function sameBytes(a: ArrayBuffer, b: ArrayBuffer): boolean {
   return x.length === y.length && x.every((byte, i) => byte === y[i]);
 }
 
-async function passwordHash(password: string, salt: Uint8Array, iterations: number): Promise<ArrayBuffer> {
-  const key = await crypto.subtle.importKey("raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]);
-  return crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt, iterations }, key, 256);
-}
-
 interface DeviceRow {
   device_id: string;
   user_id: string;
@@ -122,20 +114,6 @@ interface SpaceRow {
   owner_id: string;
   created_at_ms: number;
   format_version: number;
-}
-
-interface ShareLinkRow {
-  link_id: string;
-  space_id: string;
-  node_id: string;
-  expires_at_ms: number | null;
-  password_kdf: string | null;
-  password_hash: ArrayBuffer | null;
-  password_salt: ArrayBuffer | null;
-  password_iterations: number | null;
-  revoked_at_ms: number | null;
-  failed_attempts: number;
-  locked_until_ms: number | null;
 }
 
 function spaceInfo(row: SpaceRow): SpaceInfo {
@@ -155,11 +133,17 @@ export class AccountDO extends DurableObject<Env> {
   private readonly driving = new Set<string>();
   /** The time rewinds are admitted, completed and timed out against. Tests replace it to move through days. */
   clock: () => number = () => Date.now();
+  private readonly shares: ShareLinks;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     ctx.storage.transactionSync(() => migrate(this.sql));
+    this.shares = new ShareLinks(this.sql, {
+      clock: () => this.clock(),
+      serverSecret: async () => (await this.serverKey()).secret,
+      spaceClosed: (spaceId) => this.spaceClosed(spaceId),
+    });
   }
 
   /** The signing key for tokens, tickets and receipts, created with crypto.getRandomValues on first use. */
@@ -547,63 +531,37 @@ export class AccountDO extends DurableObject<Env> {
   }
 
   /** Records a read-only share link with a 128-bit random id. */
-  async createShareLink(args: {
-    spaceId: string;
-    nodeId: string;
-    createdBy: string;
-    expiresAtMs?: number;
-    password?: string;
-  }): Promise<string> {
-    const linkId = base64url(crypto.getRandomValues(new Uint8Array(16)));
-    const salt = args.password ? crypto.getRandomValues(new Uint8Array(16)) : undefined;
-    this.sql.exec(
-      `INSERT INTO share_links (link_id, space_id, node_id, created_by, created_at_ms, expires_at_ms, password_kdf,
-         password_hash, password_salt, password_iterations) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      linkId,
-      args.spaceId,
-      args.nodeId,
-      args.createdBy,
-      Date.now(),
-      args.expiresAtMs ?? null,
-      salt ? SHARE_PASSWORD_KDF : null,
-      salt ? await passwordHash(args.password!, salt, SHARE_PASSWORD_ITERATIONS) : null,
-      salt ? salt.buffer : null,
-      salt ? SHARE_PASSWORD_ITERATIONS : null,
-    );
-    return linkId;
+  async createShareLink(args: { spaceId: string; nodeId: string; createdBy: string; expiresAtMs?: number; password?: string }): Promise<string> {
+    return this.shares.create(args);
   }
 
   async revokeShareLink(linkId: string): Promise<void> {
-    this.sql.exec("UPDATE share_links SET revoked_at_ms = ? WHERE link_id = ? AND revoked_at_ms IS NULL", Date.now(), linkId);
+    this.shares.revoke(linkId);
   }
 
   /** Resolves a share link, checking expiry, revocation and the password, and locking it after repeated failures. */
   async openShareLink(linkId: string, password: string | undefined): Promise<Outcome<{ spaceId: string; nodeId: string }>> {
-    const nowMs = Date.now();
-    const read = () => this.sql.exec("SELECT * FROM share_links WHERE link_id = ?", linkId).toArray()[0] as unknown as ShareLinkRow | undefined;
-    const found = read();
-    if (!found || found.revoked_at_ms !== null || (found.expires_at_ms !== null && found.expires_at_ms <= nowMs)) {
-      return failure(Error_Code.FORBIDDEN, "this link does not exist or has expired");
-    }
-    if (found.password_hash) {
-      if (found.locked_until_ms !== null && found.locked_until_ms > nowMs) return failure(Error_Code.RETRY_LATER, "too many wrong passwords");
-      if (found.password_kdf !== SHARE_PASSWORD_KDF) return failure(Error_Code.INTERNAL, "unsupported password scheme");
-      const given = password === undefined ? undefined : await passwordHash(password, new Uint8Array(found.password_salt!), found.password_iterations!);
-      const link = read()!;
-      if (link.locked_until_ms !== null && link.locked_until_ms > nowMs) return failure(Error_Code.RETRY_LATER, "too many wrong passwords");
-      if (!given || !sameBytes(given, link.password_hash!)) {
-        const failed = link.failed_attempts + 1;
-        const locked = failed >= SHARE_FAILURES_BEFORE_LOCK;
-        this.sql.exec(
-          "UPDATE share_links SET failed_attempts = ?, locked_until_ms = ? WHERE link_id = ?",
-          locked ? 0 : failed,
-          locked ? nowMs + SHARE_LOCK_MS : link.locked_until_ms,
-          linkId,
-        );
-        return failure(Error_Code.UNAUTHENTICATED, "wrong password");
-      }
-      if (link.failed_attempts > 0) this.sql.exec("UPDATE share_links SET failed_attempts = 0 WHERE link_id = ?", linkId);
-    }
-    return ok({ spaceId: found.space_id, nodeId: found.node_id });
+    return this.shares.open(linkId, password);
+  }
+
+  /** The owner API and public API of RFC 0005; see ShareLinks. */
+  async shareCreate(args: Parameters<ShareLinks["ownerCreate"]>[0]): Promise<ShareOutcome<ShareLink>> {
+    return this.shares.ownerCreate(args, () => this.spaceStub(args.spaceId).shareCheckNode(args.nodeId));
+  }
+
+  async shareList(args: Parameters<ShareLinks["ownerList"]>[0]): Promise<ShareOutcome<ShareLinkList>> {
+    return this.shares.ownerList(args);
+  }
+
+  async shareRevoke(args: Parameters<ShareLinks["ownerRevoke"]>[0]): Promise<ShareOutcome<null>> {
+    return this.shares.ownerRevoke(args);
+  }
+
+  async shareResolve(args: Parameters<ShareLinks["resolve"]>[0]): Promise<ShareOutcome<ResolvedLink>> {
+    return this.shares.resolve(args);
+  }
+
+  async shareUnlock(args: Parameters<ShareLinks["unlock"]>[0]): Promise<ShareOutcome<{ session?: string }>> {
+    return this.shares.unlock(args);
   }
 }

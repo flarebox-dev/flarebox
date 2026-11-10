@@ -22,6 +22,7 @@ import { Error_Code } from "./gen/flarebox/v1/rpc_pb";
 import { BadRequest, errorReply, readMessage, reply } from "./http";
 import { type ChunkObject, deriveSpaceKey, signChunkGrant, verifyChunkGrant } from "./crypto";
 import { fromHex, isUuidV7 } from "./ids";
+import { shareRoute } from "./share/routes";
 import { CONNECT_HEADER, type Connect, GRANT_MS, MAX_CHUNK_BYTES, MAX_CLIENT_FRAME } from "./space-do";
 import { chunkKey, INCARNATION } from "./space/store";
 import { PROTO_MAX, PROTO_MIN, SERVER_VERSION } from "./version";
@@ -139,6 +140,9 @@ async function route(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const path = url.pathname;
   const method = request.method;
+
+  const shared = await shareRoute(request, env, () => authenticate(request, env));
+  if (shared) return shared;
 
   if (method === "GET" && path === "/v1/server") {
     const info = create(ServerInfoSchema, {

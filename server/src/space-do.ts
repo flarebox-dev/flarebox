@@ -56,6 +56,9 @@ import { type ChunkObject, sha256, signChunkGrant, verifyChunkGrant } from "./cr
 import { fromHex, isUuidV7, toHex, uuidv7 } from "./ids";
 import { type ApplyContext, CallFailure, CommitApplier } from "./space/commit";
 import { bootstrapExport, descriptorDurable, Exporter, noteCommitted, startExport } from "./space/export";
+import type { ShareInfo, ShareListing } from "./gen/flarebox/v1/share_pb";
+import type { ShareOutcome } from "./share/links";
+import { checkFence, checkLinkRoot, type DownloadFence, type ShareFile, shareFile, shareInfo, shareListing } from "./share/space";
 import { type Pitr, pitrBackend } from "./space/pitr";
 import { ChunkState, migrate } from "./space/schema";
 import {
@@ -112,6 +115,8 @@ const CLOSED_RECHECK_MS = 10 * 60_000;
 const EXPORT_RETRY_MS = 60_000;
 
 export type Role = "owner" | "editor" | "viewer";
+
+const SHARE_CLOSED = { ok: false, code: Error_Code.RETRY_LATER, message: "this link is temporarily unavailable; retry later", status: 503 } as const;
 
 /** Header the Worker sets on the WebSocket upgrade it forwards: JSON of {@link Connect}. */
 export const CONNECT_HEADER = "X-Flarebox-Connect";
@@ -1206,6 +1211,36 @@ export class SpaceDO extends DurableObject<Env> {
     });
     await this.armAlarm();
     return { state: "completed", receipt };
+  }
+
+  /** Whether a node can be the root of a new share link (RFC 0005 section 2). The Account DO has checked the closure. */
+  async shareCheckNode(nodeId: string): Promise<ShareOutcome<null>> {
+    return checkLinkRoot(this.sql, nodeId);
+  }
+
+  /** The public reads of a share link (RFC 0005 sections 3 and 7). Each first asks the Account DO whether a rewind holds the space closed. */
+  async shareInfo(rootId: string, expiresAtMs: number): Promise<ShareOutcome<ShareInfo>> {
+    return (await this.closedForRewind()) ? SHARE_CLOSED : shareInfo(this.sql, rootId, expiresAtMs);
+  }
+
+  async shareList(rootId: string, dirId: string, cursor: string): Promise<ShareOutcome<ShareListing>> {
+    return (await this.closedForRewind()) ? SHARE_CLOSED : shareListing(this.sql, rootId, dirId, cursor);
+  }
+
+  async shareFile(rootId: string, nodeId: string): Promise<ShareOutcome<ShareFile>> {
+    return (await this.closedForRewind()) ? SHARE_CLOSED : shareFile(this.sql, this.spaceId, rootId, nodeId);
+  }
+
+  /** The fence check before each later chunk of a download: the link resolves again, and the space was not rewound. */
+  async shareContinue(link: { linkId: string; client: string; session?: string }, fence: DownloadFence): Promise<ShareOutcome<null>> {
+    let resolved;
+    try {
+      resolved = await this.account().shareResolve({ ...link, counted: false });
+    } catch (error) {
+      console.error("account link check failed", error);
+      return SHARE_CLOSED;
+    }
+    return checkFence(this.sql, this.spaceId, resolved, fence);
   }
 
   /** Whether a rewind holds this space closed; an unanswered check counts as closed. */
