@@ -97,7 +97,6 @@ pub struct Commits {
     in_flight: Option<InFlight>,
     problems: BTreeSet<NodeId>,
     halted: Option<Halt>,
-    waiting: BTreeMap<NodeId, Option<Shape>>,
     /// The most ops the next commit holds after a `LIMIT_EXCEEDED`, doubled back towards
     /// [`MAX_OPS`] by every acknowledged commit.
     cap: Option<usize>,
@@ -134,16 +133,11 @@ impl Commits {
         self.halted
     }
 
-    /// S updates of acknowledged ops that would not leave S a valid tree yet, by node. Each is
-    /// made as soon as it fits, or dropped once S agrees with L for the node anyway; until then
-    /// the node is left out of planning.
-    pub fn waiting(&self) -> &BTreeMap<NodeId, Option<Shape>> {
-        &self.waiting
-    }
-
     /// Builds the next commit from local changes, unless one is in flight or committing has
-    /// stopped. The caller builds only when connected and caught up, with `base_seq` the
-    /// `last_seq` of R and `history_id` the history R belongs to.
+    /// stopped. While committing has stopped it still makes the waiting S updates that fit (see
+    /// [`Trees::waiting`]), so the effects plan their nodes again as downloads go on. The caller
+    /// builds only when connected and caught up, with `base_seq` the `last_seq` of R and
+    /// `history_id` the history R belongs to.
     ///
     /// Concurrent changes are rebased onto R first (section 2.4): a file whose content changed
     /// differently on both sides is forked, its local version becoming a new node that is created
@@ -169,15 +163,18 @@ impl Commits {
         history_id: &str,
         base_seq: u64,
     ) -> Option<&proto::Commit> {
-        if self.in_flight.is_some() || self.halted.is_some() {
+        if self.in_flight.is_some() {
             return None;
         }
         self.retry_waiting(trees, BTreeSet::new(), Vec::new());
+        if self.halted.is_some() {
+            return None;
+        }
         let parked = trees.local().iter().filter(|(_, node)| node.parked);
         let skip: BTreeSet<NodeId> = self
             .problems
             .iter()
-            .chain(self.waiting.keys())
+            .chain(trees.waiting().keys())
             .chain(parked.map(|(id, _)| id))
             .cloned()
             .collect();
@@ -230,7 +227,7 @@ impl Commits {
     /// the commit's slot. Returns false while there is nothing to acknowledge.
     ///
     /// S stays a valid tree. When the updates together would break it, because S still lags R
-    /// elsewhere, each is made as soon as it fits and the rest wait (see [`Commits::waiting`]).
+    /// elsewhere, each is made as soon as it fits and the rest wait (see [`Trees::waiting`]).
     pub fn acknowledge(&mut self, trees: &mut Trees, last_seq: u64) -> bool {
         let Some(flight) = self
             .in_flight
@@ -344,7 +341,7 @@ impl Commits {
             }
         }
         for (id, shape) in synced.apply(trees) {
-            self.waiting.insert(id, shape);
+            trees.wait(id, shape);
         }
         self.retry_waiting(trees, BTreeSet::new(), Vec::new());
         self.accepted = flight.commit.device_seq;
@@ -362,13 +359,12 @@ impl Commits {
         needed: BTreeSet<NodeId>,
         agreed: Vec<(NodeId, Option<Shape>)>,
     ) -> BTreeSet<NodeId> {
-        self.waiting.retain(|id, _| {
-            !same(
-                trees.synced().live(id),
-                trees.local().get(id).map(|node| &node.shape),
-            )
-        });
-        let updates = std::mem::take(&mut self.waiting)
+        let waiting: Vec<_> = trees
+            .take_waiting()
+            .into_iter()
+            .filter_map(|(id, shape)| Some((id.clone(), outstanding(trees, &id, shape)?)))
+            .collect();
+        let updates = waiting
             .into_iter()
             .chain(needed.iter().map(|id| (id.clone(), None)))
             .chain(agreed.iter().cloned())
@@ -378,7 +374,7 @@ impl Commits {
             if needed.contains(&id) {
                 still.insert(id);
             } else if !agreed.iter().any(|(other, _)| *other == id) {
-                self.waiting.insert(id, shape);
+                trees.wait(id, shape);
             }
         }
         still
@@ -593,7 +589,8 @@ fn rebase(
 ) -> (BTreeSet<NodeId>, Vec<(NodeId, Option<Shape>)>) {
     let dirty: Vec<NodeId> = trees.dirty().iter().cloned().collect();
     for id in &dirty {
-        if trees.reverted().contains(id) && trees.remote().live(id).is_none() && trees.edited(id) {
+        let held = trees.reverted().contains(id) || trees.waiting().contains_key(id);
+        if held && trees.remote().live(id).is_none() && trees.edited(id) {
             rekey(trees, id, &ids.uuid_v7(now_ms));
         }
     }
@@ -705,6 +702,29 @@ fn keep(trees: &mut Trees, id: &str, needed: &mut BTreeSet<NodeId>) {
         }
         current = parent;
     }
+}
+
+/// What is left of a waiting S update. Its position is stale once R no longer has the node there
+/// and L has left it too: it then falls back to the position S holds, or to R's when S does not
+/// hold the node, so L's and R's positions are compared with the S they came from, as for any
+/// change both sides made. Its content stays, so the acknowledged content remains the base L's
+/// content is compared with. None when nothing is left: the update comes to what S holds, or
+/// neither L nor R holds the node.
+fn outstanding(trees: &Trees, id: &str, waiting: Option<Shape>) -> Option<Option<Shape>> {
+    let local = trees.local().get(id).map(|node| &node.shape);
+    let synced = trees.synced().live(id);
+    let Some(remote) = trees.remote().live(id) else {
+        return local.is_some().then_some(waiting);
+    };
+    let Some(mut left) = waiting else {
+        return Some(None);
+    };
+    if !left.same_position(remote) && !local.is_some_and(|local| local.same_position(&left)) {
+        let base = synced.unwrap_or(remote);
+        left.parent = base.parent.clone();
+        left.name = base.name.clone();
+    }
+    (synced != Some(&left)).then_some(Some(left))
 }
 
 /// The bytes a change record of a node with this shape takes, roughly.
