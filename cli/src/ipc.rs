@@ -33,7 +33,8 @@ pub enum Request {
     SaveCredential {
         credential: Credential,
     },
-    /// Removes a credential the server no longer accepts, unlinking every folder; their files stay.
+    /// Removes a credential the server no longer accepts, unlinking every folder; their files stay. Revoking the device
+    /// on the server is best effort, since the server already refuses the credential.
     SignOut,
     Link {
         folder: PathBuf,
@@ -75,7 +76,7 @@ pub async fn handle(driver: &Driver, request: Request) -> Response {
         Request::SaveCredential { credential } => driver
             .save_credential(credential)
             .map(|account| Response::Paired { account }),
-        Request::SignOut => driver.sign_out().await.map(|()| Response::SignedOut),
+        Request::SignOut => driver.sign_out(true).await.map(|()| Response::SignedOut),
         Request::Link { folder, space } => driver
             .link(&folder, &space)
             .await
