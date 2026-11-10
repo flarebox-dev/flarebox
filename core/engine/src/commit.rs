@@ -45,10 +45,11 @@ pub enum Halt {
     /// The store cannot account for the server's state (sections 2.8 and 6.4). The commit in flight
     /// is kept as evidence and nothing is planned from this store.
     Recovery,
-    /// The server refused the commit with an error the engine cannot act on: a code it does not
-    /// know, `UNSPECIFIED` among them, or `QUOTA_EXCEEDED` without a retry time. The commit in
-    /// flight is kept and never resent, nothing more is planned, and downloads continue.
-    Refused,
+    /// A policy halt (RFC 0006 section 1): the server refused the commit with `code`, which only
+    /// the user or a client update can resolve. The commit in flight is kept with its slot and
+    /// never resent, nothing more is planned, and downloads continue. No `Welcome` lifts it, and
+    /// it is part of the stored state (section 2.8), so it outlasts a restart.
+    Policy { code: i32 },
 }
 
 /// What to do with the commit in flight after connecting (section 2.8, RFC 0002 section 2).
@@ -385,9 +386,9 @@ impl Commits {
 
     /// What a call-level error on the commit in flight means. An error that proves nothing was
     /// applied forgets the commit; one that leaves the outcome unknown keeps it to resend; a
-    /// history mismatch or a stale device state keeps it as evidence and stops committing; and an
-    /// error the engine cannot act on refuses it (see [`Halt::Refused`]). `QUOTA_EXCEEDED` is
-    /// resent only when it names a retry time, after that wait.
+    /// history mismatch or a stale device state keeps it as evidence and stops committing; and
+    /// every other code, known or not, is a policy halt ([`Halt::Policy`], RFC 0006 section 1).
+    /// `QUOTA_EXCEEDED` is resent only when it names a retry time, after that wait.
     pub fn failed(&mut self, error: &proto::Error) -> Result<Failure, CommitError> {
         use error::Code;
         if self.in_flight.is_none() {
@@ -395,20 +396,20 @@ impl Commits {
         }
         let failure = match Code::try_from(error.code) {
             Ok(Code::HistoryMismatch | Code::StaleDeviceState) => Failure::Halted(Halt::Recovery),
-            Ok(Code::ReadOnly | Code::Forbidden) => Failure::Halted(Halt::ReadOnly),
+            Ok(Code::ReadOnly) => Failure::Halted(Halt::ReadOnly),
             Ok(Code::AheadOfServer) => Failure::Resync,
             Ok(Code::LimitExceeded) => Failure::Split,
-            Ok(Code::InvalidArgument | Code::HeadMoved | Code::UnsupportedVersion) => {
-                Failure::Abandoned
-            }
+            Ok(Code::HeadMoved | Code::UnsupportedVersion) => Failure::Abandoned,
             Ok(Code::QuotaExceeded) if error.retry_after_ms > 0 => Failure::Resend,
             Ok(Code::MissingChunks | Code::RetryLater | Code::Unauthenticated | Code::Internal) => {
                 Failure::Resend
             }
-            _ => Failure::Halted(Halt::Refused),
+            _ => Failure::Halted(Halt::Policy { code: error.code }),
         };
         match failure {
-            Failure::Halted(halt @ (Halt::Recovery | Halt::Refused)) => self.halted = Some(halt),
+            Failure::Halted(halt @ (Halt::Recovery | Halt::Policy { .. })) => {
+                self.halted = Some(halt)
+            }
             Failure::Resend => {}
             Failure::Halted(halt) => {
                 self.halted = Some(halt);
@@ -437,8 +438,11 @@ impl Commits {
 
     /// Forgets the commit in flight when the driver knows it was not applied: after
     /// `MISSING_CHUNKS` when the file changed since it was chunked (section 4.2). False when no
-    /// commit is in flight or its result has arrived.
+    /// commit is in flight, its result has arrived, or a policy halt keeps it.
     pub fn abandon(&mut self) -> bool {
+        if matches!(self.halted, Some(Halt::Policy { .. })) {
+            return false;
+        }
         self.in_flight
             .take_if(|flight| flight.result.is_none())
             .is_some()
@@ -448,9 +452,13 @@ impl Commits {
     /// 2.8). With *w* the server's counter, *w* = *a* means the commit in flight was not accepted
     /// and *w* = *a* + 1 that it was and its response was lost; both resend it unchanged, and
     /// the server answers an accepted one with its stored result. Any other *w*, or a commit
-    /// built in another history, starts recovery. A read-only or refused device resends nothing. Whether R
-    /// itself belongs to the `Welcome`'s history is checked where R is kept.
+    /// built in another history, starts recovery. A read-only device resends nothing, and a
+    /// device under a policy halt resends nothing whatever the `Welcome` says. Whether R itself
+    /// belongs to the `Welcome`'s history is checked where R is kept.
     pub fn connected(&mut self, welcome: &proto::Welcome) -> Reconnect {
+        if matches!(self.halted, Some(Halt::Policy { .. })) {
+            return Reconnect::Idle;
+        }
         let (a, w) = (self.accepted, welcome.device_seq);
         let reconnect = match &self.in_flight {
             _ if self.halted == Some(Halt::Recovery) => Reconnect::Recovery,
@@ -463,9 +471,6 @@ impl Commits {
         if reconnect == Reconnect::Recovery {
             self.halted = Some(Halt::Recovery);
             return reconnect;
-        }
-        if self.halted == Some(Halt::Refused) {
-            return Reconnect::Idle;
         }
         if welcome.read_only {
             self.halted = Some(Halt::ReadOnly);

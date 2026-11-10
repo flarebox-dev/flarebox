@@ -34,7 +34,7 @@ Each change answers a blocking finding of the review of d37ee0d (B1–B7), of th
 | A changed `history_id` on connect starts recovery before any bootstrap; unanswered questions are asked again after a restart; deleting a folder that holds excluded nodes is split so they stay on the server; a user move out of an ignored path propagates; `.flarebox/` does not make a disappearance ambiguous; a recovery answer is committed only if the server has not changed since its simulation | §2.8, §4.4, §5.10, §6.1, §6.4, §7.5, §10 | review of #7 (CodeRabbit) |
 | Recovery is a draft verified by simulation: holds are released only by a certain row, explicit intents such as a version restore are kept as evidence, and an answer is checked against the whole server transition, so R8 cannot revive nodes outside it; every counterexample of the four reviews is a named scenario | §6.4, §7.5, §10 | R4-2, R4-3, R4-4, owner decision |
 | `EffectDone` carries the new entry's identity; S updates wait until S stays valid; a delete waits for a forced folder create that may merge into it, and a folder created where a moving folder still is takes a pending name; local positions the server will not take (cycles, renames, merges into a folder held elsewhere) are reverted on disk instead of through S, keep and upload their local edits, and are parked when they block each other; commits are sized to fit the 1 MiB message limit and `LIMIT_EXCEEDED` splits a commit instead of abandoning it | §1, §2.6, §2.7, §2.8, §4.2, §9 | engine implementation (effects and commit layers); message limit decided by the project |
-| An unknown error code, `UNSPECIFIED` included, and `QUOTA_EXCEEDED` without a retry time are refusals: the commit is kept and never resent, and committing stops | §4.2 | owner decision (GUN-281) |
+| A refused commit is handled as RFC 0006 §1 says: `FORBIDDEN`, `INVALID_ARGUMENT`, `NOT_FOUND`, `CONFIRMATION_REQUIRED`, `QUOTA_EXCEEDED` without a retry time, `UNSPECIFIED` and unknown codes are a policy halt that keeps the commit, resends nothing whatever the `Welcome` says, and is stored | §4.2 | owner decision (GUN-281), RFC 0006 |
 
 ## 1. Context
 
@@ -186,7 +186,7 @@ After a crash the engine restarts from that state. The fs driver first recovers 
 
 - The store keeps the **accepted counter** *a*: the `device_seq` of the last commit whose result this device applied. A new commit takes slot *a* + 1, which is persisted with the commit before it is sent.
 - A commit whose outcome is uncertain keeps its slot and its `commit_id` on every retry.
-- A commit the server refused as a whole (a call-level error such as `MISSING_CHUNKS` or `INVALID_ARGUMENT`, so nothing was applied) does not use up its slot: the server advances its counter only when it accepts a commit. The re-planned commit gets a new `commit_id` and the same slot *a* + 1.
+- A commit the server refused as a whole (a call-level error such as `MISSING_CHUNKS` or `UNSUPPORTED_VERSION`, so nothing was applied) does not use up its slot: the server advances its counter only when it accepts a commit. The re-planned commit gets a new `commit_id` and the same slot *a* + 1.
 - Applying a commit's result sets *a* to its slot, in the same transaction that clears the commit in flight.
 
 The server keeps, per device, the highest `device_seq` it accepted and that commit's result, updated atomically with accepting the commit, and reports the counter in `Welcome` as *w*. On reconnect:
@@ -303,14 +303,17 @@ Kleppmann et al. show that concurrent moves either duplicate subtrees (Dropbox a
 | transport error, disconnect, timeout | unknown | Resend the same commit, same `commit_id`, after reconnecting and catching up |
 | `MISSING_CHUNKS` | no (checked before any op, spec §8 step 4) | Upload again, resend the same commit. If the bytes are gone (the file changed since it was chunked), abandon the commit and re-plan from L with a new `commit_id` |
 | `RETRY_LATER` | no | Back off for `retry_after_ms` and resend |
-| `QUOTA_EXCEEDED` **[changed]** | no | With `retry_after_ms` above 0, back off for it and resend; without one, a refusal |
-| unknown code, `UNSPECIFIED` **[changed]** | unknown | Refusal: keep the commit and never resend it, stop committing and report it; downloads continue |
-| `READ_ONLY` (format too new, spec §9.2) | no | Abandon, stop committing, report a problem; downloads continue |
-| `INVALID_ARGUMENT` | no | Abandon and report; this is an engine bug, and the simulation treats it as a failure |
+| `QUOTA_EXCEEDED` **[changed]** | no | With `retry_after_ms` above 0, back off for it and resend; without one, a policy halt |
+| `READ_ONLY` (format too new, spec §9.2) | no | Abandon, stop committing, report a problem; downloads continue; a `Welcome` that allows writes ends it |
+| `FORBIDDEN`, `NOT_FOUND`, `CONFIRMATION_REQUIRED`, `UNSPECIFIED`, unknown code **[changed]** | no, or unknown | Policy halt (below) |
+| `INVALID_ARGUMENT` **[changed]** | no | Policy halt, keeping the commit as evidence; this is an engine bug or a reused `commit_id`, and the simulation treats it as a failure |
+| `UNSUPPORTED_VERSION`, `HEAD_MOVED` | no | Abandon and re-plan with a new `commit_id` |
 | `LIMIT_EXCEEDED` **[changed]** | no | The commit's change records or its result do not fit in one 1 MiB message (spec §7.2). Abandon and re-plan in commits of half as many ops; a commit of one `Delete` is re-planned as deletes of the folder's contents first, and any other single op marks its node as a problem. Each acknowledged commit doubles the op count back towards 1,000 |
 | `base_seq > head_seq` | no | Resync (§4.4), then re-plan |
 | history mismatch (proposed fence, §10) **[changed]** | no | Stop committing; the space enters recovery as for `HISTORY_CHANGED` (§6.4) and the commit is kept as evidence |
 | `STALE_DEVICE_STATE` (proposed, §10) **[changed]** | unknown | Stop committing; recovery (§6.4) |
+
+**[changed]** A **policy halt** (RFC 0006 §1) keeps the refused commit with its `commit_id` and slot and records the code. The engine sends nothing more to the space, neither that commit nor a new one, and downloads continue. The refusal is reported to the user with the code and the error's message. The halt is stored, so it outlasts a reconnect and a restart, and no `Welcome` lifts it, so it overrides the resend of §2.8. Only a user action or a client update that knows the code ends it; RFC 0006 leaves those actions to a later RFC. It differs from read-only, which follows from the device's format or role and ends with a `Welcome` that allows writes.
 
 A commit is abandoned only after an error that proves it was not applied. **[changed]** An earlier revision also abandoned a commit whose outcome was unknown and re-planned it from the trees. That is unsafe (review D1): if the commit wrote B and another device that had seen B then deleted the node, re-planning finds a local edit against a remote delete and revives the node. An outcome that is unknown is resolved by the stored result, never by inference from the current tree; when it cannot be resolved (another history, or a store older than the device's history), the space enters recovery (§6.4). Abandoning means forgetting the in-flight record; S was not changed for it, so the same local changes are planned again from the trees.
 
