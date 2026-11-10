@@ -3,6 +3,8 @@
 //! Pairing codes that carry their server: `<code>@<host>`, such as `K7QM-2XPD@flarebox.alice.workers.dev`
 //! (docs/design/cli-setup.md section 1).
 
+use url::Url;
+
 /// A pairing code and the server it was issued by.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Invitation {
@@ -37,6 +39,33 @@ pub fn parse(text: &str, server: Option<&str>) -> Result<Invitation, String> {
     })
 }
 
+/// The arguments of `flarebox join` for `code` from `server`: `<code>@<host>`, which [`parse`] reads back, for an https
+/// address with no path, and the code with `--server` for any other.
+pub fn join_args(code: &str, server: &Url) -> String {
+    match (
+        server.scheme(),
+        server.host_str(),
+        server.path(),
+        server.query(),
+    ) {
+        ("https", Some(host), "/", None) => match server.port() {
+            Some(port) => format!("{code}@{host}:{port}"),
+            None => format!("{code}@{host}"),
+        },
+        _ => format!("{code} --server {server}"),
+    }
+}
+
+/// A server address as typed: `https://` goes before a bare host name.
+pub fn server_url(text: &str) -> String {
+    let text = text.trim();
+    if text.contains("://") {
+        text.to_owned()
+    } else {
+        format!("https://{text}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,6 +97,42 @@ mod tests {
             parse("K7QM-2XPD@files.example.com", local).unwrap().server,
             "http://127.0.0.1:8787"
         );
+    }
+
+    #[test]
+    fn join_args_read_back_as_the_same_code_and_server() {
+        for server in [
+            "https://flarebox.alice.workers.dev",
+            "https://files.example.com:8443",
+            "http://127.0.0.1:8787",
+            "https://files.example.com/flarebox/",
+        ] {
+            let url = Url::parse(server).unwrap();
+            let args = join_args("K7QM-2XPD", &url);
+            let (code, flag) = match args.split_once(" --server ") {
+                Some((code, flag)) => (code, Some(flag)),
+                None => (args.as_str(), None),
+            };
+            let read = parse(code, flag).unwrap();
+            assert_eq!(read.code, "K7QM-2XPD", "{args}");
+            assert_eq!(Url::parse(&read.server).unwrap(), url, "{args}");
+        }
+        assert_eq!(
+            join_args(
+                "K7QM-2XPD",
+                &Url::parse("https://flarebox.alice.workers.dev").unwrap()
+            ),
+            "K7QM-2XPD@flarebox.alice.workers.dev"
+        );
+    }
+
+    #[test]
+    fn a_bare_server_host_gets_https() {
+        assert_eq!(
+            server_url(" flarebox.alice.workers.dev "),
+            "https://flarebox.alice.workers.dev"
+        );
+        assert_eq!(server_url("http://127.0.0.1:8787"), "http://127.0.0.1:8787");
     }
 
     #[test]

@@ -181,6 +181,8 @@ enum SpaceAction {
 
 #[derive(Subcommand)]
 enum DeviceAction {
+    /// Show a pairing code that adds another device to this server. It works once, for a few minutes.
+    Add,
     /// List the devices paired with the server, revoked ones included.
     List {
         #[arg(long)]
@@ -260,6 +262,9 @@ fn main() -> ExitCode {
                 device,
                 login,
             } => setup::setup(&paths, &device.name(), &login).await,
+            command @ Command::Server {
+                action: setup::ServerAction::Claim { .. },
+            } => client(paths, command).await,
             Command::Server { action } => setup::server(&paths, action).await,
             command => client(paths, command).await,
         }
@@ -336,6 +341,23 @@ async fn client(paths: Paths, command: Command) -> Result<(), String> {
             server,
             device,
         } => join_request(&code, server.as_deref(), &device)?,
+        Command::Server {
+            action:
+                setup::ServerAction::Claim {
+                    server,
+                    code,
+                    user,
+                    device,
+                },
+        } => (
+            Request::Claim {
+                server: pairing::server_url(&server),
+                code: code.trim().to_owned(),
+                user_name: user,
+                name: device.name(),
+            },
+            false,
+        ),
         Command::Link { folder, space } => (
             Request::Link {
                 folder: absolute(&folder)?,
@@ -498,6 +520,15 @@ async fn device(paths: Paths, action: DeviceAction) -> Result<(), String> {
                 return print_json(&devices.iter().map(device_json).collect::<Vec<_>>());
             }
             print!("{}", device_table(&devices, now_ms()));
+            Ok(())
+        }
+        DeviceAction::Add => {
+            let started = auth.api().pair_start(&auth).await.map_err(refusal)?;
+            let minutes = ((started.expires_at_ms - now_ms()) / 60_000).max(1);
+            println!(
+                "On the new device, run:\n  flarebox join {}\nThe code works once, for about {minutes} minutes.",
+                pairing::join_args(&started.code, auth.api().base())
+            );
             Ok(())
         }
         DeviceAction::Revoke { id } => {
