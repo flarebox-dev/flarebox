@@ -550,6 +550,46 @@ fn a_download_s_cannot_place_yet_is_not_forked_by_the_next_remote_edit() {
     assert_eq!(trees.class("n"), Class::Remote);
 }
 
+/// The user renames folder f to a and back to f. A commit built before the second rename was seen
+/// moves f to a, and the server renames it to "a (conflict)" because another device holds a, so
+/// the node is reverted. The rename back to f is the user's last word: it is sent, and nothing
+/// moves the folder to the conflict name.
+#[test]
+fn a_folder_renamed_back_after_its_move_was_renamed_by_the_server_keeps_the_users_name() {
+    for back_before_the_result in [false, true] {
+        let mut trees = trees(&[(
+            "n",
+            Some(dir(ROOT, "a")),
+            Some(dir(ROOT, "f")),
+            Some(remote(dir(ROOT, "f"))),
+        )]);
+        let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+        let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+        assert_eq!(ops(&commit), [mv("n", ROOT, "a")]);
+        if back_before_the_result {
+            trees.set_local("n".into(), local(dir(ROOT, "f"), 1));
+        }
+        trees.set_remote("n".into(), remote(dir(ROOT, "a (conflict)")));
+        let renamed = OpResult {
+            name: "a (conflict)".into(),
+            ..outcome(op_result::Code::AppliedRenamed)
+        };
+        acknowledge(&mut commits, &mut trees, vec![renamed]);
+        trees.set_local("n".into(), local(dir(ROOT, "f"), 1));
+        trees.settle();
+        assert!(!trees.reverted().contains("n"), "{back_before_the_result}");
+        let mut effects = Effects::default();
+        let planned = (effects.plan(&trees, &mut ids, NOW)).map(|record| record.effect.clone());
+        assert_eq!(planned, None, "{back_before_the_result}");
+        let commit = build(&mut commits, &mut trees, &mut ids);
+        assert_eq!(
+            commit.map(|commit| ops(&commit)),
+            Some(vec![mv("n", ROOT, "f")]),
+            "{back_before_the_result}"
+        );
+    }
+}
+
 #[test]
 fn a_local_edit_on_a_reverted_file_is_kept_on_disk_and_uploaded() {
     let mut trees = trees(&[("a", Some(file(ROOT, "x", 1)), None, None)]);
@@ -1833,10 +1873,10 @@ fn a_waiting_update_settling_replaced_is_not_made_afterwards() {
     assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "z", 2)));
 }
 
-/// The server renames n's move, so n is reverted as well as waiting, and the user puts n back as
-/// S still holds it. The reverted node is moved to its R name, but its content, an edit against
-/// the acknowledged update, is neither replaced nor removed, and is uploaded once the update is
-/// made.
+/// The server renames n's move, so n is reverted as well as waiting, and then the user puts n back
+/// as S still holds it. That move is the user's last word, so n is not moved to its R name, and
+/// its content, an edit against the acknowledged update, is neither replaced nor removed. Both are
+/// uploaded once the update is made.
 #[test]
 fn a_renamed_waiting_file_put_back_as_s_still_holds_it_keeps_its_content() {
     let mut trees = trees(&[
@@ -1881,19 +1921,14 @@ fn a_renamed_waiting_file_put_back_as_s_still_holds_it_keeps_its_content() {
     trees.set_local("n".into(), local(file(ROOT, "old", 0), 2));
     trees.settle();
     assert_eq!(trees.class("n"), Class::Remote, "L matches S");
-    let effects = effects_for(&mut trees, &mut ids, "n");
-    assert!(
-        effects
-            .iter()
-            .all(|effect| matches!(effect, Effect::Move { .. })),
-        "{effects:?}"
-    );
+    assert!(!trees.reverted().contains("n"));
+    assert_eq!(effects_for(&mut trees, &mut ids, "n"), []);
     assert_eq!(
         trees.local().get("n").map(|node| &node.shape),
-        Some(&file(ROOT, "x (2)", 0))
+        Some(&file(ROOT, "old", 0))
     );
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
-    assert_eq!(ops(&commit), [update("n", 0)]);
+    assert_eq!(ops(&commit), [mv("n", ROOT, "old"), update("n", 0)]);
 }
 
 /// n's update waits and h needs n's place on disk, so n is parked. When the driver fails to park

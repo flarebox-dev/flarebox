@@ -433,6 +433,12 @@ impl Commits {
                 true => outcome.name.clone(),
                 false => sent.to_owned(),
             };
+            let sent = match &op.op {
+                Some(op::Op::CreateDir(create)) => Some((&create.parent_id, &create.name)),
+                Some(op::Op::CreateFile(create)) => Some((&create.parent_id, &create.name)),
+                Some(op::Op::Move(moved)) => Some((&moved.new_parent_id, &moved.new_name)),
+                _ => None,
+            };
             let (node, done) = match &op.op {
                 Some(op::Op::CreateDir(create)) => {
                     let shape = Shape {
@@ -519,7 +525,11 @@ impl Commits {
                 let held = &local.shape.parent;
                 aliases.contains_key(held) || merged.contains_key(held)
             });
-            if renamed || (done && follows) {
+            let left = sent.is_some_and(|(parent, name)| {
+                (trees.local().get(node))
+                    .is_some_and(|local| local.shape.parent != *parent || local.shape.name != *name)
+            });
+            if (renamed && !left) || (done && follows) {
                 trees.revert(node.clone());
             }
             if !done {

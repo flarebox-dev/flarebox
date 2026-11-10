@@ -558,7 +558,8 @@ fn rename_to_a_and_back(site: &Site, b: &mut Device) {
 }
 
 /// GUN-330. The effect was planned while the name `a` was free in L. Recording its outcome beside the folder L
-/// then held at `a` left two nodes with one name, and the store did not load again.
+/// then held at `a` left two nodes with one name, and the store did not load again. The server renames the folder's
+/// move to `a`, and the user's rename back to `f` is kept on both devices (GUN-344).
 #[test]
 fn an_effect_whose_name_l_gave_to_another_node_writes_nothing_and_is_planned_again() {
     let mut remote = Remote::new();
@@ -585,6 +586,12 @@ fn an_effect_whose_name_l_gave_to_another_node_writes_nothing_and_is_planned_aga
         .collect();
     assert_eq!(texts.len(), 2, "{held:?}");
     assert!(texts.contains(&"written on a") && texts.contains(&"kept on b"));
+    assert_eq!(
+        names(&site.root),
+        ["a", "f"],
+        "the rename back to f is kept"
+    );
+    assert_eq!(names(&site_a.root), ["a", "f"]);
 }
 
 /// The same L, with the file already at its name when the process stops. `Disk::apply` no longer gets there, so
