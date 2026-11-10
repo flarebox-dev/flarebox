@@ -28,6 +28,8 @@ message Error {
     CODE_HEAD_MOVED = 13;
     // The commit's base_seq is above head_seq in the same history: the server is behind what the client saw.
     CODE_AHEAD_OF_SERVER = 14;
+    // The share link, or the node or link the request names, does not exist or is not reachable (RFC 0005).
+    CODE_NOT_FOUND = 15;
   }
   Code code = 1;
   string message = 2;

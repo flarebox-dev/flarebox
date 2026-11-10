@@ -551,6 +551,8 @@ pub mod error {
         HeadMoved = 13,
         /// The commit's base_seq is above head_seq in the same history: the server is behind what the client saw.
         AheadOfServer = 14,
+        /// The share link, or the node or link the request names, does not exist or is not reachable (RFC 0005).
+        NotFound = 15,
     }
     impl Code {
         /// String value of the enum field names used in the ProtoBuf definition.
@@ -574,6 +576,7 @@ pub mod error {
                 Self::StaleDeviceState => "CODE_STALE_DEVICE_STATE",
                 Self::HeadMoved => "CODE_HEAD_MOVED",
                 Self::AheadOfServer => "CODE_AHEAD_OF_SERVER",
+                Self::NotFound => "CODE_NOT_FOUND",
             }
         }
         /// Creates an enum from field names used in the ProtoBuf definition.
@@ -594,6 +597,7 @@ pub mod error {
                 "CODE_STALE_DEVICE_STATE" => Some(Self::StaleDeviceState),
                 "CODE_HEAD_MOVED" => Some(Self::HeadMoved),
                 "CODE_AHEAD_OF_SERVER" => Some(Self::AheadOfServer),
+                "CODE_NOT_FOUND" => Some(Self::NotFound),
                 _ => None,
             }
         }
@@ -1032,5 +1036,112 @@ pub struct Goodbye {
     pub code: u32,
     #[prost(string, tag="2")]
     pub reason: ::prost::alloc::string::String,
+}
+// Bodies of the share-link endpoints in RFC 0005.
+
+/// POST /v1/spaces/{space_id}/links
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CreateShareLinkRequest {
+    /// A live file or folder of the space, the root included.
+    #[prost(string, tag="1")]
+    pub node_id: ::prost::alloc::string::String,
+    /// Unix milliseconds. 0 with no_expiry false means 7 days after creation.
+    #[prost(int64, tag="2")]
+    pub expires_at_ms: i64,
+    /// A link that never expires. Refused together with a nonzero expires_at_ms.
+    #[prost(bool, tag="3")]
+    pub no_expiry: bool,
+    /// Empty for a link without a password; otherwise 8 to 256 Unicode scalar values.
+    #[prost(string, tag="4")]
+    pub password: ::prost::alloc::string::String,
+}
+/// One link, as the owner sees it.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ShareLink {
+    /// The link's 128-bit secret, unpadded base64url (22 characters).
+    #[prost(string, tag="1")]
+    pub link_id: ::prost::alloc::string::String,
+    /// <origin>/s/<link_id>
+    #[prost(string, tag="2")]
+    pub url: ::prost::alloc::string::String,
+    #[prost(string, tag="3")]
+    pub space_id: ::prost::alloc::string::String,
+    #[prost(string, tag="4")]
+    pub node_id: ::prost::alloc::string::String,
+    #[prost(int64, tag="5")]
+    pub created_at_ms: i64,
+    /// 0 when the link never expires.
+    #[prost(int64, tag="6")]
+    pub expires_at_ms: i64,
+    #[prost(bool, tag="7")]
+    pub has_password: bool,
+    /// 0 while the link is not revoked.
+    #[prost(int64, tag="8")]
+    pub revoked_at_ms: i64,
+}
+/// GET /v1/spaces/{space_id}/links
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ShareLinkList {
+    /// Newest first.
+    #[prost(message, repeated, tag="1")]
+    pub links: ::prost::alloc::vec::Vec<ShareLink>,
+    /// Empty on the last page.
+    #[prost(string, tag="2")]
+    pub next_cursor: ::prost::alloc::string::String,
+}
+/// GET /v1/share/{link_id}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ShareInfo {
+    /// Set, with no other field, when the link has a password and the request has no valid session.
+    #[prost(bool, tag="1")]
+    pub password_required: bool,
+    #[prost(enumeration="NodeKind", tag="2")]
+    pub kind: i32,
+    #[prost(string, tag="3")]
+    pub name: ::prost::alloc::string::String,
+    /// The node_id of the link's root.
+    #[prost(string, tag="4")]
+    pub root_id: ::prost::alloc::string::String,
+    /// For a file: the size and modification time of its current version.
+    #[prost(uint64, tag="5")]
+    pub size: u64,
+    #[prost(int64, tag="6")]
+    pub mtime_ms: i64,
+    /// 0 when the link never expires.
+    #[prost(int64, tag="7")]
+    pub expires_at_ms: i64,
+}
+/// POST /v1/share/{link_id}/unlock
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ShareUnlockRequest {
+    #[prost(string, tag="1")]
+    pub password: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ShareEntry {
+    #[prost(string, tag="1")]
+    pub node_id: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(enumeration="NodeKind", tag="3")]
+    pub kind: i32,
+    /// For a file: the size and modification time of its current version. 0 for a folder.
+    #[prost(uint64, tag="4")]
+    pub size: u64,
+    #[prost(int64, tag="5")]
+    pub mtime_ms: i64,
+}
+/// GET /v1/share/{link_id}/list
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ShareListing {
+    /// The live children of the listed folder, sorted by name_key and then node_id.
+    #[prost(message, repeated, tag="1")]
+    pub entries: ::prost::alloc::vec::Vec<ShareEntry>,
+    /// The folders from the link's root down to the listed folder, both included.
+    #[prost(message, repeated, tag="2")]
+    pub path: ::prost::alloc::vec::Vec<ShareEntry>,
+    /// Empty on the last page.
+    #[prost(string, tag="3")]
+    pub next_cursor: ::prost::alloc::string::String,
 }
 // @@protoc_insertion_point(module)
