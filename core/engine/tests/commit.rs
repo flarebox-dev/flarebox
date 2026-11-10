@@ -1327,6 +1327,66 @@ fn a_conflict_copy_downloaded_before_its_result_is_kept_once() {
     assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
 }
 
+/// On a disk that tells "A" from "a", the user edits the file "A" and creates the folder "a" while
+/// another device edits the file and renames it to "b". The commit makes the edit the conflict copy
+/// y, whose S update at "A" waits behind the folder: S cannot hold both names. The effects still
+/// move y to the server's name, which ends the wait, and the trees come into sync.
+#[test]
+fn a_conflict_copy_whose_s_update_waits_behind_a_new_folder_is_moved_to_its_name() {
+    let mut trees = trees(&[
+        (
+            "n",
+            Some(file(ROOT, "A", 2)),
+            Some(file(ROOT, "A", 1)),
+            Some(remote(file(ROOT, "A", 1))),
+        ),
+        ("d", Some(dir(ROOT, "a")), None, None),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit).len(), 2);
+    trees.set_remote("n".into(), remote(file(ROOT, "b", 3)));
+    trees.set_remote("y".into(), remote(file(ROOT, "b (conflict)", 2)));
+    trees.set_remote("d".into(), remote(dir(ROOT, "a")));
+    let results = commit
+        .ops
+        .iter()
+        .map(|op| match &op.op {
+            Some(op::Op::UpdateContent(_)) => OpResult {
+                node_id: "y".into(),
+                ..outcome(op_result::Code::ConflictCopy)
+            },
+            _ => outcome(op_result::Code::Applied),
+        })
+        .collect();
+    acknowledge(&mut commits, &mut trees, results);
+    assert!(trees.waiting().contains_key("y"));
+    let mut effects = Effects::default();
+    let mut ino = 10;
+    while let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() {
+        let identity = FileIdentity {
+            dev: 1,
+            ino,
+            birth_ns: Some(0),
+        };
+        effects
+            .done(&mut trees, &record.effect_id, Some(identity))
+            .unwrap();
+        ino += 1;
+        trees.settle();
+        assert!(ino < 20, "the effects do not end");
+    }
+    assert_eq!(
+        trees.local().get("y").unwrap().shape,
+        file(ROOT, "b (conflict)", 2)
+    );
+    assert_eq!(trees.local().get("n").unwrap().shape, file(ROOT, "b", 3));
+    assert!(trees.waiting().is_empty());
+    trees.settle();
+    assert!(trees.work().is_empty());
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+}
+
 #[test]
 fn a_rejected_op_marks_a_problem_but_a_rejected_cycle_moves_the_node_back() {
     let mut trees = trees(&[
@@ -1859,13 +1919,11 @@ fn a_waiting_blocker_whose_parking_failed_is_not_parked_again_unchanged() {
     assert!(effects.blocked().contains_key("n"));
 }
 
-/// Committing is halted, read-only, while n's update waits and the other device moves n on. Once
-/// the update fits, building makes it anyway, so the remote move reaches the disk while downloads
-/// go on.
+/// Committing is halted, read-only, while n's update waits. Once the update fits, building makes it
+/// anyway, so S stays in step while downloads go on.
 #[test]
 fn a_waiting_update_is_made_while_committing_is_halted() {
     let (mut trees, mut commits, mut ids) = a_move_and_edit_whose_s_update_waits();
-    trees.set_remote("n".into(), remote(file(ROOT, "q", 1)));
     trees.set_local("p".into(), local(file(ROOT, "p", 3), 3));
     trees.settle();
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
@@ -1879,11 +1937,49 @@ fn a_waiting_update_is_made_while_committing_is_halted() {
     assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
     assert_eq!(trees.waiting(), &Default::default());
     assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "x", 1)));
-    effects_for(&mut trees, &mut ids, "n");
+    assert_eq!(effects_for(&mut trees, &mut ids, "n"), []);
+}
+
+/// As above, with an edit the user made after the commit: L leaves the waiting shape, so nothing
+/// but building makes the update. Once it fits, building makes it while committing is halted,
+/// and the edit stays the user's.
+#[test]
+fn a_waiting_update_is_made_while_committing_is_halted_under_a_local_edit() {
+    let (mut trees, mut commits, mut ids) = a_move_and_edit_whose_s_update_waits();
+    trees.set_local("n".into(), local(file(ROOT, "x", 2), 2));
+    trees.set_local("p".into(), local(file(ROOT, "p", 3), 3));
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id == "p"));
+    assert_eq!(
+        commits.failed(&refusal(error::Code::ReadOnly, 0)),
+        Ok(Failure::Halted(Halt::ReadOnly))
+    );
+    effects_for(&mut trees, &mut ids, "");
+    assert_eq!(trees.synced().live("h"), Some(&file(ROOT, "y", 9)));
+    assert!(trees.waiting().contains_key("n"));
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    assert!(trees.waiting().is_empty());
+    assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "x", 1)));
+    assert_eq!(trees.local().live("n"), Some(&file(ROOT, "x", 2)));
+}
+
+/// The other device moves n on while n's update waits behind h. Against the waiting shape that is
+/// a remote change, so the effects move n at once, and the update then takes R's position.
+#[test]
+fn a_remote_move_of_a_node_whose_update_waits_reaches_the_disk() {
+    let (mut trees, mut commits, mut ids) = a_move_and_edit_whose_s_update_waits();
+    trees.set_remote("n".into(), remote(file(ROOT, "q", 1)));
+    trees.settle();
+    let planned = effects_for(&mut trees, &mut ids, "n");
+    assert!(matches!(&planned[..], [Effect::Move { .. }]), "{planned:?}");
     assert_eq!(
         trees.local().get("n").map(|node| &node.shape),
         Some(&file(ROOT, "q", 1))
     );
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    assert_eq!(trees.waiting(), &Default::default());
+    assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "q", 1)));
 }
 
 /// The user creates folder d at X, where S still holds parked file h at x, and file m in d, so the
