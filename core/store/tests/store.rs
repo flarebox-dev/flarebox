@@ -6,8 +6,8 @@ use flarebox_proto::v1::{
     VersionInfo, op,
 };
 use flarebox_store::{
-    CachedChunk, Cursor, Durability, Error, InFlightCommit, LocalNode, Problem, SCHEMA_VERSION,
-    Shape, Store, SyncedNode,
+    CachedChunk, Cursor, Durability, Error, GivenAnswer, InFlightCommit, Link, LocalNode, Problem,
+    SCHEMA_VERSION, Shape, Store, StoredQuestion, SyncedNode,
 };
 use rusqlite::Connection;
 
@@ -68,8 +68,10 @@ fn migrations_apply_from_empty() {
             "commit_in_flight",
             "commit_in_flight_shapes",
             "engine_state",
+            "link",
             "local_nodes",
             "problems",
+            "questions",
             "remote_cursor",
             "remote_nodes",
             "synced_nodes",
@@ -399,6 +401,90 @@ fn chunk_cache_tracks_size_and_eviction_order() {
             assert!(tx.remove_chunk(&b)?);
             assert_eq!(tx.chunk(&b)?, None);
             assert_eq!(tx.chunk_cache_size()?, 400);
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn link_and_questions_persist() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let link = Link {
+        space_id: "0190f0a0-0000-7000-8000-000000000001".into(),
+        space_name: "Projects".into(),
+        root: std::path::PathBuf::from("/home/ada/Flarebox"),
+        root_dev: 66306,
+        server_url: "https://files.example.com/".into(),
+        device_id: "d1".into(),
+        linked_at_ms: 1_700_000_000_000,
+    };
+    let question = |id: &str, at: i64| StoredQuestion {
+        question_id: id.into(),
+        asked_at_ms: at,
+        body: format!("{{\"id\":\"{id}\"}}").into_bytes(),
+        answer: None,
+    };
+    let answer = GivenAnswer {
+        answer: "restore".into(),
+        answered_at_ms: 30,
+    };
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| {
+            assert_eq!(tx.link()?, None);
+            tx.set_link(&link)?;
+            tx.put_question(&question("q2", 20))?;
+            tx.put_question(&question("q1", 10))?;
+            assert!(tx.answer_question("q2", &answer)?);
+            assert!(!tx.answer_question(
+                "q2",
+                &GivenAnswer {
+                    answer: "delete".into(),
+                    answered_at_ms: 40
+                }
+            )?);
+            assert!(!tx.answer_question("missing", &answer)?);
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+
+    let mut store = Store::open(&path).unwrap();
+    store
+        .transaction(|tx| {
+            assert_eq!(tx.link()?, Some(link.clone()));
+            let questions = tx.questions()?;
+            assert_eq!(questions[0], question("q1", 10));
+            assert_eq!(questions[1].question_id, "q2");
+            assert_eq!(questions[1].answer, Some(answer.clone()));
+            assert!(tx.remove_question("q1")?);
+            assert!(!tx.remove_question("q1")?);
+            assert_eq!(tx.questions()?.len(), 1);
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn remote_tree_can_be_counted_and_cleared() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path().join("state.db")).unwrap();
+    store
+        .transaction(|tx| {
+            for id in ["a", "b", "c"] {
+                tx.put_remote_node(&NodeState {
+                    node_id: id.into(),
+                    parent_id: "root".into(),
+                    name: id.into(),
+                    kind: NodeKind::Dir as i32,
+                    status: NodeStatus::Live as i32,
+                    ..Default::default()
+                })?;
+            }
+            assert_eq!(tx.remote_node_count()?, 3);
+            tx.clear_remote_nodes()?;
+            assert_eq!(tx.remote_node_count()?, 0);
+            assert!(tx.remote_nodes()?.is_empty());
             Ok::<_, Error>(())
         })
         .unwrap();

@@ -10,7 +10,9 @@
 //!   parked flag;
 //! - the one commit in flight, with the shape each op sent;
 //! - problem nodes, the engine's ID generator state, and the index of chunks
-//!   cached on disk.
+//!   cached on disk;
+//! - the [`Link`]: the folder the store syncs and the device credential that
+//!   writes it, and the questions the engine asked with their answers.
 //!
 //! The engine keeps the trees in memory and reports row-level changes after each
 //! input; the driver writes them with the methods of [`Tx`] inside one
@@ -23,7 +25,9 @@
 //! `fsync` alone may leave the data in the drive's cache. Process-kill tests
 //! cover the rollback, not power loss.
 
-use std::path::Path;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use flarebox_fs::FileId;
@@ -34,7 +38,8 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 /// Schema migrations, applied in order. Migration `i` moves the database from
 /// `user_version = i` to `user_version = i + 1`. Never edit an entry once it
 /// has shipped; append a new one.
-const MIGRATIONS: &[&str] = &["
+const MIGRATIONS: &[&str] = &[
+    "
     CREATE TABLE remote_cursor (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         history_id TEXT NOT NULL,
@@ -102,7 +107,29 @@ const MIGRATIONS: &[&str] = &["
         last_used_ms INTEGER NOT NULL
     ) STRICT, WITHOUT ROWID;
     CREATE INDEX chunk_cache_by_use ON chunk_cache (last_used_ms);
-"];
+",
+    "
+    CREATE TABLE link (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        space_id TEXT NOT NULL,
+        space_name TEXT NOT NULL,
+        root BLOB NOT NULL,
+        root_dev INTEGER NOT NULL,
+        server_url TEXT NOT NULL,
+        device_id TEXT NOT NULL,
+        linked_at_ms INTEGER NOT NULL
+    ) STRICT;
+
+    CREATE TABLE questions (
+        question_id TEXT PRIMARY KEY,
+        asked_at_ms INTEGER NOT NULL,
+        body BLOB NOT NULL,
+        answer TEXT,
+        answered_at_ms INTEGER,
+        CHECK ((answer IS NULL) = (answered_at_ms IS NULL))
+    ) STRICT;
+",
+];
 
 /// The schema version this build writes.
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
@@ -192,6 +219,39 @@ pub struct InFlightCommit {
 pub struct Problem {
     pub node_id: String,
     pub reason: String,
+}
+
+/// The folder this store syncs and the credential that writes it. One device
+/// credential writes a store, and a store belongs to one linked folder: a
+/// driver refuses to sync a store whose `device_id` is not its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    pub space_id: String,
+    pub space_name: String,
+    /// The linked folder's absolute path.
+    pub root: PathBuf,
+    /// The device (`st_dev`) the folder was on when it was linked, for the
+    /// root check of design §6.2.
+    pub root_dev: u64,
+    pub server_url: String,
+    pub device_id: String,
+    pub linked_at_ms: i64,
+}
+
+/// A question the engine asked the person (`AskUser`, design §1), with its
+/// answer once given. The body is opaque to the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredQuestion {
+    pub question_id: String,
+    pub asked_at_ms: i64,
+    pub body: Vec<u8>,
+    pub answer: Option<GivenAnswer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GivenAnswer {
+    pub answer: String,
+    pub answered_at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -371,6 +431,19 @@ impl Tx<'_> {
     /// it existed.
     pub fn remove_remote_node(&self, node_id: &str) -> Result<bool> {
         self.remove("remote_nodes", node_id)
+    }
+
+    /// Removes every node of the remote tree, before a bootstrap replaces it.
+    pub fn clear_remote_nodes(&self) -> Result<()> {
+        self.0.execute("DELETE FROM remote_nodes", [])?;
+        Ok(())
+    }
+
+    /// How many nodes the remote tree holds, live and trashed.
+    pub fn remote_node_count(&self) -> Result<u64> {
+        Ok(self
+            .0
+            .query_row("SELECT COUNT(*) FROM remote_nodes", [], |row| row.get(0))?)
     }
 
     /// Every node of the synced tree, ordered by `node_id`.
@@ -627,6 +700,108 @@ impl Tx<'_> {
         )?;
         let rows = stmt.query_map([limit], read_chunk)?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn link(&self) -> Result<Option<Link>> {
+        Ok(self
+            .0
+            .query_row(
+                "SELECT space_id, space_name, root, root_dev, server_url, device_id, linked_at_ms
+                 FROM link WHERE id = 1",
+                [],
+                |row| {
+                    Ok(Link {
+                        space_id: row.get(0)?,
+                        space_name: row.get(1)?,
+                        root: PathBuf::from(OsStr::from_bytes(&row.get::<_, Vec<u8>>(2)?)),
+                        root_dev: row.get(3)?,
+                        server_url: row.get(4)?,
+                        device_id: row.get(5)?,
+                        linked_at_ms: row.get(6)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn set_link(&self, link: &Link) -> Result<()> {
+        self.0.execute(
+            "INSERT OR REPLACE INTO link
+             (id, space_id, space_name, root, root_dev, server_url, device_id, linked_at_ms)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                link.space_id,
+                link.space_name,
+                link.root.as_os_str().as_bytes(),
+                link.root_dev,
+                link.server_url,
+                link.device_id,
+                link.linked_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every question, answered or not, oldest first.
+    pub fn questions(&self) -> Result<Vec<StoredQuestion>> {
+        let mut stmt = self.0.prepare_cached(
+            "SELECT question_id, asked_at_ms, body, answer, answered_at_ms
+             FROM questions ORDER BY asked_at_ms, question_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let answer: Option<String> = row.get(3)?;
+            let answered_at_ms: Option<i64> = row.get(4)?;
+            Ok(StoredQuestion {
+                question_id: row.get(0)?,
+                asked_at_ms: row.get(1)?,
+                body: row.get(2)?,
+                answer: answer
+                    .zip(answered_at_ms)
+                    .map(|(answer, answered_at_ms)| GivenAnswer {
+                        answer,
+                        answered_at_ms,
+                    }),
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Inserts or replaces the question with `question.question_id`.
+    pub fn put_question(&self, question: &StoredQuestion) -> Result<()> {
+        let (answer, answered_at_ms) = match &question.answer {
+            Some(given) => (Some(given.answer.as_str()), Some(given.answered_at_ms)),
+            None => (None, None),
+        };
+        self.0.execute(
+            "INSERT OR REPLACE INTO questions
+             (question_id, asked_at_ms, body, answer, answered_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                question.question_id,
+                question.asked_at_ms,
+                question.body,
+                answer,
+                answered_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Records the answer to an unanswered question. Returns false, changing
+    /// nothing, when the question does not exist or already has an answer.
+    pub fn answer_question(&self, question_id: &str, answer: &GivenAnswer) -> Result<bool> {
+        Ok(self.0.execute(
+            "UPDATE questions SET answer = ?2, answered_at_ms = ?3
+             WHERE question_id = ?1 AND answer IS NULL",
+            params![question_id, answer.answer, answer.answered_at_ms],
+        )? > 0)
+    }
+
+    pub fn remove_question(&self, question_id: &str) -> Result<bool> {
+        Ok(self.0.execute(
+            "DELETE FROM questions WHERE question_id = ?1",
+            [question_id],
+        )? > 0)
     }
 
     fn remove(&self, table: &str, node_id: &str) -> Result<bool> {
