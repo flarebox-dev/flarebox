@@ -1227,6 +1227,59 @@ fn a_conflict_copy_takes_the_local_file_and_the_original_is_downloaded_again() {
     assert_eq!(trees.class("f"), Class::Remote);
 }
 
+/// The device's own commit makes the conflict copy y, and its answer is lost. A log replay after
+/// the reconnect brings y into R before the stored result arrives, and the effects download y.
+/// The result then finds y on disk already: that entry stays y's, f takes the server's content,
+/// and nothing is left to upload.
+#[test]
+fn a_conflict_copy_downloaded_before_its_result_is_kept_once() {
+    let mut trees = trees(&[(
+        "f",
+        Some(file(ROOT, "f", 2)),
+        Some(file(ROOT, "f", 1)),
+        Some(remote(file(ROOT, "f", 1))),
+    )]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    trees.set_remote("f".into(), remote(file(ROOT, "f", 3)));
+    trees.set_remote("y".into(), remote(file(ROOT, "f (conflict)", 2)));
+    trees.settle();
+    let mut effects = Effects::default();
+    let identity = |ino| FileIdentity {
+        dev: 1,
+        ino,
+        birth_ns: Some(0),
+    };
+    let download = effects.plan(&trees, &mut ids, NOW).cloned().unwrap();
+    assert_eq!(download.node, "y");
+    effects
+        .done(&mut trees, &download.effect_id, Some(identity(9)))
+        .unwrap();
+    trees.settle();
+    let copy = OpResult {
+        node_id: "y".into(),
+        ..outcome(op_result::Code::ConflictCopy)
+    };
+    acknowledge(&mut commits, &mut trees, vec![copy]);
+    let mut ino = 10;
+    while let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() {
+        effects
+            .done(&mut trees, &record.effect_id, Some(identity(ino)))
+            .unwrap();
+        ino += 1;
+        trees.settle();
+    }
+    let y = trees.local().get("y").unwrap();
+    assert_eq!(
+        (&y.shape, y.identity.ino),
+        (&file(ROOT, "f (conflict)", 2), 9)
+    );
+    assert_eq!(trees.local().get("f").unwrap().shape, file(ROOT, "f", 3));
+    assert_eq!(trees.local().iter().count(), 2);
+    assert!(trees.settle().is_empty());
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+}
+
 #[test]
 fn a_rejected_op_marks_a_problem_but_a_rejected_cycle_moves_the_node_back() {
     let mut trees = trees(&[
