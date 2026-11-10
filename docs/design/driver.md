@@ -1,4 +1,4 @@
-# Sync driver
+# Sync driver and Linux daemon
 
 Status: part 1 of step C (plans/macos-0.1.0.md). The driver links folders, keeps a session with each space and applies the server's log to the store's remote tree, observes the disk, and serves the CLI. It does not run the sync engine yet: nothing is uploaded and nothing is written to a linked folder except its root marker. Part 2 wires the engine once its commit layer (#28) is merged; [What part 2 wires](#what-part-2-wires) lists exactly what that adds.
 
@@ -6,6 +6,7 @@ Status: part 1 of step C (plans/macos-0.1.0.md). The driver links folders, keeps
 
 ```mermaid
 flowchart LR
+  CLI["cli: commands, daemon, socket"] --> D["core/driver: Driver"]
   APP["core/ffi: macOS app (step D)"] -.-> D
   D --> NET["core/net: Session, Api"]
   D --> ST["core/store: one store per space"]
@@ -15,6 +16,7 @@ flowchart LR
 ```
 
 - **`core/driver`** (`flarebox-driver`) is everything a client runs on one device around the engine. It is a library with an async API, so the daemon calls it from its Tokio runtime and the macOS app can call it in-process through `core/ffi`, holding a runtime of its own. It never prints and never exits; it logs through `tracing`.
+- **`cli`** is the `flarebox` command. Each command is a request that runs against a `Driver`: the daemon's, through its socket, when the daemon runs, or one the command opens itself when it does not. `flarebox daemon` opens the driver, starts it, serves the socket, and stops on SIGTERM or SIGINT.
 - The driver depends on `core/net`, `core/store`, `core/fs` and `core/chunk`, and not on `core/engine`. Part 2 adds that dependency.
 
 ## Profile layout
@@ -116,6 +118,14 @@ How `core/ffi`'s `Core` trait maps onto it in step D:
 - the root check made after the batch's scans, and the folders the scans could not read.
 
 Changes whose path the matcher excludes are dropped. In part 1 the driver starts each observer from an empty snapshot, so its first batch lists the whole folder, and it only counts the entries.
+
+## The daemon
+
+`flarebox daemon` runs in the foreground: it opens the driver (taking the profile lock), binds the socket, starts every folder, and serves requests until SIGTERM or SIGINT. Then it stops accepting requests, removes the socket, stops the folders (closing their sessions) and exits 0. `cli/systemd/flarebox.service` runs it as a systemd user service (`Type=exec`, `Restart=on-failure`).
+
+**Socket.** One JSON line each way per connection: a request tagged `request` (`status`, `pair`, `link`, `unlink`, `questions`, `answer`) and a response tagged `response`. The socket is 0600 in a 0700 directory, and the daemon also refuses a peer whose uid is not its own.
+
+**Logs** go to stderr, as key-value text or, with `--log-format json`, one JSON object per line; `FLAREBOX_LOG` sets the filter. They carry space ids, paths, seqs and counts. They never carry the refresh credential, an access token or a pairing code: `Credential`, like `core/net`'s `Credentials`, leaves the secret out of its `Debug` output, and requests are never logged. The integration test checks the daemon's log for both secrets.
 
 ## What part 2 wires
 
