@@ -1025,6 +1025,11 @@ pub trait Watcher {
     /// The state the returned changes lead to. Keep it across restarts and
     /// pass it to the next watcher to catch changes made in between.
     fn snapshot(&self) -> &Snapshot;
+
+    /// Drops what the snapshot knows at and below `scope`, a relative path,
+    /// so the next poll reports what is there as created. Entries outside
+    /// `scope` are not reported again unless they changed.
+    fn forget(&mut self, scope: &Path);
 }
 
 /// Watches with FSEvents on macOS and inotify on Linux.
@@ -1327,6 +1332,11 @@ impl Watcher for NativeWatcher {
     fn snapshot(&self) -> &Snapshot {
         &self.snapshot
     }
+
+    fn forget(&mut self, scope: &Path) {
+        self.snapshot.forget(scope);
+        self.dirty.insert(scope.to_path_buf());
+    }
 }
 
 /// Rescans the whole tree every `interval`. Slower than [`NativeWatcher`] on
@@ -1374,6 +1384,10 @@ impl Watcher for RescanWatcher {
 
     fn snapshot(&self) -> &Snapshot {
         &self.snapshot
+    }
+
+    fn forget(&mut self, scope: &Path) {
+        self.snapshot.forget(scope);
     }
 }
 

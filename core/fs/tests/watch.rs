@@ -632,6 +632,64 @@ fn forgotten_scope_is_reported_again_by_the_next_rescan() {
     assert!(snapshot.entries.is_empty());
 }
 
+/// A tree with a folder `d` to forget and a folder `e` beside it.
+fn two_folders() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("d/sub")).unwrap();
+    fs::write(root.join("d/x"), "x").unwrap();
+    fs::write(root.join("d/sub/y"), "y").unwrap();
+    fs::create_dir(root.join("e")).unwrap();
+    fs::write(root.join("e/z"), "z").unwrap();
+    dir
+}
+
+/// Forgets `d` in a watcher that has caught up with the tree, then polls
+/// without waiting for events. Nothing on disk changed, so the poll can only
+/// report `d` because the watcher rescans it on its own.
+fn forgotten_scope_is_reported(watcher: &mut dyn Watcher, root: &Path) {
+    assert_eq!(
+        watcher.poll(Duration::from_millis(300)).unwrap(),
+        quiet(root)
+    );
+
+    watcher.forget(Path::new("d"));
+    assert_eq!(
+        watcher.poll(Duration::ZERO).unwrap(),
+        Poll {
+            changes: vec![
+                created("d", Dir),
+                created("d/sub", Dir),
+                created("d/sub/y", File),
+                created("d/x", File),
+            ],
+            ..quiet(root)
+        }
+    );
+    assert_eq!(watcher.snapshot(), &Snapshot::scan(root).unwrap());
+}
+
+#[test]
+fn native_watcher_rescans_a_forgotten_scope_without_an_event() {
+    let dir = two_folders();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let mut watcher = NativeWatcher::start(&root, Snapshot::scan(&root).unwrap()).unwrap();
+    forgotten_scope_is_reported(&mut watcher, &root);
+}
+
+#[test]
+fn rescan_watcher_reports_only_a_forgotten_scope() {
+    let dir = two_folders();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let mut watcher = RescanWatcher::new(
+        &root,
+        Snapshot::scan(&root).unwrap(),
+        Duration::from_millis(20),
+    )
+    .unwrap();
+    forgotten_scope_is_reported(&mut watcher, &root);
+}
+
 #[test]
 fn rescans_and_polls_report_the_root_they_scanned() {
     let dir = tempfile::tempdir().unwrap();
