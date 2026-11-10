@@ -884,6 +884,43 @@ fn a_move_r_undid_with_new_content_while_it_was_in_flight_keeps_the_new_content(
     assert_in_sync(&mut trees);
 }
 
+/// GUN-349. The user edited f while a move to R's position was in flight, and R moved f back.
+/// The move still was this device's, so only the edit is committed, and f keeps its name.
+#[test]
+fn an_edit_made_while_a_move_r_undid_was_in_flight_is_uploaded_without_the_move() {
+    let (mut trees, mut disk) = space(&[("f", Some(file(ROOT, "a", 1)), Some(file(ROOT, "b", 1)))]);
+    trees.settle();
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    let record = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    assert!(matches!(record.effect, Effect::Move { .. }));
+
+    trees.set_remote("f".into(), remote(file(ROOT, "a", 1)));
+    let mut local = trees.local().get("f").unwrap().clone();
+    local.shape.content = Some(content(2));
+    trees.set_local("f".into(), local);
+    disk.entries.get_mut(&1).unwrap().content = Some(content(2));
+    trees.settle();
+    let created = disk.apply(&record.effect).unwrap();
+    effects
+        .done(&mut trees, &record.effect_id, created)
+        .unwrap();
+    trees.settle();
+    assert_eq!(trees.local().live("f"), Some(&file(ROOT, "b", 2)));
+    assert_eq!(trees.synced().live("f"), Some(&file(ROOT, "b", 1)));
+    let mut commits = flarebox_engine::commit::Commits::default();
+    let commit = commits
+        .build(&mut trees, &mut ids, NOW, "history", 1)
+        .unwrap();
+    assert!(
+        !(commit.ops.iter()).any(|op| matches!(&op.op, Some(flarebox_proto::v1::op::Op::Move(_)))),
+        "{:?}",
+        commit.ops
+    );
+    assert!(commit.ops.iter().any(|op| matches!(&op.op,
+        Some(flarebox_proto::v1::op::Op::UpdateContent(update)) if update.node_id == "f" && update.content == Some(content(2)))),
+        "{:?}", commit.ops);
+}
+
 /// The server renamed f while the user edited it, so its position is reverted with the edit
 /// unsent. The move to the server's name keeps the edit, which is uploaded.
 #[test]

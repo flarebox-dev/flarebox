@@ -321,14 +321,15 @@ impl Effects {
     /// The driver did the effect. L takes the node's new shape, with `identity` for an entry the
     /// effect created. When L matched S, or the shape S's waiting update holds, the effect gave L
     /// the shape R had when it was planned, so S takes that shape too, when S stays a valid tree.
-    /// A move changes only the position, so L and S each keep their content, which can be newer
-    /// than the content the move was planned with.
+    /// A move changes only the position, so for a move L only has to match that shape's position,
+    /// and L and S each keep their content, which can be newer than the content the move was
+    /// planned with. An edit the user made while the move was in flight stays the user's.
     /// A change R made while the effect was in flight then stays a remote change and is never
     /// taken for the user's: a file R restored during its removal is downloaded again, and a file
     /// R moved back during its move is moved back. S stays as it is when L no longer matched it:
-    /// L then holds a change of the user's, such as an edit a move carries or one that recovery
-    /// after a crash reports as the effect's outcome (a missing file as the removal, the planned
-    /// bytes as the write), and that change stays the user's.
+    /// L then holds a change of the user's, such as one that recovery after a crash reports as
+    /// the effect's outcome (a missing file as the removal, the planned bytes as the write), and
+    /// that change stays the user's.
     /// An outcome L does not take ([`EffectRecord::applies`]) is refused, and the effect stays
     /// in flight.
     pub fn done(
@@ -361,7 +362,13 @@ impl Effects {
             Some(waiting) => waiting.as_ref(),
             None => trees.synced().live(&record.node),
         };
-        let unchanged = same(trees.local().live(&record.node), base);
+        let local = trees.local().live(&record.node);
+        let unchanged = match (&record.effect, local, base) {
+            (Effect::Move { .. }, Some(local), Some(base)) => {
+                local.kind == base.kind && local.same_position(base)
+            }
+            _ => same(local, base),
+        };
         if unchanged {
             let synced = match (&record.effect, &record.after, base) {
                 (Effect::Move { .. }, Some(after), Some(base)) => Some(Shape {
