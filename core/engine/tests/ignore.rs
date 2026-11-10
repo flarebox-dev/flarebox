@@ -573,6 +573,78 @@ fn an_excluded_folder_s_cannot_follow_to_r_frees_its_name_in_s_all_the_same() {
 }
 
 #[test]
+fn a_folder_is_not_parked_to_move_below_an_excluded_folder_it_holds() {
+    let mut trees = trees(&[
+        (
+            "a",
+            Some(dir(ROOT, "a")),
+            Some(dir(ROOT, "a")),
+            Some(dir("b", "a")),
+        ),
+        (
+            "x",
+            Some(dir("a", "x.log")),
+            Some(dir("a", "x.log")),
+            Some(dir(ROOT, "x")),
+        ),
+        synced("b", dir("x", "b")),
+    ]);
+    trees.set_rules(&AT_ROOT, rules("*.log\n"));
+    assert!(trees.excluded("x") && trees.excluded("b") && !trees.excluded("a"));
+    assert_eq!(
+        effects(&mut trees),
+        [],
+        "b stays inside a on disk, so parking a would not let a move into b"
+    );
+    assert!(!trees.local().get("a").unwrap().parked);
+    assert_eq!(ops(&mut trees), []);
+}
+
+#[test]
+fn an_excluded_node_whose_s_update_waits_is_not_parked_to_make_room() {
+    let mut trees = trees(&[
+        (
+            "old",
+            Some(file(ROOT, "notes.txt", 5)),
+            Some(file(ROOT, "notes.txt", 1)),
+            Some(file(ROOT, "notes.log", 5)),
+        ),
+        (
+            "draft",
+            Some(file(ROOT, "draft.txt", 2)),
+            Some(file(ROOT, "draft.txt", 2)),
+            Some(file(ROOT, "notes.txt", 2)),
+        ),
+    ]);
+    let mut state = trees.state();
+    let acknowledged = Some(file(ROOT, "notes.txt", 5));
+    state.waiting.insert("old".into(), acknowledged);
+    assert_eq!(trees.restore(state), Ok(()));
+    trees.set_rules(&AT_ROOT, rules("*.log\n"));
+    trees.rules_scanned();
+    assert!(trees.excluded("old") && trees.waiting().contains_key("old"));
+    assert_eq!(effects(&mut trees), []);
+    assert!(!trees.local().get("old").unwrap().parked);
+    assert!(!trees.local().get("draft").unwrap().parked);
+}
+
+#[test]
+fn s_of_an_excluded_node_takes_what_l_and_r_both_hold() {
+    let mut trees = trees(&[synced("a", file(ROOT, "a.log", 1))]);
+    trees.set_rules(&AT_ROOT, rules("*.log\n"));
+    set_content(&mut trees, "a", 7);
+    trees.set_local("a".into(), local(file(ROOT, "a.log", 7), 1));
+    trees.set_local("b".into(), local(file(ROOT, "b.log", 2), 2));
+    trees.set_remote("b".into(), remote(file(ROOT, "b.log", 2)));
+    assert!(trees.excluded("a") && trees.excluded("b"));
+    assert_eq!(trees.settle(), [], "settling alone takes both");
+    assert_eq!(trees.synced().live("a"), Some(&file(ROOT, "a.log", 7)));
+    assert_eq!(trees.synced().live("b"), Some(&file(ROOT, "b.log", 2)));
+    assert_eq!(ops(&mut trees), []);
+    assert_eq!(effects(&mut trees), []);
+}
+
+#[test]
 fn a_remote_rules_file_is_written_before_anything_else_below_its_folder() {
     let mut trees = trees(&[
         synced("d", dir(ROOT, "d")),
