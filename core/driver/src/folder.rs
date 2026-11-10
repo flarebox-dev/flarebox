@@ -13,6 +13,7 @@
 //! A future owns what it needs and borrows only the session and the transfer client, so none holds the store or
 //! the engine across an await.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::future::Future;
 use std::io;
@@ -20,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use flarebox_engine::commit::{Commits, Failure, Halt as CommitHalt, Reconnect};
 use flarebox_engine::state::CommitsState;
@@ -56,6 +57,12 @@ const CLAIM_RECHECK: Duration = Duration::from_secs(2);
 /// The wait before a commit is built again after a file changed while its content was uploaded. The observer
 /// reads the file again meanwhile.
 const BUILD_AGAIN: Duration = Duration::from_secs(1);
+/// The waits before a node whose disk effect failed is planned again: from about a second, doubling with each
+/// failure of the node in a row, up to ten minutes.
+const EFFECT_RETRY: Backoff = Backoff {
+    initial: Duration::from_secs(1),
+    max: Duration::from_secs(600),
+};
 
 /// Why a folder halts once its path no longer leads to the folder its task locked.
 const REPLACED: &str = "the folder at this path is no longer the folder this task locked (it was moved, replaced or \
@@ -83,6 +90,10 @@ pub(crate) struct Folder {
     backoff: Backoff,
     /// What the last transient failure was.
     note: Option<String>,
+    /// The disk effects of each node that failed in a row in this task, for [`EFFECT_RETRY`].
+    effect_failures: BTreeMap<String, u32>,
+    /// When the [`Work::RetryAfter`] that is out ends.
+    retry_at: Option<Instant>,
 }
 
 /// Where R stands against the session's change stream (design §4.4). It is not stored: the next `Welcome` and the
@@ -140,6 +151,8 @@ pub(crate) enum Work {
     Send(Commit),
     /// Answered with [`Folder::resend`] after the wait.
     ResendAfter(Duration),
+    /// Answered with [`Folder::retry`] after the wait. A later one replaces it, and always ends earlier.
+    RetryAfter(Duration),
 }
 
 /// The part of a folder's status the task knows.
@@ -157,11 +170,15 @@ pub(crate) struct View {
 impl Folder {
     /// Opens the folder's store, loads the engine and starts the disk through `lock`, the descriptor the task
     /// locked. [`Disk::start`] recovers an effect that was in flight before anything is observed or planned. The
-    /// engine then takes the restores asked for while no task ran.
+    /// engine then takes the restores asked for while no task ran. Every node whose effect failed is unblocked, so each
+    /// is planned again once after the first scan of this start.
     pub fn open(link: Link, lock: &File, store: &Path) -> Result<Folder, Stop> {
         let mut store = Store::open(store)?;
         let mut engine = store.transaction(|tx| Engine::load(tx, &link.space_id))?;
         let disk = Disk::start(lock, &link, &mut engine, &mut store)?;
+        for node in engine.effects.blocked().clone().into_keys() {
+            engine.effects.unblock(&node);
+        }
         let remote_nodes = store.transaction(|tx| {
             engine.accept_restores(tx)?;
             engine.checkpoint(tx)?;
@@ -187,6 +204,8 @@ impl Folder {
             failures: 0,
             backoff: Backoff::default(),
             note: None,
+            effect_failures: BTreeMap::new(),
+            retry_at: None,
         })
     }
 
@@ -343,13 +362,55 @@ impl Folder {
             Err(Stall::Later(wait)) => return Ok(vec![Work::StageAfter(wait, pending)]),
             Err(Stall::Halt(stop)) => return Err(stop),
         };
+        let node = (self.engine.effects.in_flight()).map(|record| record.node.clone());
         let settled = self.disk.apply(staged, &mut self.engine, &mut self.store)?;
-        if let Settled::Failed(why) = settled {
-            tracing::warn!(
-                space_id = self.link.space_id,
-                why,
-                "an effect failed; its node waits until what is planned for it changes"
-            );
+        let mut work = Vec::new();
+        if let Some(node) = node {
+            match settled {
+                Settled::Done => {
+                    self.effect_failures.remove(&node);
+                }
+                Settled::Failed(why) if self.engine.effects.blocked().contains_key(&node) => {
+                    let failures = self.effect_failures.entry(node).or_default();
+                    let wait = EFFECT_RETRY.delay(*failures);
+                    *failures += 1;
+                    tracing::warn!(
+                        space_id = self.link.space_id,
+                        why,
+                        ?wait,
+                        "an effect failed; its node is planned again after the wait, or once what is planned for                          it changes"
+                    );
+                    let at = Instant::now() + wait;
+                    if self.retry_at.is_none_or(|out| at < out) {
+                        self.retry_at = Some(at);
+                        work.push(Work::RetryAfter(wait));
+                    }
+                }
+                Settled::Failed(why) => {
+                    tracing::info!(
+                        space_id = self.link.space_id,
+                        why,
+                        "an effect failed and is planned again"
+                    );
+                }
+            }
+        }
+        self.drive(&mut work)?;
+        Ok(work)
+    }
+
+    /// A [`Work::RetryAfter`] ended. Every node whose effect failed is unblocked, so the engine plans its effect again
+    /// even when it is the one that failed: the disk may have changed in a way the observer does not report, such as
+    /// a name that was taken for a moment. A node that fails again waits longer the next time.
+    pub fn retry(&mut self) -> Result<Vec<Work>, Stop> {
+        self.retry_at = None;
+        if !self.engine.effects.blocked().is_empty() {
+            self.step(|engine, _| {
+                for node in engine.effects.blocked().clone().into_keys() {
+                    engine.effects.unblock(&node);
+                }
+                Ok(())
+            })?;
         }
         let mut work = Vec::new();
         self.drive(&mut work)?;
@@ -987,6 +1048,7 @@ impl FolderTask {
             let mut upload: Slot<'_, Result<Vec<UploadReceipt>, ChunkError>> = None;
             let mut send: Slot<'_, Result<CommitResult, CallError>> = None;
             let mut wait: Slot<'_, ()> = None;
+            let mut retry: Slot<'_, ()> = None;
             let mut recheck = tokio::time::interval(CLAIM_RECHECK);
             loop {
                 let step = tokio::select! {
@@ -1009,6 +1071,7 @@ impl FolderTask {
                     receipts = finished(&mut upload) => folder.uploaded(receipts),
                     result = finished(&mut send) => folder.sent(result),
                     () = finished(&mut wait) => folder.resend(),
+                    () = finished(&mut retry) => folder.retry(),
                     () = self.requests.notified() => folder.requested(),
                     _ = recheck.tick() => {
                         if !claim::still_locked(&lock, &self.link.root) {
@@ -1047,6 +1110,9 @@ impl FolderTask {
                         Work::Send(commit) => send = Some(Box::pin(session.commit(commit))),
                         Work::ResendAfter(after) => {
                             wait = Some(Box::pin(tokio::time::sleep(after)))
+                        }
+                        Work::RetryAfter(after) => {
+                            retry = Some(Box::pin(tokio::time::sleep(after)))
                         }
                     }
                 }
