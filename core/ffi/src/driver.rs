@@ -40,9 +40,10 @@ pub(crate) struct DriverCore {
     paths: Paths,
     events: Events,
     inner: Mutex<Inner>,
-    /// Taken by the calls that sign in, sign out or change the linked folders, so that they run one
-    /// at a time. The questions are not read while one runs, because reading them opens the stores
-    /// it may be removing. The calls the app makes on its main thread never wait for it, and no
+    /// Taken by the calls that sign in, sign out, answer a question or change the linked folders,
+    /// so that they run one at a time: an answer is written to a store that an unlink or a sign-out
+    /// may be removing. The questions are not read while one runs, because reading them opens the
+    /// stores too. The calls the app makes on its main thread never wait for it, and no
     /// call holds `inner` while it waits on the network.
     changes: Mutex<()>,
     closed: AtomicBool,
@@ -474,12 +475,11 @@ impl Core for DriverCore {
     }
 
     fn answer(&self, question_id: &str, answer: Answer) -> Result<(), SessionError> {
-        let mut inner = self.lock();
-        self.driver(&inner)?
-            .answer(question_id, driver_answer(answer))
-            .map_err(driver_error)?;
-        self.refresh(&mut inner, false);
-        Ok(())
+        self.change(|driver| {
+            driver
+                .answer(question_id, driver_answer(answer))
+                .map_err(driver_error)
+        })
     }
 
     fn dismiss_notice(&self, _notice_id: &str) -> Result<(), SessionError> {
