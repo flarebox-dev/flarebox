@@ -130,7 +130,7 @@ pub fn revoked() -> Reply {
 
 /// A session whose grant came from `oauth`'s token endpoint and whose Cloudflare API is `api`. Its account is the
 /// empty one `Session::login` returns.
-pub async fn login(oauth: &Fake, api: Url) -> Session {
+pub(super) async fn login(oauth: &Fake, api: Url) -> Session {
     let endpoint = |path: &str| oauth.base.join(path).unwrap();
     let endpoints = Endpoints {
         authorize: endpoint("oauth2/auth"),
@@ -161,7 +161,7 @@ pub async fn login(oauth: &Fake, api: Url) -> Session {
 }
 
 /// A session logged in to [`ACCOUNT`] with `fake` as both its OAuth endpoints and its Cloudflare API.
-pub async fn session(fake: &Fake) -> Session {
+pub(super) async fn session(fake: &Fake) -> Session {
     let mut session = login(fake, fake.base.join("client/v4/").unwrap()).await;
     session.account = Account {
         id: ACCOUNT.into(),

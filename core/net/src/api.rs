@@ -2,8 +2,8 @@
 
 use flarebox_proto::v1::{
     AccessToken, ClaimRequest, CreateSpaceRequest, DeviceCredentials, DeviceList,
-    PairCompleteRequest, PairStartResponse, RewindRequest, RewindResult, ServerInfo, SpaceInfo,
-    SpaceList, SpaceUsage, TokenRequest,
+    PairCompleteRequest, PairStartResponse, RewindRequest, RewindResult, RpcRequest, RpcResponse,
+    ServerInfo, SpaceInfo, SpaceList, SpaceUsage, TokenRequest, rpc_request,
 };
 use std::time::Duration;
 
@@ -232,6 +232,29 @@ impl Api {
             &path,
             Some(request.encode_to_vec()),
             "RewindResult",
+            MAX_ANSWER,
+        )
+        .await
+    }
+
+    /// `POST /v1/spaces/{space_id}/rpc`: one call of the session protocol without a WebSocket. The server answers with the
+    /// call's result, or with an `Error` in `RpcResponse.result`, which the caller reads like any other result.
+    pub async fn rpc(
+        &self,
+        auth: &Auth,
+        space_id: &str,
+        call: rpc_request::Call,
+    ) -> Result<RpcResponse, ApiError> {
+        let request = RpcRequest {
+            req_id: 1,
+            call: Some(call),
+        };
+        self.authed(
+            auth,
+            Method::POST,
+            &format!("v1/spaces/{space_id}/rpc"),
+            Some(request.encode_to_vec()),
+            "RpcResponse",
             MAX_ANSWER,
         )
         .await

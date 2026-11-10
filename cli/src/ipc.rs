@@ -183,20 +183,29 @@ pub async fn send(socket: &Path, request: &Request) -> io::Result<Option<Respons
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
+/// Runs a request in the daemon, or returns `None` when no daemon answers on the profile's socket.
+pub async fn ask(paths: &Paths, request: &Request) -> Result<Option<Response>, String> {
+    let socket = paths.socket();
+    send(&socket, request)
+        .await
+        .map_err(|error| format!("the daemon's socket {} failed: {error}", socket.display()))
+}
+
+/// The error for a profile that a process holds while its socket does not answer.
+pub fn busy(paths: &Paths) -> String {
+    format!(
+        "a Flarebox process holds this profile, but its socket {} does not answer",
+        paths.socket().display()
+    )
+}
+
 /// Runs a request in the daemon when one runs, and in a driver of its own otherwise.
 pub async fn run(paths: &Paths, request: Request) -> Result<Response, String> {
-    let socket = paths.socket();
-    if let Some(response) = send(&socket, &request)
-        .await
-        .map_err(|error| format!("the daemon's socket {} failed: {error}", socket.display()))?
-    {
+    if let Some(response) = ask(paths, &request).await? {
         return Ok(response);
     }
     let driver = Driver::open(paths.clone()).map_err(|error| match error {
-        DriverError::Busy(_) => format!(
-            "a Flarebox process holds this profile, but its socket {} does not answer",
-            socket.display()
-        ),
+        DriverError::Busy(_) => busy(paths),
         other => other.to_string(),
     })?;
     Ok(handle(&driver, request).await)

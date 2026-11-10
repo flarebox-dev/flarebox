@@ -12,9 +12,12 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use flarebox_net::{Api, Auth, Credentials, Event, Session, SessionConfig};
+use bytes::Bytes;
+use flarebox_chunk::{ChunkerConfig, chunk_hash};
+use flarebox_net::{Api, Auth, Credentials, Event, Session, SessionConfig, Transfer};
 use flarebox_proto::v1::{
-    ClaimRequest, Commit, CreateDir, CreateSpaceRequest, Op, PairCompleteRequest, TokenRequest, op,
+    ChunkRef, ClaimRequest, Commit, Content, CreateDir, CreateFile, CreateSpaceRequest, Delete, Op,
+    PairCompleteRequest, TokenRequest, UpdateContent, op, op_result,
 };
 use serde_json::Value;
 use tokio::sync::OnceCell;
@@ -158,6 +161,33 @@ impl Machine {
 
     fn status(&self) -> Value {
         serde_json::from_str(&self.run(&["status", "--json"])).unwrap()
+    }
+
+    /// Every entry of the profile's directories with its modification time and, for a file, its contents.
+    fn profile(&self) -> Vec<(PathBuf, SystemTime, Vec<u8>)> {
+        let mut found = Vec::new();
+        let mut todo: Vec<PathBuf> = ["config", "state", "run"]
+            .iter()
+            .map(|dir| self.path(dir))
+            .filter(|dir| dir.exists())
+            .collect();
+        while let Some(dir) = todo.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                let meta = fs::symlink_metadata(&path).unwrap();
+                let bytes = if meta.is_dir() {
+                    todo.push(path.clone());
+                    Vec::new()
+                } else if meta.is_file() {
+                    fs::read(&path).unwrap()
+                } else {
+                    Vec::new()
+                };
+                found.push((path, meta.modified().unwrap(), bytes));
+            }
+        }
+        found.sort();
+        found
     }
 
     /// Polls `flarebox status --json` until `done` accepts it.
@@ -571,5 +601,249 @@ async fn usage_lists_what_each_space_stores() {
     assert!(
         report.contains(&format!("{name} ({})\n  Live files ", space.space_id)),
         "{report}"
+    );
+}
+
+/// A one-chunk file of these bytes.
+fn file_content(bytes: &[u8]) -> Content {
+    let chunk = ChunkRef {
+        hash: chunk_hash(bytes).to_vec(),
+        size: bytes.len() as u32,
+        encoding: 0,
+    };
+    flarebox_chunk::content(
+        vec![chunk],
+        1_700_000_000_000_000_000,
+        false,
+        &ChunkerConfig::V0,
+    )
+}
+
+/// Uploads `files` and commits `ops` from the owner's device, as the daemon does not upload yet; returns the
+/// commit's seq.
+async fn commit_as_owner(
+    owner: &Arc<Auth>,
+    space_id: &str,
+    files: &[&'static [u8]],
+    ops: Vec<op::Op>,
+) -> u64 {
+    let config = SessionConfig::new(space_id, "cli integration test", "0", 1);
+    let (session, mut events) = Session::start(owner.clone(), config).unwrap();
+    let welcome = loop {
+        match tokio::time::timeout(WAIT, events.next())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Event::Connected(welcome) => break welcome,
+            Event::Stopped(reason) => panic!("the owner's session stopped: {reason}"),
+            _ => {}
+        }
+    };
+    let chunks: Vec<ChunkRef> = files
+        .iter()
+        .flat_map(|bytes| file_content(bytes).chunks)
+        .collect();
+    let receipts = Transfer::new(owner.api())
+        .upload(&session, &chunks, |chunk: &ChunkRef| {
+            let bytes = files
+                .iter()
+                .find(|bytes| chunk_hash(bytes)[..] == chunk.hash[..])
+                .copied()
+                .unwrap();
+            async move { Ok(Bytes::from_static(bytes)) }
+        })
+        .await
+        .unwrap();
+    let committed = session
+        .commit(Commit {
+            commit_id: uuidv7(),
+            base_seq: welcome.head_seq,
+            ops: ops.into_iter().map(|op| Op { op: Some(op) }).collect(),
+            receipts,
+            history_id: welcome.history_id.clone(),
+            device_seq: welcome.device_seq + 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    session.close().await;
+    assert!(
+        committed
+            .results
+            .iter()
+            .all(|result| result.code == op_result::Code::Applied as i32),
+        "{committed:?}"
+    );
+    committed.seq
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Worker; run cli/scripts/integration-test.sh"]
+async fn trash_and_versions_list_what_the_space_keeps() {
+    let owner = Arc::new(Auth::new(api(), owner().await));
+    let space_name = format!("history {}", uuidv7());
+    let space = owner
+        .api()
+        .create_space(
+            &owner,
+            &CreateSpaceRequest {
+                name: space_name.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let pairing = owner.api().pair_start(&owner).await.unwrap();
+    let server = server_url().to_string();
+    let machine = Machine::new();
+    machine.run(&["join", &pairing.code, "--server", &server, "--name", "desk"]);
+    let folder = machine.path("Sync");
+    fs::create_dir_all(&folder).unwrap();
+    let folder_arg = folder.to_str().unwrap();
+    machine.run(&["link", folder_arg, "--space", &space_name]);
+    let daemon = machine
+        .command(&["daemon"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let socket = machine.path("run/flarebox/daemon.sock");
+    let started = Instant::now();
+    while !socket.exists() {
+        assert!(
+            started.elapsed() < WAIT,
+            "the daemon did not open its socket"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    machine
+        .status_until("the first sync", |status| {
+            status["folders"][0]["state"] == "up_to_date"
+        })
+        .await;
+
+    let docs = uuidv7();
+    let note = uuidv7();
+    let gone = uuidv7();
+    commit_as_owner(
+        &owner,
+        &space.space_id,
+        &[b"first", b"deleted later", b"link", b"target text"],
+        vec![
+            op::Op::CreateDir(CreateDir {
+                node_id: docs.clone(),
+                parent_id: space.space_id.clone(),
+                name: "docs".into(),
+            }),
+            op::Op::CreateFile(CreateFile {
+                node_id: note.clone(),
+                parent_id: docs.clone(),
+                name: "note.txt".into(),
+                content: Some(file_content(b"first")),
+            }),
+            op::Op::CreateFile(CreateFile {
+                node_id: gone.clone(),
+                parent_id: docs.clone(),
+                name: "gone.txt".into(),
+                content: Some(file_content(b"deleted later")),
+            }),
+            op::Op::CreateFile(CreateFile {
+                node_id: uuidv7(),
+                parent_id: docs.clone(),
+                name: "link.txt".into(),
+                content: Some(file_content(b"link")),
+            }),
+            op::Op::CreateFile(CreateFile {
+                node_id: uuidv7(),
+                parent_id: docs.clone(),
+                name: "target.txt".into(),
+                content: Some(file_content(b"target text")),
+            }),
+        ],
+    )
+    .await;
+    let empty = machine.run(&["trash", folder_arg]);
+    assert!(empty.contains("Nothing from"), "{empty}");
+
+    commit_as_owner(
+        &owner,
+        &space.space_id,
+        &[b"second!"],
+        vec![
+            op::Op::UpdateContent(UpdateContent {
+                node_id: note,
+                content: Some(file_content(b"second!")),
+            }),
+            op::Op::Delete(Delete { node_id: gone }),
+        ],
+    )
+    .await;
+    let note_path = folder.join("docs/note.txt");
+    let note_arg = note_path.to_str().unwrap();
+    let versions: Value =
+        serde_json::from_str(&machine.run(&["versions", note_arg, "--json"])).unwrap();
+    assert_eq!(versions.as_array().unwrap().len(), 2, "{versions:#}");
+    assert_eq!(versions[0]["size"], 7, "{versions:#}");
+    assert_eq!(versions[1]["size"], 5, "{versions:#}");
+    let trash: Value =
+        serde_json::from_str(&machine.run(&["trash", folder_arg, "--json"])).unwrap();
+    assert_eq!(trash.as_array().unwrap().len(), 1, "{trash:#}");
+    assert_eq!(trash[0]["path"], "docs/gone.txt", "{trash:#}");
+    assert_eq!(trash[0]["kind"], "file");
+    assert_eq!(trash[0]["bytes"], 13);
+    let below = machine.run(&["trash", folder.join("docs").to_str().unwrap()]);
+    assert!(below.contains("docs/gone.txt"), "{below}");
+    let report = machine.run(&["versions", note_arg]);
+    assert!(
+        report.starts_with("docs/note.txt: 2 versions, newest first\ncurrent"),
+        "{report}"
+    );
+    let deleted = machine.fails(&["versions", folder.join("docs/gone.txt").to_str().unwrap()]);
+    assert!(
+        deleted.contains("flarebox trash lists deleted ones"),
+        "{deleted}"
+    );
+    let outside = machine.fails(&["trash", machine.path("state").to_str().unwrap()]);
+    assert!(outside.contains("not in a linked folder"), "{outside}");
+    let link = folder.join("docs/link.txt");
+    let started = Instant::now();
+    while fs::read(&link).ok().as_deref() != Some(&b"link"[..]) {
+        assert!(
+            started.elapsed() < WAIT,
+            "the daemon did not download docs/link.txt"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(stop(daemon).success());
+
+    let profile = machine.profile();
+    fs::remove_file(&link).unwrap();
+    let link_arg = link.to_str().unwrap();
+    let size_of_link = |what: &str| {
+        let versions: Value =
+            serde_json::from_str(&machine.run(&["versions", link_arg, "--json"])).unwrap();
+        assert_eq!(
+            versions.as_array().unwrap().len(),
+            1,
+            "{what}: {versions:#}"
+        );
+        versions[0]["size"].clone()
+    };
+    std::os::unix::fs::symlink("target.txt", &link).unwrap();
+    assert_eq!(size_of_link("a link to target.txt"), 4);
+    fs::remove_file(&link).unwrap();
+    let elsewhere = machine.path("elsewhere.txt");
+    fs::write(&elsewhere, b"not synced").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+    assert_eq!(size_of_link("a link outside the folder"), 4);
+    let stopped = machine.run(&["trash", folder_arg, "--json"]);
+    assert!(stopped.contains("docs/gone.txt"), "{stopped}");
+    let unlinked = machine.fails(&["trash", machine.path("elsewhere").to_str().unwrap()]);
+    assert!(unlinked.contains("not in a linked folder"), "{unlinked}");
+    let unlinked = machine.fails(&["versions", elsewhere.to_str().unwrap()]);
+    assert!(unlinked.contains("not in a linked folder"), "{unlinked}");
+    assert!(
+        machine.profile() == profile,
+        "the commands changed the profile without a daemon"
     );
 }
