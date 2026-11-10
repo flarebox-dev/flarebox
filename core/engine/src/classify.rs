@@ -585,6 +585,55 @@ impl Trees {
         true
     }
 
+    /// Forgets what the server may have lost, after a bootstrap from a server that is behind what
+    /// this device applied (design §4.4). S forgets every node that R does not hold at all or holds
+    /// live with another shape, and every node S holds below one. A node L still holds is then
+    /// created again instead of being taken for a remote delete, and one whose content differs from
+    /// R's is kept beside R's as a conflict copy instead of being replaced by R's older content. A
+    /// node R holds in the trash keeps S, so it stays a remote delete, also below a node S forgets.
+    /// S then forgets each such ancestor only once the delete has taken what it held: the update
+    /// waits ([`Trees::waiting`]) and is made as soon as it fits.
+    pub fn forget_lost(&mut self) {
+        let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for (id, shape) in self.s.iter() {
+            children.entry(&shape.parent).or_default().push(id);
+        }
+        let mut lost: BTreeSet<&str> = (self.s.iter())
+            .filter(|(id, synced)| {
+                self.r.get(id).is_none()
+                    || (self.r.live(id)).is_some_and(|remote| !same(Some(remote), Some(*synced)))
+            })
+            .map(|(id, _)| id.as_str())
+            .collect();
+        let mut below: Vec<&str> = lost.iter().copied().collect();
+        while let Some(id) = below.pop() {
+            for &child in children.get(id).into_iter().flatten() {
+                let trashed = self.r.get(child).is_some_and(|remote| remote.trashed);
+                if !trashed && lost.insert(child) {
+                    below.push(child);
+                }
+            }
+        }
+        let mut waits = BTreeSet::new();
+        for (_, shape) in self.s.iter().filter(|(id, _)| !lost.contains(id.as_str())) {
+            let mut parent = shape.parent.as_str();
+            while lost.contains(parent) && waits.insert(parent) {
+                parent = &self.s.live(parent).expect("a lost node is in S").parent;
+            }
+        }
+        let lost: Vec<(NodeId, bool)> = (lost.into_iter())
+            .map(|id| (id.to_owned(), waits.contains(id)))
+            .collect();
+        for (id, waits) in lost {
+            if waits {
+                self.wait(id, None);
+            } else {
+                self.set_synced(id, None);
+            }
+        }
+        debug_assert_eq!(self.s.check(Names::ByKey), Ok(()));
+    }
+
     pub fn class(&self, id: &str) -> Class {
         classify(self.l.live(id), self.s.live(id), self.r.live(id))
     }

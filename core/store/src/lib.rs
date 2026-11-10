@@ -225,6 +225,10 @@ const MIGRATIONS: &[&str] = &[
         CHECK ((outcome IS 'rejected') = (reject_reason IS NOT NULL))
     ) STRICT, WITHOUT ROWID;
 ",
+    "
+    ALTER TABLE remote_cursor ADD COLUMN ahead_of_server INTEGER NOT NULL DEFAULT 0
+        CHECK (ahead_of_server IN (0, 1));
+",
 ];
 
 /// The schema version this build writes.
@@ -279,6 +283,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct Cursor {
     pub history_id: String,
     pub last_seq: u64,
+    /// The server reported its log below `last_seq` (`AHEAD_OF_SERVER`), and no bootstrap has replaced R
+    /// since: the server lost commits this device applied.
+    pub ahead_of_server: bool,
 }
 
 /// A node's position, kind and content: what the synced tree records per node
@@ -482,12 +489,13 @@ impl Tx<'_> {
         Ok(self
             .0
             .query_row(
-                "SELECT history_id, last_seq FROM remote_cursor WHERE id = 1",
+                "SELECT history_id, last_seq, ahead_of_server FROM remote_cursor WHERE id = 1",
                 [],
                 |row| {
                     Ok(Cursor {
                         history_id: row.get(0)?,
                         last_seq: row.get(1)?,
+                        ahead_of_server: row.get(2)?,
                     })
                 },
             )
@@ -496,8 +504,9 @@ impl Tx<'_> {
 
     pub fn set_cursor(&self, cursor: &Cursor) -> Result<()> {
         self.0.execute(
-            "INSERT OR REPLACE INTO remote_cursor (id, history_id, last_seq) VALUES (1, ?1, ?2)",
-            params![cursor.history_id, cursor.last_seq],
+            "INSERT OR REPLACE INTO remote_cursor (id, history_id, last_seq, ahead_of_server)
+             VALUES (1, ?1, ?2, ?3)",
+            params![cursor.history_id, cursor.last_seq, cursor.ahead_of_server],
         )?;
         Ok(())
     }

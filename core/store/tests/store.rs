@@ -118,6 +118,7 @@ fn reopening_keeps_data_and_schema_version() {
     let cursor = Cursor {
         history_id: "h1".into(),
         last_seq: 7,
+        ahead_of_server: true,
     };
     Store::open(&path)
         .unwrap()
@@ -740,6 +741,40 @@ fn the_engines_restores_are_read_without_the_rest_of_its_state() {
         .unwrap();
 }
 
+/// A database of the schema before the cursor records a server that is behind keeps its cursor,
+/// which records none.
+#[test]
+fn a_cursor_stored_before_it_could_record_a_server_behind_it_records_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let cursor = Cursor {
+        history_id: "h1".into(),
+        last_seq: 7,
+        ahead_of_server: true,
+    };
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| tx.set_cursor(&cursor))
+        .unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("ALTER TABLE remote_cursor DROP COLUMN ahead_of_server;")
+        .unwrap();
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+        .unwrap();
+    drop(conn);
+
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    let stored = store.transaction(|tx| tx.cursor()).unwrap();
+    assert_eq!(
+        stored,
+        Some(Cursor {
+            ahead_of_server: false,
+            ..cursor
+        })
+    );
+}
+
 /// A database of the schema before restores gains the two restore tables, empty, and keeps the
 /// engine state it held.
 #[test]
@@ -755,8 +790,11 @@ fn a_version_3_store_opens_with_empty_restore_tables() {
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("DROP TABLE restore_requests; DROP TABLE restore_intents;")
-        .unwrap();
+    conn.execute_batch(
+        "DROP TABLE restore_requests; DROP TABLE restore_intents;
+         ALTER TABLE remote_cursor DROP COLUMN ahead_of_server;",
+    )
+    .unwrap();
     conn.pragma_update(None, "user_version", 3).unwrap();
     drop(conn);
 
@@ -839,6 +877,7 @@ fn failed_transaction_rolls_back() {
         tx.set_cursor(&Cursor {
             history_id: "h1".into(),
             last_seq: 1,
+            ahead_of_server: false,
         })?;
         Err(Error::SchemaTooNew {
             found: 0,

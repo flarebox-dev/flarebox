@@ -607,6 +607,78 @@ fn apply(i: usize, s: &[Option<Shape>], change: &Change, out: &[Option<Shape>]) 
     Some(shape)
 }
 
+/// After a bootstrap from a server that lost commits, S forgets each node that R lacks or holds
+/// live with another shape, and what S holds below it. A node in R's trash keeps S, so it stays a
+/// remote delete, and so does a node R holds as S does.
+#[test]
+fn forgetting_what_the_server_lost_keeps_the_rest_of_s() {
+    let mut trees = Trees::new(ROOT);
+    let shapes = [
+        ("albums", dir(ROOT, "albums")),
+        ("photos", dir("albums", "photos")),
+        ("one", file(ROOT, "one", 1)),
+        ("two", file(ROOT, "two", 1)),
+        ("old", file(ROOT, "old", 1)),
+        ("same", file(ROOT, "same", 1)),
+    ];
+    for (ino, (id, shape)) in shapes.iter().enumerate() {
+        trees.set_local(id.to_string(), local(shape.clone(), ino as u64));
+        trees.set_synced(id.to_string(), Some(shape.clone()));
+    }
+    trees.set_remote("photos".into(), remote(dir(ROOT, "photos")));
+    trees.set_remote("two".into(), remote(file(ROOT, "two", 0)));
+    trees.set_remote(
+        "old".into(),
+        RemoteNode {
+            trashed: true,
+            ..remote(file(ROOT, "old", 1))
+        },
+    );
+    trees.set_remote("same".into(), remote(file(ROOT, "same", 1)));
+    trees.forget_lost();
+    assert_eq!(trees.check(), Ok(()));
+    let classes = shapes.map(|(id, _)| (id, trees.class(id)));
+    assert_eq!(
+        classes,
+        [
+            ("albums", Class::Local),
+            ("photos", Class::Concurrent),
+            ("one", Class::Local),
+            ("two", Class::Concurrent),
+            ("old", Class::Remote),
+            ("same", Class::InSync),
+        ]
+    );
+}
+
+/// A node R holds in the trash below a folder the server lost stays a remote delete. S forgets the
+/// folder once the delete has taken the node out of it, and a node R lacks below it at once.
+#[test]
+fn a_remote_delete_below_a_folder_the_server_lost_stays_a_remote_delete() {
+    let mut trees = Trees::new(ROOT);
+    let shapes = [
+        ("albums", dir(ROOT, "albums")),
+        ("one", file("albums", "one", 1)),
+        ("two", file("albums", "two", 1)),
+    ];
+    for (ino, (id, shape)) in shapes.iter().enumerate() {
+        trees.set_local(id.to_string(), local(shape.clone(), ino as u64));
+        trees.set_synced(id.to_string(), Some(shape.clone()));
+    }
+    trees.set_remote(
+        "one".into(),
+        RemoteNode {
+            trashed: true,
+            ..remote(file(ROOT, "one", 1))
+        },
+    );
+    trees.forget_lost();
+    assert_eq!(trees.check(), Ok(()));
+    assert_eq!(trees.class("one"), Class::Remote);
+    assert_eq!(trees.class("two"), Class::Local);
+    assert_eq!(trees.waiting().get("albums"), Some(&None));
+}
+
 fn spaces() -> impl Strategy<Value = Vec<(bool, Change, Change)>> {
     proptest::collection::vec((any::<bool>(), changes(), changes()), 1..9)
 }
