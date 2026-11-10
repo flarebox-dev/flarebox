@@ -261,6 +261,8 @@ extension SessionError {
         case .TooManyAttempts: String(localized: "Too many wrong codes. Try again in a few minutes.")
         case .EmptyName: String(localized: "Enter a name.")
         case .NotSignedIn: String(localized: "This Mac isn't signed in.")
+        case .LastDevice: String(localized: "This is the last device signed in to this server.")
+        case .NotRevoked(let reason): String(localized: "The server didn't confirm that it removed this Mac: \(reason)")
         case .SpaceNotFound: String(localized: "The space no longer exists.")
         case .FolderNotFound: String(localized: "Choose an existing folder.")
         case .SpaceAlreadyLinked: String(localized: "This space is already linked to a folder on this Mac.")

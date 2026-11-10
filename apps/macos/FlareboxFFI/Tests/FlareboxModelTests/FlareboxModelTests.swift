@@ -204,6 +204,16 @@ private func item(_ path: String) -> HeldItem {
         #expect(model.needsSetup)
         await #expect(throws: SessionError.NotSignedIn) { try await model.devices() }
     }
+
+    @Test func theLastDeviceSignsOutOnlyOnceConfirmed() async throws {
+        let model = AppModel.fake(scenario: .upToDate)
+        let fake = try #require(model.session.fakeCore())
+        try fake.setDevices(devices: [Device(deviceId: "device-1", name: "Mac", platform: "macos", thisDevice: true, addedAtMs: 1)])
+        await #expect(throws: SessionError.LastDevice) { try await model.signOut() }
+        #expect(model.state.account != nil)
+        try await model.signOut(confirmLastDevice: true)
+        #expect(model.state.account == nil)
+    }
 }
 
 @MainActor

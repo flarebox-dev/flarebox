@@ -145,6 +145,8 @@ private struct AccountSettings: View {
     @State private var devices: DeviceList?
     @State private var pairing: PairingCode?
     @State private var confirmingSignOut = false
+    @State private var confirmingLastDevice = false
+    @State private var confirmingOffline = false
     @State private var error: SessionError?
 
     var body: some View {
@@ -213,10 +215,32 @@ private struct AccountSettings: View {
         }
         .confirmationDialog("Sign out of Flarebox?", isPresented: $confirmingSignOut) {
             Button("Sign Out", role: .destructive) {
-                perform { try await model.signOut() }
+                perform {
+                    do {
+                        try await model.signOut()
+                    } catch SessionError.LastDevice {
+                        confirmingLastDevice = true
+                    } catch SessionError.NotRevoked(_) {
+                        confirmingOffline = true
+                    }
+                }
             }
         } message: {
-            Text("This Mac stops syncing and unlinks every folder. The files stay in the folders and on the server.")
+            Text("This Mac stops syncing, unlinks every folder and is removed from the server's devices. The files stay in the folders and on the server.")
+        }
+        .confirmationDialog("Sign out of your last device?", isPresented: $confirmingLastDevice) {
+            Button("Sign Out", role: .destructive) {
+                perform { try await model.signOut(confirmLastDevice: true) }
+            }
+        } message: {
+            Text("No other device is signed in to this server. After this Mac signs out, you can't sign back in from the Flarebox app. Getting back in needs the owner recovery steps from the deployment guide, run outside the app with administrator access to the server's deployment.")
+        }
+        .confirmationDialog("Sign out without the server?", isPresented: $confirmingOffline) {
+            Button("Sign Out", role: .destructive) {
+                perform { try await model.signOut(confirmLastDevice: true) }
+            }
+        } message: {
+            Text("Flarebox can't reach the server, so it can't tell whether another device is still signed in, and the server keeps this Mac listed until another device removes it. If this Mac is the last one, after it signs out you can't sign back in from the Flarebox app. Getting back in needs the owner recovery steps from the deployment guide, run outside the app with administrator access to the server's deployment.")
         }
     }
 

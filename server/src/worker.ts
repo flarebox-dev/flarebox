@@ -93,7 +93,8 @@ async function devices(request: Request, env: Env, deviceId: string | undefined)
     return reply(request, DeviceListSchema, await account(env).listDevices({ userId: identity.userId, callerId: identity.deviceId, cursor: after ? String(after) : "" }));
   }
   if (deviceId !== undefined && request.method === "DELETE") {
-    const outcome = await account(env).revokeUserDevice({ userId: identity.userId, callerId: identity.deviceId, deviceId });
+    const confirmLastDevice = new URL(request.url).searchParams.get("confirm") === "last-device";
+    const outcome = await account(env).revokeUserDevice({ userId: identity.userId, callerId: identity.deviceId, deviceId, confirmLastDevice });
     return outcome.ok ? new Response(null, { status: 204 }) : errorReply(request, outcome.code, outcome.message);
   }
   return new Response("Method Not Allowed", { status: 405 });

@@ -522,6 +522,15 @@ pub enum SessionError {
     EmptyName,
     #[error("this device is not signed in")]
     NotSignedIn,
+    /// No other device of the account is active, so after this one signs out only owner recovery
+    /// signs a device in again. The app tells the person and signs out again with confirmation.
+    #[error("this is the account's last active device")]
+    LastDevice,
+    /// The server could not be reached or did not answer, so this device cannot tell whether
+    /// another device of the account stays signed in. Nothing changed. The app tells the person
+    /// that this may be their last device and signs out again with confirmation.
+    #[error("the server did not confirm that it removed this device: {reason}")]
+    NotRevoked { reason: String },
     #[error("the space does not exist")]
     SpaceNotFound,
     #[error("the folder does not exist")]

@@ -382,10 +382,10 @@ impl Core for DriverCore {
     /// Signing out stops the driver. It starts again here if the session runs, so that a sign-in
     /// that follows syncs the folders it links, but not after a failed sign-out: the folders it
     /// could not unlink stay stopped until the person signs out again or resumes.
-    fn sign_out(&self) -> Result<(), SessionError> {
+    fn sign_out(&self, confirm_last_device: bool) -> Result<(), SessionError> {
         self.change(|driver| {
             self.runtime
-                .block_on(driver.sign_out())
+                .block_on(driver.sign_out(confirm_last_device))
                 .map_err(driver_error)?;
             let inner = self.lock();
             if inner.started && !inner.paused {
@@ -700,6 +700,8 @@ fn driver_error(error: DriverError) -> SessionError {
     match error {
         DriverError::Busy(_) => SessionError::ProfileInUse,
         DriverError::NotPaired => SessionError::NotSignedIn,
+        DriverError::LastDevice => SessionError::LastDevice,
+        DriverError::NotRevoked(reason) => SessionError::NotRevoked { reason },
         DriverError::EmptyName | DriverError::EmptyUserName => SessionError::EmptyName,
         DriverError::Api(error) => api_error(error),
         DriverError::SpaceNotFound(_) => SessionError::SpaceNotFound,

@@ -123,7 +123,7 @@ fn signing_out_while_the_app_reads_the_state_unlinks_every_folder() {
                 }
             })
         };
-        let signed_out = session.sign_out();
+        let signed_out = session.sign_out(true);
         done.store(true, Ordering::SeqCst);
         reader.join().unwrap();
         assert_eq!(signed_out, Ok(()));
@@ -153,7 +153,7 @@ fn signing_out_while_the_person_answers_questions_unlinks_every_folder() {
                 }
             })
         };
-        let signed_out = session.sign_out();
+        let signed_out = session.sign_out(true);
         done.store(true, Ordering::SeqCst);
         answering.join().unwrap();
         assert_eq!(signed_out, Ok(()));
@@ -175,7 +175,7 @@ fn a_sign_out_that_cannot_unlink_a_folder_leaves_sync_stopped() {
 
     let private = base.join("a1/.flarebox");
     fs::set_permissions(&private, fs::Permissions::from_mode(0o000)).unwrap();
-    let refused = session.sign_out();
+    let refused = session.sign_out(true);
     fs::set_permissions(&private, fs::Permissions::from_mode(0o755)).unwrap();
     assert!(refused.is_err(), "the first folder's cleanup should fail");
     assert!(
@@ -186,7 +186,7 @@ fn a_sign_out_that_cannot_unlink_a_folder_leaves_sync_stopped() {
     assert!(state.account.is_some());
     assert_eq!(state.status, SyncStatus::Stopped);
 
-    assert_eq!(session.sign_out(), Ok(()));
+    assert_eq!(session.sign_out(true), Ok(()));
     let state = session.state();
     assert_eq!(state.account, None);
     assert!(state.folders.is_empty());

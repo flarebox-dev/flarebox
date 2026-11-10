@@ -407,19 +407,29 @@ export class AccountDO extends DurableObject<Env> {
   }
 
   /**
-   * DELETE /v1/devices/{device_id}: revokes one of the user's principals other than the caller's own, so the caller
-   * always stays active and the user keeps at least one device (RFC 0009 section 5). Revoking a revoked one changes
+   * DELETE /v1/devices/{device_id}: revokes one of the user's principals. A device revokes itself when it signs out, but
+   * the user's last active device does so only with confirmLastDevice, which its client sends after telling the person,
+   * so that no request takes an owner's last device by surprise (RFC 0009 section 5). Revoking a revoked one changes
    * nothing, but delivers the notices still pending for it.
    */
-  async revokeUserDevice(args: { userId: string; callerId: string; deviceId: string }): Promise<Outcome<null>> {
-    if (args.deviceId === args.callerId) return failure(Error_Code.FORBIDDEN, "a device cannot revoke itself; revoke it from another device");
+  async revokeUserDevice(args: { userId: string; callerId: string; deviceId: string; confirmLastDevice: boolean }): Promise<Outcome<null>> {
     // The Worker checked the caller in an earlier event, and a concurrent revocation may have revoked it since. Checked
-    // again here, with no await before revokeDevice's update, so of two devices revoking each other only one succeeds.
+    // again here, with no await before revokeDevice's update, so of two devices revoking each other only one succeeds,
+    // and of two last devices signing out at once the second must confirm.
     if (!this.activeDevice(args.callerId)) return failure(Error_Code.UNAUTHENTICATED, "this device was revoked");
     const found = this.sql.exec("SELECT 1 FROM devices WHERE device_id = ? AND user_id = ?", args.deviceId, args.userId).toArray().length > 0;
     if (!found) return failure(Error_Code.NOT_FOUND, "no such device");
+    if (args.deviceId === args.callerId && !args.confirmLastDevice && this.isLastActiveDevice(args.userId, args.callerId)) {
+      return failure(Error_Code.CONFIRMATION_REQUIRED, "this is the user's last active device; confirm to revoke it");
+    }
     await this.revokeDevice(args.deviceId);
     return ok(null);
+  }
+
+  /** Whether no other device of the user is active, so that revoking this one leaves the user with none. */
+  private isLastActiveDevice(userId: string, deviceId: string): boolean {
+    const others = this.sql.exec("SELECT device_id FROM devices WHERE user_id = ? AND kind = 'device' AND device_id != ? AND revoked_at_ms IS NULL", userId, deviceId).toArray();
+    return !others.some((row) => this.activeDevice(String(row.device_id)) !== undefined);
   }
 
   /**

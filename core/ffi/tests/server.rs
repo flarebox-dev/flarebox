@@ -8,6 +8,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use flarebox_driver as driver;
@@ -15,6 +16,7 @@ use flarebox_ffi::{
     Answer, FolderState, LinkedFolder, Problem, ProblemKind, Question, SessionError, SessionEvent,
     SessionListener, SessionState, SyncSession, SyncStatus,
 };
+use flarebox_net::Auth;
 use flarebox_store::{Store, StoredQuestion};
 
 const WAIT: Duration = Duration::from_secs(30);
@@ -181,6 +183,23 @@ impl Device {
     }
 }
 
+/// Copies the credential of the profile at `profile` to `copy`, to ask the server about it after a sign-out.
+fn keep_credential(profile: &Path, copy: &Path) {
+    fs::copy(driver::Paths::under(profile).credential(), copy).unwrap();
+}
+
+/// Whether the server still accepts the credential kept at `copy`.
+fn accepted(copy: &Path) -> bool {
+    let credential = driver::Credential::load(copy).unwrap().unwrap();
+    let auth = Auth::new(credential.api().unwrap(), credential.net());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    match runtime.block_on(auth.api().list_spaces(&auth)) {
+        Ok(_) => true,
+        Err(error) if error.is_unauthenticated() => false,
+        Err(error) => panic!("the server did not answer: {error}"),
+    }
+}
+
 fn path_str(path: &Path) -> String {
     path.to_str().unwrap().to_owned()
 }
@@ -292,6 +311,11 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
     other.until("the paired device's first sync", |m| {
         m.status == SyncStatus::Idle
     });
+    let kept = other.path("credential");
+    keep_credential(&other.profile(), &kept);
+    other.session().sign_out(false).unwrap();
+    other.until("the paired device's sign-out", |m| !m.signed_in);
+    assert!(!accepted(&kept));
     drop(other);
 
     let held = driver::Question {
@@ -377,13 +401,36 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
         .link_folder(space.space_id, path_str(&again))
         .unwrap();
     mac.until("the second link's sync", |m| m.status == SyncStatus::Idle);
-    mac.session().sign_out().unwrap();
+    let spare = Device::new();
+    spare.session().connect(server).unwrap();
+    let pairing = mac.session().start_pairing().unwrap();
+    spare.session().pair(pairing.code, "Spare".into()).unwrap();
+    let kept = mac.path("credential");
+    keep_credential(&mac.profile(), &kept);
+    let spare_kept = spare.path("credential");
+    keep_credential(&spare.profile(), &spare_kept);
+    let (mac_out, spare_out) = thread::scope(|scope| {
+        let spare_out = scope.spawn(|| spare.session().sign_out(false));
+        (mac.session().sign_out(false), spare_out.join().unwrap())
+    });
+    let (last, last_kept) = match (&mac_out, &spare_out) {
+        (Err(SessionError::LastDevice), Ok(())) => (&mac, &kept),
+        (Ok(()), Err(SessionError::LastDevice)) => (&spare, &spare_kept),
+        outcomes => {
+            panic!("one of the last two devices signs out and the other must confirm: {outcomes:?}")
+        }
+    };
+    assert!(last.session().state().account.is_some());
+    assert!(accepted(last_kept));
+    last.session().sign_out(true).unwrap();
+    assert!(!accepted(&spare_kept));
     let signed_out = mac.until("the sign-out", |m| {
         !m.signed_in && m.folders.is_empty() && m.status == SyncStatus::NeedsSetup
     });
     assert!(signed_out.problems.is_empty());
     assert_eq!(fs::read(again.join("kept.txt")).unwrap(), b"kept");
     assert_eq!(mac.session().spaces(), Err(SessionError::NotSignedIn));
+    assert!(!accepted(&kept));
     mac.reopen();
     assert_eq!(mac.opened.as_ref().unwrap().account, None);
 }

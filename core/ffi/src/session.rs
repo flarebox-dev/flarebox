@@ -102,8 +102,8 @@ impl SyncSession {
         self.core.pair(&code, &device_name)
     }
 
-    pub fn sign_out(&self) -> Result<(), SessionError> {
-        self.core.sign_out()
+    pub fn sign_out(&self, confirm_last_device: bool) -> Result<(), SessionError> {
+        self.core.sign_out(confirm_last_device)
     }
 
     pub fn devices(&self) -> Result<DeviceList, SessionError> {

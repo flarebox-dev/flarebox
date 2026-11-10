@@ -671,11 +671,11 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
     expect((await refresh(owner)).status).toBe(200);
   });
 
-  it("refuses a device that revokes itself, so the last active device of a user cannot be revoked (RFC 0009 section 5)", async () => {
+  it("lets a device revoke itself when it signs out, and refuses the last active device until it confirms (RFC 0009 section 5)", async () => {
     const owner = await getOwner();
-    const other = await pairDevice(owner, "Spare");
-    expect(await send("/v1/devices/" + other.deviceId, { method: "DELETE", token: other.access!.token })).toEqual({ status: 403, code: Error_Code.FORBIDDEN });
-    expect((await refresh(other)).status).toBe(200);
+    const spare = await pairDevice(owner, "Spare");
+    expect(await send("/v1/devices/" + spare.deviceId, { method: "DELETE", token: spare.access!.token })).toEqual({ status: 204, code: undefined });
+    expect((await refresh(spare)).status).toBe(401);
 
     const active = (await listDevices(owner.access!.token)).message!.devices.filter((device) => device.revokedAtMs === 0n && !device.current);
     for (const device of active) {
@@ -684,10 +684,42 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
     const listed = (await listDevices(owner.access!.token)).message!.devices;
     expect(listed.filter((device) => device.revokedAtMs === 0n).map((device) => device.deviceId)).toEqual([owner.deviceId]);
 
-    expect(await send("/v1/devices/" + owner.deviceId, { method: "DELETE", token: owner.access!.token })).toEqual({ status: 403, code: Error_Code.FORBIDDEN });
+    for (const query of ["", "?confirm=yes"]) {
+      const refused = await send("/v1/devices/" + owner.deviceId + query, { method: "DELETE", token: owner.access!.token });
+      expect(refused).toEqual({ status: 409, code: Error_Code.CONFIRMATION_REQUIRED });
+    }
     const after = (await listDevices(owner.access!.token)).message!.devices.find((device) => device.deviceId === owner.deviceId)!;
     expect(after.revokedAtMs).toBe(0n);
     expect((await refresh(owner)).status).toBe(200);
+  });
+
+  it("revokes the user's last active device once it confirms, and of two last devices signing out at once the second must confirm (RFC 0009 section 5)", async () => {
+    const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName("last-device"));
+    await runInDurableObject(stub, async (instance: import("../src/account-do").AccountDO) => {
+      const code = (await instance.issueClaimCode())!;
+      const claimed = await instance.claim({ code, userName: "Owner", deviceName: "Only", platform: "macos" });
+      if (!claimed.ok) throw new Error(claimed.message);
+      const only = claimed.value;
+      const pairing = await instance.startPairing(only.deviceId);
+      if (!pairing.ok) throw new Error(pairing.message);
+      const paired = await instance.completePairing({ code: pairing.value.code, deviceName: "Second", platform: "linux" }, "test-client");
+      if (!paired.ok) throw new Error(paired.message);
+      const second = paired.value;
+      const revoke = (device: DeviceCredentials, confirmLastDevice: boolean) =>
+        instance.revokeUserDevice({ userId: only.userId, callerId: device.deviceId, deviceId: device.deviceId, confirmLastDevice });
+
+      const both = await Promise.all([revoke(only, false), revoke(second, false)]);
+      expect(both.map((outcome) => (outcome.ok ? "revoked" : Error_Code[outcome.code])).sort()).toEqual(["CONFIRMATION_REQUIRED", "revoked"]);
+      const last = (await instance.isDeviceActive(only.deviceId)) ? only : second;
+      expect(await instance.isDeviceActive(last.deviceId)).toBe(true);
+
+      expect(await revoke(last, true)).toMatchObject({ ok: true });
+      expect(await instance.isDeviceActive(last.deviceId)).toBe(false);
+      expect(await instance.refreshAccess({ deviceId: last.deviceId, refreshCredential: last.refreshCredential })).toMatchObject({
+        ok: false,
+        code: Error_Code.UNAUTHENTICATED,
+      });
+    });
   });
 
   it("lets only one of two devices that revoke each other at the same time succeed, so one stays active (RFC 0009 section 5)", async () => {
@@ -807,13 +839,13 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
       const pending = (deviceId: string) => state.storage.sql.exec("SELECT COUNT(*) AS n FROM revocation_notices WHERE device_id = ?", deviceId).one().n;
       try {
         for (const device of [repeated, alarmed]) {
-          expect(await instance.revokeUserDevice({ userId: owner.userId, callerId: owner.deviceId, deviceId: device.deviceId })).toMatchObject({ ok: true });
+          expect(await instance.revokeUserDevice({ userId: owner.userId, callerId: owner.deviceId, deviceId: device.deviceId, confirmLastDevice: false })).toMatchObject({ ok: true });
           expect(pending(device.deviceId)).toBeGreaterThan(0);
           expect((await instance.checkSession(device.deviceId)).revoked).toBe(true);
         }
         expect(await state.storage.getAlarm()).not.toBeNull();
         fail = false;
-        await instance.revokeUserDevice({ userId: owner.userId, callerId: owner.deviceId, deviceId: repeated.deviceId });
+        await instance.revokeUserDevice({ userId: owner.userId, callerId: owner.deviceId, deviceId: repeated.deviceId, confirmLastDevice: false });
         expect(pending(repeated.deviceId)).toBe(0);
         expect(delivered).toContain(repeated.deviceId);
         state.storage.sql.exec("UPDATE revocation_notices SET next_try_ms = 0");
@@ -836,7 +868,7 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
     await runInDurableObject(stub, async (instance: import("../src/account-do").AccountDO, state) => {
       await state.storage.deleteAlarm();
       vi.spyOn(instance as unknown as { deliverNotices: () => Promise<void> }, "deliverNotices").mockRejectedValue(new Error("evicted before delivery"));
-      await expect(instance.revokeUserDevice({ userId: owner.userId, callerId: owner.deviceId, deviceId: pad.deviceId })).rejects.toThrow("evicted before delivery");
+      await expect(instance.revokeUserDevice({ userId: owner.userId, callerId: owner.deviceId, deviceId: pad.deviceId, confirmLastDevice: false })).rejects.toThrow("evicted before delivery");
       expect(await state.storage.getAlarm()).not.toBeNull();
       state.storage.sql.exec("UPDATE revocation_notices SET next_try_ms = 0 WHERE device_id = ?", pad.deviceId);
     });

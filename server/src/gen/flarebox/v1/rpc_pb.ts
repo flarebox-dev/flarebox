@@ -148,7 +148,8 @@ export enum Error_Code {
 
   /**
    * A commit that would trash more than the server's delete policy allows, until the owner confirms (RFC 0006
-   * section 10). Reserved: no 0.1.0 server sends it.
+   * section 10); no 0.1.0 server sends it for a commit. Also the refusal of a user's last active device that
+   * revokes itself without confirming it (RFC 0009 section 5).
    *
    * @generated from enum value: CODE_CONFIRMATION_REQUIRED = 16;
    */

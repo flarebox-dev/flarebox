@@ -3,7 +3,7 @@
 //! The device routes against the real Worker (RFC 0006 section 7, RFC 0009).
 
 use flarebox_net::Auth;
-use flarebox_proto::v1::{DeviceInfo, TokenRequest, error::Code};
+use flarebox_proto::v1::{DeviceInfo, TokenRequest};
 
 use crate::support::*;
 
@@ -22,7 +22,7 @@ async fn devices(auth: &Auth) -> Vec<DeviceInfo> {
 
 #[tokio::test]
 #[ignore = "needs a local Worker; run core/net/scripts/integration-test.sh"]
-async fn the_owner_revokes_a_lost_device_from_another_but_never_its_own() {
+async fn the_owner_revokes_a_lost_device_and_a_spare_revokes_itself() {
     let owner = auth(owner().await);
     let lost = new_device("lost laptop").await;
     let thief = auth(lost.clone());
@@ -72,15 +72,9 @@ async fn the_owner_revokes_a_lost_device_from_another_but_never_its_own() {
         .unwrap();
     assert!(revoked.revoked_at_ms > 0);
 
-    let own = owner
-        .api()
-        .revoke_device(&owner, &owner.credentials().device_id)
-        .await
-        .unwrap_err();
-    assert_eq!(
-        own.server().map(|error| error.code()),
-        Some(Code::Forbidden),
-        "{own:?}"
-    );
+    let spare = auth(new_device("spare laptop").await);
+    spare.api().revoke_self(&spare, false).await.unwrap();
+    let signed_out = spare.api().list_spaces(&spare).await.unwrap_err();
+    assert!(signed_out.is_unauthenticated(), "{signed_out:?}");
     owner.api().list_spaces(&owner).await.unwrap();
 }
