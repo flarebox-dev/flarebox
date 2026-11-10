@@ -12,7 +12,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use flarebox_driver::{Credential, Paths};
-use flarebox_ffi::{SessionEvent, SessionListener, SyncSession, SyncStatus};
+use flarebox_ffi::{
+    FolderState, ProblemKind, SessionEvent, SessionListener, SyncSession, SyncStatus,
+};
 use flarebox_store::{Link, Store};
 
 /// Longer than any main-thread call may take, and shorter than the server waits for the test.
@@ -154,4 +156,36 @@ fn sync_pauses_and_resumes_while_a_folder_link_waits_on_the_server() {
     );
     assert!(link.join().unwrap().is_err());
     server.join().unwrap();
+}
+
+#[test]
+fn a_session_whose_only_folder_halted_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = paired_profile(
+        dir.path(),
+        "http://127.0.0.1:1/",
+        dir.path().join("missing"),
+    );
+    let session = open(&profile);
+    session.start();
+    let started = Instant::now();
+    let state = loop {
+        let state = session.state();
+        if state.folders[0].state == FolderState::Halted {
+            break state;
+        }
+        assert!(
+            started.elapsed() < WAIT,
+            "the folder never halted: {state:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(state.status, SyncStatus::Halted);
+    let [problem] = state.problems.as_slice() else {
+        panic!("one problem expected: {:?}", state.problems);
+    };
+    let ProblemKind::FolderHalted { reason } = &problem.kind else {
+        panic!("a halted folder expected: {problem:?}");
+    };
+    assert!(reason.contains("missing"), "{reason}");
 }

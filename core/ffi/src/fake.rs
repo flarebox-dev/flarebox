@@ -127,6 +127,13 @@ impl State {
             SyncStatus::NeedsSetup
         } else if self.saved.paused {
             SyncStatus::Paused
+        } else if self
+            .saved
+            .folders
+            .iter()
+            .any(|folder| folder.state == FolderState::Halted)
+        {
+            SyncStatus::Halted
         } else {
             match self.activity {
                 FakeActivity::Connecting => SyncStatus::Connecting,

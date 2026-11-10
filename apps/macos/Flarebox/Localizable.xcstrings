@@ -160,6 +160,7 @@
     "A file from the server can't be placed because an ignored or unsupported item, such as a symbolic link, already has its name. Rename or move that item." : {},
     "A file from the server has a name this Mac's file system can't hold. Rename it on another device." : {},
     "A file keeps changing" : {},
+    "A folder stopped syncing" : {},
     "A name is taken by an ignored item" : {},
     "A name isn't allowed on this Mac" : {},
     "About" : {},

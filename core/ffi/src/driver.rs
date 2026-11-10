@@ -47,7 +47,7 @@ pub(crate) struct DriverCore {
     inner: Mutex<Inner>,
     /// Taken by the calls that sign in or change the linked folders, one at a time, so that a claim
     /// never opens the profile again while another call still holds the driver. The calls the app
-    /// makes on its main thread never take it, and `inner` is never held while the network is awaited.
+    /// makes on its main thread never take it, and no call holds `inner` while it waits on the network.
     changes: Mutex<()>,
     closed: AtomicBool,
     poller: Mutex<Option<JoinHandle<()>>>,
@@ -543,7 +543,8 @@ fn not_saved(path: &Path) -> impl FnOnce(io::Error) -> SessionError + '_ {
 }
 
 /// The session's status: what its folders are doing, unless the session is stopped, paused or
-/// has nothing to sync.
+/// has nothing to sync. A halted folder outranks the others, and the session is idle only when
+/// every folder is up to date.
 fn sync_status(status: &Status, started: bool, paused: bool) -> SyncStatus {
     if !started {
         return SyncStatus::Stopped;
@@ -555,11 +556,13 @@ fn sync_status(status: &Status, started: bool, paused: bool) -> SyncStatus {
         return SyncStatus::NeedsSetup;
     }
     let any = |state| status.folders.iter().any(|folder| folder.state == state);
-    if any(DriverFolderState::Bootstrapping) || any(DriverFolderState::CatchingUp) {
+    if any(DriverFolderState::Halted) {
+        SyncStatus::Halted
+    } else if any(DriverFolderState::Bootstrapping) || any(DriverFolderState::CatchingUp) {
         SyncStatus::Syncing
     } else if any(DriverFolderState::Connecting) || any(DriverFolderState::Stopped) {
         SyncStatus::Connecting
-    } else if any(DriverFolderState::Offline) && !any(DriverFolderState::UpToDate) {
+    } else if any(DriverFolderState::Offline) {
         SyncStatus::Offline
     } else {
         SyncStatus::Idle
@@ -840,12 +843,16 @@ mod tests {
         );
         for (states, expected) in [
             (vec![UpToDate], SyncStatus::Idle),
-            (vec![UpToDate, Halted], SyncStatus::Idle),
+            (vec![UpToDate, UpToDate], SyncStatus::Idle),
+            (vec![Halted], SyncStatus::Halted),
+            (vec![Halted, Halted], SyncStatus::Halted),
+            (vec![UpToDate, Halted], SyncStatus::Halted),
+            (vec![CatchingUp, Halted], SyncStatus::Halted),
+            (vec![Offline, Halted], SyncStatus::Halted),
             (vec![UpToDate, CatchingUp], SyncStatus::Syncing),
             (vec![Bootstrapping, Connecting], SyncStatus::Syncing),
             (vec![UpToDate, Connecting], SyncStatus::Connecting),
-            (vec![Offline, Halted], SyncStatus::Offline),
-            (vec![Offline, UpToDate], SyncStatus::Idle),
+            (vec![Offline, UpToDate], SyncStatus::Offline),
         ] {
             assert_eq!(
                 sync_status(&status_of(&states), true, false),

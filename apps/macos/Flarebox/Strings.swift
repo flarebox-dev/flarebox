@@ -15,6 +15,7 @@ extension SyncStatus {
         case .idle: String(localized: "Up to date")
         case .paused: String(localized: "Sync is paused")
         case .offline: String(localized: "Can't reach the server. Retrying…")
+        case .halted: String(localized: "A folder stopped syncing")
         }
     }
 
@@ -24,6 +25,7 @@ extension SyncStatus {
         case .connecting, .syncing, .idle: "arrow.triangle.2.circlepath.circle.fill"
         case .paused: "pause.circle"
         case .offline: "bolt.horizontal.circle"
+        case .halted: "exclamationmark.triangle"
         }
     }
 }

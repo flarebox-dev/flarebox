@@ -26,6 +26,9 @@ pub enum SyncStatus {
     Paused,
     /// The server cannot be reached. The session keeps retrying on its own.
     Offline,
+    /// A linked folder stopped syncing because of a problem the person has to fix.
+    /// [`SessionState::problems`] says which folder and why. The other folders keep syncing.
+    Halted,
 }
 
 /// How far the current sync has got, across every linked folder.
