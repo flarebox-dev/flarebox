@@ -373,16 +373,35 @@ impl Effects {
 /// A node the planner considers: one whose only change is remote, one that is parked, one whose
 /// local position is reverted, or one whose S update waits and that R no longer has. A reverted or
 /// waiting node that R no longer has is removed only when it holds no unuploaded edit; otherwise
-/// the commit layer makes it a new node, so the edit is uploaded. An excluded node is never one.
+/// the commit layer makes it a new node, so the edit is uploaded. A reverted node that L does not
+/// hold is created only as a folder that a node L holds needs on its R path: otherwise the user
+/// deleted it, and that delete is committed instead. An excluded node is never one.
 fn candidate(trees: &Trees, id: &str) -> bool {
     let changed = remote_only(trees, id)
         || trees.local().get(id).is_some_and(|node| node.parked)
         || (trees.reverted().contains(id)
+            && (trees.local().get(id).is_some() || holds_below(trees, id))
             && (trees.remote().live(id).is_some() || !trees.edited(id)))
         || (trees.waiting().contains_key(id)
             && trees.remote().live(id).is_none()
             && !trees.edited(id));
     changed && !trees.excluded(id)
+}
+
+/// Whether L holds a node that R places below `id`.
+fn holds_below(trees: &Trees, id: &str) -> bool {
+    let remote = trees.remote();
+    trees.local().iter().any(|(node, _)| {
+        let mut up = remote.live(node).map(|shape| shape.parent.as_str());
+        for _ in 0..=remote.len() {
+            match up {
+                Some(parent) if parent == id => return true,
+                Some(parent) => up = remote.live(parent).map(|shape| shape.parent.as_str()),
+                None => return false,
+            }
+        }
+        false
+    })
 }
 
 /// Whether the node's only change is remote. While its S update waits, [`Class::Remote`] means L

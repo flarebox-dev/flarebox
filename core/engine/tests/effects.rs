@@ -728,6 +728,24 @@ fn done_takes_only_the_effect_in_flight_and_a_created_entry_needs_its_identity()
 /// One node's draw for one tree: ⊥, or its rank, a parent choice and a name.
 type Draw = Option<(u8, u8, u8)>;
 
+/// GUN-332. The server renamed a file this device created, so its local position is reverted.
+/// The user deleted the file before an effect moved it to the server's name. That delete is the
+/// user's to commit, and no effect brings the file back.
+#[test]
+fn a_reverted_file_that_the_user_deleted_is_not_downloaded_again() {
+    let renamed = file(ROOT, "a (conflict)", 1);
+    let (mut trees, _) = space(&[
+        ("d", Some(dir(ROOT, "a")), Some(dir(ROOT, "a"))),
+        ("n", Some(renamed.clone()), Some(renamed)),
+    ]);
+    trees.revert("n".into());
+    trees.remove_local("n");
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::Local);
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    assert_eq!(effects.plan(&trees, &mut ids, NOW), None);
+}
+
 /// A valid tree over `n0`, `n1`, ... from one [`Draw`] per node, as in tests/trees.rs, where each
 /// node has the kind and file content of `kinds`. S and R are drawn with their own ranks, so their
 /// moves can swap, rotate and nest into each other.
