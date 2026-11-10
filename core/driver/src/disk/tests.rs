@@ -17,9 +17,10 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use flarebox_chunk::{ChunkerConfig, chunks, content};
+use flarebox_engine::classify::Trees;
 use flarebox_engine::effects::{Base as EngineBase, Dir as EngineDir};
 use flarebox_engine::state::{EffectsState, TreesState};
-use flarebox_engine::tree::{FileIdentity, LocalNode};
+use flarebox_engine::tree::{FileIdentity, Kind, LocalNode, Shape};
 use flarebox_fs::{
     FileId, Known, PRIVATE_DIR, QUARANTINE_DIR, STAGING_DIR, Snapshot, TRASH_DIR, read_marker,
     write_marker,
@@ -380,6 +381,34 @@ struct Scenario {
     displaces: Option<&'static [u8]>,
     /// The first cut after which the next start finds the effect done.
     done_from: Cut,
+    /// What a batch puts into L after the plan so that L no longer takes the effect, while the disk stays as it
+    /// was. `None` for an effect that L always takes.
+    refuse: Option<fn(&mut Trees)>,
+}
+
+const OTHER: &str = "0190f0a0-0000-7000-8000-0000000000b2";
+
+/// A node that only L holds, as after a batch that reported an entry the disk no longer has.
+fn other(parent: &str, name: &str, kind: Kind) -> LocalNode {
+    let content = (kind == Kind::File).then(|| Content {
+        size: 1,
+        manifest_digest: vec![7; 32],
+        ..Content::default()
+    });
+    LocalNode {
+        shape: Shape {
+            parent: parent.into(),
+            name: name.into(),
+            kind,
+            content,
+        },
+        identity: FileIdentity {
+            dev: 1,
+            ino: 1,
+            birth_ns: None,
+        },
+        parked: false,
+    }
 }
 
 const SCENARIOS: [Scenario; 6] = [
@@ -389,6 +418,7 @@ const SCENARIOS: [Scenario; 6] = [
         check: |folder| assert!(folder.root.join("docs").is_dir()),
         displaces: None,
         done_from: Cut::Step(Step::Placed),
+        refuse: Some(|trees| trees.set_local(OTHER.into(), other(SPACE, "docs", Kind::Dir))),
     },
     Scenario {
         name: "write a new file",
@@ -407,6 +437,7 @@ const SCENARIOS: [Scenario; 6] = [
         },
         displaces: None,
         done_from: Cut::Step(Step::Placed),
+        refuse: Some(|trees| trees.set_local(OTHER.into(), other(SPACE, "report.txt", Kind::Dir))),
     },
     Scenario {
         name: "replace a file",
@@ -422,6 +453,12 @@ const SCENARIOS: [Scenario; 6] = [
         check: |folder| assert_eq!(fs::read(folder.root.join("report.txt")).unwrap(), REMOTE),
         displaces: Some(SYNCED),
         done_from: Cut::Step(Step::Quarantined),
+        refuse: Some(|trees| {
+            let mut renamed = trees.local().get(NODE).unwrap().clone();
+            renamed.shape.name = "renamed.txt".into();
+            trees.set_local(NODE.into(), renamed);
+            trees.set_local(OTHER.into(), other(SPACE, "report.txt", Kind::File));
+        }),
     },
     Scenario {
         name: "move a file",
@@ -440,6 +477,9 @@ const SCENARIOS: [Scenario; 6] = [
         },
         displaces: None,
         done_from: Cut::Step(Step::Placed),
+        refuse: Some(|trees| {
+            trees.set_local(OTHER.into(), other(SPACE, "renamed.txt", Kind::File))
+        }),
     },
     Scenario {
         name: "remove a file",
@@ -450,6 +490,7 @@ const SCENARIOS: [Scenario; 6] = [
         check: |folder| assert!(!folder.root.join("report.txt").exists()),
         displaces: Some(SYNCED),
         done_from: Cut::Step(Step::Quarantined),
+        refuse: None,
     },
     Scenario {
         name: "remove a folder",
@@ -460,6 +501,7 @@ const SCENARIOS: [Scenario; 6] = [
         check: |folder| assert!(!folder.root.join("docs").exists()),
         displaces: None,
         done_from: Cut::Step(Step::Quarantined),
+        refuse: Some(|trees| trees.set_local(OTHER.into(), other(NODE, "new.txt", Kind::File))),
     },
 ];
 
@@ -639,6 +681,150 @@ fn a_crash_during_recovery_is_recovered_on_the_start_after() {
             );
             assert_done(scenario, &folder, &running, &context);
         }
+    }
+}
+
+/// Changes L as a batch does: in one transaction that ends with the checkpoint.
+fn batch(running: &mut Running, change: impl FnOnce(&mut Trees)) {
+    change(&mut running.engine.trees);
+    let Running { engine, store, .. } = running;
+    store.transaction(|tx| engine.checkpoint(tx)).unwrap();
+}
+
+/// What the user sees under the root.
+fn visible(folder: &Folder) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    let mut found = tree(&folder.root);
+    found.retain(|path, _| !path.starts_with(PRIVATE_DIR));
+    found
+}
+
+/// Plans and stages the scenario's effect, then lets a batch change L so that it no longer takes the effect. With
+/// `apply` the effect is applied next and the process stops at `cut`, if any; without it the process stops before
+/// the effect section. Then starts again, checks that the store loads and nothing under the root changed, and
+/// finishes the effect once a batch has taken the stale node out of L.
+fn refuse_and_finish(scenario: &Scenario, refuse: fn(&mut Trees), cut: Option<Cut>, apply: bool) {
+    let context = format!(
+        "{}, refused, stopped at {cut:?}, applied: {apply}",
+        scenario.name
+    );
+    let folder = Folder::new();
+    let mut server = Server::default();
+    (scenario.setup)(&folder, &mut server);
+    let seen = visible(&folder);
+    let (_, planned_for) = folder.open();
+    let stopped = catch_unwind(AssertUnwindSafe(|| {
+        let mut running = folder.start(cut.and_then(crash_at)).unwrap();
+        let (disk, engine, store) = (&mut running.disk, &mut running.engine, &mut running.store);
+        let pending = disk.next(engine, store).unwrap().expect("an effect");
+        let staged = ready(pending.stage(&server)).unwrap();
+        batch(&mut running, refuse);
+        assert!(!running.engine.takes(&pending.record), "{context}");
+        if apply {
+            let (disk, engine, store) =
+                (&mut running.disk, &mut running.engine, &mut running.store);
+            let settled = disk.apply(staged, engine, store).unwrap();
+            let why = "L changed since it was planned";
+            assert_eq!(settled, Settled::Failed(why.into()), "{context}");
+        }
+    }));
+    match stopped {
+        Err(payload) if !payload.is::<Crash>() => resume_unwind(payload),
+        stopped => assert_eq!(stopped.is_err(), cut.is_some(), "{context}"),
+    }
+
+    let mut running = folder.start(no_hook()).unwrap();
+    assert_eq!(running.engine.trees.check(), Ok(()), "{context}");
+    let (_, stored) = folder.open();
+    assert_eq!(
+        stored.trees.local(),
+        running.engine.trees.local(),
+        "{context}"
+    );
+    assert!(running.engine.effects.in_flight().is_none(), "{context}");
+    assert!(running.engine.effects.blocked().is_empty(), "{context}");
+    assert_eq!(running.engine.effects.cleared(), 1, "{context}");
+    assert_eq!(folder.marker(), 1, "{context}");
+    assert_eq!(
+        names(&folder, QUARANTINE_DIR),
+        Vec::<String>::new(),
+        "{context}"
+    );
+    assert_eq!(
+        names(&folder, STAGING_DIR),
+        Vec::<String>::new(),
+        "{context}"
+    );
+    assert_eq!(visible(&folder), seen, "{context}");
+    assert_eq!(
+        running.step(&server),
+        None,
+        "{context}: planned while L holds the stale node"
+    );
+
+    batch(&mut running, |trees| {
+        let held: Vec<String> = trees.local().iter().map(|(id, _)| id.clone()).collect();
+        for id in held {
+            trees.remove_local(&id);
+        }
+        for (id, node) in planned_for.trees.local().iter() {
+            trees.set_local(id.clone(), node.clone());
+        }
+    });
+    assert_eq!(
+        running.step(&server),
+        Some(Settled::Done),
+        "{context}: not planned again"
+    );
+    assert_eq!(running.step(&server), None, "{context}");
+    assert_done(scenario, &folder, &running, &context);
+}
+
+#[test]
+fn an_effect_l_no_longer_takes_leaves_a_store_that_loads_at_every_cut() {
+    for scenario in &SCENARIOS {
+        let Some(refuse) = scenario.refuse else {
+            continue;
+        };
+        refuse_and_finish(scenario, refuse, None, false);
+        refuse_and_finish(scenario, refuse, None, true);
+        for cut in [Cut::Step(Step::Marked), Cut::BeforeAck, Cut::AfterAck] {
+            refuse_and_finish(scenario, refuse, Some(cut), true);
+        }
+    }
+}
+
+/// The marker is the only thing an effect that L no longer takes writes under the root.
+#[test]
+fn an_effect_l_no_longer_takes_reaches_no_cut_that_changes_the_folder() {
+    for scenario in &SCENARIOS {
+        let Some(refuse) = scenario.refuse else {
+            continue;
+        };
+        let folder = Folder::new();
+        let mut server = Server::default();
+        (scenario.setup)(&folder, &mut server);
+        let reached = Arc::new(Mutex::new(Vec::new()));
+        let record = reached.clone();
+        let hook: Hook = Box::new(move |cut| record.lock().unwrap().push(cut));
+        let mut running = folder.start(Some(hook)).unwrap();
+        let (disk, engine, store) = (&mut running.disk, &mut running.engine, &mut running.store);
+        let pending = disk.next(engine, store).unwrap().expect("an effect");
+        let staged = ready(pending.stage(&server)).unwrap();
+        batch(&mut running, refuse);
+        let (disk, engine, store) = (&mut running.disk, &mut running.engine, &mut running.store);
+        disk.apply(staged, engine, store).unwrap();
+        assert_eq!(
+            *reached.lock().unwrap(),
+            [
+                Cut::BeforePlan,
+                Cut::AfterPlan,
+                Cut::Step(Step::Marked),
+                Cut::BeforeAck,
+                Cut::AfterAck
+            ],
+            "{}",
+            scenario.name
+        );
     }
 }
 

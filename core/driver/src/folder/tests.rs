@@ -9,7 +9,7 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::time::Instant;
 
-use flarebox_engine::tree::{LocalNode, Tree};
+use flarebox_engine::tree::{Kind, LocalNode, Tree};
 use flarebox_fs::{Marker, write_marker};
 use flarebox_net::Committed;
 use flarebox_proto::v1::{ListTree, Op, PrepareUpload, Resume, chunk_plan, op};
@@ -151,6 +151,16 @@ impl Site {
         }
     }
 
+    /// The engine a process that started now would load from the store. Its trees must be trees.
+    fn stored(&self) -> Engine {
+        let mut store = Store::open(&self.db).unwrap();
+        let engine = store
+            .transaction(|tx| Engine::load(tx, &self.link.space_id))
+            .unwrap();
+        assert_eq!(engine.trees.check(), Ok(()));
+        engine
+    }
+
     /// Starts the folder as the task does once it holds the lock: the store, the engine, the disk, and the observer
     /// from L's snapshot.
     fn start(&self) -> Device {
@@ -199,6 +209,7 @@ impl Device {
             .transaction(|tx| Engine::load(tx, &folder.link.space_id))
             .unwrap();
         let held = &folder.engine;
+        assert_eq!(held.trees.check(), Ok(()));
         assert_eq!(stored.trees.local(), held.trees.local(), "L");
         assert_eq!(stored.trees.synced(), held.trees.synced(), "S");
         assert_eq!(stored.trees.remote(), held.trees.remote(), "R");
@@ -391,6 +402,207 @@ fn files(root: &Path) -> Vec<(String, String)> {
     }
     files.sort();
     files
+}
+
+/// Every entry under a folder besides `.flarebox`, by its path from the folder, with the text of a file, in order.
+fn entries(root: &Path) -> Vec<(String, Option<String>)> {
+    let mut entries = Vec::new();
+    let mut dirs = vec![root.to_owned()];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path == root.join(flarebox_fs::PRIVATE_DIR) {
+                continue;
+            }
+            let name = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned();
+            if path.is_dir() {
+                entries.push((name, None));
+                dirs.push(path);
+            } else {
+                entries.push((name, Some(fs::read_to_string(&path).unwrap())));
+            }
+        }
+    }
+    entries.sort();
+    entries
+}
+
+/// Runs two devices as their tasks would, each one piece of work at a time with a pass of its observer after it,
+/// until neither has had work for a while. Both must then hold the server's head and the same entries.
+fn sync(remote: &mut Remote, a: (&Site, &mut Device), b: (&Site, &mut Device)) {
+    let (mut quiet, mut rounds) = (0, 0);
+    while quiet < 4 {
+        rounds += 1;
+        assert!(rounds < 200, "the devices do not come to rest");
+        quiet += 1;
+        for (site, device) in [(a.0, &mut *a.1), (b.0, &mut *b.1)] {
+            match device.work.pop_front() {
+                Some(work) => {
+                    device.perform(work, remote).unwrap();
+                    quiet = 0;
+                }
+                None => device.pull(remote),
+            }
+            device.scan(Duration::from_millis(150));
+            if !device.work.is_empty() {
+                quiet = 0;
+            }
+            site.stored();
+        }
+    }
+    assert_eq!(a.1.state(), FolderState::UpToDate);
+    assert_eq!(b.1.state(), FolderState::UpToDate);
+    assert_eq!(entries(&a.0.root), entries(&b.0.root));
+}
+
+/// Two devices that hold the folder `f` with `f/kept.txt`, written on `b`. Device `a` then wrote the file `a`, and
+/// `b` planned the effect that writes it, which is returned unstaged.
+fn planned_beside_a_folder(remote: &mut Remote) -> ((Site, Device), (Site, Device), Pending) {
+    let (site_a, mut a) = linked(remote, "a");
+    let (site, mut b) = linked(remote, "b");
+    fs::create_dir(site.root.join("f")).unwrap();
+    fs::write(site.root.join("f/kept.txt"), b"kept on b").unwrap();
+    sync(remote, (&site_a, &mut a), (&site, &mut b));
+    assert_eq!(entries(&site_a.root).len(), 2);
+    a.create(remote, &site_a.root.join("a"), b"written on a");
+
+    b.pull(remote);
+    let Some(Work::Stage(pending)) = b.work.pop_front() else {
+        panic!("the effect that writes a is staged");
+    };
+    assert!(b.work.is_empty());
+    site.stored();
+    ((site_a, a), (site, b), pending)
+}
+
+/// The user renames the folder `f` to `a`, which a batch reports, and back, which no batch has reported yet.
+fn rename_to_a_and_back(site: &Site, b: &mut Device) {
+    fs::rename(site.root.join("f"), site.root.join("a")).unwrap();
+    b.scan_until(|b| {
+        (b.folder.engine.trees.local().iter())
+            .any(|(_, node)| node.shape.name == "a" && node.shape.kind == Kind::Dir)
+    });
+    site.stored();
+    fs::rename(site.root.join("a"), site.root.join("f")).unwrap();
+}
+
+/// GUN-330. The effect was planned while the name `a` was free in L. Recording its outcome beside the folder L
+/// then held at `a` left two nodes with one name, and the store did not load again.
+#[test]
+fn an_effect_whose_name_l_gave_to_another_node_writes_nothing_and_is_planned_again() {
+    let mut remote = Remote::new();
+    let ((site_a, mut a), (site, mut b), pending) = planned_beside_a_folder(&mut remote);
+    rename_to_a_and_back(&site, &mut b);
+
+    let staged = ready(pending.stage(&remote.chunks));
+    let step = b.folder.staged(pending, staged);
+    b.take(step).unwrap();
+    site.stored();
+    assert_eq!(names(&site.root), ["f"], "nothing is written at the name");
+    let effects = &b.folder.engine.effects;
+    assert!(effects.in_flight().is_none() && effects.blocked().is_empty());
+    let marker = flarebox_fs::read_marker(&site.root).unwrap().unwrap();
+    assert_eq!(marker.effects, effects.cleared());
+    let staging = site.root.join(flarebox_fs::PRIVATE_DIR).join("staging");
+    assert_eq!(fs::read_dir(staging).unwrap().count(), 0);
+
+    sync(&mut remote, (&site_a, &mut a), (&site, &mut b));
+    let held = entries(&site.root);
+    let texts: Vec<&str> = held
+        .iter()
+        .filter_map(|(_, text)| text.as_deref())
+        .collect();
+    assert_eq!(texts.len(), 2, "{held:?}");
+    assert!(texts.contains(&"written on a") && texts.contains(&"kept on b"));
+}
+
+/// The same L, with the file already at its name when the process stops. `Disk::apply` no longer gets there, so
+/// the test leaves what a process without the check left: the marker written and the staged file renamed to `a`,
+/// with no acknowledgement. The next start finds the effect's file at its name and does not record it. The
+/// observer then reports the file as the user's own, so it is uploaded, and both devices end with the bytes twice:
+/// at `a` and at the name the server gave the copy.
+#[test]
+fn a_file_placed_at_a_name_l_gave_away_is_not_recorded_by_the_next_start() {
+    let mut remote = Remote::new();
+    let ((site_a, mut a), (site, mut b), pending) = planned_beside_a_folder(&mut remote);
+    rename_to_a_and_back(&site, &mut b);
+
+    let Ok(staged) = ready(pending.stage(&remote.chunks)) else {
+        panic!("the download is staged");
+    };
+    let record = b.folder.engine.effects.in_flight().unwrap().clone();
+    let marker = Marker {
+        space_id: site.link.space_id.clone(),
+        effects: record.counter,
+    };
+    write_marker(&site.root, &marker).unwrap();
+    fs::rename(site.root.join(record.staging()), site.root.join("a")).unwrap();
+    drop((staged, pending, b));
+
+    let mut b = site.start();
+    let stored = site.stored();
+    assert!(stored.effects.in_flight().is_none() && stored.effects.blocked().is_empty());
+    assert_eq!(stored.effects.cleared(), record.counter);
+    assert!(stored.trees.local().get(&record.node).is_none());
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    sync(&mut remote, (&site_a, &mut a), (&site, &mut b));
+    let held = entries(&site.root);
+    let mut texts: Vec<&str> = held
+        .iter()
+        .filter_map(|(_, text)| text.as_deref())
+        .collect();
+    texts.sort();
+    assert_eq!(
+        texts,
+        ["kept on b", "written on a", "written on a"],
+        "{held:?}"
+    );
+}
+
+/// The second way to the same store: the folder `a` is planned, the user makes a folder `a` of their own, which a
+/// batch reports, and the process stops. The next start finds a folder at the effect's name and takes the effect
+/// for done.
+#[test]
+fn a_restart_that_finds_the_users_folder_at_a_planned_folders_name_keeps_l_a_tree() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    let (site, mut b) = linked(&mut remote, "b");
+    fs::create_dir(site_a.root.join("a")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    assert_eq!(a.run(&mut remote), ["send"]);
+
+    b.pull(&remote);
+    let Some(Work::Stage(pending)) = b.work.pop_front() else {
+        panic!("the effect that creates a is staged");
+    };
+    site.stored();
+    fs::create_dir(site.root.join("a")).unwrap();
+    fs::write(site.root.join("a/kept.txt"), b"kept on b").unwrap();
+    b.scan_until(|b| b.folder.engine.trees.local().len() == 2);
+    site.stored();
+    drop((pending, b));
+
+    let mut b = site.start();
+    let stored = site.stored();
+    assert!(stored.effects.in_flight().is_none() && stored.effects.blocked().is_empty());
+    assert_eq!(stored.trees.local().len(), 2);
+    drop(b);
+    b = site.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    sync(&mut remote, (&site_a, &mut a), (&site, &mut b));
+    let held = entries(&site.root);
+    let texts: Vec<&str> = held
+        .iter()
+        .filter_map(|(_, text)| text.as_deref())
+        .collect();
+    assert_eq!(texts, ["kept on b"], "{held:?}");
 }
 
 /// Device `a` synced `notes.txt` and stopped with its second commit built and uploaded but never sent. Returns its
