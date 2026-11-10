@@ -544,3 +544,55 @@ async fn a_device_revokes_a_lost_one_and_stops_syncing_when_another_revokes_it()
         b"stays on the device"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Worker; run cli/scripts/integration-test.sh"]
+async fn usage_lists_what_each_space_stores() {
+    let owner = Arc::new(Auth::new(api(), owner().await));
+    let machine = Machine::new();
+    let unpaired = machine.fails(&["usage"]);
+    assert!(unpaired.contains("not paired"), "{unpaired}");
+    let pairing = owner.api().pair_start(&owner).await.unwrap();
+    let server = server_url().to_string();
+    machine.run(&[
+        "pair",
+        "--server",
+        &server,
+        "--code",
+        &pairing.code,
+        "--name",
+        "desk",
+    ]);
+    let name = format!("usage {}", uuidv7());
+    let space = owner
+        .api()
+        .create_space(&owner, &CreateSpaceRequest { name: name.clone() })
+        .await
+        .unwrap();
+
+    let listed: Value = serde_json::from_str(&machine.run(&["usage", "--json"])).unwrap();
+    let entry = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["space_id"] == space.space_id.as_str())
+        .unwrap_or_else(|| panic!("the new space is not listed: {listed:#}"));
+    assert_eq!(entry["name"], name.as_str());
+    for field in [
+        "live_files",
+        "live_bytes",
+        "trashed_files",
+        "trash_bytes",
+        "old_versions",
+        "old_version_bytes",
+        "unreferenced_bytes",
+        "total_bytes",
+    ] {
+        assert_eq!(entry[field], 0, "{field} of a new space: {entry:#}");
+    }
+    let report = machine.run(&["usage"]);
+    assert!(
+        report.contains(&format!("{name} ({})\n  Live files ", space.space_id)),
+        "{report}"
+    );
+}

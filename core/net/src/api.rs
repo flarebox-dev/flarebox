@@ -3,7 +3,7 @@
 use flarebox_proto::v1::{
     AccessToken, ClaimRequest, CreateSpaceRequest, DeviceCredentials, DeviceList,
     PairCompleteRequest, PairStartResponse, RewindRequest, RewindResult, ServerInfo, SpaceInfo,
-    SpaceList, TokenRequest,
+    SpaceList, SpaceUsage, TokenRequest,
 };
 use std::time::Duration;
 
@@ -235,6 +235,14 @@ impl Api {
             MAX_ANSWER,
         )
         .await
+    }
+
+    /// `GET /v1/spaces/{space_id}/usage`, owner only (RFC 0010): the bytes of the chunks the space holds, split by
+    /// live files, the trash and old versions, with each chunk counted once.
+    pub async fn space_usage(&self, auth: &Auth, space_id: &str) -> Result<SpaceUsage, ApiError> {
+        let path = format!("v1/spaces/{space_id}/usage");
+        self.authed(auth, Method::GET, &path, None, "SpaceUsage", MAX_ANSWER)
+            .await
     }
 
     /// `GET /v1/devices`: one page of the devices of this device's user, revoked ones included (RFC 0006 section 7).
@@ -709,6 +717,50 @@ mod tests {
                 "GET /v1/spaces HTTP/1.1",
                 "GET /v1/spaces?cursor=b%26c HTTP/1.1"
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn space_usage_reads_the_space_s_usage_route() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let read = socket.read(&mut request).await.unwrap();
+            let body = SpaceUsage {
+                live_files: 2,
+                live_bytes: 300,
+                unreferenced_bytes: 7,
+                ..Default::default()
+            }
+            .encode_to_vec();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: {PROTOBUF}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(&body).await.unwrap();
+            String::from_utf8_lossy(&request[..read]).into_owned()
+        });
+        let auth = signed_in(base);
+        let usage = auth.api().space_usage(&auth, "s").await.unwrap();
+        assert_eq!(
+            (usage.live_files, usage.live_bytes, usage.unreferenced_bytes),
+            (2, 300, 7)
+        );
+        let request = server.await.unwrap();
+        assert!(
+            request.starts_with("GET /v1/spaces/s/usage HTTP/1.1"),
+            "{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer token"),
+            "{request}"
         );
     }
 

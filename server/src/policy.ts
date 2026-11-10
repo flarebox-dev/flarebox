@@ -15,7 +15,7 @@ export interface Principal {
   scope: string | null;
 }
 
-export type Capability = "space.create" | "device.pair" | "device.manage" | "share.manage" | "space.rewind";
+export type Capability = "space.create" | "device.pair" | "device.manage" | "share.manage" | "space.rewind" | "space.usage";
 
 /** The transition one op made, read from the tree just before and just after it (RFC 0006 section 3). */
 export interface OpEffect {

@@ -16,6 +16,7 @@ import {
   ServerInfoSchema,
   SpaceInfoSchema,
   SpaceListSchema,
+  SpaceUsageSchema,
   TokenRequestSchema,
 } from "./gen/flarebox/v1/auth_pb";
 import { UploadReceiptSchema } from "./gen/flarebox/v1/commit_pb";
@@ -119,6 +120,17 @@ async function rewind(request: Request, env: Env, spaceId: string): Promise<Resp
   });
   if (!outcome.ok) return errorReply(request, outcome.code, outcome.message, REWIND_STATUS[outcome.code]);
   return reply(request, RewindResultSchema, create(RewindResultSchema, outcome.value));
+}
+
+/** GET /v1/spaces/{space_id}/usage, owner only (RFC 0010). */
+async function usage(request: Request, env: Env, spaceId: string): Promise<Response> {
+  const identity = await authenticate(request, env, spaceId);
+  if (identity instanceof Response) return identity;
+  const refused = refuseWithout(request, identity, "space.usage");
+  if (refused) return refused;
+  const outcome = await space(env, spaceId).usage(identity.userId);
+  if (!outcome.ok) return errorReply(request, outcome.code, outcome.message);
+  return reply(request, SpaceUsageSchema, outcome.value);
 }
 
 /** The per-space ticket key, derived for each request from the cached server key, so a request keeps no per-space state. */
@@ -237,6 +249,9 @@ async function route(request: Request, env: Env): Promise<Response> {
 
   const rewindRoute = /^\/v1\/spaces\/([0-9a-f-]{36})\/rewind$/.exec(path);
   if (rewindRoute && method === "POST" && isUuidV7(rewindRoute[1]!)) return rewind(request, env, rewindRoute[1]!);
+
+  const usageRoute = /^\/v1\/spaces\/([0-9a-f-]{36})\/usage$/.exec(path);
+  if (usageRoute && method === "GET" && isUuidV7(usageRoute[1]!)) return usage(request, env, usageRoute[1]!);
 
   const devicesRoute = /^\/v1\/devices(?:\/([0-9a-f-]{36}))?$/.exec(path);
   if (devicesRoute) return devices(request, env, devicesRoute[1]);

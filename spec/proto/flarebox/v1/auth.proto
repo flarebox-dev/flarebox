@@ -147,3 +147,23 @@ message RewindResult {
   // history the restore point belonged to, which can be an earlier one, so the two do not bound the discarded commits.
   uint64 previous_head_seq = 5;
 }
+
+// Response of GET /v1/spaces/{space_id}/usage, owner only (RFC 0010). Each chunk the space holds counts once, under the
+// first of live, trash and old versions that holds it, so the four byte counts add up to the space's chunk bytes.
+message SpaceUsage {
+  // Files in the live tree.
+  uint64 live_files = 1;
+  // Bytes of the chunks that the current versions of live files hold.
+  uint64 live_bytes = 2;
+  // Files in the trash.
+  uint64 trashed_files = 3;
+  // Bytes of the chunks that the current versions of trashed files hold and no live file holds.
+  uint64 trash_bytes = 4;
+  // Versions that a newer version replaced and that the space still keeps, of live and trashed files.
+  uint64 old_versions = 5;
+  // Bytes of the chunks that only old versions hold.
+  uint64 old_version_bytes = 6;
+  // Bytes of the chunks that no version holds: uploads not committed yet, and chunks waiting out the grace period
+  // before deletion.
+  uint64 unreferenced_bytes = 7;
+}

@@ -2,6 +2,7 @@
 
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { DurableObject } from "cloudflare:workers";
+import type { SpaceUsage } from "./gen/flarebox/v1/auth_pb";
 import { type Commit, type CommitResult, CommitResultSchema, type Op, type UploadReceipt } from "./gen/flarebox/v1/commit_pb";
 import {
   CaughtUpSchema,
@@ -64,6 +65,7 @@ import type { ShareOutcome } from "./share/links";
 import { checkFence, checkLinkRoot, type DownloadFence, type ShareFile, shareFile, shareInfo, shareListing } from "./share/space";
 import { type Pitr, pitrBackend } from "./space/pitr";
 import { ChunkState, migrate } from "./space/schema";
+import { readUsage } from "./space/usage";
 import {
   chunkKey,
   encodeChunkList,
@@ -1303,6 +1305,12 @@ export class SpaceDO extends DurableObject<Env> {
     });
     await this.armAlarm();
     return { state: "completed", receipt };
+  }
+
+  /** What the space holds, for its owner only (RFC 0010). The Worker has checked the closure. */
+  async usage(userId: string): Promise<{ ok: true; value: SpaceUsage } | { ok: false; code: Error_Code; message: string }> {
+    if (this.memberRole(userId) !== "owner") return { ok: false, code: Error_Code.FORBIDDEN, message: "only the space's owner can read its usage" };
+    return { ok: true, value: readUsage(this.sql) };
   }
 
   /** Whether a node can be the root of a new share link (RFC 0005 section 2). The Account DO has checked the closure. */

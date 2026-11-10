@@ -346,3 +346,44 @@ async fn commits_are_bound_by_the_1_mib_server_message() {
     );
     assert_eq!(records[0].seq, 1);
 }
+
+#[tokio::test]
+#[ignore = "needs a local Worker; run core/net/scripts/integration-test.sh"]
+async fn space_usage_counts_a_committed_chunk_once() {
+    let space = new_space().await;
+    let owner_auth = auth(owner().await);
+    let api = owner_auth.api();
+    let empty = api.space_usage(&owner_auth, &space.space_id).await.unwrap();
+    assert_eq!((empty.live_files, empty.live_bytes), (0, 0));
+
+    let (writer, mut events) = start(owner_auth.clone(), &space);
+    let history = connected(&mut events).await.history_id;
+    let parts: [&'static [u8]; 3] = [b"first chunk", b"second chunk", b"first chunk"];
+    let chunks: Vec<ChunkRef> = parts.iter().map(|p| chunk(p)).collect();
+    let mut sent = commit(
+        &history,
+        0,
+        1,
+        vec![create_file(&space.space_id, "notes.txt", content(&chunks))],
+    );
+    let source = Source::new(&parts);
+    sent.receipts = upload(&new_transfer(api), &writer, &source, &chunks)
+        .await
+        .unwrap();
+    assert!(applied(&writer.commit(sent).await.unwrap()));
+
+    let usage = api.space_usage(&owner_auth, &space.space_id).await.unwrap();
+    assert_eq!(
+        (usage.live_files, usage.live_bytes),
+        (1, (b"first chunk".len() + b"second chunk".len()) as u64),
+        "the repeated chunk counts once"
+    );
+    assert_eq!(
+        (
+            usage.trashed_files,
+            usage.old_versions,
+            usage.unreferenced_bytes
+        ),
+        (0, 0, 0)
+    );
+}

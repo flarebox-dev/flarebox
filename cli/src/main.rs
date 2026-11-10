@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The `flarebox` command: pairs this machine, links folders, shows status and questions, manages the account's devices,
-//! and runs the sync daemon. Commands run in the daemon through its socket when it is running, and on their own
-//! otherwise. The device commands read only the credential and talk to the server directly.
+//! shows what each space stores, and runs the sync daemon. Commands run in the daemon through its socket when it is
+//! running, and on their own otherwise. The device and usage commands read only the credential and talk to the server
+//! directly.
 
 mod ipc;
 
@@ -15,7 +16,7 @@ use flarebox_driver::{
     Answer, Credential, Driver, DriverError, FolderStatus, Paths, Question, QuestionKind, Status,
 };
 use flarebox_net::{ApiError, Auth};
-use flarebox_proto::v1::{DeviceInfo, device_info::Kind};
+use flarebox_proto::v1::{DeviceInfo, SpaceInfo, SpaceUsage, device_info::Kind};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::EnvFilter;
 
@@ -71,6 +72,11 @@ enum Command {
     Device {
         #[command(subcommand)]
         action: DeviceAction,
+    },
+    /// Show how many bytes each space stores: in live files, in the trash and in old versions.
+    Usage {
+        #[arg(long)]
+        json: bool,
     },
     /// Run the sync daemon in the foreground until SIGTERM or SIGINT.
     Daemon {
@@ -136,6 +142,7 @@ fn main() -> ExitCode {
         match command {
             Command::Daemon { .. } => daemon(paths).await,
             Command::Device { action } => device(paths, action).await,
+            Command::Usage { json } => usage(paths, json).await,
             command => client(paths, command).await,
         }
     });
@@ -227,8 +234,8 @@ async fn client(paths: Paths, command: Command) -> Result<(), String> {
             },
             false,
         ),
-        Command::Daemon { .. } | Command::Device { .. } => {
-            unreachable!("the daemon and the device commands do not go through the socket")
+        Command::Daemon { .. } | Command::Device { .. } | Command::Usage { .. } => {
+            unreachable!("the daemon, device and usage commands do not go through the socket")
         }
     };
     let credential = paths.credential();
@@ -289,16 +296,21 @@ async fn client(paths: Paths, command: Command) -> Result<(), String> {
     }
 }
 
-/// Runs a device command with this profile's credential (RFC 0009). It writes nothing to the profile, so it runs the same
-/// whether or not the daemon holds the profile.
-async fn device(paths: Paths, action: DeviceAction) -> Result<(), String> {
+/// This profile's credential, for the commands that talk to the server directly. They write nothing to the profile, so
+/// they run the same whether or not the daemon holds it.
+fn signed_in(paths: &Paths) -> Result<Auth, String> {
     let credential = Credential::load(&paths.credential())
         .map_err(|error| error.to_string())?
         .ok_or_else(|| DriverError::NotPaired.to_string())?;
-    let auth = Auth::new(
+    Ok(Auth::new(
         credential.api().map_err(|error| error.to_string())?,
         credential.net(),
-    );
+    ))
+}
+
+/// Runs a device command (RFC 0009).
+async fn device(paths: Paths, action: DeviceAction) -> Result<(), String> {
+    let auth = signed_in(&paths)?;
     match action {
         DeviceAction::List { json } => {
             let mut devices = Vec::new();
@@ -332,6 +344,111 @@ async fn device(paths: Paths, action: DeviceAction) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+/// Shows what each space of the account stores (RFC 0010).
+async fn usage(paths: Paths, json: bool) -> Result<(), String> {
+    let auth = signed_in(&paths)?;
+    let spaces = auth.api().list_spaces(&auth).await.map_err(refusal)?.spaces;
+    let mut usages = Vec::new();
+    for space in spaces {
+        let usage = auth
+            .api()
+            .space_usage(&auth, &space.space_id)
+            .await
+            .map_err(refusal)?;
+        usages.push((space, usage));
+    }
+    if json {
+        return print_json(
+            &usages
+                .iter()
+                .map(|(space, usage)| usage_json(space, usage))
+                .collect::<Vec<_>>(),
+        );
+    }
+    print!("{}", usage_report(&usages));
+    Ok(())
+}
+
+fn usage_json(space: &SpaceInfo, usage: &SpaceUsage) -> serde_json::Value {
+    serde_json::json!({
+        "space_id": space.space_id,
+        "name": space.name,
+        "live_files": usage.live_files,
+        "live_bytes": usage.live_bytes,
+        "trashed_files": usage.trashed_files,
+        "trash_bytes": usage.trash_bytes,
+        "old_versions": usage.old_versions,
+        "old_version_bytes": usage.old_version_bytes,
+        "unreferenced_bytes": usage.unreferenced_bytes,
+        "total_bytes": total_bytes(usage),
+    })
+}
+
+fn total_bytes(usage: &SpaceUsage) -> u64 {
+    usage.live_bytes + usage.trash_bytes + usage.old_version_bytes + usage.unreferenced_bytes
+}
+
+/// One block per space: its live files, trash, old versions and unreferenced chunks, then a note on how they count.
+fn usage_report(usages: &[(SpaceInfo, SpaceUsage)]) -> String {
+    if usages.is_empty() {
+        return "No spaces.\n".to_owned();
+    }
+    let mut report = String::new();
+    for (space, usage) in usages {
+        let rows = [
+            (
+                "Live files",
+                count(usage.live_files, "file"),
+                usage.live_bytes,
+            ),
+            (
+                "Trash",
+                count(usage.trashed_files, "file"),
+                usage.trash_bytes,
+            ),
+            (
+                "Old versions",
+                count(usage.old_versions, "version"),
+                usage.old_version_bytes,
+            ),
+            ("Unreferenced", String::new(), usage.unreferenced_bytes),
+            ("Total", String::new(), total_bytes(usage)),
+        ];
+        report.push_str(&format!(
+            "{} ({})\n",
+            printable(&space.name),
+            space.space_id
+        ));
+        for (label, what, bytes) in rows {
+            report.push_str(&format!("  {label:<14}{what:>14}  {:>9}\n", size(bytes)));
+        }
+    }
+    report.push_str(
+        "\nEach stored chunk counts once, under the first of live files, trash and old versions that holds it.\n\
+         Unreferenced chunks are uploads not committed yet and chunks waiting out the grace period before deletion.\n",
+    );
+    report
+}
+
+fn count(n: u64, noun: &str) -> String {
+    format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
+}
+
+/// Bytes in decimal units, such as 999 B, 1.0 kB or 1.5 GB.
+fn size(bytes: u64) -> String {
+    if bytes < 1000 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64;
+    for unit in ["kB", "MB", "GB", "TB"] {
+        value /= 1000.0;
+        if value < 999.95 {
+            return format!("{value:.1} {unit}");
+        }
+    }
+    format!("{:.1} PB", value / 1000.0)
 }
 
 /// A device ID as the server issues it: a lowercase UUID. Checked here so that the argument cannot name another path.
@@ -594,6 +711,53 @@ mod tests {
         assert_eq!(ago(now - 5 * 60_000, now), "5 min ago");
         assert_eq!(ago(now - 47 * 3_600_000, now), "47 h ago");
         assert_eq!(ago(now - 3 * 86_400_000, now), "3 days ago");
+    }
+
+    #[test]
+    fn sizes_read_in_decimal_units() {
+        assert_eq!(size(0), "0 B");
+        assert_eq!(size(999), "999 B");
+        assert_eq!(size(1_000), "1.0 kB");
+        assert_eq!(size(999_949), "999.9 kB");
+        assert_eq!(size(999_950), "1.0 MB");
+        assert_eq!(size(1_500_000_000), "1.5 GB");
+        assert_eq!(size(u64::MAX), "18446.7 PB");
+    }
+
+    #[test]
+    fn the_usage_report_lists_each_space_and_its_total() {
+        let space = SpaceInfo {
+            space_id: ID.into(),
+            name: "Home\u{1b}[2J".into(),
+            ..Default::default()
+        };
+        let usage = SpaceUsage {
+            live_files: 1_204,
+            live_bytes: 3_200_000_000,
+            trashed_files: 1,
+            trash_bytes: 40_100_000,
+            old_versions: 30,
+            old_version_bytes: 12_000_000,
+            unreferenced_bytes: 1_500_000,
+        };
+        assert_eq!(
+            usage_report(&[(space.clone(), usage)]),
+            format!(
+                "Home\\u{{1b}}[2J ({ID})\n\
+                 \x20 Live files        1204 files     3.2 GB\n\
+                 \x20 Trash                 1 file    40.1 MB\n\
+                 \x20 Old versions     30 versions    12.0 MB\n\
+                 \x20 Unreferenced                     1.5 MB\n\
+                 \x20 Total                            3.3 GB\n\
+                 \n\
+                 Each stored chunk counts once, under the first of live files, trash and old versions that holds it.\n\
+                 Unreferenced chunks are uploads not committed yet and chunks waiting out the grace period before deletion.\n"
+            )
+        );
+        assert_eq!(usage_report(&[]), "No spaces.\n");
+        let json = usage_json(&space, &usage);
+        assert_eq!(json["total_bytes"], 3_253_600_000u64);
+        assert_eq!(json["trashed_files"], 1);
     }
 
     #[test]
