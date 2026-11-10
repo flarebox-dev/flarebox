@@ -75,6 +75,7 @@ private struct QuestionDetail: View {
     let question: Question
     let folder: LinkedFolder?
     @State private var confirming: Answer?
+    @State private var isConfirming = false
     @State private var error: SessionError?
     @State private var answering = false
 
@@ -98,6 +99,7 @@ private struct QuestionDetail: View {
                         Button(question.title(for: answer), role: answer.isDestructive ? .destructive : nil) {
                             if answer.isDestructive {
                                 confirming = answer
+                                isConfirming = true
                             } else {
                                 send(answer)
                             }
@@ -122,7 +124,7 @@ private struct QuestionDetail: View {
         }
         .confirmationDialog(
             confirming.map { question.title(for: $0) } ?? "",
-            isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } }),
+            isPresented: $isConfirming,
             presenting: confirming
         ) { answer in
             Button(question.title(for: answer), role: .destructive) { send(answer) }

@@ -42,6 +42,7 @@ private struct FoldersSettings: View {
     @Environment(AppModel.self) private var model
     @State private var adding: SetupModel?
     @State private var unlinking: LinkedFolder?
+    @State private var isUnlinking = false
     @State private var error: SessionError?
 
     var body: some View {
@@ -67,7 +68,10 @@ private struct FoldersSettings: View {
                         Button("Show in Finder") {
                             NSWorkspace.shared.open(URL(filePath: folder.path, directoryHint: .isDirectory))
                         }
-                        Button("Unlink…") { unlinking = folder }
+                        Button("Unlink…") {
+                            unlinking = folder
+                            isUnlinking = true
+                        }
                     }
                     .padding(.vertical, 4)
                 }
@@ -89,7 +93,7 @@ private struct FoldersSettings: View {
         }
         .confirmationDialog(
             "Unlink \(unlinking?.spaceName ?? "")?",
-            isPresented: Binding(get: { unlinking != nil }, set: { if !$0 { unlinking = nil } }),
+            isPresented: $isUnlinking,
             presenting: unlinking
         ) { folder in
             Button("Unlink", role: .destructive) {
@@ -293,15 +297,18 @@ private struct ProblemRow: View {
 
 private struct GeneralSettings: View {
     @State private var loginItemStatus = SMAppService.mainApp.status
+    @State private var openAtLogin = false
     @State private var loginItemError: String?
 
     var body: some View {
         Form {
             Section {
-                Toggle("Open Flarebox at login", isOn: Binding(
-                    get: { loginItemStatus == .enabled || loginItemStatus == .requiresApproval },
-                    set: setOpenAtLogin
-                ))
+                Toggle("Open Flarebox at login", isOn: $openAtLogin)
+                    .onChange(of: openAtLogin) { _, on in
+                        if on != isRegistered {
+                            setOpenAtLogin(on)
+                        }
+                    }
                 if loginItemStatus == .requiresApproval {
                     HStack {
                         Text("Allow Flarebox in Login Items to finish.")
@@ -323,7 +330,16 @@ private struct GeneralSettings: View {
             }
         }
         .formStyle(.grouped)
-        .onAppear { loginItemStatus = SMAppService.mainApp.status }
+        .onAppear(perform: readStatus)
+    }
+
+    private var isRegistered: Bool {
+        loginItemStatus == .enabled || loginItemStatus == .requiresApproval
+    }
+
+    private func readStatus() {
+        loginItemStatus = SMAppService.mainApp.status
+        openAtLogin = isRegistered
     }
 
     private func setOpenAtLogin(_ on: Bool) {
@@ -337,7 +353,7 @@ private struct GeneralSettings: View {
         } catch {
             loginItemError = error.localizedDescription
         }
-        loginItemStatus = SMAppService.mainApp.status
+        readStatus()
     }
 }
 
