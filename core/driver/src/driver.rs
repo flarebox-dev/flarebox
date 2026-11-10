@@ -18,7 +18,7 @@ use tokio::sync::watch;
 
 use crate::claim::{self, Owner};
 use crate::config::{Config, ConfigError};
-use crate::credential::{Credential, CredentialError, api_for};
+use crate::credential::{Credential, CredentialError, NewCredentialFile, api_for};
 use crate::folder::FolderTask;
 use crate::ignore::{IgnoreInput, Matcher, RuleFile, RuleSource, matcher};
 use crate::paths::{Paths, PathsError};
@@ -239,6 +239,9 @@ impl Driver {
             });
         }
         let credential = Credential::load(&paths.credential())?;
+        if credential.is_some() {
+            Credential::keep_out_of_backups(&paths.credential())?;
+        }
         let folders = load_folders(&paths)?;
         Ok(Driver {
             inner: Arc::new(Inner {
@@ -313,6 +316,8 @@ impl Driver {
         if device_name.trim().is_empty() {
             return Err(DriverError::EmptyName);
         }
+        let file = NewCredentialFile::create(&self.inner.paths.credential())?;
+        self.unlink_folders_of_lost_credential().await?;
         let api = api_for(server)?;
         let issued = api
             .pair_complete(&PairCompleteRequest {
@@ -322,6 +327,7 @@ impl Driver {
             })
             .await?;
         self.adopt(
+            file,
             api.base().to_string(),
             issued,
             None,
@@ -347,6 +353,8 @@ impl Driver {
         if device_name.trim().is_empty() {
             return Err(DriverError::EmptyName);
         }
+        let file = NewCredentialFile::create(&self.inner.paths.credential())?;
+        self.unlink_folders_of_lost_credential().await?;
         let api = api_for(server)?;
         let issued = api
             .claim(&ClaimRequest {
@@ -358,6 +366,7 @@ impl Driver {
             })
             .await?;
         self.adopt(
+            file,
             api.base().to_string(),
             issued,
             Some(user_name.to_owned()),
@@ -408,6 +417,18 @@ impl Driver {
         Ok(())
     }
 
+    /// Unlinks the folders of a profile that has no credential, before it pairs or claims. Such folders were linked by
+    /// a device whose credential is gone, typically on a Mac restored from a backup, which leaves the credential out.
+    /// Their stores and owner records belong to that device, so the new device links the folders again; their files
+    /// stay.
+    async fn unlink_folders_of_lost_credential(&self) -> Result<(), DriverError> {
+        let roots = roots(&self.inner.folders.lock().unwrap());
+        for root in roots {
+            self.unlink_folder(&root).await?;
+        }
+        Ok(())
+    }
+
     fn check_unpaired(&self) -> Result<(), DriverError> {
         match self.inner.credential.lock().unwrap().as_ref() {
             Some(credential) => Err(DriverError::AlreadyPaired {
@@ -417,9 +438,10 @@ impl Driver {
         }
     }
 
-    /// Stores the credential the server issued, unless another one was stored meanwhile.
+    /// Stores the credential the server issued in `file`, unless another one was stored meanwhile.
     fn adopt(
         &self,
+        file: NewCredentialFile,
         server: String,
         issued: DeviceCredentials,
         user_name: Option<String>,
@@ -440,7 +462,7 @@ impl Driver {
                 device_id: existing.device_id.clone(),
             });
         }
-        credential.save_new(&self.inner.paths.credential())?;
+        file.write(&credential)?;
         tracing::info!(
             device_id = credential.device_id,
             server = credential.server,
@@ -708,7 +730,7 @@ impl Driver {
                 Some(credential) => self.spawn(folder, credential, linked),
                 None => halt(
                     folder,
-                    "this device is not paired; run flarebox pair".into(),
+                    "this device is signed out, for example after restoring a backup, which leaves out its sign-in; set it up again to sync this folder, and its files stay where they are".into(),
                 ),
             }
         }
@@ -2226,6 +2248,172 @@ mod tests {
         gate.open();
         sign_out.await.unwrap().unwrap();
         signed_out(&driver, &paths, &root);
+    }
+
+    #[tokio::test]
+    async fn a_profile_restored_without_its_credential_pairs_as_a_new_device_and_links_its_folder_again()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("notes.txt"), b"kept").unwrap();
+        let paths = Paths::under(&base.join("profile"));
+        let token = || {
+            prost::Message::encode_to_vec(&flarebox_proto::v1::AccessToken {
+                token: "token".into(),
+                expires_at_ms: i64::MAX,
+            })
+        };
+        let spaces = || {
+            prost::Message::encode_to_vec(&flarebox_proto::v1::SpaceList {
+                spaces: vec![SpaceInfo {
+                    space_id: SPACE.into(),
+                    name: "Projects".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+        };
+        let (server, held) = serve_held(vec![token(), spaces()]).await;
+        held.release.send(()).unwrap();
+        Credential {
+            server,
+            ..credential("d1")
+        }
+        .save_new(&paths.credential())
+        .unwrap();
+        let driver = Driver::open(paths.clone()).unwrap();
+        driver.link(&root, "Projects").await.unwrap();
+        drop(driver);
+        fs::remove_file(paths.credential()).unwrap();
+
+        let driver = Driver::open(paths.clone()).unwrap();
+        driver.start();
+        let status = driver.status();
+        assert_eq!(status.account, None);
+        assert_eq!(status.folders[0].state, FolderState::Halted);
+        let problem = status.folders[0].problem.clone().unwrap();
+        assert!(problem.contains("signed out"), "{problem}");
+        driver.stop().await;
+
+        let (server, held) = serve_held(vec![issued("d2"), token(), spaces()]).await;
+        held.release.send(()).unwrap();
+        driver.pair(&server, "code", "Mac").await.unwrap();
+        assert!(driver.status().folders.is_empty());
+        assert_eq!(claim::owner(&root).unwrap(), None);
+        assert!(!paths.store(SPACE).unwrap().parent().unwrap().exists());
+        driver.link(&root, "Projects").await.unwrap();
+        let status = driver.status();
+        assert_eq!(status.account.unwrap().device_id, "d2");
+        assert_eq!(status.folders.len(), 1);
+        assert_eq!(fs::read(root.join("notes.txt")).unwrap(), b"kept");
+        assert_eq!(
+            held.served.await.unwrap(),
+            ["/v1/pair/complete", "/v1/token", "/v1/spaces"]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn opening_the_profile_excludes_its_credential_from_time_machine_again() {
+        use crate::credential::BACKUP_EXCLUSION;
+        use crate::credential::tests::time_machine_excludes;
+
+        let home = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+        let paths = Paths::under(home.path());
+        paired(&paths, "d1");
+        assert!(time_machine_excludes(&paths.credential()));
+        rustix::fs::removexattr(paths.credential(), BACKUP_EXCLUSION.0).unwrap();
+        assert!(!time_machine_excludes(&paths.credential()));
+
+        drop(Driver::open(paths.clone()).unwrap());
+        assert!(time_machine_excludes(&paths.credential()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn opening_refuses_a_credential_it_cannot_keep_out_of_backups() {
+        use crate::credential::tests::time_machine_excludes;
+        use crate::credential::{BACKUP_EXCLUSION, CredentialError};
+
+        let home = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+        let paths = Paths::under(home.path());
+        paired(&paths, "d1");
+        rustix::fs::removexattr(paths.credential(), BACKUP_EXCLUSION.0).unwrap();
+        struct Unlock(std::path::PathBuf);
+        impl Drop for Unlock {
+            fn drop(&mut self) {
+                let status = std::process::Command::new("chflags")
+                    .arg("nouchg")
+                    .arg(&self.0)
+                    .status();
+                if !std::thread::panicking() {
+                    assert!(status.unwrap().success());
+                }
+            }
+        }
+        let status = std::process::Command::new("chflags")
+            .arg("uchg")
+            .arg(paths.credential())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let unlock = Unlock(paths.credential());
+        let refused = Driver::open(paths.clone()).err();
+        drop(unlock);
+        let error = refused.expect("the driver opened with a credential that backups would copy");
+        assert!(
+            matches!(
+                error,
+                DriverError::Credential(CredentialError::NotExcludedFromBackups { .. })
+            ),
+            "{error}"
+        );
+        assert!(error.to_string().contains("Time Machine"), "{error}");
+        assert!(error.to_string().contains("restart Flarebox"), "{error}");
+
+        drop(Driver::open(paths.clone()).unwrap());
+        assert!(time_machine_excludes(&paths.credential()));
+    }
+
+    #[tokio::test]
+    async fn a_credential_that_backups_would_copy_is_refused_before_the_server_uses_up_the_code() {
+        use crate::credential::tests::REFUSE_EXCLUSION;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let driver = Driver::open(paths.clone()).unwrap();
+        let (server, served) = serve_once(issued("d1")).await;
+        REFUSE_EXCLUSION.set(true);
+        let claimed = driver.claim(&server, "claim-code", "Ada", "laptop").await;
+        let paired = driver.pair(&server, "pair-code", "laptop").await;
+        REFUSE_EXCLUSION.set(false);
+        for refused in [claimed.err(), paired.err()] {
+            assert!(
+                matches!(
+                    refused,
+                    Some(DriverError::Credential(
+                        CredentialError::NotExcludedFromBackups { .. }
+                    ))
+                ),
+                "{refused:?}"
+            );
+        }
+        let state = fs::read_dir(paths.credential().parent().unwrap()).unwrap();
+        let left: Vec<_> = state.map(|entry| entry.unwrap().file_name()).collect();
+        assert!(
+            !left
+                .iter()
+                .any(|name| name.to_string_lossy().contains("credential")),
+            "{left:?}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), served)
+                .await
+                .is_err(),
+            "the server was asked for a credential"
+        );
     }
 
     #[tokio::test]
