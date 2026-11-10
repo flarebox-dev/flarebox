@@ -76,6 +76,11 @@ jobs:
           cache-dependency-path: server/pnpm-lock.yaml
       - name: Deploy a copy of server/ on its own (dry run, then wrangler dev and a claim)
         run: node server/scripts/check-deploy.mjs
+      - name: Install server dependencies
+        working-directory: server
+        run: pnpm install --frozen-lockfile
+      - name: Pack the server bundle that the CLI embeds
+        run: node server/scripts/pack-bundle.mjs "$RUNNER_TEMP/server-bundle"
 
   net-integration:
     name: net integration (ubuntu-latest)
