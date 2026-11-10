@@ -611,3 +611,71 @@ async fn a_malformed_server_message_drops_the_connection_as_a_protocol_violation
     ));
     drop(server.await.unwrap());
 }
+
+/// Queues about 10 MB of protocol-sized requests on a connection whose server has stopped reading, so the session
+/// blocks in a socket write.
+async fn block_a_write(session: &Arc<Session>) {
+    let calls = tokio::spawn({
+        let session = session.clone();
+        async move {
+            let chunks = vec![
+                ChunkRef {
+                    hash: vec![7; 32],
+                    size: 1,
+                    ..Default::default()
+                };
+                1000
+            ];
+            futures_util::future::join_all((0..250).map(|_| session.prepare_upload(chunks.clone())))
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!calls.is_finished(), "the server answers nothing");
+    calls.abort();
+    let _ = calls.await;
+}
+
+#[tokio::test]
+async fn close_interrupts_a_write_the_server_does_not_read() {
+    let (listener, auth) = listen().await;
+    let (session, mut events) = Session::start(auth, config()).unwrap();
+    let _server = accept(&listener, welcome("h", 0)).await;
+    assert!(matches!(next(&mut events).await, Event::Connected(_)));
+    let session = Arc::new(session);
+    block_a_write(&session).await;
+    let session = Arc::try_unwrap(session).unwrap();
+    let closed = tokio::time::timeout(Duration::from_millis(500), session.close()).await;
+    assert!(closed.is_ok(), "close does not wait for the blocked write");
+    assert!(matches!(
+        next(&mut events).await,
+        Event::Stopped(StopReason::Closed)
+    ));
+}
+
+#[tokio::test]
+async fn a_write_the_server_does_not_read_times_out() {
+    let (listener, auth) = listen().await;
+    let mut config = config();
+    config.write_timeout = Duration::from_millis(200);
+    let (session, mut events) = Session::start(auth, config).unwrap();
+    let _server = accept(&listener, welcome("h", 0)).await;
+    assert!(matches!(next(&mut events).await, Event::Connected(_)));
+    let session = Arc::new(session);
+    let disconnected =
+        tokio::spawn(
+            async move { tokio::time::timeout(Duration::from_secs(2), events.next()).await },
+        );
+    block_a_write(&session).await;
+    let event = disconnected.await.unwrap();
+    assert!(
+        matches!(
+            event,
+            Ok(Some(Event::Disconnected {
+                reason: DisconnectReason::Timeout,
+                ..
+            }))
+        ),
+        "{event:?}"
+    );
+}

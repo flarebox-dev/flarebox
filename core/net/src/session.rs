@@ -66,6 +66,8 @@ pub struct SessionConfig {
     pub connect_timeout: Duration,
     /// Bounds the wait for `Welcome` after `Hello`.
     pub welcome_timeout: Duration,
+    /// Bounds sending one message. A server that stops reading for this long counts as lost.
+    pub write_timeout: Duration,
     /// How many times a call refused with `CODE_RETRY_LATER` is sent again before the error is returned.
     pub retry_later_attempts: u32,
 }
@@ -91,6 +93,7 @@ impl SessionConfig {
             ping_interval: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(30),
             welcome_timeout: Duration::from_secs(30),
+            write_timeout: Duration::from_secs(60),
             retry_later_attempts: 5,
         }
     }
@@ -110,7 +113,8 @@ impl Events {
 #[derive(Debug)]
 pub struct Session {
     commands: mpsc::UnboundedSender<Command>,
-    /// Set by `close`; the task drops whatever it is waiting on. Dropping the session has the same effect.
+    /// Set by `close`; the task drops the connection and whatever it is waiting on, a blocked write included.
+    /// Dropping the session has the same effect.
     closing: watch::Sender<bool>,
     stopped: Arc<OnceLock<StopReason>>,
     commit_lock: Mutex<()>,
@@ -445,7 +449,13 @@ struct Task {
 impl Task {
     async fn run(mut self) {
         let reason = loop {
-            let (reason, now) = match self.connection().await {
+            let mut closing = self.closing.clone();
+            let exit = tokio::select! {
+                biased;
+                exit = self.connection() => exit,
+                () = closed(&mut closing) => Exit::Closed,
+            };
+            let (reason, now) = match exit {
                 Exit::Closed => break StopReason::Closed,
                 Exit::Stop(reason) => break reason,
                 Exit::Reconnect { reason, now } => (reason, now),
@@ -492,19 +502,16 @@ impl Task {
     }
 
     async fn connection(&mut self) -> Exit {
-        let mut closing = self.closing.clone();
-        let established = tokio::select! {
-            established = self.establish() => established,
-            () = closed(&mut closing) => return Exit::Closed,
-        };
-        let (mut socket, token, welcome) = match established {
+        let (mut socket, token, welcome) = match self.establish().await {
             Ok(established) => established,
             Err(exit) => return exit,
         };
         self.attempt = 0;
         self.emit(Event::Connected(welcome.clone()));
         if let Some(resume) = self.stream.reconnected()
-            && let Err(exit) = send(&mut socket, client_message::Msg::Resume(resume)).await
+            && let Err(exit) = self
+                .send(&mut socket, client_message::Msg::Resume(resume))
+                .await
         {
             return exit;
         }
@@ -604,7 +611,7 @@ impl Task {
     }
 
     async fn handshake(&mut self, socket: &mut Socket) -> Result<Welcome, Exit> {
-        send(
+        self.send(
             socket,
             client_message::Msg::Hello(self.config.hello.clone()),
         )
@@ -653,7 +660,7 @@ impl Task {
             })
             .collect();
         for request in calls {
-            send(socket, client_message::Msg::Rpc(request)).await?;
+            self.send(socket, client_message::Msg::Rpc(request)).await?;
         }
         Ok(())
     }
@@ -664,7 +671,6 @@ impl Task {
         let mut last_heard = Instant::now();
         let reauth = sleep_until(self.reauth_at(&token));
         tokio::pin!(reauth);
-        let mut closing = self.closing.clone();
         loop {
             tokio::select! {
                 item = socket.next() => {
@@ -686,13 +692,13 @@ impl Task {
                         }
                         Some(Command::Subscribe(history_id, since_seq)) => {
                             let resume = self.stream.subscribe(history_id, since_seq);
-                            send(&mut socket, client_message::Msg::Resume(resume)).await
+                            self.send(&mut socket, client_message::Msg::Resume(resume)).await
                         }
                         Some(Command::Call { call, commit, reply }) => {
                             let req_id = self.req_id();
                             let request = RpcRequest { req_id, call: Some(call.clone()) };
                             self.pending.insert(req_id, PendingCall { call, commit, reply });
-                            send(&mut socket, client_message::Msg::Rpc(request)).await
+                            self.send(&mut socket, client_message::Msg::Rpc(request)).await
                         }
                     };
                     if let Err(exit) = sent {
@@ -703,18 +709,12 @@ impl Task {
                     if last_heard.elapsed() > 2 * interval {
                         return Exit::Reconnect { reason: DisconnectReason::Timeout, now: false };
                     }
-                    if let Err(error) = socket.send(WsMessage::Ping(Default::default())).await {
-                        return Exit::transport(error);
+                    if let Err(exit) = self.write(&mut socket, WsMessage::Ping(Default::default())).await {
+                        return exit;
                     }
                 }
                 () = &mut reauth => {
-                    let refreshed = tokio::select! {
-                        refreshed = timeout(self.config.connect_timeout, self.auth.access_token()) => refreshed,
-                        () = closed(&mut closing) => {
-                            let _ = socket.close(None).await;
-                            return Exit::Closed;
-                        }
-                    };
+                    let refreshed = timeout(self.config.connect_timeout, self.auth.access_token()).await;
                     let Ok(refreshed) = refreshed else {
                         tracing::debug!("flarebox session timed out refreshing its access token");
                         reauth.as_mut().reset(Instant::now() + self.config.backoff.delay(0));
@@ -723,7 +723,7 @@ impl Task {
                     match refreshed {
                         Ok(fresh) if fresh.token != token.token => {
                             let message = client_message::Msg::Reauth(Reauth { access_token: fresh.token.clone() });
-                            if let Err(exit) = send(&mut socket, message).await {
+                            if let Err(exit) = self.send(&mut socket, message).await {
                                 return exit;
                             }
                             self.token = Some(fresh.token.clone());
@@ -871,8 +871,22 @@ impl Task {
             self.emit(event);
         }
         match fed.resume {
-            Some(resume) => send(socket, client_message::Msg::Resume(resume)).await,
+            Some(resume) => self.send(socket, client_message::Msg::Resume(resume)).await,
             None => Ok(()),
+        }
+    }
+
+    async fn send(&self, socket: &mut Socket, msg: client_message::Msg) -> Result<(), Exit> {
+        let bytes = ClientMessage { msg: Some(msg) }.encode_to_vec();
+        self.write(socket, WsMessage::Binary(bytes.into())).await
+    }
+
+    /// Sends one WebSocket message within `write_timeout`.
+    async fn write(&self, socket: &mut Socket, message: WsMessage) -> Result<(), Exit> {
+        match timeout(self.config.write_timeout, socket.send(message)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(Exit::transport(error)),
+            Err(_) => Err(Exit::timeout()),
         }
     }
 
@@ -890,14 +904,6 @@ impl Task {
 /// Resolves once the session is closed or dropped.
 async fn closed(closing: &mut watch::Receiver<bool>) {
     let _ = closing.wait_for(|closed| *closed).await;
-}
-
-async fn send(socket: &mut Socket, msg: client_message::Msg) -> Result<(), Exit> {
-    let bytes = ClientMessage { msg: Some(msg) }.encode_to_vec();
-    socket
-        .send(WsMessage::Binary(bytes.into()))
-        .await
-        .map_err(Exit::transport)
 }
 
 #[cfg(test)]
