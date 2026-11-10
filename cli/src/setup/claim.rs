@@ -397,6 +397,7 @@ mod tests {
         let answer = AccessToken {
             token: "access".into(),
             expires_at_ms: i64::MAX,
+            ..Default::default()
         };
         let fake = Fake::start(vec![token(200, answer.encode_to_vec())]).await;
         let (_dir, paths) = profile(&fake.base);
