@@ -1,55 +1,45 @@
 # Refresh credential rotation
 
-Status: design for spec/rfc/0011-refresh-credential-rotation.md. Nothing here is built yet. Where the client stores its credential (a file as today, or the Keychain on macOS) is decided separately; this note works with either.
+Status: design for spec/rfc/0011-refresh-credential-rotation.md. Nothing here is built yet.
 
-RFC 0011 defines the protocol. This note says how the server, `core/net`, `core/driver`, `core/ffi` and the CLI implement it, and how to test it.
+RFC 0011 defines the protocol: the device generates its next credential, stores it, and sends it with a token request, and the server stores it in place of the old one. This note says how the server, `core/net`, `core/driver`, `core/ffi` and the CLI implement it, and how to test it.
 
 ## Server
 
-**Schema.** One step appended to `server/src/account/schema.ts` adds two columns to `devices`:
+**No schema change.** `devices.refresh_hash` already holds the one credential the server accepts. A rotation overwrites it.
 
-- `refresh_issued_at_ms INTEGER`: when the current credential was issued. `NULL` for rows from before the step, which counts as due (RFC 0011 §1). Claim, pairing and recovery set it.
-- `next_refresh_hash BLOB`: the SHA-256 of the successor, or `NULL`.
+**`refreshAccess`.** It computes the SHA-256 of the presented credential and, if the request carries one, of `next_refresh_credential` before it reads the row, because hashing is asynchronous. Then, with no `await` between the read and the write:
 
-**`refreshAccess`.** It takes `rotate` from the request and compares the presented hash with both columns:
+1. It loads the active principal and applies the existing guards: unknown, revoked or expired is `UNAUTHENTICATED`.
+2. It compares the presented hash with `refresh_hash`. A mismatch is `UNAUTHENTICATED`.
+3. With a proposal, it updates `refresh_hash` together with the existing `last_seen_ms` update, in one statement, and sets `rotated` in the answer.
 
-1. It matches `next_refresh_hash`: set `refresh_hash` to it, `refresh_issued_at_ms` to now and `next_refresh_hash` to `NULL`, then answer with a token and no successor.
-2. It matches `refresh_hash`, `rotate` is set and the credential is due: generate a successor, store its hash in `next_refresh_hash` (replacing any), and answer with a token and the successor.
-3. It matches `refresh_hash` otherwise: answer with a token, as today.
-4. Anything else: `UNAUTHENTICATED`, as today.
+A proposal that does not match `^[A-Za-z0-9_-]{43}$` is `INVALID_ARGUMENT` before anything is read. A rotation adds no row write, since every refresh already writes `last_seen_ms`.
 
-Cases 1 and 2 write in the same statement as the existing `last_seen_ms` update, so a rotation adds no row write beyond the one every refresh already makes. `revokeUserDevice` also sets `next_refresh_hash` to `NULL`. The rotation period is a constant next to `ACCESS_TOKEN_MS`. The Worker passes `TokenRequest.rotate` through and puts the successor in `AccessToken.next_refresh_credential`.
-
-**Proto.** `TokenRequest.rotate = 3` and `AccessToken.next_refresh_credential = 3`, both additive, so `buf breaking` against main passes.
+**Proto.** `TokenRequest.next_refresh_credential = 3` and `AccessToken.rotated = 3`, both additive, so `buf breaking` against main passes.
 
 ## Clients
 
-**One credential per process.** Today each folder task builds its own `Auth` (core/driver/src/driver.rs, `spawn`), as do linking, the sign-out revocation and the FFI's server calls. Each would ask for its own successor, and each new successor replaces the last (RFC 0011 §1). So the driver builds one `Arc<Auth>` when it loads or receives the credential, and every caller in the process uses it: folder tasks, `link`, `revoke`, and the FFI's `signed_in` while a driver is open.
+**One credential per process.** Today each folder task builds its own `Auth` (core/driver/src/driver.rs, `spawn`), as do linking, the sign-out revocation and the FFI's server calls. After a rotation, every one of them except the one that rotated would present a credential the server refuses. So the driver builds one `Arc<Auth>` when it loads or receives the credential, and every caller in the process uses it: folder tasks, `link`, the sign-out revocation, and the FFI's `signed_in` while a driver is open.
 
-**`core/net`.** `Auth` keeps its `Credentials` behind the same lock as its cached token, and takes an optional store:
+**`core/net`.** `Auth` keeps its `Credentials` behind the same lock as its cached token, so one refresh at a time reads or changes them, and `Auth::credentials` returns a copy. It takes an optional store with three operations, each of which returns once its write is durable: stage a new credential, make the staged credential current, and clear the staged slot. With a store, `access_token` follows RFC 0011 §2 steps 1 to 6, and it learns the credential's age and any staged credential when it is built. Without a store, it never proposes a credential, and on `UNAUTHENTICATED` from `POST /v1/token` it calls a reload function once and presents what it returns (RFC 0011 §2, processes that only read).
 
-```rust
-pub trait CredentialStore: Send + Sync {
-    /// Keeps `next` next to the current credential; returns once it is written.
-    fn stage(&self, next: &str) -> io::Result<()>;
-    /// Makes the staged credential the only one.
-    fn confirm(&self, next: &str) -> io::Result<()>;
-    /// Forgets the staged credential.
-    fn discard(&self) -> io::Result<()>;
-}
-```
+**`core/driver`.** The two slots are two files in the state directory:
 
-With a store, `access_token` sets `rotate` and follows RFC 0011 §3. After `stage` succeeds, it presents the successor before it returns, so the successor is confirmed within one call. If `confirm` fails after the server accepted the successor, the record still holds the successor as staged, and the next start presents it first. Without a store, `Auth` never sets `rotate`. `Auth::credentials` returns a copy, because the credential can now change.
+- `credential.json` keeps its format, so a build from before rotation still reads it. Its modification time is when the credential last changed, which gives the credential's age without a new field. `Credential` has `deny_unknown_fields`, so a new field would make the file unreadable to an older build.
+- `credential.next` holds the staged credential, only while a rotation is unfinished. An older build ignores it.
 
-**`core/driver`.** `Credential` gets `next_refresh_credential: Option<String>` with `#[serde(default, skip_serializing_if = "Option::is_none")]`, so files written before this change still load. `Credential` has `deny_unknown_fields`, so an older build can't load a file that holds a staged credential. That window lasts from `stage` to `confirm`, one request, unless the confirmation failed. The file store's `stage`, `confirm` and `discard` write a temporary file with mode 0600, sync it, rename it over `credential.json` and sync the directory. `save_new` stays as it is for pairing. Only a `Driver`, which holds the profile lock, passes a store to `Auth`. Sign-out deletes the whole record, the staged credential included.
+Both are written to a temporary file with mode 0600, excluded from Time Machine as the credential file is at pairing, synced, renamed into place, and followed by a sync of the directory. Making the staged credential current writes `credential.json` first and removes `credential.next` second. A crash in between leaves both files with the same credential, and the next refresh presents the staged one, which the server accepts, and finishes. `save_new` stays as it is for pairing. Only a `Driver`, which holds the profile lock, gives its `Auth` a store. Sign-out deletes both files.
 
-**CLI.** The commands that call the server directly (`device list`, `device revoke`, `usage`) build an `Auth` without a store. On `UNAUTHENTICATED` from `POST /v1/token`, they load the credential again once and retry if its refresh credential differs (RFC 0011 §3). The command that opens its own driver goes through the driver's `Auth`.
+An older build that starts while `credential.next` exists uses `credential.json`. If the server already stored the staged credential, that build is refused and signed out. This only happens on a downgrade in the middle of a rotation, which is one request long unless the answer was lost.
 
-**macOS app.** The app opens its profile through the FFI driver, so it rotates like the daemon. Whether the record lives in `credential.json` or in a Keychain item, it holds the current and the staged credential together and is replaced in one write.
+**CLI.** The commands that call the server directly (`device list`, `device revoke`, `usage`) build an `Auth` without a store, whose reload function reads both files again. The command that opens its own driver goes through the driver's `Auth`.
+
+**macOS app.** The app opens its profile through the FFI driver, so it rotates like the daemon.
 
 ## Tests
 
-- Server (`server/test/`): no successor before the period or without `rotate`; a successor after it; a second request replaces the successor; presenting the successor makes it current and refuses the old credential; an old credential after a confirmation gets `UNAUTHENTICATED` and does not revoke the device; revocation forgets the successor; a row from before the schema step is due.
-- `core/net`, against a stub server: the successor answer is lost, and the next refresh still works with the current credential; `stage` fails, and the client keeps the current credential; the successor is refused, and the client discards it and goes on with the current one.
-- `core/driver`: a record with a staged credential presents it first after a restart; folder tasks and `link` share one `Auth`, so one rotation leaves every task working.
-- Against `wrangler dev`, with the rotation period shortened for the test: a daemon rotates while a CLI command holds the old credential, and the command succeeds after reading the record again; two profiles with copies of one record both refresh, and only one keeps working.
+- Server (`server/test/`): a request with a proposal stores it and sets `rotated`; the old credential is then refused, and the device is not revoked; a request without one changes nothing; a malformed proposal is `INVALID_ARGUMENT` and changes nothing; a revoked or expired principal's proposal is refused and changes nothing; two requests with different proposals from the same credential leave exactly one of them working.
+- `core/net`, against a stub server, for each cut of RFC 0011 §2: the stage write fails; the request is lost; the answer is lost and the next refresh presents the staged credential; the staged credential is refused and the current one is presented; a server without RFC 0011 answers without `rotated`. In each case the client ends with a credential the stub accepts. A store-less `Auth` that is refused presents the reloaded staged credential first and then the current one.
+- `core/driver`: the age comes from the file's modification time; a crash between the two writes of a promotion finishes on the next refresh; folder tasks and `link` share one `Auth`, so one rotation leaves every task working.
+- Against `wrangler dev`, with the rotation period shortened for the test: a daemon rotates while a CLI command holds the old credential, and the command succeeds after reading the files again; two profiles with copies of one credential both run, and only one keeps working after the first rotation.
