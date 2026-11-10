@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `flarebox` command: sets up a server or joins one, links folders, shows status and questions, manages the
-//! account's devices, shows what each space stores, and runs the sync daemon. Commands run in the daemon through its
-//! socket when it is running, and on their own otherwise. The device and usage commands read only the credential and
-//! talk to the server directly.
+//! The `flarebox` command: sets up a server or joins one, links folders, shows status and questions, lists a folder's
+//! trash and a file's versions, manages the account's devices, shows what each space stores, and runs the sync daemon.
+//! Commands run in the daemon through its socket when it is running, and on their own otherwise. The device, usage,
+//! trash and versions commands talk to the server directly with the credential.
 
+mod history;
 mod ipc;
 mod pairing;
 mod setup;
@@ -87,6 +88,20 @@ enum Command {
     Device {
         #[command(subcommand)]
         action: DeviceAction,
+    },
+    /// List what was deleted in a linked folder and is still in its space's trash.
+    Trash {
+        /// A linked folder, or a folder inside one.
+        #[arg(default_value = ".")]
+        folder: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the versions the server keeps of a file in a linked folder, newest first.
+    Versions {
+        file: PathBuf,
+        #[arg(long)]
+        json: bool,
     },
     /// Show how many bytes each space stores: in live files, in the trash and in old versions.
     Usage {
@@ -177,6 +192,8 @@ fn main() -> ExitCode {
             Command::Daemon { .. } => daemon(paths).await,
             Command::Device { action } => device(paths, action).await,
             Command::Usage { json } => usage(paths, json).await,
+            Command::Trash { folder, json } => history::trash(&paths, &folder, json).await,
+            Command::Versions { file, json } => history::versions(&paths, &file, json).await,
             Command::Setup {
                 code: None,
                 device,
@@ -286,6 +303,8 @@ async fn client(paths: Paths, command: Command) -> Result<(), String> {
         Command::Daemon { .. }
         | Command::Device { .. }
         | Command::Usage { .. }
+        | Command::Trash { .. }
+        | Command::Versions { .. }
         | Command::Setup { code: None, .. }
         | Command::Server { .. } => {
             unreachable!("main runs these commands itself")

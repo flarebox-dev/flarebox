@@ -519,10 +519,13 @@ dependencies = [
 name = "flarebox-cli"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "clap",
  "fastrand",
+ "flarebox-chunk",
  "flarebox-cloudflare",
  "flarebox-driver",
+ "flarebox-engine",
  "flarebox-net",
  "flarebox-proto",
  "getrandom 0.4.3",

@@ -8,7 +8,7 @@
 mod bundle_files;
 mod claim;
 #[cfg(test)]
-mod fake;
+pub(crate) mod fake;
 mod state;
 mod uninstall;
 
