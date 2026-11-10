@@ -3,8 +3,8 @@
 // An in-memory stand-in for the parts of the Cloudflare API that run.ts and Wrangler's tail use, plus the two Worker
 // routes the claim calls, for run.unit.ts. Point CLOUDFLARE_API_BASE_URL at url + "/client/v4" and the state's server
 // URL at url. The tail is a minimal WebSocket server that pushes one request event whose log line carries the claim
-// code each time /setup is requested. POST /mock/workers/<name> creates a Worker from another process, as a concurrent
-// creator or Wrangler would.
+// code each time /setup is requested. POST /mock/workers/<name> with an optional {"tag"} uploads a Worker version from
+// another process, creating the Worker if needed, as a concurrent creator or `wrangler deploy --tag` would.
 
 import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -12,6 +12,8 @@ import type { Socket } from "node:net";
 
 export interface MockWorker {
   id: string;
+  /** Newest first, with the `workers/tag` annotation of the upload that created each. */
+  versions: { id: string; tag?: string }[];
 }
 
 export interface MockBucket {
@@ -48,9 +50,9 @@ export class MockCloudflare {
     await new Promise<void>((resolve) => this.server?.close(() => resolve()) ?? resolve());
   }
 
-  /** A Worker with its two Durable Object namespaces, as a deploy would leave it. */
-  addWorker(name: string, id: string = crypto.randomUUID()): MockWorker {
-    const worker = { id };
+  /** A Worker with one version and its two Durable Object namespaces, as a deploy with this tag would leave it. */
+  addWorker(name: string, id: string = crypto.randomUUID(), tag?: string): MockWorker {
+    const worker = { id, versions: [{ id: crypto.randomUUID(), tag }] };
     this.workers.set(name, worker);
     this.namespaces.push({ id: id + "-account", class: "AccountDO", script: name }, { id: id + "-space", class: "SpaceDO", script: name });
     return worker;
@@ -115,7 +117,13 @@ export class MockCloudflare {
         response.end("A one-time claim code, valid for one hour, is in this Worker's logs.\n\nFlarebox is not affiliated with Cloudflare, Inc.\n");
         return;
       }
-      if ((match = /^\/mock\/workers\/([^/]+)$/.exec(path)) && method === "POST") return send(200, this.addWorker(match[1]!));
+      if ((match = /^\/mock\/workers\/([^/]+)$/.exec(path)) && method === "POST") {
+        const { tag } = JSON.parse(body || "{}") as { tag?: string };
+        const worker = this.workers.get(match[1]!);
+        if (!worker) return send(200, this.addWorker(match[1]!, undefined, tag));
+        worker.versions.unshift({ id: crypto.randomUUID(), tag });
+        return send(200, worker);
+      }
       if (path === "/v1/claim") {
         const claimed = JSON.parse(body) as { code?: string };
         if (this.claimStatus !== 200 || claimed.code !== this.claimCode) return send(403, { code: "CODE_FORBIDDEN", message: "wrong claim code" });
@@ -134,6 +142,17 @@ export class MockCloudflare {
         const name = match[1];
         for (let i = this.namespaces.length - 1; i >= 0; i--) if (this.namespaces[i]!.script === name) this.namespaces.splice(i, 1);
         return ok(null);
+      }
+      if ((match = /^\/workers\/scripts\/([^/]+)\/versions$/.exec(api)) && method === "GET") {
+        const worker = this.workers.get(match[1]!);
+        if (!worker) return missing();
+        const page = Number(new URL(request.url ?? "/", this.url).searchParams.get("page") ?? "1");
+        return ok({ items: page === 1 ? worker.versions.map((version, i) => ({ id: version.id, number: worker.versions.length - i })) : [] });
+      }
+      if ((match = /^\/workers\/scripts\/([^/]+)\/versions\/([^/]+)$/.exec(api)) && method === "GET") {
+        const version = this.workers.get(match[1]!)?.versions.find((candidate) => candidate.id === match![2]);
+        if (!version) return missing();
+        return ok({ id: version.id, annotations: { "workers/triggered_by": "upload", ...(version.tag ? { "workers/tag": version.tag } : {}) } });
       }
       if ((match = /^\/workers\/scripts\/([^/]+)\/tails$/.exec(api)) && method === "POST") {
         return ok({ id: "tail-1", url: this.url.replace("http", "ws") + "/tail", expires_at: new Date(Date.now() + 3_600_000).toISOString() });

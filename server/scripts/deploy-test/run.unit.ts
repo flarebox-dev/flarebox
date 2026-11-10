@@ -76,18 +76,30 @@ function runTs(...args: string[]): Promise<{ status: number | null; output: stri
   });
 }
 
+interface Step {
+  /** Uploads a version of the run's Worker through the mock, creating the Worker if needed. */
+  createsWorker: boolean;
+  /** Whether that upload carries the deploy's --tag, as Wrangler's does; a concurrent creator's never does. */
+  tagged?: boolean;
+  status: number;
+}
+
 /**
- * Puts a pnpm on run.ts's PATH that logs its arguments, creates the run's Worker through the mock when a step says so
- * (as a concurrent creator during install, or as Wrangler during deploy), and exits with the step's status. A deploy
- * that exits 0 prints what wrangler deploy prints.
+ * Puts a pnpm on run.ts's PATH that logs its arguments without --tag, uploads the run's Worker through the mock when a
+ * step says so (as a concurrent creator during install, or as Wrangler during deploy), and exits with the step's status.
+ * A deploy that exits 0 prints what wrangler deploy prints.
  */
-function fakePnpm(steps: { install: { createsWorker: boolean; status: number }; deploy: { createsWorker: boolean; status: number } }): void {
+function fakePnpm(steps: { install: Step; deploy: Step }): void {
   const script = `#!${process.execPath}
 const { appendFileSync } = require("node:fs");
 const steps = ${JSON.stringify(steps)};
 const step = process.argv[2] === "install" ? steps.install : steps.deploy;
-appendFileSync(process.env.FAKE_PNPM_LOG, process.argv.slice(2).join(" ") + "\\n");
-const created = step.createsWorker ? fetch(process.env.MOCK_URL + "/mock/workers/${NAME}", { method: "POST" }) : Promise.resolve();
+const args = process.argv.slice(2);
+const at = args.indexOf("--tag");
+const tag = at >= 0 ? args.splice(at, 2)[1] : undefined;
+appendFileSync(process.env.FAKE_PNPM_LOG, args.join(" ") + "\\n");
+const body = JSON.stringify(process.argv[2] !== "install" && step.tagged !== false ? { tag } : {});
+const created = step.createsWorker ? fetch(process.env.MOCK_URL + "/mock/workers/${NAME}", { method: "POST", body }) : Promise.resolve();
 created.then(() => {
   if (process.argv[2] !== "install" && step.status === 0) {
     console.log("Deployed ${NAME} triggers\\n  https://${NAME}.mock.workers.dev\\nCurrent Version ID: 00000000-0000-4000-8000-000000000001");
@@ -214,6 +226,33 @@ describe("deploy", () => {
     expect(tornDown.status).toBe(0);
     expect(mock.workers.has(NAME)).toBe(false);
     expect(mock.buckets.has(NAME)).toBe(false);
+  });
+});
+
+describe("a deploy that fails after creating the Worker", () => {
+  it("leaves proof that this run created the Worker, so teardown deletes it, its Durable Objects and the bucket", async () => {
+    fakePnpm({ install: { createsWorker: false, status: 0 }, deploy: { createsWorker: true, status: 1 } });
+    const deployed = await runTs("deploy", "HEAD");
+    expect(deployed.status).toBe(1);
+    expect(pnpmCalls()).toEqual(["install --frozen-lockfile", "run deploy"]);
+    expect(mock.workers.has(NAME)).toBe(true);
+    const tornDown = await runTs("teardown");
+    expect(tornDown.output).not.toContain("::error::");
+    expect(tornDown.status).toBe(0);
+    expect(mock.workers.has(NAME)).toBe(false);
+    expect(mock.namespaces.filter((namespace) => namespace.script === NAME)).toEqual([]);
+    expect(mock.buckets.has(NAME)).toBe(false);
+  });
+
+  it("fails teardown loudly and names the Worker to delete by hand when no upload of this run's deploy is on it", async () => {
+    fakePnpm({ install: { createsWorker: false, status: 0 }, deploy: { createsWorker: true, tagged: false, status: 1 } });
+    expect((await runTs("deploy", "HEAD")).status).toBe(1);
+    const tornDown = await runTs("teardown");
+    expect(tornDown.status).toBe(1);
+    expect(mock.deletes().filter((request) => request.includes("/workers/"))).toEqual([]);
+    expect(mock.workers.has(NAME)).toBe(true);
+    expect(tornDown.output).toContain("::error::teardown: a Worker named " + NAME);
+    expect(tornDown.output).toContain("delete the Worker " + NAME + " by hand");
   });
 });
 
