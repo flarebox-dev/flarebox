@@ -443,7 +443,7 @@ fn a_restore_waits_while_s_lags_what_l_and_r_agree_on() {
     };
     trees.set_local(m.clone(), folder("g", true));
     trees.settle();
-    assert_eq!(trees.synced().live(&n), Some(&file(&root(), "f", 2)));
+    assert_eq!(trees.synced().live(&n), Some(&file(&root(), "f", 1)));
 
     // A restore sent now would leave L with content S does not show, and the engine would
     // upload it over the restored version as if the user had written it.

@@ -510,6 +510,46 @@ fn a_renamed_result_reverts_the_local_name_to_the_server_one() {
     moves_back(&mut trees, &mut ids, "a");
 }
 
+/// Another device renames and rewrites n, and the disk takes both, so L and R agree. S cannot take
+/// the new name yet, because the folder p it holds there is parked on its way to q. S still takes
+/// the content both sides hold, so the other device's next edit is not taken for a concurrent one
+/// and forked: once p has moved, S takes the name and the edit is a remote change.
+#[test]
+fn a_download_s_cannot_place_yet_is_not_forked_by_the_next_remote_edit() {
+    let mut trees = trees(&[
+        (
+            "p",
+            Some(dir(ROOT, "y")),
+            Some(dir(ROOT, "y")),
+            Some(remote(dir(ROOT, "q"))),
+        ),
+        (
+            "n",
+            Some(file(ROOT, "y", 2)),
+            Some(file(ROOT, "x", 1)),
+            Some(remote(file(ROOT, "y", 2))),
+        ),
+    ]);
+    trees.set_local(
+        "p".into(),
+        LocalNode {
+            parked: true,
+            ..local(dir(ROOT, "y"), 1)
+        },
+    );
+    trees.settle();
+    assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "x", 2)));
+    trees.set_remote("n".into(), remote(file(ROOT, "y", 3)));
+    trees.settle();
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    trees.set_local("p".into(), local(dir(ROOT, "q"), 1));
+    trees.settle();
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "y", 2)));
+    assert_eq!(trees.class("n"), Class::Remote);
+}
+
 #[test]
 fn a_local_edit_on_a_reverted_file_is_kept_on_disk_and_uploaded() {
     let mut trees = trees(&[("a", Some(file(ROOT, "x", 1)), None, None)]);

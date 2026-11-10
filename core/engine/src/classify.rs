@@ -607,7 +607,9 @@ impl Trees {
     /// non-empty set of the remaining [`Class::Same`] updates can be made together with S still valid,
     /// searching each group of updates that depend on each other exhaustively. A group of more
     /// than [`SETTLE_GROUP_LIMIT`] updates is not searched: its nodes stay dirty as [`Class::Same`] and
-    /// [`Trees::unsearched`] lists them. [`Trees::work`] gives the dirty nodes that are left.
+    /// [`Trees::unsearched`] lists them. A [`Class::Same`] node whose update is left still takes R's
+    /// content into S, unless an acknowledged update of the node waits, since content never breaks S, so a later change on either side is compared
+    /// with the content both sides already hold. [`Trees::work`] gives the dirty nodes that are left.
     pub fn settle(&mut self) {
         self.reverted
             .retain(|id| match (self.l.get(id), self.r.live(id)) {
@@ -685,6 +687,21 @@ impl Trees {
         for id in taken {
             if !self.parked(&id) {
                 self.dirty.remove(&id);
+            }
+        }
+        for id in &pending {
+            let (Some(synced), Some(remote)) = (self.s.get(id), self.r.live(id)) else {
+                continue;
+            };
+            if self.waiting.contains_key(id) {
+                continue;
+            }
+            if synced.content != remote.content {
+                let next = Shape {
+                    content: remote.content.clone(),
+                    ..synced.clone()
+                };
+                self.set_synced_unmarked(id, Some(next));
             }
         }
         self.same = pending;
