@@ -64,6 +64,7 @@ async fn auth_claims_pairs_refreshes_and_refuses_bad_credentials() {
         user_name: "x".into(),
         device_name: "x".into(),
         platform: "x".into(),
+        setup_attempt: String::new(),
     };
     match api().claim(&again).await {
         Err(ApiError::Server { status: 403, error }) => assert_eq!(error.code(), Code::Forbidden),

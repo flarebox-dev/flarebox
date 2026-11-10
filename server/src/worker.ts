@@ -215,6 +215,9 @@ async function route(request: Request, env: Env): Promise<Response> {
       protoMax: PROTO_MAX,
       dataPath: ServerInfo_DataPath.RELAY,
       claimed: await account(env).isClaimed(),
+      setupAttempts: await account(env)
+        .handlesSetupAttempts()
+        .catch(() => false),
     });
     return reply(request, ServerInfoSchema, info);
   }

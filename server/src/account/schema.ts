@@ -71,6 +71,11 @@ export const MIGRATIONS: readonly Migration[] = [
     sql.exec("UPDATE devices SET list_seq = rowid WHERE list_seq IS NULL");
     sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS devices_list_seq ON devices(list_seq)");
   },
+  // The setup attempt of a device made by a recovery-key claim (ClaimRequest.setup_attempt).
+  (sql) => {
+    const columns = sql.exec("SELECT name FROM pragma_table_info('devices')").toArray().map((row) => row.name);
+    if (!columns.includes("setup_attempt")) sql.exec("ALTER TABLE devices ADD COLUMN setup_attempt TEXT");
+  },
 ];
 
 export function migrate(sql: SqlStorage): void {

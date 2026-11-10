@@ -17,8 +17,11 @@ export const MAX_FAILURE_ROWS = 10_000;
 export const NO_ADDRESS = "(no address)";
 /** Recovery keys shorter than this are ignored, so a short secret never opens the deployment. */
 export const MIN_RECOVERY_KEY_LENGTH = 32;
+/** The longest ClaimRequest.setup_attempt the server stores. */
+export const MAX_SETUP_ATTEMPT_LENGTH = 64;
 
-export type ClaimOutcome = { ok: true } | { ok: false; code: Error_Code; message: string };
+/** A successful claim lists the earlier devices of its setup attempt, for the caller to revoke once it has committed. */
+export type ClaimOutcome = { ok: true; revoke: string[] } | { ok: false; code: Error_Code; message: string };
 
 export interface ClaimAttempt {
   /** SHA-256 of the presented code after normalization, for claim codes. */
@@ -34,6 +37,9 @@ export interface ClaimAttempt {
   ownerBefore: string | undefined;
   userId: string;
   userName: string;
+  /** The prepared device, and the client's setup attempt id, or empty. */
+  deviceId: string;
+  setupAttempt: string;
   /** Stores the prepared device; called inside the transaction, after every check passed. */
   storeDevice(): void;
 }
@@ -125,7 +131,7 @@ export function redeemClaim(sql: SqlStorage, attempt: ClaimAttempt): ClaimOutcom
   sql.exec("DELETE FROM claim_failures WHERE scope = 'claim'");
   sql.exec("INSERT INTO users (user_id, name, created_at_ms) VALUES (?, ?, ?)", attempt.userId, attempt.userName || "Owner", attempt.nowMs);
   attempt.storeDevice();
-  return { ok: true };
+  return { ok: true, revoke: key ? joinAttempt(sql, attempt) : [] };
 }
 
 /** A wrong key counts and throttles the same with or without a configured key, so answers do not reveal whether one is. */
@@ -135,7 +141,25 @@ function recover(sql: SqlStorage, attempt: ClaimAttempt): ClaimOutcome {
   const spent = spendKey(sql, key, attempt.nowMs);
   if (spent) return spent;
   attempt.storeDevice();
-  return { ok: true };
+  return { ok: true, revoke: joinAttempt(sql, attempt) };
+}
+
+/**
+ * Records the new device's setup attempt and returns the attempt's earlier devices that never refreshed a token. Their
+ * credentials never reached the client, so nobody can use them.
+ */
+function joinAttempt(sql: SqlStorage, attempt: ClaimAttempt): string[] {
+  if (!attempt.setupAttempt) return [];
+  sql.exec("UPDATE devices SET setup_attempt = ? WHERE device_id = ?", attempt.setupAttempt, attempt.deviceId);
+  return sql
+    .exec(
+      "SELECT device_id FROM devices WHERE setup_attempt = ? AND user_id = ? AND device_id != ? AND last_seen_ms IS NULL AND revoked_at_ms IS NULL",
+      attempt.setupAttempt,
+      attempt.userId,
+      attempt.deviceId,
+    )
+    .toArray()
+    .map((row) => String(row.device_id));
 }
 
 /** The Worker's recovery key hash, if the attempt presents that key. */
