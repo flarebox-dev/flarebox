@@ -1392,6 +1392,21 @@ mod tests {
         assert_eq!(driver.status().folders[0].state, FolderState::Stopped);
     }
 
+    #[tokio::test]
+    async fn a_restart_that_halts_at_once_returns_the_halt() {
+        let (_dir, paths, root) = profile(&[]);
+        credential("d2").save_new(&paths.credential()).unwrap();
+        let driver = Driver::open(paths).unwrap();
+        driver.start();
+        let restarted = driver.restart(&root).await.unwrap();
+        assert_eq!(restarted.state, FolderState::Halted);
+        assert!(
+            restarted.problem.as_ref().unwrap().contains("device d1"),
+            "{restarted:?}"
+        );
+        driver.stop().await;
+    }
+
     /// A server address nobody answers.
     const NOWHERE: &str = "http://127.0.0.1:9/";
 

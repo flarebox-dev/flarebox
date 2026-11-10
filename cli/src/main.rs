@@ -348,14 +348,21 @@ async fn client(paths: Paths, command: Command) -> Result<(), String> {
             );
             Ok(())
         }
-        Response::Restarted { folder } => {
-            if folder.state == flarebox_driver::FolderState::Stopped {
+        Response::Restarted { folder } => match folder.state {
+            flarebox_driver::FolderState::Stopped => {
                 println!("Run flarebox daemon to sync {}.", folder.path);
-            } else {
-                println!("Syncing {} again.", folder.path);
+                Ok(())
             }
-            Ok(())
-        }
+            flarebox_driver::FolderState::Halted => Err(format!(
+                "{} cannot sync: {}",
+                folder.path,
+                folder.problem.unwrap_or_default()
+            )),
+            _ => {
+                println!("Syncing {} again.", folder.path);
+                Ok(())
+            }
+        },
         Response::Status { status } if json => print_json(&status),
         Response::Status { status } => {
             print_status(&status);
