@@ -560,8 +560,13 @@ fn rekey(trees: &mut Trees, from: &str, to: &str) {
         .filter(|(_, child)| child.shape.parent == from)
         .map(|(id, _)| id.clone())
         .collect();
+    let parked_name = trees.parked_name(from).to_owned();
+    let parked = node.parked;
     trees.remove_local(from);
     trees.set_local(to.to_owned(), node);
+    if parked {
+        trees.park_as(to.to_owned(), parked_name);
+    }
     for id in children {
         let mut child = trees.local().get(&id).cloned().expect("listed above");
         child.shape.parent = to.to_owned();

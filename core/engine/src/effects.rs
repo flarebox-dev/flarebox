@@ -428,7 +428,7 @@ impl<'a> View<'a> {
         };
         Step::Apply(
             Effect::Move {
-                from: Location::Parked(id.to_owned()),
+                from: Location::Parked(self.trees.parked_name(id).to_owned()),
                 identity: local.identity,
                 to,
             },
@@ -521,7 +521,7 @@ impl<'a> View<'a> {
     fn location(&self, id: &str) -> Option<Location> {
         let node = self.trees.local().get(id)?;
         if node.parked {
-            return Some(Location::Parked(id.to_owned()));
+            return Some(Location::Parked(self.trees.parked_name(id).to_owned()));
         }
         self.location_in(&node.shape.parent, &node.shape.name)
     }
@@ -543,7 +543,7 @@ impl<'a> View<'a> {
                 dirs.reverse();
                 return Some(Location::At {
                     base: Base::Parked {
-                        node: current.to_owned(),
+                        node: self.trees.parked_name(current).to_owned(),
                         identity: node.identity,
                     },
                     dirs,

@@ -50,6 +50,7 @@ pub struct Trees {
     dirty: BTreeSet<NodeId>,
     unsearched: BTreeSet<NodeId>,
     reverted: BTreeSet<NodeId>,
+    parked_as: BTreeMap<NodeId, NodeId>,
 }
 
 impl Trees {
@@ -62,6 +63,7 @@ impl Trees {
             dirty: BTreeSet::new(),
             unsearched: BTreeSet::new(),
             reverted: BTreeSet::new(),
+            parked_as: BTreeMap::new(),
         }
     }
 
@@ -93,13 +95,31 @@ impl Trees {
     }
 
     pub fn set_local(&mut self, id: NodeId, node: LocalNode) {
+        if !node.parked {
+            self.parked_as.remove(&id);
+        }
         self.dirty.insert(id.clone());
         self.l.insert(id, node);
     }
 
     pub fn remove_local(&mut self, id: &str) {
+        self.parked_as.remove(id);
         if self.l.remove(id).is_some() {
             self.dirty.insert(id.to_owned());
+        }
+    }
+
+    /// The name of a parked node's entry in the parked directory: its ID, or, for a node re-keyed
+    /// while parked, the ID it was parked under. The entry keeps that name until it leaves the
+    /// parked directory.
+    pub fn parked_name<'a>(&'a self, id: &'a str) -> &'a str {
+        self.parked_as.get(id).map_or(id, String::as_str)
+    }
+
+    /// Records that parked node `id` sits in the parked directory under `name`.
+    pub fn park_as(&mut self, id: NodeId, name: NodeId) {
+        if id != name {
+            self.parked_as.insert(id, name);
         }
     }
 

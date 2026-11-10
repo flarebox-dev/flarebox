@@ -5,7 +5,7 @@
 
 use flarebox_engine::classify::{Class, Trees};
 use flarebox_engine::commit::{Commits, Failure, Halt, MAX_OPS, Reconnect};
-use flarebox_engine::effects::{Effect, Effects};
+use flarebox_engine::effects::{Effect, Effects, Location};
 use flarebox_engine::ids::IdGen;
 use flarebox_engine::names::{MAX_NAME_BYTES, nfc, normalize_name};
 use flarebox_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape};
@@ -679,6 +679,96 @@ fn a_folder_deleted_around_a_parked_node_is_brought_back_for_it() {
         assert_eq!((&f.shape, f.parked), (&file("d", name, 1), false));
         assert_eq!(build(&mut commits, &mut trees, &mut ids), None, "{name}");
     }
+}
+
+#[test]
+fn a_parked_file_rekeyed_for_its_edit_is_moved_out_from_where_it_was_parked() {
+    let mut trees = trees(&[
+        (
+            "a",
+            Some(file(ROOT, "x", 2)),
+            Some(file(ROOT, "x (conflict)", 1)),
+            Some(remote(file(ROOT, "y", 1))),
+        ),
+        (
+            "c",
+            Some(file(ROOT, "y", 4)),
+            Some(file(ROOT, "y (conflict)", 4)),
+            Some(remote(file(ROOT, "x", 4))),
+        ),
+    ]);
+    trees.revert("a".into());
+    trees.revert("c".into());
+    let (mut commits, mut ids, mut effects) =
+        (Commits::default(), IdGen::new(1), Effects::default());
+    let parking = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    assert!(
+        matches!(&parking.effect, Effect::Move { to: Location::Parked(id), .. } if id == "a"),
+        "{parking:?}"
+    );
+    effects.done(&mut trees, &parking.effect_id, None).unwrap();
+    trees.set_remote("a".into(), trashed(file(ROOT, "y", 1)));
+    trees.set_remote("c".into(), trashed(file(ROOT, "x", 4)));
+    trees.set_local("b".into(), local(file(ROOT, "x", 3), 3));
+    trees.settle();
+    let remove = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    assert_eq!(remove.node, "c");
+    effects.done(&mut trees, &remove.effect_id, None).unwrap();
+    trees.settle();
+    assert!(effects.plan(&trees, &mut ids, NOW).is_none());
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(commit.ops.len(), 2);
+    let rekeyed = trees
+        .local()
+        .iter()
+        .find(|(_, node)| node.parked)
+        .unwrap()
+        .0
+        .clone();
+    assert_ne!(rekeyed, "a");
+    assert_eq!(trees.parked_name(&rekeyed), "a");
+    trees.set_remote(rekeyed.clone(), remote(file(ROOT, "x", 2)));
+    trees.set_remote("b".into(), remote(file(ROOT, "x (new conflict)", 3)));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![
+            outcome(op_result::Code::Applied),
+            OpResult {
+                name: "x (new conflict)".into(),
+                ..outcome(op_result::Code::AppliedRenamed)
+            },
+        ],
+    );
+    let mut unparked = false;
+    for ino in 10..16 {
+        trees.settle();
+        let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() else {
+            break;
+        };
+        if record.node == rekeyed {
+            let Effect::Move { from, .. } = &record.effect else {
+                panic!("{record:?}");
+            };
+            assert_eq!(from, &Location::Parked("a".into()));
+            unparked = true;
+        }
+        let identity = FileIdentity {
+            dev: 1,
+            ino,
+            birth_ns: 0,
+        };
+        effects
+            .done(&mut trees, &record.effect_id, Some(identity))
+            .unwrap();
+    }
+    assert!(unparked);
+    assert_eq!(trees.settle(), vec![]);
+    let node = trees.local().get(&rekeyed).unwrap();
+    assert_eq!((&node.shape, node.parked), (&file(ROOT, "x", 2), false));
+    assert_eq!(trees.parked_name(&rekeyed), rekeyed);
+    let b = &trees.local().get("b").unwrap().shape;
+    assert_eq!(b, &file(ROOT, "x (new conflict)", 3));
 }
 
 #[test]
