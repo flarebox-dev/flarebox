@@ -31,6 +31,8 @@ export interface NodeRow {
   content_dev: string;
   meta_rev: number;
   meta_dev: string;
+  /** The seq at which the node last took a new parent or came back from the trash. */
+  parent_rev: number;
   cur_version_id: string | null;
   trash_group: string | null;
   trashed_at_ms: number | null;

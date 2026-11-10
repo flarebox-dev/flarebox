@@ -56,6 +56,8 @@ pub(super) struct Applier<'a> {
     remap: HashMap<String, String>,
     touched: Vec<String>,
     touched_set: BTreeSet<String>,
+    /// The R3 conflict copies this commit made.
+    conflict_copies: BTreeSet<String>,
 }
 
 impl<'a> Applier<'a> {
@@ -66,6 +68,7 @@ impl<'a> Applier<'a> {
             remap: HashMap::new(),
             touched: Vec::new(),
             touched_set: BTreeSet::new(),
+            conflict_copies: BTreeSet::new(),
         }
     }
 
@@ -252,6 +255,7 @@ impl<'a> Applier<'a> {
         let node = self.st.nodes.get_mut(node_id).expect("revived node exists");
         node.status = NodeStatus::Live;
         node.parent_id = Some(parent_id.to_string());
+        node.parent_rev = seq;
         node.name_key = name_key(&name);
         node.name = name.clone();
         node.trash_group = None;
@@ -343,6 +347,7 @@ impl<'a> Applier<'a> {
             content_dev: self.dev().into(),
             meta_rev: self.ctx.seq,
             meta_dev: self.dev().into(),
+            parent_rev: self.ctx.seq,
             cur_version_id: version_id,
             trash_group: None,
             row,
@@ -458,6 +463,7 @@ impl<'a> Applier<'a> {
                 NodeKind::File,
                 Some(version_id),
             );
+            self.conflict_copies.insert(copy_id.clone());
             return Ok(result(op_result::Code::ConflictCopy, &copy_id, &name));
         }
         let version_id = self.insert_version(&node.node_id, content, chunks);
@@ -533,6 +539,9 @@ impl<'a> Applier<'a> {
             .nodes
             .get_mut(&found.node_id)
             .expect("moved node exists");
+        if stored.parent_id.as_deref() != Some(parent.node_id.as_str()) {
+            stored.parent_rev = seq;
+        }
         stored.parent_id = Some(parent.node_id.clone());
         stored.name_key = name_key(&name);
         stored.name = name.clone();
@@ -542,11 +551,20 @@ impl<'a> Applier<'a> {
         Ok(applied(renamed, &name))
     }
 
-    /// R7: trashes the subtree except nodes with unseen changes and their ancestors. Returns true when the node stays.
+    /// Whether `node` came under its parent after the commit's base: another device moved, restored or
+    /// created it there, or an earlier op of this commit made it as a conflict copy.
+    fn entered_after_base(&self, node: &Node) -> bool {
+        self.conflict_copies.contains(&node.node_id)
+            || (self.unseen_meta(node) && node.parent_rev > self.ctx.base_seq)
+    }
+
+    /// R7 and RFC 0002 section 9: trashes the subtree the deleting device had at its base. Nodes with
+    /// unseen changes stay with their ancestors, and a child that entered after the base stays with its
+    /// whole subtree. Returns true when the node stays.
     fn trash_subtree(&mut self, node: &Node, group: &str) -> bool {
         let mut keep = self.unseen_content(node) || self.unseen_meta(node);
         for child in self.st.children(&node.node_id, NodeStatus::Live) {
-            keep = self.trash_subtree(&child, group) || keep;
+            keep = self.entered_after_base(&child) || self.trash_subtree(&child, group) || keep;
         }
         if keep {
             return true;

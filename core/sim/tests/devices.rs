@@ -7,10 +7,7 @@
 //!
 //! `devices_lose_no_write` fails when a write is lost or when the engine, the store or the server
 //! refuses a state. `devices_converge_once_the_faults_stop` also asks that every disk reaches the
-//! server's tree and that no commit makes a change the user of its device never made. The
-//! reference server puts files into the trash that no user deleted (GUN-333), so this property is
-//! ignored, and so are the two fixed schedules of that failure.
-//! `cargo test -p flarebox-sim --test devices -- --ignored` runs them.
+//! server's tree and that no commit makes a change the user of its device never made.
 
 use std::collections::BTreeMap;
 
@@ -120,7 +117,6 @@ proptest! {
     }
 
     #[test]
-    #[ignore = "GUN-333: the reference server puts files into the trash that no user deleted"]
     fn devices_converge_once_the_faults_stop(devices in 2..=3usize, phases in phases()) {
         converge(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
@@ -521,7 +517,6 @@ fn a_file_deleted_before_the_disk_took_the_servers_name_stays_deleted() {
 /// that folder and edited it, so device 1's edit becomes a conflict copy inside the folder that the
 /// same commit deletes.
 #[test]
-#[ignore = "GUN-333: the server puts the conflict copy into the trash, and the edit leaves the disk"]
 fn an_edit_that_becomes_a_conflict_copy_in_a_folder_its_commit_deletes_is_kept() {
     let synced = vec![(0, file("b")), (0, folder("a"))];
     let mut racing = vec![
@@ -538,7 +533,6 @@ fn an_edit_that_becomes_a_conflict_copy_in_a_folder_its_commit_deletes_is_kept()
 /// Device 1 deletes the empty folder "b". Meanwhile device 0 has moved the folder "a", which holds
 /// a file, into "b".
 #[test]
-#[ignore = "GUN-333: the server keeps both folders and puts the file into the trash"]
 fn a_file_in_a_folder_moved_into_a_folder_that_another_device_deletes_is_kept() {
     let synced = vec![
         (0, folder("a")),

@@ -115,6 +115,8 @@ Both are 0 when the history began with the creation of the space. The Account DO
 
 A `Delete` whose target stays live because a descendant has an unseen change also returns `SUPERSEDED`, as when the target's own change keeps it. `SUPERSEDED` means that the target is still live after the op.
 
+A `Delete` covers only the nodes that were under its target at the commit's `base_seq`. A node that came under the target later stays live with its whole subtree, and its ancestors stay live too. Such a node is one that another device created there, moved there or brought back from the trash there after `base_seq`, or an R3 conflict copy that an earlier op of the same commit made. A node that the commit's own `CreateDir` or `CreateFile` put there is not kept for that reason. A node whose parent another device changed after `base_seq` counts as having come under the target even when it moved between two folders inside the target. A rename that keeps the parent is an ordinary unseen change. R7 keeps the renamed node and its ancestors and trashes its unchanged descendants.
+
 ## 10. Renamed revival on UpdateContent (R8)
 
 An `UpdateContent` whose target R8 revives under a conflict name, because the revived name clashes under R1, returns `APPLIED_RENAMED` with the name used, as `Move`, `Restore`, `CreateDir` and `CreateFile` do. `APPLIED_RENAMED` replaces only a result that would otherwise be `APPLIED`. If the update also has an unseen content change, so that R3 applies, the result stays `CONFLICT_COPY`. A client acknowledges an `APPLIED_RENAMED` update as it would an `APPLIED` one: the content it sent becomes synced. The new name and position reach the disk through the node's `NodeState` in the result's changes, like any remote rename.
