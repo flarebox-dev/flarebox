@@ -798,6 +798,113 @@ fn a_file_an_effect_removes_after_the_server_restored_it_is_downloaded_again() {
     assert_in_sync(&mut trees);
 }
 
+/// GUN-332. The server renamed a file this device created, so its local position is reverted.
+/// The user deleted the file before an effect moved it to the server's name. That delete is the
+/// user's to commit, and no effect brings the file back.
+#[test]
+fn a_reverted_file_that_the_user_deleted_is_not_downloaded_again() {
+    let renamed = file(ROOT, "a (conflict)", 1);
+    let (mut trees, _) = space(&[
+        ("d", Some(dir(ROOT, "a")), Some(dir(ROOT, "a"))),
+        ("n", Some(renamed.clone()), Some(renamed)),
+    ]);
+    trees.revert("n".into());
+    trees.remove_local("n");
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::Local);
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    assert_eq!(effects.plan(&trees, &mut ids, NOW), None);
+}
+
+/// A parked file holds an edit, and the user deleted its folder, which the server keeps. When R
+/// trashes the file, the folder is created again so the file goes back to its local position and
+/// the edit is uploaded.
+#[test]
+fn a_parked_edit_brings_back_its_deleted_folder_after_a_remote_trash() {
+    let (mut trees, mut disk) = space(&[
+        ("d", Some(dir(ROOT, "d")), Some(dir(ROOT, "d"))),
+        ("f", Some(file("d", "f", 1)), None),
+    ]);
+    let mut trashed = remote(file("d", "f", 1));
+    trashed.trashed = true;
+    trashed.trash_group = "other-device".into();
+    trees.set_remote("f".into(), trashed);
+    let mut local = trees.local().get("f").unwrap().clone();
+    local.parked = true;
+    local.shape.content = Some(content(2));
+    trees.set_local("f".into(), local);
+    trees.remove_local("d");
+    trees.revert("d".into());
+    disk.entries.remove(&1);
+    let entry = disk.entries.get_mut(&2).unwrap();
+    entry.area = Area::Parked;
+    entry.name = "f".into();
+    entry.content = Some(content(2));
+    trees.check().unwrap();
+    disk.matches(&trees).unwrap();
+    let done = converge(&mut trees, &mut disk, 10).unwrap();
+    assert!(
+        matches!(
+            done.as_slice(),
+            [Effect::CreateDir { .. }, Effect::Move { .. }]
+        ),
+        "{done:?}"
+    );
+    assert!(!trees.local().get("f").unwrap().parked);
+    assert_eq!(trees.local().live("f").unwrap().content, Some(content(2)));
+    assert!(trees.edited("f"));
+    let (mut commits, mut ids) = (flarebox_engine::commit::Commits::default(), IdGen::new(1));
+    let commit = commits
+        .build(&mut trees, &mut ids, NOW, "history", 7)
+        .unwrap();
+    assert!(commit.ops.iter().any(|op| match &op.op {
+        Some(flarebox_proto::v1::op::Op::UpdateContent(op)) => op.content == Some(content(2)),
+        Some(flarebox_proto::v1::op::Op::CreateFile(op)) => op.content == Some(content(2)),
+        _ => false,
+    }));
+}
+
+/// As above, but R moves the file into a folder the rules leave out instead of trashing it. A
+/// parked node that is ignored goes back to its local position, so its deleted folder is created
+/// again for it there too.
+#[test]
+fn a_parked_edit_brings_back_its_deleted_folder_after_a_remote_move_into_an_ignored_folder() {
+    let (mut trees, mut disk) = space(&[
+        ("d", Some(dir(ROOT, "d")), Some(dir(ROOT, "d"))),
+        ("logs", Some(dir(ROOT, "logs")), Some(dir(ROOT, "logs"))),
+        ("f", Some(file("d", "f", 1)), Some(file("logs", "f", 1))),
+    ]);
+    trees.set_rules(
+        &[] as &[&str],
+        Some(flarebox_engine::ignore::RuleFile::parse(b"logs/\n")),
+    );
+    let mut local = trees.local().get("f").unwrap().clone();
+    local.parked = true;
+    local.shape.content = Some(content(2));
+    trees.set_local("f".into(), local);
+    trees.remove_local("d");
+    trees.revert("d".into());
+    disk.entries.remove(&1);
+    let entry = disk.entries.get_mut(&3).unwrap();
+    entry.area = Area::Parked;
+    entry.name = "f".into();
+    entry.content = Some(content(2));
+    trees.check().unwrap();
+    disk.matches(&trees).unwrap();
+    assert!(trees.ignored("f"));
+    let done = converge(&mut trees, &mut disk, 10).unwrap();
+    assert!(
+        matches!(
+            done.as_slice(),
+            [Effect::CreateDir { .. }, Effect::Move { .. }]
+        ),
+        "{done:?}"
+    );
+    let f = trees.local().get("f").unwrap();
+    assert!(!f.parked);
+    assert_eq!(f.shape, file("d", "f", 2));
+}
+
 /// A valid tree over `n0`, `n1`, ... from one [`Draw`] per node, as in tests/trees.rs, where each
 /// node has the kind and file content of `kinds`. S and R are drawn with their own ranks, so their
 /// moves can swap, rotate and nest into each other.
