@@ -523,11 +523,15 @@ impl Disk {
             return Err(Stop::Withdrawn(self.path.clone()));
         }
         observation.root.map_err(Stop::Root)?;
-        engine.rules(observation.rules, &observation.unreadable);
+        let read: Vec<PathBuf> = (observation.rules.iter())
+            .map(|change| change.dir.clone())
+            .collect();
+        engine.rules(observation.rules);
         if (self.rules_after).is_some_and(|requested| answered >= Some(requested)) {
             self.rules_after = None;
         }
         if stamp.0 < self.forgotten {
+            engine.read(&read, &observation.unreadable);
             self.sections.request(engine.resets([PathBuf::new()]));
             return Ok(());
         }
@@ -559,6 +563,7 @@ impl Disk {
                 Ok(engine.checkpoint(tx)?)
             })?;
         }
+        engine.read(&read, &observation.unreadable);
         if !dropped.is_empty() {
             self.sections.request(engine.resets(dropped));
         }

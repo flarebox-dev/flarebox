@@ -777,3 +777,54 @@ fn nothing_is_planned_after_a_restore_until_the_rules_are_scanned() {
     assert_eq!(ops(&mut trees), [delete("txt")]);
     assert_eq!(effects(&mut trees), []);
 }
+
+/// A case-sensitive volume holds folders whose names differ only in case, and L holds them as two
+/// nodes. The rules of one being unknown holds nothing below the other.
+#[test]
+fn a_folder_whose_rules_are_unknown_holds_nothing_below_its_namesake_in_another_case() {
+    let mut trees = trees(&[
+        ("lower", Some(dir(ROOT, "proj")), None, None),
+        ("upper", Some(dir(ROOT, "PROJ")), None, None),
+        ("readable", Some(file("lower", "file.txt", 1)), None, None),
+        ("unknown", Some(file("upper", "file.txt", 1)), None, None),
+    ]);
+    assert_eq!(trees.check(), Ok(()));
+    trees.set_rules_unknown("upper");
+    assert!(trees.held("unknown"));
+    assert!(!trees.held("readable"));
+}
+
+/// Reading the rules of one of two folders whose names differ only in case says nothing about the
+/// rules of the other, which stay unknown.
+#[test]
+fn reading_a_folder_keeps_the_hold_of_its_namesake_in_another_case() {
+    let mut trees = trees(&[
+        ("lower", Some(dir(ROOT, "proj")), None, None),
+        ("upper", Some(dir(ROOT, "PROJ")), None, None),
+        ("unknown", Some(file("upper", "file.txt", 1)), None, None),
+    ]);
+    assert_eq!(trees.check(), Ok(()));
+    trees.set_rules_unknown("upper");
+    trees.set_rules(&["proj"], None);
+    trees.set_rules_known("lower");
+    assert!(trees.held("unknown"));
+}
+
+/// A folder L no longer holds has no rules on this disk, so the nodes S and R still place below it
+/// are planned again, and the deletion of the folder can be sent.
+#[test]
+fn the_hold_of_a_folder_ends_when_it_leaves_l() {
+    let mut trees = trees(&[
+        (
+            "d",
+            Some(dir(ROOT, "d")),
+            Some(dir(ROOT, "d")),
+            Some(dir(ROOT, "d")),
+        ),
+        ("f", None, Some(file("d", "f", 1)), Some(file("d", "f", 1))),
+    ]);
+    trees.set_rules_unknown("d");
+    assert!(trees.held("f"));
+    trees.remove_local("d");
+    assert!(!trees.held("f"));
+}

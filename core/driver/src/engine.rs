@@ -316,21 +316,34 @@ impl Engine {
         Some(names.into_iter().rev().collect())
     }
 
-    /// Gives the trees the rules files a batch lists, before the changes of that batch, and the folders it could not
-    /// read, whose rules are unknown until a later batch lists them. An observer's first batch follows its scan of
-    /// the whole tree and lists every rules file, so from the first call on the trees know the rules, and the engine
-    /// plans again (design §5.10), except below a folder that could not be read. The rules of a folder whose path L
-    /// cannot hold are left out, since no node is below it.
-    pub fn rules(&mut self, rules: Vec<RulesChange>, unreadable: &[PathBuf]) {
+    /// Gives the trees the rules files a batch lists, before the changes of that batch. An observer's first batch
+    /// follows its scan of the whole tree and lists every rules file, so from the first call on the trees know the
+    /// rules, and the engine plans again (design §5.10), except below a folder that could not be read
+    /// ([`Engine::read`]). The rules of a folder whose path L cannot hold are left out, since no node is below it.
+    pub fn rules(&mut self, rules: Vec<RulesChange>) {
         for RulesChange { dir, rules } in rules {
             if let Some(dir) = names(&dir) {
                 self.trees.set_rules(&dir, rules);
             }
         }
-        for dir in unreadable.iter().filter_map(|dir| names(dir)) {
-            self.trees.set_rules_unknown(&dir);
-        }
         self.trees.rules_scanned();
+    }
+
+    /// Gives the trees, after the changes of a batch, the folders whose rules the batch passed (`read`) and the folders it
+    /// could not read, whose rules are unknown until a later batch passes them. Each path is the folder's on disk,
+    /// so it names the node L holds there by its exact name: a folder renamed only in case is the same node, and two
+    /// folders whose names differ only in case are two.
+    pub fn read(&mut self, read: &[PathBuf], unreadable: &[PathBuf]) {
+        if read.is_empty() && unreadable.is_empty() {
+            return;
+        }
+        let index = Index::new(&self.trees);
+        for id in read.iter().filter_map(|dir| index.at(dir)) {
+            self.trees.set_rules_known(&id);
+        }
+        for id in unreadable.iter().filter_map(|dir| index.at(dir)) {
+            self.trees.set_rules_unknown(&id);
+        }
     }
 
     /// Puts `changes` into L and returns the nodes whose L entry changed. Paths a change names in the previous state

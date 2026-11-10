@@ -44,9 +44,29 @@ pub fn classify(l: Option<&Shape>, s: Option<&Shape>, r: Option<&Shape>) -> Clas
     }
 }
 
-/// The `name_key` of each of `names`.
-fn keys<S: AsRef<str>>(names: &[S]) -> Vec<String> {
-    names.iter().map(|name| name_key(name.as_ref())).collect()
+/// Whether `tree` holds `id` live and placed below one of `folders`, through live, placed folders.
+fn below<N: Node>(tree: &Tree<N>, id: &str, folders: &BTreeSet<NodeId>) -> bool {
+    let held = |id: &str| {
+        tree.get(id)
+            .filter(|node| node.is_live() && node.is_placed())
+    };
+    let Some(mut current) = held(id) else {
+        return false;
+    };
+    for _ in 0..tree.len() {
+        let parent = current.shape().parent.as_str();
+        if folders.contains(parent) {
+            return true;
+        }
+        if parent == tree.root {
+            return false;
+        }
+        match held(parent) {
+            Some(node) => current = node,
+            None => return false,
+        }
+    }
+    false
 }
 
 /// The names from the root to `id` in `tree` with the node's kind, or `None` when the tree does not
@@ -94,9 +114,9 @@ pub struct Trees {
     outside: BTreeSet<NodeId>,
     /// False from a restore until the rules of a full scan are in force.
     rules_known: bool,
-    /// The folders whose rules the last scan of each could not read, by the `name_key` of each name from the root,
-    /// as the matcher holds rules: a folder renamed only in case is the same folder.
-    unknown_rules: BTreeSet<Vec<String>>,
+    /// The folders whose rules the last scan of each could not read, by node: a folder renamed is the same folder,
+    /// and two folders whose names differ only in case are two folders.
+    unknown_rules: BTreeSet<NodeId>,
 }
 
 impl Trees {
@@ -156,6 +176,7 @@ impl Trees {
 
     pub fn remove_local(&mut self, id: &str) {
         self.parked_as.remove(id);
+        self.unknown_rules.remove(id);
         self.outside.remove(id);
         if self.l.remove(id).is_some() {
             self.dirty.insert(id.to_owned());
@@ -177,28 +198,29 @@ impl Trees {
     /// device's disk and passes the rules here with the observation.
     pub fn set_rules<S: AsRef<str>>(&mut self, dir: &[S], rules: Option<RuleFile>) {
         self.ignore.set_rules(dir, rules, std::iter::empty());
-        self.unknown_rules.remove(&keys(dir));
     }
 
-    /// Records that a scan could not read the folder at `dir`, the names from the root to it, so
-    /// the rules below it are unknown until the driver passes the folder's rules again
-    /// ([`Trees::set_rules`]). Meanwhile nothing is planned for a node below it ([`Trees::held`]).
-    pub fn set_rules_unknown<S: AsRef<str>>(&mut self, dir: &[S]) {
-        self.unknown_rules.insert(keys(dir));
+    /// Records that a scan could not read the folder `id` of L, or the root, so the rules below it are unknown until
+    /// a scan reads it again ([`Trees::set_rules_known`]) or L no longer holds it. Meanwhile nothing is planned for a
+    /// node below it ([`Trees::held`]).
+    pub fn set_rules_unknown(&mut self, id: &str) {
+        if id == self.l.root || self.l.get(id).is_some() {
+            self.unknown_rules.insert(id.to_owned());
+        }
+    }
+
+    /// Records that a scan read the folder `id` and passed its rules, or found it has none.
+    pub fn set_rules_known(&mut self, id: &str) {
+        self.unknown_rules.remove(id);
     }
 
     /// Whether L, S or R places the node below a folder whose rules are unknown
     /// ([`Trees::set_rules_unknown`]). Neither an effect nor a commit is planned for it.
     pub fn held(&self, id: &str) -> bool {
-        let below = |path: Option<(Vec<&str>, Kind)>| {
-            path.is_some_and(|(names, _)| {
-                let names = keys(&names);
-                (self.unknown_rules.iter())
-                    .any(|dir| names.len() > dir.len() && names.starts_with(dir))
-            })
-        };
         !self.unknown_rules.is_empty()
-            && (below(path(&self.l, id)) || below(path(&self.s, id)) || below(path(&self.r, id)))
+            && (below(&self.l, id, &self.unknown_rules)
+                || below(&self.s, id, &self.unknown_rules)
+                || below(&self.r, id, &self.unknown_rules))
     }
 
     /// The caller has passed the rules files of a full scan made since the last restore, and the
