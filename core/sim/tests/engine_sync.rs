@@ -185,7 +185,7 @@ fn identity(ino: u64) -> FileIdentity {
     FileIdentity {
         dev: 1,
         ino,
-        birth_ns: (ino % 2 == 0).then_some(1_700_000_000_000_000_000),
+        birth_ns: ino.is_multiple_of(2).then_some(1_700_000_000_000_000_000),
     }
 }
 
