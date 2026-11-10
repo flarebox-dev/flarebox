@@ -499,7 +499,7 @@ impl Snapshot {
     ) -> Result<Rescan> {
         let root_dir = open_root(root)?;
         let root_stat = stat_fd(root_dir.as_fd())?;
-        if expected.is_some_and(|expected| !root_stat.same_inode(&expected)) {
+        if expected.is_some_and(|expected| root_stat.id != expected) {
             return Err(Error::RootReplaced);
         }
         cut(Cut::RootOpened);

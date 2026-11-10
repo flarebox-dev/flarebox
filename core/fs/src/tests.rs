@@ -774,6 +774,32 @@ fn a_new_folder_rescan_that_reaches_another_root_fails_the_watcher() {
 }
 
 #[test]
+fn a_rescan_expecting_a_root_born_at_another_time_changes_nothing() {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("space");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("theirs"), b"replacement").unwrap();
+    let found = root_id(&root);
+    let Some(born) = found.birth_ns else {
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIPPED a_rescan_expecting_a_root_born_at_another_time_changes_nothing: no birth time"
+        );
+        return;
+    };
+    let reused = FileId {
+        birth_ns: Some(born - 1),
+        ..found
+    };
+    let mut snapshot = Snapshot::default();
+    let result = snapshot.rescan_with(&root, [PathBuf::new()], Some(reused), &mut |_| {});
+    assert!(matches!(result, Err(Error::RootReplaced)), "{result:?}");
+    assert!(snapshot.entries.is_empty());
+}
+
+#[test]
 fn utc_dates_follow_the_calendar() {
     let date = |secs: i64| {
         let time = if secs < 0 {
