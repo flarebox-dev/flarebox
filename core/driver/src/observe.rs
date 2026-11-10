@@ -214,6 +214,13 @@ impl FsObserver {
         }
     }
 
+    /// Whether every reset so far is answered: a scan made after it settled each of its scopes, and the batch of that
+    /// scan was returned. A reset stays unanswered while a scope of it is pending, and through a batch that scanned
+    /// nothing.
+    pub fn answered(&self) -> bool {
+        !self.reset
+    }
+
     /// Adds what `change` means for the engine to `out`. The scans leave out excluded paths, so every path here is
     /// one this device syncs, except the target of a move into an excluded path.
     fn observed(&self, change: Change, out: &mut Vec<Observed>, busy: &mut Vec<PathBuf>) {

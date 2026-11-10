@@ -993,7 +993,7 @@ fn a_start_that_recovers_an_effect_has_its_paths_read_again() {
     drop((watching, running));
 
     let running = folder.start(no_hook()).unwrap();
-    assert!(running.disk.sections().take_resets().is_empty());
+    assert!(running.disk.sections().take_resets().0.is_empty());
     let mut watching = observer(&folder.root, running.engine.snapshot());
     assert_eq!(
         settle(&mut watching),
@@ -1187,6 +1187,7 @@ fn observe_until(
             if done(&seen) {
                 return Batch {
                     stamp,
+                    answered: None,
                     observation: Observation {
                         changes: seen,
                         rules,
@@ -1624,7 +1625,7 @@ fn kinds_map_one_to_one() {
 
 /// Passes the resets the disk requested to the observer, and returns them.
 fn catch_up(watching: &mut FsObserver, sections: &Sections) -> Vec<Reset> {
-    let resets = sections.take_resets();
+    let (resets, _) = sections.take_resets();
     watching.reset(resets.clone());
     resets
 }

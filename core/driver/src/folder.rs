@@ -1182,11 +1182,8 @@ impl FolderTask {
         }
     }
 
-    /// Observes the disk on a thread of its own, starting from `previous`. Before each observation the thread
-    /// resets the scopes the effect sections asked for, then takes the stamp the batch is sent with, so the stamp
-    /// covers the batch's scans and content reads. After a reset it does not wait for a change: the scan of the reset
-    /// scopes is reported as soon as it is made, since the task may plan nothing until then. The thread holds the folder's `lock` and ends with the first
-    /// observation after the receiver is dropped.
+    /// Observes the disk on a thread of its own, starting from `previous`, one [`Sections::observe`] after another.
+    /// The thread holds the folder's `lock` and ends with the first observation after the receiver is dropped.
     fn observe(
         &self,
         lock: Arc<Flock>,
@@ -1212,23 +1209,18 @@ impl FolderTask {
             };
             let mut scanned = false;
             while !sender.is_closed() {
-                let resets = sections.take_resets();
-                let wait = Duration::from_secs(if resets.is_empty() { 1 } else { 0 });
-                observer.reset(resets);
-                let stamp = sections.stamp();
-                match observer.observe(wait) {
+                match sections.observe(&mut observer, Duration::from_secs(1)) {
                     Ok(None) => {}
-                    Ok(Some(observation)) => {
+                    Ok(Some(batch)) => {
                         tracing::debug!(
                             space_id = link.space_id,
-                            changes = observation.changes.len(),
-                            busy = observation.busy.len(),
-                            unreadable = observation.unreadable.len(),
-                            root_ok = observation.root.is_ok(),
+                            changes = batch.observation.changes.len(),
+                            busy = batch.observation.busy.len(),
+                            unreadable = batch.observation.unreadable.len(),
+                            root_ok = batch.observation.root.is_ok(),
                             "observed the folder"
                         );
                         let entries = observer.snapshot().entries.len() as u64;
-                        let batch = Batch { stamp, observation };
                         let _ = sender.send(FromDisk::Batch(batch, entries));
                     }
                     Err(error) => {

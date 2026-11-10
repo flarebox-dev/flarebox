@@ -242,11 +242,9 @@ impl Device {
     /// One pass of the observer's thread.
     fn scan(&mut self, wait: Duration) {
         let sections = self.folder.sections();
-        self.observer.reset(sections.take_resets());
-        let stamp = sections.stamp();
-        if let Some(observation) = self.observer.observe(wait).unwrap() {
+        if let Some(batch) = sections.observe(&mut self.observer, wait).unwrap() {
             let entries = self.observer.snapshot().entries.len() as u64;
-            let step = self.folder.observed(Batch { stamp, observation }, entries);
+            let step = self.folder.observed(batch, entries);
             self.take(step).unwrap();
         }
         if !self.folder.scanned && self.observer.scanned().is_some() {
@@ -1622,6 +1620,29 @@ fn a_downloaded_rules_file_is_in_force_before_anything_else_is_planned() {
 }
 
 #[test]
+fn a_rules_file_named_in_another_case_is_downloaded_and_in_force_first() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("cache.tmp"), b"cache");
+    a.create(&mut remote, &site_a.root.join(".FBIGNORE"), b"*.tmp\n");
+
+    let site = Site::new(&remote, "b");
+    let mut b = site.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    assert_eq!(b.run(&mut remote), ["list", "subscribe", "stage"]);
+    assert_eq!(names(&site.root), [".FBIGNORE"]);
+    assert!(b.folder.disk.awaits_rules());
+
+    b.scan_until(|b| !b.folder.disk.awaits_rules());
+    assert!(b.run(&mut remote).is_empty());
+    b.settle();
+    assert!(b.work.is_empty() && b.sent.is_empty());
+    assert_eq!(names(&site.root), [".FBIGNORE"]);
+    assert_eq!(b.state(), FolderState::UpToDate);
+}
+
+#[test]
 fn planning_goes_on_after_a_folder_move_once_a_scan_that_found_nothing_is_reported() {
     let mut remote = Remote::new();
     let (site_a, mut a) = linked(&mut remote, "a");
@@ -1649,11 +1670,12 @@ fn planning_goes_on_after_a_folder_move_once_a_scan_that_found_nothing_is_report
     assert!(b.work.is_empty(), "nothing is planned before the scan");
 
     let sections = b.folder.sections();
-    b.observer.reset(sections.take_resets());
-    let stamp = sections.stamp();
-    let observation = (b.observer.observe(Duration::ZERO).unwrap()).expect("a reset is answered");
-    assert!(observation.changes.is_empty() && observation.rules.is_empty());
-    let step = b.folder.observed(Batch { stamp, observation }, 1);
+    let batch = (sections
+        .observe(&mut b.observer, Duration::from_secs(10))
+        .unwrap())
+    .expect("a reset is answered");
+    assert!(batch.observation.changes.is_empty() && batch.observation.rules.is_empty());
+    let step = b.folder.observed(batch, 1);
     b.take(step).unwrap();
     assert_eq!(b.run(&mut remote), ["stage"]);
     assert_eq!(names(&site.root), ["later.txt", "new"]);
@@ -1711,18 +1733,18 @@ fn a_batch_scanned_before_a_rules_file_was_written_does_not_end_the_wait_for_its
     b.scan_until(|b| b.folder.scanned);
     fs::write(site.root.join("mine.txt"), b"mine").unwrap();
     let sections = b.folder.sections();
-    let stamp = sections.stamp();
     let deadline = Instant::now() + Duration::from_secs(10);
-    let observation = loop {
+    let batch = loop {
         assert!(Instant::now() < deadline, "not observed in time");
-        if let Some(observation) = b.observer.observe(Duration::from_millis(100)).unwrap() {
-            break observation;
+        let wait = Duration::from_millis(100);
+        if let Some(batch) = sections.observe(&mut b.observer, wait).unwrap() {
+            break batch;
         }
     };
     assert_eq!(b.run(&mut remote), ["list", "subscribe", "stage"]);
     assert!(b.folder.disk.awaits_rules());
 
-    let step = b.folder.observed(Batch { stamp, observation }, 1);
+    let step = b.folder.observed(batch, 1);
     b.take(step).unwrap();
     assert!(
         b.folder.disk.awaits_rules(),
@@ -1733,4 +1755,62 @@ fn a_batch_scanned_before_a_rules_file_was_written_does_not_end_the_wait_for_its
     b.scan_until(|b| !b.folder.disk.awaits_rules());
     assert_eq!(b.run(&mut remote), ["upload", "send"]);
     assert_eq!(names(&site.root), [".fbignore", "mine.txt"]);
+}
+
+/// The observer's thread takes its resets, and the effect that moves the folder ends before the thread reads its
+/// stamp. The batch that follows began after the effect, but its scans were never asked to read the moved folder.
+#[test]
+fn a_batch_that_was_not_asked_to_scan_a_moved_folder_does_not_end_the_wait_for_its_rules() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site_a.root.join("proj")).unwrap();
+    a.create(&mut remote, &site_a.root.join("proj/build.log"), b"v1");
+    let (site, mut b) = linked(&mut remote, "b");
+    let (site_c, mut c) = linked(&mut remote, "c");
+    b.settle();
+    c.settle();
+    a.create(&mut remote, &site_a.root.join("proj/.fbignore"), b"*.log\n");
+    b.pull(&remote);
+    assert_eq!(b.run(&mut remote), ["stage"]);
+    b.scan_until(|b| !b.folder.disk.awaits_rules());
+    assert!(b.run(&mut remote).is_empty());
+    fs::rename(site_a.root.join("proj"), site_a.root.join("work")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    assert_eq!(a.run(&mut remote), ["send"]);
+    c.create(
+        &mut remote,
+        &site_c.root.join("proj/build.log"),
+        b"v2 from c",
+    );
+
+    let sections = b.folder.sections();
+    let (resets, requests) = sections.take_resets();
+    assert!(resets.is_empty() && b.observer.answered());
+    b.pull(&remote);
+    assert_eq!(b.run(&mut remote), ["stage"]);
+    assert!(b.folder.disk.awaits_rules());
+    let unrelated = Batch {
+        stamp: sections.stamp(),
+        answered: Some(requests),
+        observation: crate::observe::Observation {
+            changes: Vec::new(),
+            root: Ok(()),
+            unreadable: vec![PathBuf::from("unrelated")],
+            scanned: b.observer.scanned(),
+            busy: Vec::new(),
+            rules: Vec::new(),
+        },
+    };
+    let step = b.folder.observed(unrelated, 1);
+    b.take(step).unwrap();
+    assert!(
+        b.folder.disk.awaits_rules(),
+        "no scan has read the rules file at the new path"
+    );
+    assert!(b.run(&mut remote).is_empty());
+    assert_eq!(fs::read(site.root.join("work/build.log")).unwrap(), b"v1");
+
+    b.scan_until(|b| !b.folder.disk.awaits_rules());
+    assert!(b.run(&mut remote).is_empty());
+    assert_eq!(fs::read(site.root.join("work/build.log")).unwrap(), b"v1");
 }
