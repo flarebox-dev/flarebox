@@ -16,7 +16,7 @@ fn chunk(bytes: &[u8]) -> ChunkRef {
 }
 
 fn transfer() -> Transfer {
-    let api = Api::new("http://127.0.0.1:9".parse().unwrap()).unwrap();
+    let api = Api::local_development("http://127.0.0.1:9".parse().unwrap()).unwrap();
     Transfer {
         backoff: Backoff {
             initial: Duration::from_millis(1),

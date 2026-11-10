@@ -217,7 +217,7 @@ async fn corrupted_chunks_are_refused_in_both_directions() {
     let space = new_space().await;
     let proxy = Proxy::start(&server_url()).await;
     let through_proxy = Arc::new(Auth::new(
-        Api::new(proxy.url.clone()).unwrap(),
+        Api::local_development(proxy.url.clone()).unwrap(),
         owner().await,
     ));
     let (session, mut events) = start(through_proxy.clone(), &space);
