@@ -2,7 +2,7 @@
 
 Status: proposed. Applies to spec v0 (format_version 1). Tracks GUN-279.
 
-Flarebox 0.1.0 does not support AI agents or other automated clients. This RFC adds the hooks that let agent support come later as an additive change: without a format bump, without a migration that rewrites existing rows, and without old clients misbehaving against a newer server. Every hook keeps the behaviour of 0.1.0 clients unchanged, except the device routes of section 7 and the refusal of section 8. A bare section number such as section 3 refers to this RFC; sections of spec v0 are written as spec v0 §N.
+Flarebox 0.1.0 does not support AI agents or other automated clients. This RFC adds the hooks that let agent support come later as an additive change: without a format bump, without a migration that rewrites existing rows, and without old clients misbehaving against a newer server. On the server, every hook keeps what 0.1.0 clients see unchanged, except the device routes of section 7 and the refusals of section 8. Section 1 is a rule for clients, which 0.1.0 clients follow. A bare section number such as section 3 refers to this RFC; sections of spec v0 are written as spec v0 §N.
 
 The schema changes add fields, messages and one error code:
 
@@ -18,19 +18,46 @@ The schema changes add fields, messages and one error code:
 
 Not covered here: commits over HTTP alone, which need `history_id` and `device_seq` outside the WebSocket `Welcome`; agent credentials, scopes and their policy; scoped change feeds; per-principal quotas; the server-side mass-delete thresholds. Each comes later in its own RFC, on top of these hooks.
 
-## 1. Error codes a client does not know (spec v0 §6.3, §13)
+## 1. How clients handle refusals (spec v0 §6.3, §8, §13; RFC 0002 §2, §3)
 
-A client treats an `Error.Code` it does not know as a refusal. `CODE_UNSPECIFIED` counts as unknown. A refusal means:
+This section says what a client does with each `Error.Code` it gets for a request, and adds a new outcome, the policy halt, so that a server can refuse a request in a new way without old clients retrying it forever.
 
-1. The client halts the operation that got the error. It does not resend the same request, either at once or after a backoff.
-2. The client reports the refusal to the user, with the code's number and the error's `message`.
-3. The client keeps its local state. A commit that was refused stays pending in the client's store and is not dropped. It waits for the user, or for a client update that knows the code.
+**Policy halt.** A policy halt means the client keeps the refused request and does not send it again by itself. For a commit:
 
-A server may therefore add a new code for a new kind of refusal, and a client released before that code exists stops instead of retrying forever.
+1. The client keeps the commit in its store with its `commit_id` and slot, unchanged, and records that it was refused and with which code. It does not drop the commit, and it does not re-plan its changes into a new commit.
+2. It sends nothing to that space: not the refused commit, and no new commit, because a device has at most one commit in flight (spec v0 §8). Downloads continue.
+3. It reports the refusal to the user, with the code's name or number and the error's `message`.
+4. The halt survives a reconnect and a restart. A `Welcome`, whatever it says, does not lift it. This overrides the automatic resend of RFC 0002 §2: a commit under a policy halt is not resent when the device connects, even when `Welcome.device_seq` would allow it.
+5. Only a user action, or a client update that knows what the code asks for, lifts the halt. This RFC does not define those actions. A later RFC that makes a server send a policy refusal also defines how its halt is lifted.
 
-`QUOTA_EXCEEDED` is retried only when `retry_after_ms` is greater than 0, and only after that wait. With `retry_after_ms` 0, it is a refusal as above. The platform daily limit of spec v0 §13 always sets `retry_after_ms`, so it is retried as before. A later per-principal quota with no reset time is a refusal.
+A policy halt is not the read-only state of spec v0 §9.2. Read-only follows from the device's format or role, and a `Welcome` that allows writes ends it. A policy halt follows from a refusal of one commit, and only the user ends it.
 
-`RETRY_LATER` keeps its current behaviour. The rule of this section changes the handling of no other known code.
+**Codes for a commit.** For each code of `Error.Code`, a client does this with a refused `Commit`:
+
+| Code | What the client does |
+|---|---|
+| `UNAUTHENTICATED` | Gets a new access token and sends the same commit again. If `POST /v1/token` refuses, the client is signed out (section 7) and keeps the commit |
+| `FORBIDDEN` | Policy halt |
+| `INVALID_ARGUMENT` | Forgets the commit: nothing was applied, its slot stays free, and its changes are planned again with a new `commit_id` |
+| `MISSING_CHUNKS` | Uploads the listed chunks and sends the same commit again, with new receipts (spec v0 §8 step 4) |
+| `LIMIT_EXCEEDED` | Forgets the commit and plans its changes again in smaller commits |
+| `QUOTA_EXCEEDED` | With `retry_after_ms` greater than 0, waits that long and sends the same commit again. With 0, policy halt |
+| `READ_ONLY` | Forgets the commit and stops committing until a `Welcome` allows writes (spec v0 §9.2) |
+| `RETRY_LATER` | Waits `retry_after_ms`, or a backoff when it is 0, and sends the same commit again |
+| `UNSUPPORTED_VERSION` | Forgets the commit, as for `INVALID_ARGUMENT` |
+| `INTERNAL` | Sends the same commit again after a backoff, because its outcome is unknown |
+| `HISTORY_MISMATCH`, `STALE_DEVICE_STATE` | Keeps the commit as evidence and enters recovery (RFC 0002 §6) |
+| `HEAD_MOVED` | Forgets the commit (RFC 0002 §4) |
+| `AHEAD_OF_SERVER` | Forgets the commit and bootstraps again (RFC 0002 §3) |
+| `NOT_FOUND` | Not sent for a commit. If it is, policy halt |
+| `CONFIRMATION_REQUIRED` | Policy halt (section 10) |
+| `UNSPECIFIED`, or any code the client does not know | Policy halt |
+
+"Sends the same commit again" means the bytes of RFC 0002 §2: the same `commit_id`, `history_id`, `device_seq`, `base_seq`, `require_head` and ops. Only the receipts may be new.
+
+**Other requests.** For a request that is not a commit, `RETRY_LATER` and `QUOTA_EXCEEDED` with `retry_after_ms` greater than 0 are retried after the wait, `UNAUTHENTICATED` after a new access token, and `INTERNAL` after a backoff. Any other code, known or not, ends that request: the client reports it and does not send the same request again by itself.
+
+The platform daily limit of spec v0 §13 always sets `retry_after_ms`, so it is retried as before. A later per-principal quota with no reset time is a policy halt.
 
 ## 2. Principals (spec v0 §2, §4.2, §15.2)
 
@@ -45,7 +72,7 @@ A row of the Account DO's `devices` table is a principal: one credential that th
 
 The migration adds the columns with these defaults, so every existing row becomes a full-scope device that never expires.
 
-0.1.0 issues only `kind = 'device'` with full scope and no expiry. A server that finds a `kind` or a non-NULL `scope` it does not know denies that principal everything. It fails closed, so a credential written by a newer server is never treated as having full access by an older one.
+0.1.0 issues only `kind = 'device'` with full scope and no expiry. A server that finds a `kind` or a non-NULL `scope` it does not know denies that principal everything. It fails closed, so a credential written by a newer server is never treated as having full access by an older one. The server applies this wherever it reads the principal: when it refreshes a token, accepts a request or a WebSocket, takes a `Reauth`, and starts or completes a pairing. A token's claims never override the principal's current row.
 
 The access token (spec v0 §15.2) carries the principal's kind, scope and expiry as claims, beside the user, device and expiry it carries today. The token stays opaque to clients, and only the server reads it, so adding claims changes no message. A token that lacks the new claims means a full-scope device. An access token never outlives its principal: its expiry is the earlier of 15 minutes after issue and `expires_at_ms`.
 
@@ -53,7 +80,12 @@ The access token (spec v0 §15.2) carries the principal's kind, scope and expiry
 
 The server decides what a principal may do at two points, and only there:
 
-- **`authorize(principal, op, nodes)`** runs in the Space DO's commit transaction, once for each op of a commit, after the op is applied by the rules of spec v0 §6. `nodes` is every node whose state the op changes, including the side effects of R7 (the subtree a delete sends to the trash), R8 (revived ancestors and descendants) and R9 (a restored trash group): the nodes that the op's change records cover. A refusal refuses the whole commit with `FORBIDDEN`, and nothing is stored.
+- **`authorize(principal, op, effect)`** runs in the Space DO's commit transaction, once for each op of a commit, in op order, after the rules of spec v0 §6 have applied that op. `effect` describes the transition the op actually made, taken from the tree just before and just after that op, not from the commit's change records:
+  - the op's effective node IDs, after R2's re-keying (`MERGED_INTO`) and including any node the op created, such as a conflict copy (R1, R3);
+  - every node whose parent, name, status or content the op changes, with its ancestry from the root both before and after the op. This includes the side effects of R7 (the subtree a delete sends to the trash or leaves in place), R8 (revived ancestors and descendants) and R9 (a restored trash group);
+  - for an op that moves, trashes or restores a folder, every node in its subtree, because their ancestry changes even though they get no change record.
+
+  Change records hold only post-images, so they cannot tell a move inside an allowed folder from a move into it from outside. That is why `effect` is built from the tree itself. A refusal of any op refuses the whole commit with `FORBIDDEN`: the transaction is rolled back, nothing is stored, and the device's slot stays free (RFC 0002 §2).
 - **`can(principal, capability)`** runs before an action that is not a commit. The capabilities are:
 
 | Capability | Action |
@@ -105,15 +137,25 @@ Two routes, both authenticated with an access token like the other endpoints of 
 
 **Revoke.** `DELETE /v1/devices/{device_id}` revokes a principal of the caller's user. It sets `revoked_at`, and every Space DO closes that principal's WebSockets with 4003 (spec v0 §7.1). A principal may revoke itself. Revoking a principal that is already revoked succeeds and changes nothing. A `device_id` that is unknown, or that belongs to another user, is `NOT_FOUND`.
 
-**Credential expiry.** A refresh credential stops working when its principal is revoked or its `expires_at_ms` passes. `POST /v1/token` then answers `UNAUTHENTICATED`, the same answer as for an unknown `device_id` or a wrong credential. A client that gets `UNAUTHENTICATED` from `POST /v1/token` stops syncing, tells the user that this computer has been signed out, and waits to be paired again. It does not retry the request. `DeviceCredentials.credential_expires_at_ms` tells a newly paired client when its credential expires, and it is 0 for a credential that never expires. An access token already issued stays valid until it expires (at most 15 minutes, section 2), but a revoked principal's WebSockets close at once.
+**Credential expiry.** A refresh credential stops working when its principal is revoked or its `expires_at_ms` passes. `POST /v1/token` then answers `UNAUTHENTICATED`, the same answer as for an unknown `device_id` or a wrong credential. A client that gets `UNAUTHENTICATED` from `POST /v1/token` stops syncing, tells the user that this computer has been signed out, and waits to be paired again. It does not retry the request. `DeviceCredentials.credential_expires_at_ms` tells a newly paired client when its credential expires, and it is 0 for a credential that never expires. A revoked or expired principal is refused at once. An access token it still holds may carry a valid signature until the token expires, but the server checks the principal's current row on every request and every WebSocket message, so the signature alone authorizes nothing. Its WebSockets close with 4003.
 
-## 8. commit_id reused with another body (spec v0 §8 step 4, RFC 0002 §3)
+## 8. Stored results belong to their principal and their request (spec v0 §8 step 4, RFC 0002 §3)
 
-The Space DO stores a digest of each commit request beside its result, in `commits` and in `device_commits`. The digest is the SHA-256 of the committing principal's `device_id` in UTF-8, one zero byte, and the binary encoding of a `Commit` that holds only the request's `ops`, `device_seq` and `require_head`. The encoding writes fields in field-number order. The digest leaves out `commit_id`, which is the key itself, and `base_seq` and `receipts`, which do not change what the commit asks for. The digest is internal to the server and never sent.
+The Space DO stores a digest of each commit request beside its result, in `commits` and in `device_commits`. The digest is the SHA-256 of the binary encoding of a `Commit` that holds only the request's `base_seq`, `ops`, `device_seq` and `require_head`. The encoding writes fields in field-number order. The digest is internal to the server and never sent.
 
-RFC 0002 §3 step 2 becomes: if a result is stored for the `commit_id` and its digest differs from the digest of this request, refuse with `INVALID_ARGUMENT` and change nothing. Otherwise return the stored result. A result stored before this RFC has no digest and is returned as before.
+What the digest covers:
 
-The history fence of RFC 0002 §3 step 1 still comes first.
+- **`base_seq` is included.** It changes what the commit means: R3 and R7 use it to decide which changes the commit has not seen (spec v0 §6), and with `require_head` it is the head the commit expects (RFC 0002 §4). A correct retry never changes it. RFC 0002 §2 resends a commit unchanged, with the same `commit_id` and slot, and a commit whose changes are planned again gets a new `commit_id`. The 0.1.0 engine sets `base_seq` once, when it builds the commit, and resends that stored commit as it is. After `MISSING_CHUNKS` (spec v0 §8 step 4) the client sends the same commit again with new receipts. That retry finds no stored result, because a refused commit stores nothing.
+- **`receipts` are left out.** They prove that chunks were uploaded and may be renewed between attempts, so they do not change what the commit asks for.
+- **`commit_id` is the key**, and `history_id` is checked by the history fence before any lookup (RFC 0002 §3 step 1). The principal is checked against the row's `device_id` (step 1 below). `run_id` is left out while it is reserved (section 4).
+
+RFC 0002 §3 step 2 becomes: if a result is stored for the `commit_id`, in `commits` or in `device_commits`:
+
+1. If the row's `device_id` is not the caller's principal, refuse with `INVALID_ARGUMENT`. A stored result is returned only to the principal that made the commit. Every row has a `device_id`, rows stored before this RFC included, so this check needs no digest. A commit the server made itself, such as a trash purge, has an empty `device_id` and is never returned.
+2. If the row has a digest and it differs from this request's digest, refuse with `INVALID_ARGUMENT`.
+3. Otherwise return the stored result. A row stored before this RFC has no digest. Its result is returned to its own principal without the body check, because its original body cannot be known.
+
+Each refusal changes nothing.
 
 ## 9. Log retention and the commit_id window (spec v0 §4.1, §7.3, §12)
 
@@ -127,4 +169,4 @@ The server truncates no log in 0.1.0, so this costs nothing now.
 
 In the commit transaction, after the ops are applied, the Space DO counts the live files that the commit sends to the trash. It passes the count, the principal and the space to one policy point. The policy either allows the commit or refuses it with `CONFIRMATION_REQUIRED`. A refused commit stores nothing, and its slot stays free (RFC 0002 §2).
 
-In 0.1.0 the policy allows every commit, so the count changes no outcome. A later RFC defines thresholds and how the owner confirms. Until then no server sends `CONFIRMATION_REQUIRED`. Over HTTP it maps to 409. A client that knows the code reports that the deletion waits for the owner's confirmation. A client that does not know it treats it as a refusal (section 1).
+In 0.1.0 the policy allows every commit, so the count changes no outcome. A later RFC defines thresholds and how the owner confirms. Until then no server sends `CONFIRMATION_REQUIRED`. Over HTTP it maps to 409. A client that gets it puts the commit under a policy halt (section 1) and reports that the deletion waits for the owner's confirmation. The later RFC defines how the confirmation lifts the halt.
