@@ -312,7 +312,8 @@ fn converge(trees: &mut Trees, disk: &mut Disk, budget: usize) -> Result<Vec<Eff
 }
 
 fn assert_in_sync(trees: &mut Trees) {
-    assert_eq!(trees.settle(), []);
+    trees.settle();
+    assert_eq!(trees.work(), []);
     assert!(trees.local().iter().all(|(_, node)| !node.parked));
 }
 
@@ -877,7 +878,8 @@ proptest! {
         prop_assert_eq!(trees.check(), Ok(()));
         let result = converge(&mut trees, &mut disk, 3 * nodes.len());
         prop_assert!(result.is_ok(), "{:?}", result);
-        prop_assert_eq!(trees.settle(), []);
+        trees.settle();
+        prop_assert_eq!(trees.work(), []);
         for id in &ids {
             prop_assert_eq!(trees.class(id), Class::InSync, "{}", id);
             prop_assert!(!trees.local().get(id).is_some_and(|node| node.parked));

@@ -590,7 +590,8 @@ fn a_child_settled_before_its_folder_leaves_s_is_classified_again() {
     for digest in [1, 2] {
         let (mut trees, _) = parked_excluded_folder();
         trees.set_local("child".into(), local(file("old", "build.log", digest), 2));
-        let left = trees.settle();
+        trees.settle();
+        let left = trees.work();
         assert_eq!(trees.synced().live("old"), None, "digest {digest}");
         assert_eq!(trees.synced().live("child"), None, "digest {digest}");
         let child: Vec<_> = left.iter().filter(|(id, _)| id == "child").collect();
@@ -699,7 +700,8 @@ fn s_of_an_excluded_node_takes_what_l_and_r_both_hold() {
     trees.set_local("b".into(), local(file(ROOT, "b.log", 2), 2));
     trees.set_remote("b".into(), remote(file(ROOT, "b.log", 2)));
     assert!(trees.excluded("a") && trees.excluded("b"));
-    assert_eq!(trees.settle(), [], "settling alone takes both");
+    trees.settle();
+    assert_eq!(trees.work(), [], "settling alone takes both");
     assert_eq!(trees.synced().live("a"), Some(&file(ROOT, "a.log", 7)));
     assert_eq!(trees.synced().live("b"), Some(&file(ROOT, "b.log", 2)));
     assert_eq!(ops(&mut trees), []);
