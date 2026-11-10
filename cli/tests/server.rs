@@ -13,8 +13,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use flarebox_net::{Api, Auth, Credentials, Event, Session, SessionConfig};
-use flarebox_proto::v1::{ClaimRequest, Commit, CreateDir, CreateSpaceRequest, Op, op};
+use flarebox_proto::v1::{
+    ClaimRequest, Commit, CreateDir, CreateSpaceRequest, Op, PairCompleteRequest, TokenRequest, op,
+};
 use serde_json::Value;
+use tokio::sync::OnceCell;
 use url::Url;
 
 const WAIT: Duration = Duration::from_secs(30);
@@ -30,8 +33,15 @@ fn api() -> Api {
     Api::local_development(server_url()).unwrap()
 }
 
-/// Claims the deployment with the code the Worker prints to its log.
+static OWNER: OnceCell<Credentials> = OnceCell::const_new();
+
+/// The deployment's owner, claimed once for every test in this binary.
 async fn owner() -> Credentials {
+    OWNER.get_or_init(claim).await.clone()
+}
+
+/// Claims the deployment with the code the Worker prints to its log.
+async fn claim() -> Credentials {
     let log =
         std::env::var("FLAREBOX_TEST_SERVER_LOG").expect("FLAREBOX_TEST_SERVER_LOG is not set");
     let setup = reqwest::get(server_url().join("setup").unwrap())
@@ -398,5 +408,139 @@ async fn a_headless_device_pairs_links_and_follows_the_change_stream() {
     assert!(
         !log.contains(&pairing.code),
         "the log holds the pairing code"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Worker; run cli/scripts/integration-test.sh"]
+async fn a_device_revokes_a_lost_one_and_stops_syncing_when_another_revokes_it() {
+    let owner = Arc::new(Auth::new(api(), owner().await));
+    let machine = Machine::new();
+    let unpaired = machine.fails(&["device", "list"]);
+    assert!(unpaired.contains("not paired"), "{unpaired}");
+    let pairing = owner.api().pair_start(&owner).await.unwrap();
+    let server = server_url().to_string();
+    machine.run(&[
+        "pair",
+        "--server",
+        &server,
+        "--code",
+        &pairing.code,
+        "--name",
+        "desk",
+    ]);
+    let device_id = machine.status()["account"]["device_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let pairing = owner.api().pair_start(&owner).await.unwrap();
+    let lost = api()
+        .pair_complete(&PairCompleteRequest {
+            code: pairing.code,
+            device_name: "lost laptop".into(),
+            platform: "test".into(),
+        })
+        .await
+        .unwrap();
+
+    let listed: Value = serde_json::from_str(&machine.run(&["device", "list", "--json"])).unwrap();
+    let entry = |listed: &Value, id: &str| {
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|device| device["device_id"] == id)
+            .unwrap_or_else(|| panic!("{id} is not listed: {listed:#}"))
+            .clone()
+    };
+    assert_eq!(entry(&listed, &device_id)["current"], true);
+    assert_eq!(entry(&listed, &lost.device_id)["name"], "lost laptop");
+    assert_eq!(entry(&listed, &lost.device_id)["revoked_at_ms"], 0);
+    let table = machine.run(&["device", "list"]);
+    assert!(table.starts_with("ID "), "{table}");
+    assert!(
+        table
+            .lines()
+            .any(|line| line.starts_with(&device_id) && line.ends_with("this device")),
+        "{table}"
+    );
+
+    let invalid = machine.fails(&["device", "revoke", "../spaces"]);
+    assert!(invalid.contains("not a device ID"), "{invalid}");
+    let own = machine.fails(&["device", "revoke", &device_id]);
+    assert!(own.contains("cannot revoke itself"), "{own}");
+    let revoked = machine.run(&["device", "revoke", &lost.device_id]);
+    assert!(revoked.starts_with("Revoked device"), "{revoked}");
+    let refresh = api()
+        .token(&TokenRequest {
+            device_id: lost.device_id.clone(),
+            refresh_credential: lost.refresh_credential.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert!(refresh.is_unauthenticated(), "{refresh:?}");
+    let listed: Value = serde_json::from_str(&machine.run(&["device", "list", "--json"])).unwrap();
+    assert!(entry(&listed, &lost.device_id)["revoked_at_ms"].as_i64() > Some(0));
+    let table = machine.run(&["device", "list"]);
+    assert!(
+        table
+            .lines()
+            .any(|line| line.starts_with(&lost.device_id) && line.contains("revoked")),
+        "{table}"
+    );
+
+    let space_name = format!("revocation {}", uuidv7());
+    owner
+        .api()
+        .create_space(
+            &owner,
+            &CreateSpaceRequest {
+                name: space_name.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let folder = machine.path("Sync");
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(folder.join("kept.txt"), b"stays on the device").unwrap();
+    machine.run(&["link", folder.to_str().unwrap(), "--space", &space_name]);
+    let daemon = machine
+        .command(&["daemon"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    while !machine.path("run/flarebox/daemon.sock").exists() {
+        assert!(
+            started.elapsed() < WAIT,
+            "the daemon did not open its socket"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    machine
+        .status_until("the first sync", |status| {
+            status["running"] == true && status["folders"][0]["state"] == "up_to_date"
+        })
+        .await;
+
+    owner.api().revoke_device(&owner, &device_id).await.unwrap();
+    let status = machine
+        .status_until("the folder halting", |status| {
+            status["folders"][0]["state"] == "halted"
+        })
+        .await;
+    let problem = status["folders"][0]["problem"].as_str().unwrap();
+    assert!(problem.contains("revoked"), "{problem}");
+    assert_eq!(
+        fs::read(folder.join("kept.txt")).unwrap(),
+        b"stays on the device"
+    );
+    let refused = machine.fails(&["device", "list"]);
+    assert!(refused.contains("Pair it again"), "{refused}");
+    assert!(stop(daemon).success());
+    assert_eq!(
+        fs::read(folder.join("kept.txt")).unwrap(),
+        b"stays on the device"
     );
 }
