@@ -994,3 +994,46 @@ async fn restore_brings_back_a_deleted_file_and_an_earlier_version() {
     assert!(trash.contains("Nothing from"), "{trash}");
     assert!(stop(daemon).success());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Worker; run cli/scripts/integration-test.sh"]
+async fn a_device_creates_a_space_and_links_a_folder_to_it() {
+    let owner = Arc::new(Auth::new(api(), owner().await));
+    let pairing = owner.api().pair_start(&owner).await.unwrap();
+    let server = server_url().to_string();
+    let machine = Machine::new();
+    machine.run(&["join", &pairing.code, "--server", &server, "--name", "desk"]);
+    let name = format!("notes {}", uuidv7());
+
+    let created = machine.run(&["space", "create", &format!(" {name} ")]);
+    assert!(
+        created.starts_with(&format!("Created the space {name} (")),
+        "{created}"
+    );
+    let spaces: Value = serde_json::from_str(&machine.run(&["space", "list", "--json"])).unwrap();
+    let ours: Vec<&Value> = spaces
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|space| space["name"] == name.as_str())
+        .collect();
+    assert_eq!(ours.len(), 1, "{spaces:#}");
+    let space_id = ours[0]["space_id"].as_str().unwrap();
+    assert!(created.contains(space_id), "{created}");
+    let listed = machine.run(&["space", "list"]);
+    assert!(listed.contains(&format!("{space_id}  {name}")), "{listed}");
+    let again = machine.fails(&["space", "create", &name]);
+    assert!(again.contains("already has that name"), "{again}");
+    let blank = machine.fails(&["space", "create", "  "]);
+    assert!(blank.contains("a space needs a name"), "{blank}");
+
+    let folder = machine.path("Notes");
+    fs::create_dir_all(&folder).unwrap();
+    let linked = machine.run(&["link", folder.to_str().unwrap(), "--space", &name]);
+    assert!(linked.contains(space_id), "{linked}");
+    let owners = owner.api().list_spaces(&owner).await.unwrap().spaces;
+    assert!(
+        owners.iter().any(|space| space.space_id == space_id),
+        "the owner's other device does not see the space"
+    );
+}
