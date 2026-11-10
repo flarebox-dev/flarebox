@@ -56,7 +56,15 @@ A `Move` of a live node to its current parent under its current name, compared b
 
 ## 7. Commit size (§13)
 
-The server stores each commit's change records in one log row. A commit is rejected with `LIMIT_EXCEEDED`, and changes nothing, when its serialized `CommitRecord` and `CommitResult` together exceed 7,900,000 bytes. That bound sits below the 8 MB Durable Object SQLite row limit ([Durable Objects limits](https://developers.cloudflare.com/durable-objects/platform/limits/)). A client that gets this error splits the commit. To delete a very large subtree, it deletes the subtree's contents, files and folders alike, in bounded batches over earlier commits, deepest first.
+A commit is accepted only if both of these fit in one `ServerMessage` of at most 1 MiB (§7.2):
+- its `CommitRecord`, as the only record of a `Changes` message;
+- its `CommitResult`, as the result of an `RpcResponse`.
+
+A `CommitRecord` cannot be split across messages, so this is the effective bound on a commit. A commit that exceeds it is rejected with `LIMIT_EXCEEDED` and changes nothing.
+
+The server stores each commit's change records in one log row, and the serialized `CommitRecord` and `CommitResult` together must stay under 7,900,000 bytes. That bound sits below the 8 MB Durable Object SQLite row limit ([Durable Objects limits](https://developers.cloudflare.com/durable-objects/platform/limits/)). It is a storage ceiling only: the 1 MiB bound always keeps a commit far below it, so it never decides whether a commit is accepted.
+
+A client that gets `LIMIT_EXCEEDED` for a commit splits its changes into several commits. To delete a very large subtree, it deletes the subtree's contents, files and folders alike, in bounded batches over earlier commits, deepest first.
 
 ## 8. Share-link passwords (§15.2)
 
