@@ -93,6 +93,8 @@ async function newSpace() {
     deviceId: creds.deviceId,
     userId: creds.userId,
     deviceName: "Laptop A",
+    kind: "device",
+    scope: null,
     role: "owner",
     maxFormat: 1,
     origin: BASE,

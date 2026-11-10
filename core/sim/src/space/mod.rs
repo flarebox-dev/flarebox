@@ -347,13 +347,34 @@ pub struct Committed {
     pub record: Option<CommitRecord>,
 }
 
+/// A commit's stored result, with the principal that made the commit and its request as digest v1
+/// covers it (RFC 0006 section 8). Comparing the covered request stands in for comparing digests.
+#[derive(Clone, Debug)]
+struct StoredResult {
+    device_id: String,
+    request: Commit,
+    result: CommitResult,
+}
+
+/// The part of a commit request that digest v1 covers: everything but `commit_id`, `receipts`,
+/// `history_id` and `run_id`.
+fn covered(commit: &Commit) -> Commit {
+    Commit {
+        commit_id: String::new(),
+        receipts: Vec::new(),
+        history_id: String::new(),
+        run_id: String::new(),
+        ..commit.clone()
+    }
+}
+
 pub struct SpaceDo {
     space_id: String,
     history_id: String,
     format_version: u32,
     state: State,
     log: Vec<CommitRecord>,
-    results: HashMap<String, CommitResult>,
+    results: HashMap<String, StoredResult>,
     /// The highest accepted `device_seq` per device (RFC 0002 section 2). `results` keeps every
     /// commit's result, so the result of that commit is found there.
     device_seqs: HashMap<String, u64>,
@@ -564,8 +585,20 @@ impl SpaceDo {
             ));
         }
         if let Some(stored) = self.results.get(&commit.commit_id) {
+            if stored.device_id != session.device_id {
+                return Err(fail(
+                    error::Code::InvalidArgument,
+                    "commit_id belongs to a commit of another device",
+                ));
+            }
+            if stored.request != covered(commit) {
+                return Err(fail(
+                    error::Code::InvalidArgument,
+                    "commit_id belongs to a different commit",
+                ));
+            }
             return Ok(Committed {
-                result: stored.clone(),
+                result: stored.result.clone(),
                 record: None,
             });
         }
@@ -723,8 +756,14 @@ impl SpaceDo {
         }
         self.state = state;
         self.log.push(record.clone());
-        self.results
-            .insert(commit.commit_id.clone(), result.clone());
+        self.results.insert(
+            commit.commit_id.clone(),
+            StoredResult {
+                device_id: session.device_id.clone(),
+                request: covered(commit),
+                result: result.clone(),
+            },
+        );
         self.device_seqs
             .insert(session.device_id.clone(), commit.device_seq);
         self.head_seq = seq;

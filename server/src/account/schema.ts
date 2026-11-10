@@ -44,6 +44,19 @@ export const MIGRATIONS: readonly Migration[] = [
     window_start_ms INTEGER NOT NULL, PRIMARY KEY (scope, client));
   CREATE TABLE IF NOT EXISTS used_recovery_keys (key_hash BLOB PRIMARY KEY, used_at_ms INTEGER NOT NULL);
   `,
+  // RFC 0006 section 2: every device is a principal. Existing rows become full-scope devices that never expire.
+  (sql) => {
+    const columns = sql.exec("SELECT name FROM pragma_table_info('devices')").toArray().map((row) => row.name);
+    if (!columns.includes("kind")) sql.exec("ALTER TABLE devices ADD COLUMN kind TEXT NOT NULL DEFAULT 'device'");
+    if (!columns.includes("scope")) sql.exec("ALTER TABLE devices ADD COLUMN scope TEXT");
+    if (!columns.includes("expires_at_ms")) sql.exec("ALTER TABLE devices ADD COLUMN expires_at_ms INTEGER");
+    if (!columns.includes("issued_by")) sql.exec("ALTER TABLE devices ADD COLUMN issued_by TEXT");
+  },
+  // RFC 0006 section 7: a revocation's notice to each space, kept until the space took it.
+  `
+  CREATE TABLE IF NOT EXISTS revocation_notices (device_id TEXT NOT NULL, space_id TEXT NOT NULL, next_try_ms INTEGER NOT NULL,
+    PRIMARY KEY (device_id, space_id));
+  `,
 ];
 
 export function migrate(sql: SqlStorage): void {

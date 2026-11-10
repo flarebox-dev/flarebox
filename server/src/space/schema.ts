@@ -70,6 +70,13 @@ export const MIGRATIONS: readonly Migration[] = [
   `
   CREATE TABLE IF NOT EXISTS rewind_markers (rewind_id TEXT NOT NULL, attempt INTEGER NOT NULL, PRIMARY KEY (rewind_id, attempt));
   `,
+  // RFC 0006 section 8: the digest of each commit request, stored with its result. Rows stored before have none.
+  (sql) => {
+    for (const table of ["commits", "device_commits"]) {
+      const columns = sql.exec(`SELECT name FROM pragma_table_info('${table}')`).toArray().map((row) => row.name);
+      if (!columns.includes("request_digest")) sql.exec(`ALTER TABLE ${table} ADD COLUMN request_digest BLOB`);
+    }
+  },
 ];
 
 export function migrate(sql: SqlStorage): void {

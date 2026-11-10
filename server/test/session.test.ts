@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { create, type DescMessage, fromBinary, type MessageInitShape, type MessageShape, toBinary } from "@bufbuild/protobuf";
-import { evictDurableObject, runInDurableObject } from "cloudflare:test";
+import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -10,8 +10,11 @@ import {
   CreateSpaceRequestSchema,
   type DeviceCredentials,
   DeviceCredentialsSchema,
+  DeviceInfo_Kind,
+  DeviceListSchema,
   PairCompleteRequestSchema,
   PairStartResponseSchema,
+  RewindRequestSchema,
   ServerInfoSchema,
   SpaceInfoSchema,
   SpaceListSchema,
@@ -30,9 +33,11 @@ import {
 } from "../src/gen/flarebox/v1/messages_pb";
 import { ChunkRefSchema, type CommitRecord, ContentSchema } from "../src/gen/flarebox/v1/model_pb";
 import { ChunkPlan_Action, Error_Code, ErrorSchema, type Target } from "../src/gen/flarebox/v1/rpc_pb";
-import type { ServerKey } from "../src/auth";
-import { sha256 } from "../src/crypto";
+import { type Identity, type ServerKey, signAccessToken, verifyAccessToken } from "../src/auth";
+import { fromBase64url, sha256 } from "../src/crypto";
+import { ShareLinkListSchema } from "../src/gen/flarebox/v1/share_pb";
 import { toHex, uuidv7 } from "../src/ids";
+import { type Principal, policy } from "../src/policy";
 import { Close, HOLD_MS, type SpaceDO } from "../src/space-do";
 import { CallFailure } from "../src/space/commit";
 import { chunkKey, encodeChunkList } from "../src/space/store";
@@ -369,7 +374,7 @@ describe("owner claim, pairing and tokens", () => {
     const stub = env.SPACE.get(env.SPACE.idFromName(spaceId));
     await stub.closeDevice(tv.deviceId);
     await evictDurableObject(stub);
-    const identity = { userId: tv.userId, deviceId: tv.deviceId, deviceName: "TV", expiresAtMs: Date.now() + 900_000 };
+    const identity = { userId: tv.userId, deviceId: tv.deviceId, deviceName: "TV", expiresAtMs: Date.now() + 900_000, kind: "device", scope: null };
     const request = body(RpcRequestSchema, { reqId: 1n, call: { case: "commit", value: { commitId: uuidv7(), baseSeq: 0n, ops: [op.mkdir(uuidv7(), spaceId, "x")] } } });
     const result = fromBinary(RpcResponseSchema, await stub.httpRpc({ identity, origin: BASE }, request)).result;
     expect(result.case === "error" && result.value.code).toBe(Error_Code.UNAUTHENTICATED);
@@ -419,7 +424,7 @@ describe("owner claim, pairing and tokens", () => {
       version: state.storage.sql.exec("SELECT value FROM meta WHERE key = 'schema_version'").one().value,
       revoked: state.storage.sql.exec("SELECT device_id FROM revoked_devices").toArray(),
     }));
-    expect(after).toEqual({ version: 5, revoked: [{ device_id: device }] });
+    expect(after).toEqual({ version: 6, revoked: [{ device_id: device }] });
   });
 
   it("adds revoked_devices to a version-one Space database and keeps its data", async () => {
@@ -445,7 +450,325 @@ describe("owner claim, pairing and tokens", () => {
       node: state.storage.sql.exec("SELECT name FROM nodes WHERE node_id = ?", dir).toArray(),
       revoked: state.storage.sql.exec("SELECT device_id FROM revoked_devices").toArray(),
     }));
-    expect(after).toEqual({ version: 5, head: 1, commits: [{ seq: 1 }], node: [{ name: "kept" }], revoked: [{ device_id: device }] });
+    expect(after).toEqual({ version: 6, head: 1, commits: [{ seq: 1 }], node: [{ name: "kept" }], revoked: [{ device_id: device }] });
+  });
+});
+
+describe("RFC 0006 principals, capabilities and device routes", () => {
+  /** A request's status, and the error code of a refusal that carries an Error. */
+  async function send(path: string, init: { method?: string; token?: string; body?: Uint8Array }) {
+    const headers: Record<string, string> = { "Content-Type": "application/x-protobuf" };
+    if (init.token) headers.Authorization = "Bearer " + init.token;
+    const response = await exports.default.fetch(BASE + path, { method: init.method ?? "POST", headers, body: init.body });
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const error = !response.ok && response.headers.get("Content-Type") === "application/x-protobuf";
+    return { status: response.status, code: error ? fromBinary(ErrorSchema, bytes).code : undefined };
+  }
+
+  function refresh(creds: DeviceCredentials) {
+    return call("/v1/token", { body: body(TokenRequestSchema, { deviceId: creds.deviceId, refreshCredential: creds.refreshCredential }) }, AccessTokenSchema);
+  }
+
+  function listDevices(token: string, cursor = "") {
+    return call("/v1/devices" + (cursor ? "?cursor=" + cursor : ""), { method: "GET", token }, DeviceListSchema);
+  }
+
+  function updateDevice(deviceId: string, assignment: string, value: unknown) {
+    return runInDurableObject(account(), (_instance, state) => {
+      state.storage.sql.exec(`UPDATE devices SET ${assignment} = ? WHERE device_id = ?`, value, deviceId);
+    });
+  }
+
+  it("lists the user's principals in creation order with their issuer, and pages them by cursor", async () => {
+    const owner = await getOwner();
+    const pad = await pairDevice(owner, "Lister");
+    expect(pad.credentialExpiresAtMs).toBe(0n);
+    const listed = await listDevices(pad.access!.token);
+    expect(listed.status).toBe(200);
+    const byId = new Map(listed.message!.devices.map((device) => [device.deviceId, device]));
+    expect(byId.get(owner.deviceId)).toMatchObject({ name: "Laptop A", platform: "macos", kind: DeviceInfo_Kind.DEVICE, issuedBy: "", current: false });
+    expect(byId.get(pad.deviceId)).toMatchObject({
+      name: "Lister",
+      platform: "linux",
+      kind: DeviceInfo_Kind.DEVICE,
+      issuedBy: owner.deviceId,
+      current: true,
+      revokedAtMs: 0n,
+      credentialExpiresAtMs: 0n,
+    });
+    expect(byId.get(pad.deviceId)!.createdAtMs).toBeGreaterThan(0n);
+    const ids = listed.message!.devices.map((device) => device.deviceId);
+    expect(ids).toEqual([...ids].sort());
+    expect(listed.message!.nextCursor).toBe("");
+
+    const extra = Array.from({ length: 150 }, () => uuidv7());
+    await runInDurableObject(account(), (_instance, state) => {
+      for (const id of extra) {
+        state.storage.sql.exec(
+          "INSERT INTO devices (device_id, user_id, name, platform, created_at_ms, refresh_hash) VALUES (?, ?, 'Extra', 'linux', ?, ?)",
+          id,
+          owner.userId,
+          Date.now(),
+          new Uint8Array(32),
+        );
+      }
+    });
+    try {
+      const pages: string[][] = [];
+      let cursor = "";
+      do {
+        const page = await listDevices(pad.access!.token, cursor);
+        pages.push(page.message!.devices.map((device) => device.deviceId));
+        cursor = page.message!.nextCursor;
+      } while (cursor);
+      expect(pages[0]).toHaveLength(100);
+      expect(pages.flat()).toEqual([...ids, ...extra].sort());
+    } finally {
+      await runInDurableObject(account(), (_instance, state) => {
+        for (const id of extra) state.storage.sql.exec("DELETE FROM devices WHERE device_id = ?", id);
+      });
+    }
+  });
+
+  it("revokes a principal of the caller's user: its sockets close with 4003, its credential stops working, and a repeat changes nothing", async () => {
+    const owner = await getOwner();
+    const tv = await pairDevice(owner, "Revoked TV");
+    const spaceId = await createSpace(owner);
+    const socket = await Socket.connect(spaceId, tv);
+    await socket.start();
+    expect(await send("/v1/devices/" + tv.deviceId, { method: "DELETE", token: owner.access!.token })).toEqual({ status: 204, code: undefined });
+    expect((await socket.waitClosed()).code).toBe(Close.DEVICE_REVOKED);
+    expect((await refresh(tv)).status).toBe(401);
+    const listed = await listDevices(owner.access!.token);
+    expect(listed.message!.devices.find((device) => device.deviceId === tv.deviceId)!.revokedAtMs).toBeGreaterThan(0n);
+    expect((await send("/v1/devices/" + tv.deviceId, { method: "DELETE", token: owner.access!.token })).status).toBe(204);
+
+    const stranger = uuidv7();
+    await runInDurableObject(account(), (_instance, state) => {
+      state.storage.sql.exec(
+        "INSERT INTO devices (device_id, user_id, name, platform, created_at_ms, refresh_hash) VALUES (?, ?, 'Stranger', 'linux', ?, ?)",
+        stranger,
+        uuidv7(),
+        Date.now(),
+        new Uint8Array(32),
+      );
+    });
+    for (const id of [uuidv7(), stranger]) {
+      expect(await send("/v1/devices/" + id, { method: "DELETE", token: owner.access!.token })).toEqual({ status: 404, code: Error_Code.NOT_FOUND });
+    }
+    const untouched = await runInDurableObject(account(), (_instance, state) => state.storage.sql.exec("SELECT revoked_at_ms FROM devices WHERE device_id = ?", stranger).one());
+    expect(untouched.revoked_at_ms).toBeNull();
+
+    const self = await pairDevice(owner, "Leaving");
+    expect((await send("/v1/devices/" + self.deviceId, { method: "DELETE", token: self.access!.token })).status).toBe(204);
+    expect((await listDevices(self.access!.token)).status).toBe(401);
+    expect((await send("/v1/devices", { method: "POST", token: owner.access!.token })).status).toBe(405);
+    expect((await send("/v1/devices", { method: "GET" })).status).toBe(401);
+  });
+
+  it("denies everything to a principal whose kind or scope this server does not know", async () => {
+    const owner = await getOwner();
+    const spaceId = await createSpace(owner);
+    for (const [assignment, value] of [["kind", "agent"], ["scope", "photos"]] as const) {
+      const pad = await pairDevice(owner, "Unknown " + assignment);
+      const socket = await Socket.connect(spaceId, pad);
+      await socket.start();
+      await updateDevice(pad.deviceId, assignment, value);
+      expect((await refresh(pad)).status, assignment).toBe(401);
+      expect(await send("/v1/spaces", { method: "GET", token: pad.access!.token })).toEqual({ status: 401, code: Error_Code.UNAUTHENTICATED });
+      expect((await send("/v1/pair/start", { token: pad.access!.token })).status).toBe(401);
+      expect(await Socket.open(spaceId, pad.access!.token)).toBe(401);
+      socket.send({ case: "rpc", value: { reqId: 1n, call: { case: "listTree", value: {} } } });
+      expect(await socket.next()).toMatchObject({ case: "goodbye", value: { code: Close.DEVICE_REVOKED } });
+    }
+    const inviter = await pairDevice(owner, "Inviter");
+    const started = await call("/v1/pair/start", { token: inviter.access!.token }, PairStartResponseSchema);
+    await updateDevice(inviter.deviceId, "kind", "agent");
+    const pairBody = body(PairCompleteRequestSchema, { code: started.message!.code, deviceName: "Invitee", platform: "linux" });
+    expect(await send("/v1/pair/complete", { body: pairBody })).toEqual({ status: 403, code: Error_Code.FORBIDDEN });
+  });
+
+  /** Commits one folder as the owner over HTTP, so that the space pushes it to every other live connection. */
+  async function commitAsOwner(owner: DeviceCredentials, spaceId: string, historyId: string) {
+    const deviceSeq = BigInt(Number((await runInDurableObject(env.SPACE.get(env.SPACE.idFromName(spaceId)), (_instance, state) =>
+      state.storage.sql.exec("SELECT COALESCE(MAX(device_seq), 0) AS seq FROM device_commits WHERE device_id = ?", owner.deviceId).one().seq)))) + 1n;
+    const commit = { commitId: uuidv7(), historyId, deviceSeq, baseSeq: 0n, ops: [op.mkdir(uuidv7(), spaceId, "Pushed " + deviceSeq)] };
+    const result = await call(`/v1/spaces/${spaceId}/rpc`, { token: owner.access!.token, body: body(RpcRequestSchema, { reqId: 1n, call: { case: "commit", value: commit } }) }, RpcResponseSchema);
+    expect(result.message!.result.case).toBe("commit");
+  }
+
+  it("closes a passive connection with 4003 instead of pushing to it once its principal is denied", async () => {
+    const owner = await getOwner();
+    const spaceId = await createSpace(owner);
+    const watcher = await Socket.connect(spaceId, owner);
+    const { historyId } = await watcher.start();
+    for (const [column, value] of [["kind", "agent"], ["scope", "photos"], ["expires_at_ms", 1]] as const) {
+      const pad = await pairDevice(owner, "Passive " + column);
+      const socket = await Socket.connect(spaceId, pad);
+      await socket.start();
+      await updateDevice(pad.deviceId, column, value);
+      await commitAsOwner(owner, spaceId, historyId);
+      expect(await socket.next(), column).toMatchObject({ case: "goodbye", value: { code: Close.DEVICE_REVOKED } });
+      expect((await watcher.pushed()).length).toBe(1);
+    }
+  });
+
+  it("closes passive connections with 1013 when the Account DO cannot check them before a push", async () => {
+    const owner = await getOwner();
+    const pad = await pairDevice(owner, "Unchecked");
+    const spaceId = await createSpace(owner);
+    const socket = await Socket.connect(spaceId, pad);
+    const { historyId } = await socket.start();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const prototype = await runInDurableObject(account(), (instance: import("../src/account-do").AccountDO) => Object.getPrototypeOf(instance) as import("../src/account-do").AccountDO);
+    const original = prototype.checkSessions;
+    prototype.checkSessions = async () => {
+      throw new Error("injected Account DO failure");
+    };
+    try {
+      await commitAsOwner(owner, spaceId, historyId);
+      expect(await socket.next()).toMatchObject({ case: "goodbye", value: { code: Close.TRY_AGAIN_LATER } });
+    } finally {
+      prototype.checkSessions = original;
+    }
+  });
+
+  it("lets a principal back in once its row is supported again, because only a revocation is remembered", async () => {
+    const owner = await getOwner();
+    const pad = await pairDevice(owner, "Temporarily unknown");
+    const spaceId = await createSpace(owner);
+    const socket = await Socket.connect(spaceId, pad);
+    await socket.start();
+    await updateDevice(pad.deviceId, "kind", "agent");
+    socket.send({ case: "rpc", value: { reqId: 1n, call: { case: "listTree", value: {} } } });
+    expect(await socket.next()).toMatchObject({ case: "goodbye", value: { code: Close.DEVICE_REVOKED } });
+    await updateDevice(pad.deviceId, "kind", "device");
+    const reopened = await Socket.connect(spaceId, pad);
+    await reopened.start();
+    expect((await reopened.rpc({ case: "listTree", value: {} })).case).toBe("tree");
+    const remembered = await runInDurableObject(env.SPACE.get(env.SPACE.idFromName(spaceId)), (_instance, state) =>
+      state.storage.sql.exec("SELECT device_id FROM revoked_devices WHERE device_id = ?", pad.deviceId).toArray(),
+    );
+    expect(remembered).toEqual([]);
+  });
+
+  it("keeps a revocation notice that a space did not take, and delivers it on a repeat or from the alarm", async () => {
+    const owner = await getOwner();
+    const [repeated, alarmed] = [await pairDevice(owner, "Repeat"), await pairDevice(owner, "Alarm")];
+    await createSpace(owner);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    await runInDurableObject(account(), async (instance: import("../src/account-do").AccountDO, state) => {
+      const namespace = (instance as unknown as { env: Env }).env.SPACE;
+      const delivered: string[] = [];
+      let fail = true;
+      const spy = vi.spyOn(namespace, "get").mockImplementation((() => ({
+        closeDevice: async (deviceId: string) => {
+          if (fail) throw new Error("injected close failure");
+          delivered.push(deviceId);
+        },
+      })) as never);
+      const pending = (deviceId: string) => state.storage.sql.exec("SELECT COUNT(*) AS n FROM revocation_notices WHERE device_id = ?", deviceId).one().n;
+      try {
+        for (const device of [repeated, alarmed]) {
+          expect(await instance.revokeUserDevice({ userId: owner.userId, deviceId: device.deviceId })).toMatchObject({ ok: true });
+          expect(pending(device.deviceId)).toBeGreaterThan(0);
+          expect((await instance.checkSession(device.deviceId)).revoked).toBe(true);
+        }
+        expect(await state.storage.getAlarm()).not.toBeNull();
+        fail = false;
+        await instance.revokeUserDevice({ userId: owner.userId, deviceId: repeated.deviceId });
+        expect(pending(repeated.deviceId)).toBe(0);
+        expect(delivered).toContain(repeated.deviceId);
+        state.storage.sql.exec("UPDATE revocation_notices SET next_try_ms = 0");
+        await instance.alarm();
+        expect(pending(alarmed.deviceId)).toBe(0);
+        expect(delivered).toContain(alarmed.deviceId);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+  });
+
+  it("arms the alarm when it stores a revocation, so a notice is delivered even if the object is evicted before delivering it", async () => {
+    const owner = await getOwner();
+    const pad = await pairDevice(owner, "Evicted before delivery");
+    const spaceId = await createSpace(owner);
+    const socket = await Socket.connect(spaceId, pad);
+    await socket.start();
+    const stub = account();
+    await runInDurableObject(stub, async (instance: import("../src/account-do").AccountDO, state) => {
+      await state.storage.deleteAlarm();
+      vi.spyOn(instance as unknown as { deliverNotices: () => Promise<void> }, "deliverNotices").mockRejectedValue(new Error("evicted before delivery"));
+      await expect(instance.revokeUserDevice({ userId: owner.userId, deviceId: pad.deviceId })).rejects.toThrow("evicted before delivery");
+      expect(await state.storage.getAlarm()).not.toBeNull();
+      state.storage.sql.exec("UPDATE revocation_notices SET next_try_ms = 0 WHERE device_id = ?", pad.deviceId);
+    });
+    await evictDurableObject(stub);
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect((await socket.waitClosed()).code).toBe(Close.DEVICE_REVOKED);
+    const pending = await runInDurableObject(stub, (_instance, state) =>
+      state.storage.sql.exec("SELECT COUNT(*) AS n FROM revocation_notices WHERE device_id = ?", pad.deviceId).one().n,
+    );
+    expect(pending).toBe(0);
+  });
+
+  it("never lets an access token outlive its credential, and refuses an expired credential", async () => {
+    const owner = await getOwner();
+    const pad = await pairDevice(owner, "Expiring");
+    const expiresAtMs = Date.now() + 60_000;
+    await updateDevice(pad.deviceId, "expires_at_ms", expiresAtMs);
+    const token = await refresh(pad);
+    expect(token.message!.expiresAtMs).toBe(BigInt(expiresAtMs));
+    const listed = await listDevices(owner.access!.token);
+    expect(listed.message!.devices.find((device) => device.deviceId === pad.deviceId)!.credentialExpiresAtMs).toBe(BigInt(expiresAtMs));
+    await updateDevice(pad.deviceId, "expires_at_ms", Date.now() - 1);
+    expect(await send("/v1/token", { body: body(TokenRequestSchema, { deviceId: pad.deviceId, refreshCredential: pad.refreshCredential }) })).toEqual({
+      status: 401,
+      code: Error_Code.UNAUTHENTICATED,
+    });
+    expect((await send("/v1/spaces", { method: "GET", token: token.message!.token })).status).toBe(401);
+  });
+
+  it("carries the principal's kind and scope in the token, reads a token without them as a full-scope device, and decides from the row", async () => {
+    const owner = await getOwner();
+    const claims = JSON.parse(new TextDecoder().decode(fromBase64url(owner.access!.token.split(".")[2]!)!));
+    expect(claims).toMatchObject({ k: "device", s: null });
+    const key = await account().serverKey();
+    const nowMs = Date.now();
+    const identity = { userId: owner.userId, deviceId: owner.deviceId, deviceName: "Laptop A", expiresAtMs: nowMs + 60_000 };
+    const legacy = await signAccessToken(key, identity as Identity);
+    expect(JSON.parse(new TextDecoder().decode(fromBase64url(legacy.split(".")[2]!)!))).not.toHaveProperty("k");
+    expect(await verifyAccessToken(key, legacy, nowMs)).toEqual({ ...identity, kind: "device", scope: null });
+
+    const claimed = await signAccessToken(key, { ...identity, kind: "agent", scope: "photos" });
+    const asked: Principal[] = [];
+    vi.spyOn(policy, "can").mockImplementation((principal) => {
+      asked.push(principal);
+      return true;
+    });
+    expect((await send("/v1/spaces", { token: claimed, body: body(CreateSpaceRequestSchema, { name: "Row decides" }) })).status).toBe(201);
+    expect(asked).toEqual([expect.objectContaining({ deviceId: owner.deviceId, kind: "device", scope: null })]);
+  });
+
+  it("checks each capability before its action and refuses it with FORBIDDEN", async () => {
+    const owner = await getOwner();
+    const token = owner.access!.token;
+    const spaceId = await createSpace(owner);
+    const cases = [
+      ["space.create", () => send("/v1/spaces", { token, body: body(CreateSpaceRequestSchema, { name: "Refused" }) })],
+      ["device.pair", () => send("/v1/pair/start", { token })],
+      ["device.manage", () => send("/v1/devices", { method: "GET", token })],
+      ["device.manage", () => send("/v1/devices/" + owner.deviceId, { method: "DELETE", token })],
+      ["share.manage", () => send(`/v1/spaces/${spaceId}/links`, { method: "GET", token })],
+      ["space.rewind", () => send(`/v1/spaces/${spaceId}/rewind`, { token, body: body(RewindRequestSchema, { restorePointMs: 1n, rewindId: uuidv7() }) })],
+    ] as const;
+    for (const [capability, request] of cases) {
+      const can = vi.spyOn(policy, "can").mockImplementation((_principal, asked) => asked !== capability);
+      expect(await request(), capability).toEqual({ status: 403, code: Error_Code.FORBIDDEN });
+      can.mockRestore();
+    }
+    expect((await refresh(owner)).status).toBe(200);
+    expect((await call(`/v1/spaces/${spaceId}/links`, { method: "GET", token }, ShareLinkListSchema)).status).toBe(200);
   });
 });
 

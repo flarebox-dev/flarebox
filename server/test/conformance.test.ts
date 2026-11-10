@@ -152,6 +152,8 @@ class Run {
   private readonly cursors = new Map<string, string>();
   /** Per device and space, the device_seq of the device's last applied commit there; per space, the highest seq returned. */
   private readonly slots = new Map<string, bigint>();
+  /** Per device, space and commit_id, the device_seq the commit was first sent with: a retry keeps it (RFC 0002 section 2). */
+  private readonly sentSlots = new Map<string, bigint>();
   private readonly topSeq = new Map<string, bigint>();
   private reqId = 0n;
 
@@ -186,6 +188,8 @@ class Run {
         deviceId: uuidv7(),
         userId: OWNER,
         deviceName: req(optStr(device, "name"), "name"),
+        kind: "device",
+        scope: null,
         role: role as Role,
         maxFormat: optUint(device, "max_format") ?? 1,
         origin: ORIGIN,
@@ -495,7 +499,9 @@ class Run {
     const history = optStr(body, "history_id");
     const historyId = history === undefined ? this.space(space).historyId : this.id(space, history);
     const given = optUint(body, "device_seq");
-    const deviceSeq = given === undefined ? (this.slots.get(device) ?? 0n) + 1n : BigInt(given);
+    const sent = this.sentSlots.get(`${device}/${commitId}`);
+    const deviceSeq = given === undefined ? (sent ?? (this.slots.get(device) ?? 0n) + 1n) : BigInt(given);
+    if (sent === undefined) this.sentSlots.set(`${device}/${commitId}`, deviceSeq);
     const expect = expectation(step, ["missing", "missing_some"], ["seq", "results", "changed"]);
     const result = await this.rpc(space, session, atMs, {
       case: "commit",

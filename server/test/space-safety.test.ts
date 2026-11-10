@@ -194,14 +194,14 @@ describe("review regressions", () => {
     const receipts = await space.a.uploadParts(parts);
     const commitId = uuidv7();
     const ops = [op.create(uuidv7(), space.root, "one", parts.content)];
-    const [x, y] = await Promise.all([space.a.commit(ops, { commitId, receipts }), space.b.commit(ops, { commitId, receipts })]);
+    const [x, y] = await Promise.all([space.a.commit(ops, { commitId, receipts }), space.a.commit(ops, { commitId, receipts })]);
     expect(x).toEqual(y);
+    const racing = await Promise.all([space.a.commitRaw(ops, { commitId, receipts }), space.b.commitRaw(ops, { commitId, receipts })]);
+    expect(racing.map((result) => (result.case === "error" ? result.value.code : result.case))).toEqual(["commit", Error_Code.INVALID_ARGUMENT]);
     expect(await table(space, "SELECT refcount FROM chunks")).toEqual([{ refcount: 1 }]);
     expect(await table(space, "SELECT COUNT(*) AS n FROM versions")).toEqual([{ n: 1 }]);
     const accepted = await table(space, "SELECT device_id, device_seq FROM device_commits");
-    expect(accepted).toHaveLength(1);
-    const other = accepted[0]!.device_id === space.a.session.deviceId ? space.b : space.a;
-    other.acceptedSeq = 0n;
+    expect(accepted).toEqual([{ device_id: space.a.session.deviceId, device_seq: 1 }]);
     const next = await Promise.all([space.a.commit([op.mkdir(uuidv7(), space.root, "two")]), space.b.commit([op.mkdir(uuidv7(), space.root, "three")])]);
     expect(next.map((r) => r.seq).sort()).toEqual([2n, 3n]);
   });
@@ -245,7 +245,7 @@ describe("review regressions", () => {
     const first = await space.a.commit([op.update(kept.nodeId, parts.content)], { commitId, receipts });
     expect(first.seq).toBe(2n);
     await evictDurableObject(space.stub);
-    expect(await space.a.commit([op.mkdir(uuidv7(), space.root, "ignored")], { commitId })).toEqual(first);
+    expect(await space.a.commit([op.update(kept.nodeId, parts.content)], { commitId })).toEqual(first);
     expect(await table(space, "SELECT MAX(seq) AS head FROM commits")).toEqual([{ head: 2 }]);
     await expectRefcountsMatchVersions(space);
   });
@@ -362,7 +362,7 @@ describe("GC and references", () => {
     const two = uuidv7();
     const commitId = uuidv7();
     await space.a.commit([op.create(one, space.root, "one", shared.content), op.create(two, space.root, "two", shared.content)], { commitId, receipts });
-    await space.a.commit([op.mkdir(uuidv7(), space.root, "retry ignored")], { commitId });
+    await space.a.commit([op.create(one, space.root, "one", shared.content), op.create(two, space.root, "two", shared.content)], { commitId });
     await expectRefcountsMatchVersions(space);
     expect(await table(space, "SELECT refcount FROM chunks ORDER BY refcount")).toEqual([{ refcount: 2 }, { refcount: 2 }]);
 

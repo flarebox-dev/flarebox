@@ -308,6 +308,9 @@ struct Run {
     wallets: HashMap<(String, String), Vec<UploadReceipt>>,
     /// Per device and space, the `device_seq` of the device's last commit there that was applied.
     slots: HashMap<(String, String), u64>,
+    /// Per device, space and `commit_id`, the `device_seq` the commit was first sent with: a retry
+    /// keeps it (RFC 0002 section 2).
+    sent_slots: HashMap<(String, String, String), u64>,
     /// Per space, the highest seq a commit returned.
     top_seq: HashMap<String, u64>,
     last_missing: HashMap<(String, String), Vec<Vec<u8>>>,
@@ -403,6 +406,7 @@ impl Run {
             contents,
             wallets: HashMap::new(),
             slots: HashMap::new(),
+            sent_slots: HashMap::new(),
             top_seq: HashMap::new(),
             last_missing: HashMap::new(),
             symbols: HashMap::new(),
@@ -852,10 +856,15 @@ impl Run {
             None => self.space(space)?.history_id().to_owned(),
         };
         let slot = (session.device_id.clone(), space.to_owned());
+        let sent = (slot.0.clone(), slot.1.clone(), commit_id.clone());
         let device_seq = match opt_u64(body, "device_seq")? {
             Some(device_seq) => device_seq,
-            None => self.slots.get(&slot).copied().unwrap_or(0) + 1,
+            None => match self.sent_slots.get(&sent) {
+                Some(&device_seq) => device_seq,
+                None => self.slots.get(&slot).copied().unwrap_or(0) + 1,
+            },
         };
+        self.sent_slots.entry(sent).or_insert(device_seq);
         let commit = Commit {
             commit_id,
             base_seq: req(opt_u64(body, "base_seq"), "base_seq")?,
