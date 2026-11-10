@@ -9,6 +9,8 @@ import {
   ClientMessageSchema,
   GoodbyeSchema,
   type Hello,
+  Notice_Kind,
+  NoticeSchema,
   type Resume,
   ResyncRequired_Reason,
   ResyncRequiredSchema,
@@ -56,6 +58,7 @@ import { type Identity, verifyAccessToken } from "./auth";
 import { type ChunkObject, sha256, signChunkGrant, verifyChunkGrant } from "./crypto";
 import { fromHex, isUuidV7, toHex, uuidv7 } from "./ids";
 import { policy } from "./policy";
+import { quotaRefusal } from "./quota";
 import { type ApplyContext, CallFailure, CommitApplier } from "./space/commit";
 import { commitDigest } from "./space/digest";
 import { bootstrapExport, descriptorDurable, Exporter, noteCommitted, startExport } from "./space/export";
@@ -394,7 +397,23 @@ export class SpaceDO extends DurableObject<Env> {
     return new Response(null, { status: 101, webSocket: client });
   }
 
+  /**
+   * A platform limit can stop any query of a message, before an RPC is even read, so the session gets a Notice and is
+   * closed instead of an answer that never comes (spec v0 sections 7.2 and 13). Any other error escapes as before.
+   */
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    try {
+      await this.receive(ws, message);
+    } catch (error) {
+      const quota = quotaRefusal(error, this.clock());
+      if (!quota) throw error;
+      console.error("space session stopped at a platform limit", error);
+      this.send(ws, { case: "notice", value: create(NoticeSchema, { kind: Notice_Kind.QUOTA_EXCEEDED, message: quota.message, retryAfterMs: BigInt(quota.retryAfterMs) }) });
+      this.goodbye(ws, Close.TRY_AGAIN_LATER, quota.message);
+    }
+  }
+
+  private async receive(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     if (ws.readyState !== WebSocket.OPEN) return;
     if (typeof message === "string") return this.goodbye(ws, Close.PROTOCOL, "text messages other than ping are not supported");
     if (message.byteLength > MAX_CLIENT_FRAME) return this.goodbye(ws, Close.PROTOCOL, "message larger than 8 MiB");
@@ -684,7 +703,8 @@ export class SpaceDO extends DurableObject<Env> {
     } catch (error) {
       if (!(error instanceof CallFailure)) {
         console.error("space rpc failed", error);
-        error = new CallFailure(Error_Code.INTERNAL, "internal error");
+        const quota = quotaRefusal(error, this.clock());
+        error = quota ? new CallFailure(Error_Code.QUOTA_EXCEEDED, quota.message, [], quota.retryAfterMs) : new CallFailure(Error_Code.INTERNAL, "internal error");
       }
       const failure = error as CallFailure;
       const value = create(ErrorSchema, {

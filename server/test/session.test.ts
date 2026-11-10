@@ -25,6 +25,7 @@ import { OpResult_Code, type UploadReceipt, UploadReceiptSchema } from "../src/g
 import {
   type ClientMessage,
   ClientMessageSchema,
+  Notice_Kind,
   ResyncRequired_Reason,
   RpcRequestSchema,
   RpcResponseSchema,
@@ -1571,5 +1572,150 @@ describe("share links", () => {
       s.storage.sql.exec("UPDATE share_links SET password_kdf = 'argon2id' WHERE link_id = ?", link);
     });
     expect(await links.openShareLink(link, "pw")).toMatchObject({ ok: false, code: Error_Code.INTERNAL });
+  });
+});
+
+describe("platform limits", () => {
+  const DAY_MS = 86_400_000;
+  const DAILY = "Exceeded allowed rows written in Durable Objects free tier.";
+  const DAILY_MESSAGE = "the server reached a Workers Free daily limit; it resets at 00:00 UTC";
+  const untilMidnight = (nowMs: number) => BigInt(DAY_MS - (nowMs % DAY_MS));
+
+  async function connected() {
+    const a = await getOwner();
+    const spaceId = await createSpace(a);
+    const stub = env.SPACE.get(env.SPACE.idFromName(spaceId));
+    const socket = await Socket.connect(spaceId, a);
+    await socket.start();
+    const midnight = await runInDurableObject(stub, (instance: SpaceDO) => {
+      const now = Date.now();
+      instance.clock = () => now - (now % DAY_MS) + 1000;
+      return now - (now % DAY_MS);
+    });
+    return { a, spaceId, stub, socket, retryAfterMs: untilMidnight(midnight + 1000) };
+  }
+
+  function failNextSpaceQuery(stub: DurableObjectStub<SpaceDO>, error: Error) {
+    return runInDurableObject(stub, (_instance, state) => {
+      vi.spyOn(state.storage.sql, "exec").mockImplementationOnce(() => {
+        throw error;
+      });
+    });
+  }
+
+  it("answers an RPC that a daily limit stops with QUOTA_EXCEEDED and a wait until 00:00 UTC, over HTTP and WebSocket", async () => {
+    const { a, spaceId, stub, socket, retryAfterMs } = await connected();
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    await runInDurableObject(stub, (instance: SpaceDO) => {
+      (instance as unknown as { listTree: () => never }).listTree = () => {
+        throw new Error(DAILY);
+      };
+    });
+    const request: MessageInitShape<typeof RpcRequestSchema>["call"] = { case: "listTree", value: {} };
+    const http = await call("/v1/spaces/" + spaceId + "/rpc", { token: a.access!.token, body: body(RpcRequestSchema, { reqId: 1n, call: request }) }, RpcResponseSchema);
+    const quota = { case: "error", value: { code: Error_Code.QUOTA_EXCEEDED, message: DAILY_MESSAGE, retryAfterMs } };
+    expect(http.message!.result).toMatchObject(quota);
+    expect(await socket.rpc(request)).toMatchObject(quota);
+    expect(socket.closed).toBeUndefined();
+    expect(logged.mock.calls.filter(([what]) => what === "space rpc failed").map(([, error]) => (error as Error).message)).toEqual([DAILY, DAILY]);
+  });
+
+  it("keeps any other error of an RPC an INTERNAL error without a wait", async () => {
+    const { spaceId, stub, socket } = await connected();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const others = [
+      new Error("disk I/O error: SQLITE_IOERR"),
+      new Error("Durable Object reset because its code was updated."),
+      new TypeError("Cannot read properties of undefined (reading 'nodeId')"),
+    ];
+    for (const error of others) {
+      await runInDurableObject(stub, (instance: SpaceDO) => {
+        (instance as unknown as { listTree: () => never }).listTree = () => {
+          throw error;
+        };
+      });
+      expect(await socket.rpc({ case: "listTree", value: {} }), error.message).toMatchObject({
+        case: "error",
+        value: { code: Error_Code.INTERNAL, message: "internal error", retryAfterMs: 0n },
+      });
+    }
+    expect(spaceId).toBeTruthy();
+  });
+
+  it("sends a Notice and closes the session when a daily limit stops a message before its RPC is read", async () => {
+    const { stub, socket, retryAfterMs } = await connected();
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    await failNextSpaceQuery(stub, new Error(DAILY));
+    socket.send({ case: "rpc", value: { reqId: 1n, call: { case: "listTree", value: {} } } });
+    expect(await socket.next()).toMatchObject({ case: "notice", value: { kind: Notice_Kind.QUOTA_EXCEEDED, message: DAILY_MESSAGE, retryAfterMs } });
+    expect(await socket.next()).toMatchObject({ case: "goodbye", value: { code: Close.TRY_AGAIN_LATER, reason: DAILY_MESSAGE } });
+    expect((await socket.waitClosed()).code).toBe(Close.TRY_AGAIN_LATER);
+    expect(logged.mock.calls.find(([what]) => what === "space session stopped at a platform limit")?.[1]).toMatchObject({ message: DAILY });
+  });
+
+  it("sends no Notice for any other error that stops a message before its RPC is read", async () => {
+    const { stub, socket } = await connected();
+    await failNextSpaceQuery(stub, new Error("disk I/O error: SQLITE_IOERR"));
+    socket.send({ case: "rpc", value: { reqId: 99n, call: { case: "listTree", value: {} } } });
+    expect(await socket.rpc({ case: "listTree", value: {} })).toMatchObject({ case: "tree" });
+    expect(socket.closed).toBeUndefined();
+  });
+
+  it.each([
+    "Exceeded allowed rows written in Durable Objects free tier.",
+    "Exceeded allowed rows read in Durable Objects free tier.",
+    "Exceeded allowed duration in Durable Objects free tier.",
+    "Exceeded allowed volume of requests in Durable Objects free tier.",
+    "database or disk is full: SQLITE_FULL",
+  ])("answers a request the Account DO fails with %j with 429 QUOTA_EXCEEDED and a wait until 00:00 UTC", async (text) => {
+    const a = await getOwner();
+    const spaceId = await createSpace(a);
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    const exec = await runInDurableObject(account(), (_instance, state) =>
+      vi.spyOn(state.storage.sql, "exec").mockImplementation(() => {
+        throw new Error(text);
+      }),
+    );
+    const refusal = async (path: string, init: RequestInit) => {
+      const before = Date.now();
+      const response = await exports.default.fetch(BASE + path, init);
+      const after = Date.now();
+      const error = fromBinary(ErrorSchema, new Uint8Array(await response.arrayBuffer()));
+      expect(error.retryAfterMs).toBeGreaterThanOrEqual(untilMidnight(after));
+      expect(error.retryAfterMs).toBeLessThanOrEqual(untilMidnight(before));
+      return { status: response.status, code: error.code, message: error.message };
+    };
+    try {
+      const upgrade = await refusal("/v1/spaces/" + spaceId + "/ws", { headers: { Upgrade: "websocket", Authorization: "Bearer " + a.access!.token } });
+      const token = await refusal("/v1/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-protobuf" },
+        body: body(TokenRequestSchema, { deviceId: a.deviceId, refreshCredential: a.refreshCredential }),
+      });
+      const message = text.includes("SQLITE_FULL") ? "the server's storage is full" : DAILY_MESSAGE;
+      expect([upgrade, token]).toEqual([0, 1].map(() => ({ status: 429, code: Error_Code.QUOTA_EXCEEDED, message })));
+    } finally {
+      exec.mockRestore();
+    }
+    expect(logged.mock.calls.filter(([what]) => what === "request stopped at a platform limit").map(([, error]) => (error as Error).message)).toEqual([text, text]);
+  });
+
+  it("lets any other error of the Account DO escape the Worker as before", async () => {
+    const a = await getOwner();
+    const exec = await runInDurableObject(account(), (_instance, state) =>
+      vi.spyOn(state.storage.sql, "exec").mockImplementation(() => {
+        throw new Error("disk I/O error: SQLITE_IOERR");
+      }),
+    );
+    try {
+      const request = exports.default.fetch(BASE + "/v1/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-protobuf" },
+        body: body(TokenRequestSchema, { deviceId: a.deviceId, refreshCredential: a.refreshCredential }),
+      });
+      await expect(request).rejects.toThrow("disk I/O error: SQLITE_IOERR");
+    } finally {
+      exec.mockRestore();
+    }
   });
 });
