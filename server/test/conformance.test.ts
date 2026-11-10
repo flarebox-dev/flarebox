@@ -150,9 +150,9 @@ class Run {
   private readonly symbols = new Map<string, string>();
   private readonly values = new Map<string, string>();
   private readonly cursors = new Map<string, string>();
-  /** RFC 0002 section 2: each device's highest accepted device_seq per space, and the slot each commit_id was sent with. */
-  private readonly accepted = new Map<string, bigint>();
+  /** Per device and space, the device_seq of the device's last applied commit there; per space, the highest seq returned. */
   private readonly slots = new Map<string, bigint>();
+  private readonly topSeq = new Map<string, bigint>();
   private reqId = 0n;
 
   private constructor(nowMs: number, mtimeNs: bigint) {
@@ -461,7 +461,17 @@ class Run {
 
   private async commit(space: string, atMs: number, step: Obj): Promise<void> {
     const session = this.session(step);
-    const body = keys(step.commit, "commit", ["commit_id", "base_seq", "ops", "upload", "receipts_from", "receipt_size_delta"]);
+    const body = keys(step.commit, "commit", [
+      "commit_id",
+      "base_seq",
+      "history_id",
+      "device_seq",
+      "require_head",
+      "ops",
+      "upload",
+      "receipts_from",
+      "receipt_size_delta",
+    ]);
     const { ops, used } = this.ops(space, req(optList(body, "ops"), "ops"));
     const commitSymbol = optStr(body, "commit_id");
     const commitId = commitSymbol === undefined ? uuidv7(this.nowMs) : this.id(space, commitSymbol);
@@ -482,9 +492,10 @@ class Run {
       );
     }
     const device = `${session.deviceId}/${space}`;
-    const accepted = this.accepted.get(device) ?? 0n;
-    const slot = this.slots.get(`${device}/${commitId}`) ?? accepted + 1n;
-    this.slots.set(`${device}/${commitId}`, slot);
+    const history = optStr(body, "history_id");
+    const historyId = history === undefined ? this.space(space).historyId : this.id(space, history);
+    const given = optUint(body, "device_seq");
+    const deviceSeq = given === undefined ? (this.slots.get(device) ?? 0n) + 1n : BigInt(given);
     const expect = expectation(step, ["missing", "missing_some"], ["seq", "results", "changed"]);
     const result = await this.rpc(space, session, atMs, {
       case: "commit",
@@ -493,8 +504,9 @@ class Run {
         baseSeq: BigInt(req(optUint(body, "base_seq"), "base_seq")),
         ops,
         receipts,
-        historyId: this.space(space).historyId,
-        deviceSeq: slot,
+        historyId,
+        deviceSeq,
+        requireHead: optBool(body, "require_head") ?? false,
       },
     });
     const code = optStr(expect, "error");
@@ -523,7 +535,10 @@ class Run {
     }
     if (code !== undefined) fail(`expected error ${code}, got a result`);
     if (result.case !== "commit") fail("unexpected response");
-    if (slot > accepted) this.accepted.set(device, slot);
+    if (result.value.seq > (this.topSeq.get(space) ?? 0n)) {
+      this.topSeq.set(space, result.value.seq);
+      this.slots.set(device, deviceSeq);
+    }
     const committed = result.value;
     const seq = optUint(expect, "seq");
     if (seq !== undefined && committed.seq !== BigInt(seq)) fail(`seq ${committed.seq}, expected ${seq}`);
@@ -739,33 +754,6 @@ async function run(scenario: Json): Promise<string | undefined> {
 keys(doc, "the file", ["format", "version", "spec", "unicode", "now_ms", "mtime_ns", "conventions", "scenarios"]);
 const scenarios = req(optList(doc, "scenarios"), "scenarios");
 
-/**
- * Steps where the file and the server differ on purpose. A step whose expected error is replaced gets the server's
- * error; a step without a replacement is skipped. Each entry checks the step's current expectation, so it fails once
- * the file changes and is removed then.
- */
-const DIVERGENCES: Record<string, { step: number; expects: string | null; becomes?: string }> = {
-  // RFC 0002 section 3 answers a base_seq ahead of the head with AHEAD_OF_SERVER; the file covers only its section 11.
-  "whole-commit-errors-change-nothing": { step: 6, expects: "INVALID_ARGUMENT", becomes: "AHEAD_OF_SERVER" },
-  // Three files of 16,384 inline chunks fit the 7,900,000-byte log row of RFC 0001 section 7, but their change records
-  // do not fit the 1 MiB ServerMessage of spec v0 section 7.2 that pushes them, and the server refuses such a commit.
-  "a-commit-whose-log-row-is-too-large-is-refused-whole": { step: 4, expects: null },
-};
-
-function withDivergences(scenario: Json): Json {
-  const found = object(scenario, "a scenario");
-  const divergence = DIVERGENCES[String(found.name)];
-  if (divergence === undefined) return scenario;
-  const copy = structuredClone(found);
-  const steps = req(optList(copy, "steps"), "steps");
-  const expect = object(object(steps[divergence.step - 1], "a step").expect, "expect");
-  if ((expect.error ?? null) !== divergence.expects)
-    fail(`step ${divergence.step} no longer expects ${divergence.expects ?? "success"}; remove its divergence`);
-  if (divergence.becomes === undefined) steps.splice(divergence.step - 1, 1);
-  else expect.error = divergence.becomes;
-  return copy;
-}
-
 describe("space conformance (spec/testdata/scenarios/space-conformance-v1.json)", () => {
   it("reads format flarebox.space-conformance version 1", () => {
     expect([doc.format, doc.version]).toEqual(["flarebox.space-conformance", 1]);
@@ -775,7 +763,7 @@ describe("space conformance (spec/testdata/scenarios/space-conformance-v1.json)"
     const { name, reference_only } = object(scenario, "a scenario");
     const test = reference_only === undefined ? it : it.skip;
     test(String(name), { timeout: 120_000 }, async () => {
-      expect(await run(withDivergences(scenario))).toBeUndefined();
+      expect(await run(scenario)).toBeUndefined();
     });
   }
 });

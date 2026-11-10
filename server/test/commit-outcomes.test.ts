@@ -144,7 +144,9 @@ describe("RFC 0002 section 11", () => {
     const commitId = uuidv7();
     const first = await a.commitRaw(file, { commitId });
     expect(first.case === "error" && first.value.code).toBe(Error_Code.MISSING_CHUNKS);
-    expect(first.case === "error" && first.value.missingChunks.map(toHex)).toEqual(parts.content.chunks.slice(MAX_HEAD_CHECKS).map((c) => toHex(c.hash)));
+    expect(first.case === "error" && first.value.missingChunks.map(toHex)).toEqual(
+      parts.content.chunks.slice(MAX_HEAD_CHECKS).map((c) => toHex(c.hash)),
+    );
     const checked = (await holds()).filter((row) => row.head_checked === 1);
     expect(checked).toHaveLength(MAX_HEAD_CHECKS);
     expect(checked.every((row) => Number(row.hold_until_ms) > before)).toBe(true);

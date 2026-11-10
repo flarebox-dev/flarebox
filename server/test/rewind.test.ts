@@ -471,7 +471,10 @@ describe("space rewind (RFC 0003)", () => {
       const late = uuidv7();
       const commit = body(RpcRequestSchema, {
         reqId: 1n,
-        call: { case: "commit", value: { commitId: uuidv7(), baseSeq: 0n, historyId: history, deviceSeq: 1n, ops: [op.mkdir(late, spaceId, "late")] } },
+        call: {
+          case: "commit",
+          value: { commitId: uuidv7(), baseSeq: 0n, historyId: history, deviceSeq: 1n, ops: [op.mkdir(late, spaceId, "late")] },
+        },
       });
       await writer.write(commit);
       await writer.close();
@@ -482,7 +485,10 @@ describe("space rewind (RFC 0003)", () => {
         value: { code: Error_Code.RETRY_LATER },
       });
 
-      const connect = { identity: { userId: creds.userId, deviceId: creds.deviceId, deviceName: "Laptop A", expiresAtMs: Date.now() + MINUTE }, origin: BASE };
+      const connect = {
+        identity: { userId: creds.userId, deviceId: creds.deviceId, deviceName: "Laptop A", expiresAtMs: Date.now() + MINUTE },
+        origin: BASE,
+      };
       const direct = fromBinary(RpcResponseSchema, await space(spaceId).httpRpc(connect, commit));
       expect(direct.result).toMatchObject({ case: "error", value: { code: Error_Code.RETRY_LATER } });
       const upgrade = await space(spaceId).fetch(
