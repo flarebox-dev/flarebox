@@ -3,12 +3,13 @@
 import { create, fromBinary } from "@bufbuild/protobuf";
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ChunkRefSchema, CommitRecordSchema, ContentSchema } from "../src/gen/flarebox/v1/model_pb";
 import { sha256 } from "../src/crypto";
 import { uuidv7, uuidv7Ms } from "../src/ids";
-import type { SpaceDO } from "../src/space-do";
-import { encodeChunkList } from "../src/space/store";
+import { SpaceDO } from "../src/space-do";
+import { descriptorDurable } from "../src/space/export";
+import { encodeChunkList, setMeta } from "../src/space/store";
 import { type Manifest, restoreFromR2, serverState } from "./export-reader";
 import { client, content, newSpace, op, runSpaceAlarm, type TestClient, unknownOutcome } from "./helpers";
 
@@ -46,6 +47,50 @@ async function expectRestorable(space: Space) {
   expect(restored.headSeq).toBe(server.headSeq);
   expect(restored.nodes).toEqual(server.nodes);
   return restored;
+}
+
+/**
+ * Turns the space into one that a server without the export created, with the given meta, and reopens its object: no
+ * export state, no export task and nothing in R2.
+ */
+async function forgetExport(space: Space, meta: Record<string, number> = {}) {
+  await runInDurableObject(space.stub, (_instance, state) => {
+    const { sql } = state.storage;
+    sql.exec("DELETE FROM meta WHERE key IN ('export_state', 'exported_seq')");
+    sql.exec("DELETE FROM schedule WHERE task = 'export'");
+    for (const [key, value] of Object.entries(meta)) setMeta(sql, key, value);
+  });
+  await env.BUCKET.delete(await listKeys(`spaces/${space.spaceId}/meta/`));
+  await reopen(space);
+}
+
+/**
+ * Runs what opening the Space DO runs, as a new instance over the same storage does after a restart. It opens a minute
+ * ahead, so that a deadline it sets is not already past, which setAlarm would move to the moment of the call.
+ */
+function reopen(space: Space) {
+  return runInDurableObject(space.stub, (_instance, state) => {
+    vi.spyOn(Date, "now").mockReturnValue(Date.now() + MINUTE);
+    new SpaceDO(state, env);
+    vi.restoreAllMocks();
+  });
+}
+
+/** The alarm the Space DO has set, and the earliest deadline in its schedule. */
+function alarmState(space: Space) {
+  return runInDurableObject(space.stub, async (_instance, state) => ({
+    alarm: await state.storage.getAlarm(),
+    due: Number(state.storage.sql.exec("SELECT MIN(due_ms) AS due FROM schedule").one().due),
+    exportDue: Number(state.storage.sql.exec("SELECT due_ms FROM schedule WHERE task = 'export'").toArray()[0]?.due_ms),
+    descriptor: descriptorDurable(state.storage.sql),
+  }));
+}
+
+/** Makes the Space DO's next setAlarm fail. */
+function failNextAlarm(space: Space) {
+  return runInDurableObject(space.stub, (_instance, state) => {
+    vi.spyOn(state.storage, "setAlarm").mockRejectedValueOnce(new Error("the alarm write failed"));
+  });
 }
 
 const seqName = (seq: number) => String(seq).padStart(20, "0");
@@ -212,5 +257,68 @@ describe("R2 metadata export (spec v0 section 11, RFC 0004)", () => {
     expect(manifest!.pages.map((page) => page.name)).toEqual(["0.fbsnap", "2.fbsnap", "3.fbsnap"]);
     expect(await listKeys(snap + "pages/")).toContain(snap + "pages/1.fbsnap");
     await expectRestorable(space);
+  });
+
+  it("starts the export of a space that an earlier server created when its object opens, from seq 0 in its first history", async () => {
+    const space = await newSpace();
+    const a = await client(space, "Laptop");
+    const prefix = await historyPrefix(space, a);
+    await a.commit([op.mkdir(uuidv7(), space.spaceId, "one")]);
+    await forgetExport(space);
+    const opened = await alarmState(space);
+    expect(opened.alarm).toBe(opened.exportDue);
+    const b = await client(space, "Phone");
+    await b.commit([op.mkdir(uuidv7(), space.spaceId, "two")], { baseSeq: 1n });
+    await runSpaceAlarm(space.stub, Date.now() + 2 * DAY);
+    expect((await alarmState(space)).descriptor).toBe(true);
+    expect(await listKeys(prefix + "log/")).toEqual([segmentKey(prefix, 1, 2)]);
+    expect((await manifests(prefix)).map((manifest) => manifest.start_seq)).toEqual([2]);
+    await expectRestorable(space);
+  });
+
+  it("starts the export of a rewound history that an earlier server created from restore_seq, with the descriptor after a snapshot", async () => {
+    const space = await newSpace();
+    const a = await client(space, "Laptop");
+    const prefix = await historyPrefix(space, a);
+    await a.commit([op.mkdir(uuidv7(), space.spaceId, "one")]);
+    await forgetExport(space, { restore_seq: 1, rewind_number: 1 });
+    expect((await alarmState(space)).descriptor).toBe(false);
+    const b = await client(space, "Phone");
+    await b.commit([op.mkdir(uuidv7(), space.spaceId, "two")], { baseSeq: 1n });
+    await runSpaceAlarm(space.stub, Date.now() + 2 * DAY);
+    expect((await alarmState(space)).descriptor).toBe(true);
+    expect(await listKeys(prefix + "log/")).toEqual([segmentKey(prefix, 2, 2)]);
+    expect((await manifests(prefix)).map((manifest) => manifest.start_seq)).toEqual([2]);
+    expect(await (await env.BUCKET.get(prefix + "space.json"))!.json()).toMatchObject({ rewind_number: 1 });
+    await expectRestorable(space);
+  });
+
+  it("sets the alarm for the export deadline on a retry of an accepted commit whose alarm write failed", async () => {
+    const space = await newSpace();
+    const a = await client(space, "Laptop");
+    await failNextAlarm(space);
+    const commitId = uuidv7();
+    const ops = [op.mkdir(uuidv7(), space.spaceId, "one")];
+    expect((await a.commitRaw(ops, { commitId })).case).toBe("error");
+    vi.restoreAllMocks();
+    const failed = await alarmState(space);
+    expect(failed.alarm).toBeGreaterThan(failed.exportDue);
+    expect((await a.commit(ops, { commitId })).seq).toBe(1n);
+    const retried = await alarmState(space);
+    expect(retried.alarm).toBe(retried.exportDue);
+  });
+
+  it("sets the alarm for the earliest deadline when the object opens after an alarm write failed", async () => {
+    const space = await newSpace();
+    const a = await client(space, "Laptop");
+    await failNextAlarm(space);
+    expect((await a.commitRaw([op.mkdir(uuidv7(), space.spaceId, "one")])).case).toBe("error");
+    vi.restoreAllMocks();
+    const failed = await alarmState(space);
+    expect(failed.alarm).toBeGreaterThan(failed.exportDue);
+    await reopen(space);
+    const opened = await alarmState(space);
+    expect(opened.alarm).toBe(opened.exportDue);
+    expect(opened.alarm).toBe(opened.due);
   });
 });

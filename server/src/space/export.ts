@@ -108,6 +108,21 @@ export function startExport(sql: SqlStorage, fromSeq: number, atMs: number, base
   scheduleExport(sql, atMs, false);
 }
 
+/**
+ * Starts the export of a space that a server without the export created, when its object opens. Its current history
+ * exports from restore_seq if a rewind started it, else from seq 0, and a full snapshot is due at once, because the log
+ * of earlier commits omits the chunk lists of large versions.
+ */
+export function bootstrapExport(sql: SqlStorage, atMs: number): void {
+  if (getMeta(sql, "space_id") === undefined || getMeta(sql, "export_state") !== undefined) return;
+  const restoreSeq = getMeta(sql, "restore_seq");
+  const fromSeq = Number(restoreSeq ?? 0);
+  startExport(sql, fromSeq, atMs, restoreSeq !== undefined);
+  const state = readState(sql);
+  state.dueSeq ??= Number(getMeta(sql, "head_seq"));
+  setMeta(sql, "export_state", JSON.stringify(state));
+}
+
 /** Whether the current history's descriptor is durable in R2, which rewind admission requires (RFC 0003 section 1). */
 export function descriptorDurable(sql: SqlStorage): boolean {
   return readState(sql).descriptor;

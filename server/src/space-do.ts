@@ -55,7 +55,7 @@ import { type Identity, verifyAccessToken } from "./auth";
 import { type ChunkObject, sha256, signChunkGrant, verifyChunkGrant } from "./crypto";
 import { fromHex, isUuidV7, toHex, uuidv7 } from "./ids";
 import { type ApplyContext, CallFailure, CommitApplier } from "./space/commit";
-import { descriptorDurable, Exporter, noteCommitted, startExport } from "./space/export";
+import { bootstrapExport, descriptorDurable, Exporter, noteCommitted, startExport } from "./space/export";
 import { type Pitr, pitrBackend } from "./space/pitr";
 import { ChunkState, migrate } from "./space/schema";
 import {
@@ -292,7 +292,12 @@ export class SpaceDO extends DurableObject<Env> {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.pitr = pitrBackend.open(ctx);
-    ctx.storage.transactionSync(() => migrate(this.sql));
+    ctx.storage.transactionSync(() => {
+      migrate(this.sql);
+      bootstrapExport(this.sql, this.clock());
+    });
+    // The schedule is committed before the alarm is set, so a failed or interrupted setAlarm is repaired on open.
+    void ctx.blockConcurrencyWhile(() => this.armAlarm());
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
 
@@ -722,7 +727,11 @@ export class SpaceDO extends DurableObject<Env> {
 
   private async commit(session: Session, commit: Commit): Promise<{ result: CommitResult; record?: CommitRecord }> {
     const stored = this.checkCommitOrder(session.deviceId, commit);
-    if (stored) return { result: stored };
+    if (stored) {
+      // The accepted attempt may have failed to set the alarm after its transaction.
+      await this.armAlarm();
+      return { result: stored };
+    }
     this.checkCanWrite(session);
     if (!isUuidV7(commit.commitId)) fail(Error_Code.INVALID_ARGUMENT, "commit_id must be a UUIDv7");
     if (commit.ops.length === 0) fail(Error_Code.INVALID_ARGUMENT, "a commit needs at least one op");
@@ -790,7 +799,7 @@ export class SpaceDO extends DurableObject<Env> {
       );
       return { result, record, rearm: noteCommitted(this.sql, record) };
     });
-    if (done.rearm) await this.armAlarm();
+    if (done.rearm || !done.record) await this.armAlarm();
     return { result: done.result, record: done.record };
   }
 
