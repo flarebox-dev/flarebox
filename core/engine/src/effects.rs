@@ -321,6 +321,8 @@ impl Effects {
     /// The driver did the effect. L takes the node's new shape, with `identity` for an entry the
     /// effect created. When L matched S, or the shape S's waiting update holds, the effect gave L
     /// the shape R had when it was planned, so S takes that shape too, when S stays a valid tree.
+    /// A move changes only the position, so L and S each keep their content, which can be newer
+    /// than the content the move was planned with.
     /// A change R made while the effect was in flight then stays a remote change and is never
     /// taken for the user's: a file R restored during its removal is downloaded again, and a file
     /// R moved back during its move is moved back. S stays as it is when L no longer matched it:
@@ -361,14 +363,26 @@ impl Effects {
         };
         let unchanged = same(trees.local().live(&record.node), base);
         if unchanged {
-            trees.set_synced_if_valid(record.node.clone(), record.after.clone());
+            let synced = match (&record.effect, &record.after, base) {
+                (Effect::Move { .. }, Some(after), Some(base)) => Some(Shape {
+                    parent: after.parent.clone(),
+                    name: after.name.clone(),
+                    ..base.clone()
+                }),
+                _ => record.after.clone(),
+            };
+            trees.set_synced_if_valid(record.node.clone(), synced);
         }
+        let content = (trees.local().get(&record.node)).map(|node| node.shape.content.clone());
         match record.after {
             None => trees.remove_local(&record.node),
             Some(shape) => trees.set_local(
                 record.node.clone(),
                 LocalNode {
-                    shape,
+                    shape: match (&record.effect, content) {
+                        (Effect::Move { .. }, Some(content)) => Shape { content, ..shape },
+                        _ => shape,
+                    },
                     identity,
                     parked,
                 },

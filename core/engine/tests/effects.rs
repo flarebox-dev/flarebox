@@ -851,6 +851,39 @@ fn a_move_r_undid_while_it_was_in_flight_is_moved_back() {
     assert_in_sync(&mut trees);
 }
 
+/// A move to R's position is in flight when R moves the file back with new content, and the
+/// user's copy reaches the same content, so S takes it. The move changes only the position, so
+/// L and S keep that content, and the effects move the file back without a conflict.
+#[test]
+fn a_move_r_undid_with_new_content_while_it_was_in_flight_keeps_the_new_content() {
+    let (mut trees, mut disk) = space(&[("f", Some(file(ROOT, "a", 1)), Some(file(ROOT, "b", 1)))]);
+    trees.settle();
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    let record = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    assert!(matches!(record.effect, Effect::Move { .. }));
+
+    trees.set_remote("f".into(), remote(file(ROOT, "a", 2)));
+    let mut local = trees.local().get("f").unwrap().clone();
+    local.shape.content = Some(content(2));
+    trees.set_local("f".into(), local);
+    disk.entries.get_mut(&1).unwrap().content = Some(content(2));
+    trees.settle();
+    assert_eq!(trees.synced().live("f"), Some(&file(ROOT, "a", 2)));
+    let created = disk.apply(&record.effect).unwrap();
+    effects
+        .done(&mut trees, &record.effect_id, created)
+        .unwrap();
+    assert_eq!(trees.synced().live("f"), Some(&file(ROOT, "b", 2)));
+    assert_eq!(trees.local().live("f"), Some(&file(ROOT, "b", 2)));
+    trees.check().unwrap();
+    trees.settle();
+    assert_eq!(trees.class("f"), Class::Remote);
+
+    let done = converge(&mut trees, &mut disk, 10).unwrap();
+    assert!(matches!(done[..], [Effect::Move { .. }]), "{done:?}");
+    assert_in_sync(&mut trees);
+}
+
 /// The server renamed f while the user edited it, so its position is reverted with the edit
 /// unsent. The move to the server's name keeps the edit, which is uploaded.
 #[test]
