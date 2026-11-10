@@ -18,7 +18,16 @@ use crate::{Api, Credentials};
 type Server = WebSocketStream<TcpStream>;
 
 async fn listen() -> (TcpListener, Arc<Auth>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    listen_on("127.0.0.1:0", Duration::from_secs(3600), None).await
+}
+
+/// A scripted server at `address` and an `Auth` for it whose cached token expires after `lifetime`.
+async fn listen_on(
+    address: &str,
+    lifetime: Duration,
+    refresh_margin: Option<Duration>,
+) -> (TcpListener, Arc<Auth>) {
+    let listener = TcpListener::bind(address).await.unwrap();
     let base: Url = format!("http://{}", listener.local_addr().unwrap())
         .parse()
         .unwrap();
@@ -27,15 +36,16 @@ async fn listen() -> (TcpListener, Arc<Auth>) {
         device_id: "d".into(),
         refresh_credential: "r".into(),
     };
-    let expires = SystemTime::now() + Duration::from_secs(3600);
+    let expires = SystemTime::now() + lifetime;
     let token = AccessToken {
         token: "token".into(),
         expires_at_ms: expires.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64,
     };
-    (
-        listener,
-        Arc::new(Auth::new(Api::local_development(base).unwrap(), credentials).with_token(token)),
-    )
+    let mut auth = Auth::new(Api::local_development(base).unwrap(), credentials).with_token(token);
+    if let Some(margin) = refresh_margin {
+        auth = auth.with_refresh_margin(margin);
+    }
+    (listener, Arc::new(auth))
 }
 
 fn config() -> SessionConfig {
@@ -678,4 +688,84 @@ async fn a_write_the_server_does_not_read_times_out() {
         ),
         "{event:?}"
     );
+}
+
+#[tokio::test]
+async fn an_ipv6_loopback_base_connects() {
+    let (listener, auth) = listen_on("[::1]:0", Duration::from_secs(3600), None).await;
+    let (_session, mut events) = Session::start(auth, config()).unwrap();
+    let _server = accept(&listener, welcome("h", 0)).await;
+    assert!(matches!(next(&mut events).await, Event::Connected(_)));
+}
+
+#[tokio::test]
+async fn retry_later_waits_as_long_as_the_server_asks_beyond_the_backoff_limit() {
+    let (listener, auth) = listen().await;
+    let config = config();
+    assert!(config.backoff.max < Duration::from_millis(300));
+    let (session, _events) = Session::start(auth, config).unwrap();
+    let server = tokio::spawn(async move {
+        let mut ws = accept(&listener, welcome("h", 0)).await;
+        let first = recv_rpc(&mut ws).await;
+        let busy = ProtoError {
+            code: Code::RetryLater as i32,
+            retry_after_ms: 300,
+            ..Default::default()
+        };
+        reply(&mut ws, first.req_id, rpc_response::Result::Error(busy)).await;
+        let asked = Instant::now();
+        let second = recv_rpc(&mut ws).await;
+        assert!(
+            asked.elapsed() >= Duration::from_millis(300),
+            "{:?}",
+            asked.elapsed()
+        );
+        reply(
+            &mut ws,
+            second.req_id,
+            rpc_response::Result::Trash(Default::default()),
+        )
+        .await;
+        ws
+    });
+    session.list_trash("", 10).await.unwrap();
+    drop(server.await.unwrap());
+}
+
+#[tokio::test]
+async fn the_connection_keeps_serving_while_a_token_refresh_is_withheld() {
+    let (listener, auth) = listen_on(
+        "127.0.0.1:0",
+        Duration::from_millis(300),
+        Some(Duration::ZERO),
+    )
+    .await;
+    let mut config = config();
+    config.connect_timeout = Duration::from_secs(60);
+    let (session, mut events) = Session::start(auth, config).unwrap();
+    let mut ws = accept(&listener, welcome("h", 0)).await;
+    assert!(matches!(next(&mut events).await, Event::Connected(_)));
+    let (mut token_request, _) = listener.accept().await.unwrap();
+    assert!(
+        token_request.read(&mut [0; 4096]).await.unwrap() > 0,
+        "the refresh is under way"
+    );
+    let server = tokio::spawn(async move {
+        let request = recv_rpc(&mut ws).await;
+        reply(
+            &mut ws,
+            request.req_id,
+            rpc_response::Result::Tree(Default::default()),
+        )
+        .await;
+        ws
+    });
+    let listed = tokio::time::timeout(Duration::from_millis(500), session.list_tree("", 1)).await;
+    assert!(
+        matches!(listed, Ok(Ok(_))),
+        "an RPC is served while the refresh waits: {listed:?}"
+    );
+    let _ws = server.await.unwrap();
+    let closed = tokio::time::timeout(Duration::from_millis(500), session.close()).await;
+    assert!(closed.is_ok(), "close does not wait for the refresh");
 }

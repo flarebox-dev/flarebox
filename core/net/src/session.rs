@@ -4,6 +4,8 @@
 //! change stream, `Reauth`, and reconnects with backoff that resend only what RFC 0002 section 2 allows.
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
@@ -22,6 +24,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
+use tokio::time::error::Elapsed;
 use tokio::time::{Instant, sleep, sleep_until, timeout, timeout_at};
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::WebSocketStream;
@@ -34,7 +37,7 @@ use url::Url;
 
 use crate::auth::Auth;
 use crate::backoff::Backoff;
-use crate::error::{CallError, NotResent, ServerError, StopReason};
+use crate::error::{ApiError, CallError, NotResent, ServerError, StopReason};
 use crate::event::{Committed, DisconnectReason, Event};
 use crate::stream::{Fed, Stream};
 
@@ -62,7 +65,7 @@ pub struct SessionConfig {
     /// WebSocket ping interval. The connection counts as lost when nothing arrives for two intervals.
     pub ping_interval: Duration,
     /// Bounds getting an access token, the TCP connection, TLS and the WebSocket upgrade together, and each token
-    /// refresh for `Reauth`.
+    /// refresh for `Reauth`, which runs while the connection keeps serving.
     pub connect_timeout: Duration,
     /// Bounds the wait for `Welcome` after `Hello`.
     pub welcome_timeout: Duration,
@@ -319,7 +322,7 @@ impl Session {
                     let wait = error
                         .retry_after()
                         .unwrap_or_else(|| self.backoff.delay(attempt));
-                    sleep(wait.min(self.backoff.max)).await;
+                    sleep(wait).await;
                     attempt += 1;
                 }
                 outcome => return outcome,
@@ -540,14 +543,19 @@ impl Task {
             Err(error) => return Err(Exit::transport(error)),
         };
         self.token = Some(token.token.clone());
-        let host = self.url.host_str().unwrap_or_default().to_owned();
+        let host = self
+            .url
+            .host_str()
+            .unwrap_or_default()
+            .trim_matches(['[', ']'])
+            .to_owned();
         let port = self.url.port_or_known_default().unwrap_or(80);
         let tcp = TcpStream::connect((host.as_str(), port))
             .await
             .map_err(Exit::transport)?;
         let _ = tcp.set_nodelay(true);
         let io: Box<dyn Io> = if self.url.scheme() == "wss" {
-            let name = ServerName::try_from(host.trim_matches(['[', ']']).to_owned())
+            let name = ServerName::try_from(host.clone())
                 .map_err(|e| Exit::Stop(StopReason::BadUrl(e.to_string())))?;
             let tls = TlsConnector::from(self.tls_config()?);
             Box::new(tls.connect(name, tcp).await.map_err(Exit::transport)?)
@@ -671,6 +679,7 @@ impl Task {
         let mut last_heard = Instant::now();
         let reauth = sleep_until(self.reauth_at(&token));
         tokio::pin!(reauth);
+        let mut refreshing: Option<Refresh> = None;
         loop {
             tokio::select! {
                 item = socket.next() => {
@@ -713,8 +722,13 @@ impl Task {
                         return exit;
                     }
                 }
-                () = &mut reauth => {
-                    let refreshed = timeout(self.config.connect_timeout, self.auth.access_token()).await;
+                () = &mut reauth, if refreshing.is_none() => {
+                    let auth = self.auth.clone();
+                    let limit = self.config.connect_timeout;
+                    refreshing = Some(Box::pin(async move { timeout(limit, auth.access_token()).await }));
+                }
+                refreshed = refreshed(&mut refreshing) => {
+                    refreshing = None;
                     let Ok(refreshed) = refreshed else {
                         tracing::debug!("flarebox session timed out refreshing its access token");
                         reauth.as_mut().reset(Instant::now() + self.config.backoff.delay(0));
@@ -898,6 +912,19 @@ impl Task {
 
     fn emit(&self, event: Event) {
         let _ = self.events.send(event);
+    }
+}
+
+/// A token refresh for `Reauth`, run alongside the connection so a slow `/v1/token` does not hold up the stream.
+type Refresh = Pin<Box<dyn Future<Output = Result<Result<AccessToken, ApiError>, Elapsed>> + Send>>;
+
+/// The result of the refresh in progress; never resolves when there is none.
+async fn refreshed(
+    refreshing: &mut Option<Refresh>,
+) -> Result<Result<AccessToken, ApiError>, Elapsed> {
+    match refreshing {
+        Some(refresh) => refresh.await,
+        None => std::future::pending().await,
     }
 }
 
