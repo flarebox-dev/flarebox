@@ -22,7 +22,7 @@ flarebox setup
    - With no server, it deploys one. It creates an R2 bucket, uploads the server as a Worker, turns on its `workers.dev` address, and claims the server with this device.
    - With one server, it adds this device to it.
    - With several, it asks which one.
-2. Enter a pairing code from another device. See [Add another device](#add-another-device).
+2. Enter a pairing code from another device, written as `<code>@<host>`. For a code without the host, run `flarebox join <code> --server <address>` instead. See [Add another device](#add-another-device).
 
 The login asks for four permissions: reading the account's settings, managing its Workers, writing to its R2 buckets, and keeping access while the command runs (`account-settings.read`, `workers-scripts.admin`, `workers-r2.write` and `offline_access`). Flarebox revokes the login when the command ends. If it can't, it says so, and you can revoke it under Manage OAuth authorizations in the Cloudflare dashboard.
 
@@ -71,7 +71,7 @@ The command can't create a space yet. The macOS app creates one during its setup
 flarebox server upgrade
 ```
 
-This logs in with Cloudflare and uploads the server version built into your `flarebox`. Your files, devices and settings stay. Open sync sessions move to the new version within 5 minutes. The command stops if the server runs a newer version than your `flarebox`.
+This logs in with Cloudflare and uploads the server version built into your `flarebox`. Without the Cloudflare login, upgrade as [Deploying and upgrading a Flarebox server](../deploy.md#upgrade) describes. Your files, devices and settings stay. Open sync sessions move to the new version within 5 minutes. The command stops if the server runs a newer version than your `flarebox`.
 
 A server deployed with the deploy button deploys again whenever its repository changes, and that would replace the upgrade. The command warns you and asks first. Update that repository too, or answer no.
 

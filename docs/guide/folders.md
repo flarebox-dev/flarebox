@@ -8,6 +8,8 @@ flarebox link ~/Flarebox --space Flarebox
 
 `--space` takes the space's name or its ID. If two spaces have the same name, use the ID. The folder must exist. It may already hold files, and those files are uploaded. Files the space already holds are downloaded into it.
 
+The first sync can't yet merge a folder and a space that hold the same name at their top level. If both hold `Notes`, for example, the folder halts with `the folder and the space it was linked to both hold "Notes"`. To combine such a folder with a space, link an empty folder, wait until the space has downloaded, then move your files in.
+
 A space syncs to at most one folder on each device. Flarebox refuses a folder that:
 
 - is inside another linked folder, or holds one;
@@ -32,7 +34,7 @@ It doesn't sync:
 - symbolic links, sockets, FIFOs and device files. Flarebox skips them and never follows a symbolic link inside a linked folder;
 - permissions other than the executable bit, the owner and group, ACLs and extended attributes such as macOS Finder tags;
 - hard links as links. Each name of a hard-linked file syncs as a separate file;
-- the platform files `.DS_Store`, `Thumbs.db`, `desktop.ini` and `Icon\r`, and the `.flarebox/` folder. No rule can bring them back.
+- the platform files `.DS_Store`, `Thumbs.db`, `desktop.ini` and `Icon\r`, and the `.flarebox/` folder at the top of a linked folder. No rule can bring them back. When sync removes a folder that another device deleted, it deletes these platform files in it too, so that the folder can go. A `.flarebox` folder deeper down is an ordinary folder and syncs.
 
 Names compare without regard to case or Unicode normalization. Two names in one folder that differ only in case, such as `Report.txt` and `report.txt`, can exist on a Linux disk but not in a space, so the second to arrive is renamed as a [conflict](conflicts.md#two-files-with-the-same-name). A name is at most 255 bytes, and a path at most 256 folders deep.
 
@@ -58,7 +60,7 @@ There is one exception. If you move a synced file into an ignored folder while t
 
 ## Sync only part of a space on this device
 
-`~/.config/flarebox/config.toml` holds rules for this device alone. They apply to every folder it links:
+`~/.config/flarebox/config.toml`, or `$XDG_CONFIG_HOME/flarebox/config.toml` when that variable is set, holds rules for this device alone. They apply to every folder it links:
 
 ```toml
 [sync]

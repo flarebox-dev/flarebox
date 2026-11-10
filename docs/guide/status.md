@@ -20,7 +20,7 @@ Each linked folder has one line. Its state is one of these:
 | `Connecting` | Opening a session with the server |
 | `Bootstrapping` | Reading the space's whole file tree, the first time or after a long time offline |
 | `CatchingUp` | Applying changes from other devices |
-| `UpToDate` | Synced. New changes arrive as they happen |
+| `UpToDate` | The folder has the server's latest changes, and new ones arrive as they happen. Items that wait on a problem stay out of sync, and the line below names them |
 | `Offline` | The server can't be reached. The folder keeps trying |
 | `Halted` | A problem stopped the folder. The line below says which |
 

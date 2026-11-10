@@ -5,7 +5,7 @@ The server keeps what you delete and the earlier contents of files you change, f
 - A deleted file or folder stays in the space's trash for 30 days.
 - When a file's content changes, the earlier version stays for 30 days after it was replaced. The current version of a file never expires.
 
-After that, the server deletes them for good. These commands read the server, so the device must be online. They don't need the daemon.
+After that, they can't be restored. These commands read the server, so the device must be online. They don't need the daemon.
 
 ## See what is in the trash
 
@@ -13,7 +13,7 @@ After that, the server deletes them for good. These commands read the server, so
 flarebox trash ~/Flarebox
 ```
 
-This lists what was deleted in the linked folder and is still in the trash, with the size of each item. A deleted folder is one line, with the number of files and bytes that went to the trash with it. Name a folder inside a linked folder to list only what was deleted under it. Without a path, the command uses the current folder. `--json` prints each item with its node ID.
+This lists what was deleted in the linked folder and is still in the trash, with the size of each item. A deleted folder is one line, with the number of files and bytes that went to the trash with it. Name a folder inside a linked folder to list only what was deleted under it. A folder deleted as a whole is listed only at its own path: if `notes/` went to the trash with everything in it, `flarebox trash ~/Flarebox/notes/drafts` lists nothing, and `flarebox trash ~/Flarebox` shows `notes/`. Without a path, the command uses the current folder. `--json` prints each item with its node ID.
 
 ## See the versions of a file
 

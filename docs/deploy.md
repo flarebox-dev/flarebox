@@ -36,7 +36,7 @@ If the code expired, open `/setup` again for a new one. Someone who found your a
 
 `flarebox server add-device` does these steps for you after a Cloudflare login ([Devices](guide/devices.md#if-you-lose-every-device)). Without that login, no client can send a recovery key yet. The server side works as follows.
 
-You can add a new device without losing anything, as long as you can still change the Worker's settings. Recovery does not sign out your other devices: if a lost device may be in someone else's hands, it keeps working until it is revoked, and revoking devices is not available yet either.
+You can add a new device without losing anything, as long as you can still change the Worker's settings. Recovery does not sign out your other devices. If a lost device may be in someone else's hands, it keeps working until you revoke it with `flarebox device revoke` ([Devices](guide/devices.md#revoke-a-device)).
 
 1. Make a long random key, for example with `openssl rand -base64 32` (at least 32 characters).
 2. In the dashboard, open your Worker, then **Settings**, **Variables and Secrets**, and add a secret named `FLAREBOX_RECOVERY_KEY` with that value. Or run `wrangler secret put FLAREBOX_RECOVERY_KEY` in `server/`.
