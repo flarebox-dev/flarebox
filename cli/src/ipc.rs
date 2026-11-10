@@ -11,7 +11,7 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use flarebox_driver::{
-    Account, Answer, Driver, DriverError, FolderStatus, Paths, Question, Status,
+    Account, Answer, Credential, Driver, DriverError, FolderStatus, Paths, Question, Status,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -28,6 +28,16 @@ pub enum Request {
         server: String,
         code: String,
         name: String,
+    },
+    /// Stores the credential that `flarebox setup` claimed.
+    SaveCredential {
+        credential: Credential,
+    },
+    /// Removes the credential of `device_id`, which the server no longer accepts, unlinking every folder; their files
+    /// stay. Revoking the device on the server is best effort, since the server already refuses the credential. A
+    /// credential saved for another device meanwhile is kept.
+    SignOut {
+        device_id: String,
     },
     Link {
         folder: PathBuf,
@@ -52,6 +62,7 @@ pub enum Response {
     Unlinked { space_id: String, path: PathBuf },
     Questions { questions: Vec<Question> },
     Answered,
+    SignedOut,
     Error { message: String },
 }
 
@@ -65,6 +76,14 @@ pub async fn handle(driver: &Driver, request: Request) -> Response {
             .pair(&server, &code, &name)
             .await
             .map(|account| Response::Paired { account }),
+        Request::SaveCredential { credential } => driver
+            .save_credential(credential)
+            .await
+            .map(|account| Response::Paired { account }),
+        Request::SignOut { device_id } => driver
+            .sign_out_device(&device_id)
+            .await
+            .map(|()| Response::SignedOut),
         Request::Link { folder, space } => driver
             .link(&folder, &space)
             .await

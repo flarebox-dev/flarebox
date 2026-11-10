@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `flarebox` command: pairs this machine, links folders, shows status and questions, manages the account's devices,
-//! shows what each space stores, and runs the sync daemon. Commands run in the daemon through its socket when it is
-//! running, and on their own otherwise. The device and usage commands read only the credential and talk to the server
-//! directly.
+//! The `flarebox` command: sets up a server or joins one, links folders, shows status and questions, manages the
+//! account's devices, shows what each space stores, and runs the sync daemon. Commands run in the daemon through its
+//! socket when it is running, and on their own otherwise. The device and usage commands read only the credential and
+//! talk to the server directly.
 
 mod ipc;
+mod pairing;
+mod setup;
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -35,17 +37,30 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Pair this machine with a server, using a code from a device that is already paired.
-    Pair {
-        /// The server's address, such as https://files.example.com.
-        #[arg(long)]
-        server: String,
-        /// The pairing code shown on the paired device.
-        #[arg(long)]
+    /// Set up Flarebox on this machine: join with a code from another device, or log in with Cloudflare to deploy a
+    /// server to your account or add this device to the server there.
+    Setup {
+        /// A pairing code from another device, such as K7QM-2XPD@flarebox.alice.workers.dev.
+        code: Option<String>,
+        #[command(flatten)]
+        device: DeviceArgs,
+        #[command(flatten)]
+        login: setup::LoginArgs,
+    },
+    /// Join a server with a pairing code from a device that is already paired.
+    Join {
+        /// The pairing code, such as K7QM-2XPD@flarebox.alice.workers.dev.
         code: String,
-        /// A name for this device, shown on the others.
+        /// The server's address, for a code without @host or to replace its host.
         #[arg(long)]
-        name: String,
+        server: Option<String>,
+        #[command(flatten)]
+        device: DeviceArgs,
+    },
+    /// Deploy, add this device to, upgrade or remove the Flarebox server in your Cloudflare account.
+    Server {
+        #[command(subcommand)]
+        action: setup::ServerAction,
     },
     /// Link a folder to a space and start syncing it.
     Link {
@@ -110,6 +125,25 @@ enum DeviceAction {
     },
 }
 
+#[derive(clap::Args)]
+pub struct DeviceArgs {
+    /// A name for this device, shown on the others. Defaults to this machine's host name.
+    #[arg(long)]
+    name: Option<String>,
+}
+
+impl DeviceArgs {
+    pub fn name(&self) -> String {
+        self.name.clone().unwrap_or_else(|| {
+            let host = rustix::system::uname()
+                .nodename()
+                .to_string_lossy()
+                .into_owned();
+            host.split('.').next().unwrap_or_default().to_owned()
+        })
+    }
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum LogFormat {
     Text,
@@ -143,6 +177,12 @@ fn main() -> ExitCode {
             Command::Daemon { .. } => daemon(paths).await,
             Command::Device { action } => device(paths, action).await,
             Command::Usage { json } => usage(paths, json).await,
+            Command::Setup {
+                code: None,
+                device,
+                login,
+            } => setup::setup(&paths, &device.name(), &login).await,
+            Command::Server { action } => setup::server(&paths, action).await,
             command => client(paths, command).await,
         }
     });
@@ -208,7 +248,16 @@ async fn daemon(paths: Paths) -> Result<(), String> {
 
 async fn client(paths: Paths, command: Command) -> Result<(), String> {
     let (request, json) = match command {
-        Command::Pair { server, code, name } => (Request::Pair { server, code, name }, false),
+        Command::Setup {
+            code: Some(code),
+            device,
+            ..
+        } => join_request(&code, None, &device)?,
+        Command::Join {
+            code,
+            server,
+            device,
+        } => join_request(&code, server.as_deref(), &device)?,
         Command::Link { folder, space } => (
             Request::Link {
                 folder: absolute(&folder)?,
@@ -234,8 +283,12 @@ async fn client(paths: Paths, command: Command) -> Result<(), String> {
             },
             false,
         ),
-        Command::Daemon { .. } | Command::Device { .. } | Command::Usage { .. } => {
-            unreachable!("the daemon, device and usage commands do not go through the socket")
+        Command::Daemon { .. }
+        | Command::Device { .. }
+        | Command::Usage { .. }
+        | Command::Setup { code: None, .. }
+        | Command::Server { .. } => {
+            unreachable!("main runs these commands itself")
         }
     };
     let credential = paths.credential();
@@ -292,6 +345,9 @@ async fn client(paths: Paths, command: Command) -> Result<(), String> {
         Response::Answered => {
             println!("Answered.");
             Ok(())
+        }
+        Response::SignedOut => {
+            Err("the daemon answered a request that this command did not send".into())
         }
     }
 }
@@ -588,6 +644,22 @@ fn ago(ms: i64, now_ms: i64) -> String {
     }
 }
 
+fn join_request(
+    code: &str,
+    server: Option<&str>,
+    device: &DeviceArgs,
+) -> Result<(Request, bool), String> {
+    let invitation = pairing::parse(code, server)?;
+    Ok((
+        Request::Pair {
+            server: invitation.server,
+            code: invitation.code,
+            name: device.name(),
+        },
+        false,
+    ))
+}
+
 /// The folder as an absolute path, since the daemon does not share this command's working directory.
 fn absolute(folder: &Path) -> Result<PathBuf, String> {
     std::path::absolute(folder).map_err(|error| format!("{}: {error}", folder.display()))
@@ -605,7 +677,7 @@ fn print_status(status: &Status) {
             "Device: {} ({}) on {}",
             account.device_name, account.device_id, account.server
         ),
-        None => println!("Device: not paired; run flarebox pair"),
+        None => println!("Device: not set up; run flarebox setup"),
     }
     println!(
         "Daemon: {}",

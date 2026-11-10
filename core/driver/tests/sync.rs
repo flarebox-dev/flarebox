@@ -154,12 +154,18 @@ impl Device {
         driver.stop().await;
     }
 
-    /// Stops the driver, closes the profile and starts again from what is on disk.
-    async fn restart(&mut self) {
-        self.stop().await;
+    /// Opens the profile of a stopped device and starts syncing from what is on disk.
+    fn start(&mut self) {
+        assert!(self.driver.is_none(), "the device is stopped");
         let driver = self.open();
         driver.start();
         self.driver = Some(driver);
+    }
+
+    /// Stops the driver, closes the profile and starts again from what is on disk.
+    async fn restart(&mut self) {
+        self.stop().await;
+        self.start();
     }
 }
 
@@ -420,6 +426,95 @@ async fn a_second_hard_link_arrives_as_a_file_of_its_own() {
             ("two.txt".into(), file(b"linked\n")),
         ])
     );
+    a.stop().await;
+    b.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a local Worker; run core/driver/scripts/integration-test.sh"]
+async fn a_deleted_file_is_removed_on_the_other_device() {
+    log();
+    let owner = owner().await;
+    let space = new_space(&owner, "delete a file").await;
+    let mut a = Device::linked(&owner, &space, "a").await;
+    let mut b = Device::linked(&owner, &space, "b").await;
+    converged(&a, &b).await;
+
+    fs::write(a.folder().join("draft.txt"), b"deleted on b\n").unwrap();
+    fs::write(a.folder().join("kept.txt"), b"kept\n").unwrap();
+    converged(&a, &b).await;
+
+    fs::remove_file(b.folder().join("draft.txt")).unwrap();
+    let (synced, _) = converged(&a, &b).await;
+    assert_eq!(synced, Tree::from([("kept.txt".into(), file(b"kept\n"))]));
+    a.stop().await;
+    b.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a local Worker; run core/driver/scripts/integration-test.sh"]
+async fn a_deleted_folder_is_removed_with_its_children_on_the_other_device() {
+    log();
+    let owner = owner().await;
+    let space = new_space(&owner, "delete a folder").await;
+    let mut a = Device::linked(&owner, &space, "a").await;
+    let mut b = Device::linked(&owner, &space, "b").await;
+    converged(&a, &b).await;
+
+    fs::create_dir_all(b.folder().join("album/inner")).unwrap();
+    fs::write(b.folder().join("album/one.txt"), b"one\n").unwrap();
+    fs::write(b.folder().join("album/inner/two.txt"), b"two\n").unwrap();
+    fs::write(b.folder().join("kept.txt"), b"kept\n").unwrap();
+    let (synced, _) = converged(&a, &b).await;
+    assert_eq!(synced.len(), 5, "{synced:#?}");
+
+    fs::remove_dir_all(a.folder().join("album")).unwrap();
+    let (synced, _) = converged(&a, &b).await;
+    assert_eq!(synced, Tree::from([("kept.txt".into(), file(b"kept\n"))]));
+    a.stop().await;
+    b.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a local Worker; run core/driver/scripts/integration-test.sh"]
+async fn two_edits_of_one_file_keep_both_contents() {
+    log();
+    let owner = owner().await;
+    let space = new_space(&owner, "conflict").await;
+    let mut a = Device::linked(&owner, &space, "a").await;
+    let mut b = Device::linked(&owner, &space, "b").await;
+    converged(&a, &b).await;
+    fs::write(a.folder().join("notes.txt"), b"first\n").unwrap();
+    let (_, seq) = converged(&a, &b).await;
+
+    b.stop().await;
+    fs::write(a.folder().join("notes.txt"), b"edited on a\n").unwrap();
+    let started = Instant::now();
+    while !(a.status().state == FolderState::UpToDate && a.status().last_seq > Some(seq)) {
+        assert!(
+            started.elapsed() < WAIT,
+            "a did not commit its edit: {:#?}",
+            a.status()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    fs::write(b.folder().join("notes.txt"), b"edited on b\n").unwrap();
+    b.start();
+
+    let (synced, _) = converged(&a, &b).await;
+    let names: Vec<&Path> = synced.keys().map(PathBuf::as_path).collect();
+    assert_eq!(names.len(), 2, "{synced:#?}");
+    assert_eq!(synced[Path::new("notes.txt")], file(b"edited on a\n"));
+    let copy = names
+        .iter()
+        .find(|name| **name != Path::new("notes.txt"))
+        .unwrap();
+    let copy_name = copy.to_str().unwrap();
+    assert!(
+        copy_name.starts_with("notes (conflict from b ") && copy_name.ends_with(").txt"),
+        "{copy_name}"
+    );
+    assert_eq!(synced[*copy], file(b"edited on b\n"));
     a.stop().await;
     b.stop().await;
 }

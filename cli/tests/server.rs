@@ -220,11 +220,10 @@ async fn a_headless_device_pairs_links_and_follows_the_change_stream() {
     let machine = Machine::new();
 
     let paired = machine.run(&[
-        "pair",
+        "join",
+        &pairing.code,
         "--server",
         &server,
-        "--code",
-        &pairing.code,
         "--name",
         "agent-vm",
     ]);
@@ -239,15 +238,7 @@ async fn a_headless_device_pairs_links_and_follows_the_change_stream() {
         .unwrap()
         .to_owned();
     let device_id = credential["device_id"].as_str().unwrap().to_owned();
-    let again = machine.fails(&[
-        "pair",
-        "--server",
-        &server,
-        "--code",
-        "AAAA-BBBB",
-        "--name",
-        "again",
-    ]);
+    let again = machine.fails(&["join", "AAAA-BBBB", "--server", &server, "--name", "again"]);
     assert!(again.contains("already paired"), "{again}");
 
     fs::create_dir_all(machine.path("config/flarebox")).unwrap();
@@ -418,18 +409,10 @@ async fn a_device_revokes_a_lost_one_and_stops_syncing_when_another_revokes_it()
     let owner = Arc::new(Auth::new(api(), owner().await));
     let machine = Machine::new();
     let unpaired = machine.fails(&["device", "list"]);
-    assert!(unpaired.contains("not paired"), "{unpaired}");
+    assert!(unpaired.contains("not set up"), "{unpaired}");
     let pairing = owner.api().pair_start(&owner).await.unwrap();
     let server = server_url().to_string();
-    machine.run(&[
-        "pair",
-        "--server",
-        &server,
-        "--code",
-        &pairing.code,
-        "--name",
-        "desk",
-    ]);
+    machine.run(&["join", &pairing.code, "--server", &server, "--name", "desk"]);
     let device_id = machine.status()["account"]["device_id"]
         .as_str()
         .unwrap()
@@ -553,18 +536,10 @@ async fn usage_lists_what_each_space_stores() {
     let owner = Arc::new(Auth::new(api(), owner().await));
     let machine = Machine::new();
     let unpaired = machine.fails(&["usage"]);
-    assert!(unpaired.contains("not paired"), "{unpaired}");
+    assert!(unpaired.contains("not set up"), "{unpaired}");
     let pairing = owner.api().pair_start(&owner).await.unwrap();
     let server = server_url().to_string();
-    machine.run(&[
-        "pair",
-        "--server",
-        &server,
-        "--code",
-        &pairing.code,
-        "--name",
-        "desk",
-    ]);
+    machine.run(&["join", &pairing.code, "--server", &server, "--name", "desk"]);
     let name = format!("usage {}", uuidv7());
     let space = owner
         .api()

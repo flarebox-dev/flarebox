@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use flarebox_engine::restore::{Outcome, RestoreIntent};
 use flarebox_engine::tree::{Kind, LocalNode, Tree};
-use flarebox_fs::{EntryKind, Marker, write_marker};
+use flarebox_fs::{EntryKind, Marker, RootProblem, write_marker};
 use flarebox_net::Committed;
 use flarebox_proto::v1::{ListTree, ListVersions, Op, PrepareUpload, Resume, chunk_plan, op};
 use flarebox_sim::space::{Role, Session as Caller, SpaceDo};
@@ -242,16 +242,24 @@ impl Device {
 
     /// One pass of the observer's thread.
     fn scan(&mut self, wait: Duration) {
+        self.try_scan(wait).unwrap();
+    }
+
+    /// One pass of the observer's thread. Returns the folders its batch could not read.
+    fn try_scan(&mut self, wait: Duration) -> Result<Vec<PathBuf>, Stop> {
         let sections = self.folder.sections();
+        let mut unreadable = Vec::new();
         if let Some(batch) = sections.observe(&mut self.observer, wait).unwrap() {
+            unreadable.clone_from(&batch.observation.unreadable);
             let entries = self.observer.snapshot().entries.len() as u64;
             let step = self.folder.observed(batch, entries);
-            self.take(step).unwrap();
+            self.take(step)?;
         }
         if !self.folder.scanned && self.observer.scanned().is_some() {
             let step = self.folder.scanned();
-            self.take(step).unwrap();
+            self.take(step)?;
         }
+        Ok(unreadable)
     }
 
     /// Observes until `done`, for at most ten seconds.
@@ -1888,6 +1896,105 @@ fn a_deleted_folder_that_keeps_an_excluded_file_on_the_server_leaves_the_folder_
     assert_eq!(a.state(), FolderState::UpToDate);
 }
 
+/// Whether L, as the site's store holds it, has an entry named `name`.
+fn local_holds(site: &Site, name: &str) -> bool {
+    (site.stored().trees.local().iter()).any(|(_, node)| node.shape.name == name)
+}
+
+#[test]
+fn a_batch_that_fails_the_root_check_stops_the_folder_before_l_loses_a_file() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site.root.join("notes.txt"), b"written on a");
+
+    fs::remove_file(site.root.join(flarebox_fs::PRIVATE_DIR).join("space.json")).unwrap();
+    fs::remove_file(site.root.join("notes.txt")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let stop = loop {
+        assert!(Instant::now() < deadline, "the folder did not stop");
+        if let Err(stop) = a.try_scan(Duration::from_millis(100)) {
+            break stop;
+        }
+    };
+    assert!(
+        matches!(stop, Stop::Root(RootProblem::NoMarker)),
+        "{stop:?}"
+    );
+    assert!(local_holds(&site, "notes.txt"));
+    assert!(a.work.is_empty());
+    assert_eq!(remote.names(), ["notes.txt"]);
+}
+
+#[test]
+fn a_folder_the_scan_may_not_read_keeps_its_files_in_the_space() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    let folder = site.root.join("private");
+    fs::create_dir(&folder).unwrap();
+    a.create(&mut remote, &folder.join("secret.txt"), b"written on a");
+    let sent = a.sent.len();
+
+    fs::set_permissions(&folder, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(&folder).is_ok() {
+        assert!(rustix::process::geteuid().is_root());
+        eprintln!("SKIPPED: running as root, so permissions do not block reads");
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !a
+        .try_scan(Duration::from_millis(100))
+        .unwrap()
+        .contains(&"private".into())
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the folder was not found unreadable"
+        );
+    }
+    a.settle();
+    assert!(a.work.is_empty());
+    assert_eq!(a.sent.len(), sent);
+    assert!(local_holds(&site, "secret.txt"));
+
+    fs::set_permissions(&folder, fs::Permissions::from_mode(0o755)).unwrap();
+    a.settle();
+    assert!(a.work.is_empty());
+    assert_eq!(a.sent.len(), sent);
+    assert_eq!(remote.names(), ["private", "secret.txt"]);
+}
+
+#[test]
+fn a_restart_before_the_upload_of_a_commit_sends_it_once_with_its_chunks() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::write(site.root.join("notes.txt"), b"written on a").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    assert!(matches!(a.work.front(), Some(Work::Upload(_))));
+    let built = a
+        .folder
+        .engine
+        .commits
+        .in_flight()
+        .unwrap()
+        .commit
+        .commit_id
+        .clone();
+    drop(a);
+
+    let mut a = site.start();
+    a.connect(&remote);
+    a.scan_until(|a| a.folder.scanned);
+    a.run(&mut remote);
+    a.settle();
+    assert!(a.work.is_empty());
+    assert!(a.sent.iter().all(|sent| sent.commit_id == built));
+    assert_eq!(remote.space.head_seq(), 1);
+    assert_eq!(remote.names(), ["notes.txt"]);
+    assert_eq!(a.state(), FolderState::UpToDate);
+}
+
 #[test]
 fn a_rules_file_named_in_another_case_is_downloaded_and_in_force_first() {
     let mut remote = Remote::new();
@@ -2084,4 +2191,136 @@ fn a_batch_that_was_not_asked_to_scan_a_moved_folder_does_not_end_the_wait_for_i
     b.scan_until(|b| !b.folder.disk.awaits_rules());
     assert!(b.run(&mut remote).is_empty());
     assert_eq!(fs::read(site.root.join("work/build.log")).unwrap(), b"v1");
+}
+
+#[test]
+fn a_restart_during_a_bootstrap_reads_the_tree_again() {
+    for listed in [false, true] {
+        let mut remote = Remote::new();
+        let (site_a, mut a) = linked(&mut remote, "a");
+        a.create(&mut remote, &site_a.root.join("notes.txt"), b"written on a");
+
+        let site = Site::new(&remote, "b");
+        let mut b = site.start();
+        b.connect(&remote);
+        b.scan_until(|b| b.folder.scanned);
+        assert!(matches!(b.work.pop_front(), Some(Work::List)));
+        if listed {
+            let step = b.folder.listed(Ok(remote.pages(TREE_PAGE)));
+            b.take(step).unwrap();
+            assert!(matches!(b.work.front(), Some(Work::Subscribe { .. })));
+        }
+        drop(b);
+
+        let mut b = site.start();
+        b.connect(&remote);
+        b.scan_until(|b| b.folder.scanned);
+        assert_eq!(
+            b.run(&mut remote),
+            ["list", "subscribe", "stage"],
+            "listed: {listed}"
+        );
+        b.settle();
+        assert!(b.work.is_empty());
+        assert_eq!(files(&site.root), notes());
+        assert_eq!(b.state(), FolderState::UpToDate);
+    }
+}
+
+#[test]
+fn a_reconnect_while_a_commit_is_sent_starts_no_second_send() {
+    for reached_the_server in [false, true] {
+        let mut remote = Remote::new();
+        let (site, mut a) = linked(&mut remote, "a");
+        fs::write(site.root.join("notes.txt"), b"written on a").unwrap();
+        a.scan_until(|a| !a.work.is_empty());
+        let upload = a.work.pop_front().unwrap();
+        a.perform(upload, &mut remote).unwrap();
+        let Some(Work::Send(commit)) = a.work.pop_front() else {
+            panic!("the commit is sent after its upload");
+        };
+        if reached_the_server {
+            remote.commit(&a.caller, &commit).unwrap();
+        }
+
+        a.event(Event::Disconnected {
+            reason: flarebox_net::DisconnectReason::Timeout,
+            retry_in: Duration::from_secs(1),
+        })
+        .unwrap();
+        a.connect(&remote);
+        assert!(
+            !a.work.iter().any(|work| matches!(work, Work::Send(_))),
+            "reached the server: {reached_the_server}"
+        );
+
+        let result = remote.commit(&a.caller, &commit).unwrap();
+        let step = a.folder.sent(Ok(result));
+        a.take(step).unwrap();
+        a.pull(&remote);
+        a.run(&mut remote);
+        a.settle();
+        assert!(a.work.is_empty());
+        assert_eq!(remote.space.head_seq(), 1);
+        assert_eq!(remote.names(), ["notes.txt"]);
+        assert_eq!(a.state(), FolderState::UpToDate);
+    }
+}
+
+#[test]
+fn a_commit_too_large_to_send_is_split() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    for name in ["1.txt", "2.txt", "3.txt", "4.txt"] {
+        fs::write(site.root.join(name), name).unwrap();
+    }
+    a.scan_until(|a| a.folder.engine.trees.local().iter().count() == 4 && !a.work.is_empty());
+    let upload = a.work.pop_front().unwrap();
+    a.perform(upload, &mut remote).unwrap();
+    let Some(Work::Send(commit)) = a.work.pop_front() else {
+        panic!("the commit is sent after its upload");
+    };
+    assert_eq!(commit.ops.len(), 4);
+    let step = a.folder.sent(Err(CallError::TooLarge { bytes: 9 << 20 }));
+    a.take(step).unwrap();
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    let sizes: Vec<usize> = a.sent.iter().map(|commit| commit.ops.len()).collect();
+    assert_eq!(sizes, [2, 2]);
+    assert_eq!(remote.names(), ["1.txt", "2.txt", "3.txt", "4.txt"]);
+    assert_eq!(a.state(), FolderState::UpToDate);
+}
+
+#[test]
+fn a_read_only_device_keeps_downloading() {
+    let mut remote = Remote::new();
+    let (site_b, mut b) = linked(&mut remote, "b");
+    let (site, mut a) = linked(&mut remote, "a");
+    a.caller.role = Role::Viewer;
+    a.connect(&remote);
+    a.pull(&remote);
+    assert_eq!(a.folder.engine.commits.halted(), Some(CommitHalt::ReadOnly));
+    fs::write(site.root.join("mine.txt"), b"never sent").unwrap();
+    a.scan_until(|a| {
+        (a.folder.engine.trees.local().iter()).any(|(_, node)| node.shape.name == "mine.txt")
+    });
+    assert!(a.work.is_empty());
+
+    b.create(
+        &mut remote,
+        &site_b.root.join("theirs.txt"),
+        b"written on b",
+    );
+    a.pull(&remote);
+    a.run(&mut remote);
+    a.settle();
+    assert_eq!(
+        files(&site.root),
+        [
+            ("mine.txt".to_owned(), "never sent".to_owned()),
+            ("theirs.txt".to_owned(), "written on b".to_owned())
+        ]
+    );
+    assert_eq!(remote.names(), ["theirs.txt"]);
 }
