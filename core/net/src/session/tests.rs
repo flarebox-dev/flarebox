@@ -8,7 +8,7 @@ use flarebox_proto::v1::{
     CaughtUp, Changes, CommitRecord, Error as ProtoError, Goodbye, Notice, Resume, ServerMessage,
     TreePage, client_message, server_message,
 };
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::WebSocketStream;
 
@@ -60,6 +60,11 @@ fn config() -> SessionConfig {
 /// Accepts one connection, reads `Hello`, and answers with this `Welcome`.
 async fn accept(listener: &TcpListener, welcome: Welcome) -> Server {
     let (tcp, _) = listener.accept().await.unwrap();
+    accept_upgrade(tcp, welcome).await
+}
+
+/// Completes the upgrade on an accepted connection, reads `Hello`, and answers with this `Welcome`.
+async fn accept_upgrade(tcp: TcpStream, welcome: Welcome) -> Server {
     let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
     assert!(matches!(recv(&mut ws).await, client_message::Msg::Hello(_)));
     push(&mut ws, server_message::Msg::Welcome(welcome)).await;
@@ -768,4 +773,52 @@ async fn the_connection_keeps_serving_while_a_token_refresh_is_withheld() {
     let _ws = server.await.unwrap();
     let closed = tokio::time::timeout(Duration::from_millis(500), session.close()).await;
     assert!(closed.is_ok(), "close does not wait for the refresh");
+}
+
+#[tokio::test]
+async fn tokens_that_are_due_at_once_are_not_refreshed_in_a_loop() {
+    let (listener, auth) = listen_on(
+        "127.0.0.1:0",
+        Duration::from_secs(3600),
+        Some(Duration::from_secs(7200)),
+    )
+    .await;
+    let issued = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let server = tokio::spawn({
+        let issued = issued.clone();
+        async move {
+            let mut sockets = Vec::new();
+            loop {
+                let (mut tcp, _) = listener.accept().await.unwrap();
+                let mut start = [0; 4];
+                tcp.peek(&mut start).await.unwrap();
+                if &start != b"POST" {
+                    sockets.push(accept_upgrade(tcp, welcome("h", 0)).await);
+                    continue;
+                }
+                let n = issued.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut request = [0; 4096];
+                let _ = tcp.read(&mut request).await.unwrap();
+                let expires = SystemTime::now() + Duration::from_secs(3600);
+                let body = AccessToken {
+                    token: format!("token-{n}"),
+                    expires_at_ms: expires.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64,
+                }
+                .encode_to_vec();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/x-protobuf\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                tcp.write_all(head.as_bytes()).await.unwrap();
+                tcp.write_all(&body).await.unwrap();
+            }
+        }
+    });
+    let (session, mut events) = Session::start(auth, config()).unwrap();
+    assert!(matches!(next(&mut events).await, Event::Connected(_)));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let issued = issued.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(issued <= 3, "{issued} tokens in 1.5 s");
+    session.close().await;
+    server.abort();
 }

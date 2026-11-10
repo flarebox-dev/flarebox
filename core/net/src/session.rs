@@ -55,6 +55,9 @@ const CLOSE_UNSUPPORTED_VERSION: u16 = 4002;
 const CLOSE_DEVICE_REVOKED: u16 = 4003;
 /// Checks the token at least this often, whatever expiry the server sent.
 const MAX_REAUTH_WAIT: Duration = Duration::from_secs(3600);
+/// Waits at least this long between token refreshes, even when a new token is already due because the refresh
+/// margin is longer than the token's lifetime or the clocks disagree.
+const MIN_REAUTH_WAIT: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
 pub struct SessionConfig {
@@ -744,7 +747,7 @@ impl Task {
                             token = fresh;
                             reauth.as_mut().reset(self.reauth_at(&token));
                         }
-                        Ok(_) => reauth.as_mut().reset(Instant::now() + Duration::from_secs(1)),
+                        Ok(_) => reauth.as_mut().reset(Instant::now() + MIN_REAUTH_WAIT),
                         Err(error) if error.is_unauthenticated() => return Exit::Stop(StopReason::CredentialsRefused),
                         Err(error) => {
                             tracing::debug!(%error, "flarebox session could not refresh its access token");
@@ -774,7 +777,7 @@ impl Task {
             .refresh_at(token)
             .duration_since(SystemTime::now())
             .unwrap_or_default();
-        Instant::now() + wait.min(MAX_REAUTH_WAIT)
+        Instant::now() + wait.clamp(MIN_REAUTH_WAIT, MAX_REAUTH_WAIT)
     }
 
     /// Reads one WebSocket item: a server message, nothing to act on, or the end of the connection.
