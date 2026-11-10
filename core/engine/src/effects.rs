@@ -172,7 +172,8 @@ impl Effects {
         if self.in_flight.is_some() {
             return None;
         }
-        self.failed.retain(|id, _| candidate(trees, id));
+        self.failed
+            .retain(|id, _| candidate(trees, id) || trees.waiting().contains_key(id));
         let view = View::new(trees);
         let mut blockers = BTreeSet::new();
         let mut chosen = None;
@@ -353,16 +354,14 @@ impl<'a> View<'a> {
             }
             (Some(local), Some(remote)) => (local, remote),
         };
-        if local.parked && !remote_only(self.trees, id) {
+        if local.parked && self.trees.class(id) != Class::Remote {
             return self.unpark(id, local, remote);
         }
         if local.shape.kind != remote.kind {
             return Step::Skip;
         }
         let rewrite = match (&local.shape.content, &remote.content) {
-            (Some(old), Some(new)) => {
-                !same_content(old, new) && self.trees.class(id) == Class::Remote
-            }
+            (Some(old), Some(new)) => !same_content(old, new) && remote_only(self.trees, id),
             _ => false,
         };
         let moved = local.parked || !local.shape.same_position(remote);

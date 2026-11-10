@@ -133,8 +133,10 @@ impl Commits {
     }
 
     /// Builds the next commit from local changes, unless one is in flight or committing has
-    /// stopped. The caller builds only when connected and caught up, with `base_seq` the
-    /// `last_seq` of R and `history_id` the history R belongs to.
+    /// stopped. While committing has stopped it still makes the waiting S updates that fit (see
+    /// [`Trees::waiting`]), so the effects plan their nodes again as downloads go on. The caller
+    /// builds only when connected and caught up, with `base_seq` the `last_seq` of R and
+    /// `history_id` the history R belongs to.
     ///
     /// Concurrent changes are rebased onto R first (section 2.4): a file whose content changed
     /// differently on both sides is forked, its local version becoming a new node that is created
@@ -160,10 +162,13 @@ impl Commits {
         history_id: &str,
         base_seq: u64,
     ) -> Option<&proto::Commit> {
-        if self.in_flight.is_some() || self.halted.is_some() {
+        if self.in_flight.is_some() {
             return None;
         }
         self.retry_waiting(trees, BTreeSet::new(), Vec::new());
+        if self.halted.is_some() {
+            return None;
+        }
         let parked = trees.local().iter().filter(|(_, node)| node.parked);
         let skip: BTreeSet<NodeId> = self
             .problems
