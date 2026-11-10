@@ -1,0 +1,51 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Arbitrary bytes as a rules file and as a device-local exclude list. Each line of the input is
+//! also used as a path, so the matcher meets names that look like its patterns.
+//!
+//! Run with `cargo +nightly fuzz run parse` in `core/ignore/fuzz`.
+
+#![no_main]
+
+use flarebox_ignore::{Kind, LocalRules, Matcher, NameKey, RuleFile, Status};
+use libfuzzer_sys::fuzz_target;
+
+struct Folded;
+
+impl NameKey for Folded {
+    fn key(name: &str) -> String {
+        flarebox_engine::names::name_key(name)
+    }
+}
+
+struct Exact;
+
+impl NameKey for Exact {
+    fn key(name: &str) -> String {
+        name.to_owned()
+    }
+}
+
+fn check<K: NameKey>(data: &[u8]) {
+    let file = RuleFile::<K>::parse(data);
+    let lines: Vec<String> = data
+        .split(|&b| b == b'\n')
+        .take(64)
+        .map(|line| String::from_utf8_lossy(line).into_owned())
+        .collect();
+    let local = LocalRules::<K>::new(&lines, &lines).unwrap_or_default();
+    let mut matcher = Matcher::new(local);
+    matcher.set_rules(&[] as &[&str], Some(file), []);
+    for line in &lines {
+        let path: Vec<&str> = line.split('/').filter(|c| !c.is_empty()).collect();
+        for kind in [Kind::File, Kind::Dir] {
+            let _ = matcher.status(&path, kind);
+        }
+    }
+    assert_eq!(matcher.status(&[".fbignore"], Kind::File), Status::Included);
+}
+
+fuzz_target!(|data: &[u8]| {
+    check::<Folded>(data);
+    check::<Exact>(data);
+});

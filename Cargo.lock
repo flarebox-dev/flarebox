@@ -513,6 +513,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "flarebox-ignore"
+version = "0.0.0"
+dependencies = [
+ "flarebox-engine",
+ "proptest",
+ "tempfile",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "flarebox-net"
 version = "0.0.0"
 dependencies = [
