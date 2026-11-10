@@ -34,6 +34,7 @@ import type { ServerKey } from "../src/auth";
 import { sha256 } from "../src/crypto";
 import { toHex, uuidv7 } from "../src/ids";
 import { Close, HOLD_MS, type SpaceDO } from "../src/space-do";
+import { CallFailure } from "../src/space/commit";
 import { chunkKey, encodeChunkList } from "../src/space/store";
 import worker from "../src/worker";
 import { content, op, storedObjects, targetIncarnation } from "./helpers";
@@ -614,6 +615,37 @@ describe("WebSocket session", () => {
     await uploadListed(rest as Uint8Array[]);
     expect(await listed()).toBe("commit");
   }, 30_000);
+
+  it("replaces an error reply that would exceed 1 MiB with a generic LIMIT_EXCEEDED, over HTTP and WebSocket", async () => {
+    const { a, spaceId, stub } = await twoDevices();
+    const socket = await Socket.connect(spaceId, a);
+    await socket.start();
+    const hashes = Array.from({ length: 40_000 }, (_, i) => {
+      const hash = new Uint8Array(32);
+      new DataView(hash.buffer).setUint32(0, i);
+      return hash;
+    });
+    await runInDurableObject(stub, (instance: SpaceDO) => {
+      (instance as unknown as { listTree: () => never }).listTree = () => {
+        throw new CallFailure(Error_Code.MISSING_CHUNKS, "an error with more missing chunks than one message holds", hashes);
+      };
+    });
+    const request: MessageInitShape<typeof RpcRequestSchema>["call"] = { case: "listTree", value: {} };
+    const http = await exports.default.fetch(BASE + "/v1/spaces/" + spaceId + "/rpc", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + a.access!.token },
+      body: body(RpcRequestSchema, { reqId: 1n, call: request }),
+    });
+    const httpBytes = new Uint8Array(await http.arrayBuffer());
+    const viaSocket = await socket.rpc(request);
+    const wsBytes = toBinary(ServerMessageSchema, create(ServerMessageSchema, { msg: { case: "rpc", value: { reqId: 2n, result: viaSocket } } })).length;
+    for (const result of [fromBinary(RpcResponseSchema, httpBytes).result, viaSocket]) {
+      expect(result).toMatchObject({ case: "error", value: { code: Error_Code.LIMIT_EXCEEDED, message: "the error reply does not fit in one 1 MiB message", missingChunks: [] } });
+    }
+    expect(httpBytes.length).toBeLessThanOrEqual(1024 * 1024);
+    expect(wsBytes).toBeLessThanOrEqual(1024 * 1024);
+    expect(socket.closed).toBeUndefined();
+  });
 
   it("closes a connection on any text message except ping, an oversized one included", async () => {
     const { a, spaceId } = await twoDevices();
