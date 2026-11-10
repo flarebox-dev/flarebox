@@ -105,6 +105,26 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Bring a deleted file or folder back from its space's trash to where it was, or make an earlier version of a
+    /// file current again. The daemon sends the request with the folder's next commit.
+    Restore {
+        /// The deleted file or folder at the path it had, or the file whose version to restore.
+        path: PathBuf,
+        /// Restore this version of the file, as flarebox versions lists it.
+        #[arg(long)]
+        version: Option<String>,
+        /// The deleted node to restore, as flarebox trash --json lists it, when several deletions had this path.
+        #[arg(long, conflicts_with = "version")]
+        node: Option<String>,
+    },
+    /// List the restores asked for in a linked folder and how each one went.
+    Restores {
+        /// A linked folder, or a folder inside one.
+        #[arg(default_value = ".")]
+        folder: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     /// Show how many bytes each space stores: in live files, in the trash and in old versions.
     Usage {
         #[arg(long)]
@@ -196,6 +216,12 @@ fn main() -> ExitCode {
             Command::Usage { json } => usage(paths, json).await,
             Command::Trash { folder, json } => history::trash(&paths, &folder, json).await,
             Command::Versions { file, json } => history::versions(&paths, &file, json).await,
+            Command::Restore {
+                path,
+                version,
+                node,
+            } => history::restore(&paths, &path, version, node).await,
+            Command::Restores { folder, json } => history::restores(&paths, &folder, json).await,
             Command::Setup {
                 code: None,
                 device,
@@ -313,6 +339,8 @@ async fn client(paths: Paths, command: Command) -> Result<(), String> {
         | Command::Usage { .. }
         | Command::Trash { .. }
         | Command::Versions { .. }
+        | Command::Restore { .. }
+        | Command::Restores { .. }
         | Command::Setup { code: None, .. }
         | Command::Server { .. } => {
             unreachable!("main runs these commands itself")
@@ -388,7 +416,7 @@ async fn client(paths: Paths, command: Command) -> Result<(), String> {
             println!("Answered.");
             Ok(())
         }
-        Response::SignedOut => {
+        Response::SignedOut | Response::Restore { .. } | Response::Restores { .. } => {
             Err("the daemon answered a request that this command did not send".into())
         }
     }

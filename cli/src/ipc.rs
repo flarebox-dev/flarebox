@@ -11,7 +11,8 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use flarebox_driver::{
-    Account, Answer, Credential, Driver, DriverError, FolderStatus, Paths, Question, Status,
+    Account, Answer, Credential, Driver, DriverError, FolderStatus, Paths, Question,
+    RestoreRequest, RestoreStatus, Status,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -54,6 +55,14 @@ pub enum Request {
         question_id: String,
         answer: Answer,
     },
+    /// Records a restore in the folder of `space_id`, for its engine to send.
+    Restore {
+        space_id: String,
+        restore: RestoreRequest,
+    },
+    Restores {
+        space_id: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +75,8 @@ pub enum Response {
     Restarted { folder: FolderStatus },
     Questions { questions: Vec<Question> },
     Answered,
+    Restore { id: String },
+    Restores { restores: Vec<RestoreStatus> },
     SignedOut,
     Error { message: String },
 }
@@ -109,6 +120,12 @@ pub async fn handle(driver: &Driver, request: Request) -> Response {
         } => driver
             .answer(&question_id, answer)
             .map(|()| Response::Answered),
+        Request::Restore { space_id, restore } => driver
+            .restore(&space_id, restore)
+            .map(|id| Response::Restore { id }),
+        Request::Restores { space_id } => driver
+            .restores(&space_id)
+            .map(|restores| Response::Restores { restores }),
     };
     outcome.unwrap_or_else(|error| Response::Error {
         message: error.to_string(),
@@ -297,6 +314,20 @@ mod tests {
         assert_eq!(
             json,
             r#"{"request":"answer","question_id":"q1","answer":"restore"}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
+
+        let request = Request::Restore {
+            space_id: "s1".into(),
+            restore: RestoreRequest::Version {
+                node_id: "n1".into(),
+                version_id: "v1".into(),
+            },
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            json,
+            r#"{"request":"restore","space_id":"s1","restore":{"type":"version","node_id":"n1","version_id":"v1"}}"#
         );
         assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
     }

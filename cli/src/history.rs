@@ -2,12 +2,17 @@
 
 //! `flarebox trash` and `flarebox versions`: what the space of a linked folder keeps after a delete or an edit. Both
 //! read the server through its HTTP RPC route with this profile's credential. They change no file here or on the
-//! server, and without a daemon they read the profile without writing to it.
+//! server, and without a daemon they read the profile without writing to it. `flarebox restore` reads the same
+//! listings to find what to restore and records the request in the folder's store, for the folder's engine to send
+//! (design §6.3). `flarebox restores` lists those requests and how each went.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
-use flarebox_driver::{Driver, DriverError, FolderStatus, Paths};
+use flarebox_driver::{
+    Driver, DriverError, FolderState, FolderStatus, Paths, RestoreRejection, RestoreRequest,
+    RestoreState, RestoreStatus, RestoreWait,
+};
 use flarebox_engine::names::name_key;
 use flarebox_net::Auth;
 use flarebox_proto::v1::{
@@ -73,6 +78,192 @@ pub async fn versions(paths: &Paths, file: &Path, json: bool) -> Result<(), Stri
         versions_report(&below.join("/"), node, &kept, now_ms())
     );
     Ok(())
+}
+
+/// `flarebox restore <path>`: asks the folder's engine to bring the deletion at `path` back from the trash, or, with
+/// `version`, to make that version of the live file at `path` current again. `node` picks one of several deletions
+/// that had the path. The request is checked against the server's listings first, so a typo fails here and not after
+/// the next commit.
+pub async fn restore(
+    paths: &Paths,
+    path: &Path,
+    version: Option<String>,
+    node: Option<String>,
+) -> Result<(), String> {
+    let (linked, below) = locate(paths, path).await?;
+    if below.is_empty() {
+        return Err(format!(
+            "{} is the linked folder itself; name a file or folder in it",
+            linked.path
+        ));
+    }
+    let auth = signed_in(paths)?;
+    let space = linked.space_id.as_str();
+    let shown = printable(&below.join("/"));
+    let live = tree(&auth, space).await?;
+    let request = match version {
+        Some(version_id) => {
+            let file = find(&live, space, &below).ok_or_else(|| {
+                format!(
+                    "the server has no file at {shown} in {}; flarebox trash lists deleted ones",
+                    linked.path
+                )
+            })?;
+            if file.kind() == NodeKind::Dir {
+                return Err(format!("{shown} is a folder; only a file has versions"));
+            }
+            if file
+                .current
+                .as_ref()
+                .map(|current| current.version_id.as_str())
+                == Some(version_id.as_str())
+            {
+                return Err(format!(
+                    "{version_id} is already the current version of {shown}"
+                ));
+            }
+            let kept = versions_of(&auth, space, &file.node_id).await?;
+            if !kept.iter().any(|kept| kept.version_id == version_id) {
+                return Err(format!(
+                    "{shown} has no version {version_id}; flarebox versions lists them"
+                ));
+            }
+            RestoreRequest::Version {
+                node_id: file.node_id.clone(),
+                version_id,
+            }
+        }
+        None => {
+            let trashed = trash_nodes(&auth, space).await?;
+            let deleted = trashed_at(&live, &trashed, space, &below, node.as_deref())
+                .map_err(|why| why.message(&shown, &linked))?;
+            RestoreRequest::FromTrash {
+                node_id: deleted.node_id.clone(),
+                parent_id: None,
+                name: None,
+            }
+        }
+    };
+    let request = Request::Restore {
+        space_id: linked.space_id.clone(),
+        restore: request,
+    };
+    let id = match ipc::run(paths, request).await? {
+        Response::Restore { id } => id,
+        Response::Error { message } => return Err(message),
+        other => return Err(format!("the daemon answered {other:?}")),
+    };
+    println!("Asked to restore {shown} (restore {id}).");
+    if linked.state == FolderState::Stopped {
+        println!("Run flarebox daemon to send it. flarebox restores shows how it went.");
+    } else {
+        println!(
+            "The folder sends it with its next commit. flarebox restores {} shows how it went.",
+            linked.path
+        );
+    }
+    Ok(())
+}
+
+/// `flarebox restores [folder]`: the restores asked for in the folder's space, those that ended first.
+pub async fn restores(paths: &Paths, folder: &Path, json: bool) -> Result<(), String> {
+    let (linked, _) = locate(paths, folder).await?;
+    let request = Request::Restores {
+        space_id: linked.space_id.clone(),
+    };
+    let restores = match ipc::run(paths, request).await? {
+        Response::Restores { restores } => restores,
+        Response::Error { message } => return Err(message),
+        other => return Err(format!("the daemon answered {other:?}")),
+    };
+    if json {
+        return print_json(&restores);
+    }
+    print!("{}", restores_report(&restores, &linked));
+    Ok(())
+}
+
+/// Why no single deletion could be picked.
+#[derive(Debug, PartialEq)]
+enum NotPicked<'a> {
+    /// No deletion had the path. `live` says whether a live node has it.
+    None { live: bool },
+    /// Several did, and none was picked.
+    Several(Vec<&'a NodeState>),
+    /// None of the deletions at the path is the node asked for.
+    NotThere(String),
+}
+
+impl NotPicked<'_> {
+    fn message(&self, shown: &str, linked: &FolderStatus) -> String {
+        match self {
+            Self::None { live: true } => {
+                format!("{shown} is not deleted; flarebox versions lists the versions of a file")
+            }
+            Self::None { live: false } => format!(
+                "nothing deleted at {shown} is in the trash of {}; flarebox trash lists what is",
+                linked.path
+            ),
+            Self::Several(found) => {
+                let mut message = format!(
+                    "{} deletions had the path {shown}; pick one with --node:",
+                    found.len()
+                );
+                for node in found {
+                    message.push_str(&format!(
+                        "\n  {}  {}, {}",
+                        node.node_id,
+                        kind(node),
+                        size(content_size(node.current.as_ref()))
+                    ));
+                }
+                message
+            }
+            Self::NotThere(node) => {
+                format!("no deletion at {shown} is node {node}; flarebox trash --json lists them")
+            }
+        }
+    }
+}
+
+/// The trashed node that had the path `names`, or the one of them that is `node`. A node trashed with its folder
+/// counts at its own path, so a file can be restored on its own.
+fn trashed_at<'a>(
+    live: &'a [NodeState],
+    trash: &'a [NodeState],
+    root: &str,
+    names: &[String],
+    node: Option<&str>,
+) -> Result<&'a NodeState, NotPicked<'a>> {
+    let by_id: HashMap<&str, &NodeState> = live
+        .iter()
+        .chain(trash)
+        .map(|node| (node.node_id.as_str(), node))
+        .collect();
+    let mut found: Vec<&NodeState> = trash
+        .iter()
+        .filter(|trashed| {
+            let had = names_of(trashed, &by_id, root);
+            had.len() == names.len() && starts_with(&had, names)
+        })
+        .collect();
+    if let Some(node) = node {
+        found.retain(|trashed| trashed.node_id == node);
+        return match found.as_slice() {
+            [one] => Ok(one),
+            _ => Err(NotPicked::NotThere(node.to_owned())),
+        };
+    }
+    match found.as_slice() {
+        [] => Err(NotPicked::None {
+            live: find(live, root, names).is_some(),
+        }),
+        [one] => Ok(one),
+        _ => {
+            found.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+            Err(NotPicked::Several(found))
+        }
+    }
 }
 
 /// The linked folder that holds `path`, and the names below it as typed. The folders come from the daemon, or from the
@@ -382,6 +573,86 @@ fn trash_report(found: &[Deleted], linked: &FolderStatus) -> String {
         report.push('\n');
     }
     report
+}
+
+fn restores_report(restores: &[RestoreStatus], linked: &FolderStatus) -> String {
+    if restores.is_empty() {
+        return format!("No restore was asked for in {}.\n", linked.path);
+    }
+    let mut report = String::new();
+    for restore in restores {
+        let what = match &restore.request {
+            RestoreRequest::FromTrash { node_id, .. } => format!("deleted node {node_id}"),
+            RestoreRequest::Version {
+                node_id,
+                version_id,
+            } => format!("version {version_id} of node {node_id}"),
+        };
+        report.push_str(&format!(
+            "{}  {what}\n  {}\n",
+            restore.id,
+            restore_state(&restore.state)
+        ));
+    }
+    let pending = restores
+        .iter()
+        .any(|restore| matches!(restore.state, RestoreState::Pending { .. }));
+    if pending {
+        report.push_str(
+            "A pending restore goes out with a commit of the folder once the earlier changes of its node have synced.\n",
+        );
+        if linked.state == FolderState::Stopped {
+            report.push_str("The folder is not syncing: run flarebox daemon.\n");
+        }
+        if let Some(problem) = &linked.problem {
+            report.push_str(&format!("The folder has a problem: {problem}\n"));
+        }
+        if linked.questions > 0 {
+            report.push_str(&format!(
+                "{} for the folder: flarebox questions lists them.\n",
+                crate::count(linked.questions, "question waits")
+            ));
+        }
+    }
+    report
+}
+
+fn restore_state(state: &RestoreState) -> String {
+    match state {
+        RestoreState::Pending { waits_for: None } => "pending: waits for the folder to sync".into(),
+        RestoreState::Pending {
+            waits_for: Some(RestoreWait::NodeProblem),
+        } => "pending: the server refused a change this device made to the node, and nothing is sent for it until that problem is cleared"
+            .into(),
+        RestoreState::Restored => "restored".into(),
+        RestoreState::Renamed { name } => {
+            format!("restored as {}, since its name was taken", printable(name))
+        }
+        RestoreState::Copied { name, .. } => format!(
+            "restored as a new file {}, since another device changed the file meanwhile",
+            printable(name)
+        ),
+        RestoreState::Rejected { reason } => format!("refused: {}", rejection(reason)),
+        RestoreState::DoesNotFit => {
+            "not sent: it brings back more nodes than one commit can hold".into()
+        }
+    }
+}
+
+fn rejection(reason: &RestoreRejection) -> String {
+    match reason {
+        RestoreRejection::NotFound => {
+            "the server no longer has it, or the folder to restore into; it was purged or expired"
+                .into()
+        }
+        RestoreRejection::NotFile => "only a file has versions".into(),
+        RestoreRejection::InvalidName => "its name is not valid".into(),
+        RestoreRejection::ParentNotDir => "the place to restore into is a file".into(),
+        RestoreRejection::Cycle => "the folder to restore into is inside it".into(),
+        RestoreRejection::Root => "it is the root of the space".into(),
+        RestoreRejection::ReadOnly => "the server takes no writes from this device".into(),
+        RestoreRejection::Other(reason) => reason.clone(),
+    }
 }
 
 fn version_json(version: &VersionInfo) -> serde_json::Value {
@@ -707,6 +978,128 @@ mod tests {
         assert_eq!(
             trash_report(&[], &linked),
             "Nothing from /home/ada/Flarebox is in the trash.\n"
+        );
+    }
+
+    #[test]
+    fn a_restore_picks_the_deletion_that_had_the_path() {
+        let live = vec![
+            node("docs", SPACE, "docs", NodeKind::Dir, 0, ""),
+            node("note", "docs", "note.txt", NodeKind::File, 4, ""),
+        ];
+        let trash = vec![
+            node("photos", SPACE, "photos", NodeKind::Dir, 0, "g1"),
+            node("cat", "photos", "cat.jpg", NodeKind::File, 300, "g1"),
+            node("old-b", "docs", "old.txt", NodeKind::File, 12, "g3"),
+            node("old-a", "docs", "old.txt", NodeKind::File, 7, "g2"),
+        ];
+        let pick = |path: &str, node: Option<&str>| {
+            trashed_at(&live, &trash, SPACE, &names(path), node)
+                .map(|picked| picked.node_id.as_str())
+                .map_err(|why| match why {
+                    NotPicked::Several(found) => {
+                        format!(
+                            "several: {:?}",
+                            found.iter().map(|node| &node.node_id).collect::<Vec<_>>()
+                        )
+                    }
+                    other => format!("{other:?}"),
+                })
+        };
+
+        assert_eq!(pick("photos", None), Ok("photos"));
+        assert_eq!(
+            pick("photos/cat.jpg", None),
+            Ok("cat"),
+            "a file trashed with its folder"
+        );
+        assert_eq!(
+            pick("docs/old.txt", None),
+            Err(r#"several: ["old-a", "old-b"]"#.into())
+        );
+        assert_eq!(pick("docs/old.txt", Some("old-b")), Ok("old-b"));
+        assert_eq!(
+            pick("docs/old.txt", Some("cat")),
+            Err(r#"NotThere("cat")"#.into())
+        );
+        assert_eq!(
+            pick("docs/note.txt", None),
+            Err("None { live: true }".into())
+        );
+        assert_eq!(
+            pick("docs/new.txt", None),
+            Err("None { live: false }".into())
+        );
+
+        let several = trashed_at(&live, &trash, SPACE, &names("docs/old.txt"), None).unwrap_err();
+        assert_eq!(
+            several.message("docs/old.txt", &linked()),
+            "2 deletions had the path docs/old.txt; pick one with --node:\n  old-a  file, 7 B\n  old-b  file, 12 B"
+        );
+    }
+
+    fn linked() -> FolderStatus {
+        FolderStatus {
+            path: "/home/ada/Flarebox".into(),
+            ..serde_json::from_value(serde_json::json!({
+                "space_id": SPACE, "space_name": "Home", "path": "", "state": "up_to_date",
+                "history_id": null, "last_seq": null, "head_seq": null, "remote_nodes": 0,
+                "local_entries": null, "questions": 0
+            }))
+            .unwrap()
+        }
+    }
+
+    #[test]
+    fn the_restores_report_says_what_holds_a_pending_restore_back() {
+        let restores = [
+            RestoreStatus {
+                id: "r1".into(),
+                request: RestoreRequest::FromTrash {
+                    node_id: "cat".into(),
+                    parent_id: None,
+                    name: None,
+                },
+                state: RestoreState::Renamed {
+                    name: "cat (2).jpg".into(),
+                },
+            },
+            RestoreStatus {
+                id: "r2".into(),
+                request: RestoreRequest::Version {
+                    node_id: "note".into(),
+                    version_id: "note-0".into(),
+                },
+                state: RestoreState::Pending { waits_for: None },
+            },
+        ];
+        let folder = FolderStatus {
+            state: FolderState::Stopped,
+            questions: 1,
+            problem: Some("the root is missing".into()),
+            ..linked()
+        };
+
+        assert_eq!(
+            restores_report(&restores, &folder),
+            concat!(
+                "r1  deleted node cat\n",
+                "  restored as cat (2).jpg, since its name was taken\n",
+                "r2  version note-0 of node note\n",
+                "  pending: waits for the folder to sync\n",
+                "A pending restore goes out with a commit of the folder once the earlier changes of its node have synced.\n",
+                "The folder is not syncing: run flarebox daemon.\n",
+                "The folder has a problem: the root is missing\n",
+                "1 question waits for the folder: flarebox questions lists them.\n",
+            )
+        );
+        assert_eq!(
+            restores_report(&restores[..1], &folder),
+            "r1  deleted node cat\n  restored as cat (2).jpg, since its name was taken\n"
+        );
+        assert_eq!(
+            restores_report(&[], &folder),
+            "No restore was asked for in /home/ada/Flarebox.\n"
         );
     }
 

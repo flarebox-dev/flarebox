@@ -855,3 +855,142 @@ async fn trash_and_versions_list_what_the_space_keeps() {
         "the commands changed the profile without a daemon"
     );
 }
+
+async fn eventually(what: &str, done: impl Fn() -> bool) {
+    let started = Instant::now();
+    while !done() {
+        assert!(started.elapsed() < WAIT, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Worker; run cli/scripts/integration-test.sh"]
+async fn restore_brings_back_a_deleted_file_and_an_earlier_version() {
+    let owner = Arc::new(Auth::new(api(), owner().await));
+    let space_name = format!("restore {}", uuidv7());
+    let space = owner
+        .api()
+        .create_space(
+            &owner,
+            &CreateSpaceRequest {
+                name: space_name.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let pairing = owner.api().pair_start(&owner).await.unwrap();
+    let server = server_url().to_string();
+    let machine = Machine::new();
+    machine.run(&["join", &pairing.code, "--server", &server, "--name", "desk"]);
+    let folder = machine.path("Sync");
+    fs::create_dir_all(&folder).unwrap();
+    let folder_arg = folder.to_str().unwrap();
+    machine.run(&["link", folder_arg, "--space", &space_name]);
+    let daemon = machine
+        .command(&["daemon"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let socket = machine.path("run/flarebox/daemon.sock");
+    eventually("the daemon to open its socket", || socket.exists()).await;
+    machine
+        .status_until("the first sync", |status| {
+            status["folders"][0]["state"] == "up_to_date"
+        })
+        .await;
+
+    let docs = uuidv7();
+    let note = uuidv7();
+    let gone = uuidv7();
+    commit_as_owner(
+        &owner,
+        &space.space_id,
+        &[b"first", b"deleted later"],
+        vec![
+            op::Op::CreateDir(CreateDir {
+                node_id: docs.clone(),
+                parent_id: space.space_id.clone(),
+                name: "docs".into(),
+            }),
+            op::Op::CreateFile(CreateFile {
+                node_id: note.clone(),
+                parent_id: docs.clone(),
+                name: "note.txt".into(),
+                content: Some(file_content(b"first")),
+            }),
+            op::Op::CreateFile(CreateFile {
+                node_id: gone.clone(),
+                parent_id: docs,
+                name: "gone.txt".into(),
+                content: Some(file_content(b"deleted later")),
+            }),
+        ],
+    )
+    .await;
+    let note_path = folder.join("docs/note.txt");
+    let gone_path = folder.join("docs/gone.txt");
+    eventually("docs/gone.txt to arrive", || {
+        fs::read(&gone_path).ok().as_deref() == Some(&b"deleted later"[..])
+    })
+    .await;
+    commit_as_owner(
+        &owner,
+        &space.space_id,
+        &[b"second!"],
+        vec![
+            op::Op::UpdateContent(UpdateContent {
+                node_id: note,
+                content: Some(file_content(b"second!")),
+            }),
+            op::Op::Delete(Delete { node_id: gone }),
+        ],
+    )
+    .await;
+    eventually("the edit and the deletion to arrive", || {
+        fs::read(&note_path).ok().as_deref() == Some(&b"second!"[..]) && !gone_path.exists()
+    })
+    .await;
+
+    let note_arg = note_path.to_str().unwrap();
+    let versions: Value =
+        serde_json::from_str(&machine.run(&["versions", note_arg, "--json"])).unwrap();
+    let current = versions[0]["version_id"].as_str().unwrap();
+    let first = versions[1]["version_id"].as_str().unwrap();
+    let again = machine.fails(&["restore", note_arg, "--version", current]);
+    assert!(again.contains("already the current version"), "{again}");
+    let asked = machine.run(&["restore", gone_path.to_str().unwrap()]);
+    assert!(
+        asked.starts_with("Asked to restore docs/gone.txt (restore "),
+        "{asked}"
+    );
+    machine.run(&["restore", note_arg, "--version", first]);
+    eventually(
+        "the deleted file and the first version to come back",
+        || {
+            fs::read(&gone_path).ok().as_deref() == Some(&b"deleted later"[..])
+                && fs::read(&note_path).ok().as_deref() == Some(&b"first"[..])
+        },
+    )
+    .await;
+    let restores = || -> Value {
+        serde_json::from_str(&machine.run(&["restores", folder_arg, "--json"])).unwrap()
+    };
+    eventually("both restores to be reported", || {
+        restores()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|restore| restore["state"]["type"] == "restored")
+            .count()
+            == 2
+    })
+    .await;
+    let report = machine.run(&["restores", folder_arg]);
+    assert!(report.contains("restored"), "{report}");
+    assert!(!report.contains("pending"), "{report}");
+    let trash = machine.run(&["trash", folder_arg]);
+    assert!(trash.contains("Nothing from"), "{trash}");
+    assert!(stop(daemon).success());
+}
