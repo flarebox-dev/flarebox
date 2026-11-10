@@ -151,7 +151,7 @@ Changes whose path the matcher excludes are dropped. The observer starts from a 
 
 ## What part 2 wires
 
-Part 2 puts the engine between the inputs and outputs part 1 already produces and consumes, per folder. Items 1 to 5 are wired as [The loop](#the-loop) describes, and item 8 passes for new files (`core/driver/tests/sync.rs`). Still open in them: recovery (§6.4) in item 2, where the task halts, and the `.fbignore` rules in item 3.
+Part 2 puts the engine between the inputs and outputs part 1 already produces and consumes, per folder. Items 1 to 5 are wired as [The loop](#the-loop) describes, and item 8 passes for new files and deletes (`core/driver/tests/sync.rs`). Still open in them: recovery (§6.4) in item 2, where the task halts, and the `.fbignore` rules in item 3.
 
 1. **Engine state.** Build the engine from the store (R with the cursor, S, L with identities, the commit in flight, the ID generator, the accepted device counter and the effect counter) and run its `handle(now_ms, input)` loop in the folder task. After each input, write the engine's row changes in one store transaction, then execute its outputs (design §1).
 2. **Server log.** Replace `folder::apply_changes` and `folder::replace_tree` with the engine inputs `Changes`, `TreePage`, `CaughtUp` and `ResyncRequired`, and the engine's `Resume` and `ListTree` outputs. `Connected(Welcome)` goes to the engine, which compares `history_id` and `device_seq` with the store (design §2.8, RFC 0002 §2); the halts on another history, `HISTORY_CHANGED` and `AHEAD_OF_SERVER` become recovery (§6.4).
