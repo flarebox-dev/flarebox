@@ -292,7 +292,8 @@ async function route(request: Request, env: Env): Promise<Response> {
       const body = await readMessage(request, CreateSpaceRequestSchema);
       checkNames({ name: body.name });
       const created = await account(env).createSpace({ userId: identity.userId, name: body.name });
-      return reply(request, SpaceInfoSchema, create(SpaceInfoSchema, created), 201);
+      if (!created.ok) return errorReply(request, created.code, created.message, 409);
+      return reply(request, SpaceInfoSchema, create(SpaceInfoSchema, created.value), 201);
     }
   }
 

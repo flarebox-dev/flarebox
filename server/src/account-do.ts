@@ -508,12 +508,18 @@ export class AccountDO extends DurableObject<Env> {
     await this.armAlarm();
   }
 
-  async createSpace(args: { userId: string; name: string }): Promise<SpaceInfo> {
+  /**
+   * Creates a space, refusing a name the owner already uses. Names compare exactly after trimming, as `flarebox link
+   * --space` resolves them. The check and the row come before the first await, so two concurrent creates of one name
+   * cannot both pass; the row is removed again if the Space DO cannot be set up.
+   */
+  async createSpace(args: { userId: string; name: string }): Promise<Outcome<SpaceInfo>> {
     const nowMs = Date.now();
     const spaceId = uuidv7(nowMs);
     const name = args.name.trim() || "Flarebox";
-    const spaceKey = await deriveSpaceKey((await this.serverKey()).secret, spaceId);
-    await this.env.SPACE.get(this.env.SPACE.idFromName(spaceId)).init({ spaceId, name, ownerUserId: args.userId, spaceKey });
+    if (this.sql.exec("SELECT 1 FROM spaces WHERE owner_id = ? AND name = ?", args.userId, name).toArray().length > 0) {
+      return failure(Error_Code.INVALID_ARGUMENT, "you already have a space with this name");
+    }
     this.sql.exec(
       "INSERT INTO spaces (space_id, name, owner_id, created_at_ms, format_version, list_seq) VALUES (?, ?, ?, ?, ?, (SELECT COALESCE(MAX(list_seq), 0) + 1 FROM spaces))",
       spaceId,
@@ -522,7 +528,14 @@ export class AccountDO extends DurableObject<Env> {
       nowMs,
       FORMAT_VERSION,
     );
-    return spaceInfo({ space_id: spaceId, name, owner_id: args.userId, created_at_ms: nowMs, format_version: FORMAT_VERSION });
+    try {
+      const spaceKey = await deriveSpaceKey((await this.serverKey()).secret, spaceId);
+      await this.env.SPACE.get(this.env.SPACE.idFromName(spaceId)).init({ spaceId, name, ownerUserId: args.userId, spaceKey });
+    } catch (error) {
+      this.sql.exec("DELETE FROM spaces WHERE space_id = ?", spaceId);
+      throw error;
+    }
+    return ok(spaceInfo({ space_id: spaceId, name, owner_id: args.userId, created_at_ms: nowMs, format_version: FORMAT_VERSION }));
   }
 
   /**

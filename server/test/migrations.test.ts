@@ -230,8 +230,9 @@ describe("upgraded objects keep working", () => {
     });
     await evictDurableObject(stub);
     const created = await stub.createSpace({ userId: OWNER, name: "New" });
+    if (!created.ok) throw new Error(created.message);
     const listed = await stub.listSpaces({ userId: OWNER, after: 0 });
-    expect(listed.spaces.map((space) => space.spaceId)).toEqual([...older, created.spaceId]);
+    expect(listed.spaces.map((space) => space.spaceId)).toEqual([...older, created.value.spaceId]);
     expect(listed.nextCursor).toBe("");
   });
 

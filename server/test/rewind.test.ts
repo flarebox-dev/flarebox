@@ -105,7 +105,7 @@ async function pairDevice(inviter: DeviceCredentials, deviceName: string): Promi
 async function newSpace() {
   const creds = await getOwner();
   const createdAtMs = Date.now();
-  const created = await call("/v1/spaces", { token: creds.access!.token, body: body(CreateSpaceRequestSchema, { name: "Home" }) }, SpaceInfoSchema);
+  const created = await call("/v1/spaces", { token: creds.access!.token, body: body(CreateSpaceRequestSchema, { name: `Home ${crypto.randomUUID()}` }) }, SpaceInfoSchema);
   const spaceId = created.message!.spaceId;
   const device = () =>
     new TestClient(space(spaceId), spaceId, {
