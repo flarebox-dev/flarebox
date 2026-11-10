@@ -203,6 +203,17 @@ export class CommitApplier {
     return node.meta_rev > this.ctx.baseSeq && node.meta_dev !== this.dev;
   }
 
+  /** Another device put node under its parent after the commit's base (RFC 0002 section 9). */
+  private unseenParent(node: NodeRow): boolean {
+    return node.parent_rev > this.ctx.baseSeq && node.parent_dev !== this.dev;
+  }
+
+  /** An op that names node's current parent puts it there for this commit's device too (RFC 0002 section 9). */
+  private claimPlacement(node: NodeRow): void {
+    if (!this.unseenParent(node)) return;
+    this.sql.exec("UPDATE nodes SET parent_rev = ?, parent_dev = ? WHERE node_id = ?", this.ctx.seq, this.dev, node.node_id);
+  }
+
   private depth(node: NodeRow): number {
     let depth = 0;
     for (let cur: NodeRow | undefined = node; cur?.parent_id; cur = getNode(this.sql, cur.parent_id)) {
@@ -391,6 +402,7 @@ export class CommitApplier {
     if (!parent.parent_id && isReservedAtRoot(name)) return rejected("INVALID_NAME");
     const existing = this.liveWithName(parent.node_id, nameKey(name), "");
     if (existing?.kind === NodeKindValue.DIR) {
+      this.claimPlacement(existing);
       this.remap.set(op.nodeId, existing.node_id);
       return result(OpResult_Code.MERGED_INTO, existing.node_id, existing.name);
     }
@@ -457,6 +469,7 @@ export class CommitApplier {
     if (this.isSelfOrDescendant(target, found.node_id)) return rejected("CYCLE");
     if (!target.parent_id && isReservedAtRoot(name)) return rejected("INVALID_NAME");
     if (found.status === NodeStatusValue.LIVE && found.parent_id === target.node_id && found.name === name) {
+      this.claimPlacement(found);
       return result(OpResult_Code.APPLIED, "", name);
     }
     const parent = this.parentFor(target.node_id) as NodeRow;
@@ -468,12 +481,12 @@ export class CommitApplier {
       return result(picked.renamed ? OpResult_Code.APPLIED_RENAMED : OpResult_Code.APPLIED, "", picked.name);
     }
     const picked = this.pickName(parent.node_id, name, found.node_id);
-    const moved = found.parent_id !== parent.node_id;
+    const placed = found.parent_id !== parent.node_id || this.unseenParent(found);
     this.sql.exec(
       "UPDATE nodes SET parent_id = ?, parent_rev = ?, parent_dev = ?, name = ?, name_key = ?, meta_rev = ?, meta_dev = ? WHERE node_id = ?",
       parent.node_id,
-      moved ? this.ctx.seq : found.parent_rev,
-      moved ? this.dev : found.parent_dev,
+      placed ? this.ctx.seq : found.parent_rev,
+      placed ? this.dev : found.parent_dev,
       picked.name,
       nameKey(picked.name),
       this.ctx.seq,
@@ -489,7 +502,7 @@ export class CommitApplier {
    * an earlier op of this commit made it as a conflict copy.
    */
   private enteredAfterBase(node: NodeRow): boolean {
-    return this.conflictCopies.has(node.node_id) || (node.parent_rev > this.ctx.baseSeq && node.parent_dev !== this.dev);
+    return this.conflictCopies.has(node.node_id) || this.unseenParent(node);
   }
 
   /**

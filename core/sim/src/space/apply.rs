@@ -136,6 +136,23 @@ impl<'a> Applier<'a> {
         node.meta_rev > self.ctx.base_seq && node.meta_dev != self.dev()
     }
 
+    /// Another device put `node` under its parent after the commit's base (RFC 0002 section 9).
+    fn unseen_parent(&self, node: &Node) -> bool {
+        node.parent_rev > self.ctx.base_seq && node.parent_dev != self.dev()
+    }
+
+    /// An op that names the node's current parent puts it there for this commit's device too (RFC
+    /// 0002 section 9).
+    fn claim_placement(&mut self, node_id: &str) {
+        if !self.unseen_parent(&self.st.nodes[node_id]) {
+            return;
+        }
+        let (seq, dev) = (self.ctx.seq, self.dev().to_string());
+        let node = self.st.nodes.get_mut(node_id).expect("claimed node exists");
+        node.parent_rev = seq;
+        node.parent_dev = dev;
+    }
+
     fn depth(&self, node: &Node) -> usize {
         let mut depth = 0;
         let mut cur = node.parent_id.as_ref().and_then(|id| self.st.nodes.get(id));
@@ -405,6 +422,7 @@ impl<'a> Applier<'a> {
             .filter(|n| n.kind == NodeKind::Dir)
         {
             let (id, existing_name) = (existing.node_id.clone(), existing.name.clone());
+            self.claim_placement(&id);
             self.remap.insert(op.node_id.clone(), id.clone());
             return Ok(result(op_result::Code::MergedInto, &id, &existing_name));
         }
@@ -519,6 +537,7 @@ impl<'a> Applier<'a> {
             && found.parent_id.as_deref() == Some(target.node_id.as_str())
             && found.name == name
         {
+            self.claim_placement(&found.node_id);
             return Ok(result(op_result::Code::Applied, "", &name));
         }
         let parent = self
@@ -535,13 +554,15 @@ impl<'a> Applier<'a> {
             return Ok(applied(renamed, &name));
         }
         let (name, renamed) = self.pick_name(&parent.node_id, &name, &found.node_id);
+        let placed = found.parent_id.as_deref() != Some(parent.node_id.as_str())
+            || self.unseen_parent(&found);
         let (seq, dev) = (self.ctx.seq, self.dev().to_string());
         let stored = self
             .st
             .nodes
             .get_mut(&found.node_id)
             .expect("moved node exists");
-        if stored.parent_id.as_deref() != Some(parent.node_id.as_str()) {
+        if placed {
             stored.parent_rev = seq;
             stored.parent_dev = dev.clone();
         }
@@ -557,8 +578,7 @@ impl<'a> Applier<'a> {
     /// Whether `node` came under its parent after the commit's base: another device moved, restored or
     /// created it there, or an earlier op of this commit made it as a conflict copy.
     fn entered_after_base(&self, node: &Node) -> bool {
-        self.conflict_copies.contains(&node.node_id)
-            || (node.parent_rev > self.ctx.base_seq && node.parent_dev != self.dev())
+        self.conflict_copies.contains(&node.node_id) || self.unseen_parent(node)
     }
 
     /// R7 and RFC 0002 section 9: trashes the subtree the deleting device had at its base. Nodes with
