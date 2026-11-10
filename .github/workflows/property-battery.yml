@@ -114,7 +114,11 @@ jobs:
             dir=$(realpath --relative-to="$GITHUB_WORKSPACE" "$(dirname "$manifest")")
             binary="bin/$(basename "$executable")"
             cp "$executable" "battery/$binary"
-            listed=$(cd "$dir" && "$executable" --list "${filter_args[@]}" | grep -c ': test$' || true)
+            if ! listing=$(cd "$dir" && "$executable" --list "${filter_args[@]}"); then
+              echo "::error::$package $selector: listing its tests with --list failed, so the battery cannot tell which tests it would run."
+              exit 1
+            fi
+            listed=$(grep -c ': test$' <<< "$listing" || true)
             printf '%s\t%s\t%s\t%s\t%s\n' "$package" "$selector" "$dir" "$binary" "$listed" >> battery/targets.tsv
             echo "$package $selector: $listed tests selected; property files: ${properties//$'\n'/ }"
           done < <(jq -r 'select(.reason == "compiler-artifact" and .executable != null) | [.manifest_path, (if (.target.kind | any(. == "test")) then "--test " + .target.name elif (.target.kind | any(. == "bin")) then "--bin " + .target.name else "--lib" end), .executable] | @tsv' "$RUNNER_TEMP/build.json")
