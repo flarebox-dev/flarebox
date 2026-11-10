@@ -8,9 +8,11 @@
 //! - the synced tree S: per node, the shape on which disk and server last agreed;
 //! - the local tree L: the disk as last observed, with file identities and the
 //!   parked flag;
-//! - the one commit in flight, with the shape each op sent;
-//! - problem nodes, the engine's ID generator state, and the index of chunks
-//!   cached on disk;
+//! - the rest of the engine's state ([`EngineState`]): the commit in flight
+//!   with its buffered result, the accepted counter, the halt, the effect in
+//!   flight with the effect counter, and the node sets and maps the trees, the
+//!   commits and the effects keep;
+//! - the engine's ID generator state and the index of chunks cached on disk;
 //! - the [`Link`]: the folder the store syncs and the device credential that
 //!   writes it, and the questions the engine asked with their answers.
 //!
@@ -30,10 +32,13 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub use engine::EngineState;
 use flarebox_fs::FileId;
-use flarebox_proto::v1::{Commit, Content, NodeState, VersionInfo};
+use flarebox_proto::v1::{Content, NodeState, VersionInfo};
 use prost::Message;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+
+mod engine;
 
 /// Schema migrations, applied in order. Migration `i` moves the database from
 /// `user_version = i` to `user_version = i + 1`. Never edit an entry once it
@@ -129,6 +134,65 @@ const MIGRATIONS: &[&str] = &[
         CHECK ((answer IS NULL) = (answered_at_ms IS NULL))
     ) STRICT;
 ",
+    "
+    DROP TABLE commit_in_flight_shapes;
+    DROP TABLE problems;
+    ALTER TABLE commit_in_flight ADD COLUMN result BLOB;
+
+    CREATE TABLE commit_in_flight_deletes (
+        target TEXT PRIMARY KEY
+    ) STRICT, WITHOUT ROWID;
+
+    CREATE TABLE commit_in_flight_delete_members (
+        target TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        node_id TEXT NOT NULL,
+        PRIMARY KEY (target, position)
+    ) STRICT, WITHOUT ROWID;
+
+    CREATE TABLE commit_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        accepted INTEGER NOT NULL,
+        halt TEXT CHECK (halt IN ('read_only', 'recovery', 'policy')),
+        policy_code INTEGER,
+        cap INTEGER CHECK (cap > 0),
+        CHECK ((halt IS 'policy') = (policy_code IS NOT NULL))
+    ) STRICT;
+
+    CREATE TABLE effect_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        cleared INTEGER NOT NULL,
+        in_flight BLOB
+    ) STRICT;
+
+    CREATE TABLE failed_effects (
+        node_id TEXT PRIMARY KEY,
+        effect BLOB NOT NULL
+    ) STRICT, WITHOUT ROWID;
+
+    CREATE TABLE node_sets (
+        node_set TEXT NOT NULL
+            CHECK (node_set IN ('dirty', 'unsearched', 'reverted', 'problems', 'split')),
+        node_id TEXT NOT NULL,
+        PRIMARY KEY (node_set, node_id)
+    ) STRICT, WITHOUT ROWID;
+
+    CREATE TABLE node_maps (
+        node_map TEXT NOT NULL CHECK (node_map IN ('parked_as', 'aliases')),
+        node_id TEXT NOT NULL,
+        target TEXT NOT NULL,
+        PRIMARY KEY (node_map, node_id)
+    ) STRICT, WITHOUT ROWID;
+
+    CREATE TABLE waiting_updates (
+        node_id TEXT PRIMARY KEY,
+        parent_id TEXT,
+        name TEXT,
+        kind INTEGER,
+        content BLOB,
+        CHECK ((name IS NULL) = (kind IS NULL))
+    ) STRICT, WITHOUT ROWID;
+",
 ];
 
 /// The schema version this build writes.
@@ -144,6 +208,8 @@ pub enum Error {
     SchemaTooNew { found: u32, supported: u32 },
     #[error("the database did not accept the durability settings: {0:?}")]
     NotDurable(Durability),
+    #[error("the stored engine state is invalid: {0}")]
+    InvalidEngineState(String),
 }
 
 /// The connection settings that make a returned commit durable.
@@ -201,24 +267,6 @@ pub struct LocalNode {
     pub shape: Shape,
     pub identity: FileId,
     pub parked: bool,
-}
-
-/// The one commit sent or about to be sent. `sent[i]` is the shape op `i`
-/// sent, or `None` for ops that send no shape (deletes and restores). Resend
-/// it unchanged after a restart; its `commit_id` makes the server return the
-/// stored result if it was already applied.
-#[derive(Debug, Clone, PartialEq)]
-pub struct InFlightCommit {
-    pub commit: Commit,
-    pub sent: Vec<Option<Shape>>,
-}
-
-/// A node left out of planning until a rescan or a user action, with the
-/// engine's reason.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Problem {
-    pub node_id: String,
-    pub reason: String,
 }
 
 /// The folder this store syncs and the credential that writes it. One device
@@ -542,90 +590,6 @@ impl Tx<'_> {
 
     pub fn remove_local_node(&self, node_id: &str) -> Result<bool> {
         self.remove("local_nodes", node_id)
-    }
-
-    pub fn commit_in_flight(&self) -> Result<Option<InFlightCommit>> {
-        let Some(commit) = self
-            .0
-            .query_row(
-                "SELECT commit_message FROM commit_in_flight WHERE id = 1",
-                [],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()?
-        else {
-            return Ok(None);
-        };
-        let commit = Commit::decode(commit.as_slice())?;
-        let mut sent = vec![None; commit.ops.len()];
-        let mut stmt = self.0.prepare_cached(
-            "SELECT op_index, parent_id, name, kind, content FROM commit_in_flight_shapes",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, usize>(0)?, ShapeRow::read(row, 1)?))
-        })?;
-        for row in rows {
-            let (index, shape) = row?;
-            if let Some(slot) = sent.get_mut(index) {
-                *slot = Some(shape.into_shape()?);
-            }
-        }
-        Ok(Some(InFlightCommit { commit, sent }))
-    }
-
-    /// Records the commit in flight, replacing any previous one, or clears it
-    /// with `None` once its result is applied.
-    pub fn set_commit_in_flight(&self, commit: Option<&InFlightCommit>) -> Result<()> {
-        self.0.execute("DELETE FROM commit_in_flight", [])?;
-        self.0.execute("DELETE FROM commit_in_flight_shapes", [])?;
-        let Some(in_flight) = commit else {
-            return Ok(());
-        };
-        self.0.execute(
-            "INSERT INTO commit_in_flight (id, commit_message) VALUES (1, ?1)",
-            [in_flight.commit.encode_to_vec()],
-        )?;
-        let mut stmt = self.0.prepare_cached(
-            "INSERT INTO commit_in_flight_shapes (op_index, parent_id, name, kind, content)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-        )?;
-        for (index, shape) in in_flight.sent.iter().enumerate() {
-            let Some(shape) = shape else { continue };
-            stmt.execute(params![
-                index,
-                non_empty(&shape.parent_id),
-                shape.name,
-                shape.kind,
-                shape.content.as_ref().map(Content::encode_to_vec),
-            ])?;
-        }
-        Ok(())
-    }
-
-    /// Every problem node, ordered by `node_id`.
-    pub fn problems(&self) -> Result<Vec<Problem>> {
-        let mut stmt = self
-            .0
-            .prepare_cached("SELECT node_id, reason FROM problems ORDER BY node_id")?;
-        let rows = stmt.query_map([], |row| {
-            Ok(Problem {
-                node_id: row.get(0)?,
-                reason: row.get(1)?,
-            })
-        })?;
-        Ok(rows.collect::<Result<_, _>>()?)
-    }
-
-    pub fn put_problem(&self, problem: &Problem) -> Result<()> {
-        self.0.execute(
-            "INSERT OR REPLACE INTO problems (node_id, reason) VALUES (?1, ?2)",
-            params![problem.node_id, problem.reason],
-        )?;
-        Ok(())
-    }
-
-    pub fn remove_problem(&self, node_id: &str) -> Result<bool> {
-        self.remove("problems", node_id)
     }
 
     /// The engine's ID generator state, opaque to the store.

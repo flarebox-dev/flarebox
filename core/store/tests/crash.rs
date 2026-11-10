@@ -4,14 +4,17 @@
 //! the next open sees. The test binary re-runs itself as the child process;
 //! the environment variable tells the child which database to use.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use flarebox_engine::commit::InFlight;
+use flarebox_engine::state::{CommitsState, EffectsState};
 use flarebox_fs::FileId;
 use flarebox_proto::v1::{Commit, NodeKind, NodeState, NodeStatus};
-use flarebox_store::{Cursor, Error, InFlightCommit, LocalNode, Shape, Store, SyncedNode, Tx};
+use flarebox_store::{Cursor, EngineState, Error, LocalNode, Shape, Store, SyncedNode, Tx};
 use rusqlite::Connection;
 
 const CHILD_DB: &str = "FLAREBOX_STORE_CRASH_CHILD_DB";
@@ -39,22 +42,33 @@ fn shape(n: u64) -> Shape {
     }
 }
 
-fn in_flight(seq: u64) -> InFlightCommit {
-    InFlightCommit {
-        commit: Commit {
-            commit_id: format!("commit-{seq}"),
-            base_seq: seq,
+fn engine(seq: u64) -> EngineState {
+    EngineState {
+        commits: CommitsState {
+            in_flight: Some(InFlight {
+                commit: Commit {
+                    commit_id: format!("commit-{seq}"),
+                    base_seq: seq,
+                    ..Default::default()
+                },
+                deletes: BTreeMap::new(),
+                result: None,
+            }),
             ..Default::default()
         },
-        sent: vec![],
+        effects: EffectsState {
+            cleared: seq,
+            ..Default::default()
+        },
+        ..Default::default()
     }
 }
 
 /// Input `seq` writes, in one transaction like one engine input, the remote,
 /// synced and local rows of nodes `(seq - 1) * NODES_PER_INPUT .. seq * NODES_PER_INPUT`,
-/// moves the cursor to `seq` and replaces the commit in flight. A consistent
+/// moves the cursor to `seq` and replaces the engine state. A consistent
 /// database therefore holds exactly `last_seq * NODES_PER_INPUT` nodes in each
-/// tree and the commit in flight of `last_seq`.
+/// tree and the engine state of `last_seq`.
 fn write_input(tx: &Tx<'_>, seq: u64) -> Result<(), Error> {
     for n in (seq - 1) * NODES_PER_INPUT..seq * NODES_PER_INPUT {
         tx.put_remote_node(&remote(n))?;
@@ -73,7 +87,7 @@ fn write_input(tx: &Tx<'_>, seq: u64) -> Result<(), Error> {
             parked: false,
         })?;
     }
-    tx.set_commit_in_flight(Some(&in_flight(seq)))?;
+    tx.set_engine_state(&engine(seq))?;
     tx.set_cursor(&Cursor {
         history_id: "history".into(),
         last_seq: seq,
@@ -110,10 +124,12 @@ fn check_consistent(db: &Path) -> u64 {
             );
             assert_eq!(tx.synced_nodes()?.len() as u64, expected);
             assert_eq!(tx.local_nodes()?.len() as u64, expected);
-            assert_eq!(
-                tx.commit_in_flight()?,
-                (last_seq > 0).then(|| in_flight(last_seq))
-            );
+            let expected_state = if last_seq > 0 {
+                engine(last_seq)
+            } else {
+                EngineState::default()
+            };
+            assert_eq!(tx.engine_state()?, expected_state);
             Ok::<_, Error>(last_seq)
         })
         .unwrap()
