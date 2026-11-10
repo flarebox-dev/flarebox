@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -168,6 +168,12 @@ impl FsObserver {
             scanned: None,
             unread: BTreeMap::new(),
         })
+    }
+
+    /// The root folder the latest scan opened, `None` until a scan has opened it. A folder with nothing to report
+    /// gives no [`Observation`], so this is how a caller learns that the first scan is done.
+    pub fn scanned(&self) -> Option<FileId> {
+        self.scanned
     }
 
     /// Resets the snapshot at each scope of `resets`, in order, to the entries L holds there, so the next observation
@@ -448,7 +454,14 @@ fn same_version(meta: &std::fs::Metadata, entry: &Entry) -> bool {
 /// Opens the file at the relative `path` under `root` for reading, one folder at a time, following no symbolic link.
 fn open_beneath(root: &Path, path: &Path) -> io::Result<File> {
     let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-    let mut dir: OwnedFd = rustix::fs::open(root, dir_flags, Mode::empty())?;
+    open_under(rustix::fs::open(root, dir_flags, Mode::empty())?, path)
+}
+
+/// Opens the file at the relative `path` under the open folder `root` for reading, one folder at a time, following
+/// no symbolic link.
+pub(crate) fn open_under(root: impl AsFd, path: &Path) -> io::Result<File> {
+    let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    let mut dir: OwnedFd = rustix::fs::openat(&root, ".", dir_flags, Mode::empty())?;
     let mut parts = path.components().peekable();
     while let Some(part) = parts.next() {
         let Component::Normal(name) = part else {

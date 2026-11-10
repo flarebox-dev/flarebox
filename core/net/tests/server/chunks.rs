@@ -99,7 +99,10 @@ async fn upload(
     chunks: &[ChunkRef],
 ) -> Result<Vec<UploadReceipt>, ChunkError> {
     transfer
-        .upload(session, chunks, async |c: &ChunkRef| source.read(c).await)
+        .upload(session, chunks, |c: &ChunkRef| {
+            let c = c.clone();
+            async move { source.read(&c).await }
+        })
         .await
 }
 
@@ -110,10 +113,10 @@ async fn download(
 ) -> Result<Vec<Bytes>, ChunkError> {
     let mut received = Vec::new();
     transfer
-        .download(session, chunks, async |c: &ChunkRef, bytes: Bytes| {
+        .download(session, chunks, |c: &ChunkRef, bytes: Bytes| {
             assert!(matches(c, &bytes), "only verified bytes reach the caller");
             received.push(bytes);
-            Ok(())
+            std::future::ready(Ok(()))
         })
         .await?;
     Ok(received)

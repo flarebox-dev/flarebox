@@ -8,32 +8,20 @@
 //!   device, links and unlinks folders, reports [`Status`], lists [`Question`]s and records answers, and runs one
 //!   task per linked folder.
 //! - Each folder task checks the root (design §6.2) and claims the folder, observes the disk through an [`Observer`],
-//!   and keeps a `core/net` session with the space, applying the server's log to the remote tree in `core/store`.
+//!   and keeps a `core/net` session with the space. It runs the sync engine between them: the server's log goes
+//!   into the remote tree in `core/store`, observations go into the local tree, the engine's effects are applied to
+//!   the folder, and its commits are sent to the server.
 //! - [`policy`]: what to do after the server refuses a call (H1 of reports/BOX-71).
 //! - [`ignore`]: the input of the `.fbignore` matcher and the interface the driver uses it through.
 //!
-//! The engine is not wired in yet: the store holds the remote tree and the cursor, observations are produced but not
-//! acted on, and nothing is uploaded or written to disk. docs/design/driver.md lists what connecting it adds.
+//! New files and folders sync in both directions. Edits, renames, deletes and conflicts go through the same loop and
+//! are not proved end to end yet. docs/design/driver.md describes the loop and lists what is still to wire.
 
 mod claim;
 mod config;
 mod credential;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the folder task's loop starts using it in the next change"
-    )
-)]
 mod disk;
 mod driver;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the folder task's loop starts using it in the next change"
-    )
-)]
 mod engine;
 mod folder;
 pub mod ignore;

@@ -103,11 +103,14 @@ impl Transfer {
     /// Uploads the chunks the server does not hold yet and returns their receipts for the commit. `read` gives a
     /// chunk's bytes; it is called only for chunks the server asks for. Chunks are handled in order, each distinct
     /// hash once. Presigned targets give no receipt; the server checks those chunks itself at commit time.
-    pub async fn upload(
+    ///
+    /// The future `read` returns borrows neither the chunk nor `read` itself. That keeps this transfer `Send`, so a
+    /// spawned task can run it.
+    pub async fn upload<R: Future<Output = io::Result<Bytes>>>(
         &self,
         session: &Session,
         chunks: &[ChunkRef],
-        mut read: impl AsyncFnMut(&ChunkRef) -> io::Result<Bytes>,
+        mut read: impl FnMut(&ChunkRef) -> R,
     ) -> Result<Vec<UploadReceipt>, ChunkError> {
         let mut todo = distinct(chunks);
         let mut receipts = Vec::new();
@@ -145,7 +148,7 @@ impl Transfer {
                                 });
                             }
                             match self
-                                .retrying(async || self.put(target, chunk, bytes.clone()).await)
+                                .retrying(|| self.put(target, chunk, bytes.clone()))
                                 .await?
                             {
                                 Some(Some(receipt)) => receipts.push(receipt),
@@ -182,11 +185,13 @@ impl Transfer {
 
     /// Downloads each distinct chunk once, checks it against its hash and size, and hands it to `write` in order.
     /// Bytes that do not match are fetched again and never passed on.
-    pub async fn download(
+    ///
+    /// As with [`Transfer::upload`], the future `write` returns borrows neither the chunk nor `write` itself.
+    pub async fn download<W: Future<Output = io::Result<()>>>(
         &self,
         session: &Session,
         chunks: &[ChunkRef],
-        mut write: impl AsyncFnMut(&ChunkRef, Bytes) -> io::Result<()>,
+        mut write: impl FnMut(&ChunkRef, Bytes) -> W,
     ) -> Result<(), ChunkError> {
         for batch in distinct(chunks).chunks(MAX_CHUNKS_PER_CALL) {
             let hashes = batch.iter().map(|chunk| chunk.hash.clone()).collect();
@@ -204,10 +209,7 @@ impl Transfer {
                         Some(target) if !expiring(target) => target.clone(),
                         _ => self.download_target(session, chunk).await?,
                     };
-                    match self
-                        .retrying(async || self.get(&target, chunk).await)
-                        .await?
-                    {
+                    match self.retrying(|| self.get(&target, chunk)).await? {
                         Some(bytes) => break bytes,
                         None if renewed < self.attempts => {
                             renewed += 1;
@@ -251,9 +253,9 @@ impl Transfer {
 
     /// Runs one transfer up to `attempts` times, waiting as long as the server asked or else with backoff. `None`
     /// means the target needs renewing.
-    async fn retrying<T>(
+    async fn retrying<T, F: Future<Output = Attempt<T>>>(
         &self,
-        mut attempt: impl AsyncFnMut() -> Attempt<T>,
+        mut attempt: impl FnMut() -> F,
     ) -> Result<Option<T>, ChunkError> {
         let mut tries = 0;
         loop {

@@ -1,0 +1,1026 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! [`Folder`] with a test in place of the shell: a real folder, store and observer, `flarebox-sim`'s space as the
+//! server, and chunks held in memory. A test runs the work a step returns and feeds the result back, so it chooses
+//! the order results arrive in. After every step the store is loaded again and compared with the engine in memory.
+
+use std::collections::{HashMap, VecDeque};
+use std::fs;
+use std::os::unix::fs::MetadataExt;
+use std::time::Instant;
+
+use flarebox_engine::tree::{LocalNode, Tree};
+use flarebox_fs::{Marker, write_marker};
+use flarebox_net::Committed;
+use flarebox_proto::v1::{ListTree, Op, PrepareUpload, Resume, chunk_plan, op};
+use flarebox_sim::space::{Role, Session as Caller, SpaceDo};
+
+use super::*;
+use crate::disk::tests::{Server, ready};
+use crate::ignore::Unfiltered;
+
+const NOW: i64 = 1_700_000_000_000;
+
+/// The server: the space, the bytes of the chunks devices uploaded, and the result of each commit by its ID.
+struct Remote {
+    space: SpaceDo,
+    chunks: Server,
+    results: HashMap<String, CommitResult>,
+}
+
+impl Remote {
+    fn new() -> Remote {
+        Remote {
+            space: SpaceDo::new(1, NOW),
+            chunks: Server::default(),
+            results: HashMap::new(),
+        }
+    }
+
+    /// Every page of the live tree, with `limit` nodes a page.
+    fn pages(&self, limit: u32) -> Vec<TreePage> {
+        let mut pages: Vec<TreePage> = Vec::new();
+        loop {
+            let cursor = pages
+                .last()
+                .map_or(String::new(), |page| page.next_cursor.clone());
+            pages.push(self.space.list_tree(&ListTree { cursor, limit }));
+            if pages.last().unwrap().next_cursor.is_empty() {
+                return pages;
+            }
+        }
+    }
+
+    /// What `Transfer::upload` does: asks which chunks the space lacks, reads those from the folder and stores them.
+    fn store(&mut self, caller: &Caller, upload: &Upload) -> Vec<UploadReceipt> {
+        let mut chunks = upload.chunks.clone();
+        chunks.sort_by(|a, b| a.hash.cmp(&b.hash));
+        chunks.dedup_by(|a, b| a.hash == b.hash);
+        let request = PrepareUpload {
+            chunks: chunks.clone(),
+        };
+        let plan = self.space.prepare_upload(caller, NOW, &request).unwrap();
+        let wanted = |chunk: &ChunkRef| {
+            plan.chunks.iter().any(|plan| {
+                plan.hash == chunk.hash && plan.action == chunk_plan::Action::Upload as i32
+            })
+        };
+        let mut receipts = Vec::new();
+        for chunk in chunks.iter().filter(|chunk| wanted(chunk)) {
+            let bytes = upload.read(chunk).unwrap();
+            assert!(flarebox_net::matches(chunk, &bytes));
+            self.chunks
+                .chunks
+                .insert(chunk.hash.clone(), bytes.to_vec());
+            receipts.push(self.space.put_chunk(&chunk.hash, chunk.size, NOW));
+        }
+        receipts
+    }
+
+    /// What `Session::commit` does.
+    fn commit(&mut self, caller: &Caller, commit: &Commit) -> Result<CommitResult, CallError> {
+        match self.space.commit(caller, NOW, commit) {
+            Ok(committed) => {
+                let id = commit.commit_id.clone();
+                self.results.insert(id, committed.result.clone());
+                Ok(committed.result)
+            }
+            Err(error) => Err(CallError::Server(ServerError(error))),
+        }
+    }
+
+    /// The names of the live nodes besides the root, in order.
+    fn names(&self) -> Vec<String> {
+        let root = self.space.space_id();
+        let live = flarebox_proto::v1::NodeStatus::Live as i32;
+        let mut names: Vec<String> = (self.space.nodes().into_iter())
+            .filter(|node| node.node_id != root && node.status == live)
+            .map(|node| node.name)
+            .collect();
+        names.sort();
+        names
+    }
+}
+
+/// A device's folder and store on disk. They outlive the [`Device`], as they outlive a process.
+struct Site {
+    _dir: tempfile::TempDir,
+    root: PathBuf,
+    db: PathBuf,
+    link: Link,
+    caller: Caller,
+}
+
+impl Site {
+    /// An empty folder linked to the remote's space, never synced.
+    fn new(remote: &Remote, name: &str) -> Site {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("space");
+        fs::create_dir(&root).unwrap();
+        let space_id = remote.space.space_id().to_owned();
+        let marker = Marker {
+            space_id: space_id.clone(),
+            effects: 0,
+        };
+        write_marker(&root, &marker).unwrap();
+        let db = dir.path().join("store.sqlite");
+        let link = Link {
+            space_id,
+            space_name: "test".into(),
+            root: root.clone(),
+            root_dev: fs::metadata(&root).unwrap().dev(),
+            server_url: "https://files.example.com/".into(),
+            device_id: name.into(),
+            linked_at_ms: 0,
+        };
+        let mut store = Store::open(&db).unwrap();
+        store.transaction(|tx| tx.set_link(&link)).unwrap();
+        let caller = Caller {
+            device_id: name.into(),
+            user_id: "user".into(),
+            device_name: name.into(),
+            role: Role::Owner,
+            max_format: MAX_FORMAT,
+        };
+        Site {
+            _dir: dir,
+            root,
+            db,
+            link,
+            caller,
+        }
+    }
+
+    /// Starts the folder as the task does once it holds the lock: the store, the engine, the disk, and the observer
+    /// from L's snapshot.
+    fn start(&self) -> Device {
+        let lock = claim::lock(&self.root)
+            .unwrap()
+            .expect("the folder is not locked");
+        let folder = Folder::open(self.link.clone(), &lock, &self.db).unwrap();
+        let observer = FsObserver::start(
+            &self.root,
+            &self.link.space_id,
+            self.link.root_dev,
+            folder.snapshot(),
+            Arc::new(Unfiltered),
+        )
+        .unwrap();
+        Device {
+            folder,
+            observer,
+            caller: self.caller.clone(),
+            work: VecDeque::new(),
+            sent: Vec::new(),
+            _lock: lock,
+        }
+    }
+}
+
+/// A running folder with what the shell holds for it.
+struct Device {
+    folder: Folder,
+    observer: FsObserver,
+    caller: Caller,
+    /// Work the folder asked for that the test has not run.
+    work: VecDeque<Work>,
+    /// Every commit handed to `Session::commit`, in order.
+    sent: Vec<Commit>,
+    _lock: File,
+}
+
+impl Device {
+    /// Takes what one step returned. The store must then give the engine the folder holds.
+    fn take(&mut self, step: Result<Vec<Work>, Stop>) -> Result<(), Stop> {
+        self.work.extend(step?);
+        let folder = &mut self.folder;
+        let stored = folder
+            .store
+            .transaction(|tx| Engine::load(tx, &folder.link.space_id))
+            .unwrap();
+        let held = &folder.engine;
+        assert_eq!(stored.trees.local(), held.trees.local(), "L");
+        assert_eq!(stored.trees.synced(), held.trees.synced(), "S");
+        assert_eq!(stored.trees.remote(), held.trees.remote(), "R");
+        assert_eq!(stored.trees.state(), held.trees.state());
+        assert_eq!(stored.commits.state(), held.commits.state());
+        assert_eq!(stored.effects.state(), held.effects.state());
+        assert_eq!(stored.cursor, held.cursor);
+        assert_eq!(stored.ids.state, held.ids.state);
+        Ok(())
+    }
+
+    fn event(&mut self, event: Event) -> Result<(), Stop> {
+        let step = self.folder.event(event);
+        self.take(step)
+    }
+
+    fn connect(&mut self, remote: &Remote) {
+        let welcome = remote.space.welcome(&self.caller);
+        self.event(Event::Connected(welcome)).unwrap();
+    }
+
+    /// One pass of the observer's thread.
+    fn scan(&mut self, wait: Duration) {
+        let sections = self.folder.sections();
+        self.observer.reset(sections.take_resets());
+        let stamp = sections.stamp();
+        if let Some(observation) = self.observer.observe(wait).unwrap() {
+            let entries = self.observer.snapshot().entries.len() as u64;
+            let step = self.folder.observed(Batch { stamp, observation }, entries);
+            self.take(step).unwrap();
+        }
+        if !self.folder.scanned && self.observer.scanned().is_some() {
+            let step = self.folder.scanned();
+            self.take(step).unwrap();
+        }
+    }
+
+    /// Observes until `done`, for at most ten seconds.
+    fn scan_until(&mut self, done: impl Fn(&Device) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done(self) {
+            assert!(Instant::now() < deadline, "not observed in time");
+            self.scan(Duration::from_millis(100));
+        }
+    }
+
+    /// Observes for about a second, to take in changes that must lead to no work.
+    fn settle(&mut self) {
+        for _ in 0..3 {
+            self.scan(Duration::from_millis(300));
+        }
+    }
+
+    /// What the session delivers after a `Resume`: the log after `since_seq`, with this device's own commits as
+    /// their results, then `CaughtUp`.
+    fn resume(&mut self, remote: &Remote, history_id: String, since_seq: u64) -> Result<(), Stop> {
+        let resume = Resume {
+            history_id,
+            since_seq,
+        };
+        let records = match remote.space.resume(&resume) {
+            Ok(records) => records,
+            Err(resync) => return self.event(Event::ResyncRequired(resync)),
+        };
+        for record in records {
+            let event = if record.device_id == self.caller.device_id {
+                Event::Committed(Committed {
+                    result: remote.results[&record.commit_id].clone(),
+                    commit_id: record.commit_id,
+                })
+            } else {
+                Event::Changes(vec![record])
+            };
+            self.event(event)?;
+        }
+        let head_seq = remote.space.head_seq();
+        self.event(Event::CaughtUp { head_seq })
+    }
+
+    /// What a live session pushes: everything after the cursor.
+    fn pull(&mut self, remote: &Remote) {
+        let cursor = self
+            .folder
+            .engine
+            .cursor
+            .clone()
+            .expect("R follows the log");
+        self.resume(remote, cursor.history_id, cursor.last_seq)
+            .unwrap();
+    }
+
+    /// Runs one piece of work and feeds its result back.
+    fn perform(&mut self, work: Work, remote: &mut Remote) -> Result<(), Stop> {
+        let step = match work {
+            Work::Subscribe {
+                history_id,
+                since_seq,
+            } => return self.resume(remote, history_id, since_seq),
+            Work::List => self.folder.listed(Ok(remote.pages(TREE_PAGE))),
+            Work::Stage(pending) | Work::StageAfter(_, pending) => {
+                let staged = ready(pending.stage(&remote.chunks));
+                self.folder.staged(pending, staged)
+            }
+            Work::Upload(upload) => {
+                let receipts = remote.store(&self.caller, &upload);
+                self.folder.uploaded(Ok(receipts))
+            }
+            Work::Send(commit) => {
+                self.sent.push(commit.clone());
+                let result = remote.commit(&self.caller, &commit);
+                self.folder.sent(result)
+            }
+            Work::ResendAfter(_) => self.folder.resend(),
+        };
+        self.take(step)
+    }
+
+    /// Runs the work the folder asked for and the work that follows from it, until none is left. Returns what ran.
+    fn try_run(&mut self, remote: &mut Remote) -> Result<Vec<&'static str>, Stop> {
+        let mut ran = Vec::new();
+        while let Some(work) = self.work.pop_front() {
+            ran.push(match &work {
+                Work::Subscribe { .. } => "subscribe",
+                Work::List => "list",
+                Work::Stage(_) => "stage",
+                Work::StageAfter(..) => "stage again",
+                Work::Upload(_) => "upload",
+                Work::Send(_) => "send",
+                Work::ResendAfter(_) => "wait",
+            });
+            self.perform(work, remote)?;
+        }
+        Ok(ran)
+    }
+
+    fn run(&mut self, remote: &mut Remote) -> Vec<&'static str> {
+        self.try_run(remote).unwrap()
+    }
+
+    /// Writes a file and syncs it to the space.
+    fn create(&mut self, remote: &mut Remote, path: &Path, bytes: &[u8]) {
+        fs::write(path, bytes).unwrap();
+        self.scan_until(|device| !device.work.is_empty());
+        assert_eq!(self.run(remote), ["upload", "send"]);
+    }
+
+    fn state(&self) -> FolderState {
+        self.folder.view().state
+    }
+}
+
+/// A device that linked an empty folder to the remote's space and read the space's tree.
+fn linked(remote: &mut Remote, name: &str) -> (Site, Device) {
+    let site = Site::new(remote, name);
+    let mut device = site.start();
+    device.connect(remote);
+    device.scan_until(|device| device.folder.scanned);
+    device.run(remote);
+    (site, device)
+}
+
+/// The names in a folder besides `.flarebox`, in order.
+fn names(root: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name != flarebox_fs::PRIVATE_DIR)
+        .collect();
+    names.sort();
+    names
+}
+
+/// Every file under a folder besides `.flarebox`, by its path from the folder, with its text, in order.
+fn files(root: &Path) -> Vec<(String, String)> {
+    let mut files = Vec::new();
+    let mut dirs = vec![root.to_owned()];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path == root.join(flarebox_fs::PRIVATE_DIR) {
+                continue;
+            }
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                let name = path.strip_prefix(root).unwrap().to_str().unwrap();
+                files.push((name.to_owned(), fs::read_to_string(&path).unwrap()));
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// Device `a` synced `notes.txt` and stopped with its second commit built and uploaded but never sent. Returns its
+/// site, which keeps the store, and that commit.
+fn stopped_with_a_commit_in_flight(remote: &mut Remote) -> (Site, Commit) {
+    let (site, mut a) = linked(remote, "a");
+    a.create(remote, &site.root.join("notes.txt"), b"written on a");
+    fs::write(site.root.join("draft.txt"), b"never sent").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    let upload = a.work.pop_front().unwrap();
+    a.perform(upload, remote).unwrap();
+    let Some(Work::Send(commit)) = a.work.pop_front() else {
+        panic!("the commit is sent after its upload");
+    };
+    assert_eq!(commit.device_seq, 2);
+    (site, commit)
+}
+
+fn kinds(commit: &Commit) -> Vec<&'static str> {
+    (commit.ops.iter())
+        .map(|op: &Op| match &op.op {
+            Some(op::Op::CreateFile(_)) => "create file",
+            Some(op::Op::UpdateContent(_)) => "update content",
+            _ => "another op",
+        })
+        .collect()
+}
+
+#[test]
+fn a_new_file_becomes_one_commit_one_upload_and_one_send() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    assert_eq!(a.state(), FolderState::UpToDate);
+
+    fs::write(site.root.join("notes.txt"), b"written on a").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    assert_eq!(a.state(), FolderState::CatchingUp);
+    assert_eq!(a.run(&mut remote), ["upload", "send"]);
+    a.settle();
+    assert!(a.work.is_empty());
+
+    let [commit] = a.sent.as_slice() else {
+        panic!("one commit, not {}", a.sent.len());
+    };
+    assert_eq!(kinds(commit), ["create file"]);
+    assert_eq!(commit.receipts.len(), 1);
+    assert_eq!(remote.names(), ["notes.txt"]);
+    let trees = &a.folder.engine.trees;
+    let (id, local) = trees.local().iter().next().expect("L holds the file");
+    assert_eq!(trees.synced().get(id), Some(&local.shape));
+    assert_eq!(
+        trees.remote().get(id).map(|node| &node.shape),
+        Some(&local.shape)
+    );
+    assert!(trees.dirty().is_empty());
+    assert_eq!(a.state(), FolderState::UpToDate);
+    assert_eq!(a.folder.view().last_seq, Some(1));
+}
+
+#[test]
+fn a_commit_result_is_acknowledged_once_whether_the_call_or_the_stream_brings_it_first() {
+    for call_first in [true, false] {
+        let mut remote = Remote::new();
+        let (site, mut a) = linked(&mut remote, "a");
+        fs::write(site.root.join("notes.txt"), b"written on a").unwrap();
+        a.scan_until(|a| !a.work.is_empty());
+        let upload = a.work.pop_front().unwrap();
+        a.perform(upload, &mut remote).unwrap();
+        let Some(Work::Send(commit)) = a.work.pop_front() else {
+            panic!("the commit is sent after its upload");
+        };
+        let result = remote.commit(&a.caller, &commit).unwrap();
+        let by_stream = Event::Committed(Committed {
+            commit_id: commit.commit_id.clone(),
+            result: result.clone(),
+        });
+        if call_first {
+            let step = a.folder.sent(Ok(result));
+            a.take(step).unwrap();
+            a.event(by_stream).unwrap();
+        } else {
+            a.event(by_stream).unwrap();
+            let step = a.folder.sent(Ok(result));
+            a.take(step).unwrap();
+        }
+        assert!(a.work.is_empty(), "call first: {call_first}");
+        assert!(a.folder.engine.commits.in_flight().is_none());
+        assert_eq!(a.state(), FolderState::UpToDate);
+
+        a.create(&mut remote, &site.root.join("more.txt"), b"the next commit");
+        assert_eq!(a.sent.last().unwrap().device_seq, 2);
+        assert_eq!(remote.space.head_seq(), 2, "call first: {call_first}");
+        assert_eq!(a.state(), FolderState::UpToDate);
+    }
+}
+
+#[test]
+fn a_remote_file_becomes_one_effect_and_its_observation_changes_nothing() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("notes.txt"), b"written on a");
+
+    let site = Site::new(&remote, "b");
+    let mut b = site.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    assert_eq!(b.run(&mut remote), ["list", "subscribe", "stage"]);
+    assert_eq!(
+        fs::read(site.root.join("notes.txt")).unwrap(),
+        b"written on a"
+    );
+    // The effect's acknowledgement settled the trees in its own transaction, so S holds the file as L does before
+    // anything is observed or arrives from the log. Otherwise the next change of the file would count as concurrent.
+    let folder = &mut b.folder;
+    let (id, local) = (folder.engine.trees.local().iter().next()).expect("L holds the file");
+    assert_eq!(folder.engine.trees.synced().get(id), Some(&local.shape));
+    let stored = (folder.store)
+        .transaction(|tx| Engine::load(tx, &folder.link.space_id))
+        .unwrap();
+    assert_eq!(stored.trees.synced().get(id), Some(&local.shape));
+    b.settle();
+    assert!(b.work.is_empty());
+    assert!(b.sent.is_empty());
+    assert!(b.folder.engine.trees.dirty().is_empty());
+    assert_eq!(b.folder.engine.effects.cleared(), 1);
+    assert_eq!(b.state(), FolderState::UpToDate);
+    assert_eq!(remote.space.head_seq(), 1);
+}
+
+#[test]
+fn a_download_that_fails_for_now_stages_the_same_effect_again() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("notes.txt"), b"written on a");
+
+    let site = Site::new(&remote, "b");
+    let mut b = site.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    *remote.chunks.unavailable.lock().unwrap() = 1;
+    let pending = loop {
+        match b.work.pop_front().expect("an effect is staged") {
+            Work::Stage(pending) => break pending,
+            other => b.perform(other, &mut remote).unwrap(),
+        }
+    };
+    let planned = b
+        .folder
+        .engine
+        .effects
+        .in_flight()
+        .unwrap()
+        .effect_id
+        .clone();
+    let staged = ready(pending.stage(&remote.chunks));
+    assert!(matches!(staged, Err(Stall::Later(_))));
+    let step = b.folder.staged(pending, staged);
+    b.take(step).unwrap();
+    b.settle();
+    assert!(matches!(b.work.make_contiguous(), [Work::StageAfter(..)]));
+    assert_eq!(
+        b.folder.engine.effects.in_flight().unwrap().effect_id,
+        planned
+    );
+
+    assert_eq!(b.run(&mut remote), ["stage again"]);
+    assert_eq!(
+        fs::read(site.root.join("notes.txt")).unwrap(),
+        b"written on a"
+    );
+    assert_eq!(b.folder.engine.effects.cleared(), 1);
+    assert_eq!(b.state(), FolderState::UpToDate);
+}
+
+#[test]
+fn a_local_change_is_committed_only_after_the_effect_in_flight() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("notes.txt"), b"written on a");
+
+    let site = Site::new(&remote, "b");
+    let mut b = site.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    let pending = loop {
+        match b.work.pop_front().expect("an effect is staged") {
+            Work::Stage(pending) => break pending,
+            other => b.perform(other, &mut remote).unwrap(),
+        }
+    };
+    fs::write(site.root.join("mine.txt"), b"written on b").unwrap();
+    b.scan_until(|b| b.folder.engine.trees.local().len() == 1);
+    assert!(
+        b.work.is_empty(),
+        "no commit is built while the effect is staged"
+    );
+    assert!(b.folder.engine.commits.in_flight().is_none());
+
+    b.work.push_back(Work::Stage(pending));
+    assert_eq!(b.run(&mut remote), ["stage", "upload", "send"]);
+    b.settle();
+    assert_eq!(names(&site.root), ["mine.txt", "notes.txt"]);
+    assert_eq!(remote.names(), ["mine.txt", "notes.txt"]);
+    assert_eq!(b.state(), FolderState::UpToDate);
+}
+
+#[test]
+fn a_remote_change_is_applied_only_after_the_commit_in_flight() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    let (site_b, mut b) = linked(&mut remote, "b");
+    fs::write(site.root.join("mine.txt"), b"written on a").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    let upload = a.work.pop_front().unwrap();
+    a.perform(upload, &mut remote).unwrap();
+    let Some(send) = a.work.pop_front() else {
+        panic!("the commit is sent after its upload");
+    };
+
+    b.create(&mut remote, &site_b.root.join("notes.txt"), b"written on b");
+    a.pull(&remote);
+    assert_eq!(a.folder.engine.trees.remote().len(), 1, "R holds b's file");
+    assert!(
+        a.work.is_empty(),
+        "no effect is planned while the commit is in flight"
+    );
+    assert!(a.folder.engine.effects.in_flight().is_none());
+
+    a.work.push_back(send);
+    let ran = a.run(&mut remote);
+    assert_eq!(ran.last(), Some(&"stage"), "{ran:?}");
+    a.settle();
+    assert!(a.work.is_empty());
+    assert_eq!(names(&site.root), ["mine.txt", "notes.txt"]);
+    assert_eq!(remote.names(), ["mine.txt", "notes.txt"]);
+    assert_eq!(a.state(), FolderState::UpToDate);
+}
+
+#[test]
+fn a_bootstrap_whose_pages_were_read_at_two_heads_replaces_r_after_the_replay() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("one.txt"), b"one");
+    let first = remote.space.list_tree(&ListTree {
+        cursor: String::new(),
+        limit: 1,
+    });
+    a.create(&mut remote, &site_a.root.join("two.txt"), b"two");
+    let mut pages = vec![first];
+    while !pages.last().unwrap().next_cursor.is_empty() {
+        let cursor = pages.last().unwrap().next_cursor.clone();
+        pages.push(remote.space.list_tree(&ListTree { cursor, limit: 1 }));
+    }
+    let (first_head, last_head) = (pages[0].head_seq, pages.last().unwrap().head_seq);
+    assert!(first_head < last_head);
+
+    let site = Site::new(&remote, "b");
+    let mut b = site.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    assert!(matches!(b.work.pop_front(), Some(Work::List)));
+    let step = b.folder.listed(Ok(pages));
+    b.take(step).unwrap();
+    assert!(matches!(
+        b.work.front(),
+        Some(Work::Subscribe { since_seq, .. }) if *since_seq == first_head
+    ));
+    b.event(Event::CaughtUp {
+        head_seq: first_head,
+    })
+    .unwrap();
+    assert_eq!(b.state(), FolderState::Bootstrapping);
+    assert_eq!(b.folder.engine.cursor, None);
+    assert!(b.folder.engine.trees.remote().is_empty());
+
+    assert_eq!(b.run(&mut remote), ["subscribe", "stage", "stage"]);
+    assert_eq!(b.folder.view().last_seq, Some(last_head));
+    assert_eq!(names(&site.root), ["one.txt", "two.txt"]);
+    assert_eq!(b.state(), FolderState::UpToDate);
+}
+
+#[test]
+fn a_truncated_log_reads_the_tree_again_and_keeps_what_is_synced() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("one.txt"), b"one");
+    let (site, mut b) = linked(&mut remote, "b");
+    b.settle();
+    assert_eq!(names(&site.root), ["one.txt"]);
+
+    a.create(&mut remote, &site_a.root.join("two.txt"), b"two");
+    a.create(&mut remote, &site_a.root.join("three.txt"), b"three");
+    remote.space.truncate_log(remote.space.head_seq());
+    b.pull(&remote);
+    assert_eq!(b.state(), FolderState::Bootstrapping);
+    assert_eq!(b.run(&mut remote), ["list", "subscribe", "stage", "stage"]);
+    assert_eq!(names(&site.root), ["one.txt", "three.txt", "two.txt"]);
+    assert_eq!(b.folder.engine.effects.cleared(), 3);
+    assert_eq!(b.state(), FolderState::UpToDate);
+}
+
+#[test]
+fn an_edit_after_a_restart_is_an_edit_of_the_synced_file() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site.root.join("notes.txt"), b"written on a");
+    a.settle();
+    drop(a);
+
+    let mut a = site.start();
+    a.connect(&remote);
+    a.scan_until(|a| a.folder.scanned);
+    assert_eq!(a.run(&mut remote), ["subscribe"]);
+    a.settle();
+    assert!(a.work.is_empty(), "a restart finds nothing to sync");
+    assert_eq!(a.state(), FolderState::UpToDate);
+
+    a.create(
+        &mut remote,
+        &site.root.join("notes.txt"),
+        b"edited after the restart",
+    );
+    assert_eq!(kinds(&a.sent[0]), ["update content"]);
+    assert_eq!(remote.names(), ["notes.txt"]);
+    assert_eq!(a.state(), FolderState::UpToDate);
+}
+
+#[test]
+fn a_restart_with_a_commit_in_flight_sends_the_stored_commit_again() {
+    for reached_the_server in [false, true] {
+        let mut remote = Remote::new();
+        let (site, mut a) = linked(&mut remote, "a");
+        fs::write(site.root.join("notes.txt"), b"written on a").unwrap();
+        a.scan_until(|a| !a.work.is_empty());
+        let upload = a.work.pop_front().unwrap();
+        a.perform(upload, &mut remote).unwrap();
+        let Some(Work::Send(commit)) = a.work.pop_front() else {
+            panic!("the commit is sent after its upload");
+        };
+        if reached_the_server {
+            remote.commit(&a.caller, &commit).unwrap();
+        }
+        drop(a);
+
+        let mut a = site.start();
+        a.connect(&remote);
+        let stored = Commit {
+            receipts: Vec::new(),
+            ..commit
+        };
+        assert!(
+            matches!(a.work.front(), Some(Work::Send(again)) if *again == stored),
+            "reached the server: {reached_the_server}"
+        );
+        a.scan_until(|a| a.folder.scanned);
+        a.run(&mut remote);
+        a.settle();
+        assert!(a.work.is_empty());
+        assert!(a.sent.iter().all(|sent| sent.commit_id == stored.commit_id));
+        assert_eq!(remote.space.head_seq(), 1);
+        assert_eq!(remote.names(), ["notes.txt"]);
+        assert_eq!(a.state(), FolderState::UpToDate);
+    }
+}
+
+#[test]
+fn a_file_that_changes_while_it_is_uploaded_is_committed_with_its_new_bytes() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    let path = site.root.join("notes.txt");
+    fs::write(&path, b"written on a").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    let Some(Work::Upload(upload)) = a.work.pop_front() else {
+        panic!("the content is uploaded first");
+    };
+    fs::write(
+        &path,
+        b"and written again, longer, before the upload read it",
+    )
+    .unwrap();
+    let chunk = upload.chunks[0].clone();
+    assert!(!flarebox_net::matches(
+        &chunk,
+        &upload.read(&chunk).unwrap()
+    ));
+    let step = a
+        .folder
+        .uploaded(Err(ChunkError::SourceChanged { hash: chunk.hash }));
+    a.take(step).unwrap();
+    assert!(a.folder.engine.commits.in_flight().is_none());
+    assert!(matches!(a.work.make_contiguous(), [Work::ResendAfter(_)]));
+
+    let size = |tree: &Tree<LocalNode>| {
+        (tree.iter()).find_map(|(_, node)| node.shape.content.as_ref().map(|content| content.size))
+    };
+    let on_disk = Some(fs::metadata(&path).unwrap().len());
+    a.scan_until(|a| size(a.folder.engine.trees.local()) == on_disk);
+    assert_eq!(a.run(&mut remote), ["wait", "upload", "send"]);
+    a.settle();
+    assert!(a.work.is_empty());
+    let in_r = (a.folder.engine.trees.remote().iter())
+        .find_map(|(_, node)| node.shape.content.as_ref().map(|content| content.size));
+    assert_eq!(in_r, on_disk);
+    assert_eq!(remote.space.head_seq(), 1);
+    assert_eq!(a.state(), FolderState::UpToDate);
+}
+
+#[test]
+fn a_first_link_stops_when_the_folder_and_the_space_hold_the_same_name() {
+    // The space's name and the folder's: in another case, in another Unicode form, and where case folding changes
+    // the name's length.
+    for (theirs, mine) in [
+        ("notes.txt", "Notes.txt"),
+        ("r\u{e9}sum\u{e9}.txt", "re\u{301}sume\u{301}.txt"),
+        ("stra\u{df}e.txt", "STRASSE.txt"),
+    ] {
+        let mut remote = Remote::new();
+        let (site_a, mut a) = linked(&mut remote, "a");
+        a.create(&mut remote, &site_a.root.join(theirs), b"written on a");
+
+        let site = Site::new(&remote, "b");
+        fs::write(site.root.join(mine), b"already here").unwrap();
+        fs::write(site.root.join("mine.txt"), b"mine").unwrap();
+        let mut b = site.start();
+        b.connect(&remote);
+        b.scan_until(|b| b.folder.scanned);
+        let stop = b.try_run(&mut remote).unwrap_err();
+        assert!(matches!(stop, Stop::Unsupported(_)), "{mine}: {stop}");
+        assert!(b.sent.is_empty(), "{mine}");
+        let mut kept = [
+            (mine.to_owned(), "already here".to_owned()),
+            ("mine.txt".to_owned(), "mine".to_owned()),
+        ];
+        kept.sort();
+        assert_eq!(files(&site.root), kept);
+        assert_eq!(remote.names(), [theirs]);
+    }
+}
+
+#[test]
+fn a_first_link_of_a_folder_and_a_space_that_share_no_name_syncs_both_and_overwrites_nothing() {
+    let mut remote = Remote::new();
+    let site_a = Site::new(&remote, "a");
+    fs::write(site_a.root.join("notes.txt"), b"written on a").unwrap();
+    fs::create_dir(site_a.root.join("shared")).unwrap();
+    fs::write(site_a.root.join("shared/plan.txt"), b"a plan from a").unwrap();
+    let mut a = site_a.start();
+    a.connect(&remote);
+    a.scan_until(|a| a.folder.scanned);
+    assert_eq!(a.run(&mut remote), ["list", "subscribe", "upload", "send"]);
+
+    let site = Site::new(&remote, "b");
+    fs::write(site.root.join("mine.txt"), b"already here").unwrap();
+    fs::create_dir(site.root.join("drafts")).unwrap();
+    fs::write(site.root.join("drafts/plan.txt"), b"a plan from b").unwrap();
+    let mut b = site.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    let ran = b.run(&mut remote);
+    assert_eq!(ran[..2], ["list", "subscribe"]);
+    assert_eq!(ran[ran.len() - 2..], ["upload", "send"]);
+    b.settle();
+    assert!(b.work.is_empty());
+    a.pull(&remote);
+    a.run(&mut remote);
+    a.settle();
+    assert!(a.work.is_empty());
+
+    let both = [
+        ("drafts/plan.txt", "a plan from b"),
+        ("mine.txt", "already here"),
+        ("notes.txt", "written on a"),
+        ("shared/plan.txt", "a plan from a"),
+    ]
+    .map(|(path, text)| (path.to_owned(), text.to_owned()));
+    assert_eq!(files(&site.root), both);
+    assert_eq!(files(&site_a.root), both);
+    assert_eq!(remote.space.head_seq(), 2);
+    assert_eq!(a.state(), FolderState::UpToDate);
+    assert_eq!(b.state(), FolderState::UpToDate);
+}
+
+#[test]
+fn a_new_store_on_a_device_that_synced_the_space_before_goes_on_from_the_servers_count() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site.root.join("notes.txt"), b"written on a");
+    drop(a);
+
+    let again = Site::new(&remote, "a");
+    let mut a = again.start();
+    a.connect(&remote);
+    assert_eq!(a.folder.engine.commits.accepted(), 1);
+    a.scan_until(|a| a.folder.scanned);
+    assert_eq!(a.run(&mut remote), ["list", "subscribe", "stage"]);
+    a.create(
+        &mut remote,
+        &again.root.join("more.txt"),
+        b"from the folder linked again",
+    );
+    assert_eq!(a.sent[0].device_seq, 2);
+    assert_eq!(remote.names(), ["more.txt", "notes.txt"]);
+    assert_eq!(a.state(), FolderState::UpToDate);
+}
+
+#[test]
+fn a_never_synced_store_takes_the_servers_count_only_at_its_first_welcome() {
+    let remote = Remote::new();
+    let site = Site::new(&remote, "a");
+    let mut a = site.start();
+    a.connect(&remote);
+    assert_eq!(a.folder.engine.commits.accepted(), 0);
+
+    let welcome = Welcome {
+        device_seq: 1,
+        ..remote.space.welcome(&a.caller)
+    };
+    let stop = a.event(Event::Connected(welcome)).unwrap_err();
+    assert!(matches!(stop, Stop::Recovery(_)), "{stop}");
+    assert_eq!(a.folder.engine.commits.accepted(), 0);
+}
+
+#[test]
+fn a_store_that_took_the_servers_count_does_not_take_another() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site.root.join("notes.txt"), b"written on a");
+    drop(a);
+
+    let again = Site::new(&remote, "a");
+    let mut a = again.start();
+    a.connect(&remote);
+    assert_eq!(a.folder.engine.commits.accepted(), 1);
+    assert_eq!(a.folder.engine.cursor, None);
+    drop(a);
+
+    let mut a = again.start();
+    let welcome = Welcome {
+        device_seq: 2,
+        ..remote.space.welcome(&a.caller)
+    };
+    let stop = a.event(Event::Connected(welcome)).unwrap_err();
+    assert!(matches!(stop, Stop::Recovery(_)), "{stop}");
+    assert_eq!(a.folder.engine.commits.accepted(), 1);
+}
+
+#[test]
+fn a_synced_store_stops_for_recovery_when_the_server_counts_a_commit_it_does_not_hold() {
+    let mut remote = Remote::new();
+    // The old store read the space and committed nothing: it holds a cursor, and its count is 0 like a new store's.
+    let (old, a) = linked(&mut remote, "a");
+    assert!(a.folder.engine.cursor.is_some());
+    drop(a);
+    let (new, mut a) = linked(&mut remote, "a");
+    a.create(
+        &mut remote,
+        &new.root.join("more.txt"),
+        b"from the new store",
+    );
+    drop(a);
+
+    let mut stale = old.start();
+    let welcome = remote.space.welcome(&stale.caller);
+    assert_eq!(welcome.device_seq, 1);
+    let stop = stale.event(Event::Connected(welcome)).unwrap_err();
+    assert!(matches!(stop, Stop::Recovery(_)), "{stop}");
+    assert_eq!(stale.folder.engine.commits.accepted(), 0);
+    assert!(stale.work.is_empty());
+}
+
+#[test]
+fn a_store_with_a_commit_in_flight_stops_for_recovery_when_the_server_counts_past_its_slot() {
+    let mut remote = Remote::new();
+    let (old, commit) = stopped_with_a_commit_in_flight(&mut remote);
+    let (new, mut a) = linked(&mut remote, "a");
+    a.create(
+        &mut remote,
+        &new.root.join("more.txt"),
+        b"from the new store",
+    );
+    a.create(&mut remote, &new.root.join("again.txt"), b"and once more");
+    drop(a);
+
+    let mut stale = old.start();
+    let welcome = remote.space.welcome(&stale.caller);
+    assert_eq!(welcome.device_seq, 3);
+    let stop = stale.event(Event::Connected(welcome)).unwrap_err();
+    assert!(matches!(stop, Stop::Recovery(_)), "{stop}");
+    assert!(stale.work.is_empty(), "the commit is not sent again");
+    let commits = &stale.folder.engine.commits;
+    assert_eq!(commits.accepted(), 1);
+    assert_eq!(
+        commits.in_flight().unwrap().commit.commit_id,
+        commit.commit_id
+    );
+}
+
+#[test]
+fn a_commit_from_the_store_a_new_store_replaced_is_refused_by_the_server() {
+    let mut remote = Remote::new();
+    let (old, commit) = stopped_with_a_commit_in_flight(&mut remote);
+    let (new, mut a) = linked(&mut remote, "a");
+    a.create(
+        &mut remote,
+        &new.root.join("more.txt"),
+        b"from the new store",
+    );
+    assert_eq!(a.sent[0].device_seq, commit.device_seq);
+    drop(a);
+
+    // The server counts one commit more than the old store acknowledged, which is what a lost response looks like,
+    // so the old store sends its commit again. The slot is the new store's by now.
+    let mut stale = old.start();
+    stale.connect(&remote);
+    let Some(Work::Send(again)) = stale.work.pop_front() else {
+        panic!("the stored commit is sent again");
+    };
+    assert_eq!(again.commit_id, commit.commit_id);
+    let refusal = remote.commit(&stale.caller, &again).unwrap_err();
+    assert!(
+        matches!(&refusal, CallError::Server(error) if error.code() == Code::StaleDeviceState),
+        "{refusal}"
+    );
+    let step = stale.folder.sent(Err(refusal));
+    let stop = stale.take(step).unwrap_err();
+    assert!(matches!(stop, Stop::Recovery(_)), "{stop}");
+    assert_eq!(
+        stale.folder.engine.commits.halted(),
+        Some(CommitHalt::Recovery)
+    );
+    assert_eq!(remote.space.head_seq(), 2);
+    assert_eq!(remote.names(), ["more.txt", "notes.txt"]);
+}

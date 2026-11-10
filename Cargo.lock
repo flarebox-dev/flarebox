@@ -560,13 +560,16 @@ dependencies = [
 name = "flarebox-driver"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "flarebox-chunk",
  "flarebox-engine",
  "flarebox-fs",
  "flarebox-net",
  "flarebox-proto",
+ "flarebox-sim",
  "flarebox-store",
  "prost",
+ "reqwest",
  "rustix",
  "serde",
  "serde_json",
@@ -575,6 +578,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "tracing-subscriber",
  "url",
 ]
 

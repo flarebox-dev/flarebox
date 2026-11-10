@@ -171,13 +171,13 @@ impl Running {
 
 /// Chunks held in memory, standing in for the server and the chunk store.
 #[derive(Default)]
-struct Server {
-    chunks: HashMap<Vec<u8>, Vec<u8>>,
+pub(crate) struct Server {
+    pub chunks: HashMap<Vec<u8>, Vec<u8>>,
     versions: HashMap<String, Vec<ChunkRef>>,
     /// Flips a bit of every chunk it hands over.
     corrupt: bool,
     /// How many more downloads fail for now before one goes through.
-    unavailable: Mutex<u32>,
+    pub unavailable: Mutex<u32>,
     /// Runs once, before the first chunk is handed over.
     during: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
@@ -245,7 +245,7 @@ impl Fetch for Server {
 }
 
 /// The output of a future that never waits, as every future of [`Server`] is.
-fn ready<F: Future>(future: F) -> F::Output {
+pub(crate) fn ready<F: Future>(future: F) -> F::Output {
     match pin!(future).poll(&mut Context::from_waker(Waker::noop())) {
         Poll::Ready(output) => output,
         Poll::Pending => panic!("the future waited"),
@@ -482,8 +482,9 @@ fn cuts(scenario: &Scenario) -> Vec<Cut> {
     reached.lock().unwrap().clone()
 }
 
-/// Checks a folder whose effect is done and acknowledged: L holds R's shape, the disk the effect's result, the
-/// marker equals the effect counter, and nothing is left in quarantine or staging.
+/// Checks a folder whose effect is done and acknowledged: L holds R's shape and S holds L's, in memory and in the
+/// store, the disk holds the effect's result, the marker equals the effect counter, and nothing is left in
+/// quarantine or staging.
 fn assert_done(scenario: &Scenario, folder: &Folder, running: &Running, context: &str) {
     assert!(running.engine.effects.in_flight().is_none(), "{context}");
     assert!(running.engine.effects.blocked().is_empty(), "{context}");
@@ -492,6 +493,16 @@ fn assert_done(scenario: &Scenario, folder: &Folder, running: &Running, context:
     assert!(
         flarebox_engine::tree::same(local, remote),
         "{context}: L {local:?}, R {remote:?}"
+    );
+    // The acknowledgement settles the trees in its own transaction. With S left behind, the node's next change
+    // would count as concurrent.
+    let synced = running.engine.trees.synced().get(NODE);
+    assert_eq!(synced, local, "{context}: S");
+    let (_, stored) = folder.open();
+    assert_eq!(
+        stored.trees.synced().get(NODE),
+        local,
+        "{context}: S in the store"
     );
     (scenario.check)(folder);
     assert_eq!(
@@ -761,6 +772,39 @@ fn an_interrupted_effect_is_planned_again_after_a_restart() {
     assert_eq!(
         pending.record.effect,
         engine.effects.in_flight().unwrap().effect
+    );
+}
+
+#[test]
+fn a_start_that_recovers_an_effect_has_its_paths_read_again() {
+    let folder = Folder::new();
+    let mut server = Server::default();
+    (SCENARIOS[1].setup)(&folder, &mut server);
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        folder
+            .start(crash_at(Cut::Step(Step::Placed)))
+            .unwrap()
+            .step(&server);
+    }));
+    let running = folder.start(no_hook()).unwrap();
+    let sections = running.disk.sections();
+    let mut watching = observer(&folder.root, running.engine.snapshot());
+    let resets = catch_up(&mut watching, &sections);
+    let scopes: Vec<&Path> = resets.iter().map(|reset| reset.scope.as_path()).collect();
+    assert_eq!(scopes, [Path::new("report.txt")]);
+    let read = settle(&mut watching).into_iter().any(|change| {
+        matches!(change, Observed::Modified { path, content: Some(_), .. } if path == Path::new("report.txt"))
+    });
+    assert!(read, "the file the effect placed before the crash is read");
+    drop((watching, running));
+
+    let running = folder.start(no_hook()).unwrap();
+    assert!(running.disk.sections().take_resets().is_empty());
+    let mut watching = observer(&folder.root, running.engine.snapshot());
+    assert_eq!(
+        settle(&mut watching),
+        [],
+        "a file that matches L is trusted"
     );
 }
 
