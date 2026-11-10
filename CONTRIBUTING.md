@@ -1,6 +1,33 @@
 # Contributing to Flarebox
 
-Flarebox is pre-alpha. Before working on anything large, open an issue so we can agree on the approach. Changes to the protocol in [spec/](spec/) affect both the server and the clients, so discuss them in an issue first.
+Flarebox is pre-alpha. Issues are open to everyone. Until 1.0, only the project owner and invited maintainers open pull requests.
+
+## Issues
+
+Open an issue for a bug report, a reproduction, feedback on a deployment, or a feature request. Search the existing issues first, and add to a matching one instead of opening another. Remove credentials, such as API tokens, and personal data from logs, screenshots and files before you post them.
+
+Do not report security vulnerabilities in issues. [SECURITY.md](SECURITY.md) explains how to report them privately.
+
+## Pull requests
+
+Each merged change needs review now and maintenance for as long as its code stays in Flarebox. To keep that work within what the maintainers can do, only the project owner and invited maintainers open pull requests until 1.0.
+
+To propose a change, open an issue that describes the problem and the change you have in mind. Changes to the protocol in [spec/](spec/) affect both the server and the clients, so they need an issue too. An accepted issue is not an invitation to open a pull request.
+
+Forks and experiments are welcome under the licenses below. You can link a fork or an experiment in an issue, but a link does not mean a maintainer will review or merge it.
+
+We will revisit this policy after launch.
+
+## AI assistance
+
+You may use AI tools for reports and for invited changes. If you submit one, you are responsible for it:
+
+- Check every claim it makes.
+- Understand it well enough to answer questions about it.
+- Say which tools you used and how much of the work they did.
+- Give the commands that reproduce the problem or test the change.
+
+Do not submit the output of an agent that ran without your supervision. Maintainers follow the same rules.
 
 ## Developer Certificate of Origin
 
