@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::BTreeMap;
-use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::fs::{self, DirBuilder, OpenOptions};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -13,10 +13,9 @@ use flarebox_fs::{Marker, probe_no_replace, read_marker, write_marker};
 use flarebox_net::{ApiError, Auth};
 use flarebox_proto::v1::{ClaimRequest, DeviceCredentials, PairCompleteRequest, SpaceInfo};
 use flarebox_store::{GivenAnswer, Link, Store, StoredQuestion};
-use rustix::fs::FlockOperation;
 use tokio::sync::{Notify, watch};
 
-use crate::claim::{self, Owner};
+use crate::claim::{self, Flock, Owner};
 use crate::config::{Config, ConfigError};
 use crate::credential::{Credential, CredentialError, NewCredentialFile, api_for};
 use crate::folder::FolderTask;
@@ -134,7 +133,7 @@ pub struct Driver {
 
 struct Inner {
     paths: Paths,
-    _lock: File,
+    _lock: Flock,
     matcher: Arc<dyn Matcher>,
     /// Held for the whole of a pair, claim, sign-out, link or unlink, so one runs at a time: a sign-out waits for a
     /// claim or a link in flight and then undoes it, and a credential the server issued is always stored.
@@ -227,11 +226,9 @@ impl Driver {
             .mode(0o600)
             .open(&lock_path)
             .map_err(io_error(&lock_path))?;
-        match rustix::fs::flock(&lock, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => {}
-            Err(rustix::io::Errno::WOULDBLOCK) => return Err(DriverError::Busy(lock_path)),
-            Err(error) => return Err(io_error(&lock_path)(error.into())),
-        }
+        let Some(lock) = Flock::take(lock).map_err(io_error(&lock_path))? else {
+            return Err(DriverError::Busy(lock_path));
+        };
         let config = Config::load(&paths.config_file)?;
         let lines = config.sync.lines().expect("Config::load checked the rules");
         let mut input = IgnoreInput::default();
@@ -1194,6 +1191,16 @@ mod tests {
             Driver::open(paths.clone()),
             Err(DriverError::Busy(_))
         ));
+        drop(driver);
+        Driver::open(paths).unwrap();
+    }
+
+    #[test]
+    fn a_profile_opens_again_while_a_child_process_holds_a_copy_of_its_locks_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let driver = Driver::open(paths.clone()).unwrap();
+        let _child = claim::tests::Holder::of(&driver.inner._lock);
         drop(driver);
         Driver::open(paths).unwrap();
     }

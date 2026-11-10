@@ -36,7 +36,7 @@ use flarebox_proto::v1::{
 use flarebox_store::{Link, Store, Tx};
 use tokio::sync::{Notify, mpsc, watch};
 
-use crate::claim::{self, Owner};
+use crate::claim::{self, Flock, Owner};
 use crate::disk::{Batch, Disk, Pending, Sections, Settled, Staged, Stall, Stop, Upload};
 use crate::driver::check_placement;
 use crate::engine::{Applied, Engine, Staging};
@@ -1070,7 +1070,7 @@ impl FolderTask {
 
     /// Takes the folder's lock and checks that this profile's device linked it, recording the device if no record
     /// is there. Another process that syncs the folder, or a record of another device, halts the folder.
-    fn claim(&self) -> Result<File, Halt> {
+    fn claim(&self) -> Result<Flock, Halt> {
         let root = &self.link.root;
         let lock = claim::lock(root)
             .map_err(|error| format!("the folder's lock cannot be taken: {error}"))?
@@ -1094,7 +1094,7 @@ impl FolderTask {
     /// observation after the receiver is dropped.
     fn observe(
         &self,
-        lock: Arc<File>,
+        lock: Arc<Flock>,
         sections: Arc<Sections>,
         previous: Snapshot,
     ) -> mpsc::UnboundedReceiver<FromDisk> {

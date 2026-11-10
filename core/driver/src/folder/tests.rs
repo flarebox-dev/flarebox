@@ -197,7 +197,7 @@ struct Device {
     work: VecDeque<Work>,
     /// Every commit handed to `Session::commit`, in order.
     sent: Vec<Commit>,
-    _lock: File,
+    _lock: claim::Flock,
 }
 
 impl Device {
