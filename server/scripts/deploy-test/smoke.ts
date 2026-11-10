@@ -209,7 +209,7 @@ describe("a server deployed to a real account", () => {
     const chunks = (await listObjects(account, state.name, "spaces/" + run.spaceId + "/chunks/")) ?? [];
     expect(chunks.length).toBeGreaterThanOrEqual(8);
     console.log("Waiting for the first log segment, due five minutes after the first commit");
-    const keys = await waitFor("space.json and a log segment under " + prefix, run.firstCommitMs + SEGMENT_WAIT_MS - Date.now(), async () => {
+    const keys = await waitFor("space.json and a log segment under " + prefix, Math.max(60_000, run.firstCommitMs + SEGMENT_WAIT_MS - Date.now()), async () => {
       const listed = ((await listObjects(account, state.name, prefix)) ?? []).map((object) => object.key.slice(prefix.length));
       return listed.includes("space.json") && listed.some((key) => key.startsWith("log/")) ? listed : undefined;
     });
