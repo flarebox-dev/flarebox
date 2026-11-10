@@ -128,6 +128,8 @@ pub struct FsObserver {
     scanned: Option<FileId>,
     /// Whether the batch that follows the first scan of the whole tree is still to be returned.
     first: bool,
+    /// Whether a reset still waits for the batch of a scan made after it.
+    reset: bool,
     /// Files whose content could not be read, with when to read them again.
     unread: BTreeMap<PathBuf, Retry>,
 }
@@ -188,6 +190,7 @@ impl FsObserver {
             matcher,
             scanned: None,
             first: true,
+            reset: false,
             unread: BTreeMap::new(),
         })
     }
@@ -201,8 +204,10 @@ impl FsObserver {
     /// Resets the snapshot at each scope of `resets`, in order, to the entries L holds there, so the next observation
     /// reports how the disk differs from L in those scopes: what L lacks as created, what the disk lacks as removed,
     /// and every file both hold as modified, each file with the content read from the disk. Nothing outside the
-    /// scopes is reported again unless it changed.
+    /// scopes is reported again unless it changed. The first observation whose scans settled every scope after a
+    /// reset is returned also when it holds nothing, so the caller learns that the disk was read after the reset.
     pub fn reset(&mut self, resets: Vec<Reset>) {
+        self.reset |= !resets.is_empty();
         for Reset { scope, known } in resets {
             self.unread.retain(|path, _| !path.starts_with(&scope));
             self.watcher.reset(&scope, known);
@@ -383,7 +388,9 @@ impl Observer for FsObserver {
             })
             .collect();
         let first = self.first && poll.root.is_some();
+        let answers = self.reset && poll.root.is_some() && poll.pending.is_empty();
         if !first
+            && !answers
             && !observed
             && changes.is_empty()
             && poll.unreadable.is_empty()
@@ -392,6 +399,7 @@ impl Observer for FsObserver {
             return Ok(None);
         }
         self.first &= !first;
+        self.reset &= !answers;
         let root = check_root(&self.root, &self.space_id, self.dev).map(|_| ());
         Ok(Some(Observation {
             changes,

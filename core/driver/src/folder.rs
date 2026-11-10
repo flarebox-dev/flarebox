@@ -24,6 +24,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use flarebox_engine::commit::{Commits, Failure, Halt as CommitHalt, Reconnect};
+use flarebox_engine::ignore::LocalRules;
 use flarebox_engine::state::CommitsState;
 use flarebox_fs::{Snapshot, check_root};
 use flarebox_net::{
@@ -171,10 +172,13 @@ impl Folder {
     /// Opens the folder's store, loads the engine and starts the disk through `lock`, the descriptor the task
     /// locked. [`Disk::start`] recovers an effect that was in flight before anything is observed or planned. The
     /// engine then takes the restores asked for while no task ran. Every node whose effect failed is unblocked, so each
-    /// is planned again once after the first scan of this start.
-    pub fn open(link: Link, lock: &File, store: &Path) -> Result<Folder, Stop> {
+    /// is planned again once after the first scan of this start. The trees take `local`, this device's `[sync]` list,
+    /// which the store does not hold; the rules files follow with the observer's first batch, and nothing is planned
+    /// before that (design §5.10).
+    pub fn open(link: Link, lock: &File, store: &Path, local: LocalRules) -> Result<Folder, Stop> {
         let mut store = Store::open(store)?;
         let mut engine = store.transaction(|tx| Engine::load(tx, &link.space_id))?;
+        engine.trees.set_local_rules(local);
         let disk = Disk::start(lock, &link, &mut engine, &mut store)?;
         for node in engine.effects.blocked().clone().into_keys() {
             engine.effects.unblock(&node);
@@ -575,16 +579,18 @@ impl Folder {
     }
 
     /// True when nothing is left to move: R holds the server's head, the folder was scanned, no effect and no
-    /// commit is in flight, every node the trees still differ on is one that cannot be synced as it is, and so is
-    /// the node of every restore that waits.
+    /// commit is in flight, no rules are awaited, every node the trees still differ on is one that cannot be synced
+    /// as it is or that this device leaves out, and so is the node of every restore that waits.
     fn settled(&self) -> bool {
         let stuck = |id: &String| {
             self.engine.effects.blocked().contains_key(id)
                 || self.engine.commits.problems().contains(id)
+                || self.engine.trees.excluded(id)
         };
         let commits = &self.engine.commits;
         self.caught_up()
             && self.scanned
+            && !self.disk.awaits_rules()
             && self.engine.effects.in_flight().is_none()
             && matches!(self.flight, Flight::Idle)
             && self.engine.commits.in_flight().is_none()
@@ -879,9 +885,12 @@ impl Folder {
     /// building a commit and acknowledging it. A commit is built only when no effect is planned, R is caught up and
     /// the session is connected, and only when a node is dirty or a restore is queued. Building can change the
     /// trees without giving a commit, so the effects are planned once more after it.
+    /// Nothing is planned either while the rules an effect can have changed are awaited ([`Disk::awaits_rules`]);
+    /// the batch that brings them drives the folder again.
     fn drive(&mut self, work: &mut Vec<Work>) -> Result<(), Stop> {
         let staging = self.engine.effects.in_flight().is_some();
-        if !self.scanned || staging || !matches!(self.stream, Stream::Following { .. }) {
+        let held = !self.scanned || staging || self.disk.awaits_rules();
+        if held || !matches!(self.stream, Stream::Following { .. }) {
             return Ok(());
         }
         let commits = &self.engine.commits;
@@ -951,6 +960,8 @@ pub(crate) struct FolderTask {
     pub auth: Arc<Auth>,
     pub status: Arc<Mutex<FolderStatus>>,
     pub matcher: Arc<dyn Matcher>,
+    /// This device's `[sync]` list as the engine's trees take it, the same list `matcher` applies to the scans.
+    pub local: LocalRules,
     /// The profile's private directories, which the folder must neither hold nor sit inside.
     pub private_dirs: Vec<PathBuf>,
     /// The roots of the profile's other linked folders.
@@ -1024,7 +1035,8 @@ impl FolderTask {
             Ok(lock) => Arc::new(lock),
             Err(halt) => return halt,
         };
-        let mut folder = match Folder::open(self.link.clone(), &lock, &self.store) {
+        let local = self.local.clone();
+        let mut folder = match Folder::open(self.link.clone(), &lock, &self.store, local) {
             Ok(folder) => folder,
             Err(stop) => return stop.to_string(),
         };
@@ -1167,7 +1179,8 @@ impl FolderTask {
 
     /// Observes the disk on a thread of its own, starting from `previous`. Before each observation the thread
     /// resets the scopes the effect sections asked for, then takes the stamp the batch is sent with, so the stamp
-    /// covers the batch's scans and content reads. The thread holds the folder's `lock` and ends with the first
+    /// covers the batch's scans and content reads. After a reset it does not wait for a change: the scan of the reset
+    /// scopes is reported as soon as it is made, since the task may plan nothing until then. The thread holds the folder's `lock` and ends with the first
     /// observation after the receiver is dropped.
     fn observe(
         &self,
@@ -1194,9 +1207,11 @@ impl FolderTask {
             };
             let mut scanned = false;
             while !sender.is_closed() {
-                observer.reset(sections.take_resets());
+                let resets = sections.take_resets();
+                let wait = Duration::from_secs(if resets.is_empty() { 1 } else { 0 });
+                observer.reset(resets);
                 let stamp = sections.stamp();
-                match observer.observe(Duration::from_secs(1)) {
+                match observer.observe(wait) {
                     Ok(None) => {}
                     Ok(Some(observation)) => {
                         tracing::debug!(

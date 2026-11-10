@@ -31,7 +31,7 @@
 //! through the locked descriptor.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::os::fd::OwnedFd;
@@ -47,10 +47,10 @@ use flarebox_engine::effects::{
     Base as EngineBase, Displaced as EngineDisplaced, Effect as EngineEffect, EffectRecord,
     Location as EngineLocation,
 };
-use flarebox_engine::tree::Content;
+use flarebox_engine::tree::{Content, Kind};
 use flarebox_fs::{
     Action, Base, Contents, Dir, Displaced, Effect, Entry, EntryKind, FileId, Location, Marker,
-    Outcome, Reason, RootProblem, Space, Step,
+    Outcome, RULES_FILE, Reason, RootProblem, Space, Step,
 };
 use flarebox_net::{ChunkError, Session, StopReason, Transfer};
 use flarebox_proto::v1::{ChunkRef, Commit, op};
@@ -189,6 +189,10 @@ pub(crate) struct Disk {
     spans: VecDeque<(u64, Vec<PathBuf>)>,
     /// The end epoch of the latest section that `spans` no longer holds.
     forgotten: u64,
+    /// The end epoch of the latest effect section that can have changed which rules apply where: it wrote, moved or
+    /// removed a `.fbignore` file, or it moved a folder, whose rules files the trees hold by path. Set until a batch
+    /// scanned after that section has passed its rules.
+    rules_after: Option<u64>,
     hook: Hook,
 }
 
@@ -292,6 +296,7 @@ impl Disk {
             sections: Arc::default(),
             spans: VecDeque::new(),
             forgotten: 0,
+            rules_after: None,
             hook,
         };
         if !disk.space.held()? {
@@ -431,6 +436,13 @@ impl Disk {
         let settled = acknowledge(&record, &outcome, false, engine, store, hook)?;
         let end = self.sections.epoch.fetch_add(1, Ordering::SeqCst) + 1;
         let scopes = scopes(&effect.action, &outcome);
+        let moved_folder = matches!(effect.action, Action::Move { .. })
+            && (engine.trees.local().get(&record.node))
+                .is_some_and(|node| node.shape.kind == Kind::Dir);
+        let rules_file = |scope: &PathBuf| scope.file_name() == Some(OsStr::new(RULES_FILE));
+        if moved_folder || scopes.iter().any(rules_file) {
+            self.rules_after = Some(end);
+        }
         self.sections.request(engine.resets(scopes.iter().cloned()));
         self.spans.push_back((end, scopes));
         while self.spans.len() > SPANS {
@@ -466,6 +478,9 @@ impl Disk {
         }
         observation.root.map_err(Stop::Root)?;
         engine.rules(observation.rules);
+        if self.rules_after.is_some_and(|end| stamp.0 >= end) {
+            self.rules_after = None;
+        }
         if stamp.0 < self.forgotten {
             self.sections.request(engine.resets([PathBuf::new()]));
             return Ok(());
@@ -502,6 +517,16 @@ impl Disk {
             self.sections.request(engine.resets(dropped));
         }
         Ok(())
+    }
+
+    /// True from an effect that can have changed which rules apply where until a batch scanned after it has passed
+    /// its rules: an effect that wrote, moved or removed a `.fbignore` file, or that moved a folder. The caller plans
+    /// nothing meanwhile (design §5.10). Otherwise what a rules file that was just downloaded excludes would be
+    /// downloaded first, and a file that the rules file of a moved folder excludes would be uploaded, because the
+    /// trees hold each rules file by the path of its folder. The observer answers the reset that every effect
+    /// requests with a batch, also when the scan found nothing, so the wait ends with the next scan.
+    pub fn awaits_rules(&self) -> bool {
+        self.rules_after.is_some()
     }
 
     /// Asks the observer to reset `paths` to L and scan them again.
