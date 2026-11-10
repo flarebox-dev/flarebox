@@ -171,6 +171,8 @@ fn remote_action(space: &mut SpaceDo, ids: &mut IdGen, device: u8, action: &Acti
         base_seq: space.head_seq(),
         ops,
         receipts,
+        history_id: space.history_id().to_owned(),
+        device_seq: space.device_seq(&session.device_id) + 1,
         ..Default::default()
     };
     space.commit(&session, NOW, &commit).unwrap();
