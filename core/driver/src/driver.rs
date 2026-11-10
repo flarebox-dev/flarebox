@@ -136,6 +136,9 @@ struct Folder {
     status: Arc<Mutex<FolderStatus>>,
     /// The folder's task, from its start until a stop has seen it end.
     run: Option<Running>,
+    /// Set from the moment an unlink begins until it has removed the folder or failed. No task starts for the folder
+    /// meanwhile, also after its last task has ended, so the cleanup never leaves a task it does not wait for.
+    unlinking: bool,
 }
 
 struct Running {
@@ -466,6 +469,7 @@ impl Driver {
             link,
             status: status.clone(),
             run: None,
+            unlinking: false,
         };
         drop(lock);
         if self.inner.running.load(Ordering::SeqCst) {
@@ -490,13 +494,14 @@ impl Driver {
         let wanted = absolute(folder);
         let canonical = fs::canonicalize(folder).ok();
         let (link, done) = {
-            let folders = self.inner.folders.lock().unwrap();
+            let mut folders = self.inner.folders.lock().unwrap();
             let found = folders
-                .values()
+                .values_mut()
                 .find(|linked| {
                     linked.link.root == wanted || Some(&linked.link.root) == canonical.as_ref()
                 })
                 .ok_or_else(|| DriverError::NotLinked(folder.to_path_buf()))?;
+            found.unlinking = true;
             (found.link.clone(), found.run.as_ref().map(Running::stop))
         };
         if let Some(done) = done {
@@ -512,6 +517,7 @@ impl Driver {
             Err(ref error) => {
                 if let Some(folder) = folders.get_mut(&link.space_id) {
                     folder.run = None;
+                    folder.unlinking = false;
                     halt(folder, format!("the folder could not be unlinked: {error}"));
                 }
             }
@@ -620,7 +626,7 @@ impl Driver {
         let mut folders = self.inner.folders.lock().unwrap();
         let all = roots(&folders);
         for folder in folders.values_mut() {
-            if folder.run.as_ref().is_some_and(|run| !run.ended()) {
+            if folder.unlinking || folder.run.as_ref().is_some_and(|run| !run.ended()) {
                 continue;
             }
             let linked = all
@@ -863,6 +869,7 @@ fn load_folders(paths: &Paths) -> Result<BTreeMap<String, Folder>, DriverError> 
                 status: Arc::new(Mutex::new(status)),
                 link,
                 run: None,
+                unlinking: false,
             },
         );
     }
@@ -1837,6 +1844,35 @@ mod tests {
 
         gate.open();
         sign_out.await.unwrap().unwrap();
+        signed_out(&driver, &paths, &root);
+    }
+
+    #[tokio::test]
+    async fn no_task_starts_while_an_unlink_is_unfinished() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        let paths = Paths::under(&base.join("profile"));
+        let (driver, gate) = paused_driver(&paths, &root).await;
+        let unlink = tokio::spawn({
+            let driver = driver.clone();
+            let root = root.clone();
+            async move { driver.unlink(&root).await }
+        });
+        assert!(still_waiting(&unlink).await);
+        unlink.abort();
+        assert!(unlink.await.unwrap_err().is_cancelled());
+        gate.open();
+        driver.stop().await;
+        assert!(lockable(&root));
+
+        driver.start();
+        assert_eq!(
+            driver.status().folders[0].state,
+            FolderState::Stopped,
+            "a task started for a folder whose unlink is unfinished"
+        );
+        driver.sign_out().await.unwrap();
         signed_out(&driver, &paths, &root);
     }
 
