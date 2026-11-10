@@ -26,6 +26,8 @@ use crate::session::Session;
 pub const MAX_CHUNKS_PER_CALL: usize = 1000;
 /// A target this close to its expiry is fetched again before use.
 const TARGET_MARGIN: Duration = Duration::from_secs(60);
+/// The most bytes read of an answer other than chunk bytes: a receipt or an error. Anything longer is not read.
+const SMALL_ANSWER: usize = 64 << 10;
 
 /// True when `bytes` are the chunk: their SHA-256 is its hash and their length its size.
 pub fn matches(chunk: &ChunkRef, bytes: &[u8]) -> bool {
@@ -83,6 +85,8 @@ pub struct Transfer {
     pub backoff: Backoff,
     /// Attempts per chunk, and rounds of asking the server again for chunks it deferred or whose target expired.
     pub attempts: u32,
+    /// Bounds one attempt, from sending the request to the last byte of the answer.
+    pub attempt_timeout: Duration,
 }
 
 impl Transfer {
@@ -91,6 +95,7 @@ impl Transfer {
             http: api.http().clone(),
             backoff: Backoff::default(),
             attempts: 5,
+            attempt_timeout: Duration::from_secs(120),
         }
     }
 
@@ -162,11 +167,10 @@ impl Transfer {
                     message,
                 });
             }
-            let backoff = self.backoff.delay(round);
             tokio::time::sleep(if wait.is_zero() {
-                backoff
+                self.backoff.delay(round)
             } else {
-                wait.min(self.backoff.max)
+                wait
             })
             .await;
             round += 1;
@@ -244,7 +248,8 @@ impl Transfer {
         })
     }
 
-    /// Runs one transfer up to `attempts` times with backoff. `None` means the target needs renewing.
+    /// Runs one transfer up to `attempts` times, waiting as long as the server asked or else with backoff. `None`
+    /// means the target needs renewing.
     async fn retrying<T>(
         &self,
         mut attempt: impl AsyncFnMut() -> Attempt<T>,
@@ -261,13 +266,22 @@ impl Transfer {
                         return Err(error);
                     }
                     tracing::debug!(%error, "flarebox chunk transfer will be retried");
-                    tokio::time::sleep(self.backoff.delay(tries - 1)).await;
+                    let asked = match &error {
+                        ChunkError::Refused {
+                            error: Some(server),
+                            ..
+                        } => server.retry_after(),
+                        _ => None,
+                    };
+                    tokio::time::sleep(asked.unwrap_or_else(|| self.backoff.delay(tries - 1)))
+                        .await;
                 }
             }
         }
     }
 
-    /// One upload. The relay answers with an `UploadReceipt`; a presigned URL answers without a body to keep.
+    /// One upload within `attempt_timeout`. The relay answers with an `UploadReceipt`; a presigned URL answers
+    /// without a body to keep.
     async fn put(
         &self,
         target: &Target,
@@ -277,99 +291,124 @@ impl Transfer {
         if expiring(target) {
             return Attempt::Expired;
         }
-        let response = match self.request(target, "PUT").body(bytes).send().await {
-            Ok(response) => response,
-            Err(error) => return Attempt::Retry(unavailable(chunk, error)),
-        };
-        let status = response.status();
-        let is_protobuf = protobuf(&response);
-        let body = match response.bytes().await {
-            Ok(body) => body,
-            Err(error) => return Attempt::Retry(unavailable(chunk, error)),
-        };
-        if status.is_success() {
-            if !is_protobuf {
+        let attempt = async {
+            let response = match self.request(target, "PUT").body(bytes).send().await {
+                Ok(response) => response,
+                Err(error) => return Attempt::Retry(unavailable(chunk, error)),
+            };
+            let status = response.status();
+            if status.is_success() && !protobuf(&response) {
                 return Attempt::Done(None);
             }
-            return match UploadReceipt::decode(body) {
-                Ok(receipt) if receipt.hash == chunk.hash && receipt.size == chunk.size => {
-                    Attempt::Done(Some(receipt))
+            let body = if protobuf(&response) {
+                match small_answer(response).await {
+                    Ok(body) => body,
+                    Err(error) => return Attempt::Retry(unavailable(chunk, error)),
                 }
-                _ => Attempt::Fail(ChunkError::Refused {
-                    hash: chunk.hash.clone(),
-                    status: status.as_u16(),
-                    error: None,
-                }),
+            } else {
+                None
             };
-        }
-        let error = is_protobuf
-            .then(|| ProtoError::decode(body).ok().map(ServerError))
-            .flatten();
-        let refused = ChunkError::Refused {
-            hash: chunk.hash.clone(),
-            status: status.as_u16(),
-            error,
+            if status.is_success() {
+                return match body.and_then(|body| UploadReceipt::decode(body.as_slice()).ok()) {
+                    Some(receipt) if receipt.hash == chunk.hash && receipt.size == chunk.size => {
+                        Attempt::Done(Some(receipt))
+                    }
+                    _ => Attempt::Fail(ChunkError::Refused {
+                        hash: chunk.hash.clone(),
+                        status: status.as_u16(),
+                        error: None,
+                    }),
+                };
+            }
+            let refused = ChunkError::Refused {
+                hash: chunk.hash.clone(),
+                status: status.as_u16(),
+                error: body
+                    .and_then(|body| ProtoError::decode(body.as_slice()).ok())
+                    .map(ServerError),
+            };
+            match status {
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Attempt::Expired,
+                // The bytes were checked before sending, so a hash mismatch at the server happened on the way.
+                StatusCode::BAD_REQUEST => Attempt::Retry(refused),
+                status if retryable(status) => Attempt::Retry(refused),
+                _ => Attempt::Fail(refused),
+            }
         };
-        match status {
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Attempt::Expired,
-            // The bytes were checked before sending, so a hash mismatch at the server happened on the way.
-            StatusCode::BAD_REQUEST => Attempt::Retry(refused),
-            status if retryable(status) => Attempt::Retry(refused),
-            _ => Attempt::Fail(refused),
-        }
+        self.bounded(chunk, attempt).await
     }
 
-    /// One download, read up to the chunk's size and checked against its hash.
+    /// One download within `attempt_timeout`, read up to the chunk's size and checked against its hash.
     async fn get(&self, target: &Target, chunk: &ChunkRef) -> Attempt<Bytes> {
         if expiring(target) {
             return Attempt::Expired;
         }
-        let mut response = match self.request(target, "GET").send().await {
-            Ok(response) => response,
-            Err(error) => return Attempt::Retry(unavailable(chunk, error)),
-        };
-        let status = response.status();
-        if !status.is_success() {
-            let error = if protobuf(&response) {
-                response
-                    .bytes()
-                    .await
-                    .ok()
-                    .and_then(|body| ProtoError::decode(body).ok())
-                    .map(ServerError)
-            } else {
-                None
-            };
-            let refused = ChunkError::Refused {
-                hash: chunk.hash.clone(),
-                status: status.as_u16(),
-                error,
-            };
-            return match status {
-                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Attempt::Expired,
-                status if retryable(status) => Attempt::Retry(refused),
-                _ => Attempt::Fail(refused),
-            };
-        }
-        let corrupt = || {
-            Attempt::Retry(ChunkError::Corrupt {
-                hash: chunk.hash.clone(),
-            })
-        };
-        let limit = chunk.size as usize;
-        let mut body = Vec::with_capacity(limit);
-        loop {
-            match response.chunk().await {
-                Ok(Some(part)) if body.len() + part.len() <= limit => body.extend_from_slice(&part),
-                Ok(Some(_)) => return corrupt(),
-                Ok(None) => break,
+        let attempt = async {
+            let mut response = match self.request(target, "GET").send().await {
+                Ok(response) => response,
                 Err(error) => return Attempt::Retry(unavailable(chunk, error)),
+            };
+            let status = response.status();
+            if !status.is_success() {
+                let error = if protobuf(&response) {
+                    small_answer(response)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|body| ProtoError::decode(body.as_slice()).ok())
+                        .map(ServerError)
+                } else {
+                    None
+                };
+                let refused = ChunkError::Refused {
+                    hash: chunk.hash.clone(),
+                    status: status.as_u16(),
+                    error,
+                };
+                return match status {
+                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Attempt::Expired,
+                    status if retryable(status) => Attempt::Retry(refused),
+                    _ => Attempt::Fail(refused),
+                };
             }
+            let corrupt = || {
+                Attempt::Retry(ChunkError::Corrupt {
+                    hash: chunk.hash.clone(),
+                })
+            };
+            let limit = chunk.size as usize;
+            let mut body = Vec::with_capacity(limit);
+            loop {
+                match response.chunk().await {
+                    Ok(Some(part)) if body.len() + part.len() <= limit => {
+                        body.extend_from_slice(&part)
+                    }
+                    Ok(Some(_)) => return corrupt(),
+                    Ok(None) => break,
+                    Err(error) => return Attempt::Retry(unavailable(chunk, error)),
+                }
+            }
+            if !matches(chunk, &body) {
+                return corrupt();
+            }
+            Attempt::Done(Bytes::from(body))
+        };
+        self.bounded(chunk, attempt).await
+    }
+
+    /// Ends an attempt that has not finished within `attempt_timeout`, so a server that trickles its answer is retried.
+    async fn bounded<T>(
+        &self,
+        chunk: &ChunkRef,
+        attempt: impl Future<Output = Attempt<T>>,
+    ) -> Attempt<T> {
+        match tokio::time::timeout(self.attempt_timeout, attempt).await {
+            Ok(attempt) => attempt,
+            Err(_) => Attempt::Retry(ChunkError::Unavailable {
+                hash: chunk.hash.clone(),
+                message: format!("no complete answer within {:?}", self.attempt_timeout),
+            }),
         }
-        if !matches(chunk, &body) {
-            return corrupt();
-        }
-        Attempt::Done(Bytes::from(body))
     }
 
     fn request(&self, target: &Target, default_method: &str) -> reqwest::RequestBuilder {
@@ -410,6 +449,18 @@ fn retryable(status: StatusCode) -> bool {
     status == StatusCode::REQUEST_TIMEOUT
         || status == StatusCode::TOO_MANY_REQUESTS
         || status.is_server_error()
+}
+
+/// Reads a small answer, a receipt or an error, or gives `None` once it passes `SMALL_ANSWER`.
+async fn small_answer(mut response: reqwest::Response) -> Result<Option<Vec<u8>>, reqwest::Error> {
+    let mut body = Vec::new();
+    while let Some(part) = response.chunk().await? {
+        if body.len() + part.len() > SMALL_ANSWER {
+            return Ok(None);
+        }
+        body.extend_from_slice(&part);
+    }
+    Ok(Some(body))
 }
 
 fn protobuf(response: &reqwest::Response) -> bool {

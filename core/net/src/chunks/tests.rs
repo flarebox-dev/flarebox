@@ -2,8 +2,10 @@
 
 //! One-request HTTP servers that answer chunk transfers in scripted ways.
 
+use flarebox_proto::v1::error::Code;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::time::Instant;
 
 use super::*;
 
@@ -39,25 +41,7 @@ async fn serve(
         let mut bodies = Vec::new();
         for (status, content_type, body) in responses {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0u8; 4096];
-            let (head_end, length) = loop {
-                let n = socket.read(&mut buffer).await.unwrap();
-                request.extend_from_slice(&buffer[..n]);
-                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let head = String::from_utf8_lossy(&request[..end]).to_lowercase();
-                    let length = head
-                        .lines()
-                        .find_map(|line| line.strip_prefix("content-length:"))
-                        .map_or(0, |value| value.trim().parse::<usize>().unwrap());
-                    break (end + 4, length);
-                }
-            };
-            while request.len() < head_end + length {
-                let n = socket.read(&mut buffer).await.unwrap();
-                request.extend_from_slice(&buffer[..n]);
-            }
-            bodies.push(request[head_end..].to_vec());
+            bodies.push(read_request(&mut socket).await);
             let head = format!(
                 "HTTP/1.1 {status} X\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                 body.len()
@@ -76,6 +60,59 @@ async fn serve(
         },
         server,
     )
+}
+
+/// Reads one request and returns its body.
+async fn read_request(socket: &mut TcpStream) -> Vec<u8> {
+    let mut request = Vec::new();
+    let mut buffer = [0u8; 4096];
+    let (head_end, length) = loop {
+        let n = socket.read(&mut buffer).await.unwrap();
+        request.extend_from_slice(&buffer[..n]);
+        if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&request[..end]).to_lowercase();
+            let length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .map_or(0, |value| value.trim().parse::<usize>().unwrap());
+            break (end + 4, length);
+        }
+    };
+    while request.len() < head_end + length {
+        let n = socket.read(&mut buffer).await.unwrap();
+        request.extend_from_slice(&buffer[..n]);
+    }
+    request[head_end..].to_vec()
+}
+
+/// Answers one request with a body that never ends: `part` again and again, `every` apart, until the client leaves.
+async fn endless(
+    status: u16,
+    content_type: &'static str,
+    part: Vec<u8>,
+    every: Duration,
+) -> (Target, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/chunk", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_request(&mut socket).await;
+        let head = format!(
+            "HTTP/1.1 {status} X\r\ncontent-type: {content_type}\r\ntransfer-encoding: chunked\r\n\r\n"
+        );
+        let mut framed = format!("{:x}\r\n", part.len()).into_bytes();
+        framed.extend_from_slice(&part);
+        framed.extend_from_slice(b"\r\n");
+        let _ = socket.write_all(head.as_bytes()).await;
+        while socket.write_all(&framed).await.is_ok() {
+            tokio::time::sleep(every).await;
+        }
+    });
+    let target = Target {
+        url,
+        ..Default::default()
+    };
+    (target, server)
 }
 
 #[test]
@@ -254,4 +291,141 @@ fn errors_do_not_show_tickets() {
         error.to_string(),
         "the transfer of chunk abab kept failing: connection refused"
     );
+}
+
+#[tokio::test]
+async fn an_endless_receipt_or_error_is_not_read_past_a_small_limit() {
+    let sent = chunk(b"payload");
+    let transfer = transfer();
+    let quickly = Duration::from_secs(5);
+
+    let (target, server) = endless(
+        200,
+        "application/x-protobuf",
+        vec![0; 16 << 10],
+        Duration::ZERO,
+    )
+    .await;
+    let put = tokio::time::timeout(
+        quickly,
+        transfer.put(&target, &sent, Bytes::from_static(b"payload")),
+    )
+    .await;
+    assert!(
+        matches!(
+            put,
+            Ok(Attempt::Fail(ChunkError::Refused {
+                status: 200,
+                error: None,
+                ..
+            }))
+        ),
+        "an oversized receipt is refused without reading it all"
+    );
+    server.abort();
+
+    let (target, server) = endless(
+        500,
+        "application/x-protobuf",
+        vec![0; 16 << 10],
+        Duration::ZERO,
+    )
+    .await;
+    let get = tokio::time::timeout(quickly, transfer.get(&target, &sent)).await;
+    assert!(
+        matches!(
+            get,
+            Ok(Attempt::Retry(ChunkError::Refused {
+                status: 500,
+                error: None,
+                ..
+            }))
+        ),
+        "an oversized error is dropped without reading it all"
+    );
+    server.abort();
+
+    let (target, server) = endless(200, "text/plain", vec![0; 16 << 10], Duration::ZERO).await;
+    let put = tokio::time::timeout(
+        quickly,
+        transfer.put(&target, &sent, Bytes::from_static(b"payload")),
+    )
+    .await;
+    assert!(
+        matches!(put, Ok(Attempt::Done(None))),
+        "the body of a presigned answer is not read"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn an_answer_that_trickles_is_cut_off_by_the_attempt_timeout() {
+    let wanted = chunk(&[7; 1000]);
+    let transfer = Transfer {
+        attempt_timeout: Duration::from_millis(300),
+        ..transfer()
+    };
+    let every = Duration::from_millis(50);
+
+    let (target, server) = endless(200, "application/octet-stream", vec![7], every).await;
+    let started = Instant::now();
+    let get = transfer.get(&target, &wanted).await;
+    assert!(matches!(
+        get,
+        Attempt::Retry(ChunkError::Unavailable { .. })
+    ));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    server.abort();
+
+    let (target, server) = endless(200, "application/x-protobuf", vec![0], every).await;
+    let started = Instant::now();
+    let put = transfer
+        .put(&target, &wanted, Bytes::from(vec![7; 1000]))
+        .await;
+    assert!(matches!(
+        put,
+        Attempt::Retry(ChunkError::Unavailable { .. })
+    ));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_429_is_retried_after_the_wait_the_server_asks() {
+    let sent = chunk(b"payload");
+    let busy = ProtoError {
+        code: Code::RetryLater as i32,
+        retry_after_ms: 300,
+        ..Default::default()
+    };
+    let (target, server) = serve(vec![
+        (429, "application/x-protobuf", busy.encode_to_vec()),
+        (200, "application/xml", Vec::new()),
+    ])
+    .await;
+    let transfer = transfer();
+    assert!(transfer.backoff.max < Duration::from_millis(300));
+    let started = Instant::now();
+    let outcome = transfer
+        .retrying(async || {
+            transfer
+                .put(&target, &sent, Bytes::from_static(b"payload"))
+                .await
+        })
+        .await;
+    assert!(matches!(outcome, Ok(Some(None))), "{outcome:?}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(300),
+        "{:?}",
+        started.elapsed()
+    );
+    server.await.unwrap();
 }
