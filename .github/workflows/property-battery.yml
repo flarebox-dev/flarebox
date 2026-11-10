@@ -63,6 +63,10 @@ jobs:
             echo "::error::ref '$REF' is not a branch or tag on $GITHUB_REPOSITORY (deleted, misspelled or not pushed). Pass a pushed branch, a tag or a full commit SHA."
             exit 1
           fi
+          if [[ "$FILTER" == -* ]]; then
+            echo "::error::filter must be a test name, not an option: '$FILTER' starts with '-', which the test binaries would read as a flag."
+            exit 1
+          fi
           if ! [[ "$CASES" =~ ^[1-9][0-9]{0,6}$ ]]; then
             echo "::error::cases must be a whole number from 1 to 9999999, got '$CASES'."
             exit 1
@@ -80,35 +84,63 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: property-battery
+          save-if: ${{ !inputs.ref }}
       - name: Build the property test binaries
         run: |
           cargo metadata --format-version 1 --locked --no-deps > "$RUNNER_TEMP/metadata.json"
-          mapfile -t packages < <(jq -r '.packages[] | select(any(.dependencies[]; .name == "proptest" and .kind == "dev")) | .name' "$RUNNER_TEMP/metadata.json")
+          mapfile -t packages < <(jq -r '.packages[] | select(any(.dependencies[]; .name == "proptest")) | .name' "$RUNNER_TEMP/metadata.json")
           if [ "${#packages[@]}" -eq 0 ]; then
-            echo "::error::No workspace package has a proptest dev-dependency, so there is nothing to run."
+            echo "::error::No workspace package depends on proptest, so there is nothing to run."
             exit 1
           fi
           echo "Packages with property tests: ${packages[*]}"
           args=()
           for package in "${packages[@]}"; do args+=(-p "$package"); done
           cargo test --locked --no-run --tests --message-format=json-render-diagnostics "${args[@]}" > "$RUNNER_TEMP/build.json"
+          filter_args=()
+          if [ -n "$FILTER" ]; then filter_args=("$FILTER"); fi
           mkdir -p battery/bin
           : > battery/targets.tsv
-          while IFS=$'\t' read -r manifest target source executable; do
-            grep -q 'proptest!' "$source" || continue
+          : > "$RUNNER_TEMP/covered.txt"
+          while IFS=$'\t' read -r manifest selector executable; do
+            if [ ! -f "$executable.d" ]; then
+              echo "::error::$executable has no dep-info file ($executable.d), so its source files are unknown."
+              exit 1
+            fi
+            properties=$(sed -n 's/^\(.*\.rs\):$/\1/p' "$executable.d" | xargs -r realpath -m --relative-to="$GITHUB_WORKSPACE" | grep -v '^\.\./' | xargs -r grep -l 'proptest!' || true)
+            [ -n "$properties" ] || continue
+            echo "$properties" >> "$RUNNER_TEMP/covered.txt"
             package=$(jq -r --arg manifest "$manifest" '.packages[] | select(.manifest_path == $manifest) | .name' "$RUNNER_TEMP/metadata.json")
             dir=$(realpath --relative-to="$GITHUB_WORKSPACE" "$(dirname "$manifest")")
-            cp "$executable" "battery/bin/$package-$target"
-            printf '%s\t%s\t%s\t%s\n' "$package" "$target" "$dir" "bin/$package-$target" >> battery/targets.tsv
-          done < <(jq -r 'select(.reason == "compiler-artifact" and .executable != null and (.target.kind | contains(["test"]))) | [.manifest_path, .target.name, .target.src_path, .executable] | @tsv' "$RUNNER_TEMP/build.json")
+            binary="bin/$(basename "$executable")"
+            cp "$executable" "battery/$binary"
+            listed=$(cd "$dir" && "$executable" --list "${filter_args[@]}" | grep -c ': test$' || true)
+            printf '%s\t%s\t%s\t%s\t%s\n' "$package" "$selector" "$dir" "$binary" "$listed" >> battery/targets.tsv
+            echo "$package $selector: $listed tests selected; property files: ${properties//$'\n'/ }"
+          done < <(jq -r 'select(.reason == "compiler-artifact" and .executable != null) | [.manifest_path, (if (.target.kind | any(. == "test")) then "--test " + .target.name elif (.target.kind | any(. == "bin")) then "--bin " + .target.name else "--lib" end), .executable] | @tsv' "$RUNNER_TEMP/build.json")
+          missing=$(for package in "${packages[@]}"; do
+            dir=$(jq -r --arg name "$package" '.packages[] | select(.name == $name) | .manifest_path' "$RUNNER_TEMP/metadata.json" | xargs dirname | xargs realpath --relative-to="$GITHUB_WORKSPACE")
+            git ls-files -- "$dir" | grep '\.rs$' | xargs -r grep -l 'proptest!' || true
+          done | sort -u | comm -23 - <(sort -u "$RUNNER_TEMP/covered.txt"))
+          if [ -n "$missing" ]; then
+            echo "::error::These files contain proptest! but no test binary of their package compiles them, so the battery would skip them: ${missing//$'\n'/ }"
+            exit 1
+          fi
           if [ ! -s battery/targets.tsv ]; then
-            echo "::error::No integration test target in ${packages[*]} contains a proptest! block."
+            echo "::error::No test binary in ${packages[*]} compiles a file with a proptest! block."
+            exit 1
+          fi
+          selected=$(awk -F'\t' '{ n += $5 } END { print n + 0 }' battery/targets.tsv)
+          if [ "$selected" -eq 0 ]; then
+            echo "::error::The filter '$FILTER' selects no test in the property test binaries, so the battery would run nothing."
             exit 1
           fi
           {
             echo "### Property test targets"
             echo
-            cut -f1,2 battery/targets.tsv | sed 's/\t/ --test /; s/^/- /'
+            echo "$selected tests selected per shard (filter: ${FILTER:-none})."
+            echo
+            awk -F'\t' '{ print "- " $1 " " $2 ": " $5 " tests" }' battery/targets.tsv
           } | tee -a "$GITHUB_STEP_SUMMARY"
           tar -cf battery.tar battery
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -179,25 +211,36 @@ jobs:
             repro_filter=" -- $(printf '%q' "$FILTER")"
           fi
           passed=0 failed=0 failing='[]'
-          while IFS=$'\t' read -r package target dir binary; do
-            log="$out/logs/$package-$target.log"
-            echo "::group::$package --test $target"
+          while IFS=$'\t' read -r package selector dir binary expected; do
+            [ "$expected" -gt 0 ] || continue
+            log="$out/logs/$(basename "$binary").log"
+            echo "::group::$package $selector"
             set +e
             (cd "$dir" && CARGO_MANIFEST_DIR="$GITHUB_WORKSPACE/$dir" PROPTEST_RNG_SEED="$seed" PROPTEST_CASES="$CASES" "$GITHUB_WORKSPACE/battery/$binary" "${filter_args[@]}") 2>&1 | tee "$log"
             code=${PIPESTATUS[0]}
             set -e
             echo "::endgroup::"
-            counts=$(sed -nE 's/^test result: [A-Za-z]+\. ([0-9]+) passed; ([0-9]+) failed.*/\1 \2/p' "$log" | tail -n 1)
-            counts=${counts:-0 0}
-            passed=$((passed + ${counts% *}))
-            echo "$package --test $target: exit $code, ${counts% *} passed, ${counts#* } failed"
+            counts=$(sed -nE 's/^test result: [A-Za-z]+\. ([0-9]+) passed; ([0-9]+) failed; ([0-9]+) ignored.*/\1 \2 \3/p' "$log" | tail -n 1)
+            read -r p f i <<< "${counts:-0 0 0}"
+            passed=$((passed + p))
+            failed=$((failed + f))
+            echo "$package $selector: exit $code, $p passed, $f failed, $i ignored, $expected listed"
+            reason=""
             if [ "$code" -ne 0 ]; then
-              failed=$((failed + ${counts#* }))
-              repro="git checkout $SHA && PROPTEST_CASES=$CASES PROPTEST_RNG_SEED=$seed cargo test --locked -p $package --test $target$repro_filter"
-              failing=$(jq -c --arg target "$package --test $target" --arg repro "$repro" --argjson code "$code" '. + [{target: $target, exit: $code, repro: $repro}]' <<< "$failing")
-              echo "::error title=$package --test $target failed on shard $SHARD::Seed $seed, $CASES cases, exit code $code. Reproduce: $repro"
+              reason="exit code $code"
+            elif [ $((p + f + i)) -ne "$expected" ]; then
+              reason="ran $((p + f + i)) of the $expected tests listed for it"
+            fi
+            if [ -n "$reason" ]; then
+              repro="git checkout $SHA && PROPTEST_CASES=$CASES PROPTEST_RNG_SEED=$seed cargo test --locked -p $package $selector$repro_filter"
+              failing=$(jq -c --arg target "$package $selector" --arg reason "$reason" --arg repro "$repro" '. + [{target: $target, reason: $reason, repro: $repro}]' <<< "$failing")
+              echo "::error title=$package $selector failed on shard $SHARD::Seed $seed, $CASES cases, $reason. Reproduce: $repro"
             fi
           done < battery/targets.tsv
+          if [ "$passed" -eq 0 ] && [ "$failed" -eq 0 ] && [ "$failing" = '[]' ]; then
+            failing='[{"target": "all targets", "reason": "no test ran", "repro": ""}]'
+            echo "::error::Shard $SHARD ran no tests, so it checked nothing."
+          fi
           git status --porcelain --untracked-files=all -- '*.proptest-regressions' | cut -c4- | while read -r file; do
             cp --parents "$file" "$out/regressions/"
           done

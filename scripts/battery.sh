@@ -68,9 +68,13 @@ output=$(gh workflow run property-battery.yml --ref "${BATTERY_WORKFLOW_REF:-mai
 }
 url=$(grep -oE 'https://[^ ]+/actions/runs/[0-9]+' <<< "$output" | head -n 1 || true)
 if [ -z "$url" ]; then
-  echo "$output" >&2
-  echo "gh did not print the run URL. Find the run with: gh run list --workflow property-battery.yml" >&2
-  exit 1
+  echo "$output"
+  echo "The battery started, but gh did not print the run URL. Find the run with: gh run list --workflow property-battery.yml" >&2
+  if $wait; then
+    echo "Cannot wait without the run URL; follow it with gh run watch <run-id> --exit-status." >&2
+    exit 1
+  fi
+  exit 0
 fi
 echo "$url"
 if $wait; then

@@ -13,7 +13,7 @@ When a property fails, proptest prints the shrunk input and saves a line to a `.
 
 ## The property battery
 
-The battery runs the property tests at high case counts on GitHub Actions instead of a local machine (`.github/workflows/property-battery.yml`). One job builds the test binaries; then many shards run every property test target with the same case count and a different seed each. Shard `k` uses `PROPTEST_RNG_SEED` = run ID × 1000 + `k`, so every run covers new cases and every failure can be reproduced. A summary job lists each shard's seed, result and log, and the number of cases run.
+The battery runs the property tests at high case counts on GitHub Actions instead of a local machine (`.github/workflows/property-battery.yml`). One job builds the test binaries of every package that depends on proptest and keeps each binary that compiles a file with a `proptest!` block, including files it pulls in with `mod` or `include!` and library unit tests. The build fails if a file with a `proptest!` block is in no test binary, or if the filter selects no test. Then many shards run those binaries with the same case count and a different seed each, and a shard fails if a binary runs a different number of tests than it lists for the filter. Shard `k` uses `PROPTEST_RNG_SEED` = run ID × 1000 + `k`, so every run covers new cases and every failure can be reproduced. A summary job lists each shard's seed, result and log, and the number of cases run.
 
 It runs every night on `main` with the defaults: 24 shards of 8192 cases. Start it for a branch with `scripts/battery.sh`, which needs [gh](https://cli.github.com/) signed in to an account that can run workflows on the repository:
 
@@ -33,7 +33,7 @@ It prints the run URL and returns; with `--wait` it follows the run and exits wi
 | `--filter TEXT` | `filter`: a test name filter, as for `cargo test` | none |
 | `--mutations` | `mutations`: also run the mutation set | off |
 
-The workflow file is read from `main`. To try a changed workflow from another branch, set `BATTERY_WORKFLOW_REF` to that branch.
+The workflow file is read from `main`. To try a changed workflow from another branch, set `BATTERY_WORKFLOW_REF` to that branch. A run started with a `ref` restores the dependency cache of the branch the workflow runs from but never saves to it; only runs that test that branch's own code (the nightly run, or a dispatch without `ref`) save it.
 
 ### When a shard fails
 
