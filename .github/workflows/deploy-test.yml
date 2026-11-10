@@ -2,7 +2,9 @@
 
 # Deploys server/ to a real Cloudflare account under a throwaway name, claims it, smoke-tests it over HTTPS and
 # deletes everything again (docs/deploy-test.md). Manual only: it needs the account's scoped API token, and each run
-# uses a little of the account's Workers, Durable Objects and R2 usage.
+# uses a little of the account's Workers, Durable Objects and R2 usage. A first job without secrets refuses a run that
+# is not on main of flarebox-dev/flarebox, or whose deploy-test environment lacks the protection the docs require; the
+# secrets live only in that environment, which releases them after a required reviewer approves the run.
 
 name: Deploy test
 
@@ -27,8 +29,59 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  trusted:
+    name: deploy test (main and protected environment)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Refuse unless the run is for a commit on main of flarebox-dev/flarebox
+        env:
+          REPOSITORY: ${{ github.repository }}
+          REF: ${{ github.ref }}
+        run: |
+          if [ "$REPOSITORY" != flarebox-dev/flarebox ]; then
+            echo "::error::The deploy test runs only in flarebox-dev/flarebox, not in $REPOSITORY."
+            exit 1
+          fi
+          if [ "$REF" != refs/heads/main ]; then
+            echo "::error::The deploy test must start from main, not $REF. Choose main under 'Use workflow from'."
+            exit 1
+          fi
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          commit="$(git rev-parse HEAD)"
+          if ! git merge-base --is-ancestor "$commit" origin/main; then
+            echo "::error::$REF points to $commit, which is not on main. The deploy test runs only commits that were merged to main."
+            exit 1
+          fi
+          echo "$REF ($commit) is on main of $REPOSITORY."
+      - name: Refuse unless the deploy-test environment is protected
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          refuse() {
+            echo "::error::$1 Set up the deploy-test environment as docs/deploy-test.md describes before running the deploy test."
+            exit 1
+          }
+          environment="$(gh api "repos/$REPOSITORY/environments/deploy-test")" || refuse "The deploy-test environment does not exist or cannot be read."
+          reviewers="$(jq -r '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[]?.reviewer.login] | join(" ")' <<<"$environment")"
+          [[ " $reviewers " == *" gunwooterry "* ]] || refuse "The deploy-test environment does not require gunwooterry's approval (required reviewers: ${reviewers:-none})."
+          [ "$(jq -r '.can_admins_bypass' <<<"$environment")" != true ] || refuse "Administrators can bypass the deploy-test environment's protection rules."
+          [ "$(jq -r '.deployment_branch_policy.custom_branch_policies // false' <<<"$environment")" = true ] || refuse "The deploy-test environment does not limit deployments to selected branches."
+          policies="$(gh api "repos/$REPOSITORY/environments/deploy-test/deployment-branch-policies" --jq '[.branch_policies[] | (.type // "branch") + ":" + .name] | sort | join(",")')" || refuse "The deploy-test environment's branch policies cannot be read."
+          [ "$policies" = "branch:main" ] || refuse "The deploy-test environment must allow the main branch only, but allows: ${policies:-nothing}."
+          echo "The deploy-test environment requires gunwooterry's approval, cannot be bypassed by administrators, and deploys main only."
+
   deploy-test:
     name: deploy test (${{ inputs.mode }})
+    needs: trusted
     runs-on: ubuntu-latest
     environment: deploy-test
     timeout-minutes: 60
@@ -50,7 +103,7 @@ jobs:
           [ -n "$CLOUDFLARE_API_TOKEN" ] || missing="$missing CLOUDFLARE_API_TOKEN"
           [ -n "$CLOUDFLARE_ACCOUNT_ID" ] || missing="$missing CLOUDFLARE_ACCOUNT_ID"
           if [ -n "$missing" ]; then
-            echo "::error::The deploy test needs the secrets$missing in the deploy-test environment or the repository. docs/deploy-test.md lists what each holds and the token's permissions. Nothing was deployed."
+            echo "::error::The deploy test needs the environment secrets$missing in the deploy-test environment. docs/deploy-test.md lists what each holds and the token's permissions. Nothing was deployed."
             exit 1
           fi
           echo "Both secrets are set. This run deploys and then deletes the Worker and R2 bucket $FLAREBOX_TEST_NAME."

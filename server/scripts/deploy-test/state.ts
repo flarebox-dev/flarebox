@@ -40,9 +40,21 @@ export interface Written {
   second: Credentials;
 }
 
+/**
+ * The resources this run created, recorded as soon as it knows their identity. Teardown deletes a resource only when
+ * the one now carrying the run's name has the identity recorded here.
+ */
+export interface Owned {
+  /** The creation date of the bucket this run created after checking that no bucket had the name. */
+  bucketCreationDate?: string;
+  /** The immutable ID of the Worker this run's first deploy created after checking that no Worker had the name. */
+  workerId?: string;
+}
+
 export interface State {
   name: string;
   url?: string;
+  owned: Owned;
   deployments: Deployment[];
   owner?: Credentials;
   stats: Stats;
@@ -64,7 +76,7 @@ export function testName(): string {
 
 export function readState(): State {
   const path = statePath();
-  if (!existsSync(path)) return { name: testName(), deployments: [], stats: { requests: 0, bytesUp: 0, bytesDown: 0 } };
+  if (!existsSync(path)) return { name: testName(), owned: {}, deployments: [], stats: { requests: 0, bytesUp: 0, bytesDown: 0 } };
   return JSON.parse(readFileSync(path, "utf8")) as State;
 }
 

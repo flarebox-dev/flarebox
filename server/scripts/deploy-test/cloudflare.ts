@@ -2,8 +2,9 @@
 
 // The Cloudflare API calls of the deploy test (docs/deploy-test.md), made with the scoped token from
 // CLOUDFLARE_API_TOKEN. Messages name the method and path only, never a header, a body or a credential.
+// CLOUDFLARE_API_BASE_URL, which Wrangler honours too, points both at a mock API in run.unit.ts.
 
-const API = "https://api.cloudflare.com/client/v4";
+const API = process.env.CLOUDFLARE_API_BASE_URL || "https://api.cloudflare.com/client/v4";
 const ATTEMPTS = 4;
 const REQUEST_MS = 60_000;
 
@@ -106,6 +107,24 @@ async function call<T>(account: Account, method: string, path: string, body?: un
 
 export async function createBucket(account: Account, name: string): Promise<void> {
   await call(account, "POST", `/accounts/${account.id}/r2/buckets`, { name });
+}
+
+/** A bucket's creation date, which tells it apart from a later bucket of the same name, or undefined when it does not exist. */
+export async function getBucket(account: Account, name: string): Promise<{ creationDate: string } | undefined> {
+  const response = await send(account, "GET", `/accounts/${account.id}/r2/buckets/${name}`, { allowMissing: true });
+  if (!response) return undefined;
+  const bucket = ((await response.json()) as Envelope<{ creation_date?: string }>).result;
+  if (!bucket?.creation_date) throw new ApiError("GET /accounts/{id}/r2/buckets/" + name + " returned no creation_date", 200);
+  return { creationDate: bucket.creation_date };
+}
+
+/** A Worker's immutable ID, or undefined when no Worker has this name. */
+export async function getWorker(account: Account, name: string): Promise<{ id: string } | undefined> {
+  const response = await send(account, "GET", `/accounts/${account.id}/workers/workers/${name}`, { allowMissing: true });
+  if (!response) return undefined;
+  const worker = ((await response.json()) as Envelope<{ id?: string }>).result;
+  if (!worker?.id) throw new ApiError("GET /accounts/{id}/workers/workers/" + name + " returned no id", 200);
+  return { id: worker.id };
 }
 
 /** Every object in a bucket under a prefix, or undefined when the bucket does not exist. */

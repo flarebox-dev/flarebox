@@ -10,8 +10,8 @@
 // Nothing this prints contains a credential, a claim code or a chunk ticket.
 
 import { execFileSync, spawn } from "node:child_process";
-import { appendFileSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { appendFileSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -21,6 +21,8 @@ import {
   deleteBucket,
   deleteObject,
   deleteWorker,
+  getBucket,
+  getWorker,
   graphql,
   listObjects,
   type Namespace,
@@ -36,6 +38,7 @@ const TAIL_MS = 60_000;
 const PROPAGATION_MS = 15_000;
 /** The first commit whose server/ deploys on its own (#38); an upgrade cannot start earlier. */
 const FIRST_DEPLOYABLE = "8c9bf4a";
+const CLAIM_LOG_LINE = "Flarebox claim code";
 const CLAIM_CODE = /Flarebox claim code[^:]*: ([A-Z0-9-]+)/;
 
 const repo = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
@@ -163,15 +166,20 @@ async function serving(url: string): Promise<{ serverVersion: string; claimed: b
   }
 }
 
+/**
+ * Deploys server/ at ref. The first deploy checks that neither the Worker nor the bucket name is taken, creates the
+ * bucket and records its creation date, then records the Worker's immutable ID once the deploy created it, whether or
+ * not the deploy succeeded. Teardown deletes only what is recorded, so a name collision leaves the other resource alone.
+ */
 async function deploy(account: Account, ref: string): Promise<void> {
   const state = readState();
   const sha = tryGit(["rev-parse", "--verify", "--quiet", ref + "^{commit}"]) ?? fail(JSON.stringify(ref) + " is not a commit in this repository");
-  const dir = mkdtempSync(join(tmpdir(), "flarebox-deploy-test-"));
-  execFileSync("sh", ["-c", 'git archive --format=tar "$1:server" | tar -x -C "$2"', "sh", sha, dir], { cwd: repo, stdio: "inherit" });
-  rename(dir, state.name);
-  console.log("Copied server/ at " + sha + " to " + dir + " as Worker and R2 bucket " + state.name);
-
-  if (state.deployments.length === 0) {
+  const first = state.deployments.length === 0;
+  if (first) {
+    if (state.owned.workerId || state.owned.bucketCreationDate) fail("the state file already records resources but no deployment; start a new run");
+    const worker = await getWorker(account, state.name);
+    if (worker) fail("a Worker named " + state.name + " already exists (id " + worker.id + "); this run did not create it and leaves it alone");
+    if (await getBucket(account, state.name)) fail("an R2 bucket named " + state.name + " already exists; this run did not create it and leaves it alone");
     try {
       await createBucket(account, state.name);
     } catch (error) {
@@ -179,11 +187,33 @@ async function deploy(account: Account, ref: string): Promise<void> {
       if (message.includes("10042")) fail("R2 is not activated for this account. Activate it in the dashboard first (docs/deploy.md, What you need): " + message);
       throw error;
     }
-    console.log("Created the R2 bucket " + state.name);
+    state.owned.bucketCreationDate = (await getBucket(account, state.name) ?? fail("the bucket " + state.name + " was created but cannot be read back")).creationDate;
+    writeState(state);
+    console.log("Created the R2 bucket " + state.name + " (created " + state.owned.bucketCreationDate + ")");
+  } else {
+    const worker = await getWorker(account, state.name);
+    if (!worker || worker.id !== state.owned.workerId) fail("the Worker " + state.name + " is no longer the one this run created; refusing to deploy over it");
   }
 
-  await run("pnpm", ["install", "--frozen-lockfile"], dir, INSTALL_MS, withoutSecrets());
-  const deployed = await run("pnpm", ["run", "deploy"], dir, DEPLOY_MS, process.env);
+  const dir = mkdtempSync(join(tmpdir(), "flarebox-deploy-test-"));
+  execFileSync("sh", ["-c", 'git archive --format=tar "$1:server" | tar -x -C "$2"', "sh", sha, dir], { cwd: repo, stdio: "inherit" });
+  rename(dir, state.name);
+  console.log("Copied server/ at " + sha + " to " + dir + " as Worker and R2 bucket " + state.name);
+
+  let deployed: string;
+  try {
+    await run("pnpm", ["install", "--frozen-lockfile"], dir, INSTALL_MS, withoutSecrets());
+    deployed = await run("pnpm", ["run", "deploy"], dir, DEPLOY_MS, process.env);
+  } finally {
+    if (first) {
+      const worker = await getWorker(account, state.name);
+      if (worker) {
+        state.owned.workerId = worker.id;
+        writeState(state);
+        console.log("The Worker " + state.name + " this run created has id " + worker.id);
+      }
+    }
+  }
   const url = /https:\/\/[a-z0-9.-]+\.workers\.dev/.exec(deployed)?.[0];
   if (!url) fail("wrangler deploy printed no workers.dev address; the account needs a workers.dev subdomain (docs/deploy-test.md)");
   const versionId = /Current Version ID: ([0-9a-f-]{36})/.exec(deployed)?.[1] ?? fail("wrangler deploy printed no version ID");
@@ -213,25 +243,57 @@ async function until<T>(check: () => T | undefined, what: string, timeoutMs: num
   }
 }
 
+/** Files under roots (node_modules aside) whose contents include the claim code's log line. */
+function filesWithClaimCode(roots: string[]): string[] {
+  const found: string[] = [];
+  const visit = (path: string) => {
+    let entries;
+    try {
+      entries = readdirSync(path, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const child = join(path, entry.name);
+      if (entry.isDirectory() && entry.name !== "node_modules") visit(child);
+      else if (entry.isFile() && statSync(child).size < 64 * 1024 * 1024 && readFileSync(child).includes(CLAIM_LOG_LINE)) found.push(child);
+    }
+  };
+  for (const root of roots) visit(root);
+  return found;
+}
+
+/** Where Wrangler keeps its configuration and, unless told otherwise, its diagnostic logs. */
+function wranglerDirs(): string[] {
+  const home = homedir();
+  return [join(home, ".wrangler"), join(process.env.XDG_CONFIG_HOME || join(home, ".config"), ".wrangler"), join(home, "Library", "Preferences", ".wrangler")];
+}
+
 /**
  * Claims the deployment as an owner would, with no human: opens /setup, reads the one-time code from the Worker's own
  * log through wrangler tail, and redeems it. The tail connects before /setup, because the Worker issues a new code only
- * after the last one expired an hour later.
+ * after the last one expired an hour later. The code stays in this process's memory: Wrangler's diagnostic log file is
+ * turned off and pointed at a directory that is deleted afterwards, the tail output is never printed unredacted, and
+ * the run fails if any file in Wrangler's directories or the deployed copy still holds the code's log line.
  */
 async function claim(): Promise<void> {
   const state = readState();
   const deployment = state.deployments.at(-1) ?? fail("nothing is deployed yet");
   const url = state.url!;
+  const logDir = mkdtempSync(join(tmpdir(), "flarebox-wrangler-logs-"));
   const tail = spawn(join(deployment.dir, "node_modules", ".bin", "wrangler"), ["tail", state.name, "--format", "pretty"], {
     cwd: deployment.dir,
-    env: { ...process.env, WRANGLER_SEND_METRICS: "false" },
+    env: { ...process.env, WRANGLER_SEND_METRICS: "false", WRANGLER_WRITE_LOGS: "false", WRANGLER_LOG_PATH: logDir },
     detached: true,
   });
   let log = "";
+  let code = "";
   let exited: number | null | undefined;
+  const closed = new Promise<void>((resolve) => tail.on("close", () => resolve()));
   tail.stdout.on("data", (chunk: Buffer) => (log += chunk));
   tail.stderr.on("data", (chunk: Buffer) => (log += chunk));
-  tail.on("close", (code) => (exited = code));
+  tail.on("close", (status) => (exited = status));
+  const redacted = (text: string) => (code ? text.replaceAll(code, "<claim code>") : text).replace(/\b[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}\b/g, "<claim code>");
   try {
     await until(() => (log.includes("Connected to") ? true : exited !== undefined ? fail("wrangler tail exited with " + exited) : undefined), "wrangler tail to connect", TAIL_MS);
     await sleep(3000);
@@ -239,7 +301,7 @@ async function claim(): Promise<void> {
     const page = await setup.text();
     if (!setup.ok || !page.includes("claim code")) fail("/setup did not issue a claim code (HTTP " + setup.status + "): " + page.slice(0, 200));
     if (!page.includes("not affiliated with Cloudflare, Inc.")) fail("/setup lost the notice that Flarebox is not affiliated with Cloudflare, Inc.");
-    const code = await until(() => CLAIM_CODE.exec(log)?.[1], "the claim code in the Worker's log", TAIL_MS);
+    code = await until(() => CLAIM_CODE.exec(log)?.[1], "the claim code in the Worker's log", TAIL_MS);
     console.log("Read the claim code from the Worker's log through wrangler tail");
     const response = await fetch(url + "/v1/claim", {
       method: "POST",
@@ -248,17 +310,23 @@ async function claim(): Promise<void> {
       signal: AbortSignal.timeout(15_000),
     });
     const body = (await response.json()) as { userId?: string; deviceId?: string; refreshCredential?: string; message?: string };
-    if (!response.ok || !body.userId || !body.deviceId || !body.refreshCredential) fail("the claim failed with HTTP " + response.status + ": " + (body.message ?? "no message"));
+    if (!response.ok || !body.userId || !body.deviceId || !body.refreshCredential) fail("the claim failed with HTTP " + response.status + ": " + redacted(body.message ?? "no message"));
     state.owner = { userId: body.userId, deviceId: body.deviceId, refreshCredential: body.refreshCredential };
     writeState(state);
     console.log("Claimed " + url + ": owner " + body.userId + ", first device " + body.deviceId);
   } catch (error) {
-    console.error("wrangler tail output (claim codes redacted):\n" + log.replace(/\b[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}\b/g, "<claim code>"));
+    console.error("wrangler tail output (claim codes redacted):\n" + redacted(log));
     throw error;
   } finally {
     try {
       process.kill(-tail.pid!, "SIGTERM");
     } catch {}
+    await Promise.race([closed, sleep(10_000)]);
+    const holders = filesWithClaimCode([logDir, join(deployment.dir, ".wrangler"), ...wranglerDirs()]);
+    for (const holder of holders) rmSync(holder, { force: true });
+    rmSync(logDir, { recursive: true, force: true });
+    if (holders.length > 0) fail("Wrangler wrote the claim code's log line to " + holders.join(", ") + "; those files were deleted");
+    console.log("No file in Wrangler's directories or the deployed copy holds the claim code");
   }
 }
 
@@ -364,15 +432,14 @@ async function analytics(account: Account, state: State | undefined, namespaces:
 }
 
 /**
- * Deletes the Worker (and with it the Durable Object namespaces it implements), then empties and deletes the bucket, and
- * prints what the run used. Runs whatever happened before, and refuses names without the test prefix.
+ * Deletes what this run created and prints what it used. A Worker is deleted, with force, which also deletes the
+ * Durable Object namespaces it implements, only when the Worker now named like the run has the ID the run recorded;
+ * the bucket is emptied and deleted only when it has the recorded creation date. Anything else carrying the name is
+ * left alone and reported. Runs whatever happened before, and refuses names without the test prefix.
  */
 async function teardown(account: Account): Promise<void> {
   const name = testName();
-  let state: State | undefined;
-  try {
-    state = readState();
-  } catch {}
+  const state = readState();
   const problems: string[] = [];
   const attempt = async <T>(what: string, step: () => Promise<T>): Promise<T | undefined> => {
     try {
@@ -383,29 +450,48 @@ async function teardown(account: Account): Promise<void> {
     }
   };
 
-  const namespaces = (await attempt("listing the Durable Object namespaces", () => namespacesOf(account, name))) ?? [];
-  const deleted = await attempt("deleting the Worker", () => deleteWorker(account, name));
-  if (deleted !== undefined) console.log(deleted ? "Deleted the Worker " + name : "There is no Worker " + name);
-  const left = await attempt("checking the Durable Object namespaces", () => namespacesOf(account, name));
-  if (left?.length) problems.push("Durable Object namespaces of " + name + " remain: " + left.map((namespace) => namespace.class + " " + namespace.id).join(", "));
-  else if (left) console.log("No Durable Object namespace of " + name + " remains (" + namespaces.map((namespace) => namespace.class).join(", ") + " deleted with the Worker)");
-  const storage = await attempt("emptying and deleting the R2 bucket", () => emptyAndDeleteBucket(account, name));
-  if (storage === undefined && !problems.some((problem) => problem.startsWith("emptying"))) console.log("There is no R2 bucket " + name);
-  else if (storage) console.log("Deleted the R2 bucket " + name + " and its " + storage.objects + " objects");
+  let namespaces: Namespace[] = [];
+  const worker = await attempt("reading the Worker", () => getWorker(account, name));
+  if (worker && worker.id === state.owned.workerId) {
+    namespaces = (await attempt("listing the Durable Object namespaces", () => namespacesOf(account, name))) ?? [];
+    const deleted = await attempt("deleting the Worker", () => deleteWorker(account, name));
+    if (deleted) console.log("Deleted the Worker " + name + " (id " + worker.id + ")");
+    const left = await attempt("checking the Durable Object namespaces", () => namespacesOf(account, name));
+    if (left?.length) problems.push("Durable Object namespaces of " + name + " remain: " + left.map((namespace) => namespace.class + " " + namespace.id).join(", "));
+    else if (left) console.log("No Durable Object namespace of " + name + " remains (" + (namespaces.map((namespace) => namespace.class).join(", ") || "none") + " deleted with the Worker)");
+  } else if (worker) {
+    problems.push("a Worker named " + name + " (id " + worker.id + ") exists, but this run did not record creating it, so it was left alone");
+  } else if (state.owned.workerId) {
+    console.log("The Worker " + name + " this run created is already gone");
+  }
 
-  console.log("Waiting 60 s for the Analytics API to catch up");
-  await sleep(60_000);
-  const deployments = state?.deployments ?? [];
+  let storage: Storage | undefined;
+  const bucket = await attempt("reading the R2 bucket", () => getBucket(account, name));
+  if (bucket && bucket.creationDate === state.owned.bucketCreationDate) {
+    storage = await attempt("emptying and deleting the R2 bucket", () => emptyAndDeleteBucket(account, name));
+    if (storage) console.log("Deleted the R2 bucket " + name + " and its " + storage.objects + " objects");
+  } else if (bucket) {
+    problems.push("an R2 bucket named " + name + " (created " + bucket.creationDate + ") exists, but this run did not record creating it, so it was left alone");
+  } else if (state.owned.bucketCreationDate) {
+    console.log("The R2 bucket " + name + " this run created is already gone");
+  }
+  if (!state.owned.workerId && !state.owned.bucketCreationDate) console.log("This run created nothing, so teardown deleted nothing");
+
+  const deployments = state.deployments;
   const rows: [string, string][] = [
     ["Worker and bucket", name],
     ["Deployed", deployments.map((deployment) => deployment.ref + " (" + deployment.sha.slice(0, 12) + ", version " + deployment.versionId + ")").join(", then ") || "nothing"],
-    ["Test client requests", state ? state.stats.requests + " HTTPS and WebSocket requests, " + bytes(state.stats.bytesUp) + " sent, " + bytes(state.stats.bytesDown) + " received" : "unknown"],
-    ["R2 storage at teardown", storage ? storage.objects + " objects, " + bytes(storage.bytes) : "no bucket"],
+    ["Test client requests", state.stats.requests + " HTTPS and WebSocket requests, " + bytes(state.stats.bytesUp) + " sent, " + bytes(state.stats.bytesDown) + " received"],
+    ["R2 storage at teardown", storage ? storage.objects + " objects, " + bytes(storage.bytes) : "no bucket deleted"],
     ["  chunks", storage ? storage.chunkObjects + " objects, " + bytes(storage.chunkBytes) : "-"],
     ["  metadata export", storage ? storage.exportObjects + " objects, " + bytes(storage.exportBytes) : "-"],
-    ["Durable Object namespaces", namespaces.map((namespace) => namespace.class).join(", ") || "none found"],
-    ...(await analytics(account, state, namespaces)),
+    ["Durable Object namespaces", namespaces.map((namespace) => namespace.class).join(", ") || "none deleted"],
   ];
+  if (deployments.length > 0) {
+    console.log("Waiting 60 s for the Analytics API to catch up");
+    await sleep(60_000);
+    rows.push(...(await analytics(account, state, namespaces)));
+  }
   const width = Math.max(...rows.map(([label]) => label.length));
   console.log("\nCost-relevant usage of this run (Analytics API figures can lag by several minutes):");
   for (const [label, value] of rows) console.log("  " + label.padEnd(width) + "  " + value);
@@ -416,7 +502,7 @@ async function teardown(account: Account): Promise<void> {
 
   if (problems.length > 0) {
     for (const problem of problems) console.error("::error::teardown: " + problem);
-    fail("teardown left resources behind or could not check them; delete the Worker and the R2 bucket named " + name + " in the dashboard");
+    fail("teardown could not delete everything this run created, or found resources it did not create; check the Worker and R2 bucket named " + name + " in the dashboard");
   }
 }
 
