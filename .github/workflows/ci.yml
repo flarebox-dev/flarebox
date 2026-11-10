@@ -25,7 +25,6 @@ jobs:
       server_macos: ${{ steps.paths.outputs.server_macos }}
       spec_macos: ${{ steps.paths.outputs.spec_macos }}
       macos_app: ${{ steps.paths.outputs.macos_app }}
-      macos_release: ${{ steps.paths.outputs.macos_release }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -34,11 +33,11 @@ jobs:
         id: paths
         env:
           EVENT: ${{ github.event_name }}
-          BASE: ${{ github.event.pull_request.base.sha }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
         run: |
-          if [ "$EVENT" != pull_request ]; then
-            echo "Event $EVENT: every macOS job runs."
-            printf '%s=true\n' rust_macos server_macos spec_macos macos_app macos_release >> "$GITHUB_OUTPUT"
+          if [ "$EVENT" = push ]; then
+            echo "Push to $GITHUB_REF: every macOS job runs."
+            printf '%s=true\n' rust_macos server_macos spec_macos macos_app >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git fetch --no-tags --depth=1 origin "$BASE"
@@ -46,7 +45,7 @@ jobs:
             echo "::error::git diff between $BASE and HEAD failed, so the changed paths are unknown."
             exit 1
           fi
-          echo "Files this pull request changes:"
+          echo "Files this $EVENT run changes against $BASE:"
           printf '%s\n' "$changed"
           decide() {
             if grep -Eq "$2" <<<"$changed"; then
@@ -61,7 +60,6 @@ jobs:
           decide server_macos '^(\.github/workflows/ci\.yml$|server/|spec/)'
           decide spec_macos '^(\.github/workflows/ci\.yml$|spec/|server/src/gen/|core/proto/)'
           decide macos_app '^(\.github/workflows/ci\.yml$|Cargo\.(toml|lock)$|cli/Cargo\.toml$|rust-toolchain\.toml$|\.cargo/|core/|apps/macos/)'
-          decide macos_release '^(\.github/workflows/ci\.yml$|Cargo\.(toml|lock)$|cli/Cargo\.toml$|rust-toolchain\.toml$|\.cargo/|core/|apps/macos/)'
 
   rust:
     name: rust (${{ matrix.os }})
@@ -248,43 +246,6 @@ jobs:
     name: macos app
     needs: changes
     if: needs.changes.outputs.macos_app == 'true'
-    runs-on: macos-latest
-    defaults:
-      run:
-        working-directory: apps/macos
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Install toolchain from rust-toolchain.toml
-        run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - name: Show Xcode and Swift versions
-        run: xcodebuild -version && swift --version
-      - name: Build the Rust core and generate the Swift bindings
-        run: scripts/build-ffi.sh
-      - name: Test the Swift bindings
-        run: swift test --package-path FlareboxFFI
-      - name: Generate the Xcode project with the pinned XcodeGen
-        run: scripts/generate-project.sh
-      - name: Build the app (unsigned)
-        run: >-
-          xcodebuild -project Flarebox.xcodeproj -scheme Flarebox -configuration Release
-          -derivedDataPath build/DerivedData -destination "platform=macOS,arch=$(uname -m)"
-          CODE_SIGNING_ALLOWED=NO build
-      - name: Check the app bundle
-        run: |
-          app=build/DerivedData/Build/Products/Release/Flarebox.app
-          if [ ! -x "$app/Contents/MacOS/Flarebox" ]; then
-            echo "::error::xcodebuild reported success but $app/Contents/MacOS/Flarebox is missing."
-            exit 1
-          fi
-          plutil -p "$app/Contents/Info.plist"
-
-  macos-release-unsigned:
-    name: macos release (unsigned)
-    needs: changes
-    if: needs.changes.outputs.macos_release == 'true'
     runs-on: macos-26
     timeout-minutes: 45
     env:
@@ -298,12 +259,17 @@ jobs:
           persist-credentials: false
       - name: Test notarize.sh against a stub notarytool
         run: scripts/test-notarize.sh
-      - name: Show Xcode and Swift versions
-        run: xcodebuild -version && swift --version
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
-      - name: Build the app
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Show Xcode and Swift versions
+        run: xcodebuild -version && swift --version
+      - name: Build the Rust core, the Swift bindings and the app (unsigned)
         run: scripts/build-release.sh
+      - name: Test the Swift bindings
+        run: swift test --package-path FlareboxFFI
+      - name: Check the app bundle
+        run: plutil -p build/release/Flarebox.app/Contents/Info.plist
       - name: Sign the app ad hoc (pull requests are never signed with the Developer ID)
         run: scripts/sign-app.sh build/release/Flarebox.app -
       - name: Package the disk image
@@ -323,7 +289,7 @@ jobs:
   ci-report:
     name: ci-report
     if: always()
-    needs: [changes, rust, server, server-deploy, net-integration, cli-integration, ffi-integration, spec, macos-app, macos-release-unsigned]
+    needs: [changes, rust, server, server-deploy, net-integration, cli-integration, ffi-integration, spec, macos-app]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any CI job failed or was cancelled
@@ -337,28 +303,24 @@ jobs:
           FFI_INTEGRATION: ${{ needs.ffi-integration.result }}
           SPEC: ${{ needs.spec.result }}
           MACOS_APP: ${{ needs.macos-app.result }}
-          MACOS_RELEASE: ${{ needs.macos-release-unsigned.result }}
           FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
         run: |
-          echo "changes: $CHANGES, rust: $RUST, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, cli-integration: $CLI_INTEGRATION, ffi-integration: $FFI_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP, macos-release-unsigned: $MACOS_RELEASE"
+          echo "changes: $CHANGES, rust: $RUST, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, cli-integration: $CLI_INTEGRATION, ffi-integration: $FFI_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP"
           if [ "$FAILED" = "true" ]; then
-            echo "::error::At least one CI job failed or was cancelled (changes: $CHANGES, rust: $RUST, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, cli-integration: $CLI_INTEGRATION, ffi-integration: $FFI_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP, macos-release-unsigned: $MACOS_RELEASE). Open that job's log for the cause."
+            echo "::error::At least one CI job failed or was cancelled (changes: $CHANGES, rust: $RUST, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, cli-integration: $CLI_INTEGRATION, ffi-integration: $FFI_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP). Open that job's log for the cause."
             exit 1
           fi
-      - name: Fail unless every macOS job ran, outside pull requests
-        if: github.event_name != 'pull_request'
+      - name: Fail unless every macOS job ran on a push to main
+        if: github.event_name == 'push'
         env:
-          EVENT: ${{ github.event_name }}
           RUST_MACOS: ${{ needs.changes.outputs.rust_macos }}
           SERVER_MACOS: ${{ needs.changes.outputs.server_macos }}
           SPEC_MACOS: ${{ needs.changes.outputs.spec_macos }}
           MACOS_APP_WANTED: ${{ needs.changes.outputs.macos_app }}
           MACOS_APP: ${{ needs.macos-app.result }}
-          MACOS_RELEASE_WANTED: ${{ needs.changes.outputs.macos_release }}
-          MACOS_RELEASE: ${{ needs.macos-release-unsigned.result }}
         run: |
-          echo "macOS jobs in $EVENT: rust $RUST_MACOS, server $SERVER_MACOS, spec $SPEC_MACOS, macos app $MACOS_APP_WANTED ($MACOS_APP), macos release (unsigned) $MACOS_RELEASE_WANTED ($MACOS_RELEASE)"
-          if [ "$RUST_MACOS" != true ] || [ "$SERVER_MACOS" != true ] || [ "$SPEC_MACOS" != true ] || [ "$MACOS_APP_WANTED" != true ] || [ "$MACOS_APP" != success ] || [ "$MACOS_RELEASE_WANTED" != true ] || [ "$MACOS_RELEASE" != success ]; then
-            echo "::error::In $EVENT every macOS job must run and pass, but rust ${RUST_MACOS:-unknown}, server ${SERVER_MACOS:-unknown}, spec ${SPEC_MACOS:-unknown}, macos app ${MACOS_APP_WANTED:-unknown} ($MACOS_APP), macos release (unsigned) ${MACOS_RELEASE_WANTED:-unknown} ($MACOS_RELEASE). Only pull requests may skip a macOS job."
+          echo "macOS jobs on this push: rust $RUST_MACOS, server $SERVER_MACOS, spec $SPEC_MACOS, macos app $MACOS_APP_WANTED ($MACOS_APP)"
+          if [ "$RUST_MACOS" != true ] || [ "$SERVER_MACOS" != true ] || [ "$SPEC_MACOS" != true ] || [ "$MACOS_APP_WANTED" != true ] || [ "$MACOS_APP" != success ]; then
+            echo "::error::A push to main must run and pass every macOS job, but rust ${RUST_MACOS:-unknown}, server ${SERVER_MACOS:-unknown}, spec ${SPEC_MACOS:-unknown}, macos app ${MACOS_APP_WANTED:-unknown} ($MACOS_APP). Only pull requests and the merge queue may skip a macOS job."
             exit 1
           fi
