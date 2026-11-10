@@ -1285,7 +1285,8 @@ pub struct NativeWatcher {
     changed_rules: Vec<(PathBuf, Option<Vec<u8>>)>,
     /// Folders whose subfolders may be unwatched, which are registered once a
     /// scan has read them: the folders a scan could not read that no scan has
-    /// read since, and the root while it waits for a scan to read the rules.
+    /// read since, the root while it waits for a scan to read the rules, and
+    /// a folder a reset made known, which no scan reports as created.
     #[cfg(target_os = "linux")]
     blocked: BTreeSet<PathBuf>,
     rewatch: bool,
@@ -1646,6 +1647,12 @@ impl Watcher for NativeWatcher {
     }
 
     fn reset(&mut self, scope: &Path, known: BTreeMap<PathBuf, Known>) {
+        #[cfg(target_os = "linux")]
+        if scope.as_os_str().is_empty()
+            || (known.get(scope)).is_some_and(|known| known.kind == EntryKind::Dir)
+        {
+            self.blocked.insert(scope.to_path_buf());
+        }
         self.snapshot.reset(scope, known);
         self.dirty.insert(scope.to_path_buf());
     }

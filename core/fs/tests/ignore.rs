@@ -791,3 +791,33 @@ fn a_reset_to_entries_the_rules_leave_out_reports_nothing_for_them() {
     );
     assert_eq!(known(&snapshot), [RULES_FILE, "d", "d/g.txt"]);
 }
+
+/// A folder that a reset makes known is never reported as created, which is
+/// how the watcher on Linux learns of a folder to register.
+#[test]
+fn native_watcher_reports_a_change_below_a_folder_that_a_reset_made_known() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    write(&root, "keep.txt", "k");
+    let mut watcher = NativeWatcher::start_with_rules(&root, Snapshot::default(), rules()).unwrap();
+    expect(&mut watcher, &[created("keep.txt", File)], &[]);
+
+    fs::create_dir_all(root.join("made/sub")).unwrap();
+    let known = (Snapshot::scan(&root).unwrap().entries.into_iter())
+        .filter(|(path, _)| path.starts_with("made"))
+        .map(|(path, entry)| {
+            let (kind, id) = (entry.kind, entry.id);
+            (path, Known { kind, id })
+        })
+        .collect();
+    watcher.reset(Path::new("made"), known);
+    let poll = watcher.poll(Duration::from_millis(500)).unwrap();
+    assert_eq!(
+        poll.changes,
+        [],
+        "the reset told the watcher of the folders"
+    );
+
+    write(&root, "made/sub/new.txt", "n");
+    expect(&mut watcher, &[created("made/sub/new.txt", File)], &[]);
+}
