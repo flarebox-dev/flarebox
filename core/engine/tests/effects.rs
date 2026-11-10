@@ -727,6 +727,30 @@ fn done_takes_only_the_effect_in_flight_and_a_created_entry_needs_its_identity()
 
 /// One node's draw for one tree: ⊥, or its rank, a parent choice and a name.
 type Draw = Option<(u8, u8, u8)>;
+/// GUN-334. The server trashed `f`, and its removal was in flight when another device's commit
+/// restored it (R8). The removal is the engine's own, not the user's, so `f` is downloaded again
+/// and no Delete is sent for it.
+#[test]
+fn a_file_an_effect_removes_after_the_server_restored_it_is_downloaded_again() {
+    let (mut trees, mut disk) = space(&[("f", Some(file(ROOT, "f", 1)), None)]);
+    trees.settle();
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    let record = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    assert!(matches!(record.effect, Effect::RemoveFile { .. }));
+
+    trees.set_remote("f".into(), remote(file(ROOT, "f", 1)));
+    let created = disk.apply(&record.effect).unwrap();
+    effects
+        .done(&mut trees, &record.effect_id, created)
+        .unwrap();
+    trees.check().unwrap();
+    trees.settle();
+    assert_eq!(trees.class("f"), Class::Remote);
+
+    let done = converge(&mut trees, &mut disk, 10).unwrap();
+    assert!(matches!(done[..], [Effect::WriteFile { .. }]), "{done:?}");
+    assert_in_sync(&mut trees);
+}
 
 /// A valid tree over `n0`, `n1`, ... from one [`Draw`] per node, as in tests/trees.rs, where each
 /// node has the kind and file content of `kinds`. S and R are drawn with their own ranks, so their

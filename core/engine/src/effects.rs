@@ -12,7 +12,7 @@ use crate::ignore::is_rules_file;
 
 use crate::names::name_key;
 use crate::state::{EffectsState, StateError};
-use crate::tree::{Content, FileIdentity, Kind, LocalNode, NodeId, Shape, same_content};
+use crate::tree::{Content, FileIdentity, Kind, LocalNode, NodeId, Shape, same, same_content};
 
 /// A directory on the way to an entry, with the identity L holds for it. The driver resolves a
 /// location one directory at a time and fails the effect when an identity differs (section 5.2).
@@ -292,7 +292,12 @@ impl Effects {
     }
 
     /// The driver did the effect. L takes the node's new shape, with `identity` for an entry the
-    /// effect created.
+    /// effect created. An effect other than a move gave L the shape R had when it was planned, so S
+    /// takes that shape too, when S stays a valid tree. A change R made while the effect was in
+    /// flight then stays a remote change and is never taken for the user's. S stays as it is when
+    /// L no longer matched S: L then holds a change of the user's, which recovery after a crash
+    /// can report as the effect's outcome (a missing file as the removal, the planned bytes as the
+    /// write), and that change stays the user's.
     pub fn done(
         &mut self,
         trees: &mut Trees,
@@ -314,6 +319,13 @@ impl Effects {
         };
         let record = self.take(effect_id)?;
         let parked = record.parks();
+        let unchanged = same(
+            trees.local().live(&record.node),
+            trees.synced().live(&record.node),
+        );
+        if unchanged && !matches!(record.effect, Effect::Move { .. }) {
+            trees.set_synced_if_valid(record.node.clone(), record.after.clone());
+        }
         match record.after {
             None => trees.remove_local(&record.node),
             Some(shape) => trees.set_local(
