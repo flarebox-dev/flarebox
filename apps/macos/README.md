@@ -1,6 +1,6 @@
 # Flarebox for macOS
 
-A menu bar app that links the Rust core through [UniFFI](https://mozilla.github.io/uniffi-rs/). The session runs against `FakeCore` in `core/ffi`, which plays back scripted states, until the driver that runs the sync engine exists. Nothing is synced yet, and there is no File Provider extension.
+A menu bar app that links the Rust core through [UniFFI](https://mozilla.github.io/uniffi-rs/). It has a menu bar menu (status, progress, recent changes, notices, pause and resume, open folder), a first-run setup window (server, sign-in, folder), a questions window, and settings (linked folders, account, problems, open at login). The session runs against `FakeCore` in `core/ffi`, which plays back scripted states, until the driver that runs the sync engine exists. Nothing is synced yet, and there is no File Provider extension.
 
 ## Requirements
 
@@ -17,7 +17,7 @@ Run these from `apps/macos`:
 # 1. Build core/ffi as a static library and generate the Swift bindings.
 scripts/build-ffi.sh
 
-# 2. Test the bindings: Swift calls into Rust and checks the event stream, sign-in, linking and questions.
+# 2. Test the bindings and the app's models.
 swift test --package-path FlareboxFFI
 
 # 3. Generate Flarebox.xcodeproj from project.yml.
@@ -30,7 +30,15 @@ xcodebuild -project Flarebox.xcodeproj -scheme Flarebox -configuration Release \
 open build/DerivedData/Build/Products/Release/Flarebox.app
 ```
 
-You can also open `Flarebox.xcodeproj` in Xcode after step 3 and run the Flarebox scheme. Local builds are signed ad hoc, so no Apple developer account is needed.
+The fake keeps its state in `~/Library/Application Support/Flarebox`, so the account, folders and unanswered questions survive a relaunch. To start from a scripted state instead, pass a scenario, which replaces the saved state:
+
+```sh
+open build/DerivedData/Build/Products/Release/Flarebox.app --args -FakeScenario manyQuestions
+```
+
+The scenarios are `firstRun`, `upToDate`, `syncing`, `paused`, `offline`, `massDelete`, `ambiguousDisappearance`, `recovery`, `recoveredWithoutQuestions`, `remoteMassDelete`, `manyQuestions` and `problems`.
+
+You can also open `Flarebox.xcodeproj` in Xcode after step 3 and run the Flarebox scheme; the views have SwiftUI previews for these scenarios. Local builds are signed ad hoc, so no Apple developer account is needed.
 
 Run `scripts/build-ffi.sh` again after every change to `core/ffi`. It rebuilds the Rust library and regenerates the Swift API together. UniFFI checksums stop the app at launch when the library and the bindings disagree on the API, but they do not detect a build that is merely out of date: an old library with its matching bindings still launches.
 
@@ -38,9 +46,9 @@ Run `scripts/build-ffi.sh` again after every change to `core/ffi`. It rebuilds t
 
 | Path | Contents |
 |---|---|
-| `Flarebox/` | The SwiftUI menu bar app. |
+| `Flarebox/` | The SwiftUI menu bar app and its windows. User-facing text is in `Localizable.xcstrings`, with English as the base language. |
 | `project.yml` | The XcodeGen spec for `Flarebox.xcodeproj`. The generated project is not checked in, so edit `project.yml` and run `scripts/generate-project.sh` again after changing it or adding or removing source files. |
-| `FlareboxFFI/` | A Swift package that wraps the Rust core: the generated bindings, the static library as an XCFramework, and the tests. |
+| `FlareboxFFI/` | A Swift package: the `FlareboxFFI` library wraps the Rust core (the generated bindings and the static library as an XCFramework), and `FlareboxModel` holds the app's view models. Both have tests. |
 | `scripts/generate-project.sh` | Generates `Flarebox.xcodeproj` with the pinned XcodeGen. |
 | `scripts/build-ffi.sh` | Builds the Rust library and fills in `FlareboxFFI/Frameworks` and `FlareboxFFI/Sources`. These generated files are not checked in. |
 
