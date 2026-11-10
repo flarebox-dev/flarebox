@@ -121,8 +121,8 @@ export function redeemClaim(sql: SqlStorage, attempt: ClaimAttempt): ClaimOutcom
   return { ok: true };
 }
 
+/** A wrong key counts and throttles the same with or without a configured key, so answers do not reveal whether one is. */
 function recover(sql: SqlStorage, attempt: ClaimAttempt): ClaimOutcome {
-  if (!attempt.recoveryKeyHash) return refused("this deployment already has an owner");
   const key = presentedKey(attempt);
   if (!key) return wrong(sql, "recovery", attempt, "this deployment already has an owner");
   const spent = spendKey(sql, key, attempt.nowMs);
