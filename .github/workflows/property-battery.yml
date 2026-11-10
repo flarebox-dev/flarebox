@@ -29,8 +29,6 @@ on:
         default: false
   schedule:
     - cron: '17 18 * * *'
-  push:
-    branches: [ci/property-battery]
 
 permissions: {}
 
