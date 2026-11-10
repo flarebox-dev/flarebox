@@ -500,11 +500,24 @@ impl Trees {
     }
 
     /// Replaces the dirty, unsearched, reverted, parked and waiting nodes with `state`, once the
-    /// store has loaded every node. Refuses trees that break section 2.2, an unsearched node that
-    /// is not dirty, and a parked name for a node L does not hold as parked.
+    /// store has loaded every node. Refuses trees that break section 2.2, a node that is not dirty
+    /// although it is parked or not in sync, an unsearched node that is not dirty, and a parked
+    /// name for a node L does not hold as parked.
     pub fn restore(&mut self, state: TreesState) -> Result<(), StateError> {
         self.check()
             .map_err(|(tree, error)| StateError::Tree(tree, error))?;
+        let ids = (self.r.iter().map(|(id, _)| id))
+            .chain(self.l.iter().map(|(id, _)| id))
+            .chain(self.s.iter().map(|(id, _)| id));
+        let settled = |id: &NodeId| {
+            self.class(id) == Class::InSync && !self.l.get(id).is_some_and(|node| node.parked)
+        };
+        if let Some(id) = ids
+            .filter(|id| !state.dirty.contains(*id))
+            .find(|id| !settled(id))
+        {
+            return Err(StateError::NotDirty(id.clone()));
+        }
         if let Some(id) = state.unsearched.difference(&state.dirty).next() {
             return Err(StateError::UnsearchedNotDirty(id.clone()));
         }

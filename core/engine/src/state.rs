@@ -71,6 +71,8 @@ pub struct EffectsState {
 pub enum StateError {
     /// R, L or S, named by its letter, is not a valid tree.
     Tree(char, TreeError),
+    /// A node is parked or not in sync but not dirty, so settling and planning would skip it.
+    NotDirty(NodeId),
     /// A node is unsearched but not dirty.
     UnsearchedNotDirty(NodeId),
     /// A node has a parked name but L does not hold it as parked.

@@ -138,12 +138,49 @@ fn trees_restore_a_valid_state_and_refuse_each_broken_one() {
     let orphan = broken(trees(), |trees| {
         trees.set_remote("o".into(), remote(dir("gone", "o")));
     });
+    let downloaded = broken(trees(), |trees| {
+        trees.set_remote("n".into(), remote(dir(ROOT, "n")));
+    });
+    let uploaded = broken(trees(), |trees| {
+        let node = LocalNode {
+            shape: dir(ROOT, "n"),
+            identity: FileIdentity {
+                dev: 1,
+                ino: 9,
+                birth_ns: Some(0),
+            },
+            parked: false,
+        };
+        trees.set_local("n".into(), node);
+    });
     let cases = [
         (
             "a node of R whose parent is missing",
             orphan,
             trees_state(),
             StateError::Tree('R', TreeError::MissingParent("o".into())),
+        ),
+        (
+            "a node only R holds that is not dirty",
+            downloaded,
+            trees_state(),
+            StateError::NotDirty("n".into()),
+        ),
+        (
+            "a node only L holds that is not dirty",
+            uploaded,
+            trees_state(),
+            StateError::NotDirty("n".into()),
+        ),
+        (
+            "a parked node that is not dirty",
+            trees(),
+            TreesState {
+                dirty: Default::default(),
+                unsearched: Default::default(),
+                ..trees_state()
+            },
+            StateError::NotDirty("b".into()),
         ),
         (
             "an unsearched node that is not dirty",
