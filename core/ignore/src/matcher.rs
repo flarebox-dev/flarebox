@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::pattern::{LineError, RuleFile, key};
+use crate::pattern::{LineError, RuleFile, key, units};
 use crate::{NameKey, RULES_FILE};
 
 /// Platform files excluded in every directory (design §5.1).
@@ -239,7 +239,6 @@ impl<K: NameKey> Matcher<K> {
             matcher: self,
             dir: Vec::new(),
             text: Vec::new(),
-            starts: Vec::new(),
             files: self
                 .files
                 .get(&Vec::new())
@@ -350,8 +349,6 @@ pub struct Scope<'a, K> {
     dir: Vec<String>,
     /// The same path, components joined by `/`.
     text: Vec<char>,
-    /// Where each component of the path starts in `text`.
-    starts: Vec<usize>,
     /// The rules files of the directory and its ancestors, with their depths, root first.
     files: Vec<(usize, &'a RuleFile<K>)>,
     include: Include,
@@ -379,11 +376,9 @@ impl<'a, K: NameKey> Scope<'a, K> {
             return Err(reason);
         }
         let mut text = self.text.clone();
-        let mut starts = self.starts.clone();
-        if !starts.is_empty() {
+        if !self.dir.is_empty() {
             text.push('/');
         }
-        starts.push(text.len());
         text.extend(name.chars());
         let mut dir = self.dir.clone();
         dir.push(name);
@@ -395,7 +390,6 @@ impl<'a, K: NameKey> Scope<'a, K> {
             matcher: self.matcher,
             dir,
             text,
-            starts,
             files,
             include: include.unwrap_or(Include::All),
         })
@@ -419,7 +413,7 @@ impl<'a, K: NameKey> Scope<'a, K> {
     /// below it.
     fn evaluate(&self, name: &str, kind: Kind) -> (Status, Option<Include>) {
         let matcher = self.matcher;
-        let depth = self.starts.len();
+        let depth = self.dir.len();
         if matcher.platform_files.iter().any(|f| f == name)
             || (depth == 0 && name == matcher.state_dir)
         {
@@ -436,22 +430,29 @@ impl<'a, K: NameKey> Scope<'a, K> {
         if depth > 0 {
             text.push('/');
         }
-        let start = text.len();
         text.extend(name.chars());
-        let basename = &text[start..];
+        let units = units(&text);
+        let mut starts = vec![0];
+        starts.extend(
+            units
+                .iter()
+                .enumerate()
+                .filter(|(_, unit)| **unit == ['/'])
+                .map(|(i, _)| i + 1),
+        );
+        let basename = &units[starts[depth]..];
         let is_dir = kind == Kind::Dir;
 
         if matcher
             .local
             .exclude
-            .last_match(&text, basename, is_dir)
+            .last_match(&units, basename, is_dir)
             .is_some_and(|rule| !rule.negated)
         {
             return (Status::Excluded(Reason::Local), None);
         }
         for &(file_depth, file) in self.files.iter().rev() {
-            let offset = self.starts.get(file_depth).copied().unwrap_or(start);
-            if let Some(rule) = file.last_match(&text[offset..], basename, is_dir) {
+            if let Some(rule) = file.last_match(&units[starts[file_depth]..], basename, is_dir) {
                 if rule.negated {
                     break;
                 }
@@ -471,7 +472,7 @@ impl<'a, K: NameKey> Scope<'a, K> {
         let Include::Within(ids) = &self.include else {
             return Some(Include::All);
         };
-        let depth = self.starts.len();
+        let depth = self.dir.len();
         let mut on_the_way = Vec::new();
         for &id in ids {
             let entry = &self.matcher.local.include[id];

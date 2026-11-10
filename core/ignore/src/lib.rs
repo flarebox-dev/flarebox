@@ -36,11 +36,19 @@
 //! # Names
 //!
 //! Patterns and names are compared in the form the engine compares names in (design §5.5): the
-//! name key of [`NameKey::key`] (`name_key` in production), then NFC. A pattern therefore means
-//! the same thing on case-sensitive and case-insensitive volumes and for NFC and NFD spellings.
-//! `?`, `*` and bracket expressions match characters of that form, so `ß` is matched as `ss`.
-//! A bracket range matches a character, or the character's uppercase form when that has the same
-//! key, which is git's `core.ignorecase` rule for ASCII. The POSIX classes are ASCII-only, as in git.
+//! name key of [`NameKey::key`] (`name_key` in production), then NFC. Each pattern line is also
+//! normalized to NFC before it is parsed. A pattern therefore means the same thing on
+//! case-sensitive and case-insensitive volumes, and NFC and NFD spellings of a pattern or a name
+//! are interchangeable.
+//!
+//! `?`, `*` and bracket expressions match characters of that form, where a character is a code
+//! point with the combining marks that follow it (canonical combining class other than 0). So
+//! `?` and `[q\u{301}]` match `q\u{301}`, which has no composed form, and `[q\u{301}]`
+//! does not match `q`. A range endpoint must be one code point; a line where an endpoint carries
+//! combining marks is invalid ([`LineError::CombiningMarkInRange`]). A key that is longer than its
+//! name is matched as written: `ß` is matched as `ss`. A bracket range matches a character, or
+//! the character's uppercase form when that has the same key, which is git's `core.ignorecase`
+//! rule for ASCII. The POSIX classes are ASCII-only, as in git.
 //!
 //! # Changes
 //!
@@ -56,11 +64,17 @@
 //! - Case folding is Unicode full case folding through the name key, and it covers the members of
 //!   bracket expressions. Git with `core.ignorecase` folds ASCII only and leaves bracket members
 //!   and escaped letters as written, so in git `[A]` and `\A` match no letter at all.
-//! - Wildcards match characters; git matches bytes, so its `?` matches one byte of a UTF-8 name.
+//! - Wildcards match characters with their combining marks; git matches bytes, so its `?`
+//!   matches one byte of a UTF-8 name. Git also compares patterns and names byte for byte, so an
+//!   NFD pattern does not match an NFC name there.
 //! - A `.fbignore` file in an included directory is never excluded; git can ignore a `.gitignore`.
 //! - Lines git keeps as patterns that can never match are reported as invalid ([`LineError`]): an
-//!   unclosed `[`, an unknown `[:class:]`, a trailing `\`. So are lines that are not UTF-8 or
+//!   unclosed `[`, an unknown `[:class:]`, a trailing `\`. So are range endpoints with combining
+//!   marks, which git reads as bytes, and lines that are not UTF-8 or
 //!   hold a NUL byte; git would cut the pattern at the NUL.
+//! - `**` is special only at the start or end of a pattern or between slashes, as git documents
+//!   and git 2.54 does. Git 2.39 also treats it as special right after the literal start of a
+//!   pattern that contains a slash, so there `ü**/*` matches `ü`.
 
 mod matcher;
 mod pattern;

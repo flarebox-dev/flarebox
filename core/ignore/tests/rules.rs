@@ -211,6 +211,75 @@ fn names_match_by_key_after_nfc() {
     assert!(excluded(&m, "x1"));
 }
 
+/// The same pattern spelled NFC or NFD, with Kelvin and Ångström signs or their canonical letters,
+/// selects the same names (review of flarebox#50).
+#[test]
+fn equivalent_pattern_spellings_select_the_same_names() {
+    let names = [
+        "e", "E", "\u{e9}", "e\u{301}", "\u{c9}", "E\u{301}", "q", "q\u{301}", "Q\u{301}",
+        "\u{e5}", "\u{c5}", "A\u{30a}", "k", "\u{212a}", "\u{212b}", "x", "ss", "\u{df}",
+    ];
+    let spellings: &[&[&str]] = &[
+        &["[\u{e9}]", "[e\u{301}]", "[E\u{301}]", "[\u{c9}]"],
+        &["[!\u{e9}]", "[!e\u{301}]"],
+        &["[K-\u{c5}]", "[\u{212a}-\u{212b}]", "[K-A\u{30a}]"],
+        &["[q\u{301}]", "[Q\u{301}]"],
+        &["\u{e9}", "e\u{301}", "\\e\u{301}", "\\\u{e9}"],
+        &["?", "[!/]"],
+        &["\u{df}", "ss", "SS"],
+    ];
+    for group in spellings {
+        let selected = |pattern: &str| -> Vec<&str> {
+            let m = matcher(&[("", &format!("{pattern}\n"))]);
+            names
+                .iter()
+                .copied()
+                .filter(|name| excluded(&m, name))
+                .collect()
+        };
+        let first = selected(group[0]);
+        for pattern in &group[1..] {
+            assert_eq!(
+                selected(pattern),
+                first,
+                "{pattern:?} against {:?}",
+                group[0]
+            );
+        }
+    }
+
+    let m = matcher(&[("", "[e\u{301}]\n")]);
+    assert!(excluded(&m, "\u{e9}") && excluded(&m, "E\u{301}"));
+    assert!(!excluded(&m, "e"), "a plain e is not \u{e9}");
+    let m = matcher(&[("", "[q\u{301}]\n?x\n")]);
+    assert!(excluded(&m, "q\u{301}"));
+    assert!(!excluded(&m, "q"));
+    assert!(
+        excluded(&m, "q\u{301}x"),
+        "? takes a character with its marks"
+    );
+    let m = matcher(&[("", "[K-\u{c5}]\n")]);
+    assert!(excluded(&m, "\u{e5}") && excluded(&m, "\u{212b}") && excluded(&m, "k"));
+}
+
+#[test]
+fn a_range_endpoint_with_combining_marks_is_invalid() {
+    let file = RuleFile::<Folded>::parse("[a-q\u{301}]\n[q\u{301}-z]\n[q\u{301}-]\n".as_bytes());
+    assert_eq!(
+        file.invalid_lines(),
+        [
+            InvalidLine {
+                line: 1,
+                error: LineError::CombiningMarkInRange
+            },
+            InvalidLine {
+                line: 2,
+                error: LineError::CombiningMarkInRange
+            },
+        ]
+    );
+}
+
 #[test]
 fn gitignore_syntax() {
     let cases: &[(&str, &[&str], &[&str])] = &[
@@ -458,4 +527,13 @@ fn a_scope_walk_refuses_excluded_directories() {
     assert_eq!(app.status("x.tmp", Kind::File), rule(1, 1));
     assert_eq!(app.status("x.txt", Kind::File), Status::Included);
     assert!(app.enter("node_modules").is_err());
+}
+
+/// The closure over `**/` is a loop, so a long pattern cannot overflow the stack (review of
+/// flarebox#50).
+#[test]
+fn a_long_globstar_chain_matches_without_recursion() {
+    let m = matcher(&[("", &format!("{}a\n", "**/".repeat(50_000)))]);
+    assert_eq!(status(&m, "x/y/a"), rule(0, 1));
+    assert_eq!(status(&m, "b"), Status::Included);
 }

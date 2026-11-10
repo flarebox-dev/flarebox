@@ -1,13 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Property tests: incremental updates against evaluating everything again, the invariants of
-//! design §5.10 on random trees, and the parser on arbitrary bytes.
+//! design §5.10 on random trees, equivalent Unicode spellings, and the parser on arbitrary bytes.
 
 use std::collections::BTreeMap;
 
 use flarebox_ignore::{Change, Kind, LocalRules, Matcher, NameKey, Reason, RuleFile, Status};
 use proptest::prelude::*;
 use proptest::sample::Index;
+
+struct Exact;
+
+impl NameKey for Exact {
+    fn key(name: &str) -> String {
+        name.to_owned()
+    }
+}
 
 struct Folded;
 
@@ -138,6 +146,64 @@ fn build(tree: &Tree, files: &[(Index, String)], local: LocalRules<Folded>) -> M
     matcher
 }
 
+/// Pieces of patterns and names, each with its canonically equivalent spellings; the first is
+/// NFC.
+const PATTERN_PIECES: &[&[&str]] = &[
+    &["\u{e9}", "e\u{301}"],
+    &["\u{c9}", "E\u{301}"],
+    &["\u{c5}", "A\u{30a}", "\u{212b}"],
+    &["K", "\u{212a}"],
+    &["q\u{301}"],
+    &["a"],
+    &["e"],
+    &["?"],
+    &["*"],
+    &["/"],
+    &["**"],
+    &["[\u{e9}a]", "[e\u{301}a]"],
+    &["[!\u{c9}]", "[!E\u{301}]"],
+    &["[K-\u{c5}]", "[\u{212a}-\u{212b}]", "[K-A\u{30a}]"],
+    &["[q\u{301}e]"],
+    &["\\\u{e9}", "\\e\u{301}"],
+];
+
+const NAME_PIECES: &[&[&str]] = &[
+    &["\u{e9}", "e\u{301}"],
+    &["\u{c9}", "E\u{301}"],
+    &["\u{c5}", "A\u{30a}", "\u{212b}"],
+    &["K", "\u{212a}"],
+    &["q\u{301}"],
+    &["\u{e5}", "a\u{30a}"],
+    &["a"],
+    &["e"],
+    &["q"],
+    &["k"],
+];
+
+/// The NFC spelling and another equivalent spelling of the same pieces.
+fn spellings(pieces: &[&[&str]], picks: &[(Index, Index)]) -> (String, String) {
+    picks
+        .iter()
+        .map(|(piece, spelling)| {
+            let choices = piece.get(pieces);
+            (choices[0], *spelling.get(choices))
+        })
+        .fold((String::new(), String::new()), |(mut a, mut b), (x, y)| {
+            a.push_str(x);
+            b.push_str(y);
+            (a, b)
+        })
+}
+
+fn spelled_statuses<K: NameKey>(rules: &str, paths: &[(Vec<String>, Kind)]) -> Vec<Status> {
+    let mut matcher = Matcher::<K>::new(LocalRules::default());
+    matcher.set_rules(&[] as &[&str], Some(RuleFile::parse(rules.as_bytes())), []);
+    paths
+        .iter()
+        .map(|(path, kind)| matcher.status(path, *kind))
+        .collect()
+}
+
 proptest! {
     /// The changes an update reports are exactly the entries whose status flipped, and a rules
     /// file only changes entries below its directory.
@@ -231,5 +297,34 @@ proptest! {
         let kind = if is_dir { Kind::Dir } else { Kind::File };
         let _ = matcher.status(&path, kind);
         prop_assert_eq!(matcher.status(&[".fbignore"], Kind::File), Status::Included);
+    }
+    /// NFC and NFD spellings of a pattern, and of the names it is matched against, give the same
+    /// verdicts (review of flarebox#50).
+    #[test]
+    fn equivalent_spellings_give_the_same_verdicts(
+        lines in prop::collection::vec(prop::collection::vec((any::<Index>(), any::<Index>()), 1..6), 1..4),
+        paths in prop::collection::vec(
+            (prop::collection::vec(prop::collection::vec((any::<Index>(), any::<Index>()), 1..4), 1..4), any::<bool>()),
+            1..12,
+        ),
+    ) {
+        let (rules_nfc, rules_other): (Vec<String>, Vec<String>) =
+            lines.iter().map(|picks| spellings(PATTERN_PIECES, picks)).unzip();
+        let (rules_nfc, rules_other) = (rules_nfc.join("\n"), rules_other.join("\n"));
+        let mut nfc_paths = Vec::new();
+        let mut other_paths = Vec::new();
+        for (components, is_dir) in &paths {
+            let kind = if *is_dir { Kind::Dir } else { Kind::File };
+            let (a, b): (Vec<String>, Vec<String>) =
+                components.iter().map(|picks| spellings(NAME_PIECES, picks)).unzip();
+            nfc_paths.push((a, kind));
+            other_paths.push((b, kind));
+        }
+        let expected = spelled_statuses::<Folded>(&rules_nfc, &nfc_paths);
+        prop_assert_eq!(&spelled_statuses::<Folded>(&rules_other, &other_paths), &expected);
+        prop_assert_eq!(&spelled_statuses::<Folded>(&rules_nfc, &other_paths), &expected);
+        prop_assert_eq!(&spelled_statuses::<Folded>(&rules_other, &nfc_paths), &expected);
+        let expected = spelled_statuses::<Exact>(&rules_nfc, &nfc_paths);
+        prop_assert_eq!(&spelled_statuses::<Exact>(&rules_other, &other_paths), &expected);
     }
 }

@@ -7,7 +7,9 @@
 //!
 //! The generators leave out the intentional differences listed in the crate documentation: the
 //! rules files themselves are not compared, names and patterns are ASCII, and under case folding
-//! patterns hold no uppercase bracket members or escaped uppercase letters.
+//! patterns hold no uppercase bracket members or escaped uppercase letters. A third run spells
+//! names and patterns with non-ASCII letters NFD for this crate and NFC for git, without `?`
+//! and bracket expressions, which git applies to bytes.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -17,6 +19,7 @@ use std::process::{Command, Stdio};
 use flarebox_ignore::{Kind, LocalRules, Matcher, NameKey, Reason, RuleFile, Status};
 use proptest::prelude::*;
 use proptest::sample::Index;
+use unicode_normalization::UnicodeNormalization;
 
 struct Exact;
 
@@ -45,14 +48,17 @@ struct Case {
 /// the path is included.
 type Verdict = Option<(usize, u32)>;
 
-fn ours<K: NameKey>(case: &Case) -> Vec<Verdict> {
+/// This crate's verdicts, with every name and rules file respelled by `spell` first.
+fn ours<K: NameKey>(case: &Case, spell: fn(&str) -> String) -> Vec<Verdict> {
+    let respell = |path: &[String]| -> Vec<String> { path.iter().map(|n| spell(n)).collect() };
     let mut matcher = Matcher::<K>::new(LocalRules::default());
     for (dir, text) in &case.files {
-        matcher.set_rules(dir, Some(RuleFile::parse(text.as_bytes())), []);
+        let rules = RuleFile::parse(spell(text).as_bytes());
+        matcher.set_rules(&respell(dir), Some(rules), []);
     }
     case.entries
         .iter()
-        .map(|(path, kind)| match matcher.status(path, *kind) {
+        .map(|(path, kind)| match matcher.status(&respell(path), *kind) {
             Status::Included => None,
             Status::Excluded(Reason::Rule { depth, line }) => Some((depth, line)),
             Status::Excluded(reason) => panic!("{path:?} excluded by {reason:?}"),
@@ -163,8 +169,20 @@ fn run_git(dir: &Path, args: &[&str], stdin: Option<&[u8]>) -> Vec<u8> {
     output.stdout
 }
 
-fn compare<K: NameKey>(case: &Case, ignorecase: bool) -> Result<(), TestCaseError> {
-    let ours = ours::<K>(case);
+fn same(text: &str) -> String {
+    text.to_owned()
+}
+
+fn nfd(text: &str) -> String {
+    text.nfd().collect()
+}
+
+fn compare<K: NameKey>(
+    case: &Case,
+    ignorecase: bool,
+    spell: fn(&str) -> String,
+) -> Result<(), TestCaseError> {
+    let ours = ours::<K>(case, spell);
     let theirs = git(case, ignorecase);
     for ((path, kind), (ours, theirs)) in case.entries.iter().zip(ours.into_iter().zip(theirs)) {
         prop_assert_eq!(
@@ -177,6 +195,55 @@ fn compare<K: NameKey>(case: &Case, ignorecase: bool) -> Result<(), TestCaseErro
         );
     }
     Ok(())
+}
+
+/// Git's `trim_trailing_spaces`, to see a line as git compiles it.
+fn trimmed(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut last_space = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b' ' => {
+                last_space.get_or_insert(i);
+            }
+            b'\\' => {
+                i += 1;
+                if i == bytes.len() {
+                    return line;
+                }
+                last_space = None;
+            }
+            _ => last_space = None,
+        }
+        i += 1;
+    }
+    &line[..last_space.unwrap_or(line.len())]
+}
+
+/// Whether the line has a `**` right after the literal start of a pattern with a slash
+/// (`foo**/bar`). Git 2.39 treats that `**` as special, git 2.54 as a plain `*`, as git
+/// documents and this crate does, so the oracle leaves such lines out.
+fn version_dependent(line: &str) -> bool {
+    let line = trimmed(line);
+    let body = line.strip_prefix('!').unwrap_or(line);
+    let body = body.strip_suffix('/').unwrap_or(body);
+    if !body.contains('/') {
+        return false;
+    }
+    let body = body.strip_prefix('/').unwrap_or(body).as_bytes();
+    let Some(prefix) = body.iter().position(|b| b"*?[\\".contains(b)) else {
+        return false;
+    };
+    if prefix == 0 || body[prefix - 1] == b'/' || !body[prefix..].starts_with(b"**") {
+        return false;
+    }
+    let end = prefix + body[prefix..].iter().take_while(|&&b| b == b'*').count();
+    match body.get(end) {
+        None | Some(b'/') => true,
+        Some(b'\\') => body.get(end + 1) == Some(&b'/'),
+        Some(_) => false,
+    }
 }
 
 fn name() -> impl Strategy<Value = String> {
@@ -271,14 +338,52 @@ fn line(fold: bool) -> impl Strategy<Value = String> {
         1 => Just(String::new()),
         1 => Just("# comment".to_owned()),
     ]
+    .prop_filter("version-dependent in git", |line| !version_dependent(line))
+}
+
+/// Names and patterns with non-ASCII letters, for comparing NFD spellings here with NFC ones in
+/// git. Git matches bytes, so `?` and bracket expressions are left out.
+fn unicode_name() -> impl Strategy<Value = String> {
+    "[aAéÉüÅ.-]{1,3}".prop_filter("not . or ..", |n| n != "." && n != "..")
+}
+
+fn unicode_line() -> impl Strategy<Value = String> {
+    let piece = prop_oneof![
+        4 => proptest::sample::select(vec!["a", "A", "é", "É", "ü", "Å", "\\é", "-", "."])
+            .prop_map(str::to_owned),
+        2 => Just("*".to_owned()),
+        1 => Just("**".to_owned()),
+    ];
+    (
+        any::<bool>(),
+        prop_oneof![3 => Just(""), 1 => Just("/")],
+        prop::collection::vec(prop::collection::vec(piece, 1..4), 1..4),
+        prop_oneof![3 => Just(""), 1 => Just("/")],
+    )
+        .prop_map(|(negated, lead, segments, trail)| {
+            let body: Vec<String> = segments.into_iter().map(|s| s.concat()).collect();
+            format!(
+                "{}{lead}{}{trail}",
+                if negated { "!" } else { "" },
+                body.join("/")
+            )
+        })
+        .prop_filter("version-dependent in git", |line| !version_dependent(line))
 }
 
 fn case(fold: bool) -> impl Strategy<Value = Case> {
-    let paths = prop::collection::vec((prop::collection::vec(name(), 1..5), any::<bool>()), 1..30);
+    case_with(name().boxed(), line(fold).boxed())
+}
+
+fn case_with(
+    name: BoxedStrategy<String>,
+    line: BoxedStrategy<String>,
+) -> impl Strategy<Value = Case> {
+    let paths = prop::collection::vec((prop::collection::vec(name, 1..5), any::<bool>()), 1..30);
     let files = prop::collection::vec(
         (
             any::<Index>(),
-            prop::collection::vec(line(fold), 0..8),
+            prop::collection::vec(line, 0..8),
             any::<bool>(),
             any::<bool>(),
             any::<bool>(),
@@ -287,14 +392,14 @@ fn case(fold: bool) -> impl Strategy<Value = Case> {
     );
     (paths, files).prop_map(|(paths, files)| {
         let mut entries: BTreeMap<Vec<String>, Kind> = BTreeMap::new();
-        // Siblings that differ only by ASCII case would collide on a case-insensitive volume, so a
-        // later spelling takes the first one's.
+        // Siblings that differ only by case would collide on a case-insensitive volume, so a later
+        // spelling takes the first one's.
         let mut spellings: BTreeMap<(Vec<String>, String), String> = BTreeMap::new();
         'paths: for (raw, is_dir) in paths {
             let mut path = Vec::new();
             for (i, name) in raw.iter().enumerate() {
                 let spelling = spellings
-                    .entry((path.clone(), name.to_ascii_lowercase()))
+                    .entry((path.clone(), name.to_lowercase()))
                     .or_insert_with(|| name.clone())
                     .clone();
                 path.push(spelling);
@@ -341,12 +446,18 @@ fn case(fold: bool) -> impl Strategy<Value = Case> {
 proptest! {
     #[test]
     fn agrees_with_git_case_sensitive(case in case(false)) {
-        compare::<Exact>(&case, false)?;
+        compare::<Exact>(&case, false, same)?;
     }
 
     #[test]
     fn agrees_with_git_ignorecase(case in case(true)) {
-        compare::<Folded>(&case, true)?;
+        compare::<Folded>(&case, true, same)?;
+    }
+
+    /// Names and rules files spelled NFD here and NFC in git get the same verdicts.
+    #[test]
+    fn nfd_spellings_agree_with_git_on_nfc(case in case_with(unicode_name().boxed(), unicode_line().boxed())) {
+        compare::<Exact>(&case, false, nfd)?;
     }
 }
 
@@ -454,9 +565,9 @@ fn curated_lines_agree_with_git() {
             };
             for fold in [false, true] {
                 let ours = if fold {
-                    ours::<Folded>(&case)
+                    ours::<Folded>(&case, same)
                 } else {
-                    ours::<Exact>(&case)
+                    ours::<Exact>(&case, same)
                 };
                 let theirs = git(&case, fold);
                 for ((path, _), (o, t)) in case.entries.iter().zip(ours.iter().zip(&theirs)) {
