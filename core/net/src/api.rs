@@ -36,9 +36,10 @@ const ANSWER_FRAMING: usize = 64 << 10;
 /// framing for a name of control characters. GUN-289 lowers it.
 const MAX_ANSWER: usize =
     (MAX_STORED_NAME * JSON_ESCAPE_EXPANSION).div_ceil(3) * 4 + ANSWER_FRAMING;
-/// The most bytes read of a `SpaceList`, which the server neither bounds nor pages yet (GUN-289), or of a `DeviceList`
-/// page, whose 100 names the server does not bound either. The Worker builds the whole answer in memory, and a Worker
-/// isolate has at most 128 MB, so it cannot send a larger one.
+/// The most bytes read of a `DeviceList` page, and the most a listing of `SpaceList` pages holds at once, the pages
+/// kept plus the one being read. A page holds at most 100 entries (RFC 0006 section 7, RFC 0007 section 2), but a server
+/// from before RFC 0007 bounds no names and sends every space in one answer. Such a Worker builds the whole answer in
+/// memory, and a Worker isolate has at most 128 MB, so it cannot send a larger one.
 const MAX_LIST_ANSWER: usize = 128 << 20;
 /// The most bytes read of an error. The server's error messages are sentences it writes itself, without names or other
 /// text from clients.
@@ -162,10 +163,11 @@ impl Api {
     }
 
     /// `GET /v1/spaces`, following `next_cursor` to the last page (RFC 0007 section 2). All pages together are read up
-    /// to `MAX_LIST_ANSWER` bytes, and a page that repeats the cursor it was asked with ends the listing as undecodable.
+    /// to `MAX_LIST_ANSWER` bytes, and a page that repeats any earlier cursor ends the listing as undecodable.
     pub async fn list_spaces(&self, auth: &Auth) -> Result<SpaceList, ApiError> {
         let mut list = SpaceList::default();
         let mut read = 0;
+        let mut seen = std::collections::HashSet::new();
         loop {
             let path = match list.next_cursor.as_str() {
                 "" => "v1/spaces".to_owned(),
@@ -187,7 +189,7 @@ impl Api {
                 )
                 .await?;
             read += page.encoded_len();
-            if !page.next_cursor.is_empty() && page.next_cursor == list.next_cursor {
+            if !page.next_cursor.is_empty() && !seen.insert(page.next_cursor.clone()) {
                 return Err(ApiError::Decode("SpaceList"));
             }
             list.spaces.extend(page.spaces);
@@ -709,8 +711,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_spaces_stops_at_a_cursor_that_does_not_move() {
-        let (base, _server) = paging(vec![(vec!["a"], "a"), (vec!["b"], "a")]).await;
+    async fn list_spaces_stops_at_a_cursor_it_has_seen() {
+        let (base, _server) =
+            paging(vec![(vec!["a"], "a"), (vec!["b"], "b"), (vec!["c"], "a")]).await;
         let auth = signed_in(base);
         let outcome = auth.api().list_spaces(&auth).await;
         assert!(
