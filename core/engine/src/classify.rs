@@ -5,7 +5,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::names::name_key;
-use crate::tree::{Kind, LocalNode, Names, NodeId, RemoteNode, Shape, Tree, TreeError, same};
+use crate::tree::{
+    Kind, LocalNode, Names, NodeId, RemoteNode, Shape, Tree, TreeError, same, same_content,
+};
 
 /// The most mutually dependent [`Class::Same`] updates [`Trees::settle`] searches as one group.
 /// Every subset of a group is tried, so the search costs up to 2^n checks of n nodes.
@@ -47,6 +49,8 @@ pub struct Trees {
     s: Tree<Shape>,
     dirty: BTreeSet<NodeId>,
     unsearched: BTreeSet<NodeId>,
+    reverted: BTreeSet<NodeId>,
+    parked_as: BTreeMap<NodeId, NodeId>,
 }
 
 impl Trees {
@@ -58,6 +62,8 @@ impl Trees {
             s: Tree::new(root),
             dirty: BTreeSet::new(),
             unsearched: BTreeSet::new(),
+            reverted: BTreeSet::new(),
+            parked_as: BTreeMap::new(),
         }
     }
 
@@ -89,13 +95,31 @@ impl Trees {
     }
 
     pub fn set_local(&mut self, id: NodeId, node: LocalNode) {
+        if !node.parked {
+            self.parked_as.remove(&id);
+        }
         self.dirty.insert(id.clone());
         self.l.insert(id, node);
     }
 
     pub fn remove_local(&mut self, id: &str) {
+        self.parked_as.remove(id);
         if self.l.remove(id).is_some() {
             self.dirty.insert(id.to_owned());
+        }
+    }
+
+    /// The name of a parked node's entry in the parked directory: its ID, or, for a node re-keyed
+    /// while parked, the ID it was parked under. The entry keeps that name until it leaves the
+    /// parked directory.
+    pub fn parked_name<'a>(&'a self, id: &'a str) -> &'a str {
+        self.parked_as.get(id).map_or(id, String::as_str)
+    }
+
+    /// Records that parked node `id` sits in the parked directory under `name`.
+    pub fn park_as(&mut self, id: NodeId, name: NodeId) {
+        if id != name {
+            self.parked_as.insert(id, name);
         }
     }
 
@@ -105,8 +129,27 @@ impl Trees {
         self.dirty.insert(id);
     }
 
+    /// Sets S for one node, or clears it, only when S stays a valid tree. Returns whether it did.
+    pub fn set_synced_if_valid(&mut self, id: NodeId, shape: Option<Shape>) -> bool {
+        if !self.fits_synced(&id, shape.as_ref()) {
+            return false;
+        }
+        self.set_synced(id, shape);
+        true
+    }
+
     pub fn class(&self, id: &str) -> Class {
         classify(self.l.live(id), self.s.live(id), self.r.live(id))
+    }
+
+    /// Whether L holds content that S does not: an edit not uploaded yet.
+    pub fn edited(&self, id: &str) -> bool {
+        let content = self.l.get(id).and_then(|node| node.shape.content.as_ref());
+        let synced = self.s.live(id).and_then(|shape| shape.content.as_ref());
+        match (content, synced) {
+            (Some(local), Some(synced)) => !same_content(local, synced),
+            (local, _) => local.is_some(),
+        }
     }
 
     /// Settles what needs no decision: a node changed the same way on both sides takes S := R, and
@@ -119,6 +162,11 @@ impl Trees {
     /// [`Trees::unsearched`] lists them. Returns every dirty node that is left, with its class, in
     /// `node_id` order.
     pub fn settle(&mut self) -> Vec<(NodeId, Class)> {
+        self.reverted
+            .retain(|id| match (self.l.get(id), self.r.live(id)) {
+                (Some(local), Some(remote)) => !local.shape.same_position(remote),
+                (local, remote) => local.is_some() || remote.is_some(),
+            });
         let mut pending = Vec::new();
         let mut work = Vec::new();
         for id in std::mem::take(&mut self.dirty) {
@@ -154,6 +202,21 @@ impl Trees {
         work.sort_by(|a, b| a.0.cmp(&b.0));
         self.dirty = work.iter().map(|(id, _)| id.clone()).collect();
         work
+    }
+
+    /// Nodes whose local position the server will not take: a move that closes a cycle against R,
+    /// a create or move the server renamed, a folder merged into one L holds elsewhere with the
+    /// nodes created in it, and folders L deleted on the way from such a node to the root. The
+    /// commit planner sends no position change for them but still sends their content edits and deletes; the
+    /// effects put each at its R position without replacing its content, and [`Trees::settle`]
+    /// forgets it once L has it there.
+    pub fn reverted(&self) -> &BTreeSet<NodeId> {
+        &self.reverted
+    }
+
+    pub fn revert(&mut self, id: NodeId) {
+        self.dirty.insert(id.clone());
+        self.reverted.insert(id);
     }
 
     /// The [`Class::Same`] nodes the last [`Trees::settle`] left without searching, because the
@@ -338,40 +401,48 @@ impl Trees {
     /// S := R for one node, made only when S stays a valid tree.
     fn take_remote(&mut self, id: &str) -> bool {
         let next = self.r.live(id).cloned();
-        let has_children = self.s.iter().any(|(_, shape)| shape.parent == id);
-        match &next {
-            None if has_children => return false,
-            None => {}
-            Some(shape) => {
-                if has_children && shape.kind != Kind::Dir {
-                    return false;
-                }
-                if shape.parent != self.s.root {
-                    match self.s.live(&shape.parent) {
-                        Some(parent) if parent.kind == Kind::Dir => {}
-                        _ => return false,
-                    }
-                }
-                let mut ancestor = shape.parent.as_str();
-                while ancestor != self.s.root {
-                    if ancestor == id {
-                        return false;
-                    }
-                    match self.s.live(ancestor) {
-                        Some(parent) => ancestor = &parent.parent,
-                        None => return false,
-                    }
-                }
-                let key = name_key(&shape.name);
-                if self.s.iter().any(|(other, sibling)| {
-                    other != id && sibling.parent == shape.parent && name_key(&sibling.name) == key
-                }) {
-                    return false;
-                }
-            }
+        if !self.fits_synced(id, next.as_ref()) {
+            return false;
         }
         self.set_synced_unmarked(id, next);
         true
+    }
+
+    /// True when S stays a valid tree with `next` as the node's shape.
+    fn fits_synced(&self, id: &str, next: Option<&Shape>) -> bool {
+        let has_children = self.s.iter().any(|(_, shape)| shape.parent == id);
+        let Some(shape) = next else {
+            return !has_children;
+        };
+        if has_children && shape.kind != Kind::Dir {
+            return false;
+        }
+        if shape.parent != self.s.root {
+            match self.s.live(&shape.parent) {
+                Some(parent) if parent.kind == Kind::Dir => {}
+                _ => return false,
+            }
+        }
+        let mut ancestor = shape.parent.as_str();
+        for _ in 0..=self.s.len() {
+            if ancestor == self.s.root {
+                break;
+            }
+            if ancestor == id {
+                return false;
+            }
+            match self.s.live(ancestor) {
+                Some(parent) => ancestor = &parent.parent,
+                None => return false,
+            }
+        }
+        if ancestor != self.s.root {
+            return false;
+        }
+        let key = name_key(&shape.name);
+        !self.s.iter().any(|(other, sibling)| {
+            other != id && sibling.parent == shape.parent && name_key(&sibling.name) == key
+        })
     }
 
     fn set_synced_unmarked(&mut self, id: &str, shape: Option<Shape>) {

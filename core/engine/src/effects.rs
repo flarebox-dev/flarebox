@@ -193,9 +193,7 @@ impl Effects {
         }
         let (node, effect, after) = chosen.or_else(|| {
             blockers.into_iter().find_map(|id| {
-                if trees.class(&id) != Class::Remote
-                    || trees.local().get(&id).is_none_or(|node| node.parked)
-                {
+                if !candidate(trees, &id) || trees.local().get(&id).is_none_or(|node| node.parked) {
                     return None;
                 }
                 let (effect, after) = view.park(&id)?;
@@ -268,9 +266,14 @@ impl Effects {
     }
 }
 
-/// A node the planner considers: one whose only change is remote, or one that is parked.
+/// A node the planner considers: one whose only change is remote, one that is parked, or one whose
+/// local position is reverted. A reverted node that R no longer has is removed only when it holds
+/// no unuploaded edit; otherwise the commit layer makes it a new node, so the edit is uploaded.
 fn candidate(trees: &Trees, id: &str) -> bool {
-    trees.class(id) == Class::Remote || trees.local().get(id).is_some_and(|node| node.parked)
+    trees.class(id) == Class::Remote
+        || trees.local().get(id).is_some_and(|node| node.parked)
+        || (trees.reverted().contains(id)
+            && (trees.remote().live(id).is_some() || !trees.edited(id)))
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -305,7 +308,11 @@ impl<'a> View<'a> {
         let remote = self.trees.remote().live(id);
         let (local, remote) = match (local, remote) {
             (None, None) => return Step::Skip,
-            (Some(local), None) if local.parked && self.trees.class(id) != Class::Remote => {
+            (Some(local), None)
+                if local.parked
+                    && self.trees.class(id) != Class::Remote
+                    && (!self.trees.reverted().contains(id) || self.trees.edited(id)) =>
+            {
                 return self.unpark(id, local, &local.shape);
             }
             (Some(local), None) => return self.remove(id, local),
@@ -336,7 +343,9 @@ impl<'a> View<'a> {
             return Step::Skip;
         }
         let rewrite = match (&local.shape.content, &remote.content) {
-            (Some(old), Some(new)) => !same_content(old, new),
+            (Some(old), Some(new)) => {
+                !same_content(old, new) && self.trees.class(id) == Class::Remote
+            }
             _ => false,
         };
         let moved = local.parked || !local.shape.same_position(remote);
@@ -419,7 +428,7 @@ impl<'a> View<'a> {
         };
         Step::Apply(
             Effect::Move {
-                from: Location::Parked(id.to_owned()),
+                from: Location::Parked(self.trees.parked_name(id).to_owned()),
                 identity: local.identity,
                 to,
             },
@@ -512,7 +521,7 @@ impl<'a> View<'a> {
     fn location(&self, id: &str) -> Option<Location> {
         let node = self.trees.local().get(id)?;
         if node.parked {
-            return Some(Location::Parked(id.to_owned()));
+            return Some(Location::Parked(self.trees.parked_name(id).to_owned()));
         }
         self.location_in(&node.shape.parent, &node.shape.name)
     }
@@ -534,7 +543,7 @@ impl<'a> View<'a> {
                 dirs.reverse();
                 return Some(Location::At {
                     base: Base::Parked {
-                        node: current.to_owned(),
+                        node: self.trees.parked_name(current).to_owned(),
                         identity: node.identity,
                     },
                     dirs,
