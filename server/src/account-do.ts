@@ -255,6 +255,11 @@ export class AccountDO extends DurableObject<Env> {
       if (!stillUnused(this.sql, deviceId, setupAttempt, userId)) continue;
       await this.revokeDevice(deviceId).catch((error: unknown) => console.error("setup attempt cleanup failed", deviceId, error));
     }
+    // A later claim of the same attempt may have revoked this device while the loop awaited. Its credentials would not
+    // work, so the caller is told instead and claims again with a new key.
+    if (this.activeDevice(device.credentials.deviceId) === undefined) {
+      return failure(Error_Code.FORBIDDEN, "a later claim of this setup attempt replaced this one; set a new recovery key and claim again");
+    }
     return ok(create(DeviceCredentialsSchema, { ...device.credentials, userName: this.userName(userId) }));
   }
 

@@ -141,4 +141,46 @@ describe("cleanup after a claim", () => {
       }
     });
   });
+  it("refuses a claim that a later claim of its attempt superseded instead of returning revoked credentials", async () => {
+    const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName("superseded"));
+    const claimOn = (instance: AccountDO | DurableObjectStub<AccountDO>) => {
+      const key = crypto.randomUUID() + crypto.randomUUID();
+      return instance.claim({ code: key, userName: "Owner", deviceName: "Laptop", platform: "macos", setupAttempt: "overlap" }, ADDRESS, key);
+    };
+    const initial = await claimOn(stub);
+    if (!initial.ok) throw new Error(initial.message);
+    await stub.createSpace({ userId: initial.value.userId, name: "Space" });
+    await runInDurableObject(stub, async (instance: AccountDO, state) => {
+      let release = () => {};
+      let entered = () => {};
+      const hold = new Promise<void>((resolve) => (release = resolve));
+      const paused = new Promise<void>((resolve) => (entered = resolve));
+      const revoke = instance.revokeDevice.bind(instance);
+      const spy = vi.spyOn(instance, "revokeDevice").mockImplementation(async (deviceId) => {
+        await revoke(deviceId);
+        if (deviceId === initial.value.deviceId) {
+          entered();
+          await hold;
+        }
+      });
+      try {
+        const earlier = claimOn(instance);
+        await paused;
+        const later = await claimOn(instance);
+        if (!later.ok) throw new Error(later.message);
+        release();
+        expect(await earlier).toEqual({
+          ok: false,
+          code: Error_Code.FORBIDDEN,
+          message: "a later claim of this setup attempt replaced this one; set a new recovery key and claim again",
+        });
+        expect((await instance.refreshAccess({ deviceId: later.value.deviceId, refreshCredential: later.value.refreshCredential })).ok).toBe(true);
+        const active = state.storage.sql.exec("SELECT device_id FROM devices WHERE revoked_at_ms IS NULL").toArray();
+        expect(active.map((row) => String(row.device_id))).toEqual([later.value.deviceId]);
+      } finally {
+        release();
+        spy.mockRestore();
+      }
+    });
+  });
 });
