@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `flarebox` command: pairs this machine, links folders, shows status and questions, and runs the sync daemon.
-//! Commands run in the daemon through its socket when it is running, and on their own otherwise.
+//! The `flarebox` command: pairs this machine, links folders, shows status and questions, manages the account's devices,
+//! and runs the sync daemon. Commands run in the daemon through its socket when it is running, and on their own
+//! otherwise. The device commands read only the credential and talk to the server directly.
 
 mod ipc;
 
@@ -11,8 +12,10 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use flarebox_driver::{
-    Answer, Driver, DriverError, FolderStatus, Paths, Question, QuestionKind, Status,
+    Answer, Credential, Driver, DriverError, FolderStatus, Paths, Question, QuestionKind, Status,
 };
+use flarebox_net::{ApiError, Auth};
+use flarebox_proto::v1::{DeviceInfo, device_info::Kind};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::EnvFilter;
 
@@ -64,6 +67,11 @@ enum Command {
         #[command(subcommand)]
         action: Option<QuestionAction>,
     },
+    /// List the devices paired with the server, or revoke a lost one.
+    Device {
+        #[command(subcommand)]
+        action: DeviceAction,
+    },
     /// Run the sync daemon in the foreground until SIGTERM or SIGINT.
     Daemon {
         #[arg(long, value_enum, default_value_t = LogFormat::Text)]
@@ -78,6 +86,21 @@ enum QuestionAction {
         id: String,
         #[arg(value_parser = |text: &str| text.parse::<Answer>())]
         answer: Answer,
+    },
+}
+
+#[derive(Subcommand)]
+enum DeviceAction {
+    /// List the devices paired with the server, revoked ones included.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Revoke another device, such as a lost one. It stops syncing at once, and the files on it stay there.
+    Revoke {
+        /// The device's ID, as flarebox device list shows it.
+        #[arg(value_parser = device_id)]
+        id: String,
     },
 }
 
@@ -112,6 +135,7 @@ fn main() -> ExitCode {
     let outcome = runtime.block_on(async move {
         match command {
             Command::Daemon { .. } => daemon(paths).await,
+            Command::Device { action } => device(paths, action).await,
             command => client(paths, command).await,
         }
     });
@@ -203,7 +227,9 @@ async fn client(paths: Paths, command: Command) -> Result<(), String> {
             },
             false,
         ),
-        Command::Daemon { .. } => unreachable!("the daemon is not a client command"),
+        Command::Daemon { .. } | Command::Device { .. } => {
+            unreachable!("the daemon and the device commands do not go through the socket")
+        }
     };
     let credential = paths.credential();
     match ipc::run(&paths, request).await? {
@@ -260,6 +286,152 @@ async fn client(paths: Paths, command: Command) -> Result<(), String> {
             println!("Answered.");
             Ok(())
         }
+    }
+}
+
+/// Runs a device command with this profile's credential (RFC 0007). It writes nothing to the profile, so it runs the same
+/// whether or not the daemon holds the profile.
+async fn device(paths: Paths, action: DeviceAction) -> Result<(), String> {
+    let credential = Credential::load(&paths.credential())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| DriverError::NotPaired.to_string())?;
+    let auth = Auth::new(
+        credential.api().map_err(|error| error.to_string())?,
+        credential.net(),
+    );
+    match action {
+        DeviceAction::List { json } => {
+            let mut devices = Vec::new();
+            let mut cursor = String::new();
+            loop {
+                let page = auth
+                    .api()
+                    .list_devices(&auth, &cursor)
+                    .await
+                    .map_err(refusal)?;
+                devices.extend(page.devices);
+                if page.next_cursor.is_empty() {
+                    break;
+                }
+                cursor = page.next_cursor;
+            }
+            if json {
+                return print_json(&devices.iter().map(device_json).collect::<Vec<_>>());
+            }
+            print!("{}", device_table(&devices, now_ms()));
+            Ok(())
+        }
+        DeviceAction::Revoke { id } => {
+            auth.api()
+                .revoke_device(&auth, &id)
+                .await
+                .map_err(refusal)?;
+            println!(
+                "Revoked device {id}. It can no longer sync; the files already on it stay there."
+            );
+            Ok(())
+        }
+    }
+}
+
+/// A device ID as the server issues it: a lowercase UUID. Checked here so that the argument cannot name another path.
+fn device_id(text: &str) -> Result<String, String> {
+    let id = text.to_ascii_lowercase();
+    let shaped = id.len() == 36
+        && id.char_indices().all(|(at, c)| match at {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        });
+    if shaped {
+        Ok(id)
+    } else {
+        Err("not a device ID; flarebox device list shows them".to_owned())
+    }
+}
+
+fn refusal(error: ApiError) -> String {
+    if error.is_unauthenticated() {
+        return "the server refused this device's credential: another device revoked it, or the credential is wrong. Pair it again to sync.".to_owned();
+    }
+    error.to_string()
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as i64)
+}
+
+fn device_json(device: &DeviceInfo) -> serde_json::Value {
+    serde_json::json!({
+        "device_id": device.device_id,
+        "name": device.name,
+        "platform": device.platform,
+        "kind": match device.kind() {
+            Kind::Device => "device",
+            Kind::Agent => "agent",
+            Kind::Unspecified => "unspecified",
+        },
+        "created_at_ms": device.created_at_ms,
+        "last_seen_ms": device.last_seen_ms,
+        "revoked_at_ms": device.revoked_at_ms,
+        "credential_expires_at_ms": device.credential_expires_at_ms,
+        "issued_by": device.issued_by,
+        "current": device.current,
+    })
+}
+
+/// One line per device: its ID, name, platform, when it last refreshed a token, and whether it is this device, active
+/// or revoked.
+fn device_table(devices: &[DeviceInfo], now_ms: i64) -> String {
+    let rows: Vec<[String; 5]> = devices
+        .iter()
+        .map(|device| {
+            let state = match (device.revoked_at_ms, device.current) {
+                (0, true) => "this device".to_owned(),
+                (0, false) => "active".to_owned(),
+                (revoked, _) => format!("revoked {}", ago(revoked, now_ms)),
+            };
+            [
+                device.device_id.clone(),
+                device.name.clone(),
+                device.platform.clone(),
+                ago(device.last_seen_ms, now_ms),
+                state,
+            ]
+        })
+        .collect();
+    let header = ["ID", "NAME", "PLATFORM", "LAST SEEN", "STATE"].map(str::to_owned);
+    let mut widths = [0; 5];
+    for row in std::iter::once(&header).chain(&rows) {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let mut table = String::new();
+    for row in std::iter::once(&header).chain(&rows) {
+        let cells: Vec<String> = row
+            .iter()
+            .zip(widths)
+            .map(|(cell, width)| format!("{cell:<width$}"))
+            .collect();
+        table.push_str(cells.join("  ").trim_end());
+        table.push('\n');
+    }
+    table
+}
+
+/// How long before `now_ms` a time in Unix milliseconds was, or "never" for 0.
+fn ago(ms: i64, now_ms: i64) -> String {
+    if ms == 0 {
+        return "never".to_owned();
+    }
+    let minutes = (now_ms - ms).max(0) / 60_000;
+    match minutes {
+        0 => "just now".to_owned(),
+        1..60 => format!("{minutes} min ago"),
+        60..2880 => format!("{} h ago", minutes / 60),
+        _ => format!("{} days ago", minutes / 1440),
     }
 }
 
@@ -348,5 +520,71 @@ fn print_questions(questions: &[Question]) {
         for item in &question.items {
             println!("  {} ({} files)", item.path, item.files);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ID: &str = "0190a0b0-0000-7000-8000-000000000001";
+
+    #[test]
+    fn a_device_id_is_a_uuid_and_nothing_that_could_name_another_path() {
+        assert_eq!(device_id(ID).as_deref(), Ok(ID));
+        assert_eq!(device_id(&ID.to_uppercase()).as_deref(), Ok(ID));
+        for text in [
+            "",
+            "../spaces",
+            "0190a0b0-0000-7000-8000-00000000000",
+            &format!("{ID}/x"),
+            "0190a0b0x0000-7000-8000-000000000001",
+        ] {
+            assert!(device_id(text).is_err(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn times_read_as_how_long_ago() {
+        let now = 1_000 * 86_400_000;
+        assert_eq!(ago(0, now), "never");
+        assert_eq!(ago(now - 59_000, now), "just now");
+        assert_eq!(ago(now + 5_000, now), "just now");
+        assert_eq!(ago(now - 5 * 60_000, now), "5 min ago");
+        assert_eq!(ago(now - 47 * 3_600_000, now), "47 h ago");
+        assert_eq!(ago(now - 3 * 86_400_000, now), "3 days ago");
+    }
+
+    #[test]
+    fn the_table_marks_this_device_and_revoked_ones() {
+        let now = 1_000 * 86_400_000;
+        let device = |name: &str, current, last_seen_ms, revoked_at_ms| DeviceInfo {
+            device_id: ID.into(),
+            name: name.into(),
+            platform: "linux".into(),
+            kind: Kind::Device as i32,
+            last_seen_ms,
+            revoked_at_ms,
+            current,
+            ..Default::default()
+        };
+        let table = device_table(
+            &[
+                device("desk", true, now - 120_000, 0),
+                device("lost laptop", false, 0, now - 2 * 86_400_000),
+                device("phone", false, now - 7_200_000, 0),
+            ],
+            now,
+        );
+        let id = ID;
+        assert_eq!(
+            table,
+            format!(
+                "ID                                    NAME         PLATFORM  LAST SEEN  STATE\n\
+                 {id}  desk         linux     2 min ago  this device\n\
+                 {id}  lost laptop  linux     never      revoked 2 days ago\n\
+                 {id}  phone        linux     2 h ago    active\n"
+            )
+        );
     }
 }

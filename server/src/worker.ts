@@ -73,7 +73,7 @@ function refuseWithout(request: Request, identity: Identity, capability: Capabil
   return errorReply(request, Error_Code.FORBIDDEN, `this device may not use ${capability}`);
 }
 
-/** GET /v1/devices and DELETE /v1/devices/{device_id} (RFC 0006 section 7). */
+/** GET /v1/devices and DELETE /v1/devices/{device_id} (RFC 0006 section 7, RFC 0007). */
 async function devices(request: Request, env: Env, deviceId: string | undefined): Promise<Response> {
   const identity = await authenticate(request, env);
   if (identity instanceof Response) return identity;
@@ -84,7 +84,7 @@ async function devices(request: Request, env: Env, deviceId: string | undefined)
     return reply(request, DeviceListSchema, await account(env).listDevices({ userId: identity.userId, callerId: identity.deviceId, cursor }));
   }
   if (deviceId !== undefined && request.method === "DELETE") {
-    const outcome = await account(env).revokeUserDevice({ userId: identity.userId, deviceId });
+    const outcome = await account(env).revokeUserDevice({ userId: identity.userId, callerId: identity.deviceId, deviceId });
     return outcome.ok ? new Response(null, { status: 204 }) : errorReply(request, outcome.code, outcome.message);
   }
   return new Response("Method Not Allowed", { status: 405 });

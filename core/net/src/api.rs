@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use flarebox_proto::v1::{
-    AccessToken, ClaimRequest, CreateSpaceRequest, DeviceCredentials, PairCompleteRequest,
-    PairStartResponse, RewindRequest, RewindResult, ServerInfo, SpaceInfo, SpaceList, TokenRequest,
+    AccessToken, ClaimRequest, CreateSpaceRequest, DeviceCredentials, DeviceList,
+    PairCompleteRequest, PairStartResponse, RewindRequest, RewindResult, ServerInfo, SpaceInfo,
+    SpaceList, TokenRequest,
 };
 use std::time::Duration;
 
@@ -35,8 +36,9 @@ const ANSWER_FRAMING: usize = 64 << 10;
 /// framing for a name of control characters. GUN-289 lowers it.
 const MAX_ANSWER: usize =
     (MAX_STORED_NAME * JSON_ESCAPE_EXPANSION).div_ceil(3) * 4 + ANSWER_FRAMING;
-/// The most bytes read of a `SpaceList`, which the server neither bounds nor pages yet (GUN-289). The Worker builds the
-/// whole answer in memory, and a Worker isolate has at most 128 MB, so it cannot send a larger one.
+/// The most bytes read of a `SpaceList`, which the server neither bounds nor pages yet (GUN-289), or of a `DeviceList`
+/// page, whose 100 names the server does not bound either. The Worker builds the whole answer in memory, and a Worker
+/// isolate has at most 128 MB, so it cannot send a larger one.
 const MAX_LIST_ANSWER: usize = 128 << 20;
 /// The most bytes read of an error. The server's error messages are sentences it writes itself, without names or other
 /// text from clients.
@@ -206,6 +208,33 @@ impl Api {
             MAX_ANSWER,
         )
         .await
+    }
+
+    /// `GET /v1/devices`: one page of the devices of this device's user, revoked ones included (RFC 0006 section 7).
+    /// Pass an empty `cursor` for the first page and the previous page's `next_cursor` for the next.
+    pub async fn list_devices(&self, auth: &Auth, cursor: &str) -> Result<DeviceList, ApiError> {
+        let mut path = "v1/devices".to_owned();
+        if !cursor.is_empty() {
+            path.push_str("?cursor=");
+            path.extend(url::form_urlencoded::byte_serialize(cursor.as_bytes()));
+        }
+        self.authed(
+            auth,
+            Method::GET,
+            &path,
+            None,
+            "DeviceList",
+            MAX_LIST_ANSWER,
+        )
+        .await
+    }
+
+    /// `DELETE /v1/devices/{device_id}`: revokes another device of this device's user (RFC 0007). `device_id` is an ID
+    /// from [`Api::list_devices`]. The server refuses this device's own ID with `FORBIDDEN`.
+    pub async fn revoke_device(&self, auth: &Auth, device_id: &str) -> Result<(), ApiError> {
+        let path = format!("v1/devices/{device_id}");
+        self.authed(auth, Method::DELETE, &path, None, "empty reply", MAX_ANSWER)
+            .await
     }
 
     fn post(&self, path: &str, body: &impl Message) -> RequestBuilder {

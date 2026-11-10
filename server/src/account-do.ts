@@ -377,10 +377,12 @@ export class AccountDO extends DurableObject<Env> {
   }
 
   /**
-   * DELETE /v1/devices/{device_id}: revokes one of the user's principals. Revoking a revoked one changes nothing, but
-   * delivers the notices still pending for it.
+   * DELETE /v1/devices/{device_id}: revokes one of the user's principals other than the caller's own, so the caller
+   * always stays active and the user keeps at least one device (RFC 0007 section 5). Revoking a revoked one changes
+   * nothing, but delivers the notices still pending for it.
    */
-  async revokeUserDevice(args: { userId: string; deviceId: string }): Promise<Outcome<null>> {
+  async revokeUserDevice(args: { userId: string; callerId: string; deviceId: string }): Promise<Outcome<null>> {
+    if (args.deviceId === args.callerId) return failure(Error_Code.FORBIDDEN, "a device cannot revoke itself; revoke it from another device");
     const found = this.sql.exec("SELECT 1 FROM devices WHERE device_id = ? AND user_id = ?", args.deviceId, args.userId).toArray().length > 0;
     if (!found) return failure(Error_Code.NOT_FOUND, "no such device");
     await this.revokeDevice(args.deviceId);

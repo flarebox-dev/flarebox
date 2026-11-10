@@ -559,11 +559,49 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
     const untouched = await runInDurableObject(account(), (_instance, state) => state.storage.sql.exec("SELECT revoked_at_ms FROM devices WHERE device_id = ?", stranger).one());
     expect(untouched.revoked_at_ms).toBeNull();
 
-    const self = await pairDevice(owner, "Leaving");
-    expect((await send("/v1/devices/" + self.deviceId, { method: "DELETE", token: self.access!.token })).status).toBe(204);
-    expect((await listDevices(self.access!.token)).status).toBe(401);
     expect((await send("/v1/devices", { method: "POST", token: owner.access!.token })).status).toBe(405);
     expect((await send("/v1/devices", { method: "GET" })).status).toBe(401);
+  });
+
+  it("refuses a lost device's refresh credential, old access token, socket and pairing code once another device revoked it (RFC 0007 section 2)", async () => {
+    const owner = await getOwner();
+    const lost = await pairDevice(owner, "Lost laptop");
+    const spaceId = await createSpace(owner);
+    const socket = await Socket.connect(spaceId, lost);
+    await socket.start();
+    const pairing = await call("/v1/pair/start", { token: lost.access!.token }, PairStartResponseSchema);
+    expect((await send("/v1/spaces", { method: "GET", token: lost.access!.token })).status).toBe(200);
+
+    expect(await send("/v1/devices/" + lost.deviceId, { method: "DELETE", token: owner.access!.token })).toEqual({ status: 204, code: undefined });
+    const unauthenticated = { status: 401, code: Error_Code.UNAUTHENTICATED };
+    expect(await send("/v1/spaces", { method: "GET", token: lost.access!.token })).toEqual(unauthenticated);
+    expect(await send("/v1/devices", { method: "GET", token: lost.access!.token })).toEqual(unauthenticated);
+    expect(await send("/v1/pair/start", { token: lost.access!.token })).toEqual(unauthenticated);
+    expect(await send("/v1/devices/" + owner.deviceId, { method: "DELETE", token: lost.access!.token })).toEqual(unauthenticated);
+    expect(await send("/v1/token", { body: body(TokenRequestSchema, { deviceId: lost.deviceId, refreshCredential: lost.refreshCredential }) })).toEqual(unauthenticated);
+    expect((await socket.waitClosed()).code).toBe(Close.DEVICE_REVOKED);
+    const invitee = body(PairCompleteRequestSchema, { code: pairing.message!.code, deviceName: "Thief's laptop", platform: "linux" });
+    expect(await send("/v1/pair/complete", { body: invitee })).toEqual({ status: 403, code: Error_Code.FORBIDDEN });
+    expect((await refresh(owner)).status).toBe(200);
+  });
+
+  it("refuses a device that revokes itself, so the last active device of a user cannot be revoked (RFC 0007 section 5)", async () => {
+    const owner = await getOwner();
+    const other = await pairDevice(owner, "Spare");
+    expect(await send("/v1/devices/" + other.deviceId, { method: "DELETE", token: other.access!.token })).toEqual({ status: 403, code: Error_Code.FORBIDDEN });
+    expect((await refresh(other)).status).toBe(200);
+
+    const active = (await listDevices(owner.access!.token)).message!.devices.filter((device) => device.revokedAtMs === 0n && !device.current);
+    for (const device of active) {
+      expect((await send("/v1/devices/" + device.deviceId, { method: "DELETE", token: owner.access!.token })).status).toBe(204);
+    }
+    const listed = (await listDevices(owner.access!.token)).message!.devices;
+    expect(listed.filter((device) => device.revokedAtMs === 0n).map((device) => device.deviceId)).toEqual([owner.deviceId]);
+
+    expect(await send("/v1/devices/" + owner.deviceId, { method: "DELETE", token: owner.access!.token })).toEqual({ status: 403, code: Error_Code.FORBIDDEN });
+    const after = (await listDevices(owner.access!.token)).message!.devices.find((device) => device.deviceId === owner.deviceId)!;
+    expect(after.revokedAtMs).toBe(0n);
+    expect((await refresh(owner)).status).toBe(200);
   });
 
   it("denies everything to a principal whose kind or scope this server does not know", async () => {
@@ -670,13 +708,13 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
       const pending = (deviceId: string) => state.storage.sql.exec("SELECT COUNT(*) AS n FROM revocation_notices WHERE device_id = ?", deviceId).one().n;
       try {
         for (const device of [repeated, alarmed]) {
-          expect(await instance.revokeUserDevice({ userId: owner.userId, deviceId: device.deviceId })).toMatchObject({ ok: true });
+          expect(await instance.revokeUserDevice({ userId: owner.userId, callerId: owner.deviceId, deviceId: device.deviceId })).toMatchObject({ ok: true });
           expect(pending(device.deviceId)).toBeGreaterThan(0);
           expect((await instance.checkSession(device.deviceId)).revoked).toBe(true);
         }
         expect(await state.storage.getAlarm()).not.toBeNull();
         fail = false;
-        await instance.revokeUserDevice({ userId: owner.userId, deviceId: repeated.deviceId });
+        await instance.revokeUserDevice({ userId: owner.userId, callerId: owner.deviceId, deviceId: repeated.deviceId });
         expect(pending(repeated.deviceId)).toBe(0);
         expect(delivered).toContain(repeated.deviceId);
         state.storage.sql.exec("UPDATE revocation_notices SET next_try_ms = 0");
@@ -699,7 +737,7 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
     await runInDurableObject(stub, async (instance: import("../src/account-do").AccountDO, state) => {
       await state.storage.deleteAlarm();
       vi.spyOn(instance as unknown as { deliverNotices: () => Promise<void> }, "deliverNotices").mockRejectedValue(new Error("evicted before delivery"));
-      await expect(instance.revokeUserDevice({ userId: owner.userId, deviceId: pad.deviceId })).rejects.toThrow("evicted before delivery");
+      await expect(instance.revokeUserDevice({ userId: owner.userId, callerId: owner.deviceId, deviceId: pad.deviceId })).rejects.toThrow("evicted before delivery");
       expect(await state.storage.getAlarm()).not.toBeNull();
       state.storage.sql.exec("UPDATE revocation_notices SET next_try_ms = 0 WHERE device_id = ?", pad.deviceId);
     });
