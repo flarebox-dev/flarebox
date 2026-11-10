@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use flarebox_net::{Api, Auth, Credentials, Event, Events, Session, SessionConfig};
 use flarebox_proto::v1::{
-    ClaimRequest, CreateSpaceRequest, DeviceCredentials, PairCompleteRequest, SpaceInfo,
+    ClaimRequest, Commit, CreateSpaceRequest, DeviceCredentials, Op, PairCompleteRequest, SpaceInfo,
 };
 use tokio::sync::OnceCell;
 use url::Url;
@@ -174,4 +174,15 @@ pub fn uuidv7() -> String {
         &hex[16..20],
         &hex[20..]
     )
+}
+
+pub fn commit(history_id: &str, base_seq: u64, device_seq: u64, ops: Vec<Op>) -> Commit {
+    Commit {
+        commit_id: uuidv7(),
+        base_seq,
+        ops,
+        history_id: history_id.into(),
+        device_seq,
+        ..Default::default()
+    }
 }
