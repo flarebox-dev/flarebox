@@ -1025,7 +1025,7 @@ impl FolderTask {
         let _ = stop.wait_for(|stop| *stop).await;
     }
 
-    /// Waits for the observer's thread, which ends within one observation once `sync` has dropped its receiver.
+    /// Waits for the observer's thread, which ends soon after `sync` has dropped its receiver.
     async fn join_observer(&self) {
         let thread = self.observer.lock().unwrap().take();
         if let Some(thread) = thread {
@@ -1194,7 +1194,8 @@ impl FolderTask {
     }
 
     /// Observes the disk on a thread of its own, starting from `previous`, one [`Sections::observe`] after another.
-    /// The thread holds the folder's `lock` and ends with the first observation after the receiver is dropped.
+    /// The thread holds the folder's `lock`. Once the receiver is dropped, it stops reading files at the next chunk and
+    /// ends.
     fn observe(
         &self,
         lock: Arc<Flock>,
@@ -1206,8 +1207,15 @@ impl FolderTask {
         let matcher = self.matcher.clone();
         let thread = std::thread::spawn(move || {
             let _lock = lock;
-            let started =
-                FsObserver::start(&link.root, &link.space_id, link.root_dev, previous, matcher);
+            let closed = sender.clone();
+            let started = FsObserver::start(
+                &link.root,
+                &link.space_id,
+                link.root_dev,
+                previous,
+                matcher,
+                move || closed.is_closed(),
+            );
             let mut observer = match started {
                 Ok(observer) => observer,
                 Err(error) => {

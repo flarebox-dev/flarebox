@@ -183,6 +183,7 @@ impl Site {
             self.link.root_dev,
             folder.snapshot(),
             matcher(sync).unwrap(),
+            || false,
         )
         .unwrap();
         Device {

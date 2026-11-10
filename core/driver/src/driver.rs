@@ -1556,6 +1556,31 @@ mod tests {
         assert!(claim::lock(&base.join("Moved")).unwrap().is_some());
     }
 
+    #[tokio::test]
+    async fn stopping_does_not_wait_for_the_first_scan_to_read_every_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        let paths = Paths::under(&base.join("profile"));
+        linked(&paths, &root, "d1");
+        for n in 0..16 {
+            let file = fs::File::create(root.join(format!("large-{n}"))).unwrap();
+            file.set_len(4 << 30).unwrap();
+        }
+        let driver = Driver::open(paths).unwrap();
+        driver.start();
+        eventually("the folder is claimed", || {
+            claim::owner(&root).unwrap().is_some()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let stopping = Instant::now();
+        driver.stop().await;
+        let took = stopping.elapsed();
+        assert!(took < Duration::from_secs(5), "stopping took {took:?}");
+    }
+
     /// Reads one HTTP request and returns its path and its body.
     async fn read_request(socket: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
         use tokio::io::AsyncReadExt;
