@@ -107,7 +107,8 @@ pub struct Commits {
     split: BTreeSet<NodeId>,
     /// Folders merged into one L holds elsewhere, by the folder they were merged into. Creates and
     /// moves into them go to that folder, and the nodes they bring are reverted, so on disk they
-    /// follow into it.
+    /// follow into it. An alias ends with its folder's revert: a folder the user moves elsewhere
+    /// is then created on its own, and what is created in it goes into it.
     aliases: BTreeMap<NodeId, NodeId>,
     /// Restores without an outcome, in request order (see [`Commits::restore`]).
     restores: BTreeMap<RestoreId, RestoreIntent>,
@@ -350,7 +351,8 @@ impl Commits {
         skip.extend(excluded);
         let needed = self.retry_waiting(trees, needed, agreed);
         self.split.retain(|id| trees.synced().live(id).is_some());
-        self.aliases.retain(|id, _| trees.local().get(id).is_some());
+        self.aliases
+            .retain(|id, _| trees.local().get(id).is_some() && trees.reverted().contains(id));
         let cap = self.cap.unwrap_or(MAX_OPS);
         let (ops, deletes, reverts) = plan(
             trees,
@@ -526,8 +528,9 @@ impl Commits {
                 aliases.contains_key(held) || merged.contains_key(held)
             });
             let left = sent.is_some_and(|(parent, name)| {
-                (trees.local().get(node))
-                    .is_some_and(|local| local.shape.parent != *parent || local.shape.name != *name)
+                (trees.local().get(node)).is_some_and(|local| {
+                    local.shape.parent != *parent || nfc(&local.shape.name) != nfc(name)
+                })
             });
             if (renamed && !left) || (done && follows) {
                 trees.revert(node.clone());

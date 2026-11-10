@@ -620,6 +620,75 @@ fn a_local_edit_on_a_reverted_file_is_kept_on_disk_and_uploaded() {
     assert_eq!(ops(&commit), [update("a", 2)]);
 }
 
+/// Folder a is merged into b, which L holds elsewhere, so a is reverted and what is created in it
+/// goes into b. The user then renames a, which ends the revert: a is created on its own, and a
+/// file created in it afterwards goes into a, not into b.
+#[test]
+fn a_merged_folder_the_user_renames_takes_what_is_created_in_it() {
+    let mut trees = trees(&[
+        ("a", Some(dir(ROOT, "d")), None, None),
+        synced("b", dir(ROOT, "e")),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let first = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(matches!(&ops(&first)[..], [op::Op::CreateDir(c)] if c.node_id == "a"));
+    trees.set_remote("b".into(), remote(dir(ROOT, "d")));
+    let merged = OpResult {
+        node_id: "b".into(),
+        ..outcome(op_result::Code::MergedInto)
+    };
+    acknowledge(&mut commits, &mut trees, vec![merged]);
+    assert!(trees.reverted().contains("a"));
+    trees.set_local("a".into(), local(dir(ROOT, "user"), 1));
+    trees.settle();
+    let next = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(
+        matches!(&ops(&next)[..], [op::Op::CreateDir(c)] if c.node_id == "a" && c.name == "user")
+    );
+    trees.set_remote("a".into(), remote(dir(ROOT, "user")));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    trees.set_local("g".into(), local(file("a", "new", 2), 9));
+    trees.settle();
+    let child = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(
+        matches!(&ops(&child)[..], [op::Op::CreateFile(c)] if c.parent_id == "a"),
+        "{:?}",
+        ops(&child)
+    );
+}
+
+/// The server renames a create or move of n to "é (conflict)". Before the result arrives, a scan
+/// reports n under the decomposed spelling of the name the commit sent. That is the same name, not
+/// a user move, so n stays reverted and the refused name is not sent again.
+#[test]
+fn a_scan_that_respells_the_sent_name_keeps_a_renamed_result_reverted() {
+    for is_create in [true, false] {
+        let before = (!is_create).then(|| dir(ROOT, "old"));
+        let mut trees = trees(&[(
+            "n",
+            Some(dir(ROOT, "é")),
+            before.clone(),
+            before.map(remote),
+        )]);
+        let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+        build(&mut commits, &mut trees, &mut ids).unwrap();
+        trees.set_local("n".into(), local(dir(ROOT, "e\u{301}"), 1));
+        trees.set_remote("n".into(), remote(dir(ROOT, "é (conflict)")));
+        let renamed = OpResult {
+            name: "é (conflict)".into(),
+            ..outcome(op_result::Code::AppliedRenamed)
+        };
+        acknowledge(&mut commits, &mut trees, vec![renamed]);
+        assert!(trees.reverted().contains("n"), "create={is_create}");
+        let retry = build(&mut commits, &mut trees, &mut ids);
+        assert!(retry.is_none(), "create={is_create}, retry={retry:?}");
+    }
+}
+
 #[test]
 fn a_reverted_file_deleted_remotely_keeps_its_unuploaded_edit_as_a_new_file() {
     let mut trees = trees(&[("a", Some(file(ROOT, "x", 1)), None, None)]);
