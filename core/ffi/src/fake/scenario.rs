@@ -362,7 +362,7 @@ pub(super) fn build(scenario: FakeScenario, now: i64) -> Script {
                 .map(|i| {
                     file(
                         format!("node-big-{i}"),
-                        format!("Export/{:02}/row-{i:05}.csv", i % 40),
+                        format!("Export/{:02}/row-{i:05}.csv", i / 40),
                         ItemDetail::Plain,
                     )
                 })
@@ -469,8 +469,9 @@ pub(super) fn build(scenario: FakeScenario, now: i64) -> Script {
                 ),
                 (documents, Some("Logs/server.log"), ProblemKind::FileBusy),
             ];
+            let count = kinds.len() as i64;
             for (i, (space, path, kind)) in kinds.into_iter().enumerate() {
-                problem(saved, space, path, kind, now - (i as i64 + 1) * 60_000);
+                problem(saved, space, path, kind, now - (count - i as i64) * 60_000);
             }
             for folder in &mut saved.folders {
                 if folder.space_id == PHOTOS {

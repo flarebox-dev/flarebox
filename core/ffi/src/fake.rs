@@ -236,6 +236,15 @@ impl FakeCore {
     /// stays as it was, so memory always matches what was saved; [`ProblemKind::StateNotWritable`]
     /// is listed until a save succeeds, and the call returns [`SessionError::NotSaved`].
     fn commit(&self, state: &mut State, next: Saved, parts: &[Part]) -> Result<(), SessionError> {
+        let cleared = self.store(state, next)?;
+        self.publish(state, parts, cleared);
+        Ok(())
+    }
+
+    /// Saves `next` and makes it the state without sending it; returns whether a listed
+    /// [`ProblemKind::StateNotWritable`] was cleared. If saving fails, the state stays as it
+    /// was and only the problem list is sent.
+    fn store(&self, state: &mut State, next: Saved) -> Result<bool, SessionError> {
         let saved = if state.fail_saves {
             Err("saving is scripted to fail".to_owned())
         } else {
@@ -247,9 +256,7 @@ impl FakeCore {
         match saved {
             Ok(()) => {
                 state.saved = next;
-                let problems = state.set_save_failure(None);
-                self.publish(state, parts, problems);
-                Ok(())
+                Ok(state.set_save_failure(None))
             }
             Err(reason) => {
                 let problems = state.set_save_failure(Some(reason.clone()));
@@ -351,13 +358,13 @@ impl FakeCore {
     pub fn load_scenario(&self, scenario: FakeScenario) -> Result<(), SessionError> {
         let mut state = self.lock();
         let script = scenario::build(scenario, now_ms());
-        self.commit(&mut state, script.saved, &[])?;
+        let cleared = self.store(&mut state, script.saved)?;
         state.activity = script.activity;
         state.progress = script.progress;
         state.recent = script.recent;
         state.answers.clear();
         state.fail_next = None;
-        self.publish(&mut state, &ALL_PARTS, false);
+        self.publish(&mut state, &ALL_PARTS, cleared);
         Ok(())
     }
 
@@ -641,7 +648,9 @@ impl Core for FakeCore {
     fn sign_out(&self) -> Result<(), SessionError> {
         let mut state = self.lock();
         state.take_failure()?;
-        self.update(&mut state, &ALL_PARTS, |saved| {
+        let progress = state.progress.take();
+        let recent = std::mem::take(&mut state.recent);
+        let result = self.update(&mut state, &ALL_PARTS, |saved| {
             saved.account()?;
             *saved = Saved {
                 server: saved.server.take(),
@@ -651,11 +660,12 @@ impl Core for FakeCore {
                 ..Saved::default()
             };
             Ok(())
-        })?;
-        state.progress = None;
-        state.recent.clear();
-        self.publish(&mut state, &[Part::Progress, Part::Recent], false);
-        Ok(())
+        });
+        if result.is_err() {
+            state.progress = progress;
+            state.recent = recent;
+        }
+        result
     }
 
     fn devices(&self) -> Result<DeviceList, SessionError> {
@@ -1563,5 +1573,59 @@ mod tests {
             h.core.claim("ABCDEFGHJKLM", "Ada", "Mac"),
             Err(SessionError::NoServer)
         );
+    }
+
+    #[test]
+    fn scenario_and_sign_out_events_follow_the_state() {
+        let h = Harness::new(None);
+        h.core.start();
+        h.take();
+        h.core.load_scenario(FakeScenario::Syncing).unwrap();
+        let events = h.take();
+        assert_eq!(events.len(), ALL_PARTS.len() + 1, "{events:?}");
+        assert_eq!(
+            events.last(),
+            Some(&SessionEvent::Status {
+                status: SyncStatus::Syncing
+            })
+        );
+
+        h.core.sign_out().unwrap();
+        let events = h.take();
+        assert!(events.contains(&SessionEvent::Progress { progress: None }));
+        assert!(events.contains(&SessionEvent::RecentChanges { changes: vec![] }));
+        assert_eq!(
+            events.last(),
+            Some(&SessionEvent::Status {
+                status: SyncStatus::NeedsSetup
+            })
+        );
+        assert_eq!(events.len(), ALL_PARTS.len() + 1, "{events:?}");
+    }
+
+    #[test]
+    fn a_sign_out_that_cannot_be_saved_keeps_progress_and_recent_changes() {
+        let h = Harness::new(None);
+        h.core.load_scenario(FakeScenario::Syncing).unwrap();
+        h.core.fail_saves(true);
+        assert!(h.core.sign_out().is_err());
+        let state = h.core.state();
+        assert!(state.account.is_some() && state.progress.is_some());
+        assert!(!state.recent_changes.is_empty());
+    }
+
+    #[test]
+    fn scenario_lists_keep_their_documented_order() {
+        let h = Harness::new(None);
+        h.core.load_scenario(FakeScenario::ManyQuestions).unwrap();
+        for question in h.core.state().questions {
+            assert!(
+                question.items.is_sorted_by(|a, b| a.path <= b.path),
+                "{}",
+                question.id
+            );
+        }
+        h.core.load_scenario(FakeScenario::Problems).unwrap();
+        assert!(h.core.state().problems.is_sorted_by_key(|p| p.since_ms));
     }
 }
