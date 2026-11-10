@@ -1,6 +1,6 @@
 # Sync driver and Linux daemon
 
-Status: step C (plans/macos-0.1.0.md), part 1 and the first step of part 2. The driver links folders, keeps a session with each space, observes the disk, and serves the CLI. Part 2 runs the sync engine in each folder's task. Its first step is in: a new file or folder moves between two devices in both directions, and [The loop](#the-loop) describes how. Edits, renames, deletes and conflicts go through the same loop and are not proved end to end yet. [What part 2 wires](#what-part-2-wires) lists the whole of part 2.
+Status: step C (plans/macos-0.1.0.md), part 1 and the first step of part 2. The driver links folders, keeps a session with each space, observes the disk, and serves the CLI. Part 2 runs the sync engine in each folder's task. Its first step is in: a new file or folder moves between two devices in both directions, a delete of either reaches the other device, and [The loop](#the-loop) describes how. Edits, renames and conflicts go through the same loop and are not proved end to end yet. [What part 2 wires](#what-part-2-wires) lists the whole of part 2.
 
 ## Crates and boundaries
 
