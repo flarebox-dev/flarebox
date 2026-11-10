@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use flarebox_fs::{Marker, probe_no_replace, read_marker, write_marker};
 use flarebox_net::{ApiError, Auth};
-use flarebox_proto::v1::{PairCompleteRequest, SpaceInfo};
+use flarebox_proto::v1::{ClaimRequest, DeviceCredentials, PairCompleteRequest, SpaceInfo};
 use flarebox_store::{GivenAnswer, Link, Store, StoredQuestion};
 use rustix::fs::FlockOperation;
 use tokio::sync::watch;
@@ -38,6 +38,8 @@ pub enum DriverError {
     AlreadyPaired { device_id: String },
     #[error("a device name is required")]
     EmptyName,
+    #[error("a user name is required")]
+    EmptyUserName,
     #[error(transparent)]
     Paths(#[from] PathsError),
     #[error(transparent)]
@@ -122,6 +124,7 @@ struct Inner {
     credential: Mutex<Option<Credential>>,
     folders: Mutex<BTreeMap<String, Folder>>,
     running: AtomicBool,
+    changed: Arc<watch::Sender<()>>,
 }
 
 struct Folder {
@@ -181,6 +184,7 @@ impl Driver {
                 credential: Mutex::new(credential),
                 folders: Mutex::new(folders),
                 running: AtomicBool::new(false),
+                changed: Arc::new(watch::Sender::new(())),
             }),
         })
     }
@@ -196,12 +200,7 @@ impl Driver {
             .lock()
             .unwrap()
             .as_ref()
-            .map(|credential| Account {
-                server: credential.server.clone(),
-                user_id: credential.user_id.clone(),
-                device_id: credential.device_id.clone(),
-                device_name: credential.device_name.clone(),
-            });
+            .map(Credential::account);
         let folders = self
             .inner
             .folders
@@ -217,6 +216,16 @@ impl Driver {
         }
     }
 
+    /// A receiver that is marked changed whenever [`Driver::status`] or [`Driver::questions`] may have changed, so
+    /// the app can wait for a change instead of polling. A change may be signalled without a visible difference.
+    pub fn watch(&self) -> watch::Receiver<()> {
+        self.inner.changed.subscribe()
+    }
+
+    fn changed(&self) {
+        self.inner.changed.send_replace(());
+    }
+
     /// Pairs this profile with a server, using a code from a device that is already paired (`POST
     /// /v1/pair/complete`), and stores the credential. A profile is paired once.
     pub async fn pair(
@@ -225,11 +234,7 @@ impl Driver {
         code: &str,
         device_name: &str,
     ) -> Result<Account, DriverError> {
-        if let Some(credential) = self.inner.credential.lock().unwrap().as_ref() {
-            return Err(DriverError::AlreadyPaired {
-                device_id: credential.device_id.clone(),
-            });
-        }
+        self.check_unpaired()?;
         if device_name.trim().is_empty() {
             return Err(DriverError::EmptyName);
         }
@@ -241,9 +246,91 @@ impl Driver {
                 platform: std::env::consts::OS.to_owned(),
             })
             .await?;
+        self.adopt(
+            api.base().to_string(),
+            issued,
+            None,
+            device_name,
+            "paired this device",
+        )
+    }
+
+    /// Claims a new server as its first device (`POST /v1/claim`), with the one-time code from the server's log,
+    /// creating the user `user_name`, and stores the credential. Like pairing, it happens once per profile.
+    pub async fn claim(
+        &self,
+        server: &str,
+        code: &str,
+        user_name: &str,
+        device_name: &str,
+    ) -> Result<Account, DriverError> {
+        self.check_unpaired()?;
+        if user_name.trim().is_empty() {
+            return Err(DriverError::EmptyUserName);
+        }
+        if device_name.trim().is_empty() {
+            return Err(DriverError::EmptyName);
+        }
+        let api = api_for(server)?;
+        let issued = api
+            .claim(&ClaimRequest {
+                code: code.to_owned(),
+                user_name: user_name.to_owned(),
+                device_name: device_name.to_owned(),
+                platform: std::env::consts::OS.to_owned(),
+            })
+            .await?;
+        self.adopt(
+            api.base().to_string(),
+            issued,
+            Some(user_name.to_owned()),
+            device_name,
+            "claimed the server",
+        )
+    }
+
+    /// Signs this device out: stops syncing, unlinks every folder (their files stay) and deletes the credential, so
+    /// the profile can be paired or claimed again. The server is not told; the device stays registered there.
+    pub async fn sign_out(&self) -> Result<(), DriverError> {
+        self.stop().await;
+        let roots = roots(&self.inner.folders.lock().unwrap());
+        for root in roots {
+            self.unlink(&root).await?;
+        }
+        let path = self.inner.paths.credential();
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error(&path)(error)),
+        }
+        *self.inner.credential.lock().unwrap() = None;
+        tracing::info!("signed out");
+        self.changed();
+        Ok(())
+    }
+
+    fn check_unpaired(&self) -> Result<(), DriverError> {
+        match self.inner.credential.lock().unwrap().as_ref() {
+            Some(credential) => Err(DriverError::AlreadyPaired {
+                device_id: credential.device_id.clone(),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Stores the credential the server issued, unless another one was stored meanwhile.
+    fn adopt(
+        &self,
+        server: String,
+        issued: DeviceCredentials,
+        user_name: Option<String>,
+        device_name: &str,
+        done: &str,
+    ) -> Result<Account, DriverError> {
         let credential = Credential {
-            server: api.base().to_string(),
+            server,
             user_id: issued.user_id,
+            user_name,
             device_id: issued.device_id,
             device_name: device_name.to_owned(),
             refresh_credential: issued.refresh_credential,
@@ -258,15 +345,12 @@ impl Driver {
         tracing::info!(
             device_id = credential.device_id,
             server = credential.server,
-            "paired this device"
+            "{done}"
         );
-        let account = Account {
-            server: credential.server.clone(),
-            user_id: credential.user_id.clone(),
-            device_id: credential.device_id.clone(),
-            device_name: credential.device_name.clone(),
-        };
+        let account = credential.account();
         *slot = Some(credential);
+        drop(slot);
+        self.changed();
         Ok(account)
     }
 
@@ -357,6 +441,8 @@ impl Driver {
             self.spawn(&mut folder, &credential, linked);
         }
         folders.insert(space.space_id, folder);
+        drop(folders);
+        self.changed();
         let status = status.lock().unwrap().clone();
         Ok(status)
     }
@@ -397,6 +483,7 @@ impl Driver {
             tracing::warn!(path = %removed.link.root.display(), %error, "the folder's owner record was not removed");
         }
         tracing::info!(space_id = removed.link.space_id, path = %removed.link.root.display(), "unlinked a folder");
+        self.changed();
         Ok(removed.link)
     }
 
@@ -455,6 +542,7 @@ impl Driver {
                         folder.status.lock().unwrap().questions = left;
                     }
                     tracing::info!(space_id, question_id, %answer, "answered a question");
+                    self.changed();
                     return Ok(());
                 }
             }
@@ -485,6 +573,8 @@ impl Driver {
                 ),
             }
         }
+        drop(folders);
+        self.changed();
     }
 
     /// Stops every folder and waits for their tasks to end. State on disk is kept.
@@ -507,6 +597,7 @@ impl Driver {
         for folder in self.inner.folders.lock().unwrap().values() {
             folder.status.lock().unwrap().state = FolderState::Stopped;
         }
+        self.changed();
     }
 
     /// Starts the task of `folder`. `linked` are the roots of the profile's other folders, which it must not overlap.
@@ -543,6 +634,7 @@ impl Driver {
                 device_id: credential.device_id.clone(),
             },
             observer: Mutex::default(),
+            changed: self.inner.changed.clone(),
         };
         let (stop, stopped) = watch::channel(false);
         folder.status.lock().unwrap().state = FolderState::Connecting;
@@ -769,6 +861,7 @@ mod tests {
         Credential {
             server: "https://files.example.com/".into(),
             user_id: "u1".into(),
+            user_name: None,
             device_id: device_id.into(),
             device_name: "vm".into(),
             refresh_credential: "secret".into(),
@@ -1108,6 +1201,189 @@ mod tests {
         assert!(problem.contains("no longer the folder"), "{problem}");
         driver.stop().await;
         assert!(claim::lock(&base.join("Moved")).unwrap().is_some());
+    }
+
+    /// Serves one request on a loopback port with `reply`, a protobuf body, and returns the server's address and
+    /// what the request was: its path and its body.
+    async fn serve_once(reply: Vec<u8>) -> (String, tokio::task::JoinHandle<(String, Vec<u8>)>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = format!("http://{}/", listener.local_addr().unwrap());
+        let served = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let head_end = loop {
+                let n = socket.read(&mut chunk).await.unwrap();
+                request.extend_from_slice(&chunk[..n]);
+                if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break at + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&request[..head_end]).into_owned();
+            let length: usize = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .unwrap_or(0);
+            while request.len() < head_end + length {
+                let n = socket.read(&mut chunk).await.unwrap();
+                request.extend_from_slice(&chunk[..n]);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/x-protobuf\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                reply.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.write_all(&reply).await.unwrap();
+            let path = head.split_whitespace().nth(1).unwrap().to_owned();
+            (path, request[head_end..head_end + length].to_vec())
+        });
+        (server, served)
+    }
+
+    fn issued(device_id: &str) -> Vec<u8> {
+        prost::Message::encode_to_vec(&DeviceCredentials {
+            user_id: "u1".into(),
+            device_id: device_id.into(),
+            refresh_credential: "secret".into(),
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn claiming_creates_the_first_device_with_its_user_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let driver = Driver::open(paths.clone()).unwrap();
+        assert!(matches!(
+            driver
+                .claim("http://127.0.0.1:9/", "code", " ", "laptop")
+                .await,
+            Err(DriverError::EmptyUserName)
+        ));
+
+        let (server, served) = serve_once(issued("d1")).await;
+        let account = driver
+            .claim(&server, "claim-code", "Ada", "laptop")
+            .await
+            .unwrap();
+        assert_eq!(account.user_name.as_deref(), Some("Ada"));
+        assert_eq!(account.device_id, "d1");
+        let (path, body) = served.await.unwrap();
+        assert_eq!(path, "/v1/claim");
+        let request: ClaimRequest = prost::Message::decode(body.as_slice()).unwrap();
+        assert_eq!(
+            (
+                request.code.as_str(),
+                request.user_name.as_str(),
+                request.device_name.as_str()
+            ),
+            ("claim-code", "Ada", "laptop")
+        );
+        assert!(matches!(
+            driver.claim(&server, "claim-code", "Ada", "laptop").await,
+            Err(DriverError::AlreadyPaired { .. })
+        ));
+        drop(driver);
+        let reopened = Driver::open(paths).unwrap();
+        assert_eq!(reopened.status().account, Some(account));
+    }
+
+    #[tokio::test]
+    async fn a_paired_device_does_not_know_the_user_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver = Driver::open(Paths::under(dir.path())).unwrap();
+        let (server, served) = serve_once(issued("d2")).await;
+        let account = driver.pair(&server, "pair-code", "desktop").await.unwrap();
+        assert_eq!(served.await.unwrap().0, "/v1/pair/complete");
+        assert_eq!(account.user_name, None);
+        assert_eq!(account.device_name, "desktop");
+    }
+
+    #[tokio::test]
+    async fn watchers_wake_when_status_or_questions_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        let paths = Paths::under(&base.join("profile"));
+        linked(&paths, &root, "d1");
+        fs::write(root.join("one"), b"1").unwrap();
+        let store = paths.store(SPACE).unwrap();
+        Store::open(&store)
+            .unwrap()
+            .transaction(|tx| {
+                tx.put_question(&StoredQuestion {
+                    question_id: "q1".into(),
+                    asked_at_ms: 10,
+                    body: serde_json::to_vec(&mass_delete("q1")).unwrap(),
+                    answer: None,
+                })
+            })
+            .unwrap();
+        let driver = Driver::open(paths).unwrap();
+        let mut watch = driver.watch();
+        assert!(!watch.has_changed().unwrap());
+
+        driver.answer("q1", Answer::Restore).unwrap();
+        assert!(watch.has_changed().unwrap());
+        watch.borrow_and_update();
+
+        driver.start();
+        assert!(watch.has_changed().unwrap());
+        watch.borrow_and_update();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while driver.status().folders[0].local_entries != Some(1) {
+                watch.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the folder task's progress wakes the watcher");
+
+        watch.borrow_and_update();
+        driver.stop().await;
+        assert!(watch.has_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn signing_out_unlinks_every_folder_and_forgets_the_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        let paths = Paths::under(&base.join("profile"));
+        linked(&paths, &root, "d1");
+        fs::write(root.join("keep.txt"), b"mine").unwrap();
+        let driver = Driver::open(paths.clone()).unwrap();
+        driver.start();
+        eventually("the folder is claimed", || {
+            claim::owner(&root).unwrap().is_some()
+        })
+        .await;
+        let mut watch = driver.watch();
+        watch.borrow_and_update();
+
+        driver.sign_out().await.unwrap();
+        let status = driver.status();
+        assert_eq!(status.account, None);
+        assert!(!status.running);
+        assert!(status.folders.is_empty());
+        assert!(watch.has_changed().unwrap());
+        assert!(!paths.credential().exists());
+        assert!(!paths.store(SPACE).unwrap().parent().unwrap().exists());
+        assert_eq!(claim::owner(&root).unwrap(), None);
+        assert_eq!(fs::read(root.join("keep.txt")).unwrap(), b"mine");
+
+        let (server, served) = serve_once(issued("d3")).await;
+        driver.pair(&server, "pair-code", "laptop").await.unwrap();
+        served.await.unwrap();
+        drop(driver);
+        let reopened = Driver::open(paths).unwrap().status();
+        assert_eq!(reopened.account.unwrap().device_id, "d3");
+        assert!(reopened.folders.is_empty());
     }
 
     #[tokio::test]

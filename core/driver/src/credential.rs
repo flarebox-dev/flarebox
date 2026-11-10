@@ -10,7 +10,10 @@ use flarebox_net::{Api, ApiError, Credentials};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-/// A device's long-lived credential, as `POST /v1/pair/complete` returned it, with the server it belongs to. It lives
+use crate::status::Account;
+
+/// A device's long-lived credential, as `POST /v1/claim` or `POST /v1/pair/complete` returned it, with the server it
+/// belongs to. It lives
 /// in a file only its owner can read, in the profile's state directory and never inside a linked folder. One
 /// credential is one writer: it is never copied to another machine or shared with another profile (H6 of
 /// reports/BOX-71), so a second client on the same machine pairs on its own.
@@ -19,6 +22,9 @@ use url::Url;
 pub struct Credential {
     pub server: String,
     pub user_id: String,
+    /// The name given when this device claimed the server; none on a paired device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
     pub device_id: String,
     pub device_name: String,
     pub refresh_credential: String,
@@ -29,6 +35,7 @@ impl fmt::Debug for Credential {
         f.debug_struct("Credential")
             .field("server", &self.server)
             .field("user_id", &self.user_id)
+            .field("user_name", &self.user_name)
             .field("device_id", &self.device_id)
             .field("device_name", &self.device_name)
             .finish_non_exhaustive()
@@ -56,6 +63,16 @@ pub enum CredentialError {
 }
 
 impl Credential {
+    pub fn account(&self) -> Account {
+        Account {
+            server: self.server.clone(),
+            user_id: self.user_id.clone(),
+            user_name: self.user_name.clone(),
+            device_id: self.device_id.clone(),
+            device_name: self.device_name.clone(),
+        }
+    }
+
     pub fn net(&self) -> Credentials {
         Credentials {
             user_id: self.user_id.clone(),
@@ -166,6 +183,7 @@ mod tests {
         Credential {
             server: "https://files.example.com/".into(),
             user_id: "u1".into(),
+            user_name: Some("Ada".into()),
             device_id: "d1".into(),
             device_name: "vm".into(),
             refresh_credential: "secret-refresh".into(),
@@ -184,6 +202,19 @@ mod tests {
         assert_eq!(dir_mode, 0o700);
         assert_eq!(Credential::load(&path).unwrap(), Some(credential()));
         assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_credential_without_a_user_name_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credential.json");
+        let paired = Credential {
+            user_name: None,
+            ..credential()
+        };
+        paired.save_new(&path).unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains("user_name"));
+        assert_eq!(Credential::load(&path).unwrap(), Some(paired));
     }
 
     #[test]

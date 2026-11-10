@@ -25,7 +25,7 @@ A profile is one device credential and the stores it writes. The CLI uses the XD
 |---|---|
 | `$XDG_CONFIG_HOME/flarebox/config.toml` | The device-local configuration. Edited by the person; no secrets, no state, never synced |
 | `$XDG_STATE_HOME/flarebox/` (mode 0700) | Machine-bound state, never copied |
-| `…/credential.json` (mode 0600) | The device credential: server, user and device ids, device name, refresh credential |
+| `…/credential.json` (mode 0600) | The device credential: server, user and device ids, the user name on the device that claimed the server, device name, refresh credential |
 | `…/lock` | The profile lock (`flock`), held by the one process that writes the profile |
 | `…/spaces/<space_id>/store.sqlite` | One `core/store` per linked space: R, S, L, the cursor, the link and the questions |
 | `$XDG_RUNTIME_DIR/flarebox/daemon.sock` (mode 0600) | The daemon's socket; in the state directory when `XDG_RUNTIME_DIR` is unset |
@@ -33,7 +33,7 @@ A profile is one device credential and the stores it writes. The CLI uses the XD
 
 **One credential, one writer (H6 of reports/BOX-71).** Same-device changes never count as unseen on the server, and `device_seq` is strict, so two writers sharing a credential would overwrite each other silently or refuse each other's commits. The driver keeps the rule in five places:
 
-1. `pair` refuses to replace a credential: a profile is paired once. The macOS app and the CLI on the same machine are separate profiles and pair separately.
+1. `pair` and `claim` refuse to replace a credential: a profile is paired once, until `sign_out`. The macOS app and the CLI on the same machine are separate profiles and pair separately.
 2. Opening a driver takes the profile lock, so a second daemon, or a command while the daemon is not answering, is refused.
 3. Each store records the device and server that linked it (`Link` in `core/store`). A store whose device is not the profile's halts with a problem instead of syncing.
 4. `link` refuses a folder that holds, or sits inside, the state, runtime or configuration directory or another linked folder, so the credential and the stores are never synced. Each folder task checks this again before it observes the folder or connects, because a profile can be moved into a folder after linking it. Folders are compared by path and by the identity of each folder and its ancestors, so a symbolic link, a bind mount or a macOS firmlink does not hide an overlap.
@@ -60,20 +60,23 @@ The matcher is GUN-270's. Until it lands, `ignore::matcher` returns `Unfiltered`
 | Call | What it does |
 |---|---|
 | `pair(server, code, name)` | `POST /v1/pair/complete` with a code from a paired device, then writes the credential. Headless: no browser |
+| `claim(server, code, user_name, device_name)` | `POST /v1/claim` with the one-time code from the server's log, for the first device of a new server; writes the credential with the user name |
+| `sign_out()` | Stops the driver, unlinks every folder (the files stay) and deletes the credential, so the profile can pair or claim again. The server is not told: the device stays registered there |
 | `link(folder, space)` | Resolves the space by id, then by unique name (`GET /v1/spaces`); checks the folder (exists, no overlap with the profile or another linked folder, a no-replace rename (design §5.2), no other process syncing it, no record of another device, no marker of another space); writes the root marker if missing and the owner record; creates the store with its `Link`. Starts the folder if the driver runs |
 | `unlink(folder)` | Stops the folder, deletes its store and removes the folder's owner record. The files and the rest of the folder's `.flarebox/` stay, because the local trash may hold displaced files |
 | `status()` | The account and, per folder, state, cursor, head, remote node count, local entry count, unanswered questions and the current problem |
 | `questions()`, `answer(id, answer)` | Lists unanswered questions from the stores and records an answer, refusing one the question does not offer |
 | `start()`, `stop()` | Starts one task per folder on the current runtime; stops them and waits |
+| `watch()` | A `tokio::sync::watch` receiver marked changed whenever `status()` or `questions()` may have changed: pairing, claiming, linking, unlinking, answering, starting, stopping, signing out and every status update of a folder task. A mark may come without a visible difference |
 
 How `core/ffi`'s `Core` trait maps onto it in step D:
 
 | `Core` | Driver |
 |---|---|
-| `state` | `status` and `questions`. Step D adds a change notification (a `watch` channel next to the status) so the app gets `SessionEvent`s instead of polling |
-| `start`, `stop`, `pair`, `link_folder`, `unlink_folder`, `answer` | the calls of the same name (`unlink_folder` takes a space id; the app finds the path in the status) |
-| `connect`, `claim`, `start_pairing`, `spaces`, `create_space` | not in the driver yet; each is one `core/net` `Api` call |
-| `pause`, `resume`, `sign_out`, `dismiss_notice`, `devices` | not in the driver yet; notices and the pause need state the engine produces, and no server lists devices |
+| `state` | `status` and `questions`, read again after each `watch` mark, so the app gets `SessionEvent`s instead of polling. `Account.user_name` is set on the device that claimed the server |
+| `start`, `stop`, `pair`, `claim`, `sign_out`, `link_folder`, `unlink_folder`, `answer` | the calls of the same name (`unlink_folder` takes a space id; the app finds the path in the status) |
+| `connect`, `start_pairing`, `spaces`, `create_space` | not in the driver yet; each is one `core/net` `Api` call |
+| `pause`, `resume`, `dismiss_notice`, `devices` | not in the driver yet; notices and the pause need state the engine produces, and no server lists devices |
 
 ## A folder's task
 
@@ -127,7 +130,8 @@ Once #28 is merged, part 2 puts the engine between the inputs and outputs part 1
 4. **Effects.** Execute `ApplyEffect` through `core/fs`'s `Space::apply` with the quarantine protocol, writing the marker counter first, and report `EffectDone` or `EffectFailed`. The executor is bound to the descriptor of the locked folder and resolves every path relative to it (`openat`), and observations are consumed under the same guard, because the path check of H6 rule 5 is not a barrier for writes. File contents come from `GetDownloadTargets` and `Transfer::download` into staging, through the chunk cache in the store.
 5. **Commits.** Execute `SendCommit`: `PrepareUpload` and `Transfer::upload` for the chunks it references, then `Session::commit`. Report `CommitResult` or `CommitFailed` with the refusal disposition of `policy`.
 6. **Questions and problems.** Store each `AskUser` as a question row whose body is a `Question`; give recorded answers to the engine as `UserDecision` and delete the rows it has consumed. Show `Problem` outputs in the folder's status.
-7. **Pass condition:** two Linux profiles linked to one space sync files both ways, as an integration test against the Worker under `wrangler dev`.
+7. **App surface.** Extend what `status()` and `questions()` report for the macOS app (step D): per-folder progress (files and bytes left to upload and to download), typed problems instead of strings, and on each question the kind and detail of every item, the mass-delete limit that was crossed and the cause of a recovery.
+8. **Pass condition:** two Linux profiles linked to one space sync files both ways, as an integration test against the Worker under `wrangler dev`.
 
 ## Spec notes
 
@@ -135,3 +139,7 @@ These belong to the spec owner (RFC 0006, #44); the driver follows them already:
 
 - H1: a client treats an unknown `Error.Code` as a refusal that halts the operation, and retries `QUOTA_EXCEEDED` only when `retry_after_ms` is above 0.
 - H6: two processes that write must never share a `device_id`; a second client on the same machine pairs on its own.
+
+And one the driver needs:
+
+- No response carries the user's name to a paired device: `DeviceCredentials` has only ids, and no endpoint reads the user. Adding `user_name` to `DeviceCredentials` (or a read of the signed-in user) would let `Account.user_name` be set after `pair` too.
