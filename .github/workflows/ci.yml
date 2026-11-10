@@ -59,7 +59,7 @@ jobs:
           decide rust_macos '^(\.github/workflows/ci\.yml$|Cargo\.(toml|lock)$|rust-toolchain\.toml$|\.cargo/|cli/|core/|spec/)'
           decide server_macos '^(\.github/workflows/ci\.yml$|server/|spec/)'
           decide spec_macos '^(\.github/workflows/ci\.yml$|spec/|server/src/gen/|core/proto/)'
-          decide macos_app '^(\.github/workflows/ci\.yml$|Cargo\.(toml|lock)$|rust-toolchain\.toml$|\.cargo/|core/|apps/macos/)'
+          decide macos_app '^(\.github/workflows/ci\.yml$|Cargo\.(toml|lock)$|cli/Cargo\.toml$|rust-toolchain\.toml$|\.cargo/|core/|apps/macos/)'
 
   rust:
     name: rust (${{ matrix.os }})

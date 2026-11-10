@@ -68,7 +68,7 @@ jobs:
             echo "::error::git diff between $BASE and HEAD failed, so the changed paths are unknown."
             exit 1
           fi
-          pattern='^(\.github/workflows/release-macos\.yml$|Cargo\.(toml|lock)$|rust-toolchain\.toml$|\.cargo/|core/|apps/macos/)'
+          pattern='^(\.github/workflows/release-macos\.yml$|Cargo\.(toml|lock)$|cli/Cargo\.toml$|rust-toolchain\.toml$|\.cargo/|core/|apps/macos/)'
           if grep -Eq "$pattern" <<<"$changed"; then
             echo "A changed file matches $pattern: building the unsigned disk image."
             echo "affected=true" >> "$GITHUB_OUTPUT"
