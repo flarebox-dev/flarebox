@@ -163,6 +163,25 @@ pub struct Space {
     pub name: String,
 }
 
+/// What a space stores, in bytes of chunks (RFC 0010). Each chunk counts once, under the first of
+/// live files, the trash and old versions that holds it, so the four byte counts add up to the
+/// space's chunk bytes.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct SpaceUsage {
+    pub live_files: u64,
+    pub live_bytes: u64,
+    pub trashed_files: u64,
+    /// Chunks of trashed files that no live file holds.
+    pub trash_bytes: u64,
+    /// Replaced versions the space keeps, of live and trashed files.
+    pub old_versions: u64,
+    /// Chunks that only old versions hold.
+    pub old_version_bytes: u64,
+    /// Chunks no version holds: uploads not committed yet, and chunks waiting out the grace
+    /// period before deletion.
+    pub unreferenced_bytes: u64,
+}
+
 /// A folder on this device linked to a space. Each space links at most one folder, and linked
 /// folders never contain each other.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]

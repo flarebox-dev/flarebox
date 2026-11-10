@@ -6,7 +6,7 @@
 //! The driver keeps the credential, the linked folders, their stores and the questions; this
 //! module maps its [`Status`] and questions onto [`SessionState`] and sends what changed as
 //! [`SessionEvent`]s. Calls the driver does not have (`connect`, `start_pairing`, `spaces`,
-//! `create_space`) are one `core/net` call each. The pause is the driver stopped, remembered in
+//! `create_space`, `space_usage`) are one `core/net` call each. The pause is the driver stopped, remembered in
 //! the profile so that it outlives a relaunch.
 
 use std::collections::BTreeMap;
@@ -32,7 +32,7 @@ use crate::types::{
     Account, Answer, DeviceList, FolderState, HeldItem, ItemDetail, LinkedFolder, MassDeleteLimit,
     NodeKind, PairingCode, Problem, ProblemKind, Question, QuestionKind, RecoveryCause,
     RecoveryGroup, RecoveryTrigger, ServerInfo, SessionError, SessionEvent, SessionState, Space,
-    SyncStatus,
+    SpaceUsage, SyncStatus,
 };
 
 pub(crate) struct DriverCore {
@@ -445,6 +445,23 @@ impl Core for DriverCore {
         Ok(Space {
             space_id: space.space_id,
             name: space.name,
+        })
+    }
+
+    fn space_usage(&self, space_id: &str) -> Result<SpaceUsage, SessionError> {
+        let (api, auth) = self.signed_in()?;
+        let usage = self
+            .runtime
+            .block_on(api.space_usage(&auth, space_id))
+            .map_err(api_error)?;
+        Ok(SpaceUsage {
+            live_files: usage.live_files,
+            live_bytes: usage.live_bytes,
+            trashed_files: usage.trashed_files,
+            trash_bytes: usage.trash_bytes,
+            old_versions: usage.old_versions,
+            old_version_bytes: usage.old_version_bytes,
+            unreferenced_bytes: usage.unreferenced_bytes,
         })
     }
 

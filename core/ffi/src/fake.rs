@@ -16,7 +16,7 @@ use crate::types::{
     ItemDetail, LinkedFolder, MassDeleteLimit, NodeKind, Notice, NoticeKind, PairingCode, Problem,
     ProblemKind, Question, QuestionKind, RECENT_CHANGES, RecentChange, RecoveryCause,
     RecoveryGroup, RecoveryTrigger, ServerInfo, SessionError, SessionEvent, SessionState, Space,
-    SyncProgress, SyncStatus,
+    SpaceUsage, SyncProgress, SyncStatus,
 };
 
 const CLAIM_CODE_LEN: usize = 12;
@@ -101,6 +101,8 @@ struct State {
     recent: Vec<RecentChange>,
     answers: Vec<GivenAnswer>,
     fail_next: Option<SessionError>,
+    /// The spaces whose usage the server refuses, and how.
+    usage_refusals: Vec<(String, SessionError)>,
     fail_saves: bool,
     /// [`ProblemKind::StateNotWritable`] after a failed save, until a save succeeds. It is
     /// not saved itself.
@@ -214,6 +216,7 @@ impl FakeCore {
                 recent: Vec::new(),
                 answers: Vec::new(),
                 fail_next: None,
+                usage_refusals: Vec::new(),
                 fail_saves: false,
                 not_writable: None,
                 status: SyncStatus::Stopped,
@@ -337,6 +340,7 @@ impl FakeCore {
         state.recent = script.recent;
         state.answers.clear();
         state.fail_next = None;
+        state.usage_refusals.clear();
         self.publish(&mut state, &ALL_PARTS, cleared);
         Ok(())
     }
@@ -472,6 +476,11 @@ impl FakeCore {
     /// Makes the next call that can fail return `error` instead.
     pub fn fail_next(&self, error: SessionError) {
         self.lock().fail_next = Some(error);
+    }
+
+    /// Makes every usage read of the space fail with `error`, as for a space a rewind holds closed.
+    pub fn refuse_space_usage(&self, space_id: String, error: SessionError) {
+        self.lock().usage_refusals.push((space_id, error));
     }
 
     /// Makes every save fail, as an unwritable store would, until called with false.
@@ -699,6 +708,33 @@ impl Core for FakeCore {
             };
             saved.spaces.push(space.clone());
             Ok(space)
+        })
+    }
+
+    /// Made-up numbers that grow with the space's place in the list, so that previews show
+    /// spaces of different sizes.
+    fn space_usage(&self, space_id: &str) -> Result<SpaceUsage, SessionError> {
+        let mut state = self.lock();
+        state.take_failure()?;
+        state.saved.account()?;
+        if let Some((_, error)) = state.usage_refusals.iter().find(|(id, _)| id == space_id) {
+            return Err(error.clone());
+        }
+        let n = state
+            .saved
+            .spaces
+            .iter()
+            .position(|space| space.space_id == space_id)
+            .ok_or(SessionError::SpaceNotFound)? as u64
+            + 1;
+        Ok(SpaceUsage {
+            live_files: 1_204 * n,
+            live_bytes: 3_200_000_000 * n,
+            trashed_files: 12 * n,
+            trash_bytes: 40_100_000 * n,
+            old_versions: 30 * n,
+            old_version_bytes: 120_000_000 * n,
+            unreferenced_bytes: 1_500_000 * n,
         })
     }
 
@@ -1013,6 +1049,14 @@ mod tests {
         let one = h.core.create_space("One").unwrap();
         let two = h.core.create_space("Two").unwrap();
         assert_eq!(h.core.spaces().unwrap(), [one.clone(), two.clone()]);
+        assert!(
+            h.core.space_usage(&two.space_id).unwrap().live_bytes
+                > h.core.space_usage(&one.space_id).unwrap().live_bytes
+        );
+        assert_eq!(
+            h.core.space_usage("no-such-space"),
+            Err(SessionError::SpaceNotFound)
+        );
 
         let path = dir.path().to_str().unwrap();
         assert_eq!(

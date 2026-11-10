@@ -225,12 +225,43 @@ public final class AppModel {
         try await run { try $0.createSpace(name: name) }
     }
 
+    /// What each of the account's spaces stores, in the order the server lists the spaces. A space
+    /// the server refuses, such as one a rewind holds closed, keeps its refusal and does not hide
+    /// the others. Only a device that is not signed in fails the whole list.
+    public func storage() async throws -> [SpaceStorage] {
+        try await run { session in
+            try session.spaces().map { space in
+                do {
+                    return SpaceStorage(space: space, usage: .success(try session.spaceUsage(spaceId: space.spaceId)))
+                } catch SessionError.NotSignedIn {
+                    throw SessionError.NotSignedIn
+                } catch let refusal as SessionError {
+                    return SpaceStorage(space: space, usage: .failure(refusal))
+                }
+            }
+        }
+    }
+
     public func linkFolder(spaceID: String, path: String) async throws -> LinkedFolder {
         try await run { try $0.linkFolder(spaceId: spaceID, path: path) }
     }
 
     public func unlinkFolder(spaceID: String) async throws {
         try await run { try $0.unlinkFolder(spaceId: spaceID) }
+    }
+}
+
+/// What one space stores (RFC 0010), or why the server refused to say.
+public struct SpaceStorage: Identifiable, Equatable, Sendable {
+    public var id: String { space.spaceId }
+    public let space: Space
+    public let usage: Result<SpaceUsage, SessionError>
+}
+
+extension SpaceUsage {
+    /// The bytes of every chunk the space holds. Each chunk counts once.
+    public var totalBytes: UInt64 {
+        liveBytes + trashBytes + oldVersionBytes + unreferencedBytes
     }
 }
 

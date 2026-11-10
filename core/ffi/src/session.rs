@@ -9,7 +9,7 @@ use crate::driver::DriverCore;
 use crate::fake::FakeCore;
 use crate::types::{
     Account, Answer, DeviceList, LinkedFolder, PairingCode, ServerInfo, SessionError, SessionState,
-    Space,
+    Space, SpaceUsage,
 };
 
 /// A sync session: the one object the app talks to. Each method forwards to the session's
@@ -120,6 +120,10 @@ impl SyncSession {
 
     pub fn create_space(&self, name: String) -> Result<Space, SessionError> {
         self.core.create_space(&name)
+    }
+
+    pub fn space_usage(&self, space_id: String) -> Result<SpaceUsage, SessionError> {
+        self.core.space_usage(&space_id)
     }
 
     pub fn link_folder(
