@@ -5,6 +5,7 @@
 
 mod ipc;
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -134,6 +135,7 @@ fn init_logging(daemon: Option<LogFormat>) {
         EnvFilter::try_from_env("FLAREBOX_LOG").unwrap_or_else(|_| EnvFilter::new(default));
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_ansi(std::io::stderr().is_terminal())
         .with_writer(std::io::stderr);
     match daemon {
         Some(LogFormat::Json) => builder.json().with_current_span(false).init(),
