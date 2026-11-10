@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { type Migration, migrate as runMigrations } from "../migrations";
+
 // Space DO storage, following spec v0 section 4.1. Migrations only move forward.
 
-/** Each step is idempotent, so a database whose schema_version lags its tables still migrates. */
-const MIGRATIONS: (string | ((sql: SqlStorage) => void))[] = [
+/** Append-only: never edit or reorder a step that has been merged. */
+export const MIGRATIONS: readonly Migration[] = [
   `
   CREATE TABLE meta (key TEXT PRIMARY KEY, value BLOB NOT NULL);
   CREATE TABLE members (user_id TEXT PRIMARY KEY, role TEXT NOT NULL, added_seq INTEGER NOT NULL);
@@ -71,17 +73,7 @@ const MIGRATIONS: (string | ((sql: SqlStorage) => void))[] = [
 ];
 
 export function migrate(sql: SqlStorage): void {
-  const hasMeta = sql.exec("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").toArray().length > 0;
-  let version = hasMeta
-    ? Number(sql.exec("SELECT value FROM meta WHERE key = 'schema_version'").toArray()[0]?.value ?? 0)
-    : 0;
-  while (version < MIGRATIONS.length) {
-    const step = MIGRATIONS[version]!;
-    if (typeof step === "string") sql.exec(step);
-    else step(sql);
-    version++;
-    sql.exec("INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value", version);
-  }
+  runMigrations(sql, "meta", MIGRATIONS);
 }
 
 export const NodeKindValue = { DIR: 1, FILE: 2 } as const;
