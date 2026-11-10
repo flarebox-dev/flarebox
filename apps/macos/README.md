@@ -34,10 +34,13 @@ The app keeps its sync profile in `~/Library/Application Support/Flarebox`: the 
 
 To try it against a local server, start the Worker in `server/` with `pnpm exec wrangler dev` (after `pnpm install`), enter `http://127.0.0.1:8787` in the setup window, open `http://127.0.0.1:8787/setup` in a browser, and claim the server with the code that `wrangler dev` prints. Plain `http` is accepted only on a loopback address.
 
-To show a state the driver cannot reach yet, start the app on the fake core in `core/ffi` with a scripted scenario. The fake keeps its state in memory only:
+To show a state the driver cannot reach yet, start a Debug build on the fake core in `core/ffi` with a scripted scenario. Release builds ignore the `FakeScenario` setting. The fake keeps its state in memory only:
 
 ```sh
-open build/DerivedData/Build/Products/Release/Flarebox.app --args -FakeScenario manyQuestions
+xcodebuild -project Flarebox.xcodeproj -scheme Flarebox -configuration Debug \
+  -derivedDataPath build/DerivedData -destination "platform=macOS,arch=$(uname -m)" \
+  CODE_SIGNING_ALLOWED=NO build
+open build/DerivedData/Build/Products/Debug/Flarebox.app --args -FakeScenario manyQuestions
 ```
 
 The scenarios are `firstRun`, `upToDate`, `syncing`, `paused`, `offline`, `massDelete`, `ambiguousDisappearance`, `recovery`, `recoveredWithoutQuestions`, `remoteMassDelete`, `manyQuestions` and `problems`.

@@ -51,6 +51,21 @@ private func item(_ path: String) -> HeldItem {
         #expect(SetupModel(app: ready, mode: .addFolder, deviceName: "Mac").step == .folder)
     }
 
+    @Test func onlyADebugBuildStartsOnTheFakeScenarioPreference() throws {
+        let suite = "dev.flarebox.tests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set("massDelete", forKey: "FakeScenario")
+        #if DEBUG
+        #expect(AppModel.launchScenario(in: defaults) == .massDelete)
+        #else
+        #expect(AppModel.launchScenario(in: defaults) == nil)
+        #endif
+
+        defaults.set("noSuchScenario", forKey: "FakeScenario")
+        #expect(AppModel.launchScenario(in: defaults) == nil)
+    }
+
     @Test func pauseAndResume() throws {
         let model = AppModel.fake(scenario: .upToDate)
         model.start()

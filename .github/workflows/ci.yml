@@ -268,6 +268,8 @@ jobs:
         run: scripts/build-release.sh
       - name: Test the Swift bindings
         run: swift test --package-path FlareboxFFI
+      - name: Test the Swift bindings in the release configuration, which has no DEBUG condition
+        run: swift test --package-path FlareboxFFI -c release
       - name: Check the app bundle
         run: plutil -p build/release/Flarebox.app/Contents/Info.plist
       - name: Sign the app ad hoc (pull requests are never signed with the Developer ID)

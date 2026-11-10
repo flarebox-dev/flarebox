@@ -11,7 +11,7 @@ struct FlareboxApp: App {
 
     init() {
         let model: AppModel
-        if let scenario = UserDefaults.standard.string(forKey: "FakeScenario").flatMap(FakeScenario.init(name:)) {
+        if let scenario = AppModel.launchScenario(in: .standard) {
             model = AppModel.fake(scenario: scenario)
         } else {
             let profile = URL.applicationSupportDirectory.appending(path: "Flarebox", directoryHint: .isDirectory)
