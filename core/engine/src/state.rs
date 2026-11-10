@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::commit::{Halt, InFlight};
 use crate::effects::{Effect, EffectRecord};
+use crate::restore::{Resolved, RestoreId, RestoreIntent};
 use crate::tree::{NodeId, Shape, TreeError};
 
 /// What [`Trees`](crate::classify::Trees) holds besides the nodes of R, L and S.
@@ -53,6 +54,12 @@ pub struct CommitsState {
     pub split: BTreeSet<NodeId>,
     /// Folders merged into one L holds elsewhere, by the folder they were merged into.
     pub aliases: BTreeMap<NodeId, NodeId>,
+    /// The restores a person asked for that have no outcome yet, in request order. The commit in
+    /// flight carries those its `Restore` ops name.
+    pub restores: BTreeMap<RestoreId, RestoreIntent>,
+    /// The restores that ended, oldest first, at most
+    /// [`RESOLVED_KEPT`](crate::restore::RESOLVED_KEPT).
+    pub resolved: Vec<Resolved>,
 }
 
 /// What [`Effects`](crate::effects::Effects) holds.
@@ -87,6 +94,10 @@ pub enum StateError {
     Cap(usize),
     /// A folder is merged into itself.
     SelfAlias(NodeId),
+    /// The commit in flight holds a `Restore` op, at this index, that no queued restore asks for.
+    RestoreNotQueued(usize),
+    /// A restore is queued and also has an outcome, or has two outcomes.
+    RestoreResolved(RestoreId),
     /// The effect in flight does not carry the counter after the cleared one.
     EffectCounter { cleared: u64, counter: u64 },
 }

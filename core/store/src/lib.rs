@@ -10,8 +10,10 @@
 //!   parked flag;
 //! - the rest of the engine's state ([`EngineState`]): the commit in flight
 //!   with its buffered result, the accepted counter, the halt, the effect in
-//!   flight with the effect counter, and the node sets and maps the trees, the
-//!   commits and the effects keep;
+//!   flight with the effect counter, the node sets and maps the trees, the
+//!   commits and the effects keep, and the restores a person asked for with
+//!   their outcomes;
+//! - the restore requests the engine has not taken yet;
 //! - the engine's ID generator state and the index of chunks cached on disk;
 //! - the [`Link`]: the folder the store syncs and the device credential that
 //!   writes it, and the questions the engine asked with their answers.
@@ -39,6 +41,7 @@ use prost::Message;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 mod engine;
+mod restore;
 
 /// Schema migrations, applied in order. Migration `i` moves the database from
 /// `user_version = i` to `user_version = i + 1`. Never edit an entry once it
@@ -191,6 +194,35 @@ const MIGRATIONS: &[&str] = &[
         kind INTEGER,
         content BLOB,
         CHECK ((name IS NULL) = (kind IS NULL))
+    ) STRICT, WITHOUT ROWID;
+",
+    "
+    CREATE TABLE restore_requests (
+        restore_id TEXT PRIMARY KEY,
+        node_id TEXT NOT NULL,
+        version_id TEXT,
+        target_parent_id TEXT,
+        name TEXT,
+        CHECK (version_id IS NULL OR (target_parent_id IS NULL AND name IS NULL))
+    ) STRICT, WITHOUT ROWID;
+
+    CREATE TABLE restore_intents (
+        restore_id TEXT PRIMARY KEY,
+        node_id TEXT NOT NULL,
+        version_id TEXT,
+        target_parent_id TEXT,
+        name TEXT,
+        position INTEGER UNIQUE,
+        outcome TEXT
+            CHECK (outcome IN ('restored', 'renamed', 'copied', 'rejected', 'does_not_fit')),
+        outcome_node_id TEXT,
+        outcome_name TEXT,
+        reject_reason TEXT,
+        CHECK (version_id IS NULL OR (target_parent_id IS NULL AND name IS NULL)),
+        CHECK ((outcome IS NULL) = (position IS NULL)),
+        CHECK ((outcome IS 'renamed' OR outcome IS 'copied') = (outcome_name IS NOT NULL)),
+        CHECK ((outcome IS 'copied') = (outcome_node_id IS NOT NULL)),
+        CHECK ((outcome IS 'rejected') = (reject_reason IS NOT NULL))
     ) STRICT, WITHOUT ROWID;
 ",
 ];

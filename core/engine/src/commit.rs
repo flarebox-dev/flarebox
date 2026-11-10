@@ -4,7 +4,7 @@
 //! sections 2.4, 2.6, 2.7, 2.8 and 4.2, and RFC 0002): the rebase of concurrent changes onto R, the
 //! one commit in flight with its history and device slot, and what each result and error does.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use flarebox_proto::v1::{self as proto, error, op, op_result};
 use prost::Message;
@@ -12,6 +12,7 @@ use prost::Message;
 use crate::classify::{Class, Trees};
 use crate::ids::IdGen;
 use crate::names::{MAX_NAME_BYTES, name_key, nfc};
+use crate::restore::{Outcome, RESOLVED_KEPT, Rejection, Resolved, RestoreId, RestoreIntent};
 use crate::state::{CommitsState, StateError};
 use crate::tree::{Content, Kind, Names, NodeId, Shape, same, same_content};
 
@@ -77,8 +78,9 @@ pub enum Failure {
     Resync,
     /// The commit did not fit (`LIMIT_EXCEEDED`). Nothing was applied and the commit is
     /// forgotten; its changes are planned again in commits half its size, a delete that was
-    /// alone in its commit is planned as deletes of its contents first, and any other op alone in
-    /// its commit marks its node as a problem.
+    /// alone in its commit is planned as deletes of its contents first, a restore that was alone
+    /// ends as [`Outcome::DoesNotFit`], and any other op alone in its commit marks its node as a
+    /// problem.
     Split,
     Halted(Halt),
 }
@@ -91,7 +93,7 @@ pub enum CommitError {
 }
 
 /// The commit side of a space: the accepted device counter, the commit in flight, the nodes the
-/// server rejected an op for, and whether committing has stopped.
+/// server rejected an op for, the restores a person asked for, and whether committing has stopped.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Commits {
     accepted: u64,
@@ -107,6 +109,10 @@ pub struct Commits {
     /// moves into them go to that folder, and the nodes they bring are reverted, so on disk they
     /// follow into it.
     aliases: BTreeMap<NodeId, NodeId>,
+    /// Restores without an outcome, in request order (see [`Commits::restore`]).
+    restores: BTreeMap<RestoreId, RestoreIntent>,
+    /// The last [`RESOLVED_KEPT`] restores that ended, oldest first.
+    resolved: Vec<Resolved>,
 }
 
 impl Commits {
@@ -120,13 +126,16 @@ impl Commits {
             cap: self.cap,
             split: self.split.clone(),
             aliases: self.aliases.clone(),
+            restores: self.restores.clone(),
+            resolved: self.resolved.clone(),
         }
     }
 
     /// The commit side the store kept. Refuses a commit in flight that does not take slot
     /// `accepted + 1`, whose result does not have one outcome per op, or that lists planned
-    /// deletes for a node none of its `Delete` ops targets. Also refuses a cap of 0 or of at least
-    /// [`MAX_OPS`], and a folder merged into itself.
+    /// deletes for a node none of its `Delete` ops targets, or that holds a `Restore` op no queued
+    /// restore asks for. Also refuses a cap of 0 or of at least [`MAX_OPS`], a folder merged into
+    /// itself, and a restore that has an outcome and is still queued or has a second outcome.
     pub fn from_state(state: CommitsState) -> Result<Self, StateError> {
         if let Some(flight) = &state.in_flight {
             let device_seq = flight.commit.device_seq;
@@ -150,6 +159,13 @@ impl Commits {
             if let Some(id) = flight.deletes.keys().find(|id| !deleted(id)) {
                 return Err(StateError::DeleteWithoutOp(id.clone()));
             }
+            carried(&state.restores, ops).map_err(StateError::RestoreNotQueued)?;
+        }
+        let mut ended = BTreeSet::new();
+        for resolved in &state.resolved {
+            if state.restores.contains_key(&resolved.id) || !ended.insert(&resolved.id) {
+                return Err(StateError::RestoreResolved(resolved.id.clone()));
+            }
         }
         if let Some(cap) = state.cap.filter(|cap| !(1..MAX_OPS).contains(cap)) {
             return Err(StateError::Cap(cap));
@@ -165,6 +181,8 @@ impl Commits {
             cap,
             split,
             aliases,
+            restores,
+            resolved,
         } = state;
         Ok(Self {
             accepted,
@@ -174,6 +192,8 @@ impl Commits {
             cap,
             split,
             aliases,
+            restores,
+            resolved,
         })
     }
 
@@ -201,6 +221,61 @@ impl Commits {
         self.halted
     }
 
+    /// Queues a restore a person asked for. The next commit that is built carries its `Restore`
+    /// op, and acknowledging that commit moves the restore to [`Commits::resolved`] with its
+    /// outcome. On a read-only device it ends at once as rejected. False, and nothing changes,
+    /// when a restore with this ID is queued or has an outcome, so a request can be repeated.
+    pub fn restore(&mut self, id: RestoreId, intent: RestoreIntent) -> bool {
+        if self.restores.contains_key(&id) || self.resolved.iter().any(|ended| ended.id == id) {
+            return false;
+        }
+        self.restores.insert(id, intent);
+        self.reject_unsent_when_read_only();
+        true
+    }
+
+    /// The restores without an outcome, sent or not, in request order.
+    pub fn restores(&self) -> &BTreeMap<RestoreId, RestoreIntent> {
+        &self.restores
+    }
+
+    /// The last [`RESOLVED_KEPT`] restores that ended, oldest first. An older outcome is dropped.
+    pub fn resolved(&self) -> &[Resolved] {
+        &self.resolved
+    }
+
+    fn resolve(&mut self, id: RestoreId, outcome: Outcome) {
+        let intent = self.restores.remove(&id).expect("a queued restore");
+        self.resolved.push(Resolved {
+            id,
+            intent,
+            outcome,
+        });
+        let excess = self.resolved.len().saturating_sub(RESOLVED_KEPT);
+        self.resolved.drain(..excess);
+    }
+
+    /// On a read-only device nothing is committed, so a queued restore would wait without an
+    /// end. Each ends as rejected, except those the commit in flight carries: that commit may
+    /// have been applied, and its result decides them.
+    fn reject_unsent_when_read_only(&mut self) {
+        if self.halted != Some(Halt::ReadOnly) {
+            return;
+        }
+        let ops = self.in_flight.as_ref().map(|flight| &flight.commit.ops[..]);
+        let sent: BTreeSet<RestoreId> = carried(&self.restores, ops.unwrap_or_default())
+            .expect("a Restore op in flight is queued")
+            .into_values()
+            .collect();
+        let unsent: Vec<RestoreId> = (self.restores.keys())
+            .filter(|id| !sent.contains(*id))
+            .cloned()
+            .collect();
+        for id in unsent {
+            self.resolve(id, Outcome::Rejected(Rejection::ReadOnly));
+        }
+    }
+
     /// Builds the next commit from local changes, unless one is in flight or committing has
     /// stopped. While committing has stopped it still makes the waiting S updates that fit (see
     /// [`Trees::waiting`]), so the effects plan their nodes again as downloads go on. The caller
@@ -223,6 +298,12 @@ impl Commits {
     /// [`MAX_OPS`], at [`MAX_COMMIT_BYTES`] of estimated change records, or at half the size of
     /// the last commit that did not fit. The rebase changes the trees even when no commit results,
     /// so the caller plans effects again after building.
+    ///
+    /// The queued restores come first, in request order, so local changes of other nodes do not
+    /// hold them back. A restore follows every op this commit has for its own node: an unsent
+    /// edit of a file is sent before the restore of an earlier version and so becomes a version
+    /// itself. While such an op is left for a later commit, the restore waits with it. A folder
+    /// is not deleted in the commit that restores a node into it.
     pub fn build(
         &mut self,
         trees: &mut Trees,
@@ -251,7 +332,15 @@ impl Commits {
         self.split.retain(|id| trees.synced().live(id).is_some());
         self.aliases.retain(|id, _| trees.local().get(id).is_some());
         let cap = self.cap.unwrap_or(MAX_OPS);
-        let (ops, deletes, reverts) = plan(trees, &skip, &needed, cap, &self.split, &self.aliases);
+        let (ops, deletes, reverts) = plan(
+            trees,
+            &skip,
+            &needed,
+            cap,
+            &self.split,
+            &self.aliases,
+            &self.restores,
+        );
         for id in reverts {
             trees.revert(id);
         }
@@ -293,6 +382,11 @@ impl Commits {
     /// merged into, the created directory and the nodes created in it are reverted: on disk they
     /// move into the merged directory and the emptied one is removed. The accepted counter takes
     /// the commit's slot. Returns false while there is nothing to acknowledge.
+    ///
+    /// A `Restore` op changes neither S nor L. What it sent is an instruction, and only the server
+    /// knows the nodes and the content it brought back, so all of it is a remote change that R
+    /// already holds and the effects apply. The restore leaves the queue with its outcome,
+    /// whatever the result, and its node is never marked as a problem.
     ///
     /// S stays a valid tree. When the updates together would break it, because S still lags R
     /// elsewhere, each is made as soon as it fits and the rest wait (see [`Trees::waiting`]).
@@ -411,6 +505,10 @@ impl Commits {
         for (id, shape) in synced.apply(trees) {
             trees.wait(id, shape);
         }
+        let restored = carried(&self.restores, &flight.commit.ops);
+        for (index, id) in restored.expect("a Restore op in flight is queued") {
+            self.resolve(id, Outcome::from_result(&result.results[index]));
+        }
         self.retry_waiting(trees, BTreeSet::new(), Vec::new());
         self.accepted = flight.commit.device_seq;
         self.cap = self.cap.map(|cap| cap * 2).filter(|cap| *cap < MAX_OPS);
@@ -453,6 +551,9 @@ impl Commits {
     /// history mismatch or a stale device state keeps it as evidence and stops committing; and
     /// every other code, known or not, is a policy halt ([`Halt::Policy`], RFC 0006 section 1).
     /// `QUOTA_EXCEEDED` is resent only when it names a retry time, after that wait.
+    ///
+    /// The restores of a forgotten commit stay queued and go into the next commit, except on a
+    /// device that is now read-only, where they end as rejected. A halt keeps them queued.
     pub fn failed(&mut self, error: &proto::Error) -> Result<Failure, CommitError> {
         use error::Code;
         if self.in_flight.is_none() {
@@ -483,8 +584,14 @@ impl Commits {
             Failure::Split => {
                 let flight = self.in_flight.take().expect("checked");
                 let ops = flight.commit.ops;
+                let restored = carried(&self.restores, &ops);
+                let restore = restored
+                    .expect("a Restore op in flight is queued")
+                    .remove(&0);
                 if ops.len() > 1 {
                     self.cap = Some(ops.len() / 2);
+                } else if let Some(id) = restore {
+                    self.resolve(id, Outcome::DoesNotFit);
                 } else if let Some(op) = ops.into_iter().next().and_then(|op| op.op) {
                     match op {
                         op::Op::Delete(delete) if !self.split.contains(&delete.node_id) => {
@@ -497,6 +604,7 @@ impl Commits {
                 }
             }
         }
+        self.reject_unsent_when_read_only();
         Ok(failure)
     }
 
@@ -519,6 +627,11 @@ impl Commits {
     /// built in another history, starts recovery. A read-only device resends nothing, and a
     /// device under a policy halt resends nothing whatever the `Welcome` says. Whether R itself
     /// belongs to the `Welcome`'s history is checked where R is kept.
+    ///
+    /// Recovery keeps the queued restores with the commit in flight: nothing is built under that
+    /// halt, so none is sent again or planned again, and each stays as the request it was
+    /// (section 6.4). On a read-only device the restores no commit in flight carries end as
+    /// rejected.
     pub fn connected(&mut self, welcome: &proto::Welcome) -> Reconnect {
         if matches!(self.halted, Some(Halt::Policy { .. })) {
             return Reconnect::Idle;
@@ -538,6 +651,7 @@ impl Commits {
         }
         if welcome.read_only {
             self.halted = Some(Halt::ReadOnly);
+            self.reject_unsent_when_read_only();
             return Reconnect::Idle;
         }
         if self.halted == Some(Halt::ReadOnly) {
@@ -545,6 +659,28 @@ impl Commits {
         }
         reconnect
     }
+}
+
+/// The queued restore each `Restore` op of a commit carries, by the op's index: the first in
+/// request order whose op equals it and that no earlier op took. Queued restores with equal ops
+/// are interchangeable, so it makes no difference which of them an op is counted for. Err with
+/// the index of a `Restore` op that no queued restore is left for.
+fn carried(
+    restores: &BTreeMap<RestoreId, RestoreIntent>,
+    ops: &[proto::Op],
+) -> Result<BTreeMap<usize, RestoreId>, usize> {
+    let mut queued: HashMap<&proto::Restore, VecDeque<&RestoreId>> = HashMap::new();
+    for (id, intent) in restores {
+        queued.entry(intent.op()).or_default().push_back(id);
+    }
+    let mut found = BTreeMap::new();
+    for (index, op) in ops.iter().enumerate() {
+        if let Some(op::Op::Restore(restore)) = &op.op {
+            let id = queued.get_mut(restore).and_then(VecDeque::pop_front);
+            found.insert(index, id.ok_or(index)?.clone());
+        }
+    }
+    Ok(found)
 }
 
 fn op_node(op: &op::Op) -> &str {
@@ -824,6 +960,7 @@ fn cost(trees: &Trees, want: &Want) -> usize {
             .iter()
             .map(|node| record_cost(trees.synced().live(node)))
             .sum(),
+        Want::Restore { cost, .. } => *cost,
     }
 }
 
@@ -845,6 +982,26 @@ enum Want {
         id: NodeId,
         members: BTreeSet<NodeId>,
     },
+    /// A restore a person asked for, with the bytes of change records it makes, roughly: for a
+    /// node R holds as trashed, a record for every node trashed with it, and otherwise one.
+    Restore {
+        op: proto::Restore,
+        cost: usize,
+    },
+}
+
+impl Want {
+    /// The nodes a want other than a restore changes. A restore of one of them waits for it.
+    fn nodes(&self) -> impl Iterator<Item = &NodeId> {
+        let (one, many) = match self {
+            Want::Create { id, .. } | Want::Move { id, .. } | Want::Content { id, .. } => {
+                (Some(id), None)
+            }
+            Want::Delete { members, .. } => (None, Some(members)),
+            Want::Restore { .. } => (None, None),
+        };
+        one.into_iter().chain(many.into_iter().flatten())
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -857,9 +1014,10 @@ enum Fit {
 
 type Planned = (Vec<proto::Op>, BTreeMap<NodeId, Vec<NodeId>>, Vec<NodeId>);
 
-/// The ops for every local change, in an order valid on a scratch copy of R, the nodes each
-/// delete covers, and the nodes to revert: moves that close a cycle, and nodes in a merged folder
-/// that S or R already has where the folder it was merged into holds them, so they follow R.
+/// The ops for every queued restore and every local change, in an order valid on a scratch copy
+/// of R, the nodes each delete covers, and the nodes to revert: moves that close a cycle, and
+/// nodes in a merged folder that S or R already has where the folder it was merged into holds
+/// them, so they follow R.
 fn plan(
     trees: &Trees,
     problems: &BTreeSet<NodeId>,
@@ -867,8 +1025,27 @@ fn plan(
     cap: usize,
     split: &BTreeSet<NodeId>,
     aliases: &BTreeMap<NodeId, NodeId>,
+    restores: &BTreeMap<RestoreId, RestoreIntent>,
 ) -> Planned {
     let mut wants = Vec::new();
+    if !restores.is_empty() {
+        let mut groups: BTreeMap<&str, usize> = BTreeMap::new();
+        for (_, node) in trees.remote().iter().filter(|(_, node)| node.trashed) {
+            *groups.entry(&node.trash_group).or_default() += record_cost(Some(&node.shape));
+        }
+        for intent in restores.values() {
+            let cost = match trees.remote().get(intent.node()) {
+                Some(node) if node.trashed && intent.version_id().is_none() => {
+                    groups[node.trash_group.as_str()]
+                }
+                node => record_cost(node.map(|node| &node.shape)),
+            };
+            wants.push(Want::Restore {
+                op: intent.op().clone(),
+                cost,
+            });
+        }
+    }
     let mut deleted = BTreeSet::new();
     let mut reverts = Vec::new();
     for id in trees.dirty().iter().filter(|id| !problems.contains(*id)) {
@@ -967,6 +1144,12 @@ fn plan(
     }
 
     let mut scratch = Scratch::new(trees);
+    let restored: BTreeSet<&str> = restores.values().map(RestoreIntent::node).collect();
+    for node in wants.iter().flat_map(Want::nodes) {
+        if restored.contains(node.as_str()) {
+            *scratch.unsent.entry(node.clone()).or_default() += 1;
+        }
+    }
     let mut moving: BTreeSet<NodeId> = wants
         .iter()
         .filter_map(|want| match want {
@@ -978,6 +1161,14 @@ fn plan(
     let mut ops = Vec::new();
     let mut deletes = BTreeMap::new();
     let mut emit = |want: Want, scratch: &mut Scratch, moving: &mut BTreeSet<NodeId>| {
+        for node in want.nodes() {
+            if let Some(left) = scratch.unsent.get_mut(node) {
+                *left -= 1;
+                if *left == 0 {
+                    scratch.unsent.remove(node);
+                }
+            }
+        }
         let op = match want {
             Want::Create { id, shape } => {
                 scratch.place(&id, &shape.parent, &shape.name, shape.kind);
@@ -1015,6 +1206,25 @@ fn plan(
                 scratch.trash(&id);
                 deletes.insert(id.clone(), members.into_iter().collect());
                 op::Op::Delete(proto::Delete { node_id: id })
+            }
+            Want::Restore { op, .. } => {
+                let trashed = (trees.remote().get(&op.node_id))
+                    .filter(|node| node.trashed && op.version_id.is_empty());
+                match trashed {
+                    Some(node) => {
+                        let position = &node.shape;
+                        let parent = Some(&op.target_parent_id).filter(|id| !id.is_empty());
+                        let parent = parent.unwrap_or(&position.parent);
+                        let name = Some(&op.name).filter(|name| !name.is_empty());
+                        let name = name.unwrap_or(&position.name);
+                        let fit = scratch.fit_at(&op.node_id, parent, name);
+                        if matches!(fit, Fit::Valid | Fit::NameTaken) {
+                            scratch.place(&op.node_id, parent, name, node.shape.kind);
+                        }
+                    }
+                    None => scratch.revive(&op.node_id),
+                }
+                op::Op::Restore(op)
             }
         };
         ops.push(proto::Op { op: Some(op) });
@@ -1100,6 +1310,9 @@ struct Scratch {
     /// Folders a forced create will be merged into (MERGED_INTO). Deleting one in the same
     /// commit would trash what the create brings, so their deletes wait for the next commit.
     merged: BTreeSet<NodeId>,
+    /// For each node a queued restore names, how many wants that change it are not emitted yet.
+    /// The restore waits for them, so that it is applied to what this device sent.
+    unsent: BTreeMap<NodeId, usize>,
 }
 
 impl Scratch {
@@ -1109,6 +1322,7 @@ impl Scratch {
             nodes: BTreeMap::new(),
             children: BTreeMap::new(),
             merged: BTreeSet::new(),
+            unsent: BTreeMap::new(),
         };
         for (id, node) in trees.remote().iter() {
             let entry = Entry {
@@ -1168,6 +1382,8 @@ impl Scratch {
                     Fit::Wait
                 }
             }
+            Want::Restore { op, .. } if self.unsent.contains_key(&op.node_id) => Fit::Wait,
+            Want::Restore { .. } => Fit::Valid,
         }
     }
 

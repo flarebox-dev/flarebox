@@ -4,19 +4,25 @@
 //! section 7.2, planner property). A device with offline local changes meets another device's
 //! concurrent commits, then plans until nothing is left. It must end with L = S = R equal to the
 //! server's tree, and every write either device made must still be on the server.
+//!
+//! Both devices also restore from the trash and restore earlier versions (section 6.3). The other
+//! device commits its restores; this one asks its engine for them, as an app does, and every
+//! request must end with the result the server gave its `Restore` op, sent once.
 
 use std::collections::BTreeSet;
 
 use flarebox_engine::classify::Trees;
-use flarebox_engine::commit::{Commits, Failure, MAX_OPS};
+use flarebox_engine::commit::{Commits, Failure, Halt, MAX_OPS, Reconnect};
 use flarebox_engine::effects::Effects;
 use flarebox_engine::ids::IdGen;
 use flarebox_engine::names::name_key;
+use flarebox_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
 use flarebox_engine::state::StateError;
 use flarebox_engine::tree::{FileIdentity, Kind, LocalNode, Names, RemoteNode, same};
 use flarebox_proto::v1::{
-    ChangeRecord, ChunkRef, Commit, Content, CreateDir, CreateFile, Delete, Error, Move, Op,
-    PrepareUpload, Resume, UpdateContent, UploadReceipt, change_record, chunk_plan, error, op,
+    ChangeRecord, ChunkRef, Commit, Content, CreateDir, CreateFile, Delete, Error, ListVersions,
+    Move, Op, OpResult, PrepareUpload, Restore, Resume, UpdateContent, UploadReceipt, VersionInfo,
+    change_record, chunk_plan, error, op, op_result,
 };
 use flarebox_sim::space::{Role, Session, SpaceDo};
 use proptest::prelude::*;
@@ -106,7 +112,28 @@ fn upload(space: &mut SpaceDo, session: &Session, ops: &[Op]) -> Vec<UploadRecei
         .collect()
 }
 
-/// One commit of one op by another device that has seen everything, on its live nodes.
+/// The versions of a node, newest first, as an app lists them.
+fn versions(space: &SpaceDo, node_id: &str) -> Vec<VersionInfo> {
+    let request = ListVersions {
+        node_id: node_id.to_owned(),
+        ..Default::default()
+    };
+    space.list_versions(&request).unwrap().versions
+}
+
+/// The server's nodes with this status (1 live, 2 trashed) and, when given, this kind (1 folder,
+/// 2 file), without the root.
+fn nodes_with(space: &SpaceDo, status: i32, kind: Option<i32>) -> Vec<String> {
+    let nodes = space.nodes().into_iter().filter(|n| {
+        n.status == status
+            && kind.is_none_or(|kind| n.kind == kind)
+            && n.node_id != space.space_id()
+    });
+    nodes.map(|n| n.node_id).collect()
+}
+
+/// One commit of one op by another device that has seen everything, on its live nodes. Kind 5
+/// restores a node from the trash and kind 6 an earlier version of a file.
 fn remote_action(space: &mut SpaceDo, ids: &mut IdGen, device: u8, action: &Action) {
     let root = space.space_id().to_owned();
     let live: Vec<_> = space
@@ -159,6 +186,26 @@ fn remote_action(space: &mut SpaceDo, ids: &mut IdGen, device: u8, action: &Acti
             }),
             None => return,
         },
+        5 => match target(&nodes_with(space, 2, None)) {
+            Some(node_id) => op::Op::Restore(Restore {
+                node_id,
+                ..Default::default()
+            }),
+            None => return,
+        },
+        6 => {
+            let earlier = target(&files).map(|node_id| (versions(space, &node_id), node_id));
+            match earlier {
+                Some((versions, node_id)) if versions.len() > 1 => op::Op::Restore(Restore {
+                    node_id,
+                    version_id: versions[1 + action.name % (versions.len() - 1)]
+                        .version_id
+                        .clone(),
+                    ..Default::default()
+                }),
+                _ => return,
+            }
+        }
         _ => match target(&all) {
             Some(node_id) => op::Op::Delete(Delete { node_id }),
             None => return,
@@ -177,6 +224,133 @@ fn remote_action(space: &mut SpaceDo, ids: &mut IdGen, device: u8, action: &Acti
         ..Default::default()
     };
     space.commit(&session, NOW, &commit).unwrap();
+}
+
+/// A restore the person asks this device's engine for (kinds 5 and 6), chosen from the server's
+/// trash or from a file's versions, as an app lists them. With text 1 a node from the trash gets a
+/// position, which may be one the server refuses. With text 2 the version is of a file in the
+/// trash. With text 3 the node or the version is one the server does not have, as after a purge.
+/// False when there was nothing to choose.
+fn request_restore(
+    space: &SpaceDo,
+    commits: &mut Commits,
+    ids: &mut IdGen,
+    action: &Action,
+) -> bool {
+    let target =
+        |list: &[String]| (!list.is_empty()).then(|| list[action.target % list.len()].clone());
+    let unknown = action.text == 3;
+    let intent = if action.kind == 5 {
+        let node = match unknown {
+            true => Some(ids.uuid_v7(NOW as u64)),
+            false => target(&nodes_with(space, 2, None)),
+        };
+        let places: Vec<String> = [space.space_id().to_owned()]
+            .into_iter()
+            .chain(nodes_with(space, 1, None))
+            .collect();
+        let position = (action.text == 1).then(|| {
+            let parent = places[action.parent % places.len()].clone();
+            (parent, NAMES[action.name].to_owned())
+        });
+        let (parent, name) = position.unzip();
+        node.map(|node| RestoreIntent::from_trash(node, parent, name))
+    } else {
+        let status = if action.text == 2 { 2 } else { 1 };
+        target(&nodes_with(space, status, Some(2))).map(|node| {
+            let versions = versions(space, &node);
+            let version = match unknown {
+                true => ids.uuid_v7(NOW as u64),
+                false => versions[action.name % versions.len()].version_id.clone(),
+            };
+            RestoreIntent::version(node, version)
+        })
+    };
+    let Some(intent) = intent else {
+        return false;
+    };
+    assert!(commits.restore(ids.uuid_v7(NOW as u64), intent.unwrap()));
+    true
+}
+
+/// The outcome the engine must report for a restore whose op the server answered with `result`.
+fn outcome_of(result: &OpResult) -> Outcome {
+    use op_result::Code;
+    match Code::try_from(result.code) {
+        Ok(Code::Applied) => Outcome::Restored,
+        Ok(Code::AppliedRenamed) => Outcome::Renamed {
+            name: result.name.clone(),
+        },
+        Ok(Code::ConflictCopy) => Outcome::Copied {
+            node: result.node_id.clone(),
+            name: result.name.clone(),
+        },
+        _ => Outcome::Rejected(Rejection::from_reason(&result.reject_reason)),
+    }
+}
+
+/// What the restores of a commit this device sent did to the writes the property tracks, with the
+/// server's content before and after the commit. A version restore the server applied replaces
+/// the file's content because the person asked for that: the content the server held, and an edit
+/// of the file this commit sent ahead of the restore, are versions now and no lost writes. The
+/// content a restore made current again, on a file or on the nodes it brought back from the
+/// trash, is a write of the device that wrote it and must be kept from here on.
+fn restored(
+    commit: &Commit,
+    results: &[OpResult],
+    before: &BTreeSet<(String, Vec<u8>)>,
+    after: &BTreeSet<(String, Vec<u8>)>,
+    [local, remote]: [&mut BTreeSet<Vec<u8>>; 2],
+) {
+    use op_result::Code;
+    let applied = |result: &OpResult| {
+        result.code == Code::Applied as i32 || result.code == Code::AppliedRenamed as i32
+    };
+    for (index, (op, result)) in commit.ops.iter().zip(results).enumerate() {
+        let version_restore = match &op.op {
+            Some(op::Op::Restore(restore)) if !restore.version_id.is_empty() => restore,
+            _ => continue,
+        };
+        if !applied(result) {
+            continue;
+        }
+        let node = &version_restore.node_id;
+        let held = before.iter().filter(|(id, _)| id == node);
+        let held = held.map(|(_, digest)| digest.clone());
+        let sent = commit.ops[..index].iter().zip(results);
+        let sent = sent.filter_map(|(op, result)| match &op.op {
+            Some(op::Op::UpdateContent(update)) if update.node_id == *node && applied(result) => {
+                Some(update.content.as_ref()?.manifest_digest.clone())
+            }
+            _ => None,
+        });
+        for digest in held.chain(sent) {
+            if !after.contains(&(node.clone(), digest.clone())) {
+                local.remove(&digest);
+                remote.remove(&digest);
+            }
+        }
+    }
+    let current = || after.difference(before).map(|(_, digest)| digest.clone());
+    local.extend(own(current(), 1));
+    remote.extend(own(current(), 2));
+}
+
+/// Where the process stops and starts again, with the engine state as the store hands it back
+/// (the crash table of docs/design/sync-engine.md section 2.8). Without one, the state is still
+/// reloaded at the top of every step, which is the stop after a request was taken and the stop
+/// after an acknowledgement.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Cut {
+    None,
+    /// After a commit that carries a restore was built and saved, before it left.
+    Built,
+    /// After the server applied such a commit, before its response arrived.
+    Applied,
+    /// After the result of such a commit was saved, before R held its records.
+    Answered,
+    /// While an effect is in flight.
+    Effect,
 }
 
 /// An identity with inode `ino`. Entries with an odd inode stand for a filesystem that reports no
@@ -410,6 +584,25 @@ fn reload(
     Ok((loaded, restored_commits, restored_effects))
 }
 
+/// The server as [`run`] seeds it.
+fn seeded(seed: &[Action]) -> (SpaceDo, IdGen) {
+    let mut space = SpaceDo::new(5, NOW);
+    let mut other = IdGen::new(6);
+    for action in seed {
+        remote_action(&mut space, &mut other, 0, action);
+    }
+    (space, other)
+}
+
+/// How a run ended.
+struct Ran {
+    /// The most reverted nodes that were parked at one time.
+    parked_reverted: usize,
+    /// The restores this device asked for, as they ended.
+    resolved: Vec<Resolved>,
+    space: SpaceDo,
+}
+
 /// `fits` is the most ops a commit may hold before the server refuses it with `LIMIT_EXCEEDED`,
 /// standing in for the 1 MiB message limit (spec v0 section 7.2).
 fn run(
@@ -420,11 +613,30 @@ fn run(
     fresh_dir_names: bool,
     during: &[(bool, Vec<Action>)],
 ) -> Result<usize, TestCaseError> {
-    let mut space = SpaceDo::new(5, NOW);
-    let mut other = IdGen::new(6);
-    for action in seed {
-        remote_action(&mut space, &mut other, 0, action);
-    }
+    let ran = run_cut(
+        seed,
+        local,
+        remote,
+        fits,
+        fresh_dir_names,
+        during,
+        Cut::None,
+    )?;
+    Ok(ran.parked_reverted)
+}
+
+/// [`run`], with the process stopping at `cut`. An action of kind 5 or 6 on this device asks its
+/// engine for a restore.
+fn run_cut(
+    seed: &[Action],
+    local: &[Action],
+    remote: &[Action],
+    fits: usize,
+    fresh_dir_names: bool,
+    during: &[(bool, Vec<Action>)],
+    cut: Cut,
+) -> Result<Ran, TestCaseError> {
+    let (mut space, mut other) = seeded(seed);
     let root = space.space_id().to_owned();
     let history = space.history_id().to_owned();
     let mut device = Device {
@@ -450,8 +662,16 @@ fn run(
     }
     let mut last_seq = space.head_seq();
 
+    let mut commits = Commits::default();
+    let (mut requested, mut sent) = (0, 0);
     for action in local {
-        device.act(action);
+        match action.kind {
+            5 | 6 => {
+                let asked = request_restore(&space, &mut commits, &mut device.ids, action);
+                requested += usize::from(asked);
+            }
+            _ => device.act(action),
+        }
     }
     let mut local_writes = written(
         device
@@ -485,7 +705,7 @@ fn run(
     }
 
     let me = session("me");
-    let (mut effects, mut commits) = (Effects::default(), Commits::default());
+    let mut effects = Effects::default();
     let (mut steps, mut quiet, mut due, mut parked_reverted) = (0, false, false, 0);
     let mut during = during.iter();
     while !quiet {
@@ -499,7 +719,14 @@ fn run(
             if *on_device {
                 let before = held(&device.trees);
                 for action in actions {
-                    device.act(action);
+                    match action.kind {
+                        5 | 6 => {
+                            let ids = &mut device.ids;
+                            let asked = request_restore(&space, &mut commits, ids, action);
+                            requested += usize::from(asked);
+                        }
+                        _ => device.act(action),
+                    }
                 }
                 let after = held(&device.trees);
                 let writes = [&mut local_writes, &mut remote_writes];
@@ -542,6 +769,10 @@ fn run(
             .plan(&device.trees, &mut device.ids, NOW as u64)
             .cloned()
         {
+            if cut == Cut::Effect {
+                (device.trees, commits, effects) = reload(&device.trees, &commits, &effects)?;
+                prop_assert_eq!(effects.in_flight(), Some(&record));
+            }
             let identity = device.identity();
             effects
                 .done(&mut device.trees, &record.effect_id, Some(identity))
@@ -575,16 +806,74 @@ fn run(
             );
             continue;
         }
+        let restores: Vec<usize> = (0..commit.ops.len())
+            .filter(|index| matches!(commit.ops[*index].op, Some(op::Op::Restore(_))))
+            .collect();
+        let cut = if restores.is_empty() { Cut::None } else { cut };
+        let in_flight = |commits: &Commits| commits.in_flight().map(|f| f.commit.clone());
+        if cut == Cut::Built {
+            (device.trees, commits, effects) = reload(&device.trees, &commits, &effects)?;
+            prop_assert_eq!(commits.connected(&space.welcome(&me)), Reconnect::Resend);
+            prop_assert_eq!(in_flight(&commits), Some(commit.clone()));
+        }
         let receipts = upload(&mut space, &me, &commit.ops);
-        let committed = space.commit(&me, NOW, &Commit { receipts, ..commit });
-        let committed = committed.map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
-        prop_assert_eq!(committed.result.seq, last_seq + 1);
-        apply(&mut device.trees, &committed.result.changes);
-        last_seq = committed.result.seq;
-        commits.received(committed.result).unwrap();
+        let request = Commit {
+            receipts,
+            ..commit.clone()
+        };
+        let failed = |e| TestCaseError::fail(format!("{e:?}"));
+        let before = stored(&space);
+        let mut committed = space.commit(&me, NOW, &request).map_err(failed)?;
+        let after = stored(&space);
+        if cut == Cut::Applied {
+            // The response is lost. The server counts the commit, so the device sends the same
+            // commit again and gets the stored result: nothing is applied a second time.
+            (device.trees, commits, effects) = reload(&device.trees, &commits, &effects)?;
+            prop_assert_eq!(commits.connected(&space.welcome(&me)), Reconnect::Resend);
+            prop_assert_eq!(in_flight(&commits), Some(commit.clone()));
+            let head = space.head_seq();
+            let again = space.commit(&me, NOW, &request).map_err(failed)?;
+            prop_assert_eq!(&again.result, &committed.result);
+            prop_assert_eq!((space.head_seq(), stored(&space)), (head, after.clone()));
+            committed = again;
+        }
+        let result = committed.result;
+        prop_assert_eq!(result.seq, last_seq + 1);
+        let ended = commits.resolved().len();
+        if cut == Cut::Answered {
+            commits.received(result.clone()).unwrap();
+            (device.trees, commits, effects) = reload(&device.trees, &commits, &effects)?;
+            prop_assert_eq!(commits.connected(&space.welcome(&me)), Reconnect::Idle);
+            prop_assert!(!commits.acknowledge(&mut device.trees, last_seq));
+            prop_assert_eq!(commits.resolved().len(), ended);
+            apply(&mut device.trees, &result.changes);
+        } else {
+            apply(&mut device.trees, &result.changes);
+            commits.received(result.clone()).unwrap();
+        }
+        last_seq = result.seq;
         prop_assert!(commits.acknowledge(&mut device.trees, last_seq));
         due = true;
+        if restores.is_empty() {
+            continue;
+        }
+        sent += restores.len();
+        let ended = &commits.resolved()[ended..];
+        prop_assert_eq!(ended.len(), restores.len());
+        for (ended, index) in ended.iter().zip(&restores) {
+            let asked = Some(op::Op::Restore(ended.intent.op().clone()));
+            prop_assert_eq!(&asked, &commit.ops[*index].op);
+            prop_assert_eq!(&ended.outcome, &outcome_of(&result.results[*index]));
+        }
+        let writes = [&mut local_writes, &mut remote_writes];
+        restored(&commit, &result.results, &before, &after, writes);
     }
+    prop_assert!(commits.restores().is_empty(), "{:?}", commits.restores());
+    prop_assert_eq!(
+        (commits.resolved().len(), sent),
+        (requested, requested),
+        "every restore asked for ends, and its op is sent once"
+    );
 
     prop_assert_eq!(device.trees.settle(), vec![]);
     prop_assert!(commits.problems().is_empty(), "{:?}", commits.problems());
@@ -640,7 +929,11 @@ fn run(
         2,
     );
     prop_assert!(remote_writes.is_subset(&kept), "a remote write was lost");
-    Ok(parked_reverted)
+    Ok(Ran {
+        parked_reverted,
+        resolved: commits.resolved().to_vec(),
+        space,
+    })
 }
 
 proptest! {
@@ -651,17 +944,177 @@ proptest! {
     #[test]
     fn a_device_with_local_changes_converges_with_the_server_and_keeps_every_write(
         seed in prop::collection::vec(action(2), 0..12),
-        local in prop::collection::vec(action(5), 0..8),
-        remote in prop::collection::vec(action(5), 0..8),
+        local in prop::collection::vec(action(7), 0..8),
+        remote in prop::collection::vec(action(7), 0..8),
         fits in prop_oneof![Just(MAX_OPS), 1usize..4],
         fresh_dir_names in any::<bool>(),
         during in prop::collection::vec(
-            (any::<bool>(), prop::collection::vec(action(5), 1..4)),
+            (any::<bool>(), prop::collection::vec(action(7), 1..4)),
             0..6,
         ),
+        cut in prop::sample::select(vec![
+            Cut::None,
+            Cut::Built,
+            Cut::Applied,
+            Cut::Answered,
+            Cut::Effect,
+        ]),
     ) {
-        run(&seed, &local, &remote, fits, fresh_dir_names, &during)?;
+        run_cut(&seed, &local, &remote, fits, fresh_dir_names, &during, cut)?;
     }
+}
+
+const CUTS: [Cut; 5] = [
+    Cut::None,
+    Cut::Built,
+    Cut::Applied,
+    Cut::Answered,
+    Cut::Effect,
+];
+
+fn act(kind: u8, target: usize, parent: usize, name: usize, text: u8) -> Action {
+    Action {
+        kind,
+        target,
+        parent,
+        name,
+        text,
+    }
+}
+
+/// The folder `a` with the file `c.txt` in it.
+fn a_folder_with_a_file() -> Vec<Action> {
+    vec![act(0, 0, 0, 0, 0), act(1, 0, 1, 3, 0)]
+}
+
+/// The digests of a file's versions on the server, newest first.
+fn version_digests(space: &SpaceDo, node_id: &str) -> Vec<Vec<u8>> {
+    let digest = |version: VersionInfo| version.content.unwrap().manifest_digest;
+    versions(space, node_id).into_iter().map(digest).collect()
+}
+
+/// The other device deletes a folder with a file in it, and the person restores the folder from
+/// the trash on this device. Wherever the process stops on the way, the folder and the file come
+/// back on the server and on disk as the nodes they were, and the file keeps its one version.
+#[test]
+fn a_deleted_folder_comes_back_with_the_same_node_ids() {
+    let seed = a_folder_with_a_file();
+    let (space, _) = seeded(&seed);
+    let nodes = nodes_with(&space, 1, None);
+    let folder = nodes_with(&space, 1, Some(1))[0].clone();
+    let file = nodes_with(&space, 1, Some(2))[0].clone();
+    let folder_at = nodes.iter().position(|id| *id == folder).unwrap();
+    for cut in CUTS {
+        let delete = [act(4, folder_at, 0, 0, 0)];
+        let restore = (true, vec![act(5, folder_at, 0, 0, 0)]);
+        let ran = run_cut(&seed, &[], &delete, MAX_OPS, false, &[restore], cut).unwrap();
+        assert_eq!(ran.resolved.len(), 1, "{cut:?}");
+        assert_eq!(ran.resolved[0].intent.node(), folder, "{cut:?}");
+        assert_eq!(ran.resolved[0].outcome, Outcome::Restored, "{cut:?}");
+        assert_eq!(nodes_with(&ran.space, 1, None), nodes, "{cut:?}");
+        assert_eq!(nodes_with(&ran.space, 2, None), Vec::<String>::new());
+        assert_eq!(version_digests(&ran.space, &file).len(), 1, "{cut:?}");
+    }
+}
+
+/// The person edits a file and then restores an earlier version of it, before the edit was sent.
+/// The edit goes first and becomes a version, the earlier version becomes current, and the file
+/// keeps its node. Nothing is a conflict copy.
+#[test]
+fn an_edited_file_restored_to_an_earlier_version_keeps_the_edit_as_a_version() {
+    let seed = [act(1, 0, 0, 3, 0)];
+    let remote_edit = [act(2, 0, 0, 0, 1)];
+    // Versions are listed newest first, so name 1 picks the first of the two.
+    let edit_then_restore = (true, vec![act(2, 0, 0, 0, 2), act(6, 0, 0, 1, 0)]);
+    for cut in CUTS {
+        let during = [edit_then_restore.clone()];
+        let ran = run_cut(&seed, &[], &remote_edit, MAX_OPS, false, &during, cut).unwrap();
+        let files = nodes_with(&ran.space, 1, Some(2));
+        assert_eq!(files.len(), 1, "{cut:?}");
+        assert_eq!(ran.resolved[0].outcome, Outcome::Restored, "{cut:?}");
+        let digest = |device, text| content(device, text).manifest_digest;
+        assert_eq!(
+            version_digests(&ran.space, &files[0]),
+            [digest(0, 0), digest(1, 2), digest(2, 1), digest(0, 0)],
+            "{cut:?}"
+        );
+    }
+}
+
+/// The response to a commit that carries a restore is lost. The device sends the same commit
+/// again, and the server lists exactly one new version for the restore.
+#[test]
+fn a_restore_whose_response_was_lost_is_applied_once() {
+    let seed = [act(1, 0, 0, 3, 0)];
+    let remote_edit = [act(2, 0, 0, 0, 1)];
+    let restore = (true, vec![act(6, 0, 0, 1, 0)]);
+    let ran = run_cut(
+        &seed,
+        &[],
+        &remote_edit,
+        MAX_OPS,
+        false,
+        &[restore],
+        Cut::Applied,
+    )
+    .unwrap();
+    let file = &nodes_with(&ran.space, 1, Some(2))[0];
+    assert_eq!(version_digests(&ran.space, file).len(), 3);
+    assert_eq!(ran.resolved.len(), 1);
+    assert_eq!(ran.resolved[0].outcome, Outcome::Restored);
+}
+
+/// A version that expired on the server, or was never there, cannot be restored. The request ends
+/// as rejected, and a file created on this device meanwhile is uploaded in the same commit.
+#[test]
+fn a_restore_of_a_version_the_server_does_not_have_is_refused_and_sync_goes_on() {
+    let seed = [act(1, 0, 0, 3, 0)];
+    let create_and_restore = (true, vec![act(1, 0, 0, 0, 1), act(6, 0, 0, 0, 3)]);
+    for cut in CUTS {
+        let during = [create_and_restore.clone()];
+        let ran = run_cut(&seed, &[], &[], MAX_OPS, false, &during, cut).unwrap();
+        let rejected = Outcome::Rejected(Rejection::NotFound);
+        assert_eq!(ran.resolved.len(), 1, "{cut:?}");
+        assert_eq!(ran.resolved[0].outcome, rejected, "{cut:?}");
+        assert_eq!(nodes_with(&ran.space, 1, Some(2)).len(), 2, "{cut:?}");
+    }
+}
+
+/// The store is replaced by a copy from before a restore was sent, after the server applied it.
+/// The server's count of this device's commits is then one ahead of the store, which no healthy
+/// store shows. The space enters recovery and the restore, still queued in the old copy, is
+/// neither sent again nor dropped.
+#[test]
+fn a_store_rolled_back_past_a_sent_restore_starts_recovery_and_sends_nothing() {
+    let (mut space, mut other) = seeded(&a_folder_with_a_file());
+    remote_action(&mut space, &mut other, 2, &act(4, 0, 0, 0, 0));
+    let trashed = nodes_with(&space, 2, None);
+    let mut trees = Trees::new(space.space_id().to_owned());
+    for state in space.nodes().iter().skip(1) {
+        let (id, node) = RemoteNode::from_state(state).unwrap();
+        trees.set_remote(id, node);
+    }
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(7));
+    let intent = RestoreIntent::from_trash(trashed[0].clone(), None, None).unwrap();
+    commits.restore(ids.uuid_v7(NOW as u64), intent.clone());
+    let backup = commits.state();
+
+    let (history, head) = (space.history_id().to_owned(), space.head_seq());
+    let commit = commits.build(&mut trees, &mut ids, NOW as u64, &history, head);
+    let me = session("me");
+    space.commit(&me, NOW, &commit.cloned().unwrap()).unwrap();
+    let head = space.head_seq();
+
+    let mut commits = Commits::from_state(backup).unwrap();
+    assert_eq!(commits.connected(&space.welcome(&me)), Reconnect::Recovery);
+    for _ in 0..2 {
+        assert_eq!(commits.halted(), Some(Halt::Recovery));
+        assert_eq!(commits.restores().values().collect::<Vec<_>>(), [&intent]);
+        let built = commits.build(&mut trees, &mut ids, NOW as u64, &history, head);
+        assert_eq!(built, None);
+        commits = Commits::from_state(commits.state()).unwrap();
+    }
+    assert_eq!(space.head_seq(), head);
 }
 
 /// The other device creates a and b before this one does, so the server renames this device's

@@ -7,6 +7,8 @@
 use flarebox_engine::classify::Trees;
 use flarebox_engine::commit::{Commits, Halt, InFlight, MAX_OPS};
 use flarebox_engine::effects::{Effect, EffectRecord, Effects, Location};
+use flarebox_engine::ids::uuid_v7;
+use flarebox_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
 use flarebox_engine::state::{CommitsState, EffectsState, StateError, TreesState};
 use flarebox_engine::tree::{FileIdentity, Kind, LocalNode, RemoteNode, Shape, TreeError};
 use flarebox_proto::v1::{Commit, CommitResult, Delete, Move, Op, OpResult, op};
@@ -66,6 +68,12 @@ fn trees_state() -> TreesState {
     }
 }
 
+/// A restore of the trashed node `n`.
+fn restore(n: u128) -> RestoreIntent {
+    RestoreIntent::from_trash(uuid_v7(1, n), None, None).unwrap()
+}
+
+/// A state with one restore in the commit in flight, one that waits and one that ended.
 fn commits_state() -> CommitsState {
     let delete = Delete {
         node_id: "d".into(),
@@ -82,6 +90,9 @@ fn commits_state() -> CommitsState {
         Op {
             op: Some(op::Op::Move(moved)),
         },
+        Op {
+            op: Some(op::Op::Restore(restore(1).op().clone())),
+        },
     ];
     CommitsState {
         accepted: 5,
@@ -94,7 +105,7 @@ fn commits_state() -> CommitsState {
             },
             deletes: [("d".into(), vec!["d".into(), "e".into()])].into(),
             result: Some(CommitResult {
-                results: vec![OpResult::default(); 2],
+                results: vec![OpResult::default(); 3],
                 ..Default::default()
             }),
         }),
@@ -103,6 +114,12 @@ fn commits_state() -> CommitsState {
         cap: Some(4),
         split: ["s".into()].into(),
         aliases: [("f".into(), "g".into())].into(),
+        restores: [("r1".into(), restore(1)), ("r2".into(), restore(2))].into(),
+        resolved: vec![Resolved {
+            id: "r0".into(),
+            intent: restore(3),
+            outcome: Outcome::Rejected(Rejection::NotFound),
+        }],
     }
 }
 
@@ -262,6 +279,27 @@ fn commits_restore_a_valid_state_and_refuse_each_broken_one() {
                 state.aliases.insert("h".into(), "h".into());
             }),
             StateError::SelfAlias("h".into()),
+        ),
+        (
+            "a Restore op in flight that no queued restore asks for",
+            broken(commits_state(), |state| {
+                state.restores.remove("r1");
+            }),
+            StateError::RestoreNotQueued(2),
+        ),
+        (
+            "a restore that ended and is still queued",
+            broken(commits_state(), |state| {
+                state.restores.insert("r0".into(), restore(3));
+            }),
+            StateError::RestoreResolved("r0".into()),
+        ),
+        (
+            "a restore with two outcomes",
+            broken(commits_state(), |state| {
+                state.resolved.push(state.resolved[0].clone());
+            }),
+            StateError::RestoreResolved("r0".into()),
         ),
     ];
     for (name, state, error) in cases {

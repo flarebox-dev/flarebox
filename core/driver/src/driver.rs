@@ -23,6 +23,7 @@ use crate::folder::FolderTask;
 use crate::ignore::{IgnoreInput, Matcher, RuleFile, RuleSource, matcher};
 use crate::paths::{Paths, PathsError};
 use crate::question::{Answer, Question};
+use crate::restore::{self, RestoreRequest, RestoreStatus};
 use crate::status::{Account, FolderState, FolderStatus, Status};
 
 /// How long a sign-out waits for each call to the server before it goes on without it.
@@ -94,6 +95,10 @@ pub enum DriverError {
     QuestionNotFound(String),
     #[error("the question accepts only {}", allowed.iter().map(|a| a.as_str()).collect::<Vec<_>>().join(" or "))]
     AnswerNotAllowed { allowed: [Answer; 2] },
+    #[error("no linked folder syncs the space {0:?}")]
+    SpaceNotLinked(String),
+    #[error("the restore's {0} is not an id the server gave")]
+    InvalidRestore(&'static str),
     #[error("the sync state at {path} cannot be used: {error}")]
     Store {
         path: PathBuf,
@@ -290,8 +295,9 @@ impl Driver {
         }
     }
 
-    /// A receiver that is marked changed whenever [`Driver::status`] or [`Driver::questions`] may have changed, so
-    /// the app can wait for a change instead of polling. A change may be signalled without a visible difference.
+    /// A receiver that is marked changed whenever [`Driver::status`], [`Driver::questions`] or [`Driver::restores`]
+    /// may have changed, so the app can wait for a change instead of polling. A change may be signalled without a
+    /// visible difference.
     pub fn watch(&self) -> watch::Receiver<()> {
         self.inner.changed.subscribe()
     }
@@ -686,6 +692,42 @@ impl Driver {
         Err(DriverError::QuestionNotFound(question_id.to_owned()))
     }
 
+    /// Asks for a restore in a linked space: a trashed node back from the trash, or an earlier version of a file
+    /// made current. Returns the restore's ID once the request is in the folder's store, where it waits for the
+    /// engine, also while the driver is stopped, offline or halted. The engine sends it as a `Restore` op in its next
+    /// commit, and [`Driver::restores`] tells how it ended. A request is not sent twice and cannot be taken back.
+    ///
+    /// A malformed ID is refused here, because the server refuses a whole commit for one. Whether the node or the
+    /// version still exists is the server's answer.
+    pub fn restore(&self, space_id: &str, request: RestoreRequest) -> Result<String, DriverError> {
+        if !self.inner.folders.lock().unwrap().contains_key(space_id) {
+            return Err(DriverError::SpaceNotLinked(space_id.to_owned()));
+        }
+        let intent = request
+            .intent()
+            .map_err(|malformed| DriverError::InvalidRestore(malformed.0))?;
+        let id = restore::new_id(now_ms() as u64);
+        let path = self.inner.paths.store(space_id)?;
+        Store::open(&path)
+            .and_then(|mut store| store.transaction(|tx| tx.request_restore(&id, &intent)))
+            .map_err(store_error(&path))?;
+        tracing::info!(space_id, restore_id = %id, "recorded a restore request");
+        self.changed();
+        Ok(id)
+    }
+
+    /// The restores asked for in a linked space: first those that ended, in the order they ended, then those
+    /// that wait, in request order. The store keeps the last 1,000 that ended and drops older ones.
+    pub fn restores(&self, space_id: &str) -> Result<Vec<RestoreStatus>, DriverError> {
+        if !self.inner.folders.lock().unwrap().contains_key(space_id) {
+            return Err(DriverError::SpaceNotLinked(space_id.to_owned()));
+        }
+        let path = self.inner.paths.store(space_id)?;
+        Store::open(&path)
+            .and_then(|mut store| store.transaction(restore::list))
+            .map_err(store_error(&path))
+    }
+
     /// Starts syncing every linked folder, each in a task on the current Tokio runtime. Starting a running driver
     /// does nothing.
     pub fn start(&self) {
@@ -1036,6 +1078,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::question::{HeldItem, QuestionKind};
+    use crate::restore::{RestoreRejection, RestoreState};
 
     use super::*;
 
@@ -2338,5 +2381,173 @@ mod tests {
             resolve_space(spaces, "work"),
             Err(DriverError::SpaceNotFound(_))
         ));
+    }
+
+    /// A node or version ID as the server gives it.
+    fn server_id(n: u128) -> String {
+        flarebox_engine::ids::uuid_v7(1, n)
+    }
+
+    fn from_trash(node: u128) -> RestoreRequest {
+        RestoreRequest::FromTrash {
+            node_id: server_id(node),
+            parent_id: None,
+            name: None,
+        }
+    }
+
+    #[test]
+    fn a_restore_request_survives_a_reopen_and_reads_as_pending() {
+        let (_dir, paths, _root) = profile(&[]);
+        let driver = Driver::open(paths.clone()).unwrap();
+        let mut watch = driver.watch();
+        watch.mark_unchanged();
+        let placed = RestoreRequest::FromTrash {
+            node_id: server_id(1),
+            parent_id: Some(server_id(2)),
+            name: Some("back.txt".into()),
+        };
+        let version = RestoreRequest::Version {
+            node_id: server_id(3),
+            version_id: server_id(4),
+        };
+        assert_eq!(driver.restores(SPACE).unwrap(), []);
+        let first = driver.restore(SPACE, placed.clone()).unwrap();
+        assert!(watch.has_changed().unwrap());
+        std::thread::sleep(Duration::from_millis(2));
+        let second = driver.restore(SPACE, version.clone()).unwrap();
+        assert!(first < second, "the IDs sort in request order");
+        drop(driver);
+
+        // Nothing ran the engine in between: the driver was stopped the whole time.
+        let driver = Driver::open(paths).unwrap();
+        let pending = |id: &str, request: &RestoreRequest| RestoreStatus {
+            id: id.to_owned(),
+            request: request.clone(),
+            state: RestoreState::Pending,
+        };
+        assert_eq!(
+            driver.restores(SPACE).unwrap(),
+            [pending(&first, &placed), pending(&second, &version)]
+        );
+    }
+
+    #[test]
+    fn restore_refuses_a_malformed_id_and_an_unlinked_space() {
+        let (_dir, paths, _root) = profile(&[]);
+        let driver = Driver::open(paths).unwrap();
+        let other_space = "0190f0a0-0000-7000-8000-000000000002";
+        assert!(matches!(
+            driver.restore(other_space, from_trash(1)),
+            Err(DriverError::SpaceNotLinked(space)) if space == other_space
+        ));
+        assert!(matches!(
+            driver.restores(other_space),
+            Err(DriverError::SpaceNotLinked(_))
+        ));
+        let version = |node_id: &str, version_id: &str| RestoreRequest::Version {
+            node_id: node_id.into(),
+            version_id: version_id.into(),
+        };
+        let placed = |parent_id: &str| RestoreRequest::FromTrash {
+            node_id: server_id(1),
+            parent_id: Some(parent_id.into()),
+            name: None,
+        };
+        let cases = [
+            (version("report.txt", &server_id(2)), "node_id"),
+            (version(&server_id(1), ""), "version_id"),
+            (version(&server_id(1), "v2"), "version_id"),
+            (
+                placed("0190F3A0-1234-7FFF-BFFF-FFFFFFFFFFFF"),
+                "target_parent_id",
+            ),
+        ];
+        for (request, field) in cases {
+            assert!(matches!(
+                driver.restore(SPACE, request),
+                Err(DriverError::InvalidRestore(found)) if found == field
+            ));
+        }
+        assert_eq!(
+            driver.restores(SPACE).unwrap(),
+            [],
+            "a commit with a malformed ID would halt the space, so none is recorded"
+        );
+    }
+
+    #[test]
+    fn restores_lists_what_ended_and_then_what_waits() {
+        use flarebox_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
+
+        let (_dir, paths, _root) = profile(&[]);
+        let driver = Driver::open(paths.clone()).unwrap();
+        let in_inbox = driver.restore(SPACE, from_trash(9)).unwrap();
+        let intent = |node: u128| RestoreIntent::from_trash(server_id(node), None, None).unwrap();
+        let outcomes = [
+            (Outcome::Restored, RestoreState::Restored),
+            (
+                Outcome::Renamed { name: "b".into() },
+                RestoreState::Renamed { name: "b".into() },
+            ),
+            (
+                Outcome::Copied {
+                    node: server_id(50),
+                    name: "c".into(),
+                },
+                RestoreState::Copied {
+                    node_id: server_id(50),
+                    name: "c".into(),
+                },
+            ),
+            (
+                Outcome::Rejected(Rejection::NotFound),
+                RestoreState::Rejected {
+                    reason: RestoreRejection::NotFound,
+                },
+            ),
+            (
+                Outcome::Rejected(Rejection::ReadOnly),
+                RestoreState::Rejected {
+                    reason: RestoreRejection::ReadOnly,
+                },
+            ),
+            (
+                Outcome::Rejected(Rejection::Other("LATER".into())),
+                RestoreState::Rejected {
+                    reason: RestoreRejection::Other("LATER".into()),
+                },
+            ),
+            (Outcome::DoesNotFit, RestoreState::DoesNotFit),
+        ];
+        // The engine's side of the store, as the folder task saves it: one restore queued, the rest ended, the
+        // newest first by ID so that the listed order is the order they ended in.
+        let mut state = flarebox_store::EngineState::default();
+        state.commits.restores.insert("queued".into(), intent(8));
+        for (n, (outcome, _)) in outcomes.iter().enumerate() {
+            state.commits.resolved.push(Resolved {
+                id: format!("ended-{}", 9 - n),
+                intent: intent(n as u128),
+                outcome: outcome.clone(),
+            });
+        }
+        let path = paths.store(SPACE).unwrap();
+        Store::open(&path)
+            .unwrap()
+            .transaction(|tx| tx.set_engine_state(&state))
+            .unwrap();
+
+        let listed = driver.restores(SPACE).unwrap();
+        let ids: Vec<&str> = listed.iter().map(|restore| restore.id.as_str()).collect();
+        let ended = (0..outcomes.len()).map(|n| format!("ended-{}", 9 - n));
+        let expected: Vec<String> = ended.chain([in_inbox, "queued".into()]).collect();
+        assert_eq!(ids, expected);
+        for (restore, (_, state)) in listed.iter().zip(&outcomes) {
+            assert_eq!(&restore.state, state);
+        }
+        assert_eq!(listed[1].request, from_trash(1));
+        for waiting in &listed[outcomes.len()..] {
+            assert_eq!(waiting.state, RestoreState::Pending);
+        }
     }
 }

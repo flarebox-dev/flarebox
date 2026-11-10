@@ -2,6 +2,7 @@
 
 //! The engine state besides the nodes of R, L and S (design §2.8) and the rows that hold it. This
 //! module is the one place that knows both the engine's state types and the tables of migration 3.
+//! The restores of the commit side have their rows in [`crate::restore`].
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -112,6 +113,7 @@ impl Tx<'_> {
             state.commits.cap = cap;
         }
         state.commits.in_flight = self.in_flight()?;
+        (state.commits.restores, state.commits.resolved) = self.restores()?;
 
         if let Some((cleared, in_flight)) = self
             .0
@@ -153,6 +155,7 @@ impl Tx<'_> {
             "commit_in_flight_delete_members",
             "effect_state",
             "failed_effects",
+            "restore_intents",
         ] {
             self.0.execute(&format!("DELETE FROM {table}"), [])?;
         }
@@ -217,6 +220,7 @@ impl Tx<'_> {
                 }
             }
         }
+        self.set_restores(&commits.restores, &commits.resolved)?;
 
         let effects = &state.effects;
         self.0.execute(

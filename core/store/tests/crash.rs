@@ -11,9 +11,11 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use flarebox_engine::commit::InFlight;
+use flarebox_engine::ids::uuid_v7;
+use flarebox_engine::restore::{RestoreId, RestoreIntent};
 use flarebox_engine::state::{CommitsState, EffectsState};
 use flarebox_fs::FileId;
-use flarebox_proto::v1::{Commit, NodeKind, NodeState, NodeStatus};
+use flarebox_proto::v1::{Commit, NodeKind, NodeState, NodeStatus, Op, op};
 use flarebox_store::{Cursor, EngineState, Error, LocalNode, Shape, Store, SyncedNode, Tx};
 use rusqlite::Connection;
 
@@ -42,18 +44,32 @@ fn shape(n: u64) -> Shape {
     }
 }
 
-fn engine(seq: u64) -> EngineState {
+/// The restore a person asks for while input `seq` is written.
+fn request(seq: u64) -> (RestoreId, RestoreIntent) {
+    let node = uuid_v7(1, u128::from(seq));
+    let intent = RestoreIntent::from_trash(node, None, None).unwrap();
+    (uuid_v7(2, u128::from(seq)), intent)
+}
+
+/// The engine state after input `seq`, which took the requests `taken` from the inbox: they are
+/// queued, and the commit in flight carries their ops.
+fn engine(seq: u64, taken: Vec<(RestoreId, RestoreIntent)>) -> EngineState {
+    let ops = taken.iter().map(|(_, intent)| Op {
+        op: Some(op::Op::Restore(intent.op().clone())),
+    });
     EngineState {
         commits: CommitsState {
             in_flight: Some(InFlight {
                 commit: Commit {
                     commit_id: format!("commit-{seq}"),
                     base_seq: seq,
+                    ops: ops.collect(),
                     ..Default::default()
                 },
                 deletes: BTreeMap::new(),
                 result: None,
             }),
+            restores: taken.into_iter().collect(),
             ..Default::default()
         },
         effects: EffectsState {
@@ -69,7 +85,16 @@ fn engine(seq: u64) -> EngineState {
 /// moves the cursor to `seq` and replaces the engine state. A consistent
 /// database therefore holds exactly `last_seq * NODES_PER_INPUT` nodes in each
 /// tree and the engine state of `last_seq`.
+///
+/// Each input also takes the restore request the input before it left in the
+/// inbox, queues it in the engine state with the commit that carries it, and
+/// leaves a request of its own. In a consistent database the request of
+/// `last_seq` therefore waits in the inbox and the request of `last_seq - 1`
+/// is in the engine state: none is in both places and none is lost.
 fn write_input(tx: &Tx<'_>, seq: u64) -> Result<(), Error> {
+    let taken = tx.take_restore_requests()?;
+    let (id, intent) = request(seq);
+    tx.request_restore(&id, &intent)?;
     for n in (seq - 1) * NODES_PER_INPUT..seq * NODES_PER_INPUT {
         tx.put_remote_node(&remote(n))?;
         tx.put_synced_node(&SyncedNode {
@@ -87,7 +112,7 @@ fn write_input(tx: &Tx<'_>, seq: u64) -> Result<(), Error> {
             parked: false,
         })?;
     }
-    tx.set_engine_state(&engine(seq))?;
+    tx.set_engine_state(&engine(seq, taken))?;
     tx.set_cursor(&Cursor {
         history_id: "history".into(),
         last_seq: seq,
@@ -124,12 +149,16 @@ fn check_consistent(db: &Path) -> u64 {
             );
             assert_eq!(tx.synced_nodes()?.len() as u64, expected);
             assert_eq!(tx.local_nodes()?.len() as u64, expected);
+            let requests = |seqs: std::ops::RangeInclusive<u64>| -> Vec<_> {
+                seqs.filter(|seq| *seq > 0).map(request).collect()
+            };
             let expected_state = if last_seq > 0 {
-                engine(last_seq)
+                engine(last_seq, requests(last_seq - 1..=last_seq - 1))
             } else {
                 EngineState::default()
             };
             assert_eq!(tx.engine_state()?, expected_state);
+            assert_eq!(tx.restore_requests()?, requests(last_seq..=last_seq));
             Ok::<_, Error>(last_seq)
         })
         .unwrap()
