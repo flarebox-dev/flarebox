@@ -71,6 +71,10 @@ const EFFECT_RETRY: Backoff = Backoff {
     max: Duration::from_secs(600),
 };
 
+/// How long calls of one kind may fail in a row before the status shows them, unless the server asks for a wait at
+/// least this long.
+const RETRY_SHOWN: Duration = Duration::from_secs(60);
+
 /// Why a folder halts once its path no longer leads to the folder its task locked.
 const REPLACED: &str = "the folder at this path is no longer the folder this task locked (it was moved, replaced or \
                         removed)";
@@ -99,8 +103,11 @@ pub(crate) struct Folder {
     /// Commit sends and uploads that failed in a row, for the backoff.
     failures: u32,
     backoff: Backoff,
-    /// What the last transient failure was.
+    /// What the last disconnect was.
     note: Option<String>,
+    /// The calls that failed and are sent again, by kind, until one of the kind goes through. The status shows
+    /// them once they have failed for [`RETRY_SHOWN`], or at once when the wait is that long.
+    retrying: BTreeMap<Call, Retrying>,
     /// The disk effects of each node that failed in a row in this task, for [`EFFECT_RETRY`].
     effect_failures: BTreeMap<String, u32>,
     /// When the [`Work::RetryAfter`] that is out ends.
@@ -152,6 +159,8 @@ pub(crate) enum Work {
     Subscribe { history_id: String, since_seq: u64 },
     /// Read every page of the tree. Answered with [`Folder::listed`].
     List,
+    /// Read on from `Listing` after a wait.
+    ListAfter(Duration, Listing),
     /// [`Pending::stage`]. Answered with [`Folder::staged`].
     Stage(Pending),
     /// The same after a wait.
@@ -164,6 +173,44 @@ pub(crate) enum Work {
     ResendAfter(Duration),
     /// Answered with [`Folder::retry`] after the wait. A later one replaces it, and always ends earlier.
     RetryAfter(Duration),
+}
+
+/// The pages of the tree read so far, the cursor of the next page and how many times in a row a page failed.
+#[derive(Debug, Default)]
+pub(crate) struct Listing {
+    pages: Vec<TreePage>,
+    cursor: String,
+    failures: u32,
+}
+
+/// How reading the tree ended.
+#[derive(Debug)]
+pub(crate) enum Listed {
+    Done(Vec<TreePage>),
+    /// A page failed for now with `why`. Read on from `listing` after `wait`.
+    Later {
+        listing: Listing,
+        wait: Duration,
+        why: String,
+    },
+}
+
+/// The calls a folder sends again after they fail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Call {
+    List,
+    Download,
+    Upload,
+    Commit,
+}
+
+/// Calls of one kind that keep failing: since when, the latest failure and when the call is sent again.
+#[derive(Debug)]
+struct Retrying {
+    since: Instant,
+    why: String,
+    wait: Duration,
+    at: SystemTime,
 }
 
 /// The part of a folder's status the task knows.
@@ -218,6 +265,7 @@ impl Folder {
             failures: 0,
             backoff: Backoff::default(),
             note: None,
+            retrying: BTreeMap::new(),
             effect_failures: BTreeMap::new(),
             retry_at: None,
         })
@@ -324,11 +372,21 @@ impl Folder {
 
     /// The pages of a bootstrap, read in order. The log is replayed onto them from the first page's `head_seq`
     /// before they replace R.
-    pub fn listed(&mut self, pages: Result<Vec<TreePage>, Stop>) -> Result<Vec<Work>, Stop> {
-        let pages = pages?;
+    pub fn listed(&mut self, listed: Result<Listed, Stop>) -> Result<Vec<Work>, Stop> {
+        let listed = listed?;
         if !matches!(self.stream, Stream::Listing) {
             return Ok(Vec::new());
         }
+        let pages = match listed {
+            Listed::Done(pages) => {
+                self.retrying.remove(&Call::List);
+                pages
+            }
+            Listed::Later { listing, wait, why } => {
+                self.retry_after(Call::List, why, wait);
+                return Ok(vec![Work::ListAfter(wait, listing)]);
+            }
+        };
         let staging = Staging::new(self.history_id.clone(), pages);
         tracing::info!(
             space_id = self.link.space_id,
@@ -390,8 +448,14 @@ impl Folder {
         staged: Result<Staged, Stall>,
     ) -> Result<Vec<Work>, Stop> {
         let staged = match staged {
-            Ok(staged) => staged,
-            Err(Stall::Later(wait)) => return Ok(vec![Work::StageAfter(wait, pending)]),
+            Ok(staged) => {
+                self.retrying.remove(&Call::Download);
+                staged
+            }
+            Err(Stall::Later { wait, why }) => {
+                self.retry_after(Call::Download, why, wait);
+                return Ok(vec![Work::StageAfter(wait, pending)]);
+            }
             Err(Stall::Halt(stop)) => return Err(stop),
         };
         let node = (self.engine.effects.in_flight()).map(|record| record.node.clone());
@@ -464,6 +528,7 @@ impl Folder {
         let error = match receipts {
             Ok(receipts) => {
                 self.failures = 0;
+                self.retrying.remove(&Call::Upload);
                 if let Some(flight) = self.engine.commits.in_flight() {
                     let commit = Commit {
                         receipts,
@@ -484,6 +549,7 @@ impl Folder {
                     "a file changed while it was uploaded; planning its commit again"
                 );
                 self.step(|engine, _| Ok(engine.commits.abandon()))?;
+                self.commit_ended();
                 self.disk.rescan(&self.engine, paths);
                 self.flight = Flight::Waiting(Next::Build);
                 work.push(Work::ResendAfter(BUILD_AGAIN));
@@ -511,7 +577,11 @@ impl Folder {
             }
         };
         tracing::info!(space_id = self.link.space_id, %error, ?wait, "uploading again later");
-        self.note = Some(format!("uploading a file's content failed: {error}"));
+        self.retry_after(
+            Call::Upload,
+            format!("uploading a file's content failed: {error}"),
+            wait,
+        );
         self.failures += 1;
         self.flight = Flight::Waiting(Next::Upload);
         work.push(Work::ResendAfter(wait));
@@ -528,7 +598,7 @@ impl Folder {
         match result {
             Ok(result) => {
                 self.failures = 0;
-                self.note = None;
+                self.commit_ended();
                 self.result(&commit.commit_id, result)?;
             }
             Err(CallError::Server(refusal)) => self.refused(commit, &refusal, &mut work)?,
@@ -577,6 +647,26 @@ impl Folder {
         Ok(work)
     }
 
+    /// The commit in flight went through, or is not sent again as it is: the waits of its upload and its send
+    /// leave the status.
+    fn commit_ended(&mut self) {
+        self.retrying.remove(&Call::Upload);
+        self.retrying.remove(&Call::Commit);
+    }
+
+    /// Records that a call of kind `call` failed with `why` and is sent again after `wait`.
+    fn retry_after(&mut self, call: Call, why: String, wait: Duration) {
+        let since = (self.retrying.get(&call)).map_or_else(Instant::now, |retrying| retrying.since);
+        let at = SystemTime::now() + wait;
+        let retrying = Retrying {
+            since,
+            why,
+            wait,
+            at,
+        };
+        self.retrying.insert(call, retrying);
+    }
+
     /// The folder's status as the task knows it.
     pub fn view(&self) -> View {
         let state = match &self.stream {
@@ -587,8 +677,14 @@ impl Folder {
             Stream::Following { .. } => FolderState::CatchingUp,
         };
         let stuck = self.engine.effects.blocked().len() + self.engine.commits.problems().len();
+        let retrying = (self.retrying.values())
+            .find(|retrying| {
+                retrying.wait >= RETRY_SHOWN || retrying.since.elapsed() >= RETRY_SHOWN
+            })
+            .map(|retrying| format!("{}; trying again at {}", retrying.why, utc(retrying.at)));
         let problem = match self.engine.commits.halted() {
             _ if self.note.is_some() => self.note.clone(),
+            _ if retrying.is_some() => retrying,
             Some(CommitHalt::ReadOnly) => {
                 Some("the server takes no changes from this device".into())
             }
@@ -883,11 +979,17 @@ impl Folder {
                 let wait =
                     (refusal.retry_after()).unwrap_or_else(|| self.backoff.delay(self.failures));
                 self.failures += 1;
-                self.note = Some(format!("the server did not take a commit: {described}"));
+                self.retry_after(
+                    Call::Commit,
+                    format!("the server did not take a commit: {described}"),
+                    wait,
+                );
                 self.flight = Flight::Waiting(Next::Send(commit));
                 work.push(Work::ResendAfter(wait));
             }
-            Failure::Abandoned | Failure::Split | Failure::Halted(CommitHalt::ReadOnly) => {}
+            Failure::Abandoned | Failure::Split | Failure::Halted(CommitHalt::ReadOnly) => {
+                self.commit_ended();
+            }
             Failure::Resync => {
                 return Err(Stop::Recovery(format!(
                     "the server is behind what this device already applied ({described})"
@@ -1126,6 +1228,7 @@ impl FolderTask {
             MAX_FORMAT,
         );
         config.backoff = Backoff::default();
+        config.retry_later_attempts = 0;
         let (session, mut events) = match Session::start(self.auth.clone(), config) {
             Ok(started) => started,
             Err(reason) => return Halt::Person(reason.to_string()),
@@ -1134,7 +1237,7 @@ impl FolderTask {
         self.publish(&folder);
         let stop = {
             let (session, transfer) = (&session, &transfer);
-            let mut list: Slot<'_, Result<Vec<TreePage>, Stop>> = None;
+            let mut list: Slot<'_, Result<Listed, Stop>> = None;
             let mut stage: Slot<'_, (Pending, Result<Staged, Stall>)> = None;
             let mut upload: Slot<'_, Result<Vec<UploadReceipt>, ChunkError>> = None;
             let mut send: Slot<'_, Result<CommitResult, CallError>> = None;
@@ -1193,7 +1296,21 @@ impl FolderTask {
                             since_seq,
                         } => session.subscribe(history_id, since_seq),
                         Work::List => {
-                            list = Some(Box::pin(list_tree(session, &self.link.space_id)))
+                            let listing = Listing::default();
+                            list = Some(Box::pin(list_tree(
+                                session,
+                                &self.link.space_id,
+                                listing,
+                                None,
+                            )))
+                        }
+                        Work::ListAfter(wait, listing) => {
+                            list = Some(Box::pin(list_tree(
+                                session,
+                                &self.link.space_id,
+                                listing,
+                                Some(wait),
+                            )))
                         }
                         Work::Stage(pending) => {
                             stage = Some(Box::pin(stage_effect(session, transfer, pending, None)));
@@ -1374,27 +1491,31 @@ impl FolderTask {
     }
 }
 
-/// Reads the whole tree with `ListTree`, page by page (spec v0 section 7.5), waiting out the refusals the server
-/// asks to retry.
-async fn list_tree(session: &Session, space_id: &str) -> Result<Vec<TreePage>, Stop> {
-    let backoff = Backoff::default();
-    let mut pages = Vec::new();
-    let mut cursor = String::new();
-    let mut attempt = 0;
+/// Reads the rest of the tree with `ListTree` from `listing`, after `wait` when there is one, page by page (spec
+/// v0 section 7.5). A page refused in a way the server asks to retry ends it with the wait, so the folder can show it.
+async fn list_tree(
+    session: &Session,
+    space_id: &str,
+    mut listing: Listing,
+    wait: Option<Duration>,
+) -> Result<Listed, Stop> {
+    if let Some(wait) = wait {
+        tokio::time::sleep(wait).await;
+    }
     loop {
-        match session.list_tree(cursor.clone(), TREE_PAGE).await {
+        match session.list_tree(listing.cursor.clone(), TREE_PAGE).await {
             Ok(page) => {
-                attempt = 0;
-                cursor.clone_from(&page.next_cursor);
-                pages.push(page);
-                if cursor.is_empty() {
-                    return Ok(pages);
+                listing.failures = 0;
+                listing.cursor.clone_from(&page.next_cursor);
+                listing.pages.push(page);
+                if listing.cursor.is_empty() {
+                    return Ok(Listed::Done(listing.pages));
                 }
             }
             Err(error) => {
                 let wait = match policy::after_call_error(&error) {
                     Disposition::RetryAfter(wait) => wait,
-                    Disposition::Backoff => backoff.delay(attempt),
+                    Disposition::Backoff => Backoff::default().delay(listing.failures),
                     Disposition::Halt => {
                         let error = match &error {
                             CallError::Server(refusal) => policy::describe(refusal),
@@ -1406,11 +1527,28 @@ async fn list_tree(session: &Session, space_id: &str) -> Result<Vec<TreePage>, S
                     }
                 };
                 tracing::info!(space_id, %error, ?wait, "reading the tree again later");
-                attempt += 1;
-                tokio::time::sleep(wait).await;
+                listing.failures += 1;
+                let why = match &error {
+                    CallError::Server(refusal) => policy::describe(refusal),
+                    other => other.to_string(),
+                };
+                return Ok(Listed::Later {
+                    listing,
+                    wait,
+                    why: format!("reading the space's tree failed: {why}"),
+                });
             }
         }
     }
+}
+
+/// The time of day of `at` in UTC, such as `00:00 UTC`.
+fn utc(at: SystemTime) -> String {
+    let seconds = at
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+        % 86_400;
+    format!("{:02}:{:02} UTC", seconds / 3_600, seconds / 60 % 60)
 }
 
 /// Stages `pending`, after `wait` when there is one, and gives it back with how the staging ended.

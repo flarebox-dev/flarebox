@@ -324,7 +324,9 @@ impl Device {
                 history_id,
                 since_seq,
             } => return self.resume(remote, history_id, since_seq),
-            Work::List => self.folder.listed(Ok(remote.pages(TREE_PAGE))),
+            Work::List | Work::ListAfter(..) => self
+                .folder
+                .listed(Ok(Listed::Done(remote.pages(TREE_PAGE)))),
             Work::Stage(pending) | Work::StageAfter(_, pending) => {
                 let staged = ready(pending.stage(&remote.chunks));
                 self.folder.staged(pending, staged)
@@ -351,6 +353,7 @@ impl Device {
             ran.push(match &work {
                 Work::Subscribe { .. } => "subscribe",
                 Work::List => "list",
+                Work::ListAfter(..) => "list again",
                 Work::Stage(_) => "stage",
                 Work::StageAfter(..) => "stage again",
                 Work::Upload(_) => "upload",
@@ -807,6 +810,47 @@ fn a_remote_file_becomes_one_effect_and_its_observation_changes_nothing() {
 }
 
 #[test]
+fn a_download_the_server_puts_off_for_an_hour_shows_in_the_status_until_it_goes_through() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("notes.txt"), b"written on a");
+
+    let site = Site::new(&remote, "b");
+    let mut b = site.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    *remote.chunks.refusal.lock().unwrap() = Some(ServerError(flarebox_proto::v1::Error {
+        code: flarebox_proto::v1::error::Code::QuotaExceeded as i32,
+        message: "the daily limit is used up".into(),
+        retry_after_ms: 3_600_000,
+        ..Default::default()
+    }));
+    let pending = loop {
+        match b.work.pop_front().expect("an effect is staged") {
+            Work::Stage(pending) => break pending,
+            other => b.perform(other, &mut remote).unwrap(),
+        }
+    };
+    let staged = ready(pending.stage(&remote.chunks));
+    let step = b.folder.staged(pending, staged);
+    b.take(step).unwrap();
+    let problem = b
+        .folder
+        .view()
+        .problem
+        .expect("the wait shows in the status");
+    assert!(problem.contains("QUOTA_EXCEEDED"), "{problem}");
+
+    *remote.chunks.refusal.lock().unwrap() = None;
+    assert_eq!(b.run(&mut remote), ["stage again"]);
+    assert_eq!(b.folder.view().problem, None);
+    assert_eq!(
+        fs::read(site.root.join("notes.txt")).unwrap(),
+        b"written on a"
+    );
+}
+
+#[test]
 fn a_download_that_fails_for_now_stages_the_same_effect_again() {
     let mut remote = Remote::new();
     let (site_a, mut a) = linked(&mut remote, "a");
@@ -832,7 +876,7 @@ fn a_download_that_fails_for_now_stages_the_same_effect_again() {
         .effect_id
         .clone();
     let staged = ready(pending.stage(&remote.chunks));
-    assert!(matches!(staged, Err(Stall::Later(_))));
+    assert!(matches!(staged, Err(Stall::Later { .. })));
     let step = b.folder.staged(pending, staged);
     b.take(step).unwrap();
     b.settle();
@@ -916,6 +960,128 @@ fn a_remote_change_is_applied_only_after_the_commit_in_flight() {
 }
 
 #[test]
+fn a_tree_listing_put_off_for_an_hour_shows_in_the_status_and_one_put_off_for_a_second_does_not() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("one.txt"), b"one");
+    let site = Site::new(&remote, "b");
+    let mut b = site.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    assert!(matches!(b.work.pop_front(), Some(Work::List)));
+
+    let later = |wait, why: &str| Listed::Later {
+        listing: Listing::default(),
+        wait,
+        why: format!("reading the space's tree failed: {why}"),
+    };
+    let step = b
+        .folder
+        .listed(Ok(later(Duration::from_secs(1), "RETRY_LATER: busy")));
+    b.take(step).unwrap();
+    assert_eq!(b.folder.view().problem, None);
+    assert!(matches!(b.work.pop_front(), Some(Work::ListAfter(..))));
+
+    let quota = "QUOTA_EXCEEDED: the daily limit is used up";
+    let step = b
+        .folder
+        .listed(Ok(later(Duration::from_secs(3_600), quota)));
+    b.take(step).unwrap();
+    let problem = b
+        .folder
+        .view()
+        .problem
+        .expect("an hour's wait shows in the status");
+    assert!(problem.contains(quota), "{problem}");
+    assert!(problem.ends_with(" UTC"), "{problem}");
+
+    b.run(&mut remote);
+    assert_eq!(b.folder.view().problem, None);
+    assert_eq!(names(&site.root), ["one.txt"]);
+    assert_eq!(b.state(), FolderState::UpToDate);
+}
+
+/// A refusal of the server that puts a call off for an hour.
+fn put_off(code: flarebox_proto::v1::error::Code) -> ServerError {
+    ServerError(flarebox_proto::v1::Error {
+        code: code as i32,
+        message: "not now".into(),
+        retry_after_ms: 3_600_000,
+        ..Default::default()
+    })
+}
+
+#[test]
+fn an_upload_put_off_for_an_hour_leaves_the_status_once_its_file_is_deleted() {
+    use flarebox_proto::v1::error::Code;
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    let path = site.root.join("notes.txt");
+    fs::write(&path, b"written on a").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    let Some(Work::Upload(upload)) = a.work.pop_front() else {
+        panic!("the file is uploaded");
+    };
+    let hash = upload.chunks[0].hash.clone();
+    let refused = ChunkError::Call(CallError::Server(put_off(Code::QuotaExceeded)));
+    let step = a.folder.uploaded(Err(refused));
+    a.take(step).unwrap();
+    assert!(
+        a.folder.view().problem.is_some(),
+        "the wait shows in the status"
+    );
+
+    fs::remove_file(&path).unwrap();
+    a.scan_until(|a| a.folder.engine.trees.local().is_empty());
+    let wait = a.work.pop_front().unwrap();
+    a.perform(wait, &mut remote).unwrap();
+    assert!(matches!(a.work.pop_front(), Some(Work::Upload(_))));
+    let step = a.folder.uploaded(Err(ChunkError::SourceChanged { hash }));
+    a.take(step).unwrap();
+    a.run(&mut remote);
+    a.settle();
+    assert!(a.work.is_empty());
+    assert_eq!(a.state(), FolderState::UpToDate);
+    assert_eq!(a.folder.view().problem, None);
+}
+
+#[test]
+fn a_commit_put_off_for_an_hour_leaves_the_status_once_the_server_refuses_it() {
+    use flarebox_proto::v1::error::Code;
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::write(site.root.join("notes.txt"), b"written on a").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    let upload = a.work.pop_front().unwrap();
+    a.perform(upload, &mut remote).unwrap();
+    let Some(Work::Send(_)) = a.work.pop_front() else {
+        panic!("the commit is sent");
+    };
+    let step = a
+        .folder
+        .sent(Err(CallError::Server(put_off(Code::RetryLater))));
+    a.take(step).unwrap();
+    assert!(
+        a.folder.view().problem.is_some(),
+        "the wait shows in the status"
+    );
+
+    let wait = a.work.pop_front().unwrap();
+    a.perform(wait, &mut remote).unwrap();
+    let Some(Work::Send(_)) = a.work.pop_front() else {
+        panic!("the commit is sent again");
+    };
+    let step = a
+        .folder
+        .sent(Err(CallError::Server(put_off(Code::HeadMoved))));
+    a.take(step).unwrap();
+    assert_eq!(a.folder.view().problem, None);
+    assert_eq!(a.run(&mut remote), ["upload", "send"]);
+    assert_eq!(remote.names(), ["notes.txt"]);
+    assert_eq!(a.state(), FolderState::UpToDate);
+}
+
+#[test]
 fn a_bootstrap_whose_pages_were_read_at_two_heads_replaces_r_after_the_replay() {
     let mut remote = Remote::new();
     let (site_a, mut a) = linked(&mut remote, "a");
@@ -938,7 +1104,7 @@ fn a_bootstrap_whose_pages_were_read_at_two_heads_replaces_r_after_the_replay() 
     b.connect(&remote);
     b.scan_until(|b| b.folder.scanned);
     assert!(matches!(b.work.pop_front(), Some(Work::List)));
-    let step = b.folder.listed(Ok(pages));
+    let step = b.folder.listed(Ok(Listed::Done(pages)));
     b.take(step).unwrap();
     assert!(matches!(
         b.work.front(),
@@ -2242,7 +2408,7 @@ fn a_restart_during_a_bootstrap_reads_the_tree_again() {
         b.scan_until(|b| b.folder.scanned);
         assert!(matches!(b.work.pop_front(), Some(Work::List)));
         if listed {
-            let step = b.folder.listed(Ok(remote.pages(TREE_PAGE)));
+            let step = b.folder.listed(Ok(Listed::Done(remote.pages(TREE_PAGE))));
             b.take(step).unwrap();
             assert!(matches!(b.work.front(), Some(Work::Subscribe { .. })));
         }
