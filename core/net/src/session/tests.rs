@@ -1279,6 +1279,17 @@ async fn an_oversized_token_answer_is_a_transport_failure_and_is_asked_again() {
     assert!(again.is_ok(), "the token is asked for again");
 }
 
+/// Answers a request with a whole protobuf error body that is not an `Error`.
+async fn answer_not_an_error(mut tcp: TcpStream) {
+    let mut request = [0; 4096];
+    assert!(tcp.read(&mut request).await.unwrap() > 0);
+    let head =
+        b"HTTP/1.1 500 X\r\ncontent-type: application/x-protobuf\r\ncontent-length: 3\r\n\r\n";
+    tcp.write_all(&[head.as_slice(), &[0xff; 3]].concat())
+        .await
+        .unwrap();
+}
+
 /// The first event that is not a connection coming or going.
 async fn settled(events: &mut Events) -> Event {
     let settle = async {
@@ -1295,14 +1306,18 @@ async fn settled(events: &mut Events) -> Event {
 }
 
 #[tokio::test]
-async fn oversized_token_errors_are_unreadable_refusals_and_stop_the_session_in_a_row() {
+async fn oversized_or_undecodable_token_errors_stop_the_session_in_a_row() {
     let unreadable_until_stopped = |listener: TcpListener| async move {
         let mut attempts = 0;
         while let Ok(Ok((tcp, _))) =
             tokio::time::timeout(Duration::from_secs(2), listener.accept()).await
         {
             attempts += 1;
-            tokio::spawn(answer_endlessly(tcp, 500));
+            if attempts % 2 == 0 {
+                tokio::spawn(answer_endlessly(tcp, 500));
+            } else {
+                tokio::spawn(answer_not_an_error(tcp));
+            }
         }
         attempts
     };

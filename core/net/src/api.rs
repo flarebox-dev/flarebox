@@ -278,9 +278,12 @@ impl Api {
             return M::decode(body.as_slice()).map_err(|_| ApiError::Decode(what));
         }
         let status = status.as_u16();
-        match is_protobuf.then(|| ServerError::decode(&body)).flatten() {
+        if !is_protobuf || body.is_empty() {
+            return Err(ApiError::Status { status });
+        }
+        match ServerError::decode(&body) {
             Some(error) => Err(ApiError::Server { status, error }),
-            _ => Err(ApiError::Status { status }),
+            None => Err(ApiError::Unreadable { status }),
         }
     }
 }
@@ -474,6 +477,23 @@ mod tests {
                 .expect("the client hung up")
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn an_error_that_is_not_an_error_message_is_unreadable_and_an_empty_one_is_left_to_its_status()
+     {
+        let (base, _server) = answering(500, Some(vec![0xff; 3])).await;
+        let outcome = Api::local_development(base).unwrap().server_info().await;
+        assert!(
+            matches!(outcome, Err(ApiError::Unreadable { status: 500 })),
+            "{outcome:?}"
+        );
+        let (base, _server) = answering(500, Some(Vec::new())).await;
+        let outcome = Api::local_development(base).unwrap().server_info().await;
+        assert!(
+            matches!(outcome, Err(ApiError::Status { status: 500 })),
+            "{outcome:?}"
+        );
     }
 
     #[tokio::test]
