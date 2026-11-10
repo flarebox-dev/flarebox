@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use rustix::io::Errno;
 
-use crate::root::PRIVATE_DIR;
+use crate::root::{PRIVATE_DIR, make_dir};
 use crate::{DIR_FLAGS, FileId, open_root, stat_fd};
 
 /// The folder inside the private folder that holds parked entries (design
@@ -71,6 +71,19 @@ pub enum Unresolved {
     Io { path: PathBuf, err: io::Error },
 }
 
+impl From<Unresolved> for io::Error {
+    fn from(unresolved: Unresolved) -> Self {
+        let kind = match &unresolved {
+            Unresolved::Io { err, .. } => err.kind(),
+            Unresolved::BadName(_) => io::ErrorKind::InvalidInput,
+            Unresolved::Missing(_) => io::ErrorKind::NotFound,
+            Unresolved::NotAFolder(_) => io::ErrorKind::NotADirectory,
+            Unresolved::Replaced { .. } => io::ErrorKind::Other,
+        };
+        io::Error::new(kind, unresolved)
+    }
+}
+
 /// The sync root, held open. Effects resolve every path from this descriptor
 /// rather than from a path spelling.
 #[derive(Debug)]
@@ -110,6 +123,11 @@ impl Space {
         })
     }
 
+    /// The root descriptor.
+    pub fn root(&self) -> BorrowedFd<'_> {
+        self.root.as_fd()
+    }
+
     /// Resolves the folder that holds `location` and returns it with the
     /// entry's name. The entry itself is not looked at.
     pub fn parent<'a>(&self, location: &'a Location) -> Result<(Folder, &'a OsStr), Unresolved> {
@@ -143,15 +161,19 @@ impl Space {
         Ok(folder)
     }
 
-    /// Opens `.flarebox/<parts>`, recording the identity of each folder on
-    /// the way, so that [`Space::recheck`] also notices one of them moved.
-    /// Each part must be a single file name.
+    /// Opens `.flarebox/<parts>`, creating the folders that are missing, and
+    /// records the identity of each folder on the way, so that
+    /// [`Space::recheck`] also notices one of them moved. Each part must be a
+    /// single file name.
     pub fn private(&self, parts: &[&str]) -> Result<Folder, Unresolved> {
         let mut folder = self.root_folder()?;
         for name in std::iter::once(PRIVATE_DIR).chain(parts.iter().copied()) {
+            check_name(OsStr::new(name))?;
+            let fd = make_dir(folder.fd(), name).map_err(|err| Unresolved::Io {
+                path: join(&folder.route, OsStr::new(name)),
+                err,
+            })?;
             let name = OsStr::new(name);
-            check_name(name)?;
-            let fd = open_dir(folder.fd(), name, &folder.route)?;
             folder.id = identity(&fd, &folder.route, name)?;
             folder.fd = fd;
             folder.route.push(Dir {
@@ -174,7 +196,7 @@ impl Space {
         Ok(())
     }
 
-    fn root_folder(&self) -> Result<Folder, Unresolved> {
+    pub(crate) fn root_folder(&self) -> Result<Folder, Unresolved> {
         let io = |err| Unresolved::Io {
             path: PathBuf::new(),
             err,
@@ -255,7 +277,7 @@ fn join(route: &[Dir], name: &OsStr) -> PathBuf {
 
 /// Refuses anything but one ordinary file name, so a name can neither climb
 /// out of its folder nor reach past it.
-fn check_name(name: &OsStr) -> Result<(), Unresolved> {
+pub(crate) fn check_name(name: &OsStr) -> Result<(), Unresolved> {
     let bytes = name.as_bytes();
     if matches!(bytes, b"" | b"." | b"..") || bytes.contains(&b'/') || bytes.contains(&0) {
         return Err(Unresolved::BadName(name.to_owned()));
