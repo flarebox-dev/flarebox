@@ -222,6 +222,7 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
         .claim(code, "Ada".into(), "Ada's Mac".into())
         .unwrap();
     assert_eq!(owner.device_name, "Ada's Mac");
+    assert_eq!(owner.user_name, "Ada");
     assert!(mac.session().connect(server.clone()).unwrap().claimed);
     mac.until("the account arriving", |m| m.signed_in);
 
@@ -311,6 +312,7 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
     let store = mac
         .profile()
         .join(format!("state/spaces/{}/store.sqlite", space.space_id));
+    mac.session().stop();
     Store::open(&store)
         .unwrap()
         .transaction(|tx| {
@@ -322,6 +324,7 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
             })
         })
         .unwrap();
+    mac.session().start();
     let asked = mac.until("the stored question", |m| m.questions.len() == 1);
     assert_eq!(
         asked.questions[0].answers,
@@ -363,7 +366,24 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
     assert_eq!(unlinked.status, SyncStatus::NeedsSetup);
     assert_eq!(fs::read(folder.join("notes.txt")).unwrap(), b"notes");
     assert_eq!(
-        mac.session().unlink_folder(space.space_id),
+        mac.session().unlink_folder(space.space_id.clone()),
         Err(SessionError::FolderNotLinked)
     );
+
+    let again = mac.path("Again");
+    fs::create_dir_all(&again).unwrap();
+    fs::write(again.join("kept.txt"), b"kept").unwrap();
+    mac.session()
+        .link_folder(space.space_id, path_str(&again))
+        .unwrap();
+    mac.until("the second link's sync", |m| m.status == SyncStatus::Idle);
+    mac.session().sign_out().unwrap();
+    let signed_out = mac.until("the sign-out", |m| {
+        !m.signed_in && m.folders.is_empty() && m.status == SyncStatus::NeedsSetup
+    });
+    assert!(signed_out.problems.is_empty());
+    assert_eq!(fs::read(again.join("kept.txt")).unwrap(), b"kept");
+    assert_eq!(mac.session().spaces(), Err(SessionError::NotSignedIn));
+    mac.reopen();
+    assert_eq!(mac.opened.as_ref().unwrap().account, None);
 }
