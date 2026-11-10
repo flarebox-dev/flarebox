@@ -239,6 +239,13 @@ impl Commits {
         &self.restores
     }
 
+    /// The queued restores that wait because their node is a problem
+    /// ([`RestoreIntent::held_by`]), so a surface can say why they are pending.
+    pub fn held_restores(&self) -> impl Iterator<Item = &RestoreId> {
+        let held = |(_, intent): &(&RestoreId, &RestoreIntent)| intent.held_by(&self.problems);
+        self.restores.iter().filter(held).map(|(id, _)| id)
+    }
+
     /// The last [`RESOLVED_KEPT`] restores that ended, oldest first. An older outcome is dropped.
     pub fn resolved(&self) -> &[Resolved] {
         &self.resolved
@@ -302,8 +309,10 @@ impl Commits {
     /// The queued restores come first, in request order, so local changes of other nodes do not
     /// hold them back. A restore follows every op this commit has for its own node: an unsent
     /// edit of a file is sent before the restore of an earlier version and so becomes a version
-    /// itself. While such an op is left for a later commit, the restore waits with it. A folder
-    /// is not deleted in the commit that restores a node into it.
+    /// itself. While such an op is left for a later commit, the restore waits with it. It also
+    /// waits while its node is not settled: a node left out of planning (a problem node, a node
+    /// whose S update waits, a parked one), and a node L and R agree on while S lags
+    /// ([`Class::Same`]). A folder is not deleted in the commit that restores a node into it.
     pub fn build(
         &mut self,
         trees: &mut Trees,
@@ -1150,6 +1159,10 @@ fn plan(
             *scratch.unsent.entry(node.clone()).or_default() += 1;
         }
     }
+    let unsettled = |node: &&str| problems.contains(*node) || trees.class(node) == Class::Same;
+    for node in restored.into_iter().filter(unsettled) {
+        *scratch.unsent.entry(node.to_owned()).or_default() += 1;
+    }
     let mut moving: BTreeSet<NodeId> = wants
         .iter()
         .filter_map(|want| match want {
@@ -1310,8 +1323,11 @@ struct Scratch {
     /// Folders a forced create will be merged into (MERGED_INTO). Deleting one in the same
     /// commit would trash what the create brings, so their deletes wait for the next commit.
     merged: BTreeSet<NodeId>,
-    /// For each node a queued restore names, how many wants that change it are not emitted yet.
-    /// The restore waits for them, so that it is applied to what this device sent.
+    /// For each node a queued restore names, how many wants that change it are not emitted yet,
+    /// and one more while the node is not settled: this build leaves it out, so its changes are
+    /// not among the wants, or S has not taken what L and R agree on. The restore waits for all
+    /// of them, so that it is applied to what this device sent and S shows what the device
+    /// holds.
     unsent: BTreeMap<NodeId, usize>,
 }
 

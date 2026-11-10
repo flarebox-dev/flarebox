@@ -51,5 +51,5 @@ pub use folder::MAX_FORMAT;
 pub use observe::{FsObserver, Observation, Observed, Observer};
 pub use paths::{Paths, PathsError};
 pub use question::{Answer, HeldItem, Question, QuestionKind, RecoveryGroup};
-pub use restore::{RestoreRejection, RestoreRequest, RestoreState, RestoreStatus};
+pub use restore::{RestoreRejection, RestoreRequest, RestoreState, RestoreStatus, RestoreWait};
 pub use status::{Account, FolderState, FolderStatus, Status};

@@ -378,6 +378,89 @@ fn a_restore_follows_the_edit_of_its_own_file() {
 }
 
 #[test]
+fn a_restore_waits_while_its_node_is_left_out_of_planning() {
+    let (n, v) = (id(1), id(50));
+    let edited = (
+        n.clone(),
+        Some(file(&root(), "f", 3)),
+        Some(file(&root(), "f", 2)),
+        Some(remote(file(&root(), "f", 2))),
+    );
+    let mut trees = trees(&[edited]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    acknowledge(&mut commits, &mut trees, vec![rejected("LATER_REASON")]);
+    assert!(commits.problems().contains(&n));
+
+    // The edit is not planned while the file is a problem. A restore sent now would reach the
+    // server before the edit, and the edit would replace the restored version later.
+    let intent = version(&n, &v);
+    commits.restore(id(100), intent.clone());
+    commits.restore(id(101), from_trash(&id(2)));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [restore_op(&from_trash(&id(2)))]);
+    acknowledge(&mut commits, &mut trees, vec![rejected("NOT_FOUND")]);
+    assert_eq!(commits.restores().keys().collect::<Vec<_>>(), [&id(100)]);
+    assert_eq!(commits.held_restores().collect::<Vec<_>>(), [&id(100)]);
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+
+    assert!(commits.clear_problem(&n));
+    assert_eq!(commits.held_restores().count(), 0);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update(&n, 3), restore_op(&intent)]);
+}
+
+#[test]
+fn a_restore_waits_while_s_lags_what_l_and_r_agree_on() {
+    // The file was renamed to g and rewritten on the server, and the disk has both. S cannot
+    // take the name yet, because it still has the folder that held g, which is parked on disk
+    // and on its way to k.
+    let (n, m, v) = (id(1), id(2), id(50));
+    let downloaded = file(&root(), "g", 1);
+    let rows = [
+        (
+            n.clone(),
+            Some(downloaded.clone()),
+            Some(file(&root(), "f", 2)),
+            Some(remote(downloaded)),
+        ),
+        (
+            m.clone(),
+            None,
+            Some(dir(&root(), "g")),
+            Some(remote(dir(&root(), "k"))),
+        ),
+    ];
+    let mut trees = trees(&rows);
+    let folder = |name: &str, parked: bool| LocalNode {
+        shape: dir(&root(), name),
+        identity: FileIdentity {
+            dev: 1,
+            ino: 9,
+            birth_ns: Some(0),
+        },
+        parked,
+    };
+    trees.set_local(m.clone(), folder("g", true));
+    trees.settle();
+    assert_eq!(trees.synced().live(&n), Some(&file(&root(), "f", 2)));
+
+    // A restore sent now would leave L with content S does not show, and the engine would
+    // upload it over the restored version as if the user had written it.
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let intent = version(&n, &v);
+    commits.restore(id(100), intent.clone());
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    assert_eq!(commits.restores().len(), 1);
+
+    trees.set_local(m, folder("k", false));
+    trees.settle();
+    assert_eq!(trees.synced().live(&n), trees.remote().live(&n));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [restore_op(&intent)]);
+}
+
+#[test]
 fn a_restore_follows_the_delete_of_its_own_node() {
     let n = id(1);
     let shape = file(&root(), "f", 1);

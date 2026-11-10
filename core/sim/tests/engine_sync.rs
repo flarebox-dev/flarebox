@@ -9,7 +9,7 @@
 //! device commits its restores; this one asks its engine for them, as an app does, and every
 //! request must end with the result the server gave its `Restore` op, sent once.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use flarebox_engine::classify::Trees;
 use flarebox_engine::commit::{Commits, Failure, Halt, MAX_OPS, Reconnect};
@@ -21,8 +21,8 @@ use flarebox_engine::state::StateError;
 use flarebox_engine::tree::{FileIdentity, Kind, LocalNode, Names, RemoteNode, same};
 use flarebox_proto::v1::{
     ChangeRecord, ChunkRef, Commit, Content, CreateDir, CreateFile, Delete, Error, ListVersions,
-    Move, Op, OpResult, PrepareUpload, Restore, Resume, UpdateContent, UploadReceipt, VersionInfo,
-    change_record, chunk_plan, error, op, op_result,
+    Move, NodeState, Op, OpResult, PrepareUpload, Restore, Resume, UpdateContent, UploadReceipt,
+    VersionInfo, change_record, chunk_plan, error, op, op_result,
 };
 use flarebox_sim::space::{Role, Session, SpaceDo};
 use proptest::prelude::*;
@@ -289,17 +289,75 @@ fn outcome_of(result: &OpResult) -> Outcome {
     }
 }
 
-/// What the restores of a commit this device sent did to the writes the property tracks, with the
-/// server's content before and after the commit. A version restore the server applied replaces
-/// the file's content because the person asked for that: the content the server held, and an edit
-/// of the file this commit sent ahead of the restore, are versions now and no lost writes. The
-/// content a restore made current again, on a file or on the nodes it brought back from the
-/// trash, is a write of the device that wrote it and must be kept from here on.
+/// What each `Restore` op of `commit` brings back if the server applies it to the space as it
+/// is, by the op's index: the file with the content of the version the op names, or every file
+/// that went to the trash with the op's node, the node included, with the content it holds
+/// there. Empty for a restore from the trash of a node that is not in the trash.
+fn restorable(space: &SpaceDo, commit: &Commit) -> BTreeMap<usize, Vec<(String, Vec<u8>)>> {
+    let nodes = space.nodes();
+    let mut found = BTreeMap::new();
+    for (index, op) in commit.ops.iter().enumerate() {
+        let Some(op::Op::Restore(restore)) = &op.op else {
+            continue;
+        };
+        let files = if restore.version_id.is_empty() {
+            let trashed = || nodes.iter().filter(|n| n.status == 2);
+            let node = trashed().find(|n| n.node_id == restore.node_id);
+            let mut group: Vec<&NodeState> = node.into_iter().collect();
+            let mut next = 0;
+            while let Some(parent) = group.get(next).copied() {
+                let with_it = |n: &&NodeState| {
+                    n.parent_id == parent.node_id && n.trash_group == parent.trash_group
+                };
+                group.extend(trashed().filter(with_it));
+                next += 1;
+            }
+            let content = |n: &NodeState| n.current.clone()?.content;
+            let held = |n: &NodeState| Some((n.node_id.clone(), content(n)?.manifest_digest));
+            group.into_iter().filter_map(held).collect()
+        } else {
+            let request = ListVersions {
+                node_id: restore.node_id.clone(),
+                ..Default::default()
+            };
+            let versions = space.list_versions(&request).map(|list| list.versions);
+            let version = versions.unwrap_or_default().into_iter();
+            let version = version.filter(|v| v.version_id == restore.version_id);
+            let content = version.filter_map(|v| v.content);
+            content
+                .map(|c| (restore.node_id.clone(), c.manifest_digest))
+                .collect()
+        };
+        found.insert(index, files);
+    }
+    found
+}
+
+/// What the restores of a commit this device sent did to the writes the property tracks, with
+/// the server's content before and after the commit and what each restore was to bring back
+/// ([`restorable`], taken before the commit).
+///
+/// A version restore the server applied replaces the file's content because the person asked for
+/// that: the content the server held, and an edit of the file this commit sent ahead of the
+/// restore, are versions now and no lost writes.
+///
+/// The content a restore made current again is a write of the device that wrote it and must be
+/// kept from here on: the version's content on the file, or on the copy the server made of it,
+/// and the content of each file the restore brought back from the trash. Nothing else that came
+/// back in the same commit counts. A move or an edit of a trashed node revives it with its
+/// folders (R8), and what that revives is content the device already acknowledged.
+///
+/// A file a restore brought back from the trash is left out while the device holds an unsent
+/// edit of it made on that same content. The person asked for the file, not for its old content
+/// over the edit, so the edit replaces it next, as an edit beats a delete. A version restore has
+/// no such exception: it asks for that content, and an edit made before it must not replace it.
 fn restored(
     commit: &Commit,
     results: &[OpResult],
+    bringing: &BTreeMap<usize, Vec<(String, Vec<u8>)>>,
     before: &BTreeSet<(String, Vec<u8>)>,
     after: &BTreeSet<(String, Vec<u8>)>,
+    trees: &Trees,
     [local, remote]: [&mut BTreeSet<Vec<u8>>; 2],
 ) {
     use op_result::Code;
@@ -331,9 +389,28 @@ fn restored(
             }
         }
     }
-    let current = || after.difference(before).map(|(_, digest)| digest.clone());
-    local.extend(own(current(), 1));
-    remote.extend(own(current(), 2));
+    let mut current = Vec::new();
+    for (index, files) in bringing {
+        let result = &results[*index];
+        let copied = result.code == Code::ConflictCopy as i32;
+        if !applied(result) && !copied {
+            continue;
+        }
+        let from_trash =
+            matches!(&commit.ops[*index].op, Some(op::Op::Restore(r)) if r.version_id.is_empty());
+        for (node, digest) in files {
+            let node = if copied { &result.node_id } else { node };
+            let on_disk = (trees.local().get(node)).and_then(|n| n.shape.content.as_ref());
+            let edited = from_trash
+                && on_disk.is_some_and(|c| c.manifest_digest != *digest)
+                && acknowledged(trees, node).as_ref() == Some(digest);
+            if after.contains(&(node.clone(), digest.clone())) && !edited {
+                current.push(digest.clone());
+            }
+        }
+    }
+    local.extend(own(current.iter().cloned(), 1));
+    remote.extend(own(current.into_iter(), 2));
 }
 
 /// Where the process stops and starts again, with the engine state as the store hands it back
@@ -514,6 +591,16 @@ fn stored(space: &SpaceDo) -> BTreeSet<(String, Vec<u8>)> {
 }
 
 /// The L nodes that hold content, each with its manifest digest.
+/// The content the server acknowledged for a file: its waiting S update's while one waits, and
+/// S's otherwise.
+fn acknowledged(trees: &Trees, id: &str) -> Option<Vec<u8>> {
+    let shape = match trees.waiting().get(id) {
+        Some(waiting) => waiting.as_ref(),
+        None => trees.synced().live(id),
+    }?;
+    Some(shape.content.as_ref()?.manifest_digest.clone())
+}
+
 fn held(trees: &Trees) -> BTreeSet<(String, Vec<u8>)> {
     trees
         .local()
@@ -543,16 +630,9 @@ fn rewritten(
             written.remove(gone);
         }
     }
-    let synced = |id: &str| {
-        let shape = match trees.waiting().get(id) {
-            Some(waiting) => waiting.as_ref(),
-            None => trees.synced().live(id),
-        }?;
-        Some(shape.content.as_ref()?.manifest_digest.clone())
-    };
     after
         .difference(before)
-        .filter(|(id, digest)| synced(id).as_ref() != Some(digest))
+        .filter(|(id, digest)| acknowledged(trees, id).as_ref() != Some(digest))
         .map(|(_, digest)| digest.clone())
         .collect()
 }
@@ -822,6 +902,7 @@ fn run_cut(
             ..commit.clone()
         };
         let failed = |e| TestCaseError::fail(format!("{e:?}"));
+        let bringing = restorable(&space, &commit);
         let before = stored(&space);
         let mut committed = space.commit(&me, NOW, &request).map_err(failed)?;
         let after = stored(&space);
@@ -866,7 +947,16 @@ fn run_cut(
             prop_assert_eq!(&ended.outcome, &outcome_of(&result.results[*index]));
         }
         let writes = [&mut local_writes, &mut remote_writes];
-        restored(&commit, &result.results, &before, &after, writes);
+        let results = &result.results;
+        restored(
+            &commit,
+            results,
+            &bringing,
+            &before,
+            &after,
+            &device.trees,
+            writes,
+        );
     }
     prop_assert!(commits.restores().is_empty(), "{:?}", commits.restores());
     prop_assert_eq!(
@@ -1115,6 +1205,195 @@ fn a_store_rolled_back_past_a_sent_restore_starts_recovery_and_sends_nothing() {
         commits = Commits::from_state(commits.state()).unwrap();
     }
     assert_eq!(space.head_seq(), head);
+}
+
+/// A minimal interleaving the property found. The user moves and edits a file this device
+/// created, and the other device deletes it. A commit that fits two ops carries the restore of
+/// another file's version and the move, which revives the file with the content the server
+/// already acknowledged (R8). The edit follows in the next commit. What the move revived is no
+/// restored write: the edit replaces it, and it stays a version of the file.
+#[test]
+fn content_a_move_revives_next_to_a_restore_is_replaced_by_the_unsent_edit() {
+    let seed = [act(1, 0, 0, 0, 0), act(0, 0, 0, 3, 0)];
+    let local = [
+        act(4, 652086880384956978, 0, 0, 0),
+        act(1, 0, 9536159111846681508, 2, 0),
+        act(0, 0, 0, 5, 0),
+    ];
+    let remote = [act(1, 0, 2753156350273366001, 0, 0)];
+    let during = [
+        (false, vec![act(5, 0, 0, 0, 0)]),
+        (
+            true,
+            vec![
+                act(0, 0, 7165637464455973765, 0, 0),
+                act(3, 3958708204467096970, 3613361925314318621, 3, 0),
+            ],
+        ),
+        (
+            true,
+            vec![
+                act(2, 455309143188881385, 0, 0, 1),
+                act(6, 3741528846974593209, 0, 0, 0),
+            ],
+        ),
+        (
+            false,
+            vec![
+                act(1, 0, 4063425664772464998, 0, 0),
+                act(4, 2784706346093506431, 0, 0, 0),
+                act(1, 0, 0, 0, 0),
+            ],
+        ),
+        (true, vec![act(6, 206315280794903461, 0, 0, 0)]),
+    ];
+    let ran = run_cut(&seed, &local, &remote, 2, false, &during, Cut::None).unwrap();
+    let mut files = ran.space.nodes().into_iter().filter(|n| n.kind == 2);
+    let moved = files.find(|n| n.name == NAMES[3]);
+    let digest = |text| content(1, text).manifest_digest;
+    assert_eq!(
+        version_digests(&ran.space, &moved.unwrap().node_id),
+        [digest(1), digest(0)]
+    );
+}
+
+/// A minimal interleaving the property found. This device creates the file b, and its S update
+/// waits behind a delete and a move that are still unsent, so the file is left out of planning.
+/// The user edits b and then asks for its first version. One op fits a commit. The restore
+/// waits until the edit is sent, so the first version is current at the end and the edit is a
+/// version under it.
+#[test]
+fn a_version_restore_follows_an_edit_of_a_file_left_out_of_planning() {
+    let seed = [
+        act(0, 0, 0, 0, 0),
+        act(0, 0, 2960225115312676489, 0, 0),
+        act(1, 0, 482761575999273747, 2, 0),
+    ];
+    let local = [
+        act(4, 3338552224821716477, 0, 0, 0),
+        act(3, 4169982272558885297, 686010811002822325, 0, 0),
+        act(1, 0, 10528470701804065178, 2, 1),
+    ];
+    let during = [
+        (false, vec![act(3, 2253923601960195439, 0, 3, 0)]),
+        (true, vec![act(2, 6132494219199068644, 0, 0, 0)]),
+        (true, vec![act(6, 7039772437741740600, 0, 0, 0)]),
+    ];
+    for cut in CUTS {
+        let ran = run_cut(&seed, &local, &[], 1, false, &during, cut).unwrap();
+        assert_eq!(ran.resolved.len(), 1, "{cut:?}");
+        assert_eq!(ran.resolved[0].outcome, Outcome::Restored, "{cut:?}");
+        let node = ran.resolved[0].intent.node();
+        let digest = |text| content(1, text).manifest_digest;
+        assert_eq!(
+            version_digests(&ran.space, node),
+            [digest(1), digest(0), digest(1)],
+            "{cut:?}"
+        );
+    }
+}
+
+/// A minimal interleaving the property found. The other device deletes a folder, and the user
+/// edits a file in it before the delete reaches the disk and then asks for the folder back from
+/// the trash. One op fits a commit, so the restore brings the file back with its old content
+/// first and the edit follows. The edit is current at the end, as an edit beats a delete, and
+/// the content the restore brought back is the version under it.
+#[test]
+fn an_unsent_edit_of_a_file_in_a_restored_folder_stays_current() {
+    let seed = [
+        act(0, 0, 0, 0, 0),
+        act(0, 0, 101854363273155071, 2, 0),
+        act(0, 0, 3503316990192837406, 0, 0),
+        act(1, 0, 2272586388003352129, 0, 0),
+        act(1, 0, 9015892922196451787, 2, 0),
+        act(1, 0, 110837118209456033, 0, 0),
+        act(0, 0, 11223625915557445946, 0, 0),
+        act(1, 0, 12002327795321761196, 0, 0),
+        act(1, 0, 5987160327725455170, 0, 0),
+        act(0, 0, 5314422076761796984, 0, 0),
+    ];
+    let local = [
+        act(4, 989225936368150641, 0, 0, 0),
+        act(0, 0, 0, 0, 0),
+        act(4, 1897456816994156894, 0, 0, 0),
+    ];
+    let remote = [act(2, 11371124727216740042, 0, 0, 0)];
+    let during = [
+        (false, vec![act(4, 6116793111143655890, 0, 0, 0)]),
+        (
+            true,
+            vec![
+                act(2, 16490628292596182229, 0, 0, 0),
+                act(5, 13447724379140298103, 0, 0, 0),
+            ],
+        ),
+    ];
+    for cut in CUTS {
+        let ran = run_cut(&seed, &local, &remote, 1, true, &during, cut).unwrap();
+        assert_eq!(ran.resolved.len(), 1, "{cut:?}");
+        assert_eq!(ran.resolved[0].outcome, Outcome::Restored, "{cut:?}");
+        let folder = ran.resolved[0].intent.node();
+        let mut inside = ran
+            .space
+            .nodes()
+            .into_iter()
+            .filter(|n| n.parent_id == folder);
+        let file = inside.find(|n| n.kind == 2).unwrap();
+        let versions = version_digests(&ran.space, &file.node_id);
+        let (edit, restored) = (content(1, 0), content(2, 0));
+        assert_eq!(
+            versions[..2],
+            [edit.manifest_digest, restored.manifest_digest],
+            "{cut:?}"
+        );
+    }
+}
+
+/// A minimal interleaving the property found. The user asks for an earlier version of a file
+/// the other device renamed, and the disk gets the version under the new name while S still
+/// waits for a parked folder to leave that name. Then the user asks for the newer version back.
+/// Sent at once, that restore would leave L with the earlier version and S without it, and the
+/// engine would upload the earlier version over the restored one as if the user had written
+/// it. The restore waits for S, so the version asked for last is current at the end.
+#[test]
+fn a_second_version_restore_waits_until_s_has_the_first() {
+    let seed = [
+        act(0, 0, 0, 2, 0),
+        act(0, 0, 10193068882185749263, 0, 0),
+        act(0, 0, 15322717350651070711, 2, 0),
+        act(0, 0, 7458645619147002727, 0, 0),
+        act(1, 0, 5780529924190365195, 0, 0),
+        act(1, 0, 1139158932485848356, 0, 0),
+        act(0, 0, 16173846703536834397, 0, 0),
+    ];
+    let local = [
+        act(4, 6149728382812320256, 0, 0, 0),
+        act(1, 0, 0, 3, 0),
+        act(0, 0, 4089352059523475543, 0, 0),
+        act(0, 0, 0, 0, 0),
+    ];
+    let remote = [
+        act(4, 10301859415978009313, 0, 0, 0),
+        act(2, 0, 0, 0, 0),
+        act(2, 0, 0, 0, 0),
+    ];
+    let during = [
+        (false, vec![act(3, 0, 0, 0, 0)]),
+        (true, vec![act(6, 0, 0, 2, 0)]),
+        (false, vec![act(3, 0, 0, 2, 0)]),
+        (true, vec![act(6, 0, 0, 1, 0)]),
+    ];
+    for cut in CUTS {
+        let ran = run_cut(&seed, &local, &remote, 2, true, &during, cut).unwrap();
+        let outcomes: Vec<_> = ran.resolved.iter().map(|r| &r.outcome).collect();
+        assert_eq!(outcomes, [&Outcome::Restored; 2], "{cut:?}");
+        let last = &ran.resolved[1].intent;
+        let versions = versions(&ran.space, last.node());
+        let asked = versions
+            .iter()
+            .find(|v| Some(v.version_id.as_str()) == last.version_id());
+        assert_eq!(versions[0].content, asked.unwrap().content, "{cut:?}");
+    }
 }
 
 /// The other device creates a and b before this one does, so the server renames this device's

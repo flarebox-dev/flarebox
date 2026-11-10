@@ -717,7 +717,8 @@ impl Driver {
     }
 
     /// The restores asked for in a linked space: first those that ended, in the order they ended, then those
-    /// that wait, in request order. The store keeps the last 1,000 that ended and drops older ones.
+    /// that wait, in request order. A waiting restore whose node has a problem says so, because it stays pending
+    /// until the problem is cleared. The store keeps the last 1,000 that ended and drops older ones.
     pub fn restores(&self, space_id: &str) -> Result<Vec<RestoreStatus>, DriverError> {
         if !self.inner.folders.lock().unwrap().contains_key(space_id) {
             return Err(DriverError::SpaceNotLinked(space_id.to_owned()));
@@ -1078,7 +1079,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::question::{HeldItem, QuestionKind};
-    use crate::restore::{RestoreRejection, RestoreState};
+    use crate::restore::{RestoreRejection, RestoreState, RestoreWait};
 
     use super::*;
 
@@ -2424,7 +2425,7 @@ mod tests {
         let pending = |id: &str, request: &RestoreRequest| RestoreStatus {
             id: id.to_owned(),
             request: request.clone(),
-            state: RestoreState::Pending,
+            state: RestoreState::Pending { waits_for: None },
         };
         assert_eq!(
             driver.restores(SPACE).unwrap(),
@@ -2547,7 +2548,49 @@ mod tests {
         }
         assert_eq!(listed[1].request, from_trash(1));
         for waiting in &listed[outcomes.len()..] {
-            assert_eq!(waiting.state, RestoreState::Pending);
+            assert_eq!(waiting.state, RestoreState::Pending { waits_for: None });
         }
+    }
+
+    #[test]
+    fn a_restore_held_by_a_problem_node_reads_as_pending_with_the_reason() {
+        use flarebox_engine::restore::RestoreIntent;
+
+        let (_dir, paths, _root) = profile(&[]);
+        let driver = Driver::open(paths.clone()).unwrap();
+        // The engine's side of the store: the server refused a change to node 1, which is a problem since, and
+        // the engine holds a restore of an earlier version of it and a restore of node 2.
+        let mut state = flarebox_store::EngineState::default();
+        state.commits.problems.insert(server_id(1));
+        let held = RestoreIntent::version(server_id(1), server_id(40)).unwrap();
+        let free = RestoreIntent::from_trash(server_id(2), None, None).unwrap();
+        state.commits.restores.insert("a-held".into(), held);
+        state.commits.restores.insert("b-free".into(), free);
+        let path = paths.store(SPACE).unwrap();
+        Store::open(&path)
+            .unwrap()
+            .transaction(|tx| tx.set_engine_state(&state))
+            .unwrap();
+        // A request the engine has not taken yet waits for the same reason.
+        let asked = driver.restore(SPACE, from_trash(1)).unwrap();
+
+        let listed = driver.restores(SPACE).unwrap();
+        let states: Vec<_> = listed.iter().map(|r| (r.id.as_str(), &r.state)).collect();
+        let problem = RestoreState::Pending {
+            waits_for: Some(RestoreWait::NodeProblem),
+        };
+        let free = RestoreState::Pending { waits_for: None };
+        assert_eq!(
+            states,
+            [
+                (asked.as_str(), &problem),
+                ("a-held", &problem),
+                ("b-free", &free)
+            ]
+        );
+        assert_eq!(
+            serde_json::to_value(&problem).unwrap(),
+            serde_json::json!({ "type": "pending", "waits_for": "node_problem" })
+        );
     }
 }

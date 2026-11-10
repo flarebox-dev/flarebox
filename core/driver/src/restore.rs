@@ -72,7 +72,10 @@ pub struct RestoreStatus {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RestoreState {
     /// Not sent yet, or sent and not answered. It waits while the folder is not syncing, offline or halted.
-    Pending,
+    /// `waits_for` names what else holds it back, when something does.
+    Pending {
+        waits_for: Option<RestoreWait>,
+    },
     /// The server applied it, and the folder follows as for any change another device made. A node that was not in
     /// the trash counts as restored.
     Restored,
@@ -90,6 +93,16 @@ pub enum RestoreState {
     },
     /// The nodes the restore brings back are too many or too deep for one commit.
     DoesNotFit,
+}
+
+/// What holds a pending restore back besides the next commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreWait {
+    /// The node is a problem: the server refused a change this device made to it, and the engine sends nothing
+    /// for the node until the problem is cleared. A restore is sent after the unsent changes of its node, so that
+    /// an edit made before the request cannot replace what the restore brings back. It waits with them.
+    NodeProblem,
 }
 
 /// Why the server did not apply a restore, or why it was not sent.
@@ -146,9 +159,11 @@ pub(crate) fn new_id(now_ms: u64) -> String {
 }
 
 /// Every restore the store knows: first those that ended, in the order they ended, then those that wait, in
-/// request order. A restore the engine has taken and one it has not are both pending.
+/// request order. A restore the engine has taken and one it has not are both pending, and either says so when
+/// its node is a problem.
 pub(crate) fn list(tx: &Tx<'_>) -> Result<Vec<RestoreStatus>, flarebox_store::Error> {
     let (queued, resolved) = tx.restores()?;
+    let problems = tx.problem_nodes()?;
     let ended = resolved.iter().map(|ended| RestoreStatus {
         id: ended.id.clone(),
         request: RestoreRequest::of(&ended.intent),
@@ -159,7 +174,9 @@ pub(crate) fn list(tx: &Tx<'_>) -> Result<Vec<RestoreStatus>, flarebox_store::Er
     let waiting = waiting.iter().map(|(id, intent)| RestoreStatus {
         id: id.clone(),
         request: RestoreRequest::of(intent),
-        state: RestoreState::Pending,
+        state: RestoreState::Pending {
+            waits_for: (intent.held_by(&problems)).then_some(RestoreWait::NodeProblem),
+        },
     });
     Ok(ended.chain(waiting).collect())
 }

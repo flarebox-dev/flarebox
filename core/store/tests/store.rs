@@ -587,6 +587,8 @@ fn the_engines_restores_are_read_without_the_rest_of_its_state() {
             let (queued, resolved) = tx.restores()?;
             assert_eq!(queued, state.commits.restores);
             assert_eq!(resolved, state.commits.resolved);
+            assert!(!state.commits.problems.is_empty());
+            assert_eq!(tx.problem_nodes()?, state.commits.problems);
             Ok::<_, Error>(())
         })
         .unwrap();

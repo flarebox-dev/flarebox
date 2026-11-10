@@ -9,9 +9,10 @@
 //!
 //! [`CommitsState`]: flarebox_engine::state::CommitsState
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use flarebox_engine::restore::{Outcome, Rejection, Resolved, RestoreId, RestoreIntent};
+use flarebox_engine::tree::NodeId;
 use flarebox_proto::v1::Restore;
 use rusqlite::params;
 
@@ -59,6 +60,16 @@ impl Tx<'_> {
         let requests = self.restore_requests()?;
         self.0.execute("DELETE FROM restore_requests", [])?;
         Ok(requests)
+    }
+
+    /// The nodes the engine holds as problems. A queued restore of one waits until the problem
+    /// is cleared ([`RestoreIntent::held_by`]).
+    pub fn problem_nodes(&self) -> Result<BTreeSet<NodeId>> {
+        let mut stmt = self
+            .0
+            .prepare_cached("SELECT node_id FROM node_sets WHERE node_set = 'problems'")?;
+        let nodes = stmt.query_map([], |row| row.get(0))?;
+        Ok(nodes.collect::<rusqlite::Result<_>>()?)
     }
 
     /// The restores the engine holds: those without an outcome in request order, and those that

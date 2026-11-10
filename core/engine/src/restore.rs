@@ -6,6 +6,8 @@
 //! S. It is an explicit intent that [`Commits`](crate::commit::Commits) keeps from the request
 //! until the commit that carries its `Restore` op is acknowledged.
 
+use std::collections::BTreeSet;
+
 use flarebox_proto::v1::{self as proto, op_result};
 
 use crate::commit::MAX_OPS;
@@ -103,6 +105,14 @@ impl RestoreIntent {
     /// The name a trashed node returns under, when the request named one.
     pub fn name(&self) -> Option<&str> {
         Some(self.0.name.as_str()).filter(|name| !name.is_empty())
+    }
+
+    /// Whether the restore waits because its node is one of `problems`, the nodes the server
+    /// rejected an op for ([`Commits::problems`](crate::commit::Commits::problems)). The
+    /// planner sends nothing for a problem node, and a restore follows the changes of its node,
+    /// so it is sent only once the problem is cleared.
+    pub fn held_by(&self, problems: &BTreeSet<NodeId>) -> bool {
+        problems.contains(self.node())
     }
 }
 
