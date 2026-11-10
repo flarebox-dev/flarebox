@@ -476,6 +476,7 @@ async fn a_device_revokes_a_lost_one_and_stops_syncing_when_another_revokes_it()
         .token(&TokenRequest {
             device_id: lost.device_id.clone(),
             refresh_credential: lost.refresh_credential.clone(),
+            ..Default::default()
         })
         .await
         .unwrap_err();

@@ -76,6 +76,11 @@ export const MIGRATIONS: readonly Migration[] = [
     const columns = sql.exec("SELECT name FROM pragma_table_info('devices')").toArray().map((row) => row.name);
     if (!columns.includes("setup_attempt")) sql.exec("ALTER TABLE devices ADD COLUMN setup_attempt TEXT");
   },
+  // RFC 0011 section 1: the latest server_time_ms answered for each principal, so that the answered times never decrease.
+  (sql) => {
+    const columns = sql.exec("SELECT name FROM pragma_table_info('devices')").toArray().map((row) => row.name);
+    if (!columns.includes("rotation_clock_ms")) sql.exec("ALTER TABLE devices ADD COLUMN rotation_clock_ms INTEGER NOT NULL DEFAULT 0");
+  },
 ];
 
 export function migrate(sql: SqlStorage): void {

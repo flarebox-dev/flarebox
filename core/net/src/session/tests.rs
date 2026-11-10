@@ -41,6 +41,7 @@ async fn listen_on(
     let token = AccessToken {
         token: "token".into(),
         expires_at_ms: expires.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64,
+        ..Default::default()
     };
     let mut auth = Auth::new(Api::local_development(base).unwrap(), credentials).with_token(token);
     if let Some(margin) = refresh_margin {
@@ -804,6 +805,7 @@ async fn tokens_that_are_due_at_once_are_not_refreshed_in_a_loop() {
                 let body = AccessToken {
                     token: format!("token-{n}"),
                     expires_at_ms: expires.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64,
+                    ..Default::default()
                 }
                 .encode_to_vec();
                 let head = format!(

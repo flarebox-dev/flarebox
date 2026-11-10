@@ -459,6 +459,7 @@ mod tests {
         let request = TokenRequest {
             device_id: "d".into(),
             refresh_credential: "secret".into(),
+            ..Default::default()
         };
         let outcome = api.token(&request).await;
         assert!(
@@ -490,6 +491,7 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as i64,
+            ..Default::default()
         };
         let auth = Auth::new(Api::local_development(base).unwrap(), credentials).with_token(token);
         let server = tokio::spawn(async move {
@@ -599,6 +601,7 @@ mod tests {
             access: Some(AccessToken {
                 token,
                 expires_at_ms: i64::MAX,
+                ..Default::default()
             }),
             credential_expires_at_ms: i64::MAX,
             user_name: String::new(),
@@ -672,6 +675,7 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as i64,
+            ..Default::default()
         };
         Auth::new(Api::local_development(base).unwrap(), credentials).with_token(token)
     }

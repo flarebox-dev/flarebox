@@ -1766,6 +1766,7 @@ mod tests {
         let token = flarebox_proto::v1::AccessToken {
             token: "token".into(),
             expires_at_ms: i64::MAX,
+            ..Default::default()
         };
         (200, prost::Message::encode_to_vec(&token))
     }
@@ -2020,6 +2021,7 @@ mod tests {
         let token = prost::Message::encode_to_vec(&flarebox_proto::v1::AccessToken {
             token: "token".into(),
             expires_at_ms: i64::MAX,
+            ..Default::default()
         });
         let spaces = prost::Message::encode_to_vec(&flarebox_proto::v1::SpaceList {
             spaces: vec![SpaceInfo {
@@ -2321,6 +2323,7 @@ mod tests {
             prost::Message::encode_to_vec(&flarebox_proto::v1::AccessToken {
                 token: "token".into(),
                 expires_at_ms: i64::MAX,
+                ..Default::default()
             })
         };
         let spaces = || {
