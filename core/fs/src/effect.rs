@@ -210,7 +210,9 @@ impl Space {
     /// counter (design §2.8). `hook` runs at every [`Step`] reached.
     ///
     /// An error leaves the effect anywhere between its steps: run
-    /// [`Space::recover`] for it before anything else.
+    /// [`Space::recover`] for it before anything else. A replacement whose
+    /// staged file is missing fails with [`io::ErrorKind::NotFound`] before it
+    /// changes anything.
     pub fn apply(
         &self,
         marker: &Marker,
@@ -301,7 +303,17 @@ impl Space {
     ) -> io::Result<Outcome> {
         let (parent, name) = resolve!(self.parent(&displaced.at));
         let target = match place {
-            Some(at) => Some(resolve!(self.parent(at))),
+            Some(at) => {
+                let target = resolve!(self.parent(at));
+                let staging = self.private(&[STAGING_DIR])?;
+                if lookup(staging.fd(), OsStr::new(&effect.id))?.is_none() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("effect {} has no staged file", effect.id),
+                    ));
+                }
+                Some((staging, target))
+            }
             None => None,
         };
         let quarantine = self.private(&[QUARANTINE_DIR])?;
@@ -339,8 +351,7 @@ impl Space {
             });
         }
         let outcome = match target {
-            Some((target, new_name)) => {
-                let staging = self.private(&[STAGING_DIR])?;
+            Some((staging, (target, new_name))) => {
                 self.place(&staging, &effect.id, &target, new_name, hook)?
             }
             None => Outcome::Done,

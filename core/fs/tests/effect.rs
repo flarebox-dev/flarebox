@@ -15,8 +15,8 @@ use common::{
     now, prepare, private_names, rewrite_keeping_mtime, stage, trashed,
 };
 use flarebox_fs::{
-    Action, Base, Displaced, Effect, Location, Outcome, PARKED_DIR, PRIVATE_DIR, Reason,
-    STAGING_DIR, Snapshot, Space, Step, read_marker,
+    Action, Base, Displaced, Effect, Location, Outcome, PARKED_DIR, PRIVATE_DIR, QUARANTINE_DIR,
+    Reason, STAGING_DIR, Snapshot, Space, Step, read_marker,
 };
 
 fn replace(root: &Path) -> Effect {
@@ -464,6 +464,22 @@ fn recovery_puts_back_a_file_written_through_an_old_descriptor_after_a_crash() {
     assert_eq!(outcome, failed(Reason::Changed));
     assert_eq!(fs::read(root.join("docs/report.txt")).unwrap(), b"SYNCED");
     assert_settled(root);
+}
+
+#[test]
+fn replacement_without_a_staged_file_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let effect = replace(root);
+    fs::remove_file(root.join(PRIVATE_DIR).join(STAGING_DIR).join(ID)).unwrap();
+    let err = Space::open(root)
+        .unwrap()
+        .apply(&marker(), &effect, &mut Bytes, now(), &mut |_| {})
+        .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+    assert_eq!(fs::read(root.join("docs/report.txt")).unwrap(), SYNCED);
+    assert!(private_names(root, QUARANTINE_DIR).is_empty());
+    assert!(trashed(root).is_empty());
 }
 
 #[test]
