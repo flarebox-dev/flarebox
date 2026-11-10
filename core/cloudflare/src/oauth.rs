@@ -231,6 +231,7 @@ impl Login {
             expires_at: expiry(sent, tokens.expires_in)?,
             access: Secret::new(tokens.access_token),
             refresh: Some(Secret::new(tokens.refresh_token)),
+            stale: None,
             endpoints: self.endpoints,
             client_id: self.client_id,
         };
@@ -361,6 +362,8 @@ pub struct Grant {
     access: Secret,
     /// `None` once a refresh has failed: the grant cannot be refreshed again.
     refresh: Option<Secret>,
+    /// The refresh token of a failed refresh, which Cloudflare may still accept. Only [`Grant::revoke`] sends it.
+    stale: Option<Secret>,
     expires_at: Instant,
 }
 
@@ -381,6 +384,7 @@ impl Grant {
     /// revokes the new tokens and returns [`OauthError::MissingScopes`], leaving the grant unusable.
     pub async fn refresh(&mut self, http: &reqwest::Client) -> Result<(), OauthError> {
         let refresh = self.refresh.take().ok_or(OauthError::Spent)?;
+        self.stale = Some(refresh.clone());
         let sent = Instant::now();
         self.expires_at = sent;
         let tokens = token_request(
@@ -394,6 +398,7 @@ impl Grant {
         )
         .await?;
         let missing = missing_scopes(tokens.scope.as_deref());
+        self.stale = None;
         self.access = Secret::new(tokens.access_token);
         self.refresh = Some(Secret::new(tokens.refresh_token));
         if !missing.is_empty() {
@@ -407,11 +412,14 @@ impl Grant {
         Ok(())
     }
 
-    /// Revokes the refresh token, then the access token. It sends both even if the first fails, and reports the
-    /// first failure. Revoking a token again is harmless (RFC 7009 section 2.2), so the caller may retry.
+    /// Revokes the refresh token, then the refresh token of a failed refresh, then the access token. It sends each
+    /// even if an earlier one fails, and reports the first failure. Revoking a token again is harmless (RFC 7009 section 2.2), so the caller may retry.
     pub async fn revoke(&self, http: &reqwest::Client) -> Result<(), OauthError> {
         let tokens = [
             self.refresh
+                .as_ref()
+                .map(|token| (token, "refresh_token", "refresh token")),
+            self.stale
                 .as_ref()
                 .map(|token| (token, "refresh_token", "refresh token")),
             Some((&self.access, "access_token", "access token")),

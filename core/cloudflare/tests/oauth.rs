@@ -586,6 +586,7 @@ async fn a_failed_refresh_leaves_the_grant_unusable() {
         tokens("access-1", "refresh-1", &all_scopes()),
         (400, refusal),
         ok(),
+        ok(),
     ])
     .await;
     let mut grant = grant_from(&server).await;
@@ -606,9 +607,11 @@ async fn a_failed_refresh_leaves_the_grant_unusable() {
     );
 
     grant.revoke(&client()).await.unwrap();
-    let received = server.received();
-    assert_eq!(received.len(), 3);
-    assert_eq!(received[2].field("token"), Some("access-1"));
+    let revoked: Vec<_> = server.received()[2..]
+        .iter()
+        .map(|received| received.field("token").unwrap().to_owned())
+        .collect();
+    assert_eq!(revoked, ["refresh-1", "access-1"]);
 }
 
 #[tokio::test]

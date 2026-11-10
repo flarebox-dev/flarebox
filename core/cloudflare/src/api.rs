@@ -35,6 +35,9 @@ const R2_PAGE: usize = 1000;
 /// The most accounts `GET /accounts` returns in one page.
 const ACCOUNTS_PAGE: usize = 50;
 
+/// The most pages of accounts the client reads, so an answer that ignores `page` cannot keep it reading.
+const ACCOUNTS_PAGES: usize = 100;
+
 /// A message from Cloudflare's `errors` list, such as `10042` when R2 is not enabled.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct CloudflareMessage {
@@ -223,22 +226,25 @@ impl Cloudflare {
 
     /// The accounts the token can reach. An OAuth grant reaches only the account picked on the consent page.
     pub async fn accounts(&self) -> Result<Vec<Account>, ApiError> {
+        const CALL: &str = "list accounts";
         let mut accounts = Vec::new();
-        for page in 1.. {
+        for page in 1..=ACCOUNTS_PAGES {
             let mut url = self.url(&["accounts"])?;
             url.query_pairs_mut()
                 .append_pair("page", &page.to_string())
                 .append_pair("per_page", &ACCOUNTS_PAGE.to_string());
-            let (batch, _): (Vec<Account>, _) = self
-                .send("list accounts", self.request(Method::GET, url))
-                .await?;
+            let (batch, _): (Vec<Account>, _) =
+                self.send(CALL, self.request(Method::GET, url)).await?;
             let last = batch.len() < ACCOUNTS_PAGE;
             accounts.extend(batch);
             if last {
-                break;
+                return Ok(accounts);
             }
         }
-        Ok(accounts)
+        Err(ApiError::Unreadable {
+            call: CALL,
+            detail: "Cloudflare kept sending full pages of accounts",
+        })
     }
 
     /// The names of the account's R2 buckets. Error `10042` means R2 is not enabled on the account (section 4.1).
@@ -269,7 +275,14 @@ impl Cloudflare {
                 .await?;
             let full = page.buckets.len() == R2_PAGE;
             names.extend(page.buckets.into_iter().map(|bucket| bucket.name));
-            cursor = info.cursor.filter(|cursor| full && !cursor.is_empty());
+            let next = info.cursor.filter(|next| full && !next.is_empty());
+            if next.is_some() && next == cursor {
+                return Err(ApiError::Unreadable {
+                    call: "list R2 buckets",
+                    detail: "Cloudflare sent the same cursor again",
+                });
+            }
+            cursor = next;
             if cursor.is_none() {
                 return Ok(names);
             }
@@ -352,6 +365,12 @@ impl Cloudflare {
                 });
             }
             (Some(false), _) => None,
+            (_, next) if next.is_some() && next.as_deref() == cursor => {
+                return Err(ApiError::Unreadable {
+                    call: CALL,
+                    detail: "Cloudflare sent the same cursor again",
+                });
+            }
             (_, next) => next,
         };
         Ok(ObjectPage {

@@ -1113,3 +1113,52 @@ async fn a_session_without_a_buckets_list_is_not_a_completion() {
         assert!(!error.to_string().contains("upload-jwt"));
     }
 }
+
+#[tokio::test]
+async fn a_repeated_cursor_or_endless_full_pages_are_unreadable() {
+    let full: Vec<Value> = (0..1000)
+        .map(|i| json!({ "name": format!("bucket-{i}") }))
+        .collect();
+    let page = |cursor: &str| {
+        let mut page = ok(json!({ "buckets": full }));
+        page["result_info"] = json!({ "cursor": cursor, "per_page": 1000 });
+        page
+    };
+    let buckets = format!("/accounts/{ACCOUNT}/r2/buckets?per_page=1000");
+    let objects =
+        format!("/accounts/{ACCOUNT}/r2/buckets/flarebox/objects?per_page=1000&cursor=same");
+    let account = json!({ "id": ACCOUNT, "name": "Alice" });
+    let mut replies = vec![
+        reply("GET", &buckets, 200, page("same")),
+        reply("GET", &format!("{buckets}&cursor=same"), 200, page("same")),
+        reply("GET", &objects, 200, {
+            let mut page = ok(json!([{ "key": "a" }]));
+            page["result_info"] = json!({ "cursor": "same", "is_truncated": true });
+            page
+        }),
+    ];
+    for number in 1..=100 {
+        replies.push(reply(
+            "GET",
+            &format!("/accounts?page={number}&per_page=50"),
+            200,
+            ok(json!(vec![account.clone(); 50])),
+        ));
+    }
+    let fake = Fake::start(replies).await;
+    let client = fake.client();
+
+    let error = client
+        .buckets(ACCOUNT, Jurisdiction::Default)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ApiError::Unreadable { .. }), "{error:?}");
+    let error = client
+        .objects(ACCOUNT, "flarebox", Jurisdiction::Default, Some("same"))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ApiError::Unreadable { .. }), "{error:?}");
+    let error = client.accounts().await.unwrap_err();
+    assert!(matches!(error, ApiError::Unreadable { .. }), "{error:?}");
+    assert_eq!(fake.calls().len(), 103);
+}
