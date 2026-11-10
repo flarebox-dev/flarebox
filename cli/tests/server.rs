@@ -385,6 +385,14 @@ async fn a_headless_device_pairs_links_and_follows_the_change_stream() {
     assert_eq!(questions, Value::Array(vec![]));
     assert!(machine.run(&["questions"]).contains("No questions."));
 
+    let restarted = machine.run(&["restart", "Sync"]);
+    assert!(restarted.contains("again"), "{restarted}");
+    machine
+        .status_until("the restarted folder up to date", |status| {
+            status["folders"][0]["state"] == "up_to_date"
+        })
+        .await;
+
     let unlinked = machine.run(&["unlink", "Sync"]);
     assert!(unlinked.contains(&space.space_id), "{unlinked}");
     assert_eq!(machine.status()["folders"], Value::Array(vec![]));

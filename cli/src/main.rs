@@ -72,6 +72,8 @@ enum Command {
     },
     /// Stop syncing a folder. Its files stay where they are.
     Unlink { folder: PathBuf },
+    /// Sync a linked folder again from the start, after fixing the problem that halted it.
+    Restart { folder: PathBuf },
     /// Show this device and its linked folders.
     Status {
         #[arg(long)]
@@ -288,6 +290,12 @@ async fn client(paths: Paths, command: Command) -> Result<(), String> {
             },
             false,
         ),
+        Command::Restart { folder } => (
+            Request::Restart {
+                folder: absolute(&folder)?,
+            },
+            false,
+        ),
         Command::Status { json } => (Request::Status, json),
         Command::Questions { json, action: None } => (Request::Questions, json),
         Command::Questions {
@@ -338,6 +346,14 @@ async fn client(paths: Paths, command: Command) -> Result<(), String> {
                 "Unlinked {} from space {space_id}. Its files and its .flarebox folder stay.",
                 path.display()
             );
+            Ok(())
+        }
+        Response::Restarted { folder } => {
+            if folder.state == flarebox_driver::FolderState::Stopped {
+                println!("Run flarebox daemon to sync {}.", folder.path);
+            } else {
+                println!("Syncing {} again.", folder.path);
+            }
             Ok(())
         }
         Response::Status { status } if json => print_json(&status),

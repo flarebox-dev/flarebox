@@ -63,7 +63,7 @@ pub enum FolderState {
     UpToDate,
     /// The server cannot be reached; the session keeps retrying.
     Offline,
-    /// Stopped by a problem only a person can fix; `problem` says which. The driver does not retry it until it is
-    /// started again.
+    /// Stopped by a problem; `problem` says which. A folder that was moved away or fails its root check syncs again
+    /// on its own once it passes the check. Any other problem needs a person, and the folder waits for a restart.
     Halted,
 }

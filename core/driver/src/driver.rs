@@ -651,16 +651,9 @@ impl Driver {
     }
 
     async fn unlink_folder(&self, folder: &Path) -> Result<Link, DriverError> {
-        let wanted = absolute(folder);
-        let canonical = fs::canonicalize(folder).ok();
         let (link, done) = {
             let mut folders = self.inner.folders.lock().unwrap();
-            let found = folders
-                .values_mut()
-                .find(|linked| {
-                    linked.link.root == wanted || Some(&linked.link.root) == canonical.as_ref()
-                })
-                .ok_or_else(|| DriverError::NotLinked(folder.to_path_buf()))?;
+            let found = find(&mut folders, folder)?;
             found.unlink = Some(Unlink::Running);
             (found.link.clone(), found.run.as_ref().map(Running::stop))
         };
@@ -833,24 +826,63 @@ impl Driver {
         let mut folders = self.inner.folders.lock().unwrap();
         let all = roots(&folders);
         for folder in folders.values_mut() {
-            if folder.unlink.is_some() || folder.run.as_ref().is_some_and(|run| !run.ended()) {
-                continue;
-            }
-            let linked = all
-                .iter()
-                .filter(|root| **root != folder.link.root)
-                .cloned()
-                .collect();
-            match &credential {
-                Some(credential) => self.spawn(folder, credential, linked),
-                None => halt(
-                    folder,
-                    "this device is signed out, for example after restoring a backup, which leaves out its sign-in; set it up again to sync this folder, and its files stay where they are".into(),
-                ),
-            }
+            self.start_folder(folder, credential.as_ref(), &all);
         }
         drop(folders);
         self.changed();
+    }
+
+    /// Syncs the folder at `folder` again from the start: stops its task, waits for it to end, and starts a new one.
+    /// A folder halted by a problem only a person can fix stays halted until this is called. While the driver is
+    /// stopped, the folder only stops, and the next start syncs it.
+    pub async fn restart(&self, folder: &Path) -> Result<FolderStatus, DriverError> {
+        let _lifecycle = self.inner.lifecycle.lock().await;
+        let (space_id, done) = {
+            let mut folders = self.inner.folders.lock().unwrap();
+            let found = find(&mut folders, folder)?;
+            (
+                found.link.space_id.clone(),
+                found.run.as_ref().map(Running::stop),
+            )
+        };
+        if let Some(done) = done {
+            ended(done).await;
+        }
+        let credential = self.inner.credential.lock().unwrap().clone();
+        let mut folders = self.inner.folders.lock().unwrap();
+        let all = roots(&folders);
+        let folder = folders
+            .get_mut(&space_id)
+            .expect("only an unlink removes a folder, and it holds the lifecycle lock");
+        folder.run = None;
+        folder.status.lock().unwrap().state = FolderState::Stopped;
+        if self.inner.running.load(Ordering::SeqCst) {
+            self.start_folder(folder, credential.as_ref(), &all);
+        }
+        let status = folder.status.lock().unwrap().clone();
+        drop(folders);
+        self.changed();
+        Ok(status)
+    }
+
+    /// Starts the task of `folder` unless it is being unlinked or its task still runs. `all` are the roots of every
+    /// linked folder.
+    fn start_folder(&self, folder: &mut Folder, credential: Option<&Credential>, all: &[PathBuf]) {
+        if folder.unlink.is_some() || folder.run.as_ref().is_some_and(|run| !run.ended()) {
+            return;
+        }
+        let linked = all
+            .iter()
+            .filter(|root| **root != folder.link.root)
+            .cloned()
+            .collect();
+        match credential {
+            Some(credential) => self.spawn(folder, credential, linked),
+            None => halt(
+                folder,
+                "this device is signed out, for example after restoring a backup, which leaves out its sign-in; set it up again to sync this folder, and its files stay where they are".into(),
+            ),
+        }
     }
 
     /// Stops every folder and waits for their tasks to end, also those an earlier stop or unlink is still waiting for.
@@ -1005,6 +1037,19 @@ fn holds(outer: &Path, inner: &Path) -> bool {
         .ancestors()
         .filter_map(|dir| fs::metadata(dir).ok())
         .any(|dir| dir.dev() == outer.dev() && dir.ino() == outer.ino())
+}
+
+/// The linked folder at `folder`, by the path it was linked at or by the folder that path leads to now.
+fn find<'a>(
+    folders: &'a mut BTreeMap<String, Folder>,
+    folder: &Path,
+) -> Result<&'a mut Folder, DriverError> {
+    let wanted = absolute(folder);
+    let canonical = fs::canonicalize(folder).ok();
+    folders
+        .values_mut()
+        .find(|linked| linked.link.root == wanted || Some(&linked.link.root) == canonical.as_ref())
+        .ok_or_else(|| DriverError::NotLinked(folder.to_path_buf()))
 }
 
 fn halt(folder: &mut Folder, problem: String) {
@@ -1579,6 +1624,62 @@ mod tests {
         driver.stop().await;
         let took = stopping.elapsed();
         assert!(took < Duration::from_secs(5), "stopping took {took:?}");
+    }
+
+    #[tokio::test]
+    async fn a_folder_moved_away_and_back_syncs_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        let paths = Paths::under(&base.join("profile"));
+        linked(&paths, &root, "d1");
+        let driver = Driver::open(paths).unwrap();
+        driver.start();
+        eventually("the folder is claimed", || {
+            claim::owner(&root).unwrap().is_some()
+        })
+        .await;
+
+        fs::rename(&root, base.join("Moved")).unwrap();
+        let problem = halted(&driver).await;
+        assert!(problem.contains("no longer"), "{problem}");
+        fs::rename(base.join("Moved"), &root).unwrap();
+        eventually("the folder syncs again", || {
+            driver.status().folders[0].state != FolderState::Halted
+                && claim::lock(&root).unwrap().is_none()
+        })
+        .await;
+        driver.stop().await;
+        assert!(claim::lock(&root).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_restart_syncs_a_folder_again_once_its_problem_is_fixed() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        let paths = Paths::under(&base.join("profile"));
+        linked(&paths, &root, "d1");
+        let other = Owner {
+            server: NOWHERE.into(),
+            device_id: "d2".into(),
+        };
+        claim::set_owner(&root, &other).unwrap();
+        let driver = Driver::open(paths).unwrap();
+        driver.start();
+        let problem = halted(&driver).await;
+        assert!(problem.contains("device d2"), "{problem}");
+
+        claim::release(&root, &other).unwrap();
+        let restarted = driver.restart(&root).await.unwrap();
+        assert_ne!(restarted.state, FolderState::Halted);
+        eventually("the folder is claimed by this device", || {
+            claim::owner(&root)
+                .unwrap()
+                .is_some_and(|owner| owner.device_id == "d1")
+        })
+        .await;
+        driver.stop().await;
     }
 
     /// Reads one HTTP request and returns its path and its body.
