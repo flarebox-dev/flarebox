@@ -994,6 +994,86 @@ fn a_tree_listing_put_off_for_an_hour_shows_in_the_status_and_one_put_off_for_a_
     assert_eq!(b.state(), FolderState::UpToDate);
 }
 
+/// A refusal of the server that puts a call off for an hour.
+fn put_off(code: flarebox_proto::v1::error::Code) -> ServerError {
+    ServerError(flarebox_proto::v1::Error {
+        code: code as i32,
+        message: "not now".into(),
+        retry_after_ms: 3_600_000,
+        ..Default::default()
+    })
+}
+
+#[test]
+fn an_upload_put_off_for_an_hour_leaves_the_status_once_its_file_is_deleted() {
+    use flarebox_proto::v1::error::Code;
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    let path = site.root.join("notes.txt");
+    fs::write(&path, b"written on a").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    let Some(Work::Upload(upload)) = a.work.pop_front() else {
+        panic!("the file is uploaded");
+    };
+    let hash = upload.chunks[0].hash.clone();
+    let refused = ChunkError::Call(CallError::Server(put_off(Code::QuotaExceeded)));
+    let step = a.folder.uploaded(Err(refused));
+    a.take(step).unwrap();
+    assert!(
+        a.folder.view().problem.is_some(),
+        "the wait shows in the status"
+    );
+
+    fs::remove_file(&path).unwrap();
+    a.scan_until(|a| a.folder.engine.trees.local().is_empty());
+    let wait = a.work.pop_front().unwrap();
+    a.perform(wait, &mut remote).unwrap();
+    assert!(matches!(a.work.pop_front(), Some(Work::Upload(_))));
+    let step = a.folder.uploaded(Err(ChunkError::SourceChanged { hash }));
+    a.take(step).unwrap();
+    a.run(&mut remote);
+    a.settle();
+    assert!(a.work.is_empty());
+    assert_eq!(a.state(), FolderState::UpToDate);
+    assert_eq!(a.folder.view().problem, None);
+}
+
+#[test]
+fn a_commit_put_off_for_an_hour_leaves_the_status_once_the_server_refuses_it() {
+    use flarebox_proto::v1::error::Code;
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::write(site.root.join("notes.txt"), b"written on a").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    let upload = a.work.pop_front().unwrap();
+    a.perform(upload, &mut remote).unwrap();
+    let Some(Work::Send(_)) = a.work.pop_front() else {
+        panic!("the commit is sent");
+    };
+    let step = a
+        .folder
+        .sent(Err(CallError::Server(put_off(Code::RetryLater))));
+    a.take(step).unwrap();
+    assert!(
+        a.folder.view().problem.is_some(),
+        "the wait shows in the status"
+    );
+
+    let wait = a.work.pop_front().unwrap();
+    a.perform(wait, &mut remote).unwrap();
+    let Some(Work::Send(_)) = a.work.pop_front() else {
+        panic!("the commit is sent again");
+    };
+    let step = a
+        .folder
+        .sent(Err(CallError::Server(put_off(Code::HeadMoved))));
+    a.take(step).unwrap();
+    assert_eq!(a.folder.view().problem, None);
+    assert_eq!(a.run(&mut remote), ["upload", "send"]);
+    assert_eq!(remote.names(), ["notes.txt"]);
+    assert_eq!(a.state(), FolderState::UpToDate);
+}
+
 #[test]
 fn a_bootstrap_whose_pages_were_read_at_two_heads_replaces_r_after_the_replay() {
     let mut remote = Remote::new();

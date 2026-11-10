@@ -522,6 +522,7 @@ impl Folder {
                     "a file changed while it was uploaded; planning its commit again"
                 );
                 self.step(|engine, _| Ok(engine.commits.abandon()))?;
+                self.commit_ended();
                 self.disk.rescan(&self.engine, paths);
                 self.flight = Flight::Waiting(Next::Build);
                 work.push(Work::ResendAfter(BUILD_AGAIN));
@@ -570,7 +571,7 @@ impl Folder {
         match result {
             Ok(result) => {
                 self.failures = 0;
-                self.retrying.remove(&Call::Commit);
+                self.commit_ended();
                 self.result(&commit.commit_id, result)?;
             }
             Err(CallError::Server(refusal)) => self.refused(commit, &refusal, &mut work)?,
@@ -617,6 +618,13 @@ impl Folder {
         }
         self.drive(&mut work)?;
         Ok(work)
+    }
+
+    /// The commit in flight went through, or is not sent again as it is: the waits of its upload and its send
+    /// leave the status.
+    fn commit_ended(&mut self) {
+        self.retrying.remove(&Call::Upload);
+        self.retrying.remove(&Call::Commit);
     }
 
     /// Records that a call of kind `call` failed with `why` and is sent again after `wait`.
@@ -952,7 +960,9 @@ impl Folder {
                 self.flight = Flight::Waiting(Next::Send(commit));
                 work.push(Work::ResendAfter(wait));
             }
-            Failure::Abandoned | Failure::Split | Failure::Halted(CommitHalt::ReadOnly) => {}
+            Failure::Abandoned | Failure::Split | Failure::Halted(CommitHalt::ReadOnly) => {
+                self.commit_ended();
+            }
             Failure::Resync => {
                 return Err(Stop::Recovery(format!(
                     "the server is behind what this device already applied ({described})"
