@@ -53,16 +53,23 @@ if [ -z "$ref" ]; then
   fi
   current=true
 fi
-remote=$(git ls-remote origin "refs/heads/$ref" "refs/tags/$ref" | head -n 1 | cut -f1)
+repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+remote=""
+for kind in heads tags; do
+  if remote=$(gh api "repos/$repo/git/ref/$kind/$ref" --jq .object.sha 2> /dev/null); then
+    break
+  fi
+  remote=""
+done
 if [ -z "$remote" ]; then
-  echo "$ref is not a branch or tag on origin. Push it first: the battery runs on GitHub, on the ref itself." >&2
+  echo "$ref is not a branch or tag on $repo. Push it first: the battery runs on GitHub, on the ref itself." >&2
   exit 1
 fi
 if $current && [ "$remote" != "$(git rev-parse HEAD)" ]; then
-  echo "Note: origin/$ref is at ${remote:0:12}, not at your HEAD. The battery tests ${remote:0:12}." >&2
+  echo "Note: $ref on $repo is at ${remote:0:12}, not at your HEAD. The battery tests ${remote:0:12}." >&2
 fi
 
-output=$(gh workflow run property-battery.yml --ref "$ref" ${fields[@]+"${fields[@]}"} 2>&1) || {
+output=$(gh workflow run property-battery.yml --repo "$repo" --ref "$ref" ${fields[@]+"${fields[@]}"} 2>&1) || {
   echo "$output" >&2
   echo "The run needs .github/workflows/property-battery.yml on $ref itself; a branch from before it reached main does not have it." >&2
   exit 1
@@ -70,14 +77,14 @@ output=$(gh workflow run property-battery.yml --ref "$ref" ${fields[@]+"${fields
 url=$(grep -oE 'https://[^ ]+/actions/runs/[0-9]+' <<< "$output" | head -n 1 || true)
 if [ -z "$url" ]; then
   echo "$output"
-  echo "The battery started, but gh did not print the run URL. Find the run with: gh run list --workflow property-battery.yml" >&2
+  echo "The battery started, but gh did not print the run URL. Find the run with: gh run list --repo $repo --workflow property-battery.yml" >&2
   if $wait; then
-    echo "Cannot wait without the run URL; follow it with gh run watch <run-id> --exit-status." >&2
+    echo "Cannot wait without the run URL; follow it with gh run watch <run-id> --repo $repo --exit-status." >&2
     exit 1
   fi
   exit 0
 fi
 echo "$url"
 if $wait; then
-  gh run watch "${url##*/}" --compact --exit-status --interval 60
+  gh run watch "${url##*/}" --repo "$repo" --compact --exit-status --interval 60
 fi
