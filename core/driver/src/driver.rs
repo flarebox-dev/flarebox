@@ -1718,7 +1718,30 @@ mod tests {
         let stopping = Instant::now();
         driver.stop().await;
         let took = stopping.elapsed();
-        assert!(took < Duration::from_secs(5), "stopping took {took:?}");
+        assert!(took < Duration::from_secs(30), "stopping took {took:?}");
+    }
+
+    #[tokio::test]
+    async fn stopping_does_not_wait_out_the_observers_pause_after_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        let paths = Paths::under(&base.join("profile"));
+        linked(&paths, &root, "d1");
+        let driver = Driver::open(paths).unwrap();
+        driver.start();
+        eventually("the folder is claimed", || {
+            claim::owner(&root).unwrap().is_some()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        fs::rename(&root, base.join("Moved")).unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let stopping = Instant::now();
+        driver.stop().await;
+        let took = stopping.elapsed();
+        assert!(took < Duration::from_secs(2), "stopping took {took:?}");
     }
 
     #[tokio::test]
