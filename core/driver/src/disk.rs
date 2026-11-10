@@ -261,7 +261,9 @@ impl Disk {
     ///    marker, staging and quarantine as they are, for recovery (§6.4).
     /// 3. The no-replace probe.
     /// 4. The effect in flight is recovered without staging anything again, and acknowledged. An interrupted one is
-    ///    planned again; one that met another state on disk stays blocked. The marker must then equal *e*.
+    ///    planned again; one that met another state on disk stays blocked, and so does one that recovery found done
+    ///    where L shows another entry ([`flarebox_engine::effects::Effects::confirms`]). The marker must then equal
+    ///    *e*.
     /// 5. Staged files without an effect are deleted.
     ///
     /// The observer then resets the paths of a recovered effect to L, so it reads a file the effect placed before
@@ -325,6 +327,7 @@ impl Disk {
                 SystemTime::now(),
                 &mut |step| hook(Cut::Step(step)),
             )?;
+            let outcome = confirmed(outcome, engine);
             acknowledge(&record, &outcome, true, engine, store, hook)?;
             let (marker, cleared) = (disk.marker()?, engine.effects.cleared());
             if marker != cleared {
@@ -419,9 +422,11 @@ impl Disk {
                 self.space
                     .apply(&marker, &effect, &mut contents, now, &mut step)?
             }
-            _ => self
-                .space
-                .recover(&marker, &effect, &mut contents, now, &mut step)?,
+            _ => confirmed(
+                self.space
+                    .recover(&marker, &effect, &mut contents, now, &mut step)?,
+                engine,
+            ),
         };
         let settled = acknowledge(&record, &outcome, false, engine, store, hook)?;
         let end = self.sections.epoch.fetch_add(1, Ordering::SeqCst) + 1;
@@ -780,6 +785,26 @@ fn acknowledge(
     })?;
     hook(Cut::AfterAck);
     Ok(settled)
+}
+
+/// `outcome` as recovery reports it for the effect in flight, unless L refutes a done
+/// ([`flarebox_engine::effects::Effects::confirms`]). Then the effect fails as it would have on the entry recovery
+/// found: a removal finds its entry missing, and a write or a new folder finds its name taken.
+fn confirmed(outcome: Outcome, engine: &Engine) -> Outcome {
+    let Outcome::Done { identity } = &outcome else {
+        return outcome;
+    };
+    if (engine.effects).confirms(&engine.trees, identity.map(file_identity).as_ref()) {
+        return outcome;
+    }
+    let reason = match engine.effects.in_flight().map(|record| &record.effect) {
+        Some(EngineEffect::RemoveDir { .. } | EngineEffect::RemoveFile { .. }) => Reason::Missing,
+        _ => Reason::Taken,
+    };
+    Outcome::Failed {
+        reason,
+        recovered: None,
+    }
 }
 
 /// The version of a write whose content omits its chunk list: the version R holds for the node, if it has that

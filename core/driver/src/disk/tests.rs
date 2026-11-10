@@ -1029,6 +1029,80 @@ fn an_effect_that_met_a_taken_name_or_a_changed_file_stays_blocked() {
     }
 }
 
+/// The user renames a synced file, which has the bytes of a download that stopped before it touched the disk, onto
+/// the download's name. Recovery finds those bytes at the name (design §5.3), but L holds that entry as the other
+/// node, so the download fails instead of taking the entry.
+#[test]
+fn a_restart_does_not_take_a_file_that_l_holds_as_another_node_for_a_download() {
+    let folder = Folder::new();
+    let mut server = Server::default();
+    let content = server.hold(REMOTE, ChunkerConfig::V0);
+    fs::write(folder.root.join("b.txt"), REMOTE).unwrap();
+    let synced = disk_content(&folder.root.join("b.txt"));
+    folder.seed(
+        &[
+            remote(NODE, "a.txt", Some(content)),
+            remote(OTHER, "b.txt", Some(synced)),
+        ],
+        &[(OTHER, SPACE, "b.txt")],
+        0,
+    );
+    let mut running = folder.start(no_hook()).unwrap();
+    let pending = running
+        .disk
+        .next(&mut running.engine, &mut running.store)
+        .unwrap()
+        .expect("the download");
+    assert_eq!(pending.record.node, NODE);
+    drop((running, pending));
+    fs::rename(folder.root.join("b.txt"), folder.root.join("a.txt")).unwrap();
+
+    let running = folder.start(no_hook()).unwrap();
+    let held = running.local(OTHER).unwrap().identity;
+    assert_ne!(running.local(NODE).map(|node| node.identity), Some(held));
+    assert!(running.engine.effects.blocked().contains_key(NODE));
+    assert_eq!(fs::read(folder.root.join("a.txt")).unwrap(), REMOTE);
+}
+
+/// The user renames a folder or a file whose removal another device asked for, and a batch reports the rename before
+/// the removal applies. A restart finds nothing at the old name (design §5.3), but L shows the node moved, so the
+/// removal fails and L keeps the node where the user put it.
+#[test]
+fn a_restart_does_not_take_a_renamed_entry_for_removed() {
+    for folder_kind in [true, false] {
+        let folder = Folder::new();
+        let (from, to) = (folder.root.join("docs"), folder.root.join("notes"));
+        if folder_kind {
+            fs::create_dir(&from).unwrap();
+        } else {
+            fs::write(&from, SYNCED).unwrap();
+        }
+        folder.seed(&[], &[(NODE, SPACE, "docs")], 0);
+        let mut running = folder.start(no_hook()).unwrap();
+        let pending = running
+            .disk
+            .next(&mut running.engine, &mut running.store)
+            .unwrap()
+            .expect("the removal");
+        fs::rename(&from, &to).unwrap();
+        batch(&mut running, |trees| {
+            let mut renamed = trees.local().get(NODE).unwrap().clone();
+            renamed.shape.name = "notes".into();
+            trees.set_local(NODE.into(), renamed);
+        });
+        drop((running, pending));
+
+        let running = folder.start(no_hook()).unwrap();
+        let name = running.local(NODE).map(|node| node.shape.name.as_str());
+        assert_eq!(name, Some("notes"), "folder: {folder_kind}");
+        assert!(
+            running.engine.effects.blocked().contains_key(NODE),
+            "folder: {folder_kind}"
+        );
+        assert!(to.exists(), "folder: {folder_kind}");
+    }
+}
+
 /// Moves the root aside and puts an empty folder at its path.
 fn replace_root(root: &Path) -> PathBuf {
     let aside = root.with_file_name("moved");

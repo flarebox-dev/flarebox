@@ -288,6 +288,30 @@ impl Effects {
         Ok(())
     }
 
+    /// Whether L confirms what recovery reports after a crash: that the effect in flight is done,
+    /// with `identity` for the entry it created (section 5.3). Recovery judges a target by the name
+    /// and the content it finds there. An entry that L holds as another node is that node's, and a
+    /// removal whose node L places elsewhere found its name empty because the node moved.
+    pub fn confirms(&self, trees: &Trees, identity: Option<&FileIdentity>) -> bool {
+        let Some(record) = &self.in_flight else {
+            return false;
+        };
+        let local = trees.local();
+        if (local.iter()).any(|(id, node)| *id != record.node && Some(&node.identity) == identity) {
+            return false;
+        }
+        match &record.effect {
+            Effect::RemoveDir { at, .. }
+            | Effect::RemoveFile {
+                displaced: Displaced { at, .. },
+            } => {
+                local.get(&record.node).is_none()
+                    || View::new(trees).location(&record.node).as_ref() == Some(at)
+            }
+            _ => true,
+        }
+    }
+
     /// The driver did not do the effect. Its observations of the disk go to L separately; the node
     /// is blocked until the effect planned for it differs from this one.
     pub fn failed(&mut self, effect_id: &str) -> Result<(), EffectError> {
