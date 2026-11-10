@@ -1287,6 +1287,58 @@ fn a_remote_edit_never_replaces_a_file_whose_read_was_deferred() {
     assert_eq!(fs::read(&report).unwrap(), b"the user's own words");
 }
 
+/// The user replaces a synced folder with another one and moves the folder's synced file back into it, while the
+/// observer's snapshot predates the file, in a scan of more files than one observation reads. The batch takes the
+/// replaced folder out of L, so the file is read at once although it is past the budget, and keeps its node.
+#[test]
+fn a_file_created_under_a_replaced_folder_is_read_at_once_and_keeps_its_node() {
+    let folder = Folder::new();
+    let d = "0190f0a0-0000-7000-8000-0000000000d1";
+    let incoming = "0190f0a0-0000-7000-8000-0000000000d2";
+    fs::create_dir(folder.root.join("d")).unwrap();
+    fs::create_dir(folder.root.join("incoming")).unwrap();
+    let previous = Snapshot::scan(&folder.root).unwrap();
+    fs::write(folder.root.join("d/x"), SYNCED).unwrap();
+    let mut child = remote(NODE, "x", Some(disk_content(&folder.root.join("d/x"))));
+    child.parent_id = d.into();
+    folder.seed(
+        &[
+            remote(d, "d", None),
+            remote(incoming, "incoming", None),
+            child,
+        ],
+        &[
+            (d, SPACE, "d"),
+            (incoming, SPACE, "incoming"),
+            (NODE, d, "d/x"),
+        ],
+        0,
+    );
+    let mut running = folder.start(no_hook()).unwrap();
+    fs::rename(folder.root.join("d/x"), folder.dir.path().join("x")).unwrap();
+    fs::rename(folder.root.join("incoming"), folder.root.join("d")).unwrap();
+    fs::rename(folder.dir.path().join("x"), folder.root.join("d/x")).unwrap();
+    for i in 0..READ_FILES {
+        fs::write(folder.root.join(format!("{i:04}.txt")), b"a").unwrap();
+    }
+    let mut watching = observer(&folder.root, previous);
+    let stamp = running.disk.sections().stamp();
+
+    let first = observe_until(&mut watching, stamp, |seen| !seen.is_empty());
+    assert!(
+        first.observation.changes.iter().any(|change| matches!(
+            change,
+            Observed::Created { path, content: Some(_), .. } if path == Path::new("d/x")
+        )),
+        "the file is read although it is past the budget"
+    );
+    running
+        .disk
+        .observed(first, &mut running.engine, &mut running.store)
+        .unwrap();
+    assert_eq!(running.engine.path_of(NODE), Some(PathBuf::from("d/x")));
+}
+
 /// The user renames a synced file, which has the bytes of a download that stopped before it touched the disk, onto
 /// the download's name. Recovery finds those bytes at the name (design §5.3), but L holds that entry as the other
 /// node, so the download fails instead of taking the entry.
