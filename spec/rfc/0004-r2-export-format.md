@@ -80,7 +80,7 @@ The manifest is the only authority for a snapshot. A reader uses only its page l
 Every write here may have an unknown outcome and land later, even after a read found nothing ([R2 consistency](https://developers.cloudflare.com/r2/reference/consistency/), accessed 2026-11-10). The writer therefore keeps these rules:
 - **Pages.** Before it issues a page's write, the writer records the page number as used. It never writes that number again: after an unknown outcome it moves to the next number, because a late write could replace the retry's bytes after the manifest recorded their hash. So page numbers in a manifest can skip, and a page that no manifest lists is an orphan.
 - **Manifest.** The writer writes the manifest only after every page it lists is durable and the log segments through `end_seq` are durable. Before the first write, it records the manifest's bytes, and every retry writes exactly those bytes until R2 confirms one. A late write can therefore only store the same manifest again.
-- **Names.** Each snapshot starts after a commit that the previous one did not cover, so `start_seq` grows strictly within a history and no manifest name is used twice.
+- **Names.** A snapshot's `start_seq` is above the previous snapshot's `start_seq`, so no manifest name is used twice. It may equal the previous snapshot's `end_seq`: a snapshot that a large version makes due (section 3) starts at once, even if no commit follows.
 
 A deleted manifest (section 7) can still reappear through a late write, together with some of its pages. Readers never treat it as current, because they take the newest manifest by `start_seq` (section 5), and retention always keeps two newer ones.
 
@@ -90,11 +90,11 @@ Snapshots follow the cadence of §11. A snapshot is also due at once for the fir
 
 An R2-only restore of a space:
 1. Takes the descriptor with the highest `rewind_number` (RFC 0003 §7) and reads only that history's files.
-2. Lists `snap/` and takes the manifest with the highest `start_seq`. If the history has none, it starts from an empty space whose root is the space id. That can only happen in a space's first history.
+2. Lists `snap/` and takes the manifest with the highest `start_seq`. If the history has none, it starts from a space that holds only its root, whose node id is the space id, with `start_seq` 0. That can only happen in a space's first history.
 3. Loads every page the manifest lists.
-4. Replays the log segments from `start_seq` + 1 onward, whole commits in seq order (RFC 0002 §5.2), with the rules below.
+4. Replays the log from `start_seq` + 1 onward, whole commits in seq order (RFC 0002 §5.2), with the rules below. Records at or below `start_seq` are skipped. From the segment that holds `start_seq` + 1 on, each segment must start right after the previous one ends, and its records must carry consecutive seqs from its `first_seq` to its `last_seq`. The log must reach at least the manifest's `end_seq`. A gap, an overlap or a short log means the export is damaged, and the reader reports it rather than restoring partial state.
 
-If a listed page is missing while a newer manifest exists, retention has removed the snapshot during the read. The reader starts again at step 2. If the manifest is still the newest, the export is damaged, and the reader reports it rather than falling back to an older manifest. Retention keeps a snapshot until two newer ones are complete (section 7). So a reader that starts on the newest manifest has at least the time of two more snapshots, a day or more at the §11 cadence, before its snapshot can disappear.
+If a listed page is missing while a newer manifest exists, retention has removed the snapshot during the read. The reader starts again at step 2. If the manifest is still the newest, the export is damaged, and the reader reports it rather than falling back to an older manifest. Retention deletes a snapshot only after two newer ones are complete (section 7), so a fresh selection always finds a complete snapshot. It promises no minimum time: a reader that new snapshots keep overtaking may have to restart more than once.
 
 Replay applies each change record to the restored node, version and trash state:
 - **`NodeState` whose revision is not newer.** If the record's `max(content_rev, meta_rev)` is not above the restored node's, the record is skipped. The page that holds the node was read after that commit, so it already includes the record's effects.
