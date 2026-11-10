@@ -36,7 +36,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+  DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
 
 jobs:
   release-ref:
@@ -70,7 +70,7 @@ jobs:
     name: macos release
     needs: release-ref
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 360
     environment: macos-release
     defaults:

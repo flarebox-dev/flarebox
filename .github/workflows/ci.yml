@@ -25,10 +25,36 @@ jobs:
       server_macos: ${{ steps.paths.outputs.server_macos }}
       spec_macos: ${{ steps.paths.outputs.spec_macos }}
       macos_app: ${{ steps.paths.outputs.macos_app }}
+      macos_runs_on: ${{ steps.runners.outputs.macos_runs_on }}
+      macos_developer_dir: ${{ steps.runners.outputs.macos_developer_dir }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Choose the macOS runners
+        id: runners
+        env:
+          EVENT: ${{ github.event_name }}
+          RUNS_ON: ${{ vars.MACOS_RUNS_ON || '["self-hosted","flarebox-mini"]' }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            echo "Pull request: its macOS jobs run on GitHub-hosted runners."
+            RUNS_ON='["xcode-27"]'
+          fi
+          if ! jq -e 'type == "array" and length > 0 and all(.[]; type == "string")' <<<"$RUNS_ON" >/dev/null 2>&1; then
+            echo "::error::The MACOS_RUNS_ON variable must be a JSON array of runner labels, such as [\"xcode-27\"], but it is: $RUNS_ON"
+            exit 1
+          fi
+          if jq -e 'index("self-hosted")' <<<"$RUNS_ON" >/dev/null; then
+            developer_dir=/Applications/Xcode.app/Contents/Developer
+          else
+            developer_dir=/Applications/Xcode_27.2.app/Contents/Developer
+          fi
+          echo "macOS jobs run on $RUNS_ON with DEVELOPER_DIR=$developer_dir."
+          {
+            echo "macos_runs_on=$(jq -c . <<<"$RUNS_ON")"
+            echo "macos_developer_dir=$developer_dir"
+          } >> "$GITHUB_OUTPUT"
       - name: Decide which macOS jobs the change needs
         id: paths
         env:
@@ -67,12 +93,26 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(needs.changes.outputs.rust_macos == 'true' && '["ubuntu-latest","macos-latest"]' || '["ubuntu-latest"]') }}
-    runs-on: ${{ matrix.os }}
+        os: ${{ fromJSON(needs.changes.outputs.rust_macos == 'true' && '["ubuntu-latest","macos"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ matrix.os == 'macos' && fromJSON(needs.changes.outputs.macos_runs_on) || matrix.os }}
+    env:
+      DEVELOPER_DIR: ${{ matrix.os == 'macos' && needs.changes.outputs.macos_developer_dir || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Use Homebrew's rustup with rustup and Cargo homes private to this self-hosted runner
+        if: runner.environment == 'self-hosted'
+        run: |
+          printf 'RUSTUP_HOME=%s\nCARGO_HOME=%s\n' "$RUNNER_TOOL_CACHE/rustup" "$RUNNER_TOOL_CACHE/cargo" >> "$GITHUB_ENV"
+          echo "Runner $RUNNER_NAME uses RUSTUP_HOME=$RUNNER_TOOL_CACHE/rustup and CARGO_HOME=$RUNNER_TOOL_CACHE/cargo."
+          proxies=/opt/homebrew/opt/rustup/bin
+          if [ ! -x "$proxies/cargo" ] || [ ! -x "$proxies/rustc" ]; then
+            echo "::error::Runner $RUNNER_NAME has no cargo or rustc in $proxies. Install rustup with Homebrew (brew install rustup) on the Mac that hosts the runners."
+            exit 1
+          fi
+          echo "$proxies" >> "$GITHUB_PATH"
+          echo "Runner $RUNNER_NAME takes cargo and rustc from $proxies."
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -86,8 +126,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(needs.changes.outputs.server_macos == 'true' && '["ubuntu-latest","macos-latest"]' || '["ubuntu-latest"]') }}
-    runs-on: ${{ matrix.os }}
+        os: ${{ fromJSON(needs.changes.outputs.server_macos == 'true' && '["ubuntu-latest","macos"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ matrix.os == 'macos' && fromJSON(needs.changes.outputs.macos_runs_on) || matrix.os }}
+    env:
+      DEVELOPER_DIR: ${{ matrix.os == 'macos' && needs.changes.outputs.macos_developer_dir || '' }}
     defaults:
       run:
         working-directory: server
@@ -98,6 +140,7 @@ jobs:
       - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           package_json_file: server/package.json
+          dest: ${{ runner.tool_cache }}/setup-pnpm
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
@@ -210,8 +253,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(needs.changes.outputs.spec_macos == 'true' && '["ubuntu-latest","macos-latest"]' || '["ubuntu-latest"]') }}
-    runs-on: ${{ matrix.os }}
+        os: ${{ fromJSON(needs.changes.outputs.spec_macos == 'true' && '["ubuntu-latest","macos"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ matrix.os == 'macos' && fromJSON(needs.changes.outputs.macos_runs_on) || matrix.os }}
+    env:
+      DEVELOPER_DIR: ${{ matrix.os == 'macos' && needs.changes.outputs.macos_developer_dir || '' }}
     defaults:
       run:
         working-directory: spec
@@ -246,10 +291,10 @@ jobs:
     name: macos app
     needs: changes
     if: needs.changes.outputs.macos_app == 'true'
-    runs-on: macos-26
+    runs-on: ${{ fromJSON(needs.changes.outputs.macos_runs_on) }}
     timeout-minutes: 45
     env:
-      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      DEVELOPER_DIR: ${{ needs.changes.outputs.macos_developer_dir }}
     defaults:
       run:
         working-directory: apps/macos
@@ -257,6 +302,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Use Homebrew's rustup with rustup and Cargo homes private to this self-hosted runner
+        if: runner.environment == 'self-hosted'
+        run: |
+          printf 'RUSTUP_HOME=%s\nCARGO_HOME=%s\n' "$RUNNER_TOOL_CACHE/rustup" "$RUNNER_TOOL_CACHE/cargo" >> "$GITHUB_ENV"
+          echo "Runner $RUNNER_NAME uses RUSTUP_HOME=$RUNNER_TOOL_CACHE/rustup and CARGO_HOME=$RUNNER_TOOL_CACHE/cargo."
+          proxies=/opt/homebrew/opt/rustup/bin
+          if [ ! -x "$proxies/cargo" ] || [ ! -x "$proxies/rustc" ]; then
+            echo "::error::Runner $RUNNER_NAME has no cargo or rustc in $proxies. Install rustup with Homebrew (brew install rustup) on the Mac that hosts the runners."
+            exit 1
+          fi
+          echo "$proxies" >> "$GITHUB_PATH"
+          echo "Runner $RUNNER_NAME takes cargo and rustc from $proxies."
       - name: Test notarize.sh against a stub notarytool
         run: scripts/test-notarize.sh
       - name: Install toolchain from rust-toolchain.toml
@@ -288,10 +345,24 @@ jobs:
           compression-level: 0
           retention-days: 7
 
+  runner-hook:
+    name: runner hook
+    needs: changes
+    runs-on: ${{ fromJSON(needs.changes.outputs.macos_runs_on) }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test the job-started hook of the self-hosted runners
+        run: .github/runner/test-job-started.sh
+      - name: Test the hook's installer without root
+        run: .github/runner/test-install-hook.sh
+
   ci-report:
     name: ci-report
     if: always()
-    needs: [changes, rust, server, server-deploy, net-integration, cli-integration, ffi-integration, spec, macos-app]
+    needs: [changes, rust, server, server-deploy, net-integration, cli-integration, ffi-integration, spec, macos-app, runner-hook]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any CI job failed or was cancelled
@@ -305,11 +376,12 @@ jobs:
           FFI_INTEGRATION: ${{ needs.ffi-integration.result }}
           SPEC: ${{ needs.spec.result }}
           MACOS_APP: ${{ needs.macos-app.result }}
+          RUNNER_HOOK: ${{ needs.runner-hook.result }}
           FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
         run: |
-          echo "changes: $CHANGES, rust: $RUST, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, cli-integration: $CLI_INTEGRATION, ffi-integration: $FFI_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP"
+          echo "changes: $CHANGES, rust: $RUST, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, cli-integration: $CLI_INTEGRATION, ffi-integration: $FFI_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP, runner-hook: $RUNNER_HOOK"
           if [ "$FAILED" = "true" ]; then
-            echo "::error::At least one CI job failed or was cancelled (changes: $CHANGES, rust: $RUST, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, cli-integration: $CLI_INTEGRATION, ffi-integration: $FFI_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP). Open that job's log for the cause."
+            echo "::error::At least one CI job failed or was cancelled (changes: $CHANGES, rust: $RUST, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, cli-integration: $CLI_INTEGRATION, ffi-integration: $FFI_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP, runner-hook: $RUNNER_HOOK). Open that job's log for the cause."
             exit 1
           fi
       - name: Fail unless every macOS job ran on a push to main
