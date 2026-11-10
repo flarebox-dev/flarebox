@@ -138,6 +138,16 @@ impl Engine {
         tx.set_id_generator(&self.ids.state.to_le_bytes())
     }
 
+    /// Queues the restores asked for since the last take (`Driver::restore`) and empties the store's inbox. The
+    /// caller's checkpoint saves the queue in the same transaction, so a request is in the inbox or in the engine
+    /// and never in both or in neither. A request the engine already holds is not queued again.
+    pub fn accept_restores(&mut self, tx: &Tx<'_>) -> Result<(), Error> {
+        for (id, intent) in tx.take_restore_requests()? {
+            self.commits.restore(id, intent);
+        }
+        Ok(())
+    }
+
     /// Applies commits of the log to R, in the store and in the trees, in seq order from the one after the cursor
     /// (design §4.4). A commit at or below the cursor is skipped, and a commit further ahead is a gap.
     pub fn apply_records(

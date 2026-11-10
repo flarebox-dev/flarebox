@@ -71,8 +71,11 @@ pub struct RestoreStatus {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RestoreState {
-    /// Not sent yet, or sent and not answered. It waits while the folder is not syncing, offline or halted.
-    /// `waits_for` names what else holds it back, when something does.
+    /// Not sent yet, or sent and not answered. It waits while the folder is not syncing, offline or halted, and
+    /// while the folder has not synced the other changes of its node. `waits_for` names what else holds it back
+    /// when the store shows it. Without a reason the restore can still wait for a change that another node's
+    /// problem holds back, so a surface says that it waits for the folder to sync and shows the folder's
+    /// problems. It must not promise that the restore goes through by itself.
     Pending {
         waits_for: Option<RestoreWait>,
     },
