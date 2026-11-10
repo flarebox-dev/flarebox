@@ -46,6 +46,10 @@ pub struct SetupState {
     /// During an uninstall, when the bucket was created, which tells it apart from a new bucket of the same name.
     #[serde(default)]
     pub bucket_created_on: Option<String>,
+    /// When this deploy first tried to create its bucket, in milliseconds since the Unix epoch by this machine's clock.
+    /// A bucket the create finds already there counts as this deploy's only if R2 dates it later (section 4.6).
+    #[serde(default)]
+    pub bucket_create_started_ms: Option<i64>,
 }
 
 pub struct StateFile {
@@ -126,6 +130,7 @@ mod tests {
             script_created_on: Some("2026-11-10T01:02:03.456Z".into()),
             jurisdiction: Jurisdiction::Eu,
             bucket_created_on: Some("2026-11-10T01:02:00.000Z".into()),
+            bucket_create_started_ms: Some(1_794_272_400_000),
         };
         file.save(&state).unwrap();
         assert_eq!(file.load().unwrap(), Some(state));

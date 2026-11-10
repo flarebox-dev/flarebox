@@ -19,6 +19,7 @@ use flarebox_cloudflare::{Account, CLIENT_ID, Endpoints, Login};
 
 use super::Session;
 
+#[derive(Clone)]
 pub struct Reply {
     pub method: &'static str,
     pub path: String,

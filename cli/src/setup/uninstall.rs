@@ -219,7 +219,7 @@ async fn delete_worker(cloud: &mut impl Cloud, state: &SetupState) -> Result<(),
 }
 
 /// The first Worker in the account that binds `bucket` in `jurisdiction`.
-async fn binder(
+pub async fn binder(
     cloud: &mut impl Cloud,
     bucket: &str,
     jurisdiction: Jurisdiction,
@@ -252,7 +252,7 @@ async fn binder(
 }
 
 /// Lists the whole bucket, or `None` if it does not exist.
-async fn scan(
+pub async fn scan(
     cloud: &mut impl Cloud,
     bucket: &str,
     jurisdiction: Jurisdiction,

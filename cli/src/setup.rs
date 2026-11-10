@@ -680,24 +680,7 @@ impl Session {
         let bundle = embedded_bundle()?;
         let mut key = None;
         if state.step < Step::BucketCreated {
-            println!("Creating the R2 bucket {}...", state.bucket);
-            match self
-                .fresh()
-                .await?
-                .create_bucket(self.account(), &state.bucket, state.jurisdiction)
-                .await
-            {
-                Ok(()) => {}
-                Err(error) if error.status() == Some(409) => {}
-                Err(error) => {
-                    return Err(format!(
-                        "cannot create the bucket {}: {error}",
-                        state.bucket
-                    ));
-                }
-            }
-            state.step = Step::BucketCreated;
-            file.save(&state)?;
+            create_bucket(self, &file, &mut state, &bundle.manifest.default_bucket).await?;
         }
         if state.step < Step::ScriptUploaded {
             keep_script_name(
@@ -988,6 +971,148 @@ fn embedded_bundle() -> Result<Bundle, String> {
     Bundle::from_dir(dir.path()).map_err(|error| broken(&error))
 }
 
+/// Creates the bucket `state.bucket`, or moves to the next free name after `base` while the name belongs to someone
+/// else, then records the step. Uninstall empties and deletes the bucket the state file names, so the deploy adopts a
+/// bucket that already exists only when `created_by_this_deploy` shows it is its own.
+async fn create_bucket(
+    cloud: &mut impl Cloud,
+    file: &StateFile,
+    state: &mut SetupState,
+    base: &str,
+) -> Result<(), String> {
+    if state.bucket_create_started_ms.is_none() {
+        state.bucket_create_started_ms = Some(now_ms());
+        file.save(state)?;
+    }
+    let account = cloud.account().to_owned();
+    let mut refused = Vec::new();
+    loop {
+        println!("Creating the R2 bucket {}...", state.bucket);
+        let api = cloud.fresh().await?;
+        match api
+            .create_bucket(&account, &state.bucket, state.jurisdiction)
+            .await
+        {
+            Ok(()) => break,
+            Err(error) if error.status() == Some(409) => {
+                if created_by_this_deploy(cloud, state).await? {
+                    break;
+                }
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot create the bucket {}: {error}",
+                    state.bucket
+                ));
+            }
+        }
+        refused.push(state.bucket.clone());
+        let mut taken = cloud
+            .fresh()
+            .await?
+            .buckets(&account, state.jurisdiction)
+            .await
+            .map_err(|error| format!("cannot list the account's R2 buckets: {error}"))?;
+        taken.extend(refused.iter().cloned());
+        let free = free_name(base, &taken);
+        println!(
+            "The bucket {} belongs to someone else, so the server uses the bucket {free}.",
+            state.bucket
+        );
+        state.bucket = free;
+        file.save(state)?;
+    }
+    state.step = Step::BucketCreated;
+    file.save(state)
+}
+
+/// How far this machine's clock may run ahead of R2's before a bucket this deploy created looks older than the deploy.
+const CLOCK_SKEW_MS: i64 = 5 * 60 * 1000;
+
+/// Whether the existing bucket `state.bucket` is one this deploy created before it could record that: R2 dates it
+/// after the deploy's first create, no Worker binds it, and it holds no key outside `spaces/`.
+async fn created_by_this_deploy(
+    cloud: &mut impl Cloud,
+    state: &SetupState,
+) -> Result<bool, String> {
+    let Some(started) = state.bucket_create_started_ms else {
+        return Ok(false);
+    };
+    let account = cloud.account().to_owned();
+    let found = match cloud
+        .fresh()
+        .await?
+        .bucket(&account, &state.bucket, state.jurisdiction)
+        .await
+    {
+        Ok(found) => found,
+        Err(error) if error.status() == Some(404) => return Ok(false),
+        Err(error) => {
+            return Err(format!("cannot read the bucket {}: {error}", state.bucket));
+        }
+    };
+    if !utc_ms(&found.creation_date).is_some_and(|created| created >= started - CLOCK_SKEW_MS)
+        || found
+            .jurisdiction
+            .is_some_and(|other| other != state.jurisdiction)
+    {
+        return Ok(false);
+    }
+    if uninstall::binder(cloud, &state.bucket, state.jurisdiction)
+        .await?
+        .is_some()
+    {
+        return Ok(false);
+    }
+    Ok(uninstall::scan(cloud, &state.bucket, state.jurisdiction)
+        .await?
+        .is_some_and(|contents| contents.foreign.is_none()))
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as i64)
+}
+
+/// Milliseconds since the Unix epoch of an RFC 3339 time in UTC, such as R2's `2026-11-10T01:02:03.456Z`. Any other
+/// form is `None`.
+fn utc_ms(text: &str) -> Option<i64> {
+    let (date, time) = text.strip_suffix('Z')?.split_once('T')?;
+    let (clock, fraction) = time.split_once('.').unwrap_or((time, ""));
+    let number = |part: &str| -> Option<i64> {
+        (!part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| part.parse().ok())
+            .flatten()
+    };
+    let date: Vec<i64> = date.split('-').map(number).collect::<Option<_>>()?;
+    let clock: Vec<i64> = clock.split(':').map(number).collect::<Option<_>>()?;
+    let [year, month, day] = <[i64; 3]>::try_from(date).ok()?;
+    let [hour, minute, second] = <[i64; 3]>::try_from(clock).ok()?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let millis = match fraction {
+        "" => 0,
+        fraction => {
+            number(fraction)?;
+            number(&format!("{fraction:0<3}")[..3])?
+        }
+    };
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    Some(((days * 24 + hour) * 60 + minute) * 60_000 + second * 1000 + millis)
+}
+
 /// Keeps `state.script` while no other application holds the name. A Worker under it that has the tag and binds
 /// `state.bucket` is this deploy's own upload from before the state file recorded it, so the upload goes over it. Any
 /// other Worker under the name belongs to someone else, so the deploy moves to the first free name after `base`.
@@ -1108,7 +1233,7 @@ mod tests {
     use flarebox_proto::v1::DeviceCredentials;
     use serde_json::json;
 
-    use super::fake::{self, ACCOUNT, Fake, cf, proto, revoked, tokens};
+    use super::fake::{self, ACCOUNT, Fake, Reply, cf, proto, revoked, tokens};
     use super::*;
 
     fn deployed(fake: &Fake) -> Found {
@@ -1201,6 +1326,117 @@ mod tests {
                 .unwrap();
 
             assert_eq!(state.script, expected);
+        }
+    }
+
+    #[test]
+    fn utc_times_read_as_milliseconds_since_the_epoch() {
+        assert_eq!(utc_ms("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(utc_ms("2026-11-10T01:02:03.456Z"), Some(1_794_272_523_456));
+        assert_eq!(utc_ms("2026-11-10T01:02:03Z"), Some(1_794_272_523_000));
+        assert_eq!(utc_ms("2026-11-10T01:02:03.4567Z"), Some(1_794_272_523_456));
+        assert_eq!(utc_ms("2026-11-10T01:02:03.4Z"), Some(1_794_272_523_400));
+        assert_eq!(utc_ms("2026-11-10T01:02:03+00:00"), None);
+        assert_eq!(utc_ms("2026-11-10 01:02:03Z"), None);
+        assert_eq!(utc_ms("2026-13-10T01:02:03Z"), None);
+        assert_eq!(utc_ms("2026-11-10T01:02:03.4é5Z"), None);
+    }
+
+    #[tokio::test]
+    async fn a_bucket_name_someone_else_holds_moves_the_deploy_to_the_next_name() {
+        let conflict = Reply {
+            method: "POST",
+            path: format!("/client/v4/accounts/{ACCOUNT}/r2/buckets"),
+            status: 409,
+            content_type: "application/json",
+            body: json!({ "success": false, "errors": [{ "code": 10004, "message": "The bucket you tried to create already exists." }], "result": null })
+                .to_string()
+                .into_bytes(),
+        };
+        let found = |date: &str| {
+            cf(
+                "GET",
+                "/r2/buckets/flarebox",
+                json!({ "name": "flarebox", "creation_date": date }),
+            )
+        };
+        let objects = |key: &str| {
+            Reply {
+            method: "GET",
+            path: format!("/client/v4/accounts/{ACCOUNT}/r2/buckets/flarebox/objects?per_page=1000"),
+            status: 200,
+            content_type: "application/json",
+            body: json!({ "success": true, "errors": [], "result": [{ "key": key }], "result_info": { "cursor": "", "is_truncated": false } })
+                .to_string()
+                .into_bytes(),
+        }
+        };
+        let no_workers = || cf("GET", "/workers/scripts", json!([]));
+        let next_name = || {
+            vec![
+                cf(
+                    "GET",
+                    "/r2/buckets?per_page=1000",
+                    json!({ "buckets": [{ "name": "flarebox" }] }),
+                ),
+                cf("POST", "/r2/buckets", json!({})),
+            ]
+        };
+        let older = "2026-11-09T23:00:00.000Z";
+        let newer = "2026-11-10T01:00:05.000Z";
+        let cases = [
+            (vec![found(older)], next_name(), "flarebox-2"),
+            (
+                vec![found(newer), no_workers(), objects("photos/cat.jpg")],
+                next_name(),
+                "flarebox-2",
+            ),
+            (
+                vec![
+                    found(newer),
+                    cf(
+                        "GET",
+                        "/workers/scripts",
+                        json!([{ "id": "photos", "tags": [] }]),
+                    ),
+                    cf(
+                        "GET",
+                        "/workers/scripts/photos/settings",
+                        json!({ "bindings": [{ "type": "r2_bucket", "name": "PHOTOS", "bucket_name": "flarebox" }] }),
+                    ),
+                ],
+                next_name(),
+                "flarebox-2",
+            ),
+            (
+                vec![found(newer), no_workers(), objects("spaces/0194f8a2/chunk")],
+                Vec::new(),
+                "flarebox",
+            ),
+        ];
+        for (checks, after, expected) in cases {
+            let mut replies = vec![tokens(), conflict.clone()];
+            replies.extend(checks);
+            replies.extend(after);
+            let fake = Fake::start(replies).await;
+            let mut session = fake::session(&fake).await;
+            let dir = tempfile::tempdir().unwrap();
+            let file = StateFile::new(&Paths::under(dir.path()));
+            let mut state = SetupState {
+                account: ACCOUNT.into(),
+                script: "flarebox".into(),
+                bucket: "flarebox".into(),
+                bucket_create_started_ms: utc_ms("2026-11-10T01:00:00Z"),
+                ..SetupState::default()
+            };
+
+            create_bucket(&mut session, &file, &mut state, "flarebox")
+                .await
+                .unwrap();
+
+            assert_eq!(state.bucket, expected);
+            assert_eq!(state.step, Step::BucketCreated);
+            assert_eq!(file.load().unwrap(), Some(state));
         }
     }
 
