@@ -45,6 +45,10 @@ pub(crate) struct DriverCore {
     paths: Paths,
     events: Events,
     inner: Mutex<Inner>,
+    /// Taken by the calls that sign in or change the linked folders, one at a time, so that a claim
+    /// never opens the profile again while another call still holds the driver. The calls the app
+    /// makes on its main thread never take it, and `inner` is never held while the network is awaited.
+    changes: Mutex<()>,
     closed: AtomicBool,
     poller: Mutex<Option<JoinHandle<()>>>,
 }
@@ -98,6 +102,7 @@ impl DriverCore {
                 },
                 halted: BTreeMap::new(),
             }),
+            changes: Mutex::new(()),
             closed: AtomicBool::new(false),
             poller: Mutex::new(None),
         });
@@ -183,6 +188,12 @@ impl DriverCore {
         inner.driver.as_ref().ok_or_else(|| SessionError::Failed {
             reason: "this device's sync state could not be opened again; relaunch Flarebox".into(),
         })
+    }
+
+    fn change(&self) -> MutexGuard<'_, ()> {
+        self.changes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// The stored credential's API and authentication, for the calls the driver does not make.
@@ -329,9 +340,13 @@ impl Core for DriverCore {
         if user_name.trim().is_empty() || device_name.trim().is_empty() {
             return Err(SessionError::EmptyName);
         }
-        let mut inner = self.lock();
-        let api = inner.server.clone().ok_or(SessionError::NoServer)?;
-        if let Some(account) = self.driver(&inner)?.status().account {
+        let _change = self.change();
+        let (api, signed_in) = {
+            let inner = self.lock();
+            let api = inner.server.clone().ok_or(SessionError::NoServer)?;
+            (api, self.driver(&inner)?.status().account)
+        };
+        if let Some(account) = signed_in {
             return Err(SessionError::Failed {
                 reason: format!("this device is already signed in as {}", account.device_id),
             });
@@ -356,6 +371,7 @@ impl Core for DriverCore {
         .map_err(|error| SessionError::NotSaved {
             reason: error.to_string(),
         })?;
+        let mut inner = self.lock();
         if let Some(driver) = inner.driver.take() {
             self.runtime.block_on(driver.stop());
         }
@@ -369,19 +385,20 @@ impl Core for DriverCore {
     }
 
     fn pair(&self, code: &str, device_name: &str) -> Result<Account, SessionError> {
-        let mut inner = self.lock();
-        let api = inner.server.clone().ok_or(SessionError::NoServer)?;
+        let _change = self.change();
+        let (api, driver) = {
+            let inner = self.lock();
+            let api = inner.server.clone().ok_or(SessionError::NoServer)?;
+            (api, self.driver(&inner)?.clone())
+        };
         let paired = self
             .runtime
-            .block_on(
-                self.driver(&inner)?
-                    .pair(api.base().as_str(), code.trim(), device_name),
-            )
+            .block_on(driver.pair(api.base().as_str(), code.trim(), device_name))
             .map_err(|error| match error {
                 DriverError::Api(error) => code_error(error),
                 other => driver_error(other),
             })?;
-        self.refresh(&mut inner, false);
+        self.refresh(&mut self.lock(), false);
         Ok(account(&paired))
     }
 
@@ -446,18 +463,19 @@ impl Core for DriverCore {
     }
 
     fn link_folder(&self, space_id: &str, path: &str) -> Result<LinkedFolder, SessionError> {
-        let mut inner = self.lock();
+        let _change = self.change();
+        let driver = self.driver(&self.lock())?.clone();
         let linked = self
             .runtime
-            .block_on(self.driver(&inner)?.link(Path::new(path), space_id))
+            .block_on(driver.link(Path::new(path), space_id))
             .map_err(driver_error)?;
-        self.refresh(&mut inner, false);
+        self.refresh(&mut self.lock(), false);
         Ok(folder(&linked))
     }
 
     fn unlink_folder(&self, space_id: &str) -> Result<(), SessionError> {
-        let mut inner = self.lock();
-        let driver = self.driver(&inner)?;
+        let _change = self.change();
+        let driver = self.driver(&self.lock())?.clone();
         let path = driver
             .status()
             .folders
@@ -468,7 +486,7 @@ impl Core for DriverCore {
         self.runtime
             .block_on(driver.unlink(&path))
             .map_err(driver_error)?;
-        self.refresh(&mut inner, false);
+        self.refresh(&mut self.lock(), false);
         Ok(())
     }
 
