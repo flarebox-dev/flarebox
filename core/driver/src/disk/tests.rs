@@ -972,10 +972,19 @@ fn a_stale_batch_does_not_undo_an_effect_and_the_rescan_reports_its_result() {
 
     let rescans = sections.take_rescans();
     assert_eq!(rescans, vec![PathBuf::from("report.txt")]);
-    watching.forget(&rescans).unwrap();
+    watching.forget(&rescans);
     let fresh = observe_until(&mut watching, sections.stamp(), |seen| {
         created(seen, "report.txt").is_some()
     });
+    assert!(
+        fresh
+            .observation
+            .changes
+            .iter()
+            .all(|change| matches!(change, Observed::Created { path, .. } if path == Path::new("report.txt"))),
+        "the rescan reports only the effect's paths: {:?}",
+        fresh.observation.changes
+    );
     let (id, content) = created(&fresh.observation.changes, "report.txt").unwrap();
     assert_eq!(file_identity(id), written.identity);
     assert_eq!(

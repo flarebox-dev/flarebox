@@ -135,7 +135,20 @@ impl FsObserver {
         previous: Snapshot,
         matcher: Arc<dyn Matcher>,
     ) -> Result<Self, FsError> {
-        let (watcher, native) = watch(root, previous, true)?;
+        let (watcher, native): (Box<dyn Watcher + Send>, bool) = match NativeWatcher::start(
+            root,
+            previous.clone(),
+        ) {
+            Ok(watcher) => (Box::new(watcher), true),
+            Err(FsError::Watch(error)) => {
+                tracing::warn!(%error, "the platform watcher is unavailable; rescanning periodically");
+                (
+                    Box::new(RescanWatcher::new(root, previous, RESCAN_INTERVAL)?),
+                    false,
+                )
+            }
+            Err(error) => return Err(error),
+        };
         Ok(FsObserver {
             root: std::fs::canonicalize(root)?,
             space_id: space_id.to_owned(),
@@ -149,16 +162,13 @@ impl FsObserver {
     }
 
     /// Forgets what the snapshot knows at and below each of `scopes`, relative paths, so the next observation reports
-    /// what is there now as created, with the content of every file. The watcher starts again from the reduced
-    /// snapshot, so that observation also rescans the rest of the tree; what did not change there is not reported.
-    pub fn forget(&mut self, scopes: &[PathBuf]) -> Result<(), FsError> {
-        let mut snapshot = self.watcher.snapshot().clone();
+    /// what is there now as created, with the content of every file. Nothing outside `scopes` is reported again
+    /// unless it changed.
+    pub fn forget(&mut self, scopes: &[PathBuf]) {
         for scope in scopes {
-            snapshot.forget(scope);
+            self.watcher.forget(scope);
             self.unread.retain(|path, _| !path.starts_with(scope));
         }
-        (self.watcher, self.native) = watch(&self.root, snapshot, self.native)?;
-        Ok(())
     }
 
     fn excluded(&self, path: &Path, kind: EntryKind) -> bool {
@@ -389,28 +399,6 @@ impl Observer for FsObserver {
     fn snapshot(&self) -> &Snapshot {
         self.watcher.snapshot()
     }
-}
-
-/// A watcher of `root` that starts from `previous`: the platform's when `native` is set and it is available, else one
-/// that rescans the whole tree periodically. Returns whether it is the platform's.
-fn watch(
-    root: &Path,
-    previous: Snapshot,
-    native: bool,
-) -> Result<(Box<dyn Watcher + Send>, bool), FsError> {
-    if native {
-        match NativeWatcher::start(root, previous.clone()) {
-            Ok(watcher) => return Ok((Box::new(watcher), true)),
-            Err(FsError::Watch(error)) => {
-                tracing::warn!(%error, "the platform watcher is unavailable; rescanning periodically");
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Ok((
-        Box::new(RescanWatcher::new(root, previous, RESCAN_INTERVAL)?),
-        false,
-    ))
 }
 
 /// The content of the file at `path` under `root`, or `None` when it is not the file the scan saw or changed while
