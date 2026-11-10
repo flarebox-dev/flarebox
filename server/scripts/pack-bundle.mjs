@@ -13,6 +13,7 @@ import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const DRY_RUN_MS = 2 * 60_000;
+const BUNDLE_ENTRIES = ["manifest.json", "worker", "assets"];
 
 const server = join(dirname(fileURLToPath(import.meta.url)), "..");
 const output = process.argv[2] && resolve(process.argv[2]);
@@ -29,6 +30,14 @@ function fail(message) {
 /** Drops undefined fields, which Wrangler's normalized config keeps for options that are not set. */
 function defined(object) {
   return Object.fromEntries(Object.entries(object).filter(([, value]) => value !== undefined));
+}
+
+// The output is deleted and rewritten, so it must be new, empty, or a bundle this script wrote; never the source tree.
+if (existsSync(output)) {
+  const entries = readdirSync(output);
+  if (entries.length > 0 && (!entries.includes("manifest.json") || entries.some((entry) => !BUNDLE_ENTRIES.includes(entry)))) {
+    fail(output + " holds files other than a bundle; name a new or empty directory");
+  }
 }
 
 const require = createRequire(join(server, "package.json"));
