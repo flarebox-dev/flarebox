@@ -226,22 +226,25 @@ impl Login {
             ],
         )
         .await?;
-        let missing = missing_scopes(tokens.scope.as_deref());
-        let grant = Grant {
-            expires_at: expiry(sent, tokens.expires_in)?,
+        let usable = usable(sent, &tokens);
+        let mut grant = Grant {
+            expires_at: sent,
             access: Secret::new(tokens.access_token),
             refresh: Some(Secret::new(tokens.refresh_token)),
             stale: None,
             endpoints: self.endpoints,
             client_id: self.client_id,
         };
-        if !missing.is_empty() {
-            let _ = grant.revoke(http).await;
-            return Err(OauthError::MissingScopes {
-                missing: missing.join(", "),
-            });
+        match usable {
+            Ok(expires_at) => {
+                grant.expires_at = expires_at;
+                Ok(grant)
+            }
+            Err(error) => {
+                let _ = grant.revoke(http).await;
+                Err(error)
+            }
         }
-        Ok(grant)
     }
 }
 
@@ -398,19 +401,21 @@ impl Grant {
             ],
         )
         .await?;
-        let missing = missing_scopes(tokens.scope.as_deref());
+        let usable = usable(sent, &tokens);
         self.stale = None;
         self.access = Secret::new(tokens.access_token);
         self.refresh = Some(Secret::new(tokens.refresh_token));
-        if !missing.is_empty() {
-            let _ = self.revoke(http).await;
-            self.stale = self.refresh.take();
-            return Err(OauthError::MissingScopes {
-                missing: missing.join(", "),
-            });
+        match usable {
+            Ok(expires_at) => {
+                self.expires_at = expires_at;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.revoke(http).await;
+                self.stale = self.refresh.take();
+                Err(error)
+            }
         }
-        self.expires_at = expiry(sent, tokens.expires_in)?;
-        Ok(())
     }
 
     /// Revokes the refresh token, then the refresh token of a failed refresh, then the access token. It sends each
@@ -503,8 +508,16 @@ fn missing_scopes(granted: Option<&str>) -> Vec<&'static str> {
         .collect()
 }
 
-fn expiry(sent: Instant, expires_in: u64) -> Result<Instant, OauthError> {
-    sent.checked_add(Duration::from_secs(expires_in))
+/// When the tokens of a response expire, or why they cannot be used: a scope of [`SCOPES`] is missing, or
+/// `expires_in` is too large to be a time. The caller then revokes the tokens it was given.
+fn usable(sent: Instant, tokens: &TokenResponse) -> Result<Instant, OauthError> {
+    let missing = missing_scopes(tokens.scope.as_deref());
+    if !missing.is_empty() {
+        return Err(OauthError::MissingScopes {
+            missing: missing.join(", "),
+        });
+    }
+    sent.checked_add(Duration::from_secs(tokens.expires_in))
         .ok_or(OauthError::MalformedTokenResponse)
 }
 

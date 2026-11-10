@@ -606,6 +606,67 @@ async fn a_later_revoke_retries_the_new_refresh_token_of_a_refused_scope() {
     assert_eq!(revoked, ["refresh-2", "access-2", "refresh-2", "access-2"]);
 }
 
+/// A token response whose `expires_in` is too large to be a time.
+fn endless_tokens(access: &str, refresh: &str) -> (u16, String) {
+    let body = serde_json::json!({
+        "access_token": access,
+        "refresh_token": refresh,
+        "token_type": "bearer",
+        "expires_in": u64::MAX,
+        "scope": all_scopes(),
+    });
+    (200, body.to_string())
+}
+
+#[tokio::test]
+async fn tokens_with_an_unusable_expiry_are_revoked_on_exchange_and_refresh() {
+    let server = FakeServer::start(vec![
+        endless_tokens("access-0", "refresh-0"),
+        ok(),
+        ok(),
+        tokens("access-1", "refresh-1", &all_scopes()),
+        endless_tokens("access-2", "refresh-2"),
+        ok(),
+        ok(),
+    ])
+    .await;
+    let login = Login::new(server.endpoints.clone(), CLIENT_ID, PORT);
+    let code = login
+        .code_from(&callback(
+            PORT,
+            &format!("code=c&state={}", state_of(&login)),
+        ))
+        .unwrap();
+    let refused = login.exchange(&client(), code).await.err().unwrap();
+    assert!(
+        matches!(refused, OauthError::MalformedTokenResponse),
+        "{refused:?}"
+    );
+
+    let mut grant = grant_from(&server).await;
+    let refused = grant.refresh(&client()).await.err().unwrap();
+    assert!(
+        matches!(refused, OauthError::MalformedTokenResponse),
+        "{refused:?}"
+    );
+    assert!(grant.expires_within(Duration::ZERO));
+    let again = grant.refresh(&client()).await;
+    assert!(matches!(again, Err(OauthError::Spent)), "{:?}", again.err());
+
+    let revoked: Vec<_> = server
+        .received()
+        .iter()
+        .filter(|received| received.path == "/oauth2/revoke")
+        .map(|received| received.field("token").unwrap().to_owned())
+        .collect();
+    assert_eq!(revoked, ["refresh-0", "access-0", "refresh-2", "access-2"]);
+    assert_eq!(
+        server.received().len(),
+        7,
+        "a spent grant sends no second refresh"
+    );
+}
+
 #[tokio::test]
 async fn a_failed_refresh_leaves_the_grant_unusable() {
     let refusal = serde_json::json!({ "error": "invalid_grant" }).to_string();
