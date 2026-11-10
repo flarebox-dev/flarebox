@@ -371,6 +371,10 @@ dependencies = [
 name = "flarebox-ffi"
 version = "0.0.0"
 dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
  "uniffi",
 ]
 

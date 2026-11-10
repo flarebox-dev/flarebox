@@ -8,11 +8,11 @@ struct FlareboxApp: App {
     @State private var session = SessionModel()
 
     var body: some Scene {
-        MenuBarExtra("Flarebox", systemImage: session.status == .idle ? "arrow.triangle.2.circlepath.circle.fill" : "arrow.triangle.2.circlepath.circle") {
+        MenuBarExtra("Flarebox", systemImage: session.status == .stopped ? "arrow.triangle.2.circlepath.circle" : "arrow.triangle.2.circlepath.circle.fill") {
             Text("Flarebox core \(session.version)")
-            Text(session.status == .idle ? "Up to date" : "Sync is stopped")
+            Text(session.status == .stopped ? "Sync is stopped" : "Sync is running")
             Divider()
-            Button(session.status == .idle ? "Stop Sync" : "Start Sync") {
+            Button(session.status == .stopped ? "Start Sync" : "Stop Sync") {
                 session.toggle()
             }
             Divider()
