@@ -5,7 +5,7 @@
 
 use flarebox_engine::classify::{Class, Trees};
 use flarebox_engine::commit::{Commits, Failure, Halt, Lift, LiftError, MAX_OPS, Reconnect};
-use flarebox_engine::effects::{Effect, Effects, Location};
+use flarebox_engine::effects::{Effect, EffectError, Effects, Location};
 use flarebox_engine::ids::IdGen;
 use flarebox_engine::names::{MAX_NAME_BYTES, nfc, normalize_name};
 use flarebox_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape};
@@ -1475,6 +1475,64 @@ fn a_conflict_copy_downloaded_before_its_result_is_kept_once() {
     assert_eq!(
         (&y.shape, y.identity.ino),
         (&file(ROOT, "f (conflict)", 2), 9)
+    );
+    assert_eq!(trees.local().get("f").unwrap().shape, file(ROOT, "f", 3));
+    assert_eq!(trees.local().iter().count(), 2);
+    trees.settle();
+    assert!(trees.work().is_empty());
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+}
+
+/// As above, but the result arrives while y's download is in flight. The result makes the local
+/// file y, so L holds y before the download is done. L does not take the download's outcome, and
+/// the local file stays y's: it is moved to y's name, and f is downloaded again.
+#[test]
+fn a_conflict_copy_whose_result_arrives_during_its_download_keeps_the_local_file() {
+    let mut trees = trees(&[(
+        "f",
+        Some(file(ROOT, "f", 2)),
+        Some(file(ROOT, "f", 1)),
+        Some(remote(file(ROOT, "f", 1))),
+    )]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    trees.set_remote("f".into(), remote(file(ROOT, "f", 3)));
+    trees.set_remote("y".into(), remote(file(ROOT, "f (conflict)", 2)));
+    trees.settle();
+    let mut effects = Effects::default();
+    let identity = |ino| FileIdentity {
+        dev: 1,
+        ino,
+        birth_ns: Some(0),
+    };
+    let download = effects.plan(&trees, &mut ids, NOW).cloned().unwrap();
+    assert_eq!(download.node, "y");
+    let copy = OpResult {
+        node_id: "y".into(),
+        ..outcome(op_result::Code::ConflictCopy)
+    };
+    acknowledge(&mut commits, &mut trees, vec![copy]);
+    assert_eq!(trees.local().get("y").unwrap().identity.ino, 1);
+    assert!(!download.applies(&trees));
+    assert_eq!(
+        effects.done(&mut trees, &download.effect_id, Some(identity(9))),
+        Err(EffectError::DoesNotApply(download.effect_id.clone()))
+    );
+    effects.failed(&download.effect_id).unwrap();
+    effects.unblock("y");
+    trees.settle();
+    let mut ino = 10;
+    while let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() {
+        effects
+            .done(&mut trees, &record.effect_id, Some(identity(ino)))
+            .unwrap();
+        ino += 1;
+        trees.settle();
+    }
+    let y = trees.local().get("y").unwrap();
+    assert_eq!(
+        (&y.shape, y.identity.ino),
+        (&file(ROOT, "f (conflict)", 2), 1)
     );
     assert_eq!(trees.local().get("f").unwrap().shape, file(ROOT, "f", 3));
     assert_eq!(trees.local().iter().count(), 2);

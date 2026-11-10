@@ -907,7 +907,7 @@ fn refuse_and_finish(scenario: &Scenario, refuse: fn(&mut Trees), cut: Option<Cu
         let pending = disk.next(engine, store).unwrap().expect("an effect");
         let staged = ready(pending.stage(&server)).unwrap();
         batch(&mut running, refuse);
-        assert!(!running.engine.takes(&pending.record), "{context}");
+        assert!(!pending.record.applies(&running.engine.trees), "{context}");
         if apply {
             let (disk, engine, store) =
                 (&mut running.disk, &mut running.engine, &mut running.store);

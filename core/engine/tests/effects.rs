@@ -772,6 +772,34 @@ fn done_takes_only_the_effect_in_flight_and_a_created_entry_needs_its_identity()
     assert_in_sync(&mut trees);
 }
 
+/// GUN-337. A download of `a` is in flight when a scan puts another node at `a`. L does not take
+/// the download's outcome, so `done` refuses it and L keeps one entry named `a`. The effect stays
+/// in flight for the caller to fail.
+#[test]
+fn done_refuses_an_outcome_whose_name_another_node_took() {
+    let (mut trees, _) = space(&[("n", None, Some(file(ROOT, "a", 1)))]);
+    trees.settle();
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    let record = effects.plan(&trees, &mut ids, NOW).cloned().unwrap();
+    assert!(record.applies(&trees));
+    trees.set_local(
+        "u".into(),
+        LocalNode {
+            shape: file(ROOT, "a", 2),
+            identity: identity(7),
+            parked: false,
+        },
+    );
+    assert!(!record.applies(&trees));
+    assert_eq!(
+        effects.done(&mut trees, &record.effect_id, Some(identity(5))),
+        Err(EffectError::DoesNotApply(record.effect_id.clone()))
+    );
+    assert_eq!(effects.in_flight(), Some(&record));
+    assert!(trees.local().get("n").is_none());
+    assert_eq!(trees.check(), Ok(()));
+}
+
 /// One node's draw for one tree: ⊥, or its rank, a parent choice and a name.
 type Draw = Option<(u8, u8, u8)>;
 /// GUN-334. The server trashed `f`, and its removal was in flight when another device's commit

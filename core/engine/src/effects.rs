@@ -107,6 +107,16 @@ impl EffectRecord {
         format!(".flarebox/quarantine/{}", self.effect_id)
     }
 
+    /// Whether L takes the outcome of this effect as L is now, by the checks [`Effects::plan`] makes
+    /// before it plans one. The engine plans an effect for L as it is then, and a later observation
+    /// may have given the effect's name to another node, taken a folder on its way out of L, moved
+    /// such a folder under the node, put an entry into a folder it removes, or put the node it
+    /// creates into L. The planner plans none of these either, so an effect that fails for one of
+    /// them and is unblocked is planned again only once L has changed.
+    pub fn applies(&self, trees: &Trees) -> bool {
+        View::new(trees).applies(self)
+    }
+
     fn parks(&self) -> bool {
         matches!(
             self.effect,
@@ -124,6 +134,8 @@ pub enum EffectError {
     NotInFlight(String),
     /// A created or written entry was reported done without its file identity.
     MissingIdentity,
+    /// L does not take the outcome of the effect in flight ([`EffectRecord::applies`]).
+    DoesNotApply(String),
 }
 
 /// The disk side of a space: the effect in flight, the effects cleared so far, and the effect that
@@ -312,13 +324,19 @@ impl Effects {
     /// flight then stays a remote change and is never taken for the user's. S stays as it is when
     /// L no longer matched S: L then holds a change of the user's, which recovery after a crash
     /// can report as the effect's outcome (a missing file as the removal, the planned bytes as the
-    /// write), and that change stays the user's.
+    /// write), and that change stays the user's. An outcome L does not take
+    /// ([`EffectRecord::applies`]) is refused, and the effect stays in flight.
     pub fn done(
         &mut self,
         trees: &mut Trees,
         effect_id: &str,
         identity: Option<FileIdentity>,
     ) -> Result<(), EffectError> {
+        if (self.in_flight.as_ref())
+            .is_some_and(|record| record.effect_id == effect_id && !record.applies(trees))
+        {
+            return Err(EffectError::DoesNotApply(effect_id.to_owned()));
+        }
         let identity = match self.in_flight.as_ref().map(|record| &record.effect) {
             Some(Effect::CreateDir { .. } | Effect::WriteFile { .. }) => {
                 identity.ok_or(EffectError::MissingIdentity)?
@@ -593,6 +611,35 @@ impl<'a> View<'a> {
         )
     }
 
+    /// Whether L takes `record`'s outcome: a removal once the node holds no entry, a park always,
+    /// a create while L does not hold the node, and anything else while its folder is one
+    /// [`View::step`] could place the node in and no other node holds its exact name. L tells
+    /// names apart exactly, so a name another node holds in another case does not stop it.
+    fn applies(&self, record: &EffectRecord) -> bool {
+        let Some(after) = &record.after else {
+            return self.trees.local_children(&record.node).next().is_none();
+        };
+        if record.parks() {
+            return true;
+        }
+        let creates = matches!(
+            record.effect,
+            Effect::CreateDir { .. } | Effect::WriteFile { replaces: None, .. }
+        );
+        if creates && self.trees.local().get(&record.node).is_some() {
+            return false;
+        }
+        let local = self.trees.local();
+        self.blocked_in(&record.node, &after.parent).is_none()
+            && self.location_in(&after.parent, &after.name).is_some()
+            && !(self.trees.local_holders(&after.parent, &after.name)).any(|other| {
+                *other != record.node
+                    && local
+                        .get(other)
+                        .is_some_and(|node| node.shape.name == after.name)
+            })
+    }
+
     /// Moves a parked node to `target`'s position with its content as L has it.
     fn unpark(&self, id: &str, local: &LocalNode, target: &Shape) -> Step {
         if let Some(blocked) = self.blocked(id, target) {
@@ -638,20 +685,30 @@ impl<'a> View<'a> {
 
     /// Why `id` cannot be put at `remote`'s position in L yet, if it cannot.
     fn blocked(&self, id: &str, remote: &Shape) -> Option<Step> {
-        if remote.parent != self.root() {
-            match self.trees.local().get(&remote.parent) {
-                Some(parent) if parent.shape.kind == Kind::Dir => {}
-                _ => return Some(Step::Blocked(None)),
-            }
-            if self.inside(&remote.parent, id) {
-                let stays = self.held_by_excluded(&remote.parent, id);
-                return Some(Step::Blocked((!stays).then(|| id.to_owned())));
-            }
+        if let Some(step) = self.blocked_in(id, &remote.parent) {
+            return Some(step);
         }
         self.trees
             .local_holders(&remote.parent, &remote.name)
             .find(|other| *other != id)
             .map(|holder| Step::Blocked(Some(holder.clone())))
+    }
+
+    /// Why `id` cannot be put into `parent` in L yet, if it cannot: `parent` is no folder of L,
+    /// or it is `id` or inside it.
+    fn blocked_in(&self, id: &str, parent: &str) -> Option<Step> {
+        if parent == self.root() {
+            return None;
+        }
+        match self.trees.local().get(parent) {
+            Some(node) if node.shape.kind == Kind::Dir => {}
+            _ => return Some(Step::Blocked(None)),
+        }
+        if self.inside(parent, id) {
+            let stays = self.held_by_excluded(parent, id);
+            return Some(Step::Blocked((!stays).then(|| id.to_owned())));
+        }
+        None
     }
 
     /// True when an excluded node is on the way up from `inner` to `id`, which holds it on disk.

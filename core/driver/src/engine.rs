@@ -14,7 +14,7 @@ use std::path::{Component, Path, PathBuf};
 
 use flarebox_engine::classify::Trees;
 use flarebox_engine::commit::Commits;
-use flarebox_engine::effects::{Effect, EffectRecord, Effects, Location};
+use flarebox_engine::effects::Effects;
 use flarebox_engine::ids::IdGen;
 use flarebox_engine::names::name_key;
 use flarebox_engine::tree::{
@@ -519,46 +519,6 @@ impl Engine {
         touched
     }
 
-    /// True when L stays a tree (design §2.2) with the outcome of `record` in it. The engine plans an effect for L as
-    /// it is at that time. A later batch may have given the effect's name to another node, taken a folder above the
-    /// effect's position out of L, moved such a folder under the node, or put an entry into a folder the effect
-    /// removes. `Effects::plan` plans none of these either, so an effect that fails for one of them and is unblocked
-    /// is planned again only once L has changed.
-    pub fn takes(&self, record: &EffectRecord) -> bool {
-        let local = self.trees.local();
-        let Some(after) = &record.after else {
-            return self.trees.local_children(&record.node).next().is_none();
-        };
-        let parks = matches!(
-            record.effect,
-            Effect::Move {
-                to: Location::Parked(_),
-                ..
-            }
-        );
-        if parks {
-            return true;
-        }
-        let mut above = &after.parent;
-        while *above != local.root {
-            match local.get(above) {
-                Some(node) if node.shape.kind == Kind::Dir && *above != record.node => {
-                    if node.parked {
-                        break;
-                    }
-                    above = &node.shape.parent;
-                }
-                _ => return false,
-            }
-        }
-        !(self.trees.local_holders(&after.parent, &after.name)).any(|id| {
-            *id != record.node
-                && local
-                    .get(id)
-                    .is_some_and(|node| node.shape.name == after.name)
-        })
-    }
-
     /// L's view of each of `scopes`, relative paths, for the observer: the kind and identity of the placed node at
     /// the scope and of every placed node under it. The empty path covers all of L, and a path L does not hold gets
     /// no entries. L's content for a file is left out, because it does not prove what the disk holds.
@@ -927,7 +887,7 @@ pub(crate) fn file_id(identity: FileIdentity) -> FileId {
 
 #[cfg(test)]
 mod tests {
-    use flarebox_engine::effects::Base;
+    use flarebox_engine::effects::{Base, Effect, EffectRecord, Location};
     use flarebox_engine::state::EffectsState;
     use flarebox_proto::v1::{NodePurged, NodeStatus, SpaceUpdated};
     use flarebox_store::Store;
@@ -1474,16 +1434,16 @@ mod tests {
         for case in cases() {
             let context = format!("{}, {}", case.kind, case.name);
             assert_eq!(kind(&case.record.effect), case.kind, "{context}");
-            assert_eq!(case.engine.takes(&case.record), case.takes, "{context}");
+            assert_eq!(
+                case.record.applies(&case.engine.trees),
+                case.takes,
+                "{context}"
+            );
             let (mut trees, mut effects) = (case.engine.trees.clone(), case.engine.effects.clone());
             let identity = held(dir(ROOT, ""), 60).identity;
-            (effects.done(&mut trees, &case.record.effect_id, Some(identity))).unwrap();
-            assert_eq!(
-                trees.check().is_ok(),
-                case.takes,
-                "{context}: {:?}",
-                trees.check()
-            );
+            let done = effects.done(&mut trees, &case.record.effect_id, Some(identity));
+            assert_eq!(done.is_ok(), case.takes, "{context}: {done:?}");
+            assert_eq!(trees.check(), Ok(()), "{context}");
             if !case.takes {
                 refused.insert(case.kind);
             }
@@ -1525,7 +1485,7 @@ mod tests {
             };
             let context = format!("{}, {}: {planned:?}", case.kind, case.name);
             assert_ne!(planned.effect, case.record.effect, "{context}");
-            assert!(case.engine.takes(&planned), "{context}");
+            assert!(planned.applies(&case.engine.trees), "{context}");
             parked.push((case.name, kind(&planned.effect)));
         }
         assert_eq!(parked, [("its new folder moved into it", "park")]);

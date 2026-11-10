@@ -446,7 +446,7 @@ impl Disk {
     /// held, applies the effect with a marker holding the record's counter, acknowledges the outcome in one
     /// transaction, and asks the observer to reset the paths the effect acted on to L as acknowledged. A write whose
     /// content could not be fetched only writes the marker and drops its staged file, and fails. So does an effect
-    /// that L no longer takes ([`Engine::takes`]), because a batch changed L after the plan. Nothing else under the
+    /// that L no longer takes ([`EffectRecord::applies`]), because a batch changed L after the plan. Nothing else under the
     /// root is touched for it.
     pub fn apply(
         &mut self,
@@ -475,7 +475,7 @@ impl Disk {
         let mut step = |step| hook(Cut::Step(step));
         let now = SystemTime::now();
         let outcome = match &unfetchable {
-            None if engine.takes(&record) => {
+            None if record.applies(&engine.trees) => {
                 self.space
                     .apply(&marker, &effect, &mut contents, now, &mut step)?
             }
@@ -849,7 +849,7 @@ fn halt(error: io::Error) -> Stall {
 
 /// Records the outcome of the effect in flight in one transaction: done with the identity of the entry it created,
 /// or failed. With `retry`, an interrupted effect is unblocked in the same transaction, so it is planned again. An
-/// outcome that L no longer takes ([`Engine::takes`]) is never written to L, whatever the disk holds. The effect
+/// outcome that L no longer takes ([`EffectRecord::applies`]) is never written to L, whatever the disk holds. The effect
 /// fails and is unblocked, and the planner leaves it out until L changes.
 fn acknowledge(
     record: &EffectRecord,
@@ -865,7 +865,7 @@ fn acknowledge(
     };
     let settled = store.transaction(|tx| -> Result<_, Stop> {
         let settled = match outcome {
-            _ if !engine.takes(record) => {
+            _ if !record.applies(&engine.trees) => {
                 engine.effects.failed(&record.effect_id).map_err(refused)?;
                 engine.effects.unblock(&record.node);
                 Settled::Failed("L changed since it was planned".into())
