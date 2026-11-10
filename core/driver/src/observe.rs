@@ -362,16 +362,15 @@ impl FsObserver {
         }
     }
 
-    /// Reads again the unread files that are due, as many as `reads` has room for, and reports each one that can now be
-    /// read.
+    /// Reads again the unread files that are due, the longest due first and as many as `reads` has room for, and
+    /// reports each one that can now be read.
     fn retry(&mut self, now: Instant, out: &mut Vec<Observed>, reads: &mut Reads) {
-        let due: Vec<PathBuf> = self
-            .unread
-            .iter()
+        let mut due: Vec<(Instant, PathBuf)> = (self.unread.iter())
             .filter(|(_, retry)| retry.due <= now)
-            .map(|(path, _)| path.clone())
+            .map(|(path, retry)| (retry.due, path.clone()))
             .collect();
-        for path in due {
+        due.sort();
+        for (_, path) in due {
             let entry = self.watcher.snapshot().entries.get(&path).copied();
             let Some(entry) = entry.filter(|entry| entry.kind == EntryKind::File) else {
                 self.unread.remove(&path);
@@ -552,7 +551,7 @@ fn read_content(
         return Ok(None);
     }
     let config = ChunkerConfig::V0;
-    let chunks = flarebox_chunk::chunks(&file, config)
+    let chunks = flarebox_chunk::chunks(io::Read::take(&file, entry.size), config)
         .map(|chunk| match stopped() {
             true => Err(io::ErrorKind::Interrupted.into()),
             false => chunk.map(|chunk| chunk.chunk_ref()),
@@ -852,6 +851,41 @@ mod tests {
             "{later:?}"
         );
         assert!(observer.unread.is_empty());
+    }
+
+    #[test]
+    fn the_unread_file_due_longest_is_read_first() {
+        let dir = marked();
+        fs::write(dir.path().join("a.txt"), b"a").unwrap();
+        fs::write(dir.path().join("b.txt"), b"b").unwrap();
+        let mut observer = observer(dir.path());
+        observe_until(&mut observer, |seen| seen.len() >= 2);
+        let now = Instant::now();
+        observer.unread.insert(
+            "a.txt".into(),
+            Retry {
+                failures: 0,
+                due: now,
+            },
+        );
+        observer.unread.insert(
+            "b.txt".into(),
+            Retry {
+                failures: 3,
+                due: now - Duration::from_secs(1),
+            },
+        );
+        let mut reads = Reads {
+            files: READ_FILES - 1,
+            ..Reads::default()
+        };
+        let mut out = Vec::new();
+        observer.retry(now, &mut out, &mut reads);
+        assert!(
+            matches!(out.as_slice(), [Observed::Modified { path, .. }] if path == Path::new("b.txt")),
+            "{out:?}"
+        );
+        assert!(observer.unread.contains_key(Path::new("a.txt")));
     }
 
     #[test]
