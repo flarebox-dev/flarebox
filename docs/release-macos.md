@@ -6,7 +6,7 @@ The [macOS release](../.github/workflows/release-macos.yml) workflow builds the 
 |---|---|
 | A tag like `v0.1.0` on a commit that is on `main` | The app at version 0.1.0, signed and notarized if the signing secrets are set |
 | **Run workflow** (manual) from `main` | The same, at the version you enter, or `MARKETING_VERSION` from `apps/macos/project.yml` when you leave it empty |
-| Pull requests and the merge queue | An unsigned DMG, to check that the build, packaging and verification still work. These runs never see the signing secrets. |
+| Pull requests and the merge queue | An unsigned DMG, to check that the build, packaging and verification still work. The merge queue always builds it; a pull request builds it only when it changes `core/`, `apps/macos/`, `.cargo/`, the Cargo files (including `cli/Cargo.toml`, which Cargo loads as a workspace member), `rust-toolchain.toml` or the workflow. These runs never see the signing secrets. |
 
 ## What a signed run does
 
