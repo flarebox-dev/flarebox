@@ -95,18 +95,25 @@ export function ownerOf(sql: SqlStorage): string | undefined {
 }
 
 /**
- * Redeems a claim code on a deployment without an owner, creating the owner and the device, or the recovery key on a
- * deployment with one, adding the device for the existing owner. A correct code always redeems; a wrong one counts
- * against the client's address, and an address with too many recent wrong codes gets RETRY_LATER for wrong codes.
+ * Redeems a claim code or the recovery key on a deployment without an owner, creating the owner and the device, or
+ * the recovery key on a deployment with one, adding the device for the existing owner. A correct code or key always
+ * redeems; a wrong one counts against the client's address, and an address with too many recent wrong codes gets
+ * RETRY_LATER for wrong codes.
  */
 export function redeemClaim(sql: SqlStorage, attempt: ClaimAttempt): ClaimOutcome {
   const owner = ownerOf(sql);
   if (owner !== attempt.ownerBefore) return { ok: false, code: Error_Code.RETRY_LATER, message: "the deployment changed during the claim; retry" };
   if (owner) return recover(sql, attempt);
 
-  const live = sql.exec("SELECT code_hash FROM claim_codes WHERE expires_at_ms > ?", attempt.nowMs).toArray();
-  if (live.length === 0) return refused("no valid claim code; open /setup to issue one");
-  if (!live.some((row) => sameDigest(row.code_hash as ArrayBuffer, attempt.codeHash))) return wrong(sql, "claim", attempt, "wrong claim code");
+  const key = presentedKey(attempt);
+  if (key) {
+    const spent = spendKey(sql, key, attempt.nowMs);
+    if (spent) return spent;
+  } else {
+    const live = sql.exec("SELECT code_hash FROM claim_codes WHERE expires_at_ms > ?", attempt.nowMs).toArray();
+    if (live.length === 0) return refused("no valid claim code; open /setup to issue one");
+    if (!live.some((row) => sameDigest(row.code_hash as ArrayBuffer, attempt.codeHash))) return wrong(sql, "claim", attempt, "wrong claim code");
+  }
   sql.exec("DELETE FROM claim_codes");
   sql.exec("DELETE FROM claim_failures WHERE scope = 'claim'");
   sql.exec("INSERT INTO users (user_id, name, created_at_ms) VALUES (?, ?, ?)", attempt.userId, attempt.userName || "Owner", attempt.nowMs);
@@ -115,13 +122,26 @@ export function redeemClaim(sql: SqlStorage, attempt: ClaimAttempt): ClaimOutcom
 }
 
 function recover(sql: SqlStorage, attempt: ClaimAttempt): ClaimOutcome {
+  if (!attempt.recoveryKeyHash) return refused("this deployment already has an owner");
+  const key = presentedKey(attempt);
+  if (!key) return wrong(sql, "recovery", attempt, "this deployment already has an owner");
+  const spent = spendKey(sql, key, attempt.nowMs);
+  if (spent) return spent;
+  attempt.storeDevice();
+  return { ok: true };
+}
+
+/** The Worker's recovery key hash, if the attempt presents that key. */
+function presentedKey(attempt: ClaimAttempt): ArrayBuffer | undefined {
   const key = attempt.recoveryKeyHash;
-  if (!key) return refused("this deployment already has an owner");
-  if (!sameDigest(key, attempt.rawHash)) return wrong(sql, "recovery", attempt, "this deployment already has an owner");
+  return key && sameDigest(key, attempt.rawHash) ? key : undefined;
+}
+
+/** Records the key as used, or refuses it if it was used before. */
+function spendKey(sql: SqlStorage, key: ArrayBuffer, nowMs: number): ClaimOutcome | undefined {
   if (sql.exec("SELECT 1 FROM used_recovery_keys WHERE key_hash = ?", key).toArray().length > 0) {
     return refused("this recovery key was already used; set a new one");
   }
-  sql.exec("INSERT INTO used_recovery_keys (key_hash, used_at_ms) VALUES (?, ?)", key, attempt.nowMs);
-  attempt.storeDevice();
-  return { ok: true };
+  sql.exec("INSERT INTO used_recovery_keys (key_hash, used_at_ms) VALUES (?, ?)", key, nowMs);
+  return undefined;
 }
