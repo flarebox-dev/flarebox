@@ -127,30 +127,31 @@ export function versionChunks(sql: SqlStorage, version: VersionRow): ChunkRef[] 
   return out;
 }
 
-export function versionContent(sql: SqlStorage, version: VersionRow, inline: boolean): Content {
+/** Lists the chunks when inline is set and the version has at most INLINE_CHUNKS of them, or always when complete is set. */
+export function versionContent(sql: SqlStorage, version: VersionRow, inline: boolean, complete = false): Content {
   return create(ContentSchema, {
     size: BigInt(version.size),
     mtimeNs: BigInt(version.mtime_ns),
     executable: version.executable === 1,
-    chunks: inline && version.chunk_count <= INLINE_CHUNKS ? versionChunks(sql, version) : [],
+    chunks: inline && (complete || version.chunk_count <= INLINE_CHUNKS) ? versionChunks(sql, version) : [],
     chunkCount: version.chunk_count,
     manifestDigest: new Uint8Array(version.manifest_digest),
     chunker: version.chunker,
   });
 }
 
-export function versionInfo(sql: SqlStorage, version: VersionRow): VersionInfo {
+export function versionInfo(sql: SqlStorage, version: VersionRow, complete = false): VersionInfo {
   return create(VersionInfoSchema, {
     versionId: version.version_id,
     seq: BigInt(version.seq),
-    content: versionContent(sql, version, true),
+    content: versionContent(sql, version, true, complete),
     deviceId: version.device_id,
     userId: version.user_id,
     createdAtMs: BigInt(version.created_at_ms),
   });
 }
 
-export function nodeState(sql: SqlStorage, node: NodeRow): NodeState {
+export function nodeState(sql: SqlStorage, node: NodeRow, complete = false): NodeState {
   const version = node.cur_version_id ? getVersion(sql, node.cur_version_id) : undefined;
   return create(NodeStateSchema, {
     nodeId: node.node_id,
@@ -161,6 +162,6 @@ export function nodeState(sql: SqlStorage, node: NodeRow): NodeState {
     contentRev: BigInt(node.content_rev),
     metaRev: BigInt(node.meta_rev),
     trashGroup: node.trash_group ?? "",
-    current: version ? versionInfo(sql, version) : undefined,
+    current: version ? versionInfo(sql, version, complete) : undefined,
   });
 }

@@ -55,6 +55,7 @@ import { type Identity, verifyAccessToken } from "./auth";
 import { type ChunkObject, sha256, signChunkGrant, verifyChunkGrant } from "./crypto";
 import { fromHex, isUuidV7, toHex, uuidv7 } from "./ids";
 import { type ApplyContext, CallFailure, CommitApplier } from "./space/commit";
+import { descriptorDurable, Exporter, noteCommitted, startExport } from "./space/export";
 import { type Pitr, pitrBackend } from "./space/pitr";
 import { ChunkState, migrate } from "./space/schema";
 import {
@@ -108,6 +109,7 @@ const R2_DELETE_BATCH = 1000;
 const ORPHAN_SWEEP_MS = 7 * DAY_MS;
 /** While a rewind holds the space closed, the alarm runs no work and checks again this much later (RFC 0003 section 4). */
 const CLOSED_RECHECK_MS = 10 * 60_000;
+const EXPORT_RETRY_MS = 60_000;
 
 export type Role = "owner" | "editor" | "viewer";
 
@@ -282,6 +284,9 @@ export class SpaceDO extends DurableObject<Env> {
   private spaceKeyCache: Uint8Array | undefined;
   /** The time source for holds, retention and tickets. Tests replace it to move through days. */
   clock: () => number = () => Date.now();
+  /** Nodes per snapshot page of the R2 export. Tests lower it to write several pages. */
+  snapshotPageNodes = 1000;
+  private exporting: Promise<void> | undefined;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -313,7 +318,15 @@ export class SpaceDO extends DurableObject<Env> {
          VALUES (?, NULL, '', '', 1, 1, 0, '', 0, '')`,
         args.spaceId,
       );
+      startExport(this.sql, 0, this.clock(), false);
     });
+    // RFC 0003 section 7: a space's first history writes its descriptor when the space is created. A failed write is
+    // retried by the alarm.
+    try {
+      await this.runExport();
+    } catch (error) {
+      console.error("space export failed", error);
+    }
     await this.schedule("gc", this.clock() + DAY_MS);
   }
 
@@ -729,7 +742,7 @@ export class SpaceDO extends DurableObject<Env> {
     const nowMs = this.clock();
     const confirmed = await this.confirmUploads(referenced, commit.receipts, nowMs);
 
-    return this.ctx.storage.transactionSync(() => {
+    const done = this.ctx.storage.transactionSync((): { result: CommitResult; record?: CommitRecord; rearm?: boolean } => {
       if (this.revoked(session.deviceId)) fail(Error_Code.UNAUTHENTICATED, "device revoked");
       this.checkOpen();
       const again = this.checkCommitOrder(session.deviceId, commit);
@@ -775,8 +788,10 @@ export class SpaceDO extends DurableObject<Env> {
         commit.commitId,
         toBinary(CommitResultSchema, result),
       );
-      return { result, record };
+      return { result, record, rearm: noteCommitted(this.sql, record) };
     });
+    if (done.rearm) await this.armAlarm();
+    return { result: done.result, record: done.record };
   }
 
   /**
@@ -1019,6 +1034,7 @@ export class SpaceDO extends DurableObject<Env> {
         const seq = BigInt(this.headSeq + 1);
         record = create(CommitRecordSchema, { seq, commitId: uuidv7(nowMs), committedAtMs: BigInt(nowMs), changes });
         this.appendCommit(record, create(CommitResultSchema, { seq, changes }));
+        noteCommitted(this.sql, record);
       }
       return { expiredVersions: expired.length, purgedNodes: changes.length, record };
     });
@@ -1104,12 +1120,11 @@ export class SpaceDO extends DurableObject<Env> {
 
   /**
    * Rewind admission (RFC 0003 section 3, step 1): the current history and head, whether the history's descriptor is
-   * durable, and the bookmark for the restore point. Changes nothing. The R2 metadata export of section 7 is not
-   * implemented yet, so no descriptor is awaited.
+   * durable in R2 (section 7), and the bookmark for the restore point. Changes nothing.
    */
   async rewindInfo(restorePointMs: number): Promise<{ historyId: string; headSeq: number; descriptorDurable: boolean; bookmark: string }> {
     const bookmark = await this.pitr.bookmarkForTime(restorePointMs);
-    return { historyId: String(getMeta(this.sql, "history_id")), headSeq: this.headSeq, descriptorDurable: true, bookmark };
+    return { historyId: String(getMeta(this.sql, "history_id")), headSeq: this.headSeq, descriptorDurable: descriptorDurable(this.sql), bookmark };
   }
 
   /**
@@ -1175,6 +1190,8 @@ export class SpaceDO extends DurableObject<Env> {
       const holdUntil = args.completedAtMs + this.settings().chunk_grace_days * DAY_MS;
       this.sql.exec("UPDATE chunks SET state = ?, hold_until_ms = ? WHERE refcount = 0", ChunkState.PENDING, holdUntil);
       this.sql.exec("DELETE FROM rewind_markers");
+      // Section 7: the new history exports after restore_seq under its own prefix, starting with a full snapshot.
+      startExport(this.sql, completed.restoreSeq, args.completedAtMs, true);
       setMeta(this.sql, "rewind_receipt", JSON.stringify(completed));
       return completed;
     });
@@ -1192,6 +1209,14 @@ export class SpaceDO extends DurableObject<Env> {
       console.error("account rewind check failed", error);
       return true;
     }
+  }
+
+  /** Runs the R2 export now, or joins the run already in progress. */
+  private runExport(): Promise<void> {
+    this.exporting ??= new Exporter(this.ctx.storage, this.env.BUCKET, this.snapshotPageNodes).run(this.clock()).finally(() => {
+      this.exporting = undefined;
+    });
+    return this.exporting;
   }
 
   private async schedule(task: string, dueMs: number): Promise<void> {
@@ -1222,6 +1247,14 @@ export class SpaceDO extends DurableObject<Env> {
           console.error("space gc failed", error);
         }
         this.sql.exec("UPDATE schedule SET due_ms = ? WHERE task = 'gc'", nextMs);
+      }
+      if (task === "export") {
+        try {
+          await this.runExport();
+        } catch (error) {
+          console.error("space export failed", error);
+          this.sql.exec("UPDATE schedule SET due_ms = ? WHERE task = 'export'", nowMs + EXPORT_RETRY_MS);
+        }
       }
       if (task === "tokens") {
         const next = this.closeExpired(nowMs);

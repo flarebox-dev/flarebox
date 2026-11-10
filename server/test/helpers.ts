@@ -3,13 +3,14 @@
 import { create, fromBinary, type MessageInitShape, toBinary } from "@bufbuild/protobuf";
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
+import { vi } from "vitest";
 import { type CommitResult, type Op, OpSchema, UploadReceiptSchema, type UploadReceipt } from "../src/gen/flarebox/v1/commit_pb";
 import { type RpcRequest, RpcRequestSchema, type RpcResponse, RpcResponseSchema } from "../src/gen/flarebox/v1/messages_pb";
 import { type ChunkRef, ChunkRefSchema, type Content, ContentSchema, type NodeState } from "../src/gen/flarebox/v1/model_pb";
 import { ChunkPlan_Action, type Error as RpcError } from "../src/gen/flarebox/v1/rpc_pb";
 import { sha256, signChunkGrant } from "../src/crypto";
 import { toHex, uuidv7 } from "../src/ids";
-import type { Session } from "../src/space-do";
+import type { Session, SpaceDO } from "../src/space-do";
 import { chunkKey, encodeChunkList } from "../src/space/store";
 
 export const ORIGIN = "https://flarebox.test";
@@ -71,6 +72,43 @@ export async function storedObjects(spaceId: string, hash: Uint8Array | string):
 }
 
 type Stub = Awaited<ReturnType<typeof newSpace>>["stub"];
+
+/**
+ * Runs a Space DO's alarm at atMs, which takes the export steps due by then. pageNodes sets the nodes per snapshot
+ * page. When intercept is given, every R2 put of the run goes through it, with the real put as its second argument.
+ */
+export function runSpaceAlarm(
+  stub: Stub,
+  atMs: number,
+  options: { pageNodes?: number; intercept?: (key: string, put: () => Promise<unknown>) => Promise<unknown> } = {},
+): Promise<void> {
+  return runInDurableObject(stub, async (instance: SpaceDO) => {
+    instance.clock = () => atMs;
+    if (options.pageNodes !== undefined) instance.snapshotPageNodes = options.pageNodes;
+    const bucket = (instance as unknown as { env: Env }).env.BUCKET;
+    const put = bucket.put.bind(bucket);
+    const { intercept } = options;
+    const spy = intercept
+      ? vi.spyOn(bucket, "put").mockImplementation(((key: string, ...rest: [never, never]) => intercept(key, () => put(key, ...rest))) as never)
+      : undefined;
+    try {
+      await instance.alarm();
+    } finally {
+      spy?.mockRestore();
+    }
+  });
+}
+
+/** An intercept for runSpaceAlarm that fails the first put whose key matches, after the write landed when landed is set. */
+export function unknownOutcome(match: (key: string) => boolean, landed: boolean) {
+  let failed = false;
+  return async (key: string, put: () => Promise<unknown>) => {
+    if (failed || !match(key)) return put();
+    failed = true;
+    if (landed) await put();
+    throw new Error("the write's outcome is unknown");
+  };
+}
 
 export interface CommitInit {
   baseSeq?: bigint;

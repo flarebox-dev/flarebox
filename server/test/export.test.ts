@@ -1,0 +1,216 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+import { create, fromBinary } from "@bufbuild/protobuf";
+import { runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:workers";
+import { describe, expect, it } from "vitest";
+import { ChunkRefSchema, CommitRecordSchema, ContentSchema } from "../src/gen/flarebox/v1/model_pb";
+import { sha256 } from "../src/crypto";
+import { uuidv7, uuidv7Ms } from "../src/ids";
+import type { SpaceDO } from "../src/space-do";
+import { encodeChunkList } from "../src/space/store";
+import { type Manifest, restoreFromR2, serverState } from "./export-reader";
+import { client, content, newSpace, op, runSpaceAlarm, type TestClient, unknownOutcome } from "./helpers";
+
+const MINUTE = 60_000;
+const DAY = 24 * 60 * MINUTE;
+
+type Space = Awaited<ReturnType<typeof newSpace>>;
+
+/** Moves the Space DO's clock, and the time the device signs its receipts for, to atMs. */
+function setClock(space: Space, device: TestClient, atMs: number) {
+  device.nowMs = atMs;
+  return runInDurableObject(space.stub, (instance: SpaceDO) => {
+    instance.clock = () => atMs;
+  });
+}
+
+async function listKeys(prefix: string): Promise<string[]> {
+  return (await env.BUCKET.list({ prefix })).objects.map((object) => object.key);
+}
+
+async function historyPrefix(space: Space, device: TestClient): Promise<string> {
+  return `spaces/${space.spaceId}/meta/${await device.history()}/`;
+}
+
+async function manifests(prefix: string): Promise<Manifest[]> {
+  const out: Manifest[] = [];
+  for (const key of await listKeys(prefix + "snap/")) if (key.endsWith("/manifest.json")) out.push((await (await env.BUCKET.get(key))!.json()) as Manifest);
+  return out;
+}
+
+/** Restores the space from R2 alone and checks that it matches the Space DO's state. */
+async function expectRestorable(space: Space) {
+  const restored = await restoreFromR2(space.spaceId);
+  const server = await serverState(space.stub);
+  expect(restored.headSeq).toBe(server.headSeq);
+  expect(restored.nodes).toEqual(server.nodes);
+  return restored;
+}
+
+const seqName = (seq: number) => String(seq).padStart(20, "0");
+const segmentKey = (prefix: string, first: number, last: number) => `${prefix}log/${seqName(first)}-${seqName(last)}.fblog`;
+
+describe("R2 metadata export (spec v0 section 11, RFC 0004)", () => {
+  it("writes the descriptor of a space's first history when the space is created", async () => {
+    const space = await newSpace("Photos");
+    const a = await client(space, "Laptop");
+    const prefix = await historyPrefix(space, a);
+    expect(await listKeys(`spaces/${space.spaceId}/meta/`)).toEqual([prefix + "space.json"]);
+    expect(await (await env.BUCKET.get(prefix + "space.json"))!.json()).toEqual({
+      format: "flarebox.space",
+      format_version: 1,
+      space_id: space.spaceId,
+      name: "Photos",
+      created_at: new Date(uuidv7Ms(space.spaceId)).toISOString(),
+      hash_alg: "sha256",
+      chunk_key: "spaces/{space_id}/chunks/{hex2}/{hex}/{incarnation}",
+      chunk_encoding: "raw",
+      history_id: await a.history(),
+      rewind_number: 0,
+    });
+    await expectRestorable(space);
+  });
+
+  it("exports log segments and fuzzy snapshot pages that restore the tree, retained versions and trash", async () => {
+    const space = await newSpace();
+    const { spaceId } = space;
+    const a = await client(space, "Laptop");
+    const prefix = await historyPrefix(space, a);
+    let now = Date.now();
+    await setClock(space, a, now);
+    const [dir, f1, f2, f3] = [uuidv7(), uuidv7(), uuidv7(), uuidv7()];
+    const parts = await Promise.all(["one", "two", "three", "four", "five"].map((text) => content(text + " " + uuidv7())));
+    const [c1, c2, c3, c4, c5] = parts.map((part) => part.content);
+    await a.commit([op.mkdir(dir, spaceId, "docs"), op.create(f1, dir, "a.txt", c1!), op.create(f2, dir, "b.txt", c2!), op.create(f3, spaceId, "c.txt", c3!)], {
+      receipts: await a.upload(c1!, c2!, c3!),
+    });
+    await setClock(space, a, (now += MINUTE));
+    await a.commit([op.update(f1, c4!)], { receipts: await a.upload(c4!) });
+    await a.commit([op.move(f2, spaceId, "b2.txt")]);
+    await a.commit([op.delete(f3)]);
+
+    await runSpaceAlarm(space.stub, now + MINUTE);
+    expect(await listKeys(prefix + "log/")).toEqual([]);
+    await runSpaceAlarm(space.stub, now + 5 * MINUTE);
+    expect(await listKeys(prefix + "log/")).toEqual([segmentKey(prefix, 1, 4)]);
+    expect(await manifests(prefix)).toEqual([]);
+    await expectRestorable(space);
+
+    await setClock(space, a, (now += DAY));
+    const [f4, f5] = [uuidv7(), uuidv7()];
+    await a.commit([op.create(f4, dir, "d.txt", c5!), op.mkdir(f5, spaceId, "e")], { receipts: await a.upload(c5!) });
+    // The alarm pauses while it writes the first page, and a commit lands in between. Each side polls a flag, because a
+    // promise resolved inside the Durable Object would carry its I/O context back into the test.
+    const receipts = await a.upload(c2!);
+    const pause = { reached: false, released: false };
+    const until = async (flag: () => boolean) => {
+      while (!flag()) await new Promise((resolve) => setTimeout(resolve, 5));
+    };
+    const running = runSpaceAlarm(space.stub, now + 5 * MINUTE, {
+      pageNodes: 2,
+      intercept: async (key, put) => {
+        if (key.endsWith("/pages/0.fbsnap")) {
+          pause.reached = true;
+          await until(() => pause.released);
+        }
+        return put();
+      },
+    });
+    await until(() => pause.reached);
+    const during = (await a.commit([op.update(f1, c2!), op.delete(f2), op.restore(f3), op.move(f4, f5, "d.txt"), op.delete(dir)], { receipts, historyId: prefix.split("/")[3] })).seq;
+    pause.released = true;
+    await running;
+    const [manifest] = await manifests(prefix);
+    expect(manifest).toMatchObject({ format: "flarebox.snapshot", format_version: 1, space_id: spaceId, start_seq: 5, end_seq: Number(during) });
+    expect(manifest!.pages.map((page) => page.name)).toEqual(["0.fbsnap", "1.fbsnap", "2.fbsnap", "3.fbsnap"]);
+    expect(manifest!.pages.reduce((sum, page) => sum + page.records, 0)).toBe(7);
+    expect(await listKeys(prefix + "log/")).toEqual([segmentKey(prefix, 1, 4), segmentKey(prefix, 5, 5), segmentKey(prefix, 6, 6)]);
+    const restored = await expectRestorable(space);
+    expect(restored.manifest!.start_seq).toBe(5);
+    expect(restored.nodes.get(f1)!.previous.size).toBe(2);
+    expect(restored.nodes.get(f2)!.trashedAtMs).toBe(BigInt(now + 5 * MINUTE));
+  });
+
+  it("snapshots a version of more than 16,384 chunks at once and keeps its complete chunk list through later records", async () => {
+    const space = await newSpace();
+    const a = await client(space, "Laptop");
+    const prefix = await historyPrefix(space, a);
+    const now = Date.now();
+    await setClock(space, a, now);
+    const piece = new TextEncoder().encode("piece " + uuidv7());
+    const chunk = create(ChunkRefSchema, { hash: await sha256(piece), size: piece.length });
+    const chunks = Array.from({ length: 16_385 }, () => chunk);
+    const big = create(ContentSchema, {
+      size: BigInt(piece.length * chunks.length),
+      chunks,
+      chunkCount: chunks.length,
+      manifestDigest: await sha256(encodeChunkList(chunks)),
+      chunker: "fastcdc2020-1m-4m-16m",
+    });
+    const file = uuidv7();
+    await a.commit([op.create(file, space.spaceId, "big.bin", big)], { receipts: await a.upload(create(ContentSchema, { chunks: [chunk] })) });
+    const logged = await runInDurableObject(space.stub, (_instance, state) =>
+      fromBinary(CommitRecordSchema, new Uint8Array(state.storage.sql.exec("SELECT record FROM commits WHERE seq = 1").one().record as ArrayBuffer)),
+    );
+    const loggedContent = logged.changes[0]!.change.value as { current: { content: { chunks: unknown[]; chunkCount: number } } };
+    expect([loggedContent.current.content.chunks.length, loggedContent.current.content.chunkCount]).toEqual([0, 16_385]);
+
+    await runSpaceAlarm(space.stub, now);
+    expect((await manifests(prefix)).map((manifest) => [manifest.start_seq, manifest.end_seq])).toEqual([[1, 1]]);
+    await a.commit([op.move(file, space.spaceId, "renamed.bin")]);
+    await runSpaceAlarm(space.stub, now + 5 * MINUTE);
+    const restored = await expectRestorable(space);
+    expect(restored.nodes.get(file)!.state.current!.content!.chunks).toHaveLength(16_385);
+  });
+
+  it("keeps the two newest snapshots and deletes older ones, orphan pages included, but never a log segment", async () => {
+    const space = await newSpace();
+    const a = await client(space, "Laptop");
+    const prefix = await historyPrefix(space, a);
+    let now = Date.now();
+    const starts: number[] = [];
+    for (let i = 0; i < 4; i++) {
+      await setClock(space, a, (now += DAY + MINUTE));
+      const { seq } = await a.commit([op.mkdir(uuidv7(), space.spaceId, "day " + i)]);
+      starts.push(Number(seq));
+      await runSpaceAlarm(space.stub, now + 5 * MINUTE);
+      if (i === 0) await env.BUCKET.put(`${prefix}snap/${seqName(starts[0]!)}/pages/7.fbsnap`, "an orphan page");
+    }
+    expect((await manifests(prefix)).map((manifest) => manifest.start_seq)).toEqual(starts.slice(2));
+    expect(await listKeys(`${prefix}snap/${seqName(starts[0]!)}/`)).toEqual([]);
+    expect(await listKeys(`${prefix}snap/${seqName(starts[1]!)}/`)).toEqual([]);
+    expect(await listKeys(prefix + "log/")).toEqual(starts.map((seq) => segmentKey(prefix, seq, seq)));
+    await expectRestorable(space);
+  });
+
+  it("repeats a segment's range, skips a page number and rewrites the same manifest bytes after writes with unknown outcomes", async () => {
+    const space = await newSpace();
+    const a = await client(space, "Laptop");
+    const prefix = await historyPrefix(space, a);
+    let now = Date.now();
+    await setClock(space, a, now);
+    for (let i = 0; i < 3; i++) await a.commit([op.mkdir(uuidv7(), space.spaceId, "folder " + i)]);
+    const isSegment = (key: string) => key.includes("/log/");
+    await runSpaceAlarm(space.stub, (now += 5 * MINUTE), { intercept: unknownOutcome(isSegment, false) });
+    expect(await listKeys(prefix + "log/")).toEqual([]);
+    await a.commit([op.mkdir(uuidv7(), space.spaceId, "after the failure")]);
+    await runSpaceAlarm(space.stub, (now += MINUTE), { intercept: unknownOutcome(isSegment, true) });
+    expect(await listKeys(prefix + "log/")).toEqual([segmentKey(prefix, 1, 3)]);
+    await runSpaceAlarm(space.stub, (now += 5 * MINUTE));
+    expect(await listKeys(prefix + "log/")).toEqual([segmentKey(prefix, 1, 3), segmentKey(prefix, 4, 4)]);
+
+    now += DAY;
+    await runSpaceAlarm(space.stub, now, { pageNodes: 2, intercept: unknownOutcome((key) => key.endsWith("/pages/1.fbsnap"), true) });
+    const snap = `${prefix}snap/${seqName(4)}/`;
+    expect(await listKeys(snap)).toEqual([snap + "pages/0.fbsnap", snap + "pages/1.fbsnap"]);
+    await runSpaceAlarm(space.stub, (now += 2 * MINUTE), { pageNodes: 2, intercept: unknownOutcome((key) => key.endsWith("/manifest.json"), true) });
+    const lostManifest = await (await env.BUCKET.get(snap + "manifest.json"))!.text();
+    await runSpaceAlarm(space.stub, (now += 2 * MINUTE), { pageNodes: 2 });
+    expect(await (await env.BUCKET.get(snap + "manifest.json"))!.text()).toBe(lostManifest);
+    const [manifest] = await manifests(prefix);
+    expect(manifest!.pages.map((page) => page.name)).toEqual(["0.fbsnap", "2.fbsnap", "3.fbsnap"]);
+    expect(await listKeys(snap + "pages/")).toContain(snap + "pages/1.fbsnap");
+    await expectRestorable(space);
+  });
+});

@@ -29,7 +29,8 @@ import { toHex, uuidv7 } from "../src/ids";
 import { Close, CONNECT_HEADER, type SpaceDO } from "../src/space-do";
 import { ChunkState } from "../src/space/schema";
 import { chunkKey } from "../src/space/store";
-import { content, op, TestClient, targetIncarnation } from "./helpers";
+import { restoreFromR2, serverState } from "./export-reader";
+import { content, op, runSpaceAlarm, TestClient, targetIncarnation, unknownOutcome } from "./helpers";
 import { simulatedPitr } from "./pitr";
 
 simulatedPitr.install();
@@ -254,6 +255,7 @@ describe("space rewind (RFC 0003)", () => {
     await setAccountClock(createdAtMs + 10 * MINUTE);
     const inside = await rewind(token, spaceId, { restorePointMs: createdAtMs + 5 * MINUTE, expectedHistoryId: result.historyId });
     expect([inside.status, inside.error?.code]).toEqual([400, Error_Code.INVALID_ARGUMENT]);
+    await runSpaceAlarm(space(spaceId), createdAtMs + 10 * MINUTE);
     const second = await rewind(token, spaceId, { restorePointMs: p2, expectedHistoryId: result.historyId });
     expect(second.status).toBe(200);
     expect(second.message).toMatchObject({ restoreSeq: 2n, previousHistoryId: result.historyId, previousHeadSeq: 3n });
@@ -505,6 +507,62 @@ describe("space rewind (RFC 0003)", () => {
     const done = await rewind(token, spaceId, { restorePointMs: point, expectedHistoryId: history, rewindId });
     expect(done.status).toBe(200);
     expect(done.message).toMatchObject({ restoreSeq: 0n, previousHeadSeq: 1n });
+  });
+
+  it("exports the new history under its own prefix from restore_seq, and refuses a further rewind until its descriptor is durable", async () => {
+    const { spaceId, createdAtMs, creds, device } = await newSpace();
+    const token = creds.access!.token;
+    const a = device();
+    await createFile(a, spaceId, "kept.txt", "kept");
+    const p1 = createdAtMs + MINUTE;
+    await snapshot(spaceId, p1);
+    await a.commit([op.mkdir(uuidv7(), spaceId, "dropped")]);
+    const previous = await a.history();
+    await runSpaceAlarm(space(spaceId), Date.now() + 5 * MINUTE);
+    const files = async (prefix: string) => (await env.BUCKET.list({ prefix })).objects.map((object) => [object.key, object.etag]);
+    const oldPrefix = `spaces/${spaceId}/meta/${previous}/`;
+    const oldFiles = await files(oldPrefix);
+    expect(oldFiles.map(([key]) => key)).toEqual([`${oldPrefix}log/${"1".padStart(20, "0")}-${"2".padStart(20, "0")}.fblog`, `${oldPrefix}space.json`]);
+
+    const completedAtMs = createdAtMs + 5 * MINUTE;
+    await setAccountClock(completedAtMs);
+    const first = await rewind(token, spaceId, { restorePointMs: p1, expectedHistoryId: previous });
+    expect(first.status).toBe(200);
+    const { historyId, restoreSeq } = first.message!;
+    const prefix = `spaces/${spaceId}/meta/${historyId}/`;
+    expect(await files(prefix)).toEqual([]);
+
+    const p2 = completedAtMs + MINUTE;
+    await snapshot(spaceId, p2);
+    await setAccountClock(completedAtMs + 5 * MINUTE);
+    const refuse = async () => {
+      const early = await rewind(token, spaceId, { restorePointMs: p2, expectedHistoryId: historyId });
+      expect([early.status, early.error?.code, early.error?.message]).toEqual([503, Error_Code.RETRY_LATER, "the space's current history is not exported to R2 yet"]);
+    };
+    await refuse();
+    await runSpaceAlarm(space(spaceId), completedAtMs, { intercept: unknownOutcome((key) => key.endsWith("/space.json"), true) });
+    expect((await files(prefix)).map(([key]) => key)).toContain(prefix + "space.json");
+    await refuse();
+    expect(await runInDurableObject(account(), (_instance, state) => state.storage.sql.exec("SELECT * FROM rewinds WHERE space_id = ?", spaceId).toArray())).toHaveLength(1);
+
+    await runSpaceAlarm(space(spaceId), completedAtMs + 2 * MINUTE);
+    const snap = `${prefix}snap/${String(restoreSeq).padStart(20, "0")}/`;
+    expect((await files(prefix)).map(([key]) => key)).toEqual([snap + "manifest.json", snap + "pages/0.fbsnap", prefix + "space.json"]);
+    expect(await (await env.BUCKET.get(prefix + "space.json"))!.json()).toMatchObject({ history_id: historyId, rewind_number: 1 });
+    expect(await (await env.BUCKET.get(snap + "manifest.json"))!.json()).toMatchObject({ history_id: historyId, start_seq: 1, end_seq: 1 });
+
+    const b = device();
+    b.acceptedSeq = 1n;
+    await b.commit([op.mkdir(uuidv7(), spaceId, "after the rewind")], { baseSeq: 1n });
+    await runSpaceAlarm(space(spaceId), completedAtMs + 10 * MINUTE);
+    expect((await files(prefix + "log/")).map(([key]) => key)).toEqual([`${prefix}log/${"2".padStart(20, "0")}-${"2".padStart(20, "0")}.fblog`]);
+    expect(await files(oldPrefix)).toEqual(oldFiles);
+    const restored = await restoreFromR2(spaceId);
+    const server = await serverState(space(spaceId));
+    expect([restored.descriptor.history_id, restored.headSeq]).toEqual([historyId, server.headSeq]);
+    expect(restored.nodes).toEqual(server.nodes);
+
+    expect((await rewind(token, spaceId, { restorePointMs: p2, expectedHistoryId: historyId })).status).toBe(200);
   });
 
   it("writes one marker per attempt however often preparing repeats, and removes them when the rewind fails", async () => {
