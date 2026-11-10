@@ -2,7 +2,7 @@
 
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { DurableObject } from "cloudflare:workers";
-import { type ClaimAttempt, MIN_RECOVERY_KEY_LENGTH, redeemClaim, storeClaimCode } from "./account/claim";
+import { type ClaimAttempt, MIN_RECOVERY_KEY_LENGTH, ownerOf, redeemClaim, storeClaimCode } from "./account/claim";
 import { migrate } from "./account/schema";
 import { ACCESS_TOKEN_MS, type ServerKey, signAccessToken } from "./auth";
 import { base64url, deriveSpaceKey, sha256 } from "./crypto";
@@ -195,6 +195,7 @@ export class AccountDO extends DurableObject<Env> {
   /**
    * Redeems a claim code, which makes the first caller the owner, or on a claimed deployment the recovery key the
    * Worker is configured with, which adds a device for the owner. client is the caller's address, for failure counts.
+   * Everything that can fail is prepared first, so the transaction stores the owner, the key's use and the device together.
    */
   async claim(
     args: { code: string; userName: string; deviceName: string; platform: string },
@@ -202,6 +203,9 @@ export class AccountDO extends DurableObject<Env> {
     recoveryKey?: string,
   ): Promise<Outcome<DeviceCredentials>> {
     const nowMs = Date.now();
+    const ownerBefore = ownerOf(this.sql);
+    const userId = ownerBefore ?? uuidv7(nowMs);
+    const device = await this.prepareDevice(userId, args.deviceName, args.platform, nowMs);
     const attempt: ClaimAttempt = {
       codeHash: await codeHash(args.code),
       rawHash: (await sha256(encoder.encode(args.code))).slice().buffer,
@@ -209,32 +213,46 @@ export class AccountDO extends DurableObject<Env> {
         recoveryKey && recoveryKey.length >= MIN_RECOVERY_KEY_LENGTH ? (await sha256(encoder.encode(recoveryKey))).slice().buffer : undefined,
       client,
       nowMs,
-      newUserId: uuidv7(nowMs),
+      ownerBefore,
+      userId,
       userName: args.userName,
+      storeDevice: device.store,
     };
     const outcome = this.ctx.storage.transactionSync(() => redeemClaim(this.sql, attempt));
     if (!outcome.ok) return outcome;
-    return ok(await this.addDevice(outcome.userId, args.deviceName, args.platform, nowMs));
+    return ok(device.credentials);
   }
 
   private async addDevice(userId: string, deviceName: string, platform: string, nowMs: number): Promise<DeviceCredentials> {
+    const device = await this.prepareDevice(userId, deviceName, platform, nowMs);
+    device.store();
+    return device.credentials;
+  }
+
+  /** Creates a device's credentials and access token without storing anything; store() inserts the device. */
+  private async prepareDevice(userId: string, deviceName: string, platform: string, nowMs: number) {
     const deviceId = uuidv7(nowMs);
+    const name = deviceName || "Unnamed device";
     const refresh = base64url(crypto.getRandomValues(new Uint8Array(32)));
-    this.sql.exec(
-      "INSERT INTO devices (device_id, user_id, name, platform, created_at_ms, refresh_hash) VALUES (?, ?, ?, ?, ?, ?)",
-      deviceId,
-      userId,
-      deviceName || "Unnamed device",
-      platform,
-      nowMs,
-      (await sha256(encoder.encode(refresh))).slice().buffer,
-    );
-    return create(DeviceCredentialsSchema, {
+    const refreshHash = (await sha256(encoder.encode(refresh))).slice().buffer;
+    const credentials = create(DeviceCredentialsSchema, {
       userId,
       deviceId,
       refreshCredential: refresh,
-      access: await this.accessToken(userId, deviceId, deviceName || "Unnamed device", nowMs),
+      access: await this.accessToken(userId, deviceId, name, nowMs),
     });
+    const store = () => {
+      this.sql.exec(
+        "INSERT INTO devices (device_id, user_id, name, platform, created_at_ms, refresh_hash) VALUES (?, ?, ?, ?, ?, ?)",
+        deviceId,
+        userId,
+        name,
+        platform,
+        nowMs,
+        refreshHash,
+      );
+    };
+    return { credentials, store };
   }
 
   private async accessToken(userId: string, deviceId: string, deviceName: string, nowMs: number) {
