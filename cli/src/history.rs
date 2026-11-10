@@ -610,7 +610,7 @@ fn restores_report(restores: &[RestoreStatus], linked: &FolderStatus) -> String 
         if linked.questions > 0 {
             report.push_str(&format!(
                 "{} for the folder: flarebox questions lists them.\n",
-                crate::count(linked.questions, "question waits")
+                crate::count(linked.questions, "open question")
             ));
         }
     }
@@ -1090,8 +1090,16 @@ mod tests {
                 "A pending restore goes out with a commit of the folder once the earlier changes of its node have synced.\n",
                 "The folder is not syncing: run flarebox daemon.\n",
                 "The folder has a problem: the root is missing\n",
-                "1 question waits for the folder: flarebox questions lists them.\n",
+                "1 open question for the folder: flarebox questions lists them.\n",
             )
+        );
+        let two = FolderStatus {
+            questions: 2,
+            ..linked()
+        };
+        assert!(
+            restores_report(&restores, &two)
+                .ends_with("2 open questions for the folder: flarebox questions lists them.\n")
         );
         assert_eq!(
             restores_report(&restores[..1], &folder),
