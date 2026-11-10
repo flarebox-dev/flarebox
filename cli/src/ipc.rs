@@ -31,6 +31,13 @@ pub enum Request {
         code: String,
         name: String,
     },
+    /// Claims a new server with the one-time code from its log.
+    Claim {
+        server: String,
+        code: String,
+        user_name: String,
+        name: String,
+    },
     /// Stores the credential that `flarebox setup` claimed.
     SaveCredential {
         credential: Credential,
@@ -95,6 +102,15 @@ pub async fn handle(driver: &Driver, request: Request) -> Response {
         }),
         Request::Pair { server, code, name } => driver
             .pair(&server, &code, &name)
+            .await
+            .map(|account| Response::Paired { account }),
+        Request::Claim {
+            server,
+            code,
+            user_name,
+            name,
+        } => driver
+            .claim(&server, &code, &user_name, &name)
             .await
             .map(|account| Response::Paired { account }),
         Request::SaveCredential { credential } => driver

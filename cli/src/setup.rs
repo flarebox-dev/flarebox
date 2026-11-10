@@ -77,6 +77,19 @@ pub enum ServerAction {
         #[command(flatten)]
         login: LoginArgs,
     },
+    /// Claim a server deployed without flarebox setup, with the one-time claim code that its /setup page writes to the
+    /// Worker's log. This device becomes the owner's first device.
+    Claim {
+        /// The server's address, such as https://flarebox.alice.workers.dev.
+        server: String,
+        /// The claim code from the Worker's log.
+        code: String,
+        /// Your name, which the server keeps for its owner.
+        #[arg(long)]
+        user: String,
+        #[command(flatten)]
+        device: DeviceArgs,
+    },
     /// Log in with Cloudflare and upload this CLI's server version.
     Upgrade {
         #[arg(long)]
@@ -162,6 +175,7 @@ pub async fn server(paths: &Paths, action: ServerAction) -> Result<(), String> {
             })
             .await
         }
+        ServerAction::Claim { .. } => unreachable!("main sends a claim to the driver"),
         ServerAction::Upgrade { server, yes, login } => {
             with_session(&login, async |session| {
                 let found = session.pick(server.as_deref()).await?;

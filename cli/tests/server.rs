@@ -16,7 +16,7 @@ use bytes::Bytes;
 use flarebox_chunk::{ChunkerConfig, chunk_hash};
 use flarebox_net::{Api, Auth, Credentials, Event, Session, SessionConfig, Transfer};
 use flarebox_proto::v1::{
-    ChunkRef, ClaimRequest, Commit, Content, CreateDir, CreateFile, CreateSpaceRequest, Delete, Op,
+    ChunkRef, Commit, Content, CreateDir, CreateFile, CreateSpaceRequest, Delete, Op,
     PairCompleteRequest, TokenRequest, UpdateContent, op, op_result,
 };
 use serde_json::Value;
@@ -43,7 +43,7 @@ async fn owner() -> Credentials {
     OWNER.get_or_init(claim).await.clone()
 }
 
-/// Claims the deployment with the code the Worker prints to its log.
+/// Claims the deployment with `flarebox server claim` and the code the Worker prints to its log.
 async fn claim() -> Credentials {
     let log =
         std::env::var("FLAREBOX_TEST_SERVER_LOG").expect("FLAREBOX_TEST_SERVER_LOG is not set");
@@ -64,14 +64,22 @@ async fn claim() -> Credentials {
         assert!(started.elapsed() < WAIT, "no claim code in {log}");
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    let request = ClaimRequest {
-        code,
-        user_name: "Owner".into(),
-        device_name: "owner".into(),
-        platform: "test".into(),
-        setup_attempt: String::new(),
-    };
-    Credentials::from(&api().claim(&request).await.expect("the claim succeeds"))
+    let machine = Machine::new();
+    let claimed = machine.run(&[
+        "server",
+        "claim",
+        server_url().as_str(),
+        &code,
+        "--user",
+        "Owner",
+        "--name",
+        "owner",
+    ]);
+    assert!(claimed.starts_with("Paired as owner"), "{claimed}");
+    flarebox_driver::Credential::load(&machine.path("state/flarebox/credential.json"))
+        .unwrap()
+        .expect("the claim saved a credential")
+        .net()
 }
 
 /// The claim code on a Worker log line that mentions one, such as `ABCD-EFGH-JKLM`.
@@ -1160,4 +1168,58 @@ async fn two_creates_of_one_name_at_once_make_one_space() {
         .space_id;
     let linked = machine.run(&["link", root.to_str().unwrap(), "--space", &name]);
     assert!(linked.contains(space_id.as_str()), "{linked}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Worker; run cli/scripts/integration-test.sh"]
+async fn a_device_shows_a_pairing_code_that_adds_another() {
+    let owner = Arc::new(Auth::new(api(), owner().await));
+    let pairing = owner.api().pair_start(&owner).await.unwrap();
+    let server = server_url().to_string();
+    let first = Machine::new();
+    first.run(&[
+        "join",
+        &pairing.code,
+        "--server",
+        &server,
+        "--name",
+        "first",
+    ]);
+
+    let shown = first.run(&["device", "add"]);
+    let args: Vec<&str> = shown
+        .lines()
+        .find_map(|line| line.strip_prefix("  flarebox join "))
+        .unwrap_or_else(|| panic!("no join command in {shown:?}"))
+        .split_whitespace()
+        .collect();
+    let name = format!("second {}", uuidv7());
+    let mut join = vec!["join"];
+    join.extend(&args);
+    join.extend(["--name", name.as_str()]);
+    let paired = Machine::new().run(&join);
+    assert!(paired.starts_with(&format!("Paired as {name}")), "{paired}");
+    let devices: Value = serde_json::from_str(&first.run(&["device", "list", "--json"])).unwrap();
+    assert!(
+        devices
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|device| device["name"] == name.as_str()),
+        "{devices:#}"
+    );
+    let again = Machine::new().fails(&join);
+    assert!(again.contains("invalid or expired pairing code"), "{again}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Worker; run cli/scripts/integration-test.sh"]
+async fn a_claim_of_a_claimed_server_is_refused_and_sets_nothing_up() {
+    owner().await;
+    let server = server_url().to_string();
+    let machine = Machine::new();
+    let refused = machine.fails(&["server", "claim", &server, "ABCD-EFGH", "--user", "Mallory"]);
+    assert!(refused.contains("already has an owner"), "{refused}");
+    let status = machine.run(&["status"]);
+    assert!(status.starts_with("Device: not set up"), "{status}");
 }
