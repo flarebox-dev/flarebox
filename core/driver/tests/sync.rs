@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use flarebox_chunk::ChunkerConfig;
 use flarebox_driver::{Driver, FolderState, FolderStatus, Paths};
-use flarebox_net::{Api, Auth, Credentials};
+use flarebox_net::{Api, Auth, Credentials, Event, Session, SessionConfig};
 use flarebox_proto::v1::{ClaimRequest, CreateSpaceRequest, SpaceInfo};
 use tokio::sync::OnceCell;
 use url::Url;
@@ -401,6 +401,60 @@ async fn a_rename_moves_the_file_on_the_other_device() {
             ("papers/plan.txt".into(), file(b"plan\n")),
         ])
     );
+    a.stop().await;
+    b.stop().await;
+}
+
+/// The names of the nodes in the trash of `space`, read through a session of the owner.
+async fn trashed(owner: &Arc<Auth>, space: &SpaceInfo) -> Vec<String> {
+    let config = SessionConfig::new(&space.space_id, "driver sync test", "0", 1);
+    let (session, mut events) = Session::start(owner.clone(), config).unwrap();
+    loop {
+        match tokio::time::timeout(WAIT, events.next())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Event::Connected(_) => break,
+            Event::Stopped(reason) => panic!("the owner's session stopped: {reason}"),
+            _ => {}
+        }
+    }
+    let page = session.list_trash("", 1000).await.unwrap();
+    session.close().await;
+    page.nodes.into_iter().map(|node| node.name).collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a local Worker; run core/driver/scripts/integration-test.sh"]
+async fn a_folder_moved_over_an_empty_folder_keeps_its_files() {
+    log();
+    let owner = owner().await;
+    let space = new_space(&owner, "move over an empty folder").await;
+    let mut a = Device::linked(&owner, &space, "a").await;
+    let mut b = Device::linked(&owner, &space, "b").await;
+    converged(&a, &b).await;
+    fs::create_dir_all(a.folder().join("drafts/inner")).unwrap();
+    fs::write(a.folder().join("drafts/.fbignore"), b"*.tmp\n").unwrap();
+    fs::write(a.folder().join("drafts/one.txt"), b"one\n").unwrap();
+    fs::write(a.folder().join("drafts/inner/two.txt"), b"two\n").unwrap();
+    fs::create_dir(a.folder().join("final")).unwrap();
+    let (synced, _) = converged(&a, &b).await;
+    assert_eq!(synced.len(), 6, "{synced:#?}");
+
+    fs::rename(a.folder().join("drafts"), a.folder().join("final")).unwrap();
+    let (synced, _) = converged(&a, &b).await;
+    assert_eq!(
+        synced,
+        Tree::from([
+            ("final".into(), Entry::Folder),
+            ("final/.fbignore".into(), file(b"*.tmp\n")),
+            ("final/inner".into(), Entry::Folder),
+            ("final/inner/two.txt".into(), file(b"two\n")),
+            ("final/one.txt".into(), file(b"one\n")),
+        ])
+    );
+    assert_eq!(trashed(&owner, &space).await, ["final"]);
     a.stop().await;
     b.stop().await;
 }

@@ -1153,12 +1153,18 @@ fn outermost(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
 }
 
 fn diff(old: &BTreeMap<PathBuf, Entry>, new: &BTreeMap<PathBuf, Entry>) -> Vec<Change> {
+    let same = |before: &Entry, after: &Entry| {
+        after.kind == before.kind
+            && !(after.kind == EntryKind::Dir
+                && after.id.dev == before.id.dev
+                && after.id.ino != before.id.ino)
+    };
     let mut removed: BTreeMap<&Path, &Entry> = BTreeMap::new();
     let mut created: Vec<(&Path, &Entry)> = Vec::new();
     let mut modified: Vec<&Path> = Vec::new();
     for (path, before) in old {
         match new.get(path) {
-            Some(after) if after.kind == before.kind => {
+            Some(after) if same(before, after) => {
                 if after.kind == EntryKind::File && after != before {
                     modified.push(path);
                 }
@@ -1169,10 +1175,7 @@ fn diff(old: &BTreeMap<PathBuf, Entry>, new: &BTreeMap<PathBuf, Entry>) -> Vec<C
         }
     }
     for (path, after) in new {
-        if !old
-            .get(path)
-            .is_some_and(|before| before.kind == after.kind)
-        {
+        if !old.get(path).is_some_and(|before| same(before, after)) {
             created.push((path, after));
         }
     }
