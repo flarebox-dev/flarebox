@@ -141,7 +141,9 @@ Two routes, both authenticated with an access token like the other endpoints of 
 
 ## 8. Stored results belong to their principal and their request (spec v0 §8 step 4, RFC 0002 §3)
 
-The Space DO stores a digest of each commit request beside its result, in `commits` and in `device_commits`. The digest is the SHA-256 of the binary encoding of a `Commit` that holds only the request's `base_seq`, `ops`, `device_seq` and `require_head`. The encoding writes fields in field-number order. The digest is internal to the server and never sent.
+The Space DO stores a digest of each commit request beside its result, in `commits` and in `device_commits`. The digest is the SHA-256 of the binary encoding of a `Commit` that holds only the request's `base_seq`, `ops`, `device_seq` and `require_head`. The encoding writes the fields the server's schema knows, at every level of nesting, in field-number order, and leaves out unknown fields. The digest is internal to the server and never sent.
+
+Protobuf encoding is not canonical across schema versions: a field that one server release drops as unknown, the next release knows and encodes. The server therefore stores a digest version with each digest, starting at 1. A server release that changes what the digest covers, or how it is encoded, including a schema change to any message inside `ops`, raises the version. A stored digest of another version is treated as a missing digest (step 3 below), so an unchanged retry is never refused because the server was upgraded in between.
 
 What the digest covers:
 
@@ -152,10 +154,10 @@ What the digest covers:
 RFC 0002 §3 step 2 becomes: if a result is stored for the `commit_id`, in `commits` or in `device_commits`:
 
 1. If the row's `device_id` is not the caller's principal, refuse with `INVALID_ARGUMENT`. A stored result is returned only to the principal that made the commit. Every row has a `device_id`, rows stored before this RFC included, so this check needs no digest. A commit the server made itself, such as a trash purge, has an empty `device_id` and is never returned.
-2. If the row has a digest and it differs from this request's digest, refuse with `INVALID_ARGUMENT`.
-3. Otherwise return the stored result. A row stored before this RFC has no digest. Its result is returned to its own principal without the body check, because its original body cannot be known.
+2. If the row has a digest of the current version and it differs from this request's digest, refuse with `INVALID_ARGUMENT`.
+3. Otherwise return the stored result. A row stored before this RFC has no digest, and a row stored by another server release may have a digest of another version. Its result is returned to its own principal without the body check, because its original body cannot be compared.
 
-Each refusal changes nothing.
+Each refusal changes nothing. A client that follows RFC 0002 §2 never gets either refusal: it resends a commit unchanged and never reuses another principal's `commit_id`. A client that does get one, through a bug or a store copied between principals (section 6), forgets the commit as for any `INVALID_ARGUMENT` (section 1). This cannot apply a change twice or hide one. If the commit was accepted from this principal, it already holds the slot, so the re-planned commit is refused with `STALE_DEVICE_STATE` and the client enters recovery (RFC 0002 §3 step 3 and §6). Recovery compares the store with the server and needs neither the original commit nor a separate code.
 
 ## 9. Log retention and the commit_id window (spec v0 §4.1, §7.3, §12)
 
