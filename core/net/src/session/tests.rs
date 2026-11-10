@@ -371,14 +371,24 @@ async fn a_dropped_commit_is_resent_unchanged_when_welcome_shows_it_was_accepted
         let mut ws = accept(&listener, welcome("h", 1)).await;
         let sent = recv_rpc(&mut ws).await;
         drop(ws);
-        let mut ws = accept(&listener, welcome("h", 2)).await;
-        let resent = recv_rpc(&mut ws).await;
-        assert_eq!(sent, resent, "the same request, req_id included");
+        let ws = accept(&listener, welcome("h", 2)).await;
+        let (mut http, _) = listener.accept().await.unwrap();
+        let (head, body) = read_http(&mut http).await;
+        assert!(
+            head.starts_with("POST /v1/spaces/0190a0b0-0000-7000-8000-000000000001/rpc "),
+            "{head}"
+        );
+        let resent = RpcRequest::decode(&body[..]).unwrap();
+        assert_eq!(sent.call, resent.call, "the same call");
         let result = CommitResult {
             seq: 4,
             ..Default::default()
         };
-        reply(&mut ws, resent.req_id, rpc_response::Result::Commit(result)).await;
+        let response = RpcResponse {
+            req_id: resent.req_id,
+            result: Some(rpc_response::Result::Commit(result)),
+        };
+        write_http(&mut http, 200, response.encode_to_vec()).await;
         ws
     });
     let result = session.commit(commit(2)).await.unwrap();
@@ -872,6 +882,102 @@ async fn a_token_expiry_close_during_a_refresh_reconnects_with_a_new_token() {
     let closed = tokio::time::timeout(Duration::from_millis(500), session.close()).await;
     assert!(closed.is_ok(), "close does not wait for the token request");
     drop(refresh);
+}
+
+/// Reads one HTTP request on an accepted connection: its head and its body.
+async fn read_http(tcp: &mut TcpStream) -> (String, Vec<u8>) {
+    let mut request = Vec::new();
+    let mut chunk = [0; 4096];
+    let end = loop {
+        let n = tcp.read(&mut chunk).await.unwrap();
+        assert!(n > 0, "the client hung up");
+        request.extend_from_slice(&chunk[..n]);
+        if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+            break at + 4;
+        }
+    };
+    let head = String::from_utf8_lossy(&request[..end]).into_owned();
+    let length: usize = (head.lines())
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse().unwrap())
+        })
+        .unwrap_or(0);
+    while request.len() < end + length {
+        let n = tcp.read(&mut chunk).await.unwrap();
+        assert!(n > 0, "the client hung up");
+        request.extend_from_slice(&chunk[..n]);
+    }
+    (head, request[end..end + length].to_vec())
+}
+
+/// Answers an HTTP request whose head and body were read with this status and protobuf body.
+async fn write_http(tcp: &mut TcpStream, status: u16, body: Vec<u8>) {
+    let head = format!(
+        "HTTP/1.1 {status} X\r\ncontent-type: application/x-protobuf\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    tcp.write_all(&[head.as_bytes(), &body].concat())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_dropped_commit_resent_over_http_returns_the_quota_refusal_and_its_wait() {
+    let (listener, auth) = listen().await;
+    let mut config = config();
+    config.retry_later_attempts = 0;
+    let (session, _events) = Session::start(auth, config).unwrap();
+    let server = tokio::spawn(async move {
+        let mut ws = accept(&listener, welcome("h", 1)).await;
+        recv_rpc(&mut ws).await;
+        drop(ws);
+        let ws = accept(&listener, welcome("h", 1)).await;
+        let (mut http, _) = listener.accept().await.unwrap();
+        read_http(&mut http).await;
+        let quota = refusal(Code::QuotaExceeded as i32, 60_000);
+        write_http(&mut http, 429, quota.encode_to_vec()).await;
+        ws
+    });
+    let refused = tokio::time::timeout(Duration::from_secs(5), session.commit(commit(2)))
+        .await
+        .expect("the resent commit is answered");
+    assert!(
+        matches!(&refused, Err(CallError::Server(error))
+            if error.code() == Code::QuotaExceeded && error.retry_after() == Some(Duration::from_secs(60))),
+        "{refused:?}"
+    );
+    drop(server.await.unwrap());
+}
+
+#[tokio::test]
+async fn a_dropped_commit_goes_on_the_socket_when_its_http_resend_gets_no_answer() {
+    let (listener, auth) = listen().await;
+    let (session, _events) = Session::start(auth, config()).unwrap();
+    let server = tokio::spawn(async move {
+        let mut ws = accept(&listener, welcome("h", 1)).await;
+        let sent = recv_rpc(&mut ws).await;
+        drop(ws);
+        let mut ws = accept(&listener, welcome("h", 1)).await;
+        let (mut http, _) = listener.accept().await.unwrap();
+        read_http(&mut http).await;
+        drop(http);
+        let resent = recv_rpc(&mut ws).await;
+        assert_eq!(sent, resent, "the same request, req_id included");
+        let result = CommitResult {
+            seq: 4,
+            ..Default::default()
+        };
+        reply(&mut ws, resent.req_id, rpc_response::Result::Commit(result)).await;
+        ws
+    });
+    let result = tokio::time::timeout(Duration::from_secs(5), session.commit(commit(2)))
+        .await
+        .expect("the resent commit is answered")
+        .unwrap();
+    assert_eq!(result.seq, 4);
+    drop(server.await.unwrap());
 }
 
 /// Answers one HTTP request on an accepted connection with this status and a protobuf `Error`.
