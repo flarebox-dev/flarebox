@@ -39,7 +39,7 @@ use flarebox_proto::v1::{
 use flarebox_store::{Link, Store, Tx};
 use tokio::sync::{Notify, mpsc, watch};
 
-use crate::claim::{self, Flock, Owner};
+use crate::claim::{self, Flock, Identity, Owner};
 use crate::disk::{Batch, Disk, Pending, Sections, Settled, Staged, Stall, Stop, Upload};
 use crate::driver::check_placement;
 use crate::engine::{Applied, Engine, Staging};
@@ -72,6 +72,10 @@ const EFFECT_RETRY: Backoff = Backoff {
 /// Why a folder halts once its path no longer leads to the folder its task locked.
 const REPLACED: &str = "the folder at this path is no longer the folder this task locked (it was moved, replaced or \
                         removed)";
+
+/// Why a folder halts when the folder at its path after a root halt is not the one the task locked before.
+const OTHER_FOLDER: &str = "the folder at this path is not the one this device synced before (it was replaced); run \
+                            flarebox restart to sync the folder that is there now";
 
 /// One linked folder while it syncs.
 pub(crate) struct Folder {
@@ -994,7 +998,7 @@ pub(crate) struct FolderTask {
 #[derive(Debug, thiserror::Error)]
 enum Halt {
     /// The folder at the path is not the one the task locked, or it fails its root check. The task syncs again on
-    /// its own, once the root passes the check.
+    /// its own once the root passes the check, and only when the path leads to the folder it locked before.
     #[error("{0}")]
     Root(String),
     /// Only a person can fix it. The task waits for a restart.
@@ -1028,13 +1032,15 @@ async fn finished<T>(slot: &mut Slot<'_, T>) -> T {
 
 impl FolderTask {
     /// Syncs the folder until `stop` is set. After a [`Halt::Root`] it syncs again, waiting longer after each one up
-    /// to [`ROOT_RECHECK`]; after a [`Halt::Person`] it waits for `stop`.
+    /// to [`ROOT_RECHECK`]; after a [`Halt::Person`] it waits for `stop`. A sync after the first takes only the
+    /// folder the first one locked: another one at the path, even with the space's marker, waits for a restart.
     pub async fn run(self, mut stop: watch::Receiver<bool>) {
         let space_id = self.link.space_id.clone();
         let mut again = ROOT_AGAIN;
+        let mut locked = None;
         loop {
             let halted = tokio::select! {
-                halted = self.sync() => Some(halted),
+                halted = self.sync(&mut locked) => Some(halted),
                 _ = stop.wait_for(|stop| *stop) => None,
             };
             let Some(halted) = halted else {
@@ -1074,13 +1080,14 @@ impl FolderTask {
     /// Syncs the folder until something stops it. In order: the root check, the placement check, the claim, the
     /// store with the engine and the disk, the observer, the session, and then the loop that takes one input at a
     /// time. Dropping this future, which is how the task is stopped, drops every transfer with it. The store
-    /// holds the effect and the commit in flight, so the next start goes on from them.
-    async fn sync(&self) -> Halt {
+    /// holds the effect and the commit in flight, so the next start goes on from them. `locked` is the folder an
+    /// earlier sync of this task locked, which the claim requires and otherwise records.
+    async fn sync(&self, locked: &mut Option<Identity>) -> Halt {
         self.wait_for_root().await;
         if let Err(error) = check_placement(&self.link.root, &self.private_dirs, &self.linked) {
             return Halt::Person(error.to_string());
         }
-        let lock = match self.claim() {
+        let lock = match self.claim(locked) {
             Ok(lock) => Arc::new(lock),
             Err(problem) => return Halt::Person(problem),
         };
@@ -1212,12 +1219,23 @@ impl FolderTask {
     }
 
     /// Takes the folder's lock and checks that this profile's device linked it, recording the device if no record
-    /// is there. Another process that syncs the folder, or a record of another device, halts the folder.
-    fn claim(&self) -> Result<Flock, String> {
+    /// is there. Another process that syncs the folder, or a record of another device, halts the folder. So does a
+    /// folder other than `locked`, the one an earlier sync of this task locked, before anything is recorded in it.
+    /// `locked` is then set to the folder this claim locked.
+    fn claim(&self, locked: &mut Option<Identity>) -> Result<Flock, String> {
         let root = &self.link.root;
         let lock = claim::lock(root)
             .map_err(|error| format!("the folder's lock cannot be taken: {error}"))?
             .ok_or("another Flarebox process is syncing this folder; stop it, or unlink the folder there")?;
+        let found = Identity::of(
+            &lock
+                .metadata()
+                .map_err(|error| format!("the folder cannot be read: {error}"))?,
+        );
+        if locked.is_some_and(|locked| locked != found) {
+            return Err(OTHER_FOLDER.to_owned());
+        }
+        *locked = Some(found);
         match claim::owner(root) {
             Ok(Some(owner)) if owner != self.owner => Err(format!(
                 "the folder is linked by device {} of {}; unlink it there first, or remove its .flarebox/device.json",

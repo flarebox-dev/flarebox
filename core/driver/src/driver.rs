@@ -1654,6 +1654,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn another_folder_with_the_spaces_marker_waits_for_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        let paths = Paths::under(&base.join("profile"));
+        linked(&paths, &root, "d1");
+        let original = fs::metadata(&root).unwrap().ino();
+        let driver = Driver::open(paths).unwrap();
+        driver.start();
+        eventually("the folder is claimed", || {
+            claim::owner(&root).unwrap().is_some()
+        })
+        .await;
+
+        fs::rename(&root, base.join("Moved")).unwrap();
+        fs::create_dir(&root).unwrap();
+        write_marker(
+            &root,
+            &Marker {
+                space_id: SPACE.into(),
+                effects: 0,
+            },
+        )
+        .unwrap();
+        fs::write(root.join("replacement-only.txt"), b"not synced on its own").unwrap();
+        assert_ne!(fs::metadata(&root).unwrap().ino(), original);
+        eventually("the folder waits for a restart", || {
+            driver.status().folders[0]
+                .problem
+                .as_ref()
+                .is_some_and(|problem| problem.contains("flarebox restart"))
+        })
+        .await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let status = driver.status();
+        assert_eq!(status.folders[0].state, FolderState::Halted);
+        assert_eq!(claim::owner(&root).unwrap(), None);
+        assert!(claim::lock(&root).unwrap().is_some());
+
+        driver.restart(&root).await.unwrap();
+        eventually("the restart claims the folder at the path", || {
+            claim::owner(&root).unwrap().is_some()
+        })
+        .await;
+        driver.stop().await;
+    }
+
+    #[tokio::test]
     async fn a_restart_syncs_a_folder_again_once_its_problem_is_fixed() {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
