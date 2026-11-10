@@ -302,9 +302,19 @@ impl Folder {
         Ok(work)
     }
 
-    /// The observer has scanned the folder once.
+    /// The observer has scanned the folder once. Design §2.7 leaves a node the server refused an op for out of
+    /// commits until the next rescan. This scan is that rescan, so the engine may plan every such node again from
+    /// here on. Nothing else clears them.
     pub fn scanned(&mut self) -> Result<Vec<Work>, Stop> {
         self.scanned = true;
+        if !self.engine.commits.problems().is_empty() {
+            self.step(|engine, _| {
+                for node in engine.commits.problems().clone() {
+                    engine.commits.clear_problem(&node);
+                }
+                Ok(())
+            })?;
+        }
         self.publish_remote()?;
         let mut work = Vec::new();
         self.drive(&mut work)?;
