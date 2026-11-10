@@ -753,11 +753,22 @@ impl Snapshot {
         for blocked in &unreadable {
             scan.new
                 .retain(|path, _| path == blocked || !path.starts_with(blocked));
+            let known = scan
+                .new
+                .get(blocked)
+                .and_then(|now| {
+                    old.iter()
+                        .find(|(_, before)| before.kind == EntryKind::Dir && before.id == now.id)
+                })
+                .map_or(blocked, |(path, _)| path);
             scan.new.extend(
-                old.range(blocked.clone()..)
-                    .take_while(|(path, _)| path.starts_with(blocked))
-                    .filter(|(path, _)| *path != blocked)
-                    .map(|(path, entry)| (path.clone(), *entry)),
+                old.range(known.clone()..)
+                    .take_while(|(path, _)| path.starts_with(known))
+                    .filter(|(path, _)| *path != known)
+                    .map(|(path, entry)| {
+                        let below = path.strip_prefix(known).expect("taken below the folder");
+                        (blocked.join(below), *entry)
+                    }),
             );
         }
         let unsettled = keep_unconfirmed(

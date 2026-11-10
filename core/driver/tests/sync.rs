@@ -461,6 +461,57 @@ async fn a_folder_moved_over_an_empty_folder_keeps_its_files() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a local Worker; run core/driver/scripts/integration-test.sh"]
+async fn a_folder_moved_over_an_empty_folder_with_unreadable_rules_keeps_its_files() {
+    log();
+    let owner = owner().await;
+    let space = new_space(&owner, "move with unreadable rules").await;
+    let mut a = Device::linked(&owner, &space, "a").await;
+    let mut b = Device::linked(&owner, &space, "b").await;
+    converged(&a, &b).await;
+    fs::create_dir_all(a.folder().join("drafts/inner")).unwrap();
+    fs::write(a.folder().join("drafts/.fbignore"), b"*.tmp\n").unwrap();
+    fs::write(a.folder().join("drafts/one.txt"), b"one\n").unwrap();
+    fs::write(a.folder().join("drafts/inner/two.txt"), b"two\n").unwrap();
+    fs::create_dir(a.folder().join("final")).unwrap();
+    let (synced, _) = converged(&a, &b).await;
+    assert_eq!(synced.len(), 6, "{synced:#?}");
+    let moved = Tree::from([
+        ("final".into(), Entry::Folder),
+        ("final/.fbignore".into(), file(b"*.tmp\n")),
+        ("final/inner".into(), Entry::Folder),
+        ("final/inner/two.txt".into(), file(b"two\n")),
+        ("final/one.txt".into(), file(b"one\n")),
+    ]);
+
+    let rules = a.folder().join("drafts/.fbignore");
+    fs::set_permissions(&rules, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&rules).is_ok() {
+        eprintln!("skipped: the rules file is still readable, as for root");
+        return;
+    }
+    fs::rename(a.folder().join("drafts"), a.folder().join("final")).unwrap();
+    let started = Instant::now();
+    while tree(&b.folder()).ok().as_ref() != Some(&moved) {
+        assert!(
+            started.elapsed() < WAIT,
+            "the move did not reach the other device within {WAIT:?}\n{:#?}",
+            tree(&b.folder())
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(trashed(&owner, &space).await, ["final"]);
+
+    let rules = a.folder().join("final/.fbignore");
+    fs::set_permissions(&rules, fs::Permissions::from_mode(0o644)).unwrap();
+    let (synced, _) = converged(&a, &b).await;
+    assert_eq!(synced, moved);
+    assert_eq!(trashed(&owner, &space).await, ["final"]);
+    a.stop().await;
+    b.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a local Worker; run core/driver/scripts/integration-test.sh"]
 async fn a_second_hard_link_arrives_as_a_file_of_its_own() {
     log();
     let owner = owner().await;
