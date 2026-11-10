@@ -5560,7 +5560,7 @@
         "big": {
           "chunks": [
             {
-              "counter_le32": 16384
+              "counter_le32": 1024
             }
           ]
         }
@@ -5627,6 +5627,206 @@
                   "name": "f6",
                   "content": "big"
                 }
+              },
+              {
+                "create_file": {
+                  "node": "f7",
+                  "parent": "root",
+                  "name": "f7",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f8",
+                  "parent": "root",
+                  "name": "f8",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f9",
+                  "parent": "root",
+                  "name": "f9",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f10",
+                  "parent": "root",
+                  "name": "f10",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f11",
+                  "parent": "root",
+                  "name": "f11",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f12",
+                  "parent": "root",
+                  "name": "f12",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f13",
+                  "parent": "root",
+                  "name": "f13",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f14",
+                  "parent": "root",
+                  "name": "f14",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f15",
+                  "parent": "root",
+                  "name": "f15",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f16",
+                  "parent": "root",
+                  "name": "f16",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f17",
+                  "parent": "root",
+                  "name": "f17",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f18",
+                  "parent": "root",
+                  "name": "f18",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f19",
+                  "parent": "root",
+                  "name": "f19",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f20",
+                  "parent": "root",
+                  "name": "f20",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f21",
+                  "parent": "root",
+                  "name": "f21",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f22",
+                  "parent": "root",
+                  "name": "f22",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f23",
+                  "parent": "root",
+                  "name": "f23",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f24",
+                  "parent": "root",
+                  "name": "f24",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f25",
+                  "parent": "root",
+                  "name": "f25",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f26",
+                  "parent": "root",
+                  "name": "f26",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f27",
+                  "parent": "root",
+                  "name": "f27",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f28",
+                  "parent": "root",
+                  "name": "f28",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f29",
+                  "parent": "root",
+                  "name": "f29",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f30",
+                  "parent": "root",
+                  "name": "f30",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f31",
+                  "parent": "root",
+                  "name": "f31",
+                  "content": "big"
+                }
               }
             ]
           },
@@ -5695,6 +5895,206 @@
                   "name": "f6",
                   "content": "big"
                 }
+              },
+              {
+                "create_file": {
+                  "node": "f7",
+                  "parent": "root",
+                  "name": "f7",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f8",
+                  "parent": "root",
+                  "name": "f8",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f9",
+                  "parent": "root",
+                  "name": "f9",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f10",
+                  "parent": "root",
+                  "name": "f10",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f11",
+                  "parent": "root",
+                  "name": "f11",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f12",
+                  "parent": "root",
+                  "name": "f12",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f13",
+                  "parent": "root",
+                  "name": "f13",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f14",
+                  "parent": "root",
+                  "name": "f14",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f15",
+                  "parent": "root",
+                  "name": "f15",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f16",
+                  "parent": "root",
+                  "name": "f16",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f17",
+                  "parent": "root",
+                  "name": "f17",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f18",
+                  "parent": "root",
+                  "name": "f18",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f19",
+                  "parent": "root",
+                  "name": "f19",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f20",
+                  "parent": "root",
+                  "name": "f20",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f21",
+                  "parent": "root",
+                  "name": "f21",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f22",
+                  "parent": "root",
+                  "name": "f22",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f23",
+                  "parent": "root",
+                  "name": "f23",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f24",
+                  "parent": "root",
+                  "name": "f24",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f25",
+                  "parent": "root",
+                  "name": "f25",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f26",
+                  "parent": "root",
+                  "name": "f26",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f27",
+                  "parent": "root",
+                  "name": "f27",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f28",
+                  "parent": "root",
+                  "name": "f28",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f29",
+                  "parent": "root",
+                  "name": "f29",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f30",
+                  "parent": "root",
+                  "name": "f30",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f31",
+                  "parent": "root",
+                  "name": "f31",
+                  "content": "big"
+                }
               }
             ]
           },
@@ -5722,6 +6122,206 @@
                   "name": "f1",
                   "content": "big"
                 }
+              },
+              {
+                "create_file": {
+                  "node": "f2",
+                  "parent": "root",
+                  "name": "f2",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f3",
+                  "parent": "root",
+                  "name": "f3",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f4",
+                  "parent": "root",
+                  "name": "f4",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f5",
+                  "parent": "root",
+                  "name": "f5",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f6",
+                  "parent": "root",
+                  "name": "f6",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f7",
+                  "parent": "root",
+                  "name": "f7",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f8",
+                  "parent": "root",
+                  "name": "f8",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f9",
+                  "parent": "root",
+                  "name": "f9",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f10",
+                  "parent": "root",
+                  "name": "f10",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f11",
+                  "parent": "root",
+                  "name": "f11",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f12",
+                  "parent": "root",
+                  "name": "f12",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f13",
+                  "parent": "root",
+                  "name": "f13",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f14",
+                  "parent": "root",
+                  "name": "f14",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f15",
+                  "parent": "root",
+                  "name": "f15",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f16",
+                  "parent": "root",
+                  "name": "f16",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f17",
+                  "parent": "root",
+                  "name": "f17",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f18",
+                  "parent": "root",
+                  "name": "f18",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f19",
+                  "parent": "root",
+                  "name": "f19",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f20",
+                  "parent": "root",
+                  "name": "f20",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f21",
+                  "parent": "root",
+                  "name": "f21",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f22",
+                  "parent": "root",
+                  "name": "f22",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f23",
+                  "parent": "root",
+                  "name": "f23",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f24",
+                  "parent": "root",
+                  "name": "f24",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f25",
+                  "parent": "root",
+                  "name": "f25",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f26",
+                  "parent": "root",
+                  "name": "f26",
+                  "content": "big"
+                }
               }
             ]
           },
@@ -5745,12 +6345,287 @@
                   "name": "f0",
                   "content": "big"
                 }
+              },
+              {
+                "create_file": {
+                  "node": "f1",
+                  "parent": "root",
+                  "name": "f1",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f2",
+                  "parent": "root",
+                  "name": "f2",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f3",
+                  "parent": "root",
+                  "name": "f3",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f4",
+                  "parent": "root",
+                  "name": "f4",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f5",
+                  "parent": "root",
+                  "name": "f5",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f6",
+                  "parent": "root",
+                  "name": "f6",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f7",
+                  "parent": "root",
+                  "name": "f7",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f8",
+                  "parent": "root",
+                  "name": "f8",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f9",
+                  "parent": "root",
+                  "name": "f9",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f10",
+                  "parent": "root",
+                  "name": "f10",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f11",
+                  "parent": "root",
+                  "name": "f11",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f12",
+                  "parent": "root",
+                  "name": "f12",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f13",
+                  "parent": "root",
+                  "name": "f13",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f14",
+                  "parent": "root",
+                  "name": "f14",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f15",
+                  "parent": "root",
+                  "name": "f15",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f16",
+                  "parent": "root",
+                  "name": "f16",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f17",
+                  "parent": "root",
+                  "name": "f17",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f18",
+                  "parent": "root",
+                  "name": "f18",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f19",
+                  "parent": "root",
+                  "name": "f19",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f20",
+                  "parent": "root",
+                  "name": "f20",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f21",
+                  "parent": "root",
+                  "name": "f21",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f22",
+                  "parent": "root",
+                  "name": "f22",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f23",
+                  "parent": "root",
+                  "name": "f23",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f24",
+                  "parent": "root",
+                  "name": "f24",
+                  "content": "big"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f25",
+                  "parent": "root",
+                  "name": "f25",
+                  "content": "big"
+                }
               }
             ]
           },
           "expect": {
             "seq": 1,
             "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
               {
                 "code": "APPLIED"
               }
