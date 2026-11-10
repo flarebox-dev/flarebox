@@ -1,6 +1,6 @@
 # Sync driver and Linux daemon
 
-Status: part 1 of step C (plans/macos-0.1.0.md). The driver links folders, keeps a session with each space and applies the server's log to the store's remote tree, observes the disk, and serves the CLI. It does not run the sync engine yet: nothing is uploaded and nothing is written to a linked folder except its root marker. Part 2 wires the engine once its commit layer (#28) is merged; [What part 2 wires](#what-part-2-wires) lists exactly what that adds.
+Status: step C (plans/macos-0.1.0.md), part 1 and the first step of part 2. The driver links folders, keeps a session with each space, observes the disk, and serves the CLI. Part 2 runs the sync engine in each folder's task. Its first step is in: a new file or folder moves between two devices in both directions, and [The loop](#the-loop) describes how. Edits, renames, deletes and conflicts go through the same loop and are not proved end to end yet. [What part 2 wires](#what-part-2-wires) lists the whole of part 2.
 
 ## Crates and boundaries
 
@@ -12,12 +12,12 @@ flowchart LR
   D --> ST["core/store: one store per space"]
   D --> FS["core/fs: watchers, root check, marker"]
   D --> CH["core/chunk: Content"]
-  D -.-> E["core/engine (part 2)"]
+  D --> E["core/engine"]
 ```
 
 - **`core/driver`** (`flarebox-driver`) is everything a client runs on one device around the engine. It is a library with an async API, so the daemon calls it from its Tokio runtime and the macOS app can call it in-process through `core/ffi`, holding a runtime of its own. It never prints and never exits; it logs through `tracing`.
 - **`cli`** is the `flarebox` command. Each command is a request that runs against a `Driver`: the daemon's, through its socket, when the daemon runs, or one the command opens itself when it does not. `flarebox daemon` opens the driver, starts it, serves the socket, and stops on SIGTERM or SIGINT.
-- The driver depends on `core/net`, `core/store`, `core/fs` and `core/chunk`, and not on `core/engine`. Part 2 adds that dependency.
+- The driver depends on `core/net`, `core/store`, `core/fs`, `core/chunk` and `core/engine`.
 
 ## Profile layout
 
@@ -89,17 +89,31 @@ How `core/ffi`'s `Core` trait maps onto it in step D:
 3. **Observation** runs on a thread of its own (below) and reports how many entries the folder holds. The task waits for the thread to end before it stops, so the folder's lock is free once `stop` returns.
 4. **Session**: `core/net`'s `Session` with one `Auth` built from the credential, which reconnects with backoff on its own. Events are handled in order:
 
-| Event | Part 1 |
+| Event | What the task does |
 |---|---|
-| `Connected(Welcome)` | With no cursor in the store: bootstrap (below), then subscribe from the first page's `head_seq`. With a cursor of the same history: subscribe from `last_seq`, once per session (the session resumes by itself after a reconnect). With a cursor of another history: halt; that is a recovery (§6.4) |
+| `Connected(Welcome)` | With a cursor of another history: halt; that is a recovery (§6.4). Otherwise the engine compares the server's count of this device's commits with the store (§2.8), and a commit that was in flight when the task started is sent again unchanged if the count allows it. A store that never synced (no cursor, no commit in flight and none acknowledged) first takes the server's count, at its first `Welcome` only: the device synced the space with a store that is gone, as after `unlink` and a second `link`, and it continues `device_seq` from the value the server reported (design §6.4, step 2). With no cursor in the store: bootstrap (below). With a cursor: subscribe from `last_seq`, once per session (the session resumes by itself after a reconnect) |
 | `Changes` | Applied to R in one store transaction, in seq order, skipping records the store holds: each `NodeState` is a post-image, `NodePurged` removes the node, `SpaceUpdated` and `MemberUpdated` change nothing yet. A gap resubscribes from the cursor. A change of an unknown kind halts before its record (spec v0 §9.1: fail closed) |
-| `CaughtUp` | State `up_to_date` |
+| `CaughtUp` | The server's head is known. The state is `up_to_date` once R holds that head, the folder was scanned and nothing is left to move |
 | `ResyncRequired` | `LOG_TRUNCATED`: bootstrap again. `HISTORY_CHANGED`, `AHEAD_OF_SERVER` and unknown reasons: halt |
 | `Disconnected` | State `offline` with the reason; the session retries |
 | `Stopped` | Halt with the reason (credentials refused, device revoked, space not found or forbidden, unsupported version) |
-| `Committed` | Logged; part 1 sends no commits |
+| `Committed` | The result of this device's commit, which the commit call also returns. Whichever arrives first is applied to R and kept by the engine, and the other changes nothing |
 
-**Bootstrap** (spec v0 §7.5) pages through `ListTree` 5,000 nodes at a time and replaces R in one transaction, with the cursor at the first page's `head_seq`. Replaying the log from there fixes up nodes that changed between pages.
+**Bootstrap** (spec v0 §7.5, design §4.4) pages through `ListTree` 5,000 nodes at a time into a tree in memory and subscribes from the first page's `head_seq`. The log is replayed onto that tree, where a node state replaces a listed node only when it is newer. The tree replaces R in one transaction once the replay has reached the highest `head_seq` of any page and the head of a `CaughtUp`. Until then the store keeps the R it had, so R is a valid tree at every commit of the store. A folder that was never synced also waits for its first scan, and halts when the folder and the space hold an entry of the same `name_key` directly under their roots, because matching the two (design §2.8 and §6.4) is not built. Two trees that share no such name sync as they are: the space's nodes are downloaded and the folder's entries are committed as new. This rule stands until the engine holds a first link's unmatched entries for the user (GUN-324).
+
+### The loop
+
+`Folder` (in `folder.rs`) is the folder while it syncs. It owns the engine, the store and the disk and is their only writer. Each of its methods takes one input: a session event, an observation batch, or the result of work it asked for. The method changes the engine, ends with `Engine::checkpoint` in the same store transaction, and returns the work to start. No transaction contains an await. The task around it runs one `select!` that hands each input to the folder and runs the returned work as futures: the tree listing, the staging of one effect, the upload of one commit's chunks, the commit call and a wait.
+
+`Engine::checkpoint` settles the trees and writes the L row and the S row of every node that was dirty, the engine state and the ID generator. A store loaded after any step gives the engine the task holds.
+
+After every input the folder decides what runs next, in the order of the engine's reference loop (`core/sim/tests/engine_sync.rs`):
+
+1. Nothing is planned before the first scan, or while R does not follow the log.
+2. An effect comes first, one at a time. Its download is staged outside the store, and `Disk::apply` runs in the step that takes the staged file. A download that fails for now stages the same effect again after a wait.
+3. No effect is planned while a commit is in flight, unless committing has stopped, and no commit is built while an effect is in flight.
+4. A commit is built when no effect is planned and R holds the server's head. Its new content is uploaded from the files L names, then the commit is sent with the upload's receipts. A file that changed during the upload abandons the commit, which the server holds nothing of, and the observer reads the file again.
+5. A refused commit goes to the engine (`Commits::failed`), which says whether the same commit is sent again, its changes are planned again, or committing stops. A refusal that needs recovery halts the folder.
 
 **Refusals (H1).** `policy::after_refusal` decides what follows a refused call, and `ListTree` goes through it today:
 
@@ -122,7 +136,7 @@ How `core/ffi`'s `Core` trait maps onto it in step D:
 - renames across the exclusion boundary (design §5.10), the one exception to the rule below. A rename into an excluded path is reported, without reading the file, so the engine can freeze the node at its synced position instead of seeing it disappear. A rename out of one is followed by the content of the file, or by a `Created` with content for every included entry under the folder, because nothing was observed there while it was excluded;
 - the root check made after the batch's scans, and the folders the scans could not read.
 
-Changes whose path the matcher excludes are dropped. In part 1 the driver starts each observer from an empty snapshot, so its first batch lists the whole folder, and it only counts the entries.
+Changes whose path the matcher excludes are dropped. The observer starts from a snapshot rebuilt from L: every placed node at its path, each file with the size, modification time and executable bit of its content. Files whose content L never received are left out, so the observer reports them again. The first scan therefore reports what changed while nothing observed the folder, removals included, and reads only the files that differ. A file whose identity, size and modification time match L is trusted across a restart. A start that recovers an effect asks the observer to reset that effect's paths to L, so a file placed just before a crash is read once.
 
 ## The daemon
 
@@ -134,7 +148,7 @@ Changes whose path the matcher excludes are dropped. In part 1 the driver starts
 
 ## What part 2 wires
 
-Once #28 is merged, part 2 puts the engine between the inputs and outputs part 1 already produces and consumes, per folder:
+Part 2 puts the engine between the inputs and outputs part 1 already produces and consumes, per folder. Items 1 to 5 are wired as [The loop](#the-loop) describes, and item 8 passes for new files (`core/driver/tests/sync.rs`). Still open in them: recovery (§6.4) in item 2, where the task halts, and the `.fbignore` rules in item 3.
 
 1. **Engine state.** Build the engine from the store (R with the cursor, S, L with identities, the commit in flight, the ID generator, the accepted device counter and the effect counter) and run its `handle(now_ms, input)` loop in the folder task. After each input, write the engine's row changes in one store transaction, then execute its outputs (design §1).
 2. **Server log.** Replace `folder::apply_changes` and `folder::replace_tree` with the engine inputs `Changes`, `TreePage`, `CaughtUp` and `ResyncRequired`, and the engine's `Resume` and `ListTree` outputs. `Connected(Welcome)` goes to the engine, which compares `history_id` and `device_seq` with the store (design §2.8, RFC 0002 §2); the halts on another history, `HISTORY_CHANGED` and `AHEAD_OF_SERVER` become recovery (§6.4).

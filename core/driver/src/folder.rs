@@ -1,22 +1,45 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The task that syncs one linked folder: it checks the root, claims the folder, observes the disk, and keeps the
-//! session with the space, applying the server's log to the remote tree in the store.
+//! The task that syncs one linked folder.
+//!
+//! [`Folder`] is the folder while it syncs. It owns the engine, the store and the disk, and it is their only
+//! writer. Each of its public methods takes one input: a session event, an observation batch, or the result of work
+//! it asked for. A method runs its store transactions with no await and returns the [`Work`] to start. After every
+//! input it decides what runs next, in the order of the engine's reference loop (`core/sim/tests/engine_sync.rs`):
+//! an effect first, then a commit, and never an effect while a commit is in flight.
+//!
+//! [`FolderTask`] is the shell around it. It checks the root, claims the folder, starts the observer's thread and the
+//! session, and then runs one `select!` that hands each input to the folder and runs the returned work as futures.
+//! A future owns what it needs and borrows only the session and the transfer client, so none holds the store or
+//! the engine across an await.
 
 use std::fs::File;
-use std::path::PathBuf;
+use std::future::Future;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use flarebox_engine::commit::{Commits, Failure, Halt as CommitHalt, Reconnect};
+use flarebox_engine::state::CommitsState;
 use flarebox_fs::{Snapshot, check_root};
-use flarebox_net::{Auth, Backoff, Event, Session, SessionConfig};
-use flarebox_proto::v1::{CommitRecord, NodeState, change_record, resync_required::Reason};
-use flarebox_store::{Cursor, Link, Store, Tx};
+use flarebox_net::{
+    Auth, Backoff, CallError, ChunkError, Event, ServerError, Session, SessionConfig, Transfer,
+};
+use flarebox_proto::v1::error::Code;
+use flarebox_proto::v1::resync_required::Reason;
+use flarebox_proto::v1::{
+    ChunkRef, Commit, CommitRecord, CommitResult, TreePage, UploadReceipt, Welcome,
+};
+use flarebox_store::{Link, Store, Tx};
 use tokio::sync::{mpsc, watch};
 
 use crate::claim::{self, Owner};
+use crate::disk::{Batch, Disk, Pending, Sections, Settled, Staged, Stall, Stop, Upload};
 use crate::driver::check_placement;
+use crate::engine::{Applied, Engine, Staging};
 use crate::ignore::Matcher;
 use crate::observe::{FsObserver, Observer};
 use crate::policy::{self, Disposition};
@@ -30,6 +53,809 @@ const TREE_PAGE: u32 = 5_000;
 const ROOT_RECHECK: Duration = Duration::from_secs(30);
 /// How often a running folder checks that its path still names the folder it locked.
 const CLAIM_RECHECK: Duration = Duration::from_secs(2);
+/// The wait before a commit is built again after a file changed while its content was uploaded. The observer
+/// reads the file again meanwhile.
+const BUILD_AGAIN: Duration = Duration::from_secs(1);
+
+/// Why a folder halts once its path no longer leads to the folder its task locked.
+const REPLACED: &str = "the folder at this path is no longer the folder this task locked (it was moved, replaced or \
+                        removed); restart to sync it again";
+
+/// One linked folder while it syncs.
+pub(crate) struct Folder {
+    link: Link,
+    engine: Engine,
+    store: Store,
+    disk: Disk,
+    stream: Stream,
+    flight: Flight,
+    /// The observer has scanned the folder once. Nothing is planned before, because L does not describe the disk
+    /// until then.
+    scanned: bool,
+    offline: bool,
+    /// The history the server reported in its last `Welcome`.
+    history_id: String,
+    head_seq: Option<u64>,
+    local_entries: Option<u64>,
+    remote_nodes: u64,
+    /// Commit sends and uploads that failed in a row, for the backoff.
+    failures: u32,
+    backoff: Backoff,
+    /// What the last transient failure was.
+    note: Option<String>,
+}
+
+/// Where R stands against the session's change stream (design §4.4). It is not stored: the next `Welcome` and the
+/// store's cursor give it again.
+enum Stream {
+    /// No `Welcome` yet.
+    Connecting,
+    /// The tree is being listed for a bootstrap. R is untouched.
+    Listing,
+    /// The listing follows the log until it may replace R.
+    Replaying(Staging),
+    /// R follows the log. `head` is the server's head as of the last `CaughtUp` of this connection.
+    Following { head: Option<u64> },
+}
+
+/// What this process is doing with the commit in flight. The commit itself is the engine's and is in the store.
+enum Flight {
+    /// No commit in flight, or one whose result waits until R has reached it.
+    Idle,
+    /// The store held a commit in flight when the task started. The server may have it, so it is only ever sent
+    /// again unchanged, once a `Welcome` allows that (design §2.8).
+    Unknown,
+    /// The content the commit adds is being uploaded from these files. The server holds nothing of the commit.
+    Uploading(Vec<PathBuf>),
+    /// `Session::commit` is out with this copy of the commit, which carries the upload's receipts. The session
+    /// resends it after a reconnect, so the folder starts no second call.
+    Sending(Commit),
+    /// A [`Work::ResendAfter`] is out.
+    Waiting(Next),
+}
+
+/// What follows a wait.
+enum Next {
+    /// Upload the commit's content again. Only for a commit the server holds nothing of.
+    Upload,
+    /// Send the same commit again.
+    Send(Commit),
+    /// The commit was abandoned. Build the next one.
+    Build,
+}
+
+/// Work a step asks the shell to start. Each owns what it needs.
+pub(crate) enum Work {
+    /// `Session::subscribe`.
+    Subscribe { history_id: String, since_seq: u64 },
+    /// Read every page of the tree. Answered with [`Folder::listed`].
+    List,
+    /// [`Pending::stage`]. Answered with [`Folder::staged`].
+    Stage(Pending),
+    /// The same after a wait.
+    StageAfter(Duration, Pending),
+    /// `Transfer::upload` of the chunks a commit adds. Answered with [`Folder::uploaded`].
+    Upload(Upload),
+    /// `Session::commit`. Answered with [`Folder::sent`].
+    Send(Commit),
+    /// Answered with [`Folder::resend`] after the wait.
+    ResendAfter(Duration),
+}
+
+/// The part of a folder's status the task knows.
+#[derive(Debug, PartialEq)]
+pub(crate) struct View {
+    pub state: FolderState,
+    pub history_id: Option<String>,
+    pub last_seq: Option<u64>,
+    pub head_seq: Option<u64>,
+    pub remote_nodes: u64,
+    pub local_entries: Option<u64>,
+    pub problem: Option<String>,
+}
+
+impl Folder {
+    /// Opens the folder's store, loads the engine and starts the disk through `lock`, the descriptor the task
+    /// locked. [`Disk::start`] recovers an effect that was in flight before anything is observed or planned.
+    pub fn open(link: Link, lock: &File, store: &Path) -> Result<Folder, Stop> {
+        let mut store = Store::open(store)?;
+        let mut engine = store.transaction(|tx| Engine::load(tx, &link.space_id))?;
+        let disk = Disk::start(lock, &link, &mut engine, &mut store)?;
+        let remote_nodes = store.transaction(|tx| {
+            engine.checkpoint(tx)?;
+            tx.remote_node_count()
+        })?;
+        let flight = match engine.commits.in_flight() {
+            Some(flight) if flight.result.is_none() => Flight::Unknown,
+            _ => Flight::Idle,
+        };
+        Ok(Folder {
+            link,
+            engine,
+            store,
+            disk,
+            stream: Stream::Connecting,
+            flight,
+            scanned: false,
+            offline: false,
+            history_id: String::new(),
+            head_seq: None,
+            local_entries: None,
+            remote_nodes,
+            failures: 0,
+            backoff: Backoff::default(),
+            note: None,
+        })
+    }
+
+    /// What the observer's thread shares with the effect sections.
+    pub fn sections(&self) -> Arc<Sections> {
+        self.disk.sections()
+    }
+
+    /// The snapshot the observer starts from: the disk as L describes it.
+    pub fn snapshot(&self) -> Snapshot {
+        self.engine.snapshot()
+    }
+
+    /// One event of the session.
+    pub fn event(&mut self, event: Event) -> Result<Vec<Work>, Stop> {
+        let mut work = Vec::new();
+        match event {
+            Event::Connected(welcome) => self.connected(&welcome, &mut work)?,
+            Event::Changes(records) => self.changes(&records, &mut work)?,
+            Event::Committed(committed) => self.result(&committed.commit_id, committed.result)?,
+            Event::CaughtUp { head_seq } => {
+                self.head_seq = Some(head_seq);
+                match &mut self.stream {
+                    Stream::Replaying(staging) => staging.caught_up(head_seq),
+                    Stream::Following { head } => *head = Some(head_seq),
+                    Stream::Connecting | Stream::Listing => {}
+                }
+                self.publish_remote()?;
+            }
+            Event::ResyncRequired(resync) => match Reason::try_from(resync.reason) {
+                Ok(Reason::LogTruncated) => {
+                    tracing::info!(
+                        space_id = self.link.space_id,
+                        "the server's log no longer reaches the store; reading the tree again"
+                    );
+                    if !matches!(self.stream, Stream::Listing) {
+                        self.stream = Stream::Listing;
+                        work.push(Work::List);
+                    }
+                }
+                Ok(Reason::HistoryChanged) => {
+                    return Err(Stop::Recovery(
+                        "the space was rewound or restored on the server".into(),
+                    ));
+                }
+                Ok(Reason::AheadOfServer) => {
+                    return Err(Stop::Recovery(
+                        "the server is behind what this device already applied".into(),
+                    ));
+                }
+                Ok(Reason::Unspecified) | Err(_) => {
+                    return Err(Stop::Protocol(format!(
+                        "the server asked for a resync for an unknown reason ({})",
+                        resync.reason
+                    )));
+                }
+            },
+            Event::Notice(notice) => {
+                tracing::info!(
+                    space_id = self.link.space_id,
+                    kind = notice.kind,
+                    retry_after_ms = notice.retry_after_ms,
+                    message = notice.message,
+                    "notice from the server"
+                );
+            }
+            Event::Disconnected { reason, retry_in } => {
+                tracing::info!(
+                    space_id = self.link.space_id,
+                    ?reason,
+                    ?retry_in,
+                    "disconnected from the server"
+                );
+                self.offline = true;
+                self.note = Some(format!(
+                    "disconnected ({reason:?}); retrying in {retry_in:?}"
+                ));
+            }
+            Event::Stopped(reason) => return Err(Stop::Session(reason)),
+        }
+        self.drive(&mut work)?;
+        Ok(work)
+    }
+
+    /// The pages of a bootstrap, read in order. The log is replayed onto them from the first page's `head_seq`
+    /// before they replace R.
+    pub fn listed(&mut self, pages: Result<Vec<TreePage>, Stop>) -> Result<Vec<Work>, Stop> {
+        let pages = pages?;
+        if !matches!(self.stream, Stream::Listing) {
+            return Ok(Vec::new());
+        }
+        let staging = Staging::new(self.history_id.clone(), pages);
+        tracing::info!(
+            space_id = self.link.space_id,
+            seq = staging.last_seq(),
+            "read the space's tree"
+        );
+        let work = vec![Work::Subscribe {
+            history_id: self.history_id.clone(),
+            since_seq: staging.last_seq(),
+        }];
+        self.stream = Stream::Replaying(staging);
+        Ok(work)
+    }
+
+    /// One observation batch, with the number of entries the folder holds after it.
+    pub fn observed(&mut self, batch: Batch, entries: u64) -> Result<Vec<Work>, Stop> {
+        self.local_entries = Some(entries);
+        self.disk
+            .observed(batch, &mut self.engine, &mut self.store)?;
+        let mut work = Vec::new();
+        self.drive(&mut work)?;
+        Ok(work)
+    }
+
+    /// The observer has scanned the folder once.
+    pub fn scanned(&mut self) -> Result<Vec<Work>, Stop> {
+        self.scanned = true;
+        self.publish_remote()?;
+        let mut work = Vec::new();
+        self.drive(&mut work)?;
+        Ok(work)
+    }
+
+    /// The staging of `pending` ended. A staged effect is applied here, in the effect section. A transfer that
+    /// failed for now is staged again from the same `pending` after its wait, since nothing else can stage the
+    /// effect in flight.
+    pub fn staged(
+        &mut self,
+        pending: Pending,
+        staged: Result<Staged, Stall>,
+    ) -> Result<Vec<Work>, Stop> {
+        let staged = match staged {
+            Ok(staged) => staged,
+            Err(Stall::Later(wait)) => return Ok(vec![Work::StageAfter(wait, pending)]),
+            Err(Stall::Halt(stop)) => return Err(stop),
+        };
+        let settled = self.disk.apply(staged, &mut self.engine, &mut self.store)?;
+        if let Settled::Failed(why) = settled {
+            tracing::warn!(
+                space_id = self.link.space_id,
+                why,
+                "an effect failed; its node waits until what is planned for it changes"
+            );
+        }
+        let mut work = Vec::new();
+        self.drive(&mut work)?;
+        Ok(work)
+    }
+
+    /// The upload of the content a commit adds ended. With its receipts the commit is sent. A file that changed
+    /// since it was chunked, or that can no longer be read, abandons the commit, which the server holds nothing
+    /// of (design §4.2), and the observer reads the commit's files again.
+    pub fn uploaded(
+        &mut self,
+        receipts: Result<Vec<UploadReceipt>, ChunkError>,
+    ) -> Result<Vec<Work>, Stop> {
+        let mut work = Vec::new();
+        let Flight::Uploading(paths) = std::mem::replace(&mut self.flight, Flight::Idle) else {
+            return Ok(work);
+        };
+        let error = match receipts {
+            Ok(receipts) => {
+                self.failures = 0;
+                if let Some(flight) = self.engine.commits.in_flight() {
+                    let commit = Commit {
+                        receipts,
+                        ..flight.commit.clone()
+                    };
+                    self.flight = Flight::Sending(commit.clone());
+                    work.push(Work::Send(commit));
+                }
+                return Ok(work);
+            }
+            Err(error) => error,
+        };
+        let disposition = match &error {
+            ChunkError::SourceChanged { .. } | ChunkError::Io { .. } => {
+                tracing::info!(
+                    space_id = self.link.space_id,
+                    %error,
+                    "a file changed while it was uploaded; planning its commit again"
+                );
+                self.step(|engine, _| Ok(engine.commits.abandon()))?;
+                self.disk.rescan(&self.engine, paths);
+                self.flight = Flight::Waiting(Next::Build);
+                work.push(Work::ResendAfter(BUILD_AGAIN));
+                return Ok(work);
+            }
+            ChunkError::Call(CallError::Stopped(_)) => {
+                self.flight = Flight::Uploading(paths);
+                return Ok(work);
+            }
+            ChunkError::Call(call) => policy::after_call_error(call),
+            ChunkError::Refused {
+                error: Some(refusal),
+                ..
+            } => policy::after_refusal(refusal),
+            ChunkError::Refused { .. } | ChunkError::Unavailable { .. } => Disposition::Backoff,
+            ChunkError::NoTarget { .. } | ChunkError::Corrupt { .. } => Disposition::Halt,
+        };
+        let wait = match disposition {
+            Disposition::RetryAfter(wait) => wait,
+            Disposition::Backoff => self.backoff.delay(self.failures),
+            Disposition::Halt => {
+                return Err(Stop::Refused(format!(
+                    "uploading a file's content failed: {error}"
+                )));
+            }
+        };
+        tracing::info!(space_id = self.link.space_id, %error, ?wait, "uploading again later");
+        self.note = Some(format!("uploading a file's content failed: {error}"));
+        self.failures += 1;
+        self.flight = Flight::Waiting(Next::Upload);
+        work.push(Work::ResendAfter(wait));
+        Ok(work)
+    }
+
+    /// `Session::commit` returned. A result is acknowledged once R has reached it. A refusal goes to the engine,
+    /// which says whether the same commit is sent again, its changes are planned again, or committing stops.
+    pub fn sent(&mut self, result: Result<CommitResult, CallError>) -> Result<Vec<Work>, Stop> {
+        let mut work = Vec::new();
+        let Flight::Sending(commit) = std::mem::replace(&mut self.flight, Flight::Idle) else {
+            return Ok(work);
+        };
+        match result {
+            Ok(result) => {
+                self.failures = 0;
+                self.note = None;
+                self.result(&commit.commit_id, result)?;
+            }
+            Err(CallError::Server(refusal)) => self.refused(commit, &refusal, &mut work)?,
+            Err(CallError::Stopped(_)) => {
+                self.flight = Flight::Unknown;
+                return Ok(work);
+            }
+            Err(CallError::NotResent(why)) => {
+                return Err(Stop::Recovery(format!(
+                    "a commit was not sent again after reconnecting: {why}"
+                )));
+            }
+            Err(error @ (CallError::TooLarge { .. } | CallError::UnexpectedResult)) => {
+                return Err(Stop::Protocol(format!("sending a commit failed: {error}")));
+            }
+        }
+        self.drive(&mut work)?;
+        Ok(work)
+    }
+
+    /// A wait is over: upload or send the commit again, or build the next one.
+    pub fn resend(&mut self) -> Result<Vec<Work>, Stop> {
+        let mut work = Vec::new();
+        match std::mem::replace(&mut self.flight, Flight::Idle) {
+            Flight::Waiting(Next::Send(commit)) => {
+                self.flight = Flight::Sending(commit.clone());
+                work.push(Work::Send(commit));
+            }
+            Flight::Waiting(Next::Upload) => {
+                if let Some(commit) = self.in_flight() {
+                    self.start(commit, &mut work);
+                }
+            }
+            Flight::Waiting(Next::Build) => {}
+            other => self.flight = other,
+        }
+        self.drive(&mut work)?;
+        Ok(work)
+    }
+
+    /// The folder's status as the task knows it.
+    pub fn view(&self) -> View {
+        let state = match &self.stream {
+            _ if self.offline => FolderState::Offline,
+            Stream::Connecting => FolderState::Connecting,
+            Stream::Listing | Stream::Replaying(_) => FolderState::Bootstrapping,
+            Stream::Following { .. } if self.settled() => FolderState::UpToDate,
+            Stream::Following { .. } => FolderState::CatchingUp,
+        };
+        let stuck = self.engine.effects.blocked().len() + self.engine.commits.problems().len();
+        let problem = match self.engine.commits.halted() {
+            _ if self.note.is_some() => self.note.clone(),
+            Some(CommitHalt::ReadOnly) => {
+                Some("the server takes no changes from this device".into())
+            }
+            Some(CommitHalt::Policy { code }) => Some(format!(
+                "the server refused this device's changes (code {code}); nothing more is sent"
+            )),
+            Some(CommitHalt::Recovery) => {
+                Some("the folder's sync state does not match the server".into())
+            }
+            None if stuck > 0 => Some(format!("{stuck} items could not be synced")),
+            None => None,
+        };
+        let last_seq = self.engine.cursor.as_ref().map(|c| c.last_seq);
+        View {
+            state,
+            history_id: self.engine.cursor.as_ref().map(|c| c.history_id.clone()),
+            last_seq,
+            // The server reports its head only in a `Welcome` and a `CaughtUp`, and R may be past that since.
+            head_seq: self.head_seq.max(last_seq),
+            remote_nodes: self.remote_nodes,
+            local_entries: self.local_entries,
+            problem,
+        }
+    }
+
+    /// True when nothing is left to move: R holds the server's head, the folder was scanned, no effect and no
+    /// commit is in flight, and every node the trees still differ on is one that cannot be synced as it is.
+    fn settled(&self) -> bool {
+        let stuck = |id: &String| {
+            self.engine.effects.blocked().contains_key(id)
+                || self.engine.commits.problems().contains(id)
+        };
+        self.caught_up()
+            && self.scanned
+            && self.engine.effects.in_flight().is_none()
+            && matches!(self.flight, Flight::Idle)
+            && self.engine.commits.in_flight().is_none()
+            && self.engine.trees.dirty().iter().all(stuck)
+    }
+
+    /// True once R holds everything the server had at the last `CaughtUp` of this connection (design §4.4).
+    fn caught_up(&self) -> bool {
+        match (&self.stream, &self.engine.cursor) {
+            (Stream::Following { head: Some(head) }, Some(cursor)) => cursor.last_seq >= *head,
+            _ => false,
+        }
+    }
+
+    fn in_flight(&self) -> Option<Commit> {
+        (self.engine.commits.in_flight()).map(|flight| flight.commit.clone())
+    }
+
+    /// Runs one change of the engine and its checkpoint in one store transaction.
+    fn step<T>(
+        &mut self,
+        change: impl FnOnce(&mut Engine, &Tx<'_>) -> Result<T, Stop>,
+    ) -> Result<T, Stop> {
+        let engine = &mut self.engine;
+        self.store.transaction(|tx| {
+            let out = change(engine, tx)?;
+            engine.checkpoint(tx)?;
+            Ok(out)
+        })
+    }
+
+    /// A `Welcome` (design §4.4 and §2.8). A cursor of another history stops the task before anything is replaced.
+    /// The engine then compares the server's count of this device's commits with the store. A folder that was
+    /// never synced lists the tree, and any other subscribes from its cursor once. After a reconnect the session
+    /// resumes by itself.
+    ///
+    /// A store that never synced (no cursor, no commit in flight and none acknowledged) holds no commit of its own
+    /// to account for. When the server counts commits of this device at such a store's first `Welcome`, the device
+    /// synced the space with a store that is gone, as after an unlink and a second link, and the new store continues
+    /// from the server's count (design §6.4, step 2). RFC 0002 section 2 sends every count but the store's own to
+    /// recovery, and every other store still goes there.
+    fn connected(&mut self, welcome: &Welcome, work: &mut Vec<Work>) -> Result<(), Stop> {
+        self.offline = false;
+        self.note = None;
+        self.head_seq = Some(welcome.head_seq);
+        self.history_id.clone_from(&welcome.history_id);
+        if let Some(cursor) = &self.engine.cursor
+            && cursor.history_id != welcome.history_id
+        {
+            return Err(Stop::Recovery(format!(
+                "the server's history of this space changed from {} to {} (a rewind or a restore)",
+                cursor.history_id, welcome.history_id
+            )));
+        }
+        let commits = &self.engine.commits;
+        let never_synced = self.engine.cursor.is_none()
+            && commits.in_flight().is_none()
+            && commits.accepted() == 0;
+        let adopt =
+            matches!(self.stream, Stream::Connecting) && never_synced && welcome.device_seq != 0;
+        if adopt {
+            tracing::info!(
+                space_id = self.link.space_id,
+                device_seq = welcome.device_seq,
+                "this device synced the space with a store that is gone; continuing from the server's count"
+            );
+        }
+        let reconnect = self.step(|engine, _| {
+            if adopt {
+                let state = CommitsState {
+                    accepted: welcome.device_seq,
+                    ..engine.commits.state()
+                };
+                engine.commits = Commits::from_state(state).expect("no commit is in flight");
+            }
+            Ok(engine.commits.connected(welcome))
+        })?;
+        match reconnect {
+            Reconnect::Recovery => {
+                return Err(Stop::Recovery(
+                    "the server's count of this device's commits does not match the folder's sync state"
+                        .into(),
+                ));
+            }
+            Reconnect::Resend => {
+                if let (Flight::Unknown, Some(commit)) = (&self.flight, self.in_flight()) {
+                    self.flight = Flight::Sending(commit.clone());
+                    work.push(Work::Send(commit));
+                }
+            }
+            Reconnect::Idle => {
+                let waits =
+                    (self.engine.commits.in_flight()).is_some_and(|flight| flight.result.is_none());
+                if matches!(self.flight, Flight::Unknown) && !waits {
+                    self.flight = Flight::Idle;
+                }
+            }
+        }
+        match (&mut self.stream, &self.engine.cursor) {
+            (Stream::Connecting, Some(cursor)) => {
+                work.push(Work::Subscribe {
+                    history_id: cursor.history_id.clone(),
+                    since_seq: cursor.last_seq,
+                });
+                self.stream = Stream::Following { head: None };
+            }
+            (Stream::Connecting, None) => {
+                self.stream = Stream::Listing;
+                work.push(Work::List);
+            }
+            (Stream::Following { head }, _) => *head = None,
+            (Stream::Listing | Stream::Replaying(_), _) => {}
+        }
+        Ok(())
+    }
+
+    /// Commits of the log. A gap subscribes again from the last commit applied.
+    fn changes(&mut self, records: &[CommitRecord], work: &mut Vec<Work>) -> Result<(), Stop> {
+        let (applied, history_id, since_seq) = match &mut self.stream {
+            Stream::Connecting | Stream::Listing => return Ok(()),
+            Stream::Replaying(staging) => (
+                staging.replay(records)?,
+                staging.history_id().to_owned(),
+                staging.last_seq(),
+            ),
+            Stream::Following { .. } => {
+                let (applied, nodes) = self.step(|engine, tx| {
+                    Ok((engine.apply_records(tx, records)?, tx.remote_node_count()?))
+                })?;
+                self.remote_nodes = nodes;
+                let cursor = self.engine.cursor.as_ref().expect("R follows the log");
+                (applied, cursor.history_id.clone(), cursor.last_seq)
+            }
+        };
+        if applied == Applied::Gap {
+            tracing::warn!(
+                space_id = self.link.space_id,
+                "the change stream skipped a seq; resuming"
+            );
+            work.push(Work::Subscribe {
+                history_id,
+                since_seq,
+            });
+        }
+        self.publish_remote()
+    }
+
+    /// The result of this device's commit `commit_id`, from the call or from the change stream, whichever comes
+    /// first (design §2.7 and §4.4). Its records are applied when it is the commit after the cursor, and skipped
+    /// when R already holds it. The engine keeps the result once, and acknowledges it when R has reached its seq.
+    /// The second delivery finds no commit waiting for a result and changes nothing.
+    fn result(&mut self, commit_id: &str, result: CommitResult) -> Result<(), Stop> {
+        let ours = (self.engine.commits.in_flight())
+            .is_some_and(|flight| flight.commit.commit_id == commit_id && flight.result.is_none());
+        let receive = |engine: &mut Engine, result: CommitResult| {
+            (engine.commits.received(result)).map_err(|error| {
+                Stop::Protocol(format!("the result of commit {commit_id}: {error:?}"))
+            })
+        };
+        if let Stream::Replaying(staging) = &mut self.stream {
+            if result.seq == staging.last_seq() + 1 {
+                staging.replay_commit(result.seq, &result.changes)?;
+            }
+            if ours {
+                self.step(|engine, _| receive(engine, result))?;
+            }
+            return self.publish_remote();
+        }
+        self.remote_nodes = self.step(|engine, tx| {
+            let next = (engine.cursor.as_ref()).is_some_and(|c| result.seq == c.last_seq + 1);
+            if next {
+                engine.apply_commit(tx, result.seq, &result.changes)?;
+            }
+            if ours {
+                receive(engine, result)?;
+            }
+            if let Some(cursor) = &engine.cursor {
+                engine
+                    .commits
+                    .acknowledge(&mut engine.trees, cursor.last_seq);
+            }
+            Ok(tx.remote_node_count()?)
+        })?;
+        Ok(())
+    }
+
+    /// Replaces R with the bootstrap's tree once the log has caught it up (design §4.4). A folder that was never
+    /// synced waits for its first scan, and stops when the folder and the space hold an entry of the same name key
+    /// under their roots, because matching the two (design §2.8 and §6.4) is not built: syncing them as they are
+    /// would upload or fork everything both hold. Two trees that share no such name sync as they are.
+    fn publish_remote(&mut self) -> Result<(), Stop> {
+        let Stream::Replaying(staging) = &self.stream else {
+            return Ok(());
+        };
+        if !staging.ready() {
+            return Ok(());
+        }
+        if self.engine.cursor.is_none() {
+            if !self.scanned {
+                return Ok(());
+            }
+            let root = &self.link.space_id;
+            let shared = (self.engine.trees.local().iter())
+                .filter(|(_, node)| node.shape.parent == *root && !node.parked)
+                .find(|(_, node)| staging.holds(root, &node.shape.name));
+            if let Some((_, node)) = shared {
+                return Err(Stop::Unsupported(format!(
+                    "the folder and the space it was linked to both hold {:?}",
+                    node.shape.name
+                )));
+            }
+        }
+        let head = Some(staging.last_seq());
+        let Stream::Replaying(staging) =
+            std::mem::replace(&mut self.stream, Stream::Following { head })
+        else {
+            unreachable!("checked above");
+        };
+        self.remote_nodes = self.step(|engine, tx| {
+            engine.replace_remote(tx, staging)?;
+            Ok(tx.remote_node_count()?)
+        })?;
+        Ok(())
+    }
+
+    /// The server refused `commit`.
+    fn refused(
+        &mut self,
+        commit: Commit,
+        refusal: &ServerError,
+        work: &mut Vec<Work>,
+    ) -> Result<(), Stop> {
+        let failure = self.step(|engine, _| {
+            (engine.commits.failed(&refusal.0))
+                .map_err(|error| Stop::Protocol(format!("a refused commit: {error:?}")))
+        })?;
+        let described = policy::describe(refusal);
+        tracing::info!(
+            space_id = self.link.space_id,
+            refusal = described,
+            ?failure,
+            "a commit was refused"
+        );
+        match failure {
+            Failure::Resend if refusal.code() == Code::MissingChunks => {
+                if let Some(commit) = self.in_flight() {
+                    self.start(commit, work);
+                }
+            }
+            Failure::Resend => {
+                let wait =
+                    (refusal.retry_after()).unwrap_or_else(|| self.backoff.delay(self.failures));
+                self.failures += 1;
+                self.note = Some(format!("the server did not take a commit: {described}"));
+                self.flight = Flight::Waiting(Next::Send(commit));
+                work.push(Work::ResendAfter(wait));
+            }
+            Failure::Abandoned | Failure::Split | Failure::Halted(CommitHalt::ReadOnly) => {}
+            Failure::Resync => {
+                return Err(Stop::Recovery(format!(
+                    "the server is behind what this device already applied ({described})"
+                )));
+            }
+            Failure::Halted(CommitHalt::Recovery) => return Err(Stop::Recovery(described)),
+            Failure::Halted(CommitHalt::Policy { .. }) => {
+                return Err(Stop::Refused(format!(
+                    "the server refused this device's changes: {described}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Starts the upload of what `commit` adds, or its send when it adds no content.
+    fn start(&mut self, commit: Commit, work: &mut Vec<Work>) {
+        let upload = self.disk.upload(&commit, &self.engine);
+        if upload.chunks.is_empty() {
+            self.flight = Flight::Sending(commit.clone());
+            work.push(Work::Send(commit));
+        } else {
+            self.flight = Flight::Uploading(upload.paths());
+            work.push(Work::Upload(upload));
+        }
+    }
+
+    /// Decides what runs next, after every input.
+    ///
+    /// Nothing is planned before the first scan, while R does not follow the log, or while an effect is in flight:
+    /// its staging is out, or waits to be staged again. An effect comes first, and none is planned while a commit is
+    /// in flight unless committing has stopped, because the engine's property test never runs an effect between
+    /// building a commit and acknowledging it. A commit is built only when no effect is planned, R is caught up and
+    /// the session is connected. Building can change the trees without giving a commit, so the effects are planned
+    /// once more after it.
+    fn drive(&mut self, work: &mut Vec<Work>) -> Result<(), Stop> {
+        let staging = self.engine.effects.in_flight().is_some();
+        if !self.scanned || staging || !matches!(self.stream, Stream::Following { .. }) {
+            return Ok(());
+        }
+        let commits = &self.engine.commits;
+        if commits.in_flight().is_some() && commits.halted().is_none() {
+            return Ok(());
+        }
+        if self.plan_effect(work)? {
+            return Ok(());
+        }
+        let trees = &self.engine.trees;
+        let nothing_local = trees.dirty().is_empty() && trees.waiting().is_empty();
+        let may_build = matches!(self.flight, Flight::Idle)
+            && self.engine.commits.in_flight().is_none()
+            && self.caught_up()
+            && !self.offline
+            && !nothing_local;
+        if !may_build {
+            return Ok(());
+        }
+        let now_ms = (SystemTime::now().duration_since(UNIX_EPOCH))
+            .map_or(0, |since| since.as_millis() as u64);
+        let built = self.step(|engine, _| {
+            let cursor = engine.cursor.as_ref().expect("R follows the log");
+            let built = engine.commits.build(
+                &mut engine.trees,
+                &mut engine.ids,
+                now_ms,
+                &cursor.history_id,
+                cursor.last_seq,
+            );
+            Ok(built.cloned())
+        })?;
+        match built {
+            Some(commit) => self.start(commit, work),
+            None => {
+                self.plan_effect(work)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Plans the next effect, if there is one, and asks for its staging.
+    fn plan_effect(&mut self, work: &mut Vec<Work>) -> Result<bool, Stop> {
+        let Some(pending) = self.disk.next(&mut self.engine, &mut self.store)? else {
+            return Ok(false);
+        };
+        work.push(Work::Stage(pending));
+        Ok(true)
+    }
+}
+
+/// What the observer's thread sends to the task.
+pub(crate) enum FromDisk {
+    /// A stamped batch, with the number of entries the folder holds after it.
+    Batch(Batch, u64),
+    /// The first scan of the folder is done. Sent once, after the batch of that scan if it had one.
+    Scanned,
+    /// The folder cannot be observed at all.
+    Failed(String),
+}
 
 pub(crate) struct FolderTask {
     pub link: Link,
@@ -51,6 +877,21 @@ pub(crate) struct FolderTask {
 
 /// Why the task stopped syncing before it was asked to.
 type Halt = String;
+
+/// Work that is running, or nothing.
+type Slot<'a, T> = Option<Pin<Box<dyn Future<Output = T> + Send + 'a>>>;
+
+/// Waits for the work in `slot` and empties it. Never returns for an empty slot.
+async fn finished<T>(slot: &mut Slot<'_, T>) -> T {
+    match slot {
+        Some(work) => {
+            let out = work.as_mut().await;
+            *slot = None;
+            out
+        }
+        None => std::future::pending().await,
+    }
+}
 
 impl FolderTask {
     pub async fn run(self, mut stop: watch::Receiver<bool>) {
@@ -80,11 +921,11 @@ impl FolderTask {
         }
     }
 
+    /// Syncs the folder until something stops it. In order: the root check, the placement check, the claim, the
+    /// store with the engine and the disk, the observer, the session, and then the loop that takes one input at a
+    /// time. Dropping this future, which is how the task is stopped, drops every transfer with it. The store
+    /// holds the effect and the commit in flight, so the next start goes on from them.
     async fn sync(&self) -> Halt {
-        let mut store = match Store::open(&self.store) {
-            Ok(store) => store,
-            Err(error) => return format!("the folder's sync state cannot be opened: {error}"),
-        };
         self.wait_for_root().await;
         if let Err(error) = check_placement(&self.link.root, &self.private_dirs, &self.linked) {
             return error.to_string();
@@ -93,7 +934,11 @@ impl FolderTask {
             Ok(lock) => Arc::new(lock),
             Err(halt) => return halt,
         };
-        let mut observations = self.observe(lock.clone());
+        let mut folder = match Folder::open(self.link.clone(), &lock, &self.store) {
+            Ok(folder) => folder,
+            Err(stop) => return stop.to_string(),
+        };
+        let mut from_disk = self.observe(lock.clone(), folder.sections(), folder.snapshot());
         let mut config = SessionConfig::new(
             &self.link.space_id,
             "flarebox",
@@ -105,37 +950,82 @@ impl FolderTask {
             Ok(started) => started,
             Err(reason) => return reason.to_string(),
         };
-        self.update(|status| status.state = FolderState::Connecting);
-        let mut subscribed = false;
-        let mut history_id = String::new();
-        let mut recheck = tokio::time::interval(CLAIM_RECHECK);
-        loop {
-            tokio::select! {
-                Some(entries) = observations.recv() => {
-                    self.update(|status| status.local_entries = Some(entries));
-                }
-                _ = recheck.tick() => {
-                    if !claim::still_locked(&lock, &self.link.root) {
-                        session.close().await;
-                        return "the folder at this path is no longer the folder this task locked (it was moved, \
-                                replaced or removed); restart to sync it again"
-                            .into();
+        let transfer = Transfer::new(self.auth.api());
+        self.publish(&folder);
+        let stop = {
+            let (session, transfer) = (&session, &transfer);
+            let mut list: Slot<'_, Result<Vec<TreePage>, Stop>> = None;
+            let mut stage: Slot<'_, (Pending, Result<Staged, Stall>)> = None;
+            let mut upload: Slot<'_, Result<Vec<UploadReceipt>, ChunkError>> = None;
+            let mut send: Slot<'_, Result<CommitResult, CallError>> = None;
+            let mut wait: Slot<'_, ()> = None;
+            let mut recheck = tokio::time::interval(CLAIM_RECHECK);
+            loop {
+                let step = tokio::select! {
+                    event = events.next() => match event {
+                        Some(event) => folder.event(event),
+                        None => Err(Stop::Protocol("the session ended".into())),
+                    },
+                    Some(seen) = from_disk.recv() => match seen {
+                        FromDisk::Batch(batch, entries) => folder.observed(batch, entries),
+                        FromDisk::Scanned => folder.scanned(),
+                        // The observer reaches the folder by its path, so a folder replaced before the
+                        // observer started fails there before the recheck below sees it.
+                        FromDisk::Failed(_) if !claim::still_locked(&lock, &self.link.root) => {
+                            break REPLACED.to_owned();
+                        }
+                        FromDisk::Failed(why) => Err(Stop::Io(io::Error::other(why))),
+                    },
+                    pages = finished(&mut list) => folder.listed(pages),
+                    (pending, staged) = finished(&mut stage) => folder.staged(pending, staged),
+                    receipts = finished(&mut upload) => folder.uploaded(receipts),
+                    result = finished(&mut send) => folder.sent(result),
+                    () = finished(&mut wait) => folder.resend(),
+                    _ = recheck.tick() => {
+                        if !claim::still_locked(&lock, &self.link.root) {
+                            break REPLACED.to_owned();
+                        }
+                        Ok(Vec::new())
+                    }
+                };
+                let work = match step {
+                    Ok(work) => work,
+                    Err(stop) => break stop.to_string(),
+                };
+                for work in work {
+                    match work {
+                        Work::Subscribe {
+                            history_id,
+                            since_seq,
+                        } => session.subscribe(history_id, since_seq),
+                        Work::List => {
+                            list = Some(Box::pin(list_tree(session, &self.link.space_id)))
+                        }
+                        Work::Stage(pending) => {
+                            stage = Some(Box::pin(stage_effect(session, transfer, pending, None)));
+                        }
+                        Work::StageAfter(wait, pending) => {
+                            stage = Some(Box::pin(stage_effect(
+                                session,
+                                transfer,
+                                pending,
+                                Some(wait),
+                            )));
+                        }
+                        Work::Upload(chunks) => {
+                            upload = Some(Box::pin(upload_chunks(session, transfer, chunks)));
+                        }
+                        Work::Send(commit) => send = Some(Box::pin(session.commit(commit))),
+                        Work::ResendAfter(after) => {
+                            wait = Some(Box::pin(tokio::time::sleep(after)))
+                        }
                     }
                 }
-                event = events.next() => {
-                    let Some(event) = event else {
-                        return "the session ended".into();
-                    };
-                    if let Err(halt) = self
-                        .handle(event, &session, &mut store, &mut subscribed, &mut history_id)
-                        .await
-                    {
-                        session.close().await;
-                        return halt;
-                    }
-                }
+                self.publish(&folder);
             }
-        }
+        };
+        session.close().await;
+        stop
     }
 
     /// Waits until the root passes the check of design §6.2: nothing is synced for a folder that is missing,
@@ -179,28 +1069,37 @@ impl FolderTask {
         }
     }
 
-    /// Observes the disk on a thread of its own and reports how many entries the folder holds after each batch.
-    /// The thread holds the folder's `lock` and ends with the first batch after the receiver is dropped.
-    fn observe(&self, lock: Arc<File>) -> mpsc::UnboundedReceiver<u64> {
+    /// Observes the disk on a thread of its own, starting from `previous`. Before each observation the thread
+    /// resets the scopes the effect sections asked for, then takes the stamp the batch is sent with, so the stamp
+    /// covers the batch's scans and content reads. The thread holds the folder's `lock` and ends with the first
+    /// observation after the receiver is dropped.
+    fn observe(
+        &self,
+        lock: Arc<File>,
+        sections: Arc<Sections>,
+        previous: Snapshot,
+    ) -> mpsc::UnboundedReceiver<FromDisk> {
         let (sender, receiver) = mpsc::unbounded_channel();
         let link = self.link.clone();
         let matcher = self.matcher.clone();
         let thread = std::thread::spawn(move || {
             let _lock = lock;
-            let mut observer = match FsObserver::start(
-                &link.root,
-                &link.space_id,
-                link.root_dev,
-                Snapshot::default(),
-                matcher,
-            ) {
+            let started =
+                FsObserver::start(&link.root, &link.space_id, link.root_dev, previous, matcher);
+            let mut observer = match started {
                 Ok(observer) => observer,
                 Err(error) => {
                     tracing::warn!(space_id = link.space_id, %error, "the folder cannot be observed");
+                    let _ = sender.send(FromDisk::Failed(format!(
+                        "the folder cannot be observed: {error}"
+                    )));
                     return;
                 }
             };
+            let mut scanned = false;
             while !sender.is_closed() {
+                observer.reset(sections.take_resets());
+                let stamp = sections.stamp();
                 match observer.observe(Duration::from_secs(1)) {
                     Ok(None) => {}
                     Ok(Some(observation)) => {
@@ -212,12 +1111,18 @@ impl FolderTask {
                             root_ok = observation.root.is_ok(),
                             "observed the folder"
                         );
-                        let _ = sender.send(observer.snapshot().entries.len() as u64);
+                        let entries = observer.snapshot().entries.len() as u64;
+                        let batch = Batch { stamp, observation };
+                        let _ = sender.send(FromDisk::Batch(batch, entries));
                     }
                     Err(error) => {
                         tracing::warn!(space_id = link.space_id, %error, "observing the folder failed");
                         std::thread::sleep(Duration::from_secs(5));
                     }
+                }
+                if !scanned && observer.scanned().is_some() {
+                    scanned = true;
+                    let _ = sender.send(FromDisk::Scanned);
                 }
             }
         });
@@ -225,197 +1130,31 @@ impl FolderTask {
         receiver
     }
 
-    async fn handle(
-        &self,
-        event: Event,
-        session: &Session,
-        store: &mut Store,
-        subscribed: &mut bool,
-        history_id: &mut String,
-    ) -> Result<(), Halt> {
-        match event {
-            Event::Connected(welcome) => {
-                *history_id = welcome.history_id.clone();
-                self.update(|status| {
-                    status.head_seq = Some(welcome.head_seq);
-                    status.problem = None;
-                });
-                let cursor = transaction(store, |tx| tx.cursor())?;
-                match cursor {
-                    Some(cursor) if cursor.history_id != welcome.history_id => {
-                        return Err(format!(
-                            "the server's history of this space changed from {} to {} (a rewind or a restore); \
-                             this build cannot recover the folder yet",
-                            cursor.history_id, welcome.history_id
-                        ));
-                    }
-                    Some(_) if *subscribed => {}
-                    Some(cursor) => session.subscribe(cursor.history_id, cursor.last_seq),
-                    None => {
-                        let cursor = self.bootstrap(session, store, history_id).await?;
-                        session.subscribe(cursor.history_id, cursor.last_seq);
-                    }
-                }
-                *subscribed = true;
-                self.update(|status| status.state = FolderState::CatchingUp);
-            }
-            Event::Changes(records) => {
-                let applied = transaction(store, |tx| apply_changes(tx, &records))?;
-                match applied {
-                    Applied::Cursor(cursor) => self.show_cursor(store, &cursor)?,
-                    Applied::Gap(cursor) => {
-                        tracing::warn!(
-                            space_id = self.link.space_id,
-                            "the change stream skipped a seq; resuming"
-                        );
-                        session.subscribe(cursor.history_id, cursor.last_seq);
-                    }
-                    Applied::UnknownChange { seq } => {
-                        return Err(format!(
-                            "commit {seq} holds a kind of change this build does not know; update Flarebox"
-                        ));
-                    }
-                    Applied::NotBootstrapped => {
-                        return Err("changes arrived before the space's tree was read".into());
-                    }
-                }
-            }
-            Event::Committed(committed) => {
-                tracing::warn!(
-                    space_id = self.link.space_id,
-                    commit_id = committed.commit_id,
-                    "a commit result arrived, but this build sends no commits"
-                );
-            }
-            Event::CaughtUp { head_seq } => self.update(|status| {
-                status.state = FolderState::UpToDate;
-                status.head_seq = Some(head_seq);
-            }),
-            Event::ResyncRequired(resync) => match Reason::try_from(resync.reason) {
-                Ok(Reason::LogTruncated) => {
-                    tracing::info!(
-                        space_id = self.link.space_id,
-                        "the server's log no longer reaches the store; reading the tree again"
-                    );
-                    let cursor = self.bootstrap(session, store, history_id).await?;
-                    session.subscribe(cursor.history_id, cursor.last_seq);
-                }
-                Ok(Reason::HistoryChanged) => {
-                    return Err(
-                        "the space was rewound or restored on the server; this build cannot recover the folder yet"
-                            .into(),
-                    );
-                }
-                Ok(Reason::AheadOfServer) => {
-                    return Err(
-                        "the server is behind what this device already applied; this build cannot recover the folder yet"
-                            .into(),
-                    );
-                }
-                Ok(Reason::Unspecified) | Err(_) => {
-                    return Err(format!(
-                        "the server asked for a resync for an unknown reason ({})",
-                        resync.reason
-                    ));
-                }
-            },
-            Event::Notice(notice) => {
-                tracing::info!(
-                    space_id = self.link.space_id,
-                    kind = notice.kind,
-                    retry_after_ms = notice.retry_after_ms,
-                    message = notice.message,
-                    "notice from the server"
-                );
-            }
-            Event::Disconnected { reason, retry_in } => {
-                tracing::info!(
-                    space_id = self.link.space_id,
-                    ?reason,
-                    ?retry_in,
-                    "disconnected from the server"
-                );
-                self.update(|status| {
-                    status.state = FolderState::Offline;
-                    status.problem = Some(format!(
-                        "disconnected ({reason:?}); retrying in {retry_in:?}"
-                    ));
-                });
-            }
-            Event::Stopped(reason) => return Err(reason.to_string()),
-        }
-        Ok(())
-    }
-
-    /// Reads the whole tree with `ListTree` and replaces the remote tree in one transaction, with the cursor at the
-    /// first page's `head_seq` (spec v0 section 7.5). Replaying the log from there fixes up nodes that changed
-    /// between pages, so the tree is consistent once the stream has caught up.
-    async fn bootstrap(
-        &self,
-        session: &Session,
-        store: &mut Store,
-        history_id: &str,
-    ) -> Result<Cursor, Halt> {
-        self.update(|status| status.state = FolderState::Bootstrapping);
-        let backoff = Backoff::default();
-        let mut nodes: Vec<NodeState> = Vec::new();
-        let mut page_cursor = String::new();
-        let mut start_seq = None;
-        let mut attempt = 0;
-        loop {
-            match session.list_tree(page_cursor.clone(), TREE_PAGE).await {
-                Ok(page) => {
-                    attempt = 0;
-                    start_seq.get_or_insert(page.head_seq);
-                    nodes.extend(page.nodes);
-                    if page.next_cursor.is_empty() {
-                        break;
-                    }
-                    page_cursor = page.next_cursor;
-                }
-                Err(error) => {
-                    let wait = match policy::after_call_error(&error) {
-                        Disposition::RetryAfter(wait) => wait,
-                        Disposition::Backoff => backoff.delay(attempt),
-                        Disposition::Halt => {
-                            let error = match &error {
-                                flarebox_net::CallError::Server(refusal) => {
-                                    policy::describe(refusal)
-                                }
-                                other => other.to_string(),
-                            };
-                            return Err(format!("reading the space's tree failed: {error}"));
-                        }
-                    };
-                    tracing::info!(space_id = self.link.space_id, %error, ?wait, "reading the tree again later");
-                    attempt += 1;
-                    tokio::time::sleep(wait).await;
-                }
-            }
-        }
-        let cursor = Cursor {
-            history_id: history_id.to_owned(),
-            last_seq: start_seq.unwrap_or_default(),
+    /// Shows what the folder knows in the status, and marks the status changed when it differs.
+    fn publish(&self, folder: &Folder) {
+        let view = folder.view();
+        let mut status = self.status.lock().unwrap();
+        let shown = View {
+            state: status.state,
+            history_id: status.history_id.clone(),
+            last_seq: status.last_seq,
+            head_seq: status.head_seq,
+            remote_nodes: status.remote_nodes,
+            local_entries: status.local_entries,
+            problem: status.problem.clone(),
         };
-        transaction(store, |tx| replace_tree(tx, &cursor, &nodes))?;
-        tracing::info!(
-            space_id = self.link.space_id,
-            nodes = nodes.len(),
-            seq = cursor.last_seq,
-            "read the space's tree"
-        );
-        self.show_cursor(store, &cursor)?;
-        Ok(cursor)
-    }
-
-    fn show_cursor(&self, store: &mut Store, cursor: &Cursor) -> Result<(), Halt> {
-        let nodes = transaction(store, |tx| tx.remote_node_count())?;
-        self.update(|status| {
-            status.history_id = Some(cursor.history_id.clone());
-            status.last_seq = Some(cursor.last_seq);
-            status.remote_nodes = nodes;
-        });
-        Ok(())
+        if shown == view {
+            return;
+        }
+        status.state = view.state;
+        status.history_id = view.history_id;
+        status.last_seq = view.last_seq;
+        status.head_seq = view.head_seq;
+        status.remote_nodes = view.remote_nodes;
+        status.local_entries = view.local_entries;
+        status.problem = view.problem;
+        drop(status);
+        self.changed.send_replace(());
     }
 
     fn update(&self, change: impl FnOnce(&mut FolderStatus)) {
@@ -424,211 +1163,76 @@ impl FolderTask {
     }
 }
 
-fn transaction<T>(
-    store: &mut Store,
-    f: impl FnOnce(&Tx<'_>) -> flarebox_store::Result<T>,
-) -> Result<T, Halt> {
-    store
-        .transaction(f)
-        .map_err(|error| format!("the folder's sync state cannot be written: {error}"))
-}
-
-/// What applying a `Changes` batch did.
-#[derive(Debug, PartialEq)]
-pub(crate) enum Applied {
-    /// Every record was applied or already in the store; the cursor now stands here.
-    Cursor(Cursor),
-    /// A record does not follow the cursor. Nothing after the gap was applied; resume from the cursor.
-    Gap(Cursor),
-    /// A record holds a change of a kind this build does not know. Nothing from that record on was applied, and the
-    /// folder must stop applying the log (spec v0 section 9.1).
-    UnknownChange { seq: u64 },
-    /// The store has no cursor, so the records have nothing to apply to.
-    NotBootstrapped,
-}
-
-/// Applies commit records to the remote tree in seq order, skipping records the store already holds, and moves the
-/// cursor. Records are post-images, so applying one sets each node it names to its state after that commit.
-pub(crate) fn apply_changes(
-    tx: &Tx<'_>,
-    records: &[CommitRecord],
-) -> flarebox_store::Result<Applied> {
-    let Some(mut cursor) = tx.cursor()? else {
-        return Ok(Applied::NotBootstrapped);
-    };
-    let mut outcome = None;
-    for record in records {
-        if record.seq <= cursor.last_seq {
-            continue;
-        }
-        if record.seq != cursor.last_seq + 1 {
-            outcome = Some(Applied::Gap(cursor.clone()));
-            break;
-        }
-        if record.changes.iter().any(|change| change.change.is_none()) {
-            outcome = Some(Applied::UnknownChange { seq: record.seq });
-            break;
-        }
-        for change in &record.changes {
-            match &change.change {
-                Some(change_record::Change::Node(node)) => tx.put_remote_node(node)?,
-                Some(change_record::Change::Purged(purged)) => {
-                    tx.remove_remote_node(&purged.node_id)?;
-                }
-                Some(change_record::Change::Space(_) | change_record::Change::Member(_)) | None => {
+/// Reads the whole tree with `ListTree`, page by page (spec v0 section 7.5), waiting out the refusals the server
+/// asks to retry.
+async fn list_tree(session: &Session, space_id: &str) -> Result<Vec<TreePage>, Stop> {
+    let backoff = Backoff::default();
+    let mut pages = Vec::new();
+    let mut cursor = String::new();
+    let mut attempt = 0;
+    loop {
+        match session.list_tree(cursor.clone(), TREE_PAGE).await {
+            Ok(page) => {
+                attempt = 0;
+                cursor.clone_from(&page.next_cursor);
+                pages.push(page);
+                if cursor.is_empty() {
+                    return Ok(pages);
                 }
             }
+            Err(error) => {
+                let wait = match policy::after_call_error(&error) {
+                    Disposition::RetryAfter(wait) => wait,
+                    Disposition::Backoff => backoff.delay(attempt),
+                    Disposition::Halt => {
+                        let error = match &error {
+                            CallError::Server(refusal) => policy::describe(refusal),
+                            other => other.to_string(),
+                        };
+                        return Err(Stop::Refused(format!(
+                            "reading the space's tree failed: {error}"
+                        )));
+                    }
+                };
+                tracing::info!(space_id, %error, ?wait, "reading the tree again later");
+                attempt += 1;
+                tokio::time::sleep(wait).await;
+            }
         }
-        cursor.last_seq = record.seq;
     }
-    tx.set_cursor(&cursor)?;
-    Ok(outcome.unwrap_or(Applied::Cursor(cursor)))
 }
 
-/// Replaces the remote tree with a bootstrap's nodes and sets the cursor.
-pub(crate) fn replace_tree(
-    tx: &Tx<'_>,
-    cursor: &Cursor,
-    nodes: &[NodeState],
-) -> flarebox_store::Result<()> {
-    tx.clear_remote_nodes()?;
-    for node in nodes {
-        tx.put_remote_node(node)?;
+/// Stages `pending`, after `wait` when there is one, and gives it back with how the staging ended.
+async fn stage_effect(
+    session: &Session,
+    transfer: &Transfer,
+    pending: Pending,
+    wait: Option<Duration>,
+) -> (Pending, Result<Staged, Stall>) {
+    if let Some(wait) = wait {
+        tokio::time::sleep(wait).await;
     }
-    tx.set_cursor(cursor)
+    let staged = pending.stage(&(session, transfer)).await;
+    (pending, staged)
+}
+
+/// Uploads the chunks of `upload` the server lacks. Each is read on a thread that may block.
+async fn upload_chunks(
+    session: &Session,
+    transfer: &Transfer,
+    upload: Upload,
+) -> Result<Vec<UploadReceipt>, ChunkError> {
+    let upload = Arc::new(upload);
+    let read = |chunk: &ChunkRef| {
+        let (upload, chunk) = (upload.clone(), chunk.clone());
+        async move {
+            tokio::task::spawn_blocking(move || upload.read(&chunk))
+                .await
+                .map_err(io::Error::other)?
+        }
+    };
+    transfer.upload(session, &upload.chunks, read).await
 }
 
 #[cfg(test)]
-mod tests {
-    use flarebox_proto::v1::{ChangeRecord, NodeKind, NodePurged, NodeStatus, SpaceUpdated};
-
-    use super::*;
-
-    fn node(id: &str, name: &str) -> NodeState {
-        NodeState {
-            node_id: id.into(),
-            parent_id: "root".into(),
-            name: name.into(),
-            kind: NodeKind::File as i32,
-            status: NodeStatus::Live as i32,
-            ..Default::default()
-        }
-    }
-
-    fn record(seq: u64, changes: Vec<change_record::Change>) -> CommitRecord {
-        CommitRecord {
-            seq,
-            changes: changes
-                .into_iter()
-                .map(|change| ChangeRecord {
-                    change: Some(change),
-                })
-                .collect(),
-            ..Default::default()
-        }
-    }
-
-    fn cursor(seq: u64) -> Cursor {
-        Cursor {
-            history_id: "h".into(),
-            last_seq: seq,
-        }
-    }
-
-    fn store() -> (tempfile::TempDir, Store) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("store.sqlite")).unwrap();
-        (dir, store)
-    }
-
-    fn names(tx: &Tx<'_>) -> Vec<String> {
-        tx.remote_nodes()
-            .unwrap()
-            .into_iter()
-            .map(|node| node.name)
-            .collect()
-    }
-
-    #[test]
-    fn records_are_applied_in_seq_order_and_replays_are_skipped() {
-        let (_dir, mut store) = store();
-        store
-            .transaction(|tx| {
-                replace_tree(tx, &cursor(4), &[node("a", "a"), node("b", "b")])?;
-                let records = [
-                    record(4, vec![change_record::Change::Node(node("a", "stale"))]),
-                    record(5, vec![change_record::Change::Node(node("a", "a2"))]),
-                    record(
-                        6,
-                        vec![
-                            change_record::Change::Purged(NodePurged {
-                                node_id: "b".into(),
-                            }),
-                            change_record::Change::Node(node("c", "c")),
-                            change_record::Change::Space(SpaceUpdated {}),
-                        ],
-                    ),
-                ];
-                assert_eq!(apply_changes(tx, &records)?, Applied::Cursor(cursor(6)));
-                assert_eq!(names(tx), ["a2", "c"]);
-                assert_eq!(tx.cursor()?, Some(cursor(6)));
-                Ok::<_, flarebox_store::Error>(())
-            })
-            .unwrap();
-    }
-
-    #[test]
-    fn a_gap_stops_at_the_last_contiguous_record() {
-        let (_dir, mut store) = store();
-        store
-            .transaction(|tx| {
-                replace_tree(tx, &cursor(1), &[])?;
-                let records = [
-                    record(2, vec![change_record::Change::Node(node("a", "a"))]),
-                    record(4, vec![change_record::Change::Node(node("b", "b"))]),
-                ];
-                assert_eq!(apply_changes(tx, &records)?, Applied::Gap(cursor(2)));
-                assert_eq!(names(tx), ["a"]);
-                assert_eq!(tx.cursor()?, Some(cursor(2)));
-                Ok::<_, flarebox_store::Error>(())
-            })
-            .unwrap();
-    }
-
-    #[test]
-    fn an_unknown_kind_of_change_stops_before_its_record() {
-        let (_dir, mut store) = store();
-        store
-            .transaction(|tx| {
-                replace_tree(tx, &cursor(0), &[])?;
-                let mut unknown = record(2, vec![change_record::Change::Node(node("b", "b"))]);
-                unknown.changes.push(ChangeRecord { change: None });
-                let records = [
-                    record(1, vec![change_record::Change::Node(node("a", "a"))]),
-                    unknown,
-                ];
-                assert_eq!(
-                    apply_changes(tx, &records)?,
-                    Applied::UnknownChange { seq: 2 }
-                );
-                assert_eq!(names(tx), ["a"]);
-                assert_eq!(tx.cursor()?, Some(cursor(1)));
-                Ok::<_, flarebox_store::Error>(())
-            })
-            .unwrap();
-    }
-
-    #[test]
-    fn a_bootstrap_replaces_the_whole_tree() {
-        let (_dir, mut store) = store();
-        store
-            .transaction(|tx| {
-                replace_tree(tx, &cursor(3), &[node("a", "a"), node("b", "b")])?;
-                replace_tree(tx, &cursor(9), &[node("c", "c")])?;
-                assert_eq!(names(tx), ["c"]);
-                assert_eq!(tx.cursor()?, Some(cursor(9)));
-                Ok::<_, flarebox_store::Error>(())
-            })
-            .unwrap();
-    }
-}
+mod tests;

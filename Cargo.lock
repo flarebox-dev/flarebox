@@ -566,6 +566,7 @@ dependencies = [
  "flarebox-fs",
  "flarebox-net",
  "flarebox-proto",
+ "flarebox-sim",
  "flarebox-store",
  "prost",
  "rustix",

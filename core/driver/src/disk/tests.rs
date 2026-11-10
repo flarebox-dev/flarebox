@@ -482,8 +482,9 @@ fn cuts(scenario: &Scenario) -> Vec<Cut> {
     reached.lock().unwrap().clone()
 }
 
-/// Checks a folder whose effect is done and acknowledged: L holds R's shape, the disk the effect's result, the
-/// marker equals the effect counter, and nothing is left in quarantine or staging.
+/// Checks a folder whose effect is done and acknowledged: L holds R's shape and S holds L's, in memory and in the
+/// store, the disk holds the effect's result, the marker equals the effect counter, and nothing is left in
+/// quarantine or staging.
 fn assert_done(scenario: &Scenario, folder: &Folder, running: &Running, context: &str) {
     assert!(running.engine.effects.in_flight().is_none(), "{context}");
     assert!(running.engine.effects.blocked().is_empty(), "{context}");
@@ -492,6 +493,16 @@ fn assert_done(scenario: &Scenario, folder: &Folder, running: &Running, context:
     assert!(
         flarebox_engine::tree::same(local, remote),
         "{context}: L {local:?}, R {remote:?}"
+    );
+    // The acknowledgement settles the trees in its own transaction. With S left behind, the node's next change
+    // would count as concurrent.
+    let synced = running.engine.trees.synced().get(NODE);
+    assert_eq!(synced, local, "{context}: S");
+    let (_, stored) = folder.open();
+    assert_eq!(
+        stored.trees.synced().get(NODE),
+        local,
+        "{context}: S in the store"
     );
     (scenario.check)(folder);
     assert_eq!(
