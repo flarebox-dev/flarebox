@@ -114,11 +114,11 @@ impl<K: NameKey> RuleFile<K> {
     }
 
     /// The last rule matching a path. `path` is the path below the file's directory and
-    /// `basename` its last component, both in key form and split into [`units`].
+    /// `basename` its last component, both in key form.
     pub(crate) fn last_match(
         &self,
-        path: &[&[char]],
-        basename: &[&[char]],
+        path: &[char],
+        basename: &[char],
         is_dir: bool,
     ) -> Option<&Rule> {
         self.rules
@@ -164,7 +164,7 @@ pub(crate) struct Rule {
 }
 
 impl Rule {
-    fn matches<K: NameKey>(&self, path: &[&[char]], basename: &[&[char]], is_dir: bool) -> bool {
+    fn matches<K: NameKey>(&self, path: &[char], basename: &[char], is_dir: bool) -> bool {
         if self.dir_only && !is_dir {
             return false;
         }
@@ -173,10 +173,10 @@ impl Rule {
     }
 }
 
-/// Splits key-form text into the characters matching counts: a character with the combining
-/// marks (canonical combining class other than 0) that follow it. A `/` never takes marks, so
-/// path components split the same way on their own and joined.
-pub(crate) fn units(text: &[char]) -> Vec<&[char]> {
+/// Splits key-form text into clusters: a code point with the combining marks (canonical
+/// combining class other than 0) that follow it, or a run of marks with no code point before it.
+/// A `/` never takes marks.
+fn units(text: &[char]) -> Vec<&[char]> {
     let mut units = Vec::new();
     let mut start = 0;
     for i in 1..text.len() {
@@ -204,8 +204,7 @@ fn single(unit: &[char]) -> Option<char> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Token {
-    /// One character with its combining marks, in key form.
-    Literal(Box<[char]>),
+    Literal(char),
     /// A `/`, written plain or escaped.
     Slash,
     /// `?`
@@ -226,7 +225,7 @@ struct Class {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ClassItem {
-    /// One character with its combining marks, in key form.
+    /// A cluster (see [`units`]) in key form.
     Member(Box<[char]>),
     Range(char, char),
     Posix(Posix),
@@ -433,8 +432,7 @@ fn tokenize<K: NameKey>(body: &str) -> Result<Vec<Token>, LineError> {
 }
 
 fn push_literals<K: NameKey>(tokens: &mut Vec<Token>, run: &str) {
-    let keyed: Vec<char> = key::<K>(run).chars().collect();
-    tokens.extend(units(&keyed).into_iter().map(|u| Token::Literal(u.into())));
+    tokens.extend(key::<K>(run).chars().map(Token::Literal));
 }
 
 /// The end of the combining marks starting at `chars[from]`.
@@ -532,46 +530,80 @@ fn parse_class<K: NameKey>(chars: &[char], open: usize) -> Result<(Class, usize)
     Ok((Class { negated, items }, j))
 }
 
-/// Whether `tokens` match all of `text` (see [`units`]), simulated as an automaton so that no
-/// pattern takes exponential time. State `i` is "before token `i`", state `n + 1 + i` is
-/// "inside the star token `i`". In `pathname` mode only `**` and a `/` match a slash.
-fn wildmatch<K: NameKey>(tokens: &[Token], text: &[&[char]], pathname: bool) -> bool {
+/// The end of the cluster (see [`units`]) that starts at `text[start]`.
+fn cluster_end(text: &[char], start: usize) -> usize {
+    if text[start] == '/' {
+        return start + 1;
+    }
+    start
+        + 1
+        + text[start + 1..]
+            .iter()
+            .take_while(|&&c| is_mark(c))
+            .count()
+}
+
+/// Whether `tokens` match all of `text`, simulated as an automaton so that no pattern takes
+/// exponential time. State `i` is "before token `i`", state `n + 1 + i` is "inside the star
+/// token `i`". Literals and stars read one code point; `?` and bracket expressions read a
+/// cluster, so they move ahead by up to the longest cluster, and the states of the positions in
+/// between are kept in a ring of rows. In `pathname` mode only `**` and a `/` match a slash.
+fn wildmatch<K: NameKey>(tokens: &[Token], text: &[char], pathname: bool) -> bool {
     let n = tokens.len();
-    let mut current = vec![false; 2 * n + 1];
-    let mut next = vec![false; 2 * n + 1];
+    let width = 2 * n + 1;
+    let ends: Vec<usize> = (0..text.len()).map(|i| cluster_end(text, i)).collect();
+    let rows = 1 + ends
+        .iter()
+        .enumerate()
+        .map(|(i, &end)| end - i)
+        .max()
+        .unwrap_or(1);
+    let mut ring = vec![false; rows * width];
+    let row = |position: usize| (position % rows) * width;
+    let mut current = vec![false; width];
     let mut pending = Vec::new();
-    enter(tokens, &mut current, 0, &mut pending);
-    for &unit in text {
-        next.fill(false);
-        let mut alive = false;
-        let is_slash = *unit == ['/'];
-        let slash_blocked = pathname && is_slash;
+    enter(tokens, &mut ring[..width], 0, &mut pending);
+    for (position, &c) in text.iter().enumerate() {
+        let at = row(position);
+        current.copy_from_slice(&ring[at..at + width]);
+        ring[at..at + width].fill(false);
+        if !current.contains(&true) {
+            if !ring.contains(&true) {
+                return false;
+            }
+            continue;
+        }
+        let slash_blocked = pathname && c == '/';
+        let next = row(position + 1);
+        let after_cluster = row(ends[position]);
+        let cluster = &text[position..ends[position]];
         for (i, token) in tokens.iter().enumerate() {
             if current[i] {
-                let advance = match token {
-                    Token::Literal(literal) => **literal == *unit,
-                    Token::Slash => is_slash,
-                    Token::AnyChar => !slash_blocked,
-                    Token::Class(class) => !slash_blocked && class.matches::<K>(unit),
-                    Token::Star | Token::DoubleStar => false,
+                let target = match token {
+                    Token::Literal(literal) => (*literal == c).then_some(next),
+                    Token::Slash => (c == '/').then_some(next),
+                    Token::AnyChar => (!slash_blocked).then_some(after_cluster),
+                    Token::Class(class) => {
+                        (!slash_blocked && class.matches::<K>(cluster)).then_some(after_cluster)
+                    }
+                    Token::Star | Token::DoubleStar => None,
                 };
-                if advance {
-                    enter(tokens, &mut next, i + 1, &mut pending);
-                    alive = true;
+                if let Some(target) = target {
+                    enter(
+                        tokens,
+                        &mut ring[target..target + width],
+                        i + 1,
+                        &mut pending,
+                    );
                 }
             }
             if current[n + 1 + i] && !(slash_blocked && *token == Token::Star) {
-                next[n + 1 + i] = true;
-                enter(tokens, &mut next, i + 1, &mut pending);
-                alive = true;
+                ring[next + n + 1 + i] = true;
+                enter(tokens, &mut ring[next..next + width], i + 1, &mut pending);
             }
         }
-        if !alive {
-            return false;
-        }
-        std::mem::swap(&mut current, &mut next);
     }
-    current[n]
+    ring[row(text.len()) + n]
 }
 
 /// Adds state `start` and the states reachable from it without reading a character.

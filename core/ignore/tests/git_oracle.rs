@@ -344,12 +344,16 @@ fn line(fold: bool) -> impl Strategy<Value = String> {
 /// Names and patterns with non-ASCII letters, for comparing NFD spellings here with NFC ones in
 /// git. Git matches bytes, so `?` and bracket expressions are left out.
 fn unicode_name() -> impl Strategy<Value = String> {
-    "[aAéÉüÅ.-]{1,3}".prop_filter("not . or ..", |n| n != "." && n != "..")
+    prop_oneof![
+        4 => "[aAéÉüÅ.-]{1,3}".prop_filter("not . or ..", |n| n != "." && n != ".."),
+        1 => proptest::sample::select(vec!["q\u{301}", "q\u{301}.a", "aq\u{301}", "q\u{301}\u{302}"])
+            .prop_map(str::to_owned),
+    ]
 }
 
 fn unicode_line() -> impl Strategy<Value = String> {
     let piece = prop_oneof![
-        4 => proptest::sample::select(vec!["a", "A", "é", "É", "ü", "Å", "\\é", "-", "."])
+        4 => proptest::sample::select(vec!["a", "A", "é", "É", "ü", "Å", "\\é", "-", ".", "q", "\u{301}"])
             .prop_map(str::to_owned),
         2 => Just("*".to_owned()),
         1 => Just("**".to_owned()),

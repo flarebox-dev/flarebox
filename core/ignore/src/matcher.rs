@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::pattern::{LineError, RuleFile, key, units};
+use crate::pattern::{LineError, RuleFile, key};
 use crate::{NameKey, RULES_FILE};
 
 /// Platform files excluded in every directory (design §5.1).
@@ -431,28 +431,26 @@ impl<'a, K: NameKey> Scope<'a, K> {
             text.push('/');
         }
         text.extend(name.chars());
-        let units = units(&text);
         let mut starts = vec![0];
         starts.extend(
-            units
-                .iter()
+            text.iter()
                 .enumerate()
-                .filter(|(_, unit)| **unit == ['/'])
+                .filter(|(_, c)| **c == '/')
                 .map(|(i, _)| i + 1),
         );
-        let basename = &units[starts[depth]..];
+        let basename = &text[starts[depth]..];
         let is_dir = kind == Kind::Dir;
 
         if matcher
             .local
             .exclude
-            .last_match(&units, basename, is_dir)
+            .last_match(&text, basename, is_dir)
             .is_some_and(|rule| !rule.negated)
         {
             return (Status::Excluded(Reason::Local), None);
         }
         for &(file_depth, file) in self.files.iter().rev() {
-            if let Some(rule) = file.last_match(&units[starts[file_depth]..], basename, is_dir) {
+            if let Some(rule) = file.last_match(&text[starts[file_depth]..], basename, is_dir) {
                 if rule.negated {
                     break;
                 }

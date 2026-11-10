@@ -262,6 +262,34 @@ fn equivalent_pattern_spellings_select_the_same_names() {
     assert!(excluded(&m, "\u{e5}") && excluded(&m, "\u{212b}") && excluded(&m, "k"));
 }
 
+/// `*` and literals work on code points, so a glob ending or starting next to a combining mark
+/// matches as in git (review of flarebox#50).
+#[test]
+fn stars_match_across_combining_marks() {
+    let m = matcher(&[("", "q*\n")]);
+    for path in ["q\u{301}", "q\u{301}.txt", "sub/q\u{301}", "Q\u{301}x"] {
+        assert!(excluded(&m, path), "q* should exclude {path:?}");
+    }
+    assert!(!excluded(&m, "\u{e9}"));
+    let m = matcher(&[("", "*\u{301}\n")]);
+    assert!(excluded(&m, "q\u{301}"));
+    assert!(excluded(&m, "sub/aq\u{301}"));
+    assert!(!excluded(&m, "q"));
+    let m = matcher(&[("", "q\n")]);
+    assert!(
+        !excluded(&m, "q\u{301}"),
+        "a literal does not stop inside a cluster"
+    );
+    let m = matcher(&[("", "q?\n?\n")]);
+    assert_eq!(
+        status(&m, "q\u{301}"),
+        rule(0, 2),
+        "? reads q\u{301} as one character"
+    );
+    let m = matcher(&[("", "*.txt\n")]);
+    assert!(excluded(&m, "a\u{301}\u{302}.txt"));
+}
+
 #[test]
 fn a_range_endpoint_with_combining_marks_is_invalid() {
     let file = RuleFile::<Folded>::parse("[a-q\u{301}]\n[q\u{301}-z]\n[q\u{301}-]\n".as_bytes());
