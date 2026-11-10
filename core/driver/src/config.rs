@@ -111,6 +111,11 @@ impl SyncRules {
                     "exclude pattern {pattern:?} starts with '!'; list the path under include instead"
                 ));
             }
+            if pattern.starts_with('#') {
+                return Err(format!(
+                    "exclude pattern {pattern:?} starts with '#', which makes it a comment; write \\# for a literal '#'"
+                ));
+            }
             lines.push(pattern.clone());
         }
         Ok(lines)
@@ -213,7 +218,7 @@ mod tests {
         for bad in ["", "/", "../x", "a/../b", "a//b", "./a"] {
             assert!(rules(&[bad], &[]).lines().is_err(), "{bad:?}");
         }
-        for bad in ["", "  ", "!keep", "a\nb"] {
+        for bad in ["", "  ", "!keep", "#backup", "a\nb"] {
             assert!(rules(&[], &[bad]).lines().is_err(), "{bad:?}");
         }
     }

@@ -274,7 +274,12 @@ impl FsObserver {
             }
             Change::Renamed { from, to, .. } => {
                 for (path, retry) in take(&mut self.unread, from) {
-                    let moved = to.join(path.strip_prefix(from).expect("taken under from"));
+                    let rest = path.strip_prefix(from).expect("taken under from");
+                    let moved = if rest.as_os_str().is_empty() {
+                        to.clone()
+                    } else {
+                        to.join(rest)
+                    };
                     if !self.excluded(&moved, EntryKind::File) {
                         self.unread.insert(moved, retry);
                     }
@@ -658,6 +663,43 @@ mod tests {
             .unwrap_or_else(|| panic!("no content in {seen:?}"));
         assert_eq!(content.size, 7);
         assert!(observer.unread.is_empty());
+    }
+
+    #[test]
+    fn an_unread_file_that_is_renamed_is_read_at_its_new_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = marked();
+        let file = dir.path().join("locked");
+        fs::write(&file, b"content").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&file).is_ok() {
+            assert!(rustix::process::geteuid().is_root());
+            eprintln!("SKIPPED: running as root, so permissions do not block reads");
+            return;
+        }
+        let mut observer = observer(dir.path());
+        observe_until(&mut observer, |seen| !seen.is_empty());
+        assert_eq!(observer.unread.len(), 1);
+
+        fs::rename(&file, dir.path().join("moved")).unwrap();
+        observe_until(&mut observer, |seen| {
+            seen.iter()
+                .any(|change| matches!(change, Observed::Renamed { .. }))
+        });
+        fs::set_permissions(dir.path().join("moved"), fs::Permissions::from_mode(0o600)).unwrap();
+        let (seen, _) = observe_until(&mut observer, |seen| {
+            seen.iter()
+                .any(|change| matches!(change, Observed::Modified { .. }))
+        });
+        let path = seen
+            .iter()
+            .find_map(|change| match change {
+                Observed::Modified { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(path.as_os_str(), "moved");
     }
 
     #[test]
