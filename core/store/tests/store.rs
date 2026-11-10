@@ -903,6 +903,64 @@ fn chunk_cache_tracks_size_and_eviction_order() {
 }
 
 #[test]
+fn a_read_only_open_reads_the_link_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state #1?.db");
+    let link = Link {
+        space_id: "0190f0a0-0000-7000-8000-000000000001".into(),
+        space_name: "Projects".into(),
+        root: std::path::PathBuf::from("/home/ada/Flarebox"),
+        root_dev: 66306,
+        server_url: "https://files.example.com/".into(),
+        device_id: "d1".into(),
+        linked_at_ms: 1_700_000_000_000,
+    };
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| tx.set_link(&link))
+        .unwrap();
+    let listing = || {
+        let mut files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let meta = entry.metadata().unwrap();
+                (
+                    entry.file_name(),
+                    meta.modified().unwrap(),
+                    std::fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect();
+        files.sort();
+        files
+    };
+    let before = listing();
+
+    let read = Store::open_read_only(&path)
+        .unwrap()
+        .transaction(|tx| tx.link())
+        .unwrap();
+
+    assert_eq!(read, Some(link.clone()));
+    assert_eq!(listing(), before);
+
+    let mut writer = Store::open(&path).unwrap();
+    writer
+        .transaction(|tx| {
+            tx.set_link(&Link {
+                space_name: "Renamed".into(),
+                ..link.clone()
+            })
+        })
+        .unwrap();
+    match Store::open_read_only(&path) {
+        Err(Error::LogNotApplied(log)) => assert!(log.ends_with("state #1?.db-wal")),
+        other => panic!("expected LogNotApplied, got {:?}", other.err()),
+    }
+}
+
+#[test]
 fn link_and_questions_persist() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");

@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `flarebox trash` and `flarebox versions`: what the space of a linked folder keeps after a delete or an edit. Both
-//! read the server through its HTTP RPC route with this profile's credential and change nothing, so they work the same
-//! whether or not the daemon syncs the folder.
+//! read the server through its HTTP RPC route with this profile's credential. They change no file here or on the
+//! server, and without a daemon they read the profile without writing to it.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
-use flarebox_driver::{FolderStatus, Paths};
+use flarebox_driver::{Driver, DriverError, FolderStatus, Paths};
 use flarebox_engine::names::name_key;
 use flarebox_net::Auth;
 use flarebox_proto::v1::{
@@ -75,49 +75,61 @@ pub async fn versions(paths: &Paths, file: &Path, json: bool) -> Result<(), Stri
     Ok(())
 }
 
-/// The linked folder that holds `path` and `path`'s names below it. `path` need not exist here, since a file deleted on this
-/// device may still be on the server.
+/// The linked folder that holds `path`, and the names below it as typed. The folders come from the daemon, or from the
+/// profile's stores read without writing anything when no daemon runs. `path` need not exist here, since a file
+/// deleted on this device may still be on the server. Symbolic links are followed only up to the linked folder: below
+/// it a link is a node of the space like any other, so the names stay as typed and never select the node a local link
+/// points to.
 async fn locate(paths: &Paths, path: &Path) -> Result<(FolderStatus, Vec<String>), String> {
-    let status = match ipc::run(paths, Request::Status).await? {
-        Response::Status { status } => status,
-        Response::Error { message } => return Err(message),
-        other => return Err(format!("the daemon answered {other:?}")),
+    let folders = match ipc::ask(paths, &Request::Status).await? {
+        Some(Response::Status { status }) => status.folders,
+        Some(Response::Error { message }) => return Err(message),
+        Some(other) => return Err(format!("the daemon answered {other:?}")),
+        None => Driver::linked_folders(paths).map_err(|error| match error {
+            DriverError::Busy(_) => ipc::busy(paths),
+            other => other.to_string(),
+        })?,
     };
-    let path = resolved(path)?;
-    status
-        .folders
-        .into_iter()
-        .filter_map(|folder| {
-            let names = below(Path::new(&folder.path), &path)?;
-            Some((folder, names))
-        })
-        .max_by_key(|(folder, _)| folder.path.len())
-        .ok_or_else(|| {
-            format!(
-                "{} is not in a linked folder; flarebox status lists them",
-                path.display()
-            )
-        })
+    let typed = lexical(&crate::absolute(path)?);
+    let components: Vec<Component> = typed.components().collect();
+    let mut prefix = PathBuf::new();
+    for (index, component) in components.iter().enumerate() {
+        prefix.push(component);
+        let Ok(real) = std::fs::canonicalize(&prefix) else {
+            break;
+        };
+        let inside = folders
+            .iter()
+            .filter_map(|folder| Some((folder, below(Path::new(&folder.path), &real)?)))
+            .max_by_key(|(folder, _)| folder.path.len());
+        if let Some((folder, mut names)) = inside {
+            names.extend(
+                components[index + 1..]
+                    .iter()
+                    .map(|name| name.as_os_str().to_string_lossy().into_owned()),
+            );
+            return Ok((folder.clone(), names));
+        }
+    }
+    Err(format!(
+        "{} is not in a linked folder; flarebox status lists them",
+        typed.display()
+    ))
 }
 
-/// `path` made absolute, with the symbolic links of the part that exists resolved, as the linked folders' paths are.
-fn resolved(path: &Path) -> Result<PathBuf, String> {
-    let absolute = crate::absolute(path)?;
-    let mut existing = absolute.as_path();
-    let mut missing = Vec::new();
-    loop {
-        if let Ok(real) = std::fs::canonicalize(existing) {
-            return Ok(missing
-                .iter()
-                .rev()
-                .fold(real, |path, name| path.join(name)));
+/// `path` without `.` names, and with each `..` removing the name before it, worked out without reading the disk.
+fn lexical(path: &Path) -> PathBuf {
+    let mut normal = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normal.pop();
+            }
+            other => normal.push(other),
         }
-        let (Some(name), Some(parent)) = (existing.file_name(), existing.parent()) else {
-            return Ok(absolute.clone());
-        };
-        missing.push(name);
-        existing = parent;
     }
+    normal
 }
 
 /// The names of `path` below `root`, or `None` when it is not inside it.
@@ -412,8 +424,10 @@ fn versions_report(path: &str, node: &NodeState, kept: &[VersionInfo], now_ms: i
 mod tests {
     use flarebox_driver::Credential;
     use flarebox_proto::v1::{
-        AccessToken, Content, Error, NodeStatus, RpcResponse, TrashPage, TreePage, VersionList,
+        AccessToken, Content, Error, NodeStatus, RpcRequest, RpcResponse, TrashPage, TreePage,
+        VersionList,
     };
+    use prost::Message;
 
     use super::*;
     use crate::setup::fake::{Fake, proto};
@@ -538,9 +552,23 @@ mod tests {
             .map(|version| version.version_id.as_str())
             .collect();
         assert_eq!(ids, ["v3", "v2", "v1"]);
+        let asked: Vec<_> = fake
+            .seen()
+            .iter()
+            .filter(|seen| seen.path == rpc)
+            .map(
+                |seen| match RpcRequest::decode(seen.body.as_slice()).unwrap().call {
+                    Some(Call::ListVersions(list)) => (list.node_id, list.cursor),
+                    other => panic!("expected ListVersions, got {other:?}"),
+                },
+            )
+            .collect();
         assert_eq!(
-            fake.seen().iter().filter(|seen| seen.path == rpc).count(),
-            2
+            asked,
+            [
+                ("node".to_owned(), String::new()),
+                ("node".to_owned(), "after-v2".to_owned())
+            ]
         );
     }
 
@@ -595,6 +623,31 @@ mod tests {
         assert_eq!(found("café.txt"), Some("other"));
         assert_eq!(found("docs/missing.txt"), None);
         assert_eq!(found("café.txt/below"), None);
+    }
+
+    #[tokio::test]
+    async fn without_a_daemon_the_commands_leave_a_fresh_profile_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(&dir.path().join("profile"));
+        let folder = dir.path().join("Sync");
+        std::fs::create_dir(&folder).unwrap();
+
+        let trashed = trash(&paths, &folder, false).await.unwrap_err();
+        let kept = versions(&paths, &folder.join("a.txt"), false)
+            .await
+            .unwrap_err();
+
+        assert!(trashed.contains("not in a linked folder"), "{trashed}");
+        assert!(kept.contains("not in a linked folder"), "{kept}");
+        assert!(!dir.path().join("profile").exists());
+    }
+
+    #[test]
+    fn a_path_is_normalized_without_reading_the_disk() {
+        assert_eq!(
+            lexical(Path::new("/home/ada/./Flarebox/docs/../link.txt")),
+            Path::new("/home/ada/Flarebox/link.txt")
+        );
     }
 
     #[test]

@@ -38,7 +38,7 @@ pub use engine::EngineState;
 use flarebox_fs::FileId;
 use flarebox_proto::v1::{Content, NodeState, VersionInfo};
 use prost::Message;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 mod engine;
 mod restore;
@@ -238,6 +238,14 @@ pub enum Error {
     Decode(#[from] prost::DecodeError),
     #[error("database schema version {found} is newer than this build supports ({supported})")]
     SchemaTooNew { found: u32, supported: u32 },
+    #[error(
+        "database schema version {found} is older than this build's ({supported}); the daemon updates it when it starts"
+    )]
+    SchemaTooOld { found: u32, supported: u32 },
+    #[error(
+        "{0} holds changes that are not in the database file yet; the daemon applies them when it starts"
+    )]
+    LogNotApplied(PathBuf),
     #[error("the database did not accept the durability settings: {0:?}")]
     NotDurable(Durability),
     #[error("the stored engine state is invalid: {0}")]
@@ -363,6 +371,45 @@ impl Store {
         }
         migrate(&mut store.conn)?;
         Ok(store)
+    }
+
+    /// Opens the database at `path` to read it without writing anything: no migration, and no journal or shared-memory
+    /// file. SQLite takes the file as unchanging, so the caller makes sure that no process writes it meanwhile. A
+    /// database of another schema version is refused, and so is one whose write-ahead log still holds changes, which
+    /// only a writable open applies.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let mut log = path.as_os_str().to_owned();
+        log.push("-wal");
+        let log = PathBuf::from(log);
+        if std::fs::metadata(&log).is_ok_and(|log| log.len() > 0) {
+            return Err(Error::LogNotApplied(log));
+        }
+        let mut uri = String::from("file:");
+        for &byte in path.as_os_str().as_bytes() {
+            match byte {
+                b'/' | b'-' | b'_' | b'.' | b'~' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' => {
+                    uri.push(char::from(byte))
+                }
+                _ => uri.push_str(&format!("%{byte:02X}")),
+            }
+        }
+        uri.push_str("?immutable=1");
+        let conn = Connection::open_with_flags(
+            uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let found: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let supported = SCHEMA_VERSION;
+        if found > supported {
+            return Err(Error::SchemaTooNew { found, supported });
+        }
+        if found < supported {
+            return Err(Error::SchemaTooOld { found, supported });
+        }
+        Ok(Self { conn })
     }
 
     /// The durability settings in effect on this connection.

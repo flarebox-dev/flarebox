@@ -163,6 +163,33 @@ impl Machine {
         serde_json::from_str(&self.run(&["status", "--json"])).unwrap()
     }
 
+    /// Every entry of the profile's directories with its modification time and, for a file, its contents.
+    fn profile(&self) -> Vec<(PathBuf, SystemTime, Vec<u8>)> {
+        let mut found = Vec::new();
+        let mut todo: Vec<PathBuf> = ["config", "state", "run"]
+            .iter()
+            .map(|dir| self.path(dir))
+            .filter(|dir| dir.exists())
+            .collect();
+        while let Some(dir) = todo.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                let meta = fs::symlink_metadata(&path).unwrap();
+                let bytes = if meta.is_dir() {
+                    todo.push(path.clone());
+                    Vec::new()
+                } else if meta.is_file() {
+                    fs::read(&path).unwrap()
+                } else {
+                    Vec::new()
+                };
+                found.push((path, meta.modified().unwrap(), bytes));
+            }
+        }
+        found.sort();
+        found
+    }
+
     /// Polls `flarebox status --json` until `done` accepts it.
     async fn status_until(&self, what: &str, done: impl Fn(&Value) -> bool) -> Value {
         let started = Instant::now();
@@ -701,7 +728,7 @@ async fn trash_and_versions_list_what_the_space_keeps() {
     commit_as_owner(
         &owner,
         &space.space_id,
-        &[b"first", b"deleted later"],
+        &[b"first", b"deleted later", b"link", b"target text"],
         vec![
             op::Op::CreateDir(CreateDir {
                 node_id: docs.clone(),
@@ -719,6 +746,18 @@ async fn trash_and_versions_list_what_the_space_keeps() {
                 parent_id: docs.clone(),
                 name: "gone.txt".into(),
                 content: Some(file_content(b"deleted later")),
+            }),
+            op::Op::CreateFile(CreateFile {
+                node_id: uuidv7(),
+                parent_id: docs.clone(),
+                name: "link.txt".into(),
+                content: Some(file_content(b"link")),
+            }),
+            op::Op::CreateFile(CreateFile {
+                node_id: uuidv7(),
+                parent_id: docs.clone(),
+                name: "target.txt".into(),
+                content: Some(file_content(b"target text")),
             }),
         ],
     )
@@ -766,5 +805,45 @@ async fn trash_and_versions_list_what_the_space_keeps() {
     );
     let outside = machine.fails(&["trash", machine.path("state").to_str().unwrap()]);
     assert!(outside.contains("not in a linked folder"), "{outside}");
+    let link = folder.join("docs/link.txt");
+    let started = Instant::now();
+    while fs::read(&link).ok().as_deref() != Some(&b"link"[..]) {
+        assert!(
+            started.elapsed() < WAIT,
+            "the daemon did not download docs/link.txt"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     assert!(stop(daemon).success());
+
+    let profile = machine.profile();
+    fs::remove_file(&link).unwrap();
+    let link_arg = link.to_str().unwrap();
+    let size_of_link = |what: &str| {
+        let versions: Value =
+            serde_json::from_str(&machine.run(&["versions", link_arg, "--json"])).unwrap();
+        assert_eq!(
+            versions.as_array().unwrap().len(),
+            1,
+            "{what}: {versions:#}"
+        );
+        versions[0]["size"].clone()
+    };
+    std::os::unix::fs::symlink("target.txt", &link).unwrap();
+    assert_eq!(size_of_link("a link to target.txt"), 4);
+    fs::remove_file(&link).unwrap();
+    let elsewhere = machine.path("elsewhere.txt");
+    fs::write(&elsewhere, b"not synced").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+    assert_eq!(size_of_link("a link outside the folder"), 4);
+    let stopped = machine.run(&["trash", folder_arg, "--json"]);
+    assert!(stopped.contains("docs/gone.txt"), "{stopped}");
+    let unlinked = machine.fails(&["trash", machine.path("elsewhere").to_str().unwrap()]);
+    assert!(unlinked.contains("not in a linked folder"), "{unlinked}");
+    let unlinked = machine.fails(&["versions", elsewhere.to_str().unwrap()]);
+    assert!(unlinked.contains("not in a linked folder"), "{unlinked}");
+    assert!(
+        machine.profile() == profile,
+        "the commands changed the profile without a daemon"
+    );
 }

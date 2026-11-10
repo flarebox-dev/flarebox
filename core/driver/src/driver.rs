@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::BTreeMap;
-use std::fs::{self, DirBuilder, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -213,6 +213,25 @@ async fn ended(mut done: watch::Receiver<()>) {
 }
 
 impl Driver {
+    /// The folders the profile at `paths` links, read without writing anything: no directory, lock file or store is
+    /// created or changed. The stores are read under a shared lock on the profile's lock file when it exists, which keeps
+    /// writers out, so a profile that another process holds is refused with [`DriverError::Busy`].
+    pub fn linked_folders(paths: &Paths) -> Result<Vec<FolderStatus>, DriverError> {
+        let lock_path = paths.lock();
+        let _lock = match File::open(&lock_path) {
+            Ok(file) => match Flock::share(file).map_err(io_error(&lock_path))? {
+                Some(lock) => Some(lock),
+                None => return Err(DriverError::Busy(lock_path)),
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(io_error(&lock_path)(error)),
+        };
+        Ok(read_folders(paths, |path| Store::open_read_only(path))?
+            .into_iter()
+            .map(|(_, status)| status)
+            .collect())
+    }
+
     /// Opens the profile at `paths`: takes its lock, reads its configuration and credential, and finds its linked
     /// folders. Nothing syncs until [`Driver::start`].
     pub fn open(paths: Paths) -> Result<Self, DriverError> {
@@ -1020,15 +1039,37 @@ fn folder_status(
     }
 }
 
-/// Every store under the profile's spaces directory that records a link.
+/// Every store under the profile's spaces directory that records a link, with the folder's status.
 fn load_folders(paths: &Paths) -> Result<BTreeMap<String, Folder>, DriverError> {
+    Ok(read_folders(paths, |path| Store::open(path))?
+        .into_iter()
+        .map(|(link, status)| {
+            (
+                link.space_id.clone(),
+                Folder {
+                    status: Arc::new(Mutex::new(status)),
+                    link,
+                    run: None,
+                    unlink: None,
+                },
+            )
+        })
+        .collect())
+}
+
+/// The link and the status of every store under the profile's spaces directory that records a link, each store opened
+/// with `open`.
+fn read_folders(
+    paths: &Paths,
+    open: impl Fn(&Path) -> Result<Store, flarebox_store::Error>,
+) -> Result<Vec<(Link, FolderStatus)>, DriverError> {
     let spaces = paths.spaces();
     let entries = match fs::read_dir(&spaces) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(io_error(&spaces)(error)),
     };
-    let mut folders = BTreeMap::new();
+    let mut folders = Vec::new();
     for entry in entries {
         let entry = entry.map_err(io_error(&spaces))?;
         let Ok(path) = paths.store(&entry.file_name().to_string_lossy()) else {
@@ -1037,7 +1078,7 @@ fn load_folders(paths: &Paths) -> Result<BTreeMap<String, Folder>, DriverError> 
         if !path.exists() {
             continue;
         }
-        let mut store = Store::open(&path).map_err(store_error(&path))?;
+        let mut store = open(&path).map_err(store_error(&path))?;
         let (link, cursor, nodes, questions) = store
             .transaction(|tx| {
                 let questions = tx
@@ -1058,15 +1099,7 @@ fn load_folders(paths: &Paths) -> Result<BTreeMap<String, Folder>, DriverError> 
             continue;
         };
         let status = folder_status(&link, cursor, nodes, questions as u64);
-        folders.insert(
-            link.space_id.clone(),
-            Folder {
-                status: Arc::new(Mutex::new(status)),
-                link,
-                run: None,
-                unlink: None,
-            },
-        );
+        folders.push((link, status));
     }
     Ok(folders)
 }
@@ -1862,6 +1895,56 @@ mod tests {
         assert_eq!(save.await.unwrap().unwrap().device_id, "d2");
         assert!(paths.credential().exists());
         assert_eq!(driver.status().account.unwrap().device_id, "d2");
+    }
+
+    /// Every file and folder under `dir` with its modification time and contents, to show that nothing changed.
+    fn snapshot(dir: &Path) -> Vec<(PathBuf, SystemTime, Vec<u8>)> {
+        let mut found = Vec::new();
+        let mut todo = vec![dir.to_path_buf()];
+        while let Some(next) = todo.pop() {
+            for entry in fs::read_dir(&next).unwrap() {
+                let path = entry.unwrap().path();
+                let meta = fs::symlink_metadata(&path).unwrap();
+                let bytes = if meta.is_file() {
+                    fs::read(&path).unwrap()
+                } else {
+                    todo.push(path.clone());
+                    Vec::new()
+                };
+                found.push((path, meta.modified().unwrap(), bytes));
+            }
+        }
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn linked_folders_are_read_without_writing_to_the_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        let paths = Paths::under(&base.join("profile"));
+        linked(&paths, &root, "d1");
+        drop(Driver::open(paths.clone()).unwrap());
+        let before = snapshot(&base.join("profile"));
+
+        let folders = Driver::linked_folders(&paths).unwrap();
+
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].space_id, SPACE);
+        assert_eq!(folders[0].path, root.display().to_string());
+        assert_eq!(snapshot(&base.join("profile")), before);
+
+        let held = Driver::open(paths.clone()).unwrap();
+        assert!(matches!(
+            Driver::linked_folders(&paths),
+            Err(DriverError::Busy(_))
+        ));
+        drop(held);
+
+        let fresh = Paths::under(&base.join("fresh"));
+        assert!(Driver::linked_folders(&fresh).unwrap().is_empty());
+        assert!(!base.join("fresh").exists());
     }
 
     #[tokio::test]

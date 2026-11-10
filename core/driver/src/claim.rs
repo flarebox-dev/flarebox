@@ -44,7 +44,7 @@ fn private_dir(root: &Path) -> io::Result<OwnedFd> {
     )?)
 }
 
-/// An exclusive `flock` on an open file or folder, unlocked when it is dropped. Closing the descriptor is not
+/// An exclusive or shared `flock` on an open file or folder, unlocked when it is dropped. Closing the descriptor is not
 /// enough. A close releases the lock only once no copy of the descriptor is left, and a child process holds a copy
 /// of every descriptor of its parent from its fork to its exec, close-on-exec or not. Without the unlock, a folder
 /// whose task ended while another thread started a child stayed locked for some milliseconds (GUN-343).
@@ -55,7 +55,17 @@ impl Flock {
     /// Takes the lock on `file` without waiting. Returns `None` while another open of the file holds it, in this
     /// process or another.
     pub fn take(file: File) -> io::Result<Option<Self>> {
-        match rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive) {
+        Self::lock(file, FlockOperation::NonBlockingLockExclusive)
+    }
+
+    /// Takes a shared lock on `file` without waiting, which other readers can hold at the same time. Returns `None`
+    /// while an exclusive lock is held.
+    pub fn share(file: File) -> io::Result<Option<Self>> {
+        Self::lock(file, FlockOperation::NonBlockingLockShared)
+    }
+
+    fn lock(file: File, operation: FlockOperation) -> io::Result<Option<Self>> {
+        match rustix::fs::flock(&file, operation) {
             Ok(()) => Ok(Some(Self(file))),
             Err(Errno::WOULDBLOCK) => Ok(None),
             Err(error) => Err(error.into()),
@@ -205,6 +215,19 @@ pub(crate) mod tests {
         let _child = Holder::of(&held);
         assert!(lock(dir.path()).unwrap().is_none());
         drop(held);
+        assert!(lock(dir.path()).unwrap().is_some());
+    }
+
+    #[test]
+    fn shared_locks_are_released_while_a_child_process_holds_a_copy_of_a_descriptor() {
+        let dir = folder();
+        let open = || File::open(dir.path()).unwrap();
+        let first = Flock::share(open()).unwrap().unwrap();
+        let second = Flock::share(open()).unwrap().unwrap();
+        let _child = Holder::of(&first);
+        assert!(lock(dir.path()).unwrap().is_none());
+        drop(first);
+        drop(second);
         assert!(lock(dir.path()).unwrap().is_some());
     }
 
