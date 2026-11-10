@@ -87,7 +87,7 @@ async function getOwner(): Promise<DeviceCredentials> {
 /** A space with this tree: Docs/{a.txt, Sub/{b.txt}}, Other/{c.txt}, top.txt. */
 async function newSpace() {
   const creds = await getOwner();
-  const created = await owned("/v1/spaces", { token: creds.access!.token, body: body(CreateSpaceRequestSchema, { name: "Home" }) }, SpaceInfoSchema);
+  const created = await owned("/v1/spaces", { token: creds.access!.token, body: body(CreateSpaceRequestSchema, { name: `Home ${crypto.randomUUID()}` }) }, SpaceInfoSchema);
   const spaceId = created.message!.spaceId;
   const device = new TestClient(space(spaceId), spaceId, {
     deviceId: creds.deviceId,

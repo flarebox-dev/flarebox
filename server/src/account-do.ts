@@ -168,6 +168,8 @@ export class AccountDO extends DurableObject<Env> {
   private keyCache: ServerKey | undefined;
   /** Rewinds this instance is driving now, so a retry and the alarm do not run the same phase at once. */
   private readonly driving = new Set<string>();
+  /** The [owner, name] of each space whose create is setting up its Space DO, as JSON. */
+  private readonly creating = new Set<string>();
   /** The time rewinds are admitted, completed and timed out against, and token refreshes read. Tests replace it to move through days or back. */
   clock: () => number = () => Date.now();
   private readonly shares: ShareLinks;
@@ -508,21 +510,35 @@ export class AccountDO extends DurableObject<Env> {
     await this.armAlarm();
   }
 
-  async createSpace(args: { userId: string; name: string }): Promise<SpaceInfo> {
+  /**
+   * Creates a space, refusing a name the owner already uses. Names compare exactly after trimming, as `flarebox link
+   * --space` resolves them. While the Space DO is set up, the name is held in memory, so a concurrent create of it is
+   * refused and an aborted create leaves nothing behind; the row is stored once the Space DO holds the space.
+   */
+  async createSpace(args: { userId: string; name: string }): Promise<Outcome<SpaceInfo>> {
     const nowMs = Date.now();
     const spaceId = uuidv7(nowMs);
     const name = args.name.trim() || "Flarebox";
-    const spaceKey = await deriveSpaceKey((await this.serverKey()).secret, spaceId);
-    await this.env.SPACE.get(this.env.SPACE.idFromName(spaceId)).init({ spaceId, name, ownerUserId: args.userId, spaceKey });
-    this.sql.exec(
-      "INSERT INTO spaces (space_id, name, owner_id, created_at_ms, format_version, list_seq) VALUES (?, ?, ?, ?, ?, (SELECT COALESCE(MAX(list_seq), 0) + 1 FROM spaces))",
-      spaceId,
-      name,
-      args.userId,
-      nowMs,
-      FORMAT_VERSION,
-    );
-    return spaceInfo({ space_id: spaceId, name, owner_id: args.userId, created_at_ms: nowMs, format_version: FORMAT_VERSION });
+    const held = JSON.stringify([args.userId, name]);
+    if (this.creating.has(held) || this.sql.exec("SELECT 1 FROM spaces WHERE owner_id = ? AND name = ?", args.userId, name).toArray().length > 0) {
+      return failure(Error_Code.INVALID_ARGUMENT, "you already have a space with this name");
+    }
+    this.creating.add(held);
+    try {
+      const spaceKey = await deriveSpaceKey((await this.serverKey()).secret, spaceId);
+      await this.env.SPACE.get(this.env.SPACE.idFromName(spaceId)).init({ spaceId, name, ownerUserId: args.userId, spaceKey });
+      this.sql.exec(
+        "INSERT INTO spaces (space_id, name, owner_id, created_at_ms, format_version, list_seq) VALUES (?, ?, ?, ?, ?, (SELECT COALESCE(MAX(list_seq), 0) + 1 FROM spaces))",
+        spaceId,
+        name,
+        args.userId,
+        nowMs,
+        FORMAT_VERSION,
+      );
+    } finally {
+      this.creating.delete(held);
+    }
+    return ok(spaceInfo({ space_id: spaceId, name, owner_id: args.userId, created_at_ms: nowMs, format_version: FORMAT_VERSION }));
   }
 
   /**

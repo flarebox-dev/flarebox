@@ -109,7 +109,7 @@ async function pairDevice(inviter: DeviceCredentials, deviceName: string): Promi
 }
 
 async function createSpace(owner: DeviceCredentials): Promise<string> {
-  const created = await call("/v1/spaces", { token: owner.access!.token, body: body(CreateSpaceRequestSchema, { name: "Home" }) }, SpaceInfoSchema);
+  const created = await call("/v1/spaces", { token: owner.access!.token, body: body(CreateSpaceRequestSchema, { name: `Home ${uuidv7()}` }) }, SpaceInfoSchema);
   expect(created.status).toBe(201);
   return created.message!.spaceId;
 }
@@ -1018,6 +1018,53 @@ describe("RFC 0007 name limits and space list pages", () => {
     const created = await call("/v1/spaces", { token, body: body(CreateSpaceRequestSchema, { name: longest }) }, SpaceInfoSchema);
     expect(created.status).toBe(201);
     expect(created.message!.name).toBe(longest);
+  });
+
+  it("refuses a space name the owner already uses, compared exactly after trimming, when two creates race", async () => {
+    const token = (await getOwner()).access!.token;
+    const name = `Shared ${uuidv7()}`;
+    const createNamed = (text: string) => send("/v1/spaces", { token, body: body(CreateSpaceRequestSchema, { name: text }) });
+    const raced = await Promise.all([createNamed(name), createNamed(name)]);
+    expect(raced.map((outcome) => outcome.status).sort()).toEqual([201, 409]);
+    expect(await createNamed(` ${name}  `)).toEqual({ status: 409, code: Error_Code.INVALID_ARGUMENT });
+    expect((await createNamed(name.toUpperCase())).status).toBe(201);
+    const listed = (await spacePages(token)).flatMap((page) => page.spaces);
+    expect(listed.filter((space) => space.name === name)).toHaveLength(1);
+  });
+
+  it("frees a space name again when the space behind it cannot be set up", async () => {
+    const token = (await getOwner()).access!.token;
+    const name = `Broken ${uuidv7()}`;
+    await runInDurableObject(account(), (instance) => {
+      const spaces = (instance as unknown as { env: Env }).env.SPACE;
+      vi.spyOn(spaces, "get").mockImplementationOnce(
+        () => ({ init: () => Promise.reject(new Error("the Space DO is unavailable")) }) as unknown as ReturnType<typeof spaces.get>,
+      );
+    });
+    await expect(send("/v1/spaces", { token, body: body(CreateSpaceRequestSchema, { name }) })).rejects.toThrow("the Space DO is unavailable");
+    const listed = (await spacePages(token)).flatMap((page) => page.spaces);
+    expect(listed.some((space) => space.name === name)).toBe(false);
+    const created = await call("/v1/spaces", { token, body: body(CreateSpaceRequestSchema, { name }) }, SpaceInfoSchema);
+    expect(created.status).toBe(201);
+  });
+
+  it("frees a space name when the Account DO aborts during the create, after its storage was flushed", async () => {
+    const token = (await getOwner()).access!.token;
+    const name = `Interrupted ${uuidv7()}`;
+    await runInDurableObject(account(), (instance, state) => {
+      const spaces = (instance as unknown as { env: Env }).env.SPACE;
+      vi.spyOn(spaces, "get").mockImplementationOnce(
+        () =>
+          ({
+            init: async () => {
+              await state.storage.sync();
+              state.abort("interrupted while the Space DO was being set up");
+            },
+          }) as unknown as ReturnType<typeof spaces.get>,
+      );
+    });
+    await send("/v1/spaces", { token, body: body(CreateSpaceRequestSchema, { name }) }).catch(() => undefined);
+    expect((await send("/v1/spaces", { token, body: body(CreateSpaceRequestSchema, { name }) })).status).toBe(201);
   });
 
   it("lists a space whose create was still storing it when a listing passed newer spaces", async () => {

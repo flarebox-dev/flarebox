@@ -109,7 +109,7 @@ pub async fn new_space() -> SpaceInfo {
         .create_space(
             &owner,
             &CreateSpaceRequest {
-                name: "test".into(),
+                name: format!("test {}", uuidv7()),
             },
         )
         .await

@@ -994,3 +994,170 @@ async fn restore_brings_back_a_deleted_file_and_an_earlier_version() {
     assert!(trash.contains("Nothing from"), "{trash}");
     assert!(stop(daemon).success());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Worker; run cli/scripts/integration-test.sh"]
+async fn a_device_creates_a_space_and_links_a_folder_to_it() {
+    let owner = Arc::new(Auth::new(api(), owner().await));
+    let pairing = owner.api().pair_start(&owner).await.unwrap();
+    let server = server_url().to_string();
+    let machine = Machine::new();
+    machine.run(&["join", &pairing.code, "--server", &server, "--name", "desk"]);
+    let name = format!("notes {}", uuidv7());
+
+    let created = machine.run(&["space", "create", &format!(" {name} ")]);
+    assert!(
+        created.starts_with(&format!("Created the space {name} (")),
+        "{created}"
+    );
+    let spaces: Value = serde_json::from_str(&machine.run(&["space", "list", "--json"])).unwrap();
+    let ours: Vec<&Value> = spaces
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|space| space["name"] == name.as_str())
+        .collect();
+    assert_eq!(ours.len(), 1, "{spaces:#}");
+    let space_id = ours[0]["space_id"].as_str().unwrap();
+    assert!(created.contains(space_id), "{created}");
+    let listed = machine.run(&["space", "list"]);
+    assert!(listed.contains(&format!("{space_id}  {name}")), "{listed}");
+    let again = machine.fails(&["space", "create", &name]);
+    assert!(again.contains("already has that name"), "{again}");
+    let blank = machine.fails(&["space", "create", "  "]);
+    assert!(blank.contains("a space needs a name"), "{blank}");
+
+    let folder = machine.path("Notes");
+    fs::create_dir_all(&folder).unwrap();
+    let linked = machine.run(&["link", folder.to_str().unwrap(), "--space", &name]);
+    assert!(linked.contains(space_id), "{linked}");
+    let owners = owner.api().list_spaces(&owner).await.unwrap().spaces;
+    assert!(
+        owners.iter().any(|space| space.space_id == space_id),
+        "the owner's other device does not see the space"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Worker; run cli/scripts/integration-test.sh"]
+async fn two_creates_of_one_name_at_once_make_one_space() {
+    use http_body_util::{BodyExt, Full};
+    use hyper::{Request, Response, body::Incoming, service::service_fn};
+    use hyper_util::rt::TokioIo;
+    let owner = Arc::new(Auth::new(api(), owner().await));
+    let pairing = owner.api().pair_start(&owner).await.unwrap();
+    let machine = Machine::new();
+    machine.run(&[
+        "join",
+        &pairing.code,
+        "--server",
+        server_url().as_str(),
+        "--name",
+        "desk",
+    ]);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = format!("http://{}/", listener.local_addr().unwrap());
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let upstream = server_url();
+    let service = tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let barrier = barrier.clone();
+            let upstream = upstream.clone();
+            tokio::spawn(async move {
+                let handler = service_fn(move |request: Request<Incoming>| {
+                    let barrier = barrier.clone();
+                    let upstream = upstream.clone();
+                    async move {
+                        let (parts, body) = request.into_parts();
+                        let path = parts.uri.path_and_query().unwrap().as_str();
+                        let listing =
+                            parts.method == hyper::Method::GET && parts.uri.path() == "/v1/spaces";
+                        let body = body.collect().await.unwrap().to_bytes();
+                        let mut call = reqwest::Client::new()
+                            .request(
+                                parts.method,
+                                upstream.join(path.trim_start_matches('/')).unwrap(),
+                            )
+                            .body(body);
+                        for (key, value) in &parts.headers {
+                            if key != hyper::header::HOST {
+                                call = call.header(key, value);
+                            }
+                        }
+                        let response = call.send().await.unwrap();
+                        let status = response.status();
+                        let body = response.bytes().await.unwrap();
+                        if listing {
+                            barrier.wait().await;
+                        }
+                        Ok::<_, std::convert::Infallible>(
+                            Response::builder()
+                                .status(status)
+                                .header("content-type", "application/x-protobuf")
+                                .body(Full::new(body))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(tcp), handler)
+                    .await;
+            });
+        }
+    });
+    let path = machine.path("state/flarebox/credential.json");
+    let mut credential: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    credential["server"] = proxy.into();
+    fs::write(&path, serde_json::to_vec(&credential).unwrap()).unwrap();
+    let name = format!("concurrent {}", uuidv7());
+    let left = machine
+        .command(&["space", "create", &name])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let right = machine
+        .command(&["space", "create", &name])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let outcomes = tokio::task::spawn_blocking(move || {
+        [
+            left.wait_with_output().unwrap(),
+            right.wait_with_output().unwrap(),
+        ]
+    })
+    .await
+    .unwrap();
+    let spaces = owner.api().list_spaces(&owner).await.unwrap().spaces;
+    let count = spaces.iter().filter(|space| space.name == name).count();
+    service.abort();
+    let root = machine.path("Sync");
+    fs::create_dir(&root).unwrap();
+    credential["server"] = server_url().to_string().into();
+    fs::write(&path, serde_json::to_vec(&credential).unwrap()).unwrap();
+    let created = outcomes
+        .iter()
+        .filter(|result| result.status.success())
+        .count();
+    let refused: Vec<String> = outcomes
+        .iter()
+        .filter(|result| !result.status.success())
+        .map(|result| String::from_utf8_lossy(&result.stderr).into_owned())
+        .collect();
+    assert_eq!((created, refused.len()), (1, 1), "{outcomes:?}");
+    assert!(
+        refused[0].contains("already have a space with this name"),
+        "{}",
+        refused[0]
+    );
+    assert_eq!(count, 1, "both creates of one name made a space");
+    let space_id = &spaces
+        .iter()
+        .find(|space| space.name == name)
+        .unwrap()
+        .space_id;
+    let linked = machine.run(&["link", root.to_str().unwrap(), "--space", &name]);
+    assert!(linked.contains(space_id.as_str()), "{linked}");
+}

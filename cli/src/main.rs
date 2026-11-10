@@ -19,7 +19,9 @@ use flarebox_driver::{
     Answer, Credential, Driver, DriverError, FolderStatus, Paths, Question, QuestionKind, Status,
 };
 use flarebox_net::{ApiError, Auth};
-use flarebox_proto::v1::{DeviceInfo, SpaceInfo, SpaceUsage, device_info::Kind};
+use flarebox_proto::v1::{
+    CreateSpaceRequest, DeviceInfo, SpaceInfo, SpaceUsage, device_info::Kind,
+};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::EnvFilter;
 
@@ -62,6 +64,11 @@ enum Command {
     Server {
         #[command(subcommand)]
         action: setup::ServerAction,
+    },
+    /// Create a space, or list the spaces of the server.
+    Space {
+        #[command(subcommand)]
+        action: SpaceAction,
     },
     /// Link a folder to a space and start syncing it.
     Link {
@@ -159,6 +166,20 @@ enum QuestionAction {
 }
 
 #[derive(Subcommand)]
+enum SpaceAction {
+    /// Create a space. Link a folder to it with flarebox link.
+    Create {
+        /// The space's name, at most 255 bytes.
+        name: String,
+    },
+    /// List the spaces of the server.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum DeviceAction {
     /// List the devices paired with the server, revoked ones included.
     List {
@@ -224,6 +245,7 @@ fn main() -> ExitCode {
         match command {
             Command::Daemon { .. } => daemon(paths).await,
             Command::Device { action } => device(paths, action).await,
+            Command::Space { action } => space(paths, action).await,
             Command::Usage { json } => usage(paths, json).await,
             Command::Trash { folder, json } => history::trash(&paths, &folder, json).await,
             Command::Versions { file, json } => history::versions(&paths, &file, json).await,
@@ -355,6 +377,7 @@ async fn client(paths: Paths, command: Command) -> Result<(), String> {
         Command::Daemon { .. }
         | Command::Device { .. }
         | Command::Usage { .. }
+        | Command::Space { .. }
         | Command::Trash { .. }
         | Command::Versions { .. }
         | Command::Restore { .. }
@@ -493,6 +516,74 @@ async fn device(paths: Paths, action: DeviceAction) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+/// Runs a space command. Creating refuses a name another space has, since flarebox link names a space by its name.
+async fn space(paths: Paths, action: SpaceAction) -> Result<(), String> {
+    let auth = signed_in(&paths)?;
+    let spaces = auth.api().list_spaces(&auth).await.map_err(refusal)?.spaces;
+    match action {
+        SpaceAction::List { json } => {
+            if json {
+                return print_json(&spaces.iter().map(space_json).collect::<Vec<_>>());
+            }
+            print!("{}", space_table(&spaces));
+            Ok(())
+        }
+        SpaceAction::Create { name } => {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err("a space needs a name".to_owned());
+            }
+            if let Some(taken) = spaces.iter().find(|space| space.name == name) {
+                return Err(format!(
+                    "the space {} already has that name; link a folder to it, or pick another name",
+                    printable(&taken.space_id)
+                ));
+            }
+            let created = auth
+                .api()
+                .create_space(
+                    &auth,
+                    &CreateSpaceRequest {
+                        name: name.to_owned(),
+                    },
+                )
+                .await
+                .map_err(refusal)?;
+            println!(
+                "Created the space {} ({}).\nLink a folder to it with flarebox link <folder> --space {}.",
+                printable(&created.name),
+                created.space_id,
+                created.space_id
+            );
+            Ok(())
+        }
+    }
+}
+
+fn space_json(space: &SpaceInfo) -> serde_json::Value {
+    serde_json::json!({
+        "space_id": space.space_id,
+        "name": space.name,
+        "created_at_ms": space.created_at_ms,
+    })
+}
+
+/// One line per space: its ID and its name.
+fn space_table(spaces: &[SpaceInfo]) -> String {
+    if spaces.is_empty() {
+        return "No spaces. Create one with flarebox space create <name>.\n".to_owned();
+    }
+    let mut table = format!("{:<36}  NAME\n", "ID");
+    for space in spaces {
+        table.push_str(&format!(
+            "{:<36}  {}\n",
+            printable(&space.space_id),
+            printable(&space.name)
+        ));
+    }
+    table
 }
 
 /// Shows what each space of the account stores (RFC 0010). A space the server refuses, such as one a rewind holds
@@ -940,6 +1031,23 @@ mod tests {
         let json = usage_json(&space, &usage);
         assert_eq!(json["total_bytes"], 3_253_600_000u64);
         assert_eq!(json["trashed_files"], 1);
+    }
+
+    #[test]
+    fn the_space_list_shows_each_space_by_id_and_name() {
+        let spaces = [SpaceInfo {
+            space_id: ID.into(),
+            name: "Notes\u{1b}[2J".into(),
+            ..SpaceInfo::default()
+        }];
+        assert_eq!(
+            space_table(&spaces),
+            format!("ID                                    NAME\n{ID}  Notes\\u{{1b}}[2J\n")
+        );
+        assert_eq!(
+            space_table(&[]),
+            "No spaces. Create one with flarebox space create <name>.\n"
+        );
     }
 
     #[test]
