@@ -197,8 +197,11 @@ impl Effects {
     /// not go into the node's own subtree. A directory is removed only once it is empty. When no
     /// such effect applies, a node that blocks one is parked, if it is a candidate itself or its S
     /// update waits ([`Trees::waiting`]), since the commit layer does not plan it either: the
-    /// entry holding a name, or a directory that would move into its own subtree. A rename that
-    /// changes only case or normalization goes through the parked directory too.
+    /// entry holding a name, or a directory that would move into its own subtree. A node whose park
+    /// failed gets no effect until L changes: the parked directory always has room, so the park
+    /// failed on the entry itself, and the node's own effect would fail on it too, taking turns
+    /// with the park for as long as L stays as it is. A rename that changes only case or
+    /// normalization goes through the parked directory too.
     ///
     /// A parked node with a local change, such as an edit observed in the parked directory, is
     /// only moved out: to its R position, or to the position L keeps for it when R has none. Its
@@ -247,6 +250,16 @@ impl Effects {
             }
             false
         };
+        let park_failed = |id: &str| {
+            let failed = self.failed.get(id);
+            matches!(
+                failed,
+                Some(Effect::Move {
+                    to: Location::Parked(_),
+                    ..
+                })
+            ) && view.park(id).map(|(park, _)| park).as_ref() == failed
+        };
         let mut blockers = BTreeSet::new();
         let mut chosen = None;
         for id in trees.dirty() {
@@ -254,7 +267,8 @@ impl Effects {
                 continue;
             }
             match view.step(id) {
-                Step::Apply(effect, _) if self.failed.get(id) == Some(&effect) => {}
+                Step::Apply(effect, _)
+                    if self.failed.get(id) == Some(&effect) || park_failed(id) => {}
                 Step::Apply(effect, after) => {
                     chosen = Some((id.clone(), effect, after));
                     break;
