@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::names::name_key;
+use crate::state::{StateError, TreesState};
 use crate::tree::{
     Kind, LocalNode, Names, NodeId, RemoteNode, Shape, Tree, TreeError, same, same_content,
 };
@@ -485,5 +486,44 @@ impl Trees {
         self.r.check(Names::ByKey).map_err(|e| ('R', e))?;
         self.s.check(Names::ByKey).map_err(|e| ('S', e))?;
         self.l.check(Names::Exact).map_err(|e| ('L', e))
+    }
+
+    /// What the store keeps besides the nodes of R, L and S.
+    pub fn state(&self) -> TreesState {
+        TreesState {
+            dirty: self.dirty.clone(),
+            unsearched: self.unsearched.clone(),
+            reverted: self.reverted.clone(),
+            parked_as: self.parked_as.clone(),
+            waiting: self.waiting.clone(),
+        }
+    }
+
+    /// Replaces the dirty, unsearched, reverted, parked and waiting nodes with `state`, once the
+    /// store has loaded every node. Refuses trees that break section 2.2, an unsearched node that
+    /// is not dirty, and a parked name for a node L does not hold as parked.
+    pub fn restore(&mut self, state: TreesState) -> Result<(), StateError> {
+        self.check()
+            .map_err(|(tree, error)| StateError::Tree(tree, error))?;
+        if let Some(id) = state.unsearched.difference(&state.dirty).next() {
+            return Err(StateError::UnsearchedNotDirty(id.clone()));
+        }
+        let placed = |id: &&NodeId| !self.l.get(id).is_some_and(|node| node.parked);
+        if let Some(id) = state.parked_as.keys().find(placed) {
+            return Err(StateError::NotParked(id.clone()));
+        }
+        let TreesState {
+            dirty,
+            unsearched,
+            reverted,
+            parked_as,
+            waiting,
+        } = state;
+        self.dirty = dirty;
+        self.unsearched = unsearched;
+        self.reverted = reverted;
+        self.parked_as = parked_as;
+        self.waiting = waiting;
+        Ok(())
     }
 }

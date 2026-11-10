@@ -12,6 +12,7 @@ use prost::Message;
 use crate::classify::{Class, Trees};
 use crate::ids::IdGen;
 use crate::names::{MAX_NAME_BYTES, name_key, nfc};
+use crate::state::{CommitsState, StateError};
 use crate::tree::{Content, Kind, Names, NodeId, Shape, same, same_content};
 
 /// The most ops one commit holds (spec v0 section 13).
@@ -109,6 +110,73 @@ pub struct Commits {
 }
 
 impl Commits {
+    /// What the store keeps of the commit side.
+    pub fn state(&self) -> CommitsState {
+        CommitsState {
+            accepted: self.accepted,
+            in_flight: self.in_flight.clone(),
+            problems: self.problems.clone(),
+            halted: self.halted,
+            cap: self.cap,
+            split: self.split.clone(),
+            aliases: self.aliases.clone(),
+        }
+    }
+
+    /// The commit side the store kept. Refuses a commit in flight that does not take slot
+    /// `accepted + 1`, whose result does not have one outcome per op, or that lists planned
+    /// deletes for a node none of its `Delete` ops targets. Also refuses a cap of 0 or of at least
+    /// [`MAX_OPS`], and a folder merged into itself.
+    pub fn from_state(state: CommitsState) -> Result<Self, StateError> {
+        if let Some(flight) = &state.in_flight {
+            let device_seq = flight.commit.device_seq;
+            if state.accepted.checked_add(1) != Some(device_seq) {
+                return Err(StateError::DeviceSeq {
+                    accepted: state.accepted,
+                    device_seq,
+                });
+            }
+            let ops = &flight.commit.ops;
+            if let Some(result) = &flight.result
+                && result.results.len() != ops.len()
+            {
+                return Err(StateError::ResultMismatch);
+            }
+            let deleted = |id: &str| {
+                ops.iter().any(
+                    |op| matches!(&op.op, Some(op::Op::Delete(delete)) if delete.node_id == id),
+                )
+            };
+            if let Some(id) = flight.deletes.keys().find(|id| !deleted(id)) {
+                return Err(StateError::DeleteWithoutOp(id.clone()));
+            }
+        }
+        if let Some(cap) = state.cap.filter(|cap| !(1..MAX_OPS).contains(cap)) {
+            return Err(StateError::Cap(cap));
+        }
+        if let Some((id, _)) = state.aliases.iter().find(|(id, into)| id == into) {
+            return Err(StateError::SelfAlias(id.clone()));
+        }
+        let CommitsState {
+            accepted,
+            in_flight,
+            problems,
+            halted,
+            cap,
+            split,
+            aliases,
+        } = state;
+        Ok(Self {
+            accepted,
+            in_flight,
+            problems,
+            halted,
+            cap,
+            split,
+            aliases,
+        })
+    }
+
     /// The accepted counter *a* of section 2.8: the `device_seq` of the last commit whose result
     /// was applied.
     pub fn accepted(&self) -> u64 {

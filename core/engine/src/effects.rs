@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::classify::{Class, Trees};
 use crate::ids::IdGen;
 use crate::names::name_key;
+use crate::state::{EffectsState, StateError};
 use crate::tree::{Content, FileIdentity, Kind, LocalNode, NodeId, Shape, same_content};
 
 /// A directory on the way to an entry, with the identity L holds for it. The driver resolves a
@@ -135,6 +136,38 @@ pub struct Effects {
 }
 
 impl Effects {
+    /// What the store keeps of the disk side.
+    pub fn state(&self) -> EffectsState {
+        EffectsState {
+            in_flight: self.in_flight.clone(),
+            cleared: self.cleared,
+            failed: self.failed.clone(),
+        }
+    }
+
+    /// The disk side the store kept. Refuses an effect in flight whose counter is not one more
+    /// than the effects cleared.
+    pub fn from_state(state: EffectsState) -> Result<Self, StateError> {
+        if let Some(record) = &state.in_flight
+            && state.cleared.checked_add(1) != Some(record.counter)
+        {
+            return Err(StateError::EffectCounter {
+                cleared: state.cleared,
+                counter: record.counter,
+            });
+        }
+        let EffectsState {
+            in_flight,
+            cleared,
+            failed,
+        } = state;
+        Ok(Self {
+            in_flight,
+            cleared,
+            failed,
+        })
+    }
+
     pub fn in_flight(&self) -> Option<&EffectRecord> {
         self.in_flight.as_ref()
     }
