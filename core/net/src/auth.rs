@@ -89,6 +89,7 @@ impl Auth {
         let request = TokenRequest {
             device_id: self.credentials.device_id.clone(),
             refresh_credential: self.credentials.refresh_credential.clone(),
+            ..Default::default()
         };
         let token = self.api.token(&request).await?;
         *cached = Some(token.clone());
@@ -147,6 +148,7 @@ mod tests {
         AccessToken {
             token: "t".into(),
             expires_at_ms: (now + from_now).as_millis() as i64,
+            ..Default::default()
         }
     }
 

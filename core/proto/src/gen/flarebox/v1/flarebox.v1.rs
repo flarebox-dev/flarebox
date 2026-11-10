@@ -118,6 +118,16 @@ pub struct TokenRequest {
     pub device_id: ::prost::alloc::string::String,
     #[prost(string, tag="2")]
     pub refresh_credential: ::prost::alloc::string::String,
+    /// Asks for server_time_ms and rotated in the answer (RFC 0011 section 1).
+    #[prost(bool, tag="3")]
+    pub rotation: bool,
+    /// A new refresh credential the device generated, to replace refresh_credential if the request arrives by
+    /// rotate_before_ms: 32 random bytes, base64url without padding. Requires rotation and rotate_before_ms.
+    #[prost(string, tag="4")]
+    pub next_refresh_credential: ::prost::alloc::string::String,
+    /// The deadline for next_refresh_credential, in Unix milliseconds of the server's rotation clock.
+    #[prost(int64, tag="5")]
+    pub rotate_before_ms: i64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AccessToken {
@@ -126,6 +136,13 @@ pub struct AccessToken {
     pub token: ::prost::alloc::string::String,
     #[prost(int64, tag="2")]
     pub expires_at_ms: i64,
+    /// Set only when the request set rotation: the server's rotation clock for this principal, in Unix milliseconds. It
+    /// never decreases from one answer to the next (RFC 0011 section 1).
+    #[prost(int64, tag="3")]
+    pub server_time_ms: i64,
+    /// Set when the server stored next_refresh_credential in place of the presented credential.
+    #[prost(bool, tag="4")]
+    pub rotated: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SpaceInfo {

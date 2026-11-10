@@ -39,6 +39,8 @@ const DEVICE_PAGE = 100;
 const SPACE_PAGE = 100;
 const BASE32 = "ABCDEFGHJKMNPQRSTVWXYZ0123456789";
 const DAY_MS = 24 * 3_600_000;
+/** A refresh credential as a device generates one: 32 random bytes, base64url without padding (RFC 0011 section 1). */
+const REFRESH_CREDENTIAL = /^[A-Za-z0-9_-]{43}$/;
 /** How long a chunk retirement record is kept: PITR cannot restore a state older than 30 days (RFC 0003 section 5, rule 10). */
 const RETIREMENT_KEEP_MS = 30 * DAY_MS;
 /** PITR restores any point in the past 30 days. */
@@ -125,6 +127,7 @@ interface DeviceRow {
   scope: string | null;
   expires_at_ms: number | null;
   issued_by: string | null;
+  rotation_clock_ms: number;
 }
 
 /**
@@ -165,7 +168,7 @@ export class AccountDO extends DurableObject<Env> {
   private keyCache: ServerKey | undefined;
   /** Rewinds this instance is driving now, so a retry and the alarm do not run the same phase at once. */
   private readonly driving = new Set<string>();
-  /** The time rewinds are admitted, completed and timed out against. Tests replace it to move through days. */
+  /** The time rewinds are admitted, completed and timed out against, and token refreshes read. Tests replace it to move through days or back. */
   clock: () => number = () => Date.now();
   private readonly shares: ShareLinks;
 
@@ -361,15 +364,46 @@ export class AccountDO extends DurableObject<Env> {
     return ok(await this.addDevice(inviter.user_id, args.deviceName, args.platform, nowMs, inviter.device_id));
   }
 
-  async refreshAccess(args: { deviceId: string; refreshCredential: string }): Promise<Outcome<AccessToken>> {
-    const nowMs = Date.now();
-    const device = this.activeDevice(args.deviceId);
+  /**
+   * POST /v1/token. A request that sets rotation is answered with the principal's rotation clock, the later of now and
+   * every time answered before, which the same write stores; a proposal is stored in place of the presented credential
+   * when that time is at most its deadline (RFC 0011 section 1). The hashes are computed first, so nothing awaits
+   * between reading the row and writing it.
+   */
+  async refreshAccess(args: {
+    deviceId: string;
+    refreshCredential: string;
+    rotation?: boolean;
+    nextRefreshCredential?: string;
+    rotateBeforeMs?: bigint;
+  }): Promise<Outcome<AccessToken>> {
+    const proposed = args.nextRefreshCredential ?? "";
+    const rotateBeforeMs = Number(args.rotateBeforeMs ?? 0n);
+    if (proposed !== "" && (!REFRESH_CREDENTIAL.test(proposed) || !args.rotation || rotateBeforeMs === 0)) {
+      return failure(Error_Code.INVALID_ARGUMENT, "next_refresh_credential needs a well-formed credential, rotation and rotate_before_ms");
+    }
     const presented = (await sha256(encoder.encode(args.refreshCredential))).slice().buffer;
+    const proposal = proposed === "" ? undefined : (await sha256(encoder.encode(proposed))).slice().buffer;
+    const nowMs = this.clock();
+    const device = this.activeDevice(args.deviceId);
     if (!device || !sameBytes(device.refresh_hash, presented)) {
       return failure(Error_Code.UNAUTHENTICATED, "unknown device or refresh credential");
     }
-    this.sql.exec("UPDATE devices SET last_seen_ms = ? WHERE device_id = ?", nowMs, device.device_id);
-    return ok(await this.accessToken(device, nowMs));
+    const serverTimeMs = Math.max(nowMs, device.rotation_clock_ms);
+    const rotated = proposal !== undefined && serverTimeMs <= rotateBeforeMs;
+    this.sql.exec(
+      "UPDATE devices SET last_seen_ms = ?, rotation_clock_ms = ?, refresh_hash = ? WHERE device_id = ?",
+      nowMs,
+      args.rotation ? serverTimeMs : device.rotation_clock_ms,
+      rotated ? proposal : device.refresh_hash,
+      device.device_id,
+    );
+    const token = await this.accessToken(device, nowMs);
+    if (args.rotation) {
+      token.serverTimeMs = BigInt(serverTimeMs);
+      token.rotated = rotated;
+    }
+    return ok(token);
   }
 
   /**

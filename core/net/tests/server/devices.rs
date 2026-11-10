@@ -61,6 +61,7 @@ async fn the_owner_revokes_a_lost_device_and_a_spare_revokes_itself() {
         .token(&TokenRequest {
             device_id: lost.device_id.clone(),
             refresh_credential: lost.refresh_credential.clone(),
+            ..Default::default()
         })
         .await
         .unwrap_err();

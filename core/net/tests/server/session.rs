@@ -105,6 +105,7 @@ async fn auth_claims_pairs_refreshes_and_refuses_bad_credentials() {
     let stale = flarebox_proto::v1::AccessToken {
         token: "v1.unknown.e30.AAAA".into(),
         expires_at_ms: i64::MAX,
+        ..Default::default()
     };
     let recovering = Arc::new(Auth::new(api(), owner).with_token(stale));
     let (session, mut events) = start(recovering, &space);

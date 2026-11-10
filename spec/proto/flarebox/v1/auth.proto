@@ -70,12 +70,24 @@ message DeviceCredentials {
 message TokenRequest {
   string device_id = 1;
   string refresh_credential = 2;
+  // Asks for server_time_ms and rotated in the answer (RFC 0011 section 1).
+  bool rotation = 3;
+  // A new refresh credential the device generated, to replace refresh_credential if the request arrives by
+  // rotate_before_ms: 32 random bytes, base64url without padding. Requires rotation and rotate_before_ms.
+  string next_refresh_credential = 4;
+  // The deadline for next_refresh_credential, in Unix milliseconds of the server's rotation clock.
+  int64 rotate_before_ms = 5;
 }
 
 message AccessToken {
   // Opaque to clients.
   string token = 1;
   int64 expires_at_ms = 2;
+  // Set only when the request set rotation: the server's rotation clock for this principal, in Unix milliseconds. It
+  // never decreases from one answer to the next (RFC 0011 section 1).
+  int64 server_time_ms = 3;
+  // Set when the server stored next_refresh_credential in place of the presented credential.
+  bool rotated = 4;
 }
 
 message SpaceInfo {
