@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use flarebox_engine::commit::{Commits, Halt, InFlight, Reconnect};
 use flarebox_engine::effects::{Base, Dir, Displaced, Effect, EffectRecord, Location};
@@ -462,6 +463,151 @@ fn engine_state_survives_a_reopen() {
         .transaction(|tx| {
             tx.set_engine_state(&EngineState::default())?;
             assert_eq!(tx.engine_state()?, EngineState::default());
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+}
+
+/// The tables of the engine state besides the nodes of R, L and S.
+const ENGINE_TABLES: [&str; 10] = [
+    "node_sets",
+    "node_maps",
+    "waiting_updates",
+    "commit_state",
+    "commit_in_flight",
+    "commit_in_flight_deletes",
+    "commit_in_flight_delete_members",
+    "effect_state",
+    "failed_effects",
+    "restore_intents",
+];
+
+/// Counts each row inserted, updated or deleted in the engine's tables from now on in the table
+/// `writes`. The triggers are stored in the database, so they count the writes of every connection.
+fn count_engine_writes(path: &Path) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch("CREATE TABLE writes (n INTEGER NOT NULL); INSERT INTO writes VALUES (0);")
+        .unwrap();
+    for table in ENGINE_TABLES {
+        for event in ["INSERT", "UPDATE", "DELETE"] {
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER {table}_{event} AFTER {event} ON {table}
+                 BEGIN UPDATE writes SET n = n + 1; END;"
+            ))
+            .unwrap();
+        }
+    }
+}
+
+fn engine_writes(path: &Path) -> u64 {
+    let conn = Connection::open(path).unwrap();
+    conn.query_row("SELECT n FROM writes", [], |row| row.get(0))
+        .unwrap()
+}
+
+/// [`engine_state`] with `n` more nodes in each node set, node map, the waiting updates and the
+/// failed effects.
+fn engine_state_of(n: usize) -> EngineState {
+    let mut state = engine_state();
+    for i in 0..n {
+        let node = format!("node-{i}");
+        state.trees.dirty.insert(node.clone());
+        state.trees.unsearched.insert(node.clone());
+        state.trees.reverted.insert(node.clone());
+        state
+            .trees
+            .parked_as
+            .insert(node.clone(), format!("parked-{i}"));
+        let shape = engine_shape("p", &format!("{i}.txt"));
+        state.trees.waiting.insert(node.clone(), Some(shape));
+        state.commits.problems.insert(node.clone());
+        state.commits.split.insert(node.clone());
+        state
+            .commits
+            .aliases
+            .insert(node.clone(), format!("alias-{i}"));
+        let effect = Effect::CreateDir {
+            at: Location::Parked(node.clone()),
+        };
+        state.effects.failed.insert(node, effect);
+    }
+    state
+}
+
+#[test]
+fn an_engine_state_update_writes_rows_for_the_change_alone() {
+    let mut writes = Vec::new();
+    for n in [100, 1000] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let before = engine_state_of(n);
+        let mut after = before.clone();
+        after.trees.dirty.remove("node-0");
+        after.trees.dirty.insert("node-new".into());
+        after
+            .trees
+            .parked_as
+            .insert("node-1".into(), "parked-new".into());
+        after.trees.waiting.remove("node-2");
+        after.trees.waiting.insert("node-3".into(), None);
+        after.commits.problems.insert("node-new".into());
+        after.commits.accepted += 1;
+        after.commits.in_flight = None;
+        after.commits.resolved.pop();
+        after.effects.cleared += 1;
+        after.effects.in_flight = None;
+        after.effects.failed.remove("node-4");
+        Store::open(&path)
+            .unwrap()
+            .transaction(|tx| tx.set_engine_state(&before))
+            .unwrap();
+        count_engine_writes(&path);
+
+        let mut store = Store::open(&path).unwrap();
+        store
+            .transaction(|tx| tx.update_engine_state(&before, &after))
+            .unwrap();
+        writes.push(engine_writes(&path));
+        assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), after);
+        drop(store);
+        let mut store = Store::open(&path).unwrap();
+        assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), after);
+        store
+            .transaction(|tx| tx.update_engine_state(&after, &after))
+            .unwrap();
+        assert_eq!(
+            engine_writes(&path),
+            writes[writes.len() - 1],
+            "an unchanged state writes no row"
+        );
+    }
+    assert!(writes[0] > 0);
+    assert_eq!(writes[0], writes[1], "rows written for 100 and 1000 nodes");
+}
+
+/// Each part of the state reaches the store through an update: from a store that never held one,
+/// through changes of each part, back to the default state.
+#[test]
+fn engine_state_updates_store_every_part() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path().join("state.db")).unwrap();
+    let full = engine_state();
+    let mut changed = full.clone();
+    changed.commits.halted = Some(Halt::Policy { code: 3 });
+    changed.commits.cap = Some(2);
+    changed.commits.in_flight.as_mut().unwrap().result = None;
+    changed.commits.restores.clear();
+    changed.effects.in_flight = None;
+    changed.trees.waiting.clear();
+    let states = [full.clone(), changed, full, EngineState::default()];
+    let mut stored = EngineState::default();
+    store
+        .transaction(|tx| {
+            for state in &states {
+                tx.update_engine_state(&stored, state)?;
+                assert_eq!(&tx.engine_state()?, state);
+                stored = state.clone();
+            }
             Ok::<_, Error>(())
         })
         .unwrap();

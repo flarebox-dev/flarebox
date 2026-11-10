@@ -36,6 +36,8 @@ pub(crate) struct Engine {
     pub ids: IdGen,
     /// The history R belongs to and the seq of the last commit R holds. `None` until the first bootstrap.
     pub cursor: Option<Cursor>,
+    /// The engine state as the store holds it, which the next checkpoint changes row by row.
+    pub stored: EngineState,
 }
 
 /// What applying a batch of the log did.
@@ -71,18 +73,14 @@ impl Engine {
             };
             trees.set_local(node.node_id, local);
         }
-        let EngineState {
-            trees: state,
-            commits,
-            effects,
-        } = tx.engine_state()?;
+        let stored = tx.engine_state()?;
         trees
-            .restore(state)
+            .restore(stored.trees.clone())
             .map_err(|error| invalid(format!("{error:?}")))?;
-        let commits =
-            Commits::from_state(commits).map_err(|error| invalid(format!("{error:?}")))?;
-        let effects =
-            Effects::from_state(effects).map_err(|error| invalid(format!("{error:?}")))?;
+        let commits = Commits::from_state(stored.commits.clone())
+            .map_err(|error| invalid(format!("{error:?}")))?;
+        let effects = Effects::from_state(stored.effects.clone())
+            .map_err(|error| invalid(format!("{error:?}")))?;
         let ids = match tx.id_generator()? {
             Some(bytes) => {
                 let state = <[u8; 8]>::try_from(bytes.as_slice()).map_err(|_| {
@@ -101,12 +99,13 @@ impl Engine {
             commits,
             ids,
             cursor: tx.cursor()?,
+            stored,
         })
     }
 
     /// Ends a step that changed the engine, inside the step's transaction. It settles the trees, then writes the L
-    /// row and the S row of every node that was dirty before settling, the engine state and the ID generator. A row
-    /// of a node the tree no longer holds is removed.
+    /// row and the S row of every node that was dirty before settling, what changed in the engine state since the
+    /// last checkpoint, and the ID generator. A row of a node the tree no longer holds is removed.
     ///
     /// The dirty set names every changed row: each setter of [`Trees`] marks its node, and [`Trees::settle`] changes
     /// S only for nodes it took from the dirty set.
@@ -130,11 +129,13 @@ impl Engine {
                 }
             }
         }
-        tx.set_engine_state(&EngineState {
+        let state = EngineState {
             trees: self.trees.state(),
             commits: self.commits.state(),
             effects: self.effects.state(),
-        })?;
+        };
+        tx.update_engine_state(&self.stored, &state)?;
+        self.stored = state;
         tx.set_id_generator(&self.ids.state.to_le_bytes())
     }
 
@@ -1092,6 +1093,7 @@ mod tests {
             commits: Commits::default(),
             ids,
             cursor: None,
+            stored: EngineState::default(),
         };
         Case {
             name,

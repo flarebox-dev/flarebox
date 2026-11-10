@@ -159,29 +159,57 @@ impl Tx<'_> {
         ] {
             self.0.execute(&format!("DELETE FROM {table}"), [])?;
         }
-        let mut copy = state.clone();
-        let mut stmt = self
+        self.update_engine_state(&EngineState::default(), state)
+    }
+
+    /// Changes the stored engine state from `before`, which must be the state the store holds, to
+    /// `after`. Only the rows of what differs are written: a member of a node set or a node map, a
+    /// waiting update and a failed effect by node, and each of the commit counters, the commit in
+    /// flight, the restores and the effect counters as a whole.
+    pub fn update_engine_state(&self, before: &EngineState, after: &EngineState) -> Result<()> {
+        let (mut old, mut new) = (before.clone(), after.clone());
+        let mut remove = self
+            .0
+            .prepare_cached("DELETE FROM node_sets WHERE node_set = ?1 AND node_id = ?2")?;
+        let mut insert = self
             .0
             .prepare_cached("INSERT INTO node_sets (node_set, node_id) VALUES (?1, ?2)")?;
-        for (name, set) in node_sets(&mut copy) {
-            for node in set.iter() {
-                stmt.execute(params![name, node])?;
+        for ((name, old), (_, new)) in node_sets(&mut old).into_iter().zip(node_sets(&mut new)) {
+            for node in old.difference(new) {
+                remove.execute(params![name, node])?;
+            }
+            for node in new.difference(old) {
+                insert.execute(params![name, node])?;
             }
         }
-        let mut stmt = self.0.prepare_cached(
-            "INSERT INTO node_maps (node_map, node_id, target) VALUES (?1, ?2, ?3)",
+        let mut remove = self
+            .0
+            .prepare_cached("DELETE FROM node_maps WHERE node_map = ?1 AND node_id = ?2")?;
+        let mut put = self.0.prepare_cached(
+            "INSERT OR REPLACE INTO node_maps (node_map, node_id, target) VALUES (?1, ?2, ?3)",
         )?;
-        for (name, map) in node_maps(&mut copy) {
-            for (node, target) in map.iter() {
-                stmt.execute(params![name, node, target])?;
+        for ((name, old), (_, new)) in node_maps(&mut old).into_iter().zip(node_maps(&mut new)) {
+            let (removed, changed) = differences(old, new);
+            for node in removed {
+                remove.execute(params![name, node])?;
+            }
+            for (node, target) in changed {
+                put.execute(params![name, node, target])?;
             }
         }
-        let mut stmt = self.0.prepare_cached(
-            "INSERT INTO waiting_updates (node_id, parent_id, name, kind, content)
+        let mut remove = self
+            .0
+            .prepare_cached("DELETE FROM waiting_updates WHERE node_id = ?1")?;
+        let mut put = self.0.prepare_cached(
+            "INSERT OR REPLACE INTO waiting_updates (node_id, parent_id, name, kind, content)
              VALUES (?1, ?2, ?3, ?4, ?5)",
         )?;
-        for (node, shape) in &state.trees.waiting {
-            stmt.execute(params![
+        let (removed, changed) = differences(&before.trees.waiting, &after.trees.waiting);
+        for node in removed {
+            remove.execute([node])?;
+        }
+        for (node, shape) in changed {
+            put.execute(params![
                 node,
                 shape.as_ref().and_then(|shape| non_empty(&shape.parent)),
                 shape.as_ref().map(|shape| &shape.name),
@@ -193,51 +221,74 @@ impl Tx<'_> {
             ])?;
         }
 
-        let commits = &state.commits;
-        let (halt, code) = halt_row(commits.halted);
-        self.0.execute(
-            "INSERT INTO commit_state (id, accepted, halt, policy_code, cap) VALUES (1, ?1, ?2, ?3, ?4)",
-            params![commits.accepted, halt, code, commits.cap],
-        )?;
-        if let Some(flight) = &commits.in_flight {
+        let (old, new) = (&before.commits, &after.commits);
+        if (old.accepted, old.halted, old.cap) != (new.accepted, new.halted, new.cap) {
+            let (halt, code) = halt_row(new.halted);
             self.0.execute(
-                "INSERT INTO commit_in_flight (id, commit_message, result) VALUES (1, ?1, ?2)",
-                params![
-                    flight.commit.encode_to_vec(),
-                    flight.result.as_ref().map(CommitResult::encode_to_vec),
-                ],
+                "INSERT OR REPLACE INTO commit_state (id, accepted, halt, policy_code, cap)
+                 VALUES (1, ?1, ?2, ?3, ?4)",
+                params![new.accepted, halt, code, new.cap],
             )?;
-            let mut targets = self
-                .0
-                .prepare_cached("INSERT INTO commit_in_flight_deletes (target) VALUES (?1)")?;
-            let mut members = self.0.prepare_cached(
-                "INSERT INTO commit_in_flight_delete_members (target, position, node_id) VALUES (?1, ?2, ?3)",
-            )?;
-            for (target, nodes) in &flight.deletes {
-                targets.execute([target])?;
-                for (position, node) in nodes.iter().enumerate() {
-                    members.execute(params![target, position, node])?;
+        }
+        if old.in_flight != new.in_flight {
+            for table in [
+                "commit_in_flight",
+                "commit_in_flight_deletes",
+                "commit_in_flight_delete_members",
+            ] {
+                self.0.execute(&format!("DELETE FROM {table}"), [])?;
+            }
+            if let Some(flight) = &new.in_flight {
+                self.0.execute(
+                    "INSERT INTO commit_in_flight (id, commit_message, result) VALUES (1, ?1, ?2)",
+                    params![
+                        flight.commit.encode_to_vec(),
+                        flight.result.as_ref().map(CommitResult::encode_to_vec),
+                    ],
+                )?;
+                let mut targets = self
+                    .0
+                    .prepare_cached("INSERT INTO commit_in_flight_deletes (target) VALUES (?1)")?;
+                let mut members = self.0.prepare_cached(
+                    "INSERT INTO commit_in_flight_delete_members (target, position, node_id) VALUES (?1, ?2, ?3)",
+                )?;
+                for (target, nodes) in &flight.deletes {
+                    targets.execute([target])?;
+                    for (position, node) in nodes.iter().enumerate() {
+                        members.execute(params![target, position, node])?;
+                    }
                 }
             }
         }
-        self.set_restores(&commits.restores, &commits.resolved)?;
+        if (&old.restores, &old.resolved) != (&new.restores, &new.resolved) {
+            self.0.execute("DELETE FROM restore_intents", [])?;
+            self.set_restores(&new.restores, &new.resolved)?;
+        }
 
-        let effects = &state.effects;
-        self.0.execute(
-            "INSERT INTO effect_state (id, cleared, in_flight) VALUES (1, ?1, ?2)",
-            params![
-                effects.cleared,
-                effects
-                    .in_flight
-                    .as_ref()
-                    .map(|record| StoredRecord::from(record).encode_to_vec()),
-            ],
-        )?;
-        let mut stmt = self
+        let (old, new) = (&before.effects, &after.effects);
+        if (old.cleared, &old.in_flight) != (new.cleared, &new.in_flight) {
+            self.0.execute(
+                "INSERT OR REPLACE INTO effect_state (id, cleared, in_flight) VALUES (1, ?1, ?2)",
+                params![
+                    new.cleared,
+                    new.in_flight
+                        .as_ref()
+                        .map(|record| StoredRecord::from(record).encode_to_vec()),
+                ],
+            )?;
+        }
+        let mut remove = self
             .0
-            .prepare_cached("INSERT INTO failed_effects (node_id, effect) VALUES (?1, ?2)")?;
-        for (node, effect) in &effects.failed {
-            stmt.execute(params![node, StoredEffect::from(effect).encode_to_vec()])?;
+            .prepare_cached("DELETE FROM failed_effects WHERE node_id = ?1")?;
+        let mut put = self.0.prepare_cached(
+            "INSERT OR REPLACE INTO failed_effects (node_id, effect) VALUES (?1, ?2)",
+        )?;
+        let (removed, changed) = differences(&old.failed, &new.failed);
+        for node in removed {
+            remove.execute([node])?;
+        }
+        for (node, effect) in changed {
+            put.execute(params![node, StoredEffect::from(effect).encode_to_vec()])?;
         }
         Ok(())
     }
@@ -282,6 +333,22 @@ impl Tx<'_> {
 
 fn invalid(what: String) -> Error {
     Error::InvalidEngineState(what)
+}
+
+/// The keys of `before` that `after` lacks, and the entries of `after` that `before` lacks or holds
+/// with another value.
+fn differences<'a, K: Ord, V: PartialEq>(
+    before: &'a BTreeMap<K, V>,
+    after: &'a BTreeMap<K, V>,
+) -> (
+    impl Iterator<Item = &'a K>,
+    impl Iterator<Item = (&'a K, &'a V)>,
+) {
+    let removed = before.keys().filter(|key| !after.contains_key(*key));
+    let changed = after
+        .iter()
+        .filter(|(key, value)| before.get(*key) != Some(*value));
+    (removed, changed)
 }
 
 fn halt_row(halt: Option<Halt>) -> (Option<&'static str>, Option<i32>) {
