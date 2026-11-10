@@ -1070,10 +1070,15 @@ impl FolderTask {
                         None => Err(Stop::Protocol("the session ended".into())),
                     },
                     Some(seen) = from_disk.recv() => match seen {
-                        FromDisk::Batch(batch, entries) => folder.observed(batch, entries),
+                        // The observer reaches the folder by its path, so a folder replaced before its
+                        // first scan is scanned or fails there before the recheck below sees it.
+                        FromDisk::Batch(batch, entries) => match folder.observed(batch, entries) {
+                            Err(Stop::OtherRoot) if !claim::still_locked(&lock, &self.link.root) => {
+                                break REPLACED.to_owned();
+                            }
+                            step => step,
+                        },
                         FromDisk::Scanned => folder.scanned(),
-                        // The observer reaches the folder by its path, so a folder replaced before the
-                        // observer started fails there before the recheck below sees it.
                         FromDisk::Failed(_) if !claim::still_locked(&lock, &self.link.root) => {
                             break REPLACED.to_owned();
                         }
