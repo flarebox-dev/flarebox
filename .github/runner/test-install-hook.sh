@@ -22,8 +22,8 @@ new_root() {
   for n in 1 2 3 4; do
     mkdir -p "$root/Users/ghrunner/runner-$n"
     echo '{}' > "$root/Users/ghrunner/runner-$n/.runner"
-    printf 'LANG=en_US.UTF-8\nJAVA_HOME=/opt/java\n' > "$root/Users/ghrunner/runner-$n/.env"
-    echo "/Users/ghrunner/.cargo/bin:/usr/bin:/bin" > "$root/Users/ghrunner/runner-$n/.path"
+    printf 'LANG=en_US.UTF-8\nJAVA_HOME=/opt/java-%s\n' "$n" > "$root/Users/ghrunner/runner-$n/.env"
+    echo "/Users/ghrunner/.cargo/bin:/usr/bin:/bin:/opt/runner-$n/bin" > "$root/Users/ghrunner/runner-$n/.path"
   done
 }
 runner() { echo "$root/Users/ghrunner/runner-$1"; }
@@ -55,7 +55,7 @@ expect() {
 }
 installed() {
   local dir="$1"
-  [ "$(cat "$dir/.env")" = "$(printf 'LANG=en_US.UTF-8\nJAVA_HOME=/opt/java\nACTIONS_RUNNER_HOOK_JOB_STARTED=%s' "$root/usr/local/libexec/flarebox/job-started.sh")" ] &&
+  [ "$(cat "$dir/.env")" = "$(printf 'LANG=en_US.UTF-8\nJAVA_HOME=/opt/java-%s\nACTIONS_RUNNER_HOOK_JOB_STARTED=%s' "${dir##*-}" "$root/usr/local/libexec/flarebox/job-started.sh")" ] &&
     [ "$(cat "$dir/.path")" = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/Users/ghrunner/.cargo/bin" ] &&
     [ "$(stat -f '%Sf' "$dir/.env")" = uchg ] && [ "$(stat -f '%Sf' "$dir/.path")" = uchg ] &&
     [ ! -e "$dir/.env.flarebox-new" ] && [ ! -e "$dir/.path.flarebox-new" ]

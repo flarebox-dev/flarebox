@@ -150,8 +150,8 @@ mv -f "$hook_dir/.job-started.sh.new" "$hook"
 n=0
 for dir in "$@"; do
   n=$((n + 1))
-  current_dir="$dir"
   current_stage="$staging/$n"
+  current_dir="$dir"
   if ! apply_runner "$dir" "$current_stage"; then
     echo "error: installing the hook in $dir failed." >&2
     roll_back_current
