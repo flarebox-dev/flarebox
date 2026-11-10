@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use flarebox_engine::commit::{Commits, Halt, InFlight, Reconnect};
 use flarebox_engine::effects::{Base, Dir, Displaced, Effect, EffectRecord, Location};
+use flarebox_engine::ids::uuid_v7;
+use flarebox_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
 use flarebox_engine::state::{CommitsState, EffectsState, TreesState};
 use flarebox_engine::tree::{FileIdentity, Kind, Shape as EngineShape};
 use flarebox_fs::FileId;
@@ -85,6 +87,8 @@ fn migrations_apply_from_empty() {
             "questions",
             "remote_cursor",
             "remote_nodes",
+            "restore_intents",
+            "restore_requests",
             "synced_nodes",
             "waiting_updates",
         ]
@@ -263,7 +267,26 @@ fn nodes<const N: usize>(ids: [&str; N]) -> BTreeSet<String> {
     ids.into_iter().map(String::from).collect()
 }
 
-/// An engine state with every field set, and every kind of effect and location.
+/// A node, version or restore ID.
+fn id(n: u128) -> String {
+    uuid_v7(1, n)
+}
+
+fn from_trash(node: u128) -> RestoreIntent {
+    RestoreIntent::from_trash(id(node), None, None).unwrap()
+}
+
+/// A restore from the trash to a named position, and one of a version.
+fn placed_and_version() -> [RestoreIntent; 2] {
+    let placed = RestoreIntent::from_trash(id(2), Some(id(3)), Some("back.txt".into()));
+    [
+        placed.unwrap(),
+        RestoreIntent::version(id(4), id(5)).unwrap(),
+    ]
+}
+
+/// An engine state with every field set, and every kind of effect, location, restore and
+/// restore outcome.
 fn engine_state() -> EngineState {
     let in_docs = |name: &str| Location::At {
         base: Base::Root,
@@ -303,12 +326,38 @@ fn engine_state() -> EngineState {
                     node_id: "old".into(),
                 })),
             },
+            Op {
+                op: Some(op::Op::Restore(from_trash(1).op().clone())),
+            },
         ],
         history_id: "h1".into(),
         device_seq: 5,
         require_head: true,
         ..Default::default()
     };
+    let [placed, version] = placed_and_version();
+    let outcomes = [
+        Outcome::Restored,
+        Outcome::Renamed {
+            name: "back (conflict).txt".into(),
+        },
+        Outcome::Copied {
+            node: id(6),
+            name: "copy.txt".into(),
+        },
+        Outcome::Rejected(Rejection::NotFound),
+        Outcome::Rejected(Rejection::ReadOnly),
+        Outcome::Rejected(Rejection::Other("LATER_REASON".into())),
+        Outcome::DoesNotFit,
+    ];
+    let resolved = outcomes
+        .into_iter()
+        .enumerate()
+        .map(|(n, outcome)| Resolved {
+            id: id(900 - n as u128),
+            intent: [&placed, &version][n % 2].clone(),
+            outcome,
+        });
     let applied = OpResult {
         code: op_result::Code::Applied as i32,
         ..Default::default()
@@ -337,7 +386,7 @@ fn engine_state() -> EngineState {
                 ]),
                 result: Some(CommitResult {
                     seq: 30,
-                    results: vec![applied.clone(), applied],
+                    results: vec![applied.clone(), applied.clone(), applied],
                     changes: vec![],
                 }),
             }),
@@ -346,6 +395,12 @@ fn engine_state() -> EngineState {
             cap: Some(8),
             split: nodes(["big"]),
             aliases: BTreeMap::from([("twin".into(), "kept".into())]),
+            restores: BTreeMap::from([
+                (id(100), from_trash(1)),
+                (id(101), placed.clone()),
+                (id(102), version.clone()),
+            ]),
+            resolved: resolved.collect(),
         },
         effects: EffectsState {
             in_flight: Some(EffectRecord {
@@ -481,6 +536,127 @@ fn a_policy_halt_outlasts_a_restart_and_resends_nothing() {
         assert_eq!(commits.connected(&welcome), Reconnect::Idle);
         assert_eq!(commits.halted(), Some(halt));
     }
+}
+
+#[test]
+fn a_restore_request_waits_until_it_is_taken() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let [placed, version] = placed_and_version();
+    let mut store = Store::open(&path).unwrap();
+    store
+        .transaction(|tx| {
+            tx.request_restore(&id(101), &version)?;
+            tx.request_restore(&id(100), &placed)
+        })
+        .unwrap();
+    let lost = store.transaction(|tx| {
+        tx.request_restore(&id(102), &from_trash(1))?;
+        Err::<(), _>(Error::InvalidEngineState("the process stopped here".into()))
+    });
+    assert!(lost.is_err());
+    drop(store);
+
+    let requests = vec![(id(100), placed), (id(101), version)];
+    let mut store = Store::open(&path).unwrap();
+    store
+        .transaction(|tx| {
+            assert_eq!(tx.restore_requests()?, requests, "in request order");
+            // Saving the engine state leaves the requests the engine has not taken.
+            tx.set_engine_state(&engine_state())?;
+            assert_eq!(tx.restore_requests()?, requests);
+            assert_eq!(tx.engine_state()?, engine_state());
+
+            assert_eq!(tx.take_restore_requests()?, requests);
+            assert_eq!(tx.restore_requests()?, vec![]);
+            assert_eq!(tx.take_restore_requests()?, vec![]);
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn the_engines_restores_are_read_without_the_rest_of_its_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path().join("state.db")).unwrap();
+    let state = engine_state();
+    store
+        .transaction(|tx| {
+            assert_eq!(tx.restores()?, (BTreeMap::new(), vec![]));
+            tx.set_engine_state(&state)?;
+            let (queued, resolved) = tx.restores()?;
+            assert_eq!(queued, state.commits.restores);
+            assert_eq!(resolved, state.commits.resolved);
+            assert!(!state.commits.problems.is_empty());
+            assert_eq!(tx.problem_nodes()?, state.commits.problems);
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+}
+
+/// A database of the schema before restores gains the two restore tables, empty, and keeps the
+/// engine state it held.
+#[test]
+fn a_version_3_store_opens_with_empty_restore_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let mut before = engine_state();
+    before.commits.in_flight.as_mut().unwrap().commit.ops.pop();
+    before.commits.restores.clear();
+    before.commits.resolved.clear();
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| tx.set_engine_state(&before))
+        .unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("DROP TABLE restore_requests; DROP TABLE restore_intents;")
+        .unwrap();
+    conn.pragma_update(None, "user_version", 3).unwrap();
+    drop(conn);
+
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    store
+        .transaction(|tx| {
+            assert_eq!(tx.engine_state()?, before);
+            assert_eq!(tx.restore_requests()?, vec![]);
+            tx.request_restore(&id(100), &from_trash(1))?;
+            tx.set_engine_state(&engine_state())?;
+            assert_eq!(tx.engine_state()?, engine_state());
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn a_stored_restore_the_server_would_refuse_is_not_loaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    drop(Store::open(&path).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    conn.execute(
+        "INSERT INTO restore_intents (restore_id, node_id) VALUES ('r', 'not-a-uuid')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO restore_requests (restore_id, node_id) VALUES ('r', 'not-a-uuid')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut store = Store::open(&path).unwrap();
+    let loaded = store.transaction(|tx| tx.engine_state());
+    assert!(
+        matches!(loaded, Err(Error::InvalidEngineState(_))),
+        "{loaded:?}"
+    );
+    let taken = store.transaction(|tx| tx.take_restore_requests());
+    assert!(
+        matches!(taken, Err(Error::InvalidEngineState(_))),
+        "{taken:?}"
+    );
 }
 
 #[test]

@@ -5,8 +5,8 @@
 //! - [`Paths`], [`Credential`] and [`Config`]: where a profile keeps its files, the device credential (one file only
 //!   its owner can read, outside every linked folder) and the device-local configuration with its `[sync]` rules.
 //! - [`Driver`]: the profile's API, shared by the Linux daemon and, through `core/ffi`, the macOS app. It pairs the
-//!   device, links and unlinks folders, reports [`Status`], lists [`Question`]s and records answers, and runs one
-//!   task per linked folder.
+//!   device, links and unlinks folders, reports [`Status`], lists [`Question`]s and records answers, records the
+//!   restores a person asks for ([`RestoreRequest`]), and runs one task per linked folder.
 //! - Each folder task checks the root (design §6.2) and claims the folder, observes the disk through an [`Observer`],
 //!   and keeps a `core/net` session with the space. It runs the sync engine between them: the server's log goes
 //!   into the remote tree in `core/store`, observations go into the local tree, the engine's effects are applied to
@@ -29,6 +29,7 @@ mod observe;
 mod paths;
 pub mod policy;
 mod question;
+mod restore;
 mod status;
 
 pub use config::{Config, ConfigError, SyncRules};
@@ -38,4 +39,5 @@ pub use folder::MAX_FORMAT;
 pub use observe::{FsObserver, Observation, Observed, Observer};
 pub use paths::{Paths, PathsError};
 pub use question::{Answer, HeldItem, Question, QuestionKind, RecoveryGroup};
+pub use restore::{RestoreRejection, RestoreRequest, RestoreState, RestoreStatus, RestoreWait};
 pub use status::{Account, FolderState, FolderStatus, Status};
