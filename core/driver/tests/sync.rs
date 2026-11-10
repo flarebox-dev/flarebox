@@ -423,3 +423,48 @@ async fn a_second_hard_link_arrives_as_a_file_of_its_own() {
     a.stop().await;
     b.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a local Worker; run core/driver/scripts/integration-test.sh"]
+async fn a_deleted_file_is_removed_on_the_other_device() {
+    log();
+    let owner = owner().await;
+    let space = new_space(&owner, "delete a file").await;
+    let mut a = Device::linked(&owner, &space, "a").await;
+    let mut b = Device::linked(&owner, &space, "b").await;
+    converged(&a, &b).await;
+
+    fs::write(a.folder().join("draft.txt"), b"deleted on b\n").unwrap();
+    fs::write(a.folder().join("kept.txt"), b"kept\n").unwrap();
+    converged(&a, &b).await;
+
+    fs::remove_file(b.folder().join("draft.txt")).unwrap();
+    let (synced, _) = converged(&a, &b).await;
+    assert_eq!(synced, Tree::from([("kept.txt".into(), file(b"kept\n"))]));
+    a.stop().await;
+    b.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a local Worker; run core/driver/scripts/integration-test.sh"]
+async fn a_deleted_folder_is_removed_with_its_children_on_the_other_device() {
+    log();
+    let owner = owner().await;
+    let space = new_space(&owner, "delete a folder").await;
+    let mut a = Device::linked(&owner, &space, "a").await;
+    let mut b = Device::linked(&owner, &space, "b").await;
+    converged(&a, &b).await;
+
+    fs::create_dir_all(b.folder().join("album/inner")).unwrap();
+    fs::write(b.folder().join("album/one.txt"), b"one\n").unwrap();
+    fs::write(b.folder().join("album/inner/two.txt"), b"two\n").unwrap();
+    fs::write(b.folder().join("kept.txt"), b"kept\n").unwrap();
+    let (synced, _) = converged(&a, &b).await;
+    assert_eq!(synced.len(), 5, "{synced:#?}");
+
+    fs::remove_dir_all(a.folder().join("album")).unwrap();
+    let (synced, _) = converged(&a, &b).await;
+    assert_eq!(synced, Tree::from([("kept.txt".into(), file(b"kept\n"))]));
+    a.stop().await;
+    b.stop().await;
+}

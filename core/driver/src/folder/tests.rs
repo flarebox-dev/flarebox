@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use flarebox_engine::restore::{Outcome, RestoreIntent};
 use flarebox_engine::tree::{Kind, LocalNode, Tree};
-use flarebox_fs::{Marker, write_marker};
+use flarebox_fs::{Marker, RootProblem, write_marker};
 use flarebox_net::Committed;
 use flarebox_proto::v1::{ListTree, ListVersions, Op, PrepareUpload, Resume, chunk_plan, op};
 use flarebox_sim::space::{Role, Session as Caller, SpaceDo};
@@ -234,18 +234,26 @@ impl Device {
 
     /// One pass of the observer's thread.
     fn scan(&mut self, wait: Duration) {
+        self.try_scan(wait).unwrap();
+    }
+
+    /// One pass of the observer's thread. Returns the folders its batch could not read.
+    fn try_scan(&mut self, wait: Duration) -> Result<Vec<PathBuf>, Stop> {
         let sections = self.folder.sections();
         self.observer.reset(sections.take_resets());
         let stamp = sections.stamp();
+        let mut unreadable = Vec::new();
         if let Some(observation) = self.observer.observe(wait).unwrap() {
+            unreadable.clone_from(&observation.unreadable);
             let entries = self.observer.snapshot().entries.len() as u64;
             let step = self.folder.observed(Batch { stamp, observation }, entries);
-            self.take(step).unwrap();
+            self.take(step)?;
         }
         if !self.folder.scanned && self.observer.scanned().is_some() {
             let step = self.folder.scanned();
-            self.take(step).unwrap();
+            self.take(step)?;
         }
+        Ok(unreadable)
     }
 
     /// Observes until `done`, for at most ten seconds.
@@ -1575,4 +1583,73 @@ fn a_folder_with_a_queued_restore_is_not_up_to_date() {
     let commits = &mut a.folder.engine.commits;
     assert!(commits.restore(crate::restore::new_id(NOW as u64), intent));
     assert_eq!(a.state(), FolderState::CatchingUp);
+}
+
+/// Whether L, as the site's store holds it, has an entry named `name`.
+fn local_holds(site: &Site, name: &str) -> bool {
+    (site.stored().trees.local().iter()).any(|(_, node)| node.shape.name == name)
+}
+
+#[test]
+fn a_batch_that_fails_the_root_check_stops_the_folder_before_l_loses_a_file() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site.root.join("notes.txt"), b"written on a");
+
+    fs::remove_file(site.root.join(flarebox_fs::PRIVATE_DIR).join("space.json")).unwrap();
+    fs::remove_file(site.root.join("notes.txt")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let stop = loop {
+        assert!(Instant::now() < deadline, "the folder did not stop");
+        if let Err(stop) = a.try_scan(Duration::from_millis(100)) {
+            break stop;
+        }
+    };
+    assert!(
+        matches!(stop, Stop::Root(RootProblem::NoMarker)),
+        "{stop:?}"
+    );
+    assert!(local_holds(&site, "notes.txt"));
+    assert!(a.work.is_empty());
+    assert_eq!(remote.names(), ["notes.txt"]);
+}
+
+#[test]
+fn a_folder_the_scan_may_not_read_keeps_its_files_in_the_space() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    let folder = site.root.join("private");
+    fs::create_dir(&folder).unwrap();
+    a.create(&mut remote, &folder.join("secret.txt"), b"written on a");
+    let sent = a.sent.len();
+
+    fs::set_permissions(&folder, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(&folder).is_ok() {
+        assert!(rustix::process::geteuid().is_root());
+        eprintln!("SKIPPED: running as root, so permissions do not block reads");
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !a
+        .try_scan(Duration::from_millis(100))
+        .unwrap()
+        .contains(&"private".into())
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the folder was not found unreadable"
+        );
+    }
+    a.settle();
+    assert!(a.work.is_empty());
+    assert_eq!(a.sent.len(), sent);
+    assert!(local_holds(&site, "secret.txt"));
+
+    fs::set_permissions(&folder, fs::Permissions::from_mode(0o755)).unwrap();
+    a.settle();
+    assert!(a.work.is_empty());
+    assert_eq!(a.sent.len(), sent);
+    assert_eq!(remote.names(), ["private", "secret.txt"]);
 }
