@@ -418,8 +418,8 @@ struct StoredIdentity {
     dev: u64,
     #[prost(uint64, tag = "2")]
     ino: u64,
-    #[prost(int64, tag = "3")]
-    birth_ns: i64,
+    #[prost(int64, optional, tag = "3")]
+    birth_ns: Option<i64>,
 }
 
 #[derive(Clone, PartialEq, Message)]

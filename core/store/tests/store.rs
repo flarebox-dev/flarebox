@@ -2,14 +2,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flarebox_engine::commit::{Halt, InFlight};
+use flarebox_engine::commit::{Commits, Halt, InFlight, Reconnect};
 use flarebox_engine::effects::{Base, Dir, Displaced, Effect, EffectRecord, Location};
 use flarebox_engine::state::{CommitsState, EffectsState, TreesState};
 use flarebox_engine::tree::{FileIdentity, Kind, Shape as EngineShape};
 use flarebox_fs::FileId;
 use flarebox_proto::v1::{
     ChunkRef, Commit, CommitResult, Content, CreateFile, Delete, NodeKind, NodeState, NodeStatus,
-    Op, OpResult, VersionInfo, op, op_result,
+    Op, OpResult, VersionInfo, Welcome, op, op_result,
 };
 use flarebox_store::{
     CachedChunk, Cursor, Durability, EngineState, Error, GivenAnswer, Link, LocalNode,
@@ -245,7 +245,7 @@ fn identity(ino: u64) -> FileIdentity {
     FileIdentity {
         dev: u64::MAX,
         ino,
-        birth_ns: -1,
+        birth_ns: ino.is_multiple_of(2).then_some(-1),
     }
 }
 
@@ -430,6 +430,52 @@ fn a_halt_survives_a_reopen_with_its_commit() {
             .unwrap();
         assert_eq!(stored.commits.halted, halted);
         assert_eq!(stored.commits.in_flight, state.commits.in_flight);
+    }
+}
+
+#[test]
+fn a_policy_halt_outlasts_a_restart_and_resends_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let halt = Halt::Policy { code: 42 };
+    let state = EngineState {
+        commits: CommitsState {
+            accepted: 4,
+            in_flight: Some(InFlight {
+                commit: Commit {
+                    commit_id: "c1".into(),
+                    history_id: "h1".into(),
+                    device_seq: 5,
+                    ..Default::default()
+                },
+                deletes: BTreeMap::new(),
+                result: None,
+            }),
+            halted: Some(halt),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| tx.set_engine_state(&state))
+        .unwrap();
+
+    let stored = Store::open(&path)
+        .unwrap()
+        .transaction(|tx| tx.engine_state())
+        .unwrap();
+    let mut commits = Commits::from_state(stored.commits).unwrap();
+    assert_eq!(commits.halted(), Some(halt));
+    for device_seq in [4, 5] {
+        let welcome = Welcome {
+            history_id: "h1".into(),
+            device_seq,
+            read_only: false,
+            ..Default::default()
+        };
+        assert_eq!(commits.connected(&welcome), Reconnect::Idle);
+        assert_eq!(commits.halted(), Some(halt));
     }
 }
 
