@@ -65,7 +65,7 @@ fn local(shape: Shape, ino: u64) -> LocalNode {
         identity: FileIdentity {
             dev: 1,
             ino,
-            birth_ns: 0,
+            birth_ns: Some(0),
         },
         parked: false,
     }
@@ -415,7 +415,7 @@ fn a_reverted_move_brings_back_the_folders_l_deleted_on_its_way() {
         let identity = FileIdentity {
             dev: 1,
             ino: 99,
-            birth_ns: 0,
+            birth_ns: Some(0),
         };
         effects
             .done(&mut trees, &record.effect_id, Some(identity))
@@ -667,7 +667,7 @@ fn a_folder_deleted_around_a_parked_node_is_brought_back_for_it() {
             let identity = FileIdentity {
                 dev: 1,
                 ino,
-                birth_ns: 0,
+                birth_ns: Some(0),
             };
             effects
                 .done(&mut trees, &record.effect_id, Some(identity))
@@ -756,7 +756,7 @@ fn a_parked_file_rekeyed_for_its_edit_is_moved_out_from_where_it_was_parked() {
         let identity = FileIdentity {
             dev: 1,
             ino,
-            birth_ns: 0,
+            birth_ns: Some(0),
         };
         effects
             .done(&mut trees, &record.effect_id, Some(identity))
@@ -1537,7 +1537,7 @@ fn effects_for(trees: &mut Trees, ids: &mut IdGen, node: &str) -> Vec<Effect> {
         let identity = created.then_some(FileIdentity {
             dev: 1,
             ino: 100,
-            birth_ns: 0,
+            birth_ns: Some(0),
         });
         effects.done(trees, &record.effect_id, identity).unwrap();
         trees.settle();

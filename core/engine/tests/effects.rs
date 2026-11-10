@@ -49,7 +49,7 @@ fn identity(ino: u64) -> FileIdentity {
     FileIdentity {
         dev: 1,
         ino,
-        birth_ns: 0,
+        birth_ns: Some(0),
     }
 }
 

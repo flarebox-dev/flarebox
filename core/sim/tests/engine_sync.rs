@@ -12,6 +12,7 @@ use flarebox_engine::commit::{Commits, Failure, MAX_OPS};
 use flarebox_engine::effects::Effects;
 use flarebox_engine::ids::IdGen;
 use flarebox_engine::names::name_key;
+use flarebox_engine::state::StateError;
 use flarebox_engine::tree::{FileIdentity, Kind, LocalNode, Names, RemoteNode, same};
 use flarebox_proto::v1::{
     ChangeRecord, ChunkRef, Commit, Content, CreateDir, CreateFile, Delete, Error, Move, Op,
@@ -178,11 +179,13 @@ fn remote_action(space: &mut SpaceDo, ids: &mut IdGen, device: u8, action: &Acti
     space.commit(&session, NOW, &commit).unwrap();
 }
 
+/// An identity with inode `ino`. Entries with an odd inode stand for a filesystem that reports no
+/// birth time.
 fn identity(ino: u64) -> FileIdentity {
     FileIdentity {
         dev: 1,
         ino,
-        birth_ns: 0,
+        birth_ns: ino.is_multiple_of(2).then_some(1_700_000_000_000_000_000),
     }
 }
 
@@ -380,6 +383,33 @@ fn rewritten(
         .collect()
 }
 
+/// Rebuilds the engine state the way the store does after a restart, and checks that each part
+/// comes back equal.
+fn reload(
+    trees: &Trees,
+    commits: &Commits,
+    effects: &Effects,
+) -> Result<(Trees, Commits, Effects), TestCaseError> {
+    let mut loaded = Trees::new(trees.remote().root.clone());
+    for (id, node) in trees.remote().iter() {
+        loaded.set_remote(id.clone(), node.clone());
+    }
+    for (id, node) in trees.local().iter() {
+        loaded.set_local(id.clone(), node.clone());
+    }
+    for (id, shape) in trees.synced().iter() {
+        loaded.set_synced(id.clone(), Some(shape.clone()));
+    }
+    let refused = |error: StateError| TestCaseError::fail(format!("refused: {error:?}"));
+    loaded.restore(trees.state()).map_err(refused)?;
+    let restored_commits = Commits::from_state(commits.state()).map_err(refused)?;
+    let restored_effects = Effects::from_state(effects.state()).map_err(refused)?;
+    prop_assert_eq!(&loaded, trees);
+    prop_assert_eq!(&restored_commits, commits);
+    prop_assert_eq!(&restored_effects, effects);
+    Ok((loaded, restored_commits, restored_effects))
+}
+
 /// `fits` is the most ops a commit may hold before the server refuses it with `LIMIT_EXCEEDED`,
 /// standing in for the 1 MiB message limit (spec v0 section 7.2).
 fn run(
@@ -498,6 +528,7 @@ fn run(
         }
         device.trees.settle();
         prop_assert_eq!(device.trees.check(), Ok(()));
+        (device.trees, commits, effects) = reload(&device.trees, &commits, &effects)?;
         let reverted = device.trees.reverted();
         parked_reverted = parked_reverted.max(
             device
