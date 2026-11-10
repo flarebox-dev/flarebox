@@ -145,10 +145,12 @@ impl Space {
 
     /// Opens `.flarebox/<parts>`, recording the identity of each folder on
     /// the way, so that [`Space::recheck`] also notices one of them moved.
+    /// Each part must be a single file name.
     pub fn private(&self, parts: &[&str]) -> Result<Folder, Unresolved> {
         let mut folder = self.root_folder()?;
         for name in std::iter::once(PRIVATE_DIR).chain(parts.iter().copied()) {
             let name = OsStr::new(name);
+            check_name(name)?;
             let fd = open_dir(folder.fd(), name, &folder.route)?;
             folder.id = identity(&fd, &folder.route, name)?;
             folder.fd = fd;

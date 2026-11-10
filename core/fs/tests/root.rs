@@ -139,3 +139,27 @@ fn rename_never_replaces_its_target() {
     assert!(!root.join("a").exists());
     assert_eq!(fs::read_to_string(root.join("c")).unwrap(), "a");
 }
+
+/// A folder on a file system whose rename refuses the no-replace flag, such
+/// as a FUSE file system without `RENAME_NOREPLACE`. Linux checks an existing
+/// target before the file system sees the flag, so only a rename to a free
+/// name shows the gap. CI has no such mount; the variable names one set up in
+/// a container.
+const NO_REPLACE_FREE_DIR: &str = "FLAREBOX_TEST_NO_REPLACE_FREE_DIR";
+
+#[test]
+fn probe_refuses_a_file_system_whose_rename_lacks_no_replace() {
+    use std::io::Write;
+
+    let Some(dir) = std::env::var_os(NO_REPLACE_FREE_DIR) else {
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIPPED probe_refuses_a_file_system_whose_rename_lacks_no_replace: \
+             {NO_REPLACE_FREE_DIR} names no folder on such a file system"
+        );
+        return;
+    };
+    let root = Path::new(&dir).join(format!("probe-{}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    assert!(!probe_no_replace(&root).unwrap());
+}

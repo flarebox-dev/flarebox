@@ -14,7 +14,7 @@ use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags};
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
-use crate::{list, open_dir_at, open_root, stat_fd};
+use crate::{FileId, list, open_dir_at, open_root, stat_at, stat_fd};
 
 /// The engine's private folder at the root of a space, for the marker,
 /// staging, quarantine, parked entries and the local trash. Scans and watchers
@@ -23,7 +23,11 @@ pub const PRIVATE_DIR: &str = ".flarebox";
 
 const MARKER: &str = "space.json";
 const MARKER_TEMP: &str = "space.json.tmp";
-const PROBE: [&str; 2] = ["no-replace-probe-a", "no-replace-probe-b"];
+const PROBE: [&str; 3] = [
+    "no-replace-probe-a",
+    "no-replace-probe-b",
+    "no-replace-probe-c",
+];
 
 /// The root marker `.flarebox/space.json`: the space the folder holds, and the
 /// effect counter *m* of design §2.8.
@@ -128,34 +132,58 @@ pub fn write_marker(root: &Path, marker: &Marker) -> io::Result<()> {
 
 /// Whether the file system under `root` has a rename that fails instead of
 /// replacing its target. Effects need it, so a space on a file system without
-/// it is refused (design §5.2). The probe renames two files of its own in the
-/// private folder, which it creates if needed, and removes them again.
+/// it is refused (design §5.2). The probe works on files of its own in the
+/// private folder, which it creates if needed, and removes them again. It
+/// requires both halves: a no-replace rename onto an existing file fails with
+/// `EEXIST` and leaves both files where they were, and one onto a free name
+/// moves the file. Linux refuses the first before the file system sees the
+/// flag, so only the second shows a file system that does not support it.
 pub fn probe_no_replace(root: &Path) -> io::Result<bool> {
     let root = open_root(root)?;
     let private = private_dir(root.as_fd())?;
-    let [a, b] = PROBE;
+    let private = private.as_fd();
+    let [a, b, _] = PROBE;
     for name in PROBE {
-        remove_if_present(private.as_fd(), name)?;
+        remove_if_present(private, name)?;
+    }
+    for name in [a, b] {
         let flags =
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        rustix::fs::openat(&private, name, flags, Mode::from_raw_mode(0o600))?;
+        rustix::fs::openat(private, name, flags, Mode::from_raw_mode(0o600))?;
     }
-    let renamed = rename_no_replace(
-        private.as_fd(),
-        OsStr::new(a),
-        private.as_fd(),
-        OsStr::new(b),
-    );
-    let supported = match renamed {
-        Err(err) if err.raw_os_error() == Some(Errno::EXIST.raw_os_error()) => true,
-        Ok(()) => false,
-        Err(err) if unsupported(&err) => false,
-        Err(err) => return Err(err),
-    };
+    let supported = probe_renames(private)?;
     for name in PROBE {
-        remove_if_present(private.as_fd(), name)?;
+        remove_if_present(private, name)?;
     }
     Ok(supported)
+}
+
+fn probe_renames(private: BorrowedFd<'_>) -> io::Result<bool> {
+    let [a, b, c] = PROBE.map(OsStr::new);
+    let (id_a, id_b) = (probe_id(private, a)?, probe_id(private, b)?);
+    match rename_no_replace(private, a, private, b) {
+        Err(err) if err.raw_os_error() == Some(Errno::EXIST.raw_os_error()) => {}
+        Err(err) if !unsupported(&err) => return Err(err),
+        _ => return Ok(false),
+    }
+    if probe_id(private, a)? != id_a || probe_id(private, b)? != id_b {
+        return Ok(false);
+    }
+    match rename_no_replace(private, a, private, c) {
+        Ok(()) => {}
+        Err(err) if unsupported(&err) => return Ok(false),
+        Err(err) => return Err(err),
+    }
+    Ok(probe_id(private, a)?.is_none() && probe_id(private, c)? == id_a)
+}
+
+/// The identity of the probe file `name`, or `None` when it is gone.
+fn probe_id(private: BorrowedFd<'_>, name: &OsStr) -> io::Result<Option<FileId>> {
+    match stat_at(private, name) {
+        Ok(stat) => Ok(Some(stat.id)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 /// Renames `from` in `from_dir` to `to` in `to_dir`, failing with

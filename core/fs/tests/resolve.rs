@@ -282,3 +282,29 @@ fn unreadable_parent_is_not_missing() {
         other => panic!("expected a permission error, got {other:?}"),
     }
 }
+
+#[test]
+fn private_folders_are_single_names_inside_the_private_folder() {
+    let outside = tempfile::tempdir().unwrap();
+    let dir_ = tempfile::tempdir().unwrap();
+    let root = dir_.path();
+    fs::create_dir_all(root.join(PRIVATE_DIR).join(PARKED_DIR)).unwrap();
+    let space = Space::open(root).unwrap();
+    let parked = space.private(&[PARKED_DIR]).unwrap();
+    assert_eq!(parked.path(), Path::new(".flarebox/parked"));
+
+    let absolute = outside.path().to_str().unwrap();
+    for parts in [
+        vec![".."],
+        vec!["../..", "outside"],
+        vec![absolute],
+        vec!["parked/.."],
+        vec![""],
+        vec!["."],
+    ] {
+        assert!(
+            matches!(space.private(&parts), Err(Unresolved::BadName(_))),
+            "{parts:?}"
+        );
+    }
+}
