@@ -730,6 +730,29 @@ fn a_folder_with_two_rules_files_that_differ_only_in_case_is_unknown_until_one_i
     assert_eq!(known(&snapshot), ["sub", "sub/.fbignore", "sub/b"]);
 }
 
+/// On a case-sensitive volume a folder can hold a folder named `.fbignore` beside the regular file `.FBIGNORE`. Only
+/// the regular file is a rules file, so its rules are in force.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_folder_named_like_the_rules_file_does_not_hide_a_rules_file_in_another_case() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "sub/.fbignore/x", "x");
+    write(root, "sub/.FBIGNORE", "b\n");
+    write(root, "sub/b", "left out by .FBIGNORE");
+    let mut rules = rules();
+    let mut snapshot = Snapshot::default();
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert!(rescan.unreadable.is_empty());
+    assert_eq!(rescan.rules, [rule("sub", Some("b\n"))]);
+    assert_eq!(
+        known(&snapshot),
+        ["sub", "sub/.FBIGNORE", "sub/.fbignore", "sub/.fbignore/x"]
+    );
+}
+
 #[test]
 fn review_renaming_an_unread_folder_and_removing_its_rules_reports_the_current_path_known() {
     let dir = tempfile::tempdir().unwrap();

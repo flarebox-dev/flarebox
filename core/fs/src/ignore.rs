@@ -86,20 +86,6 @@ impl Rules {
         path.iter().map(|name| self.ignore.key(name)).collect()
     }
 
-    /// The rules file among the `names` a folder lists: `.fbignore` itself, or
-    /// else the first name the matcher takes for the same name, such as
-    /// `.FBIGNORE`.
-    fn rules_file<'n>(&self, names: &'n BTreeSet<OsString>) -> Option<&'n OsStr> {
-        names
-            .get(OsStr::new(RULES_FILE))
-            .or_else(|| {
-                names
-                    .iter()
-                    .find(|name| self.ignore.key(name) == self.rules_file)
-            })
-            .map(OsString::as_os_str)
-    }
-
     /// Whether the entry at `path`, relative to the root, is left out. The
     /// root itself never is.
     pub fn status(&self, path: &Path, kind: EntryKind) -> Ignored {
@@ -154,7 +140,9 @@ impl<'r> Pending<'r> {
     }
 
     /// Reads the rules file of the folder `dir` at `rel`, which lists
-    /// `names`. A rules file that cannot be read keeps the rules the folder
+    /// `names`: the regular file among the names the matcher takes for
+    /// `.fbignore`, such as `.FBIGNORE`. A folder or a link of such a name is
+    /// not one. A rules file that cannot be read keeps the rules the folder
     /// last had. When the folder had none, its rules are [`RulesRead::Unknown`],
     /// and so are they when it holds two rules files.
     pub(crate) fn read(
@@ -163,17 +151,18 @@ impl<'r> Pending<'r> {
         rel: &Path,
         names: &BTreeSet<OsString>,
     ) -> RulesRead {
-        let named: Vec<&OsString> = (names.iter())
+        let files: Vec<&OsString> = (names.iter())
             .filter(|name| self.rules.ignore.key(name) == self.rules.rules_file)
+            .filter(|name| match stat_at(dir, name) {
+                Ok(stat) => stat.file_type == FileType::RegularFile,
+                Err(err) => !is_gone(&err),
+            })
             .collect();
-        let regular = |name: &&&OsString| {
-            stat_at(dir, name).is_ok_and(|stat| stat.file_type == FileType::RegularFile)
-        };
-        if named.len() > 1 && named.iter().filter(regular).count() > 1 {
+        if files.len() > 1 {
             return RulesRead::Unknown;
         }
         let key = self.rules.key(rel);
-        let read = (self.rules.rules_file(names)).map(|name| read_rules(dir, name));
+        let read = files.first().map(|name| read_rules(dir, name));
         if matches!(read, Some(Err(_))) && !self.rules.files.contains_key(&key) {
             return RulesRead::Unknown;
         }
