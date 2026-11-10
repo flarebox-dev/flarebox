@@ -27,8 +27,12 @@ const NOT_YET: [&str; 2] = [
     "no valid claim code; open /setup to issue one",
     "this deployment already has an owner",
 ];
-/// The server's refusal of a key that a claim already used. Retrying it never succeeds.
-const SPENT: &str = "this recovery key was already used; set a new one";
+/// The server's refusals that spend the key: one a claim already used, and a claim whose device a later claim of the
+/// same attempt revoked before it answered. Retrying the key never succeeds; a new one does.
+const SPENT: [&str; 2] = [
+    "this recovery key was already used; set a new one",
+    "a later claim of this setup attempt replaced this one; set a new recovery key and claim again",
+];
 
 pub struct Claim<'a> {
     session: &'a mut Session,
@@ -156,7 +160,9 @@ impl<'a> Claim<'a> {
                         refresh_credential: issued.refresh_credential,
                     }));
                 }
-                Err(ApiError::Server { status: 403, error }) if error.message() == SPENT => {
+                Err(ApiError::Server { status: 403, error })
+                    if SPENT.contains(&error.message()) =>
+                {
                     return Ok(Outcome::Spent);
                 }
                 Err(ApiError::Server { status: 403, error })
