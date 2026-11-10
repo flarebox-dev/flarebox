@@ -4,62 +4,91 @@ Status: proposed. Applies to spec v0 (format_version 1). Amends RFC 0006 §7.
 
 A device's refresh credential (spec v0 §15.2) never changes after pairing. The server keeps its SHA-256 and compares every `POST /v1/token` against that one hash. A copy of the credential therefore works for as long as the device is not revoked: a copy in a backup, a copy that moved to another computer with the user's files, or a copy that a process running as the user read. Two computers can then run as the same device.
 
-This RFC lets a device replace its own credential about once a day. The device generates the new credential, keeps it, and sends it with a token request; the server stores it in place of the old one in the same request. From then on, every copy of the old credential is refused. A bare section number such as §2 refers to this RFC; sections of spec v0 are written as spec v0 §N.
+This RFC lets a device replace its own credential about once a day. The device generates the new credential, keeps it, and sends it with a token request that carries a deadline. The server stores it in place of the old one if the request arrives before the deadline. From then on, every copy of the old credential is refused. A bare section number such as §2 refers to this RFC; sections of spec v0 are written as spec v0 §N.
 
-The schema change adds two fields:
+The schema change adds five fields:
 
 | Message | Field | Section |
 |---|---|---|
-| `TokenRequest` | `next_refresh_credential = 3` | 1 |
-| `AccessToken` | `rotated = 3` | 1 |
+| `TokenRequest` | `rotation = 3` | 1 |
+| `TokenRequest` | `next_refresh_credential = 4` | 1 |
+| `TokenRequest` | `rotate_before_ms = 5` | 1 |
+| `AccessToken` | `server_time_ms = 3` | 1 |
+| `AccessToken` | `rotated = 4` | 1 |
 
-## 1. Rotating on the server
+## 1. The server
 
-A client may set `TokenRequest.next_refresh_credential` to a credential it generated the same way the server generates one at pairing: 32 random bytes, base64url-encoded without padding, so 43 characters.
+The Account DO handles the token requests of one principal one at a time, so each request sees the effect of every request handled before it.
 
-When the request's `refresh_credential` is the principal's current credential and the principal is active, the server replaces the stored hash with the SHA-256 of `next_refresh_credential`, in the same transaction that checks the presented one. It answers with an access token and `rotated` set. From then on, the old credential gets `UNAUTHENTICATED` like any wrong credential. A `next_refresh_credential` that is not 43 base64url characters is refused with `INVALID_ARGUMENT` and changes nothing.
+**Server time.** When a request sets `rotation`, the answer carries `server_time_ms`: the server's time, in Unix milliseconds, at which it checked the presented credential. Without `rotation`, the answer carries neither `server_time_ms` nor `rotated`, so it is the same answer as before this RFC.
 
-Without `next_refresh_credential`, the server answers as before, with `rotated` unset. The server keeps no other state for rotation: no pending credential, no history of old ones and no deadline. `DeviceCredentials.access` from `POST /v1/claim` and `POST /v1/pair/complete` never sets `rotated`.
+**Rotating.** A request that sets `next_refresh_credential` also sets `rotation` and `rotate_before_ms`. `next_refresh_credential` is a credential the client generated the same way the server generates one at pairing: 32 random bytes, base64url-encoded without padding, so 43 characters. A request with a malformed `next_refresh_credential`, or without `rotation` or `rotate_before_ms`, is refused with `INVALID_ARGUMENT` and changes nothing.
+
+When the presented credential is the active principal's current one:
+
+- If the server time is at most `rotate_before_ms`, the server replaces the stored hash with the SHA-256 of `next_refresh_credential` in the same transaction that checked the presented one, and answers with an access token and `rotated` set. From then on, the old credential gets `UNAUTHENTICATED` like any wrong credential.
+- Otherwise it answers with an access token, `rotated` unset, and the stored credential unchanged. A request that arrives after its deadline can never change the credential.
+
+The server keeps no other state for rotation: no pending credential and no history of old ones. `DeviceCredentials.access` from `POST /v1/claim` and `POST /v1/pair/complete` carries neither new field.
 
 The server does not revoke a principal when an old credential comes back. A process of the device itself that still holds the old credential (§2) is the common cause, and revoking would sign out the device that holds the new one. A rotation changes neither the credential's expiry (RFC 0006 §7) nor a revocation (RFC 0009).
 
 ## 2. Clients
 
-**The process that rotates.** On one device, only the process that owns the stored credential rotates it, and it uses one credential for all its requests. The Rust clients use the process that holds the profile lock: the daemon, the macOS app, or a CLI command that opens the profile itself when no daemon runs. Its stored credential has two slots: the current credential and, while a rotation is unfinished, the staged one.
+**The process that rotates.** On one device, only the process that owns the stored credential rotates it, and it uses one credential for all its requests. The Rust clients use the process that holds the profile lock: the daemon, the macOS app, or a CLI command that opens the profile itself when no daemon runs. Its stored credential has two slots: the current credential, and, while a rotation's outcome is unknown, the staged credential with its deadline. It sets `rotation` on every token request.
 
-1. When its credential is older than the rotation period, 24 hours in 0.1.0, the process generates a new credential and stores it as staged. It waits until the store reports it written before it sends the request. If the write fails, it refreshes without rotating and tries again at its next refresh.
-2. It sends the current credential with the staged one in `next_refresh_credential`.
+1. When its credential is older than the rotation period, 24 hours in 0.1.0, the process refreshes with the current credential and takes the answer's `server_time_ms` S. It generates a new credential and stores it as staged with the deadline D = S + 60 seconds. It waits until the store reports it written. If the write fails, it tries again at its next refresh. An answer without `server_time_ms` comes from a server without this RFC, and the process does not rotate.
+2. It sends the current credential with the staged one in `next_refresh_credential` and D in `rotate_before_ms`.
 3. If the answer has `rotated` set, it stores the staged credential as current and clears the staged slot.
-4. If the answer is an access token without `rotated`, the server does not support this RFC. It clears the staged slot and keeps the current credential.
-5. If no answer arrives, it keeps both slots.
-6. Whenever the staged slot is set, the process presents the staged credential first, without `next_refresh_credential`. If it is accepted, the server stored it in a request whose answer was lost, so the process makes it current as in step 3. If it is refused with `UNAUTHENTICATED`, the server never stored it, so the process clears the staged slot and presents the current credential.
+4. If the answer is an access token without `rotated`, the request arrived after D and the server will never store the staged credential, so the process clears the staged slot.
+5. If no answer arrives, it keeps both slots. The outcome is unknown, because the request may still arrive before D.
+6. While the staged slot is set, also after a restart, each refresh presents the current credential, without a new proposal:
+   - Accepted with a `server_time_ms` later than D: the staged credential was not stored before that time and cannot be stored after D, so the process clears the staged slot.
+   - Accepted with a `server_time_ms` at or before D: it keeps both slots and asks again once D has passed on the server's clock.
+   - Refused with `UNAUTHENTICATED`: it presents the staged credential. If that is accepted, the delayed request stored it, and the process makes it current as in step 3. If that is refused too, another copy rotated the credential, and the device is signed out (RFC 0006 §7).
 
-Each slot is kept until the server has decided about it, so a lost request, a lost answer or a crash at any point leaves the process with a credential the server accepts.
+A refusal of the staged credential alone never clears it, because its request may still arrive. The process clears it only after the server has answered for a time later than D, or has said that it did not store it. Two delayed orders show the difference:
 
-**Processes that only read.** A process that only reads the stored credential, such as a CLI command that calls the server directly while the daemon runs, never sets `next_refresh_credential`. The owning process may rotate while such a process still holds the old credential, and the owning process may not yet have made the new credential current (step 5). So when a process that only reads gets `UNAUTHENTICATED` from `POST /v1/token`, it reads the stored credential again, once. It presents the staged credential if one is stored, then the current one, skipping a credential it has already presented. It treats the device as signed out only if every one of them is refused. Presenting a credential never changes the server's state, so this cannot interfere with the owning process.
+- The rotation request is slow, and the client presents the current credential before it arrives. The server accepts the current credential at a time before D, so the client keeps both slots. The request then arrives before D and stores the staged credential. The client's next refresh is refused for the current credential and accepted for the staged one.
+- The rotation request is slow and arrives after D. The server answers it without `rotated`, or nobody reads the answer. The client's next refresh after D is accepted for the current credential, with a server time later than D, and the client clears the staged slot.
+
+In every order, the slots the client keeps include the one credential the server accepts.
+
+**Reading the stored credential.** Every process that reads the two slots reads them as one state that the owning process stored at some moment, even while that process is changing them. How a store achieves that is a client matter; the design note describes it for the Rust clients.
+
+**Processes that only read.** A process that only reads the stored credential, such as a CLI command that calls the server directly while the daemon runs, never sets `rotation` or `next_refresh_credential`. The owning process may rotate while such a process still holds the old credential. So when a process that only reads gets `UNAUTHENTICATED` from `POST /v1/token`, it reads the stored credential again, once. It presents the current credential and then the staged one, skipping a credential it has already presented, and treats the device as signed out only if every one of them is refused. Presenting a credential without a proposal never changes the server's state, so this cannot interfere with the owning process.
 
 ## 3. Two copies of one credential
 
-Suppose two computers hold the same credential. The first one to rotate replaces the stored hash, and the other is refused at its next token request, within one access-token lifetime (15 minutes, spec v0 §15.2). It is then signed out (RFC 0006 §7). Its WebSockets close when it can no longer authenticate.
+Suppose two computers hold the same credential. The first one whose rotation the server stores replaces the stored hash. The other is refused at its next token request, within one access-token lifetime (15 minutes, spec v0 §15.2), and is signed out (RFC 0006 §7). Its WebSockets close when it can no longer authenticate.
 
-A copy that is only stored, such as one in a backup, stops working when the original next rotates: within one rotation period of the moment the copy was made, if the original runs during that time. A copy that rotates first wins instead, and the original is signed out. That is the expected outcome after the user moves to a new computer and stops using the old one, and it is also what happens when someone runs a stolen copy. Rotation does not tell the two apart. In the second case, another active principal of the user can revoke the shared principal (RFC 0009). If none remains, owner recovery creates one first. Pairing again alone does not revoke the shared principal. Detecting a copy on the computer that holds it, before it refreshes, is up to the client and is not part of this RFC.
+A copy that is only stored, such as one in a backup, stops working when the original's next rotation is stored. That happens within one rotation period of the moment the copy was made, under an assumption this RFC does not guarantee: that the original runs during that period, refreshes when it is due, and its rotation reaches the server before its deadline. An original that is off, offline or keeps losing its rotation requests rotates later, and the copy works until then.
 
-Rotating more often does not help a copy beyond rotating first, because the server keeps only one credential per principal.
+A copy that rotates first wins instead, and the original is signed out. That is the expected outcome after the user moves to a new computer and stops using the old one, and it is also what happens when someone runs a stolen copy. Rotation does not tell the two apart. In the second case, another active principal of the user can revoke the shared principal (RFC 0009). If none remains, owner recovery creates one first. Pairing again alone does not revoke the shared principal. Detecting a copy on the computer that holds it, before it refreshes, is up to the client and is not part of this RFC.
+
+Rotating more often does not help a copy beyond rotating first, because the server keeps one credential per principal.
 
 ## 4. Older clients and servers, and encodings
 
-An older client never sets `next_refresh_credential`, so the server never rotates its credential, and the client works as before without the protection of §3.
+An older client never sets the new fields, so the server never rotates its credential, and its answers are the ones it got before. The client works as before without the protection of §3.
 
 The server accepts request bodies as binary protobuf and as proto3 JSON (spec v0 §15.1). The two encodings differ for a server without this RFC:
 
-- **Binary.** Such a server decodes the request and ignores field 3, so it answers without `rotated`, and the client keeps its current credential (§2 step 4).
-- **JSON.** Such a server refuses a JSON body that names a field it does not know, so the request fails. A client that sends JSON must therefore not set `next_refresh_credential` unless it knows the server supports this RFC.
+- **Binary.** Such a server decodes the request and ignores the new fields. Its answer carries no `server_time_ms`, so a client following §2 never proposes a credential to it.
+- **JSON.** Such a server refuses a JSON body that names a field it does not know, with `400`. A client that sends JSON sets the new fields only for a server it knows supports this RFC. For example, it can send its first request with `rotation` set and, if that is refused as a malformed body, continue without the new fields.
 
-The Rust clients in this repository send every request body as binary protobuf (`application/x-protobuf`, core/net), `POST /v1/token` included, and no client in this repository sends JSON to `POST /v1/token`. So the server and the clients can be released in either order.
+Answers carry the new fields only for requests that set `rotation`, so a JSON client that never sets it gets exactly the answers it got before, whichever server it talks to.
+
+In this repository:
+
+- The Rust clients send every request body as binary protobuf (`application/x-protobuf`, core/net), `POST /v1/token` included.
+- The deployment test client (server/scripts/deploy-test/client.ts) sends `POST /v1/token` as JSON. It never sets the new fields, and it reads answers with unknown fields ignored, so its upgrade run, which starts on a server without this RFC, works unchanged.
+
+So the server and the clients can be released in either order.
 
 ## 5. Changes to RFC 0006 §7
 
 In RFC 0006 §7, "**Credential expiry.**" paragraph:
 
 - "A refresh credential stops working when its principal is revoked or its `expires_at_ms` passes." is replaced by "A refresh credential stops working when its principal is revoked, when its `expires_at_ms` passes, or when the device replaces it with a new one (RFC 0011 §1)."
-- "It does not retry the request." is replaced by "It does not retry the request, except that a process that does not rotate the credential first reads the stored credential again once and presents what it holds (RFC 0011 §2)."
+- "It does not retry the request." is replaced by "It does not retry the request, except that a process that does not rotate the credential first reads the stored credential again once and presents what it holds, and the process that rotates presents its staged credential (RFC 0011 §2)."
