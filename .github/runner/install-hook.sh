@@ -64,6 +64,7 @@ for dir in "$@"; do
       [ -f "$dir/$file" ] || die "$dir/$file is not a regular file; nothing was changed."
       cat "$dir/$file" > "$s/old$file" || die "cannot read $dir/$file; nothing was changed."
       cp -p "$dir/$file" "$s/backup$file" || die "cannot back up $dir/$file; nothing was changed."
+      stat -f '%Su:%Sg %Lp %Sf' "$dir/$file" > "$s/stat$file" || die "cannot read the owner, mode and flags of $dir/$file; nothing was changed."
     fi
   done
   : > "$s/new.env"
@@ -100,6 +101,9 @@ restore_runner() {
     fi
     if [ -f "$s/backup$file" ]; then
       cp -p "$s/backup$file" "$dir/$file" || status=1
+      if ! cmp -s "$s/backup$file" "$dir/$file" || [ "$(stat -f '%Su:%Sg %Lp %Sf' "$dir/$file")" != "$(cat "$s/stat$file")" ]; then
+        status=1
+      fi
     else
       rm -f "$dir/$file" || status=1
     fi

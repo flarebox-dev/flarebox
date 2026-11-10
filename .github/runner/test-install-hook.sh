@@ -18,6 +18,7 @@ code=0
 
 new_root() {
   root="$(mktemp -d "$tmp/root.XXXXXX")"
+  chgrp "$grp" "$root"
   for n in 1 2 3 4; do
     mkdir -p "$root/Users/ghrunner/runner-$n"
     echo '{}' > "$root/Users/ghrunner/runner-$n/.runner"
