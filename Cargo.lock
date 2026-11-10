@@ -460,6 +460,26 @@ name = "flarebox-cli"
 version = "0.0.0"
 
 [[package]]
+name = "flarebox-driver"
+version = "0.0.0"
+dependencies = [
+ "flarebox-chunk",
+ "flarebox-fs",
+ "flarebox-net",
+ "flarebox-proto",
+ "flarebox-store",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "flarebox-engine"
 version = "0.0.0"
 dependencies = [
