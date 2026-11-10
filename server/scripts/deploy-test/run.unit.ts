@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // Runs run.ts against MockCloudflare: teardown deletes only resources whose identity this run recorded, a name that is
-// already taken stops the deploy before it creates anything, and the claim code read through the pinned Wrangler's
-// tail ends up in no file and no output, whether the claim succeeds or fails.
+// already taken stops the deploy before it creates anything, a Worker is recorded only when this run's own deploy
+// created it, and the claim code read through the pinned Wrangler's tail ends up in no file and no output, whether the
+// claim succeeds or fails.
 
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MockCloudflare } from "./mock-cloudflare.ts";
@@ -26,6 +27,7 @@ beforeEach(async () => {
   work = mkdtempSync(join(tmpdir(), "flarebox-run-unit-"));
   mkdirSync(join(work, "home"));
   mkdirSync(join(work, "tmp"));
+  mkdirSync(join(work, "bin"));
 });
 
 afterEach(async () => {
@@ -60,9 +62,11 @@ function exec(command: string, args: string[], cwd: string, env: NodeJS.ProcessE
 function runTs(...args: string[]): Promise<{ status: number | null; output: string }> {
   const flags = Number(process.versions.node.split(".")[0]) < 23 ? ["--experimental-strip-types", "--no-warnings"] : [];
   return exec(process.execPath, [...flags, join(here, "run.ts"), ...args], server, {
-      PATH: process.env.PATH,
+      PATH: join(work, "bin") + delimiter + process.env.PATH,
       HOME: join(work, "home"),
       TMPDIR: join(work, "tmp"),
+      MOCK_URL: mock.url,
+      FAKE_PNPM_LOG: join(work, "pnpm.log"),
       CLOUDFLARE_API_BASE_URL: mock.url + "/client/v4",
       CLOUDFLARE_API_TOKEN: "dummy-token",
       CLOUDFLARE_ACCOUNT_ID: "0123456789abcdef0123456789abcdef",
@@ -70,6 +74,32 @@ function runTs(...args: string[]): Promise<{ status: number | null; output: stri
       FLAREBOX_DEPLOY_TEST_STATE: join(work, "state.json"),
       WRANGLER_SEND_METRICS: "false",
   });
+}
+
+/**
+ * Puts a pnpm on run.ts's PATH that logs its arguments, creates the run's Worker through the mock when a step says so
+ * (as a concurrent creator during install, or as Wrangler during deploy), and exits with the step's status. A deploy
+ * that exits 0 prints what wrangler deploy prints.
+ */
+function fakePnpm(steps: { install: { createsWorker: boolean; status: number }; deploy: { createsWorker: boolean; status: number } }): void {
+  const script = `#!${process.execPath}
+const { appendFileSync } = require("node:fs");
+const steps = ${JSON.stringify(steps)};
+const step = process.argv[2] === "install" ? steps.install : steps.deploy;
+appendFileSync(process.env.FAKE_PNPM_LOG, process.argv.slice(2).join(" ") + "\\n");
+const created = step.createsWorker ? fetch(process.env.MOCK_URL + "/mock/workers/${NAME}", { method: "POST" }) : Promise.resolve();
+created.then(() => {
+  if (process.argv[2] !== "install" && step.status === 0) {
+    console.log("Deployed ${NAME} triggers\\n  https://${NAME}.mock.workers.dev\\nCurrent Version ID: 00000000-0000-4000-8000-000000000001");
+  }
+  process.exit(step.status);
+});
+`;
+  writeFileSync(join(work, "bin", "pnpm"), script, { mode: 0o755 });
+}
+
+function pnpmCalls(): string[] {
+  return existsSync(join(work, "pnpm.log")) ? readFileSync(join(work, "pnpm.log"), "utf8").trim().split("\n") : [];
 }
 
 /** Files under root whose bytes contain text. */
@@ -144,6 +174,46 @@ describe("deploy", () => {
     expect((await runTs("teardown")).status).toBe(1);
     expect(mock.deletes()).toEqual([]);
     expect(mock.buckets.has(NAME)).toBe(true);
+  });
+
+  it("records no Worker when the install fails while another creator takes the name, so teardown deletes nothing", async () => {
+    fakePnpm({ install: { createsWorker: true, status: 1 }, deploy: { createsWorker: true, status: 0 } });
+    const deployed = await runTs("deploy", "HEAD");
+    expect(deployed.status).toBe(1);
+    expect(pnpmCalls()).toEqual(["install --frozen-lockfile"]);
+    expect(readState().owned.workerId).toBeUndefined();
+    const id = mock.workers.get(NAME)?.id;
+    expect(id).toBeDefined();
+    const tornDown = await runTs("teardown");
+    expect(tornDown.status).toBe(1);
+    expect(mock.deletes().filter((request) => request.includes("/workers/"))).toEqual([]);
+    expect(mock.workers.get(NAME)?.id).toBe(id);
+    expect(mock.namespaces.filter((namespace) => namespace.script === NAME)).toHaveLength(2);
+  });
+
+  it("does not deploy over a Worker that another creator made while dependencies were installing", async () => {
+    fakePnpm({ install: { createsWorker: true, status: 0 }, deploy: { createsWorker: true, status: 0 } });
+    const deployed = await runTs("deploy", "HEAD");
+    expect(deployed.status).toBe(1);
+    expect(deployed.output).toContain("appeared before this run deployed");
+    expect(pnpmCalls()).toEqual(["install --frozen-lockfile"]);
+    expect(readState().owned.workerId).toBeUndefined();
+    expect((await runTs("teardown")).status).toBe(1);
+    expect(mock.deletes().filter((request) => request.includes("/workers/"))).toEqual([]);
+    expect(mock.workers.has(NAME)).toBe(true);
+  });
+
+  it("records the Worker its own deploy created, even when a later step fails, so teardown deletes it", async () => {
+    fakePnpm({ install: { createsWorker: false, status: 0 }, deploy: { createsWorker: true, status: 0 } });
+    const deployed = await runTs("deploy", "HEAD");
+    expect(pnpmCalls()).toEqual(["install --frozen-lockfile", "run deploy"]);
+    expect(deployed.status).toBe(1);
+    expect(readState().owned.workerId).toBe(mock.workers.get(NAME)?.id);
+    const tornDown = await runTs("teardown");
+    expect(tornDown.output).not.toContain("::error::");
+    expect(tornDown.status).toBe(0);
+    expect(mock.workers.has(NAME)).toBe(false);
+    expect(mock.buckets.has(NAME)).toBe(false);
   });
 });
 

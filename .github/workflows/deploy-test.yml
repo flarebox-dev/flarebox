@@ -72,12 +72,12 @@ jobs:
           }
           environment="$(gh api "repos/$REPOSITORY/environments/deploy-test")" || refuse "The deploy-test environment does not exist or cannot be read."
           reviewers="$(jq -r '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[]?.reviewer.login] | join(" ")' <<<"$environment")"
-          [[ " $reviewers " == *" gunwooterry "* ]] || refuse "The deploy-test environment does not require gunwooterry's approval (required reviewers: ${reviewers:-none})."
+          [ "$reviewers" = gunwooterry ] || refuse "The deploy-test environment's required reviewers must be gunwooterry alone, because any one listed reviewer can approve a run (required reviewers: ${reviewers:-none})."
           [ "$(jq -r '.can_admins_bypass' <<<"$environment")" != true ] || refuse "Administrators can bypass the deploy-test environment's protection rules."
           [ "$(jq -r '.deployment_branch_policy.custom_branch_policies // false' <<<"$environment")" = true ] || refuse "The deploy-test environment does not limit deployments to selected branches."
           policies="$(gh api "repos/$REPOSITORY/environments/deploy-test/deployment-branch-policies" --jq '[.branch_policies[] | (.type // "branch") + ":" + .name] | sort | join(",")')" || refuse "The deploy-test environment's branch policies cannot be read."
           [ "$policies" = "branch:main" ] || refuse "The deploy-test environment must allow the main branch only, but allows: ${policies:-nothing}."
-          echo "The deploy-test environment requires gunwooterry's approval, cannot be bypassed by administrators, and deploys main only."
+          echo "The deploy-test environment lists gunwooterry as its only required reviewer, allows main only, and does not report administrator bypass as allowed. These checks are defence in depth: the boundary is the required reviewer's approval of each run, with administrator bypass turned off by hand as docs/deploy-test.md describes."
 
   deploy-test:
     name: deploy test (${{ inputs.mode }})

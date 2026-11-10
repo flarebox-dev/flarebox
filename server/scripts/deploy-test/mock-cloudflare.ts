@@ -3,7 +3,8 @@
 // An in-memory stand-in for the parts of the Cloudflare API that run.ts and Wrangler's tail use, plus the two Worker
 // routes the claim calls, for run.unit.ts. Point CLOUDFLARE_API_BASE_URL at url + "/client/v4" and the state's server
 // URL at url. The tail is a minimal WebSocket server that pushes one request event whose log line carries the claim
-// code each time /setup is requested.
+// code each time /setup is requested. POST /mock/workers/<name> creates a Worker from another process, as a concurrent
+// creator or Wrangler would.
 
 import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -106,6 +107,7 @@ export class MockCloudflare {
       };
       const ok = (result: unknown) => send(200, { success: true, errors: [], messages: [], result });
       const missing = () => send(404, { success: false, errors: [{ code: 10007, message: "not found" }], messages: [], result: null });
+      let match: RegExpExecArray | null;
 
       if (path === "/setup") {
         this.pushClaimCode(this.url + "/setup");
@@ -113,6 +115,7 @@ export class MockCloudflare {
         response.end("A one-time claim code, valid for one hour, is in this Worker's logs.\n\nFlarebox is not affiliated with Cloudflare, Inc.\n");
         return;
       }
+      if ((match = /^\/mock\/workers\/([^/]+)$/.exec(path)) && method === "POST") return send(200, this.addWorker(match[1]!));
       if (path === "/v1/claim") {
         const claimed = JSON.parse(body) as { code?: string };
         if (this.claimStatus !== 200 || claimed.code !== this.claimCode) return send(403, { code: "CODE_FORBIDDEN", message: "wrong claim code" });
@@ -122,7 +125,6 @@ export class MockCloudflare {
       this.requests.push(method + " " + path);
       const api = /^\/client\/v4\/accounts\/[^/]+(\/.*)$/.exec(path)?.[1];
       if (!api) return missing();
-      let match: RegExpExecArray | null;
       if ((match = /^\/workers\/workers\/([^/]+)$/.exec(api)) && method === "GET") {
         const worker = this.workers.get(match[1]!);
         return worker ? ok({ id: worker.id, name: match[1], created_on: new Date().toISOString() }) : missing();

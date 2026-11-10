@@ -168,8 +168,11 @@ async function serving(url: string): Promise<{ serverVersion: string; claimed: b
 
 /**
  * Deploys server/ at ref. The first deploy checks that neither the Worker nor the bucket name is taken, creates the
- * bucket and records its creation date, then records the Worker's immutable ID once the deploy created it, whether or
- * not the deploy succeeded. Teardown deletes only what is recorded, so a name collision leaves the other resource alone.
+ * bucket and records its creation date. It records the Worker's immutable ID only when the name is still free right
+ * before its own wrangler deploy and the Worker exists once that deploy succeeded, so a Worker that someone else
+ * created under the name, during dependency installation for example, is never recorded. A failed install or deploy
+ * records no Worker; teardown then leaves any Worker with the name alone and fails, because it deletes only what is
+ * recorded.
  */
 async function deploy(account: Account, ref: string): Promise<void> {
   const state = readState();
@@ -200,19 +203,17 @@ async function deploy(account: Account, ref: string): Promise<void> {
   rename(dir, state.name);
   console.log("Copied server/ at " + sha + " to " + dir + " as Worker and R2 bucket " + state.name);
 
-  let deployed: string;
-  try {
-    await run("pnpm", ["install", "--frozen-lockfile"], dir, INSTALL_MS, withoutSecrets());
-    deployed = await run("pnpm", ["run", "deploy"], dir, DEPLOY_MS, process.env);
-  } finally {
-    if (first) {
-      const worker = await getWorker(account, state.name);
-      if (worker) {
-        state.owned.workerId = worker.id;
-        writeState(state);
-        console.log("The Worker " + state.name + " this run created has id " + worker.id);
-      }
-    }
+  await run("pnpm", ["install", "--frozen-lockfile"], dir, INSTALL_MS, withoutSecrets());
+  if (first) {
+    const worker = await getWorker(account, state.name);
+    if (worker) fail("a Worker named " + state.name + " appeared before this run deployed (id " + worker.id + "); this run did not create it and leaves it alone");
+  }
+  const deployed = await run("pnpm", ["run", "deploy"], dir, DEPLOY_MS, process.env);
+  if (first) {
+    const worker = (await getWorker(account, state.name)) ?? fail("wrangler deploy succeeded but the Worker " + state.name + " cannot be read back");
+    state.owned.workerId = worker.id;
+    writeState(state);
+    console.log("The Worker " + state.name + " this run's deploy created has id " + worker.id);
   }
   const url = /https:\/\/[a-z0-9.-]+\.workers\.dev/.exec(deployed)?.[0];
   if (!url) fail("wrangler deploy printed no workers.dev address; the account needs a workers.dev subdomain (docs/deploy-test.md)");
