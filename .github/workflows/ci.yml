@@ -33,10 +33,10 @@ jobs:
         id: paths
         env:
           EVENT: ${{ github.event_name }}
-          BASE: ${{ github.event.pull_request.base.sha }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
         run: |
-          if [ "$EVENT" != pull_request ]; then
-            echo "Event $EVENT: every macOS job runs."
+          if [ "$EVENT" = push ]; then
+            echo "Push to $GITHUB_REF: every macOS job runs."
             printf '%s=true\n' rust_macos server_macos spec_macos macos_app >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -45,7 +45,7 @@ jobs:
             echo "::error::git diff between $BASE and HEAD failed, so the changed paths are unknown."
             exit 1
           fi
-          echo "Files this pull request changes:"
+          echo "Files this $EVENT run changes against $BASE:"
           printf '%s\n' "$changed"
           decide() {
             if grep -Eq "$2" <<<"$changed"; then
@@ -310,18 +310,17 @@ jobs:
             echo "::error::At least one CI job failed or was cancelled (changes: $CHANGES, rust: $RUST, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, cli-integration: $CLI_INTEGRATION, ffi-integration: $FFI_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP). Open that job's log for the cause."
             exit 1
           fi
-      - name: Fail unless every macOS job ran, outside pull requests
-        if: github.event_name != 'pull_request'
+      - name: Fail unless every macOS job ran on a push to main
+        if: github.event_name == 'push'
         env:
-          EVENT: ${{ github.event_name }}
           RUST_MACOS: ${{ needs.changes.outputs.rust_macos }}
           SERVER_MACOS: ${{ needs.changes.outputs.server_macos }}
           SPEC_MACOS: ${{ needs.changes.outputs.spec_macos }}
           MACOS_APP_WANTED: ${{ needs.changes.outputs.macos_app }}
           MACOS_APP: ${{ needs.macos-app.result }}
         run: |
-          echo "macOS jobs in $EVENT: rust $RUST_MACOS, server $SERVER_MACOS, spec $SPEC_MACOS, macos app $MACOS_APP_WANTED ($MACOS_APP)"
+          echo "macOS jobs on this push: rust $RUST_MACOS, server $SERVER_MACOS, spec $SPEC_MACOS, macos app $MACOS_APP_WANTED ($MACOS_APP)"
           if [ "$RUST_MACOS" != true ] || [ "$SERVER_MACOS" != true ] || [ "$SPEC_MACOS" != true ] || [ "$MACOS_APP_WANTED" != true ] || [ "$MACOS_APP" != success ]; then
-            echo "::error::In $EVENT every macOS job must run and pass, but rust ${RUST_MACOS:-unknown}, server ${SERVER_MACOS:-unknown}, spec ${SPEC_MACOS:-unknown}, macos app ${MACOS_APP_WANTED:-unknown} ($MACOS_APP). Only pull requests may skip a macOS job."
+            echo "::error::A push to main must run and pass every macOS job, but rust ${RUST_MACOS:-unknown}, server ${SERVER_MACOS:-unknown}, spec ${SPEC_MACOS:-unknown}, macos app ${MACOS_APP_WANTED:-unknown} ($MACOS_APP). Only pull requests and the merge queue may skip a macOS job."
             exit 1
           fi

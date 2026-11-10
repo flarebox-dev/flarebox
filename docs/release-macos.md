@@ -6,7 +6,7 @@ The [macOS release](../.github/workflows/release-macos.yml) workflow builds the 
 |---|---|
 | A tag like `v0.1.0` on a commit that is on `main` | The app at version 0.1.0, signed and notarized if the signing secrets are set |
 | **Run workflow** (manual) from `main` | The same, at the version you enter, or `MARKETING_VERSION` from `apps/macos/project.yml` when you leave it empty |
-| Pull requests, the merge queue and pushes to `main` | An unsigned DMG, to check that the build, packaging and verification still work. The `macos app` job of [CI](../.github/workflows/ci.yml) builds it after testing the app's Swift bindings. `ci-report` requires it to pass in the merge queue and on `main`; a pull request builds it only when it changes `core/`, `apps/macos/`, `.cargo/`, the Cargo files (including `cli/Cargo.toml`, which Cargo loads as a workspace member), `rust-toolchain.toml` or the workflow. These runs never see the signing secrets. |
+| Pull requests, the merge queue and pushes to `main` | An unsigned DMG, to check that the build, packaging and verification still work. The `macos app` job of [CI](../.github/workflows/ci.yml) builds it after testing the app's Swift bindings. A pull request or merge queue run builds it only when the change touches `core/`, `apps/macos/`, `.cargo/`, the Cargo files (including `cli/Cargo.toml`, which Cargo loads as a workspace member), `rust-toolchain.toml` or the workflow. A push to `main` always builds it, and `ci-report` fails the push if it did not run and pass. These runs never see the signing secrets. |
 
 ## What a signed run does
 
