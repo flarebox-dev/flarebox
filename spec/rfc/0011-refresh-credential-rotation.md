@@ -55,7 +55,7 @@ A refusal of the staged credential alone never clears it, because its request ma
 
 Both orders still hold if the server's clock moves backward. In the first, the client keeps both slots until an answer settles the outcome, so a clock change cannot make it drop the credential the server stores. In the second, the client clears the staged slot only after an answer with a time T0 later than D. The server sent that answer only after its rotation clock durably held T0. So a delayed request that arrives later, even while the server's clock reads a time before D, is checked against a time of at least T0 and is not stored.
 
-A lost proposal does not stall the rotation either. While the server's clock is behind the rotation clock, the answers carry the rotation clock, a time at or before D, so the next proposal of the same staged credential is stored.
+A proposal lost before it reaches the server does not stall the rotation either. While the server's clock is behind the rotation clock, the answers carry the rotation clock, a time at or before D, so the next proposal of the same staged credential is stored. If only the answer was lost, the server already stored the staged credential, and the next refresh recovers it through the refusal of the current credential (step 6).
 
 In every order, the slots the client keeps include the one credential the server accepts.
 
