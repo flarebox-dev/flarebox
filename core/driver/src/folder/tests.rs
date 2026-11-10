@@ -1757,3 +1757,61 @@ fn a_reconnect_while_a_commit_is_sent_starts_no_second_send() {
         assert_eq!(a.state(), FolderState::UpToDate);
     }
 }
+
+#[test]
+fn a_commit_too_large_to_send_is_split() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    for name in ["1.txt", "2.txt", "3.txt", "4.txt"] {
+        fs::write(site.root.join(name), name).unwrap();
+    }
+    a.scan_until(|a| a.folder.engine.trees.local().iter().count() == 4 && !a.work.is_empty());
+    let upload = a.work.pop_front().unwrap();
+    a.perform(upload, &mut remote).unwrap();
+    let Some(Work::Send(commit)) = a.work.pop_front() else {
+        panic!("the commit is sent after its upload");
+    };
+    assert_eq!(commit.ops.len(), 4);
+    let step = a.folder.sent(Err(CallError::TooLarge { bytes: 9 << 20 }));
+    a.take(step).unwrap();
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    let sizes: Vec<usize> = a.sent.iter().map(|commit| commit.ops.len()).collect();
+    assert_eq!(sizes, [2, 2]);
+    assert_eq!(remote.names(), ["1.txt", "2.txt", "3.txt", "4.txt"]);
+    assert_eq!(a.state(), FolderState::UpToDate);
+}
+
+#[test]
+fn a_read_only_device_keeps_downloading() {
+    let mut remote = Remote::new();
+    let (site_b, mut b) = linked(&mut remote, "b");
+    let (site, mut a) = linked(&mut remote, "a");
+    a.caller.role = Role::Viewer;
+    a.connect(&remote);
+    a.pull(&remote);
+    assert_eq!(a.folder.engine.commits.halted(), Some(CommitHalt::ReadOnly));
+    fs::write(site.root.join("mine.txt"), b"never sent").unwrap();
+    a.scan_until(|a| {
+        (a.folder.engine.trees.local().iter()).any(|(_, node)| node.shape.name == "mine.txt")
+    });
+    assert!(a.work.is_empty());
+
+    b.create(
+        &mut remote,
+        &site_b.root.join("theirs.txt"),
+        b"written on b",
+    );
+    a.pull(&remote);
+    a.run(&mut remote);
+    a.settle();
+    assert_eq!(
+        files(&site.root),
+        [
+            ("mine.txt".to_owned(), "never sent".to_owned()),
+            ("theirs.txt".to_owned(), "written on b".to_owned())
+        ]
+    );
+    assert_eq!(remote.names(), ["theirs.txt"]);
+}
