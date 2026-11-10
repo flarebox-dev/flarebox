@@ -390,7 +390,8 @@ export class AccountDO extends DurableObject<Env> {
   /**
    * Revokes a device: its refresh credential stops working and its open WebSockets close with 4003. The revocation and
    * a notice to every space are stored together, and a notice stays until its space took it, so a space that cannot be
-   * reached now gets it on a repeat or from the alarm.
+   * reached now gets it on a repeat or from the alarm. The alarm is armed before the first delivery, so the notices are
+   * retried even if this object is evicted before it delivers them.
    */
   async revokeDevice(deviceId: string): Promise<void> {
     const nowMs = Date.now();
@@ -400,9 +401,10 @@ export class AccountDO extends DurableObject<Env> {
       this.sql.exec(
         "INSERT INTO revocation_notices (device_id, space_id, next_try_ms) SELECT ?, space_id, ? FROM spaces WHERE true ON CONFLICT DO NOTHING",
         deviceId,
-        nowMs,
+        nowMs + NOTICE_RETRY_MS,
       );
     });
+    await this.armAlarm();
     await this.deliverNotices(deviceId);
   }
 

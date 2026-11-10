@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { create, type DescMessage, fromBinary, type MessageInitShape, type MessageShape, toBinary } from "@bufbuild/protobuf";
-import { evictDurableObject, runInDurableObject } from "cloudflare:test";
+import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -687,6 +687,29 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
         spy.mockRestore();
       }
     });
+  });
+
+  it("arms the alarm when it stores a revocation, so a notice is delivered even if the object is evicted before delivering it", async () => {
+    const owner = await getOwner();
+    const pad = await pairDevice(owner, "Evicted before delivery");
+    const spaceId = await createSpace(owner);
+    const socket = await Socket.connect(spaceId, pad);
+    await socket.start();
+    const stub = account();
+    await runInDurableObject(stub, async (instance: import("../src/account-do").AccountDO, state) => {
+      await state.storage.deleteAlarm();
+      vi.spyOn(instance as unknown as { deliverNotices: () => Promise<void> }, "deliverNotices").mockRejectedValue(new Error("evicted before delivery"));
+      await expect(instance.revokeUserDevice({ userId: owner.userId, deviceId: pad.deviceId })).rejects.toThrow("evicted before delivery");
+      expect(await state.storage.getAlarm()).not.toBeNull();
+      state.storage.sql.exec("UPDATE revocation_notices SET next_try_ms = 0 WHERE device_id = ?", pad.deviceId);
+    });
+    await evictDurableObject(stub);
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect((await socket.waitClosed()).code).toBe(Close.DEVICE_REVOKED);
+    const pending = await runInDurableObject(stub, (_instance, state) =>
+      state.storage.sql.exec("SELECT COUNT(*) AS n FROM revocation_notices WHERE device_id = ?", pad.deviceId).one().n,
+    );
+    expect(pending).toBe(0);
   });
 
   it("never lets an access token outlive its credential, and refuses an expired credential", async () => {
