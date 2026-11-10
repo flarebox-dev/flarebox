@@ -6,14 +6,13 @@
 // Usage: node scripts/pack-bundle.mjs <output directory>
 
 import { execFileSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const DRY_RUN_MS = 2 * 60_000;
-const BUNDLE_ENTRIES = ["manifest.json", "worker", "assets"];
 
 const server = join(dirname(fileURLToPath(import.meta.url)), "..");
 const output = process.argv[2] && resolve(process.argv[2]);
@@ -32,12 +31,9 @@ function defined(object) {
   return Object.fromEntries(Object.entries(object).filter(([, value]) => value !== undefined));
 }
 
-// The output is deleted and rewritten, so it must be new, empty, or a bundle this script wrote; never the source tree.
-if (existsSync(output)) {
-  const entries = readdirSync(output);
-  if (entries.length > 0 && (!entries.includes("manifest.json") || entries.some((entry) => !BUNDLE_ENTRIES.includes(entry)))) {
-    fail(output + " holds files other than a bundle; name a new or empty directory");
-  }
+// The script never deletes anything at the output, so it writes only into a new or empty directory.
+if (existsSync(output) && (!statSync(output).isDirectory() || readdirSync(output).length > 0)) {
+  fail(output + " exists and is not an empty directory; name a new or empty one");
 }
 
 const require = createRequire(join(server, "package.json"));
@@ -63,7 +59,6 @@ try {
   const assets = resolve(server, config.assets.directory);
   if (!existsSync(assets) || readdirSync(assets).length === 0) fail(config.assets.directory + " is empty after the build");
 
-  rmSync(output, { recursive: true, force: true });
   mkdirSync(join(output, "worker"), { recursive: true });
   cpSync(join(built, mainModule), join(output, "worker", mainModule));
   cpSync(assets, join(output, "assets"), { recursive: true });
