@@ -47,8 +47,12 @@ pub struct Observation {
     /// The root check of design §6.2, made after the scans of this batch. Removals in a batch whose check failed
     /// are not trusted.
     pub root: Result<(), RootProblem>,
-    /// Folders the scans may not read. What is below them is unknown, not absent.
+    /// Folders the scans may not read. What is below them is unknown, not absent. Until a scan of the current watcher
+    /// has settled every scope, the folders still pending are among them too, since no scan may have read their rules.
     pub unreadable: Vec<PathBuf>,
+    /// Folders whose rules the scans established, at the paths the scans read them. A folder reported unreadable
+    /// before has known rules again once it is here.
+    pub read: Vec<PathBuf>,
     /// The identity of the root folder the observer's scans opened, from the latest poll that scanned. A batch
     /// whose root is not the folder the task locked describes another folder. `None` only before the first scan.
     pub scanned: Option<FileId>,
@@ -61,6 +65,10 @@ pub struct Observation {
     /// The engine takes them before the changes of the batch. The first batch of an observer follows its scan of the
     /// whole tree and lists every rules file there is, also when nothing else changed.
     pub rules: Vec<RulesChange>,
+    /// Whether `rules` lists every rules file the scans read: the first batch of an observer, and the first after the
+    /// platform watcher failed and a rescanning one took over. Rules known from before are stale then, since the new
+    /// scans compare with no earlier rules and report no rules file as gone.
+    pub all_rules: bool,
 }
 
 /// The rules of the `.fbignore` file in `dir`, a folder relative to the root and empty for the root, or `None` when
@@ -132,6 +140,9 @@ pub struct FsObserver {
     scanned: Option<FileId>,
     /// Whether the batch that follows the first scan of the whole tree is still to be returned.
     first: bool,
+    /// Whether no poll of the current watcher has settled every scope yet. Until one has, a folder still pending may
+    /// be one whose rules no scan of this watcher has read.
+    settling: bool,
     /// Whether a reset still waits for the batch of a scan made after it.
     reset: bool,
     /// Files whose content could not be read, with when to read them again.
@@ -194,6 +205,7 @@ impl FsObserver {
             matcher,
             scanned: None,
             first: true,
+            settling: true,
             reset: false,
             unread: BTreeMap::new(),
         })
@@ -390,6 +402,8 @@ impl Observer for FsObserver {
                     scan_rules(&self.matcher),
                 )?);
                 self.native = false;
+                self.first = true;
+                self.settling = true;
                 return Ok(None);
             }
             poll => poll?,
@@ -417,11 +431,26 @@ impl Observer for FsObserver {
             .collect();
         let first = self.first && poll.root.is_some();
         let answers = self.reset && poll.root.is_some() && poll.pending.is_empty();
+        let mut unreadable = poll.unreadable;
+        if self.settling && poll.root.is_some() {
+            let snapshot = self.watcher.snapshot();
+            unreadable.extend(
+                (poll.pending.iter())
+                    .filter(|scope| {
+                        scope.as_os_str().is_empty()
+                            || (snapshot.entries.get(*scope))
+                                .is_some_and(|entry| entry.kind == EntryKind::Dir)
+                    })
+                    .cloned(),
+            );
+            self.settling = !poll.pending.is_empty();
+        }
         if !first
             && !answers
             && !observed
             && changes.is_empty()
-            && poll.unreadable.is_empty()
+            && unreadable.is_empty()
+            && poll.read.is_empty()
             && rules.is_empty()
         {
             return Ok(None);
@@ -432,10 +461,12 @@ impl Observer for FsObserver {
         Ok(Some(Observation {
             changes,
             root,
-            unreadable: poll.unreadable,
+            unreadable,
+            read: poll.read,
             scanned: self.scanned,
             busy,
             rules,
+            all_rules: first,
         }))
     }
 
@@ -517,7 +548,7 @@ mod tests {
     use std::os::unix::fs::MetadataExt;
     use std::time::Instant;
 
-    use flarebox_fs::{Marker, write_marker};
+    use flarebox_fs::{Marker, Poll, write_marker};
 
     use super::*;
     use crate::ignore::Unfiltered;
@@ -852,6 +883,111 @@ mod tests {
             .collect();
         paths.sort();
         paths
+    }
+
+    /// A watcher that answers each poll from a script, and fails as the platform watcher can once the script ends.
+    struct Scripted {
+        snapshot: Snapshot,
+        polls: Vec<Poll>,
+    }
+
+    impl Watcher for Scripted {
+        fn poll(&mut self, _timeout: Duration) -> Result<Poll, FsError> {
+            if self.polls.is_empty() {
+                return Err(FsError::Watch("the platform watcher failed".into()));
+            }
+            Ok(self.polls.remove(0))
+        }
+
+        fn snapshot(&self) -> &Snapshot {
+            &self.snapshot
+        }
+
+        fn reset(&mut self, _scope: &Path, _known: BTreeMap<PathBuf, Known>) {}
+    }
+
+    /// The first scan of an observer saw `proj`, a folder it knew, disappear and could not settle it, so it may not
+    /// have read the folder's rules file. The folder is reported unreadable until a scan settles it. Once every scope
+    /// has settled, a folder that is pending again is not: the rules a scan read for it stay in force.
+    #[test]
+    fn a_folder_the_first_scan_left_pending_is_unreadable_until_a_scan_settles_it() {
+        let dir = marked();
+        let root = dir.path();
+        fs::create_dir(root.join("proj")).unwrap();
+        let mut known = observer(root);
+        known.observe(Duration::from_secs(10)).unwrap();
+        let snapshot = known.snapshot().clone();
+        let scanned = known.scanned();
+        let dev = fs::metadata(root).unwrap().dev();
+        let mut observer =
+            FsObserver::start(root, SPACE, dev, snapshot.clone(), Arc::new(Unfiltered)).unwrap();
+        let proj = PathBuf::from("proj");
+        observer.watcher = Box::new(Scripted {
+            snapshot,
+            polls: vec![
+                Poll {
+                    pending: vec![proj.clone()],
+                    root: scanned,
+                    read: vec![PathBuf::new()],
+                    ..Poll::default()
+                },
+                Poll {
+                    root: scanned,
+                    read: vec![proj.clone()],
+                    ..Poll::default()
+                },
+                Poll {
+                    pending: vec![proj.clone()],
+                    root: scanned,
+                    ..Poll::default()
+                },
+            ],
+        });
+        let first =
+            (observer.observe(Duration::ZERO).unwrap()).expect("the batch of the first scan");
+        assert_eq!(first.unreadable, std::slice::from_ref(&proj));
+        let settled =
+            (observer.observe(Duration::ZERO).unwrap()).expect("the scan that read the folder");
+        assert!(settled.unreadable.is_empty());
+        assert_eq!(settled.read, [proj]);
+        assert!(observer.observe(Duration::ZERO).unwrap().is_none());
+    }
+
+    /// The platform watcher fails after the user deleted a rules file it had not reported. The rescanning watcher that
+    /// takes over compares with no rules, so it cannot report the rules file as gone. Its first batch says that it
+    /// lists every rules file there is, so the engine forgets the others.
+    #[test]
+    fn the_first_batch_after_the_platform_watcher_fails_lists_every_rules_file() {
+        let dir = marked();
+        let root = dir.path();
+        fs::create_dir(root.join("proj")).unwrap();
+        fs::write(root.join("proj/.fbignore"), b"*.log\n").unwrap();
+        fs::write(root.join("proj/build.log"), b"log").unwrap();
+        let mut observer = observer(root);
+        let first = (observer.observe(Duration::from_secs(10)).unwrap())
+            .expect("the batch of the first scan");
+        assert!(first.all_rules);
+        assert!(observer.native, "the platform watcher is running");
+        observer.watcher = Box::new(Scripted {
+            snapshot: observer.watcher.snapshot().clone(),
+            polls: Vec::new(),
+        });
+        fs::remove_file(root.join("proj/.fbignore")).unwrap();
+        assert!(observer.observe(Duration::ZERO).unwrap().is_none());
+        let after = (observer.observe(Duration::from_secs(10)).unwrap())
+            .expect("the batch of the rescanning watcher's first scan");
+        assert!(after.all_rules);
+        assert_eq!(after.rules, []);
+        assert_eq!(
+            paths(&after.changes),
+            [Path::new("proj/.fbignore"), Path::new("proj/build.log")]
+        );
+        assert!(
+            !observer
+                .observe(Duration::ZERO)
+                .unwrap()
+                .is_some_and(|next| next.all_rules)
+        );
     }
 
     #[test]

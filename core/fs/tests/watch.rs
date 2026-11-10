@@ -56,6 +56,7 @@ fn nothing(root: &Path) -> Rescan {
         unreadable: vec![],
         root: root_id(root),
         rules: vec![],
+        read: vec![],
     }
 }
 
@@ -391,6 +392,7 @@ fn folder_replaced_by_a_symlink_is_removed_not_followed() {
             unreadable: vec![],
             root: root_id(&root),
             rules: vec![],
+            read: vec![],
         }
     );
     assert_eq!(snapshot, Snapshot::scan(&root).unwrap());
@@ -439,6 +441,7 @@ fn unreadable_folder_is_kept_and_reported() {
                 unreadable: blocked.clone(),
                 root: root_id(root),
                 rules: vec![],
+                read: vec![],
             },
             "{mode:o}"
         );
@@ -801,6 +804,7 @@ fn rescans_and_polls_report_the_root_they_scanned() {
             unreadable: vec![],
             root: second,
             rules: vec![],
+            read: vec![],
         }
     );
     let poll = watcher.poll(Duration::from_millis(50)).unwrap();

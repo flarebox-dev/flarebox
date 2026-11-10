@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use flarebox_engine::restore::{Outcome, RestoreIntent};
 use flarebox_engine::tree::{Kind, LocalNode, Tree};
-use flarebox_fs::{Marker, write_marker};
+use flarebox_fs::{EntryKind, Marker, write_marker};
 use flarebox_net::Committed;
 use flarebox_proto::v1::{ListTree, ListVersions, Op, PrepareUpload, Resume, chunk_plan, op};
 use flarebox_sim::space::{Role, Session as Caller, SpaceDo};
@@ -20,6 +20,7 @@ use super::*;
 use crate::config::SyncRules;
 use crate::disk::tests::{Server, ready};
 use crate::ignore::{local_rules, matcher};
+use crate::observe::Observed;
 
 const NOW: i64 = 1_700_000_000_000;
 
@@ -1721,6 +1722,146 @@ fn the_rules_hold_of_a_folder_ends_also_after_it_was_renamed_only_in_case() {
     );
 }
 
+#[test]
+fn review_removing_unknown_rules_while_renaming_the_folder_does_not_hold_remote_updates_forever() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site_a.root.join("proj")).unwrap();
+    a.create(&mut remote, &site_a.root.join("proj/file.txt"), b"v1");
+    a.create(&mut remote, &site_a.root.join("proj/.fbignore"), b"*.log\n");
+    let (site, mut b) = linked(&mut remote, "b");
+    b.scan_until(|b| !b.folder.disk.awaits_rules());
+    b.run(&mut remote);
+    drop(b);
+    fs::write(site.root.join("proj/.fbignore"), "*.log\n".repeat(200_000)).unwrap();
+    let mut b = site.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    b.run(&mut remote);
+    fs::rename(site.root.join("proj"), site.root.join("PROJ")).unwrap();
+    fs::remove_file(site.root.join("PROJ/.fbignore")).unwrap();
+    b.scan_until(|b| !b.work.is_empty());
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    fs::rename(site.root.join("PROJ"), site.root.join("proj")).unwrap();
+    b.scan_until(|b| !b.work.is_empty());
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    a.create(
+        &mut remote,
+        &site_a.root.join("proj/file.txt"),
+        b"v2 from a",
+    );
+    b.pull(&remote);
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    assert_eq!(
+        fs::read(site.root.join("proj/file.txt")).unwrap(),
+        b"v2 from a"
+    );
+}
+
+/// A restart cannot read the rules file of `proj`, so what is below it is held. The user deletes the file. No rules
+/// were known for the folder, so no rules changed, but the scan that lists the folder without a rules file ends the
+/// hold, and a later remote edit arrives.
+#[test]
+fn deleting_a_rules_file_a_restart_cannot_read_ends_the_hold_of_its_folder() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site_a.root.join("proj")).unwrap();
+    a.create(&mut remote, &site_a.root.join("proj/file.txt"), b"v1");
+    a.create(&mut remote, &site_a.root.join("proj/.fbignore"), b"*.log\n");
+    let (site, mut b) = linked(&mut remote, "b");
+    b.scan_until(|b| !b.folder.disk.awaits_rules());
+    b.run(&mut remote);
+    drop(b);
+    fs::write(site.root.join("proj/.fbignore"), "*.log\n".repeat(200_000)).unwrap();
+    let mut b = site.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    b.run(&mut remote);
+    fs::remove_file(site.root.join("proj/.fbignore")).unwrap();
+    b.scan_until(|b| !b.work.is_empty());
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    a.create(
+        &mut remote,
+        &site_a.root.join("proj/file.txt"),
+        b"v2 from a",
+    );
+    b.pull(&remote);
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    assert_eq!(
+        fs::read(site.root.join("proj/file.txt")).unwrap(),
+        b"v2 from a"
+    );
+}
+
+/// An effect creates the folder `b` from the server. The user then moves `a` into it and puts a rules file that cannot
+/// be read in it. The batch that reports the move began before the effect ended, so its move is dropped and both paths
+/// are read again. The removals the scan reported below `a` belong to the move and are dropped with it, so nothing
+/// below the folder is deleted on the server.
+#[test]
+fn removals_below_a_folder_move_that_is_dropped_are_dropped_with_it() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site_a.root.join("a")).unwrap();
+    a.create(&mut remote, &site_a.root.join("a/x"), b"x");
+    let (site, mut b) = linked(&mut remote, "b");
+    fs::create_dir(site_a.root.join("b")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(&mut remote);
+    b.scan_until(|b| (b.observer.snapshot().entries).contains_key(Path::new("a/x")));
+    let id = b.observer.snapshot().entries[Path::new("a")].id;
+    let sections = b.folder.sections();
+    let stamp = sections.stamp();
+    b.pull(&remote);
+    b.run(&mut remote);
+    assert!(site.root.join("b").is_dir());
+    fs::rename(site.root.join("a"), site.root.join("b/a")).unwrap();
+    fs::write(site.root.join("b/a/.fbignore"), "*.log\n".repeat(200_000)).unwrap();
+    let stale = Batch {
+        stamp,
+        answered: None,
+        observation: crate::observe::Observation {
+            changes: vec![
+                Observed::Removed {
+                    path: "a/x".into(),
+                    kind: EntryKind::File,
+                },
+                Observed::Renamed {
+                    from: "a".into(),
+                    to: "b/a".into(),
+                    kind: EntryKind::Dir,
+                    id,
+                    linked: false,
+                },
+            ],
+            root: Ok(()),
+            unreadable: vec![PathBuf::from("b/a")],
+            scanned: b.observer.scanned(),
+            busy: Vec::new(),
+            rules: Vec::new(),
+            read: Vec::new(),
+            all_rules: false,
+        },
+    };
+    let step = b.folder.observed(stale, 1);
+    b.take(step).unwrap();
+    assert!(!b.run(&mut remote).contains(&"send"));
+    b.settle();
+    b.run(&mut remote);
+    let live = (b.folder.engine.trees.remote().iter())
+        .any(|(_, node)| !node.trashed && node.shape.name == "x");
+    assert!(live, "x stays on the server");
+}
+
 /// A folder the user deletes stays on the server while it holds a file the rules exclude here (design §5.10), so
 /// nothing is left to send for it, and the folder is up to date.
 #[test]
@@ -1927,6 +2068,8 @@ fn a_batch_that_was_not_asked_to_scan_a_moved_folder_does_not_end_the_wait_for_i
             scanned: b.observer.scanned(),
             busy: Vec::new(),
             rules: Vec::new(),
+            read: Vec::new(),
+            all_rules: false,
         },
     };
     let step = b.folder.observed(unrelated, 1);

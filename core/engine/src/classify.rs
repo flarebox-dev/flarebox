@@ -200,6 +200,11 @@ impl Trees {
         self.ignore.set_rules(dir, rules, std::iter::empty());
     }
 
+    /// Forgets the rules of every `.fbignore` file, for a caller about to pass all of them again.
+    pub fn clear_rules(&mut self) {
+        self.ignore.clear_rules();
+    }
+
     /// Records that a scan could not read the folder `id` of L, or the root, so the rules below it are unknown until
     /// a scan reads it again ([`Trees::set_rules_known`]) or L no longer holds it. Meanwhile nothing is planned for a
     /// node below it ([`Trees::held`]).
@@ -207,6 +212,11 @@ impl Trees {
         if id == self.l.root || self.l.get(id).is_some() {
             self.unknown_rules.insert(id.to_owned());
         }
+    }
+
+    /// The folders whose rules are unknown ([`Trees::set_rules_unknown`]).
+    pub fn unknown_rules(&self) -> &BTreeSet<NodeId> {
+        &self.unknown_rules
     }
 
     /// Records that a scan read the folder `id` and passed its rules, or found it has none.

@@ -483,7 +483,7 @@ impl Disk {
             (scope.file_name()).is_some_and(|name| is_rules_file(&name.to_string_lossy()))
         };
         let requested = (self.sections).request(engine.resets(scopes.iter().cloned()));
-        if moved_folder || scopes.iter().any(rules_file) {
+        if !scopes.is_empty() && (moved_folder || scopes.iter().any(rules_file)) {
             self.rules_after = Some(requested);
         }
         self.spans.push_back((end, scopes));
@@ -503,7 +503,8 @@ impl Disk {
     /// check failed. The rules of a batch are taken even when its changes are dropped: the scans report a rules file
     /// only when it changed. Drops the changes at or below
     /// the paths of every effect section that ended after the batch's stamp, and a whole batch older than the
-    /// sections remembered. The observer then resets every path a dropped change names, both ends of a rename, or
+    /// sections remembered. A change at or below a path that a dropped change names is dropped with it: the removals a
+    /// scan reports below a folder it saw move belong to that move. The observer then resets every path a dropped change names, both ends of a rename, or
     /// the whole tree for a dropped batch, to L as it is after the batch, so a later batch reports what was lost.
     pub fn observed(
         &mut self,
@@ -523,36 +524,40 @@ impl Disk {
             return Err(Stop::Withdrawn(self.path.clone()));
         }
         observation.root.map_err(Stop::Root)?;
-        let read: Vec<PathBuf> = (observation.rules.iter())
-            .map(|change| change.dir.clone())
-            .collect();
-        engine.rules(observation.rules);
+        engine.rules(observation.rules, observation.all_rules);
         if (self.rules_after).is_some_and(|requested| answered >= Some(requested)) {
             self.rules_after = None;
         }
         if stamp.0 < self.forgotten {
-            engine.read(&read, &observation.unreadable);
+            engine.read(&observation.read, &observation.unreadable);
             self.sections.request(engine.resets([PathBuf::new()]));
             return Ok(());
         }
-        let spanned: Vec<&PathBuf> = self
-            .spans
-            .iter()
+        let mut scopes: BTreeSet<PathBuf> = (self.spans.iter())
             .filter(|(end, _)| *end > stamp.0)
-            .flat_map(|(_, scopes)| scopes)
+            .flat_map(|(_, scopes)| scopes.iter().cloned())
             .collect();
-        let mut dropped = BTreeSet::new();
-        let changes: Vec<Observed> = observation
-            .changes
-            .into_iter()
-            .filter(|change| {
-                let stale =
-                    paths(change).any(|path| spanned.iter().any(|scope| path.starts_with(scope)));
-                if stale {
-                    dropped.extend(paths(change).map(Path::to_path_buf));
+        let mut stale = vec![false; observation.changes.len()];
+        let mut grew = true;
+        while grew {
+            grew = false;
+            for (change, stale) in observation.changes.iter().zip(&mut stale) {
+                if !*stale
+                    && paths(change).any(|path| path.ancestors().any(|at| scopes.contains(at)))
+                {
+                    *stale = true;
+                    grew = true;
+                    scopes.extend(paths(change).map(Path::to_path_buf));
                 }
-                !stale
-            })
+            }
+        }
+        let dropped: BTreeSet<PathBuf> = (observation.changes.iter().zip(&stale))
+            .filter(|(_, stale)| **stale)
+            .flat_map(|(change, _)| paths(change).map(Path::to_path_buf))
+            .collect();
+        let changes: Vec<Observed> = (observation.changes.into_iter().zip(stale))
+            .filter(|(_, stale)| !stale)
+            .map(|(change, _)| change)
             .collect();
         if !changes.is_empty() {
             let now_ms = SystemTime::now()
@@ -563,7 +568,7 @@ impl Disk {
                 Ok(engine.checkpoint(tx)?)
             })?;
         }
-        engine.read(&read, &observation.unreadable);
+        engine.read(&observation.read, &observation.unreadable);
         if !dropped.is_empty() {
             self.sections.request(engine.resets(dropped));
         }

@@ -501,10 +501,14 @@ pub struct Rescan {
     pub root: FileId,
     /// The folders whose rules file this scan found changed, each with the
     /// bytes it holds now, or `None` for a folder that has none any more.
-    /// A folder an earlier scan reported unreadable is listed too once a scan
-    /// reads it, or with `None` once it is gone. Empty for a scan without
-    /// [`Rules`].
+    /// Empty for a scan without [`Rules`].
     pub rules: Vec<(PathBuf, Option<Vec<u8>>)>,
+    /// The folders whose rules this scan established, at the paths it listed
+    /// them: it read their rules file, found none, or could not read one and
+    /// kept the rules an earlier scan read. A folder reported unreadable
+    /// before has known rules again once it is here, whatever its rules file
+    /// did meanwhile. Empty for a scan without [`Rules`].
+    pub read: Vec<PathBuf>,
 }
 
 impl Snapshot {
@@ -769,20 +773,17 @@ impl Snapshot {
             self.entries.remove(path);
         }
         self.entries.append(&mut scan.new);
-        let rules = match scan.rules.take() {
+        let (rules, read) = match scan.rules.take() {
             Some(mut rules) => {
                 rules.settle();
                 find_ignored(&mut changes, &old, &mut rules, again.as_fd());
-                rules.finish(
-                    |dir| {
-                        self.entries
-                            .get(dir)
-                            .is_some_and(|entry| entry.kind == EntryKind::Dir)
-                    },
-                    &unreadable,
-                )
+                rules.finish(|dir| {
+                    self.entries
+                        .get(dir)
+                        .is_some_and(|entry| entry.kind == EntryKind::Dir)
+                })
             }
-            None => Vec::new(),
+            None => (Vec::new(), Vec::new()),
         };
         Ok(Rescan {
             changes,
@@ -790,6 +791,7 @@ impl Snapshot {
             unreadable,
             root: root_stat.id,
             rules,
+            read,
         })
     }
 
@@ -1262,6 +1264,9 @@ pub struct Poll {
     /// The folders whose rules file the scans of this poll found changed, in
     /// the order they found them; see [`Rescan::rules`].
     pub rules: Vec<(PathBuf, Option<Vec<u8>>)>,
+    /// The folders whose rules the scans of this poll established and that no
+    /// later scan of the poll found unreadable; see [`Rescan::read`].
+    pub read: Vec<PathBuf>,
 }
 
 /// A source of changes under one root.
@@ -1304,6 +1309,8 @@ pub struct NativeWatcher {
     rules: Option<Rules>,
     /// The rules changes of the scans since the last poll returned.
     changed_rules: Vec<(PathBuf, Option<Vec<u8>>)>,
+    /// The folders whose rules the scans since the last poll established.
+    read: BTreeSet<PathBuf>,
     /// Folders whose subfolders may be unwatched, which are registered once a
     /// scan has read them: the folders a scan could not read that no scan has
     /// read since, the root while it waits for a scan to read the rules, a
@@ -1356,6 +1363,7 @@ impl NativeWatcher {
             blocked: BTreeSet::from_iter(deferred.then(PathBuf::new)),
             rules,
             changed_rules: Vec::new(),
+            read: BTreeSet::new(),
             rewatch: false,
             failed: None,
             sender,
@@ -1498,7 +1506,7 @@ impl NativeWatcher {
                 self.changed_rules.extend(rescan.rules);
                 self.dirty.extend(rescan.unsettled);
                 self.blocked.extend(rescan.unreadable.iter().cloned());
-                self.unreadable.extend(rescan.unreadable);
+                self.learn(rescan.read, &rescan.unreadable);
                 rescan.changes
             }
             Err(Error::Changed) => {
@@ -1515,7 +1523,7 @@ impl NativeWatcher {
 
 impl NativeWatcher {
     /// What a poll returns once it has `changes` from a scan of `root`: the
-    /// scopes still dirty, and the folders its scans could not read.
+    /// scopes still dirty, and the folders its scans could not read or read.
     fn report(&mut self, changes: Vec<Change>, root: Option<FileId>) -> Poll {
         Poll {
             changes,
@@ -1523,6 +1531,20 @@ impl NativeWatcher {
             unreadable: std::mem::take(&mut self.unreadable).into_iter().collect(),
             root,
             rules: std::mem::take(&mut self.changed_rules),
+            read: std::mem::take(&mut self.read).into_iter().collect(),
+        }
+    }
+
+    /// Takes in which folders a scan read and which it could not read. The
+    /// later scan decides for a folder that two scans of a poll judged.
+    fn learn(&mut self, read: Vec<PathBuf>, unreadable: &[PathBuf]) {
+        for dir in read {
+            self.unreadable.remove(&dir);
+            self.read.insert(dir);
+        }
+        for dir in unreadable {
+            self.read.remove(dir);
+            self.unreadable.insert(dir.clone());
         }
     }
 }
@@ -1673,7 +1695,7 @@ impl Watcher for NativeWatcher {
             self.dirty = rescan.unsettled.into_iter().collect();
             #[cfg(target_os = "linux")]
             let readable = self.unblock(&scopes, &rescan.unreadable);
-            self.unreadable.extend(rescan.unreadable);
+            self.learn(rescan.read, &rescan.unreadable);
             let changes = rescan.changes;
             #[cfg(target_os = "linux")]
             let changes = {
@@ -1756,6 +1778,7 @@ impl Watcher for RescanWatcher {
                     unreadable: rescan.unreadable,
                     root: Some(rescan.root),
                     rules: rescan.rules,
+                    read: rescan.read,
                 },
                 Err(Error::Changed) => Poll {
                     pending: vec![PathBuf::new()],

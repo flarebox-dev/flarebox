@@ -320,7 +320,11 @@ impl Engine {
     /// follows its scan of the whole tree and lists every rules file, so from the first call on the trees know the
     /// rules, and the engine plans again (design §5.10), except below a folder that could not be read
     /// ([`Engine::read`]). The rules of a folder whose path L cannot hold are left out, since no node is below it.
-    pub fn rules(&mut self, rules: Vec<RulesChange>) {
+    /// When `all` is set the batch lists every rules file its scans read, and the trees forget the rules they had.
+    pub fn rules(&mut self, rules: Vec<RulesChange>, all: bool) {
+        if all {
+            self.trees.clear_rules();
+        }
         for RulesChange { dir, rules } in rules {
             if let Some(dir) = names(&dir) {
                 self.trees.set_rules(&dir, rules);
@@ -329,11 +333,16 @@ impl Engine {
         self.trees.rules_scanned();
     }
 
-    /// Gives the trees, after the changes of a batch, the folders whose rules the batch passed (`read`) and the folders it
-    /// could not read, whose rules are unknown until a later batch passes them. Each path is the folder's on disk,
-    /// so it names the node L holds there by its exact name: a folder renamed only in case is the same node, and two
-    /// folders whose names differ only in case are two.
+    /// Gives the trees, after the changes of a batch, the folders whose rules the batch's scans established (`read`)
+    /// and the folders they could not read, whose rules are unknown until a later scan establishes them. Each path is
+    /// where the scan read the folder, so it names the node L holds there by its exact name: a renamed folder is the
+    /// same node, and two folders whose names differ only in case are two.
     pub fn read(&mut self, read: &[PathBuf], unreadable: &[PathBuf]) {
+        let read = if self.trees.unknown_rules().is_empty() {
+            &[]
+        } else {
+            read
+        };
         if read.is_empty() && unreadable.is_empty() {
             return;
         }
@@ -1576,6 +1585,32 @@ mod tests {
             .as_ref()
             .map_or(0, |content| content.size);
         Some((id, node.identity, size))
+    }
+
+    /// A batch that lists every rules file takes the place of the rules the trees had: a folder it does not list has
+    /// none. Any other batch lists only the rules files that changed.
+    #[test]
+    fn a_batch_with_every_rules_file_drops_the_rules_it_does_not_list() {
+        let (_dir, mut engine) = mapper();
+        let log = || RulesChange {
+            dir: "proj".into(),
+            rules: Some(flarebox_engine::ignore::RuleFile::parse(b"*.log\n")),
+        };
+        engine.rules(vec![log()], true);
+        let proj = Observed::Created {
+            path: "proj".into(),
+            kind: EntryKind::Dir,
+            id: ino(1),
+            linked: false,
+            content: None,
+        };
+        engine.observe(&[proj, created("proj/build.log", ino(2), false, 1)], 0);
+        let (log_id, _, _) = holding(&engine, "proj/build.log").unwrap();
+        assert!(engine.trees.excluded(&log_id));
+        engine.rules(Vec::new(), false);
+        assert!(engine.trees.excluded(&log_id), "no rules file changed");
+        engine.rules(Vec::new(), true);
+        assert!(!engine.trees.excluded(&log_id), "no rules file is left");
     }
 
     #[test]

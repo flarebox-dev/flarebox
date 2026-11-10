@@ -371,6 +371,7 @@ fn sibling_recreated_after_its_parent_was_listed_publishes_no_removal() {
                 unreadable: vec![],
                 root: root_id(&root),
                 rules: vec![],
+                read: vec![],
             },
             "{paths:?}"
         );

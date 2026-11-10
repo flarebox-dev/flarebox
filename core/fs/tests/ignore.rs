@@ -627,8 +627,8 @@ fn a_rules_file_that_cannot_be_read_at_the_first_scan_leaves_its_folder_unknown(
     assert_eq!(known(&snapshot), ["keep.txt", "sub", "sub/.fbignore"]);
 }
 
-/// A folder whose rules were unknown is reported once a scan reads it, also with no rules file left to read, and once
-/// it is gone, so the caller does not wait for its rules for good.
+/// A folder whose rules were unknown is reported read once a scan lists it, also with no rules file left to read and
+/// no rules changed. A folder that is gone is not reported: the caller forgets it with the folder.
 #[test]
 fn a_folder_whose_rules_were_unknown_is_reported_once_they_are_known() {
     for how in ["the rules file is deleted", "the folder is deleted"] {
@@ -642,6 +642,7 @@ fn a_folder_whose_rules_were_unknown_is_reported_once_they_are_known() {
             .rescan_with_rules(root, whole(), &mut rules)
             .unwrap();
         assert_eq!(rescan.unreadable, [PathBuf::from("sub")], "{how}");
+        assert_eq!(rescan.read, [PathBuf::new()], "{how}");
 
         let sub = root.join("sub");
         match how {
@@ -652,11 +653,16 @@ fn a_folder_whose_rules_were_unknown_is_reported_once_they_are_known() {
             .rescan_with_rules(root, whole(), &mut rules)
             .unwrap();
         assert_eq!(rescan.unreadable, Vec::<PathBuf>::new(), "{how}");
-        assert_eq!(rescan.rules, [rule("sub", None)], "{how}");
-        let rescan = snapshot
-            .rescan_with_rules(root, whole(), &mut rules)
-            .unwrap();
         assert_eq!(rescan.rules, [], "{how}");
+        let read: &[&str] = match how {
+            "the folder is deleted" => &[""],
+            _ => &["", "sub"],
+        };
+        assert_eq!(
+            rescan.read,
+            read.iter().map(PathBuf::from).collect::<Vec<_>>(),
+            "{how}"
+        );
     }
 }
 
@@ -693,6 +699,60 @@ fn reading_a_folder_leaves_its_unread_namesake_in_another_case_unknown() {
     let partial = (snapshot.rescan_with_rules(root, [PathBuf::from("proj")], &mut rules)).unwrap();
     assert!(partial.unreadable.is_empty());
     assert_eq!(partial.rules, [], "only proj was read");
+}
+
+/// On a case-sensitive volume a folder can hold `.fbignore` and `.FBIGNORE`, two rules files. Which of them other
+/// devices would see is not known, so the folder's rules are unknown until one of them is gone.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_folder_with_two_rules_files_that_differ_only_in_case_is_unknown_until_one_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "sub/.fbignore", "a\n");
+    write(root, "sub/.FBIGNORE", "b\n");
+    write(root, "sub/b", "left out by .FBIGNORE only");
+    let mut rules = rules();
+    let mut snapshot = Snapshot::default();
+    let first = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert_eq!(first.unreadable, [PathBuf::from("sub")]);
+    assert_eq!(first.read, [PathBuf::new()]);
+    assert_eq!(known(&snapshot), ["sub"]);
+
+    fs::remove_file(root.join("sub/.FBIGNORE")).unwrap();
+    let resolved = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert!(resolved.unreadable.is_empty());
+    assert_eq!(resolved.read, [PathBuf::new(), PathBuf::from("sub")]);
+    assert_eq!(resolved.rules, [rule("sub", Some("a\n"))]);
+    assert_eq!(known(&snapshot), ["sub", "sub/.fbignore", "sub/b"]);
+}
+
+#[test]
+fn review_renaming_an_unread_folder_and_removing_its_rules_reports_the_current_path_known() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "proj/.fbignore", &"x\n".repeat((1 << 19) + 1));
+    write(root, "proj/ok", "ok");
+    let mut rules = rules();
+    let mut snapshot = Snapshot::default();
+    let first = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert_eq!(first.unreadable, [PathBuf::from("proj")]);
+    fs::rename(root.join("proj"), root.join("PROJ")).unwrap();
+    fs::remove_file(root.join("PROJ/.fbignore")).unwrap();
+    let recovered = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert!(recovered.unreadable.is_empty());
+    assert!(
+        recovered.read.iter().any(|dir| dir == Path::new("PROJ")),
+        "current folder never reported known: {:?}",
+        recovered.read
+    );
 }
 
 /// Polls until every change of `expected` and every rules change of `rules`

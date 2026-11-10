@@ -304,6 +304,11 @@ impl<K: NameKey> Matcher<K> {
         changes(below, before, after)
     }
 
+    /// Removes every rules file.
+    pub fn clear_rules(&mut self) {
+        self.files.clear();
+    }
+
     /// Replaces the device-local list and returns the entries whose status changed. `entries` are
     /// all known paths, relative to the root.
     pub fn set_local(

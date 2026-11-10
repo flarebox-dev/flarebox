@@ -69,11 +69,6 @@ pub struct Rules {
     /// The names each listed folder holds that a rule leaves out
     /// ([`Ignored::Rule`] only).
     ignored: BTreeMap<PathBuf, BTreeSet<OsString>>,
-    /// The folders a scan reported unreadable, by their paths as listed,
-    /// until a scan reads them again or they are gone. Two folders whose
-    /// names have the same keys, as a case-sensitive volume holds them, are
-    /// two folders here.
-    unread: BTreeSet<PathBuf>,
 }
 
 impl Rules {
@@ -83,7 +78,6 @@ impl Rules {
             ignore,
             files: BTreeMap::new(),
             ignored: BTreeMap::new(),
-            unread: BTreeSet::new(),
         }
     }
 
@@ -140,7 +134,8 @@ pub(crate) struct Pending<'r> {
     before: BTreeMap<PathBuf, Option<Held>>,
     /// The names a rule leaves out in each folder this scan listed.
     listed: BTreeMap<PathBuf, BTreeSet<OsString>>,
-    /// The folders whose rules this scan read, by their paths as listed.
+    /// The folders whose rules this scan established, by their paths as
+    /// listed.
     read: BTreeSet<PathBuf>,
 }
 
@@ -160,13 +155,23 @@ impl<'r> Pending<'r> {
 
     /// Reads the rules file of the folder `dir` at `rel`, which lists
     /// `names`. A rules file that cannot be read keeps the rules the folder
-    /// last had. When the folder had none, its rules are [`RulesRead::Unknown`].
+    /// last had. When the folder had none, its rules are [`RulesRead::Unknown`],
+    /// and so are they when it holds two rules files.
     pub(crate) fn read(
         &mut self,
         dir: BorrowedFd<'_>,
         rel: &Path,
         names: &BTreeSet<OsString>,
     ) -> RulesRead {
+        let named: Vec<&OsString> = (names.iter())
+            .filter(|name| self.rules.ignore.key(name) == self.rules.rules_file)
+            .collect();
+        let regular = |name: &&&OsString| {
+            stat_at(dir, name).is_ok_and(|stat| stat.file_type == FileType::RegularFile)
+        };
+        if named.len() > 1 && named.iter().filter(regular).count() > 1 {
+            return RulesRead::Unknown;
+        }
         let key = self.rules.key(rel);
         let read = (self.rules.rules_file(names)).map(|name| read_rules(dir, name));
         if matches!(read, Some(Err(_))) && !self.rules.files.contains_key(&key) {
@@ -274,15 +279,11 @@ impl<'r> Pending<'r> {
 
     /// Drops the rules of every folder for which `is_folder` is false, and
     /// returns the folders whose rules file this scan changed, with what each
-    /// one holds now. A folder an earlier scan reported unreadable is
-    /// returned too once this scan read it or it is gone, so the caller
-    /// learns that its rules are known again. The folders in `unreadable` are
-    /// remembered for that.
+    /// one holds now, and the folders whose rules this scan established.
     pub(crate) fn finish(
         self,
         is_folder: impl Fn(&Path) -> bool,
-        unreadable: &[PathBuf],
-    ) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+    ) -> (Vec<RulesFile>, Vec<PathBuf>) {
         let Self {
             rules,
             mut before,
@@ -302,7 +303,7 @@ impl<'r> Pending<'r> {
             before.entry(key).or_insert(dropped);
         }
         rules.ignored.retain(|dir, _| held(dir));
-        let mut changed: Vec<(PathBuf, Option<Vec<u8>>)> = (before.iter())
+        let changed = (before.iter())
             .filter_map(|(key, before)| match (rules.files.get(key), before) {
                 (Some((_, now)), Some((_, before))) if now == before => None,
                 (Some((dir, now)), _) => Some((dir.clone(), Some(now.clone()))),
@@ -310,21 +311,13 @@ impl<'r> Pending<'r> {
                 (None, None) => None,
             })
             .collect();
-        let known: Vec<PathBuf> = (rules.unread.iter())
-            .filter(|dir| read.contains(*dir) || !held(dir))
-            .cloned()
-            .collect();
-        for dir in known {
-            rules.unread.remove(&dir);
-            if !(changed.iter()).any(|(reported, _)| *reported == dir) {
-                let now = rules.files.get(&rules.key(&dir));
-                changed.push((dir, now.map(|(_, bytes)| bytes.clone())));
-            }
-        }
-        rules.unread.extend(unreadable.iter().cloned());
-        changed
+        (changed, read.into_iter().filter(|dir| held(dir)).collect())
     }
 }
+
+/// A folder whose rules file a scan found changed, with the bytes it holds
+/// now, or `None` for a folder that has none any more.
+pub(crate) type RulesFile = (PathBuf, Option<Vec<u8>>);
 
 /// What [`Pending::read`] found of a folder's rules.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -333,7 +326,8 @@ pub(crate) enum RulesRead {
     Same,
     Changed,
     /// The folder holds a rules file that cannot be read, and no earlier
-    /// scan read one for it, so what the folder leaves out is not known.
+    /// scan read one for it, or two rules files whose names differ only in
+    /// case, so what the folder leaves out is not known.
     Unknown,
 }
 
