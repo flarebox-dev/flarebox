@@ -1372,7 +1372,7 @@ fn observe_until(
 
 fn observer(root: &Path, previous: Snapshot) -> FsObserver {
     let dev = fs::metadata(root).unwrap().dev();
-    FsObserver::start(root, SPACE, dev, previous, Arc::new(Unfiltered)).unwrap()
+    FsObserver::start(root, SPACE, dev, previous, Arc::new(Unfiltered), || false).unwrap()
 }
 
 fn created(changes: &[Observed], name: &str) -> Option<(FileId, Option<Content>)> {

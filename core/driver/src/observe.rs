@@ -147,6 +147,8 @@ pub struct FsObserver {
     reset: bool,
     /// Files whose content could not be read, with when to read them again.
     unread: BTreeMap<PathBuf, Retry>,
+    /// Whether the caller has stopped waiting for observations.
+    stopped: Box<dyn Fn() -> bool + Send>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -170,13 +172,16 @@ impl Retry {
 impl FsObserver {
     /// Starts watching the folder of space `space_id` on device `dev`. The first observation compares the whole tree
     /// with `previous`. The scans leave out what `matcher`, the built-in exclusions and the `.fbignore` files of the
-    /// folder exclude.
+    /// folder exclude. Once `stopped` holds, the file being read is left at its next chunk and `observe` returns
+    /// `None` without reading the rest, so a caller that stops does not wait for every file of a scan to be read. The
+    /// observer's snapshot then counts changes it never returned, so drop the observer.
     pub fn start(
         root: &Path,
         space_id: &str,
         dev: u64,
         previous: Snapshot,
         matcher: Arc<dyn Matcher>,
+        stopped: impl Fn() -> bool + Send + 'static,
     ) -> Result<Self, FsError> {
         let (watcher, native): (Box<dyn Watcher + Send>, bool) =
             match NativeWatcher::start_with_rules(root, previous.clone(), scan_rules(&matcher)) {
@@ -208,6 +213,7 @@ impl FsObserver {
             settling: true,
             reset: false,
             unread: BTreeMap::new(),
+            stopped: Box::new(stopped),
         })
     }
 
@@ -344,7 +350,7 @@ impl FsObserver {
                 self.unread.remove(&path);
                 continue;
             };
-            match read_content(&self.root, &path, &entry) {
+            match read_content(&self.root, &path, &entry, &self.stopped) {
                 Ok(Some(content)) => {
                     self.unread.remove(&path);
                     out.push(Observed::Modified {
@@ -370,7 +376,7 @@ impl FsObserver {
 
     /// Chunks the file at `path` if it is still the entry the scan saw and does not change while it is read.
     fn content(&self, path: &Path, entry: &Entry, busy: &mut Vec<PathBuf>) -> Option<Content> {
-        match read_content(&self.root, path, entry) {
+        match read_content(&self.root, path, entry, &self.stopped) {
             Ok(Some(content)) => Some(content),
             Ok(None) => {
                 busy.push(path.to_path_buf());
@@ -416,10 +422,16 @@ impl Observer for FsObserver {
         let mut busy = Vec::new();
         let observed = !poll.changes.is_empty();
         for change in poll.changes {
+            if (self.stopped)() {
+                return Ok(None);
+            }
             self.supersede(&change);
             self.observed(change, &mut changes, &mut busy);
         }
         self.retry(now, &mut changes);
+        if (self.stopped)() {
+            return Ok(None);
+        }
         for path in &busy {
             self.unread.insert(path.clone(), Retry::after(0, now));
         }
@@ -476,8 +488,13 @@ impl Observer for FsObserver {
 }
 
 /// The content of the file at `path` under `root`, or `None` when it is not the file the scan saw or changed while
-/// it was read.
-fn read_content(root: &Path, path: &Path, entry: &Entry) -> io::Result<Option<Content>> {
+/// it was read. Fails with [`io::ErrorKind::Interrupted`] at the first chunk after `stopped` holds.
+fn read_content(
+    root: &Path,
+    path: &Path,
+    entry: &Entry,
+    stopped: &dyn Fn() -> bool,
+) -> io::Result<Option<Content>> {
     let file = open_beneath(root, path)?;
     let before = file.metadata()?;
     let same_file =
@@ -487,7 +504,10 @@ fn read_content(root: &Path, path: &Path, entry: &Entry) -> io::Result<Option<Co
     }
     let config = ChunkerConfig::V0;
     let chunks = flarebox_chunk::chunks(&file, config)
-        .map(|chunk| chunk.map(|chunk| chunk.chunk_ref()))
+        .map(|chunk| match stopped() {
+            true => Err(io::ErrorKind::Interrupted.into()),
+            false => chunk.map(|chunk| chunk.chunk_ref()),
+        })
         .collect::<io::Result<Vec<ChunkRef>>>()?;
     let after = file.metadata()?;
     if !same_version(&after, entry) {
@@ -557,7 +577,15 @@ mod tests {
 
     fn observer(root: &Path) -> FsObserver {
         let dev = fs::metadata(root).unwrap().dev();
-        FsObserver::start(root, SPACE, dev, Snapshot::default(), Arc::new(Unfiltered)).unwrap()
+        FsObserver::start(
+            root,
+            SPACE,
+            dev,
+            Snapshot::default(),
+            Arc::new(Unfiltered),
+            || false,
+        )
+        .unwrap()
     }
 
     fn marked() -> tempfile::TempDir {
@@ -696,7 +724,7 @@ mod tests {
         snapshot.rescan(dir.path(), [PathBuf::new()]).unwrap();
         let entry = snapshot.entries[Path::new("a.txt")];
         assert!(
-            read_content(dir.path(), Path::new("a.txt"), &entry)
+            read_content(dir.path(), Path::new("a.txt"), &entry, &|| false)
                 .unwrap()
                 .is_some()
         );
@@ -704,7 +732,7 @@ mod tests {
         fs::remove_file(dir.path().join("a.txt")).unwrap();
         fs::write(dir.path().join("a.txt"), b"other bytes").unwrap();
         assert_eq!(
-            read_content(dir.path(), Path::new("a.txt"), &entry).unwrap(),
+            read_content(dir.path(), Path::new("a.txt"), &entry, &|| false).unwrap(),
             None
         );
     }
@@ -824,6 +852,7 @@ mod tests {
             dev,
             Snapshot::default(),
             Arc::new(IgnoredFolder),
+            || false,
         )
         .unwrap();
         let (seen, _) = observe_until(&mut observer, |seen| !seen.is_empty());
@@ -919,8 +948,15 @@ mod tests {
         let snapshot = known.snapshot().clone();
         let scanned = known.scanned();
         let dev = fs::metadata(root).unwrap().dev();
-        let mut observer =
-            FsObserver::start(root, SPACE, dev, snapshot.clone(), Arc::new(Unfiltered)).unwrap();
+        let mut observer = FsObserver::start(
+            root,
+            SPACE,
+            dev,
+            snapshot.clone(),
+            Arc::new(Unfiltered),
+            || false,
+        )
+        .unwrap();
         let proj = PathBuf::from("proj");
         observer.watcher = Box::new(Scripted {
             snapshot,
@@ -1101,7 +1137,7 @@ mod tests {
 
         let dev = fs::metadata(root).unwrap().dev();
         let mut observer =
-            FsObserver::start(root, SPACE, dev, previous, Arc::new(Unfiltered)).unwrap();
+            FsObserver::start(root, SPACE, dev, previous, Arc::new(Unfiltered), || false).unwrap();
         let observation = observer.observe(Duration::from_secs(10)).unwrap().unwrap();
         let [Observed::Renamed { from, to, .. }] = &observation.changes[..] else {
             panic!("one move, no removal: {:?}", observation.changes);
@@ -1133,7 +1169,7 @@ mod tests {
         let dev = fs::metadata(root).unwrap().dev();
         let matcher = crate::ignore::matcher(&sync).unwrap();
         let mut observer =
-            FsObserver::start(root, SPACE, dev, Snapshot::default(), matcher).unwrap();
+            FsObserver::start(root, SPACE, dev, Snapshot::default(), matcher, || false).unwrap();
         let observation = observer.observe(Duration::from_secs(10)).unwrap().unwrap();
         assert_eq!(
             paths(&observation.changes),
