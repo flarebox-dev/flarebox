@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 
 use flarebox_proto::v1::{
@@ -20,7 +21,7 @@ use futures_util::{SinkExt, StreamExt};
 use prost::Message as _;
 use rustls::pki_types::ServerName;
 use rustls_platform_verifier::BuilderVerifierExt;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -28,12 +29,14 @@ use tokio::time::error::Elapsed;
 use tokio::time::{Instant, sleep, sleep_until, timeout, timeout_at};
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::handshake::client::generate_key;
-use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
+use tokio_tungstenite::tungstenite::http::header::{
+    AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING,
+};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{self, Message as WsMessage};
-use url::{Position, Url};
+use url::Url;
 
 use crate::api::PROTOBUF;
 use crate::auth::Auth;
@@ -56,8 +59,12 @@ const CLOSE_UNSUPPORTED_VERSION: u16 = 4002;
 const CLOSE_DEVICE_REVOKED: u16 = 4003;
 /// Checks the token at least this often, whatever expiry the server sent.
 const MAX_REAUTH_WAIT: Duration = Duration::from_secs(3600);
-/// The most bytes read of an answer to the WebSocket upgrade: its head, and the body of a refusal.
-const MAX_UPGRADE_ANSWER: usize = 64 << 10;
+/// The most bytes read of a refused upgrade's body.
+const MAX_REFUSAL: usize = 64 << 10;
+/// Bounds reading the rest of a refused upgrade's body.
+const REFUSAL_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Refusals in a row whose protobuf error cannot be read, after which the session stops instead of trying again.
+const MAX_UNREADABLE_REFUSALS: u32 = 5;
 /// Waits at least this long between token refreshes, even when a new token is already due because the refresh
 /// margin is longer than the token's lifetime or the clocks disagree.
 const MIN_REAUTH_WAIT: Duration = Duration::from_secs(1);
@@ -165,6 +172,7 @@ impl Session {
                     token: None,
                     expired: None,
                     asked_wait: None,
+                    unreadable_refusals: 0,
                 }
                 .run(),
             ),
@@ -407,7 +415,7 @@ struct PendingCall {
 
 trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
-type Socket = WebSocketStream<Box<dyn Io>>;
+type Socket = WebSocketStream<Shared>;
 
 /// How one connection ended.
 enum Exit {
@@ -461,6 +469,8 @@ struct Task {
     expired: Option<String>,
     /// The least wait before the next connection, when the server asked for one while refusing this one.
     asked_wait: Option<Duration>,
+    /// Refusals in a row, since the last connection, whose protobuf error could not be read.
+    unreadable_refusals: u32,
 }
 
 impl Task {
@@ -525,6 +535,7 @@ impl Task {
             Err(exit) => return exit,
         };
         self.attempt = 0;
+        self.unreadable_refusals = 0;
         self.emit(Event::Connected(welcome.clone()));
         if let Some(resume) = self.stream.reconnected()
             && let Err(exit) = self
@@ -592,85 +603,71 @@ impl Task {
         Ok((socket, token))
     }
 
-    /// The WebSocket upgrade (RFC 6455 section 4.1). It is done here rather than by tungstenite, which gives only the
-    /// part of a refusal's body that arrived with its headers, so that the whole `Error` is read before H1 decides
-    /// whether the client may connect again.
-    async fn upgrade(&mut self, mut io: Box<dyn Io>, token: &AccessToken) -> Result<Socket, Exit> {
-        if HeaderValue::from_str(&token.token).is_err() {
-            return Err(Exit::violation(
-                "an access token that is not a header value",
-            ));
-        }
-        let key = generate_key();
-        let request = format!(
-            "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\nAuthorization: Bearer {bearer}\r\n\r\n",
-            path = &self.url[Position::BeforePath..Position::AfterQuery],
-            host = &self.url[Position::BeforeHost..Position::AfterPort],
-            bearer = token.token,
-        );
-        io.write_all(request.as_bytes())
-            .await
-            .map_err(Exit::transport)?;
-        let mut received = Vec::new();
-        let (status, end, accept, length, protobuf) = loop {
-            if read_some(&mut io, &mut received).await? == 0 {
-                return Err(Exit::transport(
-                    "the connection closed during the WebSocket upgrade",
-                ));
-            }
-            let mut headers = [httparse::EMPTY_HEADER; 64];
-            let mut response = httparse::Response::new(&mut headers);
-            match response.parse(&received) {
-                Ok(httparse::Status::Complete(end)) => {
-                    let header = |name: &str| {
-                        response
-                            .headers
-                            .iter()
-                            .find(|header| header.name.eq_ignore_ascii_case(name))
-                            .and_then(|header| std::str::from_utf8(header.value).ok())
-                    };
-                    break (
-                        response.code.unwrap_or_default(),
-                        end,
-                        header("sec-websocket-accept").map(str::to_owned),
-                        header("content-length")
-                            .and_then(|value| value.trim().parse::<usize>().ok()),
-                        header("content-type").is_some_and(|value| value.starts_with(PROTOBUF)),
-                    );
-                }
-                Ok(httparse::Status::Partial) if received.len() < MAX_UPGRADE_ANSWER => {}
-                _ => {
-                    return Err(Exit::violation(
-                        "an answer to the WebSocket upgrade that is not HTTP",
-                    ));
-                }
-            }
+    /// The WebSocket upgrade, through tungstenite's client handshake. When the server refuses it, the rest of the
+    /// refusal's body is read from the connection, which `Shared` keeps after tungstenite lets go of it, so that H1
+    /// sees the whole `Error` however the body is framed.
+    async fn upgrade(&mut self, io: Box<dyn Io>, token: &AccessToken) -> Result<Socket, Exit> {
+        let mut request = self
+            .url
+            .as_str()
+            .into_client_request()
+            .map_err(|e| Exit::Stop(StopReason::BadUrl(e.to_string())))?;
+        let bearer = HeaderValue::from_str(&format!("Bearer {}", token.token))
+            .map_err(|_| Exit::violation("an access token that is not a header value"))?;
+        request.headers_mut().insert(AUTHORIZATION, bearer);
+        let config = WebSocketConfig::default()
+            .max_message_size(Some(MAX_SERVER_MESSAGE))
+            .max_frame_size(Some(MAX_SERVER_MESSAGE));
+        let mut kept = Shared(Arc::new(std::sync::Mutex::new(io)));
+        let response =
+            match tokio_tungstenite::client_async_with_config(request, kept.clone(), Some(config))
+                .await
+            {
+                Ok((socket, _)) => return Ok(socket),
+                Err(tungstenite::Error::Http(response)) => response,
+                Err(error) => return Err(Exit::transport(error)),
+            };
+        let status = response.status().as_u16();
+        let header = |name| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
         };
-        let mut body = received.split_off(end);
-        if status == 101 {
-            if accept.as_deref() != Some(derive_accept_key(key.as_bytes()).as_str()) {
-                return Err(Exit::violation(
-                    "a WebSocket upgrade with the wrong Sec-WebSocket-Accept",
-                ));
-            }
-            let config = WebSocketConfig::default()
-                .max_message_size(Some(MAX_SERVER_MESSAGE))
-                .max_frame_size(Some(MAX_SERVER_MESSAGE));
-            return Ok(
-                WebSocketStream::from_partially_read(io, body, Role::Client, Some(config)).await,
-            );
-        }
-        let mut error = None;
-        if let Some(length) = length.filter(|&length| protobuf && length <= MAX_UPGRADE_ANSWER) {
-            while body.len() < length && read_some(&mut io, &mut body).await? > 0 {}
-            if body.len() >= length {
-                error = ServerError::decode(&body[..length]);
-            }
-        }
-        if let Some(server) = &error
-            && let Some(exit) = self.refused_with(server)
+        let protobuf = header(CONTENT_TYPE).is_some_and(|value| value.starts_with(PROTOBUF));
+        let framing = if header(TRANSFER_ENCODING)
+            .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
         {
-            return Err(exit);
+            Some(Framing::Chunked)
+        } else if let Some(length) = header(CONTENT_LENGTH) {
+            length.trim().parse().ok().map(Framing::Length)
+        } else {
+            Some(Framing::Close)
+        };
+        if protobuf {
+            let tail = response.into_body().unwrap_or_default();
+            let body = match framing {
+                Some(framing) => refusal_body(&mut kept, framing, tail).await,
+                None => None,
+            };
+            match body {
+                Some(body) => {
+                    if let Some(server) = ServerError::decode(&body)
+                        && let Some(exit) = self.refused_with(&server)
+                    {
+                        return Err(exit);
+                    }
+                }
+                None => {
+                    self.unreadable_refusals += 1;
+                    if self.unreadable_refusals >= MAX_UNREADABLE_REFUSALS {
+                        return Err(Exit::Stop(StopReason::Refused(format!(
+                            "HTTP {status}, {} times in a row, with an error that could not be read",
+                            self.unreadable_refusals
+                        ))));
+                    }
+                }
+            }
         }
         Err(self.refused(status, &token.token).await)
     }
@@ -1035,12 +1032,106 @@ async fn refreshed(
     }
 }
 
-/// Reads what has arrived into `buffer`; 0 at the end of the stream.
-async fn read_some(io: &mut Box<dyn Io>, buffer: &mut Vec<u8>) -> Result<usize, Exit> {
-    let mut part = [0; 4096];
-    let n = io.read(&mut part).await.map_err(Exit::transport)?;
-    buffer.extend_from_slice(&part[..n]);
-    Ok(n)
+/// The connection under a WebSocket. It is shared so that the body of a refused upgrade can still be read after
+/// tungstenite's handshake drops its handle.
+#[derive(Clone)]
+struct Shared(Arc<std::sync::Mutex<Box<dyn Io>>>);
+
+impl Shared {
+    fn io(&self) -> std::sync::MutexGuard<'_, Box<dyn Io>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl AsyncRead for Shared {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut **self.io()).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Shared {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut **self.io()).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut **self.io()).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut **self.io()).poll_shutdown(cx)
+    }
+}
+
+/// How the body of a refused upgrade ends (RFC 9112 section 6).
+enum Framing {
+    Length(usize),
+    Chunked,
+    /// The body runs until the server closes the connection.
+    Close,
+}
+
+/// Reads the whole body of a refused upgrade, given the `raw` bytes tungstenite already read after its head, within
+/// `MAX_REFUSAL` bytes and `REFUSAL_READ_TIMEOUT`. `None` when it cannot be read as a whole.
+async fn refusal_body(io: &mut Shared, framing: Framing, mut raw: Vec<u8>) -> Option<Vec<u8>> {
+    let read = async {
+        loop {
+            match framing {
+                Framing::Length(length) if raw.len() >= length => {
+                    raw.truncate(length);
+                    return Some(raw);
+                }
+                Framing::Chunked => {
+                    if let Some(body) = dechunk(&raw) {
+                        return body;
+                    }
+                }
+                _ => {}
+            }
+            if raw.len() > MAX_REFUSAL {
+                return None;
+            }
+            let mut part = [0; 4096];
+            match io.read(&mut part).await {
+                Ok(0) => return matches!(framing, Framing::Close).then_some(raw),
+                Ok(n) => raw.extend_from_slice(&part[..n]),
+                Err(_) => return None,
+            }
+        }
+    };
+    timeout(REFUSAL_READ_TIMEOUT, read).await.ok().flatten()
+}
+
+/// The body of a complete chunked encoding: `None` while more is needed, `Some(None)` when it is malformed.
+fn dechunk(raw: &[u8]) -> Option<Option<Vec<u8>>> {
+    let mut body = Vec::new();
+    let mut at = 0;
+    loop {
+        match httparse::parse_chunk_size(&raw[at..]) {
+            Ok(httparse::Status::Complete((used, 0))) if used > 0 => return Some(Some(body)),
+            Ok(httparse::Status::Complete((used, size))) => {
+                let size = usize::try_from(size).ok()?;
+                let end = at + used + size;
+                if raw.len() < end + 2 {
+                    return None;
+                }
+                body.extend_from_slice(&raw[at + used..end]);
+                at = end + 2;
+            }
+            Ok(httparse::Status::Partial) => return None,
+            Err(_) => return Some(None),
+        }
+    }
 }
 
 /// Resolves once the session is closed or dropped.

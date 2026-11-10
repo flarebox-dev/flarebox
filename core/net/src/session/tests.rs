@@ -1096,3 +1096,112 @@ async fn a_401_with_an_unknown_code_stops_the_session_with_its_message() {
         "{event:?}"
     );
 }
+
+/// Reads one request, then writes `parts` 30 ms apart, and returns the request's head.
+async fn answer_in_parts(tcp: &mut TcpStream, parts: Vec<Vec<u8>>) -> String {
+    let mut request = [0; 4096];
+    let n = tcp.read(&mut request).await.unwrap();
+    for part in parts {
+        tcp.write_all(&part).await.unwrap();
+        tcp.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    String::from_utf8_lossy(&request[..n]).into_owned()
+}
+
+#[tokio::test]
+async fn chunked_and_close_delimited_upgrade_refusals_are_read_whole() {
+    let (listener, auth) = listen().await;
+    let body = refusal(999, 0).encode_to_vec();
+    let (first, rest) = body.split_at(3);
+    let chunked = vec![
+        b"HTTP/1.1 500 X\r\ncontent-type: application/x-protobuf\r\ntransfer-encoding: chunked\r\n\r\n".to_vec(),
+        [format!("{:x}\r\n", first.len()).as_bytes(), first, b"\r\n"].concat(),
+        [format!("{:x}\r\n", rest.len()).as_bytes(), rest, b"\r\n0\r\n\r\n"].concat(),
+    ];
+    let (_session, mut events) = Session::start(auth.clone(), config()).unwrap();
+    let (mut upgrade, _) = listener.accept().await.unwrap();
+    answer_in_parts(&mut upgrade, chunked).await;
+    let event = next(&mut events).await;
+    assert!(
+        matches!(&event, Event::Stopped(StopReason::Refused(why)) if why.ends_with(": refused")),
+        "chunked: {event:?}"
+    );
+
+    let (_session, mut events) = Session::start(auth, config()).unwrap();
+    let (mut upgrade, _) = listener.accept().await.unwrap();
+    let head =
+        b"HTTP/1.1 500 X\r\ncontent-type: application/x-protobuf\r\nconnection: close\r\n\r\n"
+            .to_vec();
+    answer_in_parts(&mut upgrade, vec![head, first.to_vec(), rest.to_vec()]).await;
+    drop(upgrade);
+    let event = next(&mut events).await;
+    assert!(
+        matches!(&event, Event::Stopped(StopReason::Refused(why)) if why.ends_with(": refused")),
+        "close-delimited: {event:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_refusal_whose_error_cannot_be_read_is_retried_a_bounded_number_of_times() {
+    let (listener, auth) = listen().await;
+    let (_session, mut events) = Session::start(auth, config()).unwrap();
+    let server = tokio::spawn(async move {
+        let mut attempts = 0;
+        while let Ok(Ok((mut upgrade, _))) =
+            tokio::time::timeout(Duration::from_secs(2), listener.accept()).await
+        {
+            attempts += 1;
+            let head = b"HTTP/1.1 500 X\r\ncontent-type: application/x-protobuf\r\ncontent-length: 1000\r\n\r\n";
+            answer_in_parts(&mut upgrade, vec![head.to_vec(), vec![0x08; 10]]).await;
+        }
+        attempts
+    });
+    let stopped = loop {
+        match next(&mut events).await {
+            Event::Disconnected {
+                reason: DisconnectReason::Refused { status: 500 },
+                ..
+            } => {}
+            other => break other,
+        }
+    };
+    assert!(
+        matches!(&stopped, Event::Stopped(StopReason::Refused(why)) if why.contains("could not be read")),
+        "{stopped:?}"
+    );
+    assert_eq!(server.await.unwrap(), MAX_UNREADABLE_REFUSALS);
+}
+
+#[tokio::test]
+async fn a_101_without_upgrade_and_connection_headers_is_not_a_websocket() {
+    let (listener, auth) = listen().await;
+    let (_session, mut events) = Session::start(auth, config()).unwrap();
+    let (mut upgrade, _) = listener.accept().await.unwrap();
+    let mut request = [0; 4096];
+    let n = upgrade.read(&mut request).await.unwrap();
+    let request = String::from_utf8_lossy(&request[..n]).into_owned();
+    let key = request
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("sec-websocket-key")
+                .then(|| value.trim().to_owned())
+        })
+        .unwrap();
+    let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+    let answer =
+        format!("HTTP/1.1 101 Switching Protocols\r\nsec-websocket-accept: {accept}\r\n\r\n");
+    upgrade.write_all(answer.as_bytes()).await.unwrap();
+    let event = next(&mut events).await;
+    assert!(
+        matches!(
+            event,
+            Event::Disconnected {
+                reason: DisconnectReason::Transport(_),
+                ..
+            }
+        ),
+        "{event:?}"
+    );
+}
