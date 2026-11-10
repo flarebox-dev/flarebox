@@ -5,7 +5,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::names::name_key;
-use crate::tree::{Kind, LocalNode, Names, NodeId, RemoteNode, Shape, Tree, TreeError, same};
+use crate::tree::{
+    Kind, LocalNode, Names, NodeId, RemoteNode, Shape, Tree, TreeError, same, same_content,
+};
 
 /// The most mutually dependent [`Class::Same`] updates [`Trees::settle`] searches as one group.
 /// Every subset of a group is tried, so the search costs up to 2^n checks of n nodes.
@@ -120,6 +122,16 @@ impl Trees {
         classify(self.l.live(id), self.s.live(id), self.r.live(id))
     }
 
+    /// Whether L holds content that S does not: an edit not uploaded yet.
+    pub fn edited(&self, id: &str) -> bool {
+        let content = self.l.get(id).and_then(|node| node.shape.content.as_ref());
+        let synced = self.s.live(id).and_then(|shape| shape.content.as_ref());
+        match (content, synced) {
+            (Some(local), Some(synced)) => !same_content(local, synced),
+            (local, _) => local.is_some(),
+        }
+    }
+
     /// Settles what needs no decision: a node changed the same way on both sides takes S := R, and
     /// a node in sync leaves the dirty set unless it is parked. S stays a valid tree, so an update that would orphan a
     /// child, put a node under a missing or non-directory parent, close a cycle or take a sibling's
@@ -172,9 +184,12 @@ impl Trees {
         work
     }
 
-    /// Directories whose local move the server cannot take, because it closes a cycle against R.
-    /// The effects move each back to its R position, and [`Trees::settle`] forgets it once L has
-    /// it there.
+    /// Nodes whose local position the server will not take: a move that closes a cycle against R,
+    /// a create or move the server renamed, a folder merged into one L holds elsewhere with the
+    /// nodes created in it, and folders L deleted on the way from such a node to the root. The
+    /// commit planner sends no position change for them but still sends their content edits and deletes; the
+    /// effects put each at its R position without replacing its content, and [`Trees::settle`]
+    /// forgets it once L has it there.
     pub fn reverted(&self) -> &BTreeSet<NodeId> {
         &self.reverted
     }

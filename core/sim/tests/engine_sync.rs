@@ -14,7 +14,7 @@ use flarebox_engine::ids::IdGen;
 use flarebox_engine::names::name_key;
 use flarebox_engine::tree::{FileIdentity, Kind, LocalNode, Names, RemoteNode, same};
 use flarebox_proto::v1::{
-    ChangeRecord, ChunkRef, Commit, Content, CreateDir, CreateFile, Delete, Move, Op,
+    ChangeRecord, ChunkRef, Commit, Content, CreateDir, CreateFile, Delete, Error, Move, Op,
     PrepareUpload, Resume, UpdateContent, UploadReceipt, change_record, chunk_plan, error, op,
 };
 use flarebox_sim::space::{Role, Session, SpaceDo};
@@ -214,13 +214,25 @@ impl Device {
         identity(self.inos)
     }
 
-    /// One change the user makes on disk while the device is offline, as the next rescan reports it.
+    /// One change the user makes on disk, as the next rescan reports it. The user sees no parked
+    /// node and nothing under one.
     fn act(&mut self, action: &Action) {
         let root = self.trees.local().root.clone();
-        let nodes: Vec<(String, LocalNode)> = self
-            .trees
-            .local()
+        let local = self.trees.local();
+        let visible = |id: &str| {
+            let mut current = id;
+            for _ in 0..=local.len() {
+                match local.get(current) {
+                    Some(node) if node.parked => return false,
+                    Some(node) => current = &node.shape.parent,
+                    None => return true,
+                }
+            }
+            false
+        };
+        let nodes: Vec<(String, LocalNode)> = local
             .iter()
+            .filter(|(id, _)| visible(id))
             .map(|(id, node)| (id.clone(), node.clone()))
             .collect();
         let dirs: Vec<String> = [root.clone()]
@@ -303,13 +315,64 @@ impl Device {
 }
 
 fn written(contents: impl Iterator<Item = Option<Content>>, device: u8) -> BTreeSet<Vec<u8>> {
+    own(contents.flatten().map(|c| c.manifest_digest), device)
+}
+
+/// The digests among `digests` that `device` wrote.
+fn own(digests: impl Iterator<Item = Vec<u8>>, device: u8) -> BTreeSet<Vec<u8>> {
     let mine: BTreeSet<Vec<u8>> = (0..4)
         .map(|text| content(device, text).manifest_digest)
         .collect();
-    contents
-        .flatten()
-        .map(|c| c.manifest_digest)
-        .filter(|digest| mine.contains(digest))
+    digests.filter(|digest| mine.contains(digest)).collect()
+}
+
+/// The live server nodes that hold content, each with its manifest digest.
+fn stored(space: &SpaceDo) -> BTreeSet<(String, Vec<u8>)> {
+    space
+        .nodes()
+        .into_iter()
+        .filter(|n| n.status == 1)
+        .filter_map(|n| Some((n.node_id, n.current?.content?.manifest_digest)))
+        .collect()
+}
+
+/// The L nodes that hold content, each with its manifest digest.
+fn held(trees: &Trees) -> BTreeSet<(String, Vec<u8>)> {
+    trees
+        .local()
+        .iter()
+        .filter_map(|(id, node)| {
+            Some((
+                id.clone(),
+                node.shape.content.as_ref()?.manifest_digest.clone(),
+            ))
+        })
+        .collect()
+}
+
+/// Forgets the writes that left a node holding content in `before` by `after`, which the user
+/// or the other device overwrote or deleted, and returns the digests that nodes in `after` hold
+/// anew. Content equal to what S holds for the node is not a write the engine can tell apart from
+/// no change at all, so it is left out.
+fn rewritten(
+    before: &BTreeSet<(String, Vec<u8>)>,
+    after: &BTreeSet<(String, Vec<u8>)>,
+    trees: &Trees,
+    mut writes: [&mut BTreeSet<Vec<u8>>; 2],
+) -> Vec<Vec<u8>> {
+    for (_, gone) in before.difference(after) {
+        for written in writes.iter_mut() {
+            written.remove(gone);
+        }
+    }
+    let synced = |id: &str| {
+        let shape = trees.synced().live(id)?;
+        Some(shape.content.as_ref()?.manifest_digest.clone())
+    };
+    after
+        .difference(before)
+        .filter(|(id, digest)| synced(id).as_ref() != Some(digest))
+        .map(|(_, digest)| digest.clone())
         .collect()
 }
 
@@ -321,7 +384,8 @@ fn run(
     remote: &[Action],
     fits: usize,
     fresh_dir_names: bool,
-) -> Result<(), TestCaseError> {
+    during: &[(bool, Vec<Action>)],
+) -> Result<usize, TestCaseError> {
     let mut space = SpaceDo::new(5, NOW);
     let mut other = IdGen::new(6);
     for action in seed {
@@ -355,7 +419,7 @@ fn run(
     for action in local {
         device.act(action);
     }
-    let local_writes = written(
+    let mut local_writes = written(
         device
             .trees
             .local()
@@ -366,7 +430,7 @@ fn run(
     for action in remote {
         remote_action(&mut space, &mut other, 2, action);
     }
-    let remote_writes = written(
+    let mut remote_writes = written(
         space
             .nodes()
             .into_iter()
@@ -388,12 +452,57 @@ fn run(
 
     let me = session("me");
     let (mut effects, mut commits) = (Effects::default(), Commits::default());
-    let (mut steps, mut quiet) = (0, false);
+    let (mut steps, mut quiet, mut due, mut parked_reverted) = (0, false, false, 0);
+    let mut during = during.iter();
     while !quiet {
         steps += 1;
         prop_assert!(steps <= STEPS, "no convergence within {} steps", STEPS);
         device.trees.settle();
+        if (due || steps % 2 == 0)
+            && let Some((on_device, actions)) = during.next()
+        {
+            due = false;
+            if *on_device {
+                let before = held(&device.trees);
+                for action in actions {
+                    device.act(action);
+                }
+                let after = held(&device.trees);
+                let writes = [&mut local_writes, &mut remote_writes];
+                let new = rewritten(&before, &after, &device.trees, writes);
+                local_writes.extend(own(new.into_iter(), 1));
+            } else {
+                let before = stored(&space);
+                for action in actions {
+                    remote_action(&mut space, &mut other, 2, action);
+                }
+                let after = stored(&space);
+                let writes = [&mut local_writes, &mut remote_writes];
+                let new = rewritten(&before, &after, &device.trees, writes);
+                remote_writes.extend(own(new.into_iter(), 2));
+                let backlog = space
+                    .resume(&Resume {
+                        history_id: history.clone(),
+                        since_seq: last_seq,
+                    })
+                    .unwrap();
+                for record in backlog {
+                    apply(&mut device.trees, &record.changes);
+                    last_seq = record.seq;
+                }
+            }
+        }
+        device.trees.settle();
         prop_assert_eq!(device.trees.check(), Ok(()));
+        let reverted = device.trees.reverted();
+        parked_reverted = parked_reverted.max(
+            device
+                .trees
+                .local()
+                .iter()
+                .filter(|(id, node)| node.parked && reverted.contains(*id))
+                .count(),
+        );
         if let Some(record) = effects
             .plan(&device.trees, &mut device.ids, NOW as u64)
             .cloned()
@@ -418,12 +527,15 @@ fn run(
             "S is not a valid tree"
         );
         let Some(commit) = built else {
-            quiet = device.trees == before;
+            quiet = device.trees == before && during.len() == 0;
             continue;
         };
         if commit.ops.len() > fits {
             prop_assert_eq!(
-                commits.failed(error::Code::LimitExceeded),
+                commits.failed(&Error {
+                    code: error::Code::LimitExceeded as i32,
+                    ..Default::default()
+                }),
                 Ok(Failure::Split)
             );
             continue;
@@ -436,6 +548,7 @@ fn run(
         last_seq = committed.result.seq;
         commits.received(committed.result).unwrap();
         prop_assert!(commits.acknowledge(&mut device.trees, last_seq));
+        due = true;
     }
 
     prop_assert_eq!(device.trees.settle(), vec![]);
@@ -492,11 +605,13 @@ fn run(
         2,
     );
     prop_assert!(remote_writes.is_subset(&kept), "a remote write was lost");
-    Ok(())
+    Ok(parked_reverted)
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(1024))]
+    #![proptest_config(ProptestConfig::with_cases(
+        std::env::var("PROPTEST_CASES").ok().and_then(|cases| cases.parse().ok()).unwrap_or(1024),
+    ))]
 
     #[test]
     fn a_device_with_local_changes_converges_with_the_server_and_keeps_every_write(
@@ -505,7 +620,674 @@ proptest! {
         remote in prop::collection::vec(action(5), 0..8),
         fits in prop_oneof![Just(MAX_OPS), 1usize..4],
         fresh_dir_names in any::<bool>(),
+        during in prop::collection::vec(
+            (any::<bool>(), prop::collection::vec(action(5), 1..4)),
+            0..6,
+        ),
     ) {
-        run(&seed, &local, &remote, fits, fresh_dir_names)?;
+        run(&seed, &local, &remote, fits, fresh_dir_names, &during)?;
     }
+}
+
+/// The other device creates a and b before this one does, so the server renames this device's
+/// files and both are reverted. Right after that commit, the other device moves its own files away
+/// and gives each renamed file the other's local name, so the two reverted files block each other.
+#[test]
+fn two_reverted_files_that_swap_names_converge() {
+    let act = |kind, target, name, text| Action {
+        kind,
+        target,
+        parent: 0,
+        name,
+        text,
+    };
+    let local = [act(1, 0, 0, 0), act(1, 0, 2, 1)];
+    let remote = [act(1, 0, 0, 2), act(1, 0, 2, 3)];
+    let swap = vec![
+        act(3, 3, 3, 0),
+        act(3, 0, 5, 0),
+        act(3, 1, 2, 0),
+        act(3, 2, 0, 0),
+    ];
+    let parked = run(&[], &local, &remote, MAX_OPS, false, &[(false, swap)]).unwrap();
+    assert!(parked > 0, "no reverted file was parked");
+}
+
+/// A minimal interleaving the property found: a folder created here is merged into a folder this
+/// device holds elsewhere, and a node the user moved into the new folder, which the server already
+/// has in the merge target, must still follow it on disk.
+#[test]
+fn a_node_moved_into_a_merged_folder_follows_it_on_disk() {
+    let seed = vec![
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 0,
+            name: 2,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 6967822464045520996,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 0,
+            name: 3,
+            text: 0,
+        },
+        Action {
+            kind: 1,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 9526621794622326438,
+            name: 1,
+            text: 0,
+        },
+    ];
+    let local = vec![
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 10553703446551236695,
+            name: 5,
+            text: 0,
+        },
+        Action {
+            kind: 1,
+            target: 0,
+            parent: 16106826873077682970,
+            name: 2,
+            text: 0,
+        },
+        Action {
+            kind: 3,
+            target: 880737998146561905,
+            parent: 5552030480946143737,
+            name: 1,
+            text: 0,
+        },
+    ];
+    let remote = vec![];
+    let fits = 1;
+    let fresh_dir_names = false;
+    let during = vec![
+        (
+            false,
+            vec![Action {
+                kind: 3,
+                target: 443641311708994000,
+                parent: 3064515660927608345,
+                name: 5,
+                text: 0,
+            }],
+        ),
+        (
+            false,
+            vec![Action {
+                kind: 0,
+                target: 0,
+                parent: 0,
+                name: 0,
+                text: 0,
+            }],
+        ),
+    ];
+    run(&seed, &local, &remote, fits, fresh_dir_names, &during).unwrap();
+}
+
+/// A minimal interleaving the property found: a file the server renamed is edited and then deleted
+/// by the other device while its old name blocks another renamed file, so the edit must be
+/// uploaded as a new file.
+#[test]
+fn an_edited_renamed_file_deleted_remotely_is_uploaded_as_a_new_file() {
+    let seed = vec![Action {
+        kind: 1,
+        target: 0,
+        parent: 0,
+        name: 0,
+        text: 0,
+    }];
+    let local = vec![
+        Action {
+            kind: 2,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 3,
+            target: 0,
+            parent: 0,
+            name: 3,
+            text: 0,
+        },
+    ];
+    let remote = vec![
+        Action {
+            kind: 2,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 3,
+            target: 2278650491807642941,
+            parent: 9127562380887983576,
+            name: 3,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 10772034385298179478,
+            name: 3,
+            text: 0,
+        },
+    ];
+    let fits = 1000;
+    let fresh_dir_names = false;
+    let during = vec![
+        (
+            false,
+            vec![
+                Action {
+                    kind: 4,
+                    target: 12531602759342590661,
+                    parent: 0,
+                    name: 0,
+                    text: 0,
+                },
+                Action {
+                    kind: 3,
+                    target: 283388978725368259,
+                    parent: 0,
+                    name: 4,
+                    text: 0,
+                },
+                Action {
+                    kind: 1,
+                    target: 0,
+                    parent: 0,
+                    name: 0,
+                    text: 1,
+                },
+            ],
+        ),
+        (
+            false,
+            vec![Action {
+                kind: 2,
+                target: 2943695200610841979,
+                parent: 0,
+                name: 0,
+                text: 0,
+            }],
+        ),
+        (
+            true,
+            vec![Action {
+                kind: 1,
+                target: 0,
+                parent: 0,
+                name: 3,
+                text: 0,
+            }],
+        ),
+        (
+            false,
+            vec![
+                Action {
+                    kind: 0,
+                    target: 0,
+                    parent: 0,
+                    name: 0,
+                    text: 0,
+                },
+                Action {
+                    kind: 4,
+                    target: 6986862736185568223,
+                    parent: 0,
+                    name: 0,
+                    text: 0,
+                },
+            ],
+        ),
+    ];
+    run(&seed, &local, &remote, fits, fresh_dir_names, &during).unwrap();
+}
+
+/// A minimal interleaving the property found: the user moves a folder into a folder created here,
+/// which the server merges into one this device holds elsewhere, while the other device moves it
+/// away, so on disk it must follow the other device's move.
+#[test]
+fn a_node_moved_into_a_merged_folder_follows_a_remote_move() {
+    let seed = vec![Action {
+        kind: 1,
+        target: 0,
+        parent: 0,
+        name: 3,
+        text: 0,
+    }];
+    let local = vec![
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 0,
+            name: 2,
+            text: 0,
+        },
+        Action {
+            kind: 4,
+            target: 3390051005637832722,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 1,
+            target: 0,
+            parent: 3573038702653260728,
+            name: 5,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 0,
+            name: 3,
+            text: 0,
+        },
+    ];
+    let remote = vec![
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 4,
+            target: 761663922910750675,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 0,
+            name: 5,
+            text: 0,
+        },
+        Action {
+            kind: 2,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 2,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 3824710055192453609,
+            name: 0,
+            text: 0,
+        },
+    ];
+    let fits = 1;
+    let fresh_dir_names = false;
+    let during = vec![
+        (
+            true,
+            vec![
+                Action {
+                    kind: 0,
+                    target: 0,
+                    parent: 7106800540313915127,
+                    name: 0,
+                    text: 0,
+                },
+                Action {
+                    kind: 3,
+                    target: 69233815001145249,
+                    parent: 11870616208155072313,
+                    name: 5,
+                    text: 0,
+                },
+            ],
+        ),
+        (
+            false,
+            vec![
+                Action {
+                    kind: 3,
+                    target: 4672328705971433533,
+                    parent: 9740151841705065456,
+                    name: 0,
+                    text: 0,
+                },
+                Action {
+                    kind: 4,
+                    target: 1845576325211218462,
+                    parent: 0,
+                    name: 0,
+                    text: 0,
+                },
+            ],
+        ),
+        (
+            true,
+            vec![
+                Action {
+                    kind: 4,
+                    target: 10069492413079588418,
+                    parent: 0,
+                    name: 0,
+                    text: 0,
+                },
+                Action {
+                    kind: 3,
+                    target: 17076322275721598278,
+                    parent: 13906480724080066383,
+                    name: 5,
+                    text: 0,
+                },
+            ],
+        ),
+        (
+            false,
+            vec![Action {
+                kind: 3,
+                target: 10335766898245895506,
+                parent: 4894905971208633107,
+                name: 0,
+                text: 0,
+            }],
+        ),
+    ];
+    run(&seed, &local, &remote, fits, fresh_dir_names, &during).unwrap();
+}
+
+/// A minimal interleaving the property found: the other device deletes a folder holding a parked
+/// node with a folder the user created under it, so the effects clear the folders above it, and
+/// the create then brings them back on the server. S cannot drop them while the parked node hangs
+/// from them, so they must be brought back on disk.
+#[test]
+fn folders_revived_above_a_parked_node_are_brought_back() {
+    let seed = vec![
+        Action {
+            kind: 1,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 5801581838394722479,
+            name: 5,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 6476457337238582140,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 1,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 4564459193690538441,
+            name: 4,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 6344555226843187279,
+            name: 5,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 1911679536950536619,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 10497572882504026615,
+            name: 0,
+            text: 0,
+        },
+    ];
+    let local = vec![
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 7649716111743945145,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 2,
+            target: 11369682697835578077,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+    ];
+    let remote = vec![
+        Action {
+            kind: 3,
+            target: 9257115507352902041,
+            parent: 14556351700413880842,
+            name: 3,
+            text: 0,
+        },
+        Action {
+            kind: 2,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 2,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 2,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 3,
+            target: 14758948430815737821,
+            parent: 277029637290519871,
+            name: 0,
+            text: 0,
+        },
+    ];
+    let fits = 1000;
+    let fresh_dir_names = false;
+    let during = vec![(
+        false,
+        vec![
+            Action {
+                kind: 0,
+                target: 0,
+                parent: 101087396655831711,
+                name: 0,
+                text: 0,
+            },
+            Action {
+                kind: 4,
+                target: 7391292373329721386,
+                parent: 0,
+                name: 0,
+                text: 0,
+            },
+        ],
+    )];
+    run(&seed, &local, &remote, fits, fresh_dir_names, &during).unwrap();
+}
+
+#[test]
+fn an_edited_reverted_file_parked_under_a_folder_deleted_remotely_is_kept() {
+    let seed = vec![
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 1,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+    ];
+    let local = vec![
+        Action {
+            kind: 2,
+            target: 620503160258612587,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 3,
+            target: 6503485206416241607,
+            parent: 3276521438384508601,
+            name: 5,
+            text: 0,
+        },
+    ];
+    let remote = vec![
+        Action {
+            kind: 2,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 4,
+            target: 6817887910542140471,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 0,
+            name: 2,
+            text: 0,
+        },
+        Action {
+            kind: 2,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+    ];
+    let fits = 1;
+    let fresh_dir_names = false;
+    let during = vec![
+        (
+            false,
+            vec![Action {
+                kind: 0,
+                target: 0,
+                parent: 1247370204288523498,
+                name: 5,
+                text: 0,
+            }],
+        ),
+        (
+            false,
+            vec![Action {
+                kind: 3,
+                target: 47517915818211563,
+                parent: 1344201196089021663,
+                name: 0,
+                text: 0,
+            }],
+        ),
+        (
+            false,
+            vec![Action {
+                kind: 4,
+                target: 12752295931867524494,
+                parent: 0,
+                name: 0,
+                text: 0,
+            }],
+        ),
+    ];
+    run(&seed, &local, &remote, fits, fresh_dir_names, &during).unwrap();
 }

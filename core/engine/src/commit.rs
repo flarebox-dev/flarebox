@@ -11,7 +11,7 @@ use prost::Message;
 
 use crate::classify::{Class, Trees};
 use crate::ids::IdGen;
-use crate::names::name_key;
+use crate::names::{MAX_NAME_BYTES, name_key, nfc};
 use crate::tree::{Content, Kind, Names, NodeId, Shape, same, same_content};
 
 /// The most ops one commit holds (spec v0 section 13).
@@ -45,6 +45,10 @@ pub enum Halt {
     /// The store cannot account for the server's state (sections 2.8 and 6.4). The commit in flight
     /// is kept as evidence and nothing is planned from this store.
     Recovery,
+    /// The server refused the commit with an error the engine cannot act on: a code it does not
+    /// know, \`UNSPECIFIED\` among them, or \`QUOTA_EXCEEDED\` without a retry time. The commit in
+    /// flight is kept and never resent, nothing more is planned, and downloads continue.
+    Refused,
 }
 
 /// What to do with the commit in flight after connecting (section 2.8, RFC 0002 section 2).
@@ -174,7 +178,6 @@ impl Commits {
             .iter()
             .chain(self.waiting.keys())
             .chain(parked.map(|(id, _)| id))
-            .chain(trees.reverted())
             .cloned()
             .collect();
         let (needed, agreed) = rebase(trees, ids, now_ms, &skip);
@@ -382,29 +385,30 @@ impl Commits {
 
     /// What a call-level error on the commit in flight means. An error that proves nothing was
     /// applied forgets the commit; one that leaves the outcome unknown keeps it to resend; a
-    /// history mismatch or a stale device state keeps it as evidence and stops committing.
-    pub fn failed(&mut self, code: error::Code) -> Result<Failure, CommitError> {
+    /// history mismatch or a stale device state keeps it as evidence and stops committing; and an
+    /// error the engine cannot act on refuses it (see [\`Halt::Refused\`]). \`QUOTA_EXCEEDED\` is
+    /// resent only when it names a retry time, after that wait.
+    pub fn failed(&mut self, error: &proto::Error) -> Result<Failure, CommitError> {
         use error::Code;
         if self.in_flight.is_none() {
             return Err(CommitError::NotInFlight);
         }
-        let failure = match code {
-            Code::HistoryMismatch | Code::StaleDeviceState => Failure::Halted(Halt::Recovery),
-            Code::ReadOnly | Code::Forbidden => Failure::Halted(Halt::ReadOnly),
-            Code::AheadOfServer => Failure::Resync,
-            Code::LimitExceeded => Failure::Split,
-            Code::InvalidArgument | Code::HeadMoved | Code::UnsupportedVersion => {
+        let failure = match Code::try_from(error.code) {
+            Ok(Code::HistoryMismatch | Code::StaleDeviceState) => Failure::Halted(Halt::Recovery),
+            Ok(Code::ReadOnly | Code::Forbidden) => Failure::Halted(Halt::ReadOnly),
+            Ok(Code::AheadOfServer) => Failure::Resync,
+            Ok(Code::LimitExceeded) => Failure::Split,
+            Ok(Code::InvalidArgument | Code::HeadMoved | Code::UnsupportedVersion) => {
                 Failure::Abandoned
             }
-            Code::MissingChunks
-            | Code::RetryLater
-            | Code::QuotaExceeded
-            | Code::Unauthenticated
-            | Code::Internal
-            | Code::Unspecified => Failure::Resend,
+            Ok(Code::QuotaExceeded) if error.retry_after_ms > 0 => Failure::Resend,
+            Ok(Code::MissingChunks | Code::RetryLater | Code::Unauthenticated | Code::Internal) => {
+                Failure::Resend
+            }
+            Ok(Code::QuotaExceeded | Code::Unspecified) | Err(_) => Failure::Halted(Halt::Refused),
         };
         match failure {
-            Failure::Halted(Halt::Recovery) => self.halted = Some(Halt::Recovery),
+            Failure::Halted(halt @ (Halt::Recovery | Halt::Refused)) => self.halted = Some(halt),
             Failure::Resend => {}
             Failure::Halted(halt) => {
                 self.halted = Some(halt);
@@ -444,7 +448,7 @@ impl Commits {
     /// 2.8). With *w* the server's counter, *w* = *a* means the commit in flight was not accepted
     /// and *w* = *a* + 1 that it was and its response was lost; both resend it unchanged, and
     /// the server answers an accepted one with its stored result. Any other *w*, or a commit
-    /// built in another history, starts recovery. A read-only device resends nothing. Whether R
+    /// built in another history, starts recovery. A read-only or refused device resends nothing. Whether R
     /// itself belongs to the `Welcome`'s history is checked where R is kept.
     pub fn connected(&mut self, welcome: &proto::Welcome) -> Reconnect {
         let (a, w) = (self.accepted, welcome.device_seq);
@@ -459,6 +463,9 @@ impl Commits {
         if reconnect == Reconnect::Recovery {
             self.halted = Some(Halt::Recovery);
             return reconnect;
+        }
+        if self.halted == Some(Halt::Refused) {
+            return Reconnect::Idle;
         }
         if welcome.read_only {
             self.halted = Some(Halt::ReadOnly);
@@ -562,8 +569,10 @@ fn rekey(trees: &mut Trees, from: &str, to: &str) {
     }
 }
 
-/// The rebase of section 2.4, before ops are planned. Nodes in `skip` are not rebased, though
-/// what they changed remotely still keeps their ancestors. Returns the nodes the keep rule could
+/// The rebase of section 2.4, before ops are planned. A reverted file that R no longer has but that
+/// holds an edit not uploaded yet becomes a new node, so the edit is uploaded as a create instead
+/// of being removed with the node. Nodes in `skip` are not rebased otherwise, though what they changed
+/// remotely still keeps their ancestors. Returns the nodes the keep rule could
 /// not clear from S yet, and the S updates both sides agree on, which are made together with the
 /// waiting ones.
 fn rebase(
@@ -573,6 +582,11 @@ fn rebase(
     skip: &BTreeSet<NodeId>,
 ) -> (BTreeSet<NodeId>, Vec<(NodeId, Option<Shape>)>) {
     let dirty: Vec<NodeId> = trees.dirty().iter().cloned().collect();
+    for id in &dirty {
+        if trees.reverted().contains(id) && trees.remote().live(id).is_none() && trees.edited(id) {
+            rekey(trees, id, &ids.uuid_v7(now_ms));
+        }
+    }
     for id in dirty.iter().filter(|id| !skip.contains(*id)) {
         if trees.class(id) != Class::Concurrent || !edited_on_both_sides(trees, id) {
             continue;
@@ -636,12 +650,17 @@ fn edited_on_both_sides(trees: &Trees, id: &str) -> bool {
     changed(&l) && changed(&r) && !same_content(&l, &r)
 }
 
-/// The keep rule (R7): a node that changed remotely keeps every node L deleted on the way it will
-/// hang from the root, by setting S := ⊥ for them, so they are downloaded again. A kept node that
-/// still has children in S, deleted locally without a remote change, waits for their deletes to be
-/// acknowledged and goes into `needed` meanwhile, so it is not deleted with them.
+/// The keep rule (R7): a node that changed remotely, or that L still has but must move to its R
+/// position because it is reverted or parked, keeps every node L deleted on the way it will hang
+/// from the root, by setting S := ⊥ for them, so they are downloaded again. A kept node that S
+/// cannot drop yet, because S still has children under it, is reverted instead, so the effects
+/// bring it back at its R position, and it goes into `needed` so it is not deleted. A reverted node
+/// L deleted is an ordinary local delete.
 fn keep(trees: &mut Trees, id: &str, needed: &mut BTreeSet<NodeId>) {
-    let reverted = trees.reverted().contains(id);
+    let reverted = trees
+        .local()
+        .get(id)
+        .is_some_and(|node| node.parked || trees.reverted().contains(id));
     if trees.remote().live(id).is_none()
         || (!reverted && same(trees.remote().live(id), trees.synced().live(id)))
     {
@@ -655,10 +674,8 @@ fn keep(trees: &mut Trees, id: &str, needed: &mut BTreeSet<NodeId>) {
         let parent = remote.parent.clone();
         match trees.local().get(&current) {
             None if trees.synced().live(&current).is_some() => {
-                if reverted {
+                if !trees.set_synced_if_valid(current.clone(), None) {
                     trees.revert(current.clone());
-                    needed.insert(current.clone());
-                } else if !trees.set_synced_if_valid(current.clone(), None) {
                     needed.insert(current.clone());
                 }
             }
@@ -735,7 +752,8 @@ enum Fit {
 type Planned = (Vec<proto::Op>, BTreeMap<NodeId, Vec<NodeId>>, Vec<NodeId>);
 
 /// The ops for every local change, in an order valid on a scratch copy of R, the nodes each
-/// delete covers, and the moves to revert.
+/// delete covers, and the nodes to revert: moves that close a cycle, and nodes in a merged folder
+/// that S or R already has where the folder it was merged into holds them, so they follow R.
 fn plan(
     trees: &Trees,
     problems: &BTreeSet<NodeId>,
@@ -746,6 +764,7 @@ fn plan(
 ) -> Planned {
     let mut wants = Vec::new();
     let mut deleted = BTreeSet::new();
+    let mut reverts = Vec::new();
     for id in trees.dirty().iter().filter(|id| !problems.contains(*id)) {
         if !matches!(trees.class(id), Class::Local | Class::Concurrent) {
             continue;
@@ -758,6 +777,7 @@ fn plan(
             continue;
         };
         let aliased;
+        let in_alias = aliases.contains_key(&local.parent);
         let local = match aliases.get(&local.parent) {
             Some(into) => {
                 aliased = Shape {
@@ -769,18 +789,25 @@ fn plan(
             None => local,
         };
         let Some(remote) = trees.remote().get(id) else {
-            wants.push(Want::Create {
-                id: id.clone(),
-                shape: local.clone(),
-            });
+            if !trees.reverted().contains(id) {
+                wants.push(Want::Create {
+                    id: id.clone(),
+                    shape: local.clone(),
+                });
+            }
             continue;
         };
         if remote.shape.kind != local.kind || synced.is_some_and(|s| s.kind != local.kind) {
             continue;
         }
         let remote = trees.remote().live(id);
+        let placed = |shape: Option<&Shape>| shape.is_some_and(|s| s.same_position(local));
+        if in_alias && (placed(synced) || placed(remote)) && !trees.reverted().contains(id) {
+            reverts.push(id.clone());
+        }
         if synced.is_none_or(|s| !s.same_position(local))
             && remote.is_none_or(|r| !r.same_position(local))
+            && !trees.reverted().contains(id)
         {
             wants.push(Want::Move {
                 id: id.clone(),
@@ -939,7 +966,6 @@ fn plan(
         }
         emit(slot.take().expect("checked"), &mut scratch, &mut moving);
     };
-    let mut reverts = Vec::new();
     if !capped {
         for want in wants.iter().flatten() {
             if let Want::Move { id, .. } = want
@@ -1138,9 +1164,17 @@ impl Scratch {
     /// into the folder that leaves.
     fn free_name(&self, parent: &str, name: &str) -> String {
         (1..)
-            .map(|n| match n {
-                1 => format!("{name} (pending)"),
-                n => format!("{name} (pending {n})"),
+            .map(|n| {
+                let suffix = match n {
+                    1 => " (pending)".to_owned(),
+                    n => format!(" (pending {n})"),
+                };
+                let mut stem: Vec<char> = nfc(name).chars().collect();
+                let named = |stem: &[char]| format!("{}{suffix}", stem.iter().collect::<String>());
+                while nfc(&named(&stem)).len() > MAX_NAME_BYTES {
+                    stem.pop();
+                }
+                named(&stem)
             })
             .find(|candidate| {
                 self.children

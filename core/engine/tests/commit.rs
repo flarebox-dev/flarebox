@@ -5,8 +5,9 @@
 
 use flarebox_engine::classify::{Class, Trees};
 use flarebox_engine::commit::{Commits, Failure, Halt, MAX_OPS, Reconnect};
-use flarebox_engine::effects::Effects;
+use flarebox_engine::effects::{Effect, Effects};
 use flarebox_engine::ids::IdGen;
+use flarebox_engine::names::{MAX_NAME_BYTES, nfc, normalize_name};
 use flarebox_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape};
 use flarebox_proto::v1::{self as proto, CommitResult, OpResult, Welcome, error, op, op_result};
 
@@ -509,6 +510,236 @@ fn a_renamed_result_reverts_the_local_name_to_the_server_one() {
 }
 
 #[test]
+fn a_local_edit_on_a_reverted_file_is_kept_on_disk_and_uploaded() {
+    let mut trees = trees(&[("a", Some(file(ROOT, "x", 1)), None, None)]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    let renamed = OpResult {
+        name: "x (conflict)".into(),
+        ..outcome(op_result::Code::AppliedRenamed)
+    };
+    acknowledge(&mut commits, &mut trees, vec![renamed]);
+    trees.set_remote("a".into(), remote(file(ROOT, "x (conflict)", 1)));
+    trees.set_local("a".into(), local(file(ROOT, "x", 2), 1));
+    let mut effects = Effects::default();
+    let record = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    assert!(
+        matches!(record.effect, Effect::Move { .. }),
+        "{:?}",
+        record.effect
+    );
+    effects.done(&mut trees, &record.effect_id, None).unwrap();
+    trees.settle();
+    assert_eq!(
+        trees.local().get("a").unwrap().shape,
+        file(ROOT, "x (conflict)", 2)
+    );
+    assert!(trees.reverted().is_empty());
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("a", 2)]);
+}
+
+#[test]
+fn a_reverted_file_deleted_remotely_keeps_its_unuploaded_edit_as_a_new_file() {
+    let mut trees = trees(&[("a", Some(file(ROOT, "x", 1)), None, None)]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    let renamed = OpResult {
+        name: "x (conflict)".into(),
+        ..outcome(op_result::Code::AppliedRenamed)
+    };
+    acknowledge(&mut commits, &mut trees, vec![renamed]);
+    trees.set_local("a".into(), local(file(ROOT, "x", 2), 1));
+    trees.set_remote("a".into(), trashed(file(ROOT, "x (conflict)", 1)));
+    trees.settle();
+    assert!(trees.reverted().contains("a"));
+    let mut effects = Effects::default();
+    assert_eq!(effects.plan(&trees, &mut ids, NOW), None);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    let [op::Op::CreateFile(create)] = &ops(&commit)[..] else {
+        panic!("{:?}", ops(&commit));
+    };
+    assert_eq!(
+        (create.parent_id.as_str(), create.name.as_str()),
+        (ROOT, "x")
+    );
+    assert_eq!(create.content, Some(content(2)));
+    assert!(trees.local().get("a").is_none());
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    trees.set_remote(create.node_id.clone(), remote(file(ROOT, "x", 2)));
+    assert_eq!(trees.settle(), vec![]);
+    assert!(trees.reverted().is_empty());
+}
+
+#[test]
+fn a_renamed_file_the_user_deletes_before_it_moves_is_deleted() {
+    let mut trees = trees(&[("a", Some(file(ROOT, "x", 1)), None, None)]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    let renamed = OpResult {
+        name: "x (conflict)".into(),
+        ..outcome(op_result::Code::AppliedRenamed)
+    };
+    acknowledge(&mut commits, &mut trees, vec![renamed]);
+    trees.set_remote("a".into(), remote(file(ROOT, "x (conflict)", 1)));
+    trees.remove_local("a");
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(
+        ops(&commit),
+        [op::Op::Delete(proto::Delete {
+            node_id: "a".into()
+        })]
+    );
+}
+
+#[test]
+fn two_reverted_files_that_block_each_other_are_placed_through_parking() {
+    let mut trees = trees(&[
+        ("a", Some(file(ROOT, "x", 1)), None, None),
+        ("b", Some(file(ROOT, "y", 2)), None, None),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    let renamed = |name: &str| OpResult {
+        name: name.into(),
+        ..outcome(op_result::Code::AppliedRenamed)
+    };
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![renamed("x (conflict)"), renamed("y (conflict)")],
+    );
+    trees.set_remote("a".into(), remote(file(ROOT, "y", 1)));
+    trees.set_remote("b".into(), remote(file(ROOT, "x", 2)));
+    trees.settle();
+    let mut effects = Effects::default();
+    for _ in 0..8 {
+        let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() else {
+            break;
+        };
+        effects.done(&mut trees, &record.effect_id, None).unwrap();
+        trees.settle();
+    }
+    assert_eq!(trees.local().get("a").unwrap().shape, file(ROOT, "y", 1));
+    assert_eq!(trees.local().get("b").unwrap().shape, file(ROOT, "x", 2));
+    assert!(trees.reverted().is_empty());
+}
+
+#[test]
+fn a_folder_deleted_around_a_parked_node_is_brought_back_for_it() {
+    for name in ["f", "F"] {
+        let mut trees = trees(&[
+            (
+                "d",
+                None,
+                Some(dir(ROOT, "d")),
+                Some(remote(dir(ROOT, "d"))),
+            ),
+            (
+                "f",
+                Some(file("d", "F", 1)),
+                Some(file("d", "F", 1)),
+                Some(remote(file("d", name, 1))),
+            ),
+        ]);
+        trees.set_local(
+            "f".into(),
+            LocalNode {
+                parked: true,
+                ..local(file("d", "F", 1), 2)
+            },
+        );
+        trees.settle();
+        let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+        assert_eq!(build(&mut commits, &mut trees, &mut ids), None, "{name}");
+        assert!(trees.reverted().contains("d"), "{name}");
+        let mut effects = Effects::default();
+        for ino in 10..18 {
+            trees.settle();
+            let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() else {
+                break;
+            };
+            let identity = FileIdentity {
+                dev: 1,
+                ino,
+                birth_ns: 0,
+            };
+            effects
+                .done(&mut trees, &record.effect_id, Some(identity))
+                .unwrap();
+        }
+        assert_eq!(trees.settle(), vec![], "{name}");
+        assert_eq!(trees.local().get("d").unwrap().shape, dir(ROOT, "d"));
+        let f = trees.local().get("f").unwrap();
+        assert_eq!((&f.shape, f.parked), (&file("d", name, 1), false));
+        assert_eq!(build(&mut commits, &mut trees, &mut ids), None, "{name}");
+    }
+}
+
+#[test]
+fn a_parked_reverted_folder_the_server_lacks_is_removed_even_when_its_name_is_taken() {
+    let mut trees = trees(&[synced("h", dir(ROOT, "x"))]);
+    trees.set_local(
+        "n".into(),
+        LocalNode {
+            parked: true,
+            ..local(dir(ROOT, "x"), 2)
+        },
+    );
+    trees.revert("n".into());
+    trees.settle();
+    let mut effects = Effects::default();
+    let record = effects.plan(&trees, &mut IdGen::new(1), NOW).cloned();
+    let record = record.expect("an effect for the parked folder");
+    assert!(
+        matches!(record.effect, Effect::RemoveDir { .. }),
+        "{record:?}"
+    );
+    effects.done(&mut trees, &record.effect_id, None).unwrap();
+    assert_eq!(trees.settle(), vec![]);
+    assert!(trees.local().get("n").is_none());
+    assert!(trees.reverted().is_empty());
+}
+
+#[test]
+fn a_pending_name_stays_within_the_name_limit() {
+    let pending = |name: &str, taken: Option<&str>| {
+        let mut rows = vec![
+            (
+                "h",
+                Some(dir("n", name)),
+                Some(dir(ROOT, name)),
+                Some(remote(dir(ROOT, name))),
+            ),
+            ("n", Some(dir(ROOT, name)), None, None),
+        ];
+        rows.extend(taken.map(|taken| synced("p", dir(ROOT, taken))));
+        let mut trees = trees(&rows);
+        let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+        let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+        let op::Op::CreateDir(create) = &ops(&commit)[0] else {
+            panic!("{:?}", ops(&commit));
+        };
+        normalize_name(&create.name).expect("a valid name")
+    };
+    for name in ["a".repeat(255), "é".repeat(127), "e\u{301}".repeat(85)] {
+        let first = pending(&name, None);
+        let second = pending(&name, Some(&first));
+        for (pending, suffix) in [(&first, " (pending)"), (&second, " (pending 2)")] {
+            let stem = pending.strip_suffix(suffix).expect(suffix);
+            assert!(nfc(&name).starts_with(stem), "{pending}");
+            assert!(pending.len() <= MAX_NAME_BYTES, "{pending}");
+            assert!(pending.len() + "é".len() > MAX_NAME_BYTES || stem == nfc(&name));
+        }
+    }
+}
+
+#[test]
 fn a_commit_holds_at_most_the_op_limit_with_parents_first() {
     let mut rows = vec![("d".to_string(), dir(ROOT, "d"))];
     rows.extend((0..MAX_OPS).map(|i| (format!("f{i:04}"), file("d", &format!("{i}"), 1))));
@@ -588,7 +819,7 @@ fn a_commit_that_does_not_fit_is_planned_again_in_halves_and_grows_back() {
     let mut sizes = vec![build(&mut commits, &mut trees, &mut ids).unwrap().ops.len()];
     for _ in 0..2 {
         assert_eq!(
-            commits.failed(error::Code::LimitExceeded),
+            commits.failed(&refusal(error::Code::LimitExceeded, 0)),
             Ok(Failure::Split)
         );
         assert_eq!(commits.in_flight(), None);
@@ -631,7 +862,7 @@ fn a_delete_that_does_not_fit_alone_deletes_the_folder_contents_first() {
     let first = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert_eq!(ops(&first), [delete("d")]);
     assert_eq!(
-        commits.failed(error::Code::LimitExceeded),
+        commits.failed(&refusal(error::Code::LimitExceeded, 0)),
         Ok(Failure::Split)
     );
     let mut second = ops(&build(&mut commits, &mut trees, &mut ids).unwrap());
@@ -674,13 +905,17 @@ fn an_op_that_does_not_fit_alone_and_cannot_be_split_is_a_problem() {
     ]);
     let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
     build(&mut commits, &mut trees, &mut ids).unwrap();
-    commits.failed(error::Code::LimitExceeded).unwrap();
+    commits
+        .failed(&refusal(error::Code::LimitExceeded, 0))
+        .unwrap();
     for _ in 0..3 {
         let Some(commit) = build(&mut commits, &mut trees, &mut ids) else {
             break;
         };
         assert_eq!(commit.ops.len(), 1);
-        commits.failed(error::Code::LimitExceeded).unwrap();
+        commits
+            .failed(&refusal(error::Code::LimitExceeded, 0))
+            .unwrap();
     }
     assert!(build(&mut commits, &mut trees, &mut ids).is_none());
     let problems: Vec<&str> = commits.problems().iter().map(String::as_str).collect();
@@ -887,6 +1122,52 @@ fn a_result_is_acknowledged_only_once_r_holds_its_records() {
     assert_eq!((commits.accepted(), commits.in_flight()), (1, None));
 }
 
+fn refusal(code: error::Code, retry_after_ms: u64) -> proto::Error {
+    proto::Error {
+        code: code as i32,
+        retry_after_ms,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn an_unknown_error_or_a_quota_without_a_retry_time_is_refused_and_never_resent() {
+    use error::Code;
+    let unknown = proto::Error {
+        code: 99,
+        ..Default::default()
+    };
+    let cases = [
+        (unknown, Failure::Halted(Halt::Refused)),
+        (
+            refusal(Code::Unspecified, 0),
+            Failure::Halted(Halt::Refused),
+        ),
+        (
+            refusal(Code::QuotaExceeded, 0),
+            Failure::Halted(Halt::Refused),
+        ),
+        (refusal(Code::QuotaExceeded, 5_000), Failure::Resend),
+        (refusal(Code::RetryLater, 0), Failure::Resend),
+    ];
+    for (error, failure) in cases {
+        let mut trees = trees(&[("a", Some(file(ROOT, "x", 1)), None, None)]);
+        let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+        let sent = build(&mut commits, &mut trees, &mut ids).unwrap();
+        assert_eq!(commits.failed(&error), Ok(failure), "{error:?}");
+        assert_eq!(commits.in_flight().unwrap().commit, sent, "{error:?}");
+        let resend = match failure {
+            Failure::Resend => Reconnect::Resend,
+            _ => Reconnect::Idle,
+        };
+        assert_eq!(commits.connected(&welcome(0)), resend, "{error:?}");
+        if failure == Failure::Halted(Halt::Refused) {
+            assert_eq!(commits.halted(), Some(Halt::Refused), "{error:?}");
+            assert_eq!(build(&mut commits, &mut trees, &mut ids), None, "{error:?}");
+        }
+    }
+}
+
 fn welcome(device_seq: u64) -> Welcome {
     Welcome {
         history_id: HISTORY.into(),
@@ -901,12 +1182,12 @@ fn the_device_slot_is_kept_by_a_retry_and_reused_after_a_refusal() {
     let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
     let first = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert_eq!(
-        commits.failed(error::Code::MissingChunks),
+        commits.failed(&refusal(error::Code::MissingChunks, 0)),
         Ok(Failure::Resend)
     );
     assert_eq!(commits.in_flight().unwrap().commit, first);
     assert_eq!(
-        commits.failed(error::Code::AheadOfServer),
+        commits.failed(&refusal(error::Code::AheadOfServer, 0)),
         Ok(Failure::Resync)
     );
     assert_eq!(commits.in_flight(), None);
@@ -929,7 +1210,6 @@ fn errors_forget_the_commit_only_when_nothing_was_applied() {
     let cases = [
         (Code::MissingChunks, Failure::Resend, true),
         (Code::RetryLater, Failure::Resend, true),
-        (Code::QuotaExceeded, Failure::Resend, true),
         (Code::Unauthenticated, Failure::Resend, true),
         (Code::Internal, Failure::Resend, true),
         (Code::InvalidArgument, Failure::Abandoned, false),
@@ -949,7 +1229,7 @@ fn errors_forget_the_commit_only_when_nothing_was_applied() {
         let mut trees = trees(&[("a", Some(file(ROOT, "x", 1)), None, None)]);
         let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
         build(&mut commits, &mut trees, &mut ids).unwrap();
-        assert_eq!(commits.failed(code), Ok(failure), "{code:?}");
+        assert_eq!(commits.failed(&refusal(code, 0)), Ok(failure), "{code:?}");
         assert_eq!(commits.in_flight().is_some(), kept, "{code:?}");
         let halted = matches!(failure, Failure::Halted(_));
         assert_eq!(

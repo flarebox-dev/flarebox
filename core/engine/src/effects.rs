@@ -193,9 +193,7 @@ impl Effects {
         }
         let (node, effect, after) = chosen.or_else(|| {
             blockers.into_iter().find_map(|id| {
-                if trees.class(&id) != Class::Remote
-                    || trees.local().get(&id).is_none_or(|node| node.parked)
-                {
+                if !candidate(trees, &id) || trees.local().get(&id).is_none_or(|node| node.parked) {
                     return None;
                 }
                 let (effect, after) = view.park(&id)?;
@@ -269,11 +267,13 @@ impl Effects {
 }
 
 /// A node the planner considers: one whose only change is remote, one that is parked, or one whose
-/// local move is reverted.
+/// local position is reverted. A reverted node that R no longer has is removed only when it holds
+/// no unuploaded edit; otherwise the commit layer makes it a new node, so the edit is uploaded.
 fn candidate(trees: &Trees, id: &str) -> bool {
     trees.class(id) == Class::Remote
         || trees.local().get(id).is_some_and(|node| node.parked)
-        || trees.reverted().contains(id)
+        || (trees.reverted().contains(id)
+            && (trees.remote().live(id).is_some() || !trees.edited(id)))
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -308,7 +308,11 @@ impl<'a> View<'a> {
         let remote = self.trees.remote().live(id);
         let (local, remote) = match (local, remote) {
             (None, None) => return Step::Skip,
-            (Some(local), None) if local.parked && self.trees.class(id) != Class::Remote => {
+            (Some(local), None)
+                if local.parked
+                    && self.trees.class(id) != Class::Remote
+                    && (!self.trees.reverted().contains(id) || self.trees.edited(id)) =>
+            {
                 return self.unpark(id, local, &local.shape);
             }
             (Some(local), None) => return self.remove(id, local),
