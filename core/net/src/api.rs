@@ -77,6 +77,10 @@ impl Api {
         &self.base
     }
 
+    pub(crate) fn http(&self) -> &reqwest::Client {
+        &self.http
+    }
+
     /// Joins a path relative to the base, such as `v1/server`.
     pub(crate) fn url(&self, path: &str) -> Url {
         self.base

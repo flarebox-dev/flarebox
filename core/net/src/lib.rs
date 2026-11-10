@@ -7,12 +7,15 @@
 //! - [`Api`] calls the HTTP endpoints of spec v0 section 15.1, and [`Auth`] keeps a device's access token fresh.
 //! - [`Session`] is the WebSocket session with one space: RPCs, the change stream as [`Event`]s, `Reauth`, and
 //!   reconnects with backoff that resend only what RFC 0002 section 2 allows.
+//! - [`Transfer`] uploads and downloads chunks through the targets the server hands out, checking every chunk
+//!   against its SHA-256.
 //!
 //! TLS is rustls with the platform verifier, for HTTP (through reqwest) and for the WebSocket alike.
 
 mod api;
 mod auth;
 mod backoff;
+mod chunks;
 mod error;
 mod event;
 mod session;
@@ -21,6 +24,7 @@ mod stream;
 pub use api::Api;
 pub use auth::{Auth, Credentials, DEFAULT_REFRESH_MARGIN};
 pub use backoff::Backoff;
+pub use chunks::{ChunkError, MAX_CHUNKS_PER_CALL, Transfer, matches};
 pub use error::{ApiError, CallError, NotResent, ServerError, StopReason};
 pub use event::{Committed, DisconnectReason, Event};
 pub use session::{

@@ -1,19 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The client against the real Worker in `server/`, run by `core/net/scripts/integration-test.sh`.
-
-mod support;
+//! The session against the real Worker.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::support::proxy::{Fault, Proxy};
+use crate::support::*;
 use flarebox_net::{Api, ApiError, Auth, CallError, Credentials, Event, NotResent, StopReason};
 use flarebox_proto::v1::{
-    ClaimRequest, Commit, CommitResult, CreateDir, Move, Op, ResyncRequired, error::Code, op,
-    op_result, resync_required::Reason, server_info::DataPath,
+    ClaimRequest, CommitResult, CreateDir, Move, Op, ResyncRequired, error::Code, op, op_result,
+    resync_required::Reason, server_info::DataPath,
 };
-use support::proxy::{Fault, Proxy};
-use support::*;
 
 fn mkdir(parent_id: &str, name: &str) -> (String, Op) {
     let node_id = uuidv7();
@@ -25,17 +23,6 @@ fn mkdir(parent_id: &str, name: &str) -> (String, Op) {
         })),
     };
     (node_id, op)
-}
-
-fn commit(history_id: &str, base_seq: u64, device_seq: u64, ops: Vec<Op>) -> Commit {
-    Commit {
-        commit_id: uuidv7(),
-        base_seq,
-        ops,
-        history_id: history_id.into(),
-        device_seq,
-        ..Default::default()
-    }
 }
 
 fn applied(result: &CommitResult) -> bool {
