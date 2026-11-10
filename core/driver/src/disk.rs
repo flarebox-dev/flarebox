@@ -230,7 +230,9 @@ impl Fetch for (&Session, &Transfer) {
         write: &mut (dyn FnMut(&ChunkRef, &[u8]) -> io::Result<()> + Send),
     ) -> Result<(), ChunkError> {
         self.1
-            .download(self.0, chunks, async |chunk, bytes| write(chunk, &bytes))
+            .download(self.0, chunks, |chunk, bytes| {
+                std::future::ready(write(chunk, &bytes))
+            })
             .await
     }
 }
