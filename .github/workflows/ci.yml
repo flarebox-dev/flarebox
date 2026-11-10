@@ -26,6 +26,7 @@ jobs:
       spec_macos: ${{ steps.paths.outputs.spec_macos }}
       macos_app: ${{ steps.paths.outputs.macos_app }}
       macos_runs_on: ${{ steps.runners.outputs.macos_runs_on }}
+      macos_developer_dir: ${{ steps.runners.outputs.macos_developer_dir }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -38,14 +39,22 @@ jobs:
         run: |
           if [ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ]; then
             echo "Pull request from the fork $HEAD_REPO: its macOS jobs run on GitHub-hosted runners."
-            RUNS_ON='["macos-26"]'
+            RUNS_ON='["xcode-27"]'
           fi
           if ! jq -e 'type == "array" and length > 0 and all(.[]; type == "string")' <<<"$RUNS_ON" >/dev/null 2>&1; then
-            echo "::error::The MACOS_RUNS_ON variable must be a JSON array of runner labels, such as [\"macos-26\"], but it is: $RUNS_ON"
+            echo "::error::The MACOS_RUNS_ON variable must be a JSON array of runner labels, such as [\"xcode-27\"], but it is: $RUNS_ON"
             exit 1
           fi
-          echo "macOS jobs run on $RUNS_ON."
-          echo "macos_runs_on=$(jq -c . <<<"$RUNS_ON")" >> "$GITHUB_OUTPUT"
+          if jq -e 'index("self-hosted")' <<<"$RUNS_ON" >/dev/null; then
+            developer_dir=/Applications/Xcode.app/Contents/Developer
+          else
+            developer_dir=/Applications/Xcode_27.2.app/Contents/Developer
+          fi
+          echo "macOS jobs run on $RUNS_ON with DEVELOPER_DIR=$developer_dir."
+          {
+            echo "macos_runs_on=$(jq -c . <<<"$RUNS_ON")"
+            echo "macos_developer_dir=$developer_dir"
+          } >> "$GITHUB_OUTPUT"
       - name: Decide which macOS jobs the change needs
         id: paths
         env:
@@ -86,6 +95,8 @@ jobs:
       matrix:
         os: ${{ fromJSON(needs.changes.outputs.rust_macos == 'true' && '["ubuntu-latest","macos"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os == 'macos' && fromJSON(needs.changes.outputs.macos_runs_on) || matrix.os }}
+    env:
+      DEVELOPER_DIR: ${{ matrix.os == 'macos' && needs.changes.outputs.macos_developer_dir || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -110,6 +121,8 @@ jobs:
       matrix:
         os: ${{ fromJSON(needs.changes.outputs.server_macos == 'true' && '["ubuntu-latest","macos"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os == 'macos' && fromJSON(needs.changes.outputs.macos_runs_on) || matrix.os }}
+    env:
+      DEVELOPER_DIR: ${{ matrix.os == 'macos' && needs.changes.outputs.macos_developer_dir || '' }}
     defaults:
       run:
         working-directory: server
@@ -235,6 +248,8 @@ jobs:
       matrix:
         os: ${{ fromJSON(needs.changes.outputs.spec_macos == 'true' && '["ubuntu-latest","macos"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os == 'macos' && fromJSON(needs.changes.outputs.macos_runs_on) || matrix.os }}
+    env:
+      DEVELOPER_DIR: ${{ matrix.os == 'macos' && needs.changes.outputs.macos_developer_dir || '' }}
     defaults:
       run:
         working-directory: spec
@@ -271,6 +286,8 @@ jobs:
     if: needs.changes.outputs.macos_app == 'true'
     runs-on: ${{ fromJSON(needs.changes.outputs.macos_runs_on) }}
     timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: ${{ needs.changes.outputs.macos_developer_dir }}
     defaults:
       run:
         working-directory: apps/macos
@@ -278,18 +295,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Select Xcode 26.6 on GitHub-hosted runners and the installed Xcode on self-hosted ones
-        run: |
-          if [ "$RUNNER_ENVIRONMENT" = github-hosted ]; then
-            developer_dir=/Applications/Xcode_26.6.app/Contents/Developer
-          else
-            developer_dir=/Applications/Xcode.app/Contents/Developer
-          fi
-          if [ ! -d "$developer_dir" ]; then
-            echo "::error::$developer_dir is missing on $RUNNER_NAME ($RUNNER_ENVIRONMENT)."
-            exit 1
-          fi
-          echo "DEVELOPER_DIR=$developer_dir" >> "$GITHUB_ENV"
       - name: Keep rustup and Cargo homes private to this self-hosted runner
         if: runner.environment == 'self-hosted'
         run: |
