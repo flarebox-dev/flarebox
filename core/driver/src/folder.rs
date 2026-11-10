@@ -34,7 +34,7 @@ use flarebox_proto::v1::{
     ChunkRef, Commit, CommitRecord, CommitResult, TreePage, UploadReceipt, Welcome,
 };
 use flarebox_store::{Link, Store, Tx};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 
 use crate::claim::{self, Owner};
 use crate::disk::{Batch, Disk, Pending, Sections, Settled, Staged, Stall, Stop, Upload};
@@ -156,12 +156,14 @@ pub(crate) struct View {
 
 impl Folder {
     /// Opens the folder's store, loads the engine and starts the disk through `lock`, the descriptor the task
-    /// locked. [`Disk::start`] recovers an effect that was in flight before anything is observed or planned.
+    /// locked. [`Disk::start`] recovers an effect that was in flight before anything is observed or planned. The
+    /// engine then takes the restores asked for while no task ran.
     pub fn open(link: Link, lock: &File, store: &Path) -> Result<Folder, Stop> {
         let mut store = Store::open(store)?;
         let mut engine = store.transaction(|tx| Engine::load(tx, &link.space_id))?;
         let disk = Disk::start(lock, &link, &mut engine, &mut store)?;
         let remote_nodes = store.transaction(|tx| {
+            engine.accept_restores(tx)?;
             engine.checkpoint(tx)?;
             tx.remote_node_count()
         })?;
@@ -304,6 +306,15 @@ impl Folder {
     pub fn scanned(&mut self) -> Result<Vec<Work>, Stop> {
         self.scanned = true;
         self.publish_remote()?;
+        let mut work = Vec::new();
+        self.drive(&mut work)?;
+        Ok(work)
+    }
+
+    /// `Driver::restore` recorded a request. The engine takes what the inbox holds, and the next commit carries
+    /// its `Restore` op (design §6.3).
+    pub fn requested(&mut self) -> Result<Vec<Work>, Stop> {
+        self.step(|engine, tx| Ok(engine.accept_restores(tx)?))?;
         let mut work = Vec::new();
         self.drive(&mut work)?;
         Ok(work)
@@ -492,18 +503,21 @@ impl Folder {
     }
 
     /// True when nothing is left to move: R holds the server's head, the folder was scanned, no effect and no
-    /// commit is in flight, and every node the trees still differ on is one that cannot be synced as it is.
+    /// commit is in flight, every node the trees still differ on is one that cannot be synced as it is, and so is
+    /// the node of every restore that waits.
     fn settled(&self) -> bool {
         let stuck = |id: &String| {
             self.engine.effects.blocked().contains_key(id)
                 || self.engine.commits.problems().contains(id)
         };
+        let commits = &self.engine.commits;
         self.caught_up()
             && self.scanned
             && self.engine.effects.in_flight().is_none()
             && matches!(self.flight, Flight::Idle)
             && self.engine.commits.in_flight().is_none()
             && self.engine.trees.dirty().iter().all(stuck)
+            && commits.held_restores().count() == commits.restores().len()
     }
 
     /// True once R holds everything the server had at the last `CaughtUp` of this connection (design §4.4).
@@ -791,8 +805,8 @@ impl Folder {
     /// its staging is out, or waits to be staged again. An effect comes first, and none is planned while a commit is
     /// in flight unless committing has stopped, because the engine's property test never runs an effect between
     /// building a commit and acknowledging it. A commit is built only when no effect is planned, R is caught up and
-    /// the session is connected. Building can change the trees without giving a commit, so the effects are planned
-    /// once more after it.
+    /// the session is connected, and only when a node is dirty or a restore is queued. Building can change the
+    /// trees without giving a commit, so the effects are planned once more after it.
     fn drive(&mut self, work: &mut Vec<Work>) -> Result<(), Stop> {
         let staging = self.engine.effects.in_flight().is_some();
         if !self.scanned || staging || !matches!(self.stream, Stream::Following { .. }) {
@@ -806,7 +820,9 @@ impl Folder {
             return Ok(());
         }
         let trees = &self.engine.trees;
-        let nothing_local = trees.dirty().is_empty() && trees.waiting().is_empty();
+        let nothing_local = trees.dirty().is_empty()
+            && trees.waiting().is_empty()
+            && self.engine.commits.restores().is_empty();
         let may_build = matches!(self.flight, Flight::Idle)
             && self.engine.commits.in_flight().is_none()
             && self.caught_up()
@@ -873,6 +889,8 @@ pub(crate) struct FolderTask {
     pub observer: Mutex<Option<JoinHandle<()>>>,
     /// Marked whenever the folder's status changes (`Driver::watch`).
     pub changed: Arc<watch::Sender<()>>,
+    /// Notified when `Driver::restore` has recorded a request in the folder's store.
+    pub requests: Arc<Notify>,
 }
 
 /// Why the task stopped syncing before it was asked to.
@@ -981,6 +999,7 @@ impl FolderTask {
                     receipts = finished(&mut upload) => folder.uploaded(receipts),
                     result = finished(&mut send) => folder.sent(result),
                     () = finished(&mut wait) => folder.resend(),
+                    () = self.requests.notified() => folder.requested(),
                     _ = recheck.tick() => {
                         if !claim::still_locked(&lock, &self.link.root) {
                             break REPLACED.to_owned();

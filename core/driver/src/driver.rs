@@ -14,7 +14,7 @@ use flarebox_net::{ApiError, Auth};
 use flarebox_proto::v1::{ClaimRequest, DeviceCredentials, PairCompleteRequest, SpaceInfo};
 use flarebox_store::{GivenAnswer, Link, Store, StoredQuestion};
 use rustix::fs::FlockOperation;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 use crate::claim::{self, Owner};
 use crate::config::{Config, ConfigError};
@@ -186,6 +186,8 @@ impl Drop for Unlinking<'_> {
 
 struct Running {
     stop: watch::Sender<bool>,
+    /// Tells the task that the folder's store holds a new restore request.
+    requests: Arc<Notify>,
     /// Closed when the task has ended, its observer and its hold on the folder included.
     done: watch::Receiver<()>,
 }
@@ -734,6 +736,12 @@ impl Driver {
             .and_then(|mut store| store.transaction(|tx| tx.request_restore(&id, &intent)))
             .map_err(store_error(&path))?;
         tracing::info!(space_id, restore_id = %id, "recorded a restore request");
+        // A task that is not running takes the request when it next opens the folder.
+        let folders = self.inner.folders.lock().unwrap();
+        if let Some(run) = folders.get(space_id).and_then(|folder| folder.run.as_ref()) {
+            run.requests.notify_one();
+        }
+        drop(folders);
         self.changed();
         Ok(id)
     }
@@ -840,7 +848,9 @@ impl Driver {
             },
             observer: Mutex::default(),
             changed: self.inner.changed.clone(),
+            requests: Arc::default(),
         };
+        let requests = task.requests.clone();
         let (stop, stopped) = watch::channel(false);
         let (finished, done) = watch::channel(());
         folder.status.lock().unwrap().state = FolderState::Connecting;
@@ -848,7 +858,11 @@ impl Driver {
             task.run(stopped).await;
             drop(finished);
         });
-        folder.run = Some(Running { stop, done });
+        folder.run = Some(Running {
+            stop,
+            requests,
+            done,
+        });
     }
 
     fn credential(&self) -> Result<Credential, DriverError> {
@@ -2738,6 +2752,40 @@ mod tests {
         for waiting in &listed[outcomes.len()..] {
             assert_eq!(waiting.state, RestoreState::Pending { waits_for: None });
         }
+    }
+
+    /// A running folder takes a request when it is recorded, without a restart. Nothing listens at the server's
+    /// address, so the folder stays offline, and the request is then queued in the engine and no longer in the
+    /// inbox.
+    #[tokio::test]
+    async fn a_restore_asked_for_while_the_folder_runs_reaches_its_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let paths = Paths::under(&base.join("profile"));
+        linked(&paths, &base.join("Flarebox"), "d1");
+        let driver = Driver::open(paths.clone()).unwrap();
+        driver.start();
+        eventually("the folder's task runs its loop", || {
+            driver.status().folders[0].state == FolderState::Offline
+        })
+        .await;
+
+        let id = driver.restore(SPACE, from_trash(1)).unwrap();
+        let path = paths.store(SPACE).unwrap();
+        eventually("the engine holds the request", || {
+            let (inbox, (queued, _)) = Store::open(&path)
+                .unwrap()
+                .transaction(|tx| {
+                    Ok::<_, flarebox_store::Error>((tx.restore_requests()?, tx.restores()?))
+                })
+                .unwrap();
+            inbox.is_empty() && queued.contains_key(&id)
+        })
+        .await;
+        let listed = driver.restores(SPACE).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].state, RestoreState::Pending { waits_for: None });
+        driver.stop().await;
     }
 
     #[test]
