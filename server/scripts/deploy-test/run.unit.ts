@@ -136,9 +136,9 @@ describe("teardown", () => {
   });
 
   it("deletes the Worker, its Durable Object namespaces, the objects and the bucket whose identity this run recorded", async () => {
-    const worker = mock.addWorker(NAME);
+    mock.addWorker(NAME, undefined, "this-runs-tag");
     const bucket = mock.addBucket(NAME, undefined, ["spaces/a/chunks/aa/aa/1", "spaces/a/meta/h/space.json"]);
-    writeState({ owned: { workerId: worker.id, bucketCreationDate: bucket.creationDate } });
+    writeState({ owned: { workerTag: "this-runs-tag", bucketCreationDate: bucket.creationDate } });
     const { status, output } = await runTs("teardown");
     expect(output).not.toContain("::error::");
     expect(status).toBe(0);
@@ -150,7 +150,7 @@ describe("teardown", () => {
   it("leaves a Worker and a bucket alone that replaced the ones this run created", async () => {
     mock.addWorker(NAME, "someone-elses-worker");
     mock.addBucket(NAME, "2026-02-02T00:00:00.000Z", ["theirs.txt"]);
-    writeState({ owned: { workerId: "this-runs-worker", bucketCreationDate: "2026-01-01T00:00:00.000Z" } });
+    writeState({ owned: { workerTag: "this-runs-tag", bucketCreationDate: "2026-01-01T00:00:00.000Z" } });
     const { status } = await runTs("teardown");
     expect(status).toBe(1);
     expect(mock.deletes()).toEqual([]);
@@ -193,7 +193,7 @@ describe("deploy", () => {
     const deployed = await runTs("deploy", "HEAD");
     expect(deployed.status).toBe(1);
     expect(pnpmCalls()).toEqual(["install --frozen-lockfile"]);
-    expect(readState().owned.workerId).toBeUndefined();
+    expect(readState().owned.workerTag).toBeUndefined();
     const id = mock.workers.get(NAME)?.id;
     expect(id).toBeDefined();
     const tornDown = await runTs("teardown");
@@ -209,7 +209,7 @@ describe("deploy", () => {
     expect(deployed.status).toBe(1);
     expect(deployed.output).toContain("appeared before this run deployed");
     expect(pnpmCalls()).toEqual(["install --frozen-lockfile"]);
-    expect(readState().owned.workerId).toBeUndefined();
+    expect(readState().owned.workerTag).toBeUndefined();
     expect((await runTs("teardown")).status).toBe(1);
     expect(mock.deletes().filter((request) => request.includes("/workers/"))).toEqual([]);
     expect(mock.workers.has(NAME)).toBe(true);
@@ -220,12 +220,25 @@ describe("deploy", () => {
     const deployed = await runTs("deploy", "HEAD");
     expect(pnpmCalls()).toEqual(["install --frozen-lockfile", "run deploy"]);
     expect(deployed.status).toBe(1);
-    expect(readState().owned.workerId).toBe(mock.workers.get(NAME)?.id);
+    expect(mock.workers.get(NAME)?.versions[0]?.tag).toBe(readState().owned.workerTag);
+    expect(readState().owned.workerTag).toMatch(/^[0-9a-f]{16}$/);
     const tornDown = await runTs("teardown");
     expect(tornDown.output).not.toContain("::error::");
     expect(tornDown.status).toBe(0);
     expect(mock.workers.has(NAME)).toBe(false);
     expect(mock.buckets.has(NAME)).toBe(false);
+  });
+});
+
+describe("a later deploy of the same run", () => {
+  it("refuses to deploy over a Worker that carries no version of this run's deploy", async () => {
+    fakePnpm({ install: { createsWorker: false, status: 0 }, deploy: { createsWorker: true, status: 0 } });
+    mock.addWorker(NAME, "someone-elses-worker");
+    writeState({ owned: { workerTag: "this-runs-tag" }, deployments: [{ ref: "HEAD", sha: "0".repeat(40), dir: server, versionId: "v", atMs: Date.now() }] });
+    const deployed = await runTs("deploy", "HEAD");
+    expect(deployed.status).toBe(1);
+    expect(deployed.output).toContain("is no longer the one this run created");
+    expect(pnpmCalls()).toEqual([]);
   });
 });
 

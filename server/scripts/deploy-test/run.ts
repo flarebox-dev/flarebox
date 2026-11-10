@@ -10,6 +10,7 @@
 // Nothing this prints contains a credential, a claim code or a chunk ticket.
 
 import { execFileSync, spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { appendFileSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -28,6 +29,7 @@ import {
   type Namespace,
   namespacesOf,
   requireAccount,
+  workerHasTag,
 } from "./cloudflare.ts";
 import { readState, type State, testName, writeState } from "./state.ts";
 
@@ -168,18 +170,18 @@ async function serving(url: string): Promise<{ serverVersion: string; claimed: b
 
 /**
  * Deploys server/ at ref. The first deploy checks that neither the Worker nor the bucket name is taken, creates the
- * bucket and records its creation date. It records the Worker's immutable ID only when the name is still free right
- * before its own wrangler deploy and the Worker exists once that deploy succeeded, so a Worker that someone else
- * created under the name, during dependency installation for example, is never recorded. A failed install or deploy
- * records no Worker; teardown then leaves any Worker with the name alone and fails, because it deletes only what is
- * recorded.
+ * bucket and records its creation date. Once dependencies are installed it checks again that no Worker has the name, then
+ * records a random tag and passes it to every wrangler deploy of this run. Wrangler sends the tag with the upload that
+ * creates the Worker, so the Worker carries it even if the deploy fails afterwards, while a Worker that someone else
+ * created under the name, during dependency installation for example, does not. Teardown deletes the Worker only when
+ * one of its versions carries the tag.
  */
 async function deploy(account: Account, ref: string): Promise<void> {
   const state = readState();
   const sha = tryGit(["rev-parse", "--verify", "--quiet", ref + "^{commit}"]) ?? fail(JSON.stringify(ref) + " is not a commit in this repository");
   const first = state.deployments.length === 0;
   if (first) {
-    if (state.owned.workerId || state.owned.bucketCreationDate) fail("the state file already records resources but no deployment; start a new run");
+    if (state.owned.workerTag || state.owned.bucketCreationDate) fail("the state file already records resources but no deployment; start a new run");
     const worker = await getWorker(account, state.name);
     if (worker) fail("a Worker named " + state.name + " already exists (id " + worker.id + "); this run did not create it and leaves it alone");
     if (await getBucket(account, state.name)) fail("an R2 bucket named " + state.name + " already exists; this run did not create it and leaves it alone");
@@ -193,9 +195,8 @@ async function deploy(account: Account, ref: string): Promise<void> {
     state.owned.bucketCreationDate = (await getBucket(account, state.name) ?? fail("the bucket " + state.name + " was created but cannot be read back")).creationDate;
     writeState(state);
     console.log("Created the R2 bucket " + state.name + " (created " + state.owned.bucketCreationDate + ")");
-  } else {
-    const worker = await getWorker(account, state.name);
-    if (!worker || worker.id !== state.owned.workerId) fail("the Worker " + state.name + " is no longer the one this run created; refusing to deploy over it");
+  } else if (!state.owned.workerTag || !(await workerHasTag(account, state.name, state.owned.workerTag))) {
+    fail("the Worker " + state.name + " is no longer the one this run created; refusing to deploy over it");
   }
 
   const dir = mkdtempSync(join(tmpdir(), "flarebox-deploy-test-"));
@@ -207,14 +208,10 @@ async function deploy(account: Account, ref: string): Promise<void> {
   if (first) {
     const worker = await getWorker(account, state.name);
     if (worker) fail("a Worker named " + state.name + " appeared before this run deployed (id " + worker.id + "); this run did not create it and leaves it alone");
-  }
-  const deployed = await run("pnpm", ["run", "deploy"], dir, DEPLOY_MS, process.env);
-  if (first) {
-    const worker = (await getWorker(account, state.name)) ?? fail("wrangler deploy succeeded but the Worker " + state.name + " cannot be read back");
-    state.owned.workerId = worker.id;
+    state.owned.workerTag = randomBytes(8).toString("hex");
     writeState(state);
-    console.log("The Worker " + state.name + " this run's deploy created has id " + worker.id);
   }
+  const deployed = await run("pnpm", ["run", "deploy", "--tag", state.owned.workerTag!], dir, DEPLOY_MS, process.env);
   const url = /https:\/\/[a-z0-9.-]+\.workers\.dev/.exec(deployed)?.[0];
   if (!url) fail("wrangler deploy printed no workers.dev address; the account needs a workers.dev subdomain (docs/deploy-test.md)");
   const versionId = /Current Version ID: ([0-9a-f-]{36})/.exec(deployed)?.[1] ?? fail("wrangler deploy printed no version ID");
@@ -453,17 +450,24 @@ async function teardown(account: Account): Promise<void> {
 
   let namespaces: Namespace[] = [];
   const worker = await attempt("reading the Worker", () => getWorker(account, name));
-  if (worker && worker.id === state.owned.workerId) {
+  const tag = state.owned.workerTag;
+  const tagged = worker && tag ? await attempt("reading the Worker's version tags", () => workerHasTag(account, name, tag)) : false;
+  if (worker && tagged) {
     namespaces = (await attempt("listing the Durable Object namespaces", () => namespacesOf(account, name))) ?? [];
     const deleted = await attempt("deleting the Worker", () => deleteWorker(account, name));
-    if (deleted) console.log("Deleted the Worker " + name + " (id " + worker.id + ")");
+    if (deleted) console.log("Deleted the Worker " + name + " (id " + worker.id + "), which carries the tag of this run's deploy");
     const left = await attempt("checking the Durable Object namespaces", () => namespacesOf(account, name));
     if (left?.length) problems.push("Durable Object namespaces of " + name + " remain: " + left.map((namespace) => namespace.class + " " + namespace.id).join(", "));
     else if (left) console.log("No Durable Object namespace of " + name + " remains (" + (namespaces.map((namespace) => namespace.class).join(", ") || "none") + " deleted with the Worker)");
+  } else if (worker && tag) {
+    problems.push(
+      "a Worker named " + name + " (id " + worker.id + ") exists, but none of its versions carries the tag of this run's deploy, so this run cannot prove it created the Worker and left it alone. " +
+        "If this run's deploy created it, delete the Worker " + name + " by hand under Workers & Pages, which also deletes its Durable Objects",
+    );
   } else if (worker) {
     problems.push("a Worker named " + name + " (id " + worker.id + ") exists, but this run did not record creating it, so it was left alone");
-  } else if (state.owned.workerId) {
-    console.log("The Worker " + name + " this run created is already gone");
+  } else if (tag) {
+    console.log("No Worker named " + name + " exists, so this run's deploy left none to delete");
   }
 
   let storage: Storage | undefined;
@@ -476,7 +480,7 @@ async function teardown(account: Account): Promise<void> {
   } else if (state.owned.bucketCreationDate) {
     console.log("The R2 bucket " + name + " this run created is already gone");
   }
-  if (!state.owned.workerId && !state.owned.bucketCreationDate) console.log("This run created nothing, so teardown deleted nothing");
+  if (!state.owned.workerTag && !state.owned.bucketCreationDate) console.log("This run created nothing, so teardown deleted nothing");
 
   const deployments = state.deployments;
   const rows: [string, string][] = [

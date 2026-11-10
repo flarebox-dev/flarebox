@@ -127,6 +127,20 @@ export async function getWorker(account: Account, name: string): Promise<{ id: s
   return { id: worker.id };
 }
 
+/** Whether a version of the Worker has this `workers/tag` annotation; false when no Worker has the name. */
+export async function workerHasTag(account: Account, name: string, tag: string): Promise<boolean> {
+  for (let page = 1; ; page++) {
+    const response = await send(account, "GET", `/accounts/${account.id}/workers/scripts/${name}/versions?per_page=100&page=${page}`, { allowMissing: true });
+    if (!response) return false;
+    const items = ((await response.json()) as Envelope<{ items?: { id: string }[] }>).result?.items ?? [];
+    for (const item of items) {
+      const version = await call<{ annotations?: Record<string, string> }>(account, "GET", `/accounts/${account.id}/workers/scripts/${name}/versions/${item.id}`);
+      if (version.result?.annotations?.["workers/tag"] === tag) return true;
+    }
+    if (items.length < 100) return false;
+  }
+}
+
 /** Every object in a bucket under a prefix, or undefined when the bucket does not exist. */
 export async function listObjects(account: Account, bucket: string, prefix = ""): Promise<R2Object[] | undefined> {
   const objects: R2Object[] = [];

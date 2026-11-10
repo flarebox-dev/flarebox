@@ -47,8 +47,12 @@ export interface Written {
 export interface Owned {
   /** The creation date of the bucket this run created after checking that no bucket had the name. */
   bucketCreationDate?: string;
-  /** The immutable ID of the Worker this run's first deploy created after checking that no Worker had the name. */
-  workerId?: string;
+  /**
+   * The random tag this run passes to `wrangler deploy --tag`, recorded after checking that no Worker had the name and
+   * before the first deploy runs. Wrangler sends it with the upload that creates the Worker, so the Worker carries it
+   * even when the deploy fails afterwards.
+   */
+  workerTag?: string;
 }
 
 export interface State {
