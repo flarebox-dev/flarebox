@@ -616,6 +616,10 @@ async fn script_settings_name_the_bound_bucket() {
         (Some("flarebox-2"), Some(Jurisdiction::Eu))
     );
     assert!(settings.r2_bucket("ASSETS").is_none());
+    assert_eq!(
+        settings.bindings[0].class_name.as_deref(),
+        Some("AccountDO")
+    );
     let names: Vec<&str> = settings
         .bindings
         .iter()

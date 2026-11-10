@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# The Flarebox sync daemon as a systemd user service. Pair and link first (flarebox pair, flarebox link), then:
+# The Flarebox sync daemon as a systemd user service. Set up and link first (flarebox setup, flarebox link), then:
 #
 #   install -Dm644 flarebox.service ~/.config/systemd/user/flarebox.service
 #   systemctl --user daemon-reload

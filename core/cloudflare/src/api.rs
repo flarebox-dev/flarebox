@@ -166,6 +166,8 @@ pub struct Binding {
     pub kind: String,
     pub name: String,
     pub bucket_name: Option<String>,
+    /// The class of a Durable Object namespace binding, such as `AccountDO`.
+    pub class_name: Option<String>,
     /// The jurisdiction of an R2 binding's bucket, `None` when the binding names none.
     pub jurisdiction: Option<Jurisdiction>,
 }

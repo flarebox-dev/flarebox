@@ -32,7 +32,7 @@ const SERVER_WAIT: Duration = Duration::from_secs(10);
 pub enum DriverError {
     #[error("another Flarebox process is using this profile ({0})")]
     Busy(PathBuf),
-    #[error("this device is not paired; run flarebox pair first")]
+    #[error("this device is not set up; run flarebox setup first")]
     NotPaired,
     #[error(
         "this profile is already paired as device {device_id}; a profile holds one device credential"
@@ -453,26 +453,46 @@ impl Driver {
         device_name: &str,
         done: &str,
     ) -> Result<Account, DriverError> {
-        let credential = Credential {
-            server,
-            user_id: issued.user_id,
-            user_name,
-            device_id: issued.device_id,
-            device_name: device_name.to_owned(),
-            refresh_credential: issued.refresh_credential,
-        };
+        let account = self.store_credential(
+            Credential {
+                server,
+                user_id: issued.user_id,
+                user_name,
+                device_id: issued.device_id,
+                device_name: device_name.to_owned(),
+                refresh_credential: issued.refresh_credential,
+            },
+            |credential| file.write(credential),
+        )?;
+        tracing::info!(
+            device_id = account.device_id,
+            server = account.server,
+            "{done}"
+        );
+        Ok(account)
+    }
+
+    /// Stores a credential this profile was issued elsewhere, such as by `flarebox setup`'s claim, the same way
+    /// [`Driver::pair`] and [`Driver::claim`] store theirs, unless another one was stored meanwhile. The file is written
+    /// before this returns, so a caller can clean up after it.
+    pub fn save_credential(&self, credential: Credential) -> Result<Account, DriverError> {
+        let path = self.inner.paths.credential();
+        self.store_credential(credential, |credential| credential.save_new(&path))
+    }
+
+    /// Stores `credential` with `write` unless the slot holds one.
+    fn store_credential(
+        &self,
+        credential: Credential,
+        write: impl FnOnce(&Credential) -> Result<(), CredentialError>,
+    ) -> Result<Account, DriverError> {
         let mut slot = self.inner.credential.lock().unwrap();
         if let Some(existing) = slot.as_ref() {
             return Err(DriverError::AlreadyPaired {
                 device_id: existing.device_id.clone(),
             });
         }
-        file.write(&credential)?;
-        tracing::info!(
-            device_id = credential.device_id,
-            server = credential.server,
-            "{done}"
-        );
+        write(&credential)?;
         let account = credential.account();
         *slot = Some(credential);
         drop(slot);
