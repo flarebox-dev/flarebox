@@ -47,7 +47,7 @@ flowchart TD
 
 The pairing code carries the server address, so a new device needs nothing else. Today `POST /v1/pair/start` returns an 8-character code such as `K7QM-2XPD` that is valid for 600 seconds (measured on the deployed server). The CLI shows it as `<code>@<host>`, for example `K7QM-2XPD@flarebox.alice.workers.dev` (decision 3). A QR code in the macOS app comes later. The CLI splits on the last `@` and prepends `https://`. The code alone still works with `--server`. The existing `flarebox pair --server --code --name` becomes `flarebox join`, and `pair` is removed in the same change.
 
-The explicit subcommands never ask questions, so scripts can use them. Each one that needs Cloudflare runs the login itself (section 5).
+The explicit subcommands never ask questions, so scripts can use them. Where `flarebox setup` would ask, they stop instead and print the command or flag that goes on: `server add-device` on a server that needs an upgrade first (section 4.5) prints `flarebox server upgrade`, and `server uninstall` runs only with `--yes` when no terminal is attached (section 5). Each one that needs Cloudflare runs the login itself (section 5).
 
 ## 2. Cloudflare login
 
@@ -127,7 +127,7 @@ All calls go to `https://api.cloudflare.com/client/v4/accounts/<id>` with `Autho
 
 1. `POST /r2/buckets` with `{"name": <bucket>}`.
 2. `POST /workers/scripts/<name>/assets-upload-session` with a manifest of path, hash and size. The upload JWT comes back with buckets of hashes to upload. Wrangler hashes with BLAKE3; the prototype used the first 32 hex digits of SHA-256 and the API accepted them. A second deploy of the same assets returned zero files to upload.
-3. `POST /workers/assets/upload?base64=true` per bucket with the upload JWT, base64 file contents as multipart parts. The last call returns 201 and a completion JWT ([Direct uploads](#ref-direct-upload)).
+3. `POST /workers/assets/upload?base64=true` per bucket with the upload JWT, base64 file contents as multipart parts. The last call returns 201 and a completion JWT ([Direct uploads](#ref-direct-upload)). When the session lists no buckets because every file is already uploaded, the session response itself carries the completion JWT, and the CLI makes no upload call. A second deploy of the same assets measured that case: zero files to upload, and the script upload with that JWT succeeded.
 4. `PUT /workers/scripts/<name>` with a multipart body that holds the module and this metadata (the secret's value elided):
 
 ```json
@@ -164,7 +164,7 @@ The CLI generates 32 random bytes and sends them base64url-encoded (43 character
 
 1. `POST <url>/v1/claim` with `{"code": <secret>, "userName": ..., "deviceName": ..., "platform": ...}`, the JSON form of `ClaimRequest`. The first attempt returned 200 with the owner's `userId` and the device's `deviceId` (measured).
 2. Store the device credentials and wait until the store reports them written: the Keychain call returns, or the file is renamed into place and synced. The prototype saved the credentials before it deleted the secret, in this order.
-3. `DELETE /workers/scripts/<name>/secrets/FLAREBOX_RECOVERY_KEY`, then `GET .../secrets` to confirm the list is empty. A 404 counts as deleted. A replay of the same secret afterwards returned 403 "this deployment already has an owner".
+3. `DELETE /workers/scripts/<name>/secrets/FLAREBOX_RECOVERY_KEY`, then `GET .../secrets` to confirm that `FLAREBOX_RECOVERY_KEY` is no longer in the list. Other secrets the owner set stay. A 404 counts as deleted. A replay of the same secret afterwards returned 403 "this deployment already has an owner".
 
 The CLI retries the claim only while the server cannot see the key yet. Two refusals mean that: "no valid claim code; open /setup to issue one" on an unclaimed server whose Account DO still runs code without the key claim, and "this deployment already has an owner" while a new secret propagates. The refusal "this recovery key was already used; set a new one" means the key is spent, and section 4.6 handles it. The CLI never retries a spent key.
 
@@ -174,7 +174,7 @@ The change also needs the Durable Object to run the new code. On the Worker that
 
 ### 4.5 Existing server: add this device
 
-When `flarebox setup` finds a claimed server, it sets a one-time secret with `PUT /workers/scripts/<name>/secrets` (`{"name": "FLAREBOX_RECOVERY_KEY", "text": ..., "type": "secret_text"}`), claims, and deletes the secret. On a claimed server this is today's recovery path, so main can already add the device. The CLI claims only on a server that handles setup attempts (section 4.6), and the readiness check below makes sure of that. In the measured run, after a second login, the first claim 0.2 seconds after setting the secret was refused, and the next one 3.4 seconds after returned a device with the same `userId` as the first device. That device listed the space the first device had created. The CLI retries the claim for up to 60 seconds, then saves the credentials and deletes the secret in the order of section 4.4.
+When `flarebox setup` finds a claimed server, it first lists the script's secrets. If `FLAREBOX_RECOVERY_KEY` is already set and the state file does not record that this CLI set it, the owner set it for recovery ([deploy-and-upgrade.md §2](deploy-and-upgrade.md)), and the CLI stops rather than replace it. It says so and asks the owner to use that key or delete it first. Otherwise it sets a one-time secret with `PUT /workers/scripts/<name>/secrets` (`{"name": "FLAREBOX_RECOVERY_KEY", "text": ..., "type": "secret_text"}`), claims, and deletes the secret. On a claimed server this is today's recovery path, so main can already add the device. The CLI claims only on a server that handles setup attempts (section 4.6), and the readiness check below makes sure of that. In the measured run, after a second login, the first claim 0.2 seconds after setting the secret was refused, and the next one 3.4 seconds after returned a device with the same `userId` as the first device. That device listed the space the first device had created. The CLI retries the claim for up to 60 seconds, then saves the credentials and deletes the secret in the order of section 4.4.
 
 `GET /v1/server` returns `claimed`, so the CLI tells an unclaimed server from a claimed one before it sets the secret. An unclaimed server found in the account, such as a button deploy nobody claimed, takes the fresh-claim path of section 4.4. If its `server_version` predates the key-claim change, the CLI first upgrades it to the embedded bundle (section 5), after asking. The Account DO then keeps the old claim logic for up to 300 seconds, so this case retries for up to 330 seconds instead of 60.
 
@@ -184,7 +184,7 @@ Recovery adds a device; it does not revoke the others ([deploy-and-upgrade.md §
 
 ### 4.6 Interrupted runs
 
-A deploy, an add-device run or an uninstall can stop at any step: a crash, Ctrl-C, a lost network. The CLI keeps a state file, `setup-state.json` in its config directory, and writes it with an atomic rename before each step that creates or deletes something. The file holds the account id, the script name, the bucket name, the last finished step, whether a one-time secret may still be set, and a setup attempt id. It holds no secret. A rerun on the same machine reads it and continues. On another machine, section 6 finds the same resources from the account.
+A deploy, an add-device run or an uninstall can stop at any step: a crash, Ctrl-C, a lost network. The CLI keeps a state file, `setup-state.json` in its state directory, which belongs to this machine and is never shared, and writes it with an atomic rename before each step that creates or deletes something. The file holds the account id, the script name, the bucket name, the last finished step, whether a one-time secret may still be set, and a setup attempt id. It holds no secret. A rerun on the same machine reads it and continues. On another machine, section 6 finds the same resources from the account.
 
 The setup attempt id is 16 random bytes the CLI creates before its first claim and keeps until a claim's credentials are saved. Every claim of that attempt sends it as `ClaimRequest.setup_attempt`, a new optional field. The CLI claims only after the readiness check of section 4.5 has passed, and stops when it cannot pass. In the claim's transaction, the server stores it on the new device and selects every earlier device with the same attempt id that has never refreshed a token (`last_seen_ms` is 0). Once the claim commits, it revokes them with `AccountDO.revokeDevice`. If the Account DO stops between the commit and the revocation, those devices stay unrevoked, but they remain unusable. Those devices came from claims whose credentials never reached storage, so nobody can use them. A device that has refreshed a token is never touched, so the rule cannot remove a device that works. However many claim responses get lost, the attempt ends with one device. The id is not a secret: only a caller who also presents a valid one-time key can make the server revoke anything with it.
 
@@ -205,8 +205,10 @@ The CLI never takes over a resource it cannot tie to Flarebox. A script counts a
 `flarebox server upgrade`:
 
 1. Log in, find the server (section 6), and read `GET .../scripts/<name>/settings` for the bucket name and the current bindings.
-2. Upload the assets and the bundle under the same script name with the same bucket, `keep_bindings: ["secret_text", "secret_key"]`, and the migration diff from section 4.3.
-3. Poll `/v1/server` until it reports the new version.
+2. Read `GET <url>/v1/server`. If the server reports a newer `server_version` than the embedded bundle, stop: the newer server may have run storage migrations that the older code cannot read, even under the same Durable Object migration tag. The CLI tells the user to install a newer CLI.
+3. If the script has no `flarebox-server` tag, it came from the deploy button, which also created a repository whose pushes Workers Builds deploys ([deploy-and-upgrade.md](deploy-and-upgrade.md)). A later push to that repository would replace the CLI's upload with that repository's code. The CLI's scopes do not cover Workers Builds, so it cannot see or change that connection; *unverified* whether any granted scope could. It warns the user to update that repository too or disconnect its builds, and asks before it goes on (`--yes` in scripts).
+4. Upload the assets and the bundle under the same script name with the same bucket, `keep_bindings: ["secret_text", "secret_key"]`, and the migration diff from section 4.3.
+5. Poll `/v1/server` until it reports the new version.
 
 The measured upgrade from 0.0.1 to 0.0.2 kept the space created before it, and the device token still refreshed. A Worker first deployed from the release in #34 (no assets, no observability, the oldest Account DO schema) was upgraded to main, then to the patched build. Each upload added what the release adds (assets, observability) and kept the DO tag at v1. The claim on that storage succeeded with the patched build. That claim writes to `used_recovery_keys`, a table only the newer storage steps create, so the Account DO migrated the storage written by the #34 release. `keep_bindings` kept a secret's value across an upload that did not send it, since a claim with that secret succeeded after the upload.
 
@@ -216,7 +218,7 @@ Because of the deferred code update, an upgrade is complete for each Durable Obj
 
 The Worker is the only place that names the bucket, so the CLI records the bucket before it deletes the Worker:
 
-1. Find the server (section 6), read the bucket name from its settings, count the objects, and ask for confirmation, naming the bucket and the number of objects, because the uninstall deletes the owner's files.
+1. Find the server (section 6), read the bucket name from its settings, count the objects, and ask for confirmation, naming the bucket and the number of objects, because the uninstall deletes the owner's files. Without a terminal it needs `--yes` and stops otherwise. The CLI also reads the settings of every other script in the account. If another Worker binds the same bucket, the uninstall deletes only the Flarebox Worker, keeps the bucket and its objects, and names the other Worker.
 2. Write the state file with the script and the bucket.
 3. Delete the Worker with `?force=true`. This stops all writes to the bucket.
 4. List the bucket with `per_page=1000` and delete each key, following `cursor` until a list comes back empty ([List objects](#ref-r2-list)). The measured run deleted one object, so the multi-page case is *unverified*.
@@ -226,7 +228,7 @@ Every delete treats 404 as done, so a rerun repeats a finished step without erro
 
 ## 6. Finding a Flarebox server in an account
 
-An account may hold other Workers. The upload sets `tags: ["flarebox-server"]`, and `GET /workers/scripts` returns each script's `tags` (measured: `{"id": "flarebox-proto", "tags": ["flarebox-server"], "migration_tag": "v1", "has_assets": true}`). The CLI keeps the scripts with that tag, then calls `GET <workers.dev URL>/v1/server` on each and keeps those that answer with a valid `ServerInfo`. A tag alone is not proof, since anyone with the account can tag a script. A tagged script that binds a bucket but has no workers.dev route is a deploy that stopped halfway, and the CLI offers to finish it (section 4.6). A Worker deployed with the button has no tag; the CLI also probes a script named `flarebox` and adds the tag on its next upgrade. With several matches the CLI lists their names and URLs and asks. `--server <name>` picks one in scripts.
+An account may hold other Workers. The upload sets `tags: ["flarebox-server"]`, and `GET /workers/scripts` returns each script's `tags` (measured: `{"id": "flarebox-proto", "tags": ["flarebox-server"], "migration_tag": "v1", "has_assets": true}`). The CLI keeps the scripts with that tag, then calls `GET <workers.dev URL>/v1/server` on each and keeps those that answer with a valid `ServerInfo`. A tag alone is not proof, since anyone with the account can tag a script. A tagged script that binds a bucket but has no workers.dev route is a deploy that stopped halfway, and the CLI offers to finish it (section 4.6). A Worker deployed with the button has no tag, and the owner may have renamed it. So the CLI also reads the settings of each untagged script and keeps those that bind Durable Object namespaces of the classes `AccountDO` and `SpaceDO`, then checks them with `/v1/server` the same way. It adds the tag on the next upgrade. With several matches the CLI lists their names and URLs and asks. `--server <name>` picks one in scripts.
 
 ## 7. Credentials on the device
 
