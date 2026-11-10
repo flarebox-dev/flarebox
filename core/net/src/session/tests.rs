@@ -1252,6 +1252,28 @@ async fn malformed_chunked_refusals_are_left_to_their_status() {
     }
 }
 
+#[tokio::test]
+async fn an_oversized_token_answer_is_a_transport_failure_and_is_asked_again() {
+    let (listener, auth) = listen_on("127.0.0.1:0", Duration::ZERO, Some(Duration::ZERO)).await;
+    let (_session, mut events) = Session::start(auth, config()).unwrap();
+    let (mut token_request, _) = listener.accept().await.unwrap();
+    let mut request = [0; 4096];
+    assert!(token_request.read(&mut request).await.unwrap() > 0);
+    tokio::spawn(async move {
+        let head = b"HTTP/1.1 200 OK\r\ncontent-type: application/x-protobuf\r\ncontent-length: 1000000\r\n\r\n";
+        let _ = token_request
+            .write_all(&[head.as_slice(), &[0x0a; 1_000_000]].concat())
+            .await;
+    });
+    let event = next(&mut events).await;
+    assert!(
+        matches!(&event, Event::Disconnected { reason: DisconnectReason::Transport(why), .. } if why.contains("more than 65536 bytes")),
+        "{event:?}"
+    );
+    let again = tokio::time::timeout(Duration::from_secs(2), listener.accept()).await;
+    assert!(again.is_ok(), "the token is asked for again");
+}
+
 /// `refusal_body` fed arbitrary and truncated answers.
 mod refusal_reader {
     use proptest::prelude::*;

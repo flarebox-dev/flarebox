@@ -80,6 +80,10 @@ pub enum ApiError {
     Status { status: u16 },
     #[error("could not reach the server")]
     Transport(#[source] reqwest::Error),
+    /// The answer was larger than the endpoint allows, so reading it stopped there. Like `Transport`, the call may be
+    /// tried again.
+    #[error("the server sent an answer of more than {limit} bytes")]
+    TooLarge { limit: usize },
     #[error("the server sent a body that is not a valid {0}")]
     Decode(&'static str),
     #[error("the server URL cannot be used: {0}")]
