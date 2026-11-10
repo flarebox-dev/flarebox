@@ -9,7 +9,15 @@ mod bundle;
 mod oauth;
 mod secret;
 
-pub use api::{Account, ApiError, Cloudflare, CloudflareMessage, ObjectPage, Script, ScriptSettings};
-pub use bundle::{Asset, Bundle, Manifest, UploadPlan};
-pub use oauth::{AuthorizationCode, CLIENT_ID, Endpoints, Grant, Login, Loopback, OauthError, SCOPES};
+pub use api::{
+    Account, ApiError, Binding, Cloudflare, CloudflareMessage, ObjectPage, Script, ScriptSettings,
+};
+pub use bundle::{
+    Asset, Bundle, BundleError, Manifest, NewerDeployment, RECOVERY_KEY_SECRET, SERVER_TAG,
+    UploadPlan,
+};
+pub use oauth::{
+    AuthorizationCode, CLIENT_ID, Endpoints, Grant, Login, Loopback, OauthError, SCOPES,
+    http_client,
+};
 pub use secret::Secret;
