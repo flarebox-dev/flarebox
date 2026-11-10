@@ -518,3 +518,43 @@ fn folder_readable_again_is_watched_again() {
     fs::write(locked.join("inner/new.txt"), "new").unwrap();
     expect(&mut watcher, &[created("d/locked/inner/new.txt", File)]);
 }
+
+#[test]
+fn private_folder_is_never_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let private = root.join(flarebox_fs::PRIVATE_DIR);
+    fs::create_dir_all(private.join("staging")).unwrap();
+    fs::write(private.join("space.json"), "{}").unwrap();
+    fs::write(root.join("a.txt"), "a").unwrap();
+    let mut snapshot = Snapshot::scan(root).unwrap();
+    assert_eq!(
+        snapshot.entries.keys().collect::<Vec<_>>(),
+        [Path::new("a.txt")]
+    );
+
+    fs::write(private.join("staging/x"), "x").unwrap();
+    fs::remove_file(private.join("space.json")).unwrap();
+    for scope in [
+        "",
+        ".flarebox",
+        ".flarebox/staging/x",
+        ".flarebox/space.json",
+    ] {
+        assert_eq!(
+            snapshot.rescan(root, [PathBuf::from(scope)]).unwrap(),
+            Rescan::default(),
+            "{scope:?}"
+        );
+    }
+
+    let mut watcher = NativeWatcher::start(root, snapshot.clone()).unwrap();
+    assert_eq!(
+        watcher.poll(Duration::from_millis(300)).unwrap(),
+        Poll::default()
+    );
+    fs::write(private.join("staging/y"), "y").unwrap();
+    fs::write(root.join("b.txt"), "b").unwrap();
+    expect(&mut watcher, &[created("b.txt", File)]);
+    assert_eq!(watcher.snapshot(), &Snapshot::scan(root).unwrap());
+}
