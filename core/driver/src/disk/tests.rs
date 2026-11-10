@@ -39,6 +39,177 @@ const SYNCED: &[u8] = b"the synced report";
 const REMOTE: &[u8] = b"the report as the other device wrote it";
 const REMOTE_MTIME: i64 = 1_700_000_000_123_456_789;
 
+/// The user deletes a file whose removal was planned, after R brought the file back, and a crash
+/// comes before the removal. Recovery finds the file gone and reports the removal as done, but the
+/// observed delete stays the user's.
+#[test]
+fn a_delete_the_user_made_before_a_recovered_removal_stays_local() {
+    let folder = Folder::new();
+    fs::write(folder.root.join("report.txt"), SYNCED).unwrap();
+    let saved = disk_content(&folder.root.join("report.txt"));
+    folder.seed(&[], &[(NODE, SPACE, "report.txt")], 0);
+    let mut running = folder.start(no_hook()).unwrap();
+    let pending = running
+        .disk
+        .next(&mut running.engine, &mut running.store)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        pending.record.effect,
+        EngineEffect::RemoveFile { .. }
+    ));
+    let restored = remote(NODE, "report.txt", Some(saved));
+    let (_, restored_tree) = flarebox_engine::tree::RemoteNode::from_state(&restored).unwrap();
+    running.engine.trees.set_remote(NODE.into(), restored_tree);
+    let Running { engine, store, .. } = &mut running;
+    store
+        .transaction(|tx| {
+            tx.put_remote_node(&restored)?;
+            engine.checkpoint(tx)
+        })
+        .unwrap();
+    fs::remove_file(folder.root.join("report.txt")).unwrap();
+    batch(&mut running, |trees| trees.remove_local(NODE));
+    assert_eq!(
+        running.engine.trees.class(NODE),
+        flarebox_engine::classify::Class::Local
+    );
+    drop((pending, running));
+    let running = folder.start(no_hook()).unwrap();
+    assert_eq!(
+        running.engine.trees.class(NODE),
+        flarebox_engine::classify::Class::Local
+    );
+}
+
+/// The user writes the planned bytes before the download that would write them, after R moved on
+/// to a newer version, and a crash comes before the download. Recovery finds the bytes and reports
+/// the download as done, but the observed edit stays the user's.
+#[test]
+fn an_edit_the_user_made_before_a_recovered_download_stays_an_edit() {
+    let folder = Folder::new();
+    let mut server = Server::default();
+    (SCENARIOS[2].setup)(&folder, &mut server);
+    let mut running = folder.start(no_hook()).unwrap();
+    let pending = running
+        .disk
+        .next(&mut running.engine, &mut running.store)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        pending.record.effect,
+        EngineEffect::WriteFile { .. }
+    ));
+    let advanced = remote(
+        NODE,
+        "report.txt",
+        Some(server.hold(b"a newer remote version", ChunkerConfig::V0)),
+    );
+    let (_, advanced_tree) = flarebox_engine::tree::RemoteNode::from_state(&advanced).unwrap();
+    running.engine.trees.set_remote(NODE.into(), advanced_tree);
+    let Running { engine, store, .. } = &mut running;
+    store
+        .transaction(|tx| {
+            tx.put_remote_node(&advanced)?;
+            engine.checkpoint(tx)
+        })
+        .unwrap();
+    fs::write(folder.root.join("report.txt"), REMOTE).unwrap();
+    let mut edited = running.local(NODE).unwrap().clone();
+    edited.shape.content = Some(disk_content(&folder.root.join("report.txt")));
+    batch(&mut running, |trees| trees.set_local(NODE.into(), edited));
+    assert_eq!(
+        running.engine.trees.class(NODE),
+        flarebox_engine::classify::Class::Concurrent
+    );
+    drop((pending, running));
+    let running = folder.start(no_hook()).unwrap();
+    assert!(
+        running.engine.trees.edited(NODE),
+        "recovery hid the observed user edit: {:?}",
+        running.engine.trees.class(NODE)
+    );
+}
+
+/// The user saves the synced bytes again through a temporary file, so the observer sees a new entry
+/// with a new modification time but the same content, and R then removes the file. R brings it back
+/// while the removal runs. The removal is the effect's own, so no commit deletes the file.
+#[test]
+fn a_same_byte_save_before_a_removal_does_not_delete_the_restored_file() {
+    let folder = Folder::new();
+    let server = Server::default();
+    let path = folder.root.join("report.txt");
+    fs::write(&path, SYNCED).unwrap();
+    let saved = disk_content(&path);
+    let before = fs::metadata(&path).unwrap();
+    folder.seed(&[], &[(NODE, SPACE, "report.txt")], 0);
+    let mut running = folder.start(no_hook()).unwrap();
+    let mut watching = observer(&folder.root, Snapshot::scan(&folder.root).unwrap());
+    let temporary = folder.root.join("atomic-save");
+    fs::write(&temporary, SYNCED).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&temporary)
+        .unwrap()
+        .set_times(
+            fs::FileTimes::new().set_modified(before.modified().unwrap() + Duration::from_secs(1)),
+        )
+        .unwrap();
+    fs::rename(&temporary, &path).unwrap();
+    assert_ne!(fs::metadata(&path).unwrap().ino(), before.ino());
+    let fresh = observe_until(&mut watching, running.disk.sections().stamp(), |seen| {
+        !seen.is_empty()
+    });
+    running
+        .disk
+        .observed(fresh, &mut running.engine, &mut running.store)
+        .unwrap();
+    assert!(flarebox_engine::tree::same(
+        running.engine.trees.local().live(NODE),
+        running.engine.trees.synced().live(NODE)
+    ));
+    assert_ne!(
+        running.engine.trees.local().live(NODE),
+        running.engine.trees.synced().live(NODE)
+    );
+    let pending = running
+        .disk
+        .next(&mut running.engine, &mut running.store)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        pending.record.effect,
+        EngineEffect::RemoveFile { .. }
+    ));
+    let restored = remote(NODE, "report.txt", Some(saved));
+    let (_, restored_tree) = flarebox_engine::tree::RemoteNode::from_state(&restored).unwrap();
+    running.engine.trees.set_remote(NODE.into(), restored_tree);
+    let Running { engine, store, .. } = &mut running;
+    store
+        .transaction(|tx| {
+            tx.put_remote_node(&restored)?;
+            engine.checkpoint(tx)
+        })
+        .unwrap();
+    let staged = ready(pending.stage(&server)).unwrap();
+    assert_eq!(
+        running
+            .disk
+            .apply(staged, &mut running.engine, &mut running.store)
+            .unwrap(),
+        Settled::Done
+    );
+    let engine = &mut running.engine;
+    let commit = engine
+        .commits
+        .build(&mut engine.trees, &mut engine.ids, 1, "history", 2)
+        .cloned();
+    assert!(
+        commit.is_none(),
+        "the effect's own removal was committed: {commit:?}"
+    );
+}
+
 /// A linked folder with its store.
 struct Folder {
     dir: tempfile::TempDir,
