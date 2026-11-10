@@ -703,7 +703,8 @@ pub mod error {
         /// The share link, or the node or link the request names, does not exist or is not reachable (RFC 0005).
         NotFound = 15,
         /// A commit that would trash more than the server's delete policy allows, until the owner confirms (RFC 0006
-        /// section 10). Reserved: no 0.1.0 server sends it.
+        /// section 10); no 0.1.0 server sends it for a commit. Also the refusal of a user's last active device that
+        /// revokes itself without confirming it (RFC 0009 section 5).
         ConfirmationRequired = 16,
     }
     impl Code {

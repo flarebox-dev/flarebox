@@ -145,6 +145,7 @@ private struct AccountSettings: View {
     @State private var devices: DeviceList?
     @State private var pairing: PairingCode?
     @State private var confirmingSignOut = false
+    @State private var confirmingLastDevice = false
     @State private var error: SessionError?
 
     var body: some View {
@@ -213,10 +214,23 @@ private struct AccountSettings: View {
         }
         .confirmationDialog("Sign out of Flarebox?", isPresented: $confirmingSignOut) {
             Button("Sign Out", role: .destructive) {
-                perform { try await model.signOut() }
+                perform {
+                    do {
+                        try await model.signOut()
+                    } catch SessionError.LastDevice {
+                        confirmingLastDevice = true
+                    }
+                }
             }
         } message: {
-            Text("This Mac stops syncing and unlinks every folder. The files stay in the folders and on the server.")
+            Text("This Mac stops syncing, unlinks every folder and is removed from the server's devices. The files stay in the folders and on the server.")
+        }
+        .confirmationDialog("Sign out of your last device?", isPresented: $confirmingLastDevice) {
+            Button("Sign Out", role: .destructive) {
+                perform { try await model.signOut(confirmLastDevice: true) }
+            }
+        } message: {
+            Text("No other device is signed in to this server. After this Mac signs out, you can only add a device again with the server's recovery key.")
         }
     }
 

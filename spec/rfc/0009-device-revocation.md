@@ -2,7 +2,7 @@
 
 Status: proposed. Applies to spec v0 (format_version 1). Amends RFC 0006 §7.
 
-An owner who loses a computer, or has one stolen, removes it from the deployment so that it stops syncing. Adding a device through owner recovery (docs/design/deploy-and-upgrade.md §2) does not remove any device, and `flarebox setup` makes recovery the normal way to add one, so revocation ships in the same release. This RFC defines who may revoke a device, what a revocation stops and how fast, what the revoked device does, and why a device cannot revoke itself. It uses the routes of RFC 0006 §7 and changes no schema. A bare section number such as §2 refers to this RFC; sections of spec v0 are written as spec v0 §N.
+An owner who loses a computer, or has one stolen, removes it from the deployment so that it stops syncing. Adding a device through owner recovery (docs/design/deploy-and-upgrade.md §2) does not remove any device, and `flarebox setup` makes recovery the normal way to add one, so revocation ships in the same release. This RFC defines who may revoke a device, what a revocation stops and how fast, what the revoked device does, and when a device may revoke itself. It uses the routes of RFC 0006 §7 and changes no schema. A bare section number such as §2 refers to this RFC; sections of spec v0 are written as spec v0 §N.
 
 ## 1. Who may revoke
 
@@ -10,9 +10,9 @@ An owner who loses a computer, or has one stolen, removes it from the deployment
 
 1. The caller authenticates with an access token of an active principal (RFC 0006 §2) that has `can(principal, "device.manage")` (RFC 0006 §3).
 2. The target belongs to the caller's user. In 0.1.0 a deployment has one user, its owner, so every device belongs to the owner. A `device_id` that is unknown or belongs to another user is `NOT_FOUND`.
-3. The target is not the caller's own principal. A request to revoke the caller's own principal is refused with `FORBIDDEN` and changes nothing (§5).
+3. If the target is the caller's own principal and no other principal of kind device of its user is active, the request carries `?confirm=last-device`. Without it, the request is refused with `CONFIRMATION_REQUIRED` (409) and changes nothing (§5).
 
-The Account DO checks rule 1 again in the same step that stores the revocation, because another revocation may have revoked the caller after the Worker checked its token. Of two devices that revoke each other at the same time, one succeeds and the other gets `UNAUTHENTICATED` (401).
+The Account DO checks rule 1 again in the same step that stores the revocation, because another revocation may have revoked the caller after the Worker checked its token. Of two devices that revoke each other at the same time, one succeeds and the other gets `UNAUTHENTICATED` (401). Rule 3 is checked in that step too, so of the last two devices of a user that revoke themselves at the same time without confirming, one succeeds and the other gets `CONFIRMATION_REQUIRED`.
 
 Revoking a principal that is already revoked succeeds with 204 and changes nothing.
 
@@ -53,26 +53,27 @@ The device syncs again only after it is paired again (§2).
 
 ## 4. Device list
 
-`GET /v1/devices` (RFC 0006 §7) is the list an owner revokes from. It returns every principal of the caller's user, revoked ones included, with `current` set on the caller's own principal so that a client can show which device is this one and offer no revoke action for it. Listing needs the same `device.manage` capability as revoking.
+`GET /v1/devices` (RFC 0006 §7) is the list an owner revokes from. It returns every principal of the caller's user, revoked ones included, with `current` set on the caller's own principal so that a client can show which device is this one and offer to sign it out instead of a revoke action. Listing needs the same `device.manage` capability as revoking.
 
-## 5. A device cannot revoke itself
+## 5. A device revokes itself when it signs out
 
-RFC 0006 §7 allowed a principal to revoke itself. This RFC removes that permission, for two reasons:
+A device revokes its own principal when the person signs it out, so that a copy of its refresh credential, in a backup or on a discarded disk, stops working too. A credential issued in 0.1.0 never expires, so without this the copy would keep full access until another device revoked it.
 
-- **The last device.** A caller is active when its revocation is stored (§1). If it cannot be its own target, every revocation leaves at least one active principal, the caller. The device list API therefore cannot revoke the last active device, and an owner never loses every device through a revocation. The only way back would be owner recovery, which needs access to the Cloudflare account.
-- **Lost devices.** Revocation exists for devices the owner no longer holds, and those cannot send a request. A device the owner still holds can be revoked from another device.
+**The last device.** If no other principal of kind device of the user is active, a revocation leaves the owner without a device, and the only way back is owner recovery, which needs access to the Cloudflare account. The server therefore revokes the last active device only on a request that carries `?confirm=last-device`, and refuses one without it with `CONFIRMATION_REQUIRED`. A client sends the confirmation only after it has told the person that this is their last device and what getting back in takes. Principals of other kinds do not count, because they cannot pair a device.
 
-A client that wants to sign this computer out without another device at hand deletes its local credential. That stops the computer from syncing but leaves its principal active on the server until the owner revokes it from another device.
+**Order and failure.** A client signs out on the device first: it stops syncing, unlinks its folders and deletes its credential. The revocation is its last step and best effort. A device that cannot reach the server still signs out, and its principal stays active until another device revokes it, which the device list shows. Before it changes anything, a client asks the device list whether this is the last active device. If the list cannot be read, the client signs out without the confirmation, so the server refuses to revoke a last device that the person was not told about.
 
 ## 6. Changes to RFC 0006 §7
 
-In RFC 0006 §7, "**Revoke.**" paragraph, the sentence "A principal may revoke itself." is replaced by "A principal may not revoke itself: the request is refused with `FORBIDDEN` and changes nothing (RFC 0009 §5)."
+In RFC 0006 §7, "**Revoke.**" paragraph, the sentence "A principal may revoke itself." is replaced by "A principal may revoke itself when it signs out. If it is its user's last active device, the request must carry `?confirm=last-device`, or it is refused with `CONFIRMATION_REQUIRED` and changes nothing (RFC 0009 §5)."
 
 ## 7. Clients in 0.1.0
 
 The command-line client adds two commands on `flarebox-net`'s `Api::list_devices` and `Api::revoke_device`:
 
 - `flarebox device list [--json]` lists the principals of the device's user, marks this one, and shows each device's state and when it last refreshed a token.
-- `flarebox device revoke <device_id>` revokes one by its ID. It takes no names, because two devices may share one.
+- `flarebox device revoke <device_id>` revokes one by its ID. It takes no names, because two devices may share one. It refuses this device's own ID, because revoking it would leave the credential on disk unusable instead of signing the device out.
 
-Not covered here: the macOS app's settings window, which calls the same `Api` methods through `core/ffi`; revoking the principals a revoked principal issued; remote wipe.
+Signing out through `core/driver` (`Driver::sign_out`, which the macOS app's Sign Out uses) revokes the device as §5 describes, with `Api::revoke_self`. When this is the last active device, the app asks the person a second time before it confirms.
+
+Not covered here: the macOS app's device list, which calls the same `Api` methods through `core/ffi`; revoking the principals a revoked principal issued; remote wipe.

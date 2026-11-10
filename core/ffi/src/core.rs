@@ -86,8 +86,10 @@ pub trait Core: Send + Sync {
     /// Signs this device in to a claimed server with a pairing code from a device already
     /// signed in.
     fn pair(&self, code: &str, device_name: &str) -> Result<Account, SessionError>;
-    /// Forgets this device's credentials and unlinks every folder. Files on disk stay.
-    fn sign_out(&self) -> Result<(), SessionError>;
+    /// Forgets this device's credentials, unlinks every folder and revokes the device on the server,
+    /// if it can be reached. Files on disk stay. If this is the account's last active device, it
+    /// changes nothing and returns [`SessionError::LastDevice`] unless `confirm_last_device` is set.
+    fn sign_out(&self, confirm_last_device: bool) -> Result<(), SessionError>;
     /// The account's devices, or [`DeviceList::Unavailable`] when the server cannot list them.
     fn devices(&self) -> Result<DeviceList, SessionError>;
     /// Creates a code that signs in another device.

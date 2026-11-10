@@ -334,6 +334,11 @@ async fn device(paths: Paths, action: DeviceAction) -> Result<(), String> {
             Ok(())
         }
         DeviceAction::Revoke { id } => {
+            if id == credential.device_id {
+                return Err(
+                    "this device cannot revoke itself; revoke it from another device".to_owned(),
+                );
+            }
             auth.api()
                 .revoke_device(&auth, &id)
                 .await

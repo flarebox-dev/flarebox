@@ -618,9 +618,17 @@ impl Core for FakeCore {
         })
     }
 
-    fn sign_out(&self) -> Result<(), SessionError> {
+    fn sign_out(&self, confirm_last_device: bool) -> Result<(), SessionError> {
         let mut state = self.lock();
         state.take_failure()?;
+        let last = state
+            .saved
+            .devices
+            .as_ref()
+            .is_some_and(|devices| devices.iter().all(|device| device.this_device));
+        if last && !confirm_last_device && state.saved.account.is_some() {
+            return Err(SessionError::LastDevice);
+        }
         let progress = state.progress.take();
         let recent = std::mem::take(&mut state.recent);
         let result = self.update(&mut state, &ALL_PARTS, |saved| {
@@ -1060,11 +1068,11 @@ mod tests {
         let h = Harness::new();
         h.core.load_scenario(FakeScenario::MassDelete).unwrap();
         h.core.start();
-        h.core.sign_out().unwrap();
+        h.core.sign_out(false).unwrap();
         let state = h.core.state();
         assert_eq!(state.status, SyncStatus::NeedsSetup);
         assert!(state.account.is_none() && state.folders.is_empty() && state.questions.is_empty());
-        assert_eq!(h.core.sign_out(), Err(SessionError::NotSignedIn));
+        assert_eq!(h.core.sign_out(false), Err(SessionError::NotSignedIn));
     }
 
     #[test]
@@ -1301,6 +1309,36 @@ mod tests {
     }
 
     #[test]
+    fn the_last_device_signs_out_only_once_confirmed() {
+        let h = Harness::new();
+        h.core.load_scenario(FakeScenario::UpToDate).unwrap();
+        let device = |device_id: &str, this_device: bool| Device {
+            device_id: device_id.to_owned(),
+            name: "Mac".to_owned(),
+            platform: "macos".to_owned(),
+            this_device,
+            added_at_ms: 1,
+        };
+        h.core
+            .set_devices(Some(vec![device("device-1", true)]))
+            .unwrap();
+        assert_eq!(h.core.sign_out(false), Err(SessionError::LastDevice));
+        assert!(h.core.state().account.is_some());
+        h.core.sign_out(true).unwrap();
+        assert_eq!(h.core.state().account, None);
+
+        h.core.load_scenario(FakeScenario::UpToDate).unwrap();
+        h.core
+            .set_devices(Some(vec![
+                device("device-1", true),
+                device("device-2", false),
+            ]))
+            .unwrap();
+        h.core.sign_out(false).unwrap();
+        assert_eq!(h.core.state().account, None);
+    }
+
+    #[test]
     fn a_recovery_without_questions_still_has_a_notice() {
         let h = Harness::new();
         h.core
@@ -1466,7 +1504,7 @@ mod tests {
             })
         );
 
-        h.core.sign_out().unwrap();
+        h.core.sign_out(false).unwrap();
         let events = h.take();
         assert!(events.contains(&SessionEvent::Progress { progress: None }));
         assert!(events.contains(&SessionEvent::RecentChanges { changes: vec![] }));
@@ -1484,7 +1522,7 @@ mod tests {
         let h = Harness::new();
         h.core.load_scenario(FakeScenario::Syncing).unwrap();
         h.core.fail_saves(true);
-        assert!(h.core.sign_out().is_err());
+        assert!(h.core.sign_out(false).is_err());
         let state = h.core.state();
         assert!(state.account.is_some() && state.progress.is_some());
         assert!(!state.recent_changes.is_empty());

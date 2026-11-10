@@ -186,8 +186,10 @@ public final class AppModel {
         try await run { try $0.pair(code: code, deviceName: deviceName) }
     }
 
-    public func signOut() async throws {
-        try await run { try $0.signOut() }
+    /// Signs this Mac out and revokes it on the server. When no other device of the account is active, it throws
+    /// `SessionError.LastDevice` and changes nothing unless `confirmLastDevice` is set.
+    public func signOut(confirmLastDevice: Bool = false) async throws {
+        try await run { try $0.signOut(confirmLastDevice: confirmLastDevice) }
     }
 
     public func devices() async throws -> DeviceList {
