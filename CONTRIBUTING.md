@@ -65,4 +65,6 @@ Contributions are licensed under the license of the directory they land in: AGPL
 
 Generated code is checked in: `server/src/gen/` (TypeScript) and `core/proto/src/gen/` (Rust). After changing a `.proto` file, run `buf generate` in `spec/` and commit the result. CI fails if the generated code is out of date.
 
+CI runs these checks on Linux for every pull request. Their macOS runs, the macOS app build and the unsigned macOS release build run on a pull request only when it changes a path they use, as listed in the `changes` jobs of `.github/workflows/ci.yml` and `.github/workflows/release-macos.yml`. The merge queue and pushes to `main` always run them.
+
 Commit titles follow [Conventional Commits](https://www.conventionalcommits.org/), for example `feat(server): add commit validation`.
