@@ -674,6 +674,27 @@ fn scans_without_rules_leave_out_nothing_but_the_private_folder() {
     assert_eq!(rescan.rules, []);
 }
 
+/// On a case-sensitive volume `proj` and `PROJ` are two folders. A scan that reads only `proj` says nothing about
+/// `PROJ`, whose rules stay unknown.
+#[cfg(target_os = "linux")]
+#[test]
+fn reading_a_folder_leaves_its_unread_namesake_in_another_case_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "proj/ok", "ok");
+    write(root, "PROJ/.fbignore", &"x\n".repeat((1 << 19) + 1));
+    write(root, "PROJ/x", "unknown rules apply here");
+    let mut rules = rules();
+    let mut snapshot = Snapshot::default();
+    let first = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert_eq!(first.unreadable, [PathBuf::from("PROJ")]);
+    let partial = (snapshot.rescan_with_rules(root, [PathBuf::from("proj")], &mut rules)).unwrap();
+    assert!(partial.unreadable.is_empty());
+    assert_eq!(partial.rules, [], "only proj was read");
+}
+
 /// Polls until every change of `expected` and every rules change of `rules`
 /// was seen, and returns the polls.
 fn expect(

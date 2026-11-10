@@ -69,9 +69,11 @@ pub struct Rules {
     /// The names each listed folder holds that a rule leaves out
     /// ([`Ignored::Rule`] only).
     ignored: BTreeMap<PathBuf, BTreeSet<OsString>>,
-    /// The folders a scan reported unreadable, by the keys of their paths,
-    /// until a scan reads them again or they are gone.
-    unread: BTreeMap<PathBuf, PathBuf>,
+    /// The folders a scan reported unreadable, by their paths as listed,
+    /// until a scan reads them again or they are gone. Two folders whose
+    /// names have the same keys, as a case-sensitive volume holds them, are
+    /// two folders here.
+    unread: BTreeSet<PathBuf>,
 }
 
 impl Rules {
@@ -81,7 +83,7 @@ impl Rules {
             ignore,
             files: BTreeMap::new(),
             ignored: BTreeMap::new(),
-            unread: BTreeMap::new(),
+            unread: BTreeSet::new(),
         }
     }
 
@@ -138,7 +140,7 @@ pub(crate) struct Pending<'r> {
     before: BTreeMap<PathBuf, Option<Held>>,
     /// The names a rule leaves out in each folder this scan listed.
     listed: BTreeMap<PathBuf, BTreeSet<OsString>>,
-    /// The keys of the folders whose rules this scan read.
+    /// The folders whose rules this scan read, by their paths as listed.
     read: BTreeSet<PathBuf>,
 }
 
@@ -171,7 +173,7 @@ impl<'r> Pending<'r> {
             return RulesRead::Unknown;
         }
         self.listed.entry(rel.to_path_buf()).or_default();
-        self.read.insert(key.clone());
+        self.read.insert(rel.to_path_buf());
         let found = match read {
             Some(Ok(found)) => found,
             Some(Err(_)) => return RulesRead::Same,
@@ -309,20 +311,17 @@ impl<'r> Pending<'r> {
             })
             .collect();
         let known: Vec<PathBuf> = (rules.unread.iter())
-            .filter(|(key, dir)| read.contains(*key) || !held(dir))
-            .map(|(key, _)| key.clone())
+            .filter(|dir| read.contains(*dir) || !held(dir))
+            .cloned()
             .collect();
-        for key in known {
-            let unread = rules.unread.remove(&key).expect("an unread folder");
-            let now = rules.files.get(&key);
-            if !(changed.iter()).any(|(reported, _)| rules.key(reported) == key) {
-                let dir = now.map_or(unread, |(dir, _)| dir.clone());
+        for dir in known {
+            rules.unread.remove(&dir);
+            if !(changed.iter()).any(|(reported, _)| *reported == dir) {
+                let now = rules.files.get(&rules.key(&dir));
                 changed.push((dir, now.map(|(_, bytes)| bytes.clone())));
             }
         }
-        for dir in unreadable {
-            rules.unread.insert(rules.key(dir), dir.clone());
-        }
+        rules.unread.extend(unreadable.iter().cloned());
         changed
     }
 }
