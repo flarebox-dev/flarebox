@@ -126,8 +126,8 @@ The CLI embeds the bundle for its own version (decision 5): CLI 0.3.0 deploys an
 All calls go to `https://api.cloudflare.com/client/v4/accounts/<id>` with `Authorization: Bearer <access token>`:
 
 1. `POST /r2/buckets` with `{"name": <bucket>}`.
-2. `POST /workers/scripts/<name>/assets-upload-session` with a manifest of path, hash and size. The upload JWT comes back with buckets of hashes to upload. Wrangler hashes with BLAKE3; the prototype used the first 32 hex digits of SHA-256 and the API accepted them. A second deploy of the same assets returned zero files to upload.
-3. `POST /workers/assets/upload?base64=true` per bucket with the upload JWT, base64 file contents as multipart parts. The last call returns 201 and a completion JWT ([Direct uploads](#ref-direct-upload)). When the session lists no buckets because every file is already uploaded, the session response itself carries the completion JWT, and the CLI makes no upload call. A second deploy of the same assets measured that case: zero files to upload, and the script upload with that JWT succeeded.
+2. `POST /workers/scripts/<name>/assets-upload-session` with a manifest of path, hash and size. The upload JWT comes back with buckets of hashes to upload. Wrangler hashes with BLAKE3; the prototype used the first 32 hex digits of SHA-256 and the API accepted them.
+3. `POST /workers/assets/upload?base64=true` per bucket with the upload JWT, base64 file contents as multipart parts. The last call returns 201 and a completion JWT ([Direct uploads](#ref-direct-upload)). When the session lists no buckets because every file is already uploaded, the session response itself carries the completion JWT, and the CLI makes no upload call. Cloudflare documents this case: "If all assets have been previously uploaded, `buckets` will be empty, and `jwt` will contain a completion token" ([Direct uploads](#ref-direct-upload)). The prototype uses the session's JWT in that case too, but no log of such a run survives.
 4. `PUT /workers/scripts/<name>` with a multipart body that holds the module and this metadata (the secret's value elided):
 
 ```json
@@ -218,13 +218,14 @@ Because of the deferred code update, an upgrade is complete for each Durable Obj
 
 The Worker is the only place that names the bucket, so the CLI records the bucket before it deletes the Worker:
 
-1. Find the server (section 6), read the bucket name from its settings, count the objects, and ask for confirmation, naming the bucket and the number of objects, because the uninstall deletes the owner's files. Without a terminal it needs `--yes` and stops otherwise. The CLI also reads the settings of every other script in the account. If another Worker binds the same bucket, the uninstall deletes only the Flarebox Worker, keeps the bucket and its objects, and names the other Worker.
+1. Find the server (section 6), read the bucket name from its settings, count the objects, and ask for confirmation, naming the bucket and the number of objects, because the uninstall deletes the owner's files. Without a terminal it needs `--yes` and stops otherwise.
 2. Write the state file with the script and the bucket.
 3. Delete the Worker with `?force=true`. This stops all writes to the bucket.
-4. List the bucket with `per_page=1000` and delete each key, following `cursor` until a list comes back empty ([List objects](#ref-r2-list)). The measured run deleted one object, so the multi-page case is *unverified*.
-5. Delete the bucket, then the state file.
+4. Read the settings of every script still in the account. If one binds the bucket, another Worker uses it: the CLI keeps the bucket and its objects, names that Worker, deletes the state file and ends. The check runs here, after the Worker is gone and right before the first object is deleted, so every path to step 5 passes it.
+5. List the bucket with `per_page=1000` and delete each key, following `cursor` until a list comes back empty ([List objects](#ref-r2-list)). The measured run deleted one object, so the multi-page case is *unverified*.
+6. Delete the bucket, then the state file.
 
-Every delete treats 404 as done, so a rerun repeats a finished step without error. A rerun with the state file starts at step 3. If step 4 finds that the bucket no longer exists, the bucket was deleted before the run stopped, so the CLI deletes the state file and reports the uninstall as complete. The exact R2 error for a missing bucket was not measured; *unverified*. Any other error, such as a 403 or a network failure, keeps the state file for the next rerun. On another machine, or after the state file is lost, the Worker is gone and nothing in the account links the bucket to it. `flarebox server uninstall --bucket <name>` then empties and deletes the named bucket after the same confirmation. The CLI does not guess the name.
+Every delete treats 404 as done, so a rerun repeats a finished step without error. A rerun with the state file starts at step 3, so it passes the check of step 4 again before it deletes anything in the bucket. If step 5 finds that the bucket no longer exists, the bucket was deleted before the run stopped, so the CLI deletes the state file and reports the uninstall as complete. The exact R2 error for a missing bucket was not measured; *unverified*. Any other error, such as a 403 or a network failure, keeps the state file for the next rerun. On another machine, or after the state file is lost, the Worker is gone and nothing in the account links the bucket to it. `flarebox server uninstall --bucket <name>` then empties and deletes the named bucket after the same confirmation and the check of step 4. The CLI does not guess the name.
 
 ## 6. Finding a Flarebox server in an account
 
