@@ -9,9 +9,7 @@ use std::io;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use flarebox_proto::v1::{
-    ChunkRef, Error as ProtoError, Target, UploadReceipt, chunk_plan::Action,
-};
+use flarebox_proto::v1::{ChunkRef, Target, UploadReceipt, chunk_plan::Action};
 use prost::Message;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::{Method, StatusCode};
@@ -323,9 +321,7 @@ impl Transfer {
             let refused = ChunkError::Refused {
                 hash: chunk.hash.clone(),
                 status: status.as_u16(),
-                error: body
-                    .and_then(|body| ProtoError::decode(body.as_slice()).ok())
-                    .map(ServerError),
+                error: body.and_then(|body| ServerError::decode(&body)),
             };
             let refused = match by_code(refused) {
                 Ok(attempt) => return attempt,
@@ -356,8 +352,7 @@ impl Transfer {
                         .await
                         .ok()
                         .flatten()
-                        .and_then(|body| ProtoError::decode(body.as_slice()).ok())
-                        .map(ServerError)
+                        .and_then(|body| ServerError::decode(&body))
                 } else {
                     None
                 };

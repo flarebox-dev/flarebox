@@ -499,6 +499,7 @@ dependencies = [
  "fastrand",
  "flarebox-proto",
  "futures-util",
+ "httparse",
  "prost",
  "reqwest",
  "rustls",

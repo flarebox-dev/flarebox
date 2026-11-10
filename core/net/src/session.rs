@@ -11,16 +11,16 @@ use std::time::{Duration, SystemTime};
 
 use flarebox_proto::v1::{
     AccessToken, ChunkRef, ClientMessage, Commit, CommitResult, DownloadTargets,
-    Error as ProtoError, GetDownloadTargets, GetVersionChunks, Hello, ListTrash, ListTree,
-    ListVersions, PrepareUpload, PrepareUploadResult, Reauth, RpcRequest, RpcResponse,
-    ServerMessage, TrashPage, TreePage, VersionChunks, VersionList, Welcome, client_message,
-    rpc_request::Call, rpc_response, server_message::Msg,
+    GetDownloadTargets, GetVersionChunks, Hello, ListTrash, ListTree, ListVersions, PrepareUpload,
+    PrepareUploadResult, Reauth, RpcRequest, RpcResponse, ServerMessage, TrashPage, TreePage,
+    VersionChunks, VersionList, Welcome, client_message, rpc_request::Call, rpc_response,
+    server_message::Msg,
 };
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as _;
 use rustls::pki_types::ServerName;
 use rustls_platform_verifier::BuilderVerifierExt;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -28,13 +28,14 @@ use tokio::time::error::Elapsed;
 use tokio::time::{Instant, sleep, sleep_until, timeout, timeout_at};
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::handshake::client::generate_key;
+use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
-use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{self, Message as WsMessage};
-use url::Url;
+use url::{Position, Url};
 
+use crate::api::PROTOBUF;
 use crate::auth::Auth;
 use crate::backoff::Backoff;
 use crate::error::{ApiError, CallError, NotResent, Resend, ServerError, StopReason};
@@ -55,6 +56,8 @@ const CLOSE_UNSUPPORTED_VERSION: u16 = 4002;
 const CLOSE_DEVICE_REVOKED: u16 = 4003;
 /// Checks the token at least this often, whatever expiry the server sent.
 const MAX_REAUTH_WAIT: Duration = Duration::from_secs(3600);
+/// The most bytes read of an answer to the WebSocket upgrade: its head, and the body of a refusal.
+const MAX_UPGRADE_ANSWER: usize = 64 << 10;
 /// Waits at least this long between token refreshes, even when a new token is already due because the refresh
 /// margin is longer than the token's lifetime or the clocks disagree.
 const MIN_REAUTH_WAIT: Duration = Duration::from_secs(1);
@@ -585,44 +588,91 @@ impl Task {
         } else {
             Box::new(tcp)
         };
-        let mut request = self
-            .url
-            .as_str()
-            .into_client_request()
-            .map_err(|e| Exit::Stop(StopReason::BadUrl(e.to_string())))?;
-        let bearer = HeaderValue::from_str(&format!("Bearer {}", token.token))
-            .map_err(|_| Exit::violation("an access token that is not a header value"))?;
-        request.headers_mut().insert(AUTHORIZATION, bearer);
-        let config = WebSocketConfig::default()
-            .max_message_size(Some(MAX_SERVER_MESSAGE))
-            .max_frame_size(Some(MAX_SERVER_MESSAGE));
-        match tokio_tungstenite::client_async_with_config(request, io, Some(config)).await {
-            Ok((socket, _)) => Ok((socket, token)),
-            Err(tungstenite::Error::Http(response)) => {
-                let header = |name| {
-                    response
-                        .headers()
-                        .get(name)
-                        .and_then(|value: &HeaderValue| value.to_str().ok())
-                };
-                let protobuf = header(CONTENT_TYPE)
-                    .is_some_and(|value| value.starts_with("application/x-protobuf"));
-                let length = header(CONTENT_LENGTH).and_then(|value| value.parse::<usize>().ok());
-                let server = response
-                    .body()
-                    .as_deref()
-                    .filter(|body| protobuf && length == Some(body.len()))
-                    .and_then(|body| ProtoError::decode(body).ok())
-                    .map(ServerError);
-                if let Some(server) = &server
-                    && let Some(exit) = self.refused_with(server)
-                {
-                    return Err(exit);
-                }
-                Err(self.refused(response.status().as_u16(), &token.token).await)
-            }
-            Err(error) => Err(Exit::transport(error)),
+        let socket = self.upgrade(io, &token).await?;
+        Ok((socket, token))
+    }
+
+    /// The WebSocket upgrade (RFC 6455 section 4.1). It is done here rather than by tungstenite, which gives only the
+    /// part of a refusal's body that arrived with its headers, so that the whole `Error` is read before H1 decides
+    /// whether the client may connect again.
+    async fn upgrade(&mut self, mut io: Box<dyn Io>, token: &AccessToken) -> Result<Socket, Exit> {
+        if HeaderValue::from_str(&token.token).is_err() {
+            return Err(Exit::violation(
+                "an access token that is not a header value",
+            ));
         }
+        let key = generate_key();
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\nAuthorization: Bearer {bearer}\r\n\r\n",
+            path = &self.url[Position::BeforePath..Position::AfterQuery],
+            host = &self.url[Position::BeforeHost..Position::AfterPort],
+            bearer = token.token,
+        );
+        io.write_all(request.as_bytes())
+            .await
+            .map_err(Exit::transport)?;
+        let mut received = Vec::new();
+        let (status, end, accept, length, protobuf) = loop {
+            if read_some(&mut io, &mut received).await? == 0 {
+                return Err(Exit::transport(
+                    "the connection closed during the WebSocket upgrade",
+                ));
+            }
+            let mut headers = [httparse::EMPTY_HEADER; 64];
+            let mut response = httparse::Response::new(&mut headers);
+            match response.parse(&received) {
+                Ok(httparse::Status::Complete(end)) => {
+                    let header = |name: &str| {
+                        response
+                            .headers
+                            .iter()
+                            .find(|header| header.name.eq_ignore_ascii_case(name))
+                            .and_then(|header| std::str::from_utf8(header.value).ok())
+                    };
+                    break (
+                        response.code.unwrap_or_default(),
+                        end,
+                        header("sec-websocket-accept").map(str::to_owned),
+                        header("content-length")
+                            .and_then(|value| value.trim().parse::<usize>().ok()),
+                        header("content-type").is_some_and(|value| value.starts_with(PROTOBUF)),
+                    );
+                }
+                Ok(httparse::Status::Partial) if received.len() < MAX_UPGRADE_ANSWER => {}
+                _ => {
+                    return Err(Exit::violation(
+                        "an answer to the WebSocket upgrade that is not HTTP",
+                    ));
+                }
+            }
+        };
+        let mut body = received.split_off(end);
+        if status == 101 {
+            if accept.as_deref() != Some(derive_accept_key(key.as_bytes()).as_str()) {
+                return Err(Exit::violation(
+                    "a WebSocket upgrade with the wrong Sec-WebSocket-Accept",
+                ));
+            }
+            let config = WebSocketConfig::default()
+                .max_message_size(Some(MAX_SERVER_MESSAGE))
+                .max_frame_size(Some(MAX_SERVER_MESSAGE));
+            return Ok(
+                WebSocketStream::from_partially_read(io, body, Role::Client, Some(config)).await,
+            );
+        }
+        let mut error = None;
+        if let Some(length) = length.filter(|&length| protobuf && length <= MAX_UPGRADE_ANSWER) {
+            while body.len() < length && read_some(&mut io, &mut body).await? > 0 {}
+            if body.len() >= length {
+                error = ServerError::decode(&body[..length]);
+            }
+        }
+        if let Some(server) = &error
+            && let Some(exit) = self.refused_with(server)
+        {
+            return Err(exit);
+        }
+        Err(self.refused(status, &token.token).await)
     }
 
     /// Applies H1 to a refusal while connecting: one the client may not resend stops the session, and one it may
@@ -983,6 +1033,14 @@ async fn refreshed(
         Some(refresh) => refresh.await,
         None => std::future::pending().await,
     }
+}
+
+/// Reads what has arrived into `buffer`; 0 at the end of the stream.
+async fn read_some(io: &mut Box<dyn Io>, buffer: &mut Vec<u8>) -> Result<usize, Exit> {
+    let mut part = [0; 4096];
+    let n = io.read(&mut part).await.map_err(Exit::transport)?;
+    buffer.extend_from_slice(&part[..n]);
+    Ok(n)
 }
 
 /// Resolves once the session is closed or dropped.

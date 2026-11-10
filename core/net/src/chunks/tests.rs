@@ -2,6 +2,7 @@
 
 //! One-request HTTP servers that answer chunk transfers in scripted ways.
 
+use flarebox_proto::v1::Error as ProtoError;
 use flarebox_proto::v1::error::Code;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -478,7 +479,16 @@ async fn refusals_follow_the_server_error_code_before_the_http_status() {
         (429, protobuf, error(Code::QuotaExceeded as i32, 100)),
         (503, protobuf, error(Code::Internal as i32, 0)),
         (500, "text/plain", Vec::new()),
-        (500, protobuf, error(0, 0)),
+        (
+            500,
+            protobuf,
+            ProtoError {
+                message: "no code".into(),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ),
+        (500, protobuf, Vec::new()),
     ])
     .await;
     let transfer = transfer();
@@ -510,6 +520,17 @@ async fn refusals_follow_the_server_error_code_before_the_http_status() {
     assert!(
         matches!(transfer.get(&target, &sent).await, Attempt::Fail(_)),
         "UNSPECIFIED is a refusal"
+    );
+    assert!(
+        matches!(
+            transfer.get(&target, &sent).await,
+            Attempt::Retry(ChunkError::Refused {
+                status: 500,
+                error: None,
+                ..
+            })
+        ),
+        "an empty body is no refusal: the status decides"
     );
     server.await.unwrap();
 }

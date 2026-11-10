@@ -4,12 +4,22 @@ use std::fmt;
 use std::time::Duration;
 
 use flarebox_proto::v1::{Error as ProtoError, error::Code};
+use prost::Message;
 
 /// A refusal from the server: the `Error` of an RPC response or of an HTTP reply.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ServerError(pub ProtoError);
 
 impl ServerError {
+    /// The `Error` in a protobuf body, or `None` when there is none. An empty body carries no refusal, so it is not
+    /// read as `UNSPECIFIED`.
+    pub(crate) fn decode(body: &[u8]) -> Option<ServerError> {
+        if body.is_empty() {
+            return None;
+        }
+        ProtoError::decode(body).ok().map(ServerError)
+    }
+
     pub fn code(&self) -> Code {
         Code::try_from(self.0.code).unwrap_or(Code::Unspecified)
     }
@@ -77,9 +87,10 @@ pub enum ApiError {
 }
 
 impl ApiError {
-    /// The server refused the credentials or token: the device is revoked or the refresh credential is wrong.
+    /// The server refused the credentials or token with `UNAUTHENTICATED`: the token expired, the device is revoked or
+    /// the refresh credential is wrong. A 401 with another code is a refusal like any other (H1).
     pub fn is_unauthenticated(&self) -> bool {
-        matches!(self, ApiError::Server { status: 401, .. })
+        matches!(self, ApiError::Server { status: 401, error } if error.code() == Code::Unauthenticated)
     }
 
     /// The server's error, when it sent one.
