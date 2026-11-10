@@ -19,11 +19,12 @@ import {
   TokenRequestSchema,
 } from "./gen/flarebox/v1/auth_pb";
 import { UploadReceiptSchema } from "./gen/flarebox/v1/commit_pb";
-import { Error_Code } from "./gen/flarebox/v1/rpc_pb";
+import { Error_Code, ErrorSchema } from "./gen/flarebox/v1/rpc_pb";
 import { BadRequest, errorReply, readMessage, reply } from "./http";
 import { type ChunkObject, deriveSpaceKey, signChunkGrant, verifyChunkGrant } from "./crypto";
 import { fromHex, isUuidV7 } from "./ids";
 import { type Capability, policy } from "./policy";
+import { quotaRefusal } from "./quota";
 import { shareRoute } from "./share/routes";
 import { CONNECT_HEADER, type Connect, GRANT_MS, MAX_CHUNK_BYTES, MAX_CLIENT_FRAME } from "./space-do";
 import { chunkKey, INCARNATION } from "./space/store";
@@ -302,7 +303,10 @@ export default {
       return await route(request, env);
     } catch (error) {
       if (error instanceof BadRequest) return errorReply(request, Error_Code.INVALID_ARGUMENT, error.message);
-      throw error;
+      const quota = quotaRefusal(error, Date.now());
+      if (!quota) throw error;
+      console.error("request stopped at a platform limit", error);
+      return reply(request, ErrorSchema, create(ErrorSchema, { code: Error_Code.QUOTA_EXCEEDED, message: quota.message, retryAfterMs: BigInt(quota.retryAfterMs) }), 429);
     }
   },
 } satisfies ExportedHandler<Env>;
