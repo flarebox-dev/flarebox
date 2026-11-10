@@ -2614,3 +2614,324 @@ fn a_commit_that_waits_for_the_owners_confirmation_is_not_lifted() {
     let flight = a.folder.engine.commits.in_flight().unwrap();
     assert_eq!(flight.commit.commit_id, refused.commit_id);
 }
+
+/// Device `b` synced `one.txt` from `a`. The server then lost its log: a space with the same history and no
+/// commits takes its place.
+fn behind_the_device(remote: &mut Remote) -> (Site, Device) {
+    let (site_a, mut a) = linked(remote, "a");
+    a.create(remote, &site_a.root.join("one.txt"), b"one");
+    let (site, mut b) = linked(remote, "b");
+    b.settle();
+    assert_eq!(names(&site.root), ["one.txt"]);
+    *remote = Remote::new();
+    (site, b)
+}
+
+/// A server restored from a backup taken now, which holds only the commits `device` sent so far and their chunks.
+fn backup(remote: &Remote, device: &Device) -> Remote {
+    let mut restored = Remote::new();
+    let chunks: Vec<ChunkRef> = (remote.chunks.chunks.iter())
+        .map(|(hash, bytes)| ChunkRef {
+            hash: hash.clone(),
+            size: bytes.len() as u32,
+            ..Default::default()
+        })
+        .collect();
+    if !chunks.is_empty() {
+        (restored.space)
+            .prepare_upload(&device.caller, NOW, &PrepareUpload { chunks })
+            .unwrap();
+    }
+    for (hash, bytes) in &remote.chunks.chunks {
+        restored.chunks.chunks.insert(hash.clone(), bytes.clone());
+        restored.space.put_chunk(hash, bytes.len() as u32, NOW);
+    }
+    for commit in &device.sent {
+        restored.space.commit(&device.caller, NOW, commit).unwrap();
+    }
+    restored
+}
+
+/// The names in the folder's local trash.
+fn trashed(root: &Path) -> Vec<String> {
+    let trash = root.join(flarebox_fs::PRIVATE_DIR).join("trash");
+    fs::read_dir(trash).map_or(Vec::new(), |entries| {
+        entries
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect()
+    })
+}
+
+#[test]
+fn a_server_behind_the_device_gets_back_the_files_it_lost() {
+    let mut remote = Remote::new();
+    let (site, mut b) = behind_the_device(&mut remote);
+    b.pull(&remote);
+    assert_eq!(b.state(), FolderState::Bootstrapping);
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    assert_eq!(
+        files(&site.root),
+        [("one.txt".to_owned(), "one".to_owned())]
+    );
+    assert_eq!(trashed(&site.root), Vec::<String>::new());
+    assert_eq!(remote.names(), ["one.txt"]);
+    assert_eq!(b.state(), FolderState::UpToDate);
+}
+
+#[test]
+fn a_commit_the_server_is_behind_for_reads_the_tree_again_and_sends_what_it_lost() {
+    let mut remote = Remote::new();
+    let (site, mut b) = behind_the_device(&mut remote);
+    fs::write(site.root.join("two.txt"), b"two").unwrap();
+    b.scan_until(|b| !b.work.is_empty());
+    let ran = b.run(&mut remote);
+    assert!(ran.starts_with(&["upload", "send", "list"]), "{ran:?}");
+    b.settle();
+    b.run(&mut remote);
+    assert_eq!(
+        files(&site.root),
+        [
+            ("one.txt".to_owned(), "one".to_owned()),
+            ("two.txt".to_owned(), "two".to_owned())
+        ]
+    );
+    assert_eq!(trashed(&site.root), Vec::<String>::new());
+    assert_eq!(remote.names(), ["one.txt", "two.txt"]);
+    assert_eq!(b.state(), FolderState::UpToDate);
+}
+
+/// The server lost the commits that created `albums` and moved `photos` into it, but kept the one that created
+/// `photos`. Device `b` moves `photos` into `albums` again instead of downloading it at its old place.
+#[test]
+fn a_folder_moved_into_a_folder_the_server_lost_is_moved_there_again() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site_a.root.join("photos")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(&mut remote);
+    let restored = backup(&remote, &a);
+    let (site, mut b) = linked(&mut remote, "b");
+    b.settle();
+    fs::create_dir(site_a.root.join("albums")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(&mut remote);
+    fs::rename(
+        site_a.root.join("photos"),
+        site_a.root.join("albums/photos"),
+    )
+    .unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(&mut remote);
+    b.pull(&remote);
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    assert!(site.root.join("albums/photos").is_dir());
+    remote = restored;
+    b.pull(&remote);
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    assert!(site.root.join("albums/photos").is_dir());
+    assert_eq!(names(&site.root), ["albums"]);
+    assert_eq!(trashed(&site.root), Vec::<String>::new());
+    let nodes = remote.space.nodes();
+    let albums = nodes.iter().find(|node| node.name == "albums").unwrap();
+    let photos = nodes.iter().find(|node| node.name == "photos").unwrap();
+    assert_eq!(photos.parent_id, albums.node_id);
+    assert_eq!(remote.names(), ["albums", "photos"]);
+    assert_eq!(b.state(), FolderState::UpToDate);
+}
+
+/// The server lost a's edit of `one.txt` that `b` had downloaded. `b` keeps that content as a conflict copy beside
+/// the server's older content, instead of replacing it.
+#[test]
+fn an_edit_the_server_lost_is_kept_as_a_conflict_copy() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("one.txt"), b"v1");
+    let restored = backup(&remote, &a);
+    let (site, mut b) = linked(&mut remote, "b");
+    b.settle();
+    fs::write(site_a.root.join("one.txt"), b"v2").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(&mut remote);
+    b.pull(&remote);
+    b.run(&mut remote);
+    b.settle();
+    assert_eq!(files(&site.root), [("one.txt".to_owned(), "v2".to_owned())]);
+    remote = restored;
+    b.pull(&remote);
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    let copy = "one (conflict from b 2023-11-14).txt";
+    assert_eq!(
+        files(&site.root),
+        [
+            (copy.to_owned(), "v2".to_owned()),
+            ("one.txt".to_owned(), "v1".to_owned())
+        ]
+    );
+    assert_eq!(remote.names(), [copy, "one.txt"]);
+    assert_eq!(b.state(), FolderState::UpToDate);
+}
+
+/// The server lost the commits that created `albums` and moved `one.txt` into it. While `b` replays the log
+/// after its listing, the log brings device `c`'s delete of `one.txt`. `b` deletes the file instead of
+/// uploading it again, and creates `albums` again.
+#[test]
+fn a_delete_replayed_below_a_folder_the_server_lost_still_deletes_the_file() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("one.txt"), b"one");
+    let restored = backup(&remote, &a);
+    let (site, mut b) = linked(&mut remote, "b");
+    b.settle();
+    fs::create_dir(site_a.root.join("albums")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(&mut remote);
+    fs::rename(
+        site_a.root.join("one.txt"),
+        site_a.root.join("albums/one.txt"),
+    )
+    .unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(&mut remote);
+    b.pull(&remote);
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    assert_eq!(files(&site.root), [("albums/one.txt".into(), "one".into())]);
+    let trees = &b.folder.engine.trees;
+    let one = (trees.local().iter())
+        .find(|(_, node)| node.shape.name == "one.txt")
+        .unwrap()
+        .0
+        .clone();
+    remote = restored;
+    b.pull(&remote);
+    let list = b.work.pop_front().unwrap();
+    assert!(matches!(list, Work::List));
+    b.perform(list, &mut remote).unwrap();
+    assert!(matches!(b.folder.stream, Stream::Replaying(_)));
+    let (site_c, mut c) = linked(&mut remote, "c");
+    c.settle();
+    fs::remove_file(site_c.root.join("one.txt")).unwrap();
+    c.scan_until(|c| !c.work.is_empty());
+    c.run(&mut remote);
+    assert_eq!(remote.names(), Vec::<String>::new());
+    let subscribe = b.work.pop_front().unwrap();
+    assert!(matches!(subscribe, Work::Subscribe { .. }));
+    b.perform(subscribe, &mut remote).unwrap();
+    assert!(b.folder.engine.trees.remote().get(&one).unwrap().trashed);
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    assert_eq!(files(&site.root), Vec::<(String, String)>::new());
+    assert!(site.root.join("albums").is_dir());
+    assert_eq!(remote.names(), ["albums"]);
+    assert_eq!(b.state(), FolderState::UpToDate);
+}
+
+/// Device `c` commits to the server that is behind device `b`, so the server's head is no longer below `b`'s
+/// cursor when `b` lists the tree.
+fn catch_up(remote: &mut Remote, b: &Device) {
+    let (site_c, mut c) = linked(remote, "c");
+    c.create(remote, &site_c.root.join("other.txt"), b"other");
+    let cursor = b.folder.engine.cursor.as_ref().unwrap();
+    assert!(remote.space.head_seq() >= cursor.last_seq);
+}
+
+/// What `b` holds and the server holds once `b` sent what the server lost and took `c`'s file.
+fn caught_up(site: &Site, b: &Device, remote: &Remote, also: &[&str]) {
+    let mut expected = vec![("one.txt".to_owned(), "one".to_owned())];
+    expected.extend(
+        also.iter()
+            .map(|name| (format!("{name}.txt"), name.to_string())),
+    );
+    expected.push(("other.txt".to_owned(), "other".to_owned()));
+    expected.sort();
+    assert_eq!(files(&site.root), expected);
+    assert_eq!(trashed(&site.root), Vec::<String>::new());
+    let names: Vec<String> = expected.into_iter().map(|(name, _)| name).collect();
+    assert_eq!(remote.names(), names);
+    assert_eq!(b.state(), FolderState::UpToDate);
+}
+
+#[test]
+fn a_server_behind_the_device_whose_head_catches_up_before_the_listing_gets_back_the_files_it_lost()
+{
+    let mut remote = Remote::new();
+    let (site, mut b) = behind_the_device(&mut remote);
+    b.pull(&remote);
+    assert_eq!(b.state(), FolderState::Bootstrapping);
+    catch_up(&mut remote, &b);
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    caught_up(&site, &b, &remote, &[]);
+}
+
+#[test]
+fn a_commit_the_server_is_behind_for_sends_what_it_lost_when_the_head_catches_up_before_the_listing()
+ {
+    let mut remote = Remote::new();
+    let (site, mut b) = behind_the_device(&mut remote);
+    fs::write(site.root.join("two.txt"), b"two").unwrap();
+    b.scan_until(|b| !b.work.is_empty());
+    while !matches!(b.folder.stream, Stream::Listing) {
+        let work = b.work.pop_front().expect("the commit is refused");
+        b.perform(work, &mut remote).unwrap();
+    }
+    catch_up(&mut remote, &b);
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    caught_up(&site, &b, &remote, &["two"]);
+}
+
+#[test]
+fn a_device_that_restarts_after_the_server_behind_it_caught_up_still_gets_back_the_files_it_lost() {
+    let mut remote = Remote::new();
+    let (site, mut b) = behind_the_device(&mut remote);
+    b.pull(&remote);
+    catch_up(&mut remote, &b);
+    drop(b);
+    let mut b = site.start();
+    b.connect(&remote);
+    assert_eq!(b.run(&mut remote), ["list", "subscribe"]);
+    b.settle();
+    b.run(&mut remote);
+    caught_up(&site, &b, &remote, &[]);
+}
+
+/// The task stops right after the transaction that takes the refusal, before it lists the tree, and the server's head
+/// then catches up. The store still knows that the server is behind.
+#[test]
+fn a_commit_the_server_is_behind_for_sends_what_it_lost_after_a_crash_right_after_the_refusal() {
+    let mut remote = Remote::new();
+    let (site, mut b) = behind_the_device(&mut remote);
+    fs::write(site.root.join("two.txt"), b"two").unwrap();
+    b.scan_until(|b| !b.work.is_empty());
+    loop {
+        let work = b.work.pop_front().expect("the commit is sent");
+        if matches!(work, Work::Send(_)) {
+            b.folder.crash_after = Some(0);
+            b.perform(work, &mut remote).unwrap_err();
+            break;
+        }
+        b.perform(work, &mut remote).unwrap();
+    }
+    assert!(b.folder.engine.commits.in_flight().is_none());
+    catch_up(&mut remote, &b);
+    drop(b);
+    let mut b = site.start();
+    b.connect(&remote);
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    caught_up(&site, &b, &remote, &["two"]);
+}

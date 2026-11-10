@@ -213,10 +213,27 @@ impl Engine {
         Ok(())
     }
 
+    /// Records that the server's log ends below the cursor (`AHEAD_OF_SERVER`, design §4.4). The store keeps this
+    /// with the cursor until a bootstrap replaces R, also when the server's head catches up first or the task
+    /// restarts.
+    pub fn server_behind(&mut self, tx: &Tx<'_>) -> Result<(), Stop> {
+        let Some(cursor) = &mut self.cursor else {
+            return Ok(());
+        };
+        if !cursor.ahead_of_server {
+            cursor.ahead_of_server = true;
+            tx.set_cursor(cursor)?;
+        }
+        Ok(())
+    }
+
     /// Replaces R, in the store and in the trees, with a bootstrap's tree that the log has caught up, and sets the
-    /// cursor. S and L stay, so the planner then moves what differs (design §4.4). A tree that is not valid stops
-    /// the task before anything is replaced.
+    /// cursor. S and L stay, so the planner then moves what differs (design §4.4). When the server reported that it
+    /// is behind the cursor ([`Engine::server_behind`]), it lost commits this device applied, and S forgets the
+    /// nodes it lost ([`Trees::forget_lost`]), so that they are uploaded again. A tree that is not valid stops the
+    /// task before anything is replaced.
     pub fn replace_remote(&mut self, tx: &Tx<'_>, staging: Staging) -> Result<(), Stop> {
+        let behind = (self.cursor.as_ref()).is_some_and(|cursor| cursor.ahead_of_server);
         let root = self.trees.remote().root.clone();
         let mut tree = Tree::new(root.clone());
         for state in staging.nodes.values().filter(|state| state.node_id != root) {
@@ -241,6 +258,9 @@ impl Engine {
                 self.trees.set_remote(id.clone(), node.clone());
             }
         }
+        if behind {
+            self.trees.forget_lost();
+        }
         tx.clear_remote_nodes()?;
         for state in staging.nodes.values() {
             tx.put_remote_node(state)?;
@@ -248,6 +268,7 @@ impl Engine {
         let cursor = Cursor {
             history_id: staging.history_id,
             last_seq: staging.last_seq,
+            ahead_of_server: false,
         };
         tx.set_cursor(&cursor)?;
         self.commits.acknowledge(&mut self.trees, cursor.last_seq);
@@ -943,6 +964,7 @@ mod tests {
         Cursor {
             history_id: "h".into(),
             last_seq: seq,
+            ahead_of_server: false,
         }
     }
 

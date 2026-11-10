@@ -402,8 +402,11 @@ impl Effects {
 /// waiting node that R no longer has is removed only when it holds no unuploaded edit; otherwise
 /// the commit layer makes it a new node, so the edit is uploaded. A reverted node that L does not
 /// hold is created only as a folder that a node L holds needs on its way to the root: otherwise the
-/// user deleted it, and that delete is committed instead. An excluded node is never one.
+/// user deleted it, and that delete is committed instead. A node whose waiting update forgets S
+/// ([`Trees::forget_lost`]) is never one: once the update is made, L holds a node S does not,
+/// which is created again. An excluded node is never one.
 fn candidate(trees: &Trees, id: &str) -> bool {
+    let forgets = trees.waiting().get(id).is_some_and(Option::is_none);
     let changed = remote_only(trees, id)
         || trees.local().get(id).is_some_and(|node| node.parked)
         || (trees.reverted().contains(id)
@@ -412,7 +415,7 @@ fn candidate(trees: &Trees, id: &str) -> bool {
         || (trees.waiting().contains_key(id)
             && trees.remote().live(id).is_none()
             && !trees.edited(id));
-    changed && !trees.excluded(id)
+    changed && !forgets && !trees.excluded(id)
 }
 
 /// Whether L holds a node whose way to the root passes `id`. Each node on that way goes to its R

@@ -590,6 +590,53 @@ fn a_folder_renamed_back_after_its_move_was_renamed_by_the_server_keeps_the_user
     }
 }
 
+/// The server lost folder albums, which is parked here, and another device deleted one in it.
+/// Once one is removed, albums is not removed too: the commit layer forgets its S first, then the
+/// effects move it out of the parked directory, and it is created again.
+#[test]
+fn a_parked_folder_the_server_lost_is_created_again_after_a_delete_empties_it() {
+    let mut trees = trees(&[
+        (
+            "albums",
+            Some(dir(ROOT, "albums")),
+            Some(dir(ROOT, "albums")),
+            None,
+        ),
+        (
+            "one",
+            Some(file("albums", "one", 1)),
+            Some(file("albums", "one", 1)),
+            Some(trashed(file(ROOT, "one", 1))),
+        ),
+    ]);
+    trees.set_local(
+        "albums".into(),
+        LocalNode {
+            parked: true,
+            ..local(dir(ROOT, "albums"), 1)
+        },
+    );
+    trees.forget_lost();
+    trees.settle();
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    let removed = effects.plan(&trees, &mut ids, NOW).cloned().unwrap();
+    assert_eq!(removed.node, "one");
+    assert!(matches!(removed.effect, Effect::RemoveFile { .. }));
+    effects.done(&mut trees, &removed.effect_id, None).unwrap();
+    trees.settle();
+    assert!(effects.plan(&trees, &mut ids, NOW).is_none());
+    let mut commits = Commits::default();
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    trees.settle();
+    let unparked = effects.plan(&trees, &mut ids, NOW).cloned().unwrap();
+    assert_eq!(unparked.node, "albums");
+    assert!(matches!(unparked.effect, Effect::Move { .. }));
+    effects.done(&mut trees, &unparked.effect_id, None).unwrap();
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(matches!(&ops(&commit)[..], [op::Op::CreateDir(c)] if c.node_id == "albums"));
+}
+
 #[test]
 fn a_local_edit_on_a_reverted_file_is_kept_on_disk_and_uploaded() {
     let mut trees = trees(&[("a", Some(file(ROOT, "x", 1)), None, None)]);

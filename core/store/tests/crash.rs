@@ -116,6 +116,7 @@ fn write_input(tx: &Tx<'_>, seq: u64) -> Result<(), Error> {
     tx.set_cursor(&Cursor {
         history_id: "history".into(),
         last_seq: seq,
+        ahead_of_server: false,
     })
 }
 

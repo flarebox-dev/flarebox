@@ -36,7 +36,7 @@ use flarebox_proto::v1::{
     ChunkRef, Commit, CommitRecord, CommitResult, Error as ProtoError, TreePage, UploadReceipt,
     Welcome,
 };
-use flarebox_store::{Link, Store, Tx};
+use flarebox_store::{Cursor, Link, Store, Tx};
 use tokio::sync::{Notify, mpsc, watch};
 
 use crate::claim::{self, Flock, Identity, Owner};
@@ -112,6 +112,9 @@ pub(crate) struct Folder {
     effect_failures: BTreeMap<String, u32>,
     /// When the [`Work::RetryAfter`] that is out ends.
     retry_at: Option<Instant>,
+    /// Tests stop the task after this many more store transactions, as a crash right after one would.
+    #[cfg(test)]
+    crash_after: Option<usize>,
 }
 
 /// Where R stands against the session's change stream (design §4.4). It is not stored: the next `Welcome` and the
@@ -268,6 +271,8 @@ impl Folder {
             retrying: BTreeMap::new(),
             effect_failures: BTreeMap::new(),
             retry_at: None,
+            #[cfg(test)]
+            crash_after: None,
         })
     }
 
@@ -316,24 +321,20 @@ impl Folder {
                 self.publish_remote()?;
             }
             Event::ResyncRequired(resync) => match Reason::try_from(resync.reason) {
-                Ok(Reason::LogTruncated) => {
+                Ok(reason @ (Reason::LogTruncated | Reason::AheadOfServer)) => {
                     tracing::info!(
                         space_id = self.link.space_id,
-                        "the server's log no longer reaches the store; reading the tree again"
+                        ?reason,
+                        "the server's log does not continue from the store; reading the tree again"
                     );
-                    if !matches!(self.stream, Stream::Listing) {
-                        self.stream = Stream::Listing;
-                        work.push(Work::List);
+                    if reason == Reason::AheadOfServer {
+                        self.step(|engine, tx| engine.server_behind(tx))?;
                     }
+                    self.list_again(&mut work);
                 }
                 Ok(Reason::HistoryChanged) => {
                     return Err(Stop::Recovery(
                         "the space was rewound or restored on the server".into(),
-                    ));
-                }
-                Ok(Reason::AheadOfServer) => {
-                    return Err(Stop::Recovery(
-                        "the server is behind what this device already applied".into(),
                     ));
                 }
                 Ok(Reason::Unspecified) | Err(_) => {
@@ -753,11 +754,19 @@ impl Folder {
         change: impl FnOnce(&mut Engine, &Tx<'_>) -> Result<T, Stop>,
     ) -> Result<T, Stop> {
         let engine = &mut self.engine;
-        self.store.transaction(|tx| {
+        let out = self.store.transaction(|tx| -> Result<T, Stop> {
             let out = change(engine, tx)?;
             engine.checkpoint(tx)?;
             Ok(out)
-        })
+        })?;
+        #[cfg(test)]
+        if let Some(left) = &mut self.crash_after {
+            if *left == 0 {
+                return Err(Stop::Protocol("the test crashed the task".into()));
+            }
+            *left -= 1;
+        }
+        Ok(out)
     }
 
     /// A `Welcome` (design §4.4 and §2.8). A cursor of another history stops the task before anything is replaced.
@@ -828,16 +837,23 @@ impl Folder {
             }
         }
         match (&mut self.stream, &self.engine.cursor) {
+            (
+                Stream::Connecting,
+                None
+                | Some(Cursor {
+                    ahead_of_server: true,
+                    ..
+                }),
+            ) => {
+                self.stream = Stream::Listing;
+                work.push(Work::List);
+            }
             (Stream::Connecting, Some(cursor)) => {
                 work.push(Work::Subscribe {
                     history_id: cursor.history_id.clone(),
                     since_seq: cursor.last_seq,
                 });
                 self.stream = Stream::Following { head: None };
-            }
-            (Stream::Connecting, None) => {
-                self.stream = Stream::Listing;
-                work.push(Work::List);
             }
             (Stream::Following { head }, _) => *head = None,
             (Stream::Listing | Stream::Replaying(_), _) => {}
@@ -961,9 +977,13 @@ impl Folder {
         refusal: &ServerError,
         work: &mut Vec<Work>,
     ) -> Result<(), Stop> {
-        let failure = self.step(|engine, _| {
-            (engine.commits.failed(&refusal.0))
-                .map_err(|error| Stop::Protocol(format!("a refused commit: {error:?}")))
+        let failure = self.step(|engine, tx| {
+            let failure = (engine.commits.failed(&refusal.0))
+                .map_err(|error| Stop::Protocol(format!("a refused commit: {error:?}")))?;
+            if matches!(failure, Failure::Resync) {
+                engine.server_behind(tx)?;
+            }
+            Ok(failure)
         })?;
         let described = policy::describe(refusal);
         tracing::info!(
@@ -994,9 +1014,8 @@ impl Folder {
                 self.commit_ended();
             }
             Failure::Resync => {
-                return Err(Stop::Recovery(format!(
-                    "the server is behind what this device already applied ({described})"
-                )));
+                self.commit_ended();
+                self.list_again(work);
             }
             Failure::Halted(CommitHalt::Recovery) => return Err(Stop::Recovery(described)),
             Failure::Halted(CommitHalt::Policy { code }) => {
@@ -1007,6 +1026,15 @@ impl Folder {
             }
         }
         Ok(())
+    }
+
+    /// Bootstraps again (design §4.4): the tree is listed and replayed into a staging tree that replaces R, while L
+    /// and S stay.
+    fn list_again(&mut self, work: &mut Vec<Work>) {
+        if !matches!(self.stream, Stream::Listing) {
+            self.stream = Stream::Listing;
+            work.push(Work::List);
+        }
     }
 
     /// Starts the upload of what `commit` adds, or its send when it adds no content.
