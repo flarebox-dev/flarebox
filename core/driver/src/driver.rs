@@ -138,7 +138,34 @@ struct Folder {
     run: Option<Running>,
     /// Set from the moment an unlink begins until it has removed the folder or failed. No task starts for the folder
     /// meanwhile, also after its last task has ended, so the cleanup never leaves a task it does not wait for.
-    unlinking: bool,
+    unlink: Option<Unlink>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Unlink {
+    Running,
+    /// Its caller stopped waiting before it finished. Another unlink or a sign-out finishes it.
+    Abandoned,
+}
+
+/// Marks the folder's unlink abandoned if it is dropped while the unlink still runs, that is, when the caller cancels it.
+struct Unlinking<'a> {
+    driver: &'a Driver,
+    space_id: String,
+}
+
+impl Drop for Unlinking<'_> {
+    fn drop(&mut self) {
+        let mut folders = self.driver.inner.folders.lock().unwrap();
+        let Some(folder) = folders.get_mut(&self.space_id) else {
+            return;
+        };
+        if folder.unlink == Some(Unlink::Running) {
+            folder.unlink = Some(Unlink::Abandoned);
+            drop(folders);
+            self.driver.changed();
+        }
+    }
 }
 
 struct Running {
@@ -234,7 +261,16 @@ impl Driver {
             .lock()
             .unwrap()
             .values()
-            .map(|folder| folder.status.lock().unwrap().clone())
+            .map(|folder| {
+                let mut status = folder.status.lock().unwrap().clone();
+                if folder.unlink == Some(Unlink::Abandoned) {
+                    status.state = FolderState::Halted;
+                    status.problem = Some(
+                        "unlinking the folder did not finish; unlink it again to finish".into(),
+                    );
+                }
+                status
+            })
             .collect();
         Status {
             account,
@@ -469,7 +505,7 @@ impl Driver {
             link,
             status: status.clone(),
             run: None,
-            unlinking: false,
+            unlink: None,
         };
         drop(lock);
         if self.inner.running.load(Ordering::SeqCst) {
@@ -501,8 +537,12 @@ impl Driver {
                     linked.link.root == wanted || Some(&linked.link.root) == canonical.as_ref()
                 })
                 .ok_or_else(|| DriverError::NotLinked(folder.to_path_buf()))?;
-            found.unlinking = true;
+            found.unlink = Some(Unlink::Running);
             (found.link.clone(), found.run.as_ref().map(Running::stop))
+        };
+        let _unlinking = Unlinking {
+            driver: self,
+            space_id: link.space_id.clone(),
         };
         if let Some(done) = done {
             ended(done).await;
@@ -517,7 +557,7 @@ impl Driver {
             Err(ref error) => {
                 if let Some(folder) = folders.get_mut(&link.space_id) {
                     folder.run = None;
-                    folder.unlinking = false;
+                    folder.unlink = None;
                     halt(folder, format!("the folder could not be unlinked: {error}"));
                 }
             }
@@ -626,7 +666,7 @@ impl Driver {
         let mut folders = self.inner.folders.lock().unwrap();
         let all = roots(&folders);
         for folder in folders.values_mut() {
-            if folder.unlinking || folder.run.as_ref().is_some_and(|run| !run.ended()) {
+            if folder.unlink.is_some() || folder.run.as_ref().is_some_and(|run| !run.ended()) {
                 continue;
             }
             let linked = all
@@ -869,7 +909,7 @@ fn load_folders(paths: &Paths) -> Result<BTreeMap<String, Folder>, DriverError> 
                 status: Arc::new(Mutex::new(status)),
                 link,
                 run: None,
-                unlinking: false,
+                unlink: None,
             },
         );
     }
@@ -1867,11 +1907,13 @@ mod tests {
         assert!(lockable(&root));
 
         driver.start();
+        let folder = &driver.status().folders[0];
         assert_eq!(
-            driver.status().folders[0].state,
-            FolderState::Stopped,
+            folder.state,
+            FolderState::Halted,
             "a task started for a folder whose unlink is unfinished"
         );
+        assert!(folder.problem.as_ref().unwrap().contains("unlink it again"));
         driver.sign_out().await.unwrap();
         signed_out(&driver, &paths, &root);
     }
