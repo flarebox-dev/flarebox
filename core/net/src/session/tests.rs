@@ -980,6 +980,40 @@ async fn a_dropped_commit_goes_on_the_socket_when_its_http_resend_gets_no_answer
     drop(server.await.unwrap());
 }
 
+#[tokio::test]
+async fn a_commit_out_over_http_is_not_sent_on_the_socket_after_a_welcome_of_another_history() {
+    let (listener, auth) = listen().await;
+    let (session, _events) = Session::start(auth, config()).unwrap();
+    let server = tokio::spawn(async move {
+        let mut first = accept(&listener, welcome("h", 1)).await;
+        recv_rpc(&mut first).await;
+        drop(first);
+        let second = accept(&listener, welcome("h", 1)).await;
+        let (mut http, _) = listener.accept().await.unwrap();
+        read_http(&mut http).await;
+        drop(second);
+        let mut third = accept(&listener, welcome("another", 1)).await;
+        drop(http);
+        let sent = tokio::time::timeout(Duration::from_millis(300), recv_rpc(&mut third)).await;
+        assert!(
+            sent.is_err(),
+            "the commit went out after the new Welcome: {sent:?}"
+        );
+        third
+    });
+    let result = tokio::time::timeout(Duration::from_secs(5), session.commit(commit(2)))
+        .await
+        .expect("the commit is answered");
+    assert_eq!(
+        result,
+        Err(CallError::NotResent(NotResent::HistoryChanged {
+            commit: "h".into(),
+            welcome: "another".into(),
+        }))
+    );
+    drop(server.await.unwrap());
+}
+
 /// Answers one HTTP request on an accepted connection with this status and a protobuf `Error`.
 async fn answer_with_error(tcp: &mut TcpStream, status: u16, error: ProtoError) {
     let mut request = [0; 4096];

@@ -765,19 +765,21 @@ impl Task {
     /// Resends the calls of a dropped connection. A commit goes only where `may_resend` allows it, and a commit that
     /// went out on the dropped connection goes over HTTP RPC instead of this one: a commit that breaks the server's
     /// storage gets no answer on a socket, whose connection then closes, but HTTP RPC answers it with
-    /// `QUOTA_EXCEEDED` and a wait. The other calls go on this connection.
+    /// `QUOTA_EXCEEDED` and a wait. The other calls go on this connection. A commit still out over HTTP RPC is
+    /// checked against each later `Welcome` as well, and once one refuses it, its HTTP answer is ignored and it is
+    /// not sent on the socket.
     async fn resend(&mut self, welcome: &Welcome, socket: &mut Socket) -> Result<(), Exit> {
-        let refused: Vec<(u64, NotResent)> = self
-            .pending
-            .iter()
-            .filter_map(|(req_id, call)| {
-                Some((*req_id, may_resend(call.commit.as_ref()?, welcome).err()?))
-            })
-            .collect();
-        for (req_id, reason) in refused {
-            if let Some(call) = self.pending.remove(&req_id) {
-                tracing::debug!(%reason, "flarebox session did not resend a commit");
-                let _ = call.reply.send(Err(CallError::NotResent(reason)));
+        for calls in [&mut self.pending, &mut self.over_http] {
+            let refused: Vec<(u64, NotResent)> = (calls.iter())
+                .filter_map(|(req_id, call)| {
+                    Some((*req_id, may_resend(call.commit.as_ref()?, welcome).err()?))
+                })
+                .collect();
+            for (req_id, reason) in refused {
+                if let Some(call) = calls.remove(&req_id) {
+                    tracing::debug!(%reason, "flarebox session did not resend a commit");
+                    let _ = call.reply.send(Err(CallError::NotResent(reason)));
+                }
             }
         }
         let unanswered: Vec<u64> = (self.pending.iter())
