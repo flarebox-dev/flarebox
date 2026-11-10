@@ -317,19 +317,24 @@ impl Engine {
     }
 
     /// Puts `changes` into L and returns the nodes whose L entry changed. Paths a change names in the previous state
-    /// (`Removed::path`, `Renamed::from`) are resolved before any change applies. A created entry with the identity of
-    /// a node L holds is that node, wherever L had it; any other created entry is a new node. A node that held the
-    /// name a change puts an entry at is gone from there, so it leaves L with everything under it. A file whose
-    /// content could not be read is left out until the observer reports it with its content.
+    /// (`Removed::path`, `Renamed::from`) are resolved before any change applies. A renamed or modified entry is the
+    /// node L holds at its path with its identity, else the node with its identity, else the node at its path. A
+    /// created entry with the identity of a node L holds is that node, wherever L had it, unless another path links
+    /// the same file: a hard link is a file of its own (design §5.6). Any other created entry is a new node.
+    ///
+    /// A node that held the name a change puts an entry at is gone from there, so it leaves L with everything under
+    /// it. A file that arrives over a file keeps the node of the file it replaces when L's own node for the arriving
+    /// file never synced, as when an editor saves by renaming a new file over the old one. The arriving node then
+    /// leaves L. A file whose content could not be read is left out until the observer reports it with its content.
     pub fn observe(&mut self, changes: &[Observed], now_ms: u64) -> BTreeSet<NodeId> {
         let mut index = Index::new(&self.trees);
         let before: Vec<Option<NodeId>> = changes
             .iter()
             .map(|change| match change {
                 Observed::Removed { path, .. } => index.at(path),
-                Observed::Renamed { from, id, .. } => index
-                    .by_identity(&file_identity(*id))
-                    .or_else(|| index.at(from)),
+                Observed::Renamed { from, id, .. } => {
+                    index.resolve(&self.trees, from, &file_identity(*id))
+                }
                 Observed::Created { .. } | Observed::Modified { .. } => None,
             })
             .collect();
@@ -362,13 +367,14 @@ impl Engine {
                     path,
                     kind,
                     id,
+                    linked,
                     content,
                 } => {
                     if *kind == EntryKind::File && content.is_none() {
                         continue;
                     }
                     let identity = file_identity(*id);
-                    let node = index.by_identity(&identity);
+                    let node = index.by_identity(&identity).filter(|_| !linked);
                     self.place(
                         &mut index,
                         node,
@@ -383,7 +389,7 @@ impl Engine {
                 Observed::Modified { path, id, content } => {
                     let Some(content) = content else { continue };
                     let identity = file_identity(*id);
-                    let node = index.by_identity(&identity).or_else(|| index.at(path));
+                    let node = index.resolve(&self.trees, path, &identity);
                     self.place(
                         &mut index,
                         node,
@@ -535,10 +541,20 @@ impl Engine {
         if kind == Kind::File && shape.content.is_none() {
             return;
         }
-        let id = node.unwrap_or_else(|| self.ids.uuid_v7(now_ms));
+        let mut id = node.unwrap_or_else(|| self.ids.uuid_v7(now_ms));
         if let Some(holder) = index.child(&parent, name).filter(|holder| **holder != id) {
             let holder = holder.clone();
-            self.remove(index, &holder, touched);
+            let replaced = self.trees.local().get(&holder).map(|node| node.shape.kind);
+            let synced =
+                self.trees.synced().get(&id).is_some() || self.trees.remote().get(&id).is_some();
+            if kind == Kind::File && replaced == Some(Kind::File) && !synced {
+                if self.trees.local().get(&id).is_some() {
+                    self.remove(index, &id, touched);
+                }
+                id = holder;
+            } else {
+                self.remove(index, &holder, touched);
+            }
         }
         index.forget(&self.trees, &id);
         index.insert(&id, &shape, identity);
@@ -622,6 +638,21 @@ impl Index {
 
     fn by_identity(&self, identity: &FileIdentity) -> Option<NodeId> {
         self.identities.get(identity).cloned()
+    }
+
+    /// The node at `path` when it has `identity`, else the node with `identity`, else the node at `path`. Two hard
+    /// links share an identity, and the path tells them apart.
+    fn resolve(&self, trees: &Trees, path: &Path, identity: &FileIdentity) -> Option<NodeId> {
+        let at = self.at(path);
+        at.clone()
+            .filter(|id| {
+                trees
+                    .local()
+                    .get(id)
+                    .is_some_and(|node| node.identity == *identity)
+            })
+            .or_else(|| self.by_identity(identity))
+            .or(at)
     }
 
     fn forget(&mut self, trees: &Trees, id: &str) {
@@ -1422,5 +1453,131 @@ mod tests {
             parked.push((case.name, kind(&planned.effect)));
         }
         assert_eq!(parked, [("its new folder moved into it", "park")]);
+    }
+
+    /// An engine with an empty space whose R is caught up, for tests of the mapper.
+    fn mapper() -> (tempfile::TempDir, Engine) {
+        let (dir, mut store) = store();
+        let engine = store.transaction(|tx| Engine::load(tx, ROOT)).unwrap();
+        (dir, engine)
+    }
+
+    fn ino(ino: u64) -> FileId {
+        FileId {
+            dev: 1,
+            ino,
+            birth_ns: None,
+        }
+    }
+
+    fn bytes(size: u64) -> Content {
+        Content {
+            size,
+            manifest_digest: vec![size as u8; 32],
+            ..Default::default()
+        }
+    }
+
+    fn created(path: &str, id: FileId, linked: bool, size: u64) -> Observed {
+        Observed::Created {
+            path: path.into(),
+            kind: EntryKind::File,
+            id,
+            linked,
+            content: Some(bytes(size)),
+        }
+    }
+
+    fn renamed(from: &str, to: &str, id: FileId) -> Observed {
+        Observed::Renamed {
+            from: from.into(),
+            to: to.into(),
+            kind: EntryKind::File,
+            id,
+        }
+    }
+
+    /// The node L holds at `path`, with its identity and content size.
+    fn holding(engine: &Engine, path: &str) -> Option<(NodeId, FileIdentity, u64)> {
+        let index = Index::new(&engine.trees);
+        let id = index.at(Path::new(path))?;
+        let node = engine.trees.local().get(&id)?;
+        let size = node
+            .shape
+            .content
+            .as_ref()
+            .map_or(0, |content| content.size);
+        Some((id, node.identity, size))
+    }
+
+    #[test]
+    fn a_file_saved_by_rename_over_another_keeps_the_node_of_the_file_it_replaces() {
+        let (_dir, mut engine) = mapper();
+        engine.observe(&[created("notes.txt", ino(1), false, 1)], 0);
+        let (notes, _, _) = holding(&engine, "notes.txt").unwrap();
+        let shape = engine.trees.local().get(&notes).unwrap().shape.clone();
+        engine.trees.set_synced(notes.clone(), Some(shape));
+
+        engine.observe(&[created(".notes.txt.swp", ino(2), false, 2)], 0);
+        engine.observe(&[renamed(".notes.txt.swp", "notes.txt", ino(2))], 0);
+        assert_eq!(
+            holding(&engine, "notes.txt"),
+            Some((notes.clone(), file_identity(ino(2)), 2))
+        );
+        assert_eq!(holding(&engine, ".notes.txt.swp"), None);
+        assert_eq!(engine.trees.local().len(), 1, "L holds the file alone");
+
+        engine.observe(&[created("draft.txt", ino(3), false, 3)], 0);
+        let (draft, _, _) = holding(&engine, "draft.txt").unwrap();
+        let shape = engine.trees.local().get(&draft).unwrap().shape.clone();
+        engine.trees.set_synced(draft.clone(), Some(shape));
+        engine.observe(&[renamed("draft.txt", "notes.txt", ino(3))], 0);
+        assert_eq!(
+            holding(&engine, "notes.txt"),
+            Some((draft, file_identity(ino(3)), 3)),
+            "a file that synced keeps its own node when it moves over another"
+        );
+        assert!(engine.trees.local().get(&notes).is_none());
+    }
+
+    #[test]
+    fn a_second_hard_link_is_a_node_of_its_own() {
+        let (_dir, mut engine) = mapper();
+        engine.observe(&[created("one.txt", ino(1), false, 1)], 0);
+        let (one, _, _) = holding(&engine, "one.txt").unwrap();
+
+        engine.observe(&[created("two.txt", ino(1), true, 1)], 0);
+        let (two, _, _) = holding(&engine, "two.txt").unwrap();
+        assert_ne!(one, two);
+        assert_eq!(
+            holding(&engine, "one.txt"),
+            Some((one.clone(), file_identity(ino(1)), 1))
+        );
+
+        let edited = Observed::Modified {
+            path: "one.txt".into(),
+            id: ino(1),
+            content: Some(bytes(4)),
+        };
+        engine.observe(&[edited, renamed("two.txt", "three.txt", ino(1))], 0);
+        assert_eq!(
+            holding(&engine, "one.txt"),
+            Some((one, file_identity(ino(1)), 4))
+        );
+        assert_eq!(
+            holding(&engine, "three.txt"),
+            Some((two, file_identity(ino(1)), 1))
+        );
+        assert_eq!(holding(&engine, "two.txt"), None);
+
+        engine.observe(&[created("four.txt", ino(5), false, 5)], 0);
+        let (four, _, _) = holding(&engine, "four.txt").unwrap();
+        engine.observe(&[created("five.txt", ino(5), false, 5)], 0);
+        assert_eq!(
+            holding(&engine, "five.txt").map(|(id, _, _)| id),
+            Some(four),
+            "a created entry of one link with a known identity is that node"
+        );
+        assert_eq!(holding(&engine, "four.txt"), None);
     }
 }
