@@ -648,6 +648,7 @@ dependencies = [
 name = "flarebox-net"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "bytes",
  "fastrand",
  "flarebox-proto",

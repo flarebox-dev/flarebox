@@ -22,7 +22,10 @@ mod session;
 mod stream;
 
 pub use api::Api;
-pub use auth::{Auth, Credentials, DEFAULT_REFRESH_MARGIN};
+pub use auth::{
+    Auth, CredentialStore, Credentials, DEFAULT_REFRESH_MARGIN, ROTATION_PERIOD, Reload, Staged,
+    Stored,
+};
 pub use backoff::Backoff;
 pub use chunks::{ChunkError, MAX_CHUNKS_PER_CALL, Transfer, matches};
 pub use error::{ApiError, CallError, NotResent, Resend, ServerError, StopReason};

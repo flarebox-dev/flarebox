@@ -13,14 +13,17 @@ use flarebox_engine::commit::{Commits, Lift, LiftError};
 use flarebox_engine::ignore::LocalRules;
 use flarebox_fs::{Marker, probe_no_replace, read_marker, write_marker};
 use flarebox_ignore::LocalRulesError;
-use flarebox_net::{ApiError, Auth};
+use flarebox_net::{ApiError, Auth, ROTATION_PERIOD};
 use flarebox_proto::v1::{ClaimRequest, DeviceCredentials, PairCompleteRequest, SpaceInfo};
 use flarebox_store::{EngineState, GivenAnswer, Link, Store, StoredQuestion};
 use tokio::sync::{Notify, watch};
 
 use crate::claim::{self, Flock, Owner};
 use crate::config::{Config, ConfigError};
-use crate::credential::{Credential, CredentialError, NewCredentialFile, api_for};
+use crate::credential::{
+    Credential, CredentialError, CredentialFiles, NewCredentialFile, StoredCredential, api_for,
+    next_path,
+};
 use crate::folder::FolderTask;
 use crate::ignore::{Matcher, local_rules, matcher};
 use crate::paths::{Paths, PathsError};
@@ -183,6 +186,10 @@ struct Inner {
     /// claim or a link in flight and then undoes it, and a credential the server issued is always stored.
     lifecycle: tokio::sync::Mutex<()>,
     credential: Mutex<Option<Credential>>,
+    /// The one [`Auth`] of this process while it is signed in, which every caller uses, so that a rotation of the
+    /// refresh credential reaches all of them (RFC 0011 section 2). None while signed out, or when the credential's
+    /// server URL cannot be used.
+    auth: Mutex<Option<Arc<Auth>>>,
     folders: Mutex<BTreeMap<String, Folder>>,
     running: AtomicBool,
     changed: Arc<watch::Sender<()>>,
@@ -299,10 +306,17 @@ impl Driver {
         };
         let local = local_rules(&config.sync).map_err(invalid)?;
         let matcher = matcher(&config.sync).map_err(invalid)?;
-        let credential = Credential::load(&paths.credential())?;
-        if credential.is_some() {
+        let stored = Credential::load_stored(&paths.credential())?;
+        if let Some(stored) = &stored {
             Credential::keep_out_of_backups(&paths.credential())?;
+            if stored.staged.is_some() {
+                Credential::keep_out_of_backups(&next_path(&paths.credential()))?;
+            }
         }
+        let auth = stored
+            .as_ref()
+            .and_then(|stored| rotating_auth(&paths, stored).ok());
+        let credential = stored.map(|stored| stored.credential);
         let folders = load_folders(&paths)?;
         Ok(Driver {
             inner: Arc::new(Inner {
@@ -313,6 +327,7 @@ impl Driver {
                 _lock: lock,
                 lifecycle: tokio::sync::Mutex::new(()),
                 credential: Mutex::new(credential),
+                auth: Mutex::new(auth),
                 folders: Mutex::new(folders),
                 running: AtomicBool::new(false),
                 changed: Arc::new(watch::Sender::new(())),
@@ -477,7 +492,8 @@ impl Driver {
         self.stop().await;
         let signed_in = self.inner.credential.lock().unwrap().clone();
         if let Some(credential) = &signed_in
-            && let Err(refused) = revoke(credential, confirm_last_device).await
+            && let Err(refused) =
+                revoke(credential, self.auth(credential), confirm_last_device).await
         {
             if was_running {
                 self.start();
@@ -489,11 +505,14 @@ impl Driver {
             self.unlink_folder(&root).await?;
         }
         let path = self.inner.paths.credential();
-        match fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(io_error(&path)(error)),
+        for path in [next_path(&path), path] {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io_error(&path)(error)),
+            }
         }
+        *self.inner.auth.lock().unwrap() = None;
         *self.inner.credential.lock().unwrap() = None;
         self.inner.running.store(false, Ordering::SeqCst);
         tracing::info!("signed out");
@@ -578,6 +597,12 @@ impl Driver {
         }
         write(&credential)?;
         let account = credential.account();
+        let stored = StoredCredential {
+            credential: credential.clone(),
+            staged: None,
+            changed_at: SystemTime::now(),
+        };
+        *self.inner.auth.lock().unwrap() = rotating_auth(&self.inner.paths, &stored).ok();
         *slot = Some(credential);
         drop(slot);
         self.changed();
@@ -616,9 +641,8 @@ impl Driver {
             }
             _ => {}
         }
-        let api = credential.api()?;
-        let auth = Auth::new(api.clone(), credential.net());
-        let space = resolve_space(api.list_spaces(&auth).await?.spaces, space)?;
+        let auth = self.auth(&credential)?;
+        let space = resolve_space(auth.api().list_spaces(&auth).await?.spaces, space)?;
 
         let mut folders = self.inner.folders.lock().unwrap();
         self.check_placement(&root, &folders)?;
@@ -984,8 +1008,8 @@ impl Driver {
                 ),
             );
         }
-        let api = match credential.api() {
-            Ok(api) => api,
+        let auth = match self.auth(credential) {
+            Ok(auth) => auth,
             Err(error) => return halt(folder, error.to_string()),
         };
         let store = match self.inner.paths.store(&folder.link.space_id) {
@@ -995,7 +1019,7 @@ impl Driver {
         let task = FolderTask {
             link: folder.link.clone(),
             store,
-            auth: Arc::new(Auth::new(api, credential.net())),
+            auth,
             status: folder.status.clone(),
             matcher: self.inner.matcher.clone(),
             local: self.inner.local.clone(),
@@ -1023,6 +1047,24 @@ impl Driver {
             requests,
             done,
         });
+    }
+
+    /// The process's one [`Auth`] for `credential`, the one this profile is signed in with.
+    fn auth(&self, credential: &Credential) -> Result<Arc<Auth>, ApiError> {
+        let mut slot = self.inner.auth.lock().unwrap();
+        if let Some(auth) = slot.as_ref() {
+            return Ok(auth.clone());
+        }
+        let stored = Credential::load_stored(&self.inner.paths.credential())
+            .map_err(|error| ApiError::Credential(io::Error::other(error)))?
+            .unwrap_or_else(|| StoredCredential {
+                credential: credential.clone(),
+                staged: None,
+                changed_at: SystemTime::now(),
+            });
+        let auth = rotating_auth(&self.inner.paths, &stored)?;
+        *slot = Some(auth.clone());
+        Ok(auth)
     }
 
     fn credential(&self) -> Result<Credential, DriverError> {
@@ -1261,9 +1303,24 @@ fn now_ms() -> i64 {
 /// [`DriverError::LastDevice`], whatever its body, and any other failure, including no answer within [`SERVER_WAIT`],
 /// is [`DriverError::NotRevoked`]. With it, every failure, a 409 included, is logged and the device stays active on the
 /// server until another device revokes it.
-async fn revoke(credential: &Credential, confirm_last_device: bool) -> Result<(), DriverError> {
+/// An [`Auth`] that owns the profile's credential files and rotates the refresh credential they hold.
+fn rotating_auth(paths: &Paths, stored: &StoredCredential) -> Result<Arc<Auth>, ApiError> {
+    let files = CredentialFiles::new(&paths.credential(), stored.credential.clone());
+    Ok(Arc::new(Auth::rotating(
+        stored.credential.api()?,
+        stored.net(),
+        Arc::new(files),
+        ROTATION_PERIOD,
+    )))
+}
+
+async fn revoke(
+    credential: &Credential,
+    auth: Result<Arc<Auth>, ApiError>,
+    confirm_last_device: bool,
+) -> Result<(), DriverError> {
     let revoked = async {
-        let auth = Auth::new(credential.api()?, credential.net());
+        let auth = auth?;
         auth.api().revoke_self(&auth, confirm_last_device).await
     };
     let failure = match tokio::time::timeout(SERVER_WAIT, revoked).await {
@@ -2304,12 +2361,7 @@ mod tests {
         let base = fs::canonicalize(dir.path()).unwrap();
         let credential_path = Paths::under(&base.join("profile")).credential();
         let (server, served) = serve_each(
-            vec![
-                access_token(),
-                last_device_refused(),
-                access_token(),
-                (204, Vec::new()),
-            ],
+            vec![access_token(), last_device_refused(), (204, Vec::new())],
             credential_path,
         )
         .await;
@@ -2337,7 +2389,6 @@ mod tests {
             [
                 ("/v1/token".to_owned(), true),
                 ("/v1/devices/d1".to_owned(), true),
-                ("/v1/token".to_owned(), true),
                 ("/v1/devices/d1?confirm=last-device".to_owned(), true),
             ]
         );
@@ -2978,6 +3029,206 @@ mod tests {
                 .is_err(),
             "the server was asked for a credential"
         );
+    }
+
+    /// Serves one request per entry of `replies`, in order, and returns each request's path and body.
+    async fn serve_recorded(
+        replies: Vec<(u16, Vec<u8>)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<(String, Vec<u8>)>>) {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = format!("http://{}/", listener.local_addr().unwrap());
+        let served = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (status, body) in replies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                requests.push(read_request(&mut socket).await);
+                let head = format!(
+                    "HTTP/1.1 {status} Reply\r\ncontent-type: application/x-protobuf\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(head.as_bytes()).await.unwrap();
+                socket.write_all(&body).await.unwrap();
+            }
+            requests
+        });
+        (server, served)
+    }
+
+    /// A token answer of a server with RFC 0011, at server time `server_time_ms`.
+    fn rotation_answer(server_time_ms: i64, rotated: bool) -> (u16, Vec<u8>) {
+        let token = flarebox_proto::v1::AccessToken {
+            token: "token".into(),
+            expires_at_ms: i64::MAX,
+            server_time_ms,
+            rotated,
+        };
+        (200, prost::Message::encode_to_vec(&token))
+    }
+
+    fn token_request(body: &[u8]) -> flarebox_proto::v1::TokenRequest {
+        prost::Message::decode(body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_rotation_reaches_linking_and_signing_out_through_the_one_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        fs::create_dir(&root).unwrap();
+        let paths = Paths::under(&base.join("profile"));
+        let spaces = prost::Message::encode_to_vec(&flarebox_proto::v1::SpaceList {
+            spaces: vec![SpaceInfo {
+                space_id: SPACE.into(),
+                name: "Projects".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let (server, served) = serve_recorded(vec![
+            rotation_answer(5_000, false),
+            rotation_answer(5_000, true),
+            (200, spaces),
+            (204, Vec::new()),
+        ])
+        .await;
+        Credential {
+            server,
+            ..credential("d1")
+        }
+        .save_new(&paths.credential())
+        .unwrap();
+        let two_days_ago = SystemTime::now() - Duration::from_secs(2 * 24 * 3600);
+        OpenOptions::new()
+            .write(true)
+            .open(paths.credential())
+            .unwrap()
+            .set_modified(two_days_ago)
+            .unwrap();
+        let driver = Driver::open(paths.clone()).unwrap();
+
+        driver.link(&root, "Projects").await.unwrap();
+        let rotated = Credential::load(&paths.credential())
+            .unwrap()
+            .unwrap()
+            .refresh_credential;
+        assert_ne!(rotated, "secret");
+        assert!(!next_path(&paths.credential()).exists());
+        driver.sign_out(true).await.unwrap();
+
+        let requests = served.await.unwrap();
+        let paths_requested: Vec<_> = requests.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(
+            paths_requested[..3],
+            ["/v1/token", "/v1/token", "/v1/spaces"]
+        );
+        assert!(
+            paths_requested[3].starts_with("/v1/devices/d1"),
+            "{paths_requested:?}"
+        );
+        let proposal = token_request(&requests[1].1);
+        assert_eq!(proposal.refresh_credential, "secret");
+        assert_eq!(proposal.next_refresh_credential, rotated);
+        assert_eq!(proposal.rotate_before_ms, 5_000 + 60_000);
+    }
+
+    #[tokio::test]
+    async fn a_crash_between_the_two_writes_of_a_promotion_ends_with_one_file() {
+        for stored_again in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::under(dir.path());
+            let answer = if stored_again {
+                rotation_answer(500, true)
+            } else {
+                rotation_answer(2_000, false)
+            };
+            let (server, served) = serve_recorded(vec![answer]).await;
+            let promoted = Credential {
+                server,
+                refresh_credential: "promoted".into(),
+                ..credential("d1")
+            };
+            promoted.save_new(&paths.credential()).unwrap();
+            let staged = flarebox_net::Staged {
+                refresh_credential: "promoted".into(),
+                rotate_before_ms: 1_000,
+            };
+            flarebox_net::CredentialStore::stage(
+                &CredentialFiles::new(&paths.credential(), promoted.clone()),
+                &staged,
+            )
+            .unwrap();
+            let driver = Driver::open(paths.clone()).unwrap();
+
+            driver
+                .auth(&promoted)
+                .unwrap()
+                .access_token()
+                .await
+                .unwrap();
+            let request = token_request(&served.await.unwrap()[0].1);
+            assert_eq!(request.refresh_credential, "promoted");
+            assert_eq!(request.next_refresh_credential, "promoted");
+            assert!(!next_path(&paths.credential()).exists(), "{stored_again}");
+            let stored = Credential::load_stored(&paths.credential())
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.credential.refresh_credential, "promoted");
+            assert_eq!(stored.staged, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_auth_built_after_open_starts_from_the_stored_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let (server, served) = serve_recorded(vec![rotation_answer(500, true)]).await;
+        let current = Credential {
+            server,
+            refresh_credential: "current".into(),
+            ..credential("d1")
+        };
+        current.save_new(&paths.credential()).unwrap();
+        flarebox_net::CredentialStore::stage(
+            &CredentialFiles::new(&paths.credential(), current.clone()),
+            &flarebox_net::Staged {
+                refresh_credential: "staged".into(),
+                rotate_before_ms: 1_000,
+            },
+        )
+        .unwrap();
+        let driver = Driver::open(paths.clone()).unwrap();
+        *driver.inner.auth.lock().unwrap() = None;
+
+        driver.auth(&current).unwrap().access_token().await.unwrap();
+        let request = token_request(&served.await.unwrap()[0].1);
+        assert_eq!(request.refresh_credential, "current");
+        assert_eq!(request.next_refresh_credential, "staged");
+        let stored = Credential::load_stored(&paths.credential())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.credential.refresh_credential, "staged");
+        assert_eq!(stored.staged, None);
+    }
+
+    #[tokio::test]
+    async fn signing_out_removes_the_staged_credential_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        paired(&paths, "d1");
+        flarebox_net::CredentialStore::stage(
+            &CredentialFiles::new(&paths.credential(), credential("d1")),
+            &flarebox_net::Staged {
+                refresh_credential: "next".into(),
+                rotate_before_ms: 1,
+            },
+        )
+        .unwrap();
+        let driver = Driver::open(paths.clone()).unwrap();
+        driver.sign_out(true).await.unwrap();
+        assert!(!paths.credential().exists());
+        assert!(!next_path(&paths.credential()).exists());
     }
 
     #[tokio::test]

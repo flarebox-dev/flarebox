@@ -27,7 +27,8 @@ A profile is one device credential and the stores it writes. The CLI uses the XD
 |---|---|
 | `$XDG_CONFIG_HOME/flarebox/config.toml` | The device-local configuration. Edited by the person; no secrets, no state, never synced |
 | `$XDG_STATE_HOME/flarebox/` (mode 0700) | Machine-bound state, never copied |
-| `…/credential.json` (mode 0600) | The device credential: server, user and device ids, the user name on the device that claimed the server, device name, refresh credential. On macOS it is excluded from Time Machine (see below) |
+| `…/credential.json` (mode 0600) | The device credential: server, user and device ids, the user name on the device that claimed the server, device name, refresh credential. On macOS it is excluded from Time Machine (see below). Its modification time is when the refresh credential last changed |
+| `…/credential.next` (mode 0600) | Only while a rotation's outcome is unknown: the refresh credential the device proposed and its deadline (RFC 0011 §2, docs/design/credential-rotation.md). Excluded from Time Machine like `credential.json` |
 | `…/lock` | The profile lock (`flock`), held by the one process that writes the profile |
 | `…/spaces/<space_id>/store.sqlite` | One `core/store` per linked space: R, S, L, the cursor, the link and the questions |
 | `$XDG_RUNTIME_DIR/flarebox/daemon.sock` (mode 0600) | The daemon's socket; in the state directory when `XDG_RUNTIME_DIR` is unset |
@@ -95,7 +96,7 @@ How `core/ffi`'s `Core` trait maps onto it in step D:
 1. **Root check** (design §6.2): the folder exists, is readable, is on the device recorded at link time and holds a marker for its space. A folder that fails is halted with the reason and checked again every 30 seconds; nothing else runs for it meanwhile.
 2. **Placement and claim**: the folder must not overlap the profile's directories or its other folders (H6 rule 4), no other process may hold its lock, and its owner record must name this device; a folder linked before the record existed gets one. Any failure halts the folder before it is observed or connected.
 3. **Observation** runs on a thread of its own (below) and reports how many entries the folder holds. The task waits for the thread to end before it stops, so the folder's lock is free once `stop` returns. The last holder of this lock, and of the profile lock, unlocks it and does not only close its descriptor. A child process holds a copy of the descriptor from its fork to its exec, and a close alone would leave the lock with that copy.
-4. **Session**: `core/net`'s `Session` with one `Auth` built from the credential, which reconnects with backoff on its own. Events are handled in order:
+4. **Session**: `core/net`'s `Session`, which reconnects with backoff on its own. It uses the profile's one `Auth`, which every folder task, `link` and the sign-out revocation share, so a rotation of the refresh credential reaches all of them. Events are handled in order:
 
 | Event | What the task does |
 |---|---|
