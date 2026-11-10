@@ -302,18 +302,4 @@ extension Date {
     }
 }
 
-extension FakeScenario {
-    /// Reads the scenario named by the `FakeScenario` launch argument, such as `massDelete`.
-    init?(name: String) {
-        let all: [String: FakeScenario] = [
-            "firstRun": .firstRun, "upToDate": .upToDate, "syncing": .syncing, "paused": .paused,
-            "offline": .offline, "massDelete": .massDelete, "ambiguousDisappearance": .ambiguousDisappearance,
-            "recovery": .recovery, "recoveredWithoutQuestions": .recoveredWithoutQuestions,
-            "remoteMassDelete": .remoteMassDelete, "manyQuestions": .manyQuestions, "problems": .problems,
-        ]
-        guard let scenario = all[name] else { return nil }
-        self = scenario
-    }
-}
-
 let independenceNotice = String(localized: "Flarebox is an independent project and is not affiliated with Cloudflare, Inc.")

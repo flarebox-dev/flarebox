@@ -44,6 +44,22 @@ public final class AppModel {
         return AppModel(session: session, events: events)
     }
 
+    /// The scenario that the `FakeScenario` preference names, such as `massDelete`, for starting the app on the fake
+    /// core. Only a debug build reads the preference, so a release build always opens the sync profile.
+    public static func launchScenario(in defaults: UserDefaults) -> FakeScenario? {
+        #if DEBUG
+        let all: [String: FakeScenario] = [
+            "firstRun": .firstRun, "upToDate": .upToDate, "syncing": .syncing, "paused": .paused,
+            "offline": .offline, "massDelete": .massDelete, "ambiguousDisappearance": .ambiguousDisappearance,
+            "recovery": .recovery, "recoveredWithoutQuestions": .recoveredWithoutQuestions,
+            "remoteMassDelete": .remoteMassDelete, "manyQuestions": .manyQuestions, "problems": .problems,
+        ]
+        return defaults.string(forKey: "FakeScenario").flatMap { all[$0] }
+        #else
+        return nil
+        #endif
+    }
+
     deinit {
         consumer?.cancel()
     }
