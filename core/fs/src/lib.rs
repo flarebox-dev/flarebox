@@ -1074,10 +1074,10 @@ impl NativeWatcher {
         }
         for dir in &dirs {
             let path = self.root.join(dir);
-            if let Err(err) = watch_tree(&mut self.watcher, &path) {
-                if !gone(&path) {
-                    self.failed = Some(watch_error(err));
-                }
+            if let Err(err) = watch_tree(&mut self.watcher, &path)
+                && !gone(&path)
+            {
+                self.failed = Some(watch_error(err));
             }
         }
         match self.snapshot.rescan(&self.root, dirs.iter().cloned()) {
