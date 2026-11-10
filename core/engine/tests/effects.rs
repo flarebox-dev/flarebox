@@ -827,6 +827,60 @@ fn a_file_an_effect_removes_after_the_server_restored_it_is_downloaded_again() {
     assert_in_sync(&mut trees);
 }
 
+/// GUN-349. A move to R's position is in flight when R moves the file back. The move is this
+/// device's effect, not the user's, so no commit moves the file, and the effects move it back.
+#[test]
+fn a_move_r_undid_while_it_was_in_flight_is_moved_back() {
+    let (mut trees, mut disk) = space(&[("f", Some(file(ROOT, "a", 1)), Some(file(ROOT, "b", 1)))]);
+    trees.settle();
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    let record = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    assert!(matches!(record.effect, Effect::Move { .. }));
+
+    trees.set_remote("f".into(), remote(file(ROOT, "a", 1)));
+    let created = disk.apply(&record.effect).unwrap();
+    effects
+        .done(&mut trees, &record.effect_id, created)
+        .unwrap();
+    trees.check().unwrap();
+    trees.settle();
+    assert_eq!(trees.class("f"), Class::Remote);
+
+    let done = converge(&mut trees, &mut disk, 10).unwrap();
+    assert!(matches!(done[..], [Effect::Move { .. }]), "{done:?}");
+    assert_in_sync(&mut trees);
+}
+
+/// The server renamed f while the user edited it, so its position is reverted with the edit
+/// unsent. The move to the server's name keeps the edit, which is uploaded.
+#[test]
+fn a_reverted_move_keeps_an_edit_that_was_not_uploaded() {
+    let (mut trees, mut disk) = space(&[("f", Some(file(ROOT, "a", 1)), Some(file(ROOT, "b", 1)))]);
+    let mut local = trees.local().get("f").unwrap().clone();
+    local.shape.content = Some(content(2));
+    trees.set_local("f".into(), local);
+    disk.entries.get_mut(&1).unwrap().content = Some(content(2));
+    trees.revert("f".into());
+    trees.settle();
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    let record = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    assert!(matches!(record.effect, Effect::Move { .. }));
+    let created = disk.apply(&record.effect).unwrap();
+    effects
+        .done(&mut trees, &record.effect_id, created)
+        .unwrap();
+    trees.settle();
+    assert!(trees.edited("f"));
+    assert_eq!(trees.local().live("f").unwrap().content, Some(content(2)));
+    let mut commits = flarebox_engine::commit::Commits::default();
+    let commit = commits
+        .build(&mut trees, &mut ids, NOW, "history", 1)
+        .unwrap();
+    assert!(commit.ops.iter().any(|op| matches!(&op.op,
+        Some(flarebox_proto::v1::op::Op::UpdateContent(update)) if update.node_id == "f" && update.content == Some(content(2)))),
+        "{:?}", commit.ops);
+}
+
 /// GUN-332. The server renamed a file this device created, so its local position is reverted.
 /// The user deleted the file before an effect moved it to the server's name. That delete is the
 /// user's to commit, and no effect brings the file back.

@@ -319,13 +319,16 @@ impl Effects {
     }
 
     /// The driver did the effect. L takes the node's new shape, with `identity` for an entry the
-    /// effect created. An effect other than a move gave L the shape R had when it was planned, so S
-    /// takes that shape too, when S stays a valid tree. A change R made while the effect was in
-    /// flight then stays a remote change and is never taken for the user's. S stays as it is when
-    /// L no longer matched S: L then holds a change of the user's, which recovery after a crash
-    /// can report as the effect's outcome (a missing file as the removal, the planned bytes as the
-    /// write), and that change stays the user's. An outcome L does not take
-    /// ([`EffectRecord::applies`]) is refused, and the effect stays in flight.
+    /// effect created. When L matched S, or the shape S's waiting update holds, the effect gave L
+    /// the shape R had when it was planned, so S takes that shape too, when S stays a valid tree.
+    /// A change R made while the effect was in flight then stays a remote change and is never
+    /// taken for the user's: a file R restored during its removal is downloaded again, and a file
+    /// R moved back during its move is moved back. S stays as it is when L no longer matched it:
+    /// L then holds a change of the user's, such as an edit a move carries or one that recovery
+    /// after a crash reports as the effect's outcome (a missing file as the removal, the planned
+    /// bytes as the write), and that change stays the user's.
+    /// An outcome L does not take ([`EffectRecord::applies`]) is refused, and the effect stays
+    /// in flight.
     pub fn done(
         &mut self,
         trees: &mut Trees,
@@ -352,11 +355,12 @@ impl Effects {
         };
         let record = self.take(effect_id)?;
         let parked = record.parks();
-        let unchanged = same(
-            trees.local().live(&record.node),
-            trees.synced().live(&record.node),
-        );
-        if unchanged && !matches!(record.effect, Effect::Move { .. }) {
+        let base = match trees.waiting().get(&record.node) {
+            Some(waiting) => waiting.as_ref(),
+            None => trees.synced().live(&record.node),
+        };
+        let unchanged = same(trees.local().live(&record.node), base);
+        if unchanged {
             trees.set_synced_if_valid(record.node.clone(), record.after.clone());
         }
         match record.after {
