@@ -92,6 +92,23 @@ describe("refresh credential rotation (RFC 0011 section 1)", () => {
     });
   });
 
+  it("stores a proposal checked exactly at its deadline", async () => {
+    await withDevice("rotation-deadline", async (instance, device, _row, setClock) => {
+      setClock(3_000_000);
+      const next = newCredential();
+      const answer = await instance.refreshAccess({
+        deviceId: device.deviceId,
+        refreshCredential: device.refreshCredential,
+        rotation: true,
+        nextRefreshCredential: next,
+        rotateBeforeMs: 3_000_000n,
+      });
+      if (!answer.ok) throw new Error(answer.message);
+      expect(answer.value).toMatchObject({ serverTimeMs: 3_000_000n, rotated: true });
+      expect(await instance.refreshAccess({ deviceId: device.deviceId, refreshCredential: next })).toMatchObject({ ok: true });
+    });
+  });
+
   it("answers a proposal after its deadline without rotated and keeps the credential, while the clocks advance", async () => {
     await withDevice("rotation-late", async (instance, device, row, setClock) => {
       const before = hex(row().refresh_hash);
