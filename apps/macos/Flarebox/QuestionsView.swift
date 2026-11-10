@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import AppKit
 import FlareboxFFI
 import FlareboxModel
 import SwiftUI
@@ -78,6 +79,7 @@ private struct QuestionDetail: View {
     @State private var isConfirming = false
     @State private var error: SessionError?
     @State private var answering = false
+    @State private var selectedItemID: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -117,10 +119,32 @@ private struct QuestionDetail: View {
             }
             .padding(20)
             Divider()
-            List(question.items, id: \.nodeId) { item in
+            List(question.items, id: \.nodeId, selection: $selectedItemID) { item in
                 HeldItemRow(item: item)
+                    .help(item.path)
+                    .contextMenu {
+                        Button("Copy Path") { copy(item.path) }
+                    }
             }
             .listStyle(.inset)
+            .onCopyCommand {
+                selectedItem.map { [NSItemProvider(object: $0.path as NSString)] } ?? []
+            }
+            Divider()
+            Group {
+                if let selectedItem {
+                    Text(selectedItem.path)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Text("Select an item to see its full path.")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .font(.caption)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 8)
         }
         .confirmationDialog(
             confirming.map { question.title(for: $0) } ?? "",
@@ -131,6 +155,16 @@ private struct QuestionDetail: View {
         } message: { _ in
             Text("This applies to every item listed: \(itemCount(question.items.count)), \(fileCount(question.affectedFiles)).")
         }
+    }
+
+    private var selectedItem: HeldItem? {
+        guard let selectedItemID else { return nil }
+        return question.items.first { $0.nodeId == selectedItemID }
+    }
+
+    private func copy(_ path: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(path, forType: .string)
     }
 
     private func send(_ answer: Answer) {

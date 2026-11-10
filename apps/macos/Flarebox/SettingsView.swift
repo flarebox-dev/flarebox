@@ -82,7 +82,7 @@ private struct FoldersSettings: View {
             HStack {
                 Spacer()
                 Button("Add Folder…") {
-                    adding = SetupModel(app: model, deviceName: Host.current().localizedName ?? "Mac")
+                    adding = SetupModel(app: model, mode: .addFolder, deviceName: Host.current().localizedName ?? "Mac")
                 }
                 .disabled(model.state.account == nil)
             }

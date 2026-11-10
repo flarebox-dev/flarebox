@@ -4,10 +4,19 @@ import FlareboxFFI
 import Foundation
 import Observation
 
-/// The first-run setup: connect to a server, sign this device in, and link a folder to a space.
+/// The setup flow: connect to a server, sign this device in, and link a folder to a space.
 @MainActor
 @Observable
 public final class SetupModel {
+    /// Where the flow starts.
+    public enum Mode: Equatable, Sendable {
+        /// Picks up at the first step not done yet, or finishes at once if this device already
+        /// syncs a folder.
+        case firstRun
+        /// Links one more folder on a signed-in device, finishing when that link succeeds.
+        case addFolder
+    }
+
     public enum Step: Equatable, Sendable {
         case server
         case signIn
@@ -33,12 +42,12 @@ public final class SetupModel {
 
     private let app: AppModel
 
-    public init(app: AppModel, deviceName: String) {
+    public init(app: AppModel, mode: Mode, deviceName: String) {
         self.app = app
         self.deviceName = deviceName
         if app.state.account == nil {
             step = .server
-        } else if app.state.folders.isEmpty {
+        } else if mode == .addFolder || app.state.folders.isEmpty {
             step = .folder
         } else {
             step = .done

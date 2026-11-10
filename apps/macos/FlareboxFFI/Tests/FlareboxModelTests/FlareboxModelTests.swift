@@ -40,13 +40,15 @@ private func item(_ path: String) -> HeldItem {
         model.start()
         #expect(model.needsSetup)
         #expect(model.state.status == .needsSetup)
-        #expect(SetupModel(app: model, deviceName: "Mac").step == .server)
+        #expect(SetupModel(app: model, mode: .firstRun, deviceName: "Mac").step == .server)
+        #expect(SetupModel(app: model, mode: .addFolder, deviceName: "Mac").step == .server)
 
         let ready = AppModel.fake(scenario: .upToDate)
         ready.start()
         #expect(!ready.needsSetup)
         #expect(ready.state.status == .idle)
-        #expect(SetupModel(app: ready, deviceName: "Mac").step == .done)
+        #expect(SetupModel(app: ready, mode: .firstRun, deviceName: "Mac").step == .done)
+        #expect(SetupModel(app: ready, mode: .addFolder, deviceName: "Mac").step == .folder)
     }
 
     @Test func pauseAndResume() throws {
@@ -197,7 +199,7 @@ private func item(_ path: String) -> HeldItem {
         let folder = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: folder) }
         let app = AppModel.fake(scenario: .firstRun)
-        let setup = SetupModel(app: app, deviceName: "Ada's Mac")
+        let setup = SetupModel(app: app, mode: .firstRun, deviceName: "Ada's Mac")
         #expect(!setup.canConnect)
 
         setup.serverURL = "box.example.com"
@@ -236,7 +238,7 @@ private func item(_ path: String) -> HeldItem {
         defer { try? FileManager.default.removeItem(at: folder) }
         let app = AppModel.fake(scenario: .firstRun)
         try #require(app.session.fakeCore()).setServerClaimed(claimed: true)
-        let setup = SetupModel(app: app, deviceName: "Mac")
+        let setup = SetupModel(app: app, mode: .firstRun, deviceName: "Mac")
         setup.serverURL = "https://box.example.com"
         await setup.connect()
         #expect(!setup.claimsServer)
@@ -264,7 +266,7 @@ private func item(_ path: String) -> HeldItem {
     @Test func serverErrorsKeepTheStep() async throws {
         let app = AppModel.fake(scenario: .firstRun)
         try #require(app.session.fakeCore()).failNext(error: .ServerUnreachable(reason: "timed out"))
-        let setup = SetupModel(app: app, deviceName: "Mac")
+        let setup = SetupModel(app: app, mode: .firstRun, deviceName: "Mac")
         setup.serverURL = "https://box.example.com"
         await setup.connect()
         #expect(setup.error == .ServerUnreachable(reason: "timed out"))
@@ -273,5 +275,31 @@ private func item(_ path: String) -> HeldItem {
         #expect(setup.step == .signIn)
         setup.changeServer()
         #expect(setup.step == .server)
+    }
+
+    @Test func addAFolderToAConfiguredDeviceFinishesWhenTheLinkSucceeds() async throws {
+        let folder = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let app = AppModel.fake(scenario: .upToDate)
+        app.start()
+        let linked = app.state.folders.map(\.spaceId)
+        try #require(!linked.isEmpty)
+        let setup = SetupModel(app: app, mode: .addFolder, deviceName: "Mac")
+        #expect(setup.step == .folder)
+
+        await setup.loadSpaces()
+        setup.selectedSpaceID = nil
+        setup.newSpaceName = "Projects"
+        setup.folderPath = folder.appending(path: "missing").path(percentEncoded: false)
+        await setup.link()
+        #expect(setup.error == .FolderNotFound)
+        #expect(setup.step == .folder)
+
+        setup.folderPath = folder.path(percentEncoded: false)
+        await setup.link()
+        #expect(setup.error == nil)
+        #expect(setup.step == .done)
+        #expect(app.state.folders.count == linked.count + 1)
+        #expect(app.state.folders.contains { $0.spaceName == "Projects" })
     }
 }

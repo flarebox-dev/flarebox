@@ -21,7 +21,7 @@ struct SetupView: View {
         .frame(width: 480)
         .onAppear {
             if setup == nil {
-                setup = SetupModel(app: app, deviceName: Host.current().localizedName ?? "Mac")
+                setup = SetupModel(app: app, mode: .firstRun, deviceName: Host.current().localizedName ?? "Mac")
             }
         }
     }
@@ -234,6 +234,6 @@ private struct DoneStep: View {
 
 #Preview("Folder") {
     let app = AppModel.preview(.upToDate)
-    let setup = SetupModel(app: app, deviceName: "Mac")
+    let setup = SetupModel(app: app, mode: .addFolder, deviceName: "Mac")
     return FolderStep(setup: setup).padding(24).frame(width: 480).environment(app)
 }
