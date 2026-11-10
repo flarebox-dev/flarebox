@@ -1048,6 +1048,25 @@ describe("RFC 0007 name limits and space list pages", () => {
     expect(created.status).toBe(201);
   });
 
+  it("frees a space name when the Account DO aborts during the create, after its storage was flushed", async () => {
+    const token = (await getOwner()).access!.token;
+    const name = `Interrupted ${uuidv7()}`;
+    await runInDurableObject(account(), (instance, state) => {
+      const spaces = (instance as unknown as { env: Env }).env.SPACE;
+      vi.spyOn(spaces, "get").mockImplementationOnce(
+        () =>
+          ({
+            init: async () => {
+              await state.storage.sync();
+              state.abort("interrupted while the Space DO was being set up");
+            },
+          }) as unknown as ReturnType<typeof spaces.get>,
+      );
+    });
+    await send("/v1/spaces", { token, body: body(CreateSpaceRequestSchema, { name }) }).catch(() => undefined);
+    expect((await send("/v1/spaces", { token, body: body(CreateSpaceRequestSchema, { name }) })).status).toBe(201);
+  });
+
   it("lists a space whose create was still storing it when a listing passed newer spaces", async () => {
     const owner = await getOwner();
     const token = owner.access!.token;
