@@ -8,8 +8,23 @@
   "packageManager": "pnpm@12.18.0",
   "scripts": {
     "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "check:deploy": "node scripts/check-deploy.mjs",
     "typecheck": "wrangler types && tsc --noEmit && tsc --noEmit -p test",
     "test": "vitest run"
+  },
+  "cloudflare": {
+    "bindings": {
+      "ACCOUNT": {
+        "description": "Durable Object for the deployment's owner, devices, spaces and share links. Created for you; nothing to configure."
+      },
+      "SPACE": {
+        "description": "Durable Object for each synced folder: its file tree, versions and change log. Created for you; nothing to configure."
+      },
+      "BUCKET": {
+        "description": "R2 bucket that stores your file contents. Any name works; keep the name you choose here when you upgrade later."
+      }
+    }
   },
   "dependencies": {
     "@bufbuild/protobuf": "2.17.0"
