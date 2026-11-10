@@ -49,11 +49,27 @@ pub fn join_args(code: &str, server: &Url) -> String {
         server.query(),
     ) {
         ("https", Some(host), "/", None) => match server.port() {
-            Some(port) => format!("{code}@{host}:{port}"),
-            None => format!("{code}@{host}"),
+            Some(port) => shell_word(&format!("{code}@{host}:{port}")),
+            None => shell_word(&format!("{code}@{host}")),
         },
-        _ => format!("{code} --server {server}"),
+        _ => format!(
+            "{} --server {}",
+            shell_word(code),
+            shell_word(server.as_str())
+        ),
     }
+}
+
+/// The text as one POSIX shell word: quoted unless every character is safe bare.
+fn shell_word(text: &str) -> String {
+    if !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "@%+=:,./_-".contains(c))
+    {
+        return text.to_owned();
+    }
+    format!("'{}'", text.replace('\'', r"'\''"))
 }
 
 /// A server address as typed: `https://` goes before a bare host name.
@@ -124,6 +140,33 @@ mod tests {
             ),
             "K7QM-2XPD@flarebox.alice.workers.dev"
         );
+    }
+
+    #[test]
+    fn a_shell_reads_the_printed_join_arguments_literally() {
+        for (code, server) in [
+            ("ABCD-EFGH$(echo)", "https://files.example.com/"),
+            ("ABCD-EFGH", "https://files.example.com/$(echo)/"),
+            ("AB'CD `echo`", "http://127.0.0.1:8787/"),
+        ] {
+            let url = Url::parse(server).unwrap();
+            let script = format!("printf '%s\\n' {}", join_args(code, &url));
+            let shell = std::process::Command::new("sh")
+                .args(["-c", &script])
+                .output()
+                .unwrap();
+            assert!(shell.status.success(), "{script}");
+            let words = String::from_utf8(shell.stdout).unwrap();
+            let words: Vec<&str> = words.lines().collect();
+            let read = match words.as_slice() {
+                [code] => parse(code, None),
+                [code, "--server", server] => parse(code, Some(server)),
+                _ => panic!("{script} printed {words:?}"),
+            }
+            .unwrap();
+            assert_eq!(read.code, code, "{script}");
+            assert_eq!(Url::parse(&read.server).unwrap(), url, "{script}");
+        }
     }
 
     #[test]
