@@ -21,7 +21,8 @@ use flarebox_cloudflare::{
     Script, Secret, UploadPlan,
 };
 use flarebox_driver::Paths;
-use flarebox_net::Api;
+use flarebox_net::{Api, ApiError};
+use flarebox_proto::v1::ServerInfo;
 use tokio::signal::unix::{SignalKind, signal};
 use url::Url;
 
@@ -165,7 +166,7 @@ pub async fn server(paths: &Paths, action: ServerAction) -> Result<(), String> {
             let name = device.name();
             with_session(&login, async |session| {
                 let found = session.pick(server.as_deref()).await?;
-                session.add_device(paths, &found, &name, false).await
+                session.add_device(paths, found, &name, false).await
             })
             .await
         }
@@ -248,15 +249,32 @@ async fn with_session(
 ) -> Result<(), String> {
     let mut terminate = signal(SignalKind::terminate()).map_err(|error| error.to_string())?;
     let mut interrupt = signal(SignalKind::interrupt()).map_err(|error| error.to_string())?;
+    let stopped = async || {
+        tokio::select! {
+            _ = terminate.recv() => "stopped by SIGTERM",
+            _ = interrupt.recv() => "stopped",
+        }
+    };
+    guarded(Session::login(args), stopped, work).await
+}
+
+/// Runs `work` on the session `login` returns, then revokes its grant. The grant exists once `login` returns, so
+/// everything after that, the account lookup included, ends with the revocation, also when `stopped` fires.
+async fn guarded(
+    login: impl Future<Output = Result<Session, String>>,
+    mut stopped: impl AsyncFnMut() -> &'static str,
+    work: impl AsyncFnOnce(&mut Session) -> Result<(), String>,
+) -> Result<(), String> {
     let mut session = tokio::select! {
-        session = Session::login(args) => session?,
-        _ = terminate.recv() => return Err("stopped by SIGTERM before the login finished".into()),
-        _ = interrupt.recv() => return Err("stopped before the login finished".into()),
+        session = login => session?,
+        how = stopped() => return Err(format!("{how} before the login finished")),
     };
     let outcome = tokio::select! {
-        outcome = work(&mut session) => outcome,
-        _ = terminate.recv() => Err("stopped by SIGTERM; run the same command again to continue".into()),
-        _ = interrupt.recv() => Err("stopped; run the same command again to continue".into()),
+        outcome = async {
+            session.pick_account().await?;
+            work(&mut session).await
+        } => outcome,
+        how = stopped() => Err(format!("{how}; run the same command again to continue")),
     };
     session.end().await;
     outcome
@@ -311,7 +329,7 @@ struct Found {
     script: Script,
     bucket: Option<Bound>,
     url: Url,
-    info: Option<flarebox_proto::v1::ServerInfo>,
+    info: Option<ServerInfo>,
 }
 
 /// The R2 bucket a server's Worker binds.
@@ -331,6 +349,8 @@ trait Cloud {
 struct Session {
     http: reqwest::Client,
     grant: Grant,
+    /// The Cloudflare API's base URL. Tests point it at a local server.
+    api_base: Url,
     account: Account,
     subdomain: Option<String>,
 }
@@ -354,6 +374,7 @@ impl Cloud for Session {
 }
 
 impl Session {
+    /// Logs in with Cloudflare and returns once the code is exchanged for a grant, before any other call.
     async fn login(args: &LoginArgs) -> Result<Session, String> {
         let http = flarebox_cloudflare::http_client().map_err(|error| error.to_string())?;
         let loopback = if args.no_browser {
@@ -399,37 +420,36 @@ impl Session {
             .exchange(&http, code)
             .await
             .map_err(|error| error.to_string())?;
-        let mut session = Session {
+        Ok(Session {
             http,
             grant,
+            api_base: Url::parse(API_BASE).expect("the API base is a URL"),
             account: Account {
                 id: String::new(),
                 name: String::new(),
             },
             subdomain: None,
-        };
-        let accounts = match session.api().accounts().await {
-            Ok(accounts) => accounts,
-            Err(error) => {
-                session.end().await;
-                return Err(format!("cannot list the account: {error}"));
-            }
-        };
+        })
+    }
+
+    /// Reads the one account the user picked on the consent page.
+    async fn pick_account(&mut self) -> Result<(), String> {
+        let accounts = self
+            .api()
+            .accounts()
+            .await
+            .map_err(|error| format!("cannot list the account: {error}"))?;
         match <[Account; 1]>::try_from(accounts) {
-            Ok([account]) => session.account = account,
+            Ok([account]) => self.account = account,
             Err(accounts) => {
-                session.end().await;
                 return Err(format!(
                     "the login gave access to {} accounts; pick exactly one on the consent page",
                     accounts.len()
                 ));
             }
         }
-        println!(
-            "Logged in to the Cloudflare account {}.",
-            session.account.name
-        );
-        Ok(session)
+        println!("Logged in to the Cloudflare account {}.", self.account.name);
+        Ok(())
     }
 
     /// Revokes the grant, retrying three times. A failure leaves the grant active until its tokens expire, so the user
@@ -451,7 +471,7 @@ impl Session {
     fn api(&self) -> Cloudflare {
         Cloudflare::new(
             self.http.clone(),
-            Url::parse(API_BASE).expect("the API base is a URL"),
+            self.api_base.clone(),
             self.grant.access_token().clone(),
         )
     }
@@ -619,7 +639,7 @@ impl Session {
                 found.remove(index - 1)
             }
         };
-        self.add_device(paths, &server, device_name, true).await
+        self.add_device(paths, server, device_name, true).await
     }
 
     /// Picks free names, then deploys and claims a new server (sections 4.3 and 4.4).
@@ -680,6 +700,13 @@ impl Session {
             file.save(&state)?;
         }
         if state.step < Step::ScriptUploaded {
+            keep_script_name(
+                self,
+                &mut state,
+                &bundle.manifest.r2_binding,
+                &bundle.manifest.default_bucket,
+            )
+            .await?;
             println!(
                 "Uploading Flarebox {} as the Worker {}...",
                 bundle.manifest.version, state.script
@@ -699,14 +726,7 @@ impl Session {
         }
         let url = self.worker_url(&state.script).await?;
         if state.step < Step::Serving {
-            self.fresh()
-                .await?
-                .enable_workers_dev(self.account(), &state.script)
-                .await
-                .map_err(|error| {
-                    format!("cannot turn on workers.dev for {}: {error}", state.script)
-                })?;
-            wait_until_serving(&url, None).await?;
+            self.serve(&state.script, &url).await?;
             state.step = Step::Serving;
             file.save(&state)?;
         }
@@ -730,20 +750,33 @@ impl Session {
             .await
     }
 
-    /// Adds this device to a server that already exists (section 4.5). `interactive` lets it offer an upgrade when the
-    /// server's claim code does not handle setup attempts; otherwise it stops and names the upgrade command.
+    /// Adds this device to a server that already exists (section 4.5). `interactive` lets it finish a deploy that
+    /// stopped before the server answered, and offer an upgrade when the server's claim code does not handle setup
+    /// attempts; otherwise it stops and names the command that does.
     async fn add_device(
         &mut self,
         paths: &Paths,
-        server: &Found,
+        mut server: Found,
         device_name: &str,
         interactive: bool,
     ) -> Result<(), String> {
-        let Some(info) = &server.info else {
-            return Err(format!(
-                "{} stopped halfway through its deploy; run flarebox setup to finish it",
-                server.script.id
-            ));
+        let info = match server.info.clone() {
+            Some(info) => info,
+            None if interactive => {
+                println!(
+                    "{} stopped halfway through its deploy. Finishing it...",
+                    server.script.id
+                );
+                let info = self.serve(&server.script.id, &server.url).await?;
+                server.info = Some(info.clone());
+                info
+            }
+            None => {
+                return Err(format!(
+                    "{} stopped halfway through its deploy; run flarebox setup to finish it",
+                    server.script.id
+                ));
+            }
         };
         let mut window = Duration::from_secs(60);
         if !info.setup_attempts {
@@ -763,7 +796,7 @@ impl Session {
                     "{reason} Run flarebox server upgrade, then flarebox setup again."
                 ));
             }
-            self.upgrade(server, false).await?;
+            self.upgrade(&server, false).await?;
             wait_for_setup_attempts(&server.url).await?;
             window = Duration::from_secs(330);
         }
@@ -792,9 +825,19 @@ impl Session {
                 ..SetupState::default()
             },
         };
-        Claim::new(self, paths, server, device_name, state, None)
+        Claim::new(self, paths, &server, device_name, state, None)
             .run(window)
             .await
+    }
+
+    /// Turns on the Worker's workers.dev route and waits until the server answers there.
+    async fn serve(&mut self, script: &str, url: &Url) -> Result<ServerInfo, String> {
+        self.fresh()
+            .await?
+            .enable_workers_dev(self.account(), script)
+            .await
+            .map_err(|error| format!("cannot turn on workers.dev for {script}: {error}"))?;
+        wait_until_serving(url, None).await
     }
 
     /// Uploads the embedded server over an existing one (section 5).
@@ -945,6 +988,46 @@ fn embedded_bundle() -> Result<Bundle, String> {
     Bundle::from_dir(dir.path()).map_err(|error| broken(&error))
 }
 
+/// Keeps `state.script` while no other application holds the name. A Worker under it that has the tag and binds
+/// `state.bucket` is this deploy's own upload from before the state file recorded it, so the upload goes over it. Any
+/// other Worker under the name belongs to someone else, so the deploy moves to the first free name after `base`.
+async fn keep_script_name(
+    cloud: &mut impl Cloud,
+    state: &mut SetupState,
+    binding: &str,
+    base: &str,
+) -> Result<(), String> {
+    let api = cloud.fresh().await?;
+    let account = cloud.account().to_owned();
+    let scripts = api
+        .scripts(&account)
+        .await
+        .map_err(|error| format!("cannot list the account's Workers: {error}"))?;
+    let Some(current) = scripts.iter().find(|script| script.id == state.script) else {
+        return Ok(());
+    };
+    if current.tags.iter().any(|tag| tag == TAG) {
+        let settings = api
+            .script_settings(&account, &state.script)
+            .await
+            .map_err(|error| format!("cannot read the settings of {}: {error}", state.script))?;
+        if settings.r2_bucket(binding).is_some_and(|bound| {
+            bound.bucket_name.as_deref() == Some(state.bucket.as_str())
+                && bound.jurisdiction.unwrap_or_default() == state.jurisdiction
+        }) {
+            return Ok(());
+        }
+    }
+    let taken: Vec<String> = scripts.into_iter().map(|script| script.id).collect();
+    let free = free_name(base, &taken);
+    println!(
+        "Another application now has a Worker named {}, so the server becomes the Worker {free}.",
+        state.script
+    );
+    state.script = free;
+    Ok(())
+}
+
 /// `base`, or the first of `base-2`, `base-3`, ... that is not taken.
 fn free_name(base: &str, taken: &[String]) -> String {
     std::iter::once(base.to_owned())
@@ -965,8 +1048,17 @@ fn newer(a: &str, b: &str) -> bool {
     }
 }
 
-async fn server_info(url: &Url) -> Option<flarebox_proto::v1::ServerInfo> {
-    let api = Api::new(url.clone()).ok()?;
+/// The Flarebox API of the server at `url`. Tests serve it over http on a loopback address.
+fn server_api(url: &Url) -> Result<Api, ApiError> {
+    if cfg!(test) {
+        Api::local_development(url.clone())
+    } else {
+        Api::new(url.clone())
+    }
+}
+
+async fn server_info(url: &Url) -> Option<ServerInfo> {
+    let api = server_api(url).ok()?;
     tokio::time::timeout(Duration::from_secs(10), api.server_info())
         .await
         .ok()?
@@ -974,14 +1066,14 @@ async fn server_info(url: &Url) -> Option<flarebox_proto::v1::ServerInfo> {
 }
 
 /// Polls `GET /v1/server` until it answers, and until it reports `version` when one is given.
-async fn wait_until_serving(url: &Url, version: Option<&str>) -> Result<(), String> {
+async fn wait_until_serving(url: &Url, version: Option<&str>) -> Result<ServerInfo, String> {
     let started = Instant::now();
     loop {
-        if server_info(url)
+        if let Some(info) = server_info(url)
             .await
-            .is_some_and(|info| version.is_none_or(|version| info.server_version == version))
+            .filter(|info| version.is_none_or(|version| info.server_version == version))
         {
-            return Ok(());
+            return Ok(info);
         }
         if started.elapsed() > SERVE_WAIT {
             return Err(format!(
@@ -1013,7 +1105,148 @@ async fn wait_for_setup_attempts(url: &Url) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use flarebox_proto::v1::DeviceCredentials;
+    use serde_json::json;
+
+    use super::fake::{self, ACCOUNT, Fake, cf, proto, revoked, tokens};
     use super::*;
+
+    fn deployed(fake: &Fake) -> Found {
+        Found {
+            script: Script {
+                id: "flarebox".into(),
+                created_on: None,
+                tags: vec![TAG.into()],
+                migration_tag: None,
+                has_assets: true,
+            },
+            bucket: Some(Bound {
+                name: "flarebox".into(),
+                jurisdiction: Jurisdiction::Default,
+            }),
+            url: fake.base.clone(),
+            info: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stop_during_the_account_lookup_still_revokes_the_grant() {
+        let oauth = Fake::start(vec![tokens(), revoked(), revoked()]).await;
+        let api = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base =
+            Url::parse(&format!("http://{}/client/v4/", api.local_addr().unwrap())).unwrap();
+        let mut held = Vec::new();
+        let stopped = async || {
+            held.push(api.accept().await.unwrap().0);
+            "stopped"
+        };
+
+        let outcome = guarded(
+            async { Ok(fake::login(&oauth, api_base).await) },
+            stopped,
+            async |_: &mut Session| Ok(()),
+        )
+        .await;
+
+        assert_eq!(
+            outcome.unwrap_err(),
+            "stopped; run the same command again to continue"
+        );
+        let revocations = oauth
+            .seen()
+            .iter()
+            .filter(|seen| seen.path == "/oauth2/revoke")
+            .count();
+        assert_eq!(revocations, 2);
+    }
+
+    #[tokio::test]
+    async fn a_resumed_deploy_moves_off_a_worker_name_another_application_took() {
+        let binds = |bucket: &str| json!({ "bindings": [{ "type": "r2_bucket", "name": "BUCKET", "bucket_name": bucket }] });
+        let cases = [
+            (
+                json!([{ "id": "flarebox", "tags": [] }]),
+                None,
+                "flarebox-2",
+            ),
+            (
+                json!([{ "id": "flarebox", "tags": [TAG] }, { "id": "flarebox-2", "tags": [] }]),
+                Some(binds("photos")),
+                "flarebox-3",
+            ),
+            (
+                json!([{ "id": "flarebox", "tags": [TAG] }]),
+                Some(binds("flarebox")),
+                "flarebox",
+            ),
+            (json!([{ "id": "photos", "tags": [] }]), None, "flarebox"),
+        ];
+        for (scripts, settings, expected) in cases {
+            let mut replies = vec![tokens(), cf("GET", "/workers/scripts", scripts)];
+            replies.extend(
+                settings.map(|settings| cf("GET", "/workers/scripts/flarebox/settings", settings)),
+            );
+            let fake = Fake::start(replies).await;
+            let mut session = fake::session(&fake).await;
+            let mut state = SetupState {
+                account: ACCOUNT.into(),
+                script: "flarebox".into(),
+                bucket: "flarebox".into(),
+                step: Step::BucketCreated,
+                ..SetupState::default()
+            };
+
+            keep_script_name(&mut session, &mut state, "BUCKET", "flarebox")
+                .await
+                .unwrap();
+
+            assert_eq!(state.script, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_finishes_a_deploy_that_stopped_before_the_server_answered() {
+        let info = ServerInfo {
+            server_version: "0.1.0".into(),
+            setup_attempts: true,
+            ..ServerInfo::default()
+        };
+        let issued = DeviceCredentials {
+            user_id: "user".into(),
+            device_id: "0194f8a2-0000-7000-8000-000000000002".into(),
+            refresh_credential: "device".into(),
+            ..DeviceCredentials::default()
+        };
+        let secrets = "/workers/scripts/flarebox/secrets";
+        let fake = Fake::start(vec![
+            tokens(),
+            cf("POST", "/workers/scripts/flarebox/subdomain", json!(null)),
+            proto("GET", "/v1/server", info),
+            cf("GET", secrets, json!([])),
+            cf("PUT", secrets, json!(null)),
+            proto("POST", "/v1/claim", issued),
+            cf(
+                "DELETE",
+                &format!("{secrets}/FLAREBOX_RECOVERY_KEY"),
+                json!(null),
+            ),
+            cf("GET", secrets, json!([])),
+        ])
+        .await;
+        let mut session = fake::session(&fake).await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+
+        session
+            .add_device(&paths, deployed(&fake), "laptop", true)
+            .await
+            .unwrap();
+
+        assert!(fake.seen().iter().any(|seen| seen.method == "POST"
+            && seen.path.ends_with("/workers/scripts/flarebox/subdomain")));
+        assert!(paths.credential().exists());
+        assert_eq!(StateFile::new(&paths).load().unwrap(), None);
+    }
 
     #[test]
     fn free_names_count_up_from_the_default() {

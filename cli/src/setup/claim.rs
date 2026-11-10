@@ -8,12 +8,12 @@ use std::time::{Duration, Instant};
 
 use flarebox_cloudflare::Secret;
 use flarebox_driver::{Credential, Paths};
-use flarebox_net::{Api, ApiError, Auth};
+use flarebox_net::{ApiError, Auth};
 use flarebox_proto::v1::ClaimRequest;
 use flarebox_proto::v1::error::Code;
 
 use super::state::{SetupState, StateFile};
-use super::{Cloud, Found, Session, report_paired};
+use super::{Cloud, Found, Session, report_paired, server_api};
 use crate::ipc::{self, Request, Response};
 use url::Url;
 
@@ -104,9 +104,9 @@ impl<'a> Claim<'a> {
             format!("the server refused {MAX_KEYS} keys as already used; run the command again")
         })?;
         let saved = ipc::run(self.paths, Request::SaveCredential { credential }).await?;
+        report_paired(self.paths, saved)?;
         self.state.setup_attempt = None;
         file.save(&self.state)?;
-        report_paired(self.paths, saved)?;
         self.delete_key().await?;
         file.remove()
     }
@@ -138,7 +138,7 @@ impl<'a> Claim<'a> {
     }
 
     async fn claim(&self, key: &Secret, window: Duration) -> Result<Outcome, String> {
-        let api = Api::new(self.server.url.clone()).map_err(|error| error.to_string())?;
+        let api = server_api(&self.server.url).map_err(|error| error.to_string())?;
         let request = ClaimRequest {
             code: key.expose().to_owned(),
             user_name: user_name(),
@@ -266,8 +266,11 @@ mod tests {
     use flarebox_proto::v1::{AccessToken, Error};
     use prost::Message;
 
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
     use super::*;
-    use crate::setup::fake::{Fake, Reply};
+    use crate::setup::fake::{ACCOUNT, Fake, Reply, proto, session, tokens};
+    use crate::setup::state::Step;
 
     fn token(status: u16, body: Vec<u8>) -> Reply {
         Reply {
@@ -303,6 +306,73 @@ mod tests {
         .save_new(&paths.credential())
         .unwrap();
         (dir, paths)
+    }
+
+    #[tokio::test]
+    async fn a_refused_credential_save_keeps_the_setup_attempt() {
+        let issued = flarebox_proto::v1::DeviceCredentials {
+            user_id: "user".into(),
+            device_id: "0194f8a2-0000-7000-8000-000000000002".into(),
+            refresh_credential: "device".into(),
+            ..Default::default()
+        };
+        let fake = Fake::start(vec![tokens(), proto("POST", "/v1/claim", issued)]).await;
+        let mut session = session(&fake).await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        std::fs::create_dir_all(&paths.runtime_dir).unwrap();
+        let daemon = tokio::net::UnixListener::bind(paths.socket()).unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = daemon.accept().await.unwrap();
+            let (reader, mut writer) = stream.split();
+            let mut request = String::new();
+            BufReader::new(reader)
+                .read_line(&mut request)
+                .await
+                .unwrap();
+            let refusal = Response::Error {
+                message: "the disk is full".into(),
+            };
+            let line = format!("{}\n", serde_json::to_string(&refusal).unwrap());
+            writer.write_all(line.as_bytes()).await.unwrap();
+        });
+        let server = Found {
+            script: flarebox_cloudflare::Script {
+                id: "flarebox".into(),
+                created_on: None,
+                tags: Vec::new(),
+                migration_tag: None,
+                has_assets: true,
+            },
+            bucket: None,
+            url: fake.base.clone(),
+            info: None,
+        };
+        let state = SetupState {
+            account: ACCOUNT.into(),
+            script: "flarebox".into(),
+            step: Step::Serving,
+            secret_set: true,
+            setup_attempt: Some("attempt".into()),
+            ..SetupState::default()
+        };
+
+        let error = Claim::new(
+            &mut session,
+            &paths,
+            &server,
+            "laptop",
+            state,
+            Some(Secret::random(32)),
+        )
+        .run(Duration::from_secs(1))
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, "the disk is full");
+        let saved = StateFile::new(&paths).load().unwrap().unwrap();
+        assert_eq!(saved.setup_attempt.as_deref(), Some("attempt"));
+        assert!(!fake.sent(&["DELETE"]));
     }
 
     #[tokio::test]
