@@ -971,15 +971,20 @@ impl Session {
         yes: bool,
     ) -> Result<(), String> {
         let file = StateFile::new(paths);
-        let unfinished = file
-            .load()?
-            .filter(|state| state.account == self.account() && state.step == Step::Uninstalling);
-        if let (Some(state), None) = (unfinished, bucket) {
-            println!(
-                "Continuing the uninstall that stopped earlier ({}).",
-                state.bucket
-            );
-            return uninstall::finish(self, &file, state).await;
+        match file.load()? {
+            Some(state)
+                if state.account == self.account()
+                    && state.step == Step::Uninstalling
+                    && bucket.is_none() =>
+            {
+                println!(
+                    "Continuing the uninstall that stopped earlier ({}).",
+                    state.bucket
+                );
+                return uninstall::finish(self, &file, state).await;
+            }
+            Some(other) => return Err(unfinished(&other, self.account(), file.path())),
+            None => {}
         }
         let (state, contents) = match bucket {
             Some(bucket) => uninstall::plan(self, None, bucket, jurisdiction).await?,
@@ -1422,6 +1427,47 @@ mod tests {
             && seen.path.ends_with("/workers/scripts/flarebox/subdomain")));
         assert!(paths.credential().exists());
         assert_eq!(StateFile::new(&paths).load().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn uninstall_stops_at_another_unfinished_run_before_calling_the_account() {
+        let deploy = SetupState {
+            account: ACCOUNT.into(),
+            script: "flarebox".into(),
+            bucket: new_bucket_name("flarebox"),
+            step: Step::BucketCreated,
+            ..SetupState::default()
+        };
+        let uninstall = SetupState {
+            step: Step::Uninstalling,
+            ..deploy.clone()
+        };
+        let elsewhere = SetupState {
+            account: "another-account".into(),
+            ..uninstall.clone()
+        };
+        let bucket = new_bucket_name("flarebox");
+        for (other, named) in [
+            (deploy, None),
+            (elsewhere, None),
+            (uninstall, Some(bucket.as_str())),
+        ] {
+            let fake = Fake::start(vec![tokens()]).await;
+            let mut session = fake::session(&fake).await;
+            let before = fake.seen().len();
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::under(dir.path());
+            StateFile::new(&paths).save(&other).unwrap();
+
+            let error = session
+                .uninstall(&paths, None, named, Jurisdiction::Default, true)
+                .await
+                .unwrap_err();
+
+            assert!(error.contains("has not finished"), "{error}");
+            assert_eq!(StateFile::new(&paths).load().unwrap(), Some(other));
+            assert_eq!(fake.seen().len(), before, "{error}");
+        }
     }
 
     #[tokio::test]

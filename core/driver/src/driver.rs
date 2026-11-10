@@ -497,11 +497,14 @@ impl Driver {
     }
 
     /// Stores a credential this profile was issued elsewhere, such as by `flarebox setup`'s claim, the same way
-    /// [`Driver::pair`] and [`Driver::claim`] store theirs, unless another one was stored meanwhile. The file is written
-    /// before this returns, so a caller can clean up after it. Like every change to the credential, it waits for the
-    /// lifecycle lock, so a sign-out that checked the slot finishes before a new credential appears.
+    /// [`Driver::pair`] and [`Driver::claim`] store theirs, unless another one was stored meanwhile. Like them, it first
+    /// unlinks the folders of a credential that was lost. The file is written before this returns, so a caller can clean
+    /// up after it. Like every change to the credential, it waits for the lifecycle lock, so a sign-out that checked the
+    /// slot finishes before a new credential appears.
     pub async fn save_credential(&self, credential: Credential) -> Result<Account, DriverError> {
         let _lifecycle = self.inner.lifecycle.lock().await;
+        self.check_unpaired()?;
+        self.unlink_folders_of_lost_credential().await?;
         let path = self.inner.paths.credential();
         self.store_credential(credential, |credential| credential.save_new(&path))
     }
@@ -1785,6 +1788,35 @@ mod tests {
         let reopened = Driver::open(paths).unwrap().status();
         assert_eq!(reopened.account.unwrap().device_id, "d3");
         assert!(reopened.folders.is_empty());
+    }
+
+    #[tokio::test]
+    async fn saving_a_credential_unlinks_only_the_folders_of_a_lost_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        let paths = Paths::under(&base.join("profile"));
+        linked(&paths, &root, "d1");
+        fs::write(root.join("notes.txt"), b"kept").unwrap();
+        let driver = Driver::open(paths.clone()).unwrap();
+
+        let refused = driver.save_credential(credential("d2")).await.unwrap_err();
+
+        assert!(
+            matches!(&refused, DriverError::AlreadyPaired { device_id } if device_id == "d1"),
+            "{refused}"
+        );
+        assert_eq!(driver.status().folders.len(), 1);
+        drop(driver);
+        fs::remove_file(paths.credential()).unwrap();
+        let driver = Driver::open(paths.clone()).unwrap();
+
+        let account = driver.save_credential(credential("d2")).await.unwrap();
+
+        assert_eq!(account.device_id, "d2");
+        assert!(driver.status().folders.is_empty());
+        assert!(!paths.store(SPACE).unwrap().parent().unwrap().exists());
+        assert_eq!(fs::read(root.join("notes.txt")).unwrap(), b"kept");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
