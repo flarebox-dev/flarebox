@@ -89,6 +89,8 @@ pub struct Trees {
     outside: BTreeSet<NodeId>,
     /// False from a restore until the rules of a full scan are in force.
     rules_known: bool,
+    /// The folders whose rules the last scan of each could not read, as the names from the root.
+    unknown_rules: BTreeSet<Vec<String>>,
 }
 
 impl Trees {
@@ -106,6 +108,7 @@ impl Trees {
             ignore: Matcher::new(LocalRules::default()),
             outside: BTreeSet::new(),
             rules_known: true,
+            unknown_rules: BTreeSet::new(),
         }
     }
 
@@ -168,6 +171,29 @@ impl Trees {
     /// device's disk and passes the rules here with the observation.
     pub fn set_rules<S: AsRef<str>>(&mut self, dir: &[S], rules: Option<RuleFile>) {
         self.ignore.set_rules(dir, rules, std::iter::empty());
+        let dir: Vec<String> = dir.iter().map(|name| name.as_ref().to_owned()).collect();
+        self.unknown_rules.remove(&dir);
+    }
+
+    /// Records that a scan could not read the folder at `dir`, the names from the root to it, so
+    /// the rules below it are unknown until the driver passes the folder's rules again
+    /// ([`Trees::set_rules`]). Meanwhile nothing is planned for a node below it ([`Trees::held`]).
+    pub fn set_rules_unknown<S: AsRef<str>>(&mut self, dir: &[S]) {
+        (self.unknown_rules).insert(dir.iter().map(|name| name.as_ref().to_owned()).collect());
+    }
+
+    /// Whether L, S or R places the node below a folder whose rules are unknown
+    /// ([`Trees::set_rules_unknown`]). Neither an effect nor a commit is planned for it.
+    pub fn held(&self, id: &str) -> bool {
+        let below = |path: Option<(Vec<&str>, Kind)>| {
+            path.is_some_and(|(names, _)| {
+                (self.unknown_rules.iter()).any(|dir| {
+                    names.len() > dir.len() && names.iter().zip(dir).all(|(name, dir)| name == dir)
+                })
+            })
+        };
+        !self.unknown_rules.is_empty()
+            && (below(path(&self.l, id)) || below(path(&self.s, id)) || below(path(&self.r, id)))
     }
 
     /// The caller has passed the rules files of a full scan made since the last restore, and the
@@ -371,6 +397,7 @@ impl Trees {
         let mut pending = Vec::new();
         let mut work = Vec::new();
         let mut dirty: Vec<NodeId> = std::mem::take(&mut self.dirty).into_iter().collect();
+        let mut visited = BTreeSet::new();
         let mut next = 0;
         while let Some(id) = dirty.get(next).cloned() {
             next += 1;
@@ -379,12 +406,17 @@ impl Trees {
             match fitting {
                 Some(next) => self.set_synced_unmarked(&id, next.clone()),
                 None if !released.is_empty() => {
-                    let below: Vec<NodeId> = (self.release_subtree(&id).into_iter())
-                        .filter(|node| !dirty.contains(node))
-                        .collect();
-                    dirty.extend(below);
+                    for node in self.release_subtree(&id) {
+                        if !dirty[next..].contains(&node) {
+                            dirty.push(node);
+                        }
+                    }
                 }
                 None => {}
+            }
+            if !visited.insert(id.clone()) {
+                pending.retain(|other| *other != id);
+                work.retain(|(other, _)| *other != id);
             }
             match self.class(&id) {
                 Class::InSync if !self.l.get(&id).is_some_and(|node| node.parked) => {}
@@ -755,6 +787,7 @@ impl Trees {
         self.parked_as = parked_as;
         self.waiting = waiting;
         self.rules_known = false;
+        self.unknown_rules.clear();
         Ok(())
     }
 }

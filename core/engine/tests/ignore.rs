@@ -542,8 +542,9 @@ fn a_parked_node_the_rules_now_exclude_frees_its_name_in_s_for_the_node_that_too
     assert_eq!(trees.local().get("old"), Some(&parked));
 }
 
-#[test]
-fn a_parked_folder_the_rules_now_exclude_frees_its_name_in_s_with_what_it_holds() {
+/// A parked folder whose old name "docs" another node took, and whose R position the rules now exclude, with an
+/// excluded file in it.
+fn parked_excluded_folder() -> (Trees, LocalNode) {
     let mut trees = trees(&[
         (
             "old",
@@ -566,6 +567,12 @@ fn a_parked_folder_the_rules_now_exclude_frees_its_name_in_s_with_what_it_holds(
     };
     trees.set_local("old".into(), parked.clone());
     trees.set_rules(&AT_ROOT, rules("/archive/\n*.log\n"));
+    (trees, parked)
+}
+
+#[test]
+fn a_parked_folder_the_rules_now_exclude_frees_its_name_in_s_with_what_it_holds() {
+    let (mut trees, parked) = parked_excluded_folder();
     assert_eq!(effects(&mut trees), [], "its old name is taken");
     assert_eq!(ops(&mut trees), []);
     assert_eq!(trees.synced().live("new"), Some(&dir(ROOT, "docs")));
@@ -573,6 +580,28 @@ fn a_parked_folder_the_rules_now_exclude_frees_its_name_in_s_with_what_it_holds(
     assert_eq!(trees.synced().live("child"), None);
     assert_eq!(trees.local().get("old"), Some(&parked));
     assert_eq!(trees.check(), Ok(()));
+}
+
+/// The child sorts before its folder, so settling classifies it before it drops the folder from S with the child: in
+/// sync, which takes it out of the dirty set, or edited. The child's S entry is gone, so it is classified again, once,
+/// and the state loads.
+#[test]
+fn a_child_settled_before_its_folder_leaves_s_is_classified_again() {
+    for digest in [1, 2] {
+        let (mut trees, _) = parked_excluded_folder();
+        trees.set_local("child".into(), local(file("old", "build.log", digest), 2));
+        let left = trees.settle();
+        assert_eq!(trees.synced().live("old"), None, "digest {digest}");
+        assert_eq!(trees.synced().live("child"), None, "digest {digest}");
+        let child: Vec<_> = left.iter().filter(|(id, _)| id == "child").collect();
+        assert_eq!(
+            child,
+            [&("child".into(), trees.class("child"))],
+            "digest {digest}"
+        );
+        let mut restored = trees.clone();
+        restored.restore(trees.state()).unwrap();
+    }
 }
 
 #[test]
