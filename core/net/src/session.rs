@@ -542,8 +542,9 @@ impl Task {
 
     /// Gets a token and opens the WebSocket: TCP, TLS for `wss`, and the upgrade.
     async fn open(&mut self) -> Result<(Socket, AccessToken), Exit> {
-        if let Some(expired) = self.expired.take() {
+        if let Some(expired) = self.expired.clone() {
             self.auth.reject(&expired).await;
+            self.expired = None;
         }
         let token = match self.auth.access_token().await {
             Ok(token) => token,
