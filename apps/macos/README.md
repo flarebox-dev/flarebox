@@ -1,6 +1,6 @@
 # Flarebox for macOS
 
-A menu bar app that links the Rust core through [UniFFI](https://mozilla.github.io/uniffi-rs/). For now it only shows the core version and a placeholder sync session that you can start and stop. Nothing is synced yet, and there is no File Provider extension.
+A menu bar app that links the Rust core through [UniFFI](https://mozilla.github.io/uniffi-rs/). The session runs against `FakeCore` in `core/ffi`, which plays back scripted states, until the driver that runs the sync engine exists. Nothing is synced yet, and there is no File Provider extension.
 
 ## Requirements
 
@@ -17,7 +17,7 @@ Run these from `apps/macos`:
 # 1. Build core/ffi as a static library and generate the Swift bindings.
 scripts/build-ffi.sh
 
-# 2. Test the bindings: Swift calls into Rust and checks the version and status stream.
+# 2. Test the bindings: Swift calls into Rust and checks the event stream, sign-in, linking and questions.
 swift test --package-path FlareboxFFI
 
 # 3. Generate Flarebox.xcodeproj from project.yml.

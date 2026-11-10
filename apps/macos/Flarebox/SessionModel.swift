@@ -3,7 +3,7 @@
 import FlareboxFFI
 import Observation
 
-/// Holds the Rust sync session and mirrors its status stream on the main actor.
+/// Holds the Rust sync session and mirrors its status on the main actor.
 @MainActor
 @Observable
 final class SessionModel {
@@ -13,12 +13,14 @@ final class SessionModel {
     @ObservationIgnored private var consumer: Task<Void, Never>?
 
     init() {
-        let (session, statuses) = SyncSession.withStatusStream()
+        let (session, events) = SyncSession.fakeWithEventStream()
         self.session = session
-        status = session.status()
+        status = session.state().status
         consumer = Task { [weak self] in
-            for await status in statuses {
-                self?.status = status
+            for await event in events {
+                if case .status(let status) = event {
+                    self?.status = status
+                }
             }
         }
     }
@@ -28,10 +30,10 @@ final class SessionModel {
     }
 
     func toggle() {
-        if session.status() == .idle {
-            session.stop()
-        } else {
+        if session.state().status == .stopped {
             session.start()
+        } else {
+            session.stop()
         }
     }
 }
