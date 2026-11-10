@@ -121,6 +121,9 @@ struct Inner {
     paths: Paths,
     _lock: File,
     matcher: Arc<dyn Matcher>,
+    /// Held for the whole of a pair, claim, sign-out, link or unlink, so one runs at a time: a sign-out waits for a
+    /// claim or a link in flight and then undoes it, and a credential the server issued is always stored.
+    lifecycle: tokio::sync::Mutex<()>,
     credential: Mutex<Option<Credential>>,
     folders: Mutex<BTreeMap<String, Folder>>,
     running: AtomicBool,
@@ -181,6 +184,7 @@ impl Driver {
                 matcher: matcher(&input),
                 paths,
                 _lock: lock,
+                lifecycle: tokio::sync::Mutex::new(()),
                 credential: Mutex::new(credential),
                 folders: Mutex::new(folders),
                 running: AtomicBool::new(false),
@@ -234,6 +238,7 @@ impl Driver {
         code: &str,
         device_name: &str,
     ) -> Result<Account, DriverError> {
+        let _lifecycle = self.inner.lifecycle.lock().await;
         self.check_unpaired()?;
         if device_name.trim().is_empty() {
             return Err(DriverError::EmptyName);
@@ -264,6 +269,7 @@ impl Driver {
         user_name: &str,
         device_name: &str,
     ) -> Result<Account, DriverError> {
+        let _lifecycle = self.inner.lifecycle.lock().await;
         self.check_unpaired()?;
         if user_name.trim().is_empty() {
             return Err(DriverError::EmptyUserName);
@@ -290,12 +296,15 @@ impl Driver {
     }
 
     /// Signs this device out: stops syncing, unlinks every folder (their files stay) and deletes the credential, so
-    /// the profile can be paired or claimed again. The server is not told; the device stays registered there.
+    /// the profile can be paired or claimed again. The server is not told; the device stays registered there. A
+    /// folder that cannot be unlinked stops the sign-out with its error and stays linked, so signing out again
+    /// finishes it.
     pub async fn sign_out(&self) -> Result<(), DriverError> {
+        let _lifecycle = self.inner.lifecycle.lock().await;
         self.stop().await;
         let roots = roots(&self.inner.folders.lock().unwrap());
         for root in roots {
-            self.unlink(&root).await?;
+            self.unlink_folder(&root).await?;
         }
         let path = self.inner.paths.credential();
         match fs::remove_file(&path) {
@@ -357,6 +366,7 @@ impl Driver {
     /// Links `folder` to the space with id or name `space`: checks the folder, writes its root marker, and creates
     /// its store. The folder starts syncing at once if the driver is running.
     pub async fn link(&self, folder: &Path, space: &str) -> Result<FolderStatus, DriverError> {
+        let _lifecycle = self.inner.lifecycle.lock().await;
         let credential = self.credential()?;
         let root = fs::canonicalize(folder).map_err(|error| match error.kind() {
             io::ErrorKind::NotFound => DriverError::FolderNotFound(folder.to_path_buf()),
@@ -448,11 +458,17 @@ impl Driver {
     }
 
     /// Stops syncing the folder at `folder` and forgets its sync state. The files stay, and so does the folder's
-    /// `.flarebox` directory, whose local trash may hold displaced files.
+    /// `.flarebox` directory, whose local trash may hold displaced files. If the owner record or the store cannot be
+    /// removed, the folder stays linked and halted with the error, so unlinking it again finishes the job.
     pub async fn unlink(&self, folder: &Path) -> Result<Link, DriverError> {
+        let _lifecycle = self.inner.lifecycle.lock().await;
+        self.unlink_folder(folder).await
+    }
+
+    async fn unlink_folder(&self, folder: &Path) -> Result<Link, DriverError> {
         let wanted = absolute(folder);
         let canonical = fs::canonicalize(folder).ok();
-        let removed = {
+        let mut removed = {
             let mut folders = self.inner.folders.lock().unwrap();
             let space_id = folders
                 .iter()
@@ -463,28 +479,52 @@ impl Driver {
                 .ok_or_else(|| DriverError::NotLinked(folder.to_path_buf()))?;
             folders.remove(&space_id).expect("found above")
         };
-        if let Some(run) = removed.run {
+        if let Some(run) = removed.run.take() {
             let _ = run.stop.send(true);
             let _ = run.task.await;
         }
-        let store_dir = self
-            .inner
-            .paths
-            .store(&removed.link.space_id)?
-            .parent()
-            .expect("a store path has a parent")
-            .to_path_buf();
-        fs::remove_dir_all(&store_dir).map_err(io_error(&store_dir))?;
-        let owner = Owner {
-            server: removed.link.server_url.clone(),
-            device_id: removed.link.device_id.clone(),
-        };
-        if let Err(error) = claim::release(&removed.link.root, &owner) {
-            tracing::warn!(path = %removed.link.root.display(), %error, "the folder's owner record was not removed");
+        if let Err(error) = self.forget(&removed.link) {
+            halt(
+                &mut removed,
+                format!("the folder could not be unlinked: {error}"),
+            );
+            self.inner
+                .folders
+                .lock()
+                .unwrap()
+                .insert(removed.link.space_id.clone(), removed);
+            self.changed();
+            return Err(error);
         }
         tracing::info!(space_id = removed.link.space_id, path = %removed.link.root.display(), "unlinked a folder");
         self.changed();
         Ok(removed.link)
+    }
+
+    /// Removes the folder's owner record, then its store. The store records the link, so it goes last: until both are
+    /// gone, the folder is found again to finish unlinking it. Either one already missing counts as removed.
+    fn forget(&self, link: &Link) -> Result<(), DriverError> {
+        let owner = Owner {
+            server: link.server_url.clone(),
+            device_id: link.device_id.clone(),
+        };
+        match claim::release(&link.root, &owner) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error(&link.root)(error)),
+        }
+        let store_dir = self
+            .inner
+            .paths
+            .store(&link.space_id)?
+            .parent()
+            .expect("a store path has a parent")
+            .to_path_buf();
+        match fs::remove_dir_all(&store_dir) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(io_error(&store_dir)(error)),
+        }
     }
 
     /// Unanswered questions of every linked folder, oldest first per folder.
@@ -1203,47 +1243,131 @@ mod tests {
         assert!(claim::lock(&base.join("Moved")).unwrap().is_some());
     }
 
+    /// Reads one HTTP request and returns its path and its body.
+    async fn read_request(socket: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            let n = socket.read(&mut chunk).await.unwrap();
+            request.extend_from_slice(&chunk[..n]);
+            if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                break at + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&request[..head_end]).into_owned();
+        let length: usize = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().unwrap())
+            })
+            .unwrap_or(0);
+        while request.len() < head_end + length {
+            let n = socket.read(&mut chunk).await.unwrap();
+            request.extend_from_slice(&chunk[..n]);
+        }
+        let path = head.split_whitespace().nth(1).unwrap().to_owned();
+        (path, request[head_end..head_end + length].to_vec())
+    }
+
+    async fn write_reply(socket: &mut tokio::net::TcpStream, reply: &[u8]) {
+        use tokio::io::AsyncWriteExt;
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/x-protobuf\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            reply.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+        socket.write_all(reply).await.unwrap();
+    }
+
     /// Serves one request on a loopback port with `reply`, a protobuf body, and returns the server's address and
     /// what the request was: its path and its body.
     async fn serve_once(reply: Vec<u8>) -> (String, tokio::task::JoinHandle<(String, Vec<u8>)>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server = format!("http://{}/", listener.local_addr().unwrap());
         let served = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let mut chunk = [0u8; 4096];
-            let head_end = loop {
-                let n = socket.read(&mut chunk).await.unwrap();
-                request.extend_from_slice(&chunk[..n]);
-                if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                    break at + 4;
-                }
-            };
-            let head = String::from_utf8_lossy(&request[..head_end]).into_owned();
-            let length: usize = head
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse().unwrap())
-                })
-                .unwrap_or(0);
-            while request.len() < head_end + length {
-                let n = socket.read(&mut chunk).await.unwrap();
-                request.extend_from_slice(&chunk[..n]);
-            }
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/x-protobuf\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                reply.len()
-            );
-            socket.write_all(response.as_bytes()).await.unwrap();
-            socket.write_all(&reply).await.unwrap();
-            let path = head.split_whitespace().nth(1).unwrap().to_owned();
-            (path, request[head_end..head_end + length].to_vec())
+            let request = read_request(&mut socket).await;
+            write_reply(&mut socket, &reply).await;
+            request
         });
         (server, served)
+    }
+
+    /// A request the server has read and not answered yet.
+    struct Held {
+        /// Fires once the last request has arrived.
+        arrived: tokio::sync::oneshot::Receiver<()>,
+        /// Lets the server answer it.
+        release: tokio::sync::oneshot::Sender<()>,
+        /// The paths of the requests, once all are answered.
+        served: tokio::task::JoinHandle<Vec<String>>,
+    }
+
+    /// Serves one request per entry of `replies` on a loopback port, in order, and holds the answer to the last one
+    /// until it is released.
+    async fn serve_held(replies: Vec<Vec<u8>>) -> (String, Held) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = format!("http://{}/", listener.local_addr().unwrap());
+        let (arrived_tx, arrived) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let served = tokio::spawn(async move {
+            let mut paths = Vec::new();
+            let mut arrived_tx = Some(arrived_tx);
+            let mut released = Some(released);
+            let last = replies.len() - 1;
+            for (i, reply) in replies.into_iter().enumerate() {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                paths.push(read_request(&mut socket).await.0);
+                if i == last {
+                    arrived_tx.take().unwrap().send(()).unwrap();
+                    released.take().unwrap().await.unwrap();
+                }
+                write_reply(&mut socket, &reply).await;
+            }
+            paths
+        });
+        (
+            server,
+            Held {
+                arrived,
+                release,
+                served,
+            },
+        )
+    }
+
+    /// Whether `task` is still waiting a while after it was started.
+    async fn still_waiting<T>(task: &tokio::task::JoinHandle<T>) -> bool {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        !task.is_finished()
+    }
+
+    /// Sets the mode of `dir` and tells whether it keeps this process out: it does not for root. The tests that rely
+    /// on it skip when it does not.
+    fn close_dir(dir: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let probe = dir.join("probe");
+        if fs::write(&probe, b"").is_err() {
+            return true;
+        }
+        fs::remove_file(probe).unwrap();
+        open_dir(dir);
+        assert!(rustix::process::geteuid().is_root());
+        eprintln!("SKIPPED: running as root, so permissions do not block writes");
+        false
+    }
+
+    fn open_dir(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     fn issued(device_id: &str) -> Vec<u8> {
@@ -1384,6 +1508,186 @@ mod tests {
         let reopened = Driver::open(paths).unwrap().status();
         assert_eq!(reopened.account.unwrap().device_id, "d3");
         assert!(reopened.folders.is_empty());
+    }
+
+    #[tokio::test]
+    async fn signing_out_waits_for_a_claim_in_flight_and_then_undoes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let driver = Driver::open(paths.clone()).unwrap();
+        let (server, held) = serve_held(vec![issued("d1")]).await;
+        let claim = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.claim(&server, "code", "Ada", "laptop").await }
+        });
+        held.arrived.await.unwrap();
+        let sign_out = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.sign_out().await }
+        });
+        assert!(still_waiting(&sign_out).await);
+
+        held.release.send(()).unwrap();
+        assert_eq!(claim.await.unwrap().unwrap().device_id, "d1");
+        sign_out.await.unwrap().unwrap();
+        assert_eq!(held.served.await.unwrap(), ["/v1/claim"]);
+        assert_eq!(driver.status().account, None);
+        assert!(!paths.credential().exists());
+    }
+
+    #[tokio::test]
+    async fn a_pair_during_a_claim_keeps_the_claimed_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let driver = Driver::open(paths.clone()).unwrap();
+        let (server, held) = serve_held(vec![issued("d1")]).await;
+        let claim = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.claim(&server, "code", "Ada", "laptop").await }
+        });
+        held.arrived.await.unwrap();
+        let (pair_server, pair_served) = serve_once(issued("d2")).await;
+        let pair = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.pair(&pair_server, "code", "desktop").await }
+        });
+        assert!(still_waiting(&pair).await);
+
+        held.release.send(()).unwrap();
+        assert_eq!(claim.await.unwrap().unwrap().device_id, "d1");
+        assert!(matches!(
+            pair.await.unwrap(),
+            Err(DriverError::AlreadyPaired { device_id }) if device_id == "d1"
+        ));
+        assert!(!pair_served.is_finished(), "the pair reached the server");
+        pair_served.abort();
+        held.served.await.unwrap();
+        drop(driver);
+        let reopened = Driver::open(paths).unwrap().status();
+        assert_eq!(reopened.account.unwrap().device_id, "d1");
+    }
+
+    #[tokio::test]
+    async fn signing_out_waits_for_a_link_in_flight_and_then_unlinks_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        fs::create_dir(&root).unwrap();
+        let paths = Paths::under(&base.join("profile"));
+        let token = prost::Message::encode_to_vec(&flarebox_proto::v1::AccessToken {
+            token: "token".into(),
+            expires_at_ms: i64::MAX,
+        });
+        let spaces = prost::Message::encode_to_vec(&flarebox_proto::v1::SpaceList {
+            spaces: vec![SpaceInfo {
+                space_id: SPACE.into(),
+                name: "Projects".into(),
+                ..Default::default()
+            }],
+        });
+        let (server, held) = serve_held(vec![token, spaces]).await;
+        Credential {
+            server,
+            ..credential("d1")
+        }
+        .save_new(&paths.credential())
+        .unwrap();
+        let driver = Driver::open(paths.clone()).unwrap();
+        let link = tokio::spawn({
+            let driver = driver.clone();
+            let root = root.clone();
+            async move { driver.link(&root, "Projects").await }
+        });
+        held.arrived.await.unwrap();
+        let sign_out = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.sign_out().await }
+        });
+        assert!(still_waiting(&sign_out).await);
+
+        held.release.send(()).unwrap();
+        link.await.unwrap().unwrap();
+        sign_out.await.unwrap().unwrap();
+        assert_eq!(held.served.await.unwrap(), ["/v1/token", "/v1/spaces"]);
+        let status = driver.status();
+        assert_eq!(status.account, None);
+        assert!(status.folders.is_empty());
+        assert!(!paths.store(SPACE).unwrap().parent().unwrap().exists());
+        assert_eq!(claim::owner(&root).unwrap(), None);
+        assert!(!paths.credential().exists());
+    }
+
+    #[tokio::test]
+    async fn a_folder_whose_owner_record_stays_keeps_the_device_signed_in_until_a_retry_removes_it()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        let paths = Paths::under(&base.join("profile"));
+        linked(&paths, &root, "d1");
+        claim::set_owner(
+            &root,
+            &Owner {
+                server: NOWHERE.into(),
+                device_id: "d1".into(),
+            },
+        )
+        .unwrap();
+        let driver = Driver::open(paths.clone()).unwrap();
+        let mut watch = driver.watch();
+        let private = root.join(flarebox_fs::PRIVATE_DIR);
+        if !close_dir(&private) {
+            return;
+        }
+
+        let failed = driver.sign_out().await;
+        open_dir(&private);
+        assert!(matches!(failed, Err(DriverError::Io { .. })), "{failed:?}");
+        assert!(watch.has_changed().unwrap());
+        watch.borrow_and_update();
+        let status = driver.status();
+        assert_eq!(status.account.unwrap().device_id, "d1");
+        assert_eq!(status.folders[0].state, FolderState::Halted);
+        let problem = status.folders[0].problem.clone().unwrap();
+        assert!(problem.contains("could not be unlinked"), "{problem}");
+        assert!(paths.credential().exists());
+        assert!(paths.store(SPACE).unwrap().exists());
+        assert!(claim::owner(&root).unwrap().is_some());
+
+        driver.sign_out().await.unwrap();
+        assert!(watch.has_changed().unwrap());
+        assert!(driver.status().folders.is_empty());
+        assert_eq!(claim::owner(&root).unwrap(), None);
+        assert!(!paths.store(SPACE).unwrap().parent().unwrap().exists());
+        assert!(!paths.credential().exists());
+    }
+
+    #[tokio::test]
+    async fn a_failed_unlink_wakes_watchers_and_can_be_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        let paths = Paths::under(&base.join("profile"));
+        linked(&paths, &root, "d1");
+        let driver = Driver::open(paths.clone()).unwrap();
+        let mut watch = driver.watch();
+        let store_dir = paths.store(SPACE).unwrap().parent().unwrap().to_path_buf();
+        if !close_dir(&store_dir) {
+            return;
+        }
+
+        let failed = driver.unlink(&root).await;
+        open_dir(&store_dir);
+        assert!(matches!(failed, Err(DriverError::Io { .. })), "{failed:?}");
+        assert!(watch.has_changed().unwrap());
+        watch.borrow_and_update();
+        assert_eq!(driver.status().folders[0].state, FolderState::Halted);
+        assert!(paths.store(SPACE).unwrap().exists());
+
+        driver.unlink(&root).await.unwrap();
+        assert!(watch.has_changed().unwrap());
+        assert!(driver.status().folders.is_empty());
+        assert!(!store_dir.exists());
     }
 
     #[tokio::test]
