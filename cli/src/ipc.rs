@@ -78,6 +78,7 @@ pub async fn handle(driver: &Driver, request: Request) -> Response {
             .map(|account| Response::Paired { account }),
         Request::SaveCredential { credential } => driver
             .save_credential(credential)
+            .await
             .map(|account| Response::Paired { account }),
         Request::SignOut { device_id } => driver
             .sign_out_device(&device_id)

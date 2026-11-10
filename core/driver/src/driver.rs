@@ -498,13 +498,15 @@ impl Driver {
 
     /// Stores a credential this profile was issued elsewhere, such as by `flarebox setup`'s claim, the same way
     /// [`Driver::pair`] and [`Driver::claim`] store theirs, unless another one was stored meanwhile. The file is written
-    /// before this returns, so a caller can clean up after it.
-    pub fn save_credential(&self, credential: Credential) -> Result<Account, DriverError> {
+    /// before this returns, so a caller can clean up after it. Like every change to the credential, it waits for the
+    /// lifecycle lock, so a sign-out that checked the slot finishes before a new credential appears.
+    pub async fn save_credential(&self, credential: Credential) -> Result<Account, DriverError> {
+        let _lifecycle = self.inner.lifecycle.lock().await;
         let path = self.inner.paths.credential();
         self.store_credential(credential, |credential| credential.save_new(&path))
     }
 
-    /// Stores `credential` with `write` unless the slot holds one.
+    /// Stores `credential` with `write` unless the slot holds one, while the caller holds the lifecycle lock.
     fn store_credential(
         &self,
         credential: Credential,
@@ -1783,6 +1785,51 @@ mod tests {
         let reopened = Driver::open(paths).unwrap().status();
         assert_eq!(reopened.account.unwrap().device_id, "d3");
         assert!(reopened.folders.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_credential_saved_during_a_stale_sign_out_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let driver = Driver::open(paths.clone()).unwrap();
+        driver.start();
+        let (held, folders_held) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn({
+            let driver = driver.clone();
+            move || {
+                let _folders = driver.inner.folders.lock().unwrap();
+                held.send(()).unwrap();
+                released.recv().unwrap();
+            }
+        });
+        folders_held.recv().unwrap();
+        let stale = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.sign_out_device("d1").await }
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while driver.inner.running.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(driver.inner.lifecycle.try_lock().is_err());
+        let save = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.save_credential(credential("d2")).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(!save.is_finished(), "the save waits for the sign-out");
+        assert!(!paths.credential().exists());
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        stale.await.unwrap().unwrap();
+        assert_eq!(save.await.unwrap().unwrap().device_id, "d2");
+        assert!(paths.credential().exists());
+        assert_eq!(driver.status().account.unwrap().device_id, "d2");
     }
 
     #[tokio::test]
