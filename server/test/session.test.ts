@@ -702,7 +702,7 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
       const only = claimed.value;
       const pairing = await instance.startPairing(only.deviceId);
       if (!pairing.ok) throw new Error(pairing.message);
-      const paired = await instance.completePairing({ code: pairing.value.code, deviceName: "Second", platform: "linux" });
+      const paired = await instance.completePairing({ code: pairing.value.code, deviceName: "Second", platform: "linux" }, "test-client");
       if (!paired.ok) throw new Error(paired.message);
       const second = paired.value;
       const revoke = (device: DeviceCredentials, confirmLastDevice: boolean) =>
