@@ -831,6 +831,35 @@ fn a_folder_moved_over_an_empty_folder_is_renamed_onto_it() {
     assert_eq!(snapshot, Snapshot::scan(root).unwrap());
 }
 
+/// A folder that held entries is never replaced by another one, so a file
+/// that keeps its path while the folder around it changes stays where it is.
+#[test]
+fn a_folder_that_held_entries_is_not_replaced() {
+    let outer = tempfile::tempdir().unwrap();
+    let root = outer.path().join("space");
+    fs::create_dir_all(root.join("d")).unwrap();
+    fs::write(root.join("d/x"), "x").unwrap();
+    let mut snapshot = Snapshot::scan(&root).unwrap();
+    fs::rename(root.join("d/x"), root.join("x")).unwrap();
+    fs::rename(root.join("d"), outer.path().join("away")).unwrap();
+    fs::create_dir(root.join("d")).unwrap();
+    fs::rename(root.join("x"), root.join("d/x")).unwrap();
+    let changes = snapshot.rescan(&root, [PathBuf::new()]).unwrap().changes;
+    assert_eq!(changes, []);
+    assert_eq!(snapshot, Snapshot::scan(&root).unwrap());
+
+    let root = outer.path().join("moved");
+    fs::create_dir_all(root.join("d")).unwrap();
+    fs::write(root.join("d/x"), "x").unwrap();
+    let mut snapshot = Snapshot::scan(&root).unwrap();
+    fs::rename(root.join("d"), root.join("d.old")).unwrap();
+    fs::create_dir(root.join("d")).unwrap();
+    fs::rename(root.join("d.old/x"), root.join("d/x")).unwrap();
+    let changes = snapshot.rescan(&root, [PathBuf::new()]).unwrap().changes;
+    assert_eq!(changes, [created("d.old", Dir)]);
+    assert_eq!(snapshot, Snapshot::scan(&root).unwrap());
+}
+
 /// A folder whose device number changed, as after a remount, may report any
 /// inode number, so its identity cannot be compared and it is not reported as
 /// replaced.
