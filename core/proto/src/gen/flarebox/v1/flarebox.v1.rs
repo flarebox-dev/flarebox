@@ -249,6 +249,33 @@ pub struct RewindResult {
     #[prost(uint64, tag="5")]
     pub previous_head_seq: u64,
 }
+/// Response of GET /v1/spaces/{space_id}/usage, owner only (RFC 0010). Each chunk the space holds counts once, under the
+/// first of live, trash and old versions that holds it, so the four byte counts add up to the space's chunk bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SpaceUsage {
+    /// Files in the live tree.
+    #[prost(uint64, tag="1")]
+    pub live_files: u64,
+    /// Bytes of the chunks that the current versions of live files hold.
+    #[prost(uint64, tag="2")]
+    pub live_bytes: u64,
+    /// Files in the trash.
+    #[prost(uint64, tag="3")]
+    pub trashed_files: u64,
+    /// Bytes of the chunks that the current versions of trashed files hold and no live file holds.
+    #[prost(uint64, tag="4")]
+    pub trash_bytes: u64,
+    /// Versions that a newer version replaced and that the space still keeps, of live and trashed files.
+    #[prost(uint64, tag="5")]
+    pub old_versions: u64,
+    /// Bytes of the chunks that only old versions hold.
+    #[prost(uint64, tag="6")]
+    pub old_version_bytes: u64,
+    /// Bytes of the chunks that no version holds: uploads not committed yet, and chunks waiting out the grace period
+    /// before deletion.
+    #[prost(uint64, tag="7")]
+    pub unreferenced_bytes: u64,
+}
 /// A content-addressed piece of a file.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ChunkRef {

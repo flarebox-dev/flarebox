@@ -12,7 +12,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file flarebox/v1/auth.proto.
  */
 export const file_flarebox_v1_auth: GenFile = /*@__PURE__*/
-  fileDesc("ChZmbGFyZWJveC92MS9hdXRoLnByb3RvEgtmbGFyZWJveC52MSLiAQoKU2VydmVySW5mbxIWCg5zZXJ2ZXJfdmVyc2lvbhgBIAEoCRIRCglwcm90b19taW4YAiABKA0SEQoJcHJvdG9fbWF4GAMgASgNEjMKCWRhdGFfcGF0aBgEIAEoDjIgLmZsYXJlYm94LnYxLlNlcnZlckluZm8uRGF0YVBhdGgSDwoHY2xhaW1lZBgFIAEoCCJQCghEYXRhUGF0aBIZChVEQVRBX1BBVEhfVU5TUEVDSUZJRUQQABITCg9EQVRBX1BBVEhfUkVMQVkQARIUChBEQVRBX1BBVEhfRElSRUNUEAIiVgoMQ2xhaW1SZXF1ZXN0EgwKBGNvZGUYASABKAkSEQoJdXNlcl9uYW1lGAIgASgJEhMKC2RldmljZV9uYW1lGAMgASgJEhAKCHBsYXRmb3JtGAQgASgJIjgKEVBhaXJTdGFydFJlc3BvbnNlEgwKBGNvZGUYASABKAkSFQoNZXhwaXJlc19hdF9tcxgCIAEoAyJKChNQYWlyQ29tcGxldGVSZXF1ZXN0EgwKBGNvZGUYASABKAkSEwoLZGV2aWNlX25hbWUYAiABKAkSEAoIcGxhdGZvcm0YAyABKAkisgEKEURldmljZUNyZWRlbnRpYWxzEg8KB3VzZXJfaWQYASABKAkSEQoJZGV2aWNlX2lkGAIgASgJEhoKEnJlZnJlc2hfY3JlZGVudGlhbBgDIAEoCRIoCgZhY2Nlc3MYBCABKAsyGC5mbGFyZWJveC52MS5BY2Nlc3NUb2tlbhIgChhjcmVkZW50aWFsX2V4cGlyZXNfYXRfbXMYBSABKAMSEQoJdXNlcl9uYW1lGAYgASgJIj0KDFRva2VuUmVxdWVzdBIRCglkZXZpY2VfaWQYASABKAkSGgoScmVmcmVzaF9jcmVkZW50aWFsGAIgASgJIjMKC0FjY2Vzc1Rva2VuEg0KBXRva2VuGAEgASgJEhUKDWV4cGlyZXNfYXRfbXMYAiABKAMiWgoJU3BhY2VJbmZvEhAKCHNwYWNlX2lkGAEgASgJEgwKBG5hbWUYAiABKAkSFgoOZm9ybWF0X3ZlcnNpb24YAyABKA0SFQoNY3JlYXRlZF9hdF9tcxgEIAEoAyIiChJDcmVhdGVTcGFjZVJlcXVlc3QSDAoEbmFtZRgBIAEoCSJICglTcGFjZUxpc3QSJgoGc3BhY2VzGAEgAygLMhYuZmxhcmVib3gudjEuU3BhY2VJbmZvEhMKC25leHRfY3Vyc29yGAIgASgJIrQCCgpEZXZpY2VJbmZvEhEKCWRldmljZV9pZBgBIAEoCRIMCgRuYW1lGAIgASgJEhAKCHBsYXRmb3JtGAMgASgJEioKBGtpbmQYBCABKA4yHC5mbGFyZWJveC52MS5EZXZpY2VJbmZvLktpbmQSFQoNY3JlYXRlZF9hdF9tcxgFIAEoAxIUCgxsYXN0X3NlZW5fbXMYBiABKAMSFQoNcmV2b2tlZF9hdF9tcxgHIAEoAxIgChhjcmVkZW50aWFsX2V4cGlyZXNfYXRfbXMYCCABKAMSEQoJaXNzdWVkX2J5GAkgASgJEg8KB2N1cnJlbnQYCiABKAgiPQoES2luZBIUChBLSU5EX1VOU1BFQ0lGSUVEEAASDwoLS0lORF9ERVZJQ0UQARIOCgpLSU5EX0FHRU5UEAIiSwoKRGV2aWNlTGlzdBIoCgdkZXZpY2VzGAEgAygLMhcuZmxhcmVib3gudjEuRGV2aWNlSW5mbxITCgtuZXh0X2N1cnNvchgCIAEoCSJZCg1SZXdpbmRSZXF1ZXN0EhgKEHJlc3RvcmVfcG9pbnRfbXMYASABKAMSGwoTZXhwZWN0ZWRfaGlzdG9yeV9pZBgCIAEoCRIRCglyZXdpbmRfaWQYAyABKAkiiQEKDFJld2luZFJlc3VsdBISCgpoaXN0b3J5X2lkGAEgASgJEhMKC3Jlc3RvcmVfc2VxGAIgASgEEhgKEHJlc3RvcmVfcG9pbnRfbXMYAyABKAMSGwoTcHJldmlvdXNfaGlzdG9yeV9pZBgEIAEoCRIZChFwcmV2aW91c19oZWFkX3NlcRgFIAEoBGIGcHJvdG8z");
+  fileDesc("ChZmbGFyZWJveC92MS9hdXRoLnByb3RvEgtmbGFyZWJveC52MSLiAQoKU2VydmVySW5mbxIWCg5zZXJ2ZXJfdmVyc2lvbhgBIAEoCRIRCglwcm90b19taW4YAiABKA0SEQoJcHJvdG9fbWF4GAMgASgNEjMKCWRhdGFfcGF0aBgEIAEoDjIgLmZsYXJlYm94LnYxLlNlcnZlckluZm8uRGF0YVBhdGgSDwoHY2xhaW1lZBgFIAEoCCJQCghEYXRhUGF0aBIZChVEQVRBX1BBVEhfVU5TUEVDSUZJRUQQABITCg9EQVRBX1BBVEhfUkVMQVkQARIUChBEQVRBX1BBVEhfRElSRUNUEAIiVgoMQ2xhaW1SZXF1ZXN0EgwKBGNvZGUYASABKAkSEQoJdXNlcl9uYW1lGAIgASgJEhMKC2RldmljZV9uYW1lGAMgASgJEhAKCHBsYXRmb3JtGAQgASgJIjgKEVBhaXJTdGFydFJlc3BvbnNlEgwKBGNvZGUYASABKAkSFQoNZXhwaXJlc19hdF9tcxgCIAEoAyJKChNQYWlyQ29tcGxldGVSZXF1ZXN0EgwKBGNvZGUYASABKAkSEwoLZGV2aWNlX25hbWUYAiABKAkSEAoIcGxhdGZvcm0YAyABKAkisgEKEURldmljZUNyZWRlbnRpYWxzEg8KB3VzZXJfaWQYASABKAkSEQoJZGV2aWNlX2lkGAIgASgJEhoKEnJlZnJlc2hfY3JlZGVudGlhbBgDIAEoCRIoCgZhY2Nlc3MYBCABKAsyGC5mbGFyZWJveC52MS5BY2Nlc3NUb2tlbhIgChhjcmVkZW50aWFsX2V4cGlyZXNfYXRfbXMYBSABKAMSEQoJdXNlcl9uYW1lGAYgASgJIj0KDFRva2VuUmVxdWVzdBIRCglkZXZpY2VfaWQYASABKAkSGgoScmVmcmVzaF9jcmVkZW50aWFsGAIgASgJIjMKC0FjY2Vzc1Rva2VuEg0KBXRva2VuGAEgASgJEhUKDWV4cGlyZXNfYXRfbXMYAiABKAMiWgoJU3BhY2VJbmZvEhAKCHNwYWNlX2lkGAEgASgJEgwKBG5hbWUYAiABKAkSFgoOZm9ybWF0X3ZlcnNpb24YAyABKA0SFQoNY3JlYXRlZF9hdF9tcxgEIAEoAyIiChJDcmVhdGVTcGFjZVJlcXVlc3QSDAoEbmFtZRgBIAEoCSJICglTcGFjZUxpc3QSJgoGc3BhY2VzGAEgAygLMhYuZmxhcmVib3gudjEuU3BhY2VJbmZvEhMKC25leHRfY3Vyc29yGAIgASgJIrQCCgpEZXZpY2VJbmZvEhEKCWRldmljZV9pZBgBIAEoCRIMCgRuYW1lGAIgASgJEhAKCHBsYXRmb3JtGAMgASgJEioKBGtpbmQYBCABKA4yHC5mbGFyZWJveC52MS5EZXZpY2VJbmZvLktpbmQSFQoNY3JlYXRlZF9hdF9tcxgFIAEoAxIUCgxsYXN0X3NlZW5fbXMYBiABKAMSFQoNcmV2b2tlZF9hdF9tcxgHIAEoAxIgChhjcmVkZW50aWFsX2V4cGlyZXNfYXRfbXMYCCABKAMSEQoJaXNzdWVkX2J5GAkgASgJEg8KB2N1cnJlbnQYCiABKAgiPQoES2luZBIUChBLSU5EX1VOU1BFQ0lGSUVEEAASDwoLS0lORF9ERVZJQ0UQARIOCgpLSU5EX0FHRU5UEAIiSwoKRGV2aWNlTGlzdBIoCgdkZXZpY2VzGAEgAygLMhcuZmxhcmVib3gudjEuRGV2aWNlSW5mbxITCgtuZXh0X2N1cnNvchgCIAEoCSJZCg1SZXdpbmRSZXF1ZXN0EhgKEHJlc3RvcmVfcG9pbnRfbXMYASABKAMSGwoTZXhwZWN0ZWRfaGlzdG9yeV9pZBgCIAEoCRIRCglyZXdpbmRfaWQYAyABKAkiiQEKDFJld2luZFJlc3VsdBISCgpoaXN0b3J5X2lkGAEgASgJEhMKC3Jlc3RvcmVfc2VxGAIgASgEEhgKEHJlc3RvcmVfcG9pbnRfbXMYAyABKAMSGwoTcHJldmlvdXNfaGlzdG9yeV9pZBgEIAEoCRIZChFwcmV2aW91c19oZWFkX3NlcRgFIAEoBCKtAQoKU3BhY2VVc2FnZRISCgpsaXZlX2ZpbGVzGAEgASgEEhIKCmxpdmVfYnl0ZXMYAiABKAQSFQoNdHJhc2hlZF9maWxlcxgDIAEoBBITCgt0cmFzaF9ieXRlcxgEIAEoBBIUCgxvbGRfdmVyc2lvbnMYBSABKAQSGQoRb2xkX3ZlcnNpb25fYnl0ZXMYBiABKAQSGgoSdW5yZWZlcmVuY2VkX2J5dGVzGAcgASgEYgZwcm90bzM");
 
 /**
  * GET /v1/server
@@ -564,4 +564,69 @@ export type RewindResult = Message<"flarebox.v1.RewindResult"> & {
  */
 export const RewindResultSchema: GenMessage<RewindResult> = /*@__PURE__*/
   messageDesc(file_flarebox_v1_auth, 13);
+
+/**
+ * Response of GET /v1/spaces/{space_id}/usage, owner only (RFC 0010). Each chunk the space holds counts once, under the
+ * first of live, trash and old versions that holds it, so the four byte counts add up to the space's chunk bytes.
+ *
+ * @generated from message flarebox.v1.SpaceUsage
+ */
+export type SpaceUsage = Message<"flarebox.v1.SpaceUsage"> & {
+  /**
+   * Files in the live tree.
+   *
+   * @generated from field: uint64 live_files = 1;
+   */
+  liveFiles: bigint;
+
+  /**
+   * Bytes of the chunks that the current versions of live files hold.
+   *
+   * @generated from field: uint64 live_bytes = 2;
+   */
+  liveBytes: bigint;
+
+  /**
+   * Files in the trash.
+   *
+   * @generated from field: uint64 trashed_files = 3;
+   */
+  trashedFiles: bigint;
+
+  /**
+   * Bytes of the chunks that the current versions of trashed files hold and no live file holds.
+   *
+   * @generated from field: uint64 trash_bytes = 4;
+   */
+  trashBytes: bigint;
+
+  /**
+   * Versions that a newer version replaced and that the space still keeps, of live and trashed files.
+   *
+   * @generated from field: uint64 old_versions = 5;
+   */
+  oldVersions: bigint;
+
+  /**
+   * Bytes of the chunks that only old versions hold.
+   *
+   * @generated from field: uint64 old_version_bytes = 6;
+   */
+  oldVersionBytes: bigint;
+
+  /**
+   * Bytes of the chunks that no version holds: uploads not committed yet, and chunks waiting out the grace period
+   * before deletion.
+   *
+   * @generated from field: uint64 unreferenced_bytes = 7;
+   */
+  unreferencedBytes: bigint;
+};
+
+/**
+ * Describes the message flarebox.v1.SpaceUsage.
+ * Use `create(SpaceUsageSchema)` to create a new message.
+ */
+export const SpaceUsageSchema: GenMessage<SpaceUsage> = /*@__PURE__*/
+  messageDesc(file_flarebox_v1_auth, 14);
 

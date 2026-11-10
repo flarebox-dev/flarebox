@@ -95,6 +95,7 @@ The server decides what a principal may do at two points, and only there:
 | `device.manage` | The device routes of section 7 |
 | `share.manage` | The owner API of RFC 0005 §2 |
 | `space.rewind` | `POST /v1/spaces/{space_id}/rewind` (RFC 0003) |
+| `space.usage` | `GET /v1/spaces/{space_id}/usage` (RFC 0010) |
 
 A refused capability is `FORBIDDEN`.
 
