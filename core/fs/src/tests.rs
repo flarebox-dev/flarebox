@@ -621,13 +621,17 @@ fn root_id(root: &Path) -> FileId {
 }
 
 /// Replaces the platform watcher with one that watches the root folder only,
-/// as if the watches below it were lost.
+/// as if the watches below it were lost. The new watcher reports on a channel
+/// of its own: the old one stops on its own thread, and an event it reports
+/// for a folder below the root before it stops must not reach the watcher.
 fn lose_coverage(watcher: &mut NativeWatcher) {
-    watcher.watcher = notify::recommended_watcher(watcher.sender.clone()).unwrap();
+    let (sender, events) = mpsc::channel();
+    watcher.watcher = notify::recommended_watcher(sender.clone()).unwrap();
     watcher
         .watcher
         .watch(&watcher.root, RecursiveMode::NonRecursive)
         .unwrap();
+    (watcher.sender, watcher.events) = (sender, events);
 }
 
 #[test]
