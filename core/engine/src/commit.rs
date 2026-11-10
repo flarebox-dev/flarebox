@@ -46,7 +46,7 @@ pub enum Halt {
     /// is kept as evidence and nothing is planned from this store.
     Recovery,
     /// The server refused the commit with an error the engine cannot act on: a code it does not
-    /// know, \`UNSPECIFIED\` among them, or \`QUOTA_EXCEEDED\` without a retry time. The commit in
+    /// know, `UNSPECIFIED` among them, or `QUOTA_EXCEEDED` without a retry time. The commit in
     /// flight is kept and never resent, nothing more is planned, and downloads continue.
     Refused,
 }
@@ -386,7 +386,7 @@ impl Commits {
     /// What a call-level error on the commit in flight means. An error that proves nothing was
     /// applied forgets the commit; one that leaves the outcome unknown keeps it to resend; a
     /// history mismatch or a stale device state keeps it as evidence and stops committing; and an
-    /// error the engine cannot act on refuses it (see [\`Halt::Refused\`]). \`QUOTA_EXCEEDED\` is
+    /// error the engine cannot act on refuses it (see [`Halt::Refused`]). `QUOTA_EXCEEDED` is
     /// resent only when it names a retry time, after that wait.
     pub fn failed(&mut self, error: &proto::Error) -> Result<Failure, CommitError> {
         use error::Code;
