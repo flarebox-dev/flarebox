@@ -267,7 +267,7 @@ export class AccountDO extends DurableObject<Env> {
     });
     const store = () => {
       this.sql.exec(
-        "INSERT INTO devices (device_id, user_id, name, platform, created_at_ms, refresh_hash, issued_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO devices (device_id, user_id, name, platform, created_at_ms, refresh_hash, issued_by, list_seq) VALUES (?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(list_seq), 0) + 1 FROM devices))",
         deviceId,
         userId,
         name,
@@ -356,11 +356,14 @@ export class AccountDO extends DurableObject<Env> {
     return ok(await this.accessToken(device, nowMs));
   }
 
-  /** GET /v1/devices: the user's principals in creation order, revoked ones included (RFC 0006 section 7). */
-  async listDevices(args: { userId: string; callerId: string; cursor: string }): Promise<DeviceList> {
+  /**
+   * GET /v1/devices: the user's principals in the order their rows were stored, revoked ones included (RFC 0006
+   * section 7). A device stored after a listing passed newer ones gets the highest list_seq, so a later page lists it.
+   */
+  async listDevices(args: { userId: string; callerId: string; after: number }): Promise<DeviceList> {
     const found = this.sql
-      .exec("SELECT * FROM devices WHERE user_id = ? AND device_id > ? ORDER BY device_id LIMIT ?", args.userId, args.cursor, DEVICE_PAGE + 1)
-      .toArray() as unknown as DeviceRow[];
+      .exec("SELECT * FROM devices WHERE user_id = ? AND list_seq > ? ORDER BY list_seq LIMIT ?", args.userId, args.after, DEVICE_PAGE + 1)
+      .toArray() as unknown as (DeviceRow & { list_seq: number })[];
     const page = found.slice(0, DEVICE_PAGE);
     return create(DeviceListSchema, {
       devices: page.map((row) =>
@@ -377,7 +380,7 @@ export class AccountDO extends DurableObject<Env> {
           current: row.device_id === args.callerId,
         }),
       ),
-      nextCursor: found.length > DEVICE_PAGE ? page[page.length - 1]!.device_id : "",
+      nextCursor: found.length > DEVICE_PAGE ? String(page[page.length - 1]!.list_seq) : "",
     });
   }
 

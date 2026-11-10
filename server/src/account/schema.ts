@@ -64,6 +64,13 @@ export const MIGRATIONS: readonly Migration[] = [
     sql.exec("UPDATE spaces SET list_seq = rowid WHERE list_seq IS NULL");
     sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS spaces_list_seq ON spaces(list_seq)");
   },
+  // RFC 0006 section 7: devices are listed in the order their rows were stored, which a device id does not give.
+  (sql) => {
+    const columns = sql.exec("SELECT name FROM pragma_table_info('devices')").toArray().map((row) => row.name);
+    if (!columns.includes("list_seq")) sql.exec("ALTER TABLE devices ADD COLUMN list_seq INTEGER");
+    sql.exec("UPDATE devices SET list_seq = rowid WHERE list_seq IS NULL");
+    sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS devices_list_seq ON devices(list_seq)");
+  },
 ];
 
 export function migrate(sql: SqlStorage): void {
