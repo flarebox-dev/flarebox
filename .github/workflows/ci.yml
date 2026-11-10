@@ -57,8 +57,8 @@ jobs:
             fi
           }
           decide rust_macos '^(\.github/workflows/ci\.yml$|Cargo\.(toml|lock)$|rust-toolchain\.toml$|\.cargo/|cli/|core/|spec/)'
-          decide server_macos '^(\.github/workflows/ci\.yml$|server/|spec/)'
-          decide spec_macos '^(\.github/workflows/ci\.yml$|spec/|server/src/gen/|core/proto/)'
+          echo "server_macos, spec_macos: skipped, because the server and spec checks run on macOS only on pushes to main"
+          printf '%s=false\n' server_macos spec_macos >> "$GITHUB_OUTPUT"
           decide macos_app '^(\.github/workflows/ci\.yml$|Cargo\.(toml|lock)$|cli/Cargo\.toml$|rust-toolchain\.toml$|\.cargo/|core/|apps/macos/)'
 
   rust:
