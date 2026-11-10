@@ -405,7 +405,7 @@ impl Commits {
             Ok(Code::MissingChunks | Code::RetryLater | Code::Unauthenticated | Code::Internal) => {
                 Failure::Resend
             }
-            Ok(Code::QuotaExceeded | Code::Unspecified) | Err(_) => Failure::Halted(Halt::Refused),
+            _ => Failure::Halted(Halt::Refused),
         };
         match failure {
             Failure::Halted(halt @ (Halt::Recovery | Halt::Refused)) => self.halted = Some(halt),
