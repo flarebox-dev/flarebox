@@ -179,9 +179,12 @@ enum Token {
     AnyChar,
     /// `*`, or a run of asterisks that is not a special `**`.
     Star,
-    /// `**` at the start or end of the pattern or between slashes. Followed by a slash, it also
-    /// matches zero directories.
-    DoubleStar,
+    /// `**` at the start or end of the pattern or between slashes. Before a slash that is not
+    /// escaped it also matches zero directories with that slash (`or_nothing`), as in git's
+    /// `wildmatch`: `**/b` matches `b`, and `**\/b` needs a directory.
+    DoubleStar {
+        or_nothing: bool,
+    },
     Class(Class),
 }
 
@@ -357,7 +360,9 @@ fn tokenize<K: NameKey>(body: &str) -> Result<Vec<Token>, LineError> {
                     Some(_) => false,
                 };
                 raw.push(if i - start >= 2 && after_slash && before_slash {
-                    Token::DoubleStar
+                    Token::DoubleStar {
+                        or_nothing: chars.get(i) == Some(&'/'),
+                    }
                 } else {
                     Token::Star
                 });
@@ -483,7 +488,7 @@ fn wildmatch<K: NameKey>(tokens: &[Token], text: &[char], pathname: bool) -> boo
                     Token::Slash => c == '/',
                     Token::AnyChar => !slash_blocked,
                     Token::Class(class) => !slash_blocked && class.matches::<K>(c),
-                    Token::Star | Token::DoubleStar => false,
+                    Token::Star | Token::DoubleStar { .. } => false,
                 };
                 if advance {
                     enter(tokens, &mut next, i + 1, &mut pending);
@@ -519,10 +524,10 @@ fn enter(tokens: &[Token], states: &mut [bool], start: usize, pending: &mut Vec<
                 states[n + 1 + i] = true;
                 pending.push(i + 1);
             }
-            Some(Token::DoubleStar) => {
+            Some(Token::DoubleStar { or_nothing }) => {
                 states[n + 1 + i] = true;
                 pending.push(i + 1);
-                if tokens.get(i + 1) == Some(&Token::Slash) {
+                if *or_nothing {
                     pending.push(i + 2);
                 }
             }
