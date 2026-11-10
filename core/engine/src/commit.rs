@@ -387,7 +387,9 @@ impl Commits {
     /// it. S takes what was sent, not what the server returned, so any difference shows up as a
     /// remote change; a create or move the server renamed takes the server's name instead, and the
     /// node is reverted so that the disk takes it too. A conflict copy is re-keyed in L, and so is
-    /// a directory merged into one L does not hold yet. When L already holds the directory it was
+    /// a directory merged into one L does not hold yet. When L already holds the conflict copy,
+    /// because a log replay brought it before the result and the effects downloaded it, the local
+    /// file keeps its ID and takes what was sent as its S, so the server's content replaces it. When L already holds the directory it was
     /// merged into, the created directory and the nodes created in it are reverted: on disk they
     /// move into the merged directory and the emptied one is removed. The accepted counter takes
     /// the commit's slot. Returns false while there is nothing to acknowledge.
@@ -460,7 +462,9 @@ impl Commits {
                         content: update.content.clone(),
                         ..shape
                     });
-                    if applied && edited.is_some() {
+                    let downloaded =
+                        code == Code::ConflictCopy && trees.local().get(&outcome.node_id).is_some();
+                    if (applied && edited.is_some()) || downloaded {
                         synced.set(id, edited);
                     } else if code == Code::ConflictCopy {
                         synced.set(&outcome.node_id, edited);
