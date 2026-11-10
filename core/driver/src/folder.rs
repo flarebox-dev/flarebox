@@ -378,7 +378,8 @@ impl Folder {
                         space_id = self.link.space_id,
                         why,
                         ?wait,
-                        "an effect failed; its node is planned again after the wait, or once what is planned for                          it changes"
+                        "an effect failed; its node is planned again after the wait, or once what is planned for \
+                         it changes"
                     );
                     let at = Instant::now() + wait;
                     if self.retry_at.is_none_or(|out| at < out) {
