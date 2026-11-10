@@ -87,11 +87,11 @@ impl Space {
         self.recheck(from)?;
         self.recheck(&trash)?;
         rename_no_replace(from.fd(), name, trash.fd(), OsStr::new(entry))?;
+        let kept = kept(trash.fd(), entry, &original.to_string_lossy(), now, true)?;
         flush(from.fd())?;
         flush(trash.fd())?;
         let private = self.private(&[])?;
         let mut index = read_index(private.fd())?;
-        let kept = kept(trash.fd(), entry, &original.to_string_lossy(), now, true)?;
         index.entries.insert(entry.to_owned(), kept);
         self.recheck(&private)?;
         write_index(private.fd(), &index)

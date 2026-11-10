@@ -19,20 +19,21 @@ const ATTEMPTS: u32 = 10_000;
 
 /// The name a recovered copy of `original` gets on `date` (`YYYY-MM-DD`):
 /// `<stem> (recovered <date>)<ext>`, and `<stem> (recovered <date> <n>)<ext>`
-/// for the `n`th attempt after a collision. A folder or a name without an
-/// extension keeps its whole name as the stem. The stem is shortened, on a
+/// for the `n`th attempt after a collision. A folder, a name without an
+/// extension, or a name whose extension leaves no room for the label keeps
+/// its whole name as the stem. The stem is shortened, on a
 /// character boundary when it is UTF-8, so the name fits in 255 bytes.
 pub fn recovered_name(original: &OsStr, folder: bool, date: &str, n: u32) -> OsString {
     let bytes = original.as_bytes();
-    let split = match bytes.iter().rposition(|&byte| byte == b'.') {
-        Some(dot) if dot > 0 && !folder => dot,
-        _ => bytes.len(),
-    };
-    let (stem, ext) = bytes.split_at(split);
     let label = match n {
         1 => format!(" (recovered {date})"),
         n => format!(" (recovered {date} {n})"),
     };
+    let split = match bytes.iter().rposition(|&byte| byte == b'.') {
+        Some(dot) if dot > 0 && !folder && label.len() + bytes.len() - dot <= NAME_MAX => dot,
+        _ => bytes.len(),
+    };
+    let (stem, ext) = bytes.split_at(split);
     let room = NAME_MAX.saturating_sub(label.len() + ext.len());
     let mut keep = stem.len().min(room);
     while keep > 0 && keep < stem.len() && stem[keep] & 0xC0 == 0x80 {

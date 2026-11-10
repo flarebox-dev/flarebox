@@ -304,6 +304,12 @@ fn recovered_names_keep_the_extension_and_fit() {
     assert!(fitted.len() <= 255, "{}", fitted.len());
     assert!(fitted.starts_with("éé"));
     assert!(fitted.ends_with(" (recovered 2026-11-10 12).txt"));
+
+    let long_extension = format!("x.{}", "e".repeat(251));
+    let fitted = name(&long_extension, false, 1);
+    assert!(fitted.len() <= 255, "{}", fitted.len());
+    assert!(fitted.starts_with("x.eee"));
+    assert!(fitted.ends_with(" (recovered 2026-11-10)"));
 }
 
 /// Moves the root entry `name` into the trash as `entry` without indexing it,
