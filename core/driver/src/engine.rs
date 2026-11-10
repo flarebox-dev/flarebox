@@ -360,9 +360,11 @@ impl Engine {
     /// Puts `changes` into L and returns the nodes whose L entry changed. Paths a change names in the previous state
     /// (`Removed::path`, `Renamed::from`) are resolved before any change applies. A renamed or modified entry is the
     /// node L holds at its path with its identity, else the node with its identity, else the node at its path. A
-    /// created entry with the identity of a node L holds is that node, wherever L had it. Any other created entry is a
-    /// new node. An entry that another path also links is a hard link, a file of its own (design §5.6), so its
-    /// identity never takes a node from another path.
+    /// created entry with the identity of a node L holds is that node, wherever L had it. So is a created entry with
+    /// the path and identity a node had before an earlier change of the batch took it out of L, unless the batch
+    /// placed that node again. That keeps a child's node when its folder is replaced around it. Any other created
+    /// entry is a new node. An entry that another path also links is a hard link, a file of its own (design §5.6),
+    /// so its identity never takes a node from another path.
     ///
     /// A node that held the name a change puts an entry at is gone from there, so it leaves L with everything under
     /// it. A file that arrives over a file keeps the node of the file it replaces when L's own node for the arriving
@@ -383,11 +385,12 @@ impl Engine {
             })
             .collect();
         let mut touched = BTreeSet::new();
+        let mut gone = Gone::new();
         for (change, before) in changes.iter().zip(before) {
             match change {
                 Observed::Removed { .. } => {
                     if let Some(id) = before {
-                        self.remove(&id, &mut touched);
+                        self.remove(&id, &mut touched, &mut gone);
                     }
                 }
                 Observed::Renamed { to, kind, id, .. } => {
@@ -411,7 +414,16 @@ impl Engine {
                         .as_ref()
                         .and_then(|id| self.trees.local().get(id))
                         .and_then(|node| node.shape.content.clone());
-                    self.place(before, to, *kind, identity, content, now_ms, &mut touched);
+                    self.place(
+                        before,
+                        to,
+                        *kind,
+                        identity,
+                        content,
+                        now_ms,
+                        &mut touched,
+                        &mut gone,
+                    );
                 }
                 Observed::Created {
                     path,
@@ -426,7 +438,14 @@ impl Engine {
                     let identity = file_identity(*id);
                     let node = (self.trees.local_with_identity(&identity))
                         .filter(|_| !linked)
-                        .cloned();
+                        .cloned()
+                        .or_else(|| {
+                            (gone.get(path))
+                                .filter(|(node, held)| {
+                                    *held == identity && self.trees.local().get(node).is_none()
+                                })
+                                .map(|(node, _)| node.clone())
+                        });
                     self.place(
                         node,
                         path,
@@ -435,6 +454,7 @@ impl Engine {
                         content.clone(),
                         now_ms,
                         &mut touched,
+                        &mut gone,
                     );
                 }
                 Observed::Modified {
@@ -454,6 +474,7 @@ impl Engine {
                         Some(content.clone()),
                         now_ms,
                         &mut touched,
+                        &mut gone,
                     );
                 }
             }
@@ -549,6 +570,7 @@ impl Engine {
         content: Option<Content>,
         now_ms: u64,
         touched: &mut BTreeSet<NodeId>,
+        gone: &mut Gone,
     ) {
         let (Some(parent), Some(name)) = (
             path.parent()
@@ -606,11 +628,11 @@ impl Engine {
                 self.trees.synced().get(&id).is_some() || self.trees.remote().get(&id).is_some();
             if kind == Kind::File && replaced == Some(Kind::File) && !synced {
                 if self.trees.local().get(&id).is_some() {
-                    self.remove(&id, touched);
+                    self.remove(&id, touched, gone);
                 }
                 id = holder;
             } else {
-                self.remove(&holder, touched);
+                self.remove(&holder, touched, gone);
             }
         }
         self.trees.set_local(
@@ -624,13 +646,18 @@ impl Engine {
         touched.insert(id);
     }
 
-    /// Removes `id` and every node placed under it from L.
-    fn remove(&mut self, id: &NodeId, touched: &mut BTreeSet<NodeId>) {
+    /// Removes `id` and every node placed under it from L, and adds each of them to `gone`.
+    fn remove(&mut self, id: &NodeId, touched: &mut BTreeSet<NodeId>, gone: &mut Gone) {
         let mut doomed = vec![id.clone()];
         let mut next = 0;
         while let Some(current) = doomed.get(next).cloned() {
             doomed.extend(self.trees.local_children(&current).cloned());
             next += 1;
+        }
+        for id in &doomed {
+            if let (Some(path), Some(node)) = (self.path_of(id), self.trees.local().get(id)) {
+                gone.insert(path, (id.clone(), node.identity));
+            }
         }
         for id in doomed {
             self.trees.remove_local(&id);
@@ -638,6 +665,9 @@ impl Engine {
         }
     }
 }
+
+/// The nodes a batch took out of L, by the path each had, with the identity it had.
+type Gone = BTreeMap<PathBuf, (NodeId, FileIdentity)>;
 
 /// The placed node of L at `path`, or the root for the empty path.
 fn local_at(trees: &Trees, path: &Path) -> Option<NodeId> {
@@ -1533,6 +1563,182 @@ mod tests {
         assert!(engine.trees.excluded(&log_id), "no rules file changed");
         engine.rules(Vec::new(), true);
         assert!(!engine.trees.excluded(&log_id), "no rules file is left");
+    }
+
+    /// A reset queued before a child entered L leaves the snapshot without the
+    /// child. A folder made anew around the child is not the destination of a
+    /// rename, so it is not a replacement, and the child keeps its node.
+    #[test]
+    fn a_synced_child_keeps_its_node_when_a_stale_reset_hid_it_and_its_folder_is_made_anew() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("space");
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        let mut snapshot = Snapshot::scan(&root).unwrap();
+        let (_dir, mut engine) = mapper();
+        let folder = Observed::Created {
+            path: "d".into(),
+            kind: EntryKind::Dir,
+            id: snapshot.entries[Path::new("d")].id,
+            linked: false,
+            content: None,
+        };
+        engine.observe(&[folder], 0);
+        let stale = engine.resets([PathBuf::from("d")]);
+        std::fs::write(root.join("d/x"), b"abc").unwrap();
+        snapshot.rescan(&root, [PathBuf::new()]).unwrap();
+        let id = snapshot.entries[Path::new("d/x")].id;
+        engine.observe(&[created("d/x", id, false, 3)], 1);
+        let local: Vec<_> = (engine.trees.local().iter())
+            .map(|(id, node)| (id.clone(), node.shape.clone()))
+            .collect();
+        for (id, shape) in local {
+            engine.trees.set_synced(id, Some(shape));
+        }
+        let (synced, _, _) = holding(&engine, "d/x").unwrap();
+
+        for reset in stale {
+            snapshot.reset(&reset.scope, reset.known);
+        }
+        std::fs::rename(root.join("d/x"), root.join("x")).unwrap();
+        std::fs::rename(root.join("d"), outer.path().join("away")).unwrap();
+        std::fs::create_dir(root.join("d")).unwrap();
+        std::fs::rename(root.join("x"), root.join("d/x")).unwrap();
+        let changes = snapshot.rescan(&root, [PathBuf::new()]).unwrap().changes;
+        assert_eq!(
+            changes,
+            [flarebox_fs::Change::Created {
+                path: "d/x".into(),
+                kind: EntryKind::File,
+            }]
+        );
+        engine.observe(&[created("d/x", id, false, 3)], 2);
+        assert_eq!(
+            holding(&engine, "d/x").map(|(node, _, _)| node),
+            Some(synced)
+        );
+    }
+
+    /// A reset queued before a child entered L leaves the snapshot without the
+    /// child. A folder renamed over the child's folder while the child is away
+    /// replaces it, and the child that comes back keeps its node.
+    #[test]
+    fn a_synced_child_keeps_its_node_when_a_stale_reset_hid_it_and_its_folder_is_replaced() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("space");
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        std::fs::create_dir(root.join("incoming")).unwrap();
+        let mut snapshot = Snapshot::scan(&root).unwrap();
+        let (_dir, mut engine) = mapper();
+        for path in ["d", "incoming"] {
+            let folder = Observed::Created {
+                path: path.into(),
+                kind: EntryKind::Dir,
+                id: snapshot.entries[Path::new(path)].id,
+                linked: false,
+                content: None,
+            };
+            engine.observe(&[folder], 0);
+        }
+        let stale = engine.resets([PathBuf::from("d")]);
+        std::fs::write(root.join("d/x"), b"abc").unwrap();
+        snapshot.rescan(&root, [PathBuf::new()]).unwrap();
+        let id = snapshot.entries[Path::new("d/x")].id;
+        engine.observe(&[created("d/x", id, false, 3)], 1);
+        let local: Vec<_> = (engine.trees.local().iter())
+            .map(|(id, node)| (id.clone(), node.shape.clone()))
+            .collect();
+        for (id, shape) in local {
+            engine.trees.set_synced(id, Some(shape));
+        }
+        let (synced, _, _) = holding(&engine, "d/x").unwrap();
+        let (incoming, _, _) = holding(&engine, "incoming").unwrap();
+
+        for reset in stale {
+            snapshot.reset(&reset.scope, reset.known);
+        }
+        std::fs::rename(root.join("d/x"), outer.path().join("x")).unwrap();
+        std::fs::rename(root.join("incoming"), root.join("d")).unwrap();
+        std::fs::rename(outer.path().join("x"), root.join("d/x")).unwrap();
+        let changes = snapshot.rescan(&root, [PathBuf::new()]).unwrap().changes;
+        let observed: Vec<_> = (changes.into_iter())
+            .map(|change| match change {
+                flarebox_fs::Change::Removed { path, kind } => Observed::Removed { path, kind },
+                flarebox_fs::Change::Renamed { from, to, kind } => Observed::Renamed {
+                    id: snapshot.entries[&to].id,
+                    from,
+                    to,
+                    kind,
+                    linked: false,
+                },
+                flarebox_fs::Change::Created { path, kind } => Observed::Created {
+                    id: snapshot.entries[&path].id,
+                    content: (kind == EntryKind::File).then(|| bytes(3)),
+                    path,
+                    kind,
+                    linked: false,
+                },
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert!(
+            matches!(
+                &observed[..],
+                [
+                    Observed::Removed { .. },
+                    Observed::Renamed { .. },
+                    Observed::Created { .. }
+                ]
+            ),
+            "{observed:?}"
+        );
+        engine.observe(&observed, 2);
+        assert_eq!(
+            holding(&engine, "d/x").map(|(node, _, _)| node),
+            Some(synced.clone())
+        );
+        assert_eq!(
+            holding(&engine, "d").map(|(node, _, _)| node),
+            Some(incoming)
+        );
+        assert_eq!(engine.path_of(&synced), Some(PathBuf::from("d/x")));
+    }
+
+    /// A node a batch takes out of L and then places again elsewhere is not taken back by an entry created later at
+    /// its old path with its old identity, so the entry it was placed for stays in L.
+    #[test]
+    fn a_node_placed_again_in_a_batch_stays_where_it_was_placed() {
+        let (_dir, mut engine) = mapper();
+        let folder = |path: &str, id: u64| Observed::Created {
+            path: path.into(),
+            kind: EntryKind::Dir,
+            id: ino(id),
+            linked: false,
+            content: None,
+        };
+        engine.observe(&[folder("a", 1)], 0);
+        let (node, _, _) = holding(&engine, "a").unwrap();
+
+        let batch = [
+            Observed::Removed {
+                path: "a".into(),
+                kind: EntryKind::Dir,
+            },
+            Observed::Renamed {
+                from: "a".into(),
+                to: "b".into(),
+                kind: EntryKind::Dir,
+                id: ino(2),
+                linked: false,
+            },
+            folder("a", 1),
+        ];
+        engine.observe(&batch, 1);
+        assert_eq!(
+            holding(&engine, "b").map(|(id, _, _)| id),
+            Some(node.clone())
+        );
+        assert!(holding(&engine, "a").is_some_and(|(id, _, _)| id != node));
+        assert_eq!(engine.trees.local().len(), 2);
     }
 
     #[test]
