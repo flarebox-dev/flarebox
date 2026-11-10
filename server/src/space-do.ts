@@ -782,13 +782,14 @@ export class SpaceDO extends DurableObject<Env> {
     const spaceId = this.spaceId;
     const confirmed = new Map<string, string>();
     const unconfirmed: { object: ChunkObject; size: number }[] = [];
+    const receiptsByHash = Map.groupBy(receipts, (receipt) => toHex(receipt.hash));
     for (const [hex, chunk] of referenced) {
       const row = this.sql.exec("SELECT size, state, incarnation, head_checked FROM chunks WHERE hash = ?", chunk.hash).toArray()[0];
       if (!row || row.size !== chunk.size || row.state !== ChunkState.PENDING || row.incarnation === null) continue;
       const object = { spaceId, hashHex: hex, incarnation: String(row.incarnation) };
       let valid = row.head_checked === 1;
-      for (const receipt of receipts) {
-        if (toHex(receipt.hash) !== hex || receipt.size !== chunk.size) continue;
+      for (const receipt of receiptsByHash.get(hex) ?? []) {
+        if (receipt.size !== chunk.size) continue;
         if (await verifyChunkGrant(this.spaceKey, "receipt", object, receipt.size, receipt.token, nowMs)) valid = true;
       }
       if (valid) confirmed.set(hex, object.incarnation);
