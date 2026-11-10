@@ -1055,11 +1055,13 @@ impl Driver {
         if let Some(auth) = slot.as_ref() {
             return Ok(auth.clone());
         }
-        let stored = StoredCredential {
-            credential: credential.clone(),
-            staged: None,
-            changed_at: SystemTime::now(),
-        };
+        let stored = Credential::load_stored(&self.inner.paths.credential())
+            .map_err(|error| ApiError::Credential(io::Error::other(error)))?
+            .unwrap_or_else(|| StoredCredential {
+                credential: credential.clone(),
+                staged: None,
+                changed_at: SystemTime::now(),
+            });
         let auth = rotating_auth(&self.inner.paths, &stored)?;
         *slot = Some(auth.clone());
         Ok(auth)
@@ -3175,6 +3177,39 @@ mod tests {
             assert_eq!(stored.credential.refresh_credential, "promoted");
             assert_eq!(stored.staged, None);
         }
+    }
+
+    #[tokio::test]
+    async fn an_auth_built_after_open_starts_from_the_stored_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let (server, served) = serve_recorded(vec![rotation_answer(500, true)]).await;
+        let current = Credential {
+            server,
+            refresh_credential: "current".into(),
+            ..credential("d1")
+        };
+        current.save_new(&paths.credential()).unwrap();
+        flarebox_net::CredentialStore::stage(
+            &CredentialFiles::new(&paths.credential(), current.clone()),
+            &flarebox_net::Staged {
+                refresh_credential: "staged".into(),
+                rotate_before_ms: 1_000,
+            },
+        )
+        .unwrap();
+        let driver = Driver::open(paths.clone()).unwrap();
+        *driver.inner.auth.lock().unwrap() = None;
+
+        driver.auth(&current).unwrap().access_token().await.unwrap();
+        let request = token_request(&served.await.unwrap()[0].1);
+        assert_eq!(request.refresh_credential, "current");
+        assert_eq!(request.next_refresh_credential, "staged");
+        let stored = Credential::load_stored(&paths.credential())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.credential.refresh_credential, "staged");
+        assert_eq!(stored.staged, None);
     }
 
     #[tokio::test]
