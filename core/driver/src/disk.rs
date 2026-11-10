@@ -18,8 +18,9 @@
 //! Observations reach L through [`Disk::observed`]. It refuses a batch scanned from another folder than the locked
 //! one, and drops the changes a batch reports at or below the paths of an effect section that ran while the batch
 //! was scanned or waited. Such a change can predate the effect, and applying it would undo the acknowledged L.
-//! After each section the observer forgets those paths and scans them again ([`Sections::take_rescans`]), so the
-//! next batch reports what the disk holds there.
+//! After each section, and for every path of a dropped change, the observer resets its snapshot there to L's view and
+//! scans the path again ([`Sections::take_resets`]). The next batch then reports how the disk differs from L there,
+//! removals and moves included.
 //!
 //! A [`Stop`] ends the task. The engine in memory may then be ahead of the store; the next start loads it again and
 //! recovers the effect in flight. A root that is no longer at its linked path is never treated as a missing parent.
@@ -29,7 +30,7 @@
 //! same window for parents). Nothing is ever written into a folder that replaced the root, since every write goes
 //! through the locked descriptor.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io;
@@ -55,7 +56,7 @@ use flarebox_proto::v1::ChunkRef;
 use flarebox_store::{Link, Store, Tx};
 
 use crate::engine::{Engine, file_id, file_identity};
-use crate::observe::{Observation, Observed};
+use crate::observe::{Observation, Observed, Reset};
 use crate::policy::{self, Disposition};
 
 /// How many effect sections [`Disk`] remembers for batches that span them. A batch older than all of them is dropped
@@ -116,8 +117,8 @@ pub(crate) enum Settled {
 pub(crate) struct Sections {
     /// Odd while an effect section runs. Each section adds one when it starts and one when it ends.
     epoch: AtomicU64,
-    /// Paths the observer forgets and scans again before its next batch.
-    rescans: Mutex<Vec<PathBuf>>,
+    /// Scopes the observer resets to L's view and scans again before its next batch, in the order requested.
+    resets: Mutex<Vec<Reset>>,
 }
 
 /// The epoch read before a batch's scans began.
@@ -131,13 +132,13 @@ impl Sections {
         Stamp(self.epoch.load(Ordering::SeqCst))
     }
 
-    /// The paths to pass to [`FsObserver::forget`](crate::observe::FsObserver::forget) before the next observation.
-    pub fn take_rescans(&self) -> Vec<PathBuf> {
-        std::mem::take(&mut *self.rescans.lock().unwrap())
+    /// The resets to pass to [`FsObserver::reset`](crate::observe::FsObserver::reset) before the next observation.
+    pub fn take_resets(&self) -> Vec<Reset> {
+        std::mem::take(&mut *self.resets.lock().unwrap())
     }
 
-    fn request(&self, scopes: impl IntoIterator<Item = PathBuf>) {
-        self.rescans.lock().unwrap().extend(scopes);
+    fn request(&self, resets: Vec<Reset>) {
+        self.resets.lock().unwrap().extend(resets);
     }
 }
 
@@ -362,7 +363,7 @@ impl Disk {
 
     /// The effect section, which has no await. It checks that `staged` is the effect in flight and that the root is
     /// held, applies the effect with a marker holding the record's counter, acknowledges the outcome in one
-    /// transaction, and asks the observer to forget and scan again the paths the effect acted on. A write whose
+    /// transaction, and asks the observer to reset the paths the effect acted on to L as acknowledged. A write whose
     /// content could not be fetched only writes the marker and drops its staged file, and fails.
     pub fn apply(
         &mut self,
@@ -401,7 +402,7 @@ impl Disk {
         let settled = acknowledge(&record, &outcome, false, engine, store, hook)?;
         let end = self.sections.epoch.fetch_add(1, Ordering::SeqCst) + 1;
         let scopes = scopes(&effect.action, &outcome);
-        self.sections.request(scopes.iter().cloned());
+        self.sections.request(engine.resets(scopes.iter().cloned()));
         self.spans.push_back((end, scopes));
         while self.spans.len() > SPANS {
             if let Some((end, _)) = self.spans.pop_front() {
@@ -417,7 +418,8 @@ impl Disk {
     /// Puts an observation batch into L in one transaction. Refuses a batch scanned from another folder than the
     /// locked one, a root that is no longer held, and a batch whose root check failed. Drops the changes at or below
     /// the paths of every effect section that ended after the batch's stamp, and a whole batch older than the
-    /// sections remembered, after asking the observer to rescan the whole tree.
+    /// sections remembered. The observer then resets every path a dropped change names, both ends of a rename, or
+    /// the whole tree for a dropped batch, to L as it is after the batch, so a later batch reports what was lost.
     pub fn observed(
         &mut self,
         batch: Batch,
@@ -433,7 +435,7 @@ impl Disk {
         }
         observation.root.map_err(Stop::Root)?;
         if stamp.0 < self.forgotten {
-            self.sections.request([PathBuf::new()]);
+            self.sections.request(engine.resets([PathBuf::new()]));
             return Ok(());
         }
         let spanned: Vec<&PathBuf> = self
@@ -442,23 +444,32 @@ impl Disk {
             .filter(|(end, _)| *end > stamp.0)
             .flat_map(|(_, scopes)| scopes)
             .collect();
+        let mut dropped = BTreeSet::new();
         let changes: Vec<Observed> = observation
             .changes
             .into_iter()
             .filter(|change| {
-                !paths(change).any(|path| spanned.iter().any(|scope| path.starts_with(scope)))
+                let stale =
+                    paths(change).any(|path| spanned.iter().any(|scope| path.starts_with(scope)));
+                if stale {
+                    dropped.extend(paths(change).map(Path::to_path_buf));
+                }
+                !stale
             })
             .collect();
-        if changes.is_empty() {
-            return Ok(());
+        if !changes.is_empty() {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_millis() as u64);
+            store.transaction(|tx| -> Result<(), Stop> {
+                let touched = engine.observe(&changes, now_ms);
+                Ok(engine.save(tx, &touched)?)
+            })?;
         }
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |since| since.as_millis() as u64);
-        store.transaction(|tx| -> Result<(), Stop> {
-            let touched = engine.observe(&changes, now_ms);
-            Ok(engine.save(tx, &touched)?)
-        })
+        if !dropped.is_empty() {
+            self.sections.request(engine.resets(dropped));
+        }
+        Ok(())
     }
 
     fn counter(&self, effects: u64) -> Marker {

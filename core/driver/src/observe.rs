@@ -84,6 +84,14 @@ pub enum Observed {
     },
 }
 
+/// What the observer is to believe about one scope, a path relative to the root, before it scans the scope again:
+/// the entries L holds at and below it. The scan then reports how the disk differs from L there.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Reset {
+    pub scope: PathBuf,
+    pub known: BTreeMap<PathBuf, Entry>,
+}
+
 /// A source of observations for one linked folder.
 pub trait Observer: Send {
     /// Waits up to about `timeout` and returns the next batch, or `None` when nothing changed.
@@ -161,13 +169,13 @@ impl FsObserver {
         })
     }
 
-    /// Forgets what the snapshot knows at and below each of `scopes`, relative paths, so the next observation reports
-    /// what is there now as created, with the content of every file. Nothing outside `scopes` is reported again
-    /// unless it changed.
-    pub fn forget(&mut self, scopes: &[PathBuf]) {
-        for scope in scopes {
-            self.watcher.forget(scope);
-            self.unread.retain(|path, _| !path.starts_with(scope));
+    /// Resets the snapshot at each scope of `resets`, in order, to the entries L holds there, so the next observation
+    /// reports how the disk differs from L in those scopes: what L lacks as created, with the content of every file,
+    /// and what the disk lacks as removed. Nothing outside the scopes is reported again unless it changed.
+    pub fn reset(&mut self, resets: Vec<Reset>) {
+        for Reset { scope, known } in resets {
+            self.unread.retain(|path, _| !path.starts_with(&scope));
+            self.watcher.reset(&scope, known);
         }
     }
 

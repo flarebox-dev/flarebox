@@ -970,38 +970,25 @@ fn a_stale_batch_does_not_undo_an_effect_and_the_rescan_reports_its_result() {
         "a change outside the effect's paths is kept"
     );
 
-    let rescans = sections.take_rescans();
-    assert_eq!(rescans, vec![PathBuf::from("report.txt")]);
-    watching.forget(&rescans);
-    let fresh = observe_until(&mut watching, sections.stamp(), |seen| {
-        created(seen, "report.txt").is_some()
-    });
-    assert!(
-        fresh
-            .observation
-            .changes
-            .iter()
-            .all(|change| matches!(change, Observed::Created { path, .. } if path == Path::new("report.txt"))),
-        "the rescan reports only the effect's paths: {:?}",
-        fresh.observation.changes
-    );
-    let (id, content) = created(&fresh.observation.changes, "report.txt").unwrap();
-    assert_eq!(file_identity(id), written.identity);
+    let on_disk = Snapshot::scan(&folder.root).unwrap().entries[Path::new("report.txt")];
+    assert_eq!(on_disk.id, file_id(written.identity));
+    let reset = Reset {
+        scope: "report.txt".into(),
+        known: BTreeMap::from([(PathBuf::from("report.txt"), on_disk)]),
+    };
+    let resets = catch_up(&mut watching, &sections);
     assert_eq!(
-        content.map(|content| content.manifest_digest),
-        written
-            .shape
-            .content
-            .as_ref()
-            .map(|content| content.manifest_digest.clone())
+        resets,
+        vec![reset.clone(), reset],
+        "the effect and the dropped creation each reset report.txt to L"
     );
-    let nodes = running.engine.trees.local().len();
-    running
-        .disk
-        .observed(fresh, &mut running.engine, &mut running.store)
-        .unwrap();
+    assert_eq!(
+        settle(&mut watching),
+        vec![],
+        "the disk holds what L holds, so the rescan reports nothing"
+    );
+    assert_eq!(watching.snapshot(), &Snapshot::scan(&folder.root).unwrap());
     assert_eq!(running.local(NODE), Some(&written));
-    assert_eq!(running.engine.trees.local().len(), nodes);
     drop(running);
     let (_, engine) = folder.open();
     assert_eq!(engine.trees.local().get(NODE), Some(&written));
@@ -1307,4 +1294,235 @@ fn kinds_map_one_to_one() {
         )
         .collect();
     assert_eq!(kinds, ["create", "replace", "park", "remove"]);
+}
+
+/// Passes the resets the disk requested to the observer, and returns them.
+fn catch_up(watching: &mut FsObserver, sections: &Sections) -> Vec<Reset> {
+    let resets = sections.take_resets();
+    watching.reset(resets.clone());
+    resets
+}
+
+/// Every change the observer reports within about a second.
+fn settle(watching: &mut FsObserver) -> Vec<Observed> {
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        if let Some(observation) = watching.observe(Duration::from_millis(300)).unwrap() {
+            seen.extend(observation.changes);
+        }
+    }
+    seen
+}
+
+fn removed(changes: &[Observed], name: &str) -> bool {
+    changes
+        .iter()
+        .any(|change| matches!(change, Observed::Removed { path, .. } if path == Path::new(name)))
+}
+
+fn renamed(changes: &[Observed], from: &str, to: &str) -> bool {
+    changes.iter().any(|change| {
+        matches!(change, Observed::Renamed { from: f, to: t, .. } if f == Path::new(from) && t == Path::new(to))
+    })
+}
+
+#[test]
+fn a_file_deleted_once_its_replacement_is_placed_leaves_l_after_the_rescan() {
+    let folder = Folder::new();
+    let mut server = Server::default();
+    (SCENARIOS[2].setup)(&folder, &mut server);
+    let report = folder.root.join("report.txt");
+    let delete: Hook = Box::new(move |cut| {
+        if cut == Cut::Step(Step::Placed) {
+            fs::remove_file(&report).unwrap();
+        }
+    });
+    let mut running = folder.start(Some(delete)).unwrap();
+    let sections = running.disk.sections();
+    let mut watching = observer(&folder.root, Snapshot::scan(&folder.root).unwrap());
+
+    assert_eq!(running.step(&server), Some(Settled::Done));
+    assert!(running.local(NODE).is_some());
+    catch_up(&mut watching, &sections);
+    let fresh = observe_until(&mut watching, sections.stamp(), |seen| {
+        removed(seen, "report.txt")
+    });
+    running
+        .disk
+        .observed(fresh, &mut running.engine, &mut running.store)
+        .unwrap();
+    assert_eq!(running.local(NODE), None);
+}
+
+#[test]
+fn a_rename_dropped_with_a_stale_batch_reaches_l_after_the_rescan() {
+    let folder = Folder::new();
+    let mut server = Server::default();
+    (SCENARIOS[2].setup)(&folder, &mut server);
+    let mut running = folder.start(no_hook()).unwrap();
+    let sections = running.disk.sections();
+    let mut watching = observer(&folder.root, Snapshot::scan(&folder.root).unwrap());
+    let pending = running
+        .disk
+        .next(&mut running.engine, &mut running.store)
+        .unwrap()
+        .unwrap();
+    let staged = ready(pending.stage(&server)).unwrap();
+
+    fs::rename(folder.root.join("report.txt"), folder.root.join("mine.txt")).unwrap();
+    let held = observe_until(&mut watching, sections.stamp(), |seen| {
+        renamed(seen, "report.txt", "mine.txt")
+    });
+    assert_eq!(
+        running
+            .disk
+            .apply(staged, &mut running.engine, &mut running.store)
+            .unwrap(),
+        Settled::Failed("Missing".into())
+    );
+    let before = running.local(NODE).unwrap().clone();
+    assert_eq!(before.shape.name, "report.txt");
+    running
+        .disk
+        .observed(held, &mut running.engine, &mut running.store)
+        .unwrap();
+    assert_eq!(
+        running.local(NODE),
+        Some(&before),
+        "the stale rename is dropped"
+    );
+
+    catch_up(&mut watching, &sections);
+    let fresh = observe_until(&mut watching, sections.stamp(), |seen| {
+        renamed(seen, "report.txt", "mine.txt")
+    });
+    running
+        .disk
+        .observed(fresh, &mut running.engine, &mut running.store)
+        .unwrap();
+    let moved = running.local(NODE).unwrap();
+    assert_eq!(moved.shape.name, "mine.txt");
+    assert_eq!(moved.identity, before.identity);
+}
+
+#[test]
+fn a_removal_dropped_with_a_stale_batch_reaches_l_after_the_rescan() {
+    let folder = Folder::new();
+    let mut server = Server::default();
+    (SCENARIOS[2].setup)(&folder, &mut server);
+    let mut running = folder.start(no_hook()).unwrap();
+    let sections = running.disk.sections();
+    let mut watching = observer(&folder.root, Snapshot::scan(&folder.root).unwrap());
+    let stale = sections.stamp();
+
+    assert_eq!(running.step(&server), Some(Settled::Done));
+    fs::remove_file(folder.root.join("report.txt")).unwrap();
+    let held = observe_until(&mut watching, stale, |seen| removed(seen, "report.txt"));
+    running
+        .disk
+        .observed(held, &mut running.engine, &mut running.store)
+        .unwrap();
+    assert!(
+        running.local(NODE).is_some(),
+        "the stale removal is dropped"
+    );
+
+    catch_up(&mut watching, &sections);
+    let fresh = observe_until(&mut watching, sections.stamp(), |seen| {
+        removed(seen, "report.txt")
+    });
+    running
+        .disk
+        .observed(fresh, &mut running.engine, &mut running.store)
+        .unwrap();
+    assert_eq!(running.local(NODE), None);
+    drop(running);
+    let (_, engine) = folder.open();
+    assert_eq!(engine.trees.local().get(NODE), None);
+}
+
+#[test]
+fn a_reset_built_from_an_older_l_repeats_a_change_harmlessly() {
+    let folder = Folder::new();
+    let mut server = Server::default();
+    (SCENARIOS[2].setup)(&folder, &mut server);
+    let mut running = folder.start(no_hook()).unwrap();
+    let sections = running.disk.sections();
+    let mut watching = observer(&folder.root, Snapshot::scan(&folder.root).unwrap());
+    assert_eq!(running.step(&server), Some(Settled::Done));
+    let older = catch_up(&mut watching, &sections);
+
+    fs::remove_file(folder.root.join("report.txt")).unwrap();
+    let removal = observe_until(&mut watching, sections.stamp(), |seen| {
+        removed(seen, "report.txt")
+    });
+    running
+        .disk
+        .observed(removal, &mut running.engine, &mut running.store)
+        .unwrap();
+    assert_eq!(running.local(NODE), None);
+    let local: Vec<(String, LocalNode)> = running
+        .engine
+        .trees
+        .local()
+        .iter()
+        .map(|(id, node)| (id.clone(), node.clone()))
+        .collect();
+
+    watching.reset(older);
+    let repeated = observe_until(&mut watching, sections.stamp(), |seen| {
+        removed(seen, "report.txt")
+    });
+    running
+        .disk
+        .observed(repeated, &mut running.engine, &mut running.store)
+        .unwrap();
+    let after: Vec<(String, LocalNode)> = running
+        .engine
+        .trees
+        .local()
+        .iter()
+        .map(|(id, node)| (id.clone(), node.clone()))
+        .collect();
+    assert_eq!(after, local);
+}
+
+#[test]
+fn l_resets_to_exactly_what_the_scan_saw() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let folder = Folder::new();
+    folder.seed(&[], &[], 0);
+    let root = &folder.root;
+    fs::create_dir_all(root.join("docs/deep")).unwrap();
+    fs::write(root.join("docs/a.txt"), b"a").unwrap();
+    fs::write(root.join("docs/deep/b.txt"), b"bb").unwrap();
+    fs::write(root.join("run.sh"), b"#!/bin/sh\n").unwrap();
+    fs::set_permissions(root.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(root.join("empty"), b"").unwrap();
+    let mut running = folder.start(no_hook()).unwrap();
+    let sections = running.disk.sections();
+    let mut watching = observer(root, Snapshot::default());
+    let batch = observe_until(&mut watching, sections.stamp(), |seen| seen.len() >= 6);
+    running
+        .disk
+        .observed(batch, &mut running.engine, &mut running.store)
+        .unwrap();
+
+    let scanned = watching.snapshot().entries.clone();
+    let resets = running
+        .engine
+        .resets([PathBuf::new(), PathBuf::from("docs")]);
+    assert_eq!(resets[0].known, scanned);
+    let docs: BTreeMap<PathBuf, Entry> = scanned
+        .iter()
+        .filter(|(path, _)| path.starts_with("docs"))
+        .map(|(path, entry)| (path.clone(), *entry))
+        .collect();
+    assert_eq!(resets[1].known, docs);
+    assert!(resets[0].known[Path::new("run.sh")].executable);
+
+    watching.reset(resets);
+    assert_eq!(settle(&mut watching), vec![]);
+    assert_eq!(watching.snapshot().entries, scanned);
 }

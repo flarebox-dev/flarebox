@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::BuildHasher;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use flarebox_engine::classify::Trees;
 use flarebox_engine::effects::Effects;
@@ -18,11 +18,11 @@ use flarebox_engine::state::CommitsState;
 use flarebox_engine::tree::{
     Content, FileIdentity, Kind, LocalNode, NodeId, RemoteNode, Shape, same_content,
 };
-use flarebox_fs::{EntryKind, FileId};
+use flarebox_fs::{Entry, EntryKind, FileId};
 use flarebox_proto::v1::NodeKind;
 use flarebox_store::{EngineState, Error, Tx};
 
-use crate::observe::Observed;
+use crate::observe::{Observed, Reset};
 
 pub(crate) struct Engine {
     pub trees: Trees,
@@ -190,6 +190,39 @@ impl Engine {
             }
         }
         touched
+    }
+
+    /// L's view of each of `scopes`, relative paths, as `core/fs` entries: the placed node at the scope and every
+    /// placed node under it. The empty path covers all of L, and a path L does not hold gets no entries. A folder has
+    /// the zero size and time `core/fs` gives every folder; a file has the size, time and executable bit of its
+    /// content. A disk that matches L therefore rescans to no changes.
+    pub fn resets(&self, scopes: impl IntoIterator<Item = PathBuf>) -> Vec<Reset> {
+        let index = Index::new(&self.trees);
+        let local = self.trees.local();
+        scopes
+            .into_iter()
+            .map(|scope| {
+                let mut known = BTreeMap::new();
+                let mut pending: Vec<(PathBuf, NodeId)> = index
+                    .at(&scope)
+                    .map(|id| (scope.clone(), id))
+                    .into_iter()
+                    .collect();
+                while let Some((path, id)) = pending.pop() {
+                    if let Some(node) = local.get(&id)
+                        && !path.as_os_str().is_empty()
+                    {
+                        known.insert(path.clone(), entry(node));
+                    }
+                    for child in index.children_of(&id) {
+                        if let Some(node) = local.get(&child) {
+                            pending.push((path.join(&node.shape.name), child));
+                        }
+                    }
+                }
+                Reset { scope, known }
+            })
+            .collect()
     }
 
     /// Puts `node`, or a new node when it is `None`, at `path` with `identity`. A file keeps the content L had for it
@@ -397,6 +430,27 @@ fn stored(id: &NodeId, node: &LocalNode) -> flarebox_store::LocalNode {
         },
         identity: file_id(node.identity),
         parked: node.parked,
+    }
+}
+
+/// A node as the `core/fs` entry a scan of it makes.
+fn entry(node: &LocalNode) -> Entry {
+    let (kind, size, mtime_ns, executable) = match (&node.shape.kind, &node.shape.content) {
+        (Kind::Dir, _) => (EntryKind::Dir, 0, 0, false),
+        (Kind::File, None) => (EntryKind::File, 0, 0, false),
+        (Kind::File, Some(content)) => (
+            EntryKind::File,
+            content.size,
+            i128::from(content.mtime_ns),
+            content.executable,
+        ),
+    };
+    Entry {
+        kind,
+        id: file_id(node.identity),
+        size,
+        mtime_ns,
+        executable,
     }
 }
 
