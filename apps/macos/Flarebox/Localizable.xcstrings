@@ -1,0 +1,379 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "%@ (this Mac)" : {},
+    "%@ on another device removed %@ of %@ in this folder. The server decides, so Flarebox applied them here; the files are in the folder's local trash." : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@ on another device removed %2$@ of %3$@ in this folder. The server decides, so Flarebox applied them here; the files are in the folder's local trash."
+          }
+        }
+      }
+    },
+    "%@ to upload, %@ to download · %@ of %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@ to upload, %2$@ to download · %3$@ of %4$@"
+          }
+        }
+      }
+    },
+    "%@ wait for your answers in Questions." : {},
+    "%@ · %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@ · %2$@"
+          }
+        }
+      }
+    },
+    "%@ · version %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@ · version %2$@"
+          }
+        }
+      }
+    },
+    "%lld items" : {
+      "localizations" : {
+        "en" : {
+          "variations" : {
+            "plural" : {
+              "one" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld item"
+                }
+              },
+              "other" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld items"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "%lld problems" : {
+      "localizations" : {
+        "en" : {
+          "variations" : {
+            "plural" : {
+              "one" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld problem"
+                }
+              },
+              "other" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld problems"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "%lld questions need an answer" : {
+      "localizations" : {
+        "en" : {
+          "variations" : {
+            "plural" : {
+              "one" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld question needs an answer"
+                }
+              },
+              "other" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld questions need an answer"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "%llu deletions" : {
+      "localizations" : {
+        "en" : {
+          "variations" : {
+            "plural" : {
+              "one" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%llu deletion"
+                }
+              },
+              "other" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%llu deletions"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "%llu files" : {
+      "localizations" : {
+        "en" : {
+          "variations" : {
+            "plural" : {
+              "one" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%llu file"
+                }
+              },
+              "other" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%llu files"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "A change from the server can't be applied to it: %@" : {},
+    "A different disk is at the folder's location" : {},
+    "A file can't be read" : {},
+    "A file can't be written" : {},
+    "A file from the server can't be placed because an ignored or unsupported item, such as a symbolic link, already has its name. Rename or move that item." : {},
+    "A file from the server has a name this Mac's file system can't hold. Rename it on another device." : {},
+    "A file keeps changing" : {},
+    "A name is taken by an ignored item" : {},
+    "A name isn't allowed on this Mac" : {},
+    "About" : {},
+    "Account" : {},
+    "Add Folder…" : {},
+    "Add a Device…" : {},
+    "Added %@" : {},
+    "Allow Flarebox in Login Items to finish." : {},
+    "An ignore rule can't be read" : {},
+    "Asked %@" : {},
+    "Can't reach the server. Retrying…" : {},
+    "Can't reach the server: %@" : {},
+    "Cancel" : {},
+    "Cancel Request" : {},
+    "Change Server" : {},
+    "Changed on this Mac" : {},
+    "Choose" : {},
+    "Choose a folder to sync" : {},
+    "Choose an existing folder." : {},
+    "Choose…" : {},
+    "Claim Server" : {},
+    "Claim code" : {},
+    "Claim this server" : {},
+    "Conflicting copy of %@" : {},
+    "Connect" : {},
+    "Connect to a server first." : {},
+    "Connect to your Flarebox server" : {},
+    "Connecting…" : {},
+    "Core" : {},
+    "Created after the restore point" : {},
+    "Created on this Mac" : {},
+    "Delete Everywhere" : {},
+    "Delete many files?" : {},
+    "Delete on Server" : {},
+    "Deleted %@" : {},
+    "Deleted on this Mac" : {},
+    "Devices" : {},
+    "Dismiss" : {},
+    "Done" : {},
+    "Download only" : {},
+    "Downloads continue, but nothing is uploaded until you update Flarebox." : {},
+    "Edited" : {},
+    "Edited %@" : {},
+    "Edited and moved from %@" : {},
+    "Enter a name." : {},
+    "Enter the address of the Flarebox server you deployed, such as https://box.example.com." : {},
+    "Enter the pairing code on the new device while setting it up." : {},
+    "Enter the server's address, starting with https://." : {},
+    "Expires %@" : {},
+    "Files disappeared" : {},
+    "Finish setting up Flarebox" : {},
+    "Flarebox" : {},
+    "Flarebox applied what this Mac had not changed and moved the files it removed to the local trash." : {},
+    "Flarebox asks here when it needs a decision, such as before deleting many files." : {},
+    "Flarebox can only apply changes safely where the file system can rename without replacing. Move the folder to your Mac's disk." : {},
+    "Flarebox can't save its sync state" : {},
+    "Flarebox couldn't save this change, so it wasn't made: %@" : {},
+    "Flarebox is an independent project and is not affiliated with Cloudflare, Inc." : {},
+    "Flarebox is holding these deletions instead of sending them, because they would make %@: %@ removing %@ from a folder of %@. Other changes keep syncing." : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Flarebox is holding these deletions instead of sending them, because they would make %1$@: %2$@ removing %3$@ from a folder of %4$@. Other changes keep syncing."
+          }
+        }
+      }
+    },
+    "Flarebox is set up" : {},
+    "Flarebox keeps the folder and a space on your server in sync. Everything in the folder is uploaded, and everything in the space is downloaded into it." : {},
+    "Flarebox runs in the menu bar. Add more folders in Settings." : {},
+    "Flarebox stops syncing this folder on this Mac. The files stay in the folder and on the server." : {},
+    "Flarebox: %@" : {},
+    "Folder" : {},
+    "Folder recovered" : {},
+    "Folders" : {},
+    "General" : {},
+    "It changes too often to be uploaded, as a log or a database being written does. Flarebox keeps retrying; consider ignoring it in .fbignore." : {},
+    "It isn't uploaded until Flarebox can read it: %@" : {},
+    "Line %u of this .fbignore file is ignored. Fix or remove it." : {},
+    "Link Folder" : {},
+    "Many files were deleted on another device" : {},
+    "Move to Local Trash" : {},
+    "Moved from %@" : {},
+    "Moved from %@ %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Moved from %1$@ %2$@"
+          }
+        }
+      }
+    },
+    "Name of this Mac" : {},
+    "New Space…" : {},
+    "No Linked Folders" : {},
+    "No Problems" : {},
+    "No Questions" : {},
+    "None" : {},
+    "Not Signed In" : {},
+    "Nothing needed your decision." : {},
+    "Nothing syncs until Flarebox can save again: %@. Check that your disk has free space." : {},
+    "On a device that is already signed in, open Settings, choose Account, and click Add a Device to get a pairing code." : {},
+    "Open %@" : {},
+    "Open Flarebox at login" : {},
+    "Open Login Items" : {},
+    "Owner" : {},
+    "Pairing code" : {},
+    "Pause Sync" : {},
+    "Problems" : {},
+    "Put Back on Server" : {},
+    "Questions" : {},
+    "Questions…" : {},
+    "Quit Flarebox" : {},
+    "Recent changes" : {},
+    "Recovering" : {},
+    "Repeat Request" : {},
+    "Requested before the reset" : {},
+    "Restore Here" : {},
+    "Restore from trash" : {},
+    "Restore point: %@." : {},
+    "Restore the version from %@" : {},
+    "Resume Sync" : {},
+    "Server" : {},
+    "Server address" : {},
+    "Set Up Flarebox" : {},
+    "Set Up Flarebox…" : {},
+    "Settings…" : {},
+    "Show in Finder" : {},
+    "Sign In" : {},
+    "Sign Out" : {},
+    "Sign Out…" : {},
+    "Sign in again" : {},
+    "Sign in this Mac" : {},
+    "Sign out of Flarebox?" : {},
+    "Since %@" : {},
+    "Space" : {},
+    "Space name" : {},
+    "Stopped by a problem" : {},
+    "Sync for this folder is stopped so that files on the other disk aren't taken as changes. Mount the original disk." : {},
+    "Sync for this folder is stopped so that older files aren't uploaded as edits." : {},
+    "Sync for this folder is stopped until Flarebox can read it: %@" : {},
+    "Sync for this folder is stopped, because its marker names the space %@. Unlink the folder and link the right one." : {},
+    "Sync for this folder is stopped, because without the .flarebox folder it can't tell an empty folder from a deleted one. Put .flarebox back or unlink the folder." : {},
+    "Sync for this folder is stopped. If it is on an external disk, connect the disk. Otherwise, put the folder back or unlink it." : {},
+    "Sync for this folder is stopped. Put the folder back at its path or unlink it." : {},
+    "Sync for this folder is stopped: %@" : {},
+    "Sync is paused" : {},
+    "Sync is stopped" : {},
+    "Syncing" : {},
+    "Syncing…" : {},
+    "The code is wrong or has expired." : {},
+    "The folder belongs to another space" : {},
+    "The folder can't be read" : {},
+    "The folder is missing" : {},
+    "The folder was restored from an older backup" : {},
+    "The folder's Flarebox marker can't be read" : {},
+    "The folder's Flarebox marker is missing" : {},
+    "The folder's file system isn't supported" : {},
+    "The linked path is not a folder" : {},
+    "The server gave this reason: %@" : {},
+    "The server no longer accepts this Mac. Sign out in the Account settings and sign in again." : {},
+    "The server rejected a change" : {},
+    "The server runs version %@, which this version of Flarebox can't use." : {},
+    "The space no longer exists." : {},
+    "These files disappeared while Flarebox was not tracking changes. They may have been moved into an ignored folder rather than deleted, so they stay on the server and your other devices until you decide." : {},
+    "These files exist only on this Mac. Upload them, or move them to the local trash." : {},
+    "These files were created after the point the folder was restored to, so the restore removed them from the server. This Mac still has them." : {},
+    "These files were deleted on this Mac but are still on the server. Delete them on the server too, or download them again." : {},
+    "These files were edited or moved on this Mac since it last synced. Upload this Mac's versions, or move them to the local trash and take the server's." : {},
+    "These restores were requested before the reset, and the server does not show them. Send them again, or drop them." : {},
+    "This Mac" : {},
+    "This Mac isn't signed in." : {},
+    "This Mac stops syncing and unlinks every folder. The files stay in the folders and on the server." : {},
+    "This Mac's sync state is older than its history on the server, for example after restoring a backup." : {},
+    "This Mac's sync state is older than the files in the folder." : {},
+    "This applies to every item listed: %@, %@." : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This applies to every item listed: %1$@, %2$@."
+          }
+        }
+      }
+    },
+    "This folder already had files when it was linked, so Flarebox could not match them all with certainty." : {},
+    "This folder contains, or is inside, the linked folder %@." : {},
+    "This folder was linked to a space imported from an export." : {},
+    "This folder was restored to an earlier point on the server." : {},
+    "This notice was already dismissed." : {},
+    "This question doesn't take that answer." : {},
+    "This question was already answered or has changed." : {},
+    "This server already has an owner. Sign in with a pairing code instead." : {},
+    "This server can't list the account's devices yet." : {},
+    "This server has no owner yet. Claim it with the code from its log." : {},
+    "This server has no owner yet. Open the server's /setup page, then copy the one-time claim code from the server's logs." : {},
+    "This space is already linked to a folder on this Mac." : {},
+    "This space isn't linked on this Mac." : {},
+    "This space needs a newer Flarebox" : {},
+    "Too many wrong codes. Try again in a few minutes." : {},
+    "Unlink" : {},
+    "Unlink %@?" : {},
+    "Unlink…" : {},
+    "Up to date" : {},
+    "Upload This Version" : {},
+    "Version" : {},
+    "Waiting" : {},
+    "Your name" : {},
+    "from another device" : {},
+    "from this Mac" : {},
+    "more than %@ deletions in 10 minutes" : {},
+    "more than %u%% of the folder's files in 10 minutes" : {}
+  },
+  "version" : "1.0"
+}

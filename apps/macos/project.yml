@@ -8,6 +8,7 @@ options:
   deploymentTarget:
     macOS: "14.0"
   createIntermediateGroups: true
+  developmentLanguage: en
 packages:
   FlareboxFFI:
     path: FlareboxFFI
@@ -19,6 +20,9 @@ targets:
       - Flarebox
     dependencies:
       - package: FlareboxFFI
+        product: FlareboxFFI
+      - package: FlareboxFFI
+        product: FlareboxModel
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.flarebox.Flarebox
@@ -31,6 +35,8 @@ targets:
         SWIFT_VERSION: 6.0
         ONLY_ACTIVE_ARCH: YES
         CODE_SIGN_IDENTITY: "-"
+        SWIFT_EMIT_LOC_STRINGS: YES
+        LOCALIZATION_PREFERS_STRING_CATALOGS: YES
 schemes:
   Flarebox:
     build:
