@@ -7,10 +7,12 @@
 //!   sync it until it is unlinked there.
 //! - The process that syncs the folder holds an `flock` on the folder itself for as long as its task and observer
 //!   run, so two processes never sync one folder at once. Deleting or replacing `.flarebox/` cannot split the lock,
-//!   and the task checks that its path still names the locked folder.
+//!   and the task checks that its path still names the locked folder. The last holder unlocks the folder
+//!   ([`Flock`]), so the folder is free as soon as the task and the observer have ended.
 
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
+use std::ops::Deref;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -42,16 +44,46 @@ fn private_dir(root: &Path) -> io::Result<OwnedFd> {
     )?)
 }
 
-/// Takes the folder's lock without waiting. Returns `None` while another process, or another open of the folder in
-/// this one, holds it. The lock is released when the returned folder is closed.
-pub(crate) fn lock(root: &Path) -> io::Result<Option<File>> {
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-    let folder = File::from(rustix::fs::open(root, flags, Mode::empty())?);
-    match rustix::fs::flock(&folder, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(Some(folder)),
-        Err(Errno::WOULDBLOCK) => Ok(None),
-        Err(error) => Err(error.into()),
+/// An exclusive `flock` on an open file or folder, unlocked when it is dropped. Closing the descriptor is not
+/// enough. A close releases the lock only once no copy of the descriptor is left, and a child process holds a copy
+/// of every descriptor of its parent from its fork to its exec, close-on-exec or not. Without the unlock, a folder
+/// whose task ended while another thread started a child stayed locked for some milliseconds (GUN-343).
+#[derive(Debug)]
+pub(crate) struct Flock(File);
+
+impl Flock {
+    /// Takes the lock on `file` without waiting. Returns `None` while another open of the file holds it, in this
+    /// process or another.
+    pub fn take(file: File) -> io::Result<Option<Self>> {
+        match rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => Ok(Some(Self(file))),
+            Err(Errno::WOULDBLOCK) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
+}
+
+impl Deref for Flock {
+    type Target = File;
+
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+
+impl Drop for Flock {
+    fn drop(&mut self) {
+        if let Err(error) = rustix::fs::flock(&self.0, FlockOperation::Unlock) {
+            tracing::warn!(%error, "a lock was not unlocked; it is released when its last descriptor closes");
+        }
+    }
+}
+
+/// Takes the folder's lock without waiting. Returns `None` while another process, or another open of the folder in
+/// this one, holds it. Dropping the returned lock releases it.
+pub(crate) fn lock(root: &Path) -> io::Result<Option<Flock>> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    Flock::take(File::from(rustix::fs::open(root, flags, Mode::empty())?))
 }
 
 /// Whether `root` still names the folder `lock` was taken on. A folder that was moved, replaced or removed is not.
@@ -112,10 +144,32 @@ pub(crate) fn release(root: &Path, owner: &Owner) -> io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::fs;
+    use std::process::{Child, Command};
+
+    use rustix::io::FdFlags;
 
     use super::*;
+
+    /// A child process that holds a copy of a descriptor until this is dropped. Every child holds such a copy from
+    /// its fork to its exec. This one keeps it, so a test does not depend on that window.
+    pub(crate) struct Holder(Child);
+
+    impl Holder {
+        pub(crate) fn of(file: &File) -> Self {
+            let copy = OwnedFd::from(file.try_clone().unwrap());
+            rustix::io::fcntl_setfd(&copy, FdFlags::empty()).unwrap();
+            Self(Command::new("sleep").arg("600").spawn().unwrap())
+        }
+    }
+
+    impl Drop for Holder {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
 
     fn folder() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -142,6 +196,16 @@ mod tests {
         assert!(lock(dir.path()).unwrap().is_none());
         drop(held);
         assert!(lock(&alias).unwrap().is_some());
+    }
+
+    #[test]
+    fn the_lock_is_released_while_a_child_process_holds_a_copy_of_its_descriptor() {
+        let dir = folder();
+        let held = lock(dir.path()).unwrap().unwrap();
+        let _child = Holder::of(&held);
+        assert!(lock(dir.path()).unwrap().is_none());
+        drop(held);
+        assert!(lock(dir.path()).unwrap().is_some());
     }
 
     #[test]

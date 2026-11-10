@@ -150,7 +150,7 @@ struct Running {
     disk: Disk,
     engine: Engine,
     store: Store,
-    _lock: File,
+    _lock: claim::Flock,
 }
 
 impl Running {
