@@ -526,8 +526,40 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
       expect(pages[0]).toHaveLength(100);
       expect(pages.flat()).toEqual([...ids, ...extra]);
       expect((await send("/v1/devices?cursor=" + extra[0], { method: "GET", token: pad.access!.token })).status).toBe(400);
-      const fromOlderWorker = await account().listDevices({ userId: owner.userId, callerId: pad.deviceId, cursor: pages[0]!.at(-1)! });
-      expect(fromOlderWorker.devices.map((device) => device.deviceId)).toEqual(pages[1]);
+    } finally {
+      await runInDurableObject(account(), (_instance, state) => {
+        for (const id of extra) state.storage.sql.exec("DELETE FROM devices WHERE device_id = ?", id);
+      });
+    }
+  });
+
+  it("finishes a listing that an AccountDO from before list_seq started, in device_id order", async () => {
+    const owner = await getOwner();
+    const extra = Array.from({ length: 150 }, () => uuidv7()).reverse();
+    await runInDurableObject(account(), (_instance, state) => {
+      for (const id of extra) {
+        state.storage.sql.exec(
+          "INSERT INTO devices (device_id, user_id, name, platform, created_at_ms, refresh_hash, list_seq) VALUES (?, ?, 'Extra', 'linux', ?, ?, (SELECT MAX(list_seq) + 1 FROM devices))",
+          id,
+          owner.userId,
+          Date.now(),
+          new Uint8Array(32),
+        );
+      }
+    });
+    try {
+      const byDeviceId = await runInDurableObject(account(), (_instance, state) =>
+        state.storage.sql.exec("SELECT device_id FROM devices WHERE user_id = ? ORDER BY device_id", owner.userId).toArray().map((row) => String(row.device_id)),
+      );
+      const olderFirstPage = byDeviceId.slice(0, 100);
+      const continued: string[] = [];
+      let cursor = olderFirstPage.at(-1)!;
+      while (cursor) {
+        const page = await account().listDevices({ userId: owner.userId, callerId: owner.deviceId, cursor });
+        continued.push(...page.devices.map((device) => device.deviceId));
+        cursor = page.nextCursor;
+      }
+      expect([...olderFirstPage, ...continued]).toEqual(byDeviceId);
     } finally {
       await runInDurableObject(account(), (_instance, state) => {
         for (const id of extra) state.storage.sql.exec("DELETE FROM devices WHERE device_id = ?", id);
