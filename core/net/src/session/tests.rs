@@ -1,0 +1,487 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Session behaviour against a scripted WebSocket server. The real Worker is covered by `tests/server.rs`.
+
+use std::time::{Duration, UNIX_EPOCH};
+
+use flarebox_proto::v1::{
+    CaughtUp, Changes, CommitRecord, Error as ProtoError, Goodbye, Notice, Resume, ServerMessage,
+    TreePage, client_message, server_message,
+};
+use tokio::net::TcpListener;
+use tokio_tungstenite::WebSocketStream;
+
+use super::*;
+use crate::{Api, Credentials};
+
+type Server = WebSocketStream<TcpStream>;
+
+async fn listen() -> (TcpListener, Arc<Auth>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base: Url = format!("http://{}", listener.local_addr().unwrap())
+        .parse()
+        .unwrap();
+    let credentials = Credentials {
+        user_id: "u".into(),
+        device_id: "d".into(),
+        refresh_credential: "r".into(),
+    };
+    let expires = SystemTime::now() + Duration::from_secs(3600);
+    let token = AccessToken {
+        token: "token".into(),
+        expires_at_ms: expires.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64,
+    };
+    (
+        listener,
+        Arc::new(Auth::new(Api::new(base).unwrap(), credentials).with_token(token)),
+    )
+}
+
+fn config() -> SessionConfig {
+    let mut config = SessionConfig::new("0190a0b0-0000-7000-8000-000000000001", "test", "0", 1);
+    config.backoff = Backoff {
+        initial: Duration::from_millis(10),
+        max: Duration::from_millis(50),
+    };
+    config
+}
+
+/// Accepts one connection, reads `Hello`, and answers with this `Welcome`.
+async fn accept(listener: &TcpListener, welcome: Welcome) -> Server {
+    let (tcp, _) = listener.accept().await.unwrap();
+    let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+    assert!(matches!(recv(&mut ws).await, client_message::Msg::Hello(_)));
+    push(&mut ws, server_message::Msg::Welcome(welcome)).await;
+    ws
+}
+
+async fn recv(ws: &mut Server) -> client_message::Msg {
+    loop {
+        match ws.next().await.expect("the client hung up").unwrap() {
+            WsMessage::Binary(bytes) => return ClientMessage::decode(bytes).unwrap().msg.unwrap(),
+            _ => continue,
+        }
+    }
+}
+
+async fn recv_rpc(ws: &mut Server) -> RpcRequest {
+    match recv(ws).await {
+        client_message::Msg::Rpc(request) => request,
+        other => panic!("expected an RpcRequest, got {other:?}"),
+    }
+}
+
+async fn push(ws: &mut Server, msg: server_message::Msg) {
+    ws.send(WsMessage::Binary(
+        ServerMessage { msg: Some(msg) }.encode_to_vec().into(),
+    ))
+    .await
+    .unwrap();
+}
+
+async fn reply(ws: &mut Server, req_id: u64, result: rpc_response::Result) {
+    push(
+        ws,
+        server_message::Msg::Rpc(RpcResponse {
+            req_id,
+            result: Some(result),
+        }),
+    )
+    .await;
+}
+
+fn welcome(history_id: &str, device_seq: u64) -> Welcome {
+    Welcome {
+        proto: 1,
+        history_id: history_id.into(),
+        device_seq,
+        ..Default::default()
+    }
+}
+
+fn commit(device_seq: u64) -> Commit {
+    Commit {
+        commit_id: "c1".into(),
+        base_seq: 3,
+        history_id: "h".into(),
+        device_seq,
+        ..Default::default()
+    }
+}
+
+async fn next(events: &mut Events) -> Event {
+    tokio::time::timeout(Duration::from_secs(5), events.next())
+        .await
+        .expect("no event within 5 s")
+        .expect("events ended")
+}
+
+/// A `ServerMessage` carrying a `Notice` whose encoding is exactly `size` bytes.
+fn notice_of_size(size: usize) -> Notice {
+    let mut notice = Notice {
+        message: String::new(),
+        ..Default::default()
+    };
+    let encoded = |n: &Notice| {
+        ServerMessage {
+            msg: Some(server_message::Msg::Notice(n.clone())),
+        }
+        .encoded_len()
+    };
+    notice.message = "x".repeat(size - 16);
+    while encoded(&notice) < size {
+        notice.message.push('x');
+    }
+    while encoded(&notice) > size {
+        notice.message.pop();
+    }
+    assert_eq!(encoded(&notice), size);
+    notice
+}
+
+#[test]
+fn a_commit_is_resent_only_when_welcome_accounts_for_its_slot() {
+    let slot = CommitSlot {
+        commit_id: "c".into(),
+        history_id: "h".into(),
+        device_seq: 5,
+    };
+    assert_eq!(may_resend(&slot, &welcome("h", 4)), Ok(()), "not accepted");
+    assert_eq!(
+        may_resend(&slot, &welcome("h", 5)),
+        Ok(()),
+        "accepted, response lost"
+    );
+    assert_eq!(
+        may_resend(&slot, &welcome("h", 3)),
+        Err(NotResent::DeviceSeqMismatch {
+            slot: 5,
+            welcome: 3
+        })
+    );
+    assert_eq!(
+        may_resend(&slot, &welcome("h", 6)),
+        Err(NotResent::DeviceSeqMismatch {
+            slot: 5,
+            welcome: 6
+        })
+    );
+    assert_eq!(
+        may_resend(&slot, &welcome("other", 4)),
+        Err(NotResent::HistoryChanged {
+            commit: "h".into(),
+            welcome: "other".into()
+        })
+    );
+    let first = CommitSlot {
+        device_seq: 1,
+        ..slot
+    };
+    assert_eq!(may_resend(&first, &welcome("h", 0)), Ok(()));
+}
+
+#[test]
+fn the_websocket_url_follows_the_base_scheme_and_path() {
+    let url = |base: &str| {
+        websocket_url(
+            &Api::new(base.parse().unwrap()).unwrap().base().clone(),
+            "0190-ab",
+        )
+        .unwrap()
+        .to_string()
+    };
+    assert_eq!(
+        url("http://127.0.0.1:8787"),
+        "ws://127.0.0.1:8787/v1/spaces/0190-ab/ws"
+    );
+    assert_eq!(
+        url("https://files.example.com/fb"),
+        "wss://files.example.com/fb/v1/spaces/0190-ab/ws"
+    );
+    let base = Api::new("http://h".parse().unwrap())
+        .unwrap()
+        .base()
+        .clone();
+    assert!(websocket_url(&base, "../x").is_err());
+}
+
+#[tokio::test]
+async fn responses_are_matched_to_calls_by_req_id() {
+    let (listener, auth) = listen().await;
+    let (session, _events) = Session::start(auth, config()).unwrap();
+    let server = tokio::spawn(async move {
+        let mut ws = accept(&listener, welcome("h", 0)).await;
+        let first = recv_rpc(&mut ws).await;
+        let second = recv_rpc(&mut ws).await;
+        assert_ne!(first.req_id, second.req_id);
+        let page = |cursor: &str| {
+            rpc_response::Result::Tree(TreePage {
+                next_cursor: cursor.into(),
+                ..Default::default()
+            })
+        };
+        reply(&mut ws, second.req_id, page("second")).await;
+        reply(&mut ws, first.req_id, page("first")).await;
+        ws
+    });
+    let (a, b) = tokio::join!(session.list_tree("a", 1), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        session.list_tree("b", 1).await
+    });
+    assert_eq!(a.unwrap().next_cursor, "first");
+    assert_eq!(b.unwrap().next_cursor, "second");
+    drop(server.await.unwrap());
+}
+
+#[tokio::test]
+async fn a_message_of_1_mib_is_read_and_a_larger_one_drops_the_connection() {
+    let (listener, auth) = listen().await;
+    let (_session, mut events) = Session::start(auth, config()).unwrap();
+    let largest = notice_of_size(MAX_SERVER_MESSAGE);
+    let too_large = notice_of_size(MAX_SERVER_MESSAGE + 1);
+    let server = tokio::spawn({
+        let largest = largest.clone();
+        async move {
+            let mut ws = accept(&listener, welcome("h", 0)).await;
+            push(&mut ws, server_message::Msg::Notice(largest)).await;
+            let frame = ServerMessage {
+                msg: Some(server_message::Msg::Notice(too_large)),
+            }
+            .encode_to_vec();
+            let _ = ws.send(WsMessage::Binary(frame.into())).await;
+            (listener, ws)
+        }
+    });
+    assert!(matches!(next(&mut events).await, Event::Connected(_)));
+    assert_eq!(next(&mut events).await, Event::Notice(largest));
+    match next(&mut events).await {
+        Event::Disconnected {
+            reason: DisconnectReason::ProtocolViolation(what),
+            ..
+        } => assert!(what.contains("1 MiB"), "{what}"),
+        other => panic!("expected a protocol violation, got {other:?}"),
+    }
+    drop(server.await.unwrap());
+}
+
+#[tokio::test]
+async fn an_oversized_request_is_refused_before_it_is_sent() {
+    let (_listener, auth) = listen().await;
+    let (session, _events) = Session::start(auth, config()).unwrap();
+    let chunks = vec![
+        ChunkRef {
+            hash: vec![7; 32],
+            size: 1,
+            encoding: 0
+        };
+        MAX_CLIENT_MESSAGE / 30
+    ];
+    match session.prepare_upload(chunks).await {
+        Err(CallError::TooLarge { bytes }) => assert!(bytes > MAX_CLIENT_MESSAGE),
+        other => panic!("expected TooLarge, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_revoked_device_stops_the_session_and_fails_pending_calls() {
+    let (listener, auth) = listen().await;
+    let (session, mut events) = Session::start(auth, config()).unwrap();
+    let server = tokio::spawn(async move {
+        let mut ws = accept(&listener, welcome("h", 0)).await;
+        recv_rpc(&mut ws).await;
+        push(
+            &mut ws,
+            server_message::Msg::Goodbye(Goodbye {
+                code: 4003,
+                reason: "device revoked".into(),
+            }),
+        )
+        .await;
+        let _ = ws.close(None).await;
+    });
+    assert_eq!(
+        session.list_trash("", 10).await,
+        Err(CallError::Stopped(StopReason::DeviceRevoked))
+    );
+    assert!(matches!(next(&mut events).await, Event::Connected(_)));
+    assert_eq!(
+        next(&mut events).await,
+        Event::Stopped(StopReason::DeviceRevoked)
+    );
+    assert_eq!(
+        session.list_trash("", 10).await,
+        Err(CallError::Stopped(StopReason::DeviceRevoked))
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn retry_later_is_sent_again_after_the_requested_wait() {
+    let (listener, auth) = listen().await;
+    let (session, _events) = Session::start(auth, config()).unwrap();
+    let server = tokio::spawn(async move {
+        let mut ws = accept(&listener, welcome("h", 0)).await;
+        let first = recv_rpc(&mut ws).await;
+        let busy = ProtoError {
+            code: Code::RetryLater as i32,
+            retry_after_ms: 20,
+            ..Default::default()
+        };
+        reply(&mut ws, first.req_id, rpc_response::Result::Error(busy)).await;
+        let second = recv_rpc(&mut ws).await;
+        assert_eq!(first.call, second.call);
+        reply(
+            &mut ws,
+            second.req_id,
+            rpc_response::Result::Trash(Default::default()),
+        )
+        .await;
+        ws
+    });
+    session.list_trash("", 10).await.unwrap();
+    drop(server.await.unwrap());
+}
+
+#[tokio::test]
+async fn a_dropped_commit_is_resent_unchanged_when_welcome_shows_it_was_accepted() {
+    let (listener, auth) = listen().await;
+    let (session, mut events) = Session::start(auth, config()).unwrap();
+    let server = tokio::spawn(async move {
+        let mut ws = accept(&listener, welcome("h", 1)).await;
+        let sent = recv_rpc(&mut ws).await;
+        drop(ws);
+        let mut ws = accept(&listener, welcome("h", 2)).await;
+        let resent = recv_rpc(&mut ws).await;
+        assert_eq!(sent, resent, "the same request, req_id included");
+        let result = CommitResult {
+            seq: 4,
+            ..Default::default()
+        };
+        reply(&mut ws, resent.req_id, rpc_response::Result::Commit(result)).await;
+        ws
+    });
+    let result = session.commit(commit(2)).await.unwrap();
+    assert_eq!(result.seq, 4);
+    let mut seen = Vec::new();
+    while !matches!(seen.last(), Some(Event::Committed(_))) {
+        seen.push(next(&mut events).await);
+    }
+    assert!(
+        matches!(
+            seen[..],
+            [
+                Event::Connected(_),
+                Event::Disconnected { .. },
+                Event::Connected(_),
+                Event::Committed(_)
+            ]
+        ),
+        "{seen:?}"
+    );
+    drop(server.await.unwrap());
+}
+
+#[tokio::test]
+async fn a_dropped_commit_is_not_resent_when_welcome_cannot_account_for_it() {
+    for (later, expected) in [
+        (
+            welcome("h", 7),
+            NotResent::DeviceSeqMismatch {
+                slot: 2,
+                welcome: 7,
+            },
+        ),
+        (
+            welcome("new", 1),
+            NotResent::HistoryChanged {
+                commit: "h".into(),
+                welcome: "new".into(),
+            },
+        ),
+    ] {
+        let (listener, auth) = listen().await;
+        let (session, _events) = Session::start(auth, config()).unwrap();
+        let server = tokio::spawn(async move {
+            let mut ws = accept(&listener, welcome("h", 1)).await;
+            recv_rpc(&mut ws).await;
+            drop(ws);
+            let mut ws = accept(&listener, later).await;
+            let after = recv_rpc(&mut ws).await;
+            assert!(
+                matches!(after.call, Some(Call::ListTree(_))),
+                "the commit was not resent: {after:?}"
+            );
+            reply(
+                &mut ws,
+                after.req_id,
+                rpc_response::Result::Tree(Default::default()),
+            )
+            .await;
+            ws
+        });
+        assert_eq!(
+            session.commit(commit(2)).await,
+            Err(CallError::NotResent(expected))
+        );
+        session.list_tree("", 1).await.unwrap();
+        drop(server.await.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn the_stream_resumes_from_the_last_seq_after_a_reconnect() {
+    let (listener, auth) = listen().await;
+    let (session, mut events) = Session::start(auth, config()).unwrap();
+    session.subscribe("h", 2);
+    let record = |seq| CommitRecord {
+        seq,
+        ..Default::default()
+    };
+    let server = tokio::spawn(async move {
+        let mut ws = accept(&listener, welcome("h", 0)).await;
+        assert_eq!(
+            recv(&mut ws).await,
+            client_message::Msg::Resume(Resume {
+                history_id: "h".into(),
+                since_seq: 2
+            })
+        );
+        push(
+            &mut ws,
+            server_message::Msg::Changes(Changes {
+                commits: vec![record(3), record(4)],
+            }),
+        )
+        .await;
+        push(
+            &mut ws,
+            server_message::Msg::CaughtUp(CaughtUp { head_seq: 4 }),
+        )
+        .await;
+        drop(ws);
+        let mut ws = accept(&listener, welcome("h", 0)).await;
+        assert_eq!(
+            recv(&mut ws).await,
+            client_message::Msg::Resume(Resume {
+                history_id: "h".into(),
+                since_seq: 4
+            })
+        );
+        push(
+            &mut ws,
+            server_message::Msg::Changes(Changes {
+                commits: vec![record(4), record(5)],
+            }),
+        )
+        .await;
+        ws
+    });
+    let mut changes = Vec::new();
+    while changes.last() != Some(&5) {
+        if let Event::Changes(records) = next(&mut events).await {
+            changes.extend(records.iter().map(|r| r.seq));
+        }
+    }
+    assert_eq!(changes, [3, 4, 5]);
+    drop(server.await.unwrap());
+}
