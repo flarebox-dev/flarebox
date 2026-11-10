@@ -20,16 +20,16 @@ The schema change adds five fields:
 
 The Account DO handles the token requests of one principal one at a time, so each request sees the effect of every request handled before it.
 
-**Server time.** When a request sets `rotation`, the answer carries `server_time_ms`: the server's time, in Unix milliseconds, at which it checked the presented credential. Without `rotation`, the answer carries neither `server_time_ms` nor `rotated`, so it is the same answer as before this RFC.
+**Server time.** For each principal, the server keeps a rotation clock: the latest `server_time_ms` it has answered for that principal, 0 at pairing. When a request sets `rotation`, the transaction that checks the presented credential takes T, the later of the server's current time and the rotation clock, in Unix milliseconds, and stores T as the rotation clock. The server sends the answer only after that transaction is durable, and the answer carries T as `server_time_ms`. So the times in one principal's answers never decrease, even when the server's clock moves backward, and the rules below compare deadlines with T, never with the clock itself. They need no assumption about the server's clock. Without `rotation`, the answer carries neither `server_time_ms` nor `rotated`, so it is the same answer as before this RFC, and the request leaves the rotation clock as it is.
 
 **Rotating.** A request that sets `next_refresh_credential` also sets `rotation` and `rotate_before_ms`. `next_refresh_credential` is a credential the client generated the same way the server generates one at pairing: 32 random bytes, base64url-encoded without padding, so 43 characters. A request with a malformed `next_refresh_credential`, or without `rotation` or `rotate_before_ms`, is refused with `INVALID_ARGUMENT` and changes nothing.
 
 When the presented credential is the active principal's current one:
 
-- If the server time is at most `rotate_before_ms`, the server replaces the stored hash with the SHA-256 of `next_refresh_credential` in the same transaction that checked the presented one, and answers with an access token and `rotated` set. From then on, the old credential gets `UNAUTHENTICATED` like any wrong credential.
+- If T is at most `rotate_before_ms`, the server replaces the stored hash with the SHA-256 of `next_refresh_credential` in the same transaction that checked the presented one, and answers with an access token and `rotated` set. From then on, the old credential gets `UNAUTHENTICATED` like any wrong credential.
 - Otherwise it answers with an access token, `rotated` unset, and the stored credential unchanged. A request that arrives after its deadline can never change the credential.
 
-The server keeps no other state for rotation: no pending credential and no history of old ones. `DeviceCredentials.access` from `POST /v1/claim` and `POST /v1/pair/complete` carries neither new field.
+Apart from the rotation clock, the server keeps no state for rotation: no pending credential and no history of old ones. `DeviceCredentials.access` from `POST /v1/claim` and `POST /v1/pair/complete` carries neither new field.
 
 The server does not revoke a principal when an old credential comes back. A process of the device itself that still holds the old credential (§2) is the common cause, and revoking would sign out the device that holds the new one. A rotation changes neither the credential's expiry (RFC 0006 §7) nor a revocation (RFC 0009).
 
@@ -43,14 +43,16 @@ The server does not revoke a principal when an old credential comes back. A proc
 4. If the answer is an access token without `rotated`, the request arrived after D and the server will never store the staged credential, so the process clears the staged slot.
 5. If no answer arrives, it keeps both slots. The outcome is unknown, because the request may still arrive before D.
 6. While the staged slot is set, also after a restart, each refresh presents the current credential, without a new proposal:
-   - Accepted with a `server_time_ms` later than D: the staged credential was not stored before that time and cannot be stored after D, so the process clears the staged slot.
-   - Accepted with a `server_time_ms` at or before D: it keeps both slots and asks again once D has passed on the server's clock.
+   - Accepted with a `server_time_ms` later than D: the staged credential was not stored before that answer, and the server checks every later proposal against a time at least that late (§1), so it can never store it. The process clears the staged slot.
+   - Accepted with a `server_time_ms` at or before D: it keeps both slots and asks again at a later refresh, until an answer carries a time later than D.
    - Refused with `UNAUTHENTICATED`: it presents the staged credential. If that is accepted, the delayed request stored it, and the process makes it current as in step 3. If that is refused too, another copy rotated the credential, and the device is signed out (RFC 0006 §7).
 
 A refusal of the staged credential alone never clears it, because its request may still arrive. The process clears it only after the server has answered for a time later than D, or has said that it did not store it. Two delayed orders show the difference:
 
 - The rotation request is slow, and the client presents the current credential before it arrives. The server accepts the current credential at a time before D, so the client keeps both slots. The request then arrives before D and stores the staged credential. The client's next refresh is refused for the current credential and accepted for the staged one.
 - The rotation request is slow and arrives after D. The server answers it without `rotated`, or nobody reads the answer. The client's next refresh after D is accepted for the current credential, with a server time later than D, and the client clears the staged slot.
+
+Both orders still hold if the server's clock moves backward. In the first, the client keeps both slots whatever times it sees, so a clock change cannot make it drop the credential the server stores. In the second, the client clears the staged slot only after an answer with a time T0 later than D. The server sent that answer only after its rotation clock durably held T0. So a delayed request that arrives later, even while the server's clock reads a time before D, is checked against a time of at least T0 and is not stored.
 
 In every order, the slots the client keeps include the one credential the server accepts.
 
