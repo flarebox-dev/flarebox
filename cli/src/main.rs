@@ -347,7 +347,7 @@ async fn device(paths: Paths, action: DeviceAction) -> Result<(), String> {
 }
 
 /// Shows what each space of the account stores (RFC 0010). A space the server refuses, such as one a rewind holds
-/// closed, does not hide the others: they are printed, and the command then fails naming the refused ones.
+/// closed, does not hide the others: they are printed, and the command then fails naming the refused ones on stderr.
 async fn usage(paths: Paths, json: bool) -> Result<(), String> {
     let auth = signed_in(&paths)?;
     let spaces = auth.api().list_spaces(&auth).await.map_err(refusal)?.spaces;
@@ -364,21 +364,28 @@ async fn usage(paths: Paths, json: bool) -> Result<(), String> {
             )),
         }
     }
-    if json {
-        print_json(
-            &usages
-                .iter()
-                .map(|(space, usage)| usage_json(space, usage))
-                .collect::<Vec<_>>(),
-        )?;
-    } else {
-        print!("{}", usage_report(&usages, refused.len()));
-    }
+    print!("{}", usage_output(&usages, refused.len(), json));
     if refused.is_empty() {
         Ok(())
     } else {
         Err(format!("no usage for {}", refused.join("; ")))
     }
+}
+
+/// What `flarebox usage` prints on stdout: the spaces that answered, as text or as a JSON array. It prints nothing when
+/// every space refused, so that stdout never shows an empty account that is not empty; the error names them instead.
+fn usage_output(usages: &[(SpaceInfo, SpaceUsage)], refused: usize, json: bool) -> String {
+    if usages.is_empty() && refused > 0 {
+        return String::new();
+    }
+    if !json {
+        return usage_report(usages);
+    }
+    let entries: Vec<_> = usages
+        .iter()
+        .map(|(space, usage)| usage_json(space, usage))
+        .collect();
+    serde_json::to_string_pretty(&entries).expect("usage serializes") + "\n"
 }
 
 fn usage_json(space: &SpaceInfo, usage: &SpaceUsage) -> serde_json::Value {
@@ -401,10 +408,9 @@ fn total_bytes(usage: &SpaceUsage) -> u64 {
 }
 
 /// One block per space: its live files, trash, old versions and unreferenced chunks, then a note on how they count.
-/// Nothing when every space refused, since the error that follows names them.
-fn usage_report(usages: &[(SpaceInfo, SpaceUsage)], refused: usize) -> String {
+fn usage_report(usages: &[(SpaceInfo, SpaceUsage)]) -> String {
     if usages.is_empty() {
-        return if refused == 0 { "No spaces.\n" } else { "" }.to_owned();
+        return "No spaces.\n".to_owned();
     }
     let mut report = String::new();
     for (space, usage) in usages {
@@ -752,7 +758,7 @@ mod tests {
             unreferenced_bytes: 1_500_000,
         };
         assert_eq!(
-            usage_report(&[(space.clone(), usage)], 1),
+            usage_report(&[(space.clone(), usage)]),
             format!(
                 "Home\\u{{1b}}[2J ({ID})\n\
                  \x20 Live files        1204 files     3.2 GB\n\
@@ -765,11 +771,48 @@ mod tests {
                  Unreferenced chunks are uploads not committed yet and chunks waiting out the grace period before deletion.\n"
             )
         );
-        assert_eq!(usage_report(&[], 0), "No spaces.\n");
-        assert_eq!(usage_report(&[], 2), "", "every space refused");
+        assert_eq!(usage_report(&[]), "No spaces.\n");
         let json = usage_json(&space, &usage);
         assert_eq!(json["total_bytes"], 3_253_600_000u64);
         assert_eq!(json["trashed_files"], 1);
+    }
+
+    #[test]
+    fn usage_output_shows_only_the_spaces_that_answered() {
+        let answered = [(
+            SpaceInfo {
+                space_id: ID.into(),
+                name: "Home".into(),
+                ..Default::default()
+            },
+            SpaceUsage {
+                live_files: 2,
+                live_bytes: 300,
+                ..Default::default()
+            },
+        )];
+        let parse = |text: String| -> serde_json::Value { serde_json::from_str(&text).unwrap() };
+
+        assert_eq!(usage_output(&[], 0, false), "No spaces.\n");
+        assert_eq!(
+            usage_output(&[], 0, true),
+            "[]\n",
+            "an account with no spaces"
+        );
+
+        assert_eq!(usage_output(&[], 2, false), "", "every space refused");
+        assert_eq!(usage_output(&[], 2, true), "", "every space refused");
+
+        let partial = parse(usage_output(&answered, 1, true));
+        assert_eq!(partial.as_array().unwrap().len(), 1, "{partial:#}");
+        assert_eq!(partial[0]["space_id"], ID);
+        assert_eq!(partial[0]["live_bytes"], 300);
+        assert!(usage_output(&answered, 1, false).starts_with(&format!("Home ({ID})\n")));
+        assert_eq!(
+            usage_output(&answered, 1, true),
+            usage_output(&answered, 0, true),
+            "a refused space adds nothing to the JSON"
+        );
     }
 
     #[test]
