@@ -12,6 +12,8 @@
     ]
   },
   "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "flarebox" }],
+  "assets": { "directory": "./web/dist", "binding": "ASSETS" },
+  "build": { "command": "pnpm --filter flarebox-web build" },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["AccountDO", "SpaceDO"] }
   ]

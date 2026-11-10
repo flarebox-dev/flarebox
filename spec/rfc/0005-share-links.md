@@ -169,7 +169,7 @@ The server tests for this section cover:
 
 ## 8. Web viewer
 
-The viewer is a static page served with Workers Static Assets, from `server/web/`. It has plain HTML, CSS and JavaScript, no build step, no third-party code, and makes no request to another origin. It is English only. Its footer says that Flarebox is not affiliated with Cloudflare, Inc. It shows:
+The viewer is a page of the web package `server/web/`, a pnpm workspace package of the server that later web pages, such as an owner dashboard, will join. The package is TypeScript (strict, with the DOM library) built by Vite as a multi-page build, one entry per page, without a UI framework. Vite and TypeScript are build-time dependencies only: the built page holds no third-party code and makes no request to another origin. The build writes `server/web/dist/`, which Workers Static Assets serves; it is not committed. `wrangler.jsonc` names the build as its `build.command`, so `wrangler dev`, `wrangler deploy` and the deploy button always build it, and the package stays inside `server/`, the directory the deploy button copies. The build inlines nothing, since the CSP below forbids inline script and style: Vite's module preload polyfill is off and no asset becomes a `data:` URL. File names carry no hash, so the page's URLs stay `/viewer/viewer.js` and `/viewer/viewer.css`. The viewer is English only. Its footer says that Flarebox is not affiliated with Cloudflare, Inc. It shows:
 - a password form when `ShareInfo.password_required` is set;
 - for a file link, the file's name, size and a download button;
 - for a folder link, the folder's entries with their size and modification time, a path bar, and a download button per file. Pages beyond the first load on request.
@@ -186,7 +186,7 @@ Permissions-Policy: camera=(), microphone=(), geolocation=()
 X-Robots-Tag: noindex, nofollow
 ```
 
-The page renders every name with `textContent`, never as HTML. The Worker serves `/s/{link_id}` itself, with these headers, and the assets under `/viewer/` take the same headers from `server/web/_headers`.
+The page renders every name with `textContent`, never as HTML. The Worker serves `/s/{link_id}` itself, with these headers, and the assets under `/viewer/` take the same headers from `server/web/public/_headers`, which the build copies into its output.
 
 ## 9. Revocation and expiry
 

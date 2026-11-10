@@ -18,6 +18,18 @@ export const PUBLIC_HEADERS: Record<string, string> = {
   "X-Content-Type-Options": "nosniff",
 };
 
+/** Headers on every page and asset of the viewer (RFC 0005 section 8); server/web/public/_headers repeats them for the assets. */
+export const VIEWER_HEADERS: Record<string, string> = {
+  "Content-Security-Policy":
+    "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+  "Referrer-Policy": "no-referrer",
+  "X-Content-Type-Options": "nosniff",
+  "Cross-Origin-Opener-Policy": "same-origin",
+  "Cross-Origin-Resource-Policy": "same-origin",
+  "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+  "X-Robots-Tag": "noindex, nofollow",
+};
+
 const SESSION_COOKIE = "fb_share";
 
 type Failure = Extract<ShareOutcome<unknown>, { ok: false }>;
@@ -239,8 +251,20 @@ async function ownerApi(request: Request, env: Env, spaceId: string, linkId: str
 }
 
 /** Routes share-link requests, or returns undefined for any other path. authenticate checks a device access token. */
+/** GET /s/{link_id}: the viewer page, the same for every well-formed link_id, which it does not look up (RFC 0005 section 3). */
+async function viewer(request: Request, env: Env, linkId: string): Promise<Response> {
+  const headers = { ...VIEWER_HEADERS, "Cache-Control": "no-store" };
+  if (request.method !== "GET" && request.method !== "HEAD") return withHeaders(new Response("Method Not Allowed", { status: 405 }), headers);
+  if (!LINK_ID.test(linkId)) return withHeaders(new Response("Not Found", { status: 404 }), headers);
+  const page = await env.ASSETS.fetch(new URL("/viewer/", request.url));
+  return withHeaders(new Response(request.method === "HEAD" ? null : page.body, { status: page.status, headers: { "Content-Type": "text/html; charset=utf-8" } }), headers);
+}
+
 export async function shareRoute(request: Request, env: Env, authenticate: () => Promise<Identity | Response>): Promise<Response | undefined> {
   const path = new URL(request.url).pathname;
+
+  const page = /^\/s\/([^/]*)$/.exec(path);
+  if (page) return viewer(request, env, page[1]!);
 
   const shared = /^\/v1\/share\/([^/]*)(\/.*)?$/.exec(path);
   if (shared) {
