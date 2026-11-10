@@ -44,6 +44,11 @@ pub fn classify(l: Option<&Shape>, s: Option<&Shape>, r: Option<&Shape>) -> Clas
     }
 }
 
+/// The `name_key` of each of `names`.
+fn keys<S: AsRef<str>>(names: &[S]) -> Vec<String> {
+    names.iter().map(|name| name_key(name.as_ref())).collect()
+}
+
 /// The names from the root to `id` in `tree` with the node's kind, or `None` when the tree does not
 /// hold the node live and placed under live, placed folders.
 fn path<'a, N: Node>(tree: &'a Tree<N>, id: &str) -> Option<(Vec<&'a str>, Kind)> {
@@ -89,7 +94,8 @@ pub struct Trees {
     outside: BTreeSet<NodeId>,
     /// False from a restore until the rules of a full scan are in force.
     rules_known: bool,
-    /// The folders whose rules the last scan of each could not read, as the names from the root.
+    /// The folders whose rules the last scan of each could not read, by the `name_key` of each name from the root,
+    /// as the matcher holds rules: a folder renamed only in case is the same folder.
     unknown_rules: BTreeSet<Vec<String>>,
 }
 
@@ -171,15 +177,14 @@ impl Trees {
     /// device's disk and passes the rules here with the observation.
     pub fn set_rules<S: AsRef<str>>(&mut self, dir: &[S], rules: Option<RuleFile>) {
         self.ignore.set_rules(dir, rules, std::iter::empty());
-        let dir: Vec<String> = dir.iter().map(|name| name.as_ref().to_owned()).collect();
-        self.unknown_rules.remove(&dir);
+        self.unknown_rules.remove(&keys(dir));
     }
 
     /// Records that a scan could not read the folder at `dir`, the names from the root to it, so
     /// the rules below it are unknown until the driver passes the folder's rules again
     /// ([`Trees::set_rules`]). Meanwhile nothing is planned for a node below it ([`Trees::held`]).
     pub fn set_rules_unknown<S: AsRef<str>>(&mut self, dir: &[S]) {
-        (self.unknown_rules).insert(dir.iter().map(|name| name.as_ref().to_owned()).collect());
+        self.unknown_rules.insert(keys(dir));
     }
 
     /// Whether L, S or R places the node below a folder whose rules are unknown
@@ -187,9 +192,9 @@ impl Trees {
     pub fn held(&self, id: &str) -> bool {
         let below = |path: Option<(Vec<&str>, Kind)>| {
             path.is_some_and(|(names, _)| {
-                (self.unknown_rules.iter()).any(|dir| {
-                    names.len() > dir.len() && names.iter().zip(dir).all(|(name, dir)| name == dir)
-                })
+                let names = keys(&names);
+                (self.unknown_rules.iter())
+                    .any(|dir| names.len() > dir.len() && names.starts_with(dir))
             })
         };
         !self.unknown_rules.is_empty()

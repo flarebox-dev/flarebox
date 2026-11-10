@@ -1656,6 +1656,51 @@ fn a_rules_file_a_restart_cannot_read_holds_everything_below_its_folder() {
     assert!(b.work.is_empty() && b.sent.is_empty());
 }
 
+/// A restart cannot read the rules file of `proj`, so what is below it is held. The user renames the folder to `PROJ`
+/// and fixes the file, and the rules are known again under the new spelling. Renamed back, the folder is not held:
+/// the hold is by `name_key`, as the rules are, so a later remote edit arrives.
+#[test]
+fn the_rules_hold_of_a_folder_ends_also_after_it_was_renamed_only_in_case() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site_a.root.join("proj")).unwrap();
+    a.create(&mut remote, &site_a.root.join("proj/file.txt"), b"v1");
+    a.create(&mut remote, &site_a.root.join("proj/.fbignore"), b"*.log\n");
+    let (site, mut b) = linked(&mut remote, "b");
+    b.scan_until(|b| !b.folder.disk.awaits_rules());
+    b.run(&mut remote);
+    drop(b);
+    fs::write(site.root.join("proj/.fbignore"), "*.log\n".repeat(200_000)).unwrap();
+    let mut b = site.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    b.run(&mut remote);
+    fs::rename(site.root.join("proj"), site.root.join("PROJ")).unwrap();
+    fs::write(site.root.join("PROJ/.fbignore"), b"*.log\n").unwrap();
+    b.scan_until(|b| !b.work.is_empty());
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    fs::rename(site.root.join("PROJ"), site.root.join("proj")).unwrap();
+    b.scan_until(|b| !b.work.is_empty());
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    a.create(
+        &mut remote,
+        &site_a.root.join("proj/file.txt"),
+        b"v2 from a",
+    );
+    b.pull(&remote);
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    assert_eq!(
+        fs::read(site.root.join("proj/file.txt")).unwrap(),
+        b"v2 from a"
+    );
+}
+
 #[test]
 fn a_rules_file_named_in_another_case_is_downloaded_and_in_force_first() {
     let mut remote = Remote::new();
