@@ -353,13 +353,11 @@ impl Commits {
         needed: BTreeSet<NodeId>,
         agreed: Vec<(NodeId, Option<Shape>)>,
     ) -> BTreeSet<NodeId> {
-        let mut waiting = trees.take_waiting();
-        waiting.retain(|id, shape| {
-            !same(
-                trees.synced().live(id),
-                trees.local().get(id).map(|node| &node.shape),
-            ) && !overtaken(trees, id, shape.as_ref())
-        });
+        let waiting: Vec<_> = trees
+            .take_waiting()
+            .into_iter()
+            .filter_map(|(id, shape)| Some((id.clone(), outstanding(trees, &id, shape)?)))
+            .collect();
         let updates = waiting
             .into_iter()
             .chain(needed.iter().map(|id| (id.clone(), None)))
@@ -696,26 +694,27 @@ fn keep(trees: &mut Trees, id: &str, needed: &mut BTreeSet<NodeId>) {
     }
 }
 
-/// Whether both sides moved past a waiting S update the same way: wherever R no longer matches it,
-/// L matches R. The update is then stale, and S keeps what it had, as for any change both sides
-/// made alike.
-fn overtaken(trees: &Trees, id: &str, waiting: Option<&Shape>) -> bool {
-    let (Some(waiting), Some(local), Some(remote)) = (
-        waiting,
-        trees.local().get(id).map(|node| &node.shape),
-        trees.remote().live(id),
-    ) else {
-        return false;
+/// What is left of a waiting S update. Its position is stale once R no longer has the node there
+/// and L has left it too: it then falls back to the position S holds, or to R's when S does not
+/// hold the node, so L's and R's positions are compared with the S they came from, as for any
+/// change both sides made. Its content stays, so the acknowledged content remains the base L's
+/// content is compared with. None when nothing is left: the update comes to what S holds, or
+/// neither L nor R holds the node.
+fn outstanding(trees: &Trees, id: &str, waiting: Option<Shape>) -> Option<Option<Shape>> {
+    let local = trees.local().get(id).map(|node| &node.shape);
+    let synced = trees.synced().live(id);
+    let Some(remote) = trees.remote().live(id) else {
+        return local.is_some().then_some(waiting);
     };
-    let content = |a: &Shape, b: &Shape| match (&a.content, &b.content) {
-        (Some(a), Some(b)) => same_content(a, b),
-        (a, b) => a.is_none() && b.is_none(),
+    let Some(mut left) = waiting else {
+        return Some(None);
     };
-    let moved = !waiting.same_position(remote);
-    let rewritten = !content(waiting, remote);
-    (moved || rewritten)
-        && (!moved || local.same_position(remote))
-        && (!rewritten || content(local, remote))
+    if !left.same_position(remote) && !local.is_some_and(|local| local.same_position(&left)) {
+        let base = synced.unwrap_or(remote);
+        left.parent = base.parent.clone();
+        left.name = base.name.clone();
+    }
+    (synced != Some(&left)).then_some(Some(left))
 }
 
 /// The bytes a change record of a node with this shape takes, roughly.

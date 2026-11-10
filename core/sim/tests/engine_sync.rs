@@ -352,8 +352,9 @@ fn held(trees: &Trees) -> BTreeSet<(String, Vec<u8>)> {
 
 /// Forgets the writes that left a node holding content in `before` by `after`, which the user
 /// or the other device overwrote or deleted, and returns the digests that nodes in `after` hold
-/// anew. Content equal to what S holds for the node is not a write the engine can tell apart from
-/// no change at all, so it is left out.
+/// anew. Content equal to the node's acknowledged content, its waiting S update's while one
+/// waits and S's otherwise, is not a write the engine can tell apart from no change at all, so it
+/// is left out.
 fn rewritten(
     before: &BTreeSet<(String, Vec<u8>)>,
     after: &BTreeSet<(String, Vec<u8>)>,
@@ -366,7 +367,10 @@ fn rewritten(
         }
     }
     let synced = |id: &str| {
-        let shape = trees.synced().live(id)?;
+        let shape = match trees.waiting().get(id) {
+            Some(waiting) => waiting.as_ref(),
+            None => trees.synced().live(id),
+        }?;
         Some(shape.content.as_ref()?.manifest_digest.clone())
     };
     after
@@ -1835,6 +1839,139 @@ fn a_waiting_update_both_sides_moved_past_does_not_hold_back_an_edit() {
                 kind: 2,
                 target: 4350527627605106883,
                 parent: 0,
+                name: 0,
+                text: 0,
+            }],
+        ),
+    ];
+    run(&seed, &local, &remote, fits, fresh_dir_names, &during).unwrap();
+}
+
+/// A created file whose S update waits is deleted on both sides before the update fits, so the
+/// update is dropped instead of holding the device out of convergence.
+#[test]
+fn a_waiting_update_of_a_file_both_sides_deleted_is_dropped() {
+    let seed = vec![
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 1,
+            target: 0,
+            parent: 5575517051411596159,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 0,
+            target: 0,
+            parent: 9542798344174571143,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 1,
+            target: 0,
+            parent: 1134570969992643019,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 1,
+            target: 0,
+            parent: 5217341420012805030,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 1,
+            target: 0,
+            parent: 0,
+            name: 5,
+            text: 0,
+        },
+    ];
+    let local = vec![
+        Action {
+            kind: 4,
+            target: 14966158802491056936,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 1,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        },
+        Action {
+            kind: 1,
+            target: 0,
+            parent: 0,
+            name: 2,
+            text: 0,
+        },
+    ];
+    let remote = vec![
+        Action {
+            kind: 3,
+            target: 3639306566313460506,
+            parent: 17827897833710994996,
+            name: 2,
+            text: 0,
+        },
+        Action {
+            kind: 1,
+            target: 0,
+            parent: 8247849472439318298,
+            name: 2,
+            text: 0,
+        },
+    ];
+    let fits = 1000;
+    let fresh_dir_names = false;
+    let during = vec![
+        (
+            false,
+            vec![
+                Action {
+                    kind: 4,
+                    target: 2494586888620959721,
+                    parent: 0,
+                    name: 0,
+                    text: 0,
+                },
+                Action {
+                    kind: 1,
+                    target: 0,
+                    parent: 14654176779908604874,
+                    name: 0,
+                    text: 0,
+                },
+            ],
+        ),
+        (
+            false,
+            vec![Action {
+                kind: 4,
+                target: 7730499601774269038,
+                parent: 0,
+                name: 0,
+                text: 0,
+            }],
+        ),
+        (
+            false,
+            vec![Action {
+                kind: 0,
+                target: 0,
+                parent: 339548061254993100,
                 name: 0,
                 text: 0,
             }],

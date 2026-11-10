@@ -275,13 +275,20 @@ impl Effects {
 /// waiting node that R no longer has is removed only when it holds no unuploaded edit; otherwise
 /// the commit layer makes it a new node, so the edit is uploaded.
 fn candidate(trees: &Trees, id: &str) -> bool {
-    trees.class(id) == Class::Remote
+    remote_only(trees, id)
         || trees.local().get(id).is_some_and(|node| node.parked)
         || (trees.reverted().contains(id)
             && (trees.remote().live(id).is_some() || !trees.edited(id)))
         || (trees.waiting().contains_key(id)
             && trees.remote().live(id).is_none()
             && !trees.edited(id))
+}
+
+/// Whether the node's only change is remote. While its S update waits, [`Class::Remote`] means L
+/// still matches the S that the update replaces, so L differs from the acknowledged shape: the
+/// change is local, and the node holds an edit ([`Trees::edited`]) whenever the content differs.
+fn remote_only(trees: &Trees, id: &str) -> bool {
+    trees.class(id) == Class::Remote && !trees.waiting().contains_key(id)
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -318,7 +325,7 @@ impl<'a> View<'a> {
             (None, None) => return Step::Skip,
             (Some(local), None)
                 if local.parked
-                    && self.trees.class(id) != Class::Remote
+                    && !remote_only(self.trees, id)
                     && (!(self.trees.reverted().contains(id)
                         || self.trees.waiting().contains_key(id))
                         || self.trees.edited(id)) =>
@@ -346,7 +353,7 @@ impl<'a> View<'a> {
             }
             (Some(local), Some(remote)) => (local, remote),
         };
-        if local.parked && self.trees.class(id) != Class::Remote {
+        if local.parked && !remote_only(self.trees, id) {
             return self.unpark(id, local, remote);
         }
         if local.shape.kind != remote.kind {

@@ -1460,3 +1460,193 @@ fn reconnecting_compares_the_device_counter_and_the_history() {
     assert_eq!(commits.connected(&welcome(1)), Reconnect::Resend);
     assert_eq!(commits.halted(), None);
 }
+
+/// A parked file h holds root/x in S while R has it at y. n moves to x with new content; the
+/// server applies both ops, but S cannot take n at x yet, so its update waits with content 1.
+fn a_move_and_edit_whose_s_update_waits() -> (Trees, Commits, IdGen) {
+    let mut trees = trees(&[
+        (
+            "h",
+            Some(file(ROOT, "x", 9)),
+            Some(file(ROOT, "x", 9)),
+            Some(remote(file(ROOT, "y", 9))),
+        ),
+        (
+            "n",
+            Some(file(ROOT, "x", 1)),
+            Some(file(ROOT, "old", 0)),
+            Some(remote(file(ROOT, "old", 0))),
+        ),
+    ]);
+    trees.set_local(
+        "h".into(),
+        LocalNode {
+            parked: true,
+            ..local(file(ROOT, "x", 9), 1)
+        },
+    );
+    trees.settle();
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", ROOT, "x"), update("n", 1)]);
+    trees.set_remote("n".into(), remote(file(ROOT, "x", 1)));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied); 2],
+    );
+    assert_eq!(trees.waiting().get("n"), Some(&Some(file(ROOT, "x", 1))));
+    (trees, commits, ids)
+}
+
+/// Plans and does every effect, failing none, and returns those planned for `node`. An entry an
+/// effect creates gets inode 100.
+fn effects_for(trees: &mut Trees, ids: &mut IdGen, node: &str) -> Vec<Effect> {
+    let mut effects = Effects::default();
+    let mut planned = Vec::new();
+    for _ in 0..8 {
+        let Some(record) = effects.plan(trees, ids, NOW).cloned() else {
+            break;
+        };
+        if record.node == node {
+            planned.push(record.effect.clone());
+        }
+        let created = trees.local().get(&record.node).is_none();
+        let identity = created.then_some(FileIdentity {
+            dev: 1,
+            ino: 100,
+            birth_ns: 0,
+        });
+        effects.done(trees, &record.effect_id, identity).unwrap();
+        trees.settle();
+    }
+    planned
+}
+
+/// The user puts n back where S still holds it, with the content S still holds, and the server
+/// deletes n. Against the acknowledged update that is an edit, so it is uploaded, whether the
+/// effects or a commit come first, and whether n is parked or not.
+#[test]
+fn a_waiting_file_put_back_as_s_still_holds_it_is_uploaded_after_a_remote_delete() {
+    for (effects_first, parked) in [(true, false), (true, true), (false, false)] {
+        let (mut trees, mut commits, mut ids) = a_move_and_edit_whose_s_update_waits();
+        trees.set_local(
+            "n".into(),
+            LocalNode {
+                parked,
+                ..local(file(ROOT, "old", 0), 2)
+            },
+        );
+        trees.set_remote("n".into(), trashed(file(ROOT, "x", 1)));
+        trees.settle();
+        assert_eq!(trees.class("n"), Class::Remote, "L matches S");
+        assert!(trees.edited("n"));
+        if effects_first {
+            let effects = effects_for(&mut trees, &mut ids, "n");
+            assert!(
+                effects
+                    .iter()
+                    .all(|effect| matches!(effect, Effect::Move { .. })),
+                "{effects:?}"
+            );
+            assert_eq!(trees.local().get("n").map(|node| node.parked), Some(false));
+            let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+            assert_eq!(ops(&commit), [mv("n", ROOT, "old"), update("n", 0)]);
+            continue;
+        }
+        let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+        let [op::Op::CreateFile(create)] = <[op::Op; 1]>::try_from(ops(&commit)).unwrap() else {
+            panic!("{commit:?}");
+        };
+        assert_eq!(
+            (
+                create.parent_id.as_str(),
+                create.name.as_str(),
+                create.content
+            ),
+            (ROOT, "old", Some(content(0)))
+        );
+        assert_eq!(effects_for(&mut trees, &mut ids, &create.node_id), []);
+        assert_eq!(trees.local().get(&create.node_id).unwrap().identity.ino, 2);
+    }
+}
+
+#[test]
+fn a_waiting_update_both_sides_moved_past_keeps_its_content_as_the_base_of_a_later_edit() {
+    let (mut trees, mut commits, mut ids) = a_move_and_edit_whose_s_update_waits();
+    trees.set_local("n".into(), local(file(ROOT, "z", 0), 2));
+    trees.set_remote("n".into(), remote(file(ROOT, "z", 1)));
+    trees.settle();
+    assert_eq!(effects_for(&mut trees, &mut ids, "n"), []);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("n", 0)]);
+}
+
+/// The other device moves n on and puts a new folder m where n's update would place it, while the
+/// user moves n back. The update's position is stale, so it no longer holds n out of planning, and
+/// n follows the remote move with the acknowledged content.
+#[test]
+fn a_waiting_update_whose_place_r_gave_away_does_not_hold_the_node_for_good() {
+    let (mut trees, mut commits, mut ids) = a_move_and_edit_whose_s_update_waits();
+    trees.set_local("n".into(), local(file(ROOT, "old", 1), 2));
+    trees.set_remote("n".into(), remote(file(ROOT, "q", 1)));
+    trees.set_remote("m".into(), remote(dir(ROOT, "x")));
+    trees.settle();
+    for _ in 0..3 {
+        effects_for(&mut trees, &mut ids, "");
+        assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    }
+    assert_eq!(trees.waiting(), &Default::default());
+    assert_eq!(
+        trees.local().get("n").map(|node| &node.shape),
+        Some(&file(ROOT, "q", 1))
+    );
+    assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "q", 1)));
+    assert_eq!(trees.synced().live("m"), Some(&dir(ROOT, "x")));
+}
+
+/// n is parked as it was before the update, with the content S still holds, while R has n as the
+/// update left it. Against the acknowledged update the old content is an edit, so n is only moved
+/// out of the parked directory, and the content is uploaded once the update is made.
+#[test]
+fn a_parked_waiting_file_with_the_content_s_still_holds_keeps_it() {
+    let (mut trees, mut commits, mut ids) = a_move_and_edit_whose_s_update_waits();
+    trees.set_local(
+        "n".into(),
+        LocalNode {
+            parked: true,
+            ..local(file(ROOT, "old", 0), 2)
+        },
+    );
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::Remote, "L matches S");
+    let effects = effects_for(&mut trees, &mut ids, "n");
+    assert!(
+        effects
+            .iter()
+            .all(|effect| matches!(effect, Effect::Move { .. })),
+        "{effects:?}"
+    );
+    assert_eq!(
+        trees
+            .local()
+            .get("n")
+            .map(|node| (&node.shape, node.parked)),
+        Some((&file(ROOT, "x", 0), false))
+    );
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("n", 0)]);
+}
+
+/// Both sides move n to z with the same new content while its update waits. Settling makes S
+/// take that shape, which replaces the update, so nothing is uploaded and nothing is forked.
+#[test]
+fn a_waiting_update_settling_replaced_is_not_made_afterwards() {
+    let (mut trees, mut commits, mut ids) = a_move_and_edit_whose_s_update_waits();
+    trees.set_local("n".into(), local(file(ROOT, "z", 2), 2));
+    trees.set_remote("n".into(), remote(file(ROOT, "z", 2)));
+    trees.settle();
+    assert_eq!(trees.waiting(), &Default::default());
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "z", 2)));
+}
