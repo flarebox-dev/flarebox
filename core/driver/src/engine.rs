@@ -1535,6 +1535,59 @@ mod tests {
         assert!(!engine.trees.excluded(&log_id), "no rules file is left");
     }
 
+    /// A reset queued before a child entered L leaves the snapshot without the
+    /// child. A folder made anew around the child is not the destination of a
+    /// rename, so it is not a replacement, and the child keeps its node.
+    #[test]
+    fn a_synced_child_keeps_its_node_when_a_stale_reset_hid_it_and_its_folder_is_made_anew() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("space");
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        let mut snapshot = Snapshot::scan(&root).unwrap();
+        let (_dir, mut engine) = mapper();
+        let folder = Observed::Created {
+            path: "d".into(),
+            kind: EntryKind::Dir,
+            id: snapshot.entries[Path::new("d")].id,
+            linked: false,
+            content: None,
+        };
+        engine.observe(&[folder], 0);
+        let stale = engine.resets([PathBuf::from("d")]);
+        std::fs::write(root.join("d/x"), b"abc").unwrap();
+        snapshot.rescan(&root, [PathBuf::new()]).unwrap();
+        let id = snapshot.entries[Path::new("d/x")].id;
+        engine.observe(&[created("d/x", id, false, 3)], 1);
+        let local: Vec<_> = (engine.trees.local().iter())
+            .map(|(id, node)| (id.clone(), node.shape.clone()))
+            .collect();
+        for (id, shape) in local {
+            engine.trees.set_synced(id, Some(shape));
+        }
+        let (synced, _, _) = holding(&engine, "d/x").unwrap();
+
+        for reset in stale {
+            snapshot.reset(&reset.scope, reset.known);
+        }
+        std::fs::rename(root.join("d/x"), root.join("x")).unwrap();
+        std::fs::rename(root.join("d"), outer.path().join("away")).unwrap();
+        std::fs::create_dir(root.join("d")).unwrap();
+        std::fs::rename(root.join("x"), root.join("d/x")).unwrap();
+        let changes = snapshot.rescan(&root, [PathBuf::new()]).unwrap().changes;
+        assert_eq!(
+            changes,
+            [flarebox_fs::Change::Created {
+                path: "d/x".into(),
+                kind: EntryKind::File,
+            }]
+        );
+        engine.observe(&[created("d/x", id, false, 3)], 2);
+        assert_eq!(
+            holding(&engine, "d/x").map(|(node, _, _)| node),
+            Some(synced)
+        );
+    }
+
     #[test]
     fn a_file_saved_by_rename_over_another_keeps_the_node_of_the_file_it_replaces() {
         let (_dir, mut engine) = mapper();
