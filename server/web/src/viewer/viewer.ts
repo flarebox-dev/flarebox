@@ -126,11 +126,16 @@ function downloadLink(nodeId: string, label = "Download"): HTMLAnchorElement {
 function passwordForm(message?: string): void {
   const input = el("input", { type: "password", name: "password", autocomplete: "off", required: "", "aria-label": "Password" });
   const note = el("p", { class: message ? "error" : "status", text: message ?? "Enter the password you were given." });
+  const button = el("button", { type: "submit", text: "Open" });
+  let pending = false;
   const form = el(
     "form",
     {
       onsubmit: async (event: Event) => {
         event.preventDefault();
+        if (pending) return;
+        pending = true;
+        button.disabled = true;
         const { status, body } = await request<ApiError>("/unlock", { method: "POST", body: JSON.stringify({ password: input.value }) });
         if (status === 204) return start();
         if (status === 401) return passwordForm("Wrong password.");
@@ -139,7 +144,7 @@ function passwordForm(message?: string): void {
       },
     },
     input,
-    el("button", { type: "submit", text: "Open" }),
+    button,
   );
   show(el("h1", { text: "This link is protected" }), note, form);
   input.focus();
@@ -198,6 +203,7 @@ async function showFolder(info: ShareInfo): Promise<void> {
   const load = async (cursor: string): Promise<void> => {
     const query = "?dir=" + encodeURIComponent(dir) + (cursor ? "&cursor=" + encodeURIComponent(cursor) : "");
     const { status, body } = await request<ShareListing & ApiError>("/list" + query);
+    if (!heading.isConnected) return;
     if (status === 401) return passwordForm();
     if (status !== 200 || !body) return fail(status, body);
     if (first) {
