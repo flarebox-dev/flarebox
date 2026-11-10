@@ -292,7 +292,9 @@ impl Effects {
     }
 
     /// The driver did the effect. L takes the node's new shape, with `identity` for an entry the
-    /// effect created.
+    /// effect created. An effect other than a move gave L the shape R had when it was planned, so S
+    /// takes that shape too, when S stays a valid tree. A change R made while the effect was in
+    /// flight then stays a remote change and is never taken for the user's.
     pub fn done(
         &mut self,
         trees: &mut Trees,
@@ -314,6 +316,9 @@ impl Effects {
         };
         let record = self.take(effect_id)?;
         let parked = record.parks();
+        if !matches!(record.effect, Effect::Move { .. }) {
+            trees.set_synced_if_valid(record.node.clone(), record.after.clone());
+        }
         match record.after {
             None => trees.remove_local(&record.node),
             Some(shape) => trees.set_local(
