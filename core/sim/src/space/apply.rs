@@ -256,6 +256,7 @@ impl<'a> Applier<'a> {
         node.status = NodeStatus::Live;
         node.parent_id = Some(parent_id.to_string());
         node.parent_rev = seq;
+        node.parent_dev = dev.clone();
         node.name_key = name_key(&name);
         node.name = name.clone();
         node.trash_group = None;
@@ -348,6 +349,7 @@ impl<'a> Applier<'a> {
             meta_rev: self.ctx.seq,
             meta_dev: self.dev().into(),
             parent_rev: self.ctx.seq,
+            parent_dev: self.dev().into(),
             cur_version_id: version_id,
             trash_group: None,
             row,
@@ -541,6 +543,7 @@ impl<'a> Applier<'a> {
             .expect("moved node exists");
         if stored.parent_id.as_deref() != Some(parent.node_id.as_str()) {
             stored.parent_rev = seq;
+            stored.parent_dev = dev.clone();
         }
         stored.parent_id = Some(parent.node_id.clone());
         stored.name_key = name_key(&name);
@@ -555,7 +558,7 @@ impl<'a> Applier<'a> {
     /// created it there, or an earlier op of this commit made it as a conflict copy.
     fn entered_after_base(&self, node: &Node) -> bool {
         self.conflict_copies.contains(&node.node_id)
-            || (self.unseen_meta(node) && node.parent_rev > self.ctx.base_seq)
+            || (node.parent_rev > self.ctx.base_seq && node.parent_dev != self.dev())
     }
 
     /// R7 and RFC 0002 section 9: trashes the subtree the deleting device had at its base. Nodes with

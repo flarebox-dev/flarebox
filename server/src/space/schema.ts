@@ -77,12 +77,14 @@ export const MIGRATIONS: readonly Migration[] = [
       if (!columns.includes("request_digest")) sql.exec(`ALTER TABLE ${table} ADD COLUMN request_digest BLOB`);
     }
   },
-  // RFC 0002 section 9: the seq at which a node last took a new parent. A row stored before gets its meta_rev, which is
-  // never lower, so a stale Delete keeps the subtree of such a row whenever its unseen meta change might have been a move.
+  // RFC 0002 section 9: the seq and device of the commit that last gave a node a new parent. A row stored before gets its
+  // meta_rev, which is never lower, and no device, so a stale Delete keeps the subtree of such a row whenever its meta
+  // changed after the commit's base.
   (sql) => {
     const columns = sql.exec("SELECT name FROM pragma_table_info('nodes')").toArray().map((row) => row.name);
     if (columns.includes("parent_rev")) return;
     sql.exec("ALTER TABLE nodes ADD COLUMN parent_rev INTEGER NOT NULL DEFAULT 0");
+    sql.exec("ALTER TABLE nodes ADD COLUMN parent_dev TEXT NOT NULL DEFAULT ''");
     sql.exec("UPDATE nodes SET parent_rev = meta_rev");
   },
 ];

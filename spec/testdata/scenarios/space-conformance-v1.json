@@ -2012,6 +2012,168 @@
       ]
     },
     {
+      "name": "r7-a-delete-trashes-the-unchanged-children-of-a-folder-it-moved-in-that-another-device-renamed",
+      "covers": [
+        "R7"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "1"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "da",
+                  "parent": "root",
+                  "name": "a"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "da",
+                  "name": "f",
+                  "content": "c1"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "db",
+                  "parent": "root",
+                  "name": "b"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "move": {
+                  "node": "da",
+                  "parent": "db",
+                  "name": "a"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 2,
+            "ops": [
+              {
+                "move": {
+                  "node": "da",
+                  "parent": "db",
+                  "name": "c"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "delete": {
+                  "node": "db"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 4,
+            "results": [
+              {
+                "code": "SUPERSEDED"
+              }
+            ],
+            "changed": [
+              "f"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "db",
+              "status": "LIVE"
+            },
+            {
+              "node": "da",
+              "status": "LIVE",
+              "parent": "db",
+              "name": "c"
+            },
+            {
+              "node": "f",
+              "status": "TRASHED",
+              "parent": "da"
+            }
+          ],
+          "live": [
+            "db",
+            "da"
+          ]
+        }
+      ]
+    },
+    {
       "name": "r8-an-unseen-edit-revives-a-deleted-file",
       "covers": [
         "R8"

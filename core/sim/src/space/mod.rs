@@ -79,8 +79,10 @@ pub(crate) struct Node {
     content_dev: String,
     meta_rev: u64,
     meta_dev: String,
-    /// The seq at which the node last took a new parent or came back from the trash.
+    /// The seq and device of the commit that last gave the node a new parent or brought it back from
+    /// the trash.
     parent_rev: u64,
+    parent_dev: String,
     cur_version_id: Option<String>,
     trash_group: Option<String>,
     /// Insertion order, standing in for SQLite's rowid where the server reads rows without ORDER BY.
@@ -408,6 +410,7 @@ impl SpaceDo {
             meta_rev: 0,
             meta_dev: String::new(),
             parent_rev: 0,
+            parent_dev: String::new(),
             cur_version_id: None,
             trash_group: None,
             row: 1,

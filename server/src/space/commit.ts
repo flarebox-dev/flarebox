@@ -271,10 +271,11 @@ export class CommitApplier {
   private reviveOne(node: NodeRow, parentId: string, desiredName: string): { name: string; renamed: boolean } {
     const picked = this.pickName(parentId, desiredName, node.node_id);
     this.sql.exec(
-      `UPDATE nodes SET status = 1, parent_id = ?, parent_rev = ?, name = ?, name_key = ?, trash_group = NULL, trashed_at_ms = NULL,
-         meta_rev = ?, meta_dev = ? WHERE node_id = ?`,
+      `UPDATE nodes SET status = 1, parent_id = ?, parent_rev = ?, parent_dev = ?, name = ?, name_key = ?, trash_group = NULL,
+         trashed_at_ms = NULL, meta_rev = ?, meta_dev = ? WHERE node_id = ?`,
       parentId,
       this.ctx.seq,
+      this.dev,
       picked.name,
       nameKey(picked.name),
       this.ctx.seq,
@@ -327,11 +328,12 @@ export class CommitApplier {
 
   private insertNode(nodeId: string, parentId: string, name: string, kind: number, versionId: string | null): void {
     this.sql.exec(
-      `INSERT INTO nodes (node_id, parent_id, parent_rev, name, name_key, kind, status, content_rev, content_dev, meta_rev, meta_dev, cur_version_id)
-       VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`,
+      `INSERT INTO nodes (node_id, parent_id, parent_rev, parent_dev, name, name_key, kind, status, content_rev, content_dev, meta_rev,
+         meta_dev, cur_version_id) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`,
       nodeId,
       parentId,
       this.ctx.seq,
+      this.dev,
       name,
       nameKey(name),
       kind,
@@ -466,10 +468,12 @@ export class CommitApplier {
       return result(picked.renamed ? OpResult_Code.APPLIED_RENAMED : OpResult_Code.APPLIED, "", picked.name);
     }
     const picked = this.pickName(parent.node_id, name, found.node_id);
+    const moved = found.parent_id !== parent.node_id;
     this.sql.exec(
-      "UPDATE nodes SET parent_id = ?, parent_rev = ?, name = ?, name_key = ?, meta_rev = ?, meta_dev = ? WHERE node_id = ?",
+      "UPDATE nodes SET parent_id = ?, parent_rev = ?, parent_dev = ?, name = ?, name_key = ?, meta_rev = ?, meta_dev = ? WHERE node_id = ?",
       parent.node_id,
-      found.parent_id === parent.node_id ? found.parent_rev : this.ctx.seq,
+      moved ? this.ctx.seq : found.parent_rev,
+      moved ? this.dev : found.parent_dev,
       picked.name,
       nameKey(picked.name),
       this.ctx.seq,
@@ -485,7 +489,7 @@ export class CommitApplier {
    * an earlier op of this commit made it as a conflict copy.
    */
   private enteredAfterBase(node: NodeRow): boolean {
-    return this.conflictCopies.has(node.node_id) || (this.unseenMeta(node) && node.parent_rev > this.ctx.baseSeq);
+    return this.conflictCopies.has(node.node_id) || (node.parent_rev > this.ctx.baseSeq && node.parent_dev !== this.dev);
   }
 
   /**
