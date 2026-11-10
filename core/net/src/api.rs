@@ -37,9 +37,9 @@ const ANSWER_FRAMING: usize = 64 << 10;
 const MAX_ANSWER: usize =
     (MAX_STORED_NAME * JSON_ESCAPE_EXPANSION).div_ceil(3) * 4 + ANSWER_FRAMING;
 /// The most bytes read of a `DeviceList` page, and the most a listing of `SpaceList` pages holds at once, the pages
-/// kept plus the one being read. A page holds at most 100 entries (RFC 0006 section 7, RFC 0007 section 2), but a server
-/// from before RFC 0007 bounds no names and sends every space in one answer. Such a Worker builds the whole answer in
-/// memory, and a Worker isolate has at most 128 MB, so it cannot send a larger one.
+/// kept plus the one being read. A page holds at most 100 entries (RFC 0006 section 7, RFC 0007 section 2), but a
+/// server from before RFC 0007 bounds no names and sends every space in one answer. Such a Worker builds the whole
+/// answer in memory, and a Worker isolate has at most 128 MB, so it cannot send a larger one.
 const MAX_LIST_ANSWER: usize = 128 << 20;
 /// The most bytes read of an error. The server's error messages are sentences it writes itself, without names or other
 /// text from clients.
@@ -162,8 +162,9 @@ impl Api {
         .await
     }
 
-    /// `GET /v1/spaces`, following `next_cursor` to the last page (RFC 0007 section 2). All pages together are read up
-    /// to `MAX_LIST_ANSWER` bytes, and a page that repeats any earlier cursor ends the listing as undecodable.
+    /// `GET /v1/spaces`, following `next_cursor` to the last page (RFC 0007 section 2). Each page is read up to
+    /// `MAX_LIST_ANSWER` minus the encoded size of the pages kept so far, so the listing never holds more than
+    /// `MAX_LIST_ANSWER` bytes at once. A page that repeats any earlier cursor ends the listing as undecodable.
     pub async fn list_spaces(&self, auth: &Auth) -> Result<SpaceList, ApiError> {
         let mut list = SpaceList::default();
         let mut read = 0;
