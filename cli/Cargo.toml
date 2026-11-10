@@ -15,19 +15,30 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
+flarebox-cloudflare = { path = "../core/cloudflare" }
 flarebox-driver = { path = "../core/driver" }
 flarebox-net = { path = "../core/net" }
 flarebox-proto = { path = "../core/proto" }
-rustix = { version = "1.1.6", features = ["process"] }
+getrandom = "0.4.3"
+reqwest = { version = "0.13.5", default-features = false }
+rustix = { version = "1.1.6", features = ["process", "system"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+tempfile = "3.27.0"
 tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = "2.5.8"
+
+[build-dependencies]
+serde_json = "1.0.154"
 
 [dev-dependencies]
 fastrand = "2"
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
+prost.workspace = true
 reqwest = { version = "0.13.5", default-features = false }
-tempfile = "3.27.0"
 tokio = { version = "1.48", features = ["full"] }
 url = "2.5.8"
