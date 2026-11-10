@@ -73,7 +73,7 @@ function refuseWithout(request: Request, identity: Identity, capability: Capabil
   return errorReply(request, Error_Code.FORBIDDEN, `this device may not use ${capability}`);
 }
 
-/** GET /v1/devices and DELETE /v1/devices/{device_id} (RFC 0006 section 7, RFC 0007). */
+/** GET /v1/devices and DELETE /v1/devices/{device_id} (RFC 0006 section 7, RFC 0009). */
 async function devices(request: Request, env: Env, deviceId: string | undefined): Promise<Response> {
   const identity = await authenticate(request, env);
   if (identity instanceof Response) return identity;

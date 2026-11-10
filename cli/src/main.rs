@@ -289,7 +289,7 @@ async fn client(paths: Paths, command: Command) -> Result<(), String> {
     }
 }
 
-/// Runs a device command with this profile's credential (RFC 0007). It writes nothing to the profile, so it runs the same
+/// Runs a device command with this profile's credential (RFC 0009). It writes nothing to the profile, so it runs the same
 /// whether or not the daemon holds the profile.
 async fn device(paths: Paths, action: DeviceAction) -> Result<(), String> {
     let credential = Credential::load(&paths.credential())

@@ -563,7 +563,7 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
     expect((await send("/v1/devices", { method: "GET" })).status).toBe(401);
   });
 
-  it("refuses a lost device's refresh credential, old access token, socket and pairing code once another device revoked it (RFC 0007 section 2)", async () => {
+  it("refuses a lost device's refresh credential, old access token, socket and pairing code once another device revoked it (RFC 0009 section 2)", async () => {
     const owner = await getOwner();
     const lost = await pairDevice(owner, "Lost laptop");
     const spaceId = await createSpace(owner);
@@ -585,7 +585,7 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
     expect((await refresh(owner)).status).toBe(200);
   });
 
-  it("refuses a device that revokes itself, so the last active device of a user cannot be revoked (RFC 0007 section 5)", async () => {
+  it("refuses a device that revokes itself, so the last active device of a user cannot be revoked (RFC 0009 section 5)", async () => {
     const owner = await getOwner();
     const other = await pairDevice(owner, "Spare");
     expect(await send("/v1/devices/" + other.deviceId, { method: "DELETE", token: other.access!.token })).toEqual({ status: 403, code: Error_Code.FORBIDDEN });

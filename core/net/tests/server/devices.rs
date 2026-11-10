@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The device routes against the real Worker (RFC 0006 section 7, RFC 0007).
+//! The device routes against the real Worker (RFC 0006 section 7, RFC 0009).
 
 use flarebox_net::Auth;
 use flarebox_proto::v1::{DeviceInfo, TokenRequest, error::Code};

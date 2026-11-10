@@ -229,7 +229,7 @@ impl Api {
         .await
     }
 
-    /// `DELETE /v1/devices/{device_id}`: revokes another device of this device's user (RFC 0007). `device_id` is an ID
+    /// `DELETE /v1/devices/{device_id}`: revokes another device of this device's user (RFC 0009). `device_id` is an ID
     /// from [`Api::list_devices`]. The server refuses this device's own ID with `FORBIDDEN`.
     pub async fn revoke_device(&self, auth: &Auth, device_id: &str) -> Result<(), ApiError> {
         let path = format!("v1/devices/{device_id}");

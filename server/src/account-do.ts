@@ -378,7 +378,7 @@ export class AccountDO extends DurableObject<Env> {
 
   /**
    * DELETE /v1/devices/{device_id}: revokes one of the user's principals other than the caller's own, so the caller
-   * always stays active and the user keeps at least one device (RFC 0007 section 5). Revoking a revoked one changes
+   * always stays active and the user keeps at least one device (RFC 0009 section 5). Revoking a revoked one changes
    * nothing, but delivers the notices still pending for it.
    */
   async revokeUserDevice(args: { userId: string; callerId: string; deviceId: string }): Promise<Outcome<null>> {

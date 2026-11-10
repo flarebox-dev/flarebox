@@ -1,4 +1,4 @@
-# RFC 0007: Device revocation
+# RFC 0009: Device revocation
 
 Status: proposed. Applies to spec v0 (format_version 1). Amends RFC 0006 §7.
 
@@ -64,7 +64,7 @@ A client that wants to sign this computer out without another device at hand del
 
 ## 6. Changes to RFC 0006 §7
 
-In RFC 0006 §7, "**Revoke.**" paragraph, the sentence "A principal may revoke itself." is replaced by "A principal may not revoke itself: the request is refused with `FORBIDDEN` and changes nothing (RFC 0007 §5)."
+In RFC 0006 §7, "**Revoke.**" paragraph, the sentence "A principal may revoke itself." is replaced by "A principal may not revoke itself: the request is refused with `FORBIDDEN` and changes nothing (RFC 0009 §5)."
 
 ## 7. Clients in 0.1.0
 
