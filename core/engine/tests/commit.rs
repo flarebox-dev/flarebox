@@ -772,6 +772,88 @@ fn a_parked_file_rekeyed_for_its_edit_is_moved_out_from_where_it_was_parked() {
 }
 
 #[test]
+fn a_file_whose_s_update_waits_is_removed_or_uploaded_anew_after_a_remote_delete() {
+    for (edit, parked) in [(None, false), (None, true), (Some(2), false)] {
+        let mut trees = trees(&[synced("h", file(ROOT, "x", 9))]);
+        trees.set_remote("h".into(), remote(file(ROOT, "y", 9)));
+        trees.set_local(
+            "h".into(),
+            LocalNode {
+                parked: true,
+                ..local(file(ROOT, "x", 9), 1)
+            },
+        );
+        trees.set_local("n".into(), local(file(ROOT, "x", 1), 2));
+        trees.settle();
+        let (mut commits, mut ids, mut effects) =
+            (Commits::default(), IdGen::new(1), Effects::default());
+        let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+        assert!(matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id == "n"));
+        trees.set_remote("n".into(), remote(file(ROOT, "x", 1)));
+        acknowledge(
+            &mut commits,
+            &mut trees,
+            vec![outcome(op_result::Code::Applied)],
+        );
+        assert!(trees.waiting().contains_key("n"), "S still has h at x");
+        if let Some(digest) = edit {
+            trees.set_local("n".into(), local(file(ROOT, "x", digest), 3));
+        }
+        if parked {
+            trees.set_local(
+                "n".into(),
+                LocalNode {
+                    parked: true,
+                    ..local(file(ROOT, "x", 1), 2)
+                },
+            );
+            trees.set_local("b".into(), local(file(ROOT, "x", 5), 4));
+        }
+        trees.set_remote("n".into(), trashed(file(ROOT, "x", 1)));
+        trees.settle();
+        let mut removed = false;
+        for _ in 0..4 {
+            let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() else {
+                break;
+            };
+            if record.node == "h" {
+                effects.failed(&record.effect_id).unwrap();
+                continue;
+            }
+            assert_eq!(record.node, "n", "{record:?}");
+            removed = matches!(record.effect, Effect::RemoveFile { .. });
+            effects.done(&mut trees, &record.effect_id, None).unwrap();
+            trees.settle();
+        }
+        let commit = build(&mut commits, &mut trees, &mut ids);
+        match edit {
+            None => {
+                assert!(
+                    removed,
+                    "a file with no edit follows the delete, parked={parked}"
+                );
+                assert!(trees.local().get("n").is_none());
+                let ops = commit.map(|commit| ops(&commit)).unwrap_or_default();
+                assert!(
+                    ops.iter()
+                        .all(|op| matches!(op, op::Op::CreateFile(c) if c.node_id == "b")),
+                    "{ops:?}"
+                );
+            }
+            Some(digest) => {
+                assert!(!removed, "an edit is never removed");
+                let ops = ops(&commit.expect("the edit is uploaded"));
+                assert!(
+                    matches!(&ops[..], [op::Op::CreateFile(c)]
+                        if c.node_id != "n" && c.content == Some(content(digest))),
+                    "{ops:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn a_parked_reverted_folder_the_server_lacks_is_removed_even_when_its_name_is_taken() {
     let mut trees = trees(&[synced("h", dir(ROOT, "x"))]);
     trees.set_local(
@@ -1221,40 +1303,64 @@ fn refusal(code: error::Code, retry_after_ms: u64) -> proto::Error {
 }
 
 #[test]
-fn an_unknown_error_or_a_quota_without_a_retry_time_is_refused_and_never_resent() {
+fn a_policy_refusal_keeps_the_commit_and_outlasts_any_welcome() {
     use error::Code;
     let unknown = proto::Error {
         code: 99,
         ..Default::default()
     };
-    let cases = [
-        (unknown, Failure::Halted(Halt::Refused)),
-        (
-            refusal(Code::Unspecified, 0),
-            Failure::Halted(Halt::Refused),
-        ),
-        (
-            refusal(Code::QuotaExceeded, 0),
-            Failure::Halted(Halt::Refused),
-        ),
-        (refusal(Code::QuotaExceeded, 5_000), Failure::Resend),
-        (refusal(Code::RetryLater, 0), Failure::Resend),
+    let policy = [
+        unknown,
+        refusal(Code::Unspecified, 0),
+        refusal(Code::QuotaExceeded, 0),
+        refusal(Code::Forbidden, 0),
+        refusal(Code::InvalidArgument, 0),
+        refusal(Code::NotFound, 0),
+        refusal(Code::ConfirmationRequired, 0),
     ];
-    for (error, failure) in cases {
+    for error in policy {
         let mut trees = trees(&[("a", Some(file(ROOT, "x", 1)), None, None)]);
         let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
         let sent = build(&mut commits, &mut trees, &mut ids).unwrap();
-        assert_eq!(commits.failed(&error), Ok(failure), "{error:?}");
-        assert_eq!(commits.in_flight().unwrap().commit, sent, "{error:?}");
-        let resend = match failure {
-            Failure::Resend => Reconnect::Resend,
-            _ => Reconnect::Idle,
-        };
-        assert_eq!(commits.connected(&welcome(0)), resend, "{error:?}");
-        if failure == Failure::Halted(Halt::Refused) {
-            assert_eq!(commits.halted(), Some(Halt::Refused), "{error:?}");
-            assert_eq!(build(&mut commits, &mut trees, &mut ids), None, "{error:?}");
+        let halt = Halt::Policy { code: error.code };
+        assert_eq!(
+            commits.failed(&error),
+            Ok(Failure::Halted(halt)),
+            "{error:?}"
+        );
+        let welcomes = [
+            welcome(0),
+            welcome(1),
+            Welcome {
+                read_only: true,
+                ..welcome(0)
+            },
+            Welcome {
+                history_id: "another".into(),
+                ..welcome(0)
+            },
+        ];
+        for welcome in welcomes {
+            assert_eq!(commits.connected(&welcome), Reconnect::Idle, "{error:?}");
+            assert_eq!(commits.halted(), Some(halt), "{error:?}");
         }
+        assert!(!commits.abandon(), "{error:?}");
+        assert_eq!(commits.in_flight().unwrap().commit, sent, "{error:?}");
+        assert_eq!(build(&mut commits, &mut trees, &mut ids), None, "{error:?}");
+    }
+    for error in [
+        refusal(Code::QuotaExceeded, 5_000),
+        refusal(Code::RetryLater, 0),
+    ] {
+        let mut trees = trees(&[("a", Some(file(ROOT, "x", 1)), None, None)]);
+        let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+        build(&mut commits, &mut trees, &mut ids).unwrap();
+        assert_eq!(commits.failed(&error), Ok(Failure::Resend), "{error:?}");
+        assert_eq!(
+            commits.connected(&welcome(0)),
+            Reconnect::Resend,
+            "{error:?}"
+        );
     }
 }
 
@@ -1302,12 +1408,10 @@ fn errors_forget_the_commit_only_when_nothing_was_applied() {
         (Code::RetryLater, Failure::Resend, true),
         (Code::Unauthenticated, Failure::Resend, true),
         (Code::Internal, Failure::Resend, true),
-        (Code::InvalidArgument, Failure::Abandoned, false),
         (Code::HeadMoved, Failure::Abandoned, false),
         (Code::UnsupportedVersion, Failure::Abandoned, false),
         (Code::AheadOfServer, Failure::Resync, false),
         (Code::ReadOnly, Failure::Halted(Halt::ReadOnly), false),
-        (Code::Forbidden, Failure::Halted(Halt::ReadOnly), false),
         (Code::HistoryMismatch, Failure::Halted(Halt::Recovery), true),
         (
             Code::StaleDeviceState,
@@ -1377,4 +1481,307 @@ fn reconnecting_compares_the_device_counter_and_the_history() {
     assert_eq!(commits.halted(), Some(Halt::ReadOnly));
     assert_eq!(commits.connected(&welcome(1)), Reconnect::Resend);
     assert_eq!(commits.halted(), None);
+}
+
+/// A parked file h holds root/x in S while R has it at y. n moves to x with new content; the
+/// server applies both ops, but S cannot take n at x yet, so its update waits with content 1.
+fn a_move_and_edit_whose_s_update_waits() -> (Trees, Commits, IdGen) {
+    let mut trees = trees(&[
+        (
+            "h",
+            Some(file(ROOT, "x", 9)),
+            Some(file(ROOT, "x", 9)),
+            Some(remote(file(ROOT, "y", 9))),
+        ),
+        (
+            "n",
+            Some(file(ROOT, "x", 1)),
+            Some(file(ROOT, "old", 0)),
+            Some(remote(file(ROOT, "old", 0))),
+        ),
+    ]);
+    trees.set_local(
+        "h".into(),
+        LocalNode {
+            parked: true,
+            ..local(file(ROOT, "x", 9), 1)
+        },
+    );
+    trees.settle();
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", ROOT, "x"), update("n", 1)]);
+    trees.set_remote("n".into(), remote(file(ROOT, "x", 1)));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied); 2],
+    );
+    assert_eq!(trees.waiting().get("n"), Some(&Some(file(ROOT, "x", 1))));
+    (trees, commits, ids)
+}
+
+/// Plans and does every effect, failing none, and returns those planned for `node`. An entry an
+/// effect creates gets inode 100.
+fn effects_for(trees: &mut Trees, ids: &mut IdGen, node: &str) -> Vec<Effect> {
+    let mut effects = Effects::default();
+    let mut planned = Vec::new();
+    for _ in 0..8 {
+        let Some(record) = effects.plan(trees, ids, NOW).cloned() else {
+            break;
+        };
+        if record.node == node {
+            planned.push(record.effect.clone());
+        }
+        let created = trees.local().get(&record.node).is_none();
+        let identity = created.then_some(FileIdentity {
+            dev: 1,
+            ino: 100,
+            birth_ns: 0,
+        });
+        effects.done(trees, &record.effect_id, identity).unwrap();
+        trees.settle();
+    }
+    planned
+}
+
+/// The user puts n back where S still holds it, with the content S still holds, and the server
+/// deletes n. Against the acknowledged update that is an edit, so it is uploaded, whether the
+/// effects or a commit come first, and whether n is parked or not.
+#[test]
+fn a_waiting_file_put_back_as_s_still_holds_it_is_uploaded_after_a_remote_delete() {
+    for (effects_first, parked) in [(true, false), (true, true), (false, false)] {
+        let (mut trees, mut commits, mut ids) = a_move_and_edit_whose_s_update_waits();
+        trees.set_local(
+            "n".into(),
+            LocalNode {
+                parked,
+                ..local(file(ROOT, "old", 0), 2)
+            },
+        );
+        trees.set_remote("n".into(), trashed(file(ROOT, "x", 1)));
+        trees.settle();
+        assert_eq!(trees.class("n"), Class::Remote, "L matches S");
+        assert!(trees.edited("n"));
+        if effects_first {
+            let effects = effects_for(&mut trees, &mut ids, "n");
+            assert!(
+                effects
+                    .iter()
+                    .all(|effect| matches!(effect, Effect::Move { .. })),
+                "{effects:?}"
+            );
+            assert_eq!(trees.local().get("n").map(|node| node.parked), Some(false));
+            let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+            assert_eq!(ops(&commit), [mv("n", ROOT, "old"), update("n", 0)]);
+            continue;
+        }
+        let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+        let [op::Op::CreateFile(create)] = <[op::Op; 1]>::try_from(ops(&commit)).unwrap() else {
+            panic!("{commit:?}");
+        };
+        assert_eq!(
+            (
+                create.parent_id.as_str(),
+                create.name.as_str(),
+                create.content
+            ),
+            (ROOT, "old", Some(content(0)))
+        );
+        assert_eq!(effects_for(&mut trees, &mut ids, &create.node_id), []);
+        assert_eq!(trees.local().get(&create.node_id).unwrap().identity.ino, 2);
+    }
+}
+
+#[test]
+fn a_waiting_update_both_sides_moved_past_keeps_its_content_as_the_base_of_a_later_edit() {
+    let (mut trees, mut commits, mut ids) = a_move_and_edit_whose_s_update_waits();
+    trees.set_local("n".into(), local(file(ROOT, "z", 0), 2));
+    trees.set_remote("n".into(), remote(file(ROOT, "z", 1)));
+    trees.settle();
+    assert_eq!(effects_for(&mut trees, &mut ids, "n"), []);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("n", 0)]);
+}
+
+/// The other device moves n on and puts a new folder m where n's update would place it, while the
+/// user moves n back. The update's position is stale, so it no longer holds n out of planning, and
+/// n follows the remote move with the acknowledged content.
+#[test]
+fn a_waiting_update_whose_place_r_gave_away_does_not_hold_the_node_for_good() {
+    let (mut trees, mut commits, mut ids) = a_move_and_edit_whose_s_update_waits();
+    trees.set_local("n".into(), local(file(ROOT, "old", 1), 2));
+    trees.set_remote("n".into(), remote(file(ROOT, "q", 1)));
+    trees.set_remote("m".into(), remote(dir(ROOT, "x")));
+    trees.settle();
+    for _ in 0..3 {
+        effects_for(&mut trees, &mut ids, "");
+        assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    }
+    assert_eq!(trees.waiting(), &Default::default());
+    assert_eq!(
+        trees.local().get("n").map(|node| &node.shape),
+        Some(&file(ROOT, "q", 1))
+    );
+    assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "q", 1)));
+    assert_eq!(trees.synced().live("m"), Some(&dir(ROOT, "x")));
+}
+
+/// n is parked as it was before the update, with the content S still holds, while R has n as the
+/// update left it. Against the acknowledged update the old content is an edit, so n is only moved
+/// out of the parked directory, and the content is uploaded once the update is made.
+#[test]
+fn a_parked_waiting_file_with_the_content_s_still_holds_keeps_it() {
+    let (mut trees, mut commits, mut ids) = a_move_and_edit_whose_s_update_waits();
+    trees.set_local(
+        "n".into(),
+        LocalNode {
+            parked: true,
+            ..local(file(ROOT, "old", 0), 2)
+        },
+    );
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::Remote, "L matches S");
+    let effects = effects_for(&mut trees, &mut ids, "n");
+    assert!(
+        effects
+            .iter()
+            .all(|effect| matches!(effect, Effect::Move { .. })),
+        "{effects:?}"
+    );
+    assert_eq!(
+        trees
+            .local()
+            .get("n")
+            .map(|node| (&node.shape, node.parked)),
+        Some((&file(ROOT, "x", 0), false))
+    );
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("n", 0)]);
+}
+
+/// Both sides move n to z with the same new content while its update waits. Settling makes S
+/// take that shape, which replaces the update, so nothing is uploaded and nothing is forked.
+#[test]
+fn a_waiting_update_settling_replaced_is_not_made_afterwards() {
+    let (mut trees, mut commits, mut ids) = a_move_and_edit_whose_s_update_waits();
+    trees.set_local("n".into(), local(file(ROOT, "z", 2), 2));
+    trees.set_remote("n".into(), remote(file(ROOT, "z", 2)));
+    trees.settle();
+    assert_eq!(trees.waiting(), &Default::default());
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "z", 2)));
+}
+
+/// The server renames n's move, so n is reverted as well as waiting, and the user puts n back as
+/// S still holds it. The reverted node is moved to its R name, but its content, an edit against
+/// the acknowledged update, is neither replaced nor removed, and is uploaded once the update is
+/// made.
+#[test]
+fn a_renamed_waiting_file_put_back_as_s_still_holds_it_keeps_its_content() {
+    let mut trees = trees(&[
+        (
+            "h",
+            Some(file(ROOT, "x (2)", 9)),
+            Some(file(ROOT, "x (2)", 9)),
+            Some(remote(file(ROOT, "y", 9))),
+        ),
+        (
+            "n",
+            Some(file(ROOT, "x", 1)),
+            Some(file(ROOT, "old", 0)),
+            Some(remote(file(ROOT, "old", 0))),
+        ),
+    ]);
+    trees.set_local(
+        "h".into(),
+        LocalNode {
+            parked: true,
+            ..local(file(ROOT, "x (2)", 9), 1)
+        },
+    );
+    trees.settle();
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", ROOT, "x"), update("n", 1)]);
+    trees.set_remote("n".into(), remote(file(ROOT, "x (2)", 1)));
+    trees.set_remote("z".into(), remote(file(ROOT, "x", 8)));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![
+            OpResult {
+                name: "x (2)".into(),
+                ..outcome(op_result::Code::AppliedRenamed)
+            },
+            outcome(op_result::Code::Applied),
+        ],
+    );
+    assert!(trees.waiting().contains_key("n") && trees.reverted().contains("n"));
+    trees.set_local("n".into(), local(file(ROOT, "old", 0), 2));
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::Remote, "L matches S");
+    let effects = effects_for(&mut trees, &mut ids, "n");
+    assert!(
+        effects
+            .iter()
+            .all(|effect| matches!(effect, Effect::Move { .. })),
+        "{effects:?}"
+    );
+    assert_eq!(
+        trees.local().get("n").map(|node| &node.shape),
+        Some(&file(ROOT, "x (2)", 0))
+    );
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("n", 0)]);
+}
+
+/// n's update waits and h needs n's place on disk, so n is parked. When the driver fails to park
+/// it, the same move is not planned again until something changes.
+#[test]
+fn a_waiting_blocker_whose_parking_failed_is_not_parked_again_unchanged() {
+    let (mut trees, _, mut ids) = a_move_and_edit_whose_s_update_waits();
+    trees.set_local("n".into(), local(file(ROOT, "old", 0), 2));
+    trees.set_remote("h".into(), remote(file(ROOT, "old", 9)));
+    trees.settle();
+    let mut effects = Effects::default();
+    let first = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    assert_eq!(first.node, "n");
+    assert!(matches!(
+        first.effect,
+        Effect::Move {
+            to: Location::Parked(_),
+            ..
+        }
+    ));
+    effects.failed(&first.effect_id).unwrap();
+    assert_eq!(effects.plan(&trees, &mut ids, NOW), None);
+    assert!(effects.blocked().contains_key("n"));
+}
+
+/// Committing is halted, read-only, while n's update waits and the other device moves n on. Once
+/// the update fits, building makes it anyway, so the remote move reaches the disk while downloads
+/// go on.
+#[test]
+fn a_waiting_update_is_made_while_committing_is_halted() {
+    let (mut trees, mut commits, mut ids) = a_move_and_edit_whose_s_update_waits();
+    trees.set_remote("n".into(), remote(file(ROOT, "q", 1)));
+    trees.set_local("p".into(), local(file(ROOT, "p", 3), 3));
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id == "p"));
+    assert_eq!(
+        commits.failed(&refusal(error::Code::ReadOnly, 0)),
+        Ok(Failure::Halted(Halt::ReadOnly))
+    );
+    effects_for(&mut trees, &mut ids, "");
+    assert_eq!(trees.synced().live("h"), Some(&file(ROOT, "y", 9)));
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    assert_eq!(trees.waiting(), &Default::default());
+    assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "x", 1)));
+    effects_for(&mut trees, &mut ids, "n");
+    assert_eq!(
+        trees.local().get("n").map(|node| &node.shape),
+        Some(&file(ROOT, "q", 1))
+    );
 }

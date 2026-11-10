@@ -22,11 +22,14 @@ const SPACE_SCHEMA_DIGESTS = [
   "2d050ddef36718340cf200f56a0b9c29cc36f63f79f496b2708794f267f2c14d",
   "4f47c847b7d5734cb4a21738c70e6a8f1837c5b44e73f81115afd6c38d188aa3",
   "bace53ef766c53ef40805288c138d854ac27628cd5674daf517d2abe81547c56",
+  "857a54a49b2c3ee1fa6b96cd0aca389f4eb674174ccd90dd9de9bf1ee16c7ac2",
 ];
 const ACCOUNT_SCHEMA_DIGESTS = [
   "cdd5988fc835119f5b6ad96ebde0be7f38aac621215c10844fdb4fb99f4a7fcf",
   "2c844373f6d282297d92a724cfdc83b62a30648e517e9f34c6e5c528e5437c7d",
   "b67a86b2ae0d362375f2879afc44654cdf43a636f02849f823296d467777e3e0",
+  "81a059462fcc85e8d79e39486df0357cd8d2ca2b06c5ec5cc11b35f484b33185",
+  "b6c36eba27d26386f256dc8d64bc63f97cd5d47c47b4f328fb608a1e21b6b0f8",
 ];
 
 type Stub = DurableObjectStub<SpaceDO> | DurableObjectStub<AccountDO>;
@@ -211,4 +214,22 @@ describe("upgraded objects keep working", () => {
       expect(await stub.isClaimed()).toBe(true);
     });
   }
+
+  it("makes every device stored before RFC 0006 a full-scope device that never expires", async () => {
+    const stub = ACCOUNT.stub("principals") as DurableObjectStub<AccountDO>;
+    const deviceId = uuidv7();
+    await inObject(stub, (sql) => {
+      rewrite(sql, ACCOUNT, { label: "", applied: 3, versioned: true });
+      sql.exec(
+        "INSERT INTO devices (device_id, user_id, name, platform, created_at_ms, refresh_hash) VALUES (?, ?, 'Laptop', 'macos', 1, ?)",
+        deviceId,
+        OWNER,
+        new Uint8Array(32),
+      );
+    });
+    await evictDurableObject(stub);
+    expect(await stub.checkSession(deviceId)).toEqual({ active: true, revoked: false, closed: false, kind: "device", scope: null });
+    const row = await inObject(stub, (sql) => sql.exec("SELECT kind, scope, expires_at_ms, issued_by FROM devices WHERE device_id = ?", deviceId).one());
+    expect(row).toEqual({ kind: "device", scope: null, expires_at_ms: null, issued_by: null });
+  });
 });

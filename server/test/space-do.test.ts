@@ -59,9 +59,11 @@ describe("Space DO commits", () => {
   it("returns the stored result when a commit_id is retried", async () => {
     const { a, root } = await setup();
     const commitId = uuidv7();
-    const first = await a.commit([op.mkdir(uuidv7(), root, "Once")], { commitId });
-    const again = await a.commit([op.mkdir(uuidv7(), root, "Twice")], { commitId });
-    expect(again).toEqual(first);
+    const ops = [op.mkdir(uuidv7(), root, "Once")];
+    const first = await a.commit(ops, { commitId });
+    expect(await a.commit(ops, { commitId })).toEqual(first);
+    const other = await a.commitRaw([op.mkdir(uuidv7(), root, "Twice")], { commitId });
+    expect(other.case === "error" && other.value.code).toBe(Error_Code.INVALID_ARGUMENT);
     expect([...(await a.tree()).values()].map((node) => node.name)).not.toContain("Twice");
   });
 

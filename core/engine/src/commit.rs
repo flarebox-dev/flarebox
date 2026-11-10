@@ -45,10 +45,11 @@ pub enum Halt {
     /// The store cannot account for the server's state (sections 2.8 and 6.4). The commit in flight
     /// is kept as evidence and nothing is planned from this store.
     Recovery,
-    /// The server refused the commit with an error the engine cannot act on: a code it does not
-    /// know, `UNSPECIFIED` among them, or `QUOTA_EXCEEDED` without a retry time. The commit in
-    /// flight is kept and never resent, nothing more is planned, and downloads continue.
-    Refused,
+    /// A policy halt (RFC 0006 section 1): the server refused the commit with `code`, which only
+    /// the user or a client update can resolve. The commit in flight is kept with its slot and
+    /// never resent, nothing more is planned, and downloads continue. No `Welcome` lifts it, and
+    /// it is part of the stored state (section 2.8), so it outlasts a restart.
+    Policy { code: i32 },
 }
 
 /// What to do with the commit in flight after connecting (section 2.8, RFC 0002 section 2).
@@ -96,7 +97,6 @@ pub struct Commits {
     in_flight: Option<InFlight>,
     problems: BTreeSet<NodeId>,
     halted: Option<Halt>,
-    waiting: BTreeMap<NodeId, Option<Shape>>,
     /// The most ops the next commit holds after a `LIMIT_EXCEEDED`, doubled back towards
     /// [`MAX_OPS`] by every acknowledged commit.
     cap: Option<usize>,
@@ -133,16 +133,11 @@ impl Commits {
         self.halted
     }
 
-    /// S updates of acknowledged ops that would not leave S a valid tree yet, by node. Each is
-    /// made as soon as it fits, or dropped once S agrees with L for the node anyway; until then
-    /// the node is left out of planning.
-    pub fn waiting(&self) -> &BTreeMap<NodeId, Option<Shape>> {
-        &self.waiting
-    }
-
     /// Builds the next commit from local changes, unless one is in flight or committing has
-    /// stopped. The caller builds only when connected and caught up, with `base_seq` the
-    /// `last_seq` of R and `history_id` the history R belongs to.
+    /// stopped. While committing has stopped it still makes the waiting S updates that fit (see
+    /// [`Trees::waiting`]), so the effects plan their nodes again as downloads go on. The caller
+    /// builds only when connected and caught up, with `base_seq` the `last_seq` of R and
+    /// `history_id` the history R belongs to.
     ///
     /// Concurrent changes are rebased onto R first (section 2.4): a file whose content changed
     /// differently on both sides is forked, its local version becoming a new node that is created
@@ -168,15 +163,18 @@ impl Commits {
         history_id: &str,
         base_seq: u64,
     ) -> Option<&proto::Commit> {
-        if self.in_flight.is_some() || self.halted.is_some() {
+        if self.in_flight.is_some() {
             return None;
         }
         self.retry_waiting(trees, BTreeSet::new(), Vec::new());
+        if self.halted.is_some() {
+            return None;
+        }
         let parked = trees.local().iter().filter(|(_, node)| node.parked);
         let skip: BTreeSet<NodeId> = self
             .problems
             .iter()
-            .chain(self.waiting.keys())
+            .chain(trees.waiting().keys())
             .chain(parked.map(|(id, _)| id))
             .cloned()
             .collect();
@@ -229,7 +227,7 @@ impl Commits {
     /// the commit's slot. Returns false while there is nothing to acknowledge.
     ///
     /// S stays a valid tree. When the updates together would break it, because S still lags R
-    /// elsewhere, each is made as soon as it fits and the rest wait (see [`Commits::waiting`]).
+    /// elsewhere, each is made as soon as it fits and the rest wait (see [`Trees::waiting`]).
     pub fn acknowledge(&mut self, trees: &mut Trees, last_seq: u64) -> bool {
         let Some(flight) = self
             .in_flight
@@ -343,7 +341,7 @@ impl Commits {
             }
         }
         for (id, shape) in synced.apply(trees) {
-            self.waiting.insert(id, shape);
+            trees.wait(id, shape);
         }
         self.retry_waiting(trees, BTreeSet::new(), Vec::new());
         self.accepted = flight.commit.device_seq;
@@ -361,13 +359,12 @@ impl Commits {
         needed: BTreeSet<NodeId>,
         agreed: Vec<(NodeId, Option<Shape>)>,
     ) -> BTreeSet<NodeId> {
-        self.waiting.retain(|id, _| {
-            !same(
-                trees.synced().live(id),
-                trees.local().get(id).map(|node| &node.shape),
-            )
-        });
-        let updates = std::mem::take(&mut self.waiting)
+        let waiting: Vec<_> = trees
+            .take_waiting()
+            .into_iter()
+            .filter_map(|(id, shape)| Some((id.clone(), outstanding(trees, &id, shape)?)))
+            .collect();
+        let updates = waiting
             .into_iter()
             .chain(needed.iter().map(|id| (id.clone(), None)))
             .chain(agreed.iter().cloned())
@@ -377,7 +374,7 @@ impl Commits {
             if needed.contains(&id) {
                 still.insert(id);
             } else if !agreed.iter().any(|(other, _)| *other == id) {
-                self.waiting.insert(id, shape);
+                trees.wait(id, shape);
             }
         }
         still
@@ -385,9 +382,9 @@ impl Commits {
 
     /// What a call-level error on the commit in flight means. An error that proves nothing was
     /// applied forgets the commit; one that leaves the outcome unknown keeps it to resend; a
-    /// history mismatch or a stale device state keeps it as evidence and stops committing; and an
-    /// error the engine cannot act on refuses it (see [`Halt::Refused`]). `QUOTA_EXCEEDED` is
-    /// resent only when it names a retry time, after that wait.
+    /// history mismatch or a stale device state keeps it as evidence and stops committing; and
+    /// every other code, known or not, is a policy halt ([`Halt::Policy`], RFC 0006 section 1).
+    /// `QUOTA_EXCEEDED` is resent only when it names a retry time, after that wait.
     pub fn failed(&mut self, error: &proto::Error) -> Result<Failure, CommitError> {
         use error::Code;
         if self.in_flight.is_none() {
@@ -395,20 +392,20 @@ impl Commits {
         }
         let failure = match Code::try_from(error.code) {
             Ok(Code::HistoryMismatch | Code::StaleDeviceState) => Failure::Halted(Halt::Recovery),
-            Ok(Code::ReadOnly | Code::Forbidden) => Failure::Halted(Halt::ReadOnly),
+            Ok(Code::ReadOnly) => Failure::Halted(Halt::ReadOnly),
             Ok(Code::AheadOfServer) => Failure::Resync,
             Ok(Code::LimitExceeded) => Failure::Split,
-            Ok(Code::InvalidArgument | Code::HeadMoved | Code::UnsupportedVersion) => {
-                Failure::Abandoned
-            }
+            Ok(Code::HeadMoved | Code::UnsupportedVersion) => Failure::Abandoned,
             Ok(Code::QuotaExceeded) if error.retry_after_ms > 0 => Failure::Resend,
             Ok(Code::MissingChunks | Code::RetryLater | Code::Unauthenticated | Code::Internal) => {
                 Failure::Resend
             }
-            _ => Failure::Halted(Halt::Refused),
+            _ => Failure::Halted(Halt::Policy { code: error.code }),
         };
         match failure {
-            Failure::Halted(halt @ (Halt::Recovery | Halt::Refused)) => self.halted = Some(halt),
+            Failure::Halted(halt @ (Halt::Recovery | Halt::Policy { .. })) => {
+                self.halted = Some(halt)
+            }
             Failure::Resend => {}
             Failure::Halted(halt) => {
                 self.halted = Some(halt);
@@ -437,8 +434,11 @@ impl Commits {
 
     /// Forgets the commit in flight when the driver knows it was not applied: after
     /// `MISSING_CHUNKS` when the file changed since it was chunked (section 4.2). False when no
-    /// commit is in flight or its result has arrived.
+    /// commit is in flight, its result has arrived, or a policy halt keeps it.
     pub fn abandon(&mut self) -> bool {
+        if matches!(self.halted, Some(Halt::Policy { .. })) {
+            return false;
+        }
         self.in_flight
             .take_if(|flight| flight.result.is_none())
             .is_some()
@@ -448,9 +448,13 @@ impl Commits {
     /// 2.8). With *w* the server's counter, *w* = *a* means the commit in flight was not accepted
     /// and *w* = *a* + 1 that it was and its response was lost; both resend it unchanged, and
     /// the server answers an accepted one with its stored result. Any other *w*, or a commit
-    /// built in another history, starts recovery. A read-only or refused device resends nothing. Whether R
-    /// itself belongs to the `Welcome`'s history is checked where R is kept.
+    /// built in another history, starts recovery. A read-only device resends nothing, and a
+    /// device under a policy halt resends nothing whatever the `Welcome` says. Whether R itself
+    /// belongs to the `Welcome`'s history is checked where R is kept.
     pub fn connected(&mut self, welcome: &proto::Welcome) -> Reconnect {
+        if matches!(self.halted, Some(Halt::Policy { .. })) {
+            return Reconnect::Idle;
+        }
         let (a, w) = (self.accepted, welcome.device_seq);
         let reconnect = match &self.in_flight {
             _ if self.halted == Some(Halt::Recovery) => Reconnect::Recovery,
@@ -463,9 +467,6 @@ impl Commits {
         if reconnect == Reconnect::Recovery {
             self.halted = Some(Halt::Recovery);
             return reconnect;
-        }
-        if self.halted == Some(Halt::Refused) {
-            return Reconnect::Idle;
         }
         if welcome.read_only {
             self.halted = Some(Halt::ReadOnly);
@@ -588,7 +589,8 @@ fn rebase(
 ) -> (BTreeSet<NodeId>, Vec<(NodeId, Option<Shape>)>) {
     let dirty: Vec<NodeId> = trees.dirty().iter().cloned().collect();
     for id in &dirty {
-        if trees.reverted().contains(id) && trees.remote().live(id).is_none() && trees.edited(id) {
+        let held = trees.reverted().contains(id) || trees.waiting().contains_key(id);
+        if held && trees.remote().live(id).is_none() && trees.edited(id) {
             rekey(trees, id, &ids.uuid_v7(now_ms));
         }
     }
@@ -700,6 +702,29 @@ fn keep(trees: &mut Trees, id: &str, needed: &mut BTreeSet<NodeId>) {
         }
         current = parent;
     }
+}
+
+/// What is left of a waiting S update. Its position is stale once R no longer has the node there
+/// and L has left it too: it then falls back to the position S holds, or to R's when S does not
+/// hold the node, so L's and R's positions are compared with the S they came from, as for any
+/// change both sides made. Its content stays, so the acknowledged content remains the base L's
+/// content is compared with. None when nothing is left: the update comes to what S holds, or
+/// neither L nor R holds the node.
+fn outstanding(trees: &Trees, id: &str, waiting: Option<Shape>) -> Option<Option<Shape>> {
+    let local = trees.local().get(id).map(|node| &node.shape);
+    let synced = trees.synced().live(id);
+    let Some(remote) = trees.remote().live(id) else {
+        return local.is_some().then_some(waiting);
+    };
+    let Some(mut left) = waiting else {
+        return Some(None);
+    };
+    if !left.same_position(remote) && !local.is_some_and(|local| local.same_position(&left)) {
+        let base = synced.unwrap_or(remote);
+        left.parent = base.parent.clone();
+        left.name = base.name.clone();
+    }
+    (synced != Some(&left)).then_some(Some(left))
 }
 
 /// The bytes a change record of a node with this shape takes, roughly.

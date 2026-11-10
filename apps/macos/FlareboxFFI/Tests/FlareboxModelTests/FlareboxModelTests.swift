@@ -69,15 +69,13 @@ private func item(_ path: String) -> HeldItem {
         #expect(model.state.status == .stopped)
     }
 
-    @Test func unansweredQuestionsAreUnseenAfterARelaunch() throws {
-        let directory = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: directory) }
-        var model = AppModel.fake(stateDirectory: directory, scenario: .recovery)
+    @Test func unansweredQuestionsAreUnseenAtLaunch() throws {
+        var model = AppModel.fake(scenario: .recovery)
         model.markQuestionsSeen()
         #expect(!model.hasUnseenQuestions)
         let questions = model.state.questions
 
-        model = AppModel.fake(stateDirectory: directory)
+        model = AppModel(session: model.session, events: AsyncStream { $0.finish() })
         #expect(model.state.questions == questions)
         #expect(model.unseenQuestionIDs == Set(questions.map(\.id)))
         model.markQuestionsSeen()

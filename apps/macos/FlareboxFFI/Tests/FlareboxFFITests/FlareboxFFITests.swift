@@ -41,7 +41,7 @@ private final class Recorder: SessionListener {
 
 @Test func sessionStreamsEachStatusChange() throws {
     let recorder = Recorder()
-    let session = SyncSession.fake(listener: recorder, stateDir: nil)
+    let session = SyncSession.fake(listener: recorder)
     #expect(session.state().status == .stopped)
 
     session.start()
@@ -55,7 +55,7 @@ private final class Recorder: SessionListener {
 }
 
 @Test func signInAndLinkAFolder() throws {
-    let session = SyncSession.fake(listener: Recorder(), stateDir: nil)
+    let session = SyncSession.fake(listener: Recorder())
     let fake = try #require(session.fakeCore())
     fake.failNext(error: .ServerUnreachable(reason: "timed out"))
     #expect(throws: SessionError.ServerUnreachable(reason: "timed out")) {
@@ -79,7 +79,7 @@ private final class Recorder: SessionListener {
 }
 
 @Test func questionsTakeOnlyTheirOwnAnswers() throws {
-    let session = SyncSession.fake(listener: Recorder(), stateDir: nil)
+    let session = SyncSession.fake(listener: Recorder())
     let fake = try #require(session.fakeCore())
     try fake.loadScenario(scenario: .recovery)
     let questions = session.state().questions
@@ -100,7 +100,7 @@ private final class Recorder: SessionListener {
 }
 
 @Test func noticesDevicesAndSaveFailuresAreTyped() throws {
-    let session = SyncSession.fake(listener: Recorder(), stateDir: nil)
+    let session = SyncSession.fake(listener: Recorder())
     let fake = try #require(session.fakeCore())
     try fake.loadScenario(scenario: .remoteMassDelete)
     #expect(try session.devices() == .unavailable)
@@ -125,17 +125,26 @@ private final class Recorder: SessionListener {
     #expect(session.state().problems.isEmpty)
 }
 
-@Test func unansweredQuestionsSurviveARelaunch() throws {
+@Test func theDriverSessionHoldsItsProfileAndKeepsThePause() throws {
     let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: directory) }
-    var (session, _) = SyncSession.fakeWithEventStream(stateDirectory: directory)
-    try #require(session.fakeCore()).loadScenario(scenario: .massDelete)
-    let asked = session.state().questions
-    #expect(asked.count == 1)
-    #expect(asked[0].items.count == 14)
+    var session: SyncSession? = try SyncSession.openWithEventStream(profileDirectory: directory).0
+    #expect(throws: SessionError.ProfileInUse) {
+        _ = try SyncSession.openWithEventStream(profileDirectory: directory)
+    }
+    session?.start()
+    #expect(session?.state().status == .needsSetup)
+    #expect(throws: SessionError.NotSignedIn) { try session?.spaces() }
+    try session?.pause()
+    #expect(session?.state().status == .paused)
 
-    (session, _) = SyncSession.fakeWithEventStream(stateDirectory: directory)
-    #expect(session.state().questions == asked)
+    session = nil
+    let reopened = try SyncSession.openWithEventStream(profileDirectory: directory).0
+    #expect(reopened.state().status == .stopped)
+    reopened.start()
+    #expect(reopened.state().status == .paused)
+    try reopened.resume()
+    #expect(reopened.state().status == .needsSetup)
 }
 
 @Test(.timeLimit(.minutes(1)))

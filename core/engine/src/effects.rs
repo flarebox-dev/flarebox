@@ -160,9 +160,10 @@ impl Effects {
     /// or that is parked, gets the effect that makes L equal to R when it applies to L as it is:
     /// its parent is a directory there, no other entry there holds its name key, and a move does
     /// not go into the node's own subtree. A directory is removed only once it is empty. When no
-    /// such effect applies, a node that blocks one is parked, if it has a remote change of its
-    /// own: the entry holding a name, or a directory that would move into its own subtree. A
-    /// rename that changes only case or normalization goes through the parked directory too.
+    /// such effect applies, a node that blocks one is parked, if it is a candidate itself or its S
+    /// update waits ([`Trees::waiting`]), since the commit layer does not plan it either: the
+    /// entry holding a name, or a directory that would move into its own subtree. A rename that
+    /// changes only case or normalization goes through the parked directory too.
     ///
     /// A parked node with a local change, such as an edit observed in the parked directory, is
     /// only moved out: to its R position, or to the position L keeps for it when R has none. Its
@@ -171,7 +172,8 @@ impl Effects {
         if self.in_flight.is_some() {
             return None;
         }
-        self.failed.retain(|id, _| candidate(trees, id));
+        self.failed
+            .retain(|id, _| candidate(trees, id) || trees.waiting().contains_key(id));
         let view = View::new(trees);
         let mut blockers = BTreeSet::new();
         let mut chosen = None;
@@ -193,7 +195,10 @@ impl Effects {
         }
         let (node, effect, after) = chosen.or_else(|| {
             blockers.into_iter().find_map(|id| {
-                if !candidate(trees, &id) || trees.local().get(&id).is_none_or(|node| node.parked) {
+                let waiting = trees.waiting().contains_key(&id);
+                if !(candidate(trees, &id) || waiting)
+                    || trees.local().get(&id).is_none_or(|node| node.parked)
+                {
                     return None;
                 }
                 let (effect, after) = view.park(&id)?;
@@ -266,14 +271,25 @@ impl Effects {
     }
 }
 
-/// A node the planner considers: one whose only change is remote, one that is parked, or one whose
-/// local position is reverted. A reverted node that R no longer has is removed only when it holds
-/// no unuploaded edit; otherwise the commit layer makes it a new node, so the edit is uploaded.
+/// A node the planner considers: one whose only change is remote, one that is parked, one whose
+/// local position is reverted, or one whose S update waits and that R no longer has. A reverted or
+/// waiting node that R no longer has is removed only when it holds no unuploaded edit; otherwise
+/// the commit layer makes it a new node, so the edit is uploaded.
 fn candidate(trees: &Trees, id: &str) -> bool {
-    trees.class(id) == Class::Remote
+    remote_only(trees, id)
         || trees.local().get(id).is_some_and(|node| node.parked)
         || (trees.reverted().contains(id)
             && (trees.remote().live(id).is_some() || !trees.edited(id)))
+        || (trees.waiting().contains_key(id)
+            && trees.remote().live(id).is_none()
+            && !trees.edited(id))
+}
+
+/// Whether the node's only change is remote. While its S update waits, [`Class::Remote`] means L
+/// still matches the S that the update replaces, so L differs from the acknowledged shape: the
+/// change is local, and the node holds an edit ([`Trees::edited`]) whenever the content differs.
+fn remote_only(trees: &Trees, id: &str) -> bool {
+    trees.class(id) == Class::Remote && !trees.waiting().contains_key(id)
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -310,8 +326,10 @@ impl<'a> View<'a> {
             (None, None) => return Step::Skip,
             (Some(local), None)
                 if local.parked
-                    && self.trees.class(id) != Class::Remote
-                    && (!self.trees.reverted().contains(id) || self.trees.edited(id)) =>
+                    && !remote_only(self.trees, id)
+                    && (!(self.trees.reverted().contains(id)
+                        || self.trees.waiting().contains_key(id))
+                        || self.trees.edited(id)) =>
             {
                 return self.unpark(id, local, &local.shape);
             }
@@ -343,9 +361,7 @@ impl<'a> View<'a> {
             return Step::Skip;
         }
         let rewrite = match (&local.shape.content, &remote.content) {
-            (Some(old), Some(new)) => {
-                !same_content(old, new) && self.trees.class(id) == Class::Remote
-            }
+            (Some(old), Some(new)) => !same_content(old, new) && remote_only(self.trees, id),
             _ => false,
         };
         let moved = local.parked || !local.shape.same_position(remote);

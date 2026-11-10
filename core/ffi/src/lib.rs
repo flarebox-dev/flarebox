@@ -6,10 +6,11 @@
 //! engine's inputs and outputs (docs/design/sync-engine.md §1): session lifecycle, server and
 //! device sign-in, linking folders to spaces, a stream of [`SessionEvent`]s for status,
 //! progress and recent changes, the engine's questions with typed [`Answer`]s, its notices and
-//! its problems. Until the driver that runs the engine exists, sessions are backed by [`FakeCore`],
-//! which plays back scripted states.
+//! its problems. [`SyncSession::open`] runs the sync driver of `core/driver` on a profile;
+//! [`SyncSession::fake`] runs [`FakeCore`], which plays back scripted states for previews and tests.
 
 mod core;
+mod driver;
 mod fake;
 mod session;
 mod types;
@@ -44,7 +45,7 @@ mod tests {
     #[test]
     fn session_forwards_to_its_core_and_streams_events() {
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let session = SyncSession::fake(Box::new(Recorder(seen.clone())), None);
+        let session = SyncSession::fake(Box::new(Recorder(seen.clone())));
         assert_eq!(session.state().status, SyncStatus::Stopped);
         session.start();
         session
@@ -88,7 +89,7 @@ mod tests {
     #[test]
     fn dropping_the_session_drops_the_listener_even_while_the_fake_lives() {
         let dropped = Arc::new(AtomicBool::new(false));
-        let session = SyncSession::fake(Box::new(DropFlag(dropped.clone())), None);
+        let session = SyncSession::fake(Box::new(DropFlag(dropped.clone())));
         let fake = session.fake_core().unwrap();
         session.start();
         assert!(!dropped.load(Ordering::SeqCst));

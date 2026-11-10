@@ -7,6 +7,7 @@ import {
   ClaimRequestSchema,
   CreateSpaceRequestSchema,
   DeviceCredentialsSchema,
+  DeviceListSchema,
   PairCompleteRequestSchema,
   PairStartResponseSchema,
   RewindRequestSchema,
@@ -22,6 +23,7 @@ import { Error_Code } from "./gen/flarebox/v1/rpc_pb";
 import { BadRequest, errorReply, readMessage, reply } from "./http";
 import { type ChunkObject, deriveSpaceKey, signChunkGrant, verifyChunkGrant } from "./crypto";
 import { fromHex, isUuidV7 } from "./ids";
+import { type Capability, policy } from "./policy";
 import { shareRoute } from "./share/routes";
 import { CONNECT_HEADER, type Connect, GRANT_MS, MAX_CHUNK_BYTES, MAX_CLIENT_FRAME } from "./space-do";
 import { chunkKey, INCARNATION } from "./space/store";
@@ -51,7 +53,10 @@ function key(env: Env): Promise<ServerKey> {
   return cached;
 }
 
-/** Checks the access token and the device. With a space, it also refuses a space that a rewind holds closed (RFC 0003 section 4). */
+/**
+ * Checks the access token and the device, whose current row gives the identity its kind and scope (RFC 0006 section 2).
+ * With a space, it also refuses a space that a rewind holds closed (RFC 0003 section 4).
+ */
 async function authenticate(request: Request, env: Env, spaceId?: string): Promise<Identity | Response> {
   const token = bearerToken(request);
   const identity = token ? await verifyAccessToken(await key(env), token, Date.now()) : undefined;
@@ -59,7 +64,30 @@ async function authenticate(request: Request, env: Env, spaceId?: string): Promi
   const check = await account(env).checkSession(identity.deviceId, spaceId);
   if (!check.active) return errorReply(request, Error_Code.UNAUTHENTICATED, "this device was revoked");
   if (check.closed) return errorReply(request, Error_Code.RETRY_LATER, "the space is being rewound; retry later", 503);
-  return identity;
+  return { ...identity, kind: check.kind, scope: check.scope };
+}
+
+/** Refuses an action the principal lacks the capability for (RFC 0006 section 3), or returns undefined. */
+function refuseWithout(request: Request, identity: Identity, capability: Capability): Response | undefined {
+  if (policy.can(identity, capability)) return undefined;
+  return errorReply(request, Error_Code.FORBIDDEN, `this device may not use ${capability}`);
+}
+
+/** GET /v1/devices and DELETE /v1/devices/{device_id} (RFC 0006 section 7). */
+async function devices(request: Request, env: Env, deviceId: string | undefined): Promise<Response> {
+  const identity = await authenticate(request, env);
+  if (identity instanceof Response) return identity;
+  const refused = refuseWithout(request, identity, "device.manage");
+  if (refused) return refused;
+  if (deviceId === undefined && request.method === "GET") {
+    const cursor = new URL(request.url).searchParams.get("cursor") ?? "";
+    return reply(request, DeviceListSchema, await account(env).listDevices({ userId: identity.userId, callerId: identity.deviceId, cursor }));
+  }
+  if (deviceId !== undefined && request.method === "DELETE") {
+    const outcome = await account(env).revokeUserDevice({ userId: identity.userId, deviceId });
+    return outcome.ok ? new Response(null, { status: 204 }) : errorReply(request, outcome.code, outcome.message);
+  }
+  return new Response("Method Not Allowed", { status: 405 });
 }
 
 /** HTTP statuses of the rewind endpoint's errors (RFC 0003 section 1). */
@@ -68,6 +96,8 @@ const REWIND_STATUS: Partial<Record<Error_Code, number>> = { [Error_Code.HISTORY
 async function rewind(request: Request, env: Env, spaceId: string): Promise<Response> {
   const identity = await authenticate(request, env);
   if (identity instanceof Response) return identity;
+  const refused = refuseWithout(request, identity, "space.rewind");
+  if (refused) return refused;
   const body = await readMessage(request, RewindRequestSchema);
   const outcome = await account(env).rewind({
     userId: identity.userId,
@@ -141,7 +171,10 @@ async function route(request: Request, env: Env): Promise<Response> {
   const path = url.pathname;
   const method = request.method;
 
-  const shared = await shareRoute(request, env, () => authenticate(request, env));
+  const shared = await shareRoute(request, env, async () => {
+    const identity = await authenticate(request, env);
+    return identity instanceof Response ? identity : (refuseWithout(request, identity, "share.manage") ?? identity);
+  });
   if (shared) return shared;
 
   if (method === "GET" && path === "/v1/server") {
@@ -192,12 +225,17 @@ async function route(request: Request, env: Env): Promise<Response> {
   const rewindRoute = /^\/v1\/spaces\/([0-9a-f-]{36})\/rewind$/.exec(path);
   if (rewindRoute && method === "POST" && isUuidV7(rewindRoute[1]!)) return rewind(request, env, rewindRoute[1]!);
 
+  const devicesRoute = /^\/v1\/devices(?:\/([0-9a-f-]{36}))?$/.exec(path);
+  if (devicesRoute) return devices(request, env, devicesRoute[1]);
+
   const spaceRoute = /^\/v1\/spaces\/([0-9a-f-]{36})\/(ws|rpc)$/.exec(path);
   if (path !== "/v1/pair/start" && path !== "/v1/spaces" && !spaceRoute) return new Response("Not Found", { status: 404 });
   const identity = await authenticate(request, env, spaceRoute && isUuidV7(spaceRoute[1]!) ? spaceRoute[1]! : undefined);
   if (identity instanceof Response) return identity;
 
   if (method === "POST" && path === "/v1/pair/start") {
+    const refused = refuseWithout(request, identity, "device.pair");
+    if (refused) return refused;
     const outcome = await account(env).startPairing(identity.deviceId);
     if (!outcome.ok) return errorReply(request, outcome.code, outcome.message);
     const started = create(PairStartResponseSchema, { code: outcome.value.code, expiresAtMs: BigInt(outcome.value.expiresAtMs) });
@@ -210,6 +248,8 @@ async function route(request: Request, env: Env): Promise<Response> {
       return reply(request, SpaceListSchema, create(SpaceListSchema, { spaces: spaces.map((s) => create(SpaceInfoSchema, s)) }));
     }
     if (method === "POST") {
+      const refused = refuseWithout(request, identity, "space.create");
+      if (refused) return refused;
       const body = await readMessage(request, CreateSpaceRequestSchema);
       const created = await account(env).createSpace({ userId: identity.userId, name: body.name });
       return reply(request, SpaceInfoSchema, create(SpaceInfoSchema, created), 201);

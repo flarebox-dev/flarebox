@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The interface between the app's session and whatever syncs: [`FakeCore`](crate::FakeCore)
-//! now, the driver that runs the engine later. The app only talks to [`SyncSession`](crate::SyncSession),
-//! which forwards to a [`Core`], so replacing the fake changes no app code.
+//! The interface between the app's session and whatever syncs: the sync driver, or
+//! [`FakeCore`](crate::FakeCore) for previews and tests. The app only talks to
+//! [`SyncSession`](crate::SyncSession), which forwards to a [`Core`], so either runs the same app code.
 
 use std::sync::{Arc, Weak};
 
@@ -107,4 +107,9 @@ pub trait Core: Send + Sync {
     fn answer(&self, question_id: &str, answer: Answer) -> Result<(), SessionError>;
     /// Dismisses a notice.
     fn dismiss_notice(&self, notice_id: &str) -> Result<(), SessionError>;
+
+    /// Stops syncing and releases what the core holds outside memory, such as the lock on this
+    /// device's sync state, so that the state can be opened again at once. The session calls it
+    /// when it is dropped; no other call follows.
+    fn close(&self) {}
 }

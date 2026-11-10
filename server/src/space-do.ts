@@ -51,10 +51,13 @@ import {
   VersionChunksSchema,
   VersionListSchema,
 } from "./gen/flarebox/v1/rpc_pb";
+import type { SessionCheck } from "./account-do";
 import { type Identity, verifyAccessToken } from "./auth";
 import { type ChunkObject, sha256, signChunkGrant, verifyChunkGrant } from "./crypto";
 import { fromHex, isUuidV7, toHex, uuidv7 } from "./ids";
+import { policy } from "./policy";
 import { type ApplyContext, CallFailure, CommitApplier } from "./space/commit";
+import { commitDigest } from "./space/digest";
 import { bootstrapExport, descriptorDurable, Exporter, noteCommitted, startExport } from "./space/export";
 import type { ShareInfo, ShareListing } from "./gen/flarebox/v1/share_pb";
 import type { ShareOutcome } from "./share/links";
@@ -154,6 +157,9 @@ export interface Session {
   deviceId: string;
   userId: string;
   deviceName: string;
+  /** The principal's kind and scope, from its row in the Account DO (RFC 0006 section 2). */
+  kind: string;
+  scope: string | null;
   role: Role;
   maxFormat: number;
   /** Public origin of the deployment, used to build chunk URLs. */
@@ -363,9 +369,9 @@ export class SpaceDO extends DurableObject<Env> {
     if (!check.active) return refuse(Error_Code.UNAUTHENTICATED, "device revoked");
     if (check.closed) return refuse(Error_Code.RETRY_LATER, "the space is being rewound; retry later");
     const device = this.sql.exec("SELECT max_format FROM devices WHERE device_id = ?", connect.identity.deviceId).toArray()[0];
-    const session = this.sessionOf(connect, role, device ? Number(device.max_format) : FORMAT_VERSION);
+    const session = this.sessionOf(connect, role, device ? Number(device.max_format) : FORMAT_VERSION, check);
     const { response, record } = await this.call(session, req);
-    if (record) this.broadcast(record);
+    if (record) await this.broadcast(record);
     return toBinary(RpcResponseSchema, response);
   }
 
@@ -410,9 +416,9 @@ export class SpaceDO extends DurableObject<Env> {
     if (!attachment.hello) return this.goodbye(ws, Close.PROTOCOL, "Hello must come first");
     if (msg.case === "resume") return this.resume(ws, attachment, msg.value);
     if (msg.case === "rpc") {
-      const { response, record } = await this.call(this.sessionOf(attachment, attachment.role, attachment.maxFormat), msg.value);
+      const { response, record } = await this.call(this.sessionOf(attachment, attachment.role, attachment.maxFormat, check), msg.value);
       this.send(ws, { case: "rpc", value: response });
-      if (record) this.broadcast(record, attachment.connId);
+      if (record) await this.broadcast(record, attachment.connId);
       return;
     }
     return this.goodbye(ws, Close.PROTOCOL, "empty ClientMessage");
@@ -443,8 +449,8 @@ export class SpaceDO extends DurableObject<Env> {
    * DO cannot answer; the error is caught inside the callback, because an exception there would reset this object and
    * drop every connection.
    */
-  private async checkDevice(deviceId: string): Promise<{ active: boolean; closed: boolean } | undefined> {
-    if (this.revoked(deviceId)) return { active: false, closed: false };
+  private async checkDevice(deviceId: string): Promise<SessionCheck | undefined> {
+    if (this.revoked(deviceId)) return { active: false, revoked: true, closed: false, kind: "", scope: null };
     const account = this.account();
     const spaceId = String(getMeta(this.sql, "space_id"));
     const check = await this.ctx.blockConcurrencyWhile(async () => {
@@ -455,8 +461,37 @@ export class SpaceDO extends DurableObject<Env> {
         return undefined;
       }
     });
-    if (check?.active === false) this.recordRevoked(deviceId);
+    if (check?.revoked) this.recordRevoked(deviceId);
     return check;
+  }
+
+  /**
+   * checkDevice for every device with a live connection, in one Account DO call, so that a push reaches only principals
+   * that may still read the space. Returns undefined when the Account DO cannot answer.
+   */
+  private async checkDevices(deviceIds: string[]): Promise<Map<string, SessionCheck> | undefined> {
+    const checks = new Map<string, SessionCheck>();
+    const unknown = deviceIds.filter((deviceId) => {
+      if (this.revoked(deviceId)) checks.set(deviceId, { active: false, revoked: true, closed: false, kind: "", scope: null });
+      return !checks.has(deviceId);
+    });
+    if (unknown.length === 0) return checks;
+    const account = this.account();
+    const spaceId = String(getMeta(this.sql, "space_id"));
+    const answered = await this.ctx.blockConcurrencyWhile(async () => {
+      try {
+        return await account.checkSessions(unknown, spaceId);
+      } catch (error) {
+        console.error("account device check failed", error);
+        return undefined;
+      }
+    });
+    if (!answered) return undefined;
+    for (const [deviceId, check] of Object.entries(answered)) {
+      if (check.revoked) this.recordRevoked(deviceId);
+      checks.set(deviceId, check);
+    }
+    return checks;
   }
 
   /** A rewind of this space has written its marker and not yet restored or aborted (RFC 0003 section 3). */
@@ -480,9 +515,10 @@ export class SpaceDO extends DurableObject<Env> {
     return row ? (String(row.role) as Role) : undefined;
   }
 
-  private sessionOf(connect: Connect, role: Role, maxFormat: number): Session {
+  /** The caller of one request: the kind and scope come from the device check, whatever the token claims. */
+  private sessionOf(connect: Connect, role: Role, maxFormat: number, { kind, scope }: SessionCheck): Session {
     const { identity, origin } = connect;
-    return { deviceId: identity.deviceId, userId: identity.userId, deviceName: identity.deviceName, role, maxFormat, origin };
+    return { deviceId: identity.deviceId, userId: identity.userId, deviceName: identity.deviceName, kind, scope, role, maxFormat, origin };
   }
 
   /** Sends one ServerMessage; a socket this server already closed gets nothing. */
@@ -501,15 +537,32 @@ export class SpaceDO extends DurableObject<Env> {
   }
 
   /** Pushes a new commit to every caught-up connection except the one that made it. */
-  private broadcast(record: CommitRecord, exceptConnId?: string): void {
-    const frame = toBinary(ServerMessageSchema, create(ServerMessageSchema, { msg: { case: "changes", value: { commits: [record] } } }));
-    for (const ws of this.ctx.getWebSockets()) {
+  /**
+   * Pushes a commit to the live connections, checking each principal first (RFC 0006 section 7): a connection whose
+   * principal was revoked, expired or became unknown is closed with 4003 instead, and every connection is closed with
+   * 1013 when the Account DO cannot answer. A closed connection catches up with Resume when it reconnects.
+   */
+  private async broadcast(record: CommitRecord, exceptConnId?: string): Promise<void> {
+    const sockets = this.ctx.getWebSockets().filter((ws) => {
       const attachment = ws.deserializeAttachment() as Attachment;
-      if (!attachment.live || attachment.connId === exceptConnId) continue;
-      try {
-        ws.send(frame);
-      } catch {
-        // The socket is closing; the client catches up with Resume when it reconnects.
+      return attachment.live && attachment.connId !== exceptConnId;
+    });
+    if (sockets.length === 0) return;
+    const deviceIds = [...new Set(sockets.map((ws) => (ws.deserializeAttachment() as Attachment).identity.deviceId))];
+    const checks = await this.checkDevices(deviceIds);
+    const frame = toBinary(ServerMessageSchema, create(ServerMessageSchema, { msg: { case: "changes", value: { commits: [record] } } }));
+    for (const ws of sockets) {
+      if (ws.readyState !== WebSocket.OPEN) continue;
+      const check = checks?.get((ws.deserializeAttachment() as Attachment).identity.deviceId);
+      if (!check) this.goodbye(ws, Close.TRY_AGAIN_LATER, "could not check the device; reconnect later");
+      else if (!check.active) this.goodbye(ws, Close.DEVICE_REVOKED, "device revoked");
+      else if (check.closed) this.goodbye(ws, Close.SPACE_REWOUND, "the space is being rewound");
+      else {
+        try {
+          ws.send(frame);
+        } catch {
+          // The socket is closing; the client catches up with Resume when it reconnects.
+        }
       }
     }
   }
@@ -675,12 +728,20 @@ export class SpaceDO extends DurableObject<Env> {
     }
   }
 
-  /** The result stored for a commit, in the log or as its device's latest accepted commit (RFC 0002 section 2). */
-  private storedResult(commitId: string): CommitResult | undefined {
+  /**
+   * The result stored for a commit, in the log or as its device's latest accepted commit (RFC 0002 section 2), with the
+   * device that made it and the digest of its request, which rows stored before RFC 0006 lack.
+   */
+  private storedResult(commitId: string): { result: CommitResult; deviceId: string; digest: Uint8Array | null } | undefined {
     const row =
-      this.sql.exec("SELECT results FROM commits WHERE commit_id = ?", commitId).toArray()[0] ??
-      this.sql.exec("SELECT results FROM device_commits WHERE commit_id = ?", commitId).toArray()[0];
-    return row ? fromBinary(CommitResultSchema, new Uint8Array(row.results as ArrayBuffer)) : undefined;
+      this.sql.exec("SELECT results, device_id, request_digest FROM commits WHERE commit_id = ?", commitId).toArray()[0] ??
+      this.sql.exec("SELECT results, device_id, request_digest FROM device_commits WHERE commit_id = ?", commitId).toArray()[0];
+    if (!row) return undefined;
+    return {
+      result: fromBinary(CommitResultSchema, new Uint8Array(row.results as ArrayBuffer)),
+      deviceId: String(row.device_id ?? ""),
+      digest: row.request_digest === null ? null : new Uint8Array(row.request_digest as ArrayBuffer),
+    };
   }
 
   private acceptedDeviceSeq(deviceId: string): bigint {
@@ -690,12 +751,17 @@ export class SpaceDO extends DurableObject<Env> {
 
   /**
    * RFC 0002 section 3, steps 1 to 4: the history fence, the stored result, the device counter and the base.
-   * Returns the stored result of a commit that was already accepted; throws for a refused one.
+   * Returns the stored result of a commit that was already accepted; throws for a refused one. A stored result is
+   * returned only to the device that made the commit, for the same request (RFC 0006 section 8).
    */
-  private checkCommitOrder(deviceId: string, commit: Commit): CommitResult | undefined {
+  private checkCommitOrder(deviceId: string, commit: Commit, digest: Uint8Array): CommitResult | undefined {
     if (commit.historyId !== getMeta(this.sql, "history_id")) fail(Error_Code.HISTORY_MISMATCH, "the commit was built in another history of this space");
     const stored = this.storedResult(commit.commitId);
-    if (stored) return stored;
+    if (stored) {
+      if (stored.deviceId !== deviceId) fail(Error_Code.INVALID_ARGUMENT, "commit_id belongs to a commit of another device");
+      if (stored.digest && !sameBytes(stored.digest, digest)) fail(Error_Code.INVALID_ARGUMENT, "commit_id belongs to a different commit");
+      return stored.result;
+    }
     const accepted = this.acceptedDeviceSeq(deviceId);
     if (commit.deviceSeq === 0n) fail(Error_Code.INVALID_ARGUMENT, "device_seq is required");
     if (commit.deviceSeq <= accepted) {
@@ -708,7 +774,8 @@ export class SpaceDO extends DurableObject<Env> {
     return undefined;
   }
 
-  private appendCommit(record: CommitRecord, result: CommitResult): void {
+  /** Appends a commit to the log; digest is that of the device's request, and null for a commit the server makes. */
+  private appendCommit(record: CommitRecord, result: CommitResult, digest: Uint8Array | null): void {
     const recordBytes = toBinary(CommitRecordSchema, record);
     const resultBytes = toBinary(CommitResultSchema, result);
     const pushed = toBinary(ServerMessageSchema, create(ServerMessageSchema, { msg: { case: "changes", value: { commits: [record] } } }));
@@ -720,7 +787,7 @@ export class SpaceDO extends DurableObject<Env> {
       fail(Error_Code.LIMIT_EXCEEDED, "the commit's change records do not fit in one 1 MiB message; split the commit");
     }
     this.sql.exec(
-      "INSERT INTO commits (seq, commit_id, device_id, user_id, committed_at_ms, record, results) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO commits (seq, commit_id, device_id, user_id, committed_at_ms, record, results, request_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
       Number(record.seq),
       record.commitId,
       record.deviceId,
@@ -728,12 +795,14 @@ export class SpaceDO extends DurableObject<Env> {
       Number(record.committedAtMs),
       recordBytes,
       resultBytes,
+      digest,
     );
     setMeta(this.sql, "head_seq", Number(record.seq));
   }
 
   private async commit(session: Session, commit: Commit): Promise<{ result: CommitResult; record?: CommitRecord }> {
-    const stored = this.checkCommitOrder(session.deviceId, commit);
+    const digest = await commitDigest(commit);
+    const stored = this.checkCommitOrder(session.deviceId, commit, digest);
     if (stored) {
       // The accepted attempt may have failed to set the alarm after its transaction.
       await this.armAfterCommit();
@@ -761,7 +830,7 @@ export class SpaceDO extends DurableObject<Env> {
     const done = this.ctx.storage.transactionSync((): { result: CommitResult; record?: CommitRecord; rearm?: boolean } => {
       if (this.revoked(session.deviceId)) fail(Error_Code.UNAUTHENTICATED, "device revoked");
       this.checkOpen();
-      const again = this.checkCommitOrder(session.deviceId, commit);
+      const again = this.checkCommitOrder(session.deviceId, commit, digest);
       if (again) return { result: again };
       const head = this.headSeq;
 
@@ -784,8 +853,13 @@ export class SpaceDO extends DurableObject<Env> {
         baseSeq: Number(commit.baseSeq),
         nowMs,
         committer: { deviceId: session.deviceId, userId: session.userId, deviceName: session.deviceName },
+        authorize: (op, effect) => policy.authorize(session, op, effect),
       };
-      const { results, changes } = new CommitApplier(this.sql, ctx).apply(commit.ops);
+      const applier = new CommitApplier(this.sql, ctx);
+      const { results, changes } = applier.apply(commit.ops);
+      if (!policy.deletes(session, this.spaceId, applier.trashedFiles())) {
+        fail(Error_Code.CONFIRMATION_REQUIRED, "this commit deletes more files than the owner allows without confirming");
+      }
       const record = create(CommitRecordSchema, {
         seq: BigInt(ctx.seq),
         commitId: commit.commitId,
@@ -795,14 +869,16 @@ export class SpaceDO extends DurableObject<Env> {
         changes,
       });
       const result = create(CommitResultSchema, { seq: BigInt(ctx.seq), results, changes });
-      this.appendCommit(record, result);
+      this.appendCommit(record, result, digest);
       this.sql.exec(
-        `INSERT INTO device_commits (device_id, device_seq, commit_id, results) VALUES (?, ?, ?, ?)
-         ON CONFLICT (device_id) DO UPDATE SET device_seq = excluded.device_seq, commit_id = excluded.commit_id, results = excluded.results`,
+        `INSERT INTO device_commits (device_id, device_seq, commit_id, results, request_digest) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (device_id) DO UPDATE SET device_seq = excluded.device_seq, commit_id = excluded.commit_id, results = excluded.results,
+           request_digest = excluded.request_digest`,
         session.deviceId,
         Number(commit.deviceSeq),
         commit.commitId,
         toBinary(CommitResultSchema, result),
+        digest,
       );
       return { result, record, rearm: noteCommitted(this.sql, record) };
     });
@@ -1063,12 +1139,12 @@ export class SpaceDO extends DurableObject<Env> {
       if (changes.length > 0) {
         const seq = BigInt(this.headSeq + 1);
         record = create(CommitRecordSchema, { seq, commitId: uuidv7(nowMs), committedAtMs: BigInt(nowMs), changes });
-        this.appendCommit(record, create(CommitResultSchema, { seq, changes }));
+        this.appendCommit(record, create(CommitResultSchema, { seq, changes }), null);
         noteCommitted(this.sql, record);
       }
       return { expiredVersions: expired.length, purgedNodes: changes.length, record };
     });
-    if (purge.record) this.broadcast(purge.record);
+    if (purge.record) await this.broadcast(purge.record);
 
     const marked = this.ctx.storage.transactionSync(() => {
       const hashes = this.sql
