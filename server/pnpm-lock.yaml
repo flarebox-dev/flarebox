@@ -173,6 +173,9 @@ importers:
       '@cloudflare/vitest-plugin':
         specifier: 1.6.0
         version: 1.6.0(@types/node@24.19.2)(vitest@5.1.0(@types/node@24.19.2)(vite@8.3.6(@types/node@24.19.2)(esbuild@0.28.2)))
+      '@types/node':
+        specifier: 24.19.2
+        version: 24.19.2
       typescript:
         specifier: 7.0.2
         version: 7.0.2

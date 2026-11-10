@@ -1,0 +1,125 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# Deploys server/ to a real Cloudflare account under a throwaway name, claims it, smoke-tests it over HTTPS and
+# deletes everything again (docs/deploy-test.md). Manual only: it needs the account's scoped API token, and each run
+# uses a little of the account's Workers, Durable Objects and R2 usage.
+
+name: Deploy test
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "smoke: deploy this commit and test it. upgrade: deploy from_ref, write data, upgrade to this commit and check the data."
+        type: choice
+        options: [smoke, upgrade]
+        default: smoke
+      from_ref:
+        description: "upgrade only: the commit or tag to upgrade from. Empty means the newest tag before this commit."
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-test
+  cancel-in-progress: false
+
+jobs:
+  deploy-test:
+    name: deploy test (${{ inputs.mode }})
+    runs-on: ubuntu-latest
+    environment: deploy-test
+    timeout-minutes: 60
+    env:
+      FLAREBOX_TEST_NAME: flarebox-test-${{ github.run_id }}-${{ github.run_attempt }}
+      WRANGLER_SEND_METRICS: "false"
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - name: Check the Cloudflare secrets
+        id: secrets
+        working-directory: .
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          missing=""
+          [ -n "$CLOUDFLARE_API_TOKEN" ] || missing="$missing CLOUDFLARE_API_TOKEN"
+          [ -n "$CLOUDFLARE_ACCOUNT_ID" ] || missing="$missing CLOUDFLARE_ACCOUNT_ID"
+          if [ -n "$missing" ]; then
+            echo "::error::The deploy test needs the secrets$missing in the deploy-test environment or the repository. docs/deploy-test.md lists what each holds and the token's permissions. Nothing was deployed."
+            exit 1
+          fi
+          echo "Both secrets are set. This run deploys and then deletes the Worker and R2 bucket $FLAREBOX_TEST_NAME."
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          package_json_file: server/package.json
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: server/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+
+      - name: Resolve the release to upgrade from
+        id: from
+        if: inputs.mode == 'upgrade'
+        env:
+          FROM_REF: ${{ inputs.from_ref }}
+        run: node scripts/deploy-test/run.ts upgrade-from "$FROM_REF"
+
+      - name: Deploy ${{ inputs.mode == 'upgrade' && 'the earlier release' || 'this commit' }}
+        timeout-minutes: 15
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          REF: ${{ inputs.mode == 'upgrade' && steps.from.outputs.sha || github.sha }}
+        run: node scripts/deploy-test/run.ts deploy "$REF"
+
+      - name: Claim it with the code from its own log
+        timeout-minutes: 5
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node scripts/deploy-test/run.ts claim
+
+      - name: Smoke test over HTTPS
+        if: inputs.mode == 'smoke'
+        timeout-minutes: 25
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: pnpm exec vitest run --config scripts/deploy-test/vitest.config.ts --reporter=verbose smoke
+
+      - name: Write data on the earlier release
+        if: inputs.mode == 'upgrade'
+        timeout-minutes: 5
+        run: pnpm exec vitest run --config scripts/deploy-test/vitest.config.ts --reporter=verbose upgrade-write
+
+      - name: Upgrade to this commit
+        if: inputs.mode == 'upgrade'
+        timeout-minutes: 15
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node scripts/deploy-test/run.ts deploy "$GITHUB_SHA"
+
+      - name: Check that the data survived the upgrade
+        if: inputs.mode == 'upgrade'
+        timeout-minutes: 10
+        run: pnpm exec vitest run --config scripts/deploy-test/vitest.config.ts --reporter=verbose upgrade-verify
+
+      - name: Tear down the Worker, its Durable Objects and the R2 bucket
+        if: always() && steps.secrets.outcome == 'success'
+        timeout-minutes: 10
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node scripts/deploy-test/run.ts teardown
