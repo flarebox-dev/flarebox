@@ -12,6 +12,7 @@
     ]
   },
   "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "flarebox" }],
+  "assets": { "directory": "./web", "binding": "ASSETS" },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["AccountDO", "SpaceDO"] }
   ]
