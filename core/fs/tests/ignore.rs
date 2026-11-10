@@ -1039,3 +1039,61 @@ fn native_watcher_reports_a_change_below_a_folder_that_a_reset_made_known() {
     write(&root, "made/sub/new.txt", "n");
     expect(&mut watcher, &[created("made/sub/new.txt", File)], &[]);
 }
+
+/// A folder moved over an empty folder while its rules file cannot be read
+/// keeps the entries it had: the scan cannot list it at its new path, but what
+/// lies below it is what lay below it before the move.
+#[test]
+fn a_folder_moved_over_an_empty_folder_with_unreadable_rules_keeps_its_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "drafts/.fbignore", "*.tmp\n");
+    write(root, "drafts/one.txt", "one");
+    write(root, "drafts/inner/two.txt", "two");
+    fs::create_dir(root.join("final")).unwrap();
+    let mut rules = rules();
+    let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
+    write(root, "drafts/.fbignore", &"x\n".repeat((1 << 19) + 1));
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert_eq!(rescan.unreadable, Vec::<PathBuf>::new());
+
+    fs::rename(root.join("drafts"), root.join("final")).unwrap();
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert_eq!(
+        rescan.changes,
+        [
+            removed("final", Dir),
+            Change::Renamed {
+                from: "drafts".into(),
+                to: "final".into(),
+                kind: Dir,
+            },
+        ]
+    );
+    assert_eq!(rescan.unreadable, [PathBuf::from("final")]);
+    let moved = [
+        "final",
+        "final/.fbignore",
+        "final/inner",
+        "final/inner/two.txt",
+        "final/one.txt",
+    ];
+    assert_eq!(known(&snapshot), moved);
+
+    write(root, "final/.fbignore", "*.tmp\n");
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert_eq!(
+        rescan.changes,
+        [Change::Modified {
+            path: "final/.fbignore".into()
+        }]
+    );
+    assert_eq!(rescan.unreadable, Vec::<PathBuf>::new());
+    assert_eq!(known(&snapshot), moved);
+}
