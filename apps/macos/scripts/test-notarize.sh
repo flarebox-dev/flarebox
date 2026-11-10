@@ -12,14 +12,16 @@ trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/bin"
 cat >"$work/bin/xcrun" <<'STUB'
 #!/usr/bin/env bash
-# notarytool's answers come from $STUB/answers, one line per info call: a status, or network or
-# denied for a failed request. Once the answers run out, every request fails with a network error.
+# notarytool's answers come from $STUB/answers, one line per info call: a status; network,
+# untrusted or denied for a failed request; or hang for a request that never returns. Once the
+# answers run out, every request fails with a network error. Errors repeat the arguments, as
+# notarytool's own errors repeat the key's path.
 [ "$1" = notarytool ] || exit 64
 echo "$2 ${3:-}" >>"$STUB/calls"
 case "$2" in
   submit)
     if [ -f "$STUB/submit-fails" ]; then
-      echo 'Error: HTTPError(statusCode: nil, error: Error Domain=NSURLErrorDomain Code=-1009)' >&2
+      echo "Error: HTTPError(statusCode: nil, error: Error Domain=NSURLErrorDomain Code=-1009) for $*" >&2
       exit 1
     fi
     echo '{"id":"11111111-2222-3333-4444-555555555555","message":"Successfully uploaded file","path":"x"}'
@@ -30,17 +32,25 @@ case "$2" in
     tail -n +2 "$STUB/answers" >"$STUB/rest" && mv "$STUB/rest" "$STUB/answers"
     case "$answer" in
       network)
-        echo 'Error: HTTPError(statusCode: nil, error: Error Domain=NSURLErrorDomain Code=-1009 "The Internet connection appears to be offline.")' >&2
+        echo "Error: HTTPError(statusCode: nil, error: Error Domain=NSURLErrorDomain Code=-1009 \"The Internet connection appears to be offline.\") for $*" >&2
+        exit 1
+        ;;
+      untrusted)
+        echo "Error: HTTPError(statusCode: nil, error: Error Domain=NSURLErrorDomain Code=-1202 \"The certificate for this server is invalid.\") for $*" >&2
         exit 1
         ;;
       denied)
-        echo 'Error: HTTPError(statusCode: 401, error: Unauthenticated)' >&2
+        echo "Error: HTTPError(statusCode: 401, error: Unauthenticated) for $*" >&2
         exit 1
+        ;;
+      hang)
+        sleep 30
+        echo "{\"id\":\"$3\",\"status\":\"Accepted\",\"name\":\"x\"}"
         ;;
       *) echo "{\"id\":\"$3\",\"status\":\"$answer\",\"name\":\"x\"}" ;;
     esac
     ;;
-  log) echo '{"issues":[{"severity":"error","message":"The binary is not signed."}]}' ;;
+  log) echo "{\"issues\":[{\"severity\":\"error\",\"message\":\"The binary is not signed.\"}],\"request\":\"$*\"}" ;;
   *) exit 64 ;;
 esac
 STUB
@@ -57,7 +67,7 @@ run() {
   tr ',' '\n' <<<"$answers" >"$work/$name/answers"
   : >"$work/$name/calls"
   local status=0
-  STUB="$work/$name" PATH="$work/bin:$PATH" NOTARY_KEY_PATH=key.p8 NOTARY_KEY_ID=key NOTARY_ISSUER_ID=issuer \
+  STUB="$work/$name" PATH="$work/bin:$PATH" NOTARY_KEY_PATH="$key_path" NOTARY_KEY_ID="$key_id" NOTARY_ISSUER_ID="$issuer_id" \
     NOTARY_POLL_SECONDS=0 NOTARY_BACKOFF_SECONDS="${BACKOFF:-0}" NOTARY_DEADLINE_SECONDS="${DEADLINE:-60}" \
     "$scripts/notarize.sh" Flarebox.zip "$@" >"$work/$name.out" 2>&1 || status=$?
   if [ "$status" -ne "$expected" ]; then
@@ -82,6 +92,9 @@ expect_calls() {
 }
 
 id=11111111-2222-3333-4444-555555555555
+key_path="$work/signing/notary-key.p8"
+key_id=STUBKEY4242
+issuer_id=69a6de7e-0000-4000-8000-stubissuer00
 
 run network_errors_while_waiting_are_retried 0 "network,network,network,In Progress,Accepted"
 expect_output network_errors_while_waiting_are_retried "Submission $id"
@@ -113,8 +126,27 @@ run a_failed_upload_fails_without_waiting 1 "Accepted"
 expect_output a_failed_upload_fails_without_waiting "Nothing was submitted"
 expect_calls a_failed_upload_fails_without_waiting "submit "
 
+DEADLINE=5 run an_untrusted_certificate_fails_at_once 1 "untrusted,Accepted"
+expect_output an_untrusted_certificate_fails_at_once "could not report the status of submission $id"
+expect_calls an_untrusted_certificate_fails_at_once "submit info "
+
+started=$SECONDS
+DEADLINE=2 run a_hanging_status_request_ends_at_the_deadline 1 "hang"
+expect_output a_hanging_status_request_ends_at_the_deadline "Apple gave no final answer on submission $id"
+if [ $((SECONDS - started)) -gt 10 ]; then
+  fail a_hanging_status_request_ends_at_the_deadline "took $((SECONDS - started)) seconds with a 2-second deadline"
+fi
+
+for out in "$work"/*.out; do
+  for value in "$key_path" "$key_id" "$issuer_id"; do
+    if grep -qF -- "$value" "$out"; then
+      fail "$(basename "$out" .out)" "the output shows the API key's path, ID or issuer ID ($value)"
+    fi
+  done
+done
+
 if [ "$failures" -ne 0 ]; then
   echo "test-notarize.sh: $failures check(s) failed."
   exit 1
 fi
-echo "test-notarize.sh: all 7 cases passed."
+echo "test-notarize.sh: all 9 cases passed, and no output shows the API key's path, ID or issuer ID."
