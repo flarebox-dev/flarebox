@@ -9,12 +9,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use flarebox_engine::commit::{Commits, Lift, LiftError};
 use flarebox_engine::ignore::LocalRules;
 use flarebox_fs::{Marker, probe_no_replace, read_marker, write_marker};
 use flarebox_ignore::LocalRulesError;
 use flarebox_net::{ApiError, Auth};
 use flarebox_proto::v1::{ClaimRequest, DeviceCredentials, PairCompleteRequest, SpaceInfo};
-use flarebox_store::{GivenAnswer, Link, Store, StoredQuestion};
+use flarebox_store::{EngineState, GivenAnswer, Link, Store, StoredQuestion};
 use tokio::sync::{Notify, watch};
 
 use crate::claim::{self, Flock, Owner};
@@ -104,6 +105,12 @@ pub enum DriverError {
     SpaceNotLinked(String),
     #[error("the restore's {0} is not an id the server gave")]
     InvalidRestore(&'static str),
+    #[error("the folder holds no changes the server refused")]
+    NothingToLift,
+    #[error(
+        "the server waits for the space's owner to confirm the folder's changes, and Flarebox cannot ask for that yet"
+    )]
+    NeedsConfirmation,
     #[error("the sync state at {path} cannot be used: {error}")]
     Store {
         path: PathBuf,
@@ -125,6 +132,33 @@ fn store_error(path: &Path) -> impl FnOnce(flarebox_store::Error) -> DriverError
         path: path.to_path_buf(),
         error,
     }
+}
+
+/// Lifts the policy halt the store at `path` holds (RFC 0006 section 1, point 5). No task may hold the store.
+pub(crate) fn lift_halt(path: &Path, lift: Lift) -> Result<(), DriverError> {
+    let lifted = Store::open(path)
+        .and_then(|mut store| {
+            store.transaction(|tx| {
+                let before = tx.engine_state()?;
+                let mut commits = Commits::from_state(before.commits.clone()).map_err(|error| {
+                    flarebox_store::Error::InvalidEngineState(format!("{error:?}"))
+                })?;
+                let lifted = commits.lift(lift);
+                if lifted.is_ok() {
+                    let after = EngineState {
+                        commits: commits.state(),
+                        ..before.clone()
+                    };
+                    tx.update_engine_state(&before, &after)?;
+                }
+                Ok(lifted)
+            })
+        })
+        .map_err(store_error(path))?;
+    lifted.map_err(|error| match error {
+        LiftError::NotHalted => DriverError::NothingToLift,
+        LiftError::NeedsConfirmation => DriverError::NeedsConfirmation,
+    })
 }
 
 /// Runs sync for the folders one profile links. The Linux daemon and the macOS app use it alike: the daemon serves
@@ -839,6 +873,25 @@ impl Driver {
     /// A folder halted by a problem only a person can fix stays halted until this is called. While the driver is
     /// stopped, the folder only stops, and the next start syncs it.
     pub async fn restart(&self, folder: &Path) -> Result<FolderStatus, DriverError> {
+        self.restart_with(folder, None).await
+    }
+
+    /// Lifts the halt a refusal of the server put on the folder at `folder` the way a person chose, and syncs it
+    /// again as [`Driver::restart`] does. [`Lift::Resend`] sends the refused commit again, unchanged;
+    /// [`Lift::Replan`] plans its changes again into a new commit. A folder with no such halt, or whose halt waits
+    /// for the space's owner to confirm the changes, keeps its state, is restarted all the same, and the error
+    /// says why nothing was lifted.
+    pub async fn lift(&self, folder: &Path, lift: Lift) -> Result<FolderStatus, DriverError> {
+        self.restart_with(folder, Some(lift)).await
+    }
+
+    /// Stops the task of the folder at `folder`, applies `lift` to its store once the task has ended, and starts
+    /// a new task.
+    async fn restart_with(
+        &self,
+        folder: &Path,
+        lift: Option<Lift>,
+    ) -> Result<FolderStatus, DriverError> {
         let _lifecycle = self.inner.lifecycle.lock().await;
         let (space_id, done) = {
             let mut folders = self.inner.folders.lock().unwrap();
@@ -851,6 +904,12 @@ impl Driver {
         if let Some(done) = done {
             ended(done).await;
         }
+        let lifted = match lift {
+            Some(lift) => (self.inner.paths.store(&space_id))
+                .map_err(DriverError::from)
+                .and_then(|path| lift_halt(&path, lift)),
+            None => Ok(()),
+        };
         let credential = self.inner.credential.lock().unwrap().clone();
         let mut folders = self.inner.folders.lock().unwrap();
         let all = roots(&folders);
@@ -865,7 +924,7 @@ impl Driver {
         let status = folder.status.lock().unwrap().clone();
         drop(folders);
         self.changed();
-        Ok(status)
+        lifted.map(|()| status)
     }
 
     /// Starts the task of `folder` unless it is being unlinked or its task still runs. `all` are the roots of every
@@ -1407,6 +1466,23 @@ mod tests {
         assert!(
             restarted.problem.as_ref().unwrap().contains("device d1"),
             "{restarted:?}"
+        );
+        driver.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_lift_with_nothing_refused_says_so_and_restarts_the_folder() {
+        let (_dir, paths, root) = profile(&[]);
+        credential("d2").save_new(&paths.credential()).unwrap();
+        let driver = Driver::open(paths).unwrap();
+        driver.start();
+        let error = driver.lift(&root, Lift::Resend).await.unwrap_err();
+        assert!(matches!(error, DriverError::NothingToLift), "{error}");
+        let folder = &driver.status().folders[0];
+        assert_eq!(folder.state, FolderState::Halted);
+        assert!(
+            folder.problem.as_ref().unwrap().contains("device d1"),
+            "{folder:?}"
         );
         driver.stop().await;
     }

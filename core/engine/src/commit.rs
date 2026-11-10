@@ -65,6 +65,28 @@ pub enum Reconnect {
     Recovery,
 }
 
+/// How a person lifts a policy halt (RFC 0006 section 1, point 5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lift {
+    /// Send the refused commit again, unchanged, once the person fixed the cause on the server, such
+    /// as the access a `FORBIDDEN` refusal named.
+    Resend,
+    /// Forget the refused commit, so its changes are planned again into a commit with a new
+    /// `commit_id`, as after `UNSUPPORTED_VERSION`. A refused commit stores nothing, so its slot
+    /// stays free.
+    Replan,
+}
+
+/// Why [`Commits::lift`] lifted nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiftError {
+    /// No policy halt holds.
+    NotHalted,
+    /// The halt is a `CONFIRMATION_REQUIRED`, which only the owner's confirmation lifts (RFC 0006
+    /// section 10), and no RFC defines that confirmation yet.
+    NeedsConfirmation,
+}
+
 /// What a call-level error on the commit in flight leads to (section 4.2, RFC 0002 section 3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Failure {
@@ -220,6 +242,24 @@ impl Commits {
 
     pub fn halted(&self) -> Option<Halt> {
         self.halted
+    }
+
+    /// Lifts a policy halt the way a person chose. With [`Lift::Resend`] the commit in flight
+    /// stays, and the next `Welcome` that accounts for its slot sends it again (section 2.8). With
+    /// [`Lift::Replan`] it is forgotten, and its restores stay queued for the next commit, as when
+    /// a refusal forgets a commit. Nothing else changes.
+    pub fn lift(&mut self, lift: Lift) -> Result<(), LiftError> {
+        let Some(Halt::Policy { code }) = self.halted else {
+            return Err(LiftError::NotHalted);
+        };
+        if code == error::Code::ConfirmationRequired as i32 {
+            return Err(LiftError::NeedsConfirmation);
+        }
+        self.halted = None;
+        if lift == Lift::Replan {
+            self.in_flight = None;
+        }
+        Ok(())
     }
 
     /// Queues a restore a person asked for. The next commit that is built carries its `Restore`
