@@ -362,7 +362,8 @@ pub struct Grant {
     access: Secret,
     /// `None` once a refresh has failed: the grant cannot be refreshed again.
     refresh: Option<Secret>,
-    /// The refresh token of a failed refresh, which Cloudflare may still accept. Only [`Grant::revoke`] sends it.
+    /// A refresh token the grant no longer refreshes with but Cloudflare may still accept: the one a failed refresh
+    /// sent, or a new one with too few scopes. Only [`Grant::revoke`] sends it, so a failed revocation can be retried.
     stale: Option<Secret>,
     expires_at: Instant,
 }
@@ -403,7 +404,7 @@ impl Grant {
         self.refresh = Some(Secret::new(tokens.refresh_token));
         if !missing.is_empty() {
             let _ = self.revoke(http).await;
-            self.refresh = None;
+            self.stale = self.refresh.take();
             return Err(OauthError::MissingScopes {
                 missing: missing.join(", "),
             });
