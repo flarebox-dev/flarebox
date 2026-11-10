@@ -69,6 +69,7 @@ public final class SetupModel {
     }
 
     public func connect() async {
+        guard canConnect else { return }
         await attempt {
             server = try await app.connect(url: serverURL)
             step = .signIn
@@ -76,6 +77,7 @@ public final class SetupModel {
     }
 
     public func signIn() async {
+        guard canSignIn else { return }
         await attempt {
             if claimsServer {
                 _ = try await app.claim(code: code, userName: userName, deviceName: deviceName)
@@ -93,15 +95,15 @@ public final class SetupModel {
     }
 
     public func link() async {
-        guard let folderPath else { return }
+        guard canLink, let folderPath else { return }
         await attempt {
             let spaceID: String
             if let selectedSpaceID {
                 spaceID = selectedSpaceID
             } else {
                 spaceID = try await app.createSpace(name: newSpaceName).spaceId
-                try await reloadSpaces()
                 selectedSpaceID = spaceID
+                try await reloadSpaces()
             }
             _ = try await app.linkFolder(spaceID: spaceID, path: folderPath)
             app.start()

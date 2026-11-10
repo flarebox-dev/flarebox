@@ -300,6 +300,25 @@ private func item(_ path: String) -> HeldItem {
         #expect(setup.error == nil)
         #expect(setup.step == .done)
         #expect(app.state.folders.count == linked.count + 1)
-        #expect(app.state.folders.contains { $0.spaceName == "Projects" })
+        #expect(app.state.folders.filter { $0.spaceName == "Projects" }.count == 1)
+        #expect(setup.spaces.filter { $0.name == "Projects" }.count == 1)
+    }
+
+    @Test func incompleteStepsMakeNoCall() async throws {
+        let app = AppModel.fake(scenario: .firstRun)
+        let setup = SetupModel(app: app, mode: .firstRun, deviceName: "Mac")
+        await setup.connect()
+        #expect(setup.error == nil)
+        #expect(setup.step == .server)
+
+        setup.serverURL = "https://box.example.com"
+        await setup.connect()
+        #expect(setup.step == .signIn)
+        await setup.signIn()
+        #expect(setup.error == nil)
+        #expect(setup.step == .signIn)
+        await setup.link()
+        #expect(setup.error == nil)
+        #expect(app.state.account == nil)
     }
 }
