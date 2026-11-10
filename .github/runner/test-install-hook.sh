@@ -67,6 +67,9 @@ all_installed() {
 unchanged() { [ "$(snapshot "$1")" = "$2" ]; }
 no_hook() { [ ! -e "$root/usr/local/libexec/flarebox" ]; }
 failed_with() { [ "$code" -ne 0 ] && [[ "$out" == *"$1"* ]]; }
+interrupted() { [ "$code" -eq "$1" ] && [[ "$out" == *"interrupted by SIG$2."* ]]; }
+installed_and_unchanged() { installed "$1" && unchanged "$2" "$3"; }
+nothing_changed() { no_hook && unchanged "$1" "$2"; }
 verified() { [[ "$out" == *"Verification"* && "$out" != *FAILED* && "$out" == *"Installed."* ]]; }
 
 new_root
@@ -116,6 +119,49 @@ expect "the failing runner is restored with its files, owners, modes and flags" 
 expect "the runners after the failure are unchanged" unchanged "$(runner 3)" "$before3"
 expect "the error names the installed and unchanged runners" failed_with "installed in: $(runner 1). Not changed: $(runner 2) and the runners after it."
 chflags nouappnd "$(runner 2)/.path"
+
+mkdir "$tmp/signal-mv"
+cat > "$tmp/signal-mv/mv" <<'EOF'
+#!/bin/bash
+case "${!#}" in
+  */runner-2/.path) kill -"$FLAREBOX_TEST_SIGNAL" "$PPID" ;;
+esac
+exec /bin/mv "$@"
+EOF
+chmod +x "$tmp/signal-mv/mv"
+for signal in TERM:143 INT:130 HUP:129; do
+  sig="${signal%%:*}"
+  sig_status="${signal##*:}"
+  new_root
+  before2="$(snapshot "$(runner 2)")"
+  before3="$(snapshot "$(runner 3)")"
+  code=0
+  out="$(FLAREBOX_TEST_SIGNAL="$sig" PATH="$tmp/signal-mv:$PATH" FLAREBOX_INSTALL_ROOT="$root" FLAREBOX_INSTALL_OWNER="$me" FLAREBOX_INSTALL_GROUP="$grp" "$installer" 2>&1)" || code=$?
+  expect "SIG$sig after runner-2's .env is swapped exits with $sig_status" interrupted "$sig_status" "$sig"
+  expect "SIG$sig restores runner-2 with its files, owners, modes and flags" unchanged "$(runner 2)" "$before2"
+  expect "SIG$sig leaves runner-1 fully installed and runner-3 unchanged" installed_and_unchanged "$(runner 1)" "$(runner 3)" "$before3"
+done
+
+mkdir "$tmp/fake-root"
+cat > "$tmp/fake-root/id" <<'EOF'
+#!/bin/bash
+if [ "$1" = -u ]; then
+  echo 0
+else
+  exec /usr/bin/id "$@"
+fi
+EOF
+chmod +x "$tmp/fake-root/id"
+new_root
+before1="$(snapshot "$(runner 1)")"
+code=0
+out="$(PATH="$tmp/fake-root:$PATH" FLAREBOX_INSTALL_ROOT="$root" FLAREBOX_INSTALL_OWNER="$me" FLAREBOX_INSTALL_GROUP="$grp" "$installer" 2>&1)" || code=$?
+expect "as root it refuses the test overrides" failed_with "are for tests without root; unset them to install as root. Nothing was changed."
+expect "as root with the test overrides it changes nothing" nothing_changed "$(runner 1)" "$before1"
+code=0
+out="$(PATH="$tmp/fake-root:$PATH" FLAREBOX_INSTALL_ROOT="$root" "$installer" 2>&1)" || code=$?
+expect "as root it refuses FLAREBOX_INSTALL_ROOT on its own" failed_with "are for tests without root"
+expect "as root with FLAREBOX_INSTALL_ROOT alone it changes nothing" nothing_changed "$(runner 1)" "$before1"
 
 new_root
 rm "$(runner 4)/.runner"

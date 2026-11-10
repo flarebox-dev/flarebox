@@ -9,14 +9,15 @@
 # CONTRIBUTING.md explains why.
 #
 # It reads and prepares every file before it changes anything, so a read error changes nothing.
-# It then updates one runner at a time; if that fails, it restores the runner's previous files,
-# owners, modes and flags and stops, so each runner is either fully installed or unchanged.
-# Running it again is safe.
+# It then updates one runner at a time; if that fails or the script gets SIGTERM, SIGINT or SIGHUP,
+# it restores the runner's previous files, owners, modes and flags and stops, so each runner is
+# either fully installed or unchanged. Running it again is safe.
 #
 # Usage: sudo .github/runner/install-hook.sh [RUNNER_DIR...]
 # The default runner directories are /Users/ghrunner/runner-1 to /Users/ghrunner/runner-4.
 # FLAREBOX_INSTALL_ROOT, FLAREBOX_INSTALL_OWNER and FLAREBOX_INSTALL_GROUP let
-# test-install-hook.sh run it without root against fake runner directories.
+# test-install-hook.sh run it without root against fake runner directories. Run as root, it
+# refuses them.
 set -euo pipefail
 
 root="${FLAREBOX_INSTALL_ROOT:-}"
@@ -34,7 +35,11 @@ die() {
   exit 1
 }
 
-if [ "$(id -u)" -ne 0 ] && [ "$owner" != "$(id -un)" ]; then
+if [ "$(id -u)" -eq 0 ]; then
+  if [ -n "${FLAREBOX_INSTALL_ROOT+set}${FLAREBOX_INSTALL_OWNER+set}${FLAREBOX_INSTALL_GROUP+set}" ]; then
+    die "FLAREBOX_INSTALL_ROOT, FLAREBOX_INSTALL_OWNER and FLAREBOX_INSTALL_GROUP are for tests without root; unset them to install as root. Nothing was changed."
+  fi
+elif [ "$owner" != "$(id -un)" ]; then
   die "run this with sudo."
 fi
 if [ "$#" -eq 0 ]; then
@@ -50,6 +55,33 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+
+installed=()
+current_dir=""
+current_stage=""
+roll_back_current() {
+  echo "error: restoring the previous .env and .path of $current_dir." >&2
+  if restore_runner "$current_dir" "$current_stage"; then
+    echo "error: $current_dir is back to its previous state." >&2
+  else
+    keep_staging=yes
+    echo "error: restoring $current_dir failed. Its previous files are in $current_stage (backup.env, backup.path); restore them by hand." >&2
+  fi
+  echo "error: installed in: ${installed[*]:-none}. Not changed: $current_dir and the runners after it." >&2
+}
+on_signal() {
+  trap '' TERM INT HUP
+  echo "error: interrupted by SIG$1." >&2
+  if [ -n "$current_dir" ]; then
+    roll_back_current
+  else
+    echo "error: installed in: ${installed[*]:-none}. The other runners are unchanged." >&2
+  fi
+  exit "$2"
+}
+trap 'on_signal TERM 143' TERM
+trap 'on_signal INT 130' INT
+trap 'on_signal HUP 129' HUP
 
 # Stage: read and prepare everything. Nothing outside $staging changes here.
 cat "$source_hook" > "$staging/hook" || die "cannot read $source_hook; nothing was changed."
@@ -115,21 +147,17 @@ restore_runner() {
 install -d -o "$owner" -g "$group" -m 755 "$hook_dir"
 install -o "$owner" -g "$group" -m 755 "$staging/hook" "$hook_dir/.job-started.sh.new"
 mv -f "$hook_dir/.job-started.sh.new" "$hook"
-installed=()
 n=0
 for dir in "$@"; do
   n=$((n + 1))
-  if ! apply_runner "$dir" "$staging/$n"; then
-    echo "error: installing the hook in $dir failed; restoring its previous .env and .path." >&2
-    if restore_runner "$dir" "$staging/$n"; then
-      echo "error: $dir is back to its previous state." >&2
-    else
-      keep_staging=yes
-      echo "error: restoring $dir failed. Its previous files are in $staging/$n (backup.env, backup.path); restore them by hand." >&2
-    fi
-    echo "error: installed in: ${installed[*]:-none}. Not changed: $dir and the runners after it." >&2
+  current_dir="$dir"
+  current_stage="$staging/$n"
+  if ! apply_runner "$dir" "$current_stage"; then
+    echo "error: installing the hook in $dir failed." >&2
+    roll_back_current
     exit 1
   fi
+  current_dir=""
   installed+=("$dir")
 done
 
