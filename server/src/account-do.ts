@@ -208,8 +208,9 @@ export class AccountDO extends DurableObject<Env> {
   }
 
   /**
-   * Redeems a claim code, which makes the first caller the owner, or on a claimed deployment the recovery key the
-   * Worker is configured with, which adds a device for the owner. client is the caller's address, for failure counts.
+   * Redeems a claim code or the recovery key the Worker is configured with. On a deployment without an owner either one
+   * makes the caller the owner; on a claimed deployment the key adds a device for the owner. client is the caller's
+   * address, for failure counts.
    * Everything that can fail is prepared first, so the transaction stores the owner, the key's use and the device together.
    */
   async claim(
