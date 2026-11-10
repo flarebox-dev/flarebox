@@ -311,6 +311,27 @@ impl Trees {
         !self.l.get(id).is_some_and(|node| node.parked) && self.ignored(id)
     }
 
+    /// Whether L no longer holds the node while R holds an excluded node below it. The commit planner sends no
+    /// `Delete` for such a folder, which stays on the server with what it holds that this device leaves out
+    /// (section 5.10), and the effects do not create it again, so nothing is left to sync for it.
+    pub fn kept_for_excluded(&self, id: &str) -> bool {
+        if self.l.get(id).is_some() || self.r.live(id).is_none() {
+            return false;
+        }
+        let below = |node: &str| {
+            let mut current = node;
+            for _ in 0..self.r.len() {
+                match self.r.live(current) {
+                    Some(shape) if shape.parent == id => return true,
+                    Some(shape) => current = &shape.parent,
+                    None => return false,
+                }
+            }
+            false
+        };
+        (self.r.iter()).any(|(node, _)| below(node) && self.excluded(node))
+    }
+
     /// Whether the node is outside the sync tree on this device, as [`Trees::excluded`] decides
     /// it, also when the node is parked. The effects move a parked node that is ignored back to
     /// the position L keeps for it, and it is excluded from then on.

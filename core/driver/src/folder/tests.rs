@@ -1701,6 +1701,32 @@ fn the_rules_hold_of_a_folder_ends_also_after_it_was_renamed_only_in_case() {
     );
 }
 
+/// A folder the user deletes stays on the server while it holds a file the rules exclude here (design §5.10), so
+/// nothing is left to send for it, and the folder is up to date.
+#[test]
+fn a_deleted_folder_that_keeps_an_excluded_file_on_the_server_leaves_the_folder_up_to_date() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site.root.join("d")).unwrap();
+    a.create(&mut remote, &site.root.join("d/a.log"), b"log");
+    a.create(&mut remote, &site.root.join("d/b.txt"), b"text");
+    a.create(&mut remote, &site.root.join(".fbignore"), b"*.log\n");
+    fs::remove_dir_all(site.root.join("d")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    assert_eq!(a.run(&mut remote), ["send"]);
+    a.pull(&remote);
+    a.run(&mut remote);
+    a.settle();
+    assert!(a.run(&mut remote).is_empty());
+    let mut live: Vec<&str> = (a.folder.engine.trees.remote().iter())
+        .filter(|(_, node)| !node.trashed)
+        .map(|(_, node)| node.shape.name.as_str())
+        .collect();
+    live.sort();
+    assert_eq!(live, [".fbignore", "a.log", "d"]);
+    assert_eq!(a.state(), FolderState::UpToDate);
+}
+
 #[test]
 fn a_rules_file_named_in_another_case_is_downloaded_and_in_force_first() {
     let mut remote = Remote::new();

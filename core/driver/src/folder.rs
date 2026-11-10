@@ -580,12 +580,14 @@ impl Folder {
 
     /// True when nothing is left to move: R holds the server's head, the folder was scanned, no effect and no
     /// commit is in flight, no rules are awaited, every node the trees still differ on is one that cannot be synced
-    /// as it is or that this device leaves out, and so is the node of every restore that waits.
+    /// as it is, that this device leaves out, or a folder the user deleted that stays on the server for what this
+    /// device leaves out, and so is the node of every restore that waits.
     fn settled(&self) -> bool {
         let stuck = |id: &String| {
             self.engine.effects.blocked().contains_key(id)
                 || self.engine.commits.problems().contains(id)
                 || self.engine.trees.excluded(id)
+                || self.engine.trees.kept_for_excluded(id)
         };
         let commits = &self.engine.commits;
         self.caught_up()
