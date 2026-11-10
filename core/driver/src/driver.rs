@@ -239,10 +239,8 @@ impl Driver {
             });
         }
         let credential = Credential::load(&paths.credential())?;
-        if credential.is_some()
-            && let Err(error) = Credential::keep_out_of_backups(&paths.credential())
-        {
-            tracing::warn!(%error, "the credential could not be excluded from backups");
+        if credential.is_some() {
+            Credential::keep_out_of_backups(&paths.credential())?;
         }
         let folders = load_folders(&paths)?;
         Ok(Driver {
@@ -2323,6 +2321,41 @@ mod tests {
         assert!(time_machine_excludes(&paths.credential()));
         rustix::fs::removexattr(paths.credential(), BACKUP_EXCLUSION.0).unwrap();
         assert!(!time_machine_excludes(&paths.credential()));
+
+        drop(Driver::open(paths.clone()).unwrap());
+        assert!(time_machine_excludes(&paths.credential()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn opening_refuses_a_credential_it_cannot_keep_out_of_backups() {
+        use crate::credential::tests::time_machine_excludes;
+        use crate::credential::{BACKUP_EXCLUSION, CredentialError};
+
+        let home = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+        let paths = Paths::under(home.path());
+        paired(&paths, "d1");
+        rustix::fs::removexattr(paths.credential(), BACKUP_EXCLUSION.0).unwrap();
+        let chflags = |flag: &str| {
+            let status = std::process::Command::new("chflags")
+                .arg(flag)
+                .arg(paths.credential())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        chflags("uchg");
+        let refused = Driver::open(paths.clone()).err();
+        chflags("nouchg");
+        let error = refused.expect("the driver opened with a credential that backups would copy");
+        assert!(
+            matches!(
+                error,
+                DriverError::Credential(CredentialError::NotExcludedFromBackups { .. })
+            ),
+            "{error}"
+        );
+        assert!(error.to_string().contains("Time Machine"), "{error}");
 
         drop(Driver::open(paths.clone()).unwrap());
         assert!(time_machine_excludes(&paths.credential()));
