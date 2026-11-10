@@ -7,7 +7,7 @@
 use std::sync::{Arc, Weak};
 
 use crate::types::{
-    Account, Answer, Device, LinkedFolder, PairingCode, ServerInfo, SessionError, SessionEvent,
+    Account, Answer, DeviceList, LinkedFolder, PairingCode, ServerInfo, SessionError, SessionEvent,
     SessionState, Space,
 };
 
@@ -50,6 +50,12 @@ impl Events {
 /// Calls that talk to the server block until it answers, so the app makes them off its main
 /// thread. Every change a call makes to [`SessionState`] is also sent as an event before the
 /// call returns.
+///
+/// A call that changes what this device keeps (its credentials, folders, answers, notices or
+/// the pause) saves the change before it reports success, as the engine persists each input
+/// before acting on it (design §1). If saving fails, the call changes nothing and returns
+/// [`SessionError::NotSaved`], and [`ProblemKind::StateNotWritable`](crate::ProblemKind::StateNotWritable)
+/// stays listed until a save succeeds.
 pub trait Core: Send + Sync {
     /// The current state. Events sent before this call returns are already included.
     fn state(&self) -> SessionState;
@@ -61,10 +67,11 @@ pub trait Core: Send + Sync {
     /// Stops syncing. State on disk and in the store is kept. Stopping a stopped session does
     /// nothing.
     fn stop(&self);
-    /// Pauses a running session until [`Core::resume`]. The pause outlives a restart.
-    fn pause(&self);
+    /// Pauses a running session until [`Core::resume`]. The pause outlives a restart. Pausing
+    /// a stopped session does nothing.
+    fn pause(&self) -> Result<(), SessionError>;
     /// Resumes a paused session.
-    fn resume(&self);
+    fn resume(&self) -> Result<(), SessionError>;
 
     /// Looks up the server at `url` and remembers it for signing in.
     fn connect(&self, url: &str) -> Result<ServerInfo, SessionError>;
@@ -81,8 +88,8 @@ pub trait Core: Send + Sync {
     fn pair(&self, code: &str, device_name: &str) -> Result<Account, SessionError>;
     /// Forgets this device's credentials and unlinks every folder. Files on disk stay.
     fn sign_out(&self) -> Result<(), SessionError>;
-    /// The account's devices.
-    fn devices(&self) -> Result<Vec<Device>, SessionError>;
+    /// The account's devices, or [`DeviceList::Unavailable`] when the server cannot list them.
+    fn devices(&self) -> Result<DeviceList, SessionError>;
     /// Creates a code that signs in another device.
     fn start_pairing(&self) -> Result<PairingCode, SessionError>;
 
@@ -98,4 +105,6 @@ pub trait Core: Send + Sync {
     /// Answers a question. The answer must be one of the question's
     /// [`answers`](crate::Question::answers).
     fn answer(&self, question_id: &str, answer: Answer) -> Result<(), SessionError>;
+    /// Dismisses a notice.
+    fn dismiss_notice(&self, notice_id: &str) -> Result<(), SessionError>;
 }

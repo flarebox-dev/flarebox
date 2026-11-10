@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::core::{Core, Events, SessionListener};
 use crate::fake::FakeCore;
 use crate::types::{
-    Account, Answer, Device, LinkedFolder, PairingCode, ServerInfo, SessionError, SessionState,
+    Account, Answer, DeviceList, LinkedFolder, PairingCode, ServerInfo, SessionError, SessionState,
     Space,
 };
 
@@ -57,12 +57,12 @@ impl SyncSession {
         self.core.stop();
     }
 
-    pub fn pause(&self) {
-        self.core.pause();
+    pub fn pause(&self) -> Result<(), SessionError> {
+        self.core.pause()
     }
 
-    pub fn resume(&self) {
-        self.core.resume();
+    pub fn resume(&self) -> Result<(), SessionError> {
+        self.core.resume()
     }
 
     pub fn connect(&self, url: String) -> Result<ServerInfo, SessionError> {
@@ -86,7 +86,7 @@ impl SyncSession {
         self.core.sign_out()
     }
 
-    pub fn devices(&self) -> Result<Vec<Device>, SessionError> {
+    pub fn devices(&self) -> Result<DeviceList, SessionError> {
         self.core.devices()
     }
 
@@ -116,5 +116,9 @@ impl SyncSession {
 
     pub fn answer(&self, question_id: String, answer: Answer) -> Result<(), SessionError> {
         self.core.answer(&question_id, answer)
+    }
+
+    pub fn dismiss_notice(&self, notice_id: String) -> Result<(), SessionError> {
+        self.core.dismiss_notice(&notice_id)
     }
 }

@@ -2,10 +2,11 @@
 
 //! A [`Core`] that syncs nothing and plays back a scripted state, so the app's windows can be
 //! built and tested before the driver exists. It enforces the same rules the real core will:
-//! codes have the server's lengths, folders must exist and must not overlap, and a question only
-//! takes one of its own answers.
+//! codes have the server's lengths, folders must exist and must not overlap, a question only
+//! takes one of its own answers, and a change that cannot be saved is not made.
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,16 +15,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::{Core, Events};
 use crate::types::{
-    Account, Answer, ChangeKind, Device, Direction, FolderPath, FolderState, HeldItem, ItemDetail,
-    LinkedFolder, MassDeleteLimit, NodeKind, PairingCode, Problem, ProblemKind, Question,
-    QuestionKind, RECENT_CHANGES, RecentChange, RecoveryGroup, RecoveryNotice, RecoveryTrigger,
-    ServerInfo, SessionError, SessionEvent, SessionState, Space, SyncProgress, SyncStatus,
+    Account, Answer, ChangeKind, Device, DeviceList, Direction, FolderPath, FolderState, HeldItem,
+    ItemDetail, LinkedFolder, MassDeleteLimit, NodeKind, Notice, NoticeKind, PairingCode, Problem,
+    ProblemKind, Question, QuestionKind, RECENT_CHANGES, RecentChange, RecoveryCause,
+    RecoveryGroup, RecoveryTrigger, ServerInfo, SessionError, SessionEvent, SessionState, Space,
+    SyncProgress, SyncStatus,
 };
 
 const STATE_FILE: &str = "fake-core.json";
 const CLAIM_CODE_LEN: usize = 12;
 const PAIRING_CODE_LEN: usize = 8;
 const PAIRING_CODE_MS: i64 = 10 * 60_000;
+const NOT_WRITABLE_ID: &str = "problem-state-not-writable";
 
 /// What a running, set-up fake session is doing, which decides its [`SyncStatus`] unless it is
 /// paused.
@@ -36,7 +39,8 @@ pub enum FakeActivity {
 }
 
 /// A whole state the fake can switch to at once. Every scenario but [`FakeScenario::FirstRun`]
-/// is signed in to `https://box.example.com` with two linked folders, Documents and Photos.
+/// is signed in to `https://box.example.com` with two linked folders, Documents and Photos. The
+/// device list is unavailable in every scenario, as it is with every server today.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum FakeScenario {
     /// A fresh install: no server, no account, no folders, and the server is not claimed yet.
@@ -54,8 +58,14 @@ pub enum FakeScenario {
     MassDelete,
     /// One ambiguous-disappearance question in Documents with 4 files.
     AmbiguousDisappearance,
-    /// Photos is recovering after a rewind: one question for each of the five recovery groups.
+    /// Photos is recovering after a rewind: a recovery notice and one question for each of the
+    /// five recovery groups.
     Recovery,
+    /// Photos recovered after a rewind with nothing held: a recovery notice and no questions.
+    RecoveredWithoutQuestions,
+    /// Another device deleted 1,200 files from Photos, more than the guard's limit; a notice
+    /// reports it and nothing is asked.
+    RemoteMassDelete,
     /// Long lists: a mass delete of 1,500 files, the five recovery groups with 300 items each,
     /// and 25 ambiguous-disappearance questions: 31 questions in all.
     ManyQuestions,
@@ -76,11 +86,13 @@ struct Saved {
     server: Option<ServerInfo>,
     claimed: bool,
     account: Option<Account>,
-    devices: Vec<Device>,
+    /// None while the server cannot list devices.
+    devices: Option<Vec<Device>>,
     spaces: Vec<Space>,
     folders: Vec<LinkedFolder>,
     questions: Vec<Question>,
     problems: Vec<Problem>,
+    notices: Vec<Notice>,
     paused: bool,
     next_id: u64,
 }
@@ -93,6 +105,10 @@ struct State {
     recent: Vec<RecentChange>,
     answers: Vec<GivenAnswer>,
     fail_next: Option<SessionError>,
+    fail_saves: bool,
+    /// [`ProblemKind::StateNotWritable`] after a failed save, until a save succeeds. It is
+    /// not saved itself.
+    not_writable: Option<Problem>,
     status: SyncStatus,
 }
 
@@ -112,6 +128,29 @@ impl State {
                 FakeActivity::Offline => SyncStatus::Offline,
             }
         }
+    }
+
+    fn problems(&self) -> Vec<Problem> {
+        let mut problems = self.saved.problems.clone();
+        problems.extend(self.not_writable.clone());
+        problems
+    }
+
+    /// Records the outcome of a save. Returns whether the problem list changed.
+    fn set_save_failure(&mut self, reason: Option<String>) -> bool {
+        let next = reason.map(|reason| Problem {
+            id: NOT_WRITABLE_ID.to_owned(),
+            space_id: None,
+            path: None,
+            kind: ProblemKind::StateNotWritable { reason },
+            since_ms: self
+                .not_writable
+                .as_ref()
+                .map_or_else(now_ms, |p| p.since_ms),
+        });
+        let changed = next != self.not_writable;
+        self.not_writable = next;
+        changed
     }
 
     fn next_id(&mut self, prefix: &str) -> String {
@@ -137,15 +176,17 @@ enum Part {
     Recent,
     Questions,
     Problems,
+    Notices,
 }
 
-const ALL_PARTS: [Part; 6] = [
+const ALL_PARTS: [Part; 7] = [
     Part::Progress,
     Part::Account,
     Part::Folders,
     Part::Recent,
     Part::Questions,
     Part::Problems,
+    Part::Notices,
 ];
 
 /// The fake core. Swift scripts it through [`SyncSession::fake_core`](crate::SyncSession::fake_core).
@@ -158,8 +199,8 @@ pub struct FakeCore {
 
 impl FakeCore {
     /// Creates a stopped fake. With `state_dir`, it loads its saved state from that directory
-    /// and saves every change there; a missing or unreadable state file starts a first run, and
-    /// a failed save leaves the change in memory only.
+    /// and saves every change there; a missing or unreadable state file starts a first run.
+    /// Without it, saves always succeed in memory unless [`FakeCore::fail_saves`] says otherwise.
     pub fn new(events: Events, state_dir: Option<PathBuf>) -> Self {
         let state_file = state_dir.map(|dir| dir.join(STATE_FILE));
         let saved = state_file
@@ -176,6 +217,8 @@ impl FakeCore {
                 recent: Vec::new(),
                 answers: Vec::new(),
                 fail_next: None,
+                fail_saves: false,
+                not_writable: None,
                 status: SyncStatus::Stopped,
             }),
             events,
@@ -187,13 +230,47 @@ impl FakeCore {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Saves the state and sends the touched parts, then the status if it changed. Runs under
-    /// the lock, which keeps events in order.
-    fn publish(&self, state: &mut State, parts: &[Part]) {
-        if let Some(path) = &self.state_file {
-            save(path, &state.saved);
+    fn persist(&self, state: &State) -> Result<(), String> {
+        if state.fail_saves {
+            return Err("saving is scripted to fail".to_owned());
         }
-        for part in parts {
+        match &self.state_file {
+            Some(path) => save(path, &state.saved).map_err(|e| e.to_string()),
+            None => Ok(()),
+        }
+    }
+
+    /// Saves a change a session call made and sends it. If saving fails, puts back `before`,
+    /// lists [`ProblemKind::StateNotWritable`] and returns [`SessionError::NotSaved`].
+    fn commit(&self, state: &mut State, before: Saved, parts: &[Part]) -> Result<(), SessionError> {
+        match self.persist(state) {
+            Ok(()) => {
+                let problems = state.set_save_failure(None);
+                self.publish(state, parts, problems);
+                Ok(())
+            }
+            Err(reason) => {
+                state.saved = before;
+                state.set_save_failure(Some(reason.clone()));
+                self.publish(state, &[], true);
+                Err(SessionError::NotSaved { reason })
+            }
+        }
+    }
+
+    /// Saves a change a script made, which stands for something the engine did, and sends it.
+    /// A failed save keeps the change in memory and lists [`ProblemKind::StateNotWritable`].
+    fn record(&self, state: &mut State, parts: &[Part]) {
+        let outcome = self.persist(state);
+        let problems = state.set_save_failure(outcome.err());
+        self.publish(state, parts, problems);
+    }
+
+    /// Sends the touched parts, then the status if it changed. Runs under the lock, which keeps
+    /// events in order.
+    fn publish(&self, state: &mut State, parts: &[Part], problems: bool) {
+        let extra = (problems && !parts.contains(&Part::Problems)).then_some(Part::Problems);
+        for part in parts.iter().copied().chain(extra) {
             self.events.send(match part {
                 Part::Progress => SessionEvent::Progress {
                     progress: state.progress.clone(),
@@ -211,7 +288,10 @@ impl FakeCore {
                     questions: state.saved.questions.clone(),
                 },
                 Part::Problems => SessionEvent::Problems {
-                    problems: state.saved.problems.clone(),
+                    problems: state.problems(),
+                },
+                Part::Notices => SessionEvent::Notices {
+                    notices: state.saved.notices.clone(),
                 },
             });
         }
@@ -223,18 +303,14 @@ impl FakeCore {
     }
 }
 
-fn save(path: &Path, saved: &Saved) {
-    let Ok(bytes) = serde_json::to_vec_pretty(saved) else {
-        return;
-    };
-    let partial = path.with_extension("json.partial");
-    if path
-        .parent()
-        .is_some_and(|dir| fs::create_dir_all(dir).is_ok())
-        && fs::write(&partial, bytes).is_ok()
-    {
-        let _ = fs::rename(&partial, path);
+fn save(path: &Path, saved: &Saved) -> io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(saved)?;
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
     }
+    let partial = path.with_extension("json.partial");
+    fs::write(&partial, bytes)?;
+    fs::rename(&partial, path)
 }
 
 fn now_ms() -> i64 {
@@ -265,27 +341,26 @@ impl FakeCore {
     /// running.
     pub fn load_scenario(&self, scenario: FakeScenario) {
         let mut state = self.lock();
-        let now = now_ms();
-        let script = scenario::build(scenario, now);
+        let script = scenario::build(scenario, now_ms());
         state.saved = script.saved;
         state.activity = script.activity;
         state.progress = script.progress;
         state.recent = script.recent;
         state.answers.clear();
         state.fail_next = None;
-        self.publish(&mut state, &ALL_PARTS);
+        self.record(&mut state, &ALL_PARTS);
     }
 
     pub fn set_activity(&self, activity: FakeActivity) {
         let mut state = self.lock();
         state.activity = activity;
-        self.publish(&mut state, &[]);
+        self.publish(&mut state, &[], false);
     }
 
     pub fn set_progress(&self, progress: Option<SyncProgress>) {
         let mut state = self.lock();
         state.progress = progress;
-        self.publish(&mut state, &[Part::Progress]);
+        self.publish(&mut state, &[Part::Progress], false);
     }
 
     /// Adds a change at the top of the recent changes, keeping the newest
@@ -294,7 +369,7 @@ impl FakeCore {
         let mut state = self.lock();
         state.recent.insert(0, change);
         state.recent.truncate(RECENT_CHANGES);
-        self.publish(&mut state, &[Part::Recent]);
+        self.publish(&mut state, &[Part::Recent], false);
     }
 
     /// Sets whether the server reports itself claimed, which decides between claiming and
@@ -305,7 +380,14 @@ impl FakeCore {
         if let Some(server) = &mut state.saved.server {
             server.claimed = claimed;
         }
-        self.publish(&mut state, &[]);
+        self.record(&mut state, &[]);
+    }
+
+    /// Sets the device list the server reports, or none for a server that cannot list devices.
+    pub fn set_devices(&self, devices: Option<Vec<Device>>) {
+        let mut state = self.lock();
+        state.saved.devices = devices;
+        self.record(&mut state, &[]);
     }
 
     pub fn set_folder_state(&self, space_id: String, folder_state: FolderState) {
@@ -315,7 +397,7 @@ impl FakeCore {
                 folder.state = folder_state;
             }
         }
-        self.publish(&mut state, &[Part::Folders]);
+        self.record(&mut state, &[Part::Folders]);
     }
 
     /// Asks a question and returns its ID. The answers follow from the kind.
@@ -331,7 +413,7 @@ impl FakeCore {
             items,
             answers,
         });
-        self.publish(&mut state, &[Part::Questions]);
+        self.record(&mut state, &[Part::Questions]);
         id
     }
 
@@ -340,7 +422,21 @@ impl FakeCore {
     pub fn withdraw_question(&self, question_id: String) {
         let mut state = self.lock();
         state.saved.questions.retain(|q| q.id != question_id);
-        self.publish(&mut state, &[Part::Questions]);
+        self.record(&mut state, &[Part::Questions]);
+    }
+
+    /// Adds a notice and returns its ID.
+    pub fn notify(&self, space_id: String, kind: NoticeKind) -> String {
+        let mut state = self.lock();
+        let id = state.next_id("notice");
+        state.saved.notices.push(Notice {
+            id: id.clone(),
+            space_id,
+            at_ms: now_ms(),
+            kind,
+        });
+        self.record(&mut state, &[Part::Notices]);
+        id
     }
 
     /// Reports a problem and returns its ID.
@@ -359,14 +455,14 @@ impl FakeCore {
             kind,
             since_ms: now_ms(),
         });
-        self.publish(&mut state, &[Part::Problems]);
+        self.record(&mut state, &[Part::Problems]);
         id
     }
 
     pub fn resolve_problem(&self, problem_id: String) {
         let mut state = self.lock();
         state.saved.problems.retain(|p| p.id != problem_id);
-        self.publish(&mut state, &[Part::Problems]);
+        self.record(&mut state, &[Part::Problems]);
     }
 
     /// Makes the next call that can fail return `error` instead.
@@ -374,7 +470,12 @@ impl FakeCore {
         self.lock().fail_next = Some(error);
     }
 
-    /// The answers given so far, in order.
+    /// Makes every save fail, as an unwritable store would, until called with false.
+    pub fn fail_saves(&self, fail: bool) {
+        self.lock().fail_saves = fail;
+    }
+
+    /// The answers given so far, in order. An answer that could not be saved is not among them.
     pub fn given_answers(&self) -> Vec<GivenAnswer> {
         self.lock().answers.clone()
     }
@@ -390,7 +491,8 @@ impl Core for FakeCore {
             folders: state.saved.folders.clone(),
             recent_changes: state.recent.clone(),
             questions: state.saved.questions.clone(),
-            problems: state.saved.problems.clone(),
+            problems: state.problems(),
+            notices: state.saved.notices.clone(),
         }
     }
 
@@ -400,27 +502,33 @@ impl Core for FakeCore {
             return;
         }
         state.running = true;
-        self.publish(&mut state, &[Part::Questions]);
+        self.publish(&mut state, &[Part::Questions, Part::Notices], false);
     }
 
     fn stop(&self) {
         let mut state = self.lock();
         state.running = false;
-        self.publish(&mut state, &[]);
+        self.publish(&mut state, &[], false);
     }
 
-    fn pause(&self) {
+    fn pause(&self) -> Result<(), SessionError> {
         let mut state = self.lock();
-        if state.running {
-            state.saved.paused = true;
-            self.publish(&mut state, &[]);
+        if !state.running || state.saved.paused {
+            return Ok(());
         }
+        let before = state.saved.clone();
+        state.saved.paused = true;
+        self.commit(&mut state, before, &[])
     }
 
-    fn resume(&self) {
+    fn resume(&self) -> Result<(), SessionError> {
         let mut state = self.lock();
+        if !state.saved.paused {
+            return Ok(());
+        }
+        let before = state.saved.clone();
         state.saved.paused = false;
-        self.publish(&mut state, &[]);
+        self.commit(&mut state, before, &[])
     }
 
     fn connect(&self, url: &str) -> Result<ServerInfo, SessionError> {
@@ -439,8 +547,9 @@ impl Core for FakeCore {
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
             claimed: state.saved.claimed,
         };
+        let before = state.saved.clone();
         state.saved.server = Some(server.clone());
-        self.publish(&mut state, &[]);
+        self.commit(&mut state, before, &[])?;
         Ok(server)
     }
 
@@ -460,23 +569,17 @@ impl Core for FakeCore {
             return Err(SessionError::InvalidCode);
         }
         let (user_name, device_name) = (required(user_name)?, required(device_name)?);
+        let before = state.saved.clone();
         let account = Account {
             server_url: server.url,
             user_id: state.next_id("user"),
             user_name,
             device_id: state.next_id("device"),
-            device_name: device_name.clone(),
+            device_name,
         };
         state.saved.claimed = true;
-        state.saved.devices = vec![Device {
-            device_id: account.device_id.clone(),
-            name: device_name,
-            platform: "macos".to_owned(),
-            this_device: true,
-            added_at_ms: now_ms(),
-        }];
         state.saved.account = Some(account.clone());
-        self.publish(&mut state, &[Part::Account]);
+        self.commit(&mut state, before, &[Part::Account])?;
         Ok(account)
     }
 
@@ -491,30 +594,14 @@ impl Core for FakeCore {
             return Err(SessionError::InvalidCode);
         }
         let device_name = required(device_name)?;
+        let before = state.saved.clone();
         let account = Account {
             server_url: server.url,
             user_id: state.next_id("user"),
             user_name: String::new(),
             device_id: state.next_id("device"),
-            device_name: device_name.clone(),
+            device_name,
         };
-        let now = now_ms();
-        state.saved.devices = vec![
-            Device {
-                device_id: state.next_id("device"),
-                name: "Linux workstation".to_owned(),
-                platform: "linux".to_owned(),
-                this_device: false,
-                added_at_ms: now - 30 * 86_400_000,
-            },
-            Device {
-                device_id: account.device_id.clone(),
-                name: device_name,
-                platform: "macos".to_owned(),
-                this_device: true,
-                added_at_ms: now,
-            },
-        ];
         if state.saved.spaces.is_empty() {
             state.saved.spaces = vec![Space {
                 space_id: state.next_id("space"),
@@ -522,7 +609,7 @@ impl Core for FakeCore {
             }];
         }
         state.saved.account = Some(account.clone());
-        self.publish(&mut state, &[Part::Account]);
+        self.commit(&mut state, before, &[Part::Account])?;
         Ok(account)
     }
 
@@ -530,24 +617,31 @@ impl Core for FakeCore {
         let mut state = self.lock();
         state.take_failure()?;
         state.account()?;
-        let claimed = state.saved.claimed;
+        let before = state.saved.clone();
         state.saved = Saved {
-            server: state.saved.server.take(),
-            claimed,
-            next_id: state.saved.next_id,
+            server: before.server.clone(),
+            claimed: before.claimed,
+            devices: before.devices.clone(),
+            next_id: before.next_id,
             ..Saved::default()
         };
+        self.commit(&mut state, before, &ALL_PARTS)?;
         state.progress = None;
         state.recent.clear();
-        self.publish(&mut state, &ALL_PARTS);
+        self.publish(&mut state, &[Part::Progress, Part::Recent], false);
         Ok(())
     }
 
-    fn devices(&self) -> Result<Vec<Device>, SessionError> {
+    fn devices(&self) -> Result<DeviceList, SessionError> {
         let mut state = self.lock();
         state.take_failure()?;
         state.account()?;
-        Ok(state.saved.devices.clone())
+        Ok(match &state.saved.devices {
+            None => DeviceList::Unavailable,
+            Some(devices) => DeviceList::Available {
+                devices: devices.clone(),
+            },
+        })
     }
 
     fn start_pairing(&self) -> Result<PairingCode, SessionError> {
@@ -555,14 +649,15 @@ impl Core for FakeCore {
         state.take_failure()?;
         state.account()?;
         let n = state.saved.next_id;
-        state.saved.next_id += 1;
         let code: String = (0..PAIRING_CODE_LEN)
             .map(|i| {
                 let alphabet = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
                 alphabet[(n as usize * 7 + i * 13) % alphabet.len()] as char
             })
             .collect();
-        self.publish(&mut state, &[]);
+        let before = state.saved.clone();
+        state.saved.next_id += 1;
+        self.commit(&mut state, before, &[])?;
         Ok(PairingCode {
             code,
             expires_at_ms: now_ms() + PAIRING_CODE_MS,
@@ -580,12 +675,14 @@ impl Core for FakeCore {
         let mut state = self.lock();
         state.take_failure()?;
         state.account()?;
+        let name = required(name)?;
+        let before = state.saved.clone();
         let space = Space {
             space_id: state.next_id("space"),
-            name: required(name)?,
+            name,
         };
         state.saved.spaces.push(space.clone());
-        self.publish(&mut state, &[]);
+        self.commit(&mut state, before, &[])?;
         Ok(space)
     }
 
@@ -621,8 +718,9 @@ impl Core for FakeCore {
             path: folder.to_string_lossy().into_owned(),
             state: FolderState::UpToDate,
         };
+        let before = state.saved.clone();
         state.saved.folders.push(linked.clone());
-        self.publish(&mut state, &[Part::Folders]);
+        self.commit(&mut state, before, &[Part::Folders])?;
         Ok(linked)
     }
 
@@ -633,17 +731,24 @@ impl Core for FakeCore {
         if !state.saved.folders.iter().any(|f| f.space_id == space_id) {
             return Err(SessionError::FolderNotLinked);
         }
-        state.saved.folders.retain(|f| f.space_id != space_id);
-        state.saved.questions.retain(|q| q.space_id != space_id);
-        state
-            .saved
+        let before = state.saved.clone();
+        let saved = &mut state.saved;
+        saved.folders.retain(|f| f.space_id != space_id);
+        saved.questions.retain(|q| q.space_id != space_id);
+        saved.notices.retain(|n| n.space_id != space_id);
+        saved
             .problems
             .retain(|p| p.space_id.as_deref() != Some(space_id));
-        self.publish(
+        self.commit(
             &mut state,
-            &[Part::Folders, Part::Questions, Part::Problems],
-        );
-        Ok(())
+            before,
+            &[
+                Part::Folders,
+                Part::Questions,
+                Part::Problems,
+                Part::Notices,
+            ],
+        )
     }
 
     fn answer(&self, question_id: &str, answer: Answer) -> Result<(), SessionError> {
@@ -658,11 +763,8 @@ impl Core for FakeCore {
         if !state.saved.questions[index].answers.contains(&answer) {
             return Err(SessionError::AnswerNotAllowed);
         }
+        let before = state.saved.clone();
         let question = state.saved.questions.remove(index);
-        state.answers.push(GivenAnswer {
-            question_id: question.id,
-            answer,
-        });
         let space_id = question.space_id;
         let recovering = state
             .saved
@@ -676,8 +778,23 @@ impl Core for FakeCore {
                 }
             }
         }
-        self.publish(&mut state, &[Part::Questions, Part::Folders]);
+        self.commit(&mut state, before, &[Part::Questions, Part::Folders])?;
+        state.answers.push(GivenAnswer {
+            question_id: question.id,
+            answer,
+        });
         Ok(())
+    }
+
+    fn dismiss_notice(&self, notice_id: &str) -> Result<(), SessionError> {
+        let mut state = self.lock();
+        state.take_failure()?;
+        if !state.saved.notices.iter().any(|n| n.id == notice_id) {
+            return Err(SessionError::NoticeNotFound);
+        }
+        let before = state.saved.clone();
+        state.saved.notices.retain(|n| n.id != notice_id);
+        self.commit(&mut state, before, &[Part::Notices])
     }
 }
 
@@ -758,9 +875,9 @@ mod tests {
         assert_eq!(h.statuses(), [SyncStatus::NeedsSetup]);
 
         h.core.load_scenario(FakeScenario::UpToDate);
-        h.core.pause();
-        h.core.pause();
-        h.core.resume();
+        h.core.pause().unwrap();
+        h.core.pause().unwrap();
+        h.core.resume().unwrap();
         h.core.set_activity(FakeActivity::Syncing);
         h.core.set_activity(FakeActivity::Offline);
         h.core.stop();
@@ -782,11 +899,11 @@ mod tests {
     fn pause_needs_a_running_session_and_outlives_a_restart() {
         let h = Harness::new(None);
         h.core.load_scenario(FakeScenario::UpToDate);
-        h.core.pause();
+        h.core.pause().unwrap();
         h.core.start();
         assert_eq!(h.core.state().status, SyncStatus::Idle);
 
-        h.core.pause();
+        h.core.pause().unwrap();
         h.core.stop();
         h.core.start();
         assert_eq!(h.core.state().status, SyncStatus::Paused);
@@ -828,9 +945,7 @@ mod tests {
         assert_eq!(account.server_url, "https://box.example.com");
         assert_eq!(account.user_name, "Ada");
         assert_eq!(h.core.state().account, Some(account.clone()));
-        let devices = h.core.devices().unwrap();
-        assert_eq!(devices.len(), 1);
-        assert!(devices[0].this_device);
+        assert_eq!(h.core.devices(), Ok(DeviceList::Unavailable));
         assert!(h.take().contains(&SessionEvent::Account {
             account: Some(account)
         }));
@@ -852,7 +967,7 @@ mod tests {
             Err(SessionError::InvalidCode)
         );
         h.core.pair("abcd efgh", "Mac").unwrap();
-        assert_eq!(h.core.devices().unwrap().len(), 2);
+        assert_eq!(h.core.devices(), Ok(DeviceList::Unavailable));
         assert_eq!(h.core.spaces().unwrap().len(), 1);
 
         let code = h.core.start_pairing().unwrap();
@@ -1018,11 +1133,11 @@ mod tests {
         let ids = h.question_ids();
         assert_eq!(ids.len(), 5);
         for question in h.core.state().questions {
-            let QuestionKind::Recovery { notice, .. } = &question.kind else {
+            let QuestionKind::Recovery { cause, .. } = &question.kind else {
                 panic!("not a recovery question");
             };
-            assert_eq!(notice.trigger, RecoveryTrigger::SpaceRewound);
-            assert!(notice.restore_point_ms.is_some());
+            assert_eq!(cause.trigger, RecoveryTrigger::SpaceRewound);
+            assert!(cause.restore_point_ms.is_some());
         }
         for (i, question) in h.core.state().questions.into_iter().enumerate() {
             assert_eq!(
@@ -1075,7 +1190,7 @@ mod tests {
         let first = Harness::new(Some(dir.path()));
         first.core.load_scenario(FakeScenario::Recovery);
         first.core.start();
-        first.core.pause();
+        first.core.pause().unwrap();
         let answered = first.core.state().questions[0].clone();
         first
             .core
@@ -1094,6 +1209,9 @@ mod tests {
             [
                 SessionEvent::Questions {
                     questions: open.clone()
+                },
+                SessionEvent::Notices {
+                    notices: second.core.state().notices
                 },
                 SessionEvent::Status {
                     status: SyncStatus::Paused
@@ -1140,7 +1258,7 @@ mod tests {
         let h = Harness::new(None);
         h.core.load_scenario(FakeScenario::Problems);
         let problems = h.core.state().problems;
-        assert_eq!(problems.len(), 17);
+        assert_eq!(problems.len(), 19);
         assert_eq!(folder_of(&h.core, PHOTOS).state, FolderState::Halted);
         let id = problems[0].id.clone();
         h.core.resolve_problem(id.clone());
@@ -1164,10 +1282,198 @@ mod tests {
             *seen.lock().unwrap(),
             [
                 SessionEvent::Questions { questions: vec![] },
+                SessionEvent::Notices { notices: vec![] },
                 SessionEvent::Status {
                     status: SyncStatus::NeedsSetup
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn the_device_list_is_an_optional_capability() {
+        let h = Harness::new(None);
+        h.core.load_scenario(FakeScenario::UpToDate);
+        assert_eq!(h.core.devices(), Ok(DeviceList::Unavailable));
+        let device = Device {
+            device_id: "device-1".to_owned(),
+            name: "Mac".to_owned(),
+            platform: "macos".to_owned(),
+            this_device: true,
+            added_at_ms: 1,
+        };
+        h.core.set_devices(Some(vec![device.clone()]));
+        assert_eq!(
+            h.core.devices(),
+            Ok(DeviceList::Available {
+                devices: vec![device]
+            })
+        );
+    }
+
+    #[test]
+    fn a_recovery_without_questions_still_has_a_notice() {
+        let h = Harness::new(None);
+        h.core
+            .load_scenario(FakeScenario::RecoveredWithoutQuestions);
+        let state = h.core.state();
+        assert!(state.questions.is_empty());
+        let [notice] = state.notices.as_slice() else {
+            panic!("expected one notice: {:?}", state.notices);
+        };
+        assert_eq!(notice.space_id, PHOTOS);
+        let NoticeKind::Recovery { cause, held_files } = &notice.kind else {
+            panic!("not a recovery notice");
+        };
+        assert_eq!(cause.trigger, RecoveryTrigger::SpaceRewound);
+        assert_eq!(*held_files, 0);
+
+        h.core.load_scenario(FakeScenario::Recovery);
+        let notices = h.core.state().notices;
+        assert!(matches!(
+            notices[0].kind,
+            NoticeKind::Recovery { held_files: 30, .. }
+        ));
+    }
+
+    #[test]
+    fn a_remote_mass_delete_is_reported_without_asking() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = Harness::new(Some(dir.path()));
+        h.core.load_scenario(FakeScenario::RemoteMassDelete);
+        let state = h.core.state();
+        assert!(state.questions.is_empty());
+        let notice = state.notices[0].clone();
+        assert_eq!(
+            notice.kind,
+            NoticeKind::RemoteMassDelete {
+                deletions: 3,
+                affected_files: 1_200,
+                space_files: 2_000,
+                exceeded: vec![MassDeleteLimit::ShareOfSpace { percent: 50 }],
+            }
+        );
+        drop(h);
+
+        let h = Harness::new(Some(dir.path()));
+        assert_eq!(h.core.state().notices, std::slice::from_ref(&notice));
+        h.core.dismiss_notice(&notice.id).unwrap();
+        assert!(h.core.state().notices.is_empty());
+        assert_eq!(h.take(), [SessionEvent::Notices { notices: vec![] }]);
+        assert_eq!(
+            h.core.dismiss_notice(&notice.id),
+            Err(SessionError::NoticeNotFound)
+        );
+        let id = h.core.notify(
+            DOCUMENTS.to_owned(),
+            NoticeKind::Recovery {
+                cause: RecoveryCause {
+                    trigger: RecoveryTrigger::NoSyncState,
+                    restore_point_ms: None,
+                },
+                held_files: 2,
+            },
+        );
+        assert_eq!(
+            Harness::new(Some(dir.path())).core.state().notices[0].id,
+            id
+        );
+    }
+
+    fn not_writable(core: &FakeCore) -> Option<ProblemKind> {
+        core.state()
+            .problems
+            .into_iter()
+            .find(|p| p.id == NOT_WRITABLE_ID)
+            .map(|p| p.kind)
+    }
+
+    #[test]
+    fn an_answer_that_cannot_be_saved_is_not_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = Harness::new(Some(dir.path()));
+        h.core.load_scenario(FakeScenario::MassDelete);
+        h.core.start();
+        let question = h.core.state().questions[0].clone();
+        h.take();
+
+        h.core.fail_saves(true);
+        let reason = "saving is scripted to fail".to_owned();
+        assert_eq!(
+            h.core.answer(&question.id, Answer::Delete),
+            Err(SessionError::NotSaved {
+                reason: reason.clone()
+            })
+        );
+        assert_eq!(h.core.state().questions, std::slice::from_ref(&question));
+        assert!(h.core.given_answers().is_empty());
+        assert_eq!(
+            not_writable(&h.core),
+            Some(ProblemKind::StateNotWritable { reason })
+        );
+        assert!(matches!(
+            h.take().as_slice(),
+            [SessionEvent::Problems { .. }]
+        ));
+        assert!(matches!(h.core.pause(), Err(SessionError::NotSaved { .. })));
+        assert_eq!(h.core.state().status, SyncStatus::Idle);
+        assert!(matches!(
+            h.core.dismiss_notice("none"),
+            Err(SessionError::NoticeNotFound)
+        ));
+        drop(h);
+
+        let h = Harness::new(Some(dir.path()));
+        assert_eq!(h.core.state().questions, std::slice::from_ref(&question));
+        assert_eq!(not_writable(&h.core), None);
+        h.core.answer(&question.id, Answer::Delete).unwrap();
+        assert!(
+            Harness::new(Some(dir.path()))
+                .core
+                .state()
+                .questions
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_scripted_change_that_cannot_be_saved_is_reported_until_a_save_works() {
+        let h = Harness::new(None);
+        h.core.load_scenario(FakeScenario::UpToDate);
+        h.core.fail_saves(true);
+        let id = h.core.ask(
+            DOCUMENTS.to_owned(),
+            QuestionKind::AmbiguousDisappearance,
+            vec![],
+        );
+        assert_eq!(h.question_ids(), [id]);
+        assert!(not_writable(&h.core).is_some());
+        let since = h.core.state().problems.last().unwrap().since_ms;
+        h.core.report_problem(None, None, ProblemKind::FileBusy);
+        assert_eq!(h.core.state().problems.last().unwrap().since_ms, since);
+
+        h.core.fail_saves(false);
+        h.core
+            .set_folder_state(DOCUMENTS.to_owned(), FolderState::Syncing);
+        assert_eq!(not_writable(&h.core), None);
+    }
+
+    #[test]
+    fn an_unwritable_state_directory_refuses_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-directory");
+        fs::write(&file, b"").unwrap();
+        let h = Harness::new(Some(&file));
+        h.core.start();
+        let error = h.core.connect("https://box.example.com").unwrap_err();
+        assert!(matches!(error, SessionError::NotSaved { .. }), "{error:?}");
+        assert!(matches!(
+            not_writable(&h.core),
+            Some(ProblemKind::StateNotWritable { .. })
+        ));
+        assert_eq!(
+            h.core.claim("ABCDEFGHJKLM", "Ada", "Mac"),
+            Err(SessionError::NoServer)
         );
     }
 }

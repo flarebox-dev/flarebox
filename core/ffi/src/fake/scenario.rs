@@ -65,7 +65,7 @@ fn problem(
     });
 }
 
-fn signed_in(now: i64) -> Saved {
+fn signed_in() -> Saved {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/me".to_owned());
     let url = "https://box.example.com".to_owned();
     let linked = |space_id: &str, name: &str| LinkedFolder {
@@ -88,22 +88,7 @@ fn signed_in(now: i64) -> Saved {
             device_id: "device-1".to_owned(),
             device_name: "Ada's Mac mini".to_owned(),
         }),
-        devices: vec![
-            Device {
-                device_id: "device-1".to_owned(),
-                name: "Ada's Mac mini".to_owned(),
-                platform: "macos".to_owned(),
-                this_device: true,
-                added_at_ms: now - 40 * DAY_MS,
-            },
-            Device {
-                device_id: "device-2".to_owned(),
-                name: "Build server".to_owned(),
-                platform: "linux".to_owned(),
-                this_device: false,
-                added_at_ms: now - 12 * DAY_MS,
-            },
-        ],
+        devices: None,
         spaces: vec![
             Space {
                 space_id: DOCUMENTS.to_owned(),
@@ -121,6 +106,7 @@ fn signed_in(now: i64) -> Saved {
         folders: vec![linked(DOCUMENTS, "Documents"), linked(PHOTOS, "Photos")],
         questions: Vec::new(),
         problems: Vec::new(),
+        notices: Vec::new(),
         paused: false,
         next_id: 100,
     }
@@ -210,11 +196,34 @@ fn mass_delete(saved: &mut Saved, now: i64) {
     );
 }
 
-fn recovery(saved: &mut Saved, now: i64, per_group: u64) {
-    let notice = RecoveryNotice {
+fn notice(saved: &mut Saved, space_id: &str, at: i64, kind: NoticeKind) {
+    saved.next_id += 1;
+    saved.notices.push(Notice {
+        id: format!("notice-{}", saved.next_id),
+        space_id: space_id.to_owned(),
+        at_ms: at,
+        kind,
+    });
+}
+
+fn rewound(now: i64) -> RecoveryCause {
+    RecoveryCause {
         trigger: RecoveryTrigger::SpaceRewound,
         restore_point_ms: Some(now - 3 * DAY_MS),
-    };
+    }
+}
+
+fn recovery(saved: &mut Saved, now: i64, per_group: u64) {
+    let cause = rewound(now);
+    notice(
+        saved,
+        PHOTOS,
+        now - 90_000,
+        NoticeKind::Recovery {
+            cause: cause.clone(),
+            held_files: 5 * per_group,
+        },
+    );
     let groups = [
         RecoveryGroup::CreatedAfterRestorePoint,
         RecoveryGroup::ChangedOnThisDevice,
@@ -248,7 +257,7 @@ fn recovery(saved: &mut Saved, now: i64, per_group: u64) {
             PHOTOS,
             now - 60_000,
             QuestionKind::Recovery {
-                notice: notice.clone(),
+                cause: cause.clone(),
                 group,
             },
             items,
@@ -282,7 +291,7 @@ fn disappearance(saved: &mut Saved, now: i64, n: usize, files: u64) {
 
 pub(super) fn build(scenario: FakeScenario, now: i64) -> Script {
     let mut script = Script {
-        saved: signed_in(now),
+        saved: signed_in(),
         activity: FakeActivity::Idle,
         progress: None,
         recent: recent(now),
@@ -315,6 +324,39 @@ pub(super) fn build(scenario: FakeScenario, now: i64) -> Script {
         FakeScenario::MassDelete => mass_delete(saved, now),
         FakeScenario::AmbiguousDisappearance => disappearance(saved, now, 1, 4),
         FakeScenario::Recovery => recovery(saved, now, 6),
+        FakeScenario::RecoveredWithoutQuestions => notice(
+            saved,
+            PHOTOS,
+            now - 90_000,
+            NoticeKind::Recovery {
+                cause: rewound(now),
+                held_files: 0,
+            },
+        ),
+        FakeScenario::RemoteMassDelete => {
+            notice(
+                saved,
+                PHOTOS,
+                now - 45_000,
+                NoticeKind::RemoteMassDelete {
+                    deletions: 3,
+                    affected_files: 1_200,
+                    space_files: 2_000,
+                    exceeded: vec![MassDeleteLimit::ShareOfSpace { percent: 50 }],
+                },
+            );
+            script.recent.insert(
+                0,
+                RecentChange {
+                    space_id: PHOTOS.to_owned(),
+                    path: "2024".to_owned(),
+                    kind: NodeKind::Folder,
+                    change: ChangeKind::Deleted,
+                    direction: Direction::Downloaded,
+                    at_ms: now - 45_000,
+                },
+            );
+        }
         FakeScenario::ManyQuestions => {
             let items = (1..=1_500)
                 .map(|i| {
@@ -418,6 +460,14 @@ pub(super) fn build(scenario: FakeScenario, now: i64) -> Script {
                 ),
                 (Some("space-archive"), None, ProblemKind::SpaceFormatTooNew),
                 (None, None, ProblemKind::SignInRequired),
+                (
+                    None,
+                    None,
+                    ProblemKind::StateNotWritable {
+                        reason: "No space left on device".to_owned(),
+                    },
+                ),
+                (documents, Some("Logs/server.log"), ProblemKind::FileBusy),
             ];
             for (i, (space, path, kind)) in kinds.into_iter().enumerate() {
                 problem(saved, space, path, kind, now - (i as i64 + 1) * 60_000);

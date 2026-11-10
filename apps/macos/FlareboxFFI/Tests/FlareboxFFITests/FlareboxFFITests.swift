@@ -47,8 +47,8 @@ private final class Recorder: SessionListener {
     session.start()
     #expect(session.state().status == .needsSetup)
     try #require(session.fakeCore()).loadScenario(scenario: .upToDate)
-    session.pause()
-    session.resume()
+    try session.pause()
+    try session.resume()
     session.stop()
 
     #expect(recorder.statuses == [.needsSetup, .idle, .paused, .idle, .stopped])
@@ -99,6 +99,32 @@ private final class Recorder: SessionListener {
     #expect(fake.givenAnswers() == [GivenAnswer(questionId: created.id, answer: .keep)])
 }
 
+@Test func noticesDevicesAndSaveFailuresAreTyped() throws {
+    let session = SyncSession.fake(listener: Recorder(), stateDir: nil)
+    let fake = try #require(session.fakeCore())
+    fake.loadScenario(scenario: .remoteMassDelete)
+    #expect(try session.devices() == .unavailable)
+    let notice = try #require(session.state().notices.first)
+    guard case .remoteMassDelete(_, let affectedFiles, _, _) = notice.kind else {
+        Issue.record("expected a remote mass delete, got \(notice.kind)")
+        return
+    }
+    #expect(affectedFiles == 1_200)
+
+    fake.failSaves(fail: true)
+    #expect(throws: SessionError.NotSaved(reason: "saving is scripted to fail")) {
+        try session.dismissNotice(noticeId: notice.id)
+    }
+    #expect(session.state().notices == [notice])
+    #expect(session.state().problems.contains {
+        if case .stateNotWritable = $0.kind { true } else { false }
+    })
+    fake.failSaves(fail: false)
+    try session.dismissNotice(noticeId: notice.id)
+    #expect(session.state().notices.isEmpty)
+    #expect(session.state().problems.isEmpty)
+}
+
 @Test func unansweredQuestionsSurviveARelaunch() throws {
     let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: directory) }
@@ -129,5 +155,7 @@ func eventStreamFinishesWhenTheSessionIsReleased() async {
     session?.stop()
     session = nil
 
-    #expect(await seen == [.questions(questions: []), .status(status: .needsSetup), .status(status: .stopped)])
+    #expect(await seen == [
+        .questions(questions: []), .notices(notices: []), .status(status: .needsSetup), .status(status: .stopped),
+    ])
 }

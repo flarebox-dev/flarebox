@@ -5,8 +5,8 @@
 //! The app holds a [`SyncSession`], which forwards to a [`Core`]. The surface follows the sync
 //! engine's inputs and outputs (docs/design/sync-engine.md §1): session lifecycle, server and
 //! device sign-in, linking folders to spaces, a stream of [`SessionEvent`]s for status,
-//! progress and recent changes, the engine's questions with typed [`Answer`]s, and its
-//! problems. Until the driver that runs the engine exists, sessions are backed by [`FakeCore`],
+//! progress and recent changes, the engine's questions with typed [`Answer`]s, its notices and
+//! its problems. Until the driver that runs the engine exists, sessions are backed by [`FakeCore`],
 //! which plays back scripted states.
 
 mod core;

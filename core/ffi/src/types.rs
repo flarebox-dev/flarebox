@@ -136,6 +136,17 @@ pub struct Device {
     pub added_at_ms: i64,
 }
 
+/// The account's devices, if the server can list them.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum DeviceList {
+    /// The server has no API that lists an account's devices; no server has one yet (`spec/proto/flarebox/v1/auth.proto`).
+    /// The app shows that the list is unavailable rather than a partial one.
+    Unavailable,
+    Available {
+        devices: Vec<Device>,
+    },
+}
+
 /// A code that signs in another device of the same account (`POST /v1/pair/start`).
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct PairingCode {
@@ -221,10 +232,11 @@ pub enum QuestionKind {
     /// devices until answered. Answers: [`Answer::Delete`] deletes them everywhere;
     /// [`Answer::Restore`] downloads them here again.
     AmbiguousDisappearance,
-    /// One group of files held by a recovery (design §6.4). The notice is the same for every
-    /// group of one recovery; the group decides the two answers.
+    /// One group of files held by a recovery (design §6.4). The cause is the same for every
+    /// group of one recovery and is also announced by a [`NoticeKind::Recovery`] notice; the
+    /// group decides the two answers.
     Recovery {
-        notice: RecoveryNotice,
+        cause: RecoveryCause,
         group: RecoveryGroup,
     },
 }
@@ -238,9 +250,9 @@ pub enum MassDeleteLimit {
     ShareOfSpace { percent: u8 },
 }
 
-/// What started a recovery and when the space was restored to, shown once per recovery.
+/// What started a recovery and when the space was restored to.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
-pub struct RecoveryNotice {
+pub struct RecoveryCause {
     pub trigger: RecoveryTrigger,
     /// The point in time the space was rewound to, when the server reports it.
     pub restore_point_ms: Option<i64>,
@@ -354,6 +366,38 @@ impl QuestionKind {
     }
 }
 
+/// Something the person should know that needs neither an answer nor a fix. The core keeps a
+/// notice, across restarts, until the person dismisses it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct Notice {
+    pub id: String,
+    pub space_id: String,
+    pub at_ms: i64,
+    pub kind: NoticeKind,
+}
+
+/// What a [`Notice`] reports.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
+pub enum NoticeKind {
+    /// A recovery started for the space (design §6.4, What the user sees): one notice per
+    /// recovery, also when nothing is held. Changes the device had not made were applied, and
+    /// files it removed went to the local trash; `held_files` are waiting for answers to
+    /// [`QuestionKind::Recovery`] questions.
+    Recovery {
+        cause: RecoveryCause,
+        held_files: u64,
+    },
+    /// Deletions from the server crossed a limit of the mass-delete guard and were applied here
+    /// without asking, because the server is authoritative (design §6.1, Remote deletions). The
+    /// files are in the local trash. The counts cover the rolling 10-minute window.
+    RemoteMassDelete {
+        deletions: u64,
+        affected_files: u64,
+        space_files: u64,
+        exceeded: Vec<MassDeleteLimit>,
+    },
+}
+
 /// Something only a person can fix (`Problem`, design §1). A problem stays listed until its
 /// cause goes away; the engine retries on its own.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
@@ -397,6 +441,9 @@ pub enum ProblemKind {
     FileUnreadable { reason: String },
     /// A file cannot be written, so a change to it cannot be applied (design §5.7).
     FileNotWritable { reason: String },
+    /// A file keeps changing, such as a log or a database being written, so it is not uploaded.
+    /// The core retries with backoff and reports it after a limit (design §5.8).
+    FileBusy,
     /// A name from the server that this file system cannot hold.
     NameNotAllowed,
     /// A file from the server cannot be placed because an ignored or unsupported entry, such as
@@ -408,6 +455,9 @@ pub enum ProblemKind {
     IgnoreRuleInvalid { line: u32 },
     /// The server no longer accepts this device's credentials. Sign in again.
     SignInRequired,
+    /// This device cannot save its sync state or credentials. Every change waits for its state
+    /// to be saved first (design §1, §2.8), so nothing syncs until saving works again.
+    StateNotWritable { reason: String },
 }
 
 /// The whole state the app shows. [`SessionEvent`]s replace one part of it at a time.
@@ -424,6 +474,8 @@ pub struct SessionState {
     pub questions: Vec<Question>,
     /// Current problems, oldest first.
     pub problems: Vec<Problem>,
+    /// Notices not dismissed yet, oldest first.
+    pub notices: Vec<Notice>,
 }
 
 /// How many recent changes the session keeps.
@@ -441,6 +493,7 @@ pub enum SessionEvent {
     RecentChanges { changes: Vec<RecentChange> },
     Questions { questions: Vec<Question> },
     Problems { problems: Vec<Problem> },
+    Notices { notices: Vec<Notice> },
 }
 
 /// Why a session call failed.
@@ -480,4 +533,8 @@ pub enum SessionError {
     QuestionNotFound,
     #[error("the question does not accept this answer")]
     AnswerNotAllowed,
+    #[error("the notice was already dismissed")]
+    NoticeNotFound,
+    #[error("the change could not be saved on this device, so it was not made: {reason}")]
+    NotSaved { reason: String },
 }
