@@ -31,7 +31,10 @@ export interface NodeRow {
   content_dev: string;
   meta_rev: number;
   meta_dev: string;
-  /** The seq and device of the commit that last gave the node a new parent or brought it back from the trash. */
+  /**
+   * The seq and device of the commit that last gave the node a new parent or brought it back from the trash. parent_dev
+   * is empty unless that commit's op named both the node and the parent.
+   */
   parent_rev: number;
   parent_dev: string;
   cur_version_id: string | null;

@@ -80,7 +80,7 @@ pub(crate) struct Node {
     meta_rev: u64,
     meta_dev: String,
     /// The seq and device of the commit that last gave the node a new parent or brought it back from
-    /// the trash.
+    /// the trash. `parent_dev` is empty unless that commit's op named both the node and the parent.
     parent_rev: u64,
     parent_dev: String,
     cur_version_id: Option<String>,
