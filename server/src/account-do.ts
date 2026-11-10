@@ -249,9 +249,11 @@ export class AccountDO extends DurableObject<Env> {
     const outcome = this.ctx.storage.transactionSync(() => redeemClaim(this.sql, attempt));
     if (!outcome.ok) return outcome;
     // Each check runs right before revokeDevice's first transaction, with no await between them, so a device that
-    // refreshed a token while an earlier revocation awaited its notices is kept.
+    // refreshed a token while an earlier revocation awaited its notices is kept. The claim has committed, so a failed
+    // revocation must not cost the caller its credentials; that device stays unused, as its credentials reached nobody.
     for (const deviceId of outcome.revoke) {
-      if (stillUnused(this.sql, deviceId, setupAttempt, userId)) await this.revokeDevice(deviceId);
+      if (!stillUnused(this.sql, deviceId, setupAttempt, userId)) continue;
+      await this.revokeDevice(deviceId).catch((error: unknown) => console.error("setup attempt cleanup failed", deviceId, error));
     }
     return ok(create(DeviceCredentialsSchema, { ...device.credentials, userName: this.userName(userId) }));
   }

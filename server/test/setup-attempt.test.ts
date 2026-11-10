@@ -115,4 +115,30 @@ describe("cleanup after a claim", () => {
       }
     });
   });
+
+  it("returns the claim's credentials when a revocation fails, and still revokes the other selected devices", async () => {
+    const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName("revocation-fails"));
+    const lostDevices: string[] = [];
+    for (const setupAttempt of ["first", "second"]) {
+      const key = crypto.randomUUID() + crypto.randomUUID();
+      const outcome = await stub.claim({ code: key, userName: "Owner", deviceName: "Laptop", platform: "macos", setupAttempt }, ADDRESS, key);
+      if (!outcome.ok) throw new Error(outcome.message);
+      lostDevices.push(outcome.value.deviceId);
+    }
+    await runInDurableObject(stub, async (instance: AccountDO, state) => {
+      state.storage.sql.exec("UPDATE devices SET setup_attempt = 'failing'");
+      const spy = vi.spyOn(instance, "revokeDevice").mockRejectedValueOnce(new Error("injected revocation failure"));
+      try {
+        const key = crypto.randomUUID() + crypto.randomUUID();
+        const outcome = await instance.claim({ code: key, userName: "Owner", deviceName: "Laptop", platform: "macos", setupAttempt: "failing" }, ADDRESS, key);
+        if (!outcome.ok) throw new Error(outcome.message);
+        expect(spy).toHaveBeenCalledTimes(2);
+        expect((await instance.refreshAccess({ deviceId: outcome.value.deviceId, refreshCredential: outcome.value.refreshCredential })).ok).toBe(true);
+        const active = await Promise.all(lostDevices.map((deviceId) => instance.isDeviceActive(deviceId)));
+        expect(active.filter(Boolean)).toHaveLength(1);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+  });
 });
