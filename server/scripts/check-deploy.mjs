@@ -123,6 +123,7 @@ async function claimLocally() {
   });
   dev.stdout.on("data", (chunk) => (devOutput += chunk));
   dev.stderr.on("data", (chunk) => (devOutput += chunk));
+  dev.on("error", (error) => (devOutput += "could not start wrangler dev: " + error.message + "\n"));
   const json = { "Content-Type": "application/json", Accept: "application/json" };
   const before = await waitFor(
     () => request(base + "/v1/server", { headers: json }).then((response) => (response.ok ? response.json() : undefined)),
