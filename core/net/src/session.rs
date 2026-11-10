@@ -7,9 +7,10 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, SystemTime};
 
+use bytes::Bytes;
 use flarebox_proto::v1::{
     AccessToken, ChunkRef, ClientMessage, Commit, CommitResult, DownloadTargets,
     GetDownloadTargets, GetVersionChunks, Hello, ListTrash, ListTree, ListVersions, PrepareUpload,
@@ -18,10 +19,13 @@ use flarebox_proto::v1::{
     server_message::Msg,
 };
 use futures_util::{SinkExt, StreamExt};
+use http_body_util::{BodyExt, Collected, Empty, Limited};
+use hyper::client::conn::http1;
+use hyper_util::rt::TokioIo;
 use prost::Message as _;
 use rustls::pki_types::ServerName;
 use rustls_platform_verifier::BuilderVerifierExt;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -31,9 +35,7 @@ use tokio_rustls::TlsConnector;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::tungstenite::http::header::{
-    AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING,
-};
+use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{self, Message as WsMessage};
 use url::Url;
@@ -618,7 +620,7 @@ impl Task {
         let config = WebSocketConfig::default()
             .max_message_size(Some(MAX_SERVER_MESSAGE))
             .max_frame_size(Some(MAX_SERVER_MESSAGE));
-        let mut kept = Shared(Arc::new(std::sync::Mutex::new(io)));
+        let kept = Shared(Arc::new(std::sync::Mutex::new(io)));
         let response =
             match tokio_tungstenite::client_async_with_config(request, kept.clone(), Some(config))
                 .await
@@ -628,36 +630,27 @@ impl Task {
                 Err(error) => return Err(Exit::transport(error)),
             };
         let status = response.status().as_u16();
-        let header = |name| {
-            response
-                .headers()
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-        };
-        let protobuf = header(CONTENT_TYPE).is_some_and(|value| value.starts_with(PROTOBUF));
-        let framing = if header(TRANSFER_ENCODING)
-            .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
-        {
-            Some(Framing::Chunked)
-        } else if let Some(length) = header(CONTENT_LENGTH) {
-            length.trim().parse().ok().map(Framing::Length)
-        } else {
-            Some(Framing::Close)
-        };
+        let protobuf = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with(PROTOBUF));
         if protobuf {
-            let tail = response.into_body().unwrap_or_default();
-            let body = match framing {
-                Some(framing) => refusal_body(&mut kept, framing, tail).await,
-                None => None,
-            };
-            match body {
-                Some(body) => {
-                    if let Some(server) = ServerError::decode(&body)
-                        && let Some(exit) = self.refused_with(&server)
-                    {
+            let (head, tail) = response.into_parts();
+            let error = refusal_body(&head, tail.unwrap_or_default(), kept)
+                .await
+                .and_then(|body| match ServerError::decode(&body) {
+                    Some(server) => Some(Some(server)),
+                    None if body.is_empty() => Some(None),
+                    None => None,
+                });
+            match error {
+                Some(Some(server)) => {
+                    if let Some(exit) = self.refused_with(&server) {
                         return Err(exit);
                     }
                 }
+                Some(None) => {}
                 None => {
                     self.unreadable_refusals += 1;
                     if self.unreadable_refusals >= MAX_UNREADABLE_REFUSALS {
@@ -1073,64 +1066,97 @@ impl AsyncWrite for Shared {
     }
 }
 
-/// How the body of a refused upgrade ends (RFC 9112 section 6).
-enum Framing {
-    Length(usize),
-    Chunked,
-    /// The body runs until the server closes the connection.
-    Close,
-}
-
-/// Reads the whole body of a refused upgrade, given the `raw` bytes tungstenite already read after its head, within
-/// `MAX_REFUSAL` bytes and `REFUSAL_READ_TIMEOUT`. `None` when it cannot be read as a whole.
-async fn refusal_body(io: &mut Shared, framing: Framing, mut raw: Vec<u8>) -> Option<Vec<u8>> {
+/// Reads the whole body of a refused upgrade with hyper's HTTP/1 parser, given the `head` tungstenite parsed, the
+/// `tail` it read after it, and then the connection. Hyper decides the framing and checks it, so the body is only
+/// returned once it is complete, within `MAX_REFUSAL` bytes and `REFUSAL_READ_TIMEOUT`; `None` when it is
+/// incomplete, malformed or larger.
+async fn refusal_body(
+    head: &tungstenite::http::response::Parts,
+    tail: Vec<u8>,
+    rest: impl AsyncRead + Unpin,
+) -> Option<Bytes> {
+    let mut answer = format!("{:?} {} \r\n", head.version, head.status.as_u16()).into_bytes();
+    for (name, value) in &head.headers {
+        answer.extend_from_slice(name.as_str().as_bytes());
+        answer.extend_from_slice(b": ");
+        answer.extend_from_slice(value.as_bytes());
+        answer.extend_from_slice(b"\r\n");
+    }
+    answer.extend_from_slice(b"\r\n");
+    answer.extend_from_slice(&tail);
+    let replay = Replay {
+        answer: Bytes::from(answer),
+        rest,
+        asked: false,
+        waiting: None,
+    };
     let read = async {
-        loop {
-            match framing {
-                Framing::Length(length) if raw.len() >= length => {
-                    raw.truncate(length);
-                    return Some(raw);
-                }
-                Framing::Chunked => {
-                    if let Some(body) = dechunk(&raw) {
-                        return body;
-                    }
-                }
-                _ => {}
-            }
-            if raw.len() > MAX_REFUSAL {
-                return None;
-            }
-            let mut part = [0; 4096];
-            match io.read(&mut part).await {
-                Ok(0) => return matches!(framing, Framing::Close).then_some(raw),
-                Ok(n) => raw.extend_from_slice(&part[..n]),
-                Err(_) => return None,
-            }
+        let (mut sender, connection) = http1::handshake(TokioIo::new(replay)).await.ok()?;
+        let response = sender.send_request(hyper::Request::new(Empty::<Bytes>::new()));
+        drop(sender);
+        let body = async {
+            let body = Limited::new(response.await.ok()?.into_body(), MAX_REFUSAL);
+            body.collect().await.ok().map(Collected::to_bytes)
+        };
+        let mut body = std::pin::pin!(body);
+        tokio::select! {
+            body = &mut body => body,
+            _ = connection => body.await,
         }
     };
     timeout(REFUSAL_READ_TIMEOUT, read).await.ok().flatten()
 }
 
-/// The body of a complete chunked encoding: `None` while more is needed, `Some(None)` when it is malformed.
-fn dechunk(raw: &[u8]) -> Option<Option<Vec<u8>>> {
-    let mut body = Vec::new();
-    let mut at = 0;
-    loop {
-        match httparse::parse_chunk_size(&raw[at..]) {
-            Ok(httparse::Status::Complete((used, 0))) if used > 0 => return Some(Some(body)),
-            Ok(httparse::Status::Complete((used, size))) => {
-                let size = usize::try_from(size).ok()?;
-                let end = at + used + size;
-                if raw.len() < end + 2 {
-                    return None;
-                }
-                body.extend_from_slice(&raw[at + used..end]);
-                at = end + 2;
-            }
-            Ok(httparse::Status::Partial) => return None,
-            Err(_) => return Some(None),
+/// The connection of a refused upgrade as hyper's client sees it: its request goes nowhere, since the server has
+/// already answered, and the answer is the refusal's head and the bytes after it, then the rest of the connection.
+struct Replay<R> {
+    answer: Bytes,
+    rest: R,
+    /// Hyper reads an answer only once it has asked.
+    asked: bool,
+    waiting: Option<Waker>,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for Replay<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if !this.asked {
+            this.waiting = Some(cx.waker().clone());
+            return Poll::Pending;
         }
+        if this.answer.is_empty() {
+            return Pin::new(&mut this.rest).poll_read(cx, buf);
+        }
+        let n = this.answer.len().min(buf.remaining());
+        buf.put_slice(&this.answer.split_to(n));
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<R: Unpin> AsyncWrite for Replay<R> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        this.asked = true;
+        if let Some(waker) = this.waiting.take() {
+            waker.wake();
+        }
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 }
 

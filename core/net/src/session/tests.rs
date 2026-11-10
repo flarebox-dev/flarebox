@@ -1152,8 +1152,20 @@ async fn a_refusal_whose_error_cannot_be_read_is_retried_a_bounded_number_of_tim
             tokio::time::timeout(Duration::from_secs(2), listener.accept()).await
         {
             attempts += 1;
-            let head = b"HTTP/1.1 500 X\r\ncontent-type: application/x-protobuf\r\ncontent-length: 1000\r\n\r\n";
-            answer_in_parts(&mut upgrade, vec![head.to_vec(), vec![0x08; 10]]).await;
+            let answer = if attempts % 2 == 0 {
+                // A whole body that is not an `Error`.
+                vec![
+                    b"HTTP/1.1 500 X\r\ncontent-type: application/x-protobuf\r\ncontent-length: 3\r\n\r\n".to_vec(),
+                    vec![0xff; 3],
+                ]
+            } else {
+                // A body cut short.
+                vec![
+                    b"HTTP/1.1 500 X\r\ncontent-type: application/x-protobuf\r\ncontent-length: 1000\r\n\r\n".to_vec(),
+                    vec![0x08; 10],
+                ]
+            };
+            answer_in_parts(&mut upgrade, answer).await;
         }
         attempts
     });
@@ -1204,4 +1216,133 @@ async fn a_101_without_upgrade_and_connection_headers_is_not_a_websocket() {
         ),
         "{event:?}"
     );
+}
+
+#[tokio::test]
+async fn malformed_chunked_refusals_are_left_to_their_status() {
+    let (listener, auth) = listen().await;
+    let body = refusal(999, 0).encode_to_vec();
+    let head = b"HTTP/1.1 503 X\r\ncontent-type: application/x-protobuf\r\ntransfer-encoding: chunked\r\n\r\n";
+    let oversized = [b"ffffffffffffffff\r\n".as_slice(), &body].concat();
+    let unterminated = [
+        format!("{:x}\r\n", body.len()).as_bytes(),
+        &body,
+        b"\r\n0\r\n",
+    ]
+    .concat();
+    for (case, rest) in [("oversized", oversized), ("unterminated", unterminated)] {
+        let (_session, mut events) = Session::start(auth.clone(), config()).unwrap();
+        let (mut upgrade, _) = listener.accept().await.unwrap();
+        answer_in_parts(&mut upgrade, vec![head.to_vec(), rest]).await;
+        drop(upgrade);
+        let event = next(&mut events).await;
+        assert!(
+            matches!(
+                event,
+                Event::Disconnected {
+                    reason: DisconnectReason::Refused { status: 503 },
+                    ..
+                }
+            ),
+            "{case}: {event:?}"
+        );
+    }
+}
+
+/// `refusal_body` fed arbitrary and truncated answers.
+mod refusal_reader {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    type Framing = Option<(&'static str, String)>;
+
+    fn head(framing: Framing) -> tungstenite::http::response::Parts {
+        let mut response = tungstenite::http::Response::builder()
+            .status(503)
+            .header(CONTENT_TYPE, PROTOBUF);
+        if let Some((name, value)) = framing {
+            response = response.header(name, value);
+        }
+        response.body(()).unwrap().into_parts().0
+    }
+
+    fn chunked() -> Framing {
+        Some(("transfer-encoding", "chunked".into()))
+    }
+
+    fn length(length: usize) -> Framing {
+        Some(("content-length", length.to_string()))
+    }
+
+    /// Reads an answer whose first `split` bytes tungstenite already read, and whose connection then ends.
+    fn read(framing: Framing, answer: &[u8], split: usize) -> Option<Bytes> {
+        let (tail, rest) = answer.split_at(split.min(answer.len()));
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(refusal_body(&head(framing), tail.to_vec(), rest))
+    }
+
+    fn encode_chunked(body: &[u8], sizes: &[usize]) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        let mut rest = body;
+        for size in sizes.iter().cycle() {
+            if rest.is_empty() {
+                break;
+            }
+            let (chunk, after) = rest.split_at((*size).min(rest.len()));
+            encoded.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            encoded.extend_from_slice(chunk);
+            encoded.extend_from_slice(b"\r\n");
+            rest = after;
+        }
+        encoded.extend_from_slice(b"0\r\n\r\n");
+        encoded
+    }
+
+    #[test]
+    fn a_body_past_the_bound_is_not_read() {
+        let body = vec![0; MAX_REFUSAL + 1];
+        assert_eq!(read(length(body.len()), &body, 0), None);
+        assert_eq!(read(chunked(), &encode_chunked(&body, &[4096]), 0), None);
+        assert_eq!(read(None, &body, 0), None);
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_answers_are_bounded_and_never_panic(
+            framing in prop_oneof![Just(None), Just(chunked()), (0usize..100_000).prop_map(length)],
+            size_line in "([0-9a-fA-F]{1,20}(;[a-z]{0,3})?\r\n)?",
+            bytes in proptest::collection::vec(any::<u8>(), 0..512),
+            split in any::<usize>(),
+        ) {
+            let answer = [size_line.as_bytes(), &bytes].concat();
+            if let Some(body) = read(framing, &answer, split) {
+                prop_assert!(body.len() <= MAX_REFUSAL);
+            }
+        }
+
+        #[test]
+        fn complete_bodies_are_read_whole_and_cut_ones_are_not(
+            body in proptest::collection::vec(any::<u8>(), 0..2048),
+            sizes in proptest::collection::vec(1usize..600, 1..8),
+            is_chunked in any::<bool>(),
+            split in any::<usize>(),
+            cut in any::<prop::sample::Index>(),
+        ) {
+            let (framing, encoded) = if is_chunked {
+                (chunked(), encode_chunked(&body, &sizes))
+            } else {
+                (length(body.len()), body.clone())
+            };
+            let read_whole = read(framing.clone(), &encoded, split);
+            prop_assert_eq!(read_whole.as_deref(), Some(body.as_slice()));
+            if !encoded.is_empty() {
+                let cut = cut.index(encoded.len());
+                prop_assert_eq!(read(framing, &encoded[..cut], split), None);
+            }
+        }
+    }
 }
