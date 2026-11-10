@@ -58,13 +58,15 @@ describe("RFC 0002 commit checks", () => {
     const { a, b, root } = await setup();
     const first = uuidv7();
     const second = uuidv7();
-    const one = await a.commit([op.mkdir(uuidv7(), root, "One")], { commitId: first });
-    const two = await a.commit([op.mkdir(uuidv7(), root, "Two")], { commitId: second });
+    const oneOps = [op.mkdir(uuidv7(), root, "One")];
+    const twoOps = [op.mkdir(uuidv7(), root, "Two")];
+    const one = await a.commit(oneOps, { commitId: first });
+    const two = await a.commit(twoOps, { commitId: second });
     b.baseSeq = 2n;
     await b.commit([op.mkdir(uuidv7(), root, "Three")]);
-    expect(await a.commit([op.mkdir(uuidv7(), root, "One")], { commitId: first, baseSeq: 0n })).toEqual(one);
+    expect(await a.commit(oneOps, { commitId: first })).toEqual(one);
     await runInDurableObject(a.stub, (_instance, state) => state.storage.sql.exec("DELETE FROM commits WHERE commit_id = ?", second));
-    expect(await a.commit([op.mkdir(uuidv7(), root, "Two")], { commitId: second, baseSeq: 99n })).toEqual(two);
+    expect(await a.commit(twoOps, { commitId: second })).toEqual(two);
     expect((await heads(a)).head).toBe(3);
   });
 

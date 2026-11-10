@@ -16,6 +16,9 @@ export interface Identity {
   deviceId: string;
   deviceName: string;
   expiresAtMs: number;
+  /** The principal's kind and scope (RFC 0006 section 2). A token without them speaks for a full-scope device. */
+  kind: string;
+  scope: string | null;
 }
 
 const encoder = new TextEncoder();
@@ -24,7 +27,9 @@ const decoder = new TextDecoder();
 /** "v1.<kid>.<base64url JSON claims>.<base64url HMAC-SHA256>". Opaque to clients. */
 export async function signAccessToken(key: ServerKey, identity: Identity): Promise<string> {
   const payload = base64url(
-    encoder.encode(JSON.stringify({ u: identity.userId, d: identity.deviceId, n: identity.deviceName, e: identity.expiresAtMs })),
+    encoder.encode(
+      JSON.stringify({ u: identity.userId, d: identity.deviceId, n: identity.deviceName, e: identity.expiresAtMs, k: identity.kind, s: identity.scope }),
+    ),
   );
   const signed = `v1.${key.kid}.${payload}`;
   return `${signed}.${base64url(await hmac(key.secret, signed))}`;
@@ -36,9 +41,9 @@ export async function verifyAccessToken(key: ServerKey, token: string, nowMs: nu
   const mac = fromBase64url(parts[3]!);
   const payload = fromBase64url(parts[2]!);
   if (!mac || !payload || !(await hmacVerify(key.secret, parts.slice(0, 3).join("."), mac))) return undefined;
-  const claims = JSON.parse(decoder.decode(payload)) as { u: string; d: string; n: string; e: number };
+  const claims = JSON.parse(decoder.decode(payload)) as { u: string; d: string; n: string; e: number; k?: string; s?: string | null };
   if (claims.e < nowMs) return undefined;
-  return { userId: claims.u, deviceId: claims.d, deviceName: claims.n, expiresAtMs: claims.e };
+  return { userId: claims.u, deviceId: claims.d, deviceName: claims.n, expiresAtMs: claims.e, kind: claims.k ?? "device", scope: claims.s ?? null };
 }
 
 export function bearerToken(request: Request): string | undefined {

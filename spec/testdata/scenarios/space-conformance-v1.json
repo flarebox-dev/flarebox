@@ -1,7 +1,7 @@
 {
   "format": "flarebox.space-conformance",
   "version": 1,
-  "spec": "Flarebox spec v0 with RFC 0001 and RFC 0002 sections 1 to 4 and 11",
+  "spec": "Flarebox spec v0 with RFC 0001, RFC 0002 sections 1 to 4 and 11, and RFC 0006 section 8",
   "unicode": "18.0.0",
   "now_ms": 1794268740000,
   "mtime_ns": "1794268740123456789",
@@ -12,7 +12,7 @@
     "Every ID in a scenario is a symbol. root is the space's root (its space_id). A symbol that starts with = is the literal text after it. An op symbol not seen before is bound to a fresh UUIDv7 that the runner mints. A symbol in an expectation that is not bound yet is bound to the value the server returned; one already bound must equal it. Two different symbols never bind the same value.",
     "contents maps a content symbol to a file content. chunks lists its chunks: {text} is a chunk of those UTF-8 bytes, {counter_le32: n} is n chunks whose bytes are the 4-byte little-endian encodings of 0 to n-1. A chunk's hash is the SHA-256 of its bytes and its size is its byte length unless size overrides it. The content's size is the sum of its chunk sizes unless size overrides it; mtime_ns is the file-level mtime_ns (an int64 written as a string, as in proto3 JSON), executable is false, encoding is 0, chunker is fastcdc2020-1m-4m-16m, and manifest_digest follows spec v0 section 5.1 over the listed (hash, size) pairs.",
     "Ops: create_dir {node, parent, name}; create_file {node, parent, name, content}; update_content {node, content}; move {node, parent, name}; delete {node}; restore {node, version?, parent?, name?} where absent fields are empty; empty {} is an Op with no op set. Two macros expand in place: {repeat: n, op} is n copies of op, and create_dir_chain {prefix, parent, count} creates directories prefix1 to prefixN, each named after its symbol and each inside the previous one, the first inside parent.",
-    "commit: commit_id is a symbol (a fresh ID when absent), base_seq is sent as given. Unless upload is false, the runner first uploads every chunk of the contents the ops reference (PrepareUpload in batches of at most 1,000 distinct chunks, then a PUT for each chunk the plan says to upload) and sends the receipts it got. With upload false it sends the receipts that the device's earlier upload steps got in the space named by receipts_from (the step's space by default), each with its size increased by receipt_size_delta when that is set. history_id is a symbol (one not seen before is a fresh UUIDv7, so it names another history) and is the space's current history_id, as Welcome gives it, when absent. device_seq is sent as given; when absent it is one more than the device_seq of the device's last commit in that space that was applied, that is, that returned a seq above every seq a commit returned in that space before (1 when there is none). require_head is sent as given, false when absent.",
+    "commit: commit_id is a symbol (a fresh ID when absent), base_seq is sent as given. Unless upload is false, the runner first uploads every chunk of the contents the ops reference (PrepareUpload in batches of at most 1,000 distinct chunks, then a PUT for each chunk the plan says to upload) and sends the receipts it got. With upload false it sends the receipts that the device's earlier upload steps got in the space named by receipts_from (the step's space by default), each with its size increased by receipt_size_delta when that is set. history_id is a symbol (one not seen before is a fresh UUIDv7, so it names another history) and is the space's current history_id, as Welcome gives it, when absent. device_seq is sent as given. When absent, a commit_id the device sent before in that space keeps the device_seq it was first sent with, because a client resends a commit unchanged (RFC 0002 section 2); otherwise it is one more than the device_seq of the device's last commit in that space that was applied, that is, that returned a seq above every seq a commit returned in that space before (1 when there is none). require_head is sent as given, false when absent.",
     "upload {contents}: PrepareUpload and PUT for those contents' chunks; the receipts are kept for the device in that space. upload {last_missing: true} does the same for the chunks that the device's last MISSING_CHUNKS error from a commit in that space listed, each a chunk of some content. prepare_upload {chunks} or {contents} sends one PrepareUpload; expect.actions lists the action of each distinct chunk in order.",
     "Commit expectations: error is the whole-call error code; missing lists content symbols whose chunk hashes must be exactly the error's missing_chunks; missing_some {contents, count, total} requires that missing_chunks holds exactly count hashes, each a chunk of those contents, and that the first decimal number in the error's message is total. Otherwise seq, results (one per op, in order; code, and where given node, name and reason, compared exactly) and changed (the node symbols with a NodeState in the result's changes, compared as a set).",
     "list_versions {node, cursor, limit}: cursor is absent (empty), a literal written with =, or {returned: k}, the next_cursor an earlier step bound to k; limit is 0 when absent. Expectations: error, count (the number of versions), versions (each with version symbol, seq and content) and next_cursor, which is either empty (the last page) or {bind: k}, which requires another page and keeps its cursor as k without looking inside it.",
@@ -3471,9 +3471,10 @@
       ]
     },
     {
-      "name": "rfc0002-a-stored-result-comes-before-the-counter-base-precondition-and-validation",
+      "name": "rfc0006-a-stored-result-comes-before-the-counter-only-for-the-same-request-of-the-same-device",
       "covers": [
-        "RFC 0002 section 3"
+        "RFC 0002 section 3",
+        "RFC 0006 section 8"
       ],
       "devices": {
         "a": {
@@ -3583,15 +3584,7 @@
             ]
           },
           "expect": {
-            "seq": 1,
-            "results": [
-              {
-                "code": "APPLIED"
-              }
-            ],
-            "changed": [
-              "d"
-            ]
+            "error": "INVALID_ARGUMENT"
           }
         },
         {
@@ -3611,15 +3604,7 @@
             ]
           },
           "expect": {
-            "seq": 1,
-            "results": [
-              {
-                "code": "APPLIED"
-              }
-            ],
-            "changed": [
-              "d"
-            ]
+            "error": "INVALID_ARGUMENT"
           }
         },
         {
@@ -3638,15 +3623,7 @@
             ]
           },
           "expect": {
-            "seq": 1,
-            "results": [
-              {
-                "code": "APPLIED"
-              }
-            ],
-            "changed": [
-              "d"
-            ]
+            "error": "INVALID_ARGUMENT"
           }
         },
         {
@@ -3666,15 +3643,7 @@
             ]
           },
           "expect": {
-            "seq": 1,
-            "results": [
-              {
-                "code": "APPLIED"
-              }
-            ],
-            "changed": [
-              "d"
-            ]
+            "error": "INVALID_ARGUMENT"
           }
         },
         {
@@ -3685,15 +3654,7 @@
             "ops": []
           },
           "expect": {
-            "seq": 1,
-            "results": [
-              {
-                "code": "APPLIED"
-              }
-            ],
-            "changed": [
-              "d"
-            ]
+            "error": "INVALID_ARGUMENT"
           }
         },
         {
@@ -3712,15 +3673,7 @@
             ]
           },
           "expect": {
-            "seq": 1,
-            "results": [
-              {
-                "code": "APPLIED"
-              }
-            ],
-            "changed": [
-              "d"
-            ]
+            "error": "INVALID_ARGUMENT"
           }
         },
         {

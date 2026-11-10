@@ -3,6 +3,8 @@
 //! The conflict rules of spec v0 section 6 on the reference Space DO, following the scenarios of the
 //! TypeScript server's tests (server/test/space-do.test.ts in flarebox#6).
 
+use std::collections::HashMap;
+
 use flarebox_engine::ids::IdGen;
 use flarebox_engine::names::conflict_name;
 use flarebox_proto::v1::{
@@ -19,6 +21,8 @@ const NOW: i64 = 1_794_268_740_000;
 struct Space {
     space: SpaceDo,
     ids: IdGen,
+    /// The `device_seq` each `commit_id` was first sent with: a retry keeps it (RFC 0002 section 2).
+    sent: HashMap<String, u64>,
 }
 
 struct Client {
@@ -31,6 +35,7 @@ impl Space {
         Self {
             space: SpaceDo::new(1, NOW),
             ids: IdGen::new(2),
+            sent: HashMap::new(),
         }
     }
 
@@ -92,13 +97,15 @@ impl Space {
         commit_id: Option<String>,
     ) -> Result<CommitResult, Error> {
         let commit_id = commit_id.unwrap_or_else(|| self.id());
+        let next = self.space.device_seq(&c.session.device_id) + 1;
+        let device_seq = *self.sent.entry(commit_id.clone()).or_insert(next);
         let commit = Commit {
             commit_id,
             base_seq,
             ops,
             receipts,
             history_id: self.space.history_id().into(),
-            device_seq: self.space.device_seq(&c.session.device_id) + 1,
+            device_seq,
             ..Default::default()
         };
         self.space
@@ -283,13 +290,23 @@ fn returns_the_stored_result_when_a_commit_id_is_retried() {
     let again = s
         .commit_raw(
             &a,
+            vec![mkdir(&once, &root, "Once")],
+            0,
+            vec![],
+            Some(commit_id.clone()),
+        )
+        .unwrap();
+    assert_eq!(again, first);
+    let other = s
+        .commit_raw(
+            &a,
             vec![mkdir(&twice, &root, "Twice")],
             0,
             vec![],
             Some(commit_id),
         )
-        .unwrap();
-    assert_eq!(again, first);
+        .unwrap_err();
+    assert_eq!(error_code(Err(other)), error::Code::InvalidArgument);
     assert!(!s.live_names().contains(&"Twice".to_string()));
     assert_eq!(s.space.head_seq(), 1);
 }

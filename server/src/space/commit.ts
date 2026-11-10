@@ -18,6 +18,7 @@ import {
 import { type ChangeRecord, ChangeRecordSchema, type ChunkRef, type Content } from "../gen/flarebox/v1/model_pb";
 import { Error_Code } from "../gen/flarebox/v1/rpc_pb";
 import { uuidv7 } from "../ids";
+import type { OpEffect } from "../policy";
 import { conflictName, isReservedAtRoot, nameKey, normalizeName } from "./names";
 import { NodeKindValue, NodeStatusValue } from "./schema";
 import {
@@ -57,6 +58,8 @@ export interface ApplyContext {
   baseSeq: number;
   nowMs: number;
   committer: Committer;
+  /** Called after each op with the transition it made; false refuses the whole commit (RFC 0006 section 3). */
+  authorize(op: Op, effect: OpEffect): boolean;
 }
 
 type Reject = "CYCLE" | "NOT_FOUND" | "INVALID_NAME" | "PARENT_NOT_DIR" | "ID_EXISTS" | "ROOT" | "NOT_FILE";
@@ -72,6 +75,12 @@ function rejected(reason: Reject): OpResult {
 export class CommitApplier {
   private readonly remap = new Map<string, string>();
   private readonly touched = new Set<string>();
+  /** What the op being applied changed and created, and the parents it replaced. */
+  private changed = new Set<string>();
+  private created = new Set<string>();
+  private parentBefore = new Map<string, string | null>();
+  /** The files this commit sent from the live tree to the trash. */
+  private readonly trashed = new Set<string>();
 
   constructor(
     private readonly sql: SqlStorage,
@@ -79,11 +88,63 @@ export class CommitApplier {
   ) {}
 
   apply(ops: readonly Op[]): { results: OpResult[]; changes: ChangeRecord[] } {
-    const results = ops.map((op, index) => this.applyOp(op, index));
+    const results = ops.map((op, index) => {
+      this.changed = new Set();
+      this.created = new Set();
+      this.parentBefore = new Map();
+      const outcome = this.applyOp(op, index);
+      if (!this.ctx.authorize(op, this.effect())) throw new CallFailure(Error_Code.FORBIDDEN, `op ${index} is not allowed for this device`);
+      return outcome;
+    });
     const changes = [...this.touched].map((nodeId) =>
       create(ChangeRecordSchema, { change: { case: "node", value: nodeState(this.sql, getNode(this.sql, nodeId)!) } }),
     );
     return { results, changes };
+  }
+
+  /**
+   * The transition of the op just applied. The ancestry and subtree are read when asked for, so they are valid only
+   * during the authorize call, before the next op changes the tree. Before the op, only the nodes in parentBefore had
+   * another parent, so the earlier ancestry is the current one with those parents put back.
+   */
+  private effect(): OpEffect {
+    const { changed, created, parentBefore } = this;
+    const parentNow = (nodeId: string) => getNode(this.sql, nodeId)?.parent_id ?? null;
+    const ancestry = (nodeId: string, parentOf: (id: string) => string | null): string[] => {
+      const chain: string[] = [];
+      for (let parent = parentOf(nodeId); parent && chain.length <= MAX_DEPTH; parent = parentOf(parent)) chain.unshift(parent);
+      return chain;
+    };
+    return {
+      changed,
+      created,
+      ancestryBefore: (nodeId) =>
+        created.has(nodeId) ? undefined : ancestry(nodeId, (id) => (parentBefore.has(id) ? parentBefore.get(id)! : parentNow(id))),
+      ancestryAfter: (nodeId) => ancestry(nodeId, parentNow),
+      subtree: (nodeId) =>
+        rows<{ node_id: string }>(
+          this.sql.exec(
+            `WITH RECURSIVE sub(node_id) AS (
+               SELECT node_id FROM nodes WHERE parent_id = ? UNION ALL SELECT n.node_id FROM nodes n JOIN sub ON n.parent_id = sub.node_id)
+             SELECT node_id FROM sub`,
+            nodeId,
+          ),
+        ).map((row) => row.node_id),
+    };
+  }
+
+  /** Records a change of the op being applied, and the parent a node had before the op moved it. */
+  private touch(nodeId: string, previousParent?: string | null): void {
+    this.touched.add(nodeId);
+    this.changed.add(nodeId);
+    if (previousParent !== undefined && !this.parentBefore.has(nodeId)) this.parentBefore.set(nodeId, previousParent);
+  }
+
+  /** Live files the applied commit leaves in the trash, those a later op restored excluded (RFC 0006 section 10). */
+  trashedFiles(): number {
+    let count = 0;
+    for (const nodeId of this.trashed) if (getNode(this.sql, nodeId)?.status === NodeStatusValue.TRASHED) count++;
+    return count;
   }
 
   private applyOp(op: Op, index: number): OpResult {
@@ -202,7 +263,7 @@ export class CommitApplier {
       this.dev,
       node.node_id,
     );
-    this.touched.add(node.node_id);
+    this.touch(node.node_id, node.parent_id);
     return picked;
   }
 
@@ -261,7 +322,8 @@ export class CommitApplier {
       this.dev,
       versionId,
     );
-    this.touched.add(nodeId);
+    this.touch(nodeId);
+    this.created.add(nodeId);
   }
 
   private insertVersion(nodeId: string, content: Content, chunks: readonly ChunkRef[]): string {
@@ -350,7 +412,7 @@ export class CommitApplier {
       this.dev,
       node.node_id,
     );
-    this.touched.add(node.node_id);
+    this.touch(node.node_id);
     return result(renamed ? OpResult_Code.APPLIED_RENAMED : OpResult_Code.APPLIED, "", node.name);
   }
 
@@ -393,7 +455,7 @@ export class CommitApplier {
       this.dev,
       found.node_id,
     );
-    this.touched.add(found.node_id);
+    this.touch(found.node_id, found.parent_id);
     return result(picked.renamed ? OpResult_Code.APPLIED_RENAMED : OpResult_Code.APPLIED, "", picked.name);
   }
 
@@ -411,7 +473,8 @@ export class CommitApplier {
       this.dev,
       node.node_id,
     );
-    this.touched.add(node.node_id);
+    this.touch(node.node_id);
+    if (node.kind === NodeKindValue.FILE) this.trashed.add(node.node_id);
     return false;
   }
 

@@ -34,6 +34,7 @@ const STATUS: Partial<Record<Error_Code, number>> = {
   [Error_Code.LIMIT_EXCEEDED]: 413,
   [Error_Code.RETRY_LATER]: 429,
   [Error_Code.QUOTA_EXCEEDED]: 429,
+  [Error_Code.CONFIRMATION_REQUIRED]: 409,
 };
 
 export function errorReply(request: Request, code: Error_Code, message: string, status = STATUS[code] ?? 500): Response {

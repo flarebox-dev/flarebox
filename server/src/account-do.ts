@@ -11,6 +11,10 @@ import {
   AccessTokenSchema,
   type DeviceCredentials,
   DeviceCredentialsSchema,
+  DeviceInfo_Kind,
+  DeviceInfoSchema,
+  type DeviceList,
+  DeviceListSchema,
   type RewindResult,
   RewindResultSchema,
   type SpaceInfo,
@@ -19,6 +23,7 @@ import {
 import { Error_Code } from "./gen/flarebox/v1/rpc_pb";
 import type { ShareLink, ShareLinkList } from "./gen/flarebox/v1/share_pb";
 import { isUuidV7, uuidv7 } from "./ids";
+import { knownPrincipal } from "./policy";
 import { FORMAT_VERSION } from "./space-do";
 import { type Outcome, type ResolvedLink, type ShareOutcome, ShareLinks } from "./share/links";
 
@@ -27,6 +32,8 @@ export type { Outcome } from "./share/links";
 const CLAIM_CODE_MS = 3_600_000;
 const PAIRING_CODE_MS = 10 * 60_000;
 const PAIRING_FAILURES_PER_WINDOW = 20;
+/** Principals per page of GET /v1/devices (RFC 0006 section 7). */
+const DEVICE_PAGE = 100;
 const BASE32 = "ABCDEFGHJKMNPQRSTVWXYZ0123456789";
 const DAY_MS = 24 * 3_600_000;
 /** How long a chunk retirement record is kept: PITR cannot restore a state older than 30 days (RFC 0003 section 5, rule 10). */
@@ -104,9 +111,26 @@ interface DeviceRow {
   device_id: string;
   user_id: string;
   name: string;
+  platform: string;
+  created_at_ms: number;
+  last_seen_ms: number | null;
   refresh_hash: ArrayBuffer;
   revoked_at_ms: number | null;
+  kind: string;
+  scope: string | null;
+  expires_at_ms: number | null;
+  issued_by: string | null;
 }
+
+/** What checkSession answers: kind and scope come from the device's row, never from its token (RFC 0006 section 2). */
+export interface SessionCheck {
+  active: boolean;
+  closed: boolean;
+  kind: string;
+  scope: string | null;
+}
+
+const KINDS: Record<string, DeviceInfo_Kind> = { device: DeviceInfo_Kind.DEVICE, agent: DeviceInfo_Kind.AGENT };
 
 interface SpaceRow {
   space_id: string;
@@ -189,7 +213,7 @@ export class AccountDO extends DurableObject<Env> {
     const nowMs = Date.now();
     const ownerBefore = ownerOf(this.sql);
     const userId = ownerBefore ?? uuidv7(nowMs);
-    const device = await this.prepareDevice(userId, args.deviceName, args.platform, nowMs);
+    const device = await this.prepareDevice(userId, args.deviceName, args.platform, nowMs, null);
     const attempt: ClaimAttempt = {
       codeHash: await codeHash(args.code),
       rawHash: (await sha256(encoder.encode(args.code))).slice().buffer,
@@ -207,14 +231,17 @@ export class AccountDO extends DurableObject<Env> {
     return ok(device.credentials);
   }
 
-  private async addDevice(userId: string, deviceName: string, platform: string, nowMs: number): Promise<DeviceCredentials> {
-    const device = await this.prepareDevice(userId, deviceName, platform, nowMs);
+  private async addDevice(userId: string, deviceName: string, platform: string, nowMs: number, issuedBy: string): Promise<DeviceCredentials> {
+    const device = await this.prepareDevice(userId, deviceName, platform, nowMs, issuedBy);
     device.store();
     return device.credentials;
   }
 
-  /** Creates a device's credentials and access token without storing anything; store() inserts the device. */
-  private async prepareDevice(userId: string, deviceName: string, platform: string, nowMs: number) {
+  /**
+   * Creates the credentials and access token of a full-scope device that never expires, the only principal 0.1.0 issues,
+   * without storing anything; store() inserts it. issuedBy is the principal whose request creates it (RFC 0006 section 6).
+   */
+  private async prepareDevice(userId: string, deviceName: string, platform: string, nowMs: number, issuedBy: string | null) {
     const deviceId = uuidv7(nowMs);
     const name = deviceName || "Unnamed device";
     const refresh = base64url(crypto.getRandomValues(new Uint8Array(32)));
@@ -223,25 +250,35 @@ export class AccountDO extends DurableObject<Env> {
       userId,
       deviceId,
       refreshCredential: refresh,
-      access: await this.accessToken(userId, deviceId, name, nowMs),
+      access: await this.accessToken({ user_id: userId, device_id: deviceId, name, kind: "device", scope: null, expires_at_ms: null }, nowMs),
+      credentialExpiresAtMs: 0n,
     });
     const store = () => {
       this.sql.exec(
-        "INSERT INTO devices (device_id, user_id, name, platform, created_at_ms, refresh_hash) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO devices (device_id, user_id, name, platform, created_at_ms, refresh_hash, issued_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
         deviceId,
         userId,
         name,
         platform,
         nowMs,
         refreshHash,
+        issuedBy,
       );
     };
     return { credentials, store };
   }
 
-  private async accessToken(userId: string, deviceId: string, deviceName: string, nowMs: number) {
-    const expiresAtMs = nowMs + ACCESS_TOKEN_MS;
-    const token = await signAccessToken(await this.serverKey(), { userId, deviceId, deviceName, expiresAtMs });
+  /** An access token for the principal, which never outlives its credential (RFC 0006 section 2). */
+  private async accessToken(device: Pick<DeviceRow, "user_id" | "device_id" | "name" | "kind" | "scope" | "expires_at_ms">, nowMs: number) {
+    const expiresAtMs = Math.min(nowMs + ACCESS_TOKEN_MS, device.expires_at_ms ?? Infinity);
+    const token = await signAccessToken(await this.serverKey(), {
+      userId: device.user_id,
+      deviceId: device.device_id,
+      deviceName: device.name,
+      expiresAtMs,
+      kind: device.kind,
+      scope: device.scope,
+    });
     return create(AccessTokenSchema, { token, expiresAtMs: BigInt(expiresAtMs) });
   }
 
@@ -249,9 +286,17 @@ export class AccountDO extends DurableObject<Env> {
     return this.activeDevice(deviceId) !== undefined;
   }
 
+  /**
+   * The principal, if it may act at all: not revoked, not expired, and of a kind and scope this server knows. Every
+   * check of a principal goes through here, so its current row always decides, whatever a token claims.
+   */
   private activeDevice(deviceId: string): DeviceRow | undefined {
-    const row = this.sql.exec("SELECT * FROM devices WHERE device_id = ? AND revoked_at_ms IS NULL", deviceId).toArray()[0];
-    return row as unknown as DeviceRow | undefined;
+    const row = this.sql.exec("SELECT * FROM devices WHERE device_id = ? AND revoked_at_ms IS NULL", deviceId).toArray()[0] as unknown as
+      | DeviceRow
+      | undefined;
+    if (!row || !knownPrincipal(row.kind, row.scope)) return undefined;
+    if (row.expires_at_ms !== null && row.expires_at_ms <= Date.now()) return undefined;
+    return row;
   }
 
   /** Called for an already paired device; returns an 8-character one-time code valid for 10 minutes. */
@@ -285,7 +330,7 @@ export class AccountDO extends DurableObject<Env> {
       );
       return failure(Error_Code.FORBIDDEN, "invalid or expired pairing code");
     }
-    return ok(await this.addDevice(inviter.user_id, args.deviceName, args.platform, nowMs));
+    return ok(await this.addDevice(inviter.user_id, args.deviceName, args.platform, nowMs, inviter.device_id));
   }
 
   async refreshAccess(args: { deviceId: string; refreshCredential: string }): Promise<Outcome<AccessToken>> {
@@ -296,7 +341,40 @@ export class AccountDO extends DurableObject<Env> {
       return failure(Error_Code.UNAUTHENTICATED, "unknown device or refresh credential");
     }
     this.sql.exec("UPDATE devices SET last_seen_ms = ? WHERE device_id = ?", nowMs, device.device_id);
-    return ok(await this.accessToken(device.user_id, device.device_id, device.name, nowMs));
+    return ok(await this.accessToken(device, nowMs));
+  }
+
+  /** GET /v1/devices: the user's principals in creation order, revoked ones included (RFC 0006 section 7). */
+  async listDevices(args: { userId: string; callerId: string; cursor: string }): Promise<DeviceList> {
+    const found = this.sql
+      .exec("SELECT * FROM devices WHERE user_id = ? AND device_id > ? ORDER BY device_id LIMIT ?", args.userId, args.cursor, DEVICE_PAGE + 1)
+      .toArray() as unknown as DeviceRow[];
+    const page = found.slice(0, DEVICE_PAGE);
+    return create(DeviceListSchema, {
+      devices: page.map((row) =>
+        create(DeviceInfoSchema, {
+          deviceId: row.device_id,
+          name: row.name,
+          platform: row.platform,
+          kind: KINDS[row.kind] ?? DeviceInfo_Kind.UNSPECIFIED,
+          createdAtMs: BigInt(row.created_at_ms),
+          lastSeenMs: BigInt(row.last_seen_ms ?? 0),
+          revokedAtMs: BigInt(row.revoked_at_ms ?? 0),
+          credentialExpiresAtMs: BigInt(row.expires_at_ms ?? 0),
+          issuedBy: row.issued_by ?? "",
+          current: row.device_id === args.callerId,
+        }),
+      ),
+      nextCursor: found.length > DEVICE_PAGE ? page[page.length - 1]!.device_id : "",
+    });
+  }
+
+  /** DELETE /v1/devices/{device_id}: revokes one of the user's principals; revoking a revoked one changes nothing. */
+  async revokeUserDevice(args: { userId: string; deviceId: string }): Promise<Outcome<null>> {
+    const row = this.sql.exec("SELECT revoked_at_ms FROM devices WHERE device_id = ? AND user_id = ?", args.deviceId, args.userId).toArray()[0];
+    if (!row) return failure(Error_Code.NOT_FOUND, "no such device");
+    if (row.revoked_at_ms === null) await this.revokeDevice(args.deviceId);
+    return ok(null);
   }
 
   /** Revokes a device: its refresh credential stops working and its open WebSockets close with 4003. */
@@ -343,9 +421,18 @@ export class AccountDO extends DurableObject<Env> {
     return ok(null);
   }
 
-  /** Whether the device is active, and whether a rewind holds the space, if one is named, closed (RFC 0003 section 4). */
-  async checkSession(deviceId: string, spaceId?: string): Promise<{ active: boolean; closed: boolean }> {
-    return { active: this.activeDevice(deviceId) !== undefined, closed: spaceId !== undefined && this.spaceClosed(spaceId) };
+  /**
+   * Whether the device is active, with the kind and scope of its current row, and whether a rewind holds the space, if
+   * one is named, closed (RFC 0003 section 4).
+   */
+  async checkSession(deviceId: string, spaceId?: string): Promise<SessionCheck> {
+    const device = this.activeDevice(deviceId);
+    return {
+      active: device !== undefined,
+      closed: spaceId !== undefined && this.spaceClosed(spaceId),
+      kind: device?.kind ?? "",
+      scope: device?.scope ?? null,
+    };
   }
 
   async isSpaceClosed(spaceId: string): Promise<boolean> {

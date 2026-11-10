@@ -112,6 +112,8 @@ async function newSpace() {
       deviceId: creds.deviceId,
       userId: creds.userId,
       deviceName: "Laptop A",
+      kind: "device",
+      scope: null,
       role: "owner",
       maxFormat: 1,
       origin: BASE,
@@ -488,7 +490,7 @@ describe("space rewind (RFC 0003)", () => {
       });
 
       const connect = {
-        identity: { userId: creds.userId, deviceId: creds.deviceId, deviceName: "Laptop A", expiresAtMs: Date.now() + MINUTE },
+        identity: { userId: creds.userId, deviceId: creds.deviceId, deviceName: "Laptop A", expiresAtMs: Date.now() + MINUTE, kind: "device", scope: null },
         origin: BASE,
       };
       const direct = fromBinary(RpcResponseSchema, await space(spaceId).httpRpc(connect, commit));
@@ -582,6 +584,8 @@ function device(spaceId: string) {
     deviceId: uuidv7(),
     userId: owner!.userId,
     deviceName: "Probe",
+    kind: "device",
+    scope: null,
     role: "owner",
     maxFormat: 1,
     origin: BASE,

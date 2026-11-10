@@ -26,7 +26,7 @@ export async function newSpace(name = "Test space") {
 }
 
 export function session(deviceName: string, overrides: Partial<Session> = {}): Session {
-  return { deviceId: uuidv7(), userId: OWNER, deviceName, role: "owner", maxFormat: 1, origin: ORIGIN, ...overrides };
+  return { deviceId: uuidv7(), userId: OWNER, deviceName, kind: "device", scope: null, role: "owner", maxFormat: 1, origin: ORIGIN, ...overrides };
 }
 
 export async function content(...parts: string[]): Promise<{ content: Content; bytes: Uint8Array[] }> {
@@ -125,6 +125,8 @@ export class TestClient {
   /** The highest device_seq the server accepted from this device, and the slot each commit_id was sent with (RFC 0002 section 2). */
   acceptedSeq = 0n;
   private readonly slots = new Map<string, bigint>();
+  /** The base_seq each commit_id was first sent with, so a retry sends the same request (RFC 0006 section 8). */
+  private readonly bases = new Map<string, bigint>();
   /** Time the receipts are signed for; set it when the Space DO clock is moved. */
   nowMs: number | undefined;
   private nextReq = 1n;
@@ -174,19 +176,21 @@ export class TestClient {
   }
 
   /**
-   * Sends a commit in the current history. A new commit_id takes the next device slot and a repeated one keeps its slot,
-   * as a client does; init overrides either field.
+   * Sends a commit in the current history. A new commit_id takes the next device slot and the current base, and a
+   * repeated one keeps both, as a client does; init overrides either field.
    */
   async commitRaw(ops: Op[], init: CommitInit = {}): Promise<RpcResponse["result"]> {
     const commitId = init.commitId ?? uuidv7();
     const slot = this.slots.get(commitId) ?? this.acceptedSeq + 1n;
     this.slots.set(commitId, slot);
     const deviceSeq = init.deviceSeq ?? slot;
+    const baseSeq = init.baseSeq ?? this.bases.get(commitId) ?? this.baseSeq;
+    if (!this.bases.has(commitId)) this.bases.set(commitId, baseSeq);
     const result = await this.call({
       case: "commit",
       value: {
         commitId,
-        baseSeq: init.baseSeq ?? this.baseSeq,
+        baseSeq,
         ops,
         receipts: init.receipts ?? [],
         historyId: init.historyId ?? (await this.history()),
