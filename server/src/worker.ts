@@ -73,6 +73,13 @@ function refuseWithout(request: Request, identity: Identity, capability: Capabil
   return errorReply(request, Error_Code.FORBIDDEN, `this device may not use ${capability}`);
 }
 
+/** The list_seq a page of GET /v1/spaces or GET /v1/devices starts after: 0, or the cursor the previous page sent. */
+function listCursor(url: URL): number {
+  const cursor = url.searchParams.get("cursor") ?? "";
+  if (!/^\d{0,15}$/.test(cursor)) throw new BadRequest("malformed cursor");
+  return Number(cursor);
+}
+
 /** GET /v1/devices and DELETE /v1/devices/{device_id} (RFC 0006 section 7, RFC 0009). */
 async function devices(request: Request, env: Env, deviceId: string | undefined): Promise<Response> {
   const identity = await authenticate(request, env);
@@ -80,8 +87,8 @@ async function devices(request: Request, env: Env, deviceId: string | undefined)
   const refused = refuseWithout(request, identity, "device.manage");
   if (refused) return refused;
   if (deviceId === undefined && request.method === "GET") {
-    const cursor = new URL(request.url).searchParams.get("cursor") ?? "";
-    return reply(request, DeviceListSchema, await account(env).listDevices({ userId: identity.userId, callerId: identity.deviceId, cursor }));
+    const after = listCursor(new URL(request.url));
+    return reply(request, DeviceListSchema, await account(env).listDevices({ userId: identity.userId, callerId: identity.deviceId, cursor: after ? String(after) : "" }));
   }
   if (deviceId !== undefined && request.method === "DELETE") {
     const outcome = await account(env).revokeUserDevice({ userId: identity.userId, callerId: identity.deviceId, deviceId });
@@ -257,9 +264,7 @@ async function route(request: Request, env: Env): Promise<Response> {
 
   if (path === "/v1/spaces") {
     if (method === "GET") {
-      const cursor = url.searchParams.get("cursor") ?? "";
-      if (!/^\d{0,15}$/.test(cursor)) throw new BadRequest("malformed cursor");
-      return reply(request, SpaceListSchema, await account(env).listSpaces({ userId: identity.userId, after: Number(cursor) }));
+      return reply(request, SpaceListSchema, await account(env).listSpaces({ userId: identity.userId, after: listCursor(url) }));
     }
     if (method === "POST") {
       const refused = refuseWithout(request, identity, "space.create");

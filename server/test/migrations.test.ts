@@ -31,6 +31,7 @@ const ACCOUNT_SCHEMA_DIGESTS = [
   "81a059462fcc85e8d79e39486df0357cd8d2ca2b06c5ec5cc11b35f484b33185",
   "b6c36eba27d26386f256dc8d64bc63f97cd5d47c47b4f328fb608a1e21b6b0f8",
   "d1acc17396a3ec9113232584f4f72afeded27e49556b0dabe3fd241db9458ec4",
+  "c8f022a3869613f651320f6d5d56c8d67398f2703761a4a4e99af009badfb090",
 ];
 
 type Stub = DurableObjectStub<SpaceDO> | DurableObjectStub<AccountDO>;
@@ -229,6 +230,26 @@ describe("upgraded objects keep working", () => {
     const created = await stub.createSpace({ userId: OWNER, name: "New" });
     const listed = await stub.listSpaces({ userId: OWNER, after: 0 });
     expect(listed.spaces.map((space) => space.spaceId)).toEqual([...older, created.spaceId]);
+    expect(listed.nextCursor).toBe("");
+  });
+
+  it("lists the devices stored before the device list_seq step in the order they were stored", async () => {
+    const stub = ACCOUNT.stub("device-list") as DurableObjectStub<AccountDO>;
+    const older = [uuidv7(), uuidv7()].sort().reverse();
+    await inObject(stub, (sql) => {
+      rewrite(sql, ACCOUNT, { label: "", applied: 6, versioned: true });
+      for (const deviceId of older) {
+        sql.exec(
+          "INSERT INTO devices (device_id, user_id, name, platform, created_at_ms, refresh_hash) VALUES (?, ?, 'Laptop', 'macos', 1, ?)",
+          deviceId,
+          OWNER,
+          new Uint8Array(32),
+        );
+      }
+    });
+    await evictDurableObject(stub);
+    const listed = await stub.listDevices({ userId: OWNER, callerId: "", cursor: "" });
+    expect(listed.devices.map((device) => device.deviceId)).toEqual(older);
     expect(listed.nextCursor).toBe("");
   });
 

@@ -499,14 +499,15 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
     });
     expect(byId.get(pad.deviceId)!.createdAtMs).toBeGreaterThan(0n);
     const ids = listed.message!.devices.map((device) => device.deviceId);
-    expect(ids).toEqual([...ids].sort());
+    expect(ids.indexOf(owner.deviceId)).toBeLessThan(ids.indexOf(pad.deviceId));
+    expect(ids.at(-1)).toBe(pad.deviceId);
     expect(listed.message!.nextCursor).toBe("");
 
     const extra = Array.from({ length: 150 }, () => uuidv7());
     await runInDurableObject(account(), (_instance, state) => {
       for (const id of extra) {
         state.storage.sql.exec(
-          "INSERT INTO devices (device_id, user_id, name, platform, created_at_ms, refresh_hash) VALUES (?, ?, 'Extra', 'linux', ?, ?)",
+          "INSERT INTO devices (device_id, user_id, name, platform, created_at_ms, refresh_hash, list_seq) VALUES (?, ?, 'Extra', 'linux', ?, ?, (SELECT MAX(list_seq) + 1 FROM devices))",
           id,
           owner.userId,
           Date.now(),
@@ -523,10 +524,93 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
         cursor = page.message!.nextCursor;
       } while (cursor);
       expect(pages[0]).toHaveLength(100);
-      expect(pages.flat()).toEqual([...ids, ...extra].sort());
+      expect(pages.flat()).toEqual([...ids, ...extra]);
+      expect((await send("/v1/devices?cursor=" + extra[0], { method: "GET", token: pad.access!.token })).status).toBe(400);
     } finally {
       await runInDurableObject(account(), (_instance, state) => {
         for (const id of extra) state.storage.sql.exec("DELETE FROM devices WHERE device_id = ?", id);
+      });
+    }
+  });
+
+  it("finishes a listing that an AccountDO from before list_seq started, in device_id order", async () => {
+    const owner = await getOwner();
+    const extra = Array.from({ length: 150 }, () => uuidv7()).reverse();
+    await runInDurableObject(account(), (_instance, state) => {
+      for (const id of extra) {
+        state.storage.sql.exec(
+          "INSERT INTO devices (device_id, user_id, name, platform, created_at_ms, refresh_hash, list_seq) VALUES (?, ?, 'Extra', 'linux', ?, ?, (SELECT MAX(list_seq) + 1 FROM devices))",
+          id,
+          owner.userId,
+          Date.now(),
+          new Uint8Array(32),
+        );
+      }
+    });
+    try {
+      const byDeviceId = await runInDurableObject(account(), (_instance, state) =>
+        state.storage.sql.exec("SELECT device_id FROM devices WHERE user_id = ? ORDER BY device_id", owner.userId).toArray().map((row) => String(row.device_id)),
+      );
+      const olderFirstPage = byDeviceId.slice(0, 100);
+      const continued: string[] = [];
+      let cursor = olderFirstPage.at(-1)!;
+      while (cursor) {
+        const page = await account().listDevices({ userId: owner.userId, callerId: owner.deviceId, cursor });
+        continued.push(...page.devices.map((device) => device.deviceId));
+        cursor = page.nextCursor;
+      }
+      expect([...olderFirstPage, ...continued]).toEqual(byDeviceId);
+    } finally {
+      await runInDurableObject(account(), (_instance, state) => {
+        for (const id of extra) state.storage.sql.exec("DELETE FROM devices WHERE device_id = ?", id);
+      });
+    }
+  });
+
+  it("lists a device whose pairing was still storing it when a listing passed newer devices", async () => {
+    const owner = await getOwner();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let held = false;
+    await runInDurableObject(account(), (instance) => {
+      const target = instance as unknown as { accessToken: (...args: unknown[]) => Promise<unknown> };
+      const accessToken = target.accessToken.bind(instance);
+      vi.spyOn(target, "accessToken").mockImplementationOnce(async (...args) => {
+        held = true;
+        await gate;
+        return accessToken(...args);
+      });
+    });
+    const started = await call("/v1/pair/start", { token: owner.access!.token }, PairStartResponseSchema);
+    const pending = call(
+      "/v1/pair/complete",
+      { body: body(PairCompleteRequestSchema, { code: started.message!.code, deviceName: "Slow", platform: "linux" }) },
+      DeviceCredentialsSchema,
+    );
+    await vi.waitFor(() => expect(held).toBe(true));
+    const newer: string[] = [];
+    try {
+      for (let i = 0; i < 101; i++) newer.push((await pairDevice(owner, "Newer")).deviceId);
+      const first = await listDevices(owner.access!.token);
+      expect(first.message!.nextCursor).not.toBe("");
+      release();
+      const paired = await pending;
+      expect(paired.status).toBe(200);
+      newer.push(paired.message!.deviceId);
+      const listed = first.message!.devices.map((device) => device.deviceId);
+      let cursor = first.message!.nextCursor;
+      while (cursor) {
+        const page = await listDevices(owner.access!.token, cursor);
+        listed.push(...page.message!.devices.map((device) => device.deviceId));
+        cursor = page.message!.nextCursor;
+      }
+      expect(listed).toEqual(expect.arrayContaining(newer));
+      expect(new Set(listed).size).toBe(listed.length);
+    } finally {
+      release();
+      await pending;
+      await runInDurableObject(account(), (_instance, state) => {
+        for (const id of newer) state.storage.sql.exec("DELETE FROM devices WHERE device_id = ?", id);
       });
     }
   });
