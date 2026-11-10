@@ -194,17 +194,17 @@ impl Trees {
         }
     }
 
-    /// What S becomes for an excluded node whose S position neither L nor R holds any more, or
-    /// `None` when the node is not one. A parked node holds no position in L, so one that the
-    /// rules now leave out gives up its S position too, also while its old name is taken and it
-    /// cannot be moved back. Nothing is planned for the node, so no op would ever
-    /// move its S entry, and the name it holds in S would keep every other node from being
-    /// acknowledged there. With the node in L and live in R, S takes R's position and keeps its
-    /// content, so the content is still compared with the last synced one when the node is
-    /// included again. Otherwise, or when S cannot hold the node at R's position, S drops the
-    /// node, which is then resolved like a node never synced: what R holds is downloaded, and
-    /// what only L holds is uploaded.
-    fn released(&self, id: &str) -> Option<Option<Shape>> {
+    /// What S may become for an excluded node whose S position neither L nor R holds any more,
+    /// in order of preference, or `None` when the node is not one. A parked node holds no
+    /// position in L, so one that the rules now leave out gives up its S position too, also
+    /// while its old name is taken and it cannot be moved back. Nothing is planned for the node,
+    /// so no op would ever move its S entry, and the name it holds in S would keep every other
+    /// node from being acknowledged there. With the node in L and live in R, S takes R's
+    /// position, or else the position the local copy has, and keeps its content, so the content
+    /// is still compared with the last synced one when the node is included again. Otherwise, or
+    /// when S can hold the node at neither position, S drops the node, which is then resolved
+    /// like a node never synced: what R holds is downloaded, and what only L holds is uploaded.
+    fn released(&self, id: &str) -> Option<Vec<Option<Shape>>> {
         let synced = self.s.live(id)?;
         let local = self.l.get(id);
         let remote = self.r.live(id);
@@ -213,14 +213,22 @@ impl Trees {
         if held(placed) || held(remote) || !self.ignored(id) {
             return None;
         }
-        Some(match (local, remote) {
-            (Some(_), Some(remote)) => Some(Shape {
-                parent: remote.parent.clone(),
-                name: remote.name.clone(),
+        let at = |shape: &Shape| {
+            Some(Shape {
+                parent: shape.parent.clone(),
+                name: shape.name.clone(),
                 ..synced.clone()
-            }),
-            _ => None,
-        })
+            })
+        };
+        let mut next = Vec::new();
+        if local.is_some()
+            && let Some(remote) = remote
+        {
+            next.push(at(remote));
+            next.extend(placed.map(at));
+        }
+        next.push(None);
+        Some(next)
     }
 
     /// The nodes recorded by [`Trees::ignore_local`] that no observation has placed or removed
@@ -363,13 +371,10 @@ impl Trees {
         let mut pending = Vec::new();
         let mut work = Vec::new();
         for id in std::mem::take(&mut self.dirty) {
-            if let Some(next) = self.released(&id) {
-                let fitting = [next, None]
-                    .into_iter()
-                    .find(|next| self.fits_synced(&id, next.as_ref()));
-                if let Some(next) = fitting {
-                    self.set_synced_unmarked(&id, next);
-                }
+            let released = self.released(&id).into_iter().flatten();
+            let fitting = { released }.find(|next| self.fits_synced(&id, next.as_ref()));
+            if let Some(next) = fitting {
+                self.set_synced_unmarked(&id, next);
             }
             match self.class(&id) {
                 Class::InSync if !self.l.get(&id).is_some_and(|node| node.parked) => {}

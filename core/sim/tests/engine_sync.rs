@@ -857,6 +857,22 @@ fn waits_on_excluded(trees: &Trees, id: &str, waiting: &BTreeSet<String>) -> boo
     false
 }
 
+/// Whether S cannot take `id` at its R position because the S entry of a node that waits still
+/// holds that name. The entry moves only once its node is placed, which the excluded node keeps
+/// from happening.
+fn waits_on_synced(trees: &Trees, id: &str, waiting: &BTreeSet<String>) -> bool {
+    let Some(remote) = trees.remote().live(id) else {
+        return false;
+    };
+    let key = name_key(&remote.name);
+    trees.synced().iter().any(|(other, shape)| {
+        other != id
+            && waiting.contains(other)
+            && shape.parent == remote.parent
+            && name_key(&shape.name) == key
+    })
+}
+
 /// [`run`], with the process stopping at `cut`. An action of kind 5 or 6 on this device asks its
 /// engine for a restore.
 fn run_cut(
@@ -1166,7 +1182,11 @@ fn run_ignoring(
     let mut waiting: BTreeSet<String> = BTreeSet::new();
     loop {
         let more: Vec<String> = (unsettled.iter())
-            .filter(|id| !waiting.contains(*id) && waits_on_excluded(&device.trees, id, &waiting))
+            .filter(|id| {
+                !waiting.contains(*id)
+                    && (waits_on_excluded(&device.trees, id, &waiting)
+                        || waits_on_synced(&device.trees, id, &waiting))
+            })
             .cloned()
             .collect();
         if more.is_empty() {

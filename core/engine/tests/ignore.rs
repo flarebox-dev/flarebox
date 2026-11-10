@@ -543,6 +543,36 @@ fn a_parked_node_the_rules_now_exclude_frees_its_name_in_s_for_the_node_that_too
 }
 
 #[test]
+fn an_excluded_folder_s_cannot_follow_to_r_frees_its_name_in_s_all_the_same() {
+    let mut trees = trees(&[
+        (
+            "moved",
+            Some(dir(ROOT, "x")),
+            Some(dir(ROOT, "docs")),
+            Some(dir("far", "docs")),
+        ),
+        synced("child", file("moved", "a.txt", 1)),
+        incoming("far", dir(ROOT, "y")),
+        (
+            "new",
+            Some(dir(ROOT, "docs")),
+            None,
+            Some(dir(ROOT, "docs")),
+        ),
+    ]);
+    trees.set_rules(&AT_ROOT, rules("/x/\n/y/\n"));
+    assert!(trees.excluded("moved") && trees.excluded("far"));
+    assert_eq!(effects(&mut trees), []);
+    assert_eq!(ops(&mut trees), []);
+    assert_eq!(trees.synced().live("new"), Some(&dir(ROOT, "docs")));
+    assert_eq!(
+        trees.synced().live("moved"),
+        Some(&dir(ROOT, "x")),
+        "S has no folder y to follow R into, and a.txt keeps it from dropping the folder"
+    );
+}
+
+#[test]
 fn a_remote_rules_file_is_written_before_anything_else_below_its_folder() {
     let mut trees = trees(&[
         synced("d", dir(ROOT, "d")),
