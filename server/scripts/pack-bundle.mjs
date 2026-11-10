@@ -6,7 +6,7 @@
 // Usage: node scripts/pack-bundle.mjs <output directory>
 
 import { execFileSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { constants, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
@@ -24,6 +24,13 @@ if (!output || process.argv.length !== 3) {
 function fail(message) {
   console.error("pack-bundle: " + message);
   process.exit(1);
+}
+
+/** Copies a file or a directory tree to a path that must not exist yet, so that nothing is ever replaced. */
+function copyNew(from, to) {
+  if (!statSync(from).isDirectory()) return copyFileSync(from, to, constants.COPYFILE_EXCL);
+  mkdirSync(to);
+  for (const entry of readdirSync(from)) copyNew(join(from, entry), join(to, entry));
 }
 
 /** Drops undefined fields, which Wrangler's normalized config keeps for options that are not set. */
@@ -59,9 +66,6 @@ try {
   const assets = resolve(server, config.assets.directory);
   if (!existsSync(assets) || readdirSync(assets).length === 0) fail(config.assets.directory + " is empty after the build");
 
-  mkdirSync(join(output, "worker"), { recursive: true });
-  cpSync(join(built, mainModule), join(output, "worker", mainModule));
-  cpSync(assets, join(output, "assets"), { recursive: true });
   const r2 = config.r2_buckets[0];
   const manifest = defined({
     version,
@@ -75,7 +79,17 @@ try {
     observability: config.observability,
     code_update_strategy: config.durable_objects.code_update_strategy,
   });
-  writeFileSync(join(output, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
+  // Every write creates its path exclusively, so a file that appeared in the output during the build stops the packer.
+  try {
+    mkdirSync(output, { recursive: true });
+    mkdirSync(join(output, "worker"));
+    copyFileSync(join(built, mainModule), join(output, "worker", mainModule), constants.COPYFILE_EXCL);
+    copyNew(assets, join(output, "assets"));
+    writeFileSync(join(output, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n", { flag: "wx" });
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+    fail(error.path + " appeared in the output during the build; nothing was replaced");
+  }
   console.log(JSON.stringify(manifest));
 } finally {
   rmSync(built, { recursive: true, force: true });
