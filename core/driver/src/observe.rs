@@ -836,7 +836,11 @@ mod tests {
             })
             .collect();
         assert_eq!(first.len(), READ_FILES + 1, "every file is reported");
-        assert_eq!(unread, [Path::new("1000.txt")], "one file is past the budget");
+        assert_eq!(
+            unread,
+            [Path::new("1000.txt")],
+            "one file is past the budget"
+        );
 
         let (later, _) = observe_until(&mut observer, |seen| !seen.is_empty());
         assert!(
@@ -853,7 +857,10 @@ mod tests {
     #[test]
     fn an_observation_reads_no_more_bytes_than_the_budget_past_its_first_file() {
         let mut reads = Reads::default();
-        assert!(reads.take(READ_BYTES * 2), "a file larger than the budget is read on its own");
+        assert!(
+            reads.take(READ_BYTES * 2),
+            "a file larger than the budget is read on its own"
+        );
         assert!(!reads.take(0));
         let mut reads = Reads::default();
         assert!(reads.take(READ_BYTES / 2));

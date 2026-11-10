@@ -1249,7 +1249,10 @@ fn a_remote_edit_never_replaces_a_file_whose_read_was_deferred() {
         .disk
         .observed(deferred, &mut running.engine, &mut running.store)
         .unwrap();
-    assert_eq!(running.step(&server), Some(Settled::Failed("Changed".into())));
+    assert_eq!(
+        running.step(&server),
+        Some(Settled::Failed("Changed".into()))
+    );
     assert_eq!(fs::read(&report).unwrap(), b"the user's own words");
 
     catch_up(&mut watching, &sections);
