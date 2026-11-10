@@ -429,3 +429,33 @@ async fn a_429_is_retried_after_the_wait_the_server_asks() {
     );
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn a_target_inside_the_expiry_margin_is_still_tried() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let wanted = chunk(b"hello");
+    let (target, server) = serve(vec![
+        (200, "application/octet-stream", b"hello".to_vec()),
+        (200, "application/xml", Vec::new()),
+    ])
+    .await;
+    let target = Target {
+        expires_at_ms: now + 30_000,
+        ..target
+    };
+    assert!(expiring(&target));
+    let transfer = transfer();
+    assert!(
+        matches!(transfer.get(&target, &wanted).await, Attempt::Done(bytes) if bytes == b"hello"[..])
+    );
+    assert!(matches!(
+        transfer
+            .put(&target, &wanted, Bytes::from_static(b"hello"))
+            .await,
+        Attempt::Done(None)
+    ));
+    server.await.unwrap();
+}

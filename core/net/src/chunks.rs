@@ -26,6 +26,9 @@ use crate::session::Session;
 pub const MAX_CHUNKS_PER_CALL: usize = 1000;
 /// A target this close to its expiry is fetched again before use.
 const TARGET_MARGIN: Duration = Duration::from_secs(60);
+/// The most bytes reserved up front for one downloaded chunk. A larger chunk's buffer grows as its bytes arrive, so a
+/// size the server or another device claims does not reserve memory by itself.
+const MAX_PREALLOCATION: usize = 4 << 20;
 /// The most bytes read of an answer other than chunk bytes: a receipt or an error. Anything longer is not read.
 const SMALL_ANSWER: usize = 64 << 10;
 
@@ -288,9 +291,6 @@ impl Transfer {
         chunk: &ChunkRef,
         bytes: Bytes,
     ) -> Attempt<Option<UploadReceipt>> {
-        if expiring(target) {
-            return Attempt::Expired;
-        }
         let attempt = async {
             let response = match self.request(target, "PUT").body(bytes).send().await {
                 Ok(response) => response,
@@ -340,9 +340,6 @@ impl Transfer {
 
     /// One download within `attempt_timeout`, read up to the chunk's size and checked against its hash.
     async fn get(&self, target: &Target, chunk: &ChunkRef) -> Attempt<Bytes> {
-        if expiring(target) {
-            return Attempt::Expired;
-        }
         let attempt = async {
             let mut response = match self.request(target, "GET").send().await {
                 Ok(response) => response,
@@ -377,7 +374,7 @@ impl Transfer {
                 })
             };
             let limit = chunk.size as usize;
-            let mut body = Vec::with_capacity(limit);
+            let mut body = Vec::with_capacity(limit.min(MAX_PREALLOCATION));
             loop {
                 match response.chunk().await {
                     Ok(Some(part)) if body.len() + part.len() <= limit => {
