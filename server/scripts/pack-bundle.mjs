@@ -6,10 +6,22 @@
 // Usage: node scripts/pack-bundle.mjs <output directory>
 
 import { execFileSync } from "node:child_process";
-import { constants, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  constants,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { basename, dirname, extname, join, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const DRY_RUN_MS = 2 * 60_000;
@@ -33,6 +45,15 @@ function copyNew(from, to) {
   for (const entry of readdirSync(from)) copyNew(join(from, entry), join(to, entry));
 }
 
+/** The path with every symlink in its existing part resolved; the rest need not exist. */
+function realPath(path) {
+  try {
+    return realpathSync(path);
+  } catch {
+    return join(realPath(dirname(path)), basename(path));
+  }
+}
+
 /** Drops undefined fields, which Wrangler's normalized config keeps for options that are not set. */
 function defined(object) {
   return Object.fromEntries(Object.entries(object).filter(([, value]) => value !== undefined));
@@ -50,6 +71,10 @@ const version = /SERVER_VERSION = "([^"]+)"/.exec(readFileSync(join(server, "src
 if (!version) fail("src/version.ts has no SERVER_VERSION");
 if (config.r2_buckets.length !== 1) fail("wrangler.jsonc must bind exactly one R2 bucket, found " + config.r2_buckets.length);
 if (!config.assets?.directory || !config.assets.binding) fail("wrangler.jsonc must set assets.directory and assets.binding");
+const fromAssets = relative(realPath(resolve(server, config.assets.directory)), realPath(output));
+if (fromAssets === "" || (!fromAssets.startsWith("..") && !isAbsolute(fromAssets))) {
+  fail(output + " is inside " + config.assets.directory + ", which the packer copies into it; name a directory outside it");
+}
 
 const built = mkdtempSync(join(tmpdir(), "flarebox-bundle-"));
 try {
