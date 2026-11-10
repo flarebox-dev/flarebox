@@ -26,7 +26,7 @@ Until someone claims it, a new server has no owner, and the first valid claim ma
 
 1. Open `<your server>/setup` in a browser. It writes a one-time claim code, valid for one hour, to the Worker's log.
 2. In the Cloudflare dashboard, open **Workers & Pages**, select your Worker, open **Observability** and search for `Flarebox claim code`.
-3. *Not yet available:* enter the server address and the code in the Flarebox app, or run `flarebox server claim`. That device becomes your first device.
+3. Enter the server address and the code in the setup window of the macOS app. That Mac becomes your first device. The `flarebox` command can't claim a server with this code yet; `flarebox setup` deploys and claims a server in one step instead ([Set up](guide/setup.md)).
 
 If the code expired, open `/setup` again for a new one. Someone who found your address cannot see the code, and their wrong guesses do not affect yours.
 
@@ -34,14 +34,9 @@ If the code expired, open `/setup` again for a new one. Someone who found your a
 
 ## If you lose every device
 
-*Not yet available:* the apps and the CLI cannot send a recovery key yet. The server side works as follows.
+The one recovery path is `flarebox server add-device`, which needs the Cloudflare login ([Devices](guide/devices.md#if-you-lose-every-device)). It sets a one-time recovery key on your Worker, adds the new device to your existing account and deletes the key. Until Flarebox has a public OAuth client, that login works only for the project's test account, so for everyone else there is no way yet to add a device to a server that has none left. No client lets you enter a recovery key by hand.
 
-You can add a new device without losing anything, as long as you can still change the Worker's settings. Recovery does not sign out your other devices: if a lost device may be in someone else's hands, it keeps working until it is revoked, and revoking devices is not available yet either.
-
-1. Make a long random key, for example with `openssl rand -base64 32` (at least 32 characters).
-2. In the dashboard, open your Worker, then **Settings**, **Variables and Secrets**, and add a secret named `FLAREBOX_RECOVERY_KEY` with that value. Or run `wrangler secret put FLAREBOX_RECOVERY_KEY` in `server/`.
-3. In the app or the CLI, claim the server again and give the key instead of a claim code. The new device belongs to your existing account.
-4. Delete the secret. Each key works once; set a new one if you need to recover again.
+Recovery does not sign out your other devices. If a lost device may be in someone else's hands, it keeps working until you revoke it with `flarebox device revoke` ([Devices](guide/devices.md#revoke-a-device)).
 
 ## Upgrade
 
