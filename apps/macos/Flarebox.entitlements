@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  SPDX-License-Identifier: Apache-2.0
+
+  Entitlements for release builds, which scripts/sign-app.sh signs with the hardened runtime.
+  The app needs no entitlements: it is not sandboxed, links the Rust core statically, and uses
+  no JIT, unsigned executable memory, DYLD environment variables or third-party libraries, so
+  no hardened runtime exception applies. get-task-allow is absent, as notarization requires.
+  See docs/release-macos.md before adding a key here.
+-->
+<plist version="1.0">
+<dict/>
+</plist>

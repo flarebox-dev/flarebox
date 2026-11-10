@@ -1,0 +1,289 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Builds the macOS app as a disk image. On a version tag or a manual run, it signs the app with a
+# Developer ID certificate and the hardened runtime, notarizes and staples the app and the disk
+# image, verifies them and uploads the disk image as a workflow artifact. Without the signing
+# secrets it builds an unsigned disk image and says so. Pull requests and the merge queue build
+# the unsigned disk image only. This workflow never creates a GitHub release or publishes
+# anything. Setup and secrets: docs/release-macos.md.
+
+name: macOS release
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version for the app, for example 0.1.0. Empty uses MARKETING_VERSION from apps/macos/project.yml.
+        required: false
+        default: ''
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-macos-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+
+jobs:
+  unsigned:
+    name: macos release (unsigned)
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    runs-on: macos-26
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: apps/macos
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check whether the change affects the macOS release
+        id: changes
+        working-directory: ${{ github.workspace }}
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE"
+          status=0
+          git diff --quiet --no-renames "$BASE" HEAD -- \
+            apps/macos core Cargo.toml Cargo.lock rust-toolchain.toml .github/workflows/release-macos.yml || status=$?
+          case "$status" in
+            0)
+              echo "The change does not touch apps/macos, core, the Cargo files or release-macos.yml: skipping the release build."
+              echo "affected=false" >> "$GITHUB_OUTPUT"
+              ;;
+            1)
+              echo "The change touches apps/macos, core, the Cargo files or release-macos.yml: building the unsigned disk image."
+              echo "affected=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::git diff between $BASE and HEAD failed with exit code $status, so the affected paths are unknown."
+              exit 1
+              ;;
+          esac
+      - name: Show Xcode and Swift versions
+        if: steps.changes.outputs.affected == 'true'
+        run: xcodebuild -version && swift --version
+      - name: Install toolchain from rust-toolchain.toml
+        if: steps.changes.outputs.affected == 'true'
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Build the app
+        if: steps.changes.outputs.affected == 'true'
+        run: scripts/build-release.sh
+      - name: Sign the app ad hoc (pull requests are never signed with the Developer ID)
+        if: steps.changes.outputs.affected == 'true'
+        run: scripts/sign-app.sh build/release/Flarebox.app -
+      - name: Package the disk image
+        if: steps.changes.outputs.affected == 'true'
+        run: scripts/make-dmg.sh build/release/Flarebox.app build/release/Flarebox-unsigned.dmg
+      - name: Verify the disk image
+        if: steps.changes.outputs.affected == 'true'
+        run: |
+          scripts/verify-release.sh build/release/Flarebox-unsigned.dmg unsigned
+          echo "Unsigned build: pull requests and the merge queue never sign or notarize. SHA-256 $(shasum -a 256 build/release/Flarebox-unsigned.dmg | cut -d ' ' -f 1)" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.changes.outputs.affected == 'true'
+        with:
+          name: Flarebox-unsigned
+          path: apps/macos/build/release/Flarebox-unsigned.dmg
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  release:
+    name: macos release
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-26
+    timeout-minutes: 120
+    environment: macos-release
+    defaults:
+      run:
+        working-directory: apps/macos
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Decide the version
+        id: version
+        env:
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$EVENT" = push ]; then
+            version="${TAG#v}"
+          elif [ -n "$INPUT_VERSION" ]; then
+            version="$INPUT_VERSION"
+          else
+            version="$(awk '$1 == "MARKETING_VERSION:" { print $2 }' project.yml)"
+          fi
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::The version '$version' is not three numbers like 0.1.0, which CFBundleShortVersionString needs."
+            exit 1
+          fi
+          echo "Version $version, build ${GITHUB_RUN_NUMBER}."
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Check the signing secrets
+        id: signing
+        env:
+          HAS_P12: ${{ secrets.MACOS_DEVELOPER_ID_P12_BASE64 != '' }}
+          HAS_P12_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD != '' }}
+          HAS_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID != '' }}
+          HAS_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID != '' }}
+          HAS_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8_BASE64 != '' }}
+        run: |
+          present=()
+          missing=()
+          for pair in \
+            "MACOS_DEVELOPER_ID_P12_BASE64=$HAS_P12" \
+            "MACOS_DEVELOPER_ID_P12_PASSWORD=$HAS_P12_PASSWORD" \
+            "APP_STORE_CONNECT_API_KEY_ID=$HAS_KEY_ID" \
+            "APP_STORE_CONNECT_API_ISSUER_ID=$HAS_ISSUER_ID" \
+            "APP_STORE_CONNECT_API_KEY_P8_BASE64=$HAS_KEY"; do
+            if [ "${pair#*=}" = true ]; then present+=("${pair%%=*}"); else missing+=("${pair%%=*}"); fi
+          done
+          if [ ${#missing[@]} -eq 0 ]; then
+            echo "All five signing secrets are set: the app will be signed, notarized and stapled."
+            echo "sign=true" >> "$GITHUB_OUTPUT"
+          elif [ ${#present[@]} -eq 0 ]; then
+            message="Signing skipped: none of the signing secrets are set in the macos-release environment or the repository, so this run builds an UNSIGNED, un-notarized disk image that Gatekeeper blocks on other Macs. See docs/release-macos.md."
+            echo "::warning::$message"
+            echo "$message" >> "$GITHUB_STEP_SUMMARY"
+            echo "sign=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Only some signing secrets are set. Missing: ${missing[*]}. Set all five or none (docs/release-macos.md)."
+            exit 1
+          fi
+      - name: Show Xcode and Swift versions
+        run: xcodebuild -version && swift --version
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Build the app
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: scripts/build-release.sh
+
+      - name: Set up a temporary keychain and the notary key
+        id: keychain
+        if: steps.signing.outputs.sign == 'true'
+        env:
+          P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD }}
+          KEY_P8_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8_BASE64 }}
+        run: |
+          umask 077
+          secrets_dir="$RUNNER_TEMP/flarebox-signing"
+          keychain="$secrets_dir/signing.keychain-db"
+          mkdir -p "$secrets_dir"
+          keychain_password="$(openssl rand -hex 32)"
+          echo "::add-mask::$keychain_password"
+          printf '%s' "$P12_BASE64" | base64 --decode > "$secrets_dir/developer-id.p12"
+          printf '%s' "$KEY_P8_BASE64" | base64 --decode > "$secrets_dir/notary-key.p8"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 7200 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          if ! security import "$secrets_dir/developer-id.p12" -k "$keychain" -f pkcs12 -P "$P12_PASSWORD" -T /usr/bin/codesign >/dev/null; then
+            echo "::error::Could not import MACOS_DEVELOPER_ID_P12_BASE64 into the keychain. Check that it is a base64-encoded .p12 and that MACOS_DEVELOPER_ID_P12_PASSWORD is its export password."
+            exit 1
+          fi
+          rm -f "$secrets_dir/developer-id.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" >/dev/null
+          search_list=()
+          while IFS= read -r entry; do
+            entry="${entry#"${entry%%[![:space:]]*}"}"
+            search_list+=("${entry//\"/}")
+          done < <(security list-keychains -d user)
+          security list-keychains -d user -s "$keychain" "${search_list[@]}"
+          identities="$(security find-identity -v -p codesigning "$keychain" | grep '"Developer ID Application: ' || true)"
+          count="$(grep -c . <<<"$identities" || true)"
+          if [ "$count" -ne 1 ]; then
+            echo "::error::Expected one valid Developer ID Application identity in the .p12, found $count. Export the certificate together with its private key (docs/release-macos.md)."
+            exit 1
+          fi
+          echo "Signing identity: $(sed -E 's/^ *[0-9]+\) [0-9A-F]+ //' <<<"$identities")"
+          {
+            echo "identity=$(awk '{ print $2 }' <<<"$identities")"
+            echo "keychain=$keychain"
+            echo "notary-key=$secrets_dir/notary-key.p8"
+          } >> "$GITHUB_OUTPUT"
+      - name: Sign the app with the Developer ID
+        if: steps.signing.outputs.sign == 'true'
+        env:
+          KEYCHAIN: ${{ steps.keychain.outputs.keychain }}
+          IDENTITY: ${{ steps.keychain.outputs.identity }}
+        run: scripts/sign-app.sh build/release/Flarebox.app "$IDENTITY"
+      - name: Notarize and staple the app
+        if: steps.signing.outputs.sign == 'true'
+        env:
+          NOTARY_KEY_PATH: ${{ steps.keychain.outputs.notary-key }}
+          NOTARY_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+        run: |
+          ditto -c -k --keepParent build/release/Flarebox.app "$RUNNER_TEMP/Flarebox.zip"
+          scripts/notarize.sh "$RUNNER_TEMP/Flarebox.zip"
+          xcrun stapler staple build/release/Flarebox.app
+      - name: Sign the app ad hoc (signing skipped)
+        if: steps.signing.outputs.sign != 'true'
+        run: scripts/sign-app.sh build/release/Flarebox.app -
+
+      - name: Package the disk image
+        id: dmg
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SUFFIX: ${{ steps.signing.outputs.sign != 'true' && '-unsigned' || '' }}
+        run: |
+          name="Flarebox-$VERSION-$(uname -m)$SUFFIX"
+          scripts/make-dmg.sh build/release/Flarebox.app "build/release/$name.dmg"
+          {
+            echo "name=$name"
+            echo "path=build/release/$name.dmg"
+          } >> "$GITHUB_OUTPUT"
+      - name: Sign, notarize and staple the disk image
+        if: steps.signing.outputs.sign == 'true'
+        env:
+          DMG: ${{ steps.dmg.outputs.path }}
+          KEYCHAIN: ${{ steps.keychain.outputs.keychain }}
+          IDENTITY: ${{ steps.keychain.outputs.identity }}
+          NOTARY_KEY_PATH: ${{ steps.keychain.outputs.notary-key }}
+          NOTARY_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+        run: |
+          codesign --force --timestamp --keychain "$KEYCHAIN" --sign "$IDENTITY" "$DMG"
+          scripts/notarize.sh "$DMG"
+          xcrun stapler staple "$DMG"
+      - name: Verify the disk image
+        env:
+          DMG: ${{ steps.dmg.outputs.path }}
+          VERSION: ${{ steps.version.outputs.version }}
+          MODE: ${{ steps.signing.outputs.sign == 'true' && 'signed' || 'unsigned' }}
+        run: |
+          scripts/verify-release.sh "$DMG" "$MODE"
+          {
+            echo "Disk image: $(basename "$DMG") ($MODE), SHA-256 $(shasum -a 256 "$DMG" | cut -d ' ' -f 1)."
+            echo "It is a workflow artifact only; nothing was published."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.dmg.outputs.name }}
+          path: apps/macos/${{ steps.dmg.outputs.path }}
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Delete the temporary keychain and the key files
+        if: always()
+        working-directory: ${{ github.workspace }}
+        run: |
+          secrets_dir="$RUNNER_TEMP/flarebox-signing"
+          if [ -f "$secrets_dir/signing.keychain-db" ]; then
+            security delete-keychain "$secrets_dir/signing.keychain-db"
+            echo "Deleted the temporary keychain."
+          fi
+          rm -rf "$secrets_dir" "$RUNNER_TEMP/Flarebox.zip"

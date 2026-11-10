@@ -51,6 +51,8 @@ Run `scripts/build-ffi.sh` again after every change to `core/ffi`. It rebuilds t
 | `FlareboxFFI/` | A Swift package: the `FlareboxFFI` library wraps the Rust core (the generated bindings and the static library as an XCFramework), and `FlareboxModel` holds the app's view models. Both have tests. |
 | `scripts/generate-project.sh` | Generates `Flarebox.xcodeproj` with the pinned XcodeGen. |
 | `scripts/build-ffi.sh` | Builds the Rust library and fills in `FlareboxFFI/Frameworks` and `FlareboxFFI/Sources`. These generated files are not checked in. |
+| `scripts/build-release.sh`, `sign-app.sh`, `make-dmg.sh`, `notarize.sh`, `verify-release.sh` | Build, sign, package, notarize and verify a release disk image. The macOS release workflow runs them; see [docs/release-macos.md](../../docs/release-macos.md). |
+| `Flarebox.entitlements` | The entitlements release builds are signed with, deliberately empty. |
 
 The Rust library is built for the architecture of the machine you build on, not as a universal binary.
 
