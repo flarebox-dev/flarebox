@@ -8,3 +8,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
+
+[dependencies]
+notify = "8.2.2"
+rustix = { version = "1.1.6", features = ["fs"] }
+thiserror = "2.0.21"
+
+[dev-dependencies]
+rustix = { version = "1.1.6", features = ["process"] }
+tempfile = "3.27.0"
