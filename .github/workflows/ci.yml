@@ -331,7 +331,8 @@ jobs:
 
   runner-hook:
     name: runner hook
-    runs-on: ubuntu-latest
+    needs: changes
+    runs-on: ${{ fromJSON(needs.changes.outputs.macos_runs_on) }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -339,6 +340,8 @@ jobs:
           persist-credentials: false
       - name: Test the job-started hook of the self-hosted runners
         run: .github/runner/test-job-started.sh
+      - name: Test the hook's installer without root
+        run: .github/runner/test-install-hook.sh
 
   ci-report:
     name: ci-report

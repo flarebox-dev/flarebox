@@ -5,91 +5,172 @@
 # with sudo from a checkout on the Mac that hosts the runners, then restart each runner while it
 # is idle. It copies the hook to a root-owned path, and in each runner directory it writes .env
 # (with ACTIONS_RUNNER_HOOK_JOB_STARTED) and .path (system directories first, so the runner finds
-# /bin/bash for the hook), makes both files owned by root and immutable, and prints what a
-# maintainer should check. Running it again is safe. CONTRIBUTING.md explains why.
+# /bin/bash for the hook), makes both files owned by root and immutable, and checks the result.
+# CONTRIBUTING.md explains why.
+#
+# It reads and prepares every file before it changes anything, so a read error changes nothing.
+# It then updates one runner at a time; if that fails, it restores the runner's previous files,
+# owners, modes and flags and stops, so each runner is either fully installed or unchanged.
+# Running it again is safe.
 #
 # Usage: sudo .github/runner/install-hook.sh [RUNNER_DIR...]
 # The default runner directories are /Users/ghrunner/runner-1 to /Users/ghrunner/runner-4.
+# FLAREBOX_INSTALL_ROOT, FLAREBOX_INSTALL_OWNER and FLAREBOX_INSTALL_GROUP let
+# test-install-hook.sh run it without root against fake runner directories.
 set -euo pipefail
 
+root="${FLAREBOX_INSTALL_ROOT:-}"
+owner="${FLAREBOX_INSTALL_OWNER:-root}"
+group="${FLAREBOX_INSTALL_GROUP:-wheel}"
 runner_user=ghrunner
-hook_dir=/usr/local/libexec/flarebox
+hook_dir="$root/usr/local/libexec/flarebox"
 hook="$hook_dir/job-started.sh"
+hook_line="ACTIONS_RUNNER_HOOK_JOB_STARTED=$hook"
 runner_path="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/Users/$runner_user/.cargo/bin"
 source_hook="$(cd "$(dirname "$0")" && pwd)/job-started.sh"
 
-if [ "$(id -u)" -ne 0 ]; then
-  echo "error: run this with sudo." >&2
+die() {
+  echo "error: $*" >&2
   exit 1
+}
+
+if [ "$(id -u)" -ne 0 ] && [ "$owner" != "$(id -un)" ]; then
+  die "run this with sudo."
 fi
 if [ "$#" -eq 0 ]; then
-  set -- "/Users/$runner_user/runner-1" "/Users/$runner_user/runner-2" "/Users/$runner_user/runner-3" "/Users/$runner_user/runner-4"
+  set -- "$root/Users/$runner_user/runner-1" "$root/Users/$runner_user/runner-2" "$root/Users/$runner_user/runner-3" "$root/Users/$runner_user/runner-4"
 fi
-for dir in "$@"; do
-  if [ ! -f "$dir/.runner" ]; then
-    echo "error: $dir is not a configured runner directory (it has no .runner file)." >&2
-    exit 1
+
+staging="$(mktemp -d)"
+keep_staging=no
+cleanup() {
+  if [ "$keep_staging" = no ]; then
+    chflags -R 0 "$staging" 2>/dev/null || true
+    rm -rf "$staging"
   fi
-done
+}
+trap cleanup EXIT
 
-install -d -o root -g wheel -m 755 "$hook_dir"
-install -o root -g wheel -m 755 "$source_hook" "$hook"
-
+# Stage: read and prepare everything. Nothing outside $staging changes here.
+cat "$source_hook" > "$staging/hook" || die "cannot read $source_hook; nothing was changed."
+n=0
 for dir in "$@"; do
+  n=$((n + 1))
+  s="$staging/$n"
+  mkdir "$s"
+  [ -f "$dir/.runner" ] || die "$dir is not a configured runner directory (it has no .runner file); nothing was changed."
   for file in .env .path; do
-    if [ -e "$dir/$file" ]; then
-      chflags nouchg "$dir/$file"
+    if [ -e "$dir/$file" ] || [ -L "$dir/$file" ]; then
+      [ -f "$dir/$file" ] || die "$dir/$file is not a regular file; nothing was changed."
+      cat "$dir/$file" > "$s/old$file" || die "cannot read $dir/$file; nothing was changed."
+      cp -p "$dir/$file" "$s/backup$file" || die "cannot back up $dir/$file; nothing was changed."
     fi
   done
-  if [ -f "$dir/.path" ]; then
-    echo "$dir/.path was: $(cat "$dir/.path")"
+  : > "$s/new.env"
+  if [ -f "$s/old.env" ]; then
+    grep -v '^ACTIONS_RUNNER_HOOK_JOB_STARTED=' "$s/old.env" > "$s/new.env" || [ $? -eq 1 ] || die "cannot filter $dir/.env; nothing was changed."
   fi
-  env_new="$(mktemp)"
-  if [ -f "$dir/.env" ]; then
-    grep -v '^ACTIONS_RUNNER_HOOK_JOB_STARTED=' "$dir/.env" > "$env_new" || true
+  echo "$hook_line" >> "$s/new.env"
+  echo "$runner_path" > "$s/new.path"
+  if [ -f "$s/old.path" ]; then
+    echo "$dir/.path was: $(cat "$s/old.path")"
   fi
-  echo "ACTIONS_RUNNER_HOOK_JOB_STARTED=$hook" >> "$env_new"
-  install -o root -g wheel -m 644 "$env_new" "$dir/.env"
-  rm -f "$env_new"
-  path_new="$(mktemp)"
-  echo "$runner_path" > "$path_new"
-  install -o root -g wheel -m 644 "$path_new" "$dir/.path"
-  rm -f "$path_new"
-  chflags uchg "$dir/.env" "$dir/.path"
 done
 
+apply_runner() {
+  local dir="$1" s="$2" file
+  install -o "$owner" -g "$group" -m 644 "$s/new.env" "$dir/.env.flarebox-new" || return 1
+  install -o "$owner" -g "$group" -m 644 "$s/new.path" "$dir/.path.flarebox-new" || return 1
+  for file in .env .path; do
+    if [ -e "$dir/$file" ]; then
+      chflags nouchg "$dir/$file" || return 1
+    fi
+  done
+  mv -f "$dir/.env.flarebox-new" "$dir/.env" || return 1
+  mv -f "$dir/.path.flarebox-new" "$dir/.path" || return 1
+  chflags uchg "$dir/.env" "$dir/.path" || return 1
+}
+
+restore_runner() {
+  local dir="$1" s="$2" file status=0
+  rm -f "$dir/.env.flarebox-new" "$dir/.path.flarebox-new" || status=1
+  for file in .env .path; do
+    if [ -e "$dir/$file" ]; then
+      chflags 0 "$dir/$file" || status=1
+    fi
+    if [ -f "$s/backup$file" ]; then
+      cp -p "$s/backup$file" "$dir/$file" || status=1
+    else
+      rm -f "$dir/$file" || status=1
+    fi
+  done
+  return "$status"
+}
+
+# Apply: the hook first, then one runner at a time.
+install -d -o "$owner" -g "$group" -m 755 "$hook_dir"
+install -o "$owner" -g "$group" -m 755 "$staging/hook" "$hook_dir/.job-started.sh.new"
+mv -f "$hook_dir/.job-started.sh.new" "$hook"
+installed=()
+n=0
+for dir in "$@"; do
+  n=$((n + 1))
+  if ! apply_runner "$dir" "$staging/$n"; then
+    echo "error: installing the hook in $dir failed; restoring its previous .env and .path." >&2
+    if restore_runner "$dir" "$staging/$n"; then
+      echo "error: $dir is back to its previous state." >&2
+    else
+      keep_staging=yes
+      echo "error: restoring $dir failed. Its previous files are in $staging/$n (backup.env, backup.path); restore them by hand." >&2
+    fi
+    echo "error: installed in: ${installed[*]:-none}. Not changed: $dir and the runners after it." >&2
+    exit 1
+  fi
+  installed+=("$dir")
+done
+
+# Verify owners, modes, flags and contents.
+failures=0
+fail() {
+  echo "  FAILED: $*"
+  failures=$((failures + 1))
+}
 check() {
-  local writable=no
-  if sudo -u "$runner_user" test -w "$1"; then
+  local path="$1" mode="$2" flag="$3" expected="$4" writable=no
+  if [ "$(id -u)" -eq 0 ] && sudo -u "$runner_user" test -w "$path"; then
     writable=YES
   fi
-  printf '%-48s %-12s %-11s %-6s %s writable: %s\n' "$1" "$(stat -f '%Su:%Sg' "$1")" "$(stat -f '%Sp' "$1")" "$(stat -f '%Sf' "$1" | sed 's/^-$/none/')" "$runner_user" "$writable"
+  printf '%-56s %-14s %-4s %-12s %s writable: %s\n' "$path" "$(stat -f '%Su:%Sg' "$path")" "$(stat -f '%Lp' "$path")" "$(stat -f '%Sf' "$path")" "$runner_user" "$writable"
+  [ "$(stat -f '%Su:%Sg' "$path")" = "$owner:$group" ] || fail "$path is not owned by $owner:$group."
+  [ "$(stat -f '%Lp' "$path")" = "$mode" ] || fail "$path does not have mode $mode."
+  if [ -n "$flag" ] && [[ ",$(stat -f '%Sf' "$path")," != *",$flag,"* ]]; then
+    fail "$path does not have the $flag flag."
+  fi
+  if [ -n "$expected" ] && ! cmp -s "$expected" "$path"; then
+    fail "$path does not have the expected contents."
+  fi
   if [ "$writable" = YES ]; then
-    failures=$((failures + 1))
+    fail "$runner_user can write $path."
   fi
 }
 
 echo
 echo "Verification (path, owner, mode, flags, whether $runner_user can write it):"
-failures=0
-for path in /usr/local /usr/local/libexec "$hook_dir" "$hook"; do
-  check "$path"
-done
+check "$hook_dir" 755 "" ""
+check "$hook" 755 "" "$staging/hook"
+n=0
 for dir in "$@"; do
-  check "$dir/.env"
-  check "$dir/.path"
-  echo "  hook in $dir/.env: $(grep '^ACTIONS_RUNNER_HOOK_JOB_STARTED=' "$dir/.env")"
-  echo "  PATH in $dir/.path: $(cat "$dir/.path")"
+  n=$((n + 1))
+  check "$dir/.env" 644 uchg "$staging/$n/new.env"
+  check "$dir/.path" 644 uchg "$staging/$n/new.path"
 done
+echo "Hook setting: $hook_line"
+echo "PATH: $runner_path"
 echo "jq for the hook: $(/usr/bin/jq --version)"
-if ! cmp -s "$source_hook" "$hook"; then
-  echo "error: $hook differs from $source_hook." >&2
-  failures=$((failures + 1))
-fi
 if [ "$failures" -ne 0 ]; then
-  echo "error: $failures check(s) failed; see the lines above." >&2
-  exit 1
+  die "$failures check(s) failed; see the lines above."
 fi
+
 echo
 echo "Installed. Restart each runner while it is idle, for example:"
 for dir in "$@"; do
