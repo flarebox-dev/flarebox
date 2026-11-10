@@ -1653,3 +1653,107 @@ fn a_folder_the_scan_may_not_read_keeps_its_files_in_the_space() {
     assert_eq!(a.sent.len(), sent);
     assert_eq!(remote.names(), ["private", "secret.txt"]);
 }
+
+#[test]
+fn a_restart_before_the_upload_of_a_commit_sends_it_once_with_its_chunks() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::write(site.root.join("notes.txt"), b"written on a").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    assert!(matches!(a.work.front(), Some(Work::Upload(_))));
+    let built = a
+        .folder
+        .engine
+        .commits
+        .in_flight()
+        .unwrap()
+        .commit
+        .commit_id
+        .clone();
+    drop(a);
+
+    let mut a = site.start();
+    a.connect(&remote);
+    a.scan_until(|a| a.folder.scanned);
+    a.run(&mut remote);
+    a.settle();
+    assert!(a.work.is_empty());
+    assert!(a.sent.iter().all(|sent| sent.commit_id == built));
+    assert_eq!(remote.space.head_seq(), 1);
+    assert_eq!(remote.names(), ["notes.txt"]);
+    assert_eq!(a.state(), FolderState::UpToDate);
+}
+
+#[test]
+fn a_restart_during_a_bootstrap_reads_the_tree_again() {
+    for listed in [false, true] {
+        let mut remote = Remote::new();
+        let (site_a, mut a) = linked(&mut remote, "a");
+        a.create(&mut remote, &site_a.root.join("notes.txt"), b"written on a");
+
+        let site = Site::new(&remote, "b");
+        let mut b = site.start();
+        b.connect(&remote);
+        b.scan_until(|b| b.folder.scanned);
+        assert!(matches!(b.work.pop_front(), Some(Work::List)));
+        if listed {
+            let step = b.folder.listed(Ok(remote.pages(TREE_PAGE)));
+            b.take(step).unwrap();
+            assert!(matches!(b.work.front(), Some(Work::Subscribe { .. })));
+        }
+        drop(b);
+
+        let mut b = site.start();
+        b.connect(&remote);
+        b.scan_until(|b| b.folder.scanned);
+        assert_eq!(
+            b.run(&mut remote),
+            ["list", "subscribe", "stage"],
+            "listed: {listed}"
+        );
+        b.settle();
+        assert!(b.work.is_empty());
+        assert_eq!(files(&site.root), notes());
+        assert_eq!(b.state(), FolderState::UpToDate);
+    }
+}
+
+#[test]
+fn a_reconnect_while_a_commit_is_sent_starts_no_second_send() {
+    for reached_the_server in [false, true] {
+        let mut remote = Remote::new();
+        let (site, mut a) = linked(&mut remote, "a");
+        fs::write(site.root.join("notes.txt"), b"written on a").unwrap();
+        a.scan_until(|a| !a.work.is_empty());
+        let upload = a.work.pop_front().unwrap();
+        a.perform(upload, &mut remote).unwrap();
+        let Some(Work::Send(commit)) = a.work.pop_front() else {
+            panic!("the commit is sent after its upload");
+        };
+        if reached_the_server {
+            remote.commit(&a.caller, &commit).unwrap();
+        }
+
+        a.event(Event::Disconnected {
+            reason: flarebox_net::DisconnectReason::Timeout,
+            retry_in: Duration::from_secs(1),
+        })
+        .unwrap();
+        a.connect(&remote);
+        assert!(
+            !a.work.iter().any(|work| matches!(work, Work::Send(_))),
+            "reached the server: {reached_the_server}"
+        );
+
+        let result = remote.commit(&a.caller, &commit).unwrap();
+        let step = a.folder.sent(Ok(result));
+        a.take(step).unwrap();
+        a.pull(&remote);
+        a.run(&mut remote);
+        a.settle();
+        assert!(a.work.is_empty());
+        assert_eq!(remote.space.head_seq(), 1);
+        assert_eq!(remote.names(), ["notes.txt"]);
+        assert_eq!(a.state(), FolderState::UpToDate);
+    }
+}
