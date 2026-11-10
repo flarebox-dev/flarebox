@@ -523,7 +523,7 @@ impl Disk {
             return Err(Stop::Withdrawn(self.path.clone()));
         }
         observation.root.map_err(Stop::Root)?;
-        engine.rules(observation.rules);
+        engine.rules(observation.rules, &observation.unreadable);
         if (self.rules_after).is_some_and(|requested| answered >= Some(requested)) {
             self.rules_after = None;
         }

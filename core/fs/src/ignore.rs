@@ -69,6 +69,9 @@ pub struct Rules {
     /// The names each listed folder holds that a rule leaves out
     /// ([`Ignored::Rule`] only).
     ignored: BTreeMap<PathBuf, BTreeSet<OsString>>,
+    /// The folders a scan reported unreadable, by the keys of their paths,
+    /// until a scan reads them again or they are gone.
+    unread: BTreeMap<PathBuf, PathBuf>,
 }
 
 impl Rules {
@@ -78,6 +81,7 @@ impl Rules {
             ignore,
             files: BTreeMap::new(),
             ignored: BTreeMap::new(),
+            unread: BTreeMap::new(),
         }
     }
 
@@ -134,6 +138,8 @@ pub(crate) struct Pending<'r> {
     before: BTreeMap<PathBuf, Option<Held>>,
     /// The names a rule leaves out in each folder this scan listed.
     listed: BTreeMap<PathBuf, BTreeSet<OsString>>,
+    /// The keys of the folders whose rules this scan read.
+    read: BTreeSet<PathBuf>,
 }
 
 impl<'r> Pending<'r> {
@@ -142,6 +148,7 @@ impl<'r> Pending<'r> {
             rules,
             before: BTreeMap::new(),
             listed: BTreeMap::new(),
+            read: BTreeSet::new(),
         }
     }
 
@@ -164,6 +171,7 @@ impl<'r> Pending<'r> {
             return RulesRead::Unknown;
         }
         self.listed.entry(rel.to_path_buf()).or_default();
+        self.read.insert(key.clone());
         let found = match read {
             Some(Ok(found)) => found,
             Some(Err(_)) => return RulesRead::Same,
@@ -264,13 +272,20 @@ impl<'r> Pending<'r> {
 
     /// Drops the rules of every folder for which `is_folder` is false, and
     /// returns the folders whose rules file this scan changed, with what each
-    /// one holds now.
+    /// one holds now. A folder an earlier scan reported unreadable is
+    /// returned too once this scan read it or it is gone, so the caller
+    /// learns that its rules are known again. The folders in `unreadable` are
+    /// remembered for that.
     pub(crate) fn finish(
         self,
         is_folder: impl Fn(&Path) -> bool,
+        unreadable: &[PathBuf],
     ) -> Vec<(PathBuf, Option<Vec<u8>>)> {
         let Self {
-            rules, mut before, ..
+            rules,
+            mut before,
+            read,
+            ..
         } = self;
         let held = |dir: &Path| dir.as_os_str().is_empty() || is_folder(dir);
         let stale: Vec<PathBuf> = rules
@@ -285,15 +300,30 @@ impl<'r> Pending<'r> {
             before.entry(key).or_insert(dropped);
         }
         rules.ignored.retain(|dir, _| held(dir));
-        before
-            .into_iter()
-            .filter_map(|(key, before)| match (rules.files.get(&key), before) {
-                (Some((_, now)), Some((_, before))) if *now == before => None,
+        let mut changed: Vec<(PathBuf, Option<Vec<u8>>)> = (before.iter())
+            .filter_map(|(key, before)| match (rules.files.get(key), before) {
+                (Some((_, now)), Some((_, before))) if now == before => None,
                 (Some((dir, now)), _) => Some((dir.clone(), Some(now.clone()))),
-                (None, Some((dir, _))) => Some((dir, None)),
+                (None, Some((dir, _))) => Some((dir.clone(), None)),
                 (None, None) => None,
             })
-            .collect()
+            .collect();
+        let known: Vec<PathBuf> = (rules.unread.iter())
+            .filter(|(key, dir)| read.contains(*key) || !held(dir))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in known {
+            let unread = rules.unread.remove(&key).expect("an unread folder");
+            let now = rules.files.get(&key);
+            if !(changed.iter()).any(|(reported, _)| rules.key(reported) == key) {
+                let dir = now.map_or(unread, |(dir, _)| dir.clone());
+                changed.push((dir, now.map(|(_, bytes)| bytes.clone())));
+            }
+        }
+        for dir in unreadable {
+            rules.unread.insert(rules.key(dir), dir.clone());
+        }
+        changed
     }
 }
 

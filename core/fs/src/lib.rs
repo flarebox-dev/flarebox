@@ -501,7 +501,9 @@ pub struct Rescan {
     pub root: FileId,
     /// The folders whose rules file this scan found changed, each with the
     /// bytes it holds now, or `None` for a folder that has none any more.
-    /// Empty for a scan without [`Rules`].
+    /// A folder an earlier scan reported unreadable is listed too once a scan
+    /// reads it, or with `None` once it is gone. Empty for a scan without
+    /// [`Rules`].
     pub rules: Vec<(PathBuf, Option<Vec<u8>>)>,
 }
 
@@ -771,11 +773,14 @@ impl Snapshot {
             Some(mut rules) => {
                 rules.settle();
                 find_ignored(&mut changes, &old, &mut rules, again.as_fd());
-                rules.finish(|dir| {
-                    self.entries
-                        .get(dir)
-                        .is_some_and(|entry| entry.kind == EntryKind::Dir)
-                })
+                rules.finish(
+                    |dir| {
+                        self.entries
+                            .get(dir)
+                            .is_some_and(|entry| entry.kind == EntryKind::Dir)
+                    },
+                    &unreadable,
+                )
             }
             None => Vec::new(),
         };

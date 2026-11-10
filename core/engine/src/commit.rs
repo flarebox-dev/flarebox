@@ -344,7 +344,7 @@ impl Commits {
             .collect();
         let (needed, agreed) = rebase(trees, ids, now_ms, &skip);
         let excluded: Vec<NodeId> = (trees.dirty().iter())
-            .filter(|id| trees.excluded(id))
+            .filter(|id| trees.excluded(id) || trees.held(id))
             .cloned()
             .collect();
         skip.extend(excluded);
@@ -815,7 +815,12 @@ fn rebase(
     let dirty: Vec<NodeId> = trees.dirty().iter().cloned().collect();
     for id in &dirty {
         let held = trees.reverted().contains(id) || trees.waiting().contains_key(id);
-        if held && trees.remote().live(id).is_none() && trees.edited(id) && !trees.excluded(id) {
+        if held
+            && trees.remote().live(id).is_none()
+            && trees.edited(id)
+            && !trees.excluded(id)
+            && !trees.held(id)
+        {
             rekey(trees, id, &ids.uuid_v7(now_ms));
         }
     }

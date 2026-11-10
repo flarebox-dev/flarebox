@@ -627,6 +627,39 @@ fn a_rules_file_that_cannot_be_read_at_the_first_scan_leaves_its_folder_unknown(
     assert_eq!(known(&snapshot), ["keep.txt", "sub", "sub/.fbignore"]);
 }
 
+/// A folder whose rules were unknown is reported once a scan reads it, also with no rules file left to read, and once
+/// it is gone, so the caller does not wait for its rules for good.
+#[test]
+fn a_folder_whose_rules_were_unknown_is_reported_once_they_are_known() {
+    for how in ["the rules file is deleted", "the folder is deleted"] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "sub/.fbignore", &"x\n".repeat((1 << 19) + 1));
+        write(root, "sub/x", "kept");
+        let mut rules = rules();
+        let mut snapshot = Snapshot::default();
+        let rescan = snapshot
+            .rescan_with_rules(root, whole(), &mut rules)
+            .unwrap();
+        assert_eq!(rescan.unreadable, [PathBuf::from("sub")], "{how}");
+
+        let sub = root.join("sub");
+        match how {
+            "the folder is deleted" => fs::remove_dir_all(sub).unwrap(),
+            _ => fs::remove_file(sub.join(".fbignore")).unwrap(),
+        }
+        let rescan = snapshot
+            .rescan_with_rules(root, whole(), &mut rules)
+            .unwrap();
+        assert_eq!(rescan.unreadable, Vec::<PathBuf>::new(), "{how}");
+        assert_eq!(rescan.rules, [rule("sub", None)], "{how}");
+        let rescan = snapshot
+            .rescan_with_rules(root, whole(), &mut rules)
+            .unwrap();
+        assert_eq!(rescan.rules, [], "{how}");
+    }
+}
+
 #[test]
 fn scans_without_rules_leave_out_nothing_but_the_private_folder() {
     let dir = tempfile::tempdir().unwrap();

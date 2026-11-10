@@ -1619,6 +1619,43 @@ fn a_downloaded_rules_file_is_in_force_before_anything_else_is_planned() {
     assert_eq!(b.state(), FolderState::UpToDate);
 }
 
+/// After a restart the scan cannot read a rules file over the size limit, and no earlier scan of this run read it, so
+/// what it leaves out is unknown. Nothing below its folder is planned: the excluded log keeps this device's bytes, and
+/// the new file waits too. Once the file can be read, the log stays out and the new file arrives.
+#[test]
+fn a_rules_file_a_restart_cannot_read_holds_everything_below_its_folder() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("build.log"), b"v1");
+    let (site, mut b) = linked(&mut remote, "b");
+    let (site_c, mut c) = linked(&mut remote, "c");
+    a.create(&mut remote, &site_a.root.join(".fbignore"), b"*.log\n");
+    b.pull(&remote);
+    assert_eq!(b.run(&mut remote), ["stage"]);
+    b.scan_until(|b| !b.folder.disk.awaits_rules());
+    assert!(b.run(&mut remote).is_empty());
+    drop(b);
+    fs::write(site.root.join(".fbignore"), "*.log\n".repeat(200_000)).unwrap();
+    a.create(&mut remote, &site_a.root.join("notes.txt"), b"notes");
+    c.create(&mut remote, &site_c.root.join("build.log"), b"v2 from c");
+
+    let mut b = site.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    assert_eq!(b.run(&mut remote), ["subscribe"]);
+    assert_eq!(fs::read(site.root.join("build.log")).unwrap(), b"v1");
+    assert_eq!(names(&site.root), [".fbignore", "build.log"]);
+
+    fs::write(site.root.join(".fbignore"), "*.log\n").unwrap();
+    b.scan_until(|b| !b.work.is_empty());
+    assert_eq!(b.run(&mut remote), ["stage"]);
+    b.settle();
+    assert!(b.run(&mut remote).is_empty());
+    assert_eq!(names(&site.root), [".fbignore", "build.log", "notes.txt"]);
+    assert_eq!(fs::read(site.root.join("build.log")).unwrap(), b"v1");
+    assert!(b.work.is_empty() && b.sent.is_empty());
+}
+
 #[test]
 fn a_rules_file_named_in_another_case_is_downloaded_and_in_force_first() {
     let mut remote = Remote::new();

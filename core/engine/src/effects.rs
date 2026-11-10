@@ -207,7 +207,8 @@ impl Effects {
     /// An excluded node ([`Trees::excluded`]) gets no effect and is never parked, and neither is a
     /// node whose own place an excluded node holds. A parked node that the rules now leave out is
     /// only moved back to the position L keeps for it, and nothing is planned while the rules are
-    /// unknown ([`Trees::rules_known`]). A `.fbignore` file that R
+    /// unknown ([`Trees::rules_known`]), or for a node below a folder whose rules are unknown
+    /// ([`Trees::held`]). A `.fbignore` file that R
     /// holds and the disk does not yet is written before any other effect below its folder
     /// (section 5.10). The driver reads the rules of a rules file it wrote and passes them to
     /// [`Trees::set_rules`] before it asks for the next effect, so the rules are in force before
@@ -249,7 +250,7 @@ impl Effects {
         let mut blockers = BTreeSet::new();
         let mut chosen = None;
         for id in trees.dirty() {
-            if !candidate(trees, id) || (!gates.is_empty() && gated(id)) {
+            if !candidate(trees, id) || trees.held(id) || (!gates.is_empty() && gated(id)) {
                 continue;
             }
             match view.step(id) {
@@ -269,6 +270,7 @@ impl Effects {
                 let waiting = trees.waiting().contains_key(&id);
                 if !(candidate(trees, &id) || waiting)
                     || trees.excluded(&id)
+                    || trees.held(&id)
                     || trees.local().get(&id).is_none_or(|node| node.parked)
                     || view.stuck(&id, trees.local().len())
                 {
