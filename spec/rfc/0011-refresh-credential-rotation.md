@@ -42,17 +42,20 @@ The server does not revoke a principal when an old credential comes back. A proc
 3. If the answer has `rotated` set, it stores the staged credential as current and clears the staged slot.
 4. If the answer is an access token without `rotated`, the request arrived after D and the server will never store the staged credential, so the process clears the staged slot.
 5. If no answer arrives, it keeps both slots. The outcome is unknown, because the request may still arrive before D.
-6. While the staged slot is set, also after a restart, each refresh presents the current credential, without a new proposal:
-   - Accepted with a `server_time_ms` later than D: the staged credential was not stored before that answer, and the server checks every later proposal against a time at least that late (§1), so it can never store it. The process clears the staged slot.
-   - Accepted with a `server_time_ms` at or before D: it keeps both slots and asks again at a later refresh, until an answer carries a time later than D.
+6. While the staged slot is set, also after a restart, each refresh presents the current credential and proposes the same staged credential again, with the same D. It never generates a new credential while the staged slot is set.
+   - Accepted with `rotated` set: as in step 3.
+   - Accepted without `rotated`, so with a `server_time_ms` later than D: the staged credential was not stored before that answer, and the server checks every later proposal against a time at least that late (§1), so it can never store it. The process clears the staged slot.
+   - No answer: as in step 5.
    - Refused with `UNAUTHENTICATED`: it presents the staged credential. If that is accepted, the delayed request stored it, and the process makes it current as in step 3. If that is refused too, another copy rotated the credential, and the device is signed out (RFC 0006 §7).
 
 A refusal of the staged credential alone never clears it, because its request may still arrive. The process clears it only after the server has answered for a time later than D, or has said that it did not store it. Two delayed orders show the difference:
 
-- The rotation request is slow, and the client presents the current credential before it arrives. The server accepts the current credential at a time before D, so the client keeps both slots. The request then arrives before D and stores the staged credential. The client's next refresh is refused for the current credential and accepted for the staged one.
-- The rotation request is slow and arrives after D. The server answers it without `rotated`, or nobody reads the answer. The client's next refresh after D is accepted for the current credential, with a server time later than D, and the client clears the staged slot.
+- The rotation request is slow, and the client proposes the staged credential again before it arrives. If the second proposal is handled first and before D, it stores the staged credential and the client makes it current; the slow request then presents a credential that is no longer stored and changes nothing. If the slow request is handled first and before D, it stores the staged credential, and the client's next refresh is refused for the current credential and accepted for the staged one.
+- The rotation request is slow and arrives after D. The server answers it without `rotated`, or nobody reads the answer. The client's next refresh is answered for a time later than D without `rotated`, and the client clears the staged slot.
 
-Both orders still hold if the server's clock moves backward. In the first, the client keeps both slots whatever times it sees, so a clock change cannot make it drop the credential the server stores. In the second, the client clears the staged slot only after an answer with a time T0 later than D. The server sent that answer only after its rotation clock durably held T0. So a delayed request that arrives later, even while the server's clock reads a time before D, is checked against a time of at least T0 and is not stored.
+Both orders still hold if the server's clock moves backward. In the first, the client keeps both slots until an answer settles the outcome, so a clock change cannot make it drop the credential the server stores. In the second, the client clears the staged slot only after an answer with a time T0 later than D. The server sent that answer only after its rotation clock durably held T0. So a delayed request that arrives later, even while the server's clock reads a time before D, is checked against a time of at least T0 and is not stored.
+
+A lost proposal does not stall the rotation either. While the server's clock is behind the rotation clock, the answers carry the rotation clock, a time at or before D, so the next proposal of the same staged credential is stored.
 
 In every order, the slots the client keeps include the one credential the server accepts.
 
