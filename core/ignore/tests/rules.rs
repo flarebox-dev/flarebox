@@ -251,21 +251,21 @@ fn equivalent_pattern_spellings_select_the_same_names() {
     let m = matcher(&[("", "[e\u{301}]\n")]);
     assert!(excluded(&m, "\u{e9}") && excluded(&m, "E\u{301}"));
     assert!(!excluded(&m, "e"), "a plain e is not \u{e9}");
-    let m = matcher(&[("", "[q\u{301}]\n?x\n")]);
-    assert!(excluded(&m, "q\u{301}"));
-    assert!(!excluded(&m, "q"));
+    let m = matcher(&[("", "[q\u{301}]\n??x\n")]);
     assert!(
-        excluded(&m, "q\u{301}x"),
-        "? takes a character with its marks"
+        excluded(&m, "q"),
+        "[q\u{301}] is the set of q and U+0301, as in git"
     );
+    assert!(!excluded(&m, "q\u{301}"));
+    assert!(excluded(&m, "q\u{301}x"), "? reads one code point");
     let m = matcher(&[("", "[K-\u{c5}]\n")]);
     assert!(excluded(&m, "\u{e5}") && excluded(&m, "\u{212b}") && excluded(&m, "k"));
 }
 
-/// `*` and literals work on code points, so a glob ending or starting next to a combining mark
-/// matches as in git (review of flarebox#50).
+/// Every token reads one code point of the NFC key, so wildcards next to a combining mark match
+/// as in git (review of flarebox#50).
 #[test]
-fn stars_match_across_combining_marks() {
+fn wildcards_match_code_points_next_to_combining_marks() {
     let m = matcher(&[("", "q*\n")]);
     for path in ["q\u{301}", "q\u{301}.txt", "sub/q\u{301}", "Q\u{301}x"] {
         assert!(excluded(&m, path), "q* should exclude {path:?}");
@@ -275,37 +275,23 @@ fn stars_match_across_combining_marks() {
     assert!(excluded(&m, "q\u{301}"));
     assert!(excluded(&m, "sub/aq\u{301}"));
     assert!(!excluded(&m, "q"));
-    let m = matcher(&[("", "q\n")]);
-    assert!(
-        !excluded(&m, "q\u{301}"),
-        "a literal does not stop inside a cluster"
-    );
-    let m = matcher(&[("", "q?\n?\n")]);
-    assert_eq!(
-        status(&m, "q\u{301}"),
-        rule(0, 2),
-        "? reads q\u{301} as one character"
-    );
+    let m = matcher(&[("", "q\n?\n")]);
+    assert!(!excluded(&m, "q\u{301}"));
+    let m = matcher(&[("", "q?\n")]);
+    assert!(excluded(&m, "q\u{301}"), "? reads the mark");
+    for pattern in [
+        "?\u{301}",
+        "[q]\u{301}",
+        "[q]*",
+        "[!x]\u{301}",
+        "[a-z]*",
+        "[q]\u{301}*",
+    ] {
+        let m = matcher(&[("", &format!("{pattern}\n"))]);
+        assert!(excluded(&m, "q\u{301}"), "{pattern:?}");
+    }
     let m = matcher(&[("", "*.txt\n")]);
     assert!(excluded(&m, "a\u{301}\u{302}.txt"));
-}
-
-#[test]
-fn a_range_endpoint_with_combining_marks_is_invalid() {
-    let file = RuleFile::<Folded>::parse("[a-q\u{301}]\n[q\u{301}-z]\n[q\u{301}-]\n".as_bytes());
-    assert_eq!(
-        file.invalid_lines(),
-        [
-            InvalidLine {
-                line: 1,
-                error: LineError::CombiningMarkInRange
-            },
-            InvalidLine {
-                line: 2,
-                error: LineError::CombiningMarkInRange
-            },
-        ]
-    );
 }
 
 #[test]

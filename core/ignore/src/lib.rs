@@ -41,12 +41,9 @@
 //! case-sensitive and case-insensitive volumes, and NFC and NFD spellings of a pattern or a name
 //! are interchangeable.
 //!
-//! Literals and `*` work on code points of that form. `?` and a bracket expression read one
-//! cluster: a code point with the combining marks (canonical combining class other than 0) that
-//! follow it. So `q*` and `*\u{301}` match `q\u{301}`, which has no composed form, and `?` and
-//! `[q\u{301}]` match it as one character, while `[q\u{301}]` does not match `q`. A range
-//! endpoint must be one code point; a line where an endpoint carries combining marks is invalid
-//! ([`LineError::CombiningMarkInRange`]). A key that is longer than its
+//! Every token matches code points of that form, as git matches bytes: `?` and a bracket
+//! expression read one code point, so `?\u{301}` and `q?` both match `q\u{301}`, which has no
+//! composed form, and `[q\u{301}]` is the set of `q` and U+0301. A key that is longer than its
 //! name is matched as written: `ß` is matched as `ss`. A bracket range matches a character, or
 //! the character's uppercase form when that has the same key, which is git's `core.ignorecase`
 //! rule for ASCII. The POSIX classes are ASCII-only, as in git.
@@ -65,13 +62,12 @@
 //! - Case folding is Unicode full case folding through the name key, and it covers the members of
 //!   bracket expressions. Git with `core.ignorecase` folds ASCII only and leaves bracket members
 //!   and escaped letters as written, so in git `[A]` and `\A` match no letter at all.
-//! - `?` and bracket expressions read a code point with its combining marks; git matches bytes, so
-//!   its `?` matches one byte of a UTF-8 name. Git also compares patterns and names byte for byte, so an
-//!   NFD pattern does not match an NFC name there.
+//! - Wildcards match code points; git matches bytes, so its `?` and bracket expressions read one
+//!   byte of a UTF-8 name. Git also compares patterns and names byte for byte, so an NFD pattern
+//!   does not match an NFC name there.
 //! - A `.fbignore` file in an included directory is never excluded; git can ignore a `.gitignore`.
 //! - Lines git keeps as patterns that can never match are reported as invalid ([`LineError`]): an
-//!   unclosed `[`, an unknown `[:class:]`, a trailing `\`. So are range endpoints with combining
-//!   marks, which git reads as bytes, and lines that are not UTF-8 or
+//!   unclosed `[`, an unknown `[:class:]`, a trailing `\`. So are lines that are not UTF-8 or
 //!   hold a NUL byte; git would cut the pattern at the NUL.
 //! - `**` is special only at the start or end of a pattern or between slashes, as git documents
 //!   and git 2.54 does. Git 2.39 also treats it as special right after the literal start of a

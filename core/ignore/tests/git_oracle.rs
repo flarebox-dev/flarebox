@@ -7,9 +7,10 @@
 //!
 //! The generators leave out the intentional differences listed in the crate documentation: the
 //! rules files themselves are not compared, names and patterns are ASCII, and under case folding
-//! patterns hold no uppercase bracket members or escaped uppercase letters. A third run spells
-//! names and patterns with non-ASCII letters NFD for this crate and NFC for git, without `?`
-//! and bracket expressions, which git applies to bytes.
+//! patterns hold no uppercase bracket members or escaped uppercase letters. Two more runs use
+//! non-ASCII letters and combining marks: random cases, and the boundary matrix from the review of
+//! flarebox#50. This crate gets them spelled NFD or NFC; git gets the NFC text with each non-ASCII
+//! code point replaced by a one-byte stand-in, so git decides every case code point by code point.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -66,13 +67,13 @@ fn ours<K: NameKey>(case: &Case, spell: fn(&str) -> String) -> Vec<Verdict> {
         .collect()
 }
 
-fn git(case: &Case, ignorecase: bool) -> Vec<Verdict> {
+/// Git's verdicts, with every name and rules file respelled by `spell` first.
+fn git(case: &Case, ignorecase: bool, spell: fn(&str) -> String) -> Vec<Verdict> {
     let work = tempfile::tempdir().expect("temporary directory");
     let root = work.path();
+    let joined = |path: &[String]| -> String { spell(&path.join("/")) };
     for (path, kind) in &case.entries {
-        let at = path
-            .iter()
-            .fold(root.to_path_buf(), |at, name| at.join(name));
+        let at = root.join(joined(path));
         match kind {
             Kind::Dir => std::fs::create_dir_all(&at),
             Kind::File => std::fs::write(&at, b""),
@@ -80,16 +81,14 @@ fn git(case: &Case, ignorecase: bool) -> Vec<Verdict> {
         .unwrap_or_else(|e| panic!("cannot create {at:?}: {e}"));
     }
     for (dir, text) in &case.files {
-        let at = dir
-            .iter()
-            .fold(root.to_path_buf(), |at, name| at.join(name));
-        std::fs::write(at.join(".gitignore"), text).expect("write .gitignore");
+        let at = root.join(joined(dir));
+        std::fs::write(at.join(".gitignore"), spell(text)).expect("write .gitignore");
     }
     run_git(root, &["init", "-q"], None);
 
     let mut input = Vec::new();
     for path in case.entries.keys() {
-        input.extend_from_slice(path.join("/").as_bytes());
+        input.extend_from_slice(joined(path).as_bytes());
         input.push(0);
     }
     let ignorecase = format!("core.ignorecase={ignorecase}");
@@ -124,7 +123,7 @@ fn git(case: &Case, ignorecase: bool) -> Vec<Verdict> {
             };
             assert_eq!(
                 *echoed,
-                path.join("/").as_bytes(),
+                joined(path).as_bytes(),
                 "git answered out of order"
             );
             if source.is_empty() || pattern.starts_with(b"!") {
@@ -177,13 +176,49 @@ fn nfd(text: &str) -> String {
     text.nfd().collect()
 }
 
+/// The non-ASCII code points the Unicode generators can produce after NFC, each with an ASCII
+/// stand-in that nothing else uses.
+const STAND_INS: [(char, char); 10] = [
+    ('\u{e9}', '0'),
+    ('\u{c9}', '1'),
+    ('\u{fc}', '2'),
+    ('\u{c5}', '3'),
+    ('\u{301}', '4'),
+    ('\u{302}', '5'),
+    ('\u{e1}', '6'),
+    ('\u{c1}', '7'),
+    ('\u{1d8}', '8'),
+    ('\u{1fa}', '9'),
+];
+
+/// The NFC text with each non-ASCII code point but a byte order mark replaced by a one-byte
+/// stand-in. Git matches bytes, so on this spelling its `?` and bracket expressions read one code
+/// point, which is what this crate does on the NFC text.
+fn code_points(text: &str) -> String {
+    text.nfc()
+        .map(|c| {
+            if c.is_ascii() || c == '\u{feff}' {
+                return c;
+            }
+            STAND_INS
+                .iter()
+                .find(|(from, _)| *from == c)
+                .unwrap_or_else(|| panic!("no stand-in for {c:?}"))
+                .1
+        })
+        .collect()
+}
+
+/// Compares this crate on the case respelled by `ours` with git on the case respelled by
+/// `theirs`.
 fn compare<K: NameKey>(
     case: &Case,
     ignorecase: bool,
     spell: fn(&str) -> String,
+    theirs: fn(&str) -> String,
 ) -> Result<(), TestCaseError> {
     let ours = ours::<K>(case, spell);
-    let theirs = git(case, ignorecase);
+    let theirs = git(case, ignorecase, theirs);
     for ((path, kind), (ours, theirs)) in case.entries.iter().zip(ours.into_iter().zip(theirs)) {
         prop_assert_eq!(
             ours,
@@ -341,8 +376,8 @@ fn line(fold: bool) -> impl Strategy<Value = String> {
     .prop_filter("version-dependent in git", |line| !version_dependent(line))
 }
 
-/// Names and patterns with non-ASCII letters, for comparing NFD spellings here with NFC ones in
-/// git. Git matches bytes, so `?` and bracket expressions are left out.
+/// Names and patterns with non-ASCII letters and combining marks, spelled NFD for this crate and
+/// with [`code_points`] stand-ins for git.
 fn unicode_name() -> impl Strategy<Value = String> {
     prop_oneof![
         4 => "[aAéÉüÅ.-]{1,3}".prop_filter("not . or ..", |n| n != "." && n != ".."),
@@ -357,6 +392,9 @@ fn unicode_line() -> impl Strategy<Value = String> {
             .prop_map(str::to_owned),
         2 => Just("*".to_owned()),
         1 => Just("**".to_owned()),
+        1 => Just("?".to_owned()),
+        2 => proptest::sample::select(vec!["[\u{e9}]", "[!q]", "[q\u{301}]", "[a-z]", "[!\u{e9}a]", "[\u{301}]"])
+            .prop_map(str::to_owned),
     ];
     (
         any::<bool>(),
@@ -450,18 +488,18 @@ fn case_with(
 proptest! {
     #[test]
     fn agrees_with_git_case_sensitive(case in case(false)) {
-        compare::<Exact>(&case, false, same)?;
+        compare::<Exact>(&case, false, same, same)?;
     }
 
     #[test]
     fn agrees_with_git_ignorecase(case in case(true)) {
-        compare::<Folded>(&case, true, same)?;
+        compare::<Folded>(&case, true, same, same)?;
     }
 
-    /// Names and rules files spelled NFD here and NFC in git get the same verdicts.
+    /// Names and rules files spelled NFD here get git's verdicts on their NFC code points.
     #[test]
-    fn nfd_spellings_agree_with_git_on_nfc(case in case_with(unicode_name().boxed(), unicode_line().boxed())) {
-        compare::<Exact>(&case, false, nfd)?;
+    fn nfd_spellings_agree_with_git_on_nfc_code_points(case in case_with(unicode_name().boxed(), unicode_line().boxed())) {
+        compare::<Exact>(&case, false, nfd, code_points)?;
     }
 }
 
@@ -573,11 +611,102 @@ fn curated_lines_agree_with_git() {
                 } else {
                     ours::<Exact>(&case, same)
                 };
-                let theirs = git(&case, fold);
+                let theirs = git(&case, fold, same);
                 for ((path, _), (o, t)) in case.entries.iter().zip(ours.iter().zip(&theirs)) {
                     assert_eq!(o, t, "rules {text:?}, path {path:?}, folding {fold}");
                 }
             }
         }
     }
+}
+
+/// The review's boundary matrix: 48 patterns around combining marks against 8 names, 384 cases,
+/// spelled NFC and NFD, with and without case folding. Git decides each one on code-point
+/// stand-ins. Git on the UTF-8 text must agree too, except where its `?` or a bracket expression
+/// reads one byte of a multi-byte code point; the review's three cases are not among those.
+#[test]
+fn combining_mark_boundaries_agree_with_git() {
+    let names = [
+        "q",
+        "q\u{301}",
+        "q\u{301}.txt",
+        "q\u{301}\u{302}",
+        "aq\u{301}",
+        "\u{301}",
+        "xq\u{301}",
+        "sub/q\u{301}",
+    ];
+    let mut patterns: Vec<String> = [
+        "?",
+        "??",
+        "?\u{301}",
+        "[q]\u{301}",
+        "[!x]\u{301}",
+        "[q]*",
+        "[a-z]*",
+        "[q]\u{301}*",
+        "q?",
+        "[q\u{301}]",
+        "*\u{301}",
+        "q*",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let tokens = ["q", "?", "*", "[q]", "[!x]", "\u{301}"];
+    for a in tokens {
+        for b in tokens {
+            patterns.push(format!("{a}{b}"));
+        }
+    }
+    let mut entries = BTreeMap::new();
+    for name in names {
+        let parts: Vec<String> = name.split('/').map(str::to_owned).collect();
+        if parts.len() > 1 {
+            entries.insert(parts[..1].to_vec(), Kind::Dir);
+        }
+        entries.insert(parts, Kind::File);
+    }
+    let reviewed = ["?\u{301}", "[q]\u{301}", "[q]*"];
+    let mut compared = 0;
+    let mut byte_differences = 0;
+    for pattern in &patterns {
+        let case = Case {
+            entries: entries.clone(),
+            files: BTreeMap::from([(Vec::new(), format!("{pattern}\n"))]),
+        };
+        let exact = git(&case, false, code_points);
+        let folded = git(&case, true, code_points);
+        let utf8 = git(&case, false, same);
+        let ours = [
+            ("NFC", ours::<Exact>(&case, same), &exact),
+            ("NFD", ours::<Exact>(&case, nfd), &exact),
+            ("folded NFC", ours::<Folded>(&case, same), &folded),
+            ("folded NFD", ours::<Folded>(&case, nfd), &folded),
+        ];
+        for (i, (path, kind)) in case.entries.iter().enumerate() {
+            if *kind == Kind::Dir {
+                continue;
+            }
+            compared += 1;
+            for (spelling, ours, theirs) in &ours {
+                assert_eq!(
+                    ours[i], theirs[i],
+                    "{spelling} {pattern:?} against {path:?}"
+                );
+            }
+            if ours[0].1[i] == utf8[i] {
+                continue;
+            }
+            byte_differences += 1;
+            assert!(
+                !reviewed.contains(&pattern.as_str())
+                    && (pattern.contains('?') || pattern.contains('['))
+                    && !path.concat().is_ascii(),
+                "{pattern:?} against {path:?}: git on UTF-8 says {:?}",
+                utf8[i]
+            );
+        }
+    }
+    assert_eq!(compared, 384);
+    assert_eq!(byte_differences, 27);
 }

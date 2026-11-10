@@ -7,7 +7,6 @@ use std::fmt;
 use std::marker::PhantomData;
 
 use unicode_normalization::UnicodeNormalization;
-use unicode_normalization::char::canonical_combining_class;
 
 use crate::NameKey;
 
@@ -27,8 +26,6 @@ pub enum LineError {
     UnclosedBracket,
     /// A `[:name:]` names no POSIX class, so the pattern could never match.
     UnknownClass(String),
-    /// A bracket range has an endpoint with combining marks, so the endpoint is not one character.
-    CombiningMarkInRange,
     /// The pattern ends with an unescaped `\`, so it could never match.
     TrailingBackslash,
 }
@@ -173,35 +170,6 @@ impl Rule {
     }
 }
 
-/// Splits key-form text into clusters: a code point with the combining marks (canonical
-/// combining class other than 0) that follow it, or a run of marks with no code point before it.
-/// A `/` never takes marks.
-fn units(text: &[char]) -> Vec<&[char]> {
-    let mut units = Vec::new();
-    let mut start = 0;
-    for i in 1..text.len() {
-        if !is_mark(text[i]) || text[start] == '/' {
-            units.push(&text[start..i]);
-            start = i;
-        }
-    }
-    if start < text.len() {
-        units.push(&text[start..]);
-    }
-    units
-}
-
-fn is_mark(c: char) -> bool {
-    canonical_combining_class(c) != 0
-}
-
-fn single(unit: &[char]) -> Option<char> {
-    match unit {
-        [c] => Some(*c),
-        _ => None,
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Token {
     Literal(char),
@@ -225,8 +193,7 @@ struct Class {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ClassItem {
-    /// A cluster (see [`units`]) in key form.
-    Member(Box<[char]>),
+    Char(char),
     Range(char, char),
     Posix(Posix),
 }
@@ -291,25 +258,32 @@ impl Posix {
 
 /// Whether `upper`, as a name, has the single character `c` as key.
 fn folds_to<K: NameKey>(upper: char, c: char) -> bool {
-    let folded: Vec<char> = key::<K>(upper.encode_utf8(&mut [0; 4])).chars().collect();
-    folded == [c]
+    single_key::<K>(upper) == Some(c)
+}
+
+/// The key of a one-character name, when the key is one character too.
+fn single_key<K: NameKey>(c: char) -> Option<char> {
+    let folded = key::<K>(c.encode_utf8(&mut [0; 4]));
+    let mut chars = folded.chars();
+    chars.next().filter(|_| chars.next().is_none())
 }
 
 impl Class {
-    fn matches<K: NameKey>(&self, unit: &[char]) -> bool {
-        let found = self.items.iter().any(|item| match item {
-            ClassItem::Member(member) => **member == *unit,
-            ClassItem::Range(low, high) => single(unit).is_some_and(|c| {
-                let range = *low..=*high;
-                range.contains(&c) || {
+    fn matches<K: NameKey>(&self, c: char) -> bool {
+        let found = self.items.iter().any(|item| match *item {
+            ClassItem::Char(member) => member == c,
+            ClassItem::Range(low, high) => {
+                (low..=high).contains(&c) || {
                     let mut upper = c.to_uppercase();
                     match (upper.next(), upper.next()) {
-                        (Some(u), None) if u != c => range.contains(&u) && folds_to::<K>(u, c),
+                        (Some(u), None) if u != c => {
+                            (low..=high).contains(&u) && folds_to::<K>(u, c)
+                        }
                         _ => false,
                     }
                 }
-            }),
-            ClassItem::Posix(class) => single(unit).is_some_and(|c| class.matches::<K>(c)),
+            }
+            ClassItem::Posix(class) => class.matches::<K>(c),
         });
         found != self.negated
     }
@@ -356,11 +330,6 @@ fn compile<K: NameKey>(line: &[u8], number: u32) -> Result<Option<Rule>, LineErr
     }))
 }
 
-enum Raw {
-    Char(char),
-    Token(Token),
-}
-
 fn tokenize<K: NameKey>(body: &str) -> Result<Vec<Token>, LineError> {
     let chars: Vec<char> = body.chars().collect();
     let mut raw = Vec::new();
@@ -370,9 +339,9 @@ fn tokenize<K: NameKey>(body: &str) -> Result<Vec<Token>, LineError> {
             '\\' => {
                 let escaped = *chars.get(i + 1).ok_or(LineError::TrailingBackslash)?;
                 raw.push(if escaped == '/' {
-                    Raw::Token(Token::Slash)
+                    Token::Slash
                 } else {
-                    Raw::Char(escaped)
+                    Token::Literal(escaped)
                 });
                 i += 2;
             }
@@ -381,35 +350,33 @@ fn tokenize<K: NameKey>(body: &str) -> Result<Vec<Token>, LineError> {
                 while chars.get(i) == Some(&'*') {
                     i += 1;
                 }
-                let after_slash = matches!(raw.last(), None | Some(Raw::Token(Token::Slash)));
+                let after_slash = matches!(raw.last(), None | Some(Token::Slash));
                 let before_slash = match chars.get(i) {
                     None | Some('/') => true,
                     Some('\\') => chars.get(i + 1) == Some(&'/'),
                     Some(_) => false,
                 };
-                raw.push(Raw::Token(
-                    if i - start >= 2 && after_slash && before_slash {
-                        Token::DoubleStar
-                    } else {
-                        Token::Star
-                    },
-                ));
+                raw.push(if i - start >= 2 && after_slash && before_slash {
+                    Token::DoubleStar
+                } else {
+                    Token::Star
+                });
             }
             '?' => {
-                raw.push(Raw::Token(Token::AnyChar));
+                raw.push(Token::AnyChar);
                 i += 1;
             }
             '[' => {
                 let (class, next) = parse_class::<K>(&chars, i)?;
-                raw.push(Raw::Token(Token::Class(class)));
+                raw.push(Token::Class(class));
                 i = next;
             }
             '/' => {
-                raw.push(Raw::Token(Token::Slash));
+                raw.push(Token::Slash);
                 i += 1;
             }
             c => {
-                raw.push(Raw::Char(c));
+                raw.push(Token::Literal(c));
                 i += 1;
             }
         }
@@ -417,35 +384,21 @@ fn tokenize<K: NameKey>(body: &str) -> Result<Vec<Token>, LineError> {
 
     let mut tokens = Vec::with_capacity(raw.len());
     let mut run = String::new();
-    for item in raw {
-        match item {
-            Raw::Char(c) => run.push(c),
-            Raw::Token(token) => {
-                push_literals::<K>(&mut tokens, &run);
-                run.clear();
-                tokens.push(token);
-            }
+    for token in raw {
+        if let Token::Literal(c) = token {
+            run.push(c);
+            continue;
         }
+        tokens.extend(key::<K>(&run).chars().map(Token::Literal));
+        run.clear();
+        tokens.push(token);
     }
-    push_literals::<K>(&mut tokens, &run);
+    tokens.extend(key::<K>(&run).chars().map(Token::Literal));
     Ok(tokens)
 }
 
-fn push_literals<K: NameKey>(tokens: &mut Vec<Token>, run: &str) {
-    tokens.extend(key::<K>(run).chars().map(Token::Literal));
-}
-
-/// The end of the combining marks starting at `chars[from]`.
-fn marks_end(chars: &[char], from: usize) -> usize {
-    from + chars[from.min(chars.len())..]
-        .iter()
-        .take_while(|&&c| is_mark(c))
-        .count()
-}
-
 /// Parses the bracket expression starting at `chars[open]`, as `wildmatch` reads it, and
-/// returns it with the index after its closing `]`. A member is a character with the combining
-/// marks that follow it; a range endpoint must be a single character.
+/// returns it with the index after its closing `]`.
 fn parse_class<K: NameKey>(chars: &[char], open: usize) -> Result<(Class, usize), LineError> {
     let mut j = open + 1;
     let negated = matches!(chars.get(j), Some('!' | '^'));
@@ -453,7 +406,7 @@ fn parse_class<K: NameKey>(chars: &[char], open: usize) -> Result<(Class, usize)
         j += 1;
     }
     let mut items = Vec::new();
-    let mut prev: Option<Vec<char>> = None;
+    let mut prev: Option<char> = None;
     let mut first = true;
     loop {
         let c = *chars.get(j).ok_or(LineError::UnclosedBracket)?;
@@ -462,21 +415,19 @@ fn parse_class<K: NameKey>(chars: &[char], open: usize) -> Result<(Class, usize)
             break;
         }
         first = false;
-        if c == '-' && prev.is_some() && chars.get(j + 1).is_some_and(|&next| next != ']') {
-            let low = prev.take().unwrap_or_default();
-            let mut k = j + 1;
-            let mut high = chars[k];
-            k += 1;
+        if c == '\\' {
+            let escaped = *chars.get(j + 1).ok_or(LineError::UnclosedBracket)?;
+            items.push(ClassItem::Char(escaped));
+            prev = Some(escaped);
+            j += 2;
+        } else if c == '-' && prev.is_some() && chars.get(j + 1).is_some_and(|&next| next != ']') {
+            let mut high = chars[j + 1];
+            j += 2;
             if high == '\\' {
-                high = *chars.get(k).ok_or(LineError::UnclosedBracket)?;
-                k += 1;
+                high = *chars.get(j).ok_or(LineError::UnclosedBracket)?;
+                j += 1;
             }
-            let (Some(low), false) = (single(&low), chars.get(k).is_some_and(|&c| is_mark(c)))
-            else {
-                return Err(LineError::CombiningMarkInRange);
-            };
-            items.push(ClassItem::Range(low, high));
-            j = k;
+            items.push(ClassItem::Range(prev.take().unwrap_or(high), high));
         } else if c == '[' && chars.get(j + 1) == Some(&':') {
             let start = j + 2;
             let close = chars[start..]
@@ -485,8 +436,8 @@ fn parse_class<K: NameKey>(chars: &[char], open: usize) -> Result<(Class, usize)
                 .map(|offset| start + offset)
                 .ok_or(LineError::UnclosedBracket)?;
             if close == start || chars[close - 1] != ':' {
-                items.push(ClassItem::Member(Box::new(['['])));
-                prev = Some(vec!['[']);
+                items.push(ClassItem::Char('['));
+                prev = Some('[');
                 j += 1;
                 continue;
             }
@@ -496,117 +447,65 @@ fn parse_class<K: NameKey>(chars: &[char], open: usize) -> Result<(Class, usize)
             prev = None;
             j = close + 1;
         } else {
-            let (member_start, rest) = if c == '\\' {
-                (j + 1, j + 2)
-            } else {
-                (j, j + 1)
-            };
-            let first_char = *chars.get(member_start).ok_or(LineError::UnclosedBracket)?;
-            let end = marks_end(chars, rest);
-            let member: Vec<char> = std::iter::once(first_char)
-                .chain(chars[rest..end].iter().copied())
-                .collect();
-            items.push(ClassItem::Member(member.clone().into()));
-            prev = Some(member);
-            j = end;
+            items.push(ClassItem::Char(c));
+            prev = Some(c);
+            j += 1;
         }
     }
 
     let items = items
         .into_iter()
         .filter_map(|item| match item {
-            ClassItem::Member(member) => {
-                let keyed: Vec<char> = key::<K>(&member.iter().collect::<String>())
-                    .chars()
-                    .collect();
-                match units(&keyed)[..] {
-                    [unit] => Some(ClassItem::Member(unit.into())),
-                    _ => None,
-                }
-            }
+            ClassItem::Char(c) => single_key::<K>(c).map(ClassItem::Char),
             other => Some(other),
         })
         .collect();
     Ok((Class { negated, items }, j))
 }
 
-/// The end of the cluster (see [`units`]) that starts at `text[start]`.
-fn cluster_end(text: &[char], start: usize) -> usize {
-    if text[start] == '/' {
-        return start + 1;
-    }
-    start
-        + 1
-        + text[start + 1..]
-            .iter()
-            .take_while(|&&c| is_mark(c))
-            .count()
-}
-
 /// Whether `tokens` match all of `text`, simulated as an automaton so that no pattern takes
 /// exponential time. State `i` is "before token `i`", state `n + 1 + i` is "inside the star
-/// token `i`". Literals and stars read one code point; `?` and bracket expressions read a
-/// cluster, so they move ahead by up to the longest cluster, and the states of the positions in
-/// between are kept in a ring of rows. In `pathname` mode only `**` and a `/` match a slash.
+/// token `i`". In `pathname` mode only `**` and a `/` match a slash.
 fn wildmatch<K: NameKey>(tokens: &[Token], text: &[char], pathname: bool) -> bool {
     let n = tokens.len();
-    let width = 2 * n + 1;
-    let ends: Vec<usize> = (0..text.len()).map(|i| cluster_end(text, i)).collect();
-    let rows = 1 + ends
-        .iter()
-        .enumerate()
-        .map(|(i, &end)| end - i)
-        .max()
-        .unwrap_or(1);
-    let mut ring = vec![false; rows * width];
-    let row = |position: usize| (position % rows) * width;
-    let mut current = vec![false; width];
+    let mut current = vec![false; 2 * n + 1];
+    let mut next = vec![false; 2 * n + 1];
     let mut pending = Vec::new();
-    enter(tokens, &mut ring[..width], 0, &mut pending);
-    for (position, &c) in text.iter().enumerate() {
-        let at = row(position);
-        current.copy_from_slice(&ring[at..at + width]);
-        ring[at..at + width].fill(false);
-        if !current.contains(&true) {
-            if !ring.contains(&true) {
-                return false;
-            }
-            continue;
-        }
+    enter(tokens, &mut current, 0, &mut pending);
+    for &c in text {
+        next.fill(false);
+        let mut alive = false;
         let slash_blocked = pathname && c == '/';
-        let next = row(position + 1);
-        let after_cluster = row(ends[position]);
-        let cluster = &text[position..ends[position]];
         for (i, token) in tokens.iter().enumerate() {
             if current[i] {
-                let target = match token {
-                    Token::Literal(literal) => (*literal == c).then_some(next),
-                    Token::Slash => (c == '/').then_some(next),
-                    Token::AnyChar => (!slash_blocked).then_some(after_cluster),
-                    Token::Class(class) => {
-                        (!slash_blocked && class.matches::<K>(cluster)).then_some(after_cluster)
-                    }
-                    Token::Star | Token::DoubleStar => None,
+                let advance = match token {
+                    Token::Literal(literal) => *literal == c,
+                    Token::Slash => c == '/',
+                    Token::AnyChar => !slash_blocked,
+                    Token::Class(class) => !slash_blocked && class.matches::<K>(c),
+                    Token::Star | Token::DoubleStar => false,
                 };
-                if let Some(target) = target {
-                    enter(
-                        tokens,
-                        &mut ring[target..target + width],
-                        i + 1,
-                        &mut pending,
-                    );
+                if advance {
+                    enter(tokens, &mut next, i + 1, &mut pending);
+                    alive = true;
                 }
             }
             if current[n + 1 + i] && !(slash_blocked && *token == Token::Star) {
-                ring[next + n + 1 + i] = true;
-                enter(tokens, &mut ring[next..next + width], i + 1, &mut pending);
+                next[n + 1 + i] = true;
+                enter(tokens, &mut next, i + 1, &mut pending);
+                alive = true;
             }
         }
+        if !alive {
+            return false;
+        }
+        std::mem::swap(&mut current, &mut next);
     }
-    ring[row(text.len()) + n]
+    current[n]
 }
 
-/// Adds state `start` and the states reachable from it without reading a character.
+/// Adds state `start` and the states reachable from it without reading a character. A loop
+/// rather than recursion, so a long chain of `**/` cannot overflow the stack.
 fn enter(tokens: &[Token], states: &mut [bool], start: usize, pending: &mut Vec<usize>) {
     let n = tokens.len();
     pending.push(start);
