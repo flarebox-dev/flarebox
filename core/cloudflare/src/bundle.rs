@@ -5,11 +5,12 @@
 use std::fmt;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value};
 
+use crate::api::Jurisdiction;
 use crate::secret::Secret;
 
 /// The tag every upload sets, which `flarebox setup` looks for to find a Flarebox server in an account (section 6).
@@ -92,11 +93,18 @@ pub enum BundleError {
     },
     #[error("the asset {} has a file name that is not UTF-8", path.display())]
     AssetName { path: PathBuf },
+    #[error(
+        "the manifest names the Worker module {name:?}, which is not a file name inside worker/"
+    )]
+    ModulePath { name: String },
+    #[error("{} in the server bundle is not a regular file or directory; a bundle holds no links", path.display())]
+    NotRegular { path: PathBuf },
 }
 
 impl Bundle {
     /// Reads `manifest.json`, `worker/<main_module>` and every file under `assets/` in `dir`. A bundle without an
-    /// `assets/` directory has no assets.
+    /// `assets/` directory has no assets. Nothing outside `dir` is read: the module must be a plain file name, and a
+    /// symbolic link or any other entry that is not a regular file or directory stops the read.
     pub fn from_dir(dir: &Path) -> Result<Self, BundleError> {
         let manifest_path = dir.join("manifest.json");
         let manifest: Manifest =
@@ -106,10 +114,24 @@ impl Bundle {
                     source,
                 }
             })?;
-        let module = read(&dir.join("worker").join(&manifest.main_module))?;
+        let mut components = Path::new(&manifest.main_module).components();
+        if !matches!(
+            (components.next(), components.next()),
+            (Some(Component::Normal(_)), None)
+        ) {
+            return Err(BundleError::ModulePath {
+                name: manifest.main_module,
+            });
+        }
+        let worker = dir.join("worker");
+        if fs::symlink_metadata(&worker).is_ok() {
+            directory(&worker)?;
+        }
+        let module = read(&worker.join(&manifest.main_module))?;
         let root = dir.join("assets");
         let mut assets = Vec::new();
-        if root.is_dir() {
+        if fs::symlink_metadata(&root).is_ok() {
+            directory(&root)?;
             collect_assets(&root, "", &mut assets)?;
         }
         assets.sort_by(|a, b| a.path.cmp(&b.path));
@@ -132,11 +154,33 @@ impl Bundle {
     }
 }
 
+/// The file at `path`, which must be a regular file and not a link.
 fn read(path: &Path) -> Result<Vec<u8>, BundleError> {
-    fs::read(path).map_err(|source| BundleError::Read {
+    let unreadable = |source| BundleError::Read {
         path: path.to_owned(),
         source,
-    })
+    };
+    if !fs::symlink_metadata(path).map_err(unreadable)?.is_file() {
+        return Err(BundleError::NotRegular {
+            path: path.to_owned(),
+        });
+    }
+    fs::read(path).map_err(unreadable)
+}
+
+/// Checks that `path` is a directory and not a link.
+fn directory(path: &Path) -> Result<(), BundleError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| BundleError::Read {
+        path: path.to_owned(),
+        source,
+    })?;
+    if metadata.is_dir() {
+        Ok(())
+    } else {
+        Err(BundleError::NotRegular {
+            path: path.to_owned(),
+        })
+    }
 }
 
 fn collect_assets(dir: &Path, prefix: &str, assets: &mut Vec<Asset>) -> Result<(), BundleError> {
@@ -151,13 +195,16 @@ fn collect_assets(dir: &Path, prefix: &str, assets: &mut Vec<Asset>) -> Result<(
             return Err(BundleError::AssetName { path });
         };
         let asset_path = format!("{prefix}/{name}");
-        if path.is_dir() {
+        let kind = entry.file_type().map_err(unreadable)?;
+        if kind.is_dir() {
             collect_assets(&path, &asset_path, assets)?;
-        } else {
+        } else if kind.is_file() {
             assets.push(Asset {
                 bytes: read(&path)?,
                 path: asset_path,
             });
+        } else {
+            return Err(BundleError::NotRegular { path });
         }
     }
     Ok(())
@@ -208,6 +255,8 @@ enum Binding {
     R2Bucket {
         name: String,
         bucket_name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        jurisdiction: Option<Jurisdiction>,
     },
     SecretText {
         name: &'static str,
@@ -246,12 +295,14 @@ fn expose<S: Serializer>(secret: &Secret, serializer: S) -> Result<S::Ok, S::Err
 }
 
 impl UploadPlan {
-    /// `bucket` is the R2 bucket to bind. `deployed_tag` is the script's current migration tag, if it exists.
+    /// `bucket` is the R2 bucket to bind, in `jurisdiction`, which an upgrade keeps from the deployed binding.
+    /// `deployed_tag` is the script's current migration tag, if it exists.
     /// `secret` is a one-time `FLAREBOX_RECOVERY_KEY` sent in the same upload. `assets_jwt` is the completion token of
     /// the asset upload, which a bundle with assets needs.
     pub fn new(
         bundle: &Bundle,
         bucket: &str,
+        jurisdiction: Jurisdiction,
         deployed_tag: Option<&str>,
         secret: Option<&Secret>,
         assets_jwt: Option<&Secret>,
@@ -268,6 +319,7 @@ impl UploadPlan {
         bindings.push(Binding::R2Bucket {
             name: manifest.r2_binding.clone(),
             bucket_name: bucket.to_owned(),
+            jurisdiction: (jurisdiction != Jurisdiction::Default).then_some(jurisdiction),
         });
         if let Some(secret) = secret {
             bindings.push(Binding::SecretText {
@@ -391,6 +443,7 @@ mod tests {
         let plan = UploadPlan::new(
             &bundle(),
             "my-bucket",
+            Jurisdiction::Default,
             deployed_tag,
             secret.as_ref(),
             assets_jwt.as_ref(),
@@ -466,7 +519,15 @@ mod tests {
 
     #[test]
     fn an_unknown_deployed_tag_means_the_deployment_is_newer() {
-        let error = UploadPlan::new(&bundle(), "my-bucket", Some("v9"), None, None).unwrap_err();
+        let error = UploadPlan::new(
+            &bundle(),
+            "my-bucket",
+            Jurisdiction::Default,
+            Some("v9"),
+            None,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(error.deployed_tag, "v9");
         assert!(error.to_string().contains("newer than this CLI"), "{error}");
     }
@@ -483,7 +544,15 @@ mod tests {
             headers: None,
             ..bundle()
         };
-        let plan = UploadPlan::new(&bundle, "my-bucket", None, None, None).unwrap();
+        let plan = UploadPlan::new(
+            &bundle,
+            "my-bucket",
+            Jurisdiction::Default,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let metadata = serde_json::to_value(&plan.metadata).unwrap();
         assert!(
             metadata["bindings"]
@@ -500,8 +569,15 @@ mod tests {
     fn debug_output_hides_the_secret_and_the_assets_token() {
         let secret = Secret::new("one-time-key".to_owned());
         let jwt = Secret::new("completion-jwt".to_owned());
-        let plan =
-            UploadPlan::new(&bundle(), "my-bucket", None, Some(&secret), Some(&jwt)).unwrap();
+        let plan = UploadPlan::new(
+            &bundle(),
+            "my-bucket",
+            Jurisdiction::Default,
+            None,
+            Some(&secret),
+            Some(&jwt),
+        )
+        .unwrap();
         let debug = format!("{plan:?}");
         assert!(
             !debug.contains("one-time-key") && !debug.contains("completion-jwt"),
@@ -566,6 +642,97 @@ mod tests {
 
         assert!(bundle.assets.is_empty());
         assert_eq!(bundle.headers, None);
+    }
+
+    #[test]
+    fn an_upgrade_keeps_the_jurisdiction_of_the_bucket() {
+        let plan = UploadPlan::new(
+            &bundle(),
+            "my-bucket",
+            Jurisdiction::Eu,
+            Some("v3"),
+            None,
+            None,
+        )
+        .unwrap();
+        let metadata = serde_json::to_value(&plan.metadata).unwrap();
+        assert_eq!(
+            metadata["bindings"][2],
+            json!({ "type": "r2_bucket", "name": "BUCKET", "bucket_name": "my-bucket", "jurisdiction": "eu" })
+        );
+    }
+
+    /// A bundle directory with `main_module` as the module name, and a file outside the bundle.
+    fn bundle_dir(main_module: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("bundle");
+        let mut manifest = manifest();
+        manifest["main_module"] = json!(main_module);
+        fs::create_dir_all(root.join("worker")).unwrap();
+        fs::create_dir_all(root.join("assets")).unwrap();
+        fs::write(root.join("manifest.json"), manifest.to_string()).unwrap();
+        fs::write(root.join("worker/worker.js"), "export default {};").unwrap();
+        fs::write(dir.path().join("outside.txt"), "outside").unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_module_path_that_leaves_worker_is_refused() {
+        for name in [
+            "../../outside.txt",
+            "../manifest.json",
+            "/etc/hosts",
+            "sub/worker.js",
+            "",
+        ] {
+            let dir = bundle_dir(name);
+            let error = Bundle::from_dir(&dir.path().join("bundle")).unwrap_err();
+            assert!(
+                matches!(&error, BundleError::ModulePath { name: refused } if refused == name),
+                "{name}: {error:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_in_the_bundle_are_refused() {
+        use std::os::unix::fs::symlink;
+        let dir = bundle_dir("worker.js");
+        let root = dir.path().join("bundle");
+        let outside = dir.path().join("outside.txt");
+        symlink(&outside, root.join("assets/leak.txt")).unwrap();
+        let error = Bundle::from_dir(&root).unwrap_err();
+        assert!(
+            matches!(&error, BundleError::NotRegular { path } if path.ends_with("assets/leak.txt")),
+            "{error:?}"
+        );
+
+        let dir = bundle_dir("worker.js");
+        let root = dir.path().join("bundle");
+        fs::remove_file(root.join("worker/worker.js")).unwrap();
+        symlink(
+            dir.path().join("outside.txt"),
+            root.join("worker/worker.js"),
+        )
+        .unwrap();
+        let error = Bundle::from_dir(&root).unwrap_err();
+        assert!(
+            matches!(&error, BundleError::NotRegular { path } if path.ends_with("worker/worker.js")),
+            "{error:?}"
+        );
+
+        let dir = bundle_dir("worker.js");
+        let root = dir.path().join("bundle");
+        fs::remove_dir_all(root.join("assets")).unwrap();
+        fs::create_dir(dir.path().join("elsewhere")).unwrap();
+        fs::write(dir.path().join("elsewhere/page.html"), "outside").unwrap();
+        symlink(dir.path().join("elsewhere"), root.join("assets")).unwrap();
+        let error = Bundle::from_dir(&root).unwrap_err();
+        assert!(
+            matches!(&error, BundleError::NotRegular { path } if path.ends_with("bundle/assets")),
+            "{error:?}"
+        );
     }
 
     #[test]

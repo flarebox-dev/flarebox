@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use flarebox_cloudflare::{
-    ApiError, Asset, Bundle, Cloudflare, Manifest, ObjectPage, Script, Secret, UploadPlan,
+    ApiError, Asset, Bucket, Bundle, Cloudflare, Jurisdiction, Manifest, ObjectPage, Script,
+    Secret, UploadPlan,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
@@ -54,6 +55,7 @@ struct Seen {
     path: String,
     authorization: Option<String>,
     content_type: Option<String>,
+    jurisdiction: Option<String>,
     body: Vec<u8>,
 }
 
@@ -142,7 +144,11 @@ async fn answer(
             .get(name)
             .map(|value| value.to_str().unwrap().to_owned())
     };
-    let (authorization, content_type) = (header("authorization"), header("content-type"));
+    let (authorization, content_type, jurisdiction) = (
+        header("authorization"),
+        header("content-type"),
+        header("cf-r2-jurisdiction"),
+    );
     let body = request
         .into_body()
         .collect()
@@ -155,6 +161,7 @@ async fn answer(
         path: path.clone(),
         authorization,
         content_type,
+        jurisdiction,
         body,
     });
     let mut replies = replies.lock().unwrap();
@@ -295,7 +302,11 @@ async fn buckets_follow_the_cursor_while_pages_are_full() {
     ])
     .await;
 
-    let buckets = fake.client().buckets(ACCOUNT).await.unwrap();
+    let buckets = fake
+        .client()
+        .buckets(ACCOUNT, Jurisdiction::Default)
+        .await
+        .unwrap();
 
     assert_eq!(buckets.len(), 1001);
     assert_eq!(buckets.last().map(String::as_str), Some("flarebox"));
@@ -312,7 +323,11 @@ async fn a_refusal_keeps_cloudflares_error_codes() {
     )])
     .await;
 
-    let error = fake.client().buckets(ACCOUNT).await.unwrap_err();
+    let error = fake
+        .client()
+        .buckets(ACCOUNT, Jurisdiction::Default)
+        .await
+        .unwrap_err();
 
     assert!(error.has_code(10042));
     assert!(!error.has_code(10000));
@@ -388,10 +403,23 @@ async fn buckets_are_created_and_deleted() {
     .await;
     let client = fake.client();
 
-    client.create_bucket(ACCOUNT, "flarebox").await.unwrap();
-    client.delete_bucket(ACCOUNT, "flarebox").await.unwrap();
-    client.delete_bucket(ACCOUNT, "gone").await.unwrap();
-    let error = client.delete_bucket(ACCOUNT, "full").await.unwrap_err();
+    let default = Jurisdiction::Default;
+    client
+        .create_bucket(ACCOUNT, "flarebox", default)
+        .await
+        .unwrap();
+    client
+        .delete_bucket(ACCOUNT, "flarebox", default)
+        .await
+        .unwrap();
+    client
+        .delete_bucket(ACCOUNT, "gone", default)
+        .await
+        .unwrap();
+    let error = client
+        .delete_bucket(ACCOUNT, "full", default)
+        .await
+        .unwrap_err();
 
     assert!(error.has_code(10008), "{error}");
     let seen = fake.seen();
@@ -442,9 +470,17 @@ async fn objects_are_listed_page_by_page() {
     .await;
     let client = fake.client();
 
-    let first = client.objects(ACCOUNT, "flarebox", None).await.unwrap();
+    let first = client
+        .objects(ACCOUNT, "flarebox", Jurisdiction::Default, None)
+        .await
+        .unwrap();
     let second = client
-        .objects(ACCOUNT, "flarebox", first.cursor.as_deref())
+        .objects(
+            ACCOUNT,
+            "flarebox",
+            Jurisdiction::Default,
+            first.cursor.as_deref(),
+        )
         .await
         .unwrap();
 
@@ -486,12 +522,17 @@ async fn names_from_users_are_percent_encoded() {
     let client = fake.client();
 
     client
-        .delete_object(ACCOUNT, "flarebox", "spaces/a b/?q=1#x%")
+        .delete_object(
+            ACCOUNT,
+            "flarebox",
+            Jurisdiction::Default,
+            "spaces/a b/?q=1#x%",
+        )
         .await
         .unwrap();
     client.delete_script(ACCOUNT, "a/../b").await.unwrap();
     let error = client
-        .delete_object(ACCOUNT, "flarebox", "..")
+        .delete_object(ACCOUNT, "flarebox", Jurisdiction::Default, "..")
         .await
         .unwrap_err();
 
@@ -509,7 +550,7 @@ async fn scripts_are_listed_with_their_tags() {
         &format!("/accounts/{ACCOUNT}/workers/scripts"),
         200,
         ok(json!([
-            { "id": "flarebox", "tags": ["flarebox-server"], "migration_tag": "v1", "has_assets": true, "etag": "x" },
+            { "id": "flarebox", "tags": ["flarebox-server"], "migration_tag": "v1", "has_assets": true, "etag": "x", "created_on": "2026-11-10T05:00:00.000000Z" },
             { "id": "other", "tags": null, "has_modules": true }
         ])),
     )])
@@ -522,12 +563,14 @@ async fn scripts_are_listed_with_their_tags() {
         [
             Script {
                 id: "flarebox".to_owned(),
+                created_on: Some("2026-11-10T05:00:00.000000Z".to_owned()),
                 tags: vec!["flarebox-server".to_owned()],
                 migration_tag: Some("v1".to_owned()),
                 has_assets: true
             },
             Script {
                 id: "other".to_owned(),
+                created_on: None,
                 tags: Vec::new(),
                 migration_tag: None,
                 has_assets: false
@@ -546,6 +589,7 @@ async fn script_settings_name_the_bound_bucket() {
             "bindings": [
                 { "type": "durable_object_namespace", "name": "ACCOUNT", "class_name": "AccountDO", "namespace_id": "n1" },
                 { "type": "r2_bucket", "name": "BUCKET", "bucket_name": "flarebox-2" },
+                { "type": "r2_bucket", "name": "ARCHIVE", "bucket_name": "flarebox-2", "jurisdiction": "eu" },
                 { "type": "secret_text", "name": "FLAREBOX_RECOVERY_KEY" },
                 { "type": "assets", "name": "ASSETS" }
             ],
@@ -561,8 +605,17 @@ async fn script_settings_name_the_bound_bucket() {
         .await
         .unwrap();
 
-    assert_eq!(settings.r2_bucket("BUCKET"), Some("flarebox-2"));
-    assert_eq!(settings.r2_bucket("ASSETS"), None);
+    let bucket = settings.r2_bucket("BUCKET").unwrap();
+    assert_eq!(
+        (bucket.bucket_name.as_deref(), bucket.jurisdiction),
+        (Some("flarebox-2"), None)
+    );
+    let archive = settings.r2_bucket("ARCHIVE").unwrap();
+    assert_eq!(
+        (archive.bucket_name.as_deref(), archive.jurisdiction),
+        (Some("flarebox-2"), Some(Jurisdiction::Eu))
+    );
+    assert!(settings.r2_bucket("ASSETS").is_none());
     let names: Vec<&str> = settings
         .bindings
         .iter()
@@ -570,7 +623,13 @@ async fn script_settings_name_the_bound_bucket() {
         .collect();
     assert_eq!(
         names,
-        ["ACCOUNT", "BUCKET", "FLAREBOX_RECOVERY_KEY", "ASSETS"]
+        [
+            "ACCOUNT",
+            "BUCKET",
+            "ARCHIVE",
+            "FLAREBOX_RECOVERY_KEY",
+            "ASSETS"
+        ]
     );
 }
 
@@ -605,7 +664,15 @@ async fn a_script_upload_sends_the_metadata_and_the_module() {
     .await;
     let secret = Secret::new("one-time-key".to_owned());
     let jwt = Secret::new("completion-jwt".to_owned());
-    let plan = UploadPlan::new(&bundle(), "flarebox", None, Some(&secret), Some(&jwt)).unwrap();
+    let plan = UploadPlan::new(
+        &bundle(),
+        "flarebox",
+        Jurisdiction::Default,
+        None,
+        Some(&secret),
+        Some(&jwt),
+    )
+    .unwrap();
 
     let script = fake
         .client()
@@ -895,4 +962,154 @@ async fn an_asset_upload_without_a_completion_token_fails() {
 
     assert!(matches!(error, ApiError::Unreadable { .. }), "{error:?}");
     assert!(!error.to_string().contains("upload-jwt"));
+}
+
+#[tokio::test]
+async fn every_r2_call_names_the_jurisdiction() {
+    let bucket = format!("/accounts/{ACCOUNT}/r2/buckets/flarebox");
+    let fake = Fake::start(vec![
+        reply("GET", &format!("/accounts/{ACCOUNT}/r2/buckets?per_page=1000"), 200, ok(json!({ "buckets": [] }))),
+        reply("POST", &format!("/accounts/{ACCOUNT}/r2/buckets"), 200, ok(json!({ "name": "flarebox" }))),
+        reply("GET", &bucket, 200, ok(json!({ "name": "flarebox", "creation_date": "2026-11-10T05:00:00.000Z", "jurisdiction": "eu", "location": "weur" }))),
+        reply("GET", &format!("{bucket}/objects?per_page=1000"), 200, ok(json!([]))),
+        reply("DELETE", &format!("{bucket}/objects/k"), 200, ok(json!({}))),
+        reply("DELETE", &bucket, 200, ok(json!({}))),
+    ])
+    .await;
+    let client = fake.client();
+    let eu = Jurisdiction::Eu;
+
+    client.buckets(ACCOUNT, eu).await.unwrap();
+    client.create_bucket(ACCOUNT, "flarebox", eu).await.unwrap();
+    let read = client.bucket(ACCOUNT, "flarebox", eu).await.unwrap();
+    client.objects(ACCOUNT, "flarebox", eu, None).await.unwrap();
+    client
+        .delete_object(ACCOUNT, "flarebox", eu, "k")
+        .await
+        .unwrap();
+    client.delete_bucket(ACCOUNT, "flarebox", eu).await.unwrap();
+
+    assert_eq!(
+        read,
+        Bucket {
+            name: "flarebox".to_owned(),
+            creation_date: "2026-11-10T05:00:00.000Z".to_owned(),
+            jurisdiction: Some(eu)
+        }
+    );
+    let sent: Vec<_> = fake
+        .seen()
+        .into_iter()
+        .map(|seen| seen.jurisdiction)
+        .collect();
+    assert_eq!(sent, vec![Some("eu".to_owned()); 6]);
+}
+
+#[tokio::test]
+async fn an_unknown_jurisdiction_or_a_bucket_without_a_creation_date_is_unreadable() {
+    let fake = Fake::start(vec![
+        reply(
+            "GET",
+            &format!("/accounts/{ACCOUNT}/workers/scripts/flarebox/settings"),
+            200,
+            ok(json!({ "bindings": [{ "type": "r2_bucket", "name": "BUCKET", "bucket_name": "flarebox", "jurisdiction": "mars" }] })),
+        ),
+        reply("GET", &format!("/accounts/{ACCOUNT}/r2/buckets/flarebox"), 200, ok(json!({ "name": "flarebox" }))),
+    ])
+    .await;
+    let client = fake.client();
+
+    let error = client
+        .script_settings(ACCOUNT, "flarebox")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ApiError::Unreadable { .. }), "{error:?}");
+    let error = client
+        .bucket(ACCOUNT, "flarebox", Jurisdiction::Default)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ApiError::Unreadable { .. }), "{error:?}");
+}
+
+#[tokio::test]
+async fn a_truncated_object_page_without_a_cursor_is_unreadable() {
+    let fake = Fake::start(vec![reply(
+        "GET",
+        &format!("/accounts/{ACCOUNT}/r2/buckets/flarebox/objects?per_page=1000"),
+        200,
+        {
+            let mut page = ok(json!([{ "key": "a" }]));
+            page["result_info"] = json!({ "cursor": "", "is_truncated": true, "per_page": 1000 });
+            page
+        },
+    )])
+    .await;
+
+    let error = fake
+        .client()
+        .objects(ACCOUNT, "flarebox", Jurisdiction::Default, None)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ApiError::Unreadable { .. }), "{error:?}");
+}
+
+#[tokio::test]
+async fn every_asset_path_is_in_the_manifest_even_with_the_same_contents() {
+    let html = prototype_hash(b"<!doctype html>", "html");
+    let fake = Fake::start(vec![reply(
+        "POST",
+        &format!("/accounts/{ACCOUNT}/workers/scripts/flarebox/assets-upload-session"),
+        200,
+        ok(json!({ "jwt": "completion-jwt", "buckets": [] })),
+    )])
+    .await;
+    let same = [
+        Asset {
+            path: "/a/index.html".to_owned(),
+            bytes: b"<!doctype html>".to_vec(),
+        },
+        Asset {
+            path: "/b/index.html".to_owned(),
+            bytes: b"<!doctype html>".to_vec(),
+        },
+    ];
+
+    fake.client()
+        .upload_assets(ACCOUNT, "flarebox", &same)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fake.seen()[0].json(),
+        json!({ "manifest": {
+            "/a/index.html": { "hash": html, "size": 15 },
+            "/b/index.html": { "hash": html, "size": 15 }
+        } })
+    );
+}
+
+#[tokio::test]
+async fn a_session_without_a_buckets_list_is_not_a_completion() {
+    let session = format!("/accounts/{ACCOUNT}/workers/scripts/flarebox/assets-upload-session");
+    let fake = Fake::start(vec![
+        reply("POST", &session, 200, ok(json!({ "jwt": "upload-jwt" }))),
+        reply(
+            "POST",
+            &session,
+            200,
+            ok(json!({ "jwt": "upload-jwt", "buckets": null })),
+        ),
+    ])
+    .await;
+    let client = fake.client();
+
+    for _ in 0..2 {
+        let error = client
+            .upload_assets(ACCOUNT, "flarebox", &assets())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ApiError::Unreadable { .. }), "{error:?}");
+        assert!(!error.to_string().contains("upload-jwt"));
+    }
 }

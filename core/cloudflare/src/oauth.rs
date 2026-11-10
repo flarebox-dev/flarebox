@@ -377,7 +377,8 @@ impl Grant {
 
     /// Refreshes once and forgets the old refresh token. After a lost response the caller starts a new login instead
     /// of retrying, because a late reuse of a rotated refresh token revokes the grant (section 2). After any failure
-    /// the grant only keeps its access token for [`Grant::revoke`].
+    /// the grant only keeps its access token for [`Grant::revoke`]. A refresh that grants fewer scopes than [`SCOPES`]
+    /// revokes the new tokens and returns [`OauthError::MissingScopes`], leaving the grant unusable.
     pub async fn refresh(&mut self, http: &reqwest::Client) -> Result<(), OauthError> {
         let refresh = self.refresh.take().ok_or(OauthError::Spent)?;
         let sent = Instant::now();
@@ -392,9 +393,17 @@ impl Grant {
             ],
         )
         .await?;
-        self.expires_at = expiry(sent, tokens.expires_in)?;
+        let missing = missing_scopes(tokens.scope.as_deref());
         self.access = Secret::new(tokens.access_token);
         self.refresh = Some(Secret::new(tokens.refresh_token));
+        if !missing.is_empty() {
+            let _ = self.revoke(http).await;
+            self.refresh = None;
+            return Err(OauthError::MissingScopes {
+                missing: missing.join(", "),
+            });
+        }
+        self.expires_at = expiry(sent, tokens.expires_in)?;
         Ok(())
     }
 

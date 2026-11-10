@@ -10,7 +10,8 @@ mod oauth;
 mod secret;
 
 pub use api::{
-    Account, ApiError, Binding, Cloudflare, CloudflareMessage, ObjectPage, Script, ScriptSettings,
+    Account, ApiError, Binding, Bucket, Cloudflare, CloudflareMessage, Jurisdiction, ObjectPage,
+    Script, ScriptSettings,
 };
 pub use bundle::{
     Asset, Bundle, BundleError, Manifest, NewerDeployment, RECOVERY_KEY_SECRET, SERVER_TAG,

@@ -13,7 +13,7 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::multipart::{Form, Part};
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::de::{DeserializeOwned, IgnoredAny};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -91,6 +91,33 @@ impl ApiError {
     }
 }
 
+/// An R2 jurisdiction. R2 allows buckets with one name in several jurisdictions, so every R2 call names one
+/// ([Data location](https://developers.cloudflare.com/r2/reference/data-location/)). A value this release does not know
+/// fails to parse, so a caller never acts on a bucket in a jurisdiction it cannot name.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Jurisdiction {
+    #[default]
+    Default,
+    Eu,
+    Us,
+    Fedramp,
+    FedrampHigh,
+}
+
+impl Jurisdiction {
+    /// The value of the `cf-r2-jurisdiction` header.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Jurisdiction::Default => "default",
+            Jurisdiction::Eu => "eu",
+            Jurisdiction::Us => "us",
+            Jurisdiction::Fedramp => "fedramp",
+            Jurisdiction::FedrampHigh => "fedramp-high",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Account {
     pub id: String,
@@ -101,6 +128,9 @@ pub struct Account {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Script {
     pub id: String,
+    /// When the script was created. A script deleted and created again under the same name has a new time, so this
+    /// tells the two apart; `None` when Cloudflare does not send it, which leaves the script's identity unknown.
+    pub created_on: Option<String>,
     #[serde(default, deserialize_with = "null_as_default")]
     pub tags: Vec<String>,
     pub migration_tag: Option<String>,
@@ -116,12 +146,13 @@ pub struct ScriptSettings {
 }
 
 impl ScriptSettings {
-    /// The bucket of the R2 binding named `binding`, such as `BUCKET`.
-    pub fn r2_bucket(&self, binding: &str) -> Option<&str> {
-        self.bindings
-            .iter()
-            .find(|candidate| candidate.kind == "r2_bucket" && candidate.name == binding)
-            .and_then(|candidate| candidate.bucket_name.as_deref())
+    /// The R2 binding named `binding`, such as `BUCKET`, if it names a bucket.
+    pub fn r2_bucket(&self, binding: &str) -> Option<&Binding> {
+        self.bindings.iter().find(|candidate| {
+            candidate.kind == "r2_bucket"
+                && candidate.name == binding
+                && candidate.bucket_name.is_some()
+        })
     }
 }
 
@@ -132,6 +163,17 @@ pub struct Binding {
     pub kind: String,
     pub name: String,
     pub bucket_name: Option<String>,
+    /// The jurisdiction of an R2 binding's bucket, `None` when the binding names none.
+    pub jurisdiction: Option<Jurisdiction>,
+}
+
+/// An R2 bucket as `GET /r2/buckets/<bucket>` describes it.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct Bucket {
+    pub name: String,
+    /// When the bucket was created. A bucket deleted and created again under the same name has a new date.
+    pub creation_date: String,
+    pub jurisdiction: Option<Jurisdiction>,
 }
 
 /// One page of `GET /r2/buckets/<bucket>/objects`.
@@ -200,13 +242,17 @@ impl Cloudflare {
     }
 
     /// The names of the account's R2 buckets. Error `10042` means R2 is not enabled on the account (section 4.1).
-    pub async fn buckets(&self, account: &str) -> Result<Vec<String>, ApiError> {
+    pub async fn buckets(
+        &self,
+        account: &str,
+        jurisdiction: Jurisdiction,
+    ) -> Result<Vec<String>, ApiError> {
         #[derive(Deserialize)]
         struct Buckets {
-            buckets: Vec<Bucket>,
+            buckets: Vec<Named>,
         }
         #[derive(Deserialize)]
-        struct Bucket {
+        struct Named {
             name: String,
         }
         let mut names = Vec::new();
@@ -219,7 +265,7 @@ impl Cloudflare {
                 url.query_pairs_mut().append_pair("cursor", cursor);
             }
             let (page, info): (Buckets, _) = self
-                .send("list R2 buckets", self.request(Method::GET, url))
+                .send("list R2 buckets", self.r2(Method::GET, url, jurisdiction))
                 .await?;
             let full = page.buckets.len() == R2_PAGE;
             names.extend(page.buckets.into_iter().map(|bucket| bucket.name));
@@ -230,20 +276,49 @@ impl Cloudflare {
         }
     }
 
-    pub async fn create_bucket(&self, account: &str, bucket: &str) -> Result<(), ApiError> {
+    pub async fn create_bucket(
+        &self,
+        account: &str,
+        bucket: &str,
+        jurisdiction: Jurisdiction,
+    ) -> Result<(), ApiError> {
         let url = self.url(&["accounts", account, "r2", "buckets"])?;
         let request = self
-            .request(Method::POST, url)
+            .r2(Method::POST, url, jurisdiction)
             .json(&json!({ "name": bucket }));
         self.send::<IgnoredAny>("create an R2 bucket", request)
             .await
             .map(drop)
     }
 
-    /// Deletes an empty bucket. A bucket that does not exist counts as deleted.
-    pub async fn delete_bucket(&self, account: &str, bucket: &str) -> Result<(), ApiError> {
+    /// The bucket's creation date and jurisdiction. A bucket that does not exist is an `ApiError::Failed` with
+    /// status 404.
+    pub async fn bucket(
+        &self,
+        account: &str,
+        bucket: &str,
+        jurisdiction: Jurisdiction,
+    ) -> Result<Bucket, ApiError> {
         let url = self.url(&["accounts", account, "r2", "buckets", bucket])?;
-        self.delete("delete an R2 bucket", url).await
+        Ok(self
+            .send("read an R2 bucket", self.r2(Method::GET, url, jurisdiction))
+            .await?
+            .0)
+    }
+
+    /// Deletes an empty bucket. A bucket that does not exist counts as deleted.
+    pub async fn delete_bucket(
+        &self,
+        account: &str,
+        bucket: &str,
+        jurisdiction: Jurisdiction,
+    ) -> Result<(), ApiError> {
+        let url = self.url(&["accounts", account, "r2", "buckets", bucket])?;
+        self.delete(
+            "delete an R2 bucket",
+            self.r2(Method::DELETE, url, jurisdiction),
+        )
+        .await
     }
 
     /// One page of up to 1000 object keys, starting at `cursor` from the previous page.
@@ -251,6 +326,7 @@ impl Cloudflare {
         &self,
         account: &str,
         bucket: &str,
+        jurisdiction: Jurisdiction,
         cursor: Option<&str>,
     ) -> Result<ObjectPage, ApiError> {
         #[derive(Deserialize)]
@@ -263,16 +339,24 @@ impl Cloudflare {
         if let Some(cursor) = cursor {
             url.query_pairs_mut().append_pair("cursor", cursor);
         }
+        const CALL: &str = "list the objects in an R2 bucket";
         let (objects, info): (Vec<Object>, _) = self
-            .send(
-                "list the objects in an R2 bucket",
-                self.request(Method::GET, url),
-            )
+            .send(CALL, self.r2(Method::GET, url, jurisdiction))
             .await?;
-        let truncated = info.is_truncated != Some(false);
+        let next = info.cursor.filter(|cursor| !cursor.is_empty());
+        let cursor = match (info.is_truncated, next) {
+            (Some(true), None) => {
+                return Err(ApiError::Unreadable {
+                    call: CALL,
+                    detail: "Cloudflare said the list goes on but sent no cursor",
+                });
+            }
+            (Some(false), _) => None,
+            (_, next) => next,
+        };
         Ok(ObjectPage {
             keys: objects.into_iter().map(|object| object.key).collect(),
-            cursor: info.cursor.filter(|cursor| truncated && !cursor.is_empty()),
+            cursor,
         })
     }
 
@@ -281,10 +365,15 @@ impl Cloudflare {
         &self,
         account: &str,
         bucket: &str,
+        jurisdiction: Jurisdiction,
         key: &str,
     ) -> Result<(), ApiError> {
         let url = self.url(&["accounts", account, "r2", "buckets", bucket, "objects", key])?;
-        self.delete("delete an object in an R2 bucket", url).await
+        self.delete(
+            "delete an object in an R2 bucket",
+            self.r2(Method::DELETE, url, jurisdiction),
+        )
+        .await
     }
 
     pub async fn scripts(&self, account: &str) -> Result<Vec<Script>, ApiError> {
@@ -319,10 +408,10 @@ impl Cloudflare {
         script: &str,
         assets: &[Asset],
     ) -> Result<Secret, ApiError> {
+        /// `buckets` must be present: an empty list is what makes `jwt` a completion token.
         #[derive(Deserialize)]
         struct Session {
             jwt: String,
-            #[serde(default, deserialize_with = "null_as_default")]
             buckets: Vec<Vec<String>>,
         }
         #[derive(Deserialize)]
@@ -330,11 +419,11 @@ impl Cloudflare {
             jwt: Option<String>,
         }
         const CALL: &str = "upload the server's static assets";
-        let by_hash: HashMap<String, &Asset> = assets
+        let hashed: Vec<(String, &Asset)> = assets
             .iter()
             .map(|asset| (asset_hash(asset), asset))
             .collect();
-        let manifest: BTreeMap<&str, Value> = by_hash
+        let manifest: BTreeMap<&str, Value> = hashed
             .iter()
             .map(|(hash, asset)| {
                 (
@@ -342,6 +431,10 @@ impl Cloudflare {
                     json!({ "hash": hash, "size": asset.bytes.len() }),
                 )
             })
+            .collect();
+        let by_hash: HashMap<&str, &Asset> = hashed
+            .iter()
+            .map(|(hash, asset)| (hash.as_str(), *asset))
             .collect();
         let url = self.url(&[
             "accounts",
@@ -365,7 +458,7 @@ impl Cloudflare {
         for bucket in session.buckets {
             let mut form = Form::new();
             for hash in bucket {
-                let asset = by_hash.get(&hash).ok_or(ApiError::Unreadable {
+                let asset = by_hash.get(hash.as_str()).ok_or(ApiError::Unreadable {
                     call: CALL,
                     detail: "Cloudflare asked for a file that the upload did not list",
                 })?;
@@ -457,7 +550,8 @@ impl Cloudflare {
         let url = self.url(&[
             "accounts", account, "workers", "scripts", script, "secrets", name,
         ])?;
-        self.delete("delete a Worker secret", url).await
+        self.delete("delete a Worker secret", self.request(Method::DELETE, url))
+            .await
     }
 
     /// Serves the script on `<script>.<subdomain>.workers.dev`, without preview URLs.
@@ -498,7 +592,11 @@ impl Cloudflare {
     pub async fn delete_script(&self, account: &str, script: &str) -> Result<(), ApiError> {
         let mut url = self.url(&["accounts", account, "workers", "scripts", script])?;
         url.query_pairs_mut().append_pair("force", "true");
-        self.delete("delete the Flarebox server", url).await
+        self.delete(
+            "delete the Flarebox server",
+            self.request(Method::DELETE, url),
+        )
+        .await
     }
 
     /// The URL of `base` followed by `segments`, each one percent-encoded.
@@ -524,11 +622,14 @@ impl Cloudflare {
             .bearer_auth(self.token.expose())
     }
 
-    async fn delete(&self, call: &'static str, url: Url) -> Result<(), ApiError> {
-        match self
-            .send::<IgnoredAny>(call, self.request(Method::DELETE, url))
-            .await
-        {
+    /// A request to an R2 endpoint, which names the jurisdiction it acts in.
+    fn r2(&self, method: Method, url: Url, jurisdiction: Jurisdiction) -> RequestBuilder {
+        self.request(method, url)
+            .header("cf-r2-jurisdiction", jurisdiction.as_str())
+    }
+
+    async fn delete(&self, call: &'static str, request: RequestBuilder) -> Result<(), ApiError> {
+        match self.send::<IgnoredAny>(call, request).await {
             Err(error) if error.status() == Some(StatusCode::NOT_FOUND.as_u16()) => Ok(()),
             result => result.map(drop),
         }

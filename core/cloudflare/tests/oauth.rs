@@ -552,6 +552,34 @@ async fn refresh_replaces_both_tokens() {
 }
 
 #[tokio::test]
+async fn a_refresh_without_a_required_scope_revokes_the_new_tokens() {
+    let server = FakeServer::start(vec![
+        tokens("access-1", "refresh-1", &all_scopes()),
+        tokens("access-2", "refresh-2", "account-settings.read"),
+        ok(),
+        ok(),
+    ])
+    .await;
+    let mut grant = grant_from(&server).await;
+
+    let refused = grant.refresh(&client()).await.err().unwrap();
+
+    assert!(
+        matches!(&refused, OauthError::MissingScopes { missing } if missing.contains("workers-scripts.admin")),
+        "{refused:?}"
+    );
+    assert!(grant.expires_within(Duration::ZERO));
+    let again = grant.refresh(&client()).await;
+    assert!(matches!(again, Err(OauthError::Spent)), "{:?}", again.err());
+    let received = server.received();
+    let revoked: Vec<_> = received[2..]
+        .iter()
+        .map(|received| received.field("token").unwrap())
+        .collect();
+    assert_eq!(revoked, ["refresh-2", "access-2"]);
+}
+
+#[tokio::test]
 async fn a_failed_refresh_leaves_the_grant_unusable() {
     let refusal = serde_json::json!({ "error": "invalid_grant" }).to_string();
     let server = FakeServer::start(vec![
