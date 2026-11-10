@@ -2,54 +2,88 @@
 
 The design rules for this site. Every page follows them. Change a rule here before a page breaks it.
 
+The system is coreav-dev/site's (its DESIGN.md, src/styles/tokens.css, src/pages/index.astro and its Nav, Footer and Base layout): Hallmark's Ultraviolet theme for type, pills and hairlines, on the colours of Hallmark's Rim theme at night. The nav, the hero and the footer take its markup and its values. Flarebox keeps its own copy and logo, and every place it differs is in the table under "Departures from coreav-dev/site". The page has had a Hallmark v2.0.0 polish against this file; the run record is the stamp at the top of `site.css`.
+
 ## System
-- Genre: modern-minimal
-- Shape: one screen. A Stage hero, a floating bar nav with the wordmark and one key, and a footer with the trademark notice. Add a section only when the project needs it.
-- Theme: Cobalt
-- Axes: light/grotesk-sans/cool, posture: restrained
-- Signature: the two install commands, each with a copy key, and `koi setup` running under them in a terminal panel. Each progress line is a step in the CLI setup design (docs/design/cli-setup.md). The workers.dev host is an example.
+- Genre: modern-minimal. Dark only. Every head, button and label keeps the copy's own case.
+- Shape: the edge-aligned nav (the lockup and the links at opposite edges, no rule, 72px tall; under 40rem the lockup alone), the hero and a colophon footer with the trademark notice. Nothing on the page is decoration only. Add a section only when the project has true content for it.
+- Hero: CoreAV's Ledge in its bare form. The hero is at least the screen's height less the nav (`calc(100svh - 72px)`), and the head sits in its middle. The hero's bottom padding adds the nav's 72px to CoreAV's 40px, so the head centres on the screen rather than on the space under the nav, a touch above the screen's middle. The head is two equal columns (6fr and 6fr), centred on each other: the claim (the headline, then See GitHub 40px under it) on the left, the install block on the right. Under 60rem the columns stack, the hero drops its minimum height and takes 64px above and 96px below. The bare form has no field row there either, so nothing adds space under the head.
+- Footer: 120px under the hero (80px under 60rem, 56px under 40rem), a hairline, then the notice. The body is a column at least the screen tall, so on a short page the footer still sits at the foot of the screen.
+- Axes: dark/geometric-sans/warm, posture: committed.
 
 ## Tokens
-`tokens.css` is the source of truth. The roles:
+`tokens.css` is the source of truth. It is coreav-dev/site's tokens.css with one token added, `--color-surface`; every other value is unchanged. The roles:
 ```css
 :root {
-  --color-paper: oklch(98.6% 0.005 250);  --color-paper-2: oklch(96.2% 0.008 252);  --color-paper-3: oklch(93% 0.011 252);
-  --color-ink: oklch(21% 0.028 262);  --color-ink-2: oklch(36% 0.022 260);  --color-muted: oklch(50% 0.018 258);  --color-rule: oklch(90% 0.009 252);
-  --color-graphite: oklch(21% 0.024 262);  --color-graphite-2: oklch(26.5% 0.026 262);  --color-graphite-ink: oklch(93% 0.010 250);
-  --color-accent: oklch(52% 0.19 258);  --color-accent-2: oklch(76% 0.13 254);  --color-accent-wash: oklch(95% 0.028 256);
-  --color-accent-ink: oklch(98.6% 0.005 250);  --color-focus: oklch(52% 0.19 258);
-  --font-display: "Familjen Grotesk", system-ui, sans-serif;  --font-body: "IBM Plex Sans", system-ui, sans-serif;  --font-outlier: "JetBrains Mono", ui-monospace, monospace;
-  --radius-card: 8px;  --radius-input: 6px;  --rule-hair: 1px;  --shadow-card: 0 1px 2px oklch(21% 0.028 262 / 0.06);
-  --cell-w: 8px;  --cell-h: 16px;  --cut: 8px;  --cut-l: 16px;
+  --color-paper: oklch(9% 0.008 75);  --color-paper-2: oklch(12.5% 0.009 75);  --color-paper-3: oklch(6.5% 0.007 75);
+  --color-surface: oklch(19% 0.009 75);
+  --color-ink: oklch(94% 0.010 80);  --color-ink-2: oklch(84% 0.011 80);  --color-muted: oklch(68% 0.012 80);  --color-muted-2: oklch(50% 0.010 80);
+  --color-rule: oklch(25% 0.010 78);  --color-rule-2: oklch(16% 0.009 78);
+  --color-accent: oklch(72% 0.17 45);  --color-accent-deep: oklch(64% 0.17 44);  --color-accent-soft: oklch(32% 0.06 45);
+  --color-accent-ink: oklch(10% 0.02 45);  --color-focus: oklch(78% 0.15 45);
+  --font-display: "Outfit";  --font-body: "Onest";  --font-outlier: "JetBrains Mono";
+  --radius-card: 16px;  --radius-pill: 999px;  --rule-hair: 1px;  --shadow-card: none;
 }
 ```
-The spacing scale, the type scale, the easings and the durations are the scaffold's and live in `tokens.css`.
+The spacing scale, the type scale, the easings and the durations live in `tokens.css` too. `base.css` is coreav-dev/site's base.css without its image-slot rules, which nothing here uses.
+
+## Meanings
+- One orange in two strengths. The full one is for the one filled control, focus and a link's hover. The deep one is the filled control's hover. The soft one is unused today.
+- `--color-surface` is the install block's fill, a grey step above the paper that reads as a panel. On it the commands (ink) are 15.6:1, the prompt (muted) 6.4:1 and the Copy pill's outline (muted-2) 3.1:1.
+- `--color-rule` is the section line (over the footer) and the Copy pill's hover. `--color-rule-2` is the fainter row line and a nav link's hover. Pill outlines take `--color-muted-2`.
+- Body text is ink-2; heads, labels and commands are ink; the notice and the prompt are muted.
 
 ## Type
-- The fonts are self-hosted in `fonts/` as variable WOFF2 files (Latin subset from Google Fonts), each with its SIL Open Font License beside it. The page loads nothing from another host.
-- Heads: Familjen Grotesk 600, item titles 500, tracking -0.028em, sentence case. Body: IBM Plex Sans 400 and 500.
-- JetBrains Mono only for code, object keys, hosts and machine values. Never for labels, step numerals or heads.
+- The fonts are self-hosted in `fonts/` from @fontsource (Outfit 5.3.0, Onest 5.3.1, JetBrains Mono 5.3.0), Latin subset, only the weights in use (Outfit 500, Onest 400, JetBrains Mono 400), each with its SIL Open Font License beside it. `fonts.css` declares them. The page loads nothing from another host.
+- Heads: Outfit 500, tracking -0.03em, line height 1. The headline is `clamp(2.5rem, 4.6vw, 4.5rem)` with balanced lines. Labels and buttons: Outfit 500. Body: Onest 400.
+- JetBrains Mono 400 is for commands only, at 14px on a 24px line, so they are never smaller than the 14px labels around them.
 
-## Surfaces
-- Hairlines (1px rule) split rows; panels and chips are cut on two opposite corners (`.cut`, plain radius as fallback).
-- Graphite is for the terminal panel only. The commands sit on a graphite-2 strip above the setup log.
-- Cobalt stays under 5% of a screen outside the hero.
+## Logo
+- The wordmark is "Flarebox" in Outfit 500, outlined so it needs no font load, with the font's own kerning and -0.01em of tracking, in the ink (`logo/wordmark.svg`).
+- The mark is a cube: three faces in three strengths of the orange (top `#fea47c`, left `#f97c3d`, right `#dd6222`), split by a seam whose diagonals are 1.125 times its vertical. Each icon size is fitted to whole pixels.
+- The nav shows the lockup: the cube, then the wordmark. The cube is 7/6 of the wordmark's height and centred on it, and the gap is 5/12 of that height: a 24px wordmark, a 28px cube and a 10px gap, or 20px, 23.33px and 8.33px on a phone. The cube is inline SVG in index.html, so it stays sharp and needs no request.
+- Icons: `favicon.svg` is the 32px drawing; `favicon.ico` holds the 16 and 32px drawings, both on a clear ground; `apple-touch-icon.png` (180px) and the manifest's 192 and 512px icons sit on the paper.
+- `logo/draw.py` draws the wordmark from `fonts/outfit-latin-500-normal.woff2` (it needs fonttools and brotli). `logo/icons.mjs` draws the cube, renders every icon and prints the nav's 28px drawing (it needs sharp). Install both tools outside the repository.
+- The shapes and spacing are Flarebox's own. Don't reuse CoreAV's wordmark setting, its AV monogram or its icons.
 
 ## Controls
-- Primary: solid cobalt keycap (`.key--primary`), 6px radius, once per page. Today that key is "See GitHub" in the nav, at the 44px small size.
-- Secondary: key-face keycap (`.key`), same radius and height.
-- Each install command has a Copy button that copies the text of its `[data-cmd]` span exactly, and its accessible name names that command. If the copy fails, the button reads "Copy failed" and the command is selected for a keyboard copy. To change a command, edit that span in index.html.
+- Primary: the orange pill, `--color-accent-ink` text, `--color-accent-deep` on hover, 48px, Outfit 500. Once per page: "See GitHub", 40px under the headline (24px under 60rem).
+- Secondary: a pill with a 1.5px inset outline. Copy is the secondary pill at 44px and the label size, outlined in `--color-muted-2`, and 104px wide in every state (Copy, Copied, Copy failed), so the panel never reflows when the label changes.
+- Disabled: a disabled Copy button or an `aria-disabled` pill drops to 55% opacity with a not-allowed cursor and does not move.
+- Nav links: Outfit 500 at the label size in a 40px pill that steps to rule-2 on hover.
+- The install block holds the two commands, one per line, and one Copy button beside them, with 16px of padding all round. When the longest argument and Copy can't share a line (screens narrower than about 415px), Copy sits under the commands in every state. A command wraps only between its arguments, as the first one does at 1024px. It copies the text of each `[data-cmd]` span joined by a newline, so the clipboard holds exactly `brew install flarebox-dev/tap/flarebox` and `flarebox setup` on two lines. Its accessible name is "Copy both commands". If the copy fails, the button reads "Copy failed" and both commands are selected for a keyboard copy (the prompts are not selectable). A command wraps between its arguments; an `.arg` span keeps an argument whole. To change a command, edit its span in index.html.
+- Focus: a 2px ring in `--color-focus`, 3px out on pills and 2px on links.
 
 ## Motion
-- Character: still. The hero setup log prints its lines once, in order, when it comes into view, and shows every line at once under reduced motion. No other reveals.
+- Character: quick and dry. Colours step over `--dur-micro` (120ms) and a pressed pill moves 1px. Nothing is revealed on scroll or load. Under reduced motion every transition ends at once.
 
 ## Copy
-- Every word passes the project's unslop skill. The page reads as it will on launch day, with no status caveats and no roadmap lines. The shipped files carry no drafting notes.
-- Keep the notice that Koidrive is not affiliated with or endorsed by Cloudflare, Inc. Never put "Cloudflare" in the product name.
+- Every word passes the project's unslop skill. The page reads as it will on launch day, with no status caveats and no roadmap lines.
+- The ® sits 0.2 of its own size (0.064em of the headline) after "Cloudflare", with its top on the cap line.
+- The trademark notice follows Cloudflare's trademark guidelines (https://www.cloudflare.com/trademark/): the first "Cloudflare" in visible text carries ®, set small at the cap line (`.reg`), and the footer names the marks the page uses and their owners: Cloudflare, Inc. for Cloudflare and Dropbox, Inc. for Dropbox. It ends "Flarebox is not affiliated with or endorsed by either company." Keep it, and name a mark there only when the page uses it.
+- Never put "Cloudflare" in the product name.
+
+## Departures from coreav-dev/site
+| Where | coreav-dev/site | Flarebox | Reason |
+| --- | --- | --- | --- |
+| Hero | Ledge with the speed chart as its field when there is data, the bare form without it | The bare form only | Our copy: there is no chart to draw |
+| Headline | A forced break (`<br>`) before the orange word's line | No forced break; balanced lines break it as "Your own Dropbox / on Cloudflare" | Our copy |
+| Headline | No mark | ® after "Cloudflare" | Trademark rules |
+| Under the headline | The lead sentence | See GitHub | Gunwoo's cuts (no lead) and his See GitHub move |
+| Install block | One command in a `<pre>`, then a note, then the GitHub pill | Two commands and one Copy button in one row, nothing under it | Our copy (two commands, no note) and Gunwoo's cuts (one Copy button) |
+| Columns of the head | Feet on one line (`align-items: end`) | Centred on each other (`align-items: center`) | Gunwoo's request |
+| Hero bottom padding, 60rem and wider | 40px | 40px plus the nav's 72px | Design review: centres the head on the screen, not under the nav |
+| Command type | 13px on a 1.7 line | 14px on a 24px line | Design review: the commands were smaller than the labels around them |
+| Install block fill | `--color-paper-2` | `--color-surface` | Gunwoo's request: the block was close to invisible on the paper |
+| Gap above the primary pill | 16px (`.cta`), under the install note | 40px under the headline, 24px under 60rem (`.claim .cta`) | Gunwoo's request: 16px was too tight under the headline |
+| Primary pill | "GitHub", in the right column under the note | "See GitHub", in the left column under the headline | Our copy (the label) and Gunwoo's See GitHub move (the place) |
+| Nav | The CoreAV wordmark; Docs, Blog and GitHub | The Flarebox lockup (the cube and the wordmark); GitHub, hidden under 40rem | Brand rules (the wordmark) and our copy (no docs or blog); hiding the link on a phone is Gunwoo's request |
+| Footer | The licence and the Blog and GitHub links | The trademark notice | Trademark rules (the notice) and our copy (no blog) |
 
 ## Files
-- `index.html`: the page, with one inline script for the Copy buttons and the setup log.
-- `site.css` imports `tokens.css` and `base.css`.
-- `fonts/`: the three WOFF2 files and their licenses.
+- `index.html`: the page, with one inline script for the Copy button.
+- `site.css` imports `tokens.css` (which imports `fonts.css`) and `base.css`, then styles the page. The nav, hero and footer rules are coreav-dev/site's scoped Astro styles, made global under their class names.
+- `fonts/`: the three WOFF2 files and their licences. `logo/`: the logo and the scripts that draw it.
+- `favicon.*`, `apple-touch-icon.png`, `icon-*.png` and `site.webmanifest`: the icons.
 
 The site is static, with no build step. To preview it, run `python3 -m http.server` in this folder and open the printed address.
