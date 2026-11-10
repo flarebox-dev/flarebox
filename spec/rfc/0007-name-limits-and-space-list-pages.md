@@ -24,7 +24,7 @@ The server measures each field as the request carries it, before it trims the fi
 
 Every space name, device name, user name and platform the server stores is therefore at most 255 bytes. That includes the defaults for empty fields, `Flarebox` for a space and `Unnamed device` for a device. Node names keep their own rule from spec v0 §6.1.
 
-Known limitation: a deployment that stored a longer name before this rule keeps it. The server does not shorten stored names.
+Known limitation: a deployment that stored a longer name before this rule keeps it. The server does not shorten stored names, so the bounds of section 3 do not hold for its answers that carry such a name.
 
 ## 2. Space list pages (spec v0 §15)
 
@@ -32,7 +32,7 @@ Known limitation: a deployment that stored a longer name before this rule keeps 
 
 ## 3. Answer sizes
 
-With sections 1 and 2, the answers of these endpoints have fixed upper bounds. A client may cap its reads at them:
+With sections 1 and 2, the answers of these endpoints have fixed upper bounds, as long as every stored name follows section 1:
 
 | Answer | At most |
 |---|---|
@@ -41,3 +41,5 @@ With sections 1 and 2, the answers of these endpoints have fixed upper bounds. A
 | `DeviceList` page (RFC 0006 section 7) | 64 KiB |
 
 The largest fixed-shape answer is `DeviceCredentials`. Its access token carries the device name JSON-escaped, where a control character takes six bytes, inside claims encoded as base64url, which takes four bytes for every three. A 255-byte device name therefore adds at most 2,040 bytes to the token. In a list, a `SpaceInfo` takes at most 316 bytes and a `DeviceInfo` at most 643, because both carry the names of section 1.
+
+A client that caps its reads at these bounds cannot read an answer that carries an older, longer name. It reports such an answer as too large and does not misread it. Until deployments from before this rule are gone, a client that must still list their spaces keeps a larger cap.
