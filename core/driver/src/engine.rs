@@ -409,13 +409,30 @@ impl Engine {
             .filter(|(change, _)| matches!(change, Observed::Renamed { .. }))
             .filter_map(|(_, before)| before.clone())
             .collect();
+        for (change, before) in changes.iter().zip(&before) {
+            let Observed::Renamed { to, kind, .. } = change else {
+                continue;
+            };
+            let kind = match kind {
+                EntryKind::File => Kind::File,
+                EntryKind::Dir => Kind::Dir,
+            };
+            if let Some(node) = before
+                && names(to).is_some_and(|to| self.trees.ignores(&to, kind))
+                && (to.parent())
+                    .and_then(|dir| local_at(&self.trees, dir))
+                    .is_none()
+            {
+                self.trees.ignore_local(node);
+            }
+        }
         let mut touched = BTreeSet::new();
         let mut gone = Gone::new();
         for (change, before) in changes.iter().zip(before) {
             match change {
                 Observed::Removed { .. } => {
                     if let Some(id) = before {
-                        self.remove(&id, &moving, &mut touched, &mut gone);
+                        self.remove(&id, &moving, true, &mut touched, &mut gone);
                     }
                 }
                 Observed::Renamed { to, kind, id, .. } => {
@@ -513,7 +530,7 @@ impl Engine {
                 node.shape.parent != local.root && local.get(&node.shape.parent).is_none()
             });
             if orphaned {
-                self.remove(id, &BTreeSet::new(), &mut touched, &mut gone);
+                self.remove(id, &BTreeSet::new(), false, &mut touched, &mut gone);
             }
         }
         touched
@@ -626,11 +643,11 @@ impl Engine {
                 self.trees.synced().get(&id).is_some() || self.trees.remote().get(&id).is_some();
             if kind == Kind::File && replaced == Some(Kind::File) && !synced {
                 if self.trees.local().get(&id).is_some() {
-                    self.remove(&id, moving, touched, gone);
+                    self.remove(&id, moving, false, touched, gone);
                 }
                 id = holder;
             } else {
-                self.remove(&holder, moving, touched, gone);
+                self.remove(&holder, moving, false, touched, gone);
             }
         }
         self.trees.set_local(
@@ -645,20 +662,48 @@ impl Engine {
     }
 
     /// Removes `id` and every node placed under it from L, except the nodes in `moving`, which the batch moves
-    /// elsewhere, with what is placed under them, and adds each node it removes to `gone`.
+    /// elsewhere, with what is placed under them, and adds each node it removes to `gone`. When the disk lost the
+    /// entry (`outside`), a node that [`Trees::ignore_local`] recorded keeps its entry with what is under it, and so
+    /// do the folders on its way to `id`, which are recorded too: the node's local copy is in an ignored folder, so
+    /// L must keep it and its folders for the server to keep them (design §5.10).
     fn remove(
         &mut self,
         id: &NodeId,
         moving: &BTreeSet<NodeId>,
+        outside: bool,
         touched: &mut BTreeSet<NodeId>,
         gone: &mut Gone,
     ) {
         let mut doomed = vec![id.clone()];
+        let mut held = Vec::new();
         let mut next = 0;
         while let Some(current) = doomed.get(next).cloned() {
-            let children = self.trees.local_children(&current);
-            doomed.extend(children.filter(|child| !moving.contains(*child)).cloned());
+            for child in self.trees.local_children(&current) {
+                if outside && self.trees.ignored_local().contains(child) {
+                    held.push(child.clone());
+                } else if !moving.contains(child) {
+                    doomed.push(child.clone());
+                }
+            }
             next += 1;
+        }
+        let mut kept = BTreeSet::new();
+        for node in &held {
+            let mut above = self.trees.local().get(node).map(|n| n.shape.parent.clone());
+            while let Some(folder) = above.filter(|folder| doomed.contains(folder)) {
+                if !kept.insert(folder.clone()) {
+                    break;
+                }
+                above = self
+                    .trees
+                    .local()
+                    .get(&folder)
+                    .map(|n| n.shape.parent.clone());
+            }
+        }
+        doomed.retain(|node| !kept.contains(node));
+        for folder in &kept {
+            self.trees.ignore_local(folder);
         }
         for id in &doomed {
             if let (Some(path), Some(node)) = (self.path_of(id), self.trees.local().get(id)) {

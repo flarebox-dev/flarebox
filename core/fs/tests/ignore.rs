@@ -445,6 +445,107 @@ fn a_folder_moved_into_an_ignored_folder_is_ignored_as_a_whole() {
 }
 
 #[test]
+fn a_file_moved_into_an_ignored_folder_before_its_folder_was_removed_is_ignored() {
+    let (dir, mut snapshot, mut rules) = tree_with_an_ignored_folder();
+    let root = dir.path();
+    let id = snapshot.entries[Path::new("d/g.txt")].id;
+    fs::rename(root.join("d/g.txt"), root.join("ig/g.txt")).unwrap();
+    fs::remove_dir(root.join("d")).unwrap();
+
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert_eq!(
+        rescan.changes,
+        [
+            Change::Removed {
+                path: "d".into(),
+                kind: Dir,
+            },
+            Change::Ignored {
+                from: "d/g.txt".into(),
+                to: "ig/g.txt".into(),
+                kind: File,
+                id,
+            },
+        ]
+    );
+    assert_eq!(known(&snapshot), [RULES_FILE, "f.txt"]);
+}
+
+#[test]
+#[ignore = "GUN-368"]
+fn a_file_moved_out_of_a_removed_folder_with_a_link_in_an_ignored_folder_is_renamed() {
+    let (dir, mut snapshot, mut rules) = tree_with_an_ignored_folder();
+    let root = dir.path();
+    fs::hard_link(root.join("d/g.txt"), root.join("ig/alias.txt")).unwrap();
+    fs::rename(root.join("d/g.txt"), root.join("moved.txt")).unwrap();
+    fs::remove_dir(root.join("d")).unwrap();
+
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    let renamed = |change: &Change| {
+        matches!(change, Change::Renamed { from, to, .. }
+            if from == Path::new("d/g.txt") && to == Path::new("moved.txt"))
+    };
+    let ignored = |change: &Change| matches!(change, Change::Ignored { from, .. } if from == Path::new("d/g.txt"));
+    assert!(rescan.changes.iter().any(renamed), "{:?}", rescan.changes);
+    assert!(!rescan.changes.iter().any(ignored), "{:?}", rescan.changes);
+}
+
+#[test]
+fn a_file_moved_into_an_ignored_folder_out_of_a_removed_folder_with_an_included_link_that_stays_is_ignored()
+ {
+    let (dir, mut snapshot, mut rules) = tree_with_an_ignored_folder();
+    let root = dir.path();
+    fs::hard_link(root.join("d/g.txt"), root.join("also.txt")).unwrap();
+    snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    fs::rename(root.join("d/g.txt"), root.join("ig/g.txt")).unwrap();
+    fs::remove_dir(root.join("d")).unwrap();
+
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    let ignored = |change: &Change| {
+        matches!(change, Change::Ignored { from, to, .. }
+            if from == Path::new("d/g.txt") && to == Path::new("ig/g.txt"))
+    };
+    assert!(rescan.changes.iter().any(ignored), "{:?}", rescan.changes);
+    assert!(snapshot.entries.contains_key(Path::new("also.txt")));
+}
+
+#[test]
+fn a_file_moved_into_an_ignored_folder_before_a_folder_above_it_was_renamed_is_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, RULES_FILE, "ig/\n");
+    write(root, "d/a/b/file", "kept");
+    fs::create_dir(root.join("ig")).unwrap();
+    fs::create_dir(root.join("dest")).unwrap();
+    let mut snapshot = Snapshot::default();
+    let mut rules = rules();
+    snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    fs::rename(root.join("d/a/b/file"), root.join("ig/file")).unwrap();
+    fs::remove_dir(root.join("d/a/b")).unwrap();
+    fs::rename(root.join("d/a"), root.join("dest/a")).unwrap();
+    fs::remove_dir(root.join("d")).unwrap();
+
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    let ignored = |change: &Change| {
+        matches!(change, Change::Ignored { from, to, .. }
+            if from == Path::new("d/a/b/file") && to == Path::new("ig/file"))
+    };
+    assert!(rescan.changes.iter().any(ignored), "{:?}", rescan.changes);
+}
+
+#[test]
 fn a_file_renamed_to_a_name_a_rule_leaves_out_is_ignored_not_removed() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
