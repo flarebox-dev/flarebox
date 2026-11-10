@@ -19,6 +19,8 @@ export const NO_ADDRESS = "(no address)";
 export const MIN_RECOVERY_KEY_LENGTH = 32;
 /** The longest ClaimRequest.setup_attempt the server stores. */
 export const MAX_SETUP_ATTEMPT_LENGTH = 64;
+/** Devices of one setup attempt and owner that never refreshed a token and are not revoked. */
+const UNUSED_OF_ATTEMPT = "setup_attempt = ? AND user_id = ? AND last_seen_ms IS NULL AND revoked_at_ms IS NULL";
 
 /** A successful claim lists the earlier devices of its setup attempt, for the caller to revoke once it has committed. */
 export type ClaimOutcome = { ok: true; revoke: string[] } | { ok: false; code: Error_Code; message: string };
@@ -152,14 +154,14 @@ function joinAttempt(sql: SqlStorage, attempt: ClaimAttempt): string[] {
   if (!attempt.setupAttempt) return [];
   sql.exec("UPDATE devices SET setup_attempt = ? WHERE device_id = ?", attempt.setupAttempt, attempt.deviceId);
   return sql
-    .exec(
-      "SELECT device_id FROM devices WHERE setup_attempt = ? AND user_id = ? AND device_id != ? AND last_seen_ms IS NULL AND revoked_at_ms IS NULL",
-      attempt.setupAttempt,
-      attempt.userId,
-      attempt.deviceId,
-    )
+    .exec(`SELECT device_id FROM devices WHERE ${UNUSED_OF_ATTEMPT} AND device_id != ?`, attempt.setupAttempt, attempt.userId, attempt.deviceId)
     .toArray()
     .map((row) => String(row.device_id));
+}
+
+/** Whether a device joinAttempt returned is still an unused device of that owner's attempt. */
+export function stillUnused(sql: SqlStorage, deviceId: string, setupAttempt: string, userId: string): boolean {
+  return sql.exec(`SELECT 1 FROM devices WHERE ${UNUSED_OF_ATTEMPT} AND device_id = ?`, setupAttempt, userId, deviceId).toArray().length > 0;
 }
 
 /** The Worker's recovery key hash, if the attempt presents that key. */

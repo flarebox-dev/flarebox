@@ -2,7 +2,7 @@
 
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { DurableObject } from "cloudflare:workers";
-import { type ClaimAttempt, MAX_SETUP_ATTEMPT_LENGTH, MIN_RECOVERY_KEY_LENGTH, ownerOf, redeemClaim, storeClaimCode, wrongCode } from "./account/claim";
+import { type ClaimAttempt, MAX_SETUP_ATTEMPT_LENGTH, MIN_RECOVERY_KEY_LENGTH, ownerOf, redeemClaim, stillUnused, storeClaimCode, wrongCode } from "./account/claim";
 import { migrate } from "./account/schema";
 import { ACCESS_TOKEN_MS, type ServerKey, signAccessToken } from "./auth";
 import { base64url, deriveSpaceKey, sha256 } from "./crypto";
@@ -248,7 +248,11 @@ export class AccountDO extends DurableObject<Env> {
     };
     const outcome = this.ctx.storage.transactionSync(() => redeemClaim(this.sql, attempt));
     if (!outcome.ok) return outcome;
-    for (const deviceId of outcome.revoke) await this.revokeDevice(deviceId);
+    // Each check runs right before revokeDevice's first transaction, with no await between them, so a device that
+    // refreshed a token while an earlier revocation awaited its notices is kept.
+    for (const deviceId of outcome.revoke) {
+      if (stillUnused(this.sql, deviceId, setupAttempt, userId)) await this.revokeDevice(deviceId);
+    }
     return ok(create(DeviceCredentialsSchema, { ...device.credentials, userName: this.userName(userId) }));
   }
 

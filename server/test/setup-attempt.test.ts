@@ -3,7 +3,7 @@
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { AccountDO } from "../src/account-do";
 import { type DeviceCredentials, ServerInfoSchema, TokenRequestSchema } from "../src/gen/flarebox/v1/auth_pb";
 import { Error_Code } from "../src/gen/flarebox/v1/rpc_pb";
@@ -79,5 +79,40 @@ describe("recovery-key claims of one setup attempt", () => {
     const outcome = await account().claim({ code: key, userName: "Owner", deviceName: "Laptop", platform: "macos", setupAttempt: "x".repeat(65) }, ADDRESS, key);
     expect(outcome).toMatchObject({ ok: false, code: Error_Code.INVALID_ARGUMENT });
     expect(await activeDevices()).toEqual(before);
+  });
+});
+
+describe("cleanup after a claim", () => {
+  it("keeps a selected device that refreshes a token while an earlier revocation is still delivering", async () => {
+    const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName("refresh-during-cleanup"));
+    const claimOn = async (setupAttempt: string) => {
+      const key = crypto.randomUUID() + crypto.randomUUID();
+      const outcome = await stub.claim({ code: key, userName: "Owner", deviceName: "Laptop", platform: "macos", setupAttempt }, ADDRESS, key);
+      if (!outcome.ok) throw new Error(outcome.message);
+      return outcome.value;
+    };
+    const first = await claimOn("first");
+    const second = await claimOn("second");
+    await stub.createSpace({ userId: first.userId, name: "Space" });
+    await runInDurableObject(stub, async (instance: AccountDO, state) => {
+      state.storage.sql.exec("UPDATE devices SET setup_attempt = 'interrupted'");
+      const revoke = instance.revokeDevice.bind(instance);
+      const revoked: string[] = [];
+      const spy = vi.spyOn(instance, "revokeDevice").mockImplementation(async (deviceId) => {
+        revoked.push(deviceId);
+        await revoke(deviceId);
+        const other = deviceId === first.deviceId ? second : first;
+        expect((await instance.refreshAccess({ deviceId: other.deviceId, refreshCredential: other.refreshCredential })).ok).toBe(true);
+      });
+      try {
+        const key = crypto.randomUUID() + crypto.randomUUID();
+        expect((await instance.claim({ code: key, userName: "Owner", deviceName: "Laptop", platform: "macos", setupAttempt: "interrupted" }, ADDRESS, key)).ok).toBe(true);
+        expect(revoked).toHaveLength(1);
+        const refreshed = revoked[0] === first.deviceId ? second : first;
+        expect(await instance.isDeviceActive(refreshed.deviceId)).toBe(true);
+      } finally {
+        spy.mockRestore();
+      }
+    });
   });
 });
