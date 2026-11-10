@@ -648,6 +648,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_listing_that_repeats_its_cursor_stops_before_any_delete() {
+        let listing = |query: &str| {
+            let body = json!({
+                "success": true,
+                "errors": [],
+                "result": [{ "key": "spaces/a/meta/1/space.json" }],
+                "result_info": { "cursor": "c1", "is_truncated": true },
+            });
+            cf_status(
+                "GET",
+                &format!("/r2/buckets/flarebox/objects?per_page=1000{query}"),
+                200,
+                body,
+            )
+        };
+        let (fake, mut cloud) = start(vec![
+            bucket(BUCKET_CREATED),
+            cf("GET", "/workers/scripts", json!([])),
+            listing(""),
+            listing("&cursor=c1"),
+        ])
+        .await;
+        let (_dir, file) = state_file();
+        file.save(&recorded("")).unwrap();
+
+        let error = finish(&mut cloud, &file, recorded("")).await.unwrap_err();
+
+        assert!(error.contains("same cursor"), "{error}");
+        assert!(!fake.sent(&["DELETE"]));
+        assert_eq!(file.load().unwrap(), Some(recorded("")));
+    }
+
+    #[tokio::test]
     async fn a_bucket_that_is_gone_completes_the_uninstall() {
         let (fake, mut cloud) = start(vec![missing("GET", "/r2/buckets/flarebox")]).await;
         let (_dir, file) = state_file();

@@ -13,6 +13,7 @@ mod state;
 mod uninstall;
 
 use std::io::{BufRead, IsTerminal, Write};
+use std::path::Path;
 use std::process::{Command as Process, Stdio};
 use std::time::{Duration, Instant};
 
@@ -223,6 +224,28 @@ fn not_set_up(paths: &Paths) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Why a new deploy or claim must not replace `state`, the state file of a run in `account` or another one that has
+/// not finished: the file is that run's only record of what it created.
+fn unfinished(state: &SetupState, account: &str, file: &Path) -> String {
+    let run = if state.account != account {
+        format!(
+            "a setup of {} in another Cloudflare account ({}) has not finished; run flarebox setup and log in to that account to finish it",
+            state.script, state.account
+        )
+    } else if state.step == Step::Uninstalling {
+        format!(
+            "the uninstall of {} has not finished; run flarebox server uninstall to finish it",
+            state.script
+        )
+    } else {
+        format!(
+            "the deploy of {} has not finished; run flarebox setup to finish it",
+            state.script
+        )
+    };
+    format!("{run}, or delete {} to forget it", file.display())
 }
 
 fn report_paired(paths: &Paths, response: Response) -> Result<(), String> {
@@ -608,7 +631,12 @@ impl Session {
     fn resumable(&self, paths: &Paths) -> Result<Option<SetupState>, String> {
         Ok(StateFile::new(paths)
             .load()?
-            .filter(|state| state.account == self.account() && state.step != Step::Uninstalling))
+            .filter(|state| self.continues(state)))
+    }
+
+    /// Whether `state` is an unfinished deploy in this session's account, which setup goes on with.
+    fn continues(&self, state: &SetupState) -> bool {
+        state.account == self.account() && state.step != Step::Uninstalling
     }
 
     /// `flarebox setup` after the login: finish an interrupted deploy, deploy a new server, or add this device.
@@ -644,6 +672,10 @@ impl Session {
 
     /// Picks a free Worker name and a new bucket name, then deploys and claims a new server (sections 4.3 and 4.4).
     async fn deploy(&mut self, paths: &Paths, device_name: &str) -> Result<(), String> {
+        let file = StateFile::new(paths);
+        if let Some(state) = file.load()? {
+            return Err(unfinished(&state, self.account(), file.path()));
+        }
         let bundle = embedded_bundle()?;
         self.require_r2().await?;
         let api = self.fresh().await?;
@@ -661,7 +693,7 @@ impl Session {
             bucket: new_bucket_name(base),
             ..SetupState::default()
         };
-        StateFile::new(paths).save(&state)?;
+        file.save(&state)?;
         self.finish_deploy(paths, state, device_name).await
     }
 
@@ -739,6 +771,14 @@ impl Session {
         device_name: &str,
         interactive: bool,
     ) -> Result<(), String> {
+        let file = StateFile::new(paths);
+        let saved = match file.load()? {
+            Some(state) if self.continues(&state) && state.script == server.script.id => {
+                Some(state)
+            }
+            Some(other) => return Err(unfinished(&other, self.account(), file.path())),
+            None => None,
+        };
         let info = match server.info.clone() {
             Some(info) => info,
             None if interactive => {
@@ -782,10 +822,7 @@ impl Session {
         if !info.claimed {
             window = Duration::from_secs(330);
         }
-        let state = match self
-            .resumable(paths)?
-            .filter(|state| state.script == server.script.id)
-        {
+        let state = match saved {
             Some(state) => state,
             None => SetupState {
                 account: self.account().to_owned(),
@@ -1358,6 +1395,77 @@ mod tests {
             && seen.path.ends_with("/workers/scripts/flarebox/subdomain")));
         assert!(paths.credential().exists());
         assert_eq!(StateFile::new(&paths).load().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_deploy_keeps_the_state_file_of_a_run_that_has_not_finished() {
+        let others = [
+            SetupState {
+                account: "another-account".into(),
+                script: "flarebox".into(),
+                bucket: new_bucket_name("flarebox"),
+                step: Step::BucketCreated,
+                ..SetupState::default()
+            },
+            SetupState {
+                account: ACCOUNT.into(),
+                script: "flarebox".into(),
+                bucket: new_bucket_name("flarebox"),
+                step: Step::Uninstalling,
+                ..SetupState::default()
+            },
+        ];
+        for other in others {
+            let fake = Fake::start(vec![tokens()]).await;
+            let mut session = fake::session(&fake).await;
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::under(dir.path());
+            StateFile::new(&paths).save(&other).unwrap();
+
+            let error = session.deploy(&paths, "desk").await.unwrap_err();
+
+            assert!(error.contains("has not finished"), "{error}");
+            assert_eq!(StateFile::new(&paths).load().unwrap(), Some(other));
+            assert!(
+                !fake
+                    .seen()
+                    .iter()
+                    .any(|seen| seen.path.contains("/accounts/"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn adding_a_device_keeps_the_unfinished_deploy_of_another_worker() {
+        let fake = Fake::start(vec![tokens()]).await;
+        let mut session = fake::session(&fake).await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let unfinished = SetupState {
+            account: ACCOUNT.into(),
+            script: "flarebox-2".into(),
+            bucket: new_bucket_name("flarebox"),
+            step: Step::BucketCreated,
+            ..SetupState::default()
+        };
+        StateFile::new(&paths).save(&unfinished).unwrap();
+
+        let error = session
+            .add_device(&paths, deployed(&fake), "laptop", true)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.contains("the deploy of flarebox-2 has not finished"),
+            "{error}"
+        );
+        assert_eq!(StateFile::new(&paths).load().unwrap(), Some(unfinished));
+        assert!(
+            !fake
+                .seen()
+                .iter()
+                .any(|seen| seen.path.contains("/accounts/") || seen.path.starts_with("/v1/"))
+        );
     }
 
     #[test]

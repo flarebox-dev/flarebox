@@ -50,6 +50,10 @@ pub enum DriverError {
         "the server did not confirm that it revoked this device ({0}); if this is the last active device of its user, only owner recovery adds a device again after it signs out"
     )]
     NotRevoked(String),
+    #[error(
+        "the saved credential now belongs to device {device_id}, not to the one the server refused, so it was kept; run the command again"
+    )]
+    CredentialReplaced { device_id: String },
     #[error(transparent)]
     Paths(#[from] PathsError),
     #[error(transparent)]
@@ -394,6 +398,26 @@ impl Driver {
     /// stays linked, so signing out again finishes it.
     pub async fn sign_out(&self, confirm_last_device: bool) -> Result<(), DriverError> {
         let _lifecycle = self.inner.lifecycle.lock().await;
+        self.signing_out(confirm_last_device).await
+    }
+
+    /// Signs out like [`Driver::sign_out`] with `confirm_last_device`, but only while the saved credential is
+    /// `device_id`'s. A caller that found the server refusing that device's credential uses it, so a credential another
+    /// run saved meanwhile is kept and [`DriverError::CredentialReplaced`] names its device.
+    pub async fn sign_out_device(&self, device_id: &str) -> Result<(), DriverError> {
+        let _lifecycle = self.inner.lifecycle.lock().await;
+        if let Some(saved) = self.inner.credential.lock().unwrap().as_ref()
+            && saved.device_id != device_id
+        {
+            return Err(DriverError::CredentialReplaced {
+                device_id: saved.device_id.clone(),
+            });
+        }
+        self.signing_out(true).await
+    }
+
+    /// The sign-out itself, run while the caller holds the lifecycle lock.
+    async fn signing_out(&self, confirm_last_device: bool) -> Result<(), DriverError> {
         let was_running = self.inner.running.load(Ordering::SeqCst);
         self.stop().await;
         let signed_in = self.inner.credential.lock().unwrap().clone();
@@ -1759,6 +1783,27 @@ mod tests {
         let reopened = Driver::open(paths).unwrap().status();
         assert_eq!(reopened.account.unwrap().device_id, "d3");
         assert!(reopened.folders.is_empty());
+    }
+
+    #[tokio::test]
+    async fn signing_out_a_refused_device_keeps_a_credential_saved_for_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Flarebox");
+        let paths = Paths::under(&base.join("profile"));
+        linked(&paths, &root, "d2");
+        let driver = Driver::open(paths.clone()).unwrap();
+
+        let error = driver.sign_out_device("d1").await.unwrap_err();
+
+        assert!(
+            matches!(&error, DriverError::CredentialReplaced { device_id } if device_id == "d2"),
+            "{error}"
+        );
+        assert!(paths.credential().exists());
+        let status = driver.status();
+        assert_eq!(status.account.unwrap().device_id, "d2");
+        assert_eq!(status.folders.len(), 1);
     }
 
     /// Serves one request per entry of `replies`, an HTTP status and a protobuf body, on a loopback port, in order,

@@ -237,11 +237,16 @@ pub async fn saved_device(paths: &Paths, server: &Url) -> Result<bool, String> {
     match Auth::new(api, credential.net()).access_token().await {
         Ok(_) => Ok(true),
         Err(error) if error.is_unauthenticated() => {
-            println!(
-                "The server no longer accepts this device's saved credential, so it was removed."
-            );
-            match ipc::run(paths, Request::SignOut).await? {
-                Response::SignedOut => Ok(false),
+            let request = Request::SignOut {
+                device_id: credential.device_id,
+            };
+            match ipc::run(paths, request).await? {
+                Response::SignedOut => {
+                    println!(
+                        "The server no longer accepts this device's saved credential, so it was removed."
+                    );
+                    Ok(false)
+                }
                 Response::Error { message } => Err(message),
                 other => Err(format!("the daemon answered {other:?}")),
             }
