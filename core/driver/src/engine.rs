@@ -384,13 +384,17 @@ impl Engine {
                 Observed::Created { .. } | Observed::Modified { .. } => None,
             })
             .collect();
+        let moving: BTreeSet<NodeId> = (changes.iter().zip(&before))
+            .filter(|(change, _)| matches!(change, Observed::Renamed { .. }))
+            .filter_map(|(_, before)| before.clone())
+            .collect();
         let mut touched = BTreeSet::new();
         let mut gone = Gone::new();
         for (change, before) in changes.iter().zip(before) {
             match change {
                 Observed::Removed { .. } => {
                     if let Some(id) = before {
-                        self.remove(&id, &mut touched, &mut gone);
+                        self.remove(&id, &moving, &mut touched, &mut gone);
                     }
                 }
                 Observed::Renamed { to, kind, id, .. } => {
@@ -421,6 +425,7 @@ impl Engine {
                         identity,
                         content,
                         now_ms,
+                        &moving,
                         &mut touched,
                         &mut gone,
                     );
@@ -453,6 +458,7 @@ impl Engine {
                         identity,
                         content.clone(),
                         now_ms,
+                        &moving,
                         &mut touched,
                         &mut gone,
                     );
@@ -473,10 +479,20 @@ impl Engine {
                         identity,
                         Some(content.clone()),
                         now_ms,
+                        &moving,
                         &mut touched,
                         &mut gone,
                     );
                 }
+            }
+        }
+        for id in &moving {
+            let local = self.trees.local();
+            let orphaned = local.get(id).is_some_and(|node| {
+                node.shape.parent != local.root && local.get(&node.shape.parent).is_none()
+            });
+            if orphaned {
+                self.remove(id, &BTreeSet::new(), &mut touched, &mut gone);
             }
         }
         touched
@@ -569,6 +585,7 @@ impl Engine {
         identity: FileIdentity,
         content: Option<Content>,
         now_ms: u64,
+        moving: &BTreeSet<NodeId>,
         touched: &mut BTreeSet<NodeId>,
         gone: &mut Gone,
     ) {
@@ -628,11 +645,11 @@ impl Engine {
                 self.trees.synced().get(&id).is_some() || self.trees.remote().get(&id).is_some();
             if kind == Kind::File && replaced == Some(Kind::File) && !synced {
                 if self.trees.local().get(&id).is_some() {
-                    self.remove(&id, touched, gone);
+                    self.remove(&id, moving, touched, gone);
                 }
                 id = holder;
             } else {
-                self.remove(&holder, touched, gone);
+                self.remove(&holder, moving, touched, gone);
             }
         }
         self.trees.set_local(
@@ -646,12 +663,20 @@ impl Engine {
         touched.insert(id);
     }
 
-    /// Removes `id` and every node placed under it from L, and adds each of them to `gone`.
-    fn remove(&mut self, id: &NodeId, touched: &mut BTreeSet<NodeId>, gone: &mut Gone) {
+    /// Removes `id` and every node placed under it from L, except the nodes in `moving`, which the batch moves
+    /// elsewhere, with what is placed under them, and adds each node it removes to `gone`.
+    fn remove(
+        &mut self,
+        id: &NodeId,
+        moving: &BTreeSet<NodeId>,
+        touched: &mut BTreeSet<NodeId>,
+        gone: &mut Gone,
+    ) {
         let mut doomed = vec![id.clone()];
         let mut next = 0;
         while let Some(current) = doomed.get(next).cloned() {
-            doomed.extend(self.trees.local_children(&current).cloned());
+            let children = self.trees.local_children(&current);
+            doomed.extend(children.filter(|child| !moving.contains(*child)).cloned());
             next += 1;
         }
         for id in &doomed {
@@ -1537,6 +1562,90 @@ mod tests {
             .as_ref()
             .map_or(0, |content| content.size);
         Some((id, node.identity, size))
+    }
+
+    /// The scan reports a folder removed and entries renamed out of it in one batch, as it can for `rm -r b && mv a
+    /// b` (GUN-353). The entries keep their nodes, with what L holds below them, and only the folder leaves L.
+    #[test]
+    fn entries_renamed_out_of_a_folder_removed_in_the_same_batch_keep_their_nodes() {
+        let (_dir, mut engine) = mapper();
+        let folder = |path: &str, id: u64| Observed::Created {
+            path: path.into(),
+            kind: EntryKind::Dir,
+            id: ino(id),
+            linked: false,
+            content: None,
+        };
+        engine.observe(
+            &[
+                folder("drafts", 1),
+                folder("final", 2),
+                folder("drafts/inner", 3),
+                created("drafts/inner/two.txt", ino(4), false, 2),
+                created("drafts/one.txt", ino(5), false, 1),
+            ],
+            0,
+        );
+        let held = |engine: &Engine, paths: [&str; 3]| {
+            paths.map(|path| holding(engine, path).map(|(id, _, size)| (id, size)))
+        };
+        let before = held(
+            &engine,
+            ["drafts/inner", "drafts/inner/two.txt", "drafts/one.txt"],
+        );
+        assert!(before.iter().all(Option::is_some));
+        engine.observe(
+            &[
+                Observed::Removed {
+                    path: "drafts".into(),
+                    kind: EntryKind::Dir,
+                },
+                Observed::Renamed {
+                    from: "drafts/inner".into(),
+                    to: "final/inner".into(),
+                    kind: EntryKind::Dir,
+                    id: ino(3),
+                    linked: false,
+                },
+                renamed("drafts/one.txt", "final/one.txt", ino(5), false),
+            ],
+            0,
+        );
+        let after = held(
+            &engine,
+            ["final/inner", "final/inner/two.txt", "final/one.txt"],
+        );
+        assert_eq!(after, before);
+        assert_eq!(holding(&engine, "drafts"), None);
+        assert_eq!(engine.trees.local().iter().count(), 4);
+        assert_eq!(engine.trees.check(), Ok(()));
+    }
+
+    /// An entry renamed out of a removed folder to a folder L does not hold leaves L with that folder, so L stays a
+    /// tree.
+    #[test]
+    fn an_entry_renamed_out_of_a_removed_folder_into_no_folder_leaves_l() {
+        let (_dir, mut engine) = mapper();
+        let drafts = Observed::Created {
+            path: "drafts".into(),
+            kind: EntryKind::Dir,
+            id: ino(1),
+            linked: false,
+            content: None,
+        };
+        engine.observe(&[drafts, created("drafts/one.txt", ino(2), false, 1)], 0);
+        engine.observe(
+            &[
+                Observed::Removed {
+                    path: "drafts".into(),
+                    kind: EntryKind::Dir,
+                },
+                renamed("drafts/one.txt", "elsewhere/one.txt", ino(2), false),
+            ],
+            0,
+        );
+        assert_eq!(engine.trees.local().iter().count(), 0);
+        assert_eq!(engine.trees.check(), Ok(()));
     }
 
     /// A batch that lists every rules file takes the place of the rules the trees had: a folder it does not list has
