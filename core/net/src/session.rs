@@ -28,7 +28,7 @@ use rustls_platform_verifier::BuilderVerifierExt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::error::Elapsed;
 use tokio::time::{Instant, sleep, sleep_until, timeout, timeout_at};
 use tokio_rustls::TlsConnector;
@@ -169,6 +169,8 @@ impl Session {
                     stopped,
                     next_req: 1,
                     pending: BTreeMap::new(),
+                    over_http: BTreeMap::new(),
+                    http: JoinSet::new(),
                     stream: Stream::default(),
                     attempt: 0,
                     token: None,
@@ -413,6 +415,8 @@ struct PendingCall {
     call: Call,
     commit: Option<CommitSlot>,
     reply: Reply,
+    /// Whether the call went out on a connection. A pending call that did was not answered there.
+    sent: bool,
 }
 
 trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -461,6 +465,9 @@ struct Task {
     next_req: u64,
     /// Calls not yet answered, by `req_id`. A call keeps its `req_id` when it is resent on a new connection.
     pending: BTreeMap<u64, PendingCall>,
+    /// Commits being resent over HTTP RPC, by `req_id`, and the requests, each ending with its `req_id`.
+    over_http: BTreeMap<u64, PendingCall>,
+    http: JoinSet<(u64, Result<RpcResponse, ApiError>)>,
     stream: Stream,
     /// Failed connection attempts since the last `Welcome`.
     attempt: u32,
@@ -504,7 +511,11 @@ impl Task {
         };
         tracing::debug!(%reason, "flarebox session stopped");
         let _ = self.stopped.set(reason.clone());
-        for (_, call) in std::mem::take(&mut self.pending) {
+        let pending = std::mem::take(&mut self.pending);
+        for (_, call) in pending
+            .into_iter()
+            .chain(std::mem::take(&mut self.over_http))
+        {
             let _ = call.reply.send(Err(CallError::Stopped(reason.clone())));
         }
         self.emit(Event::Stopped(reason));
@@ -521,7 +532,7 @@ impl Task {
                     None | Some(Command::Close) => return false,
                     Some(Command::Call { call, commit, reply }) => {
                         let req_id = self.req_id();
-                        self.pending.insert(req_id, PendingCall { call, commit, reply });
+                        self.pending.insert(req_id, PendingCall { call, commit, reply, sent: false });
                     }
                     Some(Command::Subscribe(history_id, since_seq)) => {
                         self.stream.subscribe(history_id, since_seq);
@@ -751,33 +762,85 @@ impl Task {
         }
     }
 
-    /// Resends the calls of a dropped connection on this one. A commit goes only where `may_resend` allows it.
+    /// Resends the calls of a dropped connection. A commit goes only where `may_resend` allows it, and a commit that
+    /// went out on the dropped connection goes over HTTP RPC instead of this one: a commit that breaks the server's
+    /// storage gets no answer on a socket, whose connection then closes, but HTTP RPC answers it with
+    /// `QUOTA_EXCEEDED` and a wait. The other calls go on this connection. A commit still out over HTTP RPC is
+    /// checked against each later `Welcome` as well, and once one refuses it, its HTTP answer is ignored and it is
+    /// not sent on the socket.
     async fn resend(&mut self, welcome: &Welcome, socket: &mut Socket) -> Result<(), Exit> {
-        let refused: Vec<(u64, NotResent)> = self
-            .pending
-            .iter()
-            .filter_map(|(req_id, call)| {
-                Some((*req_id, may_resend(call.commit.as_ref()?, welcome).err()?))
-            })
-            .collect();
-        for (req_id, reason) in refused {
-            if let Some(call) = self.pending.remove(&req_id) {
-                tracing::debug!(%reason, "flarebox session did not resend a commit");
-                let _ = call.reply.send(Err(CallError::NotResent(reason)));
+        for calls in [&mut self.pending, &mut self.over_http] {
+            let refused: Vec<(u64, NotResent)> = (calls.iter())
+                .filter_map(|(req_id, call)| {
+                    Some((*req_id, may_resend(call.commit.as_ref()?, welcome).err()?))
+                })
+                .collect();
+            for (req_id, reason) in refused {
+                if let Some(call) = calls.remove(&req_id) {
+                    tracing::debug!(%reason, "flarebox session did not resend a commit");
+                    let _ = call.reply.send(Err(CallError::NotResent(reason)));
+                }
             }
         }
-        let calls: Vec<RpcRequest> = self
-            .pending
-            .iter()
-            .map(|(req_id, call)| RpcRequest {
-                req_id: *req_id,
-                call: Some(call.call.clone()),
+        let unanswered: Vec<u64> = (self.pending.iter())
+            .filter(|(_, call)| call.sent && call.commit.is_some())
+            .map(|(req_id, _)| *req_id)
+            .collect();
+        for req_id in unanswered {
+            let call = self.pending.remove(&req_id).expect("listed above");
+            let (auth, space_id, request) = (
+                self.auth.clone(),
+                self.config.space_id.clone(),
+                call.call.clone(),
+            );
+            self.http
+                .spawn(async move { (req_id, auth.api().rpc(&auth, &space_id, request).await) });
+            self.over_http.insert(req_id, call);
+        }
+        let calls: Vec<RpcRequest> = (self.pending.iter_mut())
+            .map(|(req_id, call)| {
+                call.sent = true;
+                RpcRequest {
+                    req_id: *req_id,
+                    call: Some(call.call.clone()),
+                }
             })
             .collect();
         for request in calls {
             self.send(socket, client_message::Msg::Rpc(request)).await?;
         }
         Ok(())
+    }
+
+    /// The answer to a commit resent over HTTP RPC. A refusal or a result is the call's answer, as on the socket. A
+    /// request that did not reach the server sends the commit on the socket instead.
+    async fn answered_over_http(
+        &mut self,
+        req_id: u64,
+        answer: Result<RpcResponse, ApiError>,
+        socket: &mut Socket,
+    ) -> Result<(), Exit> {
+        let Some(mut call) = self.over_http.remove(&req_id) else {
+            return Ok(());
+        };
+        let result = match answer {
+            Ok(response) => response.result,
+            Err(error) => match error.server() {
+                Some(refusal) => Some(rpc_response::Result::Error(refusal.0.clone())),
+                None => {
+                    tracing::debug!(%error, "flarebox session could not resend a commit over HTTP; sending it on the socket");
+                    let request = RpcRequest {
+                        req_id,
+                        call: Some(call.call.clone()),
+                    };
+                    call.sent = true;
+                    self.pending.insert(req_id, call);
+                    return self.send(socket, client_message::Msg::Rpc(request)).await;
+                }
+            },
+        };
+        self.pending.insert(req_id, call);
+        self.answer(RpcResponse { req_id, result }, socket).await
     }
 
     async fn serve(&mut self, mut socket: Socket, mut token: AccessToken) -> Exit {
@@ -813,11 +876,16 @@ impl Task {
                         Some(Command::Call { call, commit, reply }) => {
                             let req_id = self.req_id();
                             let request = RpcRequest { req_id, call: Some(call.clone()) };
-                            self.pending.insert(req_id, PendingCall { call, commit, reply });
+                            self.pending.insert(req_id, PendingCall { call, commit, reply, sent: true });
                             self.send(&mut socket, client_message::Msg::Rpc(request)).await
                         }
                     };
                     if let Err(exit) = sent {
+                        return exit;
+                    }
+                }
+                Some(Ok((req_id, answer))) = self.http.join_next(), if !self.http.is_empty() => {
+                    if let Err(exit) = self.answered_over_http(req_id, answer, &mut socket).await {
                         return exit;
                     }
                 }
