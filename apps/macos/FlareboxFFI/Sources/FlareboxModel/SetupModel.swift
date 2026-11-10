@@ -125,7 +125,10 @@ public final class SetupModel {
         }
     }
 
+    /// Runs one step at a time: a step asked for while another runs is dropped, so two space
+    /// reloads never race to pick the selected space.
     private func attempt(_ body: () async throws -> Void) async {
+        guard !isBusy else { return }
         isBusy = true
         error = nil
         defer { isBusy = false }
