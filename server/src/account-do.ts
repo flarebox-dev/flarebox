@@ -391,8 +391,8 @@ export class AccountDO extends DurableObject<Env> {
       console.error("rewind admission failed", error);
       return failure(Error_Code.RETRY_LATER, "the space could not be read; retry the rewind");
     }
-    if (!info.descriptorDurable) return failure(Error_Code.RETRY_LATER, "the space's current history is not exported yet");
     if (info.historyId !== args.expectedHistoryId) return failure(Error_Code.HISTORY_MISMATCH, "expected_history_id is not the space's current history");
+    if (!info.descriptorDurable) return failure(Error_Code.RETRY_LATER, "the space's current history is not exported to R2 yet");
     if (this.rewindRow(args.rewindId) || this.spaceClosed(args.spaceId)) return failure(Error_Code.RETRY_LATER, "another rewind of this space has not ended");
 
     const count = Number(this.sql.exec("SELECT rewind_count FROM space_rewinds WHERE space_id = ?", args.spaceId).toArray()[0]?.rewind_count ?? 0) + 1;
