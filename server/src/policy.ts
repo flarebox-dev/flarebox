@@ -19,15 +19,21 @@ export type Capability = "space.create" | "device.pair" | "device.manage" | "sha
 
 /** The transition one op made, read from the tree just before and just after it (RFC 0006 section 3). */
 export interface OpEffect {
+  /**
+   * The nodes the op names, by effective ID: its node, after R2's re-keying (the existing folder a CreateDir merged into,
+   * or that an earlier op's merge made an ID stand for), and the parent or target folder it names. A node here that the
+   * op did not change is not in changed.
+   */
+  nodes: ReadonlySet<string>;
   /** Every node whose parent, name, status or content the op changed, by effective ID, the nodes it created included. */
   changed: ReadonlySet<string>;
   /** The nodes the op created, such as a new file, a new folder or a conflict copy. */
   created: ReadonlySet<string>;
-  /** The node's ancestors from the root down before the op, or undefined for a node the op created. */
+  /** The node's ancestors from the root down before the op, or undefined for a node the op created. Takes any ID the commit used. */
   ancestryBefore(nodeId: string): string[] | undefined;
-  /** The node's ancestors from the root down after the op. */
+  /** The node's ancestors from the root down after the op. Takes any ID the commit used. */
   ancestryAfter(nodeId: string): string[];
-  /** Every node under nodeId at any depth, trashed ones included. */
+  /** Every node under nodeId at any depth, trashed ones included. Takes any ID the commit used. */
   subtree(nodeId: string): string[];
 }
 

@@ -29,6 +29,7 @@ const ACCOUNT_SCHEMA_DIGESTS = [
   "2c844373f6d282297d92a724cfdc83b62a30648e517e9f34c6e5c528e5437c7d",
   "b67a86b2ae0d362375f2879afc44654cdf43a636f02849f823296d467777e3e0",
   "81a059462fcc85e8d79e39486df0357cd8d2ca2b06c5ec5cc11b35f484b33185",
+  "b6c36eba27d26386f256dc8d64bc63f97cd5d47c47b4f328fb608a1e21b6b0f8",
 ];
 
 type Stub = DurableObjectStub<SpaceDO> | DurableObjectStub<AccountDO>;
@@ -218,7 +219,7 @@ describe("upgraded objects keep working", () => {
     const stub = ACCOUNT.stub("principals") as DurableObjectStub<AccountDO>;
     const deviceId = uuidv7();
     await inObject(stub, (sql) => {
-      rewrite(sql, ACCOUNT, { label: "", applied: ACCOUNT.steps.length - 1, versioned: true });
+      rewrite(sql, ACCOUNT, { label: "", applied: 3, versioned: true });
       sql.exec(
         "INSERT INTO devices (device_id, user_id, name, platform, created_at_ms, refresh_hash) VALUES (?, ?, 'Laptop', 'macos', 1, ?)",
         deviceId,
@@ -227,7 +228,7 @@ describe("upgraded objects keep working", () => {
       );
     });
     await evictDurableObject(stub);
-    expect(await stub.checkSession(deviceId)).toEqual({ active: true, closed: false, kind: "device", scope: null });
+    expect(await stub.checkSession(deviceId)).toEqual({ active: true, revoked: false, closed: false, kind: "device", scope: null });
     const row = await inObject(stub, (sql) => sql.exec("SELECT kind, scope, expires_at_ms, issued_by FROM devices WHERE device_id = ?", deviceId).one());
     expect(row).toEqual({ kind: "device", scope: null, expires_at_ms: null, issued_by: null });
   });

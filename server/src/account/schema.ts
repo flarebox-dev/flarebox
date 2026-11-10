@@ -52,6 +52,11 @@ export const MIGRATIONS: readonly Migration[] = [
     if (!columns.includes("expires_at_ms")) sql.exec("ALTER TABLE devices ADD COLUMN expires_at_ms INTEGER");
     if (!columns.includes("issued_by")) sql.exec("ALTER TABLE devices ADD COLUMN issued_by TEXT");
   },
+  // RFC 0006 section 7: a revocation's notice to each space, kept until the space took it.
+  `
+  CREATE TABLE IF NOT EXISTS revocation_notices (device_id TEXT NOT NULL, space_id TEXT NOT NULL, next_try_ms INTEGER NOT NULL,
+    PRIMARY KEY (device_id, space_id));
+  `,
 ];
 
 export function migrate(sql: SqlStorage): void {

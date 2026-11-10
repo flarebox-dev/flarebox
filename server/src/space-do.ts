@@ -371,7 +371,7 @@ export class SpaceDO extends DurableObject<Env> {
     const device = this.sql.exec("SELECT max_format FROM devices WHERE device_id = ?", connect.identity.deviceId).toArray()[0];
     const session = this.sessionOf(connect, role, device ? Number(device.max_format) : FORMAT_VERSION, check);
     const { response, record } = await this.call(session, req);
-    if (record) this.broadcast(record);
+    if (record) await this.broadcast(record);
     return toBinary(RpcResponseSchema, response);
   }
 
@@ -418,7 +418,7 @@ export class SpaceDO extends DurableObject<Env> {
     if (msg.case === "rpc") {
       const { response, record } = await this.call(this.sessionOf(attachment, attachment.role, attachment.maxFormat, check), msg.value);
       this.send(ws, { case: "rpc", value: response });
-      if (record) this.broadcast(record, attachment.connId);
+      if (record) await this.broadcast(record, attachment.connId);
       return;
     }
     return this.goodbye(ws, Close.PROTOCOL, "empty ClientMessage");
@@ -450,7 +450,7 @@ export class SpaceDO extends DurableObject<Env> {
    * drop every connection.
    */
   private async checkDevice(deviceId: string): Promise<SessionCheck | undefined> {
-    if (this.revoked(deviceId)) return { active: false, closed: false, kind: "", scope: null };
+    if (this.revoked(deviceId)) return { active: false, revoked: true, closed: false, kind: "", scope: null };
     const account = this.account();
     const spaceId = String(getMeta(this.sql, "space_id"));
     const check = await this.ctx.blockConcurrencyWhile(async () => {
@@ -461,8 +461,37 @@ export class SpaceDO extends DurableObject<Env> {
         return undefined;
       }
     });
-    if (check?.active === false) this.recordRevoked(deviceId);
+    if (check?.revoked) this.recordRevoked(deviceId);
     return check;
+  }
+
+  /**
+   * checkDevice for every device with a live connection, in one Account DO call, so that a push reaches only principals
+   * that may still read the space. Returns undefined when the Account DO cannot answer.
+   */
+  private async checkDevices(deviceIds: string[]): Promise<Map<string, SessionCheck> | undefined> {
+    const checks = new Map<string, SessionCheck>();
+    const unknown = deviceIds.filter((deviceId) => {
+      if (this.revoked(deviceId)) checks.set(deviceId, { active: false, revoked: true, closed: false, kind: "", scope: null });
+      return !checks.has(deviceId);
+    });
+    if (unknown.length === 0) return checks;
+    const account = this.account();
+    const spaceId = String(getMeta(this.sql, "space_id"));
+    const answered = await this.ctx.blockConcurrencyWhile(async () => {
+      try {
+        return await account.checkSessions(unknown, spaceId);
+      } catch (error) {
+        console.error("account device check failed", error);
+        return undefined;
+      }
+    });
+    if (!answered) return undefined;
+    for (const [deviceId, check] of Object.entries(answered)) {
+      if (check.revoked) this.recordRevoked(deviceId);
+      checks.set(deviceId, check);
+    }
+    return checks;
   }
 
   /** A rewind of this space has written its marker and not yet restored or aborted (RFC 0003 section 3). */
@@ -508,15 +537,32 @@ export class SpaceDO extends DurableObject<Env> {
   }
 
   /** Pushes a new commit to every caught-up connection except the one that made it. */
-  private broadcast(record: CommitRecord, exceptConnId?: string): void {
-    const frame = toBinary(ServerMessageSchema, create(ServerMessageSchema, { msg: { case: "changes", value: { commits: [record] } } }));
-    for (const ws of this.ctx.getWebSockets()) {
+  /**
+   * Pushes a commit to the live connections, checking each principal first (RFC 0006 section 7): a connection whose
+   * principal was revoked, expired or became unknown is closed with 4003 instead, and every connection is closed with
+   * 1013 when the Account DO cannot answer. A closed connection catches up with Resume when it reconnects.
+   */
+  private async broadcast(record: CommitRecord, exceptConnId?: string): Promise<void> {
+    const sockets = this.ctx.getWebSockets().filter((ws) => {
       const attachment = ws.deserializeAttachment() as Attachment;
-      if (!attachment.live || attachment.connId === exceptConnId) continue;
-      try {
-        ws.send(frame);
-      } catch {
-        // The socket is closing; the client catches up with Resume when it reconnects.
+      return attachment.live && attachment.connId !== exceptConnId;
+    });
+    if (sockets.length === 0) return;
+    const deviceIds = [...new Set(sockets.map((ws) => (ws.deserializeAttachment() as Attachment).identity.deviceId))];
+    const checks = await this.checkDevices(deviceIds);
+    const frame = toBinary(ServerMessageSchema, create(ServerMessageSchema, { msg: { case: "changes", value: { commits: [record] } } }));
+    for (const ws of sockets) {
+      if (ws.readyState !== WebSocket.OPEN) continue;
+      const check = checks?.get((ws.deserializeAttachment() as Attachment).identity.deviceId);
+      if (!check) this.goodbye(ws, Close.TRY_AGAIN_LATER, "could not check the device; reconnect later");
+      else if (!check.active) this.goodbye(ws, Close.DEVICE_REVOKED, "device revoked");
+      else if (check.closed) this.goodbye(ws, Close.SPACE_REWOUND, "the space is being rewound");
+      else {
+        try {
+          ws.send(frame);
+        } catch {
+          // The socket is closing; the client catches up with Resume when it reconnects.
+        }
       }
     }
   }
@@ -1098,7 +1144,7 @@ export class SpaceDO extends DurableObject<Env> {
       }
       return { expiredVersions: expired.length, purgedNodes: changes.length, record };
     });
-    if (purge.record) this.broadcast(purge.record);
+    if (purge.record) await this.broadcast(purge.record);
 
     const marked = this.ctx.storage.transactionSync(() => {
       const hashes = this.sql

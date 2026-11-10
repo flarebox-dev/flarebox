@@ -45,6 +45,8 @@ const REWIND_MIN_AGE_MS = 60_000;
 const REWIND_MAX_AGE_MS = 29 * DAY_MS;
 /** The Account DO alarm retries a rewind phase with backoff from one second up to ten minutes (RFC 0003 section 3). */
 const REWIND_RETRY_MIN_MS = 1000;
+/** How long the alarm waits before it delivers a revocation notice again to a space that did not take it. */
+const NOTICE_RETRY_MS = 30_000;
 const REWIND_RETRY_MAX_MS = 10 * 60_000;
 
 /** The phases of a rewind record (RFC 0003 section 3). */
@@ -122,9 +124,14 @@ interface DeviceRow {
   issued_by: string | null;
 }
 
-/** What checkSession answers: kind and scope come from the device's row, never from its token (RFC 0006 section 2). */
+/**
+ * What checkSession answers: kind and scope come from the device's row, never from its token (RFC 0006 section 2).
+ * revoked is set only for a device whose revocation is recorded, which cannot be undone; a device that is inactive
+ * for another reason, such as an expired credential or a kind this server does not know, may become active again.
+ */
 export interface SessionCheck {
   active: boolean;
+  revoked: boolean;
   closed: boolean;
   kind: string;
   scope: string | null;
@@ -369,19 +376,55 @@ export class AccountDO extends DurableObject<Env> {
     });
   }
 
-  /** DELETE /v1/devices/{device_id}: revokes one of the user's principals; revoking a revoked one changes nothing. */
+  /**
+   * DELETE /v1/devices/{device_id}: revokes one of the user's principals. Revoking a revoked one changes nothing, but
+   * delivers the notices still pending for it.
+   */
   async revokeUserDevice(args: { userId: string; deviceId: string }): Promise<Outcome<null>> {
-    const row = this.sql.exec("SELECT revoked_at_ms FROM devices WHERE device_id = ? AND user_id = ?", args.deviceId, args.userId).toArray()[0];
-    if (!row) return failure(Error_Code.NOT_FOUND, "no such device");
-    if (row.revoked_at_ms === null) await this.revokeDevice(args.deviceId);
+    const found = this.sql.exec("SELECT 1 FROM devices WHERE device_id = ? AND user_id = ?", args.deviceId, args.userId).toArray().length > 0;
+    if (!found) return failure(Error_Code.NOT_FOUND, "no such device");
+    await this.revokeDevice(args.deviceId);
     return ok(null);
   }
 
-  /** Revokes a device: its refresh credential stops working and its open WebSockets close with 4003. */
+  /**
+   * Revokes a device: its refresh credential stops working and its open WebSockets close with 4003. The revocation and
+   * a notice to every space are stored together, and a notice stays until its space took it, so a space that cannot be
+   * reached now gets it on a repeat or from the alarm.
+   */
   async revokeDevice(deviceId: string): Promise<void> {
-    this.sql.exec("UPDATE devices SET revoked_at_ms = ? WHERE device_id = ? AND revoked_at_ms IS NULL", Date.now(), deviceId);
-    const spaces = this.sql.exec("SELECT space_id FROM spaces").toArray();
-    await Promise.all(spaces.map(({ space_id }) => this.env.SPACE.get(this.env.SPACE.idFromName(String(space_id))).closeDevice(deviceId)));
+    const nowMs = Date.now();
+    this.ctx.storage.transactionSync(() => {
+      const revoked = this.sql.exec("UPDATE devices SET revoked_at_ms = ? WHERE device_id = ? AND revoked_at_ms IS NULL", nowMs, deviceId).rowsWritten;
+      if (revoked === 0) return;
+      this.sql.exec(
+        "INSERT INTO revocation_notices (device_id, space_id, next_try_ms) SELECT ?, space_id, ? FROM spaces WHERE true ON CONFLICT DO NOTHING",
+        deviceId,
+        nowMs,
+      );
+    });
+    await this.deliverNotices(deviceId);
+  }
+
+  /** Delivers the pending revocation notices, of one device or all that are due, and arms the alarm for those that failed. */
+  private async deliverNotices(deviceId?: string): Promise<void> {
+    const pending = (
+      deviceId === undefined
+        ? this.sql.exec("SELECT device_id, space_id FROM revocation_notices WHERE next_try_ms <= ?", Date.now())
+        : this.sql.exec("SELECT device_id, space_id FROM revocation_notices WHERE device_id = ?", deviceId)
+    ).toArray();
+    await Promise.all(
+      pending.map(async ({ device_id, space_id }) => {
+        try {
+          await this.spaceStub(String(space_id)).closeDevice(String(device_id));
+          this.sql.exec("DELETE FROM revocation_notices WHERE device_id = ? AND space_id = ?", device_id, space_id);
+        } catch (error) {
+          console.error("revocation notice failed", device_id, space_id, error);
+          this.sql.exec("UPDATE revocation_notices SET next_try_ms = ? WHERE device_id = ? AND space_id = ?", Date.now() + NOTICE_RETRY_MS, device_id, space_id);
+        }
+      }),
+    );
+    await this.armAlarm();
   }
 
   async createSpace(args: { userId: string; name: string }): Promise<SpaceInfo> {
@@ -421,14 +464,21 @@ export class AccountDO extends DurableObject<Env> {
     return ok(null);
   }
 
+  /** checkSession for several devices at once, keyed by device. */
+  async checkSessions(deviceIds: string[], spaceId: string): Promise<Record<string, SessionCheck>> {
+    return Object.fromEntries(await Promise.all(deviceIds.map(async (deviceId) => [deviceId, await this.checkSession(deviceId, spaceId)])));
+  }
+
   /**
    * Whether the device is active, with the kind and scope of its current row, and whether a rewind holds the space, if
    * one is named, closed (RFC 0003 section 4).
    */
   async checkSession(deviceId: string, spaceId?: string): Promise<SessionCheck> {
     const device = this.activeDevice(deviceId);
+    const revoked = this.sql.exec("SELECT 1 FROM devices WHERE device_id = ? AND revoked_at_ms IS NOT NULL", deviceId).toArray().length > 0;
     return {
       active: device !== undefined,
+      revoked,
       closed: spaceId !== undefined && this.spaceClosed(spaceId),
       kind: device?.kind ?? "",
       scope: device?.scope ?? null,
@@ -510,7 +560,7 @@ export class AccountDO extends DurableObject<Env> {
       nowMs,
       Date.now() + REWIND_RETRY_MIN_MS,
     );
-    await this.armRewindAlarm();
+    await this.armAlarm();
     await this.drive(args.rewindId);
     return this.rewindOutcome(args.rewindId);
   }
@@ -606,7 +656,7 @@ export class AccountDO extends DurableObject<Env> {
       );
     } finally {
       this.driving.delete(rewindId);
-      await this.armRewindAlarm();
+      await this.armAlarm();
     }
   }
 
@@ -622,11 +672,16 @@ export class AccountDO extends DurableObject<Env> {
     );
   }
 
-  /** Sets the alarm for the next due rewind, at least a second ahead so that a rewind driven right now is not retried in a loop. */
-  private async armRewindAlarm(): Promise<void> {
-    const next = this.sql.exec("SELECT MIN(next_try_ms) AS due FROM rewinds WHERE phase NOT IN ('completed', 'failed')").one().due;
-    if (next === null) await this.ctx.storage.deleteAlarm();
-    else await this.ctx.storage.setAlarm(Math.max(Number(next), Date.now() + REWIND_RETRY_MIN_MS));
+  /**
+   * Sets the alarm for the next due rewind or revocation notice, at least a second ahead so that work done right now is
+   * not retried in a loop.
+   */
+  private async armAlarm(): Promise<void> {
+    const rewind = this.sql.exec("SELECT MIN(next_try_ms) AS due FROM rewinds WHERE phase NOT IN ('completed', 'failed')").one().due;
+    const notice = this.sql.exec("SELECT MIN(next_try_ms) AS due FROM revocation_notices").one().due;
+    const due = [rewind, notice].filter((value) => value !== null).map(Number);
+    if (due.length === 0) await this.ctx.storage.deleteAlarm();
+    else await this.ctx.storage.setAlarm(Math.max(Math.min(...due), Date.now() + REWIND_RETRY_MIN_MS));
   }
 
   override async alarm(): Promise<void> {
@@ -634,7 +689,7 @@ export class AccountDO extends DurableObject<Env> {
       .exec("SELECT rewind_id FROM rewinds WHERE phase NOT IN ('completed', 'failed') AND (next_try_ms IS NULL OR next_try_ms <= ?)", Date.now())
       .toArray();
     for (const { rewind_id } of due) await this.drive(String(rewind_id));
-    await this.armRewindAlarm();
+    await this.deliverNotices();
   }
 
   async listSpaces(userId: string): Promise<SpaceInfo[]> {

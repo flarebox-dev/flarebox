@@ -6,7 +6,7 @@
 import { create, fromBinary } from "@bufbuild/protobuf";
 import { runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { type CommitResult, CommitSchema, OpSchema } from "../src/gen/flarebox/v1/commit_pb";
+import { type CommitResult, CommitSchema, OpResult_Code, OpSchema } from "../src/gen/flarebox/v1/commit_pb";
 import { ContentSchema } from "../src/gen/flarebox/v1/model_pb";
 import { Error_Code } from "../src/gen/flarebox/v1/rpc_pb";
 import { sha256 } from "../src/crypto";
@@ -160,6 +160,7 @@ describe("RFC 0006 section 3: authorize", () => {
       seen.push({
         principal: [principal.deviceId, principal.kind, principal.scope],
         op: applied.op.case,
+        nodes: sorted(effect.nodes),
         changed,
         created: sorted(effect.created),
         before: Object.fromEntries(changed.map((id) => [id, effect.ancestryBefore(id)])),
@@ -179,6 +180,7 @@ describe("RFC 0006 section 3: authorize", () => {
       {
         principal,
         op: "move",
+        nodes: sorted([docs, archive]),
         changed: [docs],
         created: [],
         before: { [docs]: [root] },
@@ -189,6 +191,7 @@ describe("RFC 0006 section 3: authorize", () => {
       {
         principal,
         op: "createDir",
+        nodes: sorted([added, sub]),
         changed: [added],
         created: [added],
         before: { [added]: undefined },
@@ -199,6 +202,7 @@ describe("RFC 0006 section 3: authorize", () => {
       {
         principal,
         op: "delete",
+        nodes: [docs],
         changed: everything,
         created: [],
         before: { [docs]: [root, archive], [sub]: [root, archive, docs], [file]: moved, [added]: moved },
@@ -209,6 +213,7 @@ describe("RFC 0006 section 3: authorize", () => {
       {
         principal,
         op: "restore",
+        nodes: [docs],
         changed: everything,
         created: [],
         before: { [docs]: [root, archive], [sub]: [root, archive, docs], [file]: moved, [added]: moved },
@@ -216,6 +221,29 @@ describe("RFC 0006 section 3: authorize", () => {
         subtree: below,
         file: [moved, moved],
       },
+    ]);
+  });
+
+  it("names the folder an R2 merge resolved to, for the merging op and for later ops that use the merged ID", async () => {
+    const { a, root } = await setup();
+    const existing = uuidv7();
+    await a.commit([op.mkdir(existing, root, "Docs")]);
+    const [alias, child] = [uuidv7(), uuidv7()];
+    const seen: unknown[] = [];
+    vi.spyOn(policy, "authorize").mockImplementation((_principal, _applied, effect) => {
+      seen.push({
+        nodes: [...effect.nodes].sort(),
+        changed: [...effect.changed],
+        created: [...effect.created],
+        alias: [effect.ancestryBefore(alias), effect.ancestryAfter(alias), effect.subtree(alias)],
+      });
+      return true;
+    });
+    const merged = await a.commit([op.mkdir(alias, root, "DOCS"), op.mkdir(child, alias, "Inside")]);
+    expect(merged.results[0]).toMatchObject({ code: OpResult_Code.MERGED_INTO, nodeId: existing });
+    expect(seen).toEqual([
+      { nodes: [existing, root].sort(), changed: [], created: [], alias: [[root], [root], []] },
+      { nodes: [child, existing].sort(), changed: [child], created: [child], alias: [[root], [root], [child]] },
     ]);
   });
 

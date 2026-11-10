@@ -93,7 +93,7 @@ export class CommitApplier {
       this.created = new Set();
       this.parentBefore = new Map();
       const outcome = this.applyOp(op, index);
-      if (!this.ctx.authorize(op, this.effect())) throw new CallFailure(Error_Code.FORBIDDEN, `op ${index} is not allowed for this device`);
+      if (!this.ctx.authorize(op, this.effect(op))) throw new CallFailure(Error_Code.FORBIDDEN, `op ${index} is not allowed for this device`);
       return outcome;
     });
     const changes = [...this.touched].map((nodeId) =>
@@ -105,10 +105,22 @@ export class CommitApplier {
   /**
    * The transition of the op just applied. The ancestry and subtree are read when asked for, so they are valid only
    * during the authorize call, before the next op changes the tree. Before the op, only the nodes in parentBefore had
-   * another parent, so the earlier ancestry is the current one with those parents put back.
+   * another parent, so the earlier ancestry is the current one with those parents put back. Every ID given to the
+   * effect, or named by the op, is resolved through R2's re-keying first.
    */
-  private effect(): OpEffect {
+  private effect(op: Op): OpEffect {
     const { changed, created, parentBefore } = this;
+    const { op: named } = op;
+    const ids =
+      named.case === "createDir" || named.case === "createFile"
+        ? [named.value.nodeId, named.value.parentId]
+        : named.case === "move"
+          ? [named.value.nodeId, named.value.newParentId]
+          : named.case === "restore"
+            ? [named.value.nodeId, named.value.targetParentId]
+            : named.case
+              ? [named.value.nodeId]
+              : [];
     const parentNow = (nodeId: string) => getNode(this.sql, nodeId)?.parent_id ?? null;
     const ancestry = (nodeId: string, parentOf: (id: string) => string | null): string[] => {
       const chain: string[] = [];
@@ -116,18 +128,21 @@ export class CommitApplier {
       return chain;
     };
     return {
+      nodes: new Set(ids.filter((id) => id !== "").map((id) => this.id(id))),
       changed,
       created,
       ancestryBefore: (nodeId) =>
-        created.has(nodeId) ? undefined : ancestry(nodeId, (id) => (parentBefore.has(id) ? parentBefore.get(id)! : parentNow(id))),
-      ancestryAfter: (nodeId) => ancestry(nodeId, parentNow),
+        created.has(this.id(nodeId))
+          ? undefined
+          : ancestry(this.id(nodeId), (id) => (parentBefore.has(id) ? parentBefore.get(id)! : parentNow(id))),
+      ancestryAfter: (nodeId) => ancestry(this.id(nodeId), parentNow),
       subtree: (nodeId) =>
         rows<{ node_id: string }>(
           this.sql.exec(
             `WITH RECURSIVE sub(node_id) AS (
                SELECT node_id FROM nodes WHERE parent_id = ? UNION ALL SELECT n.node_id FROM nodes n JOIN sub ON n.parent_id = sub.node_id)
              SELECT node_id FROM sub`,
-            nodeId,
+            this.id(nodeId),
           ),
         ).map((row) => row.node_id),
     };

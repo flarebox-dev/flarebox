@@ -588,6 +588,107 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
     expect(await send("/v1/pair/complete", { body: pairBody })).toEqual({ status: 403, code: Error_Code.FORBIDDEN });
   });
 
+  /** Commits one folder as the owner over HTTP, so that the space pushes it to every other live connection. */
+  async function commitAsOwner(owner: DeviceCredentials, spaceId: string, historyId: string) {
+    const deviceSeq = BigInt(Number((await runInDurableObject(env.SPACE.get(env.SPACE.idFromName(spaceId)), (_instance, state) =>
+      state.storage.sql.exec("SELECT COALESCE(MAX(device_seq), 0) AS seq FROM device_commits WHERE device_id = ?", owner.deviceId).one().seq)))) + 1n;
+    const commit = { commitId: uuidv7(), historyId, deviceSeq, baseSeq: 0n, ops: [op.mkdir(uuidv7(), spaceId, "Pushed " + deviceSeq)] };
+    const result = await call(`/v1/spaces/${spaceId}/rpc`, { token: owner.access!.token, body: body(RpcRequestSchema, { reqId: 1n, call: { case: "commit", value: commit } }) }, RpcResponseSchema);
+    expect(result.message!.result.case).toBe("commit");
+  }
+
+  it("closes a passive connection with 4003 instead of pushing to it once its principal is denied", async () => {
+    const owner = await getOwner();
+    const spaceId = await createSpace(owner);
+    const watcher = await Socket.connect(spaceId, owner);
+    const { historyId } = await watcher.start();
+    for (const [column, value] of [["kind", "agent"], ["scope", "photos"], ["expires_at_ms", 1]] as const) {
+      const pad = await pairDevice(owner, "Passive " + column);
+      const socket = await Socket.connect(spaceId, pad);
+      await socket.start();
+      await updateDevice(pad.deviceId, column, value);
+      await commitAsOwner(owner, spaceId, historyId);
+      expect(await socket.next(), column).toMatchObject({ case: "goodbye", value: { code: Close.DEVICE_REVOKED } });
+      expect((await watcher.pushed()).length).toBe(1);
+    }
+  });
+
+  it("closes passive connections with 1013 when the Account DO cannot check them before a push", async () => {
+    const owner = await getOwner();
+    const pad = await pairDevice(owner, "Unchecked");
+    const spaceId = await createSpace(owner);
+    const socket = await Socket.connect(spaceId, pad);
+    const { historyId } = await socket.start();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const prototype = await runInDurableObject(account(), (instance: import("../src/account-do").AccountDO) => Object.getPrototypeOf(instance) as import("../src/account-do").AccountDO);
+    const original = prototype.checkSessions;
+    prototype.checkSessions = async () => {
+      throw new Error("injected Account DO failure");
+    };
+    try {
+      await commitAsOwner(owner, spaceId, historyId);
+      expect(await socket.next()).toMatchObject({ case: "goodbye", value: { code: Close.TRY_AGAIN_LATER } });
+    } finally {
+      prototype.checkSessions = original;
+    }
+  });
+
+  it("lets a principal back in once its row is supported again, because only a revocation is remembered", async () => {
+    const owner = await getOwner();
+    const pad = await pairDevice(owner, "Temporarily unknown");
+    const spaceId = await createSpace(owner);
+    const socket = await Socket.connect(spaceId, pad);
+    await socket.start();
+    await updateDevice(pad.deviceId, "kind", "agent");
+    socket.send({ case: "rpc", value: { reqId: 1n, call: { case: "listTree", value: {} } } });
+    expect(await socket.next()).toMatchObject({ case: "goodbye", value: { code: Close.DEVICE_REVOKED } });
+    await updateDevice(pad.deviceId, "kind", "device");
+    const reopened = await Socket.connect(spaceId, pad);
+    await reopened.start();
+    expect((await reopened.rpc({ case: "listTree", value: {} })).case).toBe("tree");
+    const remembered = await runInDurableObject(env.SPACE.get(env.SPACE.idFromName(spaceId)), (_instance, state) =>
+      state.storage.sql.exec("SELECT device_id FROM revoked_devices WHERE device_id = ?", pad.deviceId).toArray(),
+    );
+    expect(remembered).toEqual([]);
+  });
+
+  it("keeps a revocation notice that a space did not take, and delivers it on a repeat or from the alarm", async () => {
+    const owner = await getOwner();
+    const [repeated, alarmed] = [await pairDevice(owner, "Repeat"), await pairDevice(owner, "Alarm")];
+    await createSpace(owner);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    await runInDurableObject(account(), async (instance: import("../src/account-do").AccountDO, state) => {
+      const namespace = (instance as unknown as { env: Env }).env.SPACE;
+      const delivered: string[] = [];
+      let fail = true;
+      const spy = vi.spyOn(namespace, "get").mockImplementation((() => ({
+        closeDevice: async (deviceId: string) => {
+          if (fail) throw new Error("injected close failure");
+          delivered.push(deviceId);
+        },
+      })) as never);
+      const pending = (deviceId: string) => state.storage.sql.exec("SELECT COUNT(*) AS n FROM revocation_notices WHERE device_id = ?", deviceId).one().n;
+      try {
+        for (const device of [repeated, alarmed]) {
+          expect(await instance.revokeUserDevice({ userId: owner.userId, deviceId: device.deviceId })).toMatchObject({ ok: true });
+          expect(pending(device.deviceId)).toBeGreaterThan(0);
+          expect((await instance.checkSession(device.deviceId)).revoked).toBe(true);
+        }
+        expect(await state.storage.getAlarm()).not.toBeNull();
+        fail = false;
+        await instance.revokeUserDevice({ userId: owner.userId, deviceId: repeated.deviceId });
+        expect(pending(repeated.deviceId)).toBe(0);
+        expect(delivered).toContain(repeated.deviceId);
+        state.storage.sql.exec("UPDATE revocation_notices SET next_try_ms = 0");
+        await instance.alarm();
+        expect(pending(alarmed.deviceId)).toBe(0);
+        expect(delivered).toContain(alarmed.deviceId);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+  });
+
   it("never lets an access token outlive its credential, and refuses an expired credential", async () => {
     const owner = await getOwner();
     const pad = await pairDevice(owner, "Expiring");
