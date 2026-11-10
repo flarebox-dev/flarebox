@@ -146,6 +146,7 @@ impl Credential {
                 .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
                 .open(&temp)?;
             file.write_all(&serde_json::to_vec_pretty(self)?)?;
+            exclude_from_backups(&file)?;
             file.sync_all()?;
             fs::hard_link(&temp, path)
         })();
@@ -160,6 +161,49 @@ impl Credential {
         }
         File::open(dir).and_then(|dir| dir.sync_all()).map_err(io)
     }
+
+    /// Excludes the credential file at `path` from backups again if a write dropped the exclusion. The driver calls
+    /// it each time it opens the profile.
+    pub fn keep_out_of_backups(path: &Path) -> Result<(), CredentialError> {
+        let io = |source| CredentialError::Io {
+            path: path.to_path_buf(),
+            source,
+        };
+        let file = File::open(path).map_err(io)?;
+        #[cfg(target_os = "macos")]
+        {
+            let mut value = [0; 64];
+            if let Ok(len) = rustix::fs::fgetxattr(&file, BACKUP_EXCLUSION.0, &mut value)
+                && value[..len] == *BACKUP_EXCLUSION.1
+            {
+                return Ok(());
+            }
+            tracing::info!(path = %path.display(), "excluding the credential from backups again");
+        }
+        exclude_from_backups(&file).map_err(io)
+    }
+}
+
+/// The extended attribute that keeps a file out of Time Machine backups, and the value `tmutil addexclusion` writes.
+#[cfg(target_os = "macos")]
+pub(crate) const BACKUP_EXCLUSION: (&str, &[u8]) = (
+    "com.apple.metadata:com_apple_backup_excludeItem",
+    b"bplist00_\x10\x11com.apple.backupd\x08\x00\x00\x00\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x1c",
+);
+
+/// Keeps the credential file out of Time Machine, so that a Mac restored from a backup has no credential and pairs as
+/// a new device. Nothing to do on other systems.
+fn exclude_from_backups(file: &File) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    rustix::fs::fsetxattr(
+        file,
+        BACKUP_EXCLUSION.0,
+        BACKUP_EXCLUSION.1,
+        rustix::fs::XattrFlags::empty(),
+    )?;
+    #[cfg(not(target_os = "macos"))]
+    let _ = file;
+    Ok(())
 }
 
 /// The API of the server at `server`. Plain `http` is accepted only on a loopback address, for a server under
@@ -174,10 +218,28 @@ pub fn api_for(server: &str) -> Result<Api, ApiError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    /// Whether `tmutil isexcluded` reports that Time Machine leaves `path` out. The temporary directory is excluded
+    /// as a whole, so the tests that call it work under the home directory.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn time_machine_excludes(path: &Path) -> bool {
+        let out = std::process::Command::new("tmutil")
+            .arg("isexcluded")
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let said = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            said.starts_with("[Excluded]") || said.starts_with("[Included]"),
+            "{said}"
+        );
+        said.starts_with("[Excluded]")
+    }
 
     fn credential() -> Credential {
         Credential {
@@ -258,5 +320,17 @@ mod tests {
         assert!(api_for("https://files.example.com").is_ok());
         assert!(api_for("http://files.example.com").is_err());
         assert!(api_for("files.example.com").is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn time_machine_leaves_out_a_new_credential() {
+        let home = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+        let path = home.path().join("state").join("credential.json");
+        credential().save_new(&path).unwrap();
+        assert!(time_machine_excludes(&path));
+
+        Credential::keep_out_of_backups(&path).unwrap();
+        assert!(time_machine_excludes(&path));
     }
 }

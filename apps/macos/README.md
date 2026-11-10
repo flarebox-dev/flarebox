@@ -30,7 +30,7 @@ xcodebuild -project Flarebox.xcodeproj -scheme Flarebox -configuration Release \
 open build/DerivedData/Build/Products/Release/Flarebox.app
 ```
 
-The app keeps its sync profile in `~/Library/Application Support/Flarebox`: the device credential (`state/credential.json`), one store per linked space (`state/spaces/`) and the pause. One process at a time can open the profile.
+The app keeps its sync profile in `~/Library/Application Support/Flarebox`: the device credential (`state/credential.json`), one store per linked space (`state/spaces/`) and the pause. One process at a time can open the profile. Time Machine leaves out the credential, so a Mac restored from a backup sets Flarebox up again as a new device, and the files in its folders stay.
 
 To try it against a local server, start the Worker in `server/` with `pnpm exec wrangler dev` (after `pnpm install`), enter `http://127.0.0.1:8787` in the setup window, open `http://127.0.0.1:8787/setup` in a browser, and claim the server with the code that `wrangler dev` prints. Plain `http` is accepted only on a loopback address.
 
