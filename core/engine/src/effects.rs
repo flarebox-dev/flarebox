@@ -536,7 +536,7 @@ impl<'a> View<'a> {
             }
             (Some(local), Some(remote)) => (local, remote),
         };
-        if local.parked && self.trees.class(id) != Class::Remote {
+        if local.parked && !remote_only(self.trees, id) {
             return self.unpark(id, local, remote);
         }
         if local.shape.kind != remote.kind {
