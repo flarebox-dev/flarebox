@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use flarebox_fs::{
-    Change, EntryKind, Error, NativeWatcher, Poll, Rescan, RescanWatcher, Snapshot, Watcher,
+    Change, EntryKind, Error, FileId, NativeWatcher, Poll, Rescan, RescanWatcher, Snapshot, Space,
+    Watcher,
 };
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -38,6 +39,31 @@ fn removed(path: &str, kind: EntryKind) -> Change {
 }
 
 use EntryKind::{Dir, File};
+
+/// The identity of the folder at `root`.
+fn root_id(root: &Path) -> FileId {
+    Space::bind(fs::File::open(root).unwrap().into(), root)
+        .unwrap()
+        .id()
+}
+
+/// What a rescan of `root` that finds nothing returns.
+fn nothing(root: &Path) -> Rescan {
+    Rescan {
+        changes: vec![],
+        unsettled: vec![],
+        unreadable: vec![],
+        root: root_id(root),
+    }
+}
+
+/// What a poll that scans `root` and finds nothing returns.
+fn quiet(root: &Path) -> Poll {
+    Poll {
+        root: Some(root_id(root)),
+        ..Poll::default()
+    }
+}
 
 /// Whether the permission change a test just made blocks reads, given the read
 /// `probe` that should now fail. Only root reads through it; the test is then
@@ -118,7 +144,7 @@ fn rescan_watcher_catches_changes_made_while_nothing_watched() {
     assert_eq!(watcher.poll(WAIT).unwrap().changes, expected);
     assert_eq!(
         watcher.poll(Duration::from_millis(100)).unwrap(),
-        Poll::default()
+        quiet(dir.path())
     );
     assert_eq!(watcher.snapshot(), &Snapshot::scan(dir.path()).unwrap());
 }
@@ -128,10 +154,8 @@ fn native_watcher_catches_changes_made_while_nothing_watched() {
     let (dir, previous, expected) = tree_changed_offline();
     let mut watcher = NativeWatcher::start(dir.path(), previous).unwrap();
     assert_eq!(watcher.poll(WAIT).unwrap().changes, expected);
-    assert_eq!(
-        watcher.poll(Duration::from_millis(300)).unwrap(),
-        Poll::default()
-    );
+    let poll = watcher.poll(Duration::from_millis(300)).unwrap();
+    assert_eq!(Poll { root: None, ..poll }, Poll::default());
     assert_eq!(watcher.snapshot(), &Snapshot::scan(dir.path()).unwrap());
 }
 
@@ -169,7 +193,7 @@ fn expect(watcher: &mut dyn Watcher, expected: &[Change]) {
 fn live_changes(watcher: &mut dyn Watcher, root: &Path) {
     assert_eq!(
         watcher.poll(Duration::from_millis(300)).unwrap(),
-        Poll::default()
+        quiet(root)
     );
 
     fs::write(root.join("a.txt"), "one").unwrap();
@@ -285,7 +309,7 @@ fn case_only_rename_is_a_rename() {
         let mut snapshot = previous.clone();
         assert_eq!(
             snapshot.rescan(root, [PathBuf::from(alias)]).unwrap(),
-            Rescan::default()
+            nothing(root)
         );
         assert_eq!(snapshot, previous, "{alias} is not a name on disk");
     }
@@ -322,7 +346,7 @@ fn normalization_alias_is_not_an_entry() {
         snapshot
             .rescan(root, [PathBuf::from("cafe\u{301}.txt")])
             .unwrap(),
-        Rescan::default()
+        nothing(root)
     );
     assert_eq!(snapshot, previous);
 }
@@ -334,7 +358,7 @@ fn native_watcher_reports_a_case_only_rename() {
     let mut watcher = NativeWatcher::start(root, Snapshot::default()).unwrap();
     assert_eq!(
         watcher.poll(Duration::from_millis(300)).unwrap(),
-        Poll::default()
+        quiet(root)
     );
     fs::write(root.join("letter.txt"), "l").unwrap();
     expect(&mut watcher, &[created("letter.txt", File)]);
@@ -363,6 +387,7 @@ fn folder_replaced_by_a_symlink_is_removed_not_followed() {
             changes: vec![removed("d", Dir)],
             unsettled: vec![],
             unreadable: vec![],
+            root: root_id(&root),
         }
     );
     assert_eq!(snapshot, Snapshot::scan(&root).unwrap());
@@ -409,6 +434,7 @@ fn unreadable_folder_is_kept_and_reported() {
                 changes: vec![created("new.txt", File)],
                 unsettled: vec![],
                 unreadable: blocked.clone(),
+                root: root_id(root),
             },
             "{mode:o}"
         );
@@ -421,7 +447,7 @@ fn unreadable_folder_is_kept_and_reported() {
                 .unwrap(),
             Rescan {
                 unreadable: blocked.clone(),
-                ..Rescan::default()
+                ..nothing(root)
             },
             "{mode:o}"
         );
@@ -440,7 +466,7 @@ fn unreadable_folder_is_kept_and_reported() {
             watcher.poll(Duration::from_millis(100)).unwrap(),
             Poll {
                 unreadable: blocked.clone(),
-                ..Poll::default()
+                ..quiet(root)
             },
             "{mode:o}"
         );
@@ -448,7 +474,7 @@ fn unreadable_folder_is_kept_and_reported() {
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
             snapshot.rescan(root, [PathBuf::new()]).unwrap(),
-            Rescan::default(),
+            nothing(root),
             "{mode:o}"
         );
         assert_eq!(snapshot, Snapshot::scan(root).unwrap(), "{mode:o}");
@@ -482,7 +508,7 @@ fn native_watcher_starts_beside_an_unreadable_folder() {
         result.unwrap(),
         Poll {
             unreadable: vec![PathBuf::from("d/locked")],
-            ..Poll::default()
+            ..quiet(root)
         }
     );
 }
@@ -507,7 +533,7 @@ fn folder_readable_again_is_watched_again() {
         watcher.poll(Duration::from_millis(300)).unwrap(),
         Poll {
             unreadable: vec![PathBuf::from("d/locked")],
-            ..Poll::default()
+            ..quiet(root)
         }
     );
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
@@ -543,7 +569,7 @@ fn private_folder_is_never_reported() {
     ] {
         assert_eq!(
             snapshot.rescan(root, [PathBuf::from(scope)]).unwrap(),
-            Rescan::default(),
+            nothing(root),
             "{scope:?}"
         );
     }
@@ -551,10 +577,100 @@ fn private_folder_is_never_reported() {
     let mut watcher = NativeWatcher::start(root, snapshot.clone()).unwrap();
     assert_eq!(
         watcher.poll(Duration::from_millis(300)).unwrap(),
-        Poll::default()
+        quiet(root)
     );
     fs::write(private.join("staging/y"), "y").unwrap();
     fs::write(root.join("b.txt"), "b").unwrap();
     expect(&mut watcher, &[created("b.txt", File)]);
     assert_eq!(watcher.snapshot(), &Snapshot::scan(root).unwrap());
+}
+#[test]
+fn forgotten_scope_is_reported_again_by_the_next_rescan() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("d/sub")).unwrap();
+    fs::write(root.join("d/x"), "x").unwrap();
+    fs::write(root.join("d/sub/y"), "y").unwrap();
+    fs::create_dir(root.join("e")).unwrap();
+    fs::write(root.join("e/z"), "z").unwrap();
+    let mut snapshot = Snapshot::scan(root).unwrap();
+    let full = snapshot.clone();
+
+    assert_eq!(
+        snapshot.rescan(root, [PathBuf::from("d")]).unwrap(),
+        nothing(root)
+    );
+
+    snapshot.forget(Path::new("d/sub"));
+    let known: Vec<&Path> = snapshot.entries.keys().map(PathBuf::as_path).collect();
+    assert_eq!(known, ["d", "d/x", "e", "e/z"].map(Path::new));
+    assert_eq!(
+        snapshot.rescan(root, [PathBuf::from("d/sub")]).unwrap(),
+        Rescan {
+            changes: vec![created("d/sub", Dir), created("d/sub/y", File)],
+            ..nothing(root)
+        }
+    );
+    assert_eq!(snapshot, full);
+
+    snapshot.forget(Path::new("d"));
+    assert_eq!(
+        snapshot.rescan(root, [PathBuf::from("d")]).unwrap(),
+        Rescan {
+            changes: vec![
+                created("d", Dir),
+                created("d/sub", Dir),
+                created("d/sub/y", File),
+                created("d/x", File),
+            ],
+            ..nothing(root)
+        }
+    );
+    assert_eq!(snapshot, full);
+
+    snapshot.forget(Path::new(""));
+    assert!(snapshot.entries.is_empty());
+}
+
+#[test]
+fn rescans_and_polls_report_the_root_they_scanned() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("space");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.txt"), "a").unwrap();
+    let first = root_id(&root);
+    let mut snapshot = Snapshot::scan(&root).unwrap();
+    assert_eq!(
+        snapshot.rescan(&root, [PathBuf::new()]).unwrap().root,
+        first
+    );
+    let mut native = NativeWatcher::start(&root, snapshot.clone()).unwrap();
+    assert_eq!(
+        native.poll(Duration::from_millis(300)).unwrap(),
+        quiet(&root)
+    );
+    drop(native);
+    let mut watcher =
+        RescanWatcher::new(&root, snapshot.clone(), Duration::from_millis(20)).unwrap();
+    assert_eq!(
+        watcher.poll(Duration::from_millis(50)).unwrap().root,
+        Some(first)
+    );
+
+    fs::rename(&root, dir.path().join("moved")).unwrap();
+    fs::create_dir(&root).unwrap();
+    let second = root_id(&root);
+    assert_ne!(first, second);
+    assert_eq!(
+        snapshot.rescan(&root, [PathBuf::new()]).unwrap(),
+        Rescan {
+            changes: vec![removed("a.txt", File)],
+            unsettled: vec![],
+            unreadable: vec![],
+            root: second,
+        }
+    );
+    let poll = watcher.poll(Duration::from_millis(50)).unwrap();
+    assert_eq!(poll.changes, [removed("a.txt", File)]);
+    assert_eq!(poll.root, Some(second));
 }

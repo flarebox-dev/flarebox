@@ -14,6 +14,7 @@ use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags};
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
+use crate::resolve::Space;
 use crate::{FileId, list, open_dir_at, open_root, stat_at, stat_fd};
 
 /// The engine's private folder at the root of a space, for the marker,
@@ -159,9 +160,27 @@ pub(crate) fn replace_file(
 /// moves the file. Linux refuses the first before the file system sees the
 /// flag, so only the second shows a file system that does not support it.
 pub fn probe_no_replace(root: &Path) -> io::Result<bool> {
-    let root = open_root(root)?;
-    let private = private_dir(root.as_fd())?;
-    let private = private.as_fd();
+    probe_in(private_dir(open_root(root)?.as_fd())?.as_fd())
+}
+
+impl Space {
+    /// Reads the root marker through the root descriptor, or returns `None`
+    /// if there is none. It writes nothing, so the caller can read the counter
+    /// before [`Space::recover`] writes the marker again. It reads the root
+    /// the space holds whether or not that root is still held.
+    pub fn marker(&self) -> io::Result<Option<Marker>> {
+        read_marker_at(self.root())
+    }
+
+    /// [`probe_no_replace`] in the private folder of the root the space
+    /// holds. Fails, creating nothing, unless the root is held.
+    pub fn probe_no_replace(&self) -> io::Result<bool> {
+        probe_in(self.private(&[])?.fd())
+    }
+}
+
+/// The probe of [`probe_no_replace`] in the private folder `private`.
+fn probe_in(private: BorrowedFd<'_>) -> io::Result<bool> {
     let [a, b, _] = PROBE;
     for name in PROBE {
         remove_if_present(private, name)?;

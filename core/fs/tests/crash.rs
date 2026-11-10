@@ -16,10 +16,10 @@ use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 
 use common::{
-    Bytes, RETURNS, SCENARIOS, Scenario, assert_settled, decode, encode, entries, marker, now,
-    prepare, scenario,
+    Bytes, RETURNS, SCENARIOS, Scenario, assert_settled, bind, decode, encode, entries, marker,
+    now, prepare, scenario,
 };
-use flarebox_fs::{Effect, Outcome, Space, Step};
+use flarebox_fs::{Effect, Outcome, Step};
 
 const CHILD: &str = "FLAREBOX_FS_CRASH_CHILD";
 const RECOVERY_STEPS: [Step; 5] = [
@@ -47,7 +47,7 @@ fn child_process_for_crash_tests() {
     let root = Path::new(root);
     let scenario = scenario(name);
     let effect = (scenario.build)(&decode(&fs::read_to_string(effect_file(root)).unwrap()));
-    let space = Space::open(root).unwrap();
+    let space = bind(root);
     let mut hook = |reached: Step| {
         if format!("{reached:?}") == step {
             rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::KILL)
@@ -89,14 +89,13 @@ fn steps(scenario: &Scenario) -> Vec<Step> {
     let root = dir.path().join("space");
     let effect = prepare(scenario, &root);
     let mut steps = Vec::new();
-    let outcome = Space::open(&root)
-        .unwrap()
+    let outcome = bind(&root)
         .apply(&marker(), &effect, &mut common::Bytes, now(), &mut |step| {
             steps.push(step)
         })
         .unwrap();
     assert_eq!(
-        outcome == Outcome::Done,
+        matches!(outcome, Outcome::Done { .. }),
         scenario.done_from.is_some(),
         "{}: {outcome:?}",
         scenario.name
@@ -126,8 +125,7 @@ fn recovery_steps(scenario: &Scenario, kill: Step) -> Vec<Step> {
     let dir = tempfile::tempdir().unwrap();
     let (root, effect) = crash(scenario, dir.path(), kill);
     let mut steps = Vec::new();
-    Space::open(&root)
-        .unwrap()
+    bind(&root)
         .recover(&marker(), &effect, &mut Bytes, now(), &mut |step| {
             steps.push(step)
         })
@@ -165,13 +163,13 @@ fn kill_at_every_step_then_recover(scenario: &Scenario) -> Vec<Step> {
                 }
             }
 
-            let space = Space::open(&root).unwrap();
+            let space = bind(&root);
             let outcome = space
                 .recover(&marker(), &effect, &mut Bytes, now(), &mut |_| {})
                 .unwrap();
             let expected_done = done_from.is_some_and(|from| index >= from);
             assert_eq!(
-                outcome == Outcome::Done,
+                matches!(outcome, Outcome::Done { .. }),
                 expected_done,
                 "{context}: {outcome:?}"
             );
@@ -182,7 +180,7 @@ fn kill_at_every_step_then_recover(scenario: &Scenario) -> Vec<Step> {
                 .recover(&marker(), &effect, &mut Bytes, now(), &mut |_| {})
                 .unwrap();
             assert_eq!(
-                again == Outcome::Done,
+                matches!(again, Outcome::Done { .. }),
                 expected_done,
                 "{context}: again {again:?}"
             );

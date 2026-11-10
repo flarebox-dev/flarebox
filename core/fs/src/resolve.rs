@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use rustix::io::Errno;
 
 use crate::root::{PRIVATE_DIR, make_dir};
-use crate::{DIR_FLAGS, FileId, open_root, stat_fd};
+use crate::{DIR_FLAGS, FileId, FileType, is_gone, stat_fd, stat_path};
 
 /// The folder inside the private folder that holds parked entries (design
 /// §2.5).
@@ -67,6 +67,10 @@ pub enum Unresolved {
         expected: FileId,
         found: FileId,
     },
+    /// The path the root was linked at names another folder or nothing: the
+    /// root was moved, replaced or removed.
+    #[error("{} no longer names the sync root", .0.display())]
+    RootWithdrawn(PathBuf),
     #[error("{}: {err}", .path.display())]
     Io { path: PathBuf, err: io::Error },
 }
@@ -78,17 +82,20 @@ impl From<Unresolved> for io::Error {
             Unresolved::BadName(_) => io::ErrorKind::InvalidInput,
             Unresolved::Missing(_) => io::ErrorKind::NotFound,
             Unresolved::NotAFolder(_) => io::ErrorKind::NotADirectory,
-            Unresolved::Replaced { .. } => io::ErrorKind::Other,
+            Unresolved::Replaced { .. } | Unresolved::RootWithdrawn(_) => io::ErrorKind::Other,
         };
         io::Error::new(kind, unresolved)
     }
 }
 
 /// The sync root, held open. Effects resolve every path from this descriptor
-/// rather than from a path spelling.
+/// rather than from a path spelling, and only while `path`, the path the root
+/// was linked at, still names it.
 #[derive(Debug)]
 pub struct Space {
     root: OwnedFd,
+    id: FileId,
+    path: PathBuf,
 }
 
 /// A folder resolved from the root and held open, with the route that
@@ -117,10 +124,54 @@ impl Folder {
 }
 
 impl Space {
-    pub fn open(root: &Path) -> io::Result<Self> {
+    /// Binds a space to `root`, a descriptor of the sync root the caller
+    /// already holds, such as the one it locked, linked at `path`. The space
+    /// never opens `path`; it only looks it up to check that it still names
+    /// `root` ([`Space::held`]).
+    pub fn bind(root: OwnedFd, path: &Path) -> io::Result<Self> {
+        let stat = stat_fd(root.as_fd())?;
+        if stat.file_type != FileType::Directory {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                format!("{} is not a folder", path.display()),
+            ));
+        }
         Ok(Self {
-            root: open_root(root)?,
+            root,
+            id: stat.id,
+            path: path.to_path_buf(),
         })
+    }
+
+    /// The identity of the root the space holds.
+    pub fn id(&self) -> FileId {
+        self.id
+    }
+
+    /// Whether the path the root was linked at still names the root the
+    /// space holds: the same device, inode and, where the file system reports
+    /// it, birth time. The lookup follows symbolic links, as linking did. A
+    /// path that leads to nothing or to something else is not held; a lookup
+    /// that fails for another reason is an error.
+    pub fn held(&self) -> io::Result<bool> {
+        match stat_path(&self.path) {
+            Ok(stat) => Ok(stat.id == self.id),
+            Err(err) if is_gone(&err) => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Fails unless the root is held. Every resolution from the root starts
+    /// with it, so it runs before each rename, `mkdir` and file creation.
+    pub(crate) fn check_held(&self) -> Result<(), Unresolved> {
+        match self.held() {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(Unresolved::RootWithdrawn(self.path.clone())),
+            Err(err) => Err(Unresolved::Io {
+                path: self.path.clone(),
+                err,
+            }),
+        }
     }
 
     /// The root descriptor.
@@ -184,10 +235,10 @@ impl Space {
         Ok(folder)
     }
 
-    /// Follows `folder`'s route from the root again and checks that every
-    /// folder on it keeps its identity. A descriptor follows its folder when
-    /// the folder is moved, even out of the root, so call this immediately
-    /// before each rename through `folder`.
+    /// Checks that the root is held, then follows `folder`'s route from the
+    /// root again and checks that every folder on it keeps its identity. A
+    /// descriptor follows its folder when the folder is moved, even out of the
+    /// root, so call this immediately before each rename through `folder`.
     pub fn recheck(&self, folder: &Folder) -> Result<(), Unresolved> {
         let mut again = self.root_folder()?;
         for dir in &folder.route {
@@ -196,14 +247,15 @@ impl Space {
         Ok(())
     }
 
+    /// The root as a folder, once [`Space::check_held`] passes.
     pub(crate) fn root_folder(&self) -> Result<Folder, Unresolved> {
-        let io = |err| Unresolved::Io {
-            path: PathBuf::new(),
-            err,
-        };
+        self.check_held()?;
         Ok(Folder {
-            fd: self.root.try_clone().map_err(io)?,
-            id: stat_fd(self.root.as_fd()).map_err(io)?.id,
+            fd: self.root.try_clone().map_err(|err| Unresolved::Io {
+                path: PathBuf::new(),
+                err,
+            })?,
+            id: self.id,
             route: Vec::new(),
         })
     }

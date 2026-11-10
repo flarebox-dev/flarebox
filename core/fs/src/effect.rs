@@ -14,7 +14,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
-use std::os::fd::BorrowedFd;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -23,7 +23,7 @@ use rustix::io::Errno;
 
 use crate::resolve::{Folder, Location, Space, Unresolved, check_name};
 use crate::root::{Marker, flush, remove_if_present, rename_no_replace, write_marker_at};
-use crate::{Entry, EntryKind, FileId, Stat, list, stat_at};
+use crate::{Entry, EntryKind, FileId, Stat, list, stat_at, stat_fd};
 
 /// The folder inside the private folder that holds staged downloads.
 pub const STAGING_DIR: &str = "staging";
@@ -110,7 +110,12 @@ pub enum Step {
 /// How an effect ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    Done,
+    /// `identity` is the identity of the entry the effect created or wrote
+    /// at its target, read through the descriptor that made or verified it:
+    /// the staged file before its rename, the new folder through its parent,
+    /// or the file whose content recovery compared. It is `None` for a move
+    /// or a removal.
+    Done { identity: Option<FileId> },
     /// The disk did not match what the effect expected. The caller observes
     /// the disk again; `recovered` is the path of a file made from the
     /// displaced entry, which is a new local file.
@@ -200,6 +205,7 @@ impl Space {
             if keep.is_some_and(|keep| name == OsStr::new(keep)) {
                 continue;
             }
+            self.recheck(&staging)?;
             rustix::fs::unlinkat(staging.fd(), &name, AtFlags::empty())?;
             cleared.push(name);
         }
@@ -212,7 +218,8 @@ impl Space {
     /// An error leaves the effect anywhere between its steps: run
     /// [`Space::recover`] for it before anything else. A replacement whose
     /// staged file is missing fails with [`io::ErrorKind::NotFound`] before it
-    /// changes anything.
+    /// changes anything. A root that is no longer held fails the effect with
+    /// [`Unresolved::RootWithdrawn`] before the next change.
     pub fn apply(
         &self,
         marker: &Marker,
@@ -222,6 +229,7 @@ impl Space {
         hook: &mut dyn FnMut(Step),
     ) -> io::Result<Outcome> {
         check_name(OsStr::new(&effect.id))?;
+        self.check_held()?;
         write_marker_at(self.root(), marker)?;
         hook(Step::Marked);
         let outcome = match &effect.action {
@@ -234,8 +242,11 @@ impl Space {
                     Err(Errno::EXIST) => return Ok(failed(Reason::Taken)),
                     Err(err) => return Err(err.into()),
                 }
+                let identity = stat_at(parent.fd(), name)?.id;
                 hook(Step::Placed);
-                Outcome::Done
+                Outcome::Done {
+                    identity: Some(identity),
+                }
             }
             Action::WriteFile { at, replaces: None } => {
                 let staging = self.private(&[STAGING_DIR])?;
@@ -281,10 +292,10 @@ impl Space {
                 flush(source.fd())?;
                 flush(target.fd())?;
                 hook(Step::Placed);
-                Outcome::Done
+                Outcome::Done { identity: None }
             }
         };
-        if outcome != Outcome::Done {
+        if !matches!(outcome, Outcome::Done { .. }) {
             self.drop_staged(&effect.id)?;
         }
         Ok(outcome)
@@ -354,14 +365,15 @@ impl Space {
             Some((staging, (target, new_name))) => {
                 self.place(&staging, &effect.id, &target, new_name, hook)?
             }
-            None => Outcome::Done,
+            None => Outcome::Done { identity: None },
         };
         self.trash(&quarantine, id, &effect.id, name, now)?;
         hook(Step::Trashed);
         Ok(outcome)
     }
 
-    /// Renames the staged file to `name` in `target`, never replacing an entry.
+    /// Renames the staged file to `name` in `target`, never replacing an entry,
+    /// and returns the staged file's identity with the outcome.
     fn place(
         &self,
         staging: &Folder,
@@ -372,6 +384,7 @@ impl Space {
     ) -> io::Result<Outcome> {
         resolve!(self.recheck(target));
         self.recheck(staging)?;
+        let identity = stat_at(staging.fd(), OsStr::new(id))?.id;
         match rename_no_replace(staging.fd(), OsStr::new(id), target.fd(), name) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
@@ -382,12 +395,15 @@ impl Space {
         flush(staging.fd())?;
         flush(target.fd())?;
         hook(Step::Placed);
-        Ok(Outcome::Done)
+        Ok(Outcome::Done {
+            identity: Some(identity),
+        })
     }
 
     /// Returns the quarantined entry `id` to `at`. When that name is taken, or
     /// its folder is gone, the entry gets a recovered name in that folder or,
-    /// failing that, at the root. Returns the recovered path.
+    /// failing that, at the root. Returns the recovered path. A root that is no
+    /// longer held is an error, never a reason to recover the entry.
     fn put_back(
         &self,
         quarantine: &Folder,
@@ -402,16 +418,16 @@ impl Space {
             Ok((parent, name))
         }) {
             Ok((parent, name)) => (parent, name),
-            Err(err @ Unresolved::Io { .. }) | Err(err @ Unresolved::BadName(_)) => {
-                return Err(err.into());
-            }
-            Err(_) => {
+            Err(
+                Unresolved::Missing(_) | Unresolved::NotAFolder(_) | Unresolved::Replaced { .. },
+            ) => {
                 let original = location_name(at);
                 let root = self.root_folder()?;
                 let path =
                     self.move_to_recovered_name(quarantine, id, &root, original, folder, now)?;
                 return Ok(Some(path));
             }
+            Err(err) => return Err(err.into()),
         };
         match rename_no_replace(quarantine.fd(), id, parent.fd(), name) {
             Ok(()) => {
@@ -432,7 +448,9 @@ impl Space {
     /// holds at its target, its staging path and its quarantine path. It
     /// writes `marker` again, since the crash may have come before the
     /// marker write. Recovery is idempotent: a crash during it is recovered by
-    /// running it again. `hook` runs at every [`Step`] reached.
+    /// running it again. `hook` runs at every [`Step`] reached. A root that is
+    /// no longer held fails recovery with [`Unresolved::RootWithdrawn`] before
+    /// the next change, and recovery runs again once the root is bound anew.
     pub fn recover(
         &self,
         marker: &Marker,
@@ -442,6 +460,7 @@ impl Space {
         hook: &mut dyn FnMut(Step),
     ) -> io::Result<Outcome> {
         check_name(OsStr::new(&effect.id))?;
+        self.check_held()?;
         write_marker_at(self.root(), marker)?;
         hook(Step::Marked);
         let quarantine = self.private(&[QUARANTINE_DIR])?;
@@ -482,9 +501,13 @@ impl Space {
                     Ok((target, name)) => self.place(&staging, &effect.id, &target, name, hook)?,
                     Err(err) => unresolved(err)?,
                 },
-                Some(at) if self.holds_written(at, contents)? => Outcome::Done,
-                Some(_) => failed(Reason::Taken),
-                None => Outcome::Done,
+                Some(at) => match self.written_at(at, contents)? {
+                    Some(identity) => Outcome::Done {
+                        identity: Some(identity),
+                    },
+                    None => failed(Reason::Taken),
+                },
+                None => Outcome::Done { identity: None },
             };
             self.drop_staged(&effect.id)?;
             let original = location_name(&displaced.at);
@@ -492,48 +515,76 @@ impl Space {
             hook(Step::Trashed);
             return Ok(outcome);
         }
-        if !staged && self.finished(&effect.action, contents)? {
-            return Ok(Outcome::Done);
+        if !staged && let Some(done) = self.finished(&effect.action, contents)? {
+            return Ok(done);
         }
         self.drop_staged(&effect.id)?;
         Ok(failed(Reason::Interrupted))
     }
 
-    /// Whether the disk holds `action`'s final state, for an effect that left
-    /// nothing in quarantine.
-    fn finished(&self, action: &Action, contents: &mut dyn Contents) -> io::Result<bool> {
+    /// The outcome of an effect that left nothing in quarantine, when the disk
+    /// holds `action`'s final state.
+    fn finished(
+        &self,
+        action: &Action,
+        contents: &mut dyn Contents,
+    ) -> io::Result<Option<Outcome>> {
         let entry_at = |at: &Location| -> io::Result<Option<Option<Stat>>> {
             match self.parent(at) {
                 Ok((parent, name)) => Ok(Some(lookup(parent.fd(), name)?)),
-                Err(err @ (Unresolved::Io { .. } | Unresolved::BadName(_))) => Err(err.into()),
-                Err(_) => Ok(None),
+                Err(
+                    Unresolved::Missing(_)
+                    | Unresolved::NotAFolder(_)
+                    | Unresolved::Replaced { .. },
+                ) => Ok(None),
+                Err(err) => Err(err.into()),
             }
         };
-        Ok(match action {
-            Action::CreateDir { at } => {
-                matches!(entry_at(at)?, Some(Some(stat)) if stat.file_type == FileType::Directory)
+        let identity = match action {
+            Action::CreateDir { at } => match entry_at(at)? {
+                Some(Some(stat)) if stat.file_type == FileType::Directory => Some(stat.id),
+                _ => return Ok(None),
+            },
+            Action::WriteFile { at, .. } => match self.written_at(at, contents)? {
+                Some(identity) => Some(identity),
+                None => return Ok(None),
+            },
+            Action::Move { to, id, .. } => match entry_at(to)? {
+                Some(Some(stat)) if stat.id == *id => None,
+                _ => return Ok(None),
+            },
+            Action::RemoveFile {
+                displaced: Displaced { at, .. },
             }
-            Action::WriteFile { at, .. } => self.holds_written(at, contents)?,
-            Action::Move { to, id, .. } => {
-                matches!(entry_at(to)?, Some(Some(stat)) if stat.id == *id)
-            }
-            Action::RemoveFile { displaced } => matches!(entry_at(&displaced.at)?, Some(None)),
-            Action::RemoveDir { at, .. } => matches!(entry_at(at)?, Some(None)),
-        })
+            | Action::RemoveDir { at, .. } => match entry_at(at)? {
+                Some(None) => None,
+                _ => return Ok(None),
+            },
+        };
+        Ok(Some(Outcome::Done { identity }))
     }
 
-    /// Whether the file at `at` holds the content the effect writes.
-    fn holds_written(&self, at: &Location, contents: &mut dyn Contents) -> io::Result<bool> {
+    /// The identity of the file at `at` when it holds the content the effect
+    /// writes, read from the descriptor the content was compared through.
+    fn written_at(&self, at: &Location, contents: &mut dyn Contents) -> io::Result<Option<FileId>> {
         let (parent, name) = match self.parent(at) {
             Ok(resolved) => resolved,
-            Err(err @ (Unresolved::Io { .. } | Unresolved::BadName(_))) => return Err(err.into()),
-            Err(_) => return Ok(false),
+            Err(
+                Unresolved::Missing(_) | Unresolved::NotAFolder(_) | Unresolved::Replaced { .. },
+            ) => {
+                return Ok(None);
+            }
+            Err(err) => return Err(err.into()),
         };
         match lookup(parent.fd(), name)? {
             Some(stat) if stat.file_type == FileType::RegularFile => {
-                contents.written(&open_file(parent.fd(), name)?)
+                let file = open_file(parent.fd(), name)?;
+                if !contents.written(&file)? {
+                    return Ok(None);
+                }
+                Ok(Some(stat_fd(file.as_fd())?.id))
             }
-            _ => Ok(false),
+            _ => Ok(None),
         }
     }
 

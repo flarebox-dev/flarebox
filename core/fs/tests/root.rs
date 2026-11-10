@@ -9,8 +9,8 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
 use flarebox_fs::{
-    Marker, PRIVATE_DIR, RootProblem, check_root, probe_no_replace, read_marker, rename_no_replace,
-    write_marker,
+    Marker, PRIVATE_DIR, RootProblem, Space, Unresolved, check_root, probe_no_replace, read_marker,
+    rename_no_replace, write_marker,
 };
 
 fn marker(space_id: &str, effects: u64) -> Marker {
@@ -162,4 +162,36 @@ fn probe_refuses_a_file_system_whose_rename_lacks_no_replace() {
     let root = Path::new(&dir).join(format!("probe-{}", std::process::id()));
     fs::create_dir(&root).unwrap();
     assert!(!probe_no_replace(&root).unwrap());
+}
+#[test]
+fn marker_and_probe_go_through_the_held_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("space");
+    let moved = dir.path().join("moved");
+    fs::create_dir(&root).unwrap();
+    let space = Space::bind(fs::File::open(&root).unwrap().into(), &root).unwrap();
+    assert_eq!(space.marker().unwrap(), None);
+    assert!(!root.join(PRIVATE_DIR).exists());
+    assert!(space.probe_no_replace().unwrap());
+    assert!(private_names(&root).is_empty());
+
+    write_marker(&root, &marker("space-1", 3)).unwrap();
+    assert_eq!(space.marker().unwrap(), Some(marker("space-1", 3)));
+    assert_eq!(private_names(&root), ["space.json"]);
+
+    fs::rename(&root, &moved).unwrap();
+    fs::create_dir(&root).unwrap();
+    write_marker(&root, &marker("space-2", 9)).unwrap();
+    assert_eq!(space.marker().unwrap(), Some(marker("space-1", 3)));
+    let err = space.probe_no_replace().unwrap_err();
+    assert!(
+        matches!(
+            err.get_ref()
+                .and_then(|err| err.downcast_ref::<Unresolved>()),
+            Some(Unresolved::RootWithdrawn(_))
+        ),
+        "{err}"
+    );
+    assert_eq!(private_names(&root), ["space.json"]);
+    assert_eq!(private_names(&moved), ["space.json"]);
 }

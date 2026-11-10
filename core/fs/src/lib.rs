@@ -56,10 +56,12 @@
 //! Effects change the disk through a [`Space`]: a descriptor of the root from
 //! which every [`Location`] is resolved one folder at a time, without following
 //! links and checking each folder's identity, and resolved again before each
-//! rename ([`Space::recheck`]). Displaced entries go to the local trash
-//! ([`Space::trash`]), which [`Space::reclaim_trash`] empties by age and size,
-//! turning an entry written to after it entered into a recovered file
-//! ([`recovered_name`]).
+//! rename ([`Space::recheck`]). The caller binds the space to a descriptor it
+//! already holds ([`Space::bind`]), and the space changes nothing once the path
+//! the root was linked at names another folder or nothing ([`Space::held`]).
+//! Displaced entries go to the local trash ([`Space::trash`]), which
+//! [`Space::reclaim_trash`] empties by age and size, turning an entry written
+//! to after it entered into a recovered file ([`recovered_name`]).
 //!
 //! [`Space::apply`] carries out one [`Effect`] with the quarantine protocol of
 //! design §5.2, writing the root marker first and calling a hook at every
@@ -208,6 +210,16 @@ fn stat_fd(fd: BorrowedFd<'_>) -> io::Result<Stat> {
     statx(fd, OsStr::new(""), rustix::fs::AtFlags::EMPTY_PATH)
 }
 
+/// Stats `path`, following symbolic links.
+#[cfg(target_os = "linux")]
+fn stat_path(path: &Path) -> io::Result<Stat> {
+    statx(
+        rustix::fs::CWD,
+        path.as_os_str(),
+        rustix::fs::AtFlags::empty(),
+    )
+}
+
 #[cfg(not(target_os = "linux"))]
 fn from_stat(st: rustix::fs::Stat) -> Stat {
     let nanos = |sec: i64, nsec: i64| i128::from(sec) * 1_000_000_000 + i128::from(nsec);
@@ -238,6 +250,12 @@ fn stat_at(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<Stat> {
 #[cfg(not(target_os = "linux"))]
 fn stat_fd(fd: BorrowedFd<'_>) -> io::Result<Stat> {
     Ok(from_stat(rustix::fs::fstat(fd)?))
+}
+
+/// Stats `path`, following symbolic links.
+#[cfg(not(target_os = "linux"))]
+fn stat_path(path: &Path) -> io::Result<Stat> {
+    Ok(from_stat(rustix::fs::stat(path)?))
 }
 
 const DIR_FLAGS: OFlags = OFlags::RDONLY
@@ -401,7 +419,7 @@ pub struct Snapshot {
 }
 
 /// What one [`Snapshot::rescan`] found.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Rescan {
     /// The changes, already applied to the snapshot.
     pub changes: Vec<Change>,
@@ -414,6 +432,10 @@ pub struct Rescan {
     /// below them, so a folder the user cannot read never reads as emptied.
     /// Report them, and rescan them once they can be read.
     pub unreadable: Vec<PathBuf>,
+    /// The identity of the root folder the scan opened. A scan that reached
+    /// another folder than the caller's root has already applied that folder
+    /// to the snapshot, so stop using the snapshot, not only its changes.
+    pub root: FileId,
 }
 
 impl Snapshot {
@@ -448,17 +470,38 @@ impl Snapshot {
         root: impl AsRef<Path>,
         paths: impl IntoIterator<Item = PathBuf>,
     ) -> Result<Rescan> {
-        self.rescan_with(root.as_ref(), paths, &mut |_| {})
+        self.rescan_with(root.as_ref(), paths, None, &mut |_| {})
     }
 
+    /// Drops what the snapshot knows at and below `scope`, a relative path,
+    /// so the next rescan of `scope` reports what is there as created. An
+    /// empty path drops everything.
+    pub fn forget(&mut self, scope: &Path) {
+        let known: Vec<PathBuf> = self
+            .entries
+            .range(scope.to_path_buf()..)
+            .take_while(|(path, _)| path.starts_with(scope))
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in known {
+            self.entries.remove(&path);
+        }
+    }
+
+    /// [`Snapshot::rescan`], failing with [`Error::RootReplaced`] and
+    /// changing nothing when `root` opens a folder other than `expected`.
     fn rescan_with(
         &mut self,
         root: &Path,
         paths: impl IntoIterator<Item = PathBuf>,
+        expected: Option<FileId>,
         cut: &mut dyn FnMut(Cut<'_>),
     ) -> Result<Rescan> {
         let root_dir = open_root(root)?;
         let root_stat = stat_fd(root_dir.as_fd())?;
+        if expected.is_some_and(|expected| root_stat.id != expected) {
+            return Err(Error::RootReplaced);
+        }
         cut(Cut::RootOpened);
 
         let mut scopes = Vec::new();
@@ -572,6 +615,7 @@ impl Snapshot {
             changes,
             unsettled,
             unreadable,
+            root: root_stat.id,
         })
     }
 
@@ -964,6 +1008,9 @@ pub struct Poll {
     /// Folders the scans of this poll may not read; see
     /// [`Rescan::unreadable`].
     pub unreadable: Vec<PathBuf>,
+    /// The identity of the root folder the scans of this poll opened, or
+    /// `None` when the poll scanned nothing; see [`Rescan::root`].
+    pub root: Option<FileId>,
 }
 
 /// A source of changes under one root.
@@ -1080,9 +1127,12 @@ impl NativeWatcher {
 
     /// Registers watches on the folders the changes created or moved, and on
     /// the blocked folders that became `readable`, then rescans them, so
-    /// anything written before the watch existed is seen.
+    /// anything written before the watch existed is seen. A rescan that opens
+    /// another root folder than `root`, the one the changes came from, fails
+    /// the watcher with [`Error::RootReplaced`], returns nothing and leaves
+    /// the snapshot as it was.
     #[cfg(target_os = "linux")]
-    fn cover(&mut self, changes: &[Change], readable: Vec<PathBuf>) -> Vec<Change> {
+    fn cover(&mut self, changes: &[Change], readable: Vec<PathBuf>, root: FileId) -> Vec<Change> {
         let dirs = outermost(
             changes
                 .iter()
@@ -1116,7 +1166,10 @@ impl NativeWatcher {
                 self.failed = Some(watch_error(err));
             }
         }
-        match self.snapshot.rescan(&self.root, dirs.iter().cloned()) {
+        match self
+            .snapshot
+            .rescan_with(&self.root, dirs.iter().cloned(), Some(root), &mut |_| {})
+        {
             Ok(rescan) => {
                 self.dirty.extend(rescan.unsettled);
                 self.blocked.extend(rescan.unreadable.iter().cloned());
@@ -1136,13 +1189,14 @@ impl NativeWatcher {
 }
 
 impl NativeWatcher {
-    /// What a poll returns once it has `changes`: the scopes still dirty, and
-    /// the folders its scans could not read.
-    fn report(&mut self, changes: Vec<Change>) -> Poll {
+    /// What a poll returns once it has `changes` from a scan of `root`: the
+    /// scopes still dirty, and the folders its scans could not read.
+    fn report(&mut self, changes: Vec<Change>, root: Option<FileId>) -> Poll {
         Poll {
             changes,
             pending: self.dirty.iter().cloned().collect(),
             unreadable: std::mem::take(&mut self.unreadable).into_iter().collect(),
+            root,
         }
     }
 }
@@ -1227,6 +1281,7 @@ fn vanished(err: &notify::Error) -> bool {
 impl Watcher for NativeWatcher {
     fn poll(&mut self, timeout: Duration) -> Result<Poll> {
         let deadline = Instant::now() + timeout;
+        let mut root = None;
         loop {
             if let Some(err) = self.failed.take() {
                 return Err(err);
@@ -1234,7 +1289,7 @@ impl Watcher for NativeWatcher {
             if self.dirty.is_empty() {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if !self.receive(left)? {
-                    return Ok(self.report(Vec::new()));
+                    return Ok(self.report(Vec::new(), root));
                 }
             }
             let settle_until = Instant::now() + MAX_SETTLE;
@@ -1247,9 +1302,10 @@ impl Watcher for NativeWatcher {
             let rescan = match self.snapshot.rescan(&self.root, scopes.iter().cloned()) {
                 Ok(rescan) => rescan,
                 Err(Error::Changed) if Instant::now() < deadline => continue,
-                Err(Error::Changed) => return Ok(self.report(Vec::new())),
+                Err(Error::Changed) => return Ok(self.report(Vec::new(), root)),
                 Err(err) => return Err(err),
             };
+            root = Some(rescan.root);
             self.dirty = rescan.unsettled.into_iter().collect();
             #[cfg(target_os = "linux")]
             let readable = self.unblock(&scopes, &rescan.unreadable);
@@ -1258,12 +1314,12 @@ impl Watcher for NativeWatcher {
             #[cfg(target_os = "linux")]
             let changes = {
                 let mut changes = changes;
-                let more = self.cover(&changes, readable);
+                let more = self.cover(&changes, readable, rescan.root);
                 changes.extend(more);
                 changes
             };
             if !changes.is_empty() || Instant::now() >= deadline {
-                return Ok(self.report(changes));
+                return Ok(self.report(changes, root));
             }
         }
     }
@@ -1300,6 +1356,7 @@ impl Watcher for RescanWatcher {
                     changes: rescan.changes,
                     pending: rescan.unsettled,
                     unreadable: rescan.unreadable,
+                    root: Some(rescan.root),
                 },
                 Err(Error::Changed) => Poll {
                     pending: vec![PathBuf::new()],

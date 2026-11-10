@@ -4,6 +4,8 @@
 //! and entries written through an old descriptor recovered instead of
 //! deleted, on the file system the tests run on.
 
+mod common;
+
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -11,6 +13,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use common::bind;
 use flarebox_fs::{
     Base, Location, PRIVATE_DIR, Reclaimed, Space, TRASH_DIR, TRASH_RETENTION, recovered_name,
 };
@@ -60,7 +63,7 @@ fn trashed_entries_stay_until_they_expire() {
     let root = dir.path();
     fs::write(root.join("old.txt"), "old").unwrap();
     fs::write(root.join("new.txt"), "new").unwrap();
-    let space = Space::open(root).unwrap();
+    let space = bind(root);
     put(&space, "old.txt", "e1", at(T0));
     put(&space, "new.txt", "e2", at(T0) + 3 * DAY);
     assert_eq!(names(root), [PRIVATE_DIR]);
@@ -92,7 +95,7 @@ fn trashed_entries_stay_until_they_expire() {
 fn size_cap_evicts_the_oldest_entries_first() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let space = Space::open(root).unwrap();
+    let space = bind(root);
     for (i, size) in [10, 20, 30].into_iter().enumerate() {
         let name = format!("f{i}");
         fs::write(root.join(&name), vec![b'x'; size]).unwrap();
@@ -134,7 +137,7 @@ fn write_through_an_old_descriptor_is_recovered_on_expiry() {
         .append(true)
         .open(root.join("report.txt"))
         .unwrap();
-    let space = Space::open(root).unwrap();
+    let space = bind(root);
     put(&space, "report.txt", "e1", at(T0));
 
     held.write_all(b" and appended later").unwrap();
@@ -167,7 +170,7 @@ fn write_through_an_old_descriptor_is_recovered_under_the_size_cap() {
         .write(true)
         .open(root.join("notes"))
         .unwrap();
-    let space = Space::open(root).unwrap();
+    let space = bind(root);
     put(&space, "notes", "e1", at(T0));
     fs::write(root.join("notes (recovered 2023-11-14)"), "taken").unwrap();
 
@@ -200,7 +203,7 @@ fn folder_written_into_after_trashing_is_recovered() {
     let root = dir.path();
     fs::create_dir(root.join("photos.d")).unwrap();
     let held = fs::File::open(root.join("photos.d")).unwrap();
-    let space = Space::open(root).unwrap();
+    let space = bind(root);
     put(&space, "photos.d", "e1", at(T0));
 
     std::thread::sleep(Duration::from_millis(50));
@@ -227,7 +230,7 @@ fn folder_written_into_after_trashing_is_recovered() {
 fn entry_missing_from_the_index_is_kept_for_a_full_period() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let space = Space::open(root).unwrap();
+    let space = bind(root);
     fs::write(root.join("a.txt"), "a").unwrap();
     put(&space, "a.txt", "e1", at(T0));
     fs::write(trash_dir(root).join("e2"), "moved in before a crash").unwrap();
@@ -256,7 +259,7 @@ fn entry_missing_from_the_index_is_kept_for_a_full_period() {
 fn trashing_never_replaces_an_entry() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let space = Space::open(root).unwrap();
+    let space = bind(root);
     fs::write(root.join("a.txt"), "a").unwrap();
     fs::write(root.join("b.txt"), "b").unwrap();
     put(&space, "a.txt", "e1", at(T0));
@@ -332,7 +335,7 @@ fn unindexed_entry_written_late_is_recovered_under_the_cap() {
     held.write_all(b" and written late").unwrap();
     drop(held);
 
-    let space = Space::open(root).unwrap();
+    let space = bind(root);
     let reclaimed = space.reclaim_trash(at(T0), 0).unwrap();
     let name = "e1 (recovered 2023-11-14)";
     assert_eq!(
@@ -361,7 +364,7 @@ fn unindexed_entry_written_late_is_recovered_on_expiry() {
     held.write_all(b" and written late").unwrap();
     drop(held);
 
-    let space = Space::open(root).unwrap();
+    let space = bind(root);
     assert_eq!(
         space.reclaim_trash(at(T0), u64::MAX).unwrap(),
         Reclaimed::default()
@@ -389,7 +392,7 @@ fn unindexed_entry_is_never_deleted() {
     let root = dir.path();
     fs::write(root.join("a.txt"), "a").unwrap();
     put_unindexed(root, "a.txt", "e1");
-    let space = Space::open(root).unwrap();
+    let space = bind(root);
     let reclaimed = space.reclaim_trash(at(T0) + TRASH_RETENTION, 0).unwrap();
     assert_eq!(
         reclaimed,
@@ -409,7 +412,7 @@ fn stale_index_temporary_file_does_not_stop_reclamation() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     fs::write(root.join("a.txt"), "a").unwrap();
-    let space = Space::open(root).unwrap();
+    let space = bind(root);
     put(&space, "a.txt", "e1", at(T0));
     fs::write(root.join(PRIVATE_DIR).join("trash.json.tmp"), "torn").unwrap();
     fs::write(root.join("b.txt"), "b").unwrap();
@@ -429,7 +432,7 @@ fn trash_names_must_be_single_components() {
     let root = dir.path().join("space");
     fs::create_dir_all(root.join("d")).unwrap();
     fs::write(root.join("d/a.txt"), "a").unwrap();
-    let space = Space::open(&root).unwrap();
+    let space = bind(&root);
     let location = Location::At {
         base: Base::Root,
         dirs: Vec::new(),
@@ -477,7 +480,7 @@ fn trash_moved_out_of_the_root_during_reclamation_is_left_alone() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     fs::write(root.join("a.txt"), "a").unwrap();
-    let space = Space::open(root).unwrap();
+    let space = bind(root);
     put(&space, "a.txt", "e1", at(T0));
     let index_path = root.join(PRIVATE_DIR).join("trash.json");
     let index = fs::read(&index_path).unwrap();
@@ -492,11 +495,7 @@ fn trash_moved_out_of_the_root_during_reclamation_is_left_alone() {
     // which happens after the trash folder has moved out of the root.
     let reclaim = std::thread::spawn({
         let root = root.to_path_buf();
-        move || {
-            Space::open(&root)
-                .unwrap()
-                .reclaim_trash(at(T0) + TRASH_RETENTION, u64::MAX)
-        }
+        move || bind(&root).reclaim_trash(at(T0) + TRASH_RETENTION, u64::MAX)
     });
     let mut fifo = OpenOptions::new().write(true).open(&index_path).unwrap();
     fs::rename(trash_dir(root), outside.path().join("trash")).unwrap();
