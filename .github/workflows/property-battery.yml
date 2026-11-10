@@ -1,0 +1,392 @@
+# SPDX-License-Identifier: Apache-2.0
+
+name: Property battery
+
+run-name: Property battery on ${{ github.ref_name }} (${{ inputs.shards || '24' }} shards x ${{ inputs.cases || '8192' }} cases)
+
+on:
+  workflow_dispatch:
+    inputs:
+      filter:
+        description: Test name filter passed to every property test binary (empty runs all their tests)
+        type: string
+        default: ''
+      cases:
+        description: PROPTEST_CASES on each shard (empty means 8192)
+        type: string
+        default: ''
+      shards:
+        description: Number of shards, each with its own seed, 1 to 256 (empty means 24)
+        type: string
+        default: ''
+      mutations:
+        description: Also run the mutation set in scripts/engine-mutations.sh
+        type: boolean
+        default: false
+  schedule:
+    - cron: '17 18 * * *'
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  CASES: ${{ inputs.cases || '8192' }}
+  SHARDS: ${{ inputs.shards || '24' }}
+  FILTER: ${{ inputs.filter }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.plan.outputs.sha }}
+      seed_base: ${{ steps.plan.outputs.seed_base }}
+      shards: ${{ steps.plan.outputs.shards }}
+      mutation_shards: ${{ steps.plan.outputs.mutation_shards }}
+    steps:
+      - name: Check the inputs
+        run: |
+          if [[ "$FILTER" == -* ]]; then
+            echo "::error::filter must be a test name, not an option: '$FILTER' starts with '-', which the test binaries would read as a flag."
+            exit 1
+          fi
+          if ! [[ "$CASES" =~ ^[1-9][0-9]{0,6}$ ]]; then
+            echo "::error::cases must be a whole number from 1 to 9999999, got '$CASES'."
+            exit 1
+          fi
+          if ! [[ "$SHARDS" =~ ^[1-9][0-9]{0,2}$ ]] || [ "$SHARDS" -gt 256 ]; then
+            echo "::error::shards must be a whole number from 1 to 256 (the matrix limit), got '$SHARDS'."
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: property-battery
+      - name: Build the property test binaries
+        run: |
+          cargo metadata --format-version 1 --locked --no-deps > "$RUNNER_TEMP/metadata.json"
+          mapfile -t packages < <(jq -r '.packages[] | select(any(.dependencies[]; .name == "proptest")) | .name' "$RUNNER_TEMP/metadata.json")
+          if [ "${#packages[@]}" -eq 0 ]; then
+            echo "::error::No workspace package depends on proptest, so there is nothing to run."
+            exit 1
+          fi
+          echo "Packages with property tests: ${packages[*]}"
+          args=()
+          for package in "${packages[@]}"; do args+=(-p "$package"); done
+          cargo test --locked --no-run --tests --message-format=json-render-diagnostics "${args[@]}" > "$RUNNER_TEMP/build.json"
+          filter_args=()
+          if [ -n "$FILTER" ]; then filter_args=("$FILTER"); fi
+          mkdir -p battery/bin
+          : > battery/targets.tsv
+          : > "$RUNNER_TEMP/covered.txt"
+          while IFS=$'\t' read -r manifest selector executable; do
+            if [ ! -f "$executable.d" ]; then
+              echo "::error::$executable has no dep-info file ($executable.d), so its source files are unknown."
+              exit 1
+            fi
+            properties=$(sed -n 's/^\(.*\.rs\):$/\1/p' "$executable.d" | xargs -r realpath -m --relative-to="$GITHUB_WORKSPACE" | grep -v '^\.\./' | xargs -r grep -l 'proptest!' || true)
+            [ -n "$properties" ] || continue
+            echo "$properties" >> "$RUNNER_TEMP/covered.txt"
+            package=$(jq -r --arg manifest "$manifest" '.packages[] | select(.manifest_path == $manifest) | .name' "$RUNNER_TEMP/metadata.json")
+            dir=$(realpath --relative-to="$GITHUB_WORKSPACE" "$(dirname "$manifest")")
+            binary="bin/$(basename "$executable")"
+            cp "$executable" "battery/$binary"
+            if ! listing=$(cd "$dir" && "$executable" --list "${filter_args[@]}"); then
+              echo "::error::$package $selector: listing its tests with --list failed, so the battery cannot tell which tests it would run."
+              exit 1
+            fi
+            listed=$(grep -c ': test$' <<< "$listing" || true)
+            printf '%s\t%s\t%s\t%s\t%s\n' "$package" "$selector" "$dir" "$binary" "$listed" >> battery/targets.tsv
+            echo "$package $selector: $listed tests selected; property files: ${properties//$'\n'/ }"
+          done < <(jq -r 'select(.reason == "compiler-artifact" and .executable != null) | [.manifest_path, (if (.target.kind | any(. == "test")) then "--test " + .target.name elif (.target.kind | any(. == "bin")) then "--bin " + .target.name else "--lib" end), .executable] | @tsv' "$RUNNER_TEMP/build.json")
+          missing=$(for package in "${packages[@]}"; do
+            dir=$(jq -r --arg name "$package" '.packages[] | select(.name == $name) | .manifest_path' "$RUNNER_TEMP/metadata.json" | xargs dirname | xargs realpath --relative-to="$GITHUB_WORKSPACE")
+            git ls-files -- "$dir" | grep '\.rs$' | xargs -r grep -l 'proptest!' || true
+          done | sort -u | comm -23 - <(sort -u "$RUNNER_TEMP/covered.txt"))
+          if [ -n "$missing" ]; then
+            echo "::error::These files contain proptest! but no test binary of their package compiles them, so the battery would skip them: ${missing//$'\n'/ }"
+            exit 1
+          fi
+          if [ ! -s battery/targets.tsv ]; then
+            echo "::error::No test binary in ${packages[*]} compiles a file with a proptest! block."
+            exit 1
+          fi
+          selected=$(awk -F'\t' '{ n += $5 } END { print n + 0 }' battery/targets.tsv)
+          if [ "$selected" -eq 0 ]; then
+            echo "::error::The filter '$FILTER' selects no test in the property test binaries, so the battery would run nothing."
+            exit 1
+          fi
+          {
+            echo "### Property test targets"
+            echo
+            echo "$selected tests selected per shard (filter: ${FILTER:-none})."
+            echo
+            awk -F'\t' '{ print "- " $1 " " $2 ": " $5 " tests" }' battery/targets.tsv
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          tar -cf battery.tar battery
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: battery-binaries
+          path: battery.tar
+          retention-days: 1
+          if-no-files-found: error
+      - name: Plan the shards
+        id: plan
+        env:
+          MUTATIONS: ${{ inputs.mutations }}
+        run: |
+          seed_base=$((GITHUB_RUN_ID * 1000))
+          mutation_shards='[]'
+          if [ "$MUTATIONS" = "true" ]; then
+            if [ ! -x scripts/mutations.sh ]; then
+              echo "::error::Commit $(git rev-parse HEAD) has no scripts/mutations.sh, so it has no mutation set to run. Test a commit that contains it, or run without mutations."
+              exit 1
+            fi
+            count=$(scripts/mutations.sh --count)
+            n=$(( count < SHARDS ? count : SHARDS ))
+            mutation_shards=$(jq -cn --argjson n "$n" '[range($n)]')
+            echo "Mutation set: $count mutations on $n shards."
+          fi
+          {
+            echo "sha=$(git rev-parse HEAD)"
+            echo "seed_base=$seed_base"
+            echo "shards=$(jq -cn --argjson n "$SHARDS" '[range($n)]')"
+            echo "mutation_shards=$mutation_shards"
+          } >> "$GITHUB_OUTPUT"
+          echo "Commit $(git rev-parse HEAD), $SHARDS shards, PROPTEST_CASES=$CASES, shard k uses PROPTEST_RNG_SEED=$seed_base + k."
+
+  shard:
+    name: shard ${{ matrix.shard }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.build.outputs.shards) }}
+    env:
+      SHA: ${{ needs.build.outputs.sha }}
+      SEED_BASE: ${{ needs.build.outputs.seed_base }}
+      SHARD: ${{ matrix.shard }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.build.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: battery-binaries
+      - name: Run the property tests
+        run: |
+          tar -xf battery.tar
+          seed=$((SEED_BASE + SHARD))
+          out="$RUNNER_TEMP/out"
+          mkdir -p "$out/logs" "$out/regressions"
+          echo "Shard $SHARD: PROPTEST_RNG_SEED=$seed PROPTEST_CASES=$CASES filter='$FILTER' commit $SHA"
+          filter_args=()
+          repro_filter=""
+          if [ -n "$FILTER" ]; then
+            filter_args=("$FILTER")
+            repro_filter=" -- $(printf '%q' "$FILTER")"
+          fi
+          passed=0 failed=0 failing='[]'
+          while IFS=$'\t' read -r package selector dir binary expected; do
+            [ "$expected" -gt 0 ] || continue
+            log="$out/logs/$(basename "$binary").log"
+            echo "::group::$package $selector"
+            set +e
+            (cd "$dir" && CARGO_MANIFEST_DIR="$GITHUB_WORKSPACE/$dir" PROPTEST_RNG_SEED="$seed" PROPTEST_CASES="$CASES" "$GITHUB_WORKSPACE/battery/$binary" "${filter_args[@]}") 2>&1 | tee "$log"
+            code=${PIPESTATUS[0]}
+            set -e
+            echo "::endgroup::"
+            counts=$(sed -nE 's/^test result: [A-Za-z]+\. ([0-9]+) passed; ([0-9]+) failed; ([0-9]+) ignored.*/\1 \2 \3/p' "$log" | tail -n 1)
+            read -r p f i <<< "${counts:-0 0 0}"
+            passed=$((passed + p))
+            failed=$((failed + f))
+            echo "$package $selector: exit $code, $p passed, $f failed, $i ignored, $expected listed"
+            reason=""
+            if [ "$code" -ne 0 ]; then
+              reason="exit code $code"
+            elif [ $((p + f + i)) -ne "$expected" ]; then
+              reason="ran $((p + f + i)) of the $expected tests listed for it"
+            fi
+            if [ -n "$reason" ]; then
+              repro="git checkout $SHA && PROPTEST_CASES=$CASES PROPTEST_RNG_SEED=$seed cargo test --locked -p $package $selector$repro_filter"
+              failing=$(jq -c --arg target "$package $selector" --arg reason "$reason" --arg repro "$repro" '. + [{target: $target, reason: $reason, repro: $repro}]' <<< "$failing")
+              echo "::error title=$package $selector failed on shard $SHARD::Seed $seed, $CASES cases, $reason. Reproduce: $repro"
+            fi
+          done < battery/targets.tsv
+          if [ "$passed" -eq 0 ] && [ "$failed" -eq 0 ] && [ "$failing" = '[]' ]; then
+            failing='[{"target": "all targets", "reason": "no test ran", "repro": ""}]'
+            echo "::error::Shard $SHARD ran no tests, so it checked nothing."
+          fi
+          git status --porcelain --untracked-files=all -- '*.proptest-regressions' | cut -c4- | while read -r file; do
+            cp --parents "$file" "$out/regressions/"
+          done
+          jq -n --argjson shard "$SHARD" --argjson seed "$seed" --argjson cases "$CASES" --argjson passed "$passed" --argjson failed "$failed" --argjson failing "$failing" \
+            '{shard: $shard, seed: $seed, cases: $cases, passed: $passed, failed: $failed, failing: $failing}' > "$out/result-$SHARD.json"
+          if [ "$failing" = '[]' ]; then
+            echo "Shard $SHARD passed: $passed tests, seed $seed, $CASES cases per property test." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          jq -r '.[] | .repro' <<< "$failing" > "$out/repro.txt"
+          echo "$seed" > "$out/seed.txt"
+          {
+            echo "### Shard $SHARD failed"
+            echo
+            echo "Seed $seed, $CASES cases, commit \`$SHA\`. The seed, repro commands, logs and new regression files are in the \`failure-shard-$SHARD\` artifact. Reproduce:"
+            echo
+            jq -r '.[] | "```sh\n\(.repro)\n```"' <<< "$failing"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          exit 1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: result-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/out/result-${{ matrix.shard }}.json
+          retention-days: 7
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: failure-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/out
+          retention-days: 30
+          if-no-files-found: warn
+
+  mutations:
+    name: mutations ${{ matrix.shard }}
+    needs: build
+    if: inputs.mutations
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.build.outputs.mutation_shards) }}
+    env:
+      MUTATION_SHARDS: ${{ strategy.job-total }}
+      SHARD: ${{ matrix.shard }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.build.outputs.sha }}
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: property-battery
+          save-if: false
+      - name: Run the mutation set
+        env:
+          MUTATION_SEED: ${{ needs.build.outputs.seed_base }}
+        run: |
+          out="$RUNNER_TEMP/out"
+          mkdir -p "$out"
+          set +e
+          scripts/mutations.sh --shard "$SHARD/$MUTATION_SHARDS" 2>&1 | tee "$out/mutations-$SHARD.log"
+          code=${PIPESTATUS[0]}
+          set -e
+          count() { grep -cE "^[^ ]+: $1" "$out/mutations-$SHARD.log" || true; }
+          jq -n --argjson shard "$SHARD" --argjson caught "$(count caught)" --argjson survived "$(count SURVIVED)" --argjson stale "$(count STALE)" --argjson broken "$(count BROKEN)" --argjson code "$code" \
+            '{shard: $shard, caught: $caught, survived: $survived, stale: $stale, broken: $broken, exit: $code}' > "$out/mutations-$SHARD.json"
+          {
+            echo "### Mutation shard $SHARD"
+            echo
+            echo '```'
+            grep -E '^[^ ]+: (caught|SURVIVED|STALE|BROKEN)|^Baseline' "$out/mutations-$SHARD.log" || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$code"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: result-mutations-${{ matrix.shard }}
+          path: ${{ runner.temp }}/out/mutations-${{ matrix.shard }}.*
+          retention-days: 7
+          if-no-files-found: warn
+
+  summary:
+    name: summary
+    needs: [build, shard, mutations]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: result-*
+          path: results
+          merge-multiple: true
+      - name: Summarize the shards
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.build.outputs.sha }}
+          REF: ${{ github.ref_name }}
+          BUILD: ${{ needs.build.result }}
+          SHARD_RESULT: ${{ needs.shard.result }}
+          MUTATIONS_RESULT: ${{ needs.mutations.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$BUILD" != "success" ]; then
+            echo "::error::The build job ended with '$BUILD', so no shard ran. Open the build job's log for the cause: $RUN_URL"
+            exit 1
+          fi
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" \
+            --jq '.jobs[] | {name, url: .html_url, conclusion}' | jq -s 'map({(.name): .}) | add // {}' > jobs.json
+          shopt -s nullglob
+          results=(results/result-*.json)
+          if [ "${#results[@]}" -gt 0 ]; then jq -s . "${results[@]}" > shards.json; else echo '[]' > shards.json; fi
+          passing=$(jq '[.[] | select(.failing == [])] | length' shards.json)
+          tests_passed=$(jq '[.[] | .passed] | add // 0' shards.json)
+          tests_failed=$(jq '[.[] | .failed] | add // 0' shards.json)
+          {
+            echo "## Property battery"
+            echo
+            echo "Commit \`$SHA\` ($REF), $SHARDS shards, PROPTEST_CASES=$CASES, filter: ${FILTER:-none}."
+            echo
+            echo "- Shards passed: $passing of $SHARDS"
+            echo "- Cases: each property test ran $CASES cases on each passing shard, $((CASES * passing)) per property test in total"
+            echo "- Tests: $tests_passed passed and $tests_failed failed, summed over shards"
+            echo
+            echo "| Shard | Seed | Result | Tests passed | Tests failed | Job |"
+            echo "|---|---|---|---|---|---|"
+            for shard in $(seq 0 $((SHARDS - 1))); do
+              job=$(jq -c --arg name "shard $shard" '.[$name] // {url: "", conclusion: "missing"}' jobs.json)
+              url=$(jq -r .url <<< "$job")
+              row=$(jq -r --argjson shard "$shard" '.[] | select(.shard == $shard) | "\(.seed) | \(if .failing == [] then "passed" else "**failed**: " + ([.failing[].target] | join(", ")) end) | \(.passed) | \(.failed)"' shards.json)
+              if [ -z "$row" ]; then row="- | no result ($(jq -r .conclusion <<< "$job")) | - | -"; fi
+              echo "| $shard | $row | [log]($url) |"
+            done
+            mutation_results=(results/mutations-*.json)
+            if [ "${#mutation_results[@]}" -gt 0 ]; then
+              echo
+              jq -rs '"Mutations: \(map(.caught) | add) caught, \(map(.survived) | add) survived, \(map(.stale) | add) stale, \(map(.broken) | add) did not compile."' "${mutation_results[@]}"
+            fi
+            echo
+            echo "Run: $RUN_URL"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$SHARD_RESULT" != "success" ] || { [ "$MUTATIONS_RESULT" != "success" ] && [ "$MUTATIONS_RESULT" != "skipped" ]; }; then
+            failed_shards=$(jq -r '[.[] | select(.failing != []) | .shard] | join(", ")' shards.json)
+            echo "::error::Shards: $SHARD_RESULT (failed: ${failed_shards:-none recorded, see the table}), mutations: $MUTATIONS_RESULT. The job summary lists the seeds and repro commands."
+            exit 1
+          fi
+          echo "All $SHARDS shards passed, $((CASES * passing)) cases per property test."
