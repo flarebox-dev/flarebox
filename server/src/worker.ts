@@ -220,7 +220,7 @@ async function route(request: Request, env: Env): Promise<Response> {
   if (method === "POST" && path === "/v1/pair/complete") {
     const body = await readMessage(request, PairCompleteRequestSchema);
     checkNames({ device_name: body.deviceName, platform: body.platform });
-    const outcome = await account(env).completePairing(body);
+    const outcome = await account(env).completePairing(body, request.headers.get("CF-Connecting-IP") ?? "");
     if (!outcome.ok) return errorReply(request, outcome.code, outcome.message);
     return reply(request, DeviceCredentialsSchema, create(DeviceCredentialsSchema, outcome.value));
   }

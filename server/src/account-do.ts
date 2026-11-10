@@ -2,7 +2,7 @@
 
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { DurableObject } from "cloudflare:workers";
-import { type ClaimAttempt, MIN_RECOVERY_KEY_LENGTH, ownerOf, redeemClaim, storeClaimCode } from "./account/claim";
+import { type ClaimAttempt, MIN_RECOVERY_KEY_LENGTH, ownerOf, redeemClaim, storeClaimCode, wrongCode } from "./account/claim";
 import { migrate } from "./account/schema";
 import { ACCESS_TOKEN_MS, type ServerKey, signAccessToken } from "./auth";
 import { base64url, deriveSpaceKey, sha256 } from "./crypto";
@@ -33,7 +33,6 @@ export type { Outcome } from "./share/links";
 
 const CLAIM_CODE_MS = 3_600_000;
 const PAIRING_CODE_MS = 10 * 60_000;
-const PAIRING_FAILURES_PER_WINDOW = 20;
 /** Principals per page of GET /v1/devices (RFC 0006 section 7). */
 const DEVICE_PAGE = 100;
 /** Spaces per page of GET /v1/spaces (RFC 0007 section 2). */
@@ -327,26 +326,17 @@ export class AccountDO extends DurableObject<Env> {
     return ok({ code: `${code.slice(0, 4)}-${code.slice(4)}`, expiresAtMs });
   }
 
-  /** Redeems a pairing code for a new device of the same user. Failed attempts are counted per 10-minute window. */
-  async completePairing(args: { code: string; deviceName: string; platform: string }): Promise<Outcome<DeviceCredentials>> {
+  /**
+   * Redeems a pairing code for a new device of the same user. A correct code always redeems; a wrong one counts against
+   * client, the caller's address, and an address with too many recent wrong codes gets RETRY_LATER for wrong codes.
+   */
+  async completePairing(args: { code: string; deviceName: string; platform: string }, client: string): Promise<Outcome<DeviceCredentials>> {
     const nowMs = Date.now();
-    const window = JSON.parse(
-      String(this.sql.exec("SELECT value FROM settings WHERE key = 'pair_failures'").toArray()[0]?.value ?? '{"start":0,"count":0}'),
-    ) as { start: number; count: number };
-    if (nowMs - window.start > PAIRING_CODE_MS) Object.assign(window, { start: nowMs, count: 0 });
-    if (window.count >= PAIRING_FAILURES_PER_WINDOW) return failure(Error_Code.RETRY_LATER, "too many failed pairing attempts");
     const row = this.sql
       .exec("DELETE FROM pairing_codes WHERE code_hash = ? AND expires_at_ms > ? RETURNING device_id", await codeHash(args.code), nowMs)
       .toArray()[0];
     const inviter = row && this.activeDevice(String(row.device_id));
-    if (!inviter) {
-      window.count++;
-      this.sql.exec(
-        "INSERT INTO settings (key, value) VALUES ('pair_failures', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-        JSON.stringify(window),
-      );
-      return failure(Error_Code.FORBIDDEN, "invalid or expired pairing code");
-    }
+    if (!inviter) return wrongCode(this.sql, "pair", client, nowMs, "invalid or expired pairing code");
     return ok(await this.addDevice(inviter.user_id, args.deviceName, args.platform, nowMs, inviter.device_id));
   }
 
