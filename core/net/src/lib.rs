@@ -25,7 +25,7 @@ pub use api::Api;
 pub use auth::{Auth, Credentials, DEFAULT_REFRESH_MARGIN};
 pub use backoff::Backoff;
 pub use chunks::{ChunkError, MAX_CHUNKS_PER_CALL, Transfer, matches};
-pub use error::{ApiError, CallError, NotResent, ServerError, StopReason};
+pub use error::{ApiError, CallError, NotResent, Resend, ServerError, StopReason};
 pub use event::{Committed, DisconnectReason, Event};
 pub use session::{
     Events, MAX_CLIENT_MESSAGE, MAX_SERVER_MESSAGE, PROTO_MAX, PROTO_MIN, Session, SessionConfig,

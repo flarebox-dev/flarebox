@@ -14,6 +14,7 @@ use tokio_tungstenite::WebSocketStream;
 
 use super::*;
 use crate::{Api, Credentials};
+use flarebox_proto::v1::error::Code;
 
 type Server = WebSocketStream<TcpStream>;
 
@@ -869,4 +870,482 @@ async fn a_token_expiry_close_during_a_refresh_reconnects_with_a_new_token() {
     let closed = tokio::time::timeout(Duration::from_millis(500), session.close()).await;
     assert!(closed.is_ok(), "close does not wait for the token request");
     drop(refresh);
+}
+
+/// Answers one HTTP request on an accepted connection with this status and a protobuf `Error`.
+async fn answer_with_error(tcp: &mut TcpStream, status: u16, error: ProtoError) {
+    let mut request = [0; 4096];
+    assert!(tcp.read(&mut request).await.unwrap() > 0);
+    let body = error.encode_to_vec();
+    let head = format!(
+        "HTTP/1.1 {status} X\r\ncontent-type: application/x-protobuf\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    tcp.write_all(&[head.as_bytes(), &body].concat())
+        .await
+        .unwrap();
+}
+
+fn refusal(code: i32, retry_after_ms: u64) -> ProtoError {
+    ProtoError {
+        code,
+        retry_after_ms,
+        message: "refused".into(),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn only_retry_later_and_quota_with_a_wait_are_resent() {
+    let (listener, auth) = listen().await;
+    let (session, _events) = Session::start(auth, config()).unwrap();
+    let server = tokio::spawn(async move {
+        let mut ws = accept(&listener, welcome("h", 0)).await;
+        for code in [999, Code::Unspecified as i32, Code::QuotaExceeded as i32] {
+            let request = recv_rpc(&mut ws).await;
+            assert!(
+                matches!(request.call, Some(Call::ListTree(_))),
+                "a new call, not a resend"
+            );
+            reply(
+                &mut ws,
+                request.req_id,
+                rpc_response::Result::Error(refusal(code, 0)),
+            )
+            .await;
+        }
+        let request = recv_rpc(&mut ws).await;
+        assert!(
+            matches!(request.call, Some(Call::ListTrash(_))),
+            "the refused calls were not resent"
+        );
+        let quota = refusal(Code::QuotaExceeded as i32, 200);
+        reply(&mut ws, request.req_id, rpc_response::Result::Error(quota)).await;
+        let asked = Instant::now();
+        let resent = recv_rpc(&mut ws).await;
+        assert!(
+            asked.elapsed() >= Duration::from_millis(200),
+            "{:?}",
+            asked.elapsed()
+        );
+        assert_eq!(
+            request.call, resent.call,
+            "a quota with a wait is resent after it"
+        );
+        reply(
+            &mut ws,
+            resent.req_id,
+            rpc_response::Result::Trash(Default::default()),
+        )
+        .await;
+        ws
+    });
+    for code in [999, Code::Unspecified as i32, Code::QuotaExceeded as i32] {
+        let refused = session.list_tree("", 1).await;
+        assert!(
+            matches!(&refused, Err(CallError::Server(error)) if error.0.code == code),
+            "{refused:?}"
+        );
+    }
+    session.list_trash("", 1).await.unwrap();
+    drop(server.await.unwrap());
+}
+#[tokio::test]
+async fn a_token_refused_with_an_unknown_code_stops_the_session_without_asking_again() {
+    let (listener, auth) = listen_on("127.0.0.1:0", Duration::ZERO, Some(Duration::ZERO)).await;
+    let (_session, mut events) = Session::start(auth, config()).unwrap();
+    let (mut token_request, _) = listener.accept().await.unwrap();
+    answer_with_error(&mut token_request, 500, refusal(999, 0)).await;
+    assert!(matches!(
+        next(&mut events).await,
+        Event::Stopped(StopReason::Refused(why)) if why.ends_with(": refused")
+    ));
+    let again = tokio::time::timeout(Duration::from_millis(300), listener.accept()).await;
+    assert!(again.is_err(), "no second token request");
+}
+
+#[tokio::test]
+async fn an_upgrade_refused_with_an_unknown_code_stops_the_session_and_a_known_one_reconnects() {
+    let (listener, auth) = listen().await;
+    let (_session, mut events) = Session::start(auth.clone(), config()).unwrap();
+    let (mut upgrade, _) = listener.accept().await.unwrap();
+    answer_with_error(&mut upgrade, 500, refusal(999, 0)).await;
+    assert!(matches!(
+        next(&mut events).await,
+        Event::Stopped(StopReason::Refused(why)) if why.ends_with(": refused")
+    ));
+
+    let (_session, mut events) = Session::start(auth, config()).unwrap();
+    let (mut upgrade, _) = listener.accept().await.unwrap();
+    answer_with_error(&mut upgrade, 500, refusal(Code::Internal as i32, 0)).await;
+    let event = next(&mut events).await;
+    assert!(
+        matches!(
+            event,
+            Event::Disconnected {
+                reason: DisconnectReason::Refused { status: 500 },
+                ..
+            }
+        ),
+        "{event:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_refresh_refused_with_an_unknown_code_stops_the_session() {
+    let (listener, auth) = listen_on(
+        "127.0.0.1:0",
+        Duration::from_millis(300),
+        Some(Duration::ZERO),
+    )
+    .await;
+    let (_session, mut events) = Session::start(auth, config()).unwrap();
+    let _ws = accept(&listener, welcome("h", 0)).await;
+    assert!(matches!(next(&mut events).await, Event::Connected(_)));
+    let (mut refresh, _) = listener.accept().await.unwrap();
+    answer_with_error(&mut refresh, 500, refusal(999, 0)).await;
+    assert!(matches!(
+        next(&mut events).await,
+        Event::Stopped(StopReason::Refused(why)) if why.ends_with(": refused")
+    ));
+}
+
+/// Answers one HTTP request with this status and a protobuf body, sending the body 30 ms after the head.
+async fn answer_in_two_parts(tcp: &mut TcpStream, status: u16, body: Vec<u8>) {
+    let mut request = [0; 4096];
+    assert!(tcp.read(&mut request).await.unwrap() > 0);
+    let head = format!(
+        "HTTP/1.1 {status} X\r\ncontent-type: application/x-protobuf\r\ncontent-length: {}\r\n\r\n",
+        body.len()
+    );
+    tcp.write_all(head.as_bytes()).await.unwrap();
+    tcp.flush().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    tcp.write_all(&body).await.unwrap();
+}
+
+#[tokio::test]
+async fn an_upgrade_refusal_whose_body_arrives_after_its_head_is_read_whole() {
+    let (listener, auth) = listen().await;
+    let (_session, mut events) = Session::start(auth.clone(), config()).unwrap();
+    let (mut upgrade, _) = listener.accept().await.unwrap();
+    answer_in_two_parts(&mut upgrade, 500, refusal(999, 0).encode_to_vec()).await;
+    assert!(matches!(
+        next(&mut events).await,
+        Event::Stopped(StopReason::Refused(why)) if why.ends_with(": refused")
+    ));
+
+    let (_session, mut events) = Session::start(auth, config()).unwrap();
+    let (mut upgrade, _) = listener.accept().await.unwrap();
+    let quota = refusal(Code::QuotaExceeded as i32, 300);
+    answer_in_two_parts(&mut upgrade, 429, quota.encode_to_vec()).await;
+    match next(&mut events).await {
+        Event::Disconnected {
+            reason: DisconnectReason::Refused { status: 429 },
+            retry_in,
+        } => assert!(retry_in >= Duration::from_millis(300), "{retry_in:?}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_empty_upgrade_refusal_is_left_to_its_status() {
+    let (listener, auth) = listen().await;
+    let (_session, mut events) = Session::start(auth, config()).unwrap();
+    let (mut upgrade, _) = listener.accept().await.unwrap();
+    answer_in_two_parts(&mut upgrade, 503, Vec::new()).await;
+    let event = next(&mut events).await;
+    assert!(
+        matches!(
+            event,
+            Event::Disconnected {
+                reason: DisconnectReason::Refused { status: 503 },
+                ..
+            }
+        ),
+        "{event:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_401_with_an_unknown_code_stops_the_session_with_its_message() {
+    let (listener, auth) = listen_on("127.0.0.1:0", Duration::ZERO, Some(Duration::ZERO)).await;
+    let (_session, mut events) = Session::start(auth, config()).unwrap();
+    let (mut token_request, _) = listener.accept().await.unwrap();
+    answer_with_error(&mut token_request, 401, refusal(999, 0)).await;
+    let event = next(&mut events).await;
+    assert!(
+        matches!(&event, Event::Stopped(StopReason::Refused(why)) if why.ends_with(": refused")),
+        "not CredentialsRefused: {event:?}"
+    );
+
+    let (listener, auth) = listen_on(
+        "127.0.0.1:0",
+        Duration::from_millis(300),
+        Some(Duration::ZERO),
+    )
+    .await;
+    let (_session, mut events) = Session::start(auth, config()).unwrap();
+    let _ws = accept(&listener, welcome("h", 0)).await;
+    assert!(matches!(next(&mut events).await, Event::Connected(_)));
+    let (mut refresh, _) = listener.accept().await.unwrap();
+    answer_with_error(&mut refresh, 401, refusal(999, 0)).await;
+    let event = next(&mut events).await;
+    assert!(
+        matches!(&event, Event::Stopped(StopReason::Refused(why)) if why.ends_with(": refused")),
+        "{event:?}"
+    );
+}
+
+/// Reads one request, then writes `parts` 30 ms apart, and returns the request's head.
+async fn answer_in_parts(tcp: &mut TcpStream, parts: Vec<Vec<u8>>) -> String {
+    let mut request = [0; 4096];
+    let n = tcp.read(&mut request).await.unwrap();
+    for part in parts {
+        tcp.write_all(&part).await.unwrap();
+        tcp.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    String::from_utf8_lossy(&request[..n]).into_owned()
+}
+
+#[tokio::test]
+async fn chunked_and_close_delimited_upgrade_refusals_are_read_whole() {
+    let (listener, auth) = listen().await;
+    let body = refusal(999, 0).encode_to_vec();
+    let (first, rest) = body.split_at(3);
+    let chunked = vec![
+        b"HTTP/1.1 500 X\r\ncontent-type: application/x-protobuf\r\ntransfer-encoding: chunked\r\n\r\n".to_vec(),
+        [format!("{:x}\r\n", first.len()).as_bytes(), first, b"\r\n"].concat(),
+        [format!("{:x}\r\n", rest.len()).as_bytes(), rest, b"\r\n0\r\n\r\n"].concat(),
+    ];
+    let (_session, mut events) = Session::start(auth.clone(), config()).unwrap();
+    let (mut upgrade, _) = listener.accept().await.unwrap();
+    answer_in_parts(&mut upgrade, chunked).await;
+    let event = next(&mut events).await;
+    assert!(
+        matches!(&event, Event::Stopped(StopReason::Refused(why)) if why.ends_with(": refused")),
+        "chunked: {event:?}"
+    );
+
+    let (_session, mut events) = Session::start(auth, config()).unwrap();
+    let (mut upgrade, _) = listener.accept().await.unwrap();
+    let head =
+        b"HTTP/1.1 500 X\r\ncontent-type: application/x-protobuf\r\nconnection: close\r\n\r\n"
+            .to_vec();
+    answer_in_parts(&mut upgrade, vec![head, first.to_vec(), rest.to_vec()]).await;
+    drop(upgrade);
+    let event = next(&mut events).await;
+    assert!(
+        matches!(&event, Event::Stopped(StopReason::Refused(why)) if why.ends_with(": refused")),
+        "close-delimited: {event:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_refusal_whose_error_cannot_be_read_is_retried_a_bounded_number_of_times_in_a_row() {
+    let (listener, auth) = listen().await;
+    let (_session, mut events) = Session::start(auth, config()).unwrap();
+    let server = tokio::spawn(async move {
+        let mut attempts = 0;
+        while let Ok(Ok((mut upgrade, _))) =
+            tokio::time::timeout(Duration::from_secs(2), listener.accept()).await
+        {
+            attempts += 1;
+            let answer = if attempts == MAX_UNREADABLE_REFUSALS {
+                // A refusal that is read ends the run.
+                vec![b"HTTP/1.1 500 X\r\ncontent-length: 0\r\n\r\n".to_vec()]
+            } else if attempts % 2 == 0 {
+                // A whole body that is not an `Error`.
+                vec![
+                    b"HTTP/1.1 500 X\r\ncontent-type: application/x-protobuf\r\ncontent-length: 3\r\n\r\n".to_vec(),
+                    vec![0xff; 3],
+                ]
+            } else {
+                // A body cut short.
+                vec![
+                    b"HTTP/1.1 500 X\r\ncontent-type: application/x-protobuf\r\ncontent-length: 1000\r\n\r\n".to_vec(),
+                    vec![0x08; 10],
+                ]
+            };
+            answer_in_parts(&mut upgrade, answer).await;
+        }
+        attempts
+    });
+    let stopped = loop {
+        match next(&mut events).await {
+            Event::Disconnected {
+                reason: DisconnectReason::Refused { status: 500 },
+                ..
+            } => {}
+            other => break other,
+        }
+    };
+    assert!(
+        matches!(&stopped, Event::Stopped(StopReason::Refused(why)) if why.contains("could not be read")),
+        "{stopped:?}"
+    );
+    assert_eq!(server.await.unwrap(), 2 * MAX_UNREADABLE_REFUSALS);
+}
+
+#[tokio::test]
+async fn a_101_without_upgrade_and_connection_headers_is_not_a_websocket() {
+    let (listener, auth) = listen().await;
+    let (_session, mut events) = Session::start(auth, config()).unwrap();
+    let (mut upgrade, _) = listener.accept().await.unwrap();
+    let mut request = [0; 4096];
+    let n = upgrade.read(&mut request).await.unwrap();
+    let request = String::from_utf8_lossy(&request[..n]).into_owned();
+    let key = request
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("sec-websocket-key")
+                .then(|| value.trim().to_owned())
+        })
+        .unwrap();
+    let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+    let answer =
+        format!("HTTP/1.1 101 Switching Protocols\r\nsec-websocket-accept: {accept}\r\n\r\n");
+    upgrade.write_all(answer.as_bytes()).await.unwrap();
+    let event = next(&mut events).await;
+    assert!(
+        matches!(
+            event,
+            Event::Disconnected {
+                reason: DisconnectReason::Transport(_),
+                ..
+            }
+        ),
+        "{event:?}"
+    );
+}
+
+#[tokio::test]
+async fn malformed_chunked_refusals_are_left_to_their_status() {
+    let (listener, auth) = listen().await;
+    let body = refusal(999, 0).encode_to_vec();
+    let head = b"HTTP/1.1 503 X\r\ncontent-type: application/x-protobuf\r\ntransfer-encoding: chunked\r\n\r\n";
+    let oversized = [b"ffffffffffffffff\r\n".as_slice(), &body].concat();
+    let unterminated = [
+        format!("{:x}\r\n", body.len()).as_bytes(),
+        &body,
+        b"\r\n0\r\n",
+    ]
+    .concat();
+    for (case, rest) in [("oversized", oversized), ("unterminated", unterminated)] {
+        let (_session, mut events) = Session::start(auth.clone(), config()).unwrap();
+        let (mut upgrade, _) = listener.accept().await.unwrap();
+        answer_in_parts(&mut upgrade, vec![head.to_vec(), rest]).await;
+        drop(upgrade);
+        let event = next(&mut events).await;
+        assert!(
+            matches!(
+                event,
+                Event::Disconnected {
+                    reason: DisconnectReason::Refused { status: 503 },
+                    ..
+                }
+            ),
+            "{case}: {event:?}"
+        );
+    }
+}
+
+/// `refusal_body` fed arbitrary and truncated answers.
+mod refusal_reader {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    type Framing = Option<(&'static str, String)>;
+
+    fn head(framing: Framing) -> tungstenite::http::response::Parts {
+        let mut response = tungstenite::http::Response::builder()
+            .status(503)
+            .header(CONTENT_TYPE, PROTOBUF);
+        if let Some((name, value)) = framing {
+            response = response.header(name, value);
+        }
+        response.body(()).unwrap().into_parts().0
+    }
+
+    fn chunked() -> Framing {
+        Some(("transfer-encoding", "chunked".into()))
+    }
+
+    fn length(length: usize) -> Framing {
+        Some(("content-length", length.to_string()))
+    }
+
+    /// Reads an answer whose first `split` bytes tungstenite already read, and whose connection then ends.
+    fn read(framing: Framing, answer: &[u8], split: usize) -> Option<Bytes> {
+        let (tail, rest) = answer.split_at(split.min(answer.len()));
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(refusal_body(&head(framing), tail.to_vec(), rest))
+    }
+
+    fn encode_chunked(body: &[u8], sizes: &[usize]) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        let mut rest = body;
+        for size in sizes.iter().cycle() {
+            if rest.is_empty() {
+                break;
+            }
+            let (chunk, after) = rest.split_at((*size).min(rest.len()));
+            encoded.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            encoded.extend_from_slice(chunk);
+            encoded.extend_from_slice(b"\r\n");
+            rest = after;
+        }
+        encoded.extend_from_slice(b"0\r\n\r\n");
+        encoded
+    }
+
+    #[test]
+    fn a_body_past_the_bound_is_not_read() {
+        let body = vec![0; MAX_REFUSAL + 1];
+        assert_eq!(read(length(body.len()), &body, 0), None);
+        assert_eq!(read(chunked(), &encode_chunked(&body, &[4096]), 0), None);
+        assert_eq!(read(None, &body, 0), None);
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_answers_are_bounded_and_never_panic(
+            framing in prop_oneof![Just(None), Just(chunked()), (0usize..100_000).prop_map(length)],
+            size_line in "([0-9a-fA-F]{1,20}(;[a-z]{0,3})?\r\n)?",
+            bytes in proptest::collection::vec(any::<u8>(), 0..512),
+            split in any::<usize>(),
+        ) {
+            let answer = [size_line.as_bytes(), &bytes].concat();
+            if let Some(body) = read(framing, &answer, split) {
+                prop_assert!(body.len() <= MAX_REFUSAL);
+            }
+        }
+
+        #[test]
+        fn complete_bodies_are_read_whole_and_cut_ones_are_not(
+            body in proptest::collection::vec(any::<u8>(), 0..2048),
+            sizes in proptest::collection::vec(1usize..600, 1..8),
+            is_chunked in any::<bool>(),
+            split in any::<usize>(),
+            cut in any::<prop::sample::Index>(),
+        ) {
+            let (framing, encoded) = if is_chunked {
+                (chunked(), encode_chunked(&body, &sizes))
+            } else {
+                (length(body.len()), body.clone())
+            };
+            let read_whole = read(framing.clone(), &encoded, split);
+            prop_assert_eq!(read_whole.as_deref(), Some(body.as_slice()));
+            if !encoded.is_empty() {
+                let cut = cut.index(encoded.len());
+                prop_assert_eq!(read(framing, &encoded[..cut], split), None);
+            }
+        }
+    }
 }

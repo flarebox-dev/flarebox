@@ -2,6 +2,7 @@
 
 //! One-request HTTP servers that answer chunk transfers in scripted ways.
 
+use flarebox_proto::v1::Error as ProtoError;
 use flarebox_proto::v1::error::Code;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -457,5 +458,79 @@ async fn a_target_inside_the_expiry_margin_is_still_tried() {
             .await,
         Attempt::Done(None)
     ));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn refusals_follow_the_server_error_code_before_the_http_status() {
+    let sent = chunk(b"payload");
+    let error = |code: i32, retry_after_ms: u64| {
+        ProtoError {
+            code,
+            retry_after_ms,
+            ..Default::default()
+        }
+        .encode_to_vec()
+    };
+    let protobuf = "application/x-protobuf";
+    let (target, server) = serve(vec![
+        (503, protobuf, error(999, 0)),
+        (429, protobuf, error(Code::QuotaExceeded as i32, 0)),
+        (429, protobuf, error(Code::QuotaExceeded as i32, 100)),
+        (503, protobuf, error(Code::Internal as i32, 0)),
+        (500, "text/plain", Vec::new()),
+        (
+            500,
+            protobuf,
+            ProtoError {
+                message: "no code".into(),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ),
+        (500, protobuf, Vec::new()),
+    ])
+    .await;
+    let transfer = transfer();
+    let put = async || {
+        transfer
+            .put(&target, &sent, Bytes::from_static(b"payload"))
+            .await
+    };
+    assert!(
+        matches!(put().await, Attempt::Fail(_)),
+        "an unknown code is a refusal"
+    );
+    assert!(
+        matches!(put().await, Attempt::Fail(_)),
+        "a quota without a wait is a refusal"
+    );
+    assert!(
+        matches!(put().await, Attempt::Retry(_)),
+        "a quota with a wait is retried"
+    );
+    assert!(
+        matches!(put().await, Attempt::Retry(_)),
+        "a known code keeps its status mapping"
+    );
+    assert!(
+        matches!(put().await, Attempt::Retry(_)),
+        "no error: the status decides"
+    );
+    assert!(
+        matches!(transfer.get(&target, &sent).await, Attempt::Fail(_)),
+        "UNSPECIFIED is a refusal"
+    );
+    assert!(
+        matches!(
+            transfer.get(&target, &sent).await,
+            Attempt::Retry(ChunkError::Refused {
+                status: 500,
+                error: None,
+                ..
+            })
+        ),
+        "an empty body is no refusal: the status decides"
+    );
     server.await.unwrap();
 }

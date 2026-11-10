@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use flarebox_proto::v1::{
-    AccessToken, ClaimRequest, CreateSpaceRequest, DeviceCredentials, Error as ProtoError,
-    PairCompleteRequest, PairStartResponse, RewindRequest, RewindResult, ServerInfo, SpaceInfo,
-    SpaceList, TokenRequest,
+    AccessToken, ClaimRequest, CreateSpaceRequest, DeviceCredentials, PairCompleteRequest,
+    PairStartResponse, RewindRequest, RewindResult, ServerInfo, SpaceInfo, SpaceList, TokenRequest,
 };
 use std::time::Duration;
 
@@ -15,7 +14,7 @@ use url::{Host, Url};
 use crate::auth::Auth;
 use crate::error::{ApiError, ServerError};
 
-const PROTOBUF: &str = "application/x-protobuf";
+pub(crate) const PROTOBUF: &str = "application/x-protobuf";
 /// Bounds making a connection, including TLS.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Bounds the wait for any single read of a response.
@@ -227,11 +226,8 @@ impl Api {
             return M::decode(body).map_err(|_| ApiError::Decode(what));
         }
         let status = status.as_u16();
-        match is_protobuf.then(|| ProtoError::decode(body)) {
-            Some(Ok(error)) => Err(ApiError::Server {
-                status,
-                error: ServerError(error),
-            }),
+        match is_protobuf.then(|| ServerError::decode(&body)).flatten() {
+            Some(error) => Err(ApiError::Server { status, error }),
             _ => Err(ApiError::Status { status }),
         }
     }
@@ -320,5 +316,54 @@ mod tests {
             server.await.unwrap().starts_with("POST /v1/token"),
             "one request, not followed"
         );
+    }
+
+    #[tokio::test]
+    async fn a_401_with_an_unknown_code_is_returned_without_a_new_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base: Url = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let credentials = crate::auth::Credentials {
+            user_id: "u".into(),
+            device_id: "d".into(),
+            refresh_credential: "r".into(),
+        };
+        let expires = std::time::SystemTime::now() + Duration::from_secs(3600);
+        let token = AccessToken {
+            token: "token".into(),
+            expires_at_ms: expires
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64,
+        };
+        let auth = Auth::new(Api::local_development(base).unwrap(), credentials).with_token(token);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            let body = flarebox_proto::v1::Error {
+                code: 999,
+                message: "refused".into(),
+                ..Default::default()
+            }
+            .encode_to_vec();
+            let head = format!(
+                "HTTP/1.1 401 X\r\ncontent-type: {PROTOBUF}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            socket
+                .write_all(&[head.as_bytes(), &body].concat())
+                .await
+                .unwrap();
+            let again = tokio::time::timeout(Duration::from_millis(300), listener.accept()).await;
+            assert!(again.is_err(), "no token request and no resend");
+        });
+        let outcome = auth.api().list_spaces(&auth).await;
+        assert!(
+            matches!(&outcome, Err(ApiError::Server { status: 401, error }) if error.0.code == 999 && error.message() == "refused"),
+            "{outcome:?}"
+        );
+        server.await.unwrap();
     }
 }

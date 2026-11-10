@@ -4,12 +4,22 @@ use std::fmt;
 use std::time::Duration;
 
 use flarebox_proto::v1::{Error as ProtoError, error::Code};
+use prost::Message;
 
 /// A refusal from the server: the `Error` of an RPC response or of an HTTP reply.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ServerError(pub ProtoError);
 
 impl ServerError {
+    /// The `Error` in a protobuf body, or `None` when there is none. An empty body carries no refusal, so it is not
+    /// read as `UNSPECIFIED`.
+    pub(crate) fn decode(body: &[u8]) -> Option<ServerError> {
+        if body.is_empty() {
+            return None;
+        }
+        ProtoError::decode(body).ok().map(ServerError)
+    }
+
     pub fn code(&self) -> Code {
         Code::try_from(self.0.code).unwrap_or(Code::Unspecified)
     }
@@ -23,10 +33,34 @@ impl ServerError {
         (self.0.retry_after_ms > 0).then(|| Duration::from_millis(self.0.retry_after_ms))
     }
 
+    /// Whether the refused request may be sent again (H1). An unknown code is never a reason to resend, so that a
+    /// refusal a newer server adds stops older clients instead of making them loop.
+    pub fn resend(&self) -> Resend {
+        match self.code() {
+            Code::RetryLater => Resend::Allowed,
+            Code::QuotaExceeded if self.retry_after().is_some() => Resend::Allowed,
+            Code::QuotaExceeded | Code::Unspecified => Resend::Never,
+            _ => Resend::ByCode,
+        }
+    }
+
     /// The hashes listed with `CODE_MISSING_CHUNKS`.
     pub fn missing_chunks(&self) -> &[Vec<u8>] {
         &self.0.missing_chunks
     }
+}
+
+/// What a client may do with a request the server refused (H1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resend {
+    /// `RETRY_LATER`, or `QUOTA_EXCEEDED` with `retry_after_ms`: send it again after `retry_after`, or after a
+    /// backoff when the server gave no wait.
+    Allowed,
+    /// A code this client does not know, `UNSPECIFIED` included, or `QUOTA_EXCEEDED` without `retry_after_ms`: the
+    /// operation stops and reports the error, and is not sent again.
+    Never,
+    /// Another known code, which the caller handles by its meaning.
+    ByCode,
 }
 
 impl fmt::Display for ServerError {
@@ -53,9 +87,18 @@ pub enum ApiError {
 }
 
 impl ApiError {
-    /// The server refused the credentials or token: the device is revoked or the refresh credential is wrong.
+    /// The server refused the credentials or token with `UNAUTHENTICATED`: the token expired, the device is revoked or
+    /// the refresh credential is wrong. A 401 with another code is a refusal like any other (H1).
     pub fn is_unauthenticated(&self) -> bool {
-        matches!(self, ApiError::Server { status: 401, .. })
+        matches!(self, ApiError::Server { status: 401, error } if error.code() == Code::Unauthenticated)
+    }
+
+    /// The server's error, when it sent one.
+    pub fn server(&self) -> Option<&ServerError> {
+        match self {
+            ApiError::Server { error, .. } => Some(error),
+            _ => None,
+        }
     }
 }
 
@@ -78,6 +121,10 @@ pub enum StopReason {
     BadUrl(String),
     #[error("TLS cannot be set up: {0}")]
     Tls(String),
+    /// The server refused to let this device connect, with an error the client may not retry (H1): a code it does not
+    /// know, or `QUOTA_EXCEEDED` without a wait.
+    #[error("the server refused the connection: {0}")]
+    Refused(String),
 }
 
 /// Why the session did not resend the commit that was in flight when its connection dropped (RFC 0002 section 2).
@@ -114,5 +161,36 @@ impl CallError {
             CallError::Server(error) => Some(error.code()),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_retry_later_and_quota_with_a_wait_may_be_resent() {
+        let error = |code: i32, retry_after_ms: u64| {
+            ServerError(ProtoError {
+                code,
+                retry_after_ms,
+                ..Default::default()
+            })
+        };
+        assert_eq!(error(Code::RetryLater as i32, 0).resend(), Resend::Allowed);
+        assert_eq!(error(Code::RetryLater as i32, 50).resend(), Resend::Allowed);
+        assert_eq!(
+            error(Code::QuotaExceeded as i32, 50).resend(),
+            Resend::Allowed
+        );
+        assert_eq!(error(Code::QuotaExceeded as i32, 0).resend(), Resend::Never);
+        assert_eq!(error(Code::Unspecified as i32, 50).resend(), Resend::Never);
+        assert_eq!(
+            error(999, 50).resend(),
+            Resend::Never,
+            "a code this client does not know"
+        );
+        assert_eq!(error(Code::Internal as i32, 50).resend(), Resend::ByCode);
+        assert_eq!(error(Code::Forbidden as i32, 0).resend(), Resend::ByCode);
     }
 }
