@@ -398,7 +398,10 @@ impl Scan<'_> {
 
     fn dir(&mut self, dir: BorrowedFd<'_>, rel: &Path) -> Result<()> {
         let result = list(dir).map_err(Error::from).and_then(|names| {
-            self.read_rules(dir, rel, &names);
+            if self.read_rules(dir, rel, &names) == RulesRead::Unknown {
+                self.unreadable.push(rel.to_path_buf());
+                return Ok(());
+            }
             names
                 .iter()
                 .filter(|name| !private(rel, name))
@@ -408,12 +411,16 @@ impl Scan<'_> {
     }
 
     /// Reads the rules file of the folder `dir` at `rel`, which lists `names`,
-    /// before any of its children is judged, and returns whether the folder's
-    /// rules changed.
-    fn read_rules(&mut self, dir: BorrowedFd<'_>, rel: &Path, names: &BTreeSet<OsString>) -> bool {
-        self.rules
-            .as_mut()
-            .is_some_and(|rules| rules.read(dir, rel, names))
+    /// before any of its children is judged. A folder whose rules are
+    /// [`RulesRead::Unknown`] is unreadable: the caller records it and judges none
+    /// of its children.
+    fn read_rules(
+        &mut self,
+        dir: BorrowedFd<'_>,
+        rel: &Path,
+        names: &BTreeSet<OsString>,
+    ) -> RulesRead {
+        (self.rules.as_mut()).map_or(RulesRead::Same, |rules| rules.read(dir, rel, names))
     }
 
     /// Records `rel` as unreadable and succeeds when `result` failed because
@@ -481,9 +488,12 @@ pub struct Rescan {
     /// The snapshot keeps what it knew about them and everything below them;
     /// rescan them later.
     pub unsettled: Vec<PathBuf>,
-    /// Folders the scan may not open or list. The snapshot keeps what it knew
-    /// below them, so a folder the user cannot read never reads as emptied.
-    /// Report them, and rescan them once they can be read.
+    /// Folders the scan may not open or list, and folders with a rules file
+    /// it cannot read when no earlier scan read one for them, so that what
+    /// they leave out is not known. The snapshot keeps what it knew below
+    /// them, so a folder the user cannot read never reads as emptied, and
+    /// nothing a rules file may leave out is reported as new. Report them,
+    /// and rescan them once they can be read.
     pub unreadable: Vec<PathBuf>,
     /// The identity of the root folder the scan opened. A scan that reached
     /// another folder than the caller's root has already applied that folder
@@ -799,7 +809,13 @@ impl Snapshot {
         };
         let dir = dir.as_fd();
         let mut names = list(dir)?;
-        let widen = scan.read_rules(dir, parent, &names);
+        let widen = match scan.read_rules(dir, parent, &names) {
+            RulesRead::Unknown => {
+                scan.unreadable.push(parent.to_path_buf());
+                return Ok(());
+            }
+            read => read == RulesRead::Changed,
+        };
         names.retain(|name| !private(parent, name));
         for name in &names {
             let child = parent.join(name);
@@ -1285,8 +1301,9 @@ pub struct NativeWatcher {
     changed_rules: Vec<(PathBuf, Option<Vec<u8>>)>,
     /// Folders whose subfolders may be unwatched, which are registered once a
     /// scan has read them: the folders a scan could not read that no scan has
-    /// read since, the root while it waits for a scan to read the rules, and
-    /// a folder a reset made known, which no scan reports as created.
+    /// read since, the root while it waits for a scan to read the rules, a
+    /// folder a reset made known, which no scan reports as created, and a
+    /// folder that the rescan after a registration found.
     #[cfg(target_os = "linux")]
     blocked: BTreeSet<PathBuf>,
     rewatch: bool,
@@ -1454,6 +1471,25 @@ impl NativeWatcher {
             &mut |_| {},
         ) {
             Ok(rescan) => {
+                // A folder this rescan found was not there when the folders
+                // were registered, or the rules as they were then left it
+                // out. The next poll rescans it and registers it.
+                let found = rescan.changes.iter().filter_map(|change| match change {
+                    Change::Created {
+                        path,
+                        kind: EntryKind::Dir,
+                    }
+                    | Change::Renamed {
+                        to: path,
+                        kind: EntryKind::Dir,
+                        ..
+                    } => Some(path.clone()),
+                    _ => None,
+                });
+                for dir in outermost(found.collect()) {
+                    self.blocked.insert(dir.clone());
+                    self.dirty.insert(dir);
+                }
                 self.changed_rules.extend(rescan.rules);
                 self.dirty.extend(rescan.unsettled);
                 self.blocked.extend(rescan.unreadable.iter().cloned());
@@ -1599,7 +1635,12 @@ impl Watcher for NativeWatcher {
             let settle_until = Instant::now() + MAX_SETTLE;
             while Instant::now() < settle_until && self.receive(SETTLE)? {}
             if self.rules.is_some() && self.dirty.is_empty() {
-                // Every event of the batch lay below a left-out folder.
+                // Every event of the batch lay below a left-out folder. Such
+                // events can keep coming, so they must not hold the poll
+                // past its deadline.
+                if Instant::now() >= deadline {
+                    return Ok(self.report(Vec::new(), root));
+                }
                 continue;
             }
             if self.rewatch {
@@ -1751,7 +1792,7 @@ pub use effect::{
     Action, Contents, Displaced, Effect, Outcome, QUARANTINE_DIR, Reason, STAGING_DIR, Step,
 };
 pub use ignore::{Ignore, Ignored, RULES_FILE, Rules};
-use ignore::{Pending, Wanted};
+use ignore::{Pending, RulesRead, Wanted};
 pub use recovered::recovered_name;
 pub use resolve::{Base, Dir, Folder, Location, PARKED_DIR, Space, Unresolved};
 pub use root::{

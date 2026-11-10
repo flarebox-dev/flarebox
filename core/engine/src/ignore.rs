@@ -6,7 +6,16 @@
 //! on this device. `core/fs` is given a matcher of the same type and the same rules, so a scan
 //! leaves out exactly the paths the engine excludes.
 
+use flarebox_ignore::RULES_FILE;
+
 use crate::names::name_key;
+
+/// Whether a file of this name is a rules file: `.fbignore`, or a name that [`name_key`] takes for the same
+/// name, such as `.FBIGNORE`. The matcher compares the name this way, so every part that singles out a rules file
+/// must as well.
+pub fn is_rules_file(name: &str) -> bool {
+    name_key(name) == name_key(RULES_FILE)
+}
 
 /// Compares names by [`name_key`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

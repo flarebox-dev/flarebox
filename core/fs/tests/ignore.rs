@@ -4,6 +4,7 @@
 //! of `flarebox-ignore` over the engine's name key.
 
 use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -50,6 +51,10 @@ impl Ignore for Matched {
             Status::Excluded(Reason::BuiltIn) => Ignored::BuiltIn,
             Status::Excluded(_) => Ignored::Rule,
         }
+    }
+
+    fn key(&self, name: &OsStr) -> OsString {
+        Folded::key(&name.to_string_lossy()).into()
     }
 }
 
@@ -544,6 +549,82 @@ fn renaming_a_folder_that_holds_a_rules_file_moves_its_rules() {
         .unwrap();
     assert_eq!(rescan.changes, [created("a", Dir), created("a/x", File)]);
     assert_eq!(rescan.rules, []);
+}
+
+#[test]
+fn a_folder_renamed_only_in_case_keeps_its_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "a/.fbignore", "x\n");
+    write(root, "a/x", "left out");
+    let mut rules = rules();
+    let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
+    assert_eq!(known(&snapshot), ["a", "a/.fbignore"]);
+
+    fs::rename(root.join("a"), root.join("A")).unwrap();
+    for _ in 0..2 {
+        let rescan = snapshot
+            .rescan_with_rules(root, whole(), &mut rules)
+            .unwrap();
+        assert_eq!(
+            rescan.rules,
+            [],
+            "the matcher holds one folder for both names"
+        );
+        assert_eq!(known(&snapshot), ["A", "A/.fbignore"]);
+    }
+    assert_eq!(rules.status(Path::new("A/x"), File), Ignored::Rule);
+}
+
+#[test]
+fn a_rules_file_renamed_only_in_case_keeps_its_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, RULES_FILE, "x\n");
+    write(root, "x", "left out");
+    let mut rules = rules();
+    let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
+    assert_eq!(known(&snapshot), [RULES_FILE]);
+
+    fs::rename(root.join(RULES_FILE), root.join(".FBIGNORE")).unwrap();
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert_eq!(rescan.rules, []);
+    assert_eq!(known(&snapshot), [".FBIGNORE"]);
+
+    write(root, ".FBIGNORE", "y\n");
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert_eq!(rescan.rules, [rule("", Some("y\n"))]);
+    assert_eq!(known(&snapshot), [".FBIGNORE", "x"]);
+}
+
+#[test]
+fn a_rules_file_that_cannot_be_read_at_the_first_scan_leaves_its_folder_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "keep.txt", "k");
+    write(root, "sub/.fbignore", &"x\n".repeat((1 << 19) + 1));
+    write(root, "sub/x", "left out");
+    let mut rules = rules();
+    let mut snapshot = Snapshot::default();
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert_eq!(rescan.unreadable, [PathBuf::from("sub")]);
+    assert_eq!(rescan.rules, []);
+    assert_eq!(known(&snapshot), ["keep.txt", "sub"]);
+
+    write(root, "sub/.fbignore", "x\n");
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert_eq!(rescan.unreadable, Vec::<PathBuf>::new());
+    assert_eq!(rescan.rules, [rule("sub", Some("x\n"))]);
+    assert_eq!(rescan.changes, [created("sub/.fbignore", File)]);
+    assert_eq!(known(&snapshot), ["keep.txt", "sub", "sub/.fbignore"]);
 }
 
 #[test]

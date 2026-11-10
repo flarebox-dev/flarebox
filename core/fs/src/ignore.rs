@@ -40,7 +40,17 @@ pub trait Ignore {
     /// Whether the entry at `path`, relative to the root, is left out. A path
     /// below a left-out folder is left out.
     fn status(&self, path: &Path, kind: EntryKind) -> Ignored;
+
+    /// The form in which the matcher compares `name`. Names with the same key
+    /// are one name to it: it holds the rules of a folder under the keys of
+    /// the folder's path, and a file whose name has the key of [`RULES_FILE`]
+    /// is a rules file.
+    fn key(&self, name: &OsStr) -> OsString;
 }
+
+/// A folder's rules file as a scan read it: the path the folder was listed at,
+/// and the bytes.
+type Held = (PathBuf, Vec<u8>);
 
 /// The rules of one root and what its scans have seen of them.
 ///
@@ -48,8 +58,14 @@ pub trait Ignore {
 /// folder it lists, so scan the whole tree before any part of it.
 pub struct Rules {
     ignore: Box<dyn Ignore + Send>,
-    /// The bytes of each folder's rules file, as last read.
-    files: BTreeMap<PathBuf, Vec<u8>>,
+    /// The key of [`RULES_FILE`].
+    rules_file: OsString,
+    /// Each folder's rules file as last read, by the keys of the folder's path
+    /// ([`Ignore::key`]). The matcher holds the rules under the same keys, so
+    /// two paths it takes for one folder never hold two entries here, and
+    /// dropping the entry of a path that is gone cannot take the rules from a
+    /// folder that is still there under another spelling.
+    files: BTreeMap<PathBuf, Held>,
     /// The names each listed folder holds that a rule leaves out
     /// ([`Ignored::Rule`] only).
     ignored: BTreeMap<PathBuf, BTreeSet<OsString>>,
@@ -58,10 +74,30 @@ pub struct Rules {
 impl Rules {
     pub fn new(ignore: Box<dyn Ignore + Send>) -> Self {
         Self {
+            rules_file: ignore.key(OsStr::new(RULES_FILE)),
             ignore,
             files: BTreeMap::new(),
             ignored: BTreeMap::new(),
         }
+    }
+
+    /// The keys of `path`, under which the rules of the folder there are held.
+    fn key(&self, path: &Path) -> PathBuf {
+        path.iter().map(|name| self.ignore.key(name)).collect()
+    }
+
+    /// The rules file among the `names` a folder lists: `.fbignore` itself, or
+    /// else the first name the matcher takes for the same name, such as
+    /// `.FBIGNORE`.
+    fn rules_file<'n>(&self, names: &'n BTreeSet<OsString>) -> Option<&'n OsStr> {
+        names
+            .get(OsStr::new(RULES_FILE))
+            .or_else(|| {
+                names
+                    .iter()
+                    .find(|name| self.ignore.key(name) == self.rules_file)
+            })
+            .map(OsString::as_os_str)
     }
 
     /// Whether the entry at `path`, relative to the root, is left out. The
@@ -73,13 +109,14 @@ impl Rules {
         self.ignore.status(path, kind)
     }
 
-    /// Gives the folder `dir` the rules file `rules`, or none, and returns
-    /// what it had.
-    fn set(&mut self, dir: &Path, rules: Option<Vec<u8>>) -> Option<Vec<u8>> {
+    /// Gives the folder at `dir` the rules file `rules`, or none, and returns
+    /// what the folder with those keys had.
+    fn set(&mut self, dir: &Path, rules: Option<Vec<u8>>) -> Option<Held> {
         self.ignore.set_rules(dir, rules.as_deref());
+        let key = self.key(dir);
         match rules {
-            Some(bytes) => self.files.insert(dir.to_path_buf(), bytes),
-            None => self.files.remove(dir),
+            Some(bytes) => self.files.insert(key, (dir.to_path_buf(), bytes)),
+            None => self.files.remove(&key),
         }
     }
 }
@@ -92,8 +129,9 @@ pub(crate) type Wanted = HashMap<(FileId, EntryKind), Option<PathBuf>>;
 /// takes back everything it changed in them.
 pub(crate) struct Pending<'r> {
     rules: &'r mut Rules,
-    /// What each folder's rules file held before this scan changed it.
-    before: BTreeMap<PathBuf, Option<Vec<u8>>>,
+    /// What each folder had before this scan changed its rules file or the
+    /// path it is listed at, by the keys of its path.
+    before: BTreeMap<PathBuf, Option<Held>>,
     /// The names a rule leaves out in each folder this scan listed.
     listed: BTreeMap<PathBuf, BTreeSet<OsString>>,
 }
@@ -112,29 +150,37 @@ impl<'r> Pending<'r> {
     }
 
     /// Reads the rules file of the folder `dir` at `rel`, which lists
-    /// `names`, and returns whether the folder's rules changed. A rules file
-    /// that cannot be read keeps the rules the folder last had.
+    /// `names`. A rules file that cannot be read keeps the rules the folder
+    /// last had. When the folder had none, its rules are [`RulesRead::Unknown`].
     pub(crate) fn read(
         &mut self,
         dir: BorrowedFd<'_>,
         rel: &Path,
         names: &BTreeSet<OsString>,
-    ) -> bool {
+    ) -> RulesRead {
+        let key = self.rules.key(rel);
+        let read = (self.rules.rules_file(names)).map(|name| read_rules(dir, name));
+        if matches!(read, Some(Err(_))) && !self.rules.files.contains_key(&key) {
+            return RulesRead::Unknown;
+        }
         self.listed.entry(rel.to_path_buf()).or_default();
-        let found = if names.contains(OsStr::new(RULES_FILE)) {
-            match read_rules(dir) {
-                Ok(found) => found,
-                Err(_) => return false,
-            }
-        } else {
-            None
+        let found = match read {
+            Some(Ok(found)) => found,
+            Some(Err(_)) => return RulesRead::Same,
+            None => None,
         };
-        if found.as_ref() == self.rules.files.get(rel) {
-            return false;
+        let held = self.rules.files.get(&key);
+        let same = found.as_ref() == held.map(|(_, bytes)| bytes);
+        if same && held.is_none_or(|(dir, _)| dir == rel) {
+            return RulesRead::Same;
         }
         let before = self.rules.set(rel, found);
-        self.before.entry(rel.to_path_buf()).or_insert(before);
-        true
+        self.before.entry(key).or_insert(before);
+        if same {
+            RulesRead::Same
+        } else {
+            RulesRead::Changed
+        }
     }
 
     /// Whether the rules leave out the listed entry at `rel`. A name a rule
@@ -157,8 +203,13 @@ impl<'r> Pending<'r> {
 
     /// Restores every rules file the scan changed.
     pub(crate) fn undo(self) {
-        for (dir, before) in self.before {
-            self.rules.set(&dir, before);
+        for (key, before) in self.before {
+            let now = self.rules.files.get(&key).map(|(dir, _)| dir.clone());
+            match (before, now) {
+                (Some((dir, bytes)), _) => self.rules.set(&dir, Some(bytes)),
+                (None, Some(dir)) => self.rules.set(&dir, None),
+                (None, None) => None,
+            };
         }
     }
 
@@ -224,31 +275,45 @@ impl<'r> Pending<'r> {
         let held = |dir: &Path| dir.as_os_str().is_empty() || is_folder(dir);
         let stale: Vec<PathBuf> = rules
             .files
-            .keys()
-            .filter(|dir| !held(dir))
-            .cloned()
+            .values()
+            .filter(|(dir, _)| !held(dir))
+            .map(|(dir, _)| dir.clone())
             .collect();
         for dir in stale {
+            let key = rules.key(&dir);
             let dropped = rules.set(&dir, None);
-            before.entry(dir).or_insert(dropped);
+            before.entry(key).or_insert(dropped);
         }
         rules.ignored.retain(|dir, _| held(dir));
         before
             .into_iter()
-            .filter_map(|(dir, before)| {
-                let now = rules.files.get(&dir);
-                (now != before.as_ref()).then(|| (dir, now.cloned()))
+            .filter_map(|(key, before)| match (rules.files.get(&key), before) {
+                (Some((_, now)), Some((_, before))) if *now == before => None,
+                (Some((dir, now)), _) => Some((dir.clone(), Some(now.clone()))),
+                (None, Some((dir, _))) => Some((dir, None)),
+                (None, None) => None,
             })
             .collect()
     }
 }
 
-/// Reads the rules file of the folder `dir`, or returns `None` when the folder
-/// holds no regular file of that name. Fails when the file cannot be read or
-/// is larger than [`MAX_RULES`].
-fn read_rules(dir: BorrowedFd<'_>) -> io::Result<Option<Vec<u8>>> {
+/// What [`Pending::read`] found of a folder's rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RulesRead {
+    /// The rules the folder had.
+    Same,
+    Changed,
+    /// The folder holds a rules file that cannot be read, and no earlier
+    /// scan read one for it, so what the folder leaves out is not known.
+    Unknown,
+}
+
+/// Reads the rules file `name` of the folder `dir`, or returns `None` when the
+/// folder holds no regular file of that name. Fails when the file cannot be
+/// read or is larger than [`MAX_RULES`].
+fn read_rules(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<Option<Vec<u8>>> {
     let regular = |stat: &Stat| stat.file_type == FileType::RegularFile;
-    match stat_at(dir, OsStr::new(RULES_FILE)) {
+    match stat_at(dir, name) {
         Ok(stat) if regular(&stat) => {}
         Ok(_) => return Ok(None),
         Err(err) if is_gone(&err) => return Ok(None),
@@ -257,7 +322,7 @@ fn read_rules(dir: BorrowedFd<'_>) -> io::Result<Option<Vec<u8>>> {
     // Without NONBLOCK, opening a FIFO that took the file's place would wait
     // for a writer.
     let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-    let file = match rustix::fs::openat(dir, RULES_FILE, flags, Mode::empty()) {
+    let file = match rustix::fs::openat(dir, name, flags, Mode::empty()) {
         Ok(file) => file,
         Err(err) if is_gone(&err.into()) => return Ok(None),
         Err(err) => return Err(err.into()),

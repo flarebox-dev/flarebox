@@ -693,6 +693,61 @@ fn new_folders_are_registered_before_their_rescan() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn folders_included_by_the_registration_rescan_keep_watch_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir(root.join("ig")).unwrap();
+    fs::write(root.join(RULES_FILE), "ig\n").unwrap();
+    fs::write(root.join("ig/file.txt"), "before").unwrap();
+    let rules = Rules::new(Box::new(Lines::default()));
+    let mut watcher = NativeWatcher::start_with_rules(&root, Snapshot::default(), rules).unwrap();
+    let mut remove = Some(root.join(RULES_FILE));
+    watcher.before_register = Some(Box::new(move || {
+        if let Some(path) = remove.take() {
+            fs::remove_file(path).unwrap();
+        }
+    }));
+
+    let first = watcher.poll(Duration::ZERO).unwrap();
+    watcher.before_register = None;
+    assert_eq!(
+        first.rules,
+        [
+            (PathBuf::new(), Some(b"ig\n".to_vec())),
+            (PathBuf::new(), None),
+        ]
+    );
+    assert!(first.changes.contains(&created("ig", EntryKind::Dir)));
+    assert!(
+        first
+            .changes
+            .contains(&created("ig/file.txt", EntryKind::File))
+    );
+    assert!(
+        watcher
+            .poll(Duration::from_millis(150))
+            .unwrap()
+            .changes
+            .is_empty()
+    );
+
+    fs::write(root.join("ig/file.txt"), "after the rules were removed").unwrap();
+    let expected = Change::Modified {
+        path: "ig/file.txt".into(),
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut seen = Vec::new();
+    while Instant::now() < deadline && !seen.contains(&expected) {
+        seen.extend(watcher.poll(Duration::from_millis(100)).unwrap().changes);
+    }
+    assert!(
+        seen.contains(&expected),
+        "the write inside the newly included folder was not reported; saw {seen:?}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn a_new_folder_that_vanishes_before_its_watch_is_not_a_watch_failure() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
@@ -915,6 +970,10 @@ impl Ignore for Lines {
             dir.push(name);
         }
         Ignored::No
+    }
+
+    fn key(&self, name: &OsStr) -> OsString {
+        name.to_os_string()
     }
 }
 

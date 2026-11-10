@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::classify::{Class, Trees};
 use crate::ids::IdGen;
-use flarebox_ignore::RULES_FILE;
+use crate::ignore::is_rules_file;
 
 use crate::names::name_key;
 use crate::state::{EffectsState, StateError};
@@ -221,7 +221,7 @@ impl Effects {
         let view = View::new(trees);
         let writes_rules = |id: &str| {
             let remote = trees.remote().live(id)?;
-            (remote.kind == Kind::File && remote.name == RULES_FILE)
+            (remote.kind == Kind::File && is_rules_file(&remote.name))
                 .then_some(remote.parent.as_str())
         };
         let gates: BTreeSet<&str> = (trees.dirty().iter())

@@ -7,10 +7,12 @@
 //! same list through [`local_rules`] and the same files with each observation, so a scan leaves out exactly the paths
 //! the engine excludes.
 
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::sync::Arc;
 
 use flarebox_engine::ignore::{LocalRules, Matcher as Rules, RuleFile};
+use flarebox_engine::names::name_key;
 use flarebox_fs::{EntryKind, Ignore, Ignored};
 use flarebox_ignore::{Kind, LocalRulesError, Reason, Status};
 
@@ -93,6 +95,10 @@ impl Ignore for Scanned {
             Status::Included if self.device.is_excluded(path, dir) => Ignored::Rule,
             Status::Included => Ignored::No,
         }
+    }
+
+    fn key(&self, name: &OsStr) -> OsString {
+        name_key(&name.to_string_lossy()).into()
     }
 }
 
