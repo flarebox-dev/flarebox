@@ -1,8 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! A device's synced folder in memory: entries keyed by inode, the parked directory, and the disk
-//! side of every effect (docs/design/sync-engine.md sections 2.5 and 5.2). An effect checks the
-//! state it expects and then changes the disk in one step, or changes nothing.
+//! side of every effect (docs/design/sync-engine.md sections 2.5, 5.2 and 5.3). An effect checks
+//! the state it expects, sends the entry it displaces to quarantine, gives the new entry its
+//! name, and sends the quarantined entry to the local trash. A crash can stop it between these
+//! steps. Recovery then decides from the target, the staged download and the quarantine, as
+//! `flarebox_fs::Space::recover` does, and the disk keeps no record of the effects it has done.
+//!
+//! Two things differ from the fs driver. The disk checks a displaced entry before it moves it to
+//! quarantine, so a quarantined entry is never returned to its name. And it refuses to remove a
+//! folder that has entries before it moves the folder, so a folder with entries is never in
+//! quarantine.
 
 use std::collections::BTreeMap;
 
@@ -43,13 +51,28 @@ pub enum Refused {
     NotEmpty,
     /// The target is inside the directory that moves.
     Cycle,
+    /// Recovery found that the effect stopped before it displaced anything, or that its target
+    /// is not in the effect's final state any more.
+    Interrupted,
 }
 
-/// What an effect did to the disk.
+/// How far an effect gets on the disk before the device crashes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cut {
+    /// The entry it displaces is in quarantine, its download is staged, and the new entry has no
+    /// name yet. An effect that neither displaces nor downloads has changed nothing.
+    Quarantined,
+    /// The new entry has its name, or found it taken. A displaced entry is still in quarantine.
+    Placed,
+    /// The effect is complete.
+    Done,
+}
+
+/// What an effect, or the recovery of one, did to the disk.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Applied {
-    /// The identity of the entry the effect created.
-    pub identity: Option<FileIdentity>,
+    /// The identity of the entry the effect created, or why the disk did not do the effect.
+    pub outcome: Result<Option<FileIdentity>, Refused>,
     /// The content of the file the effect sent to the local trash.
     pub trashed: Option<Content>,
 }
@@ -66,9 +89,10 @@ pub fn identity(ino: u64) -> FileIdentity {
 pub struct Disk {
     entries: BTreeMap<u64, Entry>,
     inos: u64,
-    /// The last effect that reached the disk, with the entry it created. It stands for the
-    /// evidence the fs driver leaves for recovery after a crash (section 5.3).
-    applied: Option<(String, Option<FileIdentity>)>,
+    /// The download of the effect in flight is staged and has no name in the folder yet.
+    pub(super) staged: bool,
+    /// The entry that the effect in flight displaced and has not sent to the local trash yet.
+    pub(super) quarantine: Option<Entry>,
 }
 
 impl Disk {
@@ -126,10 +150,10 @@ impl Disk {
         false
     }
 
-    /// True when some file, parked or not, holds the write with this tag.
+    /// True when some file, parked, in quarantine or neither, holds the write with this tag.
     pub fn holds(&self, write: i64) -> bool {
-        self.entries
-            .values()
+        (self.entries.values())
+            .chain(&self.quarantine)
             .any(|entry| entry.content.as_ref().is_some_and(|c| c.mtime_ns == write))
     }
 
@@ -185,44 +209,54 @@ impl Disk {
             .collect()
     }
 
-    /// The outcome of the effect with this ID, if it reached the disk and no effect did since.
-    pub fn applied(&self, effect_id: &str) -> Option<Option<FileIdentity>> {
-        self.applied
-            .as_ref()
-            .filter(|(id, _)| id == effect_id)
-            .map(|(_, identity)| *identity)
+    /// Does one effect the way section 5.2 asks, as far as `until`: every directory on the way
+    /// has the identity the effect names, a displaced file has the identity and content the
+    /// engine last saw, and no create or rename replaces an entry. A displaced entry goes to
+    /// the local trash also when the new entry finds its name taken.
+    pub fn apply(&mut self, record: &EffectRecord, until: Cut) -> Applied {
+        let mut trashed = None;
+        let outcome = self.change(&record.effect, until, &mut trashed);
+        if until == Cut::Done {
+            self.staged = false;
+        }
+        Applied { outcome, trashed }
     }
 
-    /// Does one effect the way section 5.2 asks: every directory on the way has the identity the
-    /// effect names, a displaced file has the identity and content the engine last saw, and no
-    /// create or rename replaces an entry.
-    pub fn apply(&mut self, record: &EffectRecord) -> Result<Applied, Refused> {
-        let mut applied = Applied {
-            identity: None,
-            trashed: None,
-        };
-        match &record.effect {
+    fn change(
+        &mut self,
+        effect: &Effect,
+        until: Cut,
+        trashed: &mut Option<Content>,
+    ) -> Result<Option<FileIdentity>, Refused> {
+        match effect {
             Effect::CreateDir { at } => {
                 let (place, name) = self.locate(at)?;
+                if until == Cut::Quarantined {
+                    return Ok(None);
+                }
                 let ino = self.create(place, &name, None).ok_or(Refused::Taken)?;
-                applied.identity = Some(identity(ino));
+                Ok(Some(identity(ino)))
             }
             Effect::WriteFile {
                 at,
                 content,
                 replaces,
             } => {
+                self.staged = true;
                 let displaced = replaces.as_ref().map(|d| self.displaced(d)).transpose()?;
                 let (place, name) = self.locate(at)?;
-                if self
-                    .child(&place, &name)
-                    .is_some_and(|ino| Some(ino) != displaced)
-                {
-                    return Err(Refused::Taken);
+                if let Some(ino) = displaced {
+                    self.quarantine = self.entries.remove(&ino);
                 }
-                applied.trashed = displaced.and_then(|ino| self.entries.remove(&ino)?.content);
+                if until == Cut::Quarantined {
+                    return Ok(None);
+                }
                 let ino = self.create(place, &name, Some(content.clone()));
-                applied.identity = Some(identity(ino.ok_or(Refused::Taken)?));
+                self.staged = ino.is_none();
+                if until == Cut::Done {
+                    *trashed = self.quarantine.take().and_then(|entry| entry.content);
+                }
+                ino.map(|ino| Some(identity(ino))).ok_or(Refused::Taken)
             }
             Effect::Move {
                 from,
@@ -232,11 +266,19 @@ impl Disk {
                 let ino = self.at(from)?.filter(|ino| *ino == moved.ino);
                 let ino = ino.ok_or(Refused::Moved)?;
                 let (place, name) = self.locate(to)?;
+                if until == Cut::Quarantined {
+                    return Ok(None);
+                }
                 self.rename(ino, place, &name)?;
+                Ok(None)
             }
             Effect::RemoveFile { displaced } => {
                 let ino = self.displaced(displaced)?;
-                applied.trashed = self.entries.remove(&ino).and_then(|entry| entry.content);
+                self.quarantine = self.entries.remove(&ino);
+                if until == Cut::Done {
+                    *trashed = self.quarantine.take().and_then(|entry| entry.content);
+                }
+                Ok(None)
             }
             Effect::RemoveDir { at, identity: gone } => {
                 let ino = self.at(at)?.filter(|ino| *ino == gone.ino);
@@ -247,11 +289,72 @@ impl Disk {
                 if self.children(&Place::In(ino)).next().is_some() {
                     return Err(Refused::NotEmpty);
                 }
-                self.entries.remove(&ino);
+                self.quarantine = self.entries.remove(&ino).filter(|_| until != Cut::Done);
+                Ok(None)
             }
         }
-        self.applied = Some((record.effect_id.clone(), applied.identity));
-        Ok(applied)
+    }
+
+    /// Ends the effect in flight after a crash (section 5.3). An entry in quarantine means that
+    /// the effect displaced it: the staged download gets its name if it has none yet, and the
+    /// entry goes to the local trash. With nothing in quarantine and nothing staged, the effect
+    /// is done when its target is in the effect's final state. Anything else is an effect that
+    /// stopped early or whose target the user has changed since.
+    pub fn recover(&mut self, record: &EffectRecord) -> Applied {
+        let staged = std::mem::take(&mut self.staged);
+        let Some(entry) = self.quarantine.take() else {
+            let outcome = match self.finished(&record.effect) {
+                Some(identity) if !staged => Ok(identity),
+                _ => Err(Refused::Interrupted),
+            };
+            return Applied {
+                outcome,
+                trashed: None,
+            };
+        };
+        let outcome = match &record.effect {
+            Effect::WriteFile { at, content, .. } if staged => {
+                self.locate(at).and_then(|(place, name)| {
+                    let ino = self.create(place, &name, Some(content.clone()));
+                    Ok(Some(identity(ino.ok_or(Refused::Taken)?)))
+                })
+            }
+            Effect::WriteFile { at, content, .. } => {
+                (self.written(at, content).map(Some)).ok_or(Refused::Taken)
+            }
+            _ => Ok(None),
+        };
+        Applied {
+            outcome,
+            trashed: entry.content,
+        }
+    }
+
+    /// The identity of the entry an effect made, when the disk is in the effect's final state.
+    fn finished(&self, effect: &Effect) -> Option<Option<FileIdentity>> {
+        match effect {
+            Effect::CreateDir { at } => {
+                let ino = self.at(at).ok()??;
+                (self.entries[&ino].content.is_none()).then(|| Some(identity(ino)))
+            }
+            Effect::WriteFile { at, content, .. } => self.written(at, content).map(Some),
+            Effect::Move {
+                identity: moved,
+                to,
+                ..
+            } => (self.at(to).ok()? == Some(moved.ino)).then_some(None),
+            Effect::RemoveFile {
+                displaced: Displaced { at, .. },
+            }
+            | Effect::RemoveDir { at, .. } => self.at(at).ok()?.is_none().then_some(None),
+        }
+    }
+
+    /// The identity of the file at `at`, when it holds `content`.
+    fn written(&self, at: &Location, content: &Content) -> Option<FileIdentity> {
+        let ino = self.at(at).ok()??;
+        let held = self.entries[&ino].content.as_ref()?;
+        same_content(held, content).then(|| identity(ino))
     }
 
     /// The file an effect displaces, when it still is the file the engine saw.

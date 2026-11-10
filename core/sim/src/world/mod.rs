@@ -9,7 +9,7 @@
 //! The oracle uses the harness's own records and the server's state, never the engine's
 //! bookkeeping. Every user write carries a tag in its content's `mtime_ns`, which the engine
 //! does not compare, so two files with the same bytes are still two writes. A broken property is
-//! a [`Failure`] of one of two kinds.
+//! a [`Failure`] of one of four kinds.
 //!
 //! [`Failure::Broken`]: a write is lost, or a state or a call is refused.
 //!
@@ -24,6 +24,19 @@
 //!   device's user overwrites or deletes it.
 //! - L, S and R are valid trees after every step, the store gives back the state it was given,
 //!   and the engine and the server accept every outcome and message the harness reports.
+//!
+//! [`Failure::Unloadable`]: a device that stops between two store transactions cannot start
+//! again.
+//!
+//! - The engine loads what the store holds after the transaction that records the outcome of an
+//!   effect. The disk is observed only after that transaction, so L can still hold an entry that
+//!   the user has moved or deleted since the last scan.
+//!
+//! [`Failure::Adopted`]: a restart gives the entry of one node to another node.
+//!
+//! - After a crash, recovery reports the effect in flight as done when its target holds the
+//!   effect's final state (section 5.3). The entry it reports is not one that L holds as another
+//!   node. The trees are not judged after such a report, so the run ends there.
 //!
 //! [`Failure::Diverged`]: the faults have stopped, and the devices did not reach one tree.
 //!
@@ -42,7 +55,8 @@ pub mod disk;
 use std::collections::{BTreeMap, BTreeSet};
 
 use flarebox_engine::commit::{self, Reconnect};
-use flarebox_engine::tree::{Content, NodeId, RemoteNode, same, same_content};
+use flarebox_engine::effects::{Effect, EffectRecord};
+use flarebox_engine::tree::{Content, LocalNode, NodeId, RemoteNode, same, same_content};
 use flarebox_proto::v1::{
     ChunkRef, Commit, Error, NodeKind, NodeStatus, PrepareUpload, Resume, UploadReceipt,
     chunk_plan, error, op, op_result,
@@ -50,7 +64,8 @@ use flarebox_proto::v1::{
 use sha2::{Digest, Sha256};
 
 use self::device::{Device, Engine, Link, Message};
-use self::disk::{Disk, Place};
+pub use self::disk::Cut;
+use self::disk::{Applied, Disk, Place, Refused};
 use crate::space::{Role, Session, SpaceDo};
 
 const NOW: i64 = 1_794_268_740_000;
@@ -68,6 +83,13 @@ pub enum Failure {
     /// A write was lost, or the engine, the store or the server refused a state or a call that
     /// the design promises.
     Broken(String),
+    /// The store was left with a state that the engine refuses to load, in the transaction that
+    /// records the outcome of an effect. This is GUN-330. Its fix removes this kind, so that the
+    /// refusal is `Broken` again.
+    Unloadable(String),
+    /// A restart reported the effect in flight as done with an entry that L holds as another
+    /// node. The run ends there. This is GUN-342. Its fix removes this kind.
+    Adopted(String),
     /// The devices did not reach the server's tree once the faults stopped, or a commit made a
     /// change that no user made.
     Diverged(String),
@@ -78,6 +100,8 @@ impl Failure {
     fn at(self, place: String) -> Self {
         match self {
             Failure::Broken(why) => Failure::Broken(format!("{place}: {why}")),
+            Failure::Unloadable(why) => Failure::Unloadable(format!("{place}: {why}")),
+            Failure::Adopted(why) => Failure::Adopted(format!("{place}: {why}")),
             Failure::Diverged(why) => Failure::Diverged(format!("{place}: {why}")),
         }
     }
@@ -85,7 +109,10 @@ impl Failure {
 
 impl std::fmt::Display for Failure {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (Failure::Broken(why) | Failure::Diverged(why)) = self;
+        let (Failure::Broken(why)
+        | Failure::Unloadable(why)
+        | Failure::Adopted(why)
+        | Failure::Diverged(why)) = self;
         out.write_str(why)
     }
 }
@@ -110,8 +137,8 @@ pub enum Outcome {
     Run,
     /// It fails before it touches the disk, as a failed download does.
     Fail,
-    /// The disk does it and the device crashes before the store hears of it.
-    Crash,
+    /// The disk does it as far as the cut, and the device crashes before the store hears of it.
+    Crash(Cut),
 }
 
 /// What happens to the commit a device sends.
@@ -119,7 +146,9 @@ pub enum Outcome {
 pub enum Reply {
     /// The server answers it.
     Served,
-    /// The server refuses it with this code before it applies anything.
+    /// The server refuses it with this code before it applies anything. The server answers a
+    /// commit that it already holds, and it gives `HEAD_MOVED` only to a commit that requires the
+    /// head it was built on. For those the commit is served.
     Refused(error::Code),
     /// The chunk uploads are lost, so the server answers `MISSING_CHUNKS` for new chunks.
     NoChunks,
@@ -219,6 +248,34 @@ fn stored(held: &Held, write: i64) -> bool {
     held.values().any(|writes| writes.contains_key(&write))
 }
 
+/// Records the outcome of an effect in the store, in its own transaction, before the disk is
+/// observed again. Returns the failure to report when the engine refuses to load that state.
+fn outcome_stored(
+    d: usize,
+    device: &mut Device,
+    record: &EffectRecord,
+) -> Result<Option<String>, Failure> {
+    Ok(device.persist_outcome()?.map(|why| {
+        format!(
+            "device {d} recorded the outcome of {:?} before it observed the disk, and the engine \
+             refuses to load L as the store then holds it: {why}",
+            record.effect
+        )
+    }))
+}
+
+/// Fails when an effect sent a file to the local trash that held a write the server never held.
+fn lost(held: &Held, d: usize, record: &EffectRecord, applied: &Applied) -> Result<(), Failure> {
+    let trashed = applied.trashed.as_ref();
+    match trashed.filter(|content| !stored(held, content.mtime_ns)) {
+        Some(lost) => Err(Failure::Broken(format!(
+            "{:?} removed write {} from the disk of device {d}, and the server never held that write",
+            record.effect, lost.mtime_ns
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Applies the result of the commit in flight to R when it is the next commit, and acknowledges
 /// the commit once R holds its records (section 2.7).
 fn acknowledge(engine: &mut Engine) -> Result<(), Failure> {
@@ -284,6 +341,12 @@ pub struct World {
     held: Held,
     /// The first change a commit made that no user asked for.
     unasked: Option<String>,
+    /// The first state the store was left with that the engine refuses to load.
+    unloadable: Option<String>,
+    /// The writes that a download left on a disk in a file the engine then took for a new one. A
+    /// crash kept the store from hearing of the download, and the user renamed the file before
+    /// the restart (section 5.3). The server holds such a write in two files.
+    copied: BTreeSet<i64>,
 }
 
 impl World {
@@ -321,6 +384,8 @@ impl World {
             published: BTreeSet::new(),
             held: Held::new(),
             unasked: None,
+            unloadable: None,
+            copied: BTreeSet::new(),
         }
     }
 
@@ -463,7 +528,12 @@ impl World {
     /// A full rescan. True when L changed.
     fn scan(&mut self, d: usize) -> Result<bool, Failure> {
         let device = &mut self.devices[d];
-        device.engine.scan(&device.disk);
+        if device.rescan() > 0 {
+            note(
+                &mut self.seen,
+                "rescan lets a problem node be planned again",
+            );
+        }
         let changed = device.engine != device.store;
         device.persist()?;
         Ok(changed)
@@ -487,23 +557,24 @@ impl World {
         };
         let applied = match outcome {
             Outcome::Fail => None,
-            Outcome::Run | Outcome::Crash => device.disk.apply(&record).ok(),
+            Outcome::Run => Some(device.disk.apply(&record, Cut::Done)),
+            Outcome::Crash(cut) => Some(device.disk.apply(&record, cut)),
         };
-        let trashed = applied
-            .as_ref()
-            .and_then(|applied| applied.trashed.as_ref());
-        if let Some(lost) = trashed.filter(|content| !stored(&self.held, content.mtime_ns)) {
-            return Err(Failure::Broken(format!(
-                "{:?} removed write {} from the disk of device {d}, and the server never held that write",
-                record.effect, lost.mtime_ns
-            )));
+        if let Some(applied) = &applied {
+            lost(&self.held, d, &record, applied)?;
         }
-        if outcome == Outcome::Crash {
+        let applied = applied.map(|applied| applied.outcome);
+        if let Outcome::Crash(cut) = outcome {
             note(
                 &mut self.seen,
                 match applied {
-                    Some(_) => "crash after an effect reached the disk",
-                    None => "crash after the disk refused an effect",
+                    _ if device.disk.quarantine.is_some() => {
+                        "crash with a displaced entry in quarantine"
+                    }
+                    _ if device.disk.staged => "crash with a download staged",
+                    Some(Err(_)) => "crash after the disk refused an effect",
+                    _ if cut == Cut::Quarantined => "crash before an effect reached the disk",
+                    _ => "crash after an effect reached the disk",
                 },
             );
             device.down = true;
@@ -511,16 +582,15 @@ impl World {
             return Ok(false);
         }
         let Engine { trees, effects, .. } = &mut device.engine;
-        let refused = applied.is_none();
         let reported = match applied {
-            Some(applied) => effects.done(trees, &record.effect_id, applied.identity),
-            None => effects.failed(&record.effect_id),
+            Some(Ok(identity)) => effects.done(trees, &record.effect_id, identity),
+            _ => effects.failed(&record.effect_id),
         };
         note(
             &mut self.seen,
-            match (refused, outcome) {
-                (false, _) if record.after.is_none() => "effect removed an entry",
-                (false, _)
+            match (applied, outcome) {
+                (Some(Ok(_)), _) if record.after.is_none() => "effect removed an entry",
+                (Some(Ok(_)), _)
                     if trees
                         .local()
                         .get(&record.node)
@@ -528,52 +598,117 @@ impl World {
                 {
                     "effect parked a node"
                 }
-                (false, _) => "effect done",
-                (true, Outcome::Fail) => "effect failed before the disk",
-                (true, _) => "effect refused by the disk",
+                (Some(Ok(_)), _) => "effect done",
+                (_, Outcome::Fail) => "effect failed before the disk",
+                _ => "effect refused by the disk",
             },
         );
         reported.map_err(|error| {
             Failure::Broken(format!("the effect's outcome was refused: {error:?}"))
         })?;
+        self.unloadable = self
+            .unloadable
+            .take()
+            .or(outcome_stored(d, device, &record)?);
         device.engine.scan(&device.disk);
         device.persist()?;
         Ok(true)
     }
 
     /// Restarts a crashed device: the engine comes back from the store, the effect in flight is
-    /// reported as the disk shows it, and the disk is scanned again (sections 2.8 and 5.3).
+    /// ended from what the disk shows, and the disk is scanned again (sections 2.8 and 5.3).
     fn restart(&mut self, d: usize) -> Result<(), Failure> {
         let device = &mut self.devices[d];
         device.down = false;
         device.engine = device.store.reload()?;
         if let Some(record) = device.engine.effects.in_flight().cloned() {
+            let quarantined = device.disk.quarantine.is_some();
+            let applied = device.disk.recover(&record);
+            lost(&self.held, d, &record, &applied)?;
             let Engine { trees, effects, .. } = &mut device.engine;
-            let reported = match device.disk.applied(&record.effect_id) {
-                Some(identity) => {
-                    note(&mut self.seen, "restart finds the effect in flight done");
-                    effects.done(trees, &record.effect_id, identity)
-                }
-                None => {
+            let download = match &record.effect {
+                Effect::WriteFile { content, .. } => Some(content),
+                _ => None,
+            };
+            let reported = match applied.outcome {
+                Ok(identity) => {
+                    let held = identity.as_ref().and_then(|identity| {
+                        let other = |(id, node): &(&NodeId, &LocalNode)| {
+                            **id != record.node && node.identity.ino == identity.ino
+                        };
+                        trees.local().iter().find(other)
+                    });
+                    if let Some((other, _)) = held {
+                        return Err(Failure::Adopted(format!(
+                            "device {d} restarted, and recovery reported {:?} for node {} as \
+                             done with the entry that L holds as node {other}",
+                            record.effect, record.node
+                        )));
+                    }
+                    // A file that the user made with the bytes of the download counts as the
+                    // download. The server holds that write from then on.
+                    let taken = identity
+                        .as_ref()
+                        .zip(download)
+                        .and_then(|(identity, content)| {
+                            let found = device.disk.entries()[&identity.ino].content.as_ref()?;
+                            (found.mtime_ns != content.mtime_ns).then_some(found)
+                        });
+                    if let Some(found) = taken {
+                        note(
+                            &mut self.seen,
+                            "restart takes a file of the user for the download",
+                        );
+                        let writes = self.held.entry(record.node.clone()).or_default();
+                        writes.insert(found.mtime_ns, found.manifest_digest.clone());
+                        self.published.insert(found.mtime_ns);
+                    }
                     note(
                         &mut self.seen,
-                        "restart finds the effect in flight not done",
+                        match quarantined {
+                            true => "restart ends an effect that left an entry in quarantine",
+                            false => "restart finds the effect in flight done",
+                        },
                     );
+                    effects.done(trees, &record.effect_id, identity)
+                }
+                Err(refused) => {
+                    note(
+                        &mut self.seen,
+                        match refused {
+                            Refused::Interrupted => "restart finds the effect in flight not done",
+                            _ => "restart finds the effect in flight refused by the disk",
+                        },
+                    );
+                    if let Some(content) = download.filter(|c| device.disk.holds(c.mtime_ns)) {
+                        self.copied.insert(content.mtime_ns);
+                    }
+                    // The driver plans an interrupted effect again. An effect that failed for
+                    // another reason waits until the disk is observed.
                     effects.failed(&record.effect_id).map(|()| {
-                        effects.unblock(&record.node);
+                        if refused == Refused::Interrupted {
+                            effects.unblock(&record.node);
+                        }
                     })
                 }
             };
             reported.map_err(|error| {
                 Failure::Broken(format!("the effect's outcome was refused: {error:?}"))
             })?;
-            // S takes what the effect brought before the scan shows what the user did since.
-            device.engine.trees.settle();
+            self.unloadable = self
+                .unloadable
+                .take()
+                .or(outcome_stored(d, device, &record)?);
         }
         if device.engine.commits.in_flight().is_some() {
             note(&mut self.seen, "restart with a commit in flight");
         }
-        device.engine.scan(&device.disk);
+        if device.rescan() > 0 {
+            note(
+                &mut self.seen,
+                "rescan lets a problem node be planned again",
+            );
+        }
         device.persist()
     }
 
@@ -664,6 +799,7 @@ impl World {
                 link.awaiting = None;
                 let device = &mut self.devices[d];
                 let refused = |error| Failure::Broken(format!("the answer was refused: {error:?}"));
+                let problems = device.engine.commits.problems().len();
                 match result {
                     Ok(result) => {
                         note(
@@ -696,7 +832,15 @@ impl World {
                         commit::Failure::Abandoned => {
                             note(&mut self.seen, "commit refused, planned again")
                         }
-                        commit::Failure::Split => note(&mut self.seen, "commit refused, split"),
+                        commit::Failure::Split => note(
+                            &mut self.seen,
+                            match device.engine.commits.problems().len() > problems {
+                                true => {
+                                    "commit of one op refused for its size, its node is a problem"
+                                }
+                                false => "commit refused for its size, planned again in parts",
+                            },
+                        ),
                         failure => {
                             return Err(Failure::Broken(format!(
                                 "{error:?} on a commit led to {failure:?}"
@@ -734,6 +878,9 @@ impl World {
                 ..
             } = engine;
             commits.build(trees, ids, NOW as u64, &history, *last_seq);
+            if commits.in_flight().is_none() && !commits.problems().is_empty() {
+                note(&mut self.seen, "no commit built while a node is a problem");
+            }
             let changed = device.engine != device.store;
             device.persist()?;
             return Ok(changed);
@@ -746,11 +893,17 @@ impl World {
         let request = link.requests;
         link.awaiting = Some(request);
         let applied = self.space.device_seq(&device.session.device_id) >= commit.device_seq;
+        let stale = commit.require_head && commit.base_seq < self.space.head_seq();
         let refusal = match reply {
             // The codes say that nothing was applied, so the server never gives one for a commit
-            // it holds. A commit of one op that does not fit marks its node as a problem for good.
-            Reply::Refused(_) if applied => None,
-            Reply::Refused(error::Code::LimitExceeded) if commit.ops.len() == 1 => None,
+            // it holds, and it gives `HEAD_MOVED` only to a commit that requires its base.
+            Reply::Refused(code) if applied || code == error::Code::HeadMoved && !stale => {
+                note(
+                    &mut self.seen,
+                    "refusal the server cannot give, commit served",
+                );
+                None
+            }
             Reply::Refused(code) => Some(Error {
                 code: code as i32,
                 retry_after_ms: 1,
@@ -881,10 +1034,13 @@ impl World {
     /// reported before a tree the devices did not reach.
     fn quiesce(&mut self) -> Result<(), Failure> {
         let quiet = self.quiet();
-        if let Err(Failure::Broken(_)) = quiet {
+        if let Err(Failure::Broken(_) | Failure::Adopted(_)) = quiet {
             return quiet;
         }
         self.kept()?;
+        if let Some(why) = self.unloadable.take() {
+            return Err(Failure::Unloadable(why));
+        }
         match self.unasked.take() {
             Some(why) => Err(Failure::Diverged(why)),
             None => quiet,
@@ -1218,7 +1374,9 @@ impl World {
                 files.entry(content.mtime_ns).or_default().push(path);
             }
         }
-        if let Some((write, paths)) = files.iter().find(|(_, paths)| paths.len() > 1) {
+        let twice =
+            |(write, paths): &(&i64, &Vec<_>)| paths.len() > 1 && !self.copied.contains(*write);
+        if let Some((write, paths)) = files.iter().find(twice) {
             return Err(Failure::Diverged(format!(
                 "write {write} is in more than one file on the server, and no user copied it: {paths:?}"
             )));

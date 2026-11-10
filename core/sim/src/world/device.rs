@@ -195,4 +195,28 @@ impl Device {
         self.store = self.engine.reload()?;
         Ok(())
     }
+
+    /// The transaction that records the outcome of an effect. The driver observes the disk only
+    /// after it, so L can still hold an entry that the user has moved or deleted since the last
+    /// scan. Returns what is wrong with L when the engine would refuse to load it. The store
+    /// then keeps the state of the transaction before.
+    pub fn persist_outcome(&mut self) -> Result<Option<String>, Failure> {
+        self.engine.trees.settle();
+        if let Err(('L', error)) = self.engine.trees.check() {
+            return Ok(Some(format!("{error:?}")));
+        }
+        self.store = self.engine.reload()?;
+        Ok(None)
+    }
+
+    /// A full rescan. After it the engine plans the nodes again that the server refused an op
+    /// for (section 2.7). Returns how many there were.
+    pub fn rescan(&mut self) -> usize {
+        self.engine.scan(&self.disk);
+        let problems: Vec<NodeId> = self.engine.commits.problems().iter().cloned().collect();
+        for node in &problems {
+            self.engine.commits.clear_problem(node);
+        }
+        problems.len()
+    }
 }
