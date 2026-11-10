@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use flarebox_fs::{
@@ -150,6 +152,61 @@ fn rescan_watcher_catches_changes_made_while_nothing_watched() {
         quiet(dir.path())
     );
     assert_eq!(watcher.snapshot(), &Snapshot::scan(dir.path()).unwrap());
+}
+
+/// A stop flag that holds once it has been checked `checks` times. Storing more checks in the returned count lifts
+/// it again.
+fn stop_after(checks: usize) -> (Arc<AtomicUsize>, impl Fn() -> bool + Send + 'static) {
+    let left = Arc::new(AtomicUsize::new(checks));
+    let checked = left.clone();
+    let stopped = move || {
+        (checked.try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+            left.checked_sub(1)
+        }))
+        .is_err()
+    };
+    (left, stopped)
+}
+
+/// Ten folders of ten files each.
+fn wide_tree() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    for folder in 0..10 {
+        let path = dir.path().join(format!("f{folder}"));
+        fs::create_dir(&path).unwrap();
+        for file in 0..10 {
+            fs::write(path.join(format!("{file}.txt")), "x").unwrap();
+        }
+    }
+    dir
+}
+
+/// The first poll of `watcher`, stopped ten entries into its walk of `root`, fails and leaves the snapshot empty.
+/// Once the stop is lifted, the next poll reports the whole tree.
+fn stopped_then_resumed(watcher: &mut dyn Watcher, left: &AtomicUsize, root: &Path) {
+    assert!(matches!(watcher.poll(WAIT), Err(Error::Stopped)));
+    assert_eq!(watcher.snapshot(), &Snapshot::default());
+    left.store(usize::MAX, Ordering::SeqCst);
+    assert_eq!(watcher.poll(WAIT).unwrap().changes.len(), 110);
+    assert_eq!(watcher.snapshot(), &Snapshot::scan(root).unwrap());
+}
+
+#[test]
+fn a_rescan_watcher_stopped_during_its_walk_keeps_its_snapshot() {
+    let dir = wide_tree();
+    let (left, stopped) = stop_after(10);
+    let watcher = RescanWatcher::new(dir.path(), Snapshot::default(), Duration::from_millis(20));
+    let mut watcher = watcher.unwrap().stopping_when(stopped);
+    stopped_then_resumed(&mut watcher, &left, dir.path());
+}
+
+#[test]
+fn a_native_watcher_stopped_during_its_walk_keeps_its_snapshot_and_its_pending_scope() {
+    let dir = wide_tree();
+    let (left, stopped) = stop_after(10);
+    let watcher = NativeWatcher::start(dir.path(), Snapshot::default());
+    let mut watcher = watcher.unwrap().stopping_when(stopped);
+    stopped_then_resumed(&mut watcher, &left, dir.path());
 }
 
 #[test]
