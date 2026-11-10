@@ -148,7 +148,7 @@ pub struct FsObserver {
     /// Files whose content could not be read, with when to read them again.
     unread: BTreeMap<PathBuf, Retry>,
     /// Whether the caller has stopped waiting for observations.
-    stopped: Box<dyn Fn() -> bool + Send>,
+    stopped: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -172,32 +172,28 @@ impl Retry {
 impl FsObserver {
     /// Starts watching the folder of space `space_id` on device `dev`. The first observation compares the whole tree
     /// with `previous`. The scans leave out what `matcher`, the built-in exclusions and the `.fbignore` files of the
-    /// folder exclude. Once `stopped` holds, the file being read is left at its next chunk and `observe` returns
-    /// `None` without reading the rest, so a caller that stops does not wait for every file of a scan to be read. The
-    /// observer's snapshot then counts changes it never returned, so drop the observer.
+    /// folder exclude. Once `stopped` holds, the scan walking the tree is left at its next entry and the file being
+    /// read at its next chunk, and `observe` returns `None` without the rest, so a caller that stops waits neither
+    /// for a walk of the whole tree nor for every file of a scan to be read. The observer's snapshot then counts
+    /// changes it never returned, so drop the observer.
     pub fn start(
         root: &Path,
         space_id: &str,
         dev: u64,
         previous: Snapshot,
         matcher: Arc<dyn Matcher>,
-        stopped: impl Fn() -> bool + Send + 'static,
+        stopped: impl Fn() -> bool + Send + Sync + 'static,
     ) -> Result<Self, FsError> {
+        let stopped: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(stopped);
         let (watcher, native): (Box<dyn Watcher + Send>, bool) =
             match NativeWatcher::start_with_rules(root, previous.clone(), scan_rules(&matcher)) {
-                Ok(watcher) => (Box::new(watcher), true),
+                Ok(watcher) => (Box::new(watcher.stopping_when(watching(&stopped))), true),
                 Err(FsError::Watch(error)) => {
                     tracing::warn!(%error, "the platform watcher is unavailable; rescanning periodically");
                     let rules = scan_rules(&matcher);
-                    (
-                        Box::new(RescanWatcher::with_rules(
-                            root,
-                            previous,
-                            RESCAN_INTERVAL,
-                            rules,
-                        )?),
-                        false,
-                    )
+                    let watcher =
+                        RescanWatcher::with_rules(root, previous, RESCAN_INTERVAL, rules)?;
+                    (Box::new(watcher.stopping_when(watching(&stopped))), false)
                 }
                 Err(error) => return Err(error),
             };
@@ -213,7 +209,7 @@ impl FsObserver {
             settling: true,
             reset: false,
             unread: BTreeMap::new(),
-            stopped: Box::new(stopped),
+            stopped,
         })
     }
 
@@ -350,7 +346,7 @@ impl FsObserver {
                 self.unread.remove(&path);
                 continue;
             };
-            match read_content(&self.root, &path, &entry, &self.stopped) {
+            match read_content(&self.root, &path, &entry, &*self.stopped) {
                 Ok(Some(content)) => {
                     self.unread.remove(&path);
                     out.push(Observed::Modified {
@@ -376,7 +372,7 @@ impl FsObserver {
 
     /// Chunks the file at `path` if it is still the entry the scan saw and does not change while it is read.
     fn content(&self, path: &Path, entry: &Entry, busy: &mut Vec<PathBuf>) -> Option<Content> {
-        match read_content(&self.root, path, entry, &self.stopped) {
+        match read_content(&self.root, path, entry, &*self.stopped) {
             Ok(Some(content)) => Some(content),
             Ok(None) => {
                 busy.push(path.to_path_buf());
@@ -401,17 +397,16 @@ impl Observer for FsObserver {
             Err(FsError::Watch(error)) if self.native => {
                 tracing::warn!(%error, "the platform watcher failed; rescanning periodically");
                 let snapshot = self.watcher.snapshot().clone();
-                self.watcher = Box::new(RescanWatcher::with_rules(
-                    &self.root,
-                    snapshot,
-                    RESCAN_INTERVAL,
-                    scan_rules(&self.matcher),
-                )?);
+                let rules = scan_rules(&self.matcher);
+                let watcher =
+                    RescanWatcher::with_rules(&self.root, snapshot, RESCAN_INTERVAL, rules)?;
+                self.watcher = Box::new(watcher.stopping_when(watching(&self.stopped)));
                 self.native = false;
                 self.first = true;
                 self.settling = true;
                 return Ok(None);
             }
+            Err(FsError::Stopped) => return Ok(None),
             poll => poll?,
         };
         if poll.root.is_some() {
@@ -485,6 +480,12 @@ impl Observer for FsObserver {
     fn snapshot(&self) -> &Snapshot {
         self.watcher.snapshot()
     }
+}
+
+/// `stopped` as a watcher takes it.
+fn watching(stopped: &Arc<dyn Fn() -> bool + Send + Sync>) -> impl Fn() -> bool + Send + 'static {
+    let stopped = stopped.clone();
+    move || stopped()
 }
 
 /// The content of the file at `path` under `root`, or `None` when it is not the file the scan saw or changed while
@@ -586,6 +587,37 @@ mod tests {
             || false,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn an_observer_stopped_during_a_walk_returns_no_observation_and_no_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = marked();
+        for file in 0..20 {
+            fs::write(dir.path().join(format!("{file}.txt")), "x").unwrap();
+        }
+        let left = AtomicUsize::new(5);
+        let stopped = move || {
+            (left.try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            }))
+            .is_err()
+        };
+        let dev = fs::metadata(dir.path()).unwrap().dev();
+        let started = FsObserver::start(
+            dir.path(),
+            SPACE,
+            dev,
+            Snapshot::default(),
+            Arc::new(Unfiltered),
+            stopped,
+        );
+        let mut observer = started.unwrap();
+        assert!(matches!(
+            observer.observe(Duration::from_secs(10)),
+            Ok(None)
+        ));
+        assert_eq!(observer.snapshot(), &Snapshot::default());
     }
 
     fn marked() -> tempfile::TempDir {

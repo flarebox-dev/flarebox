@@ -119,6 +119,10 @@ pub enum Error {
     /// The root path now names a different directory than the one scanned.
     #[error("the root directory was replaced during the scan")]
     RootReplaced,
+    /// The watcher's caller stopped while a scan was walking the tree. The
+    /// snapshot is unchanged.
+    #[error("the scan stopped because its caller stopped")]
+    Stopped,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -357,11 +361,17 @@ struct Scan<'c> {
     /// The rules that leave entries out, for a scan that applies any.
     rules: Option<Pending<'c>>,
     cut: &'c mut dyn FnMut(Cut<'_>),
+    /// Whether the caller has stopped. The scan fails with [`Error::Stopped`]
+    /// at the next entry once it holds.
+    stopped: &'c dyn Fn() -> bool,
 }
 
 impl Scan<'_> {
     /// Records the entry `name` of `dir` at `rel`, and everything below it.
     fn entry(&mut self, dir: BorrowedFd<'_>, name: &OsStr, rel: PathBuf) -> Result<()> {
+        if (self.stopped)() {
+            return Err(Error::Stopped);
+        }
         let stat = match stat_at(dir, name) {
             Ok(stat) => stat,
             Err(err) if is_gone(&err) => return Ok(()),
@@ -571,7 +581,14 @@ impl Snapshot {
         paths: impl IntoIterator<Item = PathBuf>,
         rules: &mut Rules,
     ) -> Result<Rescan> {
-        self.rescan_under(root.as_ref(), paths, None, Some(rules), &mut |_| {})
+        self.rescan_under(
+            root.as_ref(),
+            paths,
+            None,
+            Some(rules),
+            &|| false,
+            &mut |_| {},
+        )
     }
 
     /// Replaces what the snapshot knows at and below `scope`, a relative
@@ -622,17 +639,19 @@ impl Snapshot {
         expected: Option<FileId>,
         cut: &mut dyn FnMut(Cut<'_>),
     ) -> Result<Rescan> {
-        self.rescan_under(root, paths, expected, None, cut)
+        self.rescan_under(root, paths, expected, None, &|| false, cut)
     }
 
-    /// [`Snapshot::rescan_with`], leaving out what `rules` leave out. A scan
-    /// that fails takes back what it changed in `rules`.
+    /// [`Snapshot::rescan_with`], leaving out what `rules` leave out, and
+    /// failing with [`Error::Stopped`] once `stopped` holds. A scan that fails
+    /// takes back what it changed in `rules`.
     fn rescan_under(
         &mut self,
         root: &Path,
         paths: impl IntoIterator<Item = PathBuf>,
         expected: Option<FileId>,
         rules: Option<&mut Rules>,
+        stopped: &dyn Fn() -> bool,
         cut: &mut dyn FnMut(Cut<'_>),
     ) -> Result<Rescan> {
         let mut scan = Scan {
@@ -642,6 +661,7 @@ impl Snapshot {
             unreadable: Vec::new(),
             rules: rules.map(Pending::new),
             cut,
+            stopped,
         };
         let result = self.rescan_into(root, paths, expected, &mut scan);
         if result.is_err()
@@ -1351,6 +1371,7 @@ pub struct NativeWatcher {
     blocked: BTreeSet<PathBuf>,
     rewatch: bool,
     failed: Option<Error>,
+    stopped: Box<dyn Fn() -> bool + Send>,
     sender: mpsc::Sender<notify::Result<notify::Event>>,
     events: mpsc::Receiver<notify::Result<notify::Event>>,
     watcher: RecommendedWatcher,
@@ -1397,12 +1418,24 @@ impl NativeWatcher {
             read: BTreeSet::new(),
             rewatch: false,
             failed: None,
+            stopped: Box::new(|| false),
             sender,
             events,
             watcher,
             #[cfg(all(test, target_os = "linux"))]
             before_register: None,
         })
+    }
+
+    /// Makes a poll fail with [`Error::Stopped`] once `stopped` holds, at the
+    /// next entry its scans reach, so a caller that stops does not wait for a
+    /// scan of the whole tree. The snapshot stays as the last poll that
+    /// returned left it, and the scopes it was scanning stay pending.
+    pub fn stopping_when(self, stopped: impl Fn() -> bool + Send + 'static) -> Self {
+        Self {
+            stopped: Box::new(stopped),
+            ..self
+        }
     }
 
     fn note(&mut self, event: notify::Result<notify::Event>) -> Result<()> {
@@ -1495,9 +1528,10 @@ impl NativeWatcher {
             let path = self.root.join(dir);
             let registered = match &self.rules {
                 Some(rules) => watch_each(&mut self.watcher, &path, &|folder| {
-                    folder
-                        .strip_prefix(&self.root)
-                        .is_ok_and(|rel| rules.status(rel, EntryKind::Dir) == Ignored::No)
+                    !(self.stopped)()
+                        && folder
+                            .strip_prefix(&self.root)
+                            .is_ok_and(|rel| rules.status(rel, EntryKind::Dir) == Ignored::No)
                 }),
                 None => watch_tree(&mut self.watcher, &path),
             };
@@ -1507,11 +1541,19 @@ impl NativeWatcher {
                 self.failed = Some(watch_error(err));
             }
         }
+        if (self.stopped)() {
+            for dir in dirs {
+                self.blocked.insert(dir.clone());
+                self.dirty.insert(dir);
+            }
+            return Vec::new();
+        }
         match self.snapshot.rescan_under(
             &self.root,
             dirs.iter().cloned(),
             Some(root),
             self.rules.as_mut(),
+            &*self.stopped,
             &mut |_| {},
         ) {
             Ok(rescan) => {
@@ -1540,7 +1582,7 @@ impl NativeWatcher {
                 self.learn(rescan.read, &rescan.unreadable);
                 rescan.changes
             }
-            Err(Error::Changed) => {
+            Err(Error::Changed | Error::Stopped) => {
                 self.dirty.extend(dirs);
                 Vec::new()
             }
@@ -1714,6 +1756,7 @@ impl Watcher for NativeWatcher {
                 scopes.iter().cloned(),
                 None,
                 self.rules.as_mut(),
+                &*self.stopped,
                 &mut |_| {},
             ) {
                 Ok(rescan) => rescan,
@@ -1764,6 +1807,7 @@ pub struct RescanWatcher {
     snapshot: Snapshot,
     interval: Duration,
     rules: Option<Rules>,
+    stopped: Box<dyn Fn() -> bool + Send>,
 }
 
 impl RescanWatcher {
@@ -1773,6 +1817,7 @@ impl RescanWatcher {
             snapshot: previous,
             interval,
             rules: None,
+            stopped: Box::new(|| false),
         })
     }
 
@@ -1789,6 +1834,16 @@ impl RescanWatcher {
             ..Self::new(root, previous, interval)?
         })
     }
+
+    /// Makes a poll fail with [`Error::Stopped`] once `stopped` holds, as
+    /// [`NativeWatcher::stopping_when`] does. The snapshot stays as the last
+    /// poll that returned left it.
+    pub fn stopping_when(self, stopped: impl Fn() -> bool + Send + 'static) -> Self {
+        Self {
+            stopped: Box::new(stopped),
+            ..self
+        }
+    }
 }
 
 impl Watcher for RescanWatcher {
@@ -1800,6 +1855,7 @@ impl Watcher for RescanWatcher {
                 [PathBuf::new()],
                 None,
                 self.rules.as_mut(),
+                &*self.stopped,
                 &mut |_| {},
             );
             let poll = match rescan {

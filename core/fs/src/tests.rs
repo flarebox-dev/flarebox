@@ -749,6 +749,44 @@ fn folders_included_by_the_registration_rescan_keep_watch_coverage() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn a_poll_stopped_before_it_registers_its_folders_registers_them_on_the_next_poll() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir(root.join("sub")).unwrap();
+    fs::write(root.join("sub/file.txt"), "before").unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = stop.clone();
+    let rules = Rules::new(Box::new(Lines::default()));
+    let mut watcher = NativeWatcher::start_with_rules(&root, Snapshot::default(), rules)
+        .unwrap()
+        .stopping_when(move || stopped.load(Ordering::SeqCst));
+    let stopping = stop.clone();
+    watcher.before_register = Some(Box::new(move || stopping.store(true, Ordering::SeqCst)));
+
+    let first = watcher.poll(Duration::ZERO).unwrap();
+    assert_eq!(
+        first.changes,
+        [
+            created("sub", EntryKind::Dir),
+            created("sub/file.txt", EntryKind::File)
+        ]
+    );
+    assert_eq!(first.pending, [PathBuf::new()]);
+    watcher.before_register = None;
+    stop.store(false, Ordering::SeqCst);
+    watcher.poll(Duration::from_millis(150)).unwrap();
+
+    fs::write(root.join("sub/file.txt"), "after").unwrap();
+    let modified = Change::Modified {
+        path: "sub/file.txt".into(),
+    };
+    wait_for(&mut watcher, &[modified]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn a_new_folder_that_vanishes_before_its_watch_is_not_a_watch_failure() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
@@ -1012,6 +1050,7 @@ fn a_failed_scan_leaves_the_rules_as_they_were() {
         [PathBuf::new()],
         None,
         Some(&mut rules),
+        &|| false,
         &mut |cut| {
             if let Cut::OpeningDir(path) = cut
                 && path == Path::new("m")
