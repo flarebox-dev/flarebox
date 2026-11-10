@@ -67,4 +67,4 @@ flarebox questions
 flarebox questions answer <id> <answer>
 ```
 
-Sync may stop and ask before it does something you might not want. `flarebox questions` lists what it is waiting on, with the answers each question accepts, and `answer` gives one. The number of open questions is at the end of each folder's status line.
+`flarebox questions` lists the questions a folder is waiting on, with the answers each accepts, and `answer` gives one. The number of open questions is at the end of each folder's status line. 0.1.0 asks none yet: the checks that would stop and ask first, such as before deleting many files at once, are not built. Until they are, sync carries out every change without asking.

@@ -62,7 +62,7 @@ This lists the restores asked for in the folder's space and how each went:
 - **restored as a new file `<name>`, since another device changed the file meanwhile**: the earlier version came back as a [conflict copy](conflicts.md#two-edits-of-one-file) next to the file.
 - **refused**: the server said why. For example, the item was deleted for good after 30 days.
 - **not sent**: it brings back more files and folders than one change can hold.
-- **pending**: it hasn't been sent yet. The list says what the folder is waiting for: a stopped daemon, a [problem](status.md), or a question.
+- **pending**: it hasn't been sent yet. The list says what the folder is waiting for, such as a stopped daemon or a [problem](status.md).
 
 ## See what each space stores
 
