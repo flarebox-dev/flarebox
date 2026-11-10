@@ -25,10 +25,27 @@ jobs:
       server_macos: ${{ steps.paths.outputs.server_macos }}
       spec_macos: ${{ steps.paths.outputs.spec_macos }}
       macos_app: ${{ steps.paths.outputs.macos_app }}
+      macos_runs_on: ${{ steps.runners.outputs.macos_runs_on }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Choose the macOS runners
+        id: runners
+        env:
+          RUNS_ON: ${{ vars.MACOS_RUNS_ON || '["self-hosted","flarebox-mini"]' }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+        run: |
+          if [ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ]; then
+            echo "Pull request from the fork $HEAD_REPO: its macOS jobs run on GitHub-hosted runners."
+            RUNS_ON='["macos-26"]'
+          fi
+          if ! jq -e 'type == "array" and length > 0 and all(.[]; type == "string")' <<<"$RUNS_ON" >/dev/null 2>&1; then
+            echo "::error::The MACOS_RUNS_ON variable must be a JSON array of runner labels, such as [\"macos-26\"], but it is: $RUNS_ON"
+            exit 1
+          fi
+          echo "macOS jobs run on $RUNS_ON."
+          echo "macos_runs_on=$(jq -c . <<<"$RUNS_ON")" >> "$GITHUB_OUTPUT"
       - name: Decide which macOS jobs the change needs
         id: paths
         env:
@@ -67,12 +84,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(needs.changes.outputs.rust_macos == 'true' && '["ubuntu-latest","macos-latest"]' || '["ubuntu-latest"]') }}
-    runs-on: ${{ matrix.os }}
+        os: ${{ fromJSON(needs.changes.outputs.rust_macos == 'true' && '["ubuntu-latest","macos"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ matrix.os == 'macos' && fromJSON(needs.changes.outputs.macos_runs_on) || matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Keep rustup and Cargo homes private to this self-hosted runner
+        if: runner.environment == 'self-hosted'
+        run: |
+          printf 'RUSTUP_HOME=%s\nCARGO_HOME=%s\n' "$RUNNER_TOOL_CACHE/rustup" "$RUNNER_TOOL_CACHE/cargo" >> "$GITHUB_ENV"
+          echo "Runner $RUNNER_NAME uses RUSTUP_HOME=$RUNNER_TOOL_CACHE/rustup and CARGO_HOME=$RUNNER_TOOL_CACHE/cargo."
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -86,8 +108,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(needs.changes.outputs.server_macos == 'true' && '["ubuntu-latest","macos-latest"]' || '["ubuntu-latest"]') }}
-    runs-on: ${{ matrix.os }}
+        os: ${{ fromJSON(needs.changes.outputs.server_macos == 'true' && '["ubuntu-latest","macos"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ matrix.os == 'macos' && fromJSON(needs.changes.outputs.macos_runs_on) || matrix.os }}
     defaults:
       run:
         working-directory: server
@@ -98,6 +120,7 @@ jobs:
       - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           package_json_file: server/package.json
+          dest: ${{ runner.tool_cache }}/setup-pnpm
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
@@ -210,8 +233,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(needs.changes.outputs.spec_macos == 'true' && '["ubuntu-latest","macos-latest"]' || '["ubuntu-latest"]') }}
-    runs-on: ${{ matrix.os }}
+        os: ${{ fromJSON(needs.changes.outputs.spec_macos == 'true' && '["ubuntu-latest","macos"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ matrix.os == 'macos' && fromJSON(needs.changes.outputs.macos_runs_on) || matrix.os }}
     defaults:
       run:
         working-directory: spec
@@ -246,10 +269,8 @@ jobs:
     name: macos app
     needs: changes
     if: needs.changes.outputs.macos_app == 'true'
-    runs-on: macos-26
+    runs-on: ${{ fromJSON(needs.changes.outputs.macos_runs_on) }}
     timeout-minutes: 45
-    env:
-      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
     defaults:
       run:
         working-directory: apps/macos
@@ -257,6 +278,23 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Select Xcode 26.6 on GitHub-hosted runners and the installed Xcode on self-hosted ones
+        run: |
+          if [ "$RUNNER_ENVIRONMENT" = github-hosted ]; then
+            developer_dir=/Applications/Xcode_26.6.app/Contents/Developer
+          else
+            developer_dir=/Applications/Xcode.app/Contents/Developer
+          fi
+          if [ ! -d "$developer_dir" ]; then
+            echo "::error::$developer_dir is missing on $RUNNER_NAME ($RUNNER_ENVIRONMENT)."
+            exit 1
+          fi
+          echo "DEVELOPER_DIR=$developer_dir" >> "$GITHUB_ENV"
+      - name: Keep rustup and Cargo homes private to this self-hosted runner
+        if: runner.environment == 'self-hosted'
+        run: |
+          printf 'RUSTUP_HOME=%s\nCARGO_HOME=%s\n' "$RUNNER_TOOL_CACHE/rustup" "$RUNNER_TOOL_CACHE/cargo" >> "$GITHUB_ENV"
+          echo "Runner $RUNNER_NAME uses RUSTUP_HOME=$RUNNER_TOOL_CACHE/rustup and CARGO_HOME=$RUNNER_TOOL_CACHE/cargo."
       - name: Test notarize.sh against a stub notarytool
         run: scripts/test-notarize.sh
       - name: Install toolchain from rust-toolchain.toml

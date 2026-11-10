@@ -94,4 +94,6 @@ Generated code is checked in: `server/src/gen/` (TypeScript) and `core/proto/src
 
 CI runs these checks on Linux for every pull request. The macOS run of the Rust checks and the macOS app build, which also packages the unsigned release DMG, run on a pull request or in the merge queue only when the change touches a path they use, as listed in the `changes` job of `.github/workflows/ci.yml`. The server and spec checks run on macOS only on pushes to `main`, because nothing in them depends on macOS. A push to `main` runs every macOS job, and `ci-report` fails the push if one was skipped.
 
+The macOS jobs of CI run on the project's self-hosted Mac runners (label `flarebox-mini`), except for pull requests from forks, which run them on GitHub-hosted `macos-26` runners. To move every macOS job of CI to GitHub-hosted runners without changing code, set the repository variable `MACOS_RUNS_ON` to `["macos-26"]` in Settings → Secrets and variables → Actions → Variables. Delete the variable to go back to the self-hosted runners. The signed release always runs on GitHub-hosted runners.
+
 Commit titles follow [Conventional Commits](https://www.conventionalcommits.org/), for example `feat(server): add commit validation`.
