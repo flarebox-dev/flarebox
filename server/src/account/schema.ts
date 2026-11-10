@@ -39,6 +39,11 @@ export const MIGRATIONS: readonly Migration[] = [
   CREATE INDEX IF NOT EXISTS rewinds_space ON rewinds(space_id);
   CREATE TABLE IF NOT EXISTS space_rewinds (space_id TEXT PRIMARY KEY, rewind_count INTEGER NOT NULL, completed_at_ms INTEGER);
   `,
+  `
+  CREATE TABLE IF NOT EXISTS claim_failures (scope TEXT NOT NULL, client TEXT NOT NULL, failures INTEGER NOT NULL,
+    window_start_ms INTEGER NOT NULL, PRIMARY KEY (scope, client));
+  CREATE TABLE IF NOT EXISTS used_recovery_keys (key_hash BLOB PRIMARY KEY, used_at_ms INTEGER NOT NULL);
+  `,
 ];
 
 export function migrate(sql: SqlStorage): void {
