@@ -55,7 +55,7 @@ A policy halt is not the read-only state of spec v0 §9.2. Read-only follows fro
 
 "Sends the same commit again" means the bytes of RFC 0002 §2: the same `commit_id`, `history_id`, `device_seq`, `base_seq`, `require_head` and ops. Only the receipts may be new.
 
-**Other requests.** For a request that is not a commit, `RETRY_LATER` and `QUOTA_EXCEEDED` with `retry_after_ms` greater than 0 are retried after the wait, `UNAUTHENTICATED` after a new access token, and `INTERNAL` after a backoff. Any other code, known or not, ends that request: the client reports it and does not send the same request again by itself.
+**Other requests.** For a request that is not a commit, `RETRY_LATER` is retried as before: after `retry_after_ms` when it is greater than 0, otherwise after a backoff. `QUOTA_EXCEEDED` is retried only when `retry_after_ms` is greater than 0, after that wait. `UNAUTHENTICATED` is retried after a new access token, and `INTERNAL` after a backoff. Any other code, known or not, ends that request: the client reports it and does not send the same request again by itself.
 
 The platform daily limit of spec v0 §13 always sets `retry_after_ms`, so it is retried as before. A later per-principal quota with no reset time is a policy halt.
 
