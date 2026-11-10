@@ -18,7 +18,7 @@ export const PUBLIC_HEADERS: Record<string, string> = {
   "X-Content-Type-Options": "nosniff",
 };
 
-/** Headers on every page and asset of the viewer (RFC 0005 section 8); server/web/_headers repeats them for the assets. */
+/** Headers on every page and asset of the viewer (RFC 0005 section 8); server/web/public/_headers repeats them for the assets. */
 export const VIEWER_HEADERS: Record<string, string> = {
   "Content-Security-Policy":
     "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",

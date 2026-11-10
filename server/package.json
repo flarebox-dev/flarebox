@@ -10,8 +10,9 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "check:deploy": "node scripts/check-deploy.mjs",
-    "typecheck": "wrangler types && tsc --noEmit && tsc --noEmit -p test",
-    "test": "vitest run"
+    "typecheck": "wrangler types && tsc --noEmit && tsc --noEmit -p test && pnpm --filter flarebox-web typecheck",
+    "build:web": "pnpm --filter flarebox-web build",
+    "test": "pnpm build:web && vitest run"
   },
   "cloudflare": {
     "bindings": {

@@ -133,6 +133,12 @@ async function claimLocally() {
   if (before.claimed) fail("a fresh deployment reports that it already has an owner");
   const page = await request(base + "/setup").then((response) => response.text());
   if (!page.includes("not affiliated with Cloudflare, Inc.")) fail("/setup lost the notice that Flarebox is not affiliated with Cloudflare, Inc.");
+  const viewer = await request(base + "/s/AAAAAAAAAAAAAAAAAAAAAA");
+  if (!viewer.ok || !(await viewer.text()).includes('src="/viewer/viewer.js"')) fail("/s/{link_id} does not serve the built share viewer (HTTP " + viewer.status + ")");
+  const script = await request(base + "/viewer/viewer.js");
+  if (!script.ok || !script.headers.get("content-security-policy")?.includes("default-src 'none'")) {
+    fail("/viewer/viewer.js is not served from the built assets with the viewer's headers (HTTP " + script.status + ")");
+  }
   const code = await waitFor(async () => /Flarebox claim code[^:]*: ([A-Z0-9-]+)/.exec(devOutput)?.[1], "the claim code in the Worker log", 10_000);
   const response = await request(base + "/v1/claim", {
     method: "POST",
@@ -165,6 +171,8 @@ try {
   run("pnpm", ["install", "--frozen-lockfile"], INSTALL_MS);
   await checkConfig();
   run("pnpm", ["exec", "wrangler", "deploy", "--dry-run", "--outdir", join(root, ".dist")], DRY_RUN_MS);
+  if (!existsSync(join(root, "web", "dist", "viewer", "index.html"))) fail("the dry run did not build the web package: web/dist/viewer/index.html is missing");
+  console.log("The dry run built the web package through wrangler.jsonc's build.command");
   await claimLocally();
   console.log("check-deploy: server/ deploys on its own");
 } catch (error) {

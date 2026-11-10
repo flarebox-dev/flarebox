@@ -21,8 +21,11 @@ describe("share links: web viewer (RFC 0005 section 8)", () => {
     expect(response.headers.get("Cache-Control")).toBe("no-store");
     expectViewerHeaders(response);
     const page = await response.text();
-    expect(page).toContain('<script type="module" src="/viewer/viewer.js"></script>');
+    expect(page).toMatch(/<script type="module" (crossorigin )?src="\/viewer\/viewer\.js"><\/script>/);
+    expect(page).toMatch(/<link rel="stylesheet" (crossorigin )?href="\/viewer\/viewer\.css">/);
     expect(page).toContain("not affiliated with Cloudflare, Inc.");
+    for (const script of page.match(/<script\b[^>]*>/g) ?? []) expect(script, "every script is a same-origin file").toMatch(/ src="\/[^/]/);
+    expect(page).not.toMatch(/<style\b| style=| on[a-z]+=|https?:\/\//i);
 
     const head = await exports.default.fetch(`${BASE}/s/${LINK}`, { method: "HEAD" });
     expect(head.status).toBe(200);

@@ -2,27 +2,66 @@
 
 // The share-link viewer of RFC 0005 section 8. It talks only to this origin and renders every name with textContent.
 
+type NodeKind = "NODE_KIND_UNSPECIFIED" | "NODE_KIND_DIR" | "NODE_KIND_FILE" | "NODE_KIND_SYMLINK";
+
+/** The proto3 JSON forms of ShareInfo, ShareEntry, ShareListing and Error: 64-bit numbers arrive as strings, defaults are omitted. */
+interface ShareInfo {
+  passwordRequired?: boolean;
+  kind?: NodeKind;
+  name?: string;
+  rootId?: string;
+  size?: string;
+  mtimeMs?: string;
+  expiresAtMs?: string;
+}
+
+interface ShareEntry {
+  nodeId?: string;
+  name?: string;
+  kind?: NodeKind;
+  size?: string;
+  mtimeMs?: string;
+}
+
+interface ShareListing {
+  entries?: ShareEntry[];
+  path?: ShareEntry[];
+  nextCursor?: string;
+}
+
+interface ApiError {
+  retryAfterMs?: string;
+}
+
+interface Reply<T> {
+  /** 0 when the request did not reach the server. */
+  status: number;
+  body: T | null;
+}
+
+type Props = Record<string, string | ((event: Event) => unknown)>;
+
 const linkId = location.pathname.split("/")[2] ?? "";
 const api = "/v1/share/" + encodeURIComponent(linkId);
-const main = document.getElementById("main");
+const main = document.getElementById("main")!;
 
-function el(tag, props = {}, ...children) {
+function el<K extends keyof HTMLElementTagNameMap>(tag: K, props: Props = {}, ...children: (Node | string)[]): HTMLElementTagNameMap[K] {
   const node = document.createElement(tag);
   for (const [key, value] of Object.entries(props)) {
-    if (key === "class") node.className = value;
+    if (typeof value === "function") node.addEventListener(key.slice(2), value);
+    else if (key === "class") node.className = value;
     else if (key === "text") node.textContent = value;
-    else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
     else node.setAttribute(key, value);
   }
-  for (const child of children) node.append(child);
+  node.append(...children);
   return node;
 }
 
-function show(...nodes) {
+function show(...nodes: Node[]): void {
   main.replaceChildren(...nodes);
 }
 
-function formatSize(text) {
+function formatSize(text: string | undefined): string {
   let size = Number(text ?? 0);
   const units = ["bytes", "KB", "MB", "GB", "TB"];
   let unit = 0;
@@ -33,20 +72,20 @@ function formatSize(text) {
   return unit === 0 ? size + (size === 1 ? " byte" : " bytes") : size.toFixed(size < 10 ? 1 : 0) + " " + units[unit];
 }
 
-function formatTime(text) {
+function formatTime(text: string | number | undefined): string {
   const ms = Number(text ?? 0);
   if (!ms) return "";
   return new Date(ms).toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" });
 }
 
-function waitText(error) {
+function waitText(error: ApiError | null): string {
   const ms = Number(error?.retryAfterMs ?? 0);
   if (!ms) return "Try again later.";
   const minutes = Math.ceil(ms / 60_000);
   return "Try again in " + minutes + (minutes === 1 ? " minute." : " minutes.");
 }
 
-function problem(status, error) {
+function problem(status: number, error: ApiError | null): string {
   if (status === 404) return "This link does not exist, has expired, or was revoked.";
   if (status === 429) return "Too many attempts. " + waitText(error);
   if (status === 503) return "This link is temporarily unavailable. " + waitText(error);
@@ -54,8 +93,8 @@ function problem(status, error) {
   return "Something went wrong. " + waitText(error);
 }
 
-async function request(path, init = {}) {
-  let response;
+async function request<T>(path: string, init: { method?: string; body?: string } = {}): Promise<Reply<T>> {
+  let response: Response;
   try {
     response = await fetch(api + path, {
       ...init,
@@ -65,10 +104,10 @@ async function request(path, init = {}) {
   } catch {
     return { status: 0, body: null };
   }
-  let body = null;
+  let body: T | null = null;
   if (response.status !== 204) {
     try {
-      body = await response.json();
+      body = (await response.json()) as T;
     } catch {
       body = null;
     }
@@ -76,23 +115,23 @@ async function request(path, init = {}) {
   return { status: response.status, body };
 }
 
-function fail(status, error) {
+function fail(status: number, error: ApiError | null): void {
   show(el("h1", { text: "Unavailable" }), el("p", { class: "error", text: problem(status, error) }));
 }
 
-function downloadLink(nodeId, label = "Download") {
+function downloadLink(nodeId: string, label = "Download"): HTMLAnchorElement {
   return el("a", { class: "button", href: api + "/file/" + encodeURIComponent(nodeId), download: "", text: label });
 }
 
-function passwordForm(message) {
+function passwordForm(message?: string): void {
   const input = el("input", { type: "password", name: "password", autocomplete: "off", required: "", "aria-label": "Password" });
   const note = el("p", { class: message ? "error" : "status", text: message ?? "Enter the password you were given." });
   const form = el(
     "form",
     {
-      onsubmit: async (event) => {
+      onsubmit: async (event: Event) => {
         event.preventDefault();
-        const { status, body } = await request("/unlock", { method: "POST", body: JSON.stringify({ password: input.value }) });
+        const { status, body } = await request<ApiError>("/unlock", { method: "POST", body: JSON.stringify({ password: input.value }) });
         if (status === 204) return start();
         if (status === 401) return passwordForm("Wrong password.");
         if (status === 429) return passwordForm("Too many wrong passwords. " + waitText(body));
@@ -106,42 +145,43 @@ function passwordForm(message) {
   input.focus();
 }
 
-function expiry(info) {
+function expiry(info: ShareInfo): string {
   const ms = Number(info.expiresAtMs ?? 0);
   return ms ? "Link expires " + formatTime(ms) : "";
 }
 
-function showFile(info) {
+function showFile(info: ShareInfo): void {
   const details = [formatSize(info.size), formatTime(info.mtimeMs) && "modified " + formatTime(info.mtimeMs), expiry(info)].filter(Boolean).join(" · ");
-  show(el("h1", { text: info.name }), el("p", { class: "meta", text: details }), downloadLink(info.rootId));
+  show(el("h1", { text: info.name ?? "" }), el("p", { class: "meta", text: details }), downloadLink(info.rootId ?? ""));
 }
 
-function currentDir(info) {
+function currentDir(info: ShareInfo): string {
   const match = /^#dir=([0-9a-f-]{36})$/.exec(location.hash);
-  return match ? match[1] : info.rootId;
+  return match ? match[1]! : (info.rootId ?? "");
 }
 
-function entryRow(entry) {
+function entryRow(entry: ShareEntry): HTMLTableRowElement {
   const isDir = entry.kind === "NODE_KIND_DIR";
+  const nodeId = entry.nodeId ?? "";
   const name = isDir
-    ? el("button", { type: "button", text: entry.name, onclick: () => (location.hash = "dir=" + entry.nodeId) })
-    : el("span", { text: entry.name });
+    ? el("button", { type: "button", text: entry.name ?? "", onclick: () => (location.hash = "dir=" + nodeId) })
+    : el("span", { text: entry.name ?? "" });
   return el(
     "tr",
     {},
     el("td", { class: "name" }, el("span", { class: "kind", text: isDir ? "Folder" : "File" }), name),
     el("td", { class: "num hide-small", text: isDir ? "" : formatSize(entry.size) }),
     el("td", { class: "num hide-small", text: isDir ? "" : formatTime(entry.mtimeMs) }),
-    el("td", { class: "num" }, isDir ? "" : downloadLink(entry.nodeId)),
+    el("td", { class: "num" }, isDir ? "" : downloadLink(nodeId)),
   );
 }
 
-async function showFolder(info) {
+async function showFolder(info: ShareInfo): Promise<void> {
   const dir = currentDir(info);
   const rows = el("tbody");
   const crumbs = el("nav", { class: "crumbs", "aria-label": "Folder path" });
   const more = el("div", { class: "more" });
-  const heading = el("h1", { text: info.name });
+  const heading = el("h1", { text: info.name ?? "" });
   show(
     heading,
     el("p", { class: "meta", text: expiry(info) }),
@@ -149,52 +189,51 @@ async function showFolder(info) {
     el(
       "table",
       {},
-      el(
-        "thead",
-        {},
-        el("tr", {}, el("th", { text: "Name" }), el("th", { class: "num hide-small", text: "Size" }), el("th", { class: "num hide-small", text: "Modified" }), el("th", {})),
-      ),
+      el("thead", {}, el("tr", {}, el("th", { text: "Name" }), el("th", { class: "num hide-small", text: "Size" }), el("th", { class: "num hide-small", text: "Modified" }), el("th"))),
       rows,
     ),
     more,
   );
   let first = true;
-  const load = async (cursor) => {
+  const load = async (cursor: string): Promise<void> => {
     const query = "?dir=" + encodeURIComponent(dir) + (cursor ? "&cursor=" + encodeURIComponent(cursor) : "");
-    const { status, body } = await request("/list" + query);
+    const { status, body } = await request<ShareListing & ApiError>("/list" + query);
     if (status === 401) return passwordForm();
-    if (status !== 200) return fail(status, body);
+    if (status !== 200 || !body) return fail(status, body);
     if (first) {
       first = false;
       const path = body.path ?? [];
-      heading.textContent = path.at(-1)?.name ?? info.name;
+      heading.textContent = path.at(-1)?.name ?? info.name ?? "";
       path.forEach((folder, i) => {
         if (i > 0) crumbs.append(el("span", { text: "/" }));
-        crumbs.append(el("button", { type: "button", text: folder.name || "Shared folder", onclick: () => (location.hash = i === 0 ? "" : "dir=" + folder.nodeId) }));
+        crumbs.append(
+          el("button", { type: "button", text: folder.name || "Shared folder", onclick: () => (location.hash = i === 0 ? "" : "dir=" + (folder.nodeId ?? "")) }),
+        );
       });
     }
     for (const entry of body.entries ?? []) rows.append(entryRow(entry));
     if (rows.children.length === 0) rows.append(el("tr", {}, el("td", { class: "status", colspan: "4", text: "This folder is empty." })));
     more.replaceChildren();
-    if (body.nextCursor) more.append(el("button", { type: "button", class: "secondary", text: "Show more", onclick: () => load(body.nextCursor) }));
+    const next = body.nextCursor;
+    if (next) more.append(el("button", { type: "button", class: "secondary", text: "Show more", onclick: () => load(next) }));
   };
   await load("");
 }
 
-let info;
+let info: ShareInfo | undefined;
 
-async function start() {
-  const { status, body } = await request("");
+async function start(): Promise<void> {
+  const { status, body } = await request<ShareInfo & ApiError>("");
   if (status === 401 && body?.passwordRequired) return passwordForm();
-  if (status !== 200) return fail(status, body);
+  if (status !== 200 || !body) return fail(status, body);
   info = body;
-  document.title = info.name + " · Flarebox";
+  document.title = (info.name ?? "") + " · Flarebox";
   if (info.kind === "NODE_KIND_DIR") return showFolder(info);
   showFile(info);
 }
 
 window.addEventListener("hashchange", () => {
-  if (info?.kind === "NODE_KIND_DIR") showFolder(info);
+  if (info?.kind === "NODE_KIND_DIR") void showFolder(info);
 });
 
-start();
+void start();
