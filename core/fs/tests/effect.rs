@@ -7,16 +7,16 @@ mod common;
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 use common::{
-    Bytes, EDITED, ID, REMOTE, SCENARIOS, SYNCED, assert_settled, at, contents, entries, marker,
-    now, prepare, private_names, rewrite_keeping_mtime, stage, trashed,
+    Bytes, EDITED, ID, REMOTE, SCENARIOS, SYNCED, assert_settled, at, bind, contents, entries,
+    marker, now, prepare, private_names, rewrite_keeping_mtime, stage, trashed,
 };
 use flarebox_fs::{
     Action, Base, Displaced, Effect, Location, Outcome, PARKED_DIR, PRIVATE_DIR, QUARANTINE_DIR,
-    Reason, STAGING_DIR, Snapshot, Space, Step, read_marker,
+    Reason, STAGING_DIR, Snapshot, Step, Unresolved, read_marker,
 };
 
 fn replace(root: &Path) -> Effect {
@@ -24,8 +24,7 @@ fn replace(root: &Path) -> Effect {
 }
 
 fn apply(root: &Path, effect: &Effect, mut hook: impl FnMut(Step)) -> Outcome {
-    Space::open(root)
-        .unwrap()
+    bind(root)
         .apply(&marker(), effect, &mut Bytes, now(), &mut hook)
         .unwrap()
 }
@@ -35,6 +34,30 @@ fn failed(reason: Reason) -> Outcome {
         reason,
         recovered: None,
     }
+}
+
+/// The outcome of an effect that made the entry now at `path`.
+fn made(root: &Path, path: &str) -> Outcome {
+    Outcome::Done {
+        identity: Some(entries(root, &[path])[0].id),
+    }
+}
+
+/// The outcome of a move or a removal.
+const MOVED_OR_REMOVED: Outcome = Outcome::Done { identity: None };
+
+/// Moves the root at `root` to `moved` and puts an empty folder at its path.
+fn withdraw(root: &Path, moved: &Path) {
+    fs::rename(root, moved).unwrap();
+    fs::create_dir(root).unwrap();
+}
+
+fn withdrawn(err: &std::io::Error) -> bool {
+    matches!(
+        err.get_ref()
+            .and_then(|err| err.downcast_ref::<Unresolved>()),
+        Some(Unresolved::RootWithdrawn(_))
+    )
 }
 
 fn listing(path: &Path) -> Vec<PathBuf> {
@@ -52,7 +75,8 @@ fn replacement_places_the_new_file_and_trashes_the_old_one() {
     let root = dir.path();
     let effect = replace(root);
     let mut steps = Vec::new();
-    assert_eq!(apply(root, &effect, |step| steps.push(step)), Outcome::Done);
+    let outcome = apply(root, &effect, |step| steps.push(step));
+    assert_eq!(outcome, made(root, "docs/report.txt"));
     assert_eq!(
         steps,
         [
@@ -224,7 +248,8 @@ fn write_through_a_descriptor_held_across_the_effect_lands_in_the_trash() {
         .append(true)
         .open(root.join("docs/report.txt"))
         .unwrap();
-    assert_eq!(apply(root, &effect, |_| {}), Outcome::Done);
+    let outcome = apply(root, &effect, |_| {});
+    assert_eq!(outcome, made(root, "docs/report.txt"));
     held.write_all(b" and more").unwrap();
     assert_eq!(fs::read(root.join("docs/report.txt")).unwrap(), REMOTE);
     assert_eq!(trashed(root), [b"synced and more".to_vec()]);
@@ -235,7 +260,7 @@ fn removed_file_goes_to_the_trash_unless_it_changed() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let effect = prepare(&SCENARIOS[4], root);
-    assert_eq!(apply(root, &effect, |_| {}), Outcome::Done);
+    assert_eq!(apply(root, &effect, |_| {}), MOVED_OR_REMOVED);
     assert_eq!(contents(root.join("docs/report.txt")), None);
     assert_eq!(trashed(root), [SYNCED]);
     assert_settled(root);
@@ -330,7 +355,7 @@ fn move_into_and_out_of_the_parked_folder() {
             to: parked.clone(),
         },
     };
-    assert_eq!(apply(root, &park, |_| {}), Outcome::Done);
+    assert_eq!(apply(root, &park, |_| {}), MOVED_OR_REMOVED);
     let parked_path = root.join(PRIVATE_DIR).join(PARKED_DIR).join("node-1");
     assert_eq!(fs::read(&parked_path).unwrap(), SYNCED);
 
@@ -342,7 +367,7 @@ fn move_into_and_out_of_the_parked_folder() {
             to: at(Vec::new(), "F.txt"),
         },
     };
-    assert_eq!(apply(root, &unpark, |_| {}), Outcome::Done);
+    assert_eq!(apply(root, &unpark, |_| {}), MOVED_OR_REMOVED);
     assert_eq!(fs::read(root.join("F.txt")).unwrap(), SYNCED);
 }
 
@@ -457,7 +482,7 @@ fn recovery_puts_back_a_file_written_through_an_old_descriptor_after_a_crash() {
     assert!(crashed.is_err());
     held.write_all_at(b"SYNCED", 0).unwrap();
 
-    let space = Space::open(root).unwrap();
+    let space = bind(root);
     let outcome = space
         .recover(&marker(), &effect, &mut Bytes, now(), &mut |_| {})
         .unwrap();
@@ -472,8 +497,7 @@ fn replacement_without_a_staged_file_changes_nothing() {
     let root = dir.path();
     let effect = replace(root);
     fs::remove_file(root.join(PRIVATE_DIR).join(STAGING_DIR).join(ID)).unwrap();
-    let err = Space::open(root)
-        .unwrap()
+    let err = bind(root)
         .apply(&marker(), &effect, &mut Bytes, now(), &mut |_| {})
         .unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
@@ -486,7 +510,7 @@ fn replacement_without_a_staged_file_changes_nothing() {
 fn staged_files_without_a_record_are_cleared() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let space = Space::open(root).unwrap();
+    let space = bind(root);
     stage(&space, REMOTE);
     let mut other = space.stage("e0").unwrap();
     other.write_all(b"older").unwrap();
@@ -502,7 +526,7 @@ fn staged_file_gets_the_executable_bit() {
 
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let space = Space::open(root).unwrap();
+    let space = bind(root);
     stage(&space, REMOTE);
     let staged = root.join(PRIVATE_DIR).join(STAGING_DIR).join(ID);
     assert_eq!(
@@ -520,7 +544,7 @@ fn effect_ids_must_be_single_names() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let mut effect = replace(root);
-    let space = Space::open(root).unwrap();
+    let space = bind(root);
     for id in ["", ".", "..", "../e1", "a/b"] {
         effect.id = id.into();
         let err = space
@@ -533,4 +557,123 @@ fn effect_ids_must_be_single_names() {
         );
     }
     assert_eq!(fs::read(root.join("docs/report.txt")).unwrap(), SYNCED);
+}
+#[test]
+fn done_carries_the_identity_of_the_entry_the_effect_made() {
+    for scenario in &SCENARIOS {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let effect = prepare(scenario, root);
+        let staged = fs::metadata(root.join(PRIVATE_DIR).join(STAGING_DIR).join(ID)).ok();
+        let outcome = apply(root, &effect, |_| {});
+        assert!(
+            matches!(outcome, Outcome::Done { .. }),
+            "{}: {outcome:?}",
+            scenario.name
+        );
+        (scenario.check)(root, &outcome);
+        if let Some(staged) = staged {
+            let Outcome::Done {
+                identity: Some(identity),
+            } = outcome
+            else {
+                panic!("{}: {outcome:?}", scenario.name);
+            };
+            assert_eq!(
+                (identity.dev, identity.ino),
+                (staged.dev(), staged.ino()),
+                "{}",
+                scenario.name
+            );
+        }
+    }
+}
+
+#[test]
+fn root_moved_during_an_effect_gets_nothing_at_its_path_and_recovers_where_it_went() {
+    for scenario in &SCENARIOS {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("space");
+        let effect = prepare(scenario, &root);
+        let mut steps = Vec::new();
+        bind(&root)
+            .apply(&marker(), &effect, &mut Bytes, now(), &mut |step| {
+                steps.push(step)
+            })
+            .unwrap();
+        let done_from = scenario
+            .done_from
+            .map(|from| steps.iter().position(|step| *step == from).unwrap());
+
+        for (index, &step) in steps.iter().enumerate() {
+            let context = format!("{} moved at {step:?}", scenario.name);
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("space");
+            let moved = dir.path().join("moved");
+            let effect = prepare(scenario, &root);
+            let result = bind(&root).apply(&marker(), &effect, &mut Bytes, now(), &mut |reached| {
+                if reached == step {
+                    withdraw(&root, &moved);
+                }
+            });
+            match result {
+                Err(err) => assert!(withdrawn(&err), "{context}: {err}"),
+                Ok(outcome) => assert_eq!(index, steps.len() - 1, "{context}: {outcome:?}"),
+            }
+            assert!(listing(&root).is_empty(), "{context}");
+
+            let outcome = bind(&moved)
+                .recover(&marker(), &effect, &mut Bytes, now(), &mut |_| {})
+                .unwrap();
+            assert_eq!(
+                matches!(outcome, Outcome::Done { .. }),
+                done_from.is_some_and(|from| index >= from),
+                "{context}: {outcome:?}"
+            );
+            (scenario.check)(&moved, &outcome);
+            assert_settled(&moved);
+            assert!(listing(&root).is_empty(), "{context}");
+        }
+    }
+}
+
+#[test]
+fn space_changes_nothing_once_its_root_is_moved_away() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("space");
+    let moved = dir.path().join("moved");
+    let effect = replace(&root);
+    let space = bind(&root);
+    assert!(space.held().unwrap());
+    withdraw(&root, &moved);
+    assert!(!space.held().unwrap());
+
+    let results = [
+        space
+            .apply(&marker(), &effect, &mut Bytes, now(), &mut |_| {})
+            .map(drop),
+        space
+            .recover(&marker(), &effect, &mut Bytes, now(), &mut |_| {})
+            .map(drop),
+        space.stage("e2").map(drop),
+        space.finish_staged(ID, true),
+        space.clear_staging(None).map(drop),
+        space.probe_no_replace().map(drop),
+        space.reclaim_trash(now(), 0).map(drop),
+    ];
+    for result in results {
+        let err = result.unwrap_err();
+        assert!(withdrawn(&err), "{err}");
+    }
+    assert!(listing(&root).is_empty());
+    assert_eq!(read_marker(&moved).unwrap(), None);
+    assert_eq!(private_names(&moved, STAGING_DIR), [ID]);
+    assert_eq!(fs::read(moved.join("docs/report.txt")).unwrap(), SYNCED);
+
+    let outcome = bind(&moved)
+        .apply(&marker(), &effect, &mut Bytes, now(), &mut |_| {})
+        .unwrap();
+    assert_eq!(outcome, made(&moved, "docs/report.txt"));
+    assert_settled(&moved);
+    assert!(listing(&root).is_empty());
 }

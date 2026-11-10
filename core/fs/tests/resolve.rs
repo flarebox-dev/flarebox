@@ -3,11 +3,14 @@
 //! Resolving effect locations from the root descriptor (design §5.2), on the
 //! file system the tests run on.
 
+mod common;
+
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use common::bind;
 use flarebox_fs::{
     Base, Dir, FileId, Location, PARKED_DIR, PRIVATE_DIR, Snapshot, Space, Unresolved,
 };
@@ -73,7 +76,7 @@ fn location_resolves_through_folders_with_their_identities() {
     let dir_ = tempfile::tempdir().unwrap();
     let root = dir_.path();
     fs::create_dir_all(root.join("a/b")).unwrap();
-    let space = Space::open(root).unwrap();
+    let space = bind(root);
 
     let location = at(vec![dir(root, "a"), dir(root, "a/b")], "f.txt");
     let (folder, name) = space.parent(&location).unwrap();
@@ -101,7 +104,7 @@ fn parent_replaced_by_a_symlink_is_not_followed() {
 
     fs::rename(root.join("a/b"), root.join("old-b")).unwrap();
     std::os::unix::fs::symlink(outside.path().join("b"), root.join("a/b")).unwrap();
-    let space = Space::open(root).unwrap();
+    let space = bind(root);
     assert!(matches!(
         space.parent(&location),
         Err(Unresolved::NotAFolder(path)) if path == Path::new("a/b")
@@ -119,7 +122,7 @@ fn parent_replaced_by_another_folder_fails_its_identity_check() {
 
     fs::rename(root.join("a/b"), root.join("old-b")).unwrap();
     fs::create_dir(root.join("a/b")).unwrap();
-    let space = Space::open(root).unwrap();
+    let space = bind(root);
     match space.parent(&location) {
         Err(Unresolved::Replaced {
             path,
@@ -140,7 +143,7 @@ fn parent_moved_out_of_the_root_fails_the_recheck() {
     let dir_ = tempfile::tempdir().unwrap();
     let root = dir_.path();
     fs::create_dir_all(root.join("a/b")).unwrap();
-    let space = Space::open(root).unwrap();
+    let space = bind(root);
     let location = at(vec![dir(root, "a"), dir(root, "a/b")], "f.txt");
     let (folder, _) = space.parent(&location).unwrap();
 
@@ -163,7 +166,7 @@ fn ancestor_swapped_after_resolution_fails_the_recheck() {
     let dir_ = tempfile::tempdir().unwrap();
     let root = dir_.path();
     fs::create_dir_all(root.join("a/b")).unwrap();
-    let space = Space::open(root).unwrap();
+    let space = bind(root);
     let location = at(vec![dir(root, "a"), dir(root, "a/b")], "f.txt");
     let (folder, _) = space.parent(&location).unwrap();
 
@@ -182,7 +185,7 @@ fn parked_base_checks_the_parked_folder_identity() {
     let parked = root.join(PRIVATE_DIR).join(PARKED_DIR);
     fs::create_dir_all(parked.join("node-1/sub")).unwrap();
     fs::create_dir_all(root.join("x")).unwrap();
-    let space = Space::open(root).unwrap();
+    let space = bind(root);
     let node_id = |path: &Path| {
         use std::os::unix::fs::MetadataExt;
         let meta = fs::symlink_metadata(path).unwrap();
@@ -235,7 +238,7 @@ fn names_that_are_not_one_component_are_refused() {
     let dir_ = tempfile::tempdir().unwrap();
     let root = dir_.path();
     fs::create_dir(root.join("a")).unwrap();
-    let space = Space::open(root).unwrap();
+    let space = bind(root);
     for name in ["", ".", "..", "a/b", "/etc", "nul\0"] {
         assert!(
             matches!(
@@ -271,7 +274,7 @@ fn unreadable_parent_is_not_missing() {
         return;
     }
 
-    let space = Space::open(root).unwrap();
+    let space = bind(root);
     let resolved = space.parent(&location);
     fs::set_permissions(root.join("a"), fs::Permissions::from_mode(0o755)).unwrap();
     match resolved {
@@ -289,7 +292,7 @@ fn private_folders_are_single_names_inside_the_private_folder() {
     let dir_ = tempfile::tempdir().unwrap();
     let root = dir_.path();
     fs::create_dir_all(root.join(PRIVATE_DIR).join(PARKED_DIR)).unwrap();
-    let space = Space::open(root).unwrap();
+    let space = bind(root);
     let parked = space.private(&[PARKED_DIR]).unwrap();
     assert_eq!(parked.path(), Path::new(".flarebox/parked"));
 
@@ -307,4 +310,41 @@ fn private_folders_are_single_names_inside_the_private_folder() {
             "{parts:?}"
         );
     }
+}
+#[test]
+fn bind_needs_a_folder_and_held_follows_the_linked_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("space");
+    let moved = dir.path().join("moved");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("f"), "f").unwrap();
+    let file = fs::File::open(root.join("f")).unwrap();
+    assert_eq!(
+        Space::bind(file.into(), &root.join("f"))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::NotADirectory
+    );
+
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&root, &link).unwrap();
+    let space = Space::bind(fs::File::open(&link).unwrap().into(), &link).unwrap();
+    assert_eq!(space.id(), bind(&root).id());
+    assert!(space.held().unwrap());
+
+    fs::rename(&root, &moved).unwrap();
+    assert!(!space.held().unwrap());
+    assert!(matches!(
+        space.parent(&at(Vec::new(), "f")),
+        Err(Unresolved::RootWithdrawn(path)) if path == link
+    ));
+    fs::create_dir(&root).unwrap();
+    assert!(!space.held().unwrap());
+    fs::remove_dir(&root).unwrap();
+    fs::write(&root, "a file").unwrap();
+    assert!(!space.held().unwrap());
+    fs::remove_file(&root).unwrap();
+    fs::rename(&moved, &root).unwrap();
+    assert!(space.held().unwrap());
+    assert!(space.parent(&at(Vec::new(), "f")).is_ok());
 }

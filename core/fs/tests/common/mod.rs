@@ -61,6 +61,21 @@ impl Contents for Bytes {
     }
 }
 
+/// A space bound to a descriptor of `root` opened here, the way the driver
+/// binds one to the descriptor it locked.
+pub fn bind(root: &Path) -> Space {
+    Space::bind(File::open(root).unwrap().into(), root).unwrap()
+}
+
+/// Checks the identity a done outcome carries: that of the entry now at
+/// `path`, or none for an effect that creates and writes nothing.
+pub fn assert_identity(root: &Path, outcome: &Outcome, path: Option<&str>) {
+    if let Outcome::Done { identity } = outcome {
+        let expected = path.map(|path| entries(root, &[path])[0].id);
+        assert_eq!(*identity, expected, "{outcome:?}");
+    }
+}
+
 pub fn entries(root: &Path, paths: &[&str]) -> Vec<Entry> {
     let snapshot = Snapshot::scan(root).unwrap();
     paths
@@ -196,8 +211,9 @@ pub const SCENARIOS: [Scenario; 6] = [
         build: replacement,
         disturb: |_| {},
         check: |root, outcome| {
+            assert_identity(root, outcome, Some("docs/report.txt"));
             let target = contents(root.join("docs/report.txt"));
-            if *outcome == Outcome::Done {
+            if matches!(outcome, Outcome::Done { .. }) {
                 assert_eq!(target.as_deref(), Some(REMOTE));
                 assert_eq!(trashed(root), [SYNCED]);
             } else {
@@ -223,7 +239,8 @@ pub const SCENARIOS: [Scenario; 6] = [
         },
         disturb: |_| {},
         check: |root, outcome| {
-            let expected = (*outcome == Outcome::Done).then_some(REMOTE);
+            assert_identity(root, outcome, Some("docs/new.txt"));
+            let expected = matches!(outcome, Outcome::Done { .. }).then_some(REMOTE);
             assert_eq!(contents(root.join("docs/new.txt")).as_deref(), expected);
         },
         done_from: Some(Step::Placed),
@@ -240,7 +257,11 @@ pub const SCENARIOS: [Scenario; 6] = [
         },
         disturb: |_| {},
         check: |root, outcome| {
-            assert_eq!(root.join("docs/sub").is_dir(), *outcome == Outcome::Done);
+            assert_identity(root, outcome, Some("docs/sub"));
+            assert_eq!(
+                root.join("docs/sub").is_dir(),
+                matches!(outcome, Outcome::Done { .. })
+            );
         },
         done_from: Some(Step::Placed),
     },
@@ -262,11 +283,12 @@ pub const SCENARIOS: [Scenario; 6] = [
         },
         disturb: |_| {},
         check: |root, outcome| {
+            assert_identity(root, outcome, None);
             let (from, to) = (
                 contents(root.join("docs/a.txt")),
                 contents(root.join("other/b.txt")),
             );
-            if *outcome == Outcome::Done {
+            if matches!(outcome, Outcome::Done { .. }) {
                 assert_eq!((from, to.as_deref()), (None, Some(SYNCED)));
             } else {
                 assert_eq!((from.as_deref(), to), (Some(SYNCED), None));
@@ -292,8 +314,9 @@ pub const SCENARIOS: [Scenario; 6] = [
         },
         disturb: |_| {},
         check: |root, outcome| {
+            assert_identity(root, outcome, None);
             let target = contents(root.join("docs/report.txt"));
-            if *outcome == Outcome::Done {
+            if matches!(outcome, Outcome::Done { .. }) {
                 assert_eq!(target, None);
                 assert_eq!(trashed(root), [SYNCED]);
             } else {
@@ -316,9 +339,11 @@ pub const SCENARIOS: [Scenario; 6] = [
         },
         disturb: |_| {},
         check: |root, outcome| {
-            assert_eq!(root.join("docs/empty").is_dir(), *outcome != Outcome::Done);
+            assert_identity(root, outcome, None);
+            let done = matches!(outcome, Outcome::Done { .. });
+            assert_eq!(root.join("docs/empty").is_dir(), !done);
             let trashed_dirs = private_names(root, TRASH_DIR).len();
-            assert_eq!(trashed_dirs, usize::from(*outcome == Outcome::Done));
+            assert_eq!(trashed_dirs, usize::from(done));
         },
         done_from: Some(Step::Quarantined),
     },
@@ -406,8 +431,9 @@ pub const RETURNS: [Scenario; 4] = [
         build: replacement,
         disturb: take_report,
         check: |root, outcome| {
+            assert_identity(root, outcome, Some("docs/report.txt"));
             let report = contents(root.join("docs/report.txt"));
-            if *outcome == Outcome::Done {
+            if matches!(outcome, Outcome::Done { .. }) {
                 assert_eq!(report.as_deref(), Some(REMOTE));
                 assert_eq!(trashed(root), [SYNCED]);
             } else if report.as_deref() == Some(SYNCED) {
@@ -432,7 +458,7 @@ pub fn scenario(name: &str) -> &'static Scenario {
 /// Sets `scenario` up at `root` and returns its effect.
 pub fn prepare(scenario: &Scenario, root: &Path) -> Effect {
     fs::create_dir_all(root).unwrap();
-    let space = Space::open(root).unwrap();
+    let space = bind(root);
     (scenario.setup)(root, &space);
     (scenario.build)(&entries(root, scenario.paths))
 }

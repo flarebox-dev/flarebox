@@ -369,6 +369,7 @@ fn sibling_recreated_after_its_parent_was_listed_publishes_no_removal() {
                 ],
                 unsettled: vec![],
                 unreadable: vec![],
+                root: root_id(&root),
             },
             "{paths:?}"
         );
@@ -406,6 +407,7 @@ fn idle_native_poll_reports_an_unreadable_folder() {
         first.unwrap(),
         Poll {
             unreadable: vec![PathBuf::from("d/locked")],
+            root: Some(root_id(root)),
             ..Poll::default()
         }
     );
@@ -611,6 +613,11 @@ fn created(path: &str, kind: EntryKind) -> Change {
     }
 }
 
+/// The identity of the folder at `root`.
+fn root_id(root: &Path) -> FileId {
+    stat_fd(open_root(root).unwrap().as_fd()).unwrap().id
+}
+
 /// Replaces the platform watcher with one that watches the root folder only,
 /// as if the watches below it were lost.
 fn lose_coverage(watcher: &mut NativeWatcher) {
@@ -633,7 +640,10 @@ fn rescan_request_restores_lost_watch_coverage() {
     fs::write(root.join("sub/missed.txt"), "m").unwrap();
     #[cfg(target_os = "linux")]
     assert_eq!(
-        watcher.poll(Duration::from_millis(500)).unwrap(),
+        Poll {
+            root: None,
+            ..watcher.poll(Duration::from_millis(500)).unwrap()
+        },
         Poll::default()
     );
 
@@ -657,7 +667,10 @@ fn new_folders_are_registered_before_their_rescan() {
     let mut watcher = NativeWatcher::start(&root, Snapshot::default()).unwrap();
     assert_eq!(
         watcher.poll(Duration::from_millis(300)).unwrap(),
-        Poll::default()
+        Poll {
+            root: Some(root_id(&root)),
+            ..Poll::default()
+        }
     );
 
     lose_coverage(&mut watcher);
@@ -685,7 +698,10 @@ fn a_new_folder_that_vanishes_before_its_watch_is_not_a_watch_failure() {
     let mut watcher = NativeWatcher::start(&root, Snapshot::default()).unwrap();
     assert_eq!(
         watcher.poll(Duration::from_millis(300)).unwrap(),
-        Poll::default()
+        Poll {
+            root: Some(root_id(&root)),
+            ..Poll::default()
+        }
     );
 
     let sub = root.join("tmp-build");
@@ -706,9 +722,47 @@ fn a_new_folder_that_vanishes_before_its_watch_is_not_a_watch_failure() {
 
     watcher.before_register = None;
     assert_eq!(
-        watcher.poll(Duration::from_millis(300)).unwrap(),
+        Poll {
+            root: None,
+            ..watcher.poll(Duration::from_millis(300)).unwrap()
+        },
         Poll::default()
     );
+}
+
+/// The rescan that registers a new folder reaches another root than the poll
+/// scanned first. The poll reports only the changes from its first root, and
+/// the watcher fails instead of reporting the other root's.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_new_folder_rescan_that_reaches_another_root_fails_the_watcher() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap().join("space");
+    fs::create_dir(&root).unwrap();
+    let first = root_id(&root);
+    let mut watcher = NativeWatcher::start(&root, Snapshot::default()).unwrap();
+    assert_eq!(
+        watcher.poll(Duration::from_millis(300)).unwrap(),
+        Poll {
+            root: Some(first),
+            ..Poll::default()
+        }
+    );
+
+    let (path, moved) = (root.clone(), dir.path().join("moved"));
+    watcher.before_register = Some(Box::new(move || {
+        fs::rename(&path, &moved).unwrap();
+        fs::create_dir_all(path.join("sub")).unwrap();
+    }));
+    fs::create_dir(root.join("sub")).unwrap();
+    let poll = watcher.poll(WAIT).unwrap();
+    assert_eq!(poll.changes, [created("sub", EntryKind::Dir)]);
+    assert_eq!(poll.root, Some(first));
+    assert_ne!(root_id(&root), first);
+    assert!(matches!(
+        watcher.poll(Duration::from_millis(300)),
+        Err(Error::RootReplaced)
+    ));
 }
 
 #[test]
@@ -736,7 +790,7 @@ fn a_recovered_name_is_not_given_in_a_folder_moved_out_of_the_root() {
     let outside = dir.path().join("outside");
     fs::create_dir_all(root.join("docs")).unwrap();
     fs::create_dir(&outside).unwrap();
-    let space = Space::open(&root).unwrap();
+    let space = Space::bind(open_root(&root).unwrap(), &root).unwrap();
     let held = space.private(&["held"]).unwrap();
     fs::write(root.join(PRIVATE_DIR).join("held/e1"), "kept").unwrap();
     let id = Snapshot::scan(&root).unwrap().entries[Path::new("docs")].id;
@@ -777,7 +831,7 @@ fn nothing_is_recovered_from_a_folder_moved_out_of_the_root() {
     let outside = dir.path().join("outside");
     fs::create_dir_all(&root).unwrap();
     fs::create_dir(&outside).unwrap();
-    let space = Space::open(&root).unwrap();
+    let space = Space::bind(open_root(&root).unwrap(), &root).unwrap();
     let held = space.private(&["held"]).unwrap();
     fs::write(root.join(PRIVATE_DIR).join("held/e1"), "kept").unwrap();
     fs::rename(root.join(PRIVATE_DIR).join("held"), outside.join("held")).unwrap();
