@@ -140,6 +140,10 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE commit_in_flight ADD COLUMN result BLOB;
 
     CREATE TABLE commit_in_flight_deletes (
+        target TEXT PRIMARY KEY
+    ) STRICT, WITHOUT ROWID;
+
+    CREATE TABLE commit_in_flight_delete_members (
         target TEXT NOT NULL,
         position INTEGER NOT NULL,
         node_id TEXT NOT NULL,

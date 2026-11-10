@@ -150,6 +150,7 @@ impl Tx<'_> {
             "commit_state",
             "commit_in_flight",
             "commit_in_flight_deletes",
+            "commit_in_flight_delete_members",
             "effect_state",
             "failed_effects",
         ] {
@@ -203,12 +204,16 @@ impl Tx<'_> {
                     flight.result.as_ref().map(CommitResult::encode_to_vec),
                 ],
             )?;
-            let mut stmt = self.0.prepare_cached(
-                "INSERT INTO commit_in_flight_deletes (target, position, node_id) VALUES (?1, ?2, ?3)",
+            let mut targets = self
+                .0
+                .prepare_cached("INSERT INTO commit_in_flight_deletes (target) VALUES (?1)")?;
+            let mut members = self.0.prepare_cached(
+                "INSERT INTO commit_in_flight_delete_members (target, position, node_id) VALUES (?1, ?2, ?3)",
             )?;
             for (target, nodes) in &flight.deletes {
+                targets.execute([target])?;
                 for (position, node) in nodes.iter().enumerate() {
-                    stmt.execute(params![target, position, node])?;
+                    members.execute(params![target, position, node])?;
                 }
             }
         }
@@ -245,13 +250,23 @@ impl Tx<'_> {
         else {
             return Ok(None);
         };
-        let mut deletes: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
+        let mut deletes: BTreeMap<NodeId, Vec<NodeId>> = self
+            .0
+            .prepare_cached("SELECT target FROM commit_in_flight_deletes")?
+            .query_map([], |row| Ok((row.get(0)?, Vec::new())))?
+            .collect::<rusqlite::Result<_>>()?;
         let mut stmt = self.0.prepare_cached(
-            "SELECT target, node_id FROM commit_in_flight_deletes ORDER BY target, position",
+            "SELECT target, node_id FROM commit_in_flight_delete_members ORDER BY target, position",
         )?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
-            deletes.entry(row.get(0)?).or_default().push(row.get(1)?);
+            let target: NodeId = row.get(0)?;
+            let Some(nodes) = deletes.get_mut(&target) else {
+                return Err(invalid(format!(
+                    "delete members for {target}, which is not a delete target"
+                )));
+            };
+            nodes.push(row.get(1)?);
         }
         Ok(Some(InFlight {
             commit: Commit::decode(commit.as_slice())?,

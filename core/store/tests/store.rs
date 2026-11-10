@@ -72,6 +72,7 @@ fn migrations_apply_from_empty() {
         [
             "chunk_cache",
             "commit_in_flight",
+            "commit_in_flight_delete_members",
             "commit_in_flight_deletes",
             "commit_state",
             "effect_state",
@@ -327,10 +328,13 @@ fn engine_state() -> EngineState {
             accepted: 4,
             in_flight: Some(InFlight {
                 commit,
-                deletes: BTreeMap::from([(
-                    "old".into(),
-                    vec!["old".into(), "old-child".into(), "old-grandchild".into()],
-                )]),
+                deletes: BTreeMap::from([
+                    (
+                        "old".into(),
+                        vec!["old".into(), "old-child".into(), "old-grandchild".into()],
+                    ),
+                    ("empty".into(), vec![]),
+                ]),
                 result: Some(CommitResult {
                     seq: 30,
                     results: vec![applied.clone(), applied],
