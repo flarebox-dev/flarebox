@@ -1605,7 +1605,10 @@ fn a_batch_that_fails_the_root_check_stops_the_folder_before_l_loses_a_file() {
             break stop;
         }
     };
-    assert!(matches!(stop, Stop::Root(RootProblem::NoMarker)), "{stop:?}");
+    assert!(
+        matches!(stop, Stop::Root(RootProblem::NoMarker)),
+        "{stop:?}"
+    );
     assert!(local_holds(&site, "notes.txt"));
     assert!(a.work.is_empty());
     assert_eq!(remote.names(), ["notes.txt"]);
@@ -1629,8 +1632,15 @@ fn a_folder_the_scan_may_not_read_keeps_its_files_in_the_space() {
         return;
     }
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !a.try_scan(Duration::from_millis(100)).unwrap().contains(&"private".into()) {
-        assert!(Instant::now() < deadline, "the folder was not found unreadable");
+    while !a
+        .try_scan(Duration::from_millis(100))
+        .unwrap()
+        .contains(&"private".into())
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the folder was not found unreadable"
+        );
     }
     a.settle();
     assert!(a.work.is_empty());
