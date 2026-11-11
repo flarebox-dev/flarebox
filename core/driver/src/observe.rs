@@ -370,7 +370,8 @@ impl FsObserver {
 
     /// Reads again the unread files that are due, the longest due first and as many as `reads` has room for, and
     /// reports each one that can now be read. An observation retries before it reads its own changes, so a file the
-    /// budget left out gets the first turn of a later observation, also when it is larger than the budget.
+    /// budget left out gets the first turn of a later observation, also when it is larger than the budget. A read the
+    /// caller stopped ends the retry and leaves that file and the rest due as they were.
     fn retry(&mut self, now: Instant, out: &mut Vec<Observed>, reads: &mut Reads) {
         let mut due: Vec<(Instant, PathBuf)> = (self.unread.iter())
             .filter(|(_, retry)| retry.due <= now)
@@ -396,6 +397,7 @@ impl FsObserver {
                         content: Some(content),
                     });
                 }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => break,
                 _ => {
                     let failures = self.unread[&path].failures + 1;
                     self.unread.insert(path, Retry::after(failures, now));
