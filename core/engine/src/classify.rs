@@ -648,7 +648,7 @@ impl Trees {
     /// S updates of acknowledged ops that would not leave S a valid tree yet, by node. The commit
     /// layer makes each as soon as it fits, falls back to S's position once R and L have both left
     /// the waiting one, and drops one once neither L nor R holds the node; until then the node is
-    /// left out of planning.
+    /// left out of planning, unless L moved it away from the waiting shape, which R still holds.
     pub fn waiting(&self) -> &BTreeMap<NodeId, Option<Shape>> {
         &self.waiting
     }
