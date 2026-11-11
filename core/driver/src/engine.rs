@@ -380,9 +380,11 @@ impl Engine {
 
     /// Puts `changes` into L and returns the nodes whose L entry changed. Paths a change names in the previous state
     /// (`Removed::path`, `Renamed::from`) are resolved before any change applies. The changes apply in batch order,
-    /// except that a change whose folder a later change of the batch creates or moves into place waits for that
-    /// change: a scan lists renames before creations, so a file moved into a new folder would otherwise find no
-    /// folder. A renamed or modified entry is the node L holds at its path with its identity, else the node with its identity, else the node at its path. A
+    /// except that a change waits for the change of the batch that creates or moves its folder into place, and for
+    /// the rename that moves the entry at its path away. A scan lists renames before creations, so otherwise a file
+    /// moved into a new folder would find no folder. A cycle of such waits applies in batch order. A renamed or
+    /// modified entry is the node L holds at its path with its identity, else the node with its identity, else the
+    /// node at its path. A
     /// created entry with the identity of a node L holds is that node, wherever L had it. So is a created entry with
     /// the path and identity a node had before an earlier change of the batch took it out of L, unless the batch
     /// placed that node again. That keeps a child's node when its folder is replaced around it. Any other created
@@ -419,25 +421,48 @@ impl Engine {
                 Observed::Removed { .. } | Observed::Modified { .. } => None,
             })
             .collect();
-        let mut after: Vec<Vec<usize>> = vec![Vec::new(); changes.len()];
-        let mut first = Vec::new();
+        let leaving: BTreeMap<&Path, usize> = (changes.iter().enumerate())
+            .filter_map(|(at, change)| match change {
+                Observed::Renamed { from, .. } => Some((from.as_path(), at)),
+                Observed::Removed { .. } | Observed::Created { .. } | Observed::Modified { .. } => {
+                    None
+                }
+            })
+            .collect();
+        let mut waits = vec![0; changes.len()];
+        let mut unblocks: Vec<Vec<usize>> = vec![Vec::new(); changes.len()];
         for (at, change) in changes.iter().enumerate() {
-            let parent = match change {
-                Observed::Created { path, .. }
-                | Observed::Renamed { to: path, .. }
-                | Observed::Modified { path, .. } => path.parent(),
-                Observed::Removed { .. } => None,
+            let firsts = match change {
+                Observed::Created { path, .. } | Observed::Renamed { to: path, .. } => [
+                    path.parent().and_then(|dir| arrival.get(dir)),
+                    leaving.get(path.as_path()),
+                ],
+                Observed::Modified { path, .. } => [
+                    path.parent().and_then(|dir| arrival.get(dir)),
+                    arrival.get(path.as_path()),
+                ],
+                Observed::Removed { .. } => [None, None],
             };
-            match (parent.and_then(|dir| arrival.get(dir))).filter(|&&placed| placed > at) {
-                Some(&placed) => after[placed].push(at),
-                None => first.push(at),
+            for &first in firsts.into_iter().flatten().filter(|&&first| first != at) {
+                waits[at] += 1;
+                unblocks[first].push(at);
             }
         }
+        let mut ready: BTreeSet<usize> = (0..changes.len()).filter(|&at| waits[at] == 0).collect();
         let mut order = Vec::with_capacity(changes.len());
-        let mut next: Vec<usize> = first.into_iter().rev().collect();
-        while let Some(at) = next.pop() {
+        let mut done = vec![false; changes.len()];
+        while order.len() < changes.len() {
+            let at = (ready.pop_first())
+                .or_else(|| (0..changes.len()).find(|&at| !done[at]))
+                .expect("a change is left");
+            done[at] = true;
             order.push(at);
-            next.extend(after[at].iter().rev());
+            for &next in &unblocks[at] {
+                waits[next] -= 1;
+                if waits[next] == 0 && !done[next] {
+                    ready.insert(next);
+                }
+            }
         }
         for (change, before) in changes.iter().zip(&before) {
             let Observed::Renamed { to, kind, .. } = change else {
