@@ -166,7 +166,9 @@ impl Engine {
     /// asks, for `Driver::questions` to show. A question whose counts changed under the same id, as a notice's do, is
     /// shown with the new counts and keeps any answer it was given. Sets [`Engine::asked`] when it changed a row. A new question that takes the place of one the
     /// engine stopped asking, of the same kind and still unanswered, continues that one's lineage: the guard asks
-    /// again under a new id when the held set changes, and this is the one place that sees both in one step.
+    /// again under a new id when the held set changes, and this is the one place that sees both in one step. A
+    /// question whose answer the engine dropped, as it does for a conflict whose answer the server refused, is shown
+    /// again without it.
     pub fn ask(&mut self, tx: &Tx<'_>, space_id: &str) -> Result<(), Error> {
         let asked = &self.stored.commits.questions;
         let asking = self.commits.questions();
@@ -203,7 +205,14 @@ impl Engine {
             tx.reshow_question(&question.id, &body)?;
             changed = true;
         }
-        for question in asking.iter().filter(|question| !open(asked, &question.id)) {
+        let dropped = |question: &engine::Question| {
+            question.answer.is_none()
+                && (asked.iter()).any(|before| before.id == question.id && before.answer.is_some())
+        };
+        for question in asking
+            .iter()
+            .filter(|question| !open(asked, &question.id) || dropped(question))
+        {
             let continued = (replaced.iter())
                 .find(|(before, _)| same_kind(&before.kind, &question.kind))
                 .map_or_else(|| question.id.clone(), |(_, lineage)| lineage.clone());

@@ -1369,7 +1369,7 @@ fn answer_effect(answer: Answer) -> &'static str {
         Answer::Cancel => "Drop the request",
         Answer::Dismiss => "Close this notice",
         Answer::KeepOriginal => "Keep the original and move the conflict copy to the trash",
-        Answer::KeepCopy => "Move the original to the trash and give the conflict copy its name",
+        Answer::KeepCopy => "Keep the conflict copy's content in the original and trash the copy",
         Answer::KeepBoth => "Keep both files",
     }
 }

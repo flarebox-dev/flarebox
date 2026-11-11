@@ -6245,3 +6245,78 @@ fn an_edit_of_the_copy_the_answer_would_delete_is_kept() {
         );
     }
 }
+
+/// The person edits the original, and the upload of that edit is under way when they answer keep the copy. The
+/// edit is not taken for the answer: it stays, and the conflict is asked again about the new content.
+#[test]
+fn an_edit_of_the_original_sent_before_the_answer_asks_again() {
+    let mut remote = Remote::new();
+    let ((site_a, mut a), (site_b, mut b)) = edited_on_both(&mut remote);
+    let [first] = &asked(&site_b)[..] else {
+        panic!("one question");
+    };
+    fs::write(site_b.root.join("main.go"), b"edited before the answer").unwrap();
+    b.scan_until(|b| !b.work.is_empty());
+    assert!(matches!(b.work.front(), Some(Work::Upload(_))));
+    answer(&site_b, Answer::KeepCopy);
+    let step = b.folder.requested();
+    b.take(step).unwrap();
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+
+    assert_eq!(remote.names(), [COPY, "main.go"]);
+    assert_eq!(
+        fs::read(site_b.root.join("main.go")).unwrap(),
+        b"edited before the answer"
+    );
+    let [second] = &asked(&site_b)[..] else {
+        panic!("one question: {:?}", asked(&site_b));
+    };
+    assert_ne!(second.id, first.id);
+}
+
+/// Two conflict copies share one original. Keeping the first copy changes the original, so the other conflict is
+/// asked again under a new ID instead of taking an answer meant for the original as it was.
+#[test]
+fn keeping_one_of_two_copies_of_an_original_asks_about_the_other_again() {
+    use crate::question::QuestionKind;
+
+    let mut remote = Remote::new();
+    let ((site_a, mut a), (site_b, mut b)) = edited_on_both(&mut remote);
+    let first_copy = live_id(&server_nodes(&remote), COPY);
+    fs::write(site_a.root.join("main.go"), b"second from a").unwrap();
+    fs::write(site_b.root.join("main.go"), b"second from b").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(&mut remote);
+    b.scan_until(|b| !b.work.is_empty());
+    b.run(&mut remote);
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+    let questions = asked(&site_b);
+    assert_eq!(questions.len(), 2, "{questions:?}");
+    let is_first = |question: &crate::question::Question| matches!(&question.kind, QuestionKind::Conflict { copy, .. } if copy.node_id == first_copy);
+    let chosen = questions
+        .iter()
+        .find(|question| is_first(question))
+        .unwrap();
+    let other = questions
+        .iter()
+        .find(|question| !is_first(question))
+        .unwrap();
+    let mut store = Store::open(&site_b.db).unwrap();
+    let given = koidrive_store::GivenAnswer {
+        answer: Answer::KeepCopy.as_str().to_owned(),
+        answered_at_ms: NOW,
+    };
+    store
+        .transaction(|tx| tx.answer_question(&chosen.id, &given))
+        .unwrap();
+    drop(store);
+    let step = b.folder.requested();
+    b.take(step).unwrap();
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+
+    let [remaining] = &asked(&site_b)[..] else {
+        panic!("one question: {:?}", asked(&site_b));
+    };
+    assert_ne!(remaining.id, other.id);
+    assert!(!is_first(remaining));
+}

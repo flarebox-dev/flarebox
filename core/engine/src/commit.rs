@@ -759,13 +759,21 @@ impl Commits {
             let op = match question.answer {
                 Some(Answer::KeepOriginal) => Some(delete_copy),
                 Some(Answer::KeepCopy) => match (content(original), content(copy)) {
-                    (Some(current), Some(copied)) if !same_content(&current, &copied) => {
+                    (Some(current), Some(copied)) if same_content(&current, &copied) => {
+                        Some(delete_copy)
+                    }
+                    (Some(_), Some(copied))
+                        if copied.chunks.len() == copied.chunk_count as usize =>
+                    {
                         Some(op::Op::UpdateContent(proto::UpdateContent {
                             node_id: original.node_id.clone(),
                             content: Some(copied),
                         }))
                     }
-                    _ => Some(delete_copy),
+                    _ => {
+                        question.answer = None;
+                        None
+                    }
                 },
                 _ => None,
             };
@@ -797,24 +805,31 @@ impl Commits {
         })
     }
 
-    /// The nodes that the answers to conflicts change or delete ([`Commits::conflicts`]). An op of the
-    /// commit in flight for one of them leaves S as it is when it is acknowledged, and its node is
-    /// not marked as a problem.
-    fn answered(&self) -> BTreeSet<NodeId> {
-        let mut nodes = BTreeSet::new();
-        for question in &self.questions {
-            match (&question.kind, question.answer) {
-                (QuestionKind::Conflict { copy, .. }, Some(Answer::KeepOriginal)) => {
-                    nodes.insert(copy.node_id.clone());
+    /// The ID of the conflict question whose answer `op` carries out ([`Commits::conflicts`]): a
+    /// `Delete` of its copy, or for [`Answer::KeepCopy`] an `UpdateContent` of its original with the
+    /// copy's content in R. Such an op leaves S as it is when it is acknowledged, and its node is
+    /// not marked as a problem. Another op for either file, such as the upload of an edit, is
+    /// acknowledged as any op is.
+    fn answer_for(&self, trees: &Trees, op: &op::Op) -> Option<String> {
+        let question = self.questions.iter().find(|question| {
+            let QuestionKind::Conflict { original, copy } = &question.kind else {
+                return false;
+            };
+            match (question.answer, op) {
+                (Some(Answer::KeepOriginal | Answer::KeepCopy), op::Op::Delete(delete)) => {
+                    delete.node_id == copy.node_id
                 }
-                (QuestionKind::Conflict { original, copy }, Some(Answer::KeepCopy)) => {
-                    nodes.insert(original.node_id.clone());
-                    nodes.insert(copy.node_id.clone());
+                (Some(Answer::KeepCopy), op::Op::UpdateContent(update)) => {
+                    let copied = trees.remote().get(&copy.node_id);
+                    let copied = copied.and_then(|node| node.shape.content.as_ref());
+                    update.node_id == original.node_id
+                        && (update.content.as_ref().zip(copied))
+                            .is_some_and(|(sent, copied)| same_content(sent, copied))
                 }
-                _ => {}
+                _ => false,
             }
-        }
-        nodes
+        });
+        question.map(|question| question.id.clone())
     }
 
     /// Asks about the conflict between the files `original` and `copy` that op `index` of commit
@@ -921,16 +936,15 @@ impl Commits {
         let mut agreed: BTreeMap<NodeId, Agreed> = BTreeMap::new();
         let mut unreverted: BTreeSet<NodeId> = BTreeSet::new();
         let aliases = self.aliases.clone();
-        let answered = self.answered();
         let mut conflicts: Vec<(usize, NodeId, NodeId)> = Vec::new();
         let mut answers = Vec::new();
         for (index, (op, outcome)) in flight.commit.ops.iter().zip(&result.results).enumerate() {
             use op_result::Code;
             let code = Code::try_from(outcome.code).unwrap_or(Code::Unspecified);
             if let Some(sent) = &op.op
-                && answered.contains(op_node(sent))
+                && let Some(id) = self.answer_for(trees, sent)
             {
-                answers.push((index, sent, code, &outcome.node_id));
+                answers.push((id, index, sent, code, &outcome.node_id));
                 continue;
             }
             let applied = matches!(code, Code::Applied | Code::AppliedRenamed);
@@ -1111,40 +1125,34 @@ impl Commits {
             trees.wait(id, shape, Origin::Commit(flight.commit.device_seq));
         }
         let mut closed = BTreeSet::new();
-        for question in &mut self.questions {
-            let QuestionKind::Conflict { original, copy } = &mut question.kind else {
+        for (id, index, sent, code, made) in answers {
+            use op_result::Code;
+            let question = self.questions.iter_mut().find(|question| question.id == id);
+            let Some(question) = question else {
                 continue;
             };
-            for &(index, sent, code, made) in &answers {
-                use op_result::Code;
-                let applied = matches!(code, Code::Applied | Code::AppliedRenamed);
-                match sent {
-                    op::Op::Delete(delete) if delete.node_id == copy.node_id && applied => {
-                        closed.insert(question.id.clone());
-                    }
-                    op::Op::UpdateContent(update)
-                        if update.node_id == original.node_id && applied =>
-                    {
-                        let remote = trees.remote().get(&original.node_id);
-                        let took = remote.filter(|node| {
-                            (node.shape.content.as_ref().zip(update.content.as_ref()))
-                                .is_some_and(|(now, sent)| same_content(now, sent))
-                        });
-                        if let Some(node) = took {
-                            original.revisions.content_rev = node.content_rev;
-                        }
-                    }
-                    op::Op::UpdateContent(update)
-                        if update.node_id == original.node_id && code == Code::ConflictCopy =>
-                    {
-                        question.answer = None;
-                        conflicts.push((index, original.node_id.clone(), made.clone()));
-                    }
-                    _ if op_node(sent) == original.node_id || op_node(sent) == copy.node_id => {
-                        question.answer = None;
-                    }
-                    _ => {}
+            let QuestionKind::Conflict { original, .. } = &mut question.kind else {
+                continue;
+            };
+            match (sent, code) {
+                (op::Op::Delete(_), Code::Applied) => {
+                    closed.insert(id);
                 }
+                (op::Op::UpdateContent(update), Code::Applied) => {
+                    let remote = trees.remote().get(&original.node_id);
+                    let took = remote.filter(|node| {
+                        (node.shape.content.as_ref().zip(update.content.as_ref()))
+                            .is_some_and(|(now, sent)| same_content(now, sent))
+                    });
+                    if let Some(node) = took {
+                        original.revisions.content_rev = node.content_rev;
+                    }
+                }
+                (op::Op::UpdateContent(_), Code::ConflictCopy) => {
+                    question.answer = None;
+                    conflicts.push((index, original.node_id.clone(), made.clone()));
+                }
+                _ => question.answer = None,
             }
         }
         self.questions
