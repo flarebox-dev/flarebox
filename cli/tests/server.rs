@@ -326,6 +326,7 @@ async fn a_headless_device_pairs_links_and_follows_the_change_stream() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(mode(&socket), 0o600);
+    assert_eq!(mode(socket.parent().unwrap()), 0o700);
     let second = machine.fails(&["daemon"]);
     assert!(second.contains("another Flarebox daemon"), "{second}");
 

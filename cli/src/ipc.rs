@@ -282,6 +282,10 @@ async fn write_line(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
 
     #[tokio::test]
@@ -328,6 +332,67 @@ mod tests {
         let _held = Driver::open(paths.clone()).unwrap();
         let error = run(&paths, Request::Status).await.unwrap_err();
         assert!(error.contains("does not answer"), "{error}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_socket_appears_with_mode_0600_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("run/daemon.sock");
+        let stop = Arc::new(AtomicBool::new(false));
+        let watcher = std::thread::spawn({
+            let socket = socket.clone();
+            let stop = stop.clone();
+            move || {
+                let mut modes = BTreeSet::new();
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok(metadata) = fs::symlink_metadata(&socket) {
+                        modes.insert(metadata.permissions().mode() & 0o777);
+                    }
+                }
+                modes
+            }
+        });
+        for _ in 0..200 {
+            drop(bind(&socket).unwrap());
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert_eq!(watcher.join().unwrap(), BTreeSet::from([0o600]));
+        let names: Vec<_> = fs::read_dir(dir.path().join("run"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["daemon.sock"]);
+        let mode = fs::metadata(dir.path().join("run"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[tokio::test]
+    async fn a_directory_other_users_can_enter_gets_no_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        fs::create_dir(&run).unwrap();
+        fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).unwrap();
+        let error = bind(&run.join("daemon.sock")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("open to other users"), "{error}");
+        assert_eq!(fs::read_dir(&run).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_directory_of_another_user_gets_no_socket() {
+        if rustix::process::getuid().is_root() {
+            return;
+        }
+        let error = bind(Path::new("/daemon.sock")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            error.to_string().contains("belongs to another user"),
+            "{error}"
+        );
     }
 
     #[test]
