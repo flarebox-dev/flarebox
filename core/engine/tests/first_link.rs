@@ -4,14 +4,14 @@
 //! section 6.4).
 
 use koidrive_engine::classify::Trees;
-use koidrive_engine::commit::{Commits, Reconnect};
+use koidrive_engine::commit::{Commits, Failure, Reconnect};
 use koidrive_engine::effects::{Effect, Effects};
 use koidrive_engine::first_link::adopt;
 use koidrive_engine::ids::IdGen;
 use koidrive_engine::ignore::RuleFile;
 use koidrive_engine::question::{Answer, Question, QuestionKind, RecoveryGroup};
 use koidrive_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape};
-use koidrive_proto::v1::{CommitResult, OpResult, Welcome, op, op_result};
+use koidrive_proto::v1::{CommitResult, Error, OpResult, Welcome, error, op, op_result};
 
 const ROOT: &str = "root";
 const NOW: u64 = 1_794_268_740_000;
@@ -385,6 +385,99 @@ fn publishing_sends_every_held_entry_as_a_create() {
     );
     assert!(commits.questions().is_empty());
     assert!(!trees.held("l-b"));
+}
+
+/// The server gives this device's create of `id` the conflict name `name`: R holds the file under
+/// it at `seq`, and the commit's result names it.
+fn renamed_create(commits: &mut Commits, trees: &mut Trees, id: &str, name: &str, seq: u64) {
+    let shape = trees.local().get(id).unwrap().shape.clone();
+    let node = RemoteNode {
+        shape: Shape {
+            name: name.into(),
+            ..shape
+        },
+        trashed: false,
+        content_rev: seq,
+        meta_rev: seq,
+        trash_group: String::new(),
+    };
+    trees.set_remote(id.into(), node);
+    let renamed = OpResult {
+        code: op_result::Code::AppliedRenamed as i32,
+        name: name.into(),
+        ..Default::default()
+    };
+    let result = CommitResult {
+        seq,
+        results: vec![renamed],
+        changes: vec![],
+        ..Default::default()
+    };
+    commits.received(result).unwrap();
+    assert!(commits.acknowledge(trees, seq));
+    trees.settle();
+}
+
+/// Publishing a first link's `notes`, whose name the space holds with other bytes, keeps both
+/// files: its create takes a conflict name and asks nothing, also when the first commit that
+/// carried it was forgotten and the next one was stored and loaded again before its result. A
+/// file created later that takes a conflict name is asked about.
+#[test]
+fn a_published_create_that_takes_a_conflict_name_asks_nothing_and_a_later_create_asks() {
+    let mut trees = trees(
+        &[("l-notes", file(ROOT, "notes", 3))],
+        &[("r-notes", file(ROOT, "notes", 9))],
+    );
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(7));
+    commits.first_link(&mut trees, &mut ids, NOW);
+    trees.settle();
+    assert!(commits.decide(&question(&commits).id, Answer::Publish));
+    let created = [("create file", "l-notes".to_owned())];
+    assert_eq!(ops(&mut commits, &mut trees, &mut ids), created);
+    let head_moved = Error {
+        code: error::Code::HeadMoved as i32,
+        ..Default::default()
+    };
+    assert_eq!(commits.failed(&head_moved), Ok(Failure::Abandoned));
+    assert_eq!(ops(&mut commits, &mut trees, &mut ids), created);
+    let mut commits = Commits::from_state(commits.state()).unwrap();
+    renamed_create(&mut commits, &mut trees, "l-notes", "notes (conflict)", 2);
+    assert_eq!(commits.questions(), []);
+
+    let later = LocalNode {
+        shape: file(ROOT, "later", 6),
+        identity: FileIdentity {
+            dev: 1,
+            ino: 99,
+            birth_ns: Some(0),
+        },
+        parked: false,
+    };
+    trees.set_local("l-later".into(), later);
+    trees.settle();
+    assert_eq!(
+        ops(&mut commits, &mut trees, &mut ids),
+        [("create file", "l-later".to_owned())]
+    );
+    let theirs = RemoteNode {
+        shape: file(ROOT, "later", 7),
+        trashed: false,
+        content_rev: 3,
+        meta_rev: 3,
+        trash_group: String::new(),
+    };
+    trees.set_remote("r-later".into(), theirs);
+    renamed_create(&mut commits, &mut trees, "l-later", "later (conflict)", 3);
+    let [asked] = commits.questions() else {
+        panic!("one question: {:?}", commits.questions());
+    };
+    let QuestionKind::Conflict { original, copy, .. } = &asked.kind else {
+        panic!("a conflict: {asked:?}");
+    };
+    assert_eq!(
+        (original.node_id.as_str(), copy.node_id.as_str()),
+        ("r-later", "l-later")
+    );
 }
 
 /// The effects of discarding `linked`'s entries and of the downloads that follow, applied as if

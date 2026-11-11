@@ -80,9 +80,10 @@ pub enum QuestionKind {
     Recovery { group: RecoveryGroup },
     /// The server gave a write of this device a node of its own (design §2.7): an edit became the
     /// conflict copy `copy` of `original`, or a file this device created or moved took a
-    /// conflict name because `original` held the name. It holds nothing, so both files keep
-    /// syncing. It is asked again when either file's content changes, and it ends when either is
-    /// renamed, moved or deleted, here or on another device.
+    /// conflict name because `original` held the name. A create that a first link's
+    /// [`Answer::Publish`] sent asks nothing, since that answer kept both. It holds nothing, so
+    /// both files keep syncing. It is asked again when either file's content changes, and it ends
+    /// when either is renamed, moved or deleted, here or on another device.
     Conflict {
         original: ConflictFile,
         copy: ConflictFile,

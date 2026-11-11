@@ -103,6 +103,7 @@ fn migrations_apply_from_empty() {
             "open_question_members",
             "open_question_shapes",
             "open_questions",
+            "published_nodes",
             "questions",
             "recorded_nodes",
             "remote_cursor",
@@ -551,6 +552,7 @@ fn engine_state() -> EngineState {
                     shown: BTreeMap::new(),
                 },
             ],
+            published: nodes(["published"]),
             guard: GuardState {
                 ledger: BTreeMap::from([
                     ("held".into(), Counted { at_ms: 5, files: 2 }),
@@ -1019,7 +1021,7 @@ fn a_cursor_stored_before_it_could_record_a_server_behind_it_records_none() {
          DROP TABLE edited_here; DROP TABLE trashed_here; DROP TABLE commit_slots;
          DROP TABLE watched_contents;
          DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed;
-         DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions;
+         DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions; DROP TABLE published_nodes;
          ALTER TABLE remote_cursor DROP COLUMN ahead_of_server;",
     )
     .unwrap();
@@ -1050,6 +1052,7 @@ fn a_store_from_before_contents_were_watched_opens_with_nothing_watched() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
     let mut before = engine_state();
+    before.commits.published.clear();
     Store::open(&path)
         .unwrap()
         .transaction(|tx| tx.set_engine_state(&before))
@@ -1064,7 +1067,7 @@ fn a_store_from_before_contents_were_watched_opens_with_nothing_watched() {
          DROP TABLE edited_here; DROP TABLE trashed_here; DROP TABLE commit_slots;
          DROP TABLE watched_contents;
          DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed;
-         DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions;",
+         DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions; DROP TABLE published_nodes;",
     )
     .unwrap();
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
@@ -1095,6 +1098,7 @@ fn a_store_from_before_edits_were_recorded_opens_with_none_recorded() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
     let mut before = engine_state();
+    before.commits.published.clear();
     before.commits.questions.pop();
     before.commits.guard.remote.clear();
     before.commits.guard.dismissed.clear();
@@ -1106,7 +1110,7 @@ fn a_store_from_before_edits_were_recorded_opens_with_none_recorded() {
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
         "DROP TABLE edited_here; DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed;
-         DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions;",
+         DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions; DROP TABLE published_nodes;",
     )
     .unwrap();
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
@@ -1129,6 +1133,7 @@ fn a_store_from_before_deletes_were_recorded_opens_with_none_recorded() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
     let mut before = engine_state();
+    before.commits.published.clear();
     Store::open(&path)
         .unwrap()
         .transaction(|tx| tx.set_engine_state(&before))
@@ -1142,7 +1147,7 @@ fn a_store_from_before_deletes_were_recorded_opens_with_none_recorded() {
          DROP TABLE guard_confirmed_members; DROP TABLE guard_confirmed;
          DROP TABLE edited_here; DROP TABLE trashed_here; DROP TABLE commit_slots;
          DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed;
-         DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions;",
+         DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions; DROP TABLE published_nodes;",
     )
     .unwrap();
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
@@ -1172,6 +1177,7 @@ fn a_store_from_before_the_guard_opens_with_an_empty_guard() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
     let mut before = engine_state();
+    before.commits.published.clear();
     Store::open(&path)
         .unwrap()
         .transaction(|tx| tx.set_engine_state(&before))
@@ -1185,7 +1191,7 @@ fn a_store_from_before_the_guard_opens_with_an_empty_guard() {
          DROP TABLE guard_confirmed_members; DROP TABLE guard_confirmed;
          DROP TABLE edited_here;
          DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed;
-         DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions;",
+         DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions; DROP TABLE published_nodes;",
     )
     .unwrap();
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
@@ -1213,6 +1219,7 @@ fn a_store_from_before_questions_showed_local_shapes_keeps_its_questions() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
     let mut before = engine_state();
+    before.commits.published.clear();
     before.commits.questions.pop();
     before.commits.guard.remote.clear();
     before.commits.guard.dismissed.clear();
@@ -1234,7 +1241,7 @@ fn a_store_from_before_questions_showed_local_shapes_keeps_its_questions() {
         "DROP TABLE recorded_nodes; DROP TABLE open_question_shapes;
          DROP TABLE discarded_nodes; DROP TABLE edited_here;
          DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed;
-         DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions;",
+         DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions; DROP TABLE published_nodes;",
     )
     .unwrap();
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
@@ -1255,6 +1262,7 @@ fn a_store_from_before_nodes_in_ignored_folders_were_stored_opens_with_none_reco
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
     let mut before = engine_state();
+    before.commits.published.clear();
     before.commits.questions.pop();
     before.commits.guard.remote.clear();
     before.commits.guard.dismissed.clear();
@@ -1267,7 +1275,7 @@ fn a_store_from_before_nodes_in_ignored_folders_were_stored_opens_with_none_reco
     conn.execute_batch(
         "DROP TABLE recorded_nodes; DROP TABLE edited_here;
          DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed;
-         DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions;",
+         DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions; DROP TABLE published_nodes;",
     )
     .unwrap();
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
@@ -1300,13 +1308,14 @@ fn a_store_from_before_remote_removals_were_counted_opens_with_none_counted() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
     let mut before = engine_state();
+    before.commits.published.clear();
     before.commits.questions.pop();
     Store::open(&path)
         .unwrap()
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed; DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions;")
+    conn.execute_batch("DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed; DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions; DROP TABLE published_nodes;")
         .unwrap();
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
         .unwrap();
@@ -1335,7 +1344,8 @@ fn a_store_from_before_positions_were_watched_opens_with_none_watched() {
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("DROP TABLE watched_positions;").unwrap();
+    conn.execute_batch("DROP TABLE watched_positions; DROP TABLE published_nodes;")
+        .unwrap();
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
         .unwrap();
     drop_cursor_tokens(&conn);
@@ -1345,6 +1355,7 @@ fn a_store_from_before_positions_were_watched_opens_with_none_watched() {
     let mut store = Store::open(&path).unwrap();
     assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
     before.trees.watched_positions.clear();
+    before.commits.published.clear();
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
 }
 
@@ -1409,7 +1420,8 @@ fn a_store_from_before_waiting_updates_kept_their_origin_takes_the_accepted_slot
     conn.execute_batch(
         "ALTER TABLE waiting_updates DROP COLUMN slot;
          ALTER TABLE watched_positions DROP COLUMN parent_id;
-         ALTER TABLE watched_positions DROP COLUMN name;",
+         ALTER TABLE watched_positions DROP COLUMN name;
+         DROP TABLE published_nodes;",
     )
     .unwrap();
     drop_cursor_tokens(&conn);
@@ -1418,6 +1430,7 @@ fn a_store_from_before_waiting_updates_kept_their_origin_takes_the_accepted_slot
 
     let mut store = Store::open(&path).unwrap();
     assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    before.commits.published.clear();
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
 }
 
@@ -1449,8 +1462,8 @@ fn a_cursor_stored_before_commit_tokens_opens_with_none() {
         .unwrap();
     let conn = Connection::open(&path).unwrap();
     drop_cursor_tokens(&conn);
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
-        .unwrap();
+    conn.execute_batch("DROP TABLE published_nodes;").unwrap();
+    conn.pragma_update(None, "user_version", 15).unwrap();
     drop(conn);
 
     let mut store = Store::open(&path).unwrap();
@@ -1495,7 +1508,8 @@ fn a_store_from_before_watched_positions_were_kept_takes_them_from_s() {
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
         "ALTER TABLE watched_positions DROP COLUMN parent_id;
-         ALTER TABLE watched_positions DROP COLUMN name;",
+         ALTER TABLE watched_positions DROP COLUMN name;
+         DROP TABLE published_nodes;",
     )
     .unwrap();
     drop_cursor_tokens(&conn);
@@ -1505,7 +1519,39 @@ fn a_store_from_before_watched_positions_were_kept_takes_them_from_s() {
     let mut store = Store::open(&path).unwrap();
     assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
     before.trees.watched_positions.insert("lost".into(), None);
+    before.commits.published.clear();
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
+}
+
+/// A database of the schema before a first link's published entries were recorded keeps its
+/// engine state, with none recorded, and records them from then on.
+#[test]
+fn a_store_from_before_published_entries_were_recorded_opens_with_none_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let mut before = engine_state();
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| tx.set_engine_state(&before))
+        .unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("DROP TABLE published_nodes;").unwrap();
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+        .unwrap();
+    drop(conn);
+
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    let after = before.clone();
+    before.commits.published.clear();
+    assert!(!after.commits.published.is_empty());
+    assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
+    store
+        .transaction(|tx| tx.update_engine_state(&before, &after))
+        .unwrap();
+    drop(store);
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), after);
 }
 
 /// A database of the schema before restores gains the two restore tables, empty, and keeps the
@@ -1515,6 +1561,7 @@ fn a_version_3_store_opens_with_empty_restore_tables() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
     let mut before = engine_state();
+    before.commits.published.clear();
     before.commits.in_flight.as_mut().unwrap().commit.ops.pop();
     before.trees.watched.clear();
     before.trees.trashed_here.clear();
@@ -1543,7 +1590,7 @@ fn a_version_3_store_opens_with_empty_restore_tables() {
          DROP TABLE watched_contents; DROP TABLE edited_here; DROP TABLE trashed_here;
          DROP TABLE commit_slots;
          DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed;
-         DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions;
+         DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions; DROP TABLE published_nodes;
          ALTER TABLE remote_cursor DROP COLUMN ahead_of_server;",
     )
     .unwrap();

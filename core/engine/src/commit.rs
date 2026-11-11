@@ -168,6 +168,10 @@ pub struct Commits {
     slots: BTreeMap<u64, u64>,
     /// The open questions, in the order they were asked.
     questions: Vec<Question>,
+    /// The local entries a [`Answer::Publish`] to a first link's question released (section 6.4),
+    /// until the server applies their create. The person chose to keep them beside what R holds,
+    /// so a create of one that takes a conflict name asks nothing.
+    published: BTreeSet<NodeId>,
     guard: GuardState,
 }
 
@@ -186,6 +190,7 @@ impl Commits {
             resolved: self.resolved.clone(),
             slots: self.slots.clone(),
             questions: self.questions.clone(),
+            published: self.published.clone(),
             guard: self.guard.clone(),
         }
     }
@@ -244,6 +249,7 @@ impl Commits {
             resolved,
             slots,
             questions,
+            published,
             guard,
         } = state;
         Ok(Self {
@@ -258,6 +264,7 @@ impl Commits {
             resolved,
             slots,
             questions,
+            published,
             guard,
         })
     }
@@ -379,7 +386,8 @@ impl Commits {
     ///
     /// For a first link's question about entries created on this device (section 6.4),
     /// [`Answer::Publish`] lets the build send them as creates, and the server renames one whose
-    /// name R holds. [`Answer::Discard`] sets S to L for every entry, so that, R holding none of
+    /// name R holds. The person chose to keep both files then, so no conflict question is asked
+    /// about it. [`Answer::Discard`] sets S to L for every entry, so that, R holding none of
     /// them, the effects move them to the local trash, and then download what R holds at their
     /// paths.
     ///
@@ -493,6 +501,8 @@ impl Commits {
                     for (id, shape) in update_synced(trees, updates) {
                         trees.wait(id, shape, Origin::Other);
                     }
+                } else {
+                    self.published.extend(question.shown.into_keys());
                 }
             }
             None => {
@@ -660,6 +670,7 @@ impl Commits {
         }
         self.hold(trees);
         self.split.retain(|id| trees.synced().live(id).is_some());
+        self.published.retain(|id| trees.local().get(id).is_some());
         self.aliases
             .retain(|id, _| trees.local().get(id).is_some() && trees.reverted().contains(id));
         let (planned, deletes, reverts) = plan(
@@ -1080,7 +1091,11 @@ impl Commits {
                 }
                 _ => continue,
             };
+            let published = matches!(&op.op, Some(op::Op::CreateDir(_) | op::Op::CreateFile(_)))
+                && done
+                && self.published.remove(node);
             if renamed
+                && !published
                 && let Some((sent_parent, sent_name)) = sent
                 && let Some(original) = holder(
                     trees,
