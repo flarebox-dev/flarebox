@@ -8,26 +8,28 @@ use koidrive_driver::{Driver, Question};
 /// one, as when more deletions join a held set and the guard asks again under a new id, continues its lineage and gets
 /// none: the person was told about it already. Decisions open when the daemon starts get none either; `koi status`
 /// and the banner of every command show them. Each notification is sent from a task of its own, so the loop never waits
-/// on one.
-pub async fn decisions(driver: Driver) {
+/// on one. The decisions open when it is called are the baseline, so call it before the folders start.
+pub fn decisions(driver: Driver) -> impl Future<Output = ()> {
     let mut watch = driver.watch();
     let mut open = driver.questions().unwrap_or_default();
-    while watch.changed().await.is_ok() {
-        let Ok(questions) = driver.questions() else {
-            continue;
-        };
-        let folders: BTreeMap<String, String> = (driver.status().folders.into_iter())
-            .map(|folder| (folder.space_id, folder.path))
-            .collect();
-        for question in opened(&open, &questions) {
-            let folder = (folders.get(&question.space_id)).map_or_else(
-                || "A linked folder".to_owned(),
-                |path| crate::printable(path),
-            );
-            let body = format!("{folder}: {}", crate::question_notice(question));
-            tokio::spawn(async move { send("Koidrive needs a decision", &body).await });
+    async move {
+        while watch.changed().await.is_ok() {
+            let Ok(questions) = driver.questions() else {
+                continue;
+            };
+            let folders: BTreeMap<String, String> = (driver.status().folders.into_iter())
+                .map(|folder| (folder.space_id, folder.path))
+                .collect();
+            for question in opened(&open, &questions) {
+                let folder = (folders.get(&question.space_id)).map_or_else(
+                    || "A linked folder".to_owned(),
+                    |path| crate::printable(path),
+                );
+                let body = format!("{folder}: {}", crate::question_notice(question));
+                tokio::spawn(async move { send("Koidrive needs a decision", &body).await });
+            }
+            open = questions;
         }
-        open = questions;
     }
 }
 
@@ -80,6 +82,7 @@ async fn send(title: &str, body: &str) {
             return;
         }
     };
+    let body = markup_escaped(body);
     let hints: HashMap<&str, zbus::Variant<'_>> = HashMap::new();
     let call = connection
         .call_method(
@@ -92,7 +95,7 @@ async fn send(title: &str, body: &str) {
                 0u32,
                 "",
                 title,
-                body,
+                body.as_str(),
                 Vec::<&str>::new(),
                 hints,
                 -1i32,
@@ -102,6 +105,15 @@ async fn send(title: &str, body: &str) {
     if let Err(error) = call {
         tracing::info!(%error, "a desktop notification failed");
     }
+}
+
+/// The body with the characters that notification servers read as markup written as entities, so a path such as
+/// `<b>a&b` shows as it is.
+#[cfg(any(target_os = "linux", test))]
+fn markup_escaped(body: &str) -> String {
+    body.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -130,6 +142,14 @@ mod tests {
             }],
             lineage: lineage.into(),
         }
+    }
+
+    #[test]
+    fn a_body_reaches_the_notification_server_without_markup() {
+        assert_eq!(
+            markup_escaped("Sync/<b>a&b</b>: held 3 deletions"),
+            "Sync/&lt;b&gt;a&amp;b&lt;/b&gt;: held 3 deletions"
+        );
     }
 
     fn ids(questions: Vec<&Question>) -> Vec<&str> {

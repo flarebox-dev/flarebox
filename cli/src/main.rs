@@ -352,9 +352,10 @@ async fn daemon(paths: Paths) -> Result<(), String> {
         .map_err(|error| format!("cannot listen on {}: {error}", socket.display()))?;
     let mut terminate = signal(SignalKind::terminate()).map_err(|error| error.to_string())?;
     let mut interrupt = signal(SignalKind::interrupt()).map_err(|error| error.to_string())?;
+    let notifications = notify::decisions(driver.clone());
     driver.start();
     let server = tokio::spawn(ipc::serve(listener, driver.clone()));
-    let notifications = tokio::spawn(notify::decisions(driver.clone()));
+    let notifications = tokio::spawn(notifications);
     tracing::info!(
         socket = %socket.display(),
         version = env!("CARGO_PKG_VERSION"),
@@ -505,6 +506,9 @@ async fn client(paths: Paths, command: Command) -> Result<(), String> {
             let questions = match status.folders.iter().any(|folder| folder.questions > 0) {
                 true => match ipc::run(&paths, Request::Questions).await? {
                     Response::Questions { questions } => questions,
+                    Response::Error { message } => {
+                        return Err(format!("cannot read the pending decisions: {message}"));
+                    }
                     _ => Vec::new(),
                 },
                 false => Vec::new(),
@@ -1191,8 +1195,12 @@ fn banner(questions: &[Question]) -> Option<String> {
 /// The banner for the decisions pending in the profile, asked of the daemon. Without a daemon there is none, because
 /// a command run on its own leaves the profile as it found it.
 async fn pending_banner(paths: &Paths) -> Option<String> {
-    match ipc::ask(paths, &Request::Questions).await {
-        Ok(Some(Response::Questions { questions })) => banner(&questions),
+    let asked = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        ipc::ask(paths, &Request::Questions),
+    );
+    match asked.await {
+        Ok(Ok(Some(Response::Questions { questions }))) => banner(&questions),
         _ => None,
     }
 }
