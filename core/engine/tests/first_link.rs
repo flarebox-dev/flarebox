@@ -638,3 +638,31 @@ fn a_discarded_file_the_user_edits_is_sent_with_its_folder() {
         ]
     );
 }
+
+/// A matched folder whose rules a scan could not read keeps them unknown under the server's ID, so
+/// nothing below it is planned until a scan reads it.
+#[test]
+fn an_adopted_folder_keeps_its_rules_unknown() {
+    let mut trees = trees(
+        &[
+            ("l-docs", dir(ROOT, "docs")),
+            ("l-a", file("l-docs", "a", 1)),
+        ],
+        &[
+            ("r-docs", dir(ROOT, "docs")),
+            ("r-a", file("r-docs", "a", 1)),
+            ("r-new", file("r-docs", "new", 2)),
+        ],
+    );
+    trees.set_rules_unknown("l-docs");
+    let mut commits = Commits::default();
+    let mut ids = IdGen::new(7);
+    commits.first_link(&mut trees, &mut ids, NOW);
+    trees.settle();
+    assert!(
+        trees.local().get("r-docs").is_some(),
+        "the folder is adopted"
+    );
+    assert!(trees.held("r-new"));
+    assert_eq!(Effects::default().plan(&trees, &mut ids, NOW), None);
+}

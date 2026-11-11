@@ -1041,11 +1041,13 @@ fn update_synced(
     left
 }
 
-/// Gives the local node `from` the ID `to`; its children follow.
+/// Gives the local node `from` the ID `to`; its children follow, and so does a folder's unknown
+/// rules ([`Trees::set_rules_unknown`]).
 pub(crate) fn rekey(trees: &mut Trees, from: &str, to: &str) {
     let Some(node) = trees.local().get(from).cloned() else {
         return;
     };
+    let rules_unknown = trees.unknown_rules().contains(from);
     let children: Vec<NodeId> = trees
         .local()
         .iter()
@@ -1058,6 +1060,9 @@ pub(crate) fn rekey(trees: &mut Trees, from: &str, to: &str) {
     trees.set_local(to.to_owned(), node);
     if parked {
         trees.park_as(to.to_owned(), parked_name);
+    }
+    if rules_unknown {
+        trees.set_rules_unknown(to);
     }
     for id in children {
         let mut child = trees.local().get(&id).cloned().expect("listed above");
