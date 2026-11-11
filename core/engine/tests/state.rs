@@ -4,7 +4,7 @@
 //! valid state restores to the same value, and a state that breaks one invariant is refused with
 //! the error that names it.
 
-use koidrive_engine::classify::Trees;
+use koidrive_engine::classify::{Origin, Trees, Waiting};
 use koidrive_engine::commit::{Commits, Halt, InFlight, MAX_OPS};
 use koidrive_engine::effects::{Effect, EffectRecord, Effects, Location};
 use koidrive_engine::guard::{Counted, GuardState, RemoteDeletion, Trash};
@@ -73,7 +73,14 @@ fn trees_state() -> TreesState {
         unsearched: ["b".into()].into(),
         reverted: ["a".into()].into(),
         parked_as: [("b".into(), "c".into())].into(),
-        waiting: [("a".into(), Some(dir(ROOT, "x")))].into(),
+        waiting: [(
+            "a".into(),
+            Waiting {
+                shape: Some(dir(ROOT, "x")),
+                origin: Origin::Commit(3),
+            },
+        )]
+        .into(),
         watched: [("u".into(), true), ("v".into(), false)].into(),
         watched_positions: [("m".into(), Some(3)), ("p".into(), None)].into(),
         trashed_here: [("t".into(), 5)].into(),

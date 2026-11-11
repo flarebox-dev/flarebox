@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use koidrive_engine::classify::{Origin, Waiting};
 use koidrive_engine::commit::{Halt, InFlight};
 use koidrive_engine::effects::{Base, Dir, Displaced, Effect, EffectRecord, Location};
 use koidrive_engine::state::{CommitsState, EffectsState, TreesState};
@@ -77,7 +78,7 @@ impl Tx<'_> {
         }
 
         let mut stmt = self.0.prepare_cached(
-            "SELECT node_id, parent_id, name, kind, content FROM waiting_updates",
+            "SELECT node_id, parent_id, name, kind, content, slot FROM waiting_updates",
         )?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
@@ -90,7 +91,14 @@ impl Tx<'_> {
                     content: decode(row.get(4)?)?,
                 }),
             };
-            state.trees.waiting.insert(row.get(0)?, shape);
+            let origin = match row.get::<_, Option<u64>>(5)? {
+                None => Origin::Other,
+                Some(slot) => Origin::Commit(slot),
+            };
+            state
+                .trees
+                .waiting
+                .insert(row.get(0)?, Waiting { shape, origin });
         }
         let mut stmt = self
             .0
@@ -290,14 +298,18 @@ impl Tx<'_> {
             .0
             .prepare_cached("DELETE FROM waiting_updates WHERE node_id = ?1")?;
         let mut put = self.0.prepare_cached(
-            "INSERT OR REPLACE INTO waiting_updates (node_id, parent_id, name, kind, content)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT OR REPLACE INTO waiting_updates (node_id, parent_id, name, kind, content, slot)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )?;
         let (removed, changed) = differences(&before.trees.waiting, &after.trees.waiting);
         for node in removed {
             remove.execute([node])?;
         }
-        for (node, shape) in changed {
+        for (node, Waiting { shape, origin }) in changed {
+            let slot = match origin {
+                Origin::Commit(slot) => Some(*slot),
+                Origin::Other => None,
+            };
             put.execute(params![
                 node,
                 shape.as_ref().and_then(|shape| non_empty(&shape.parent)),
@@ -307,6 +319,7 @@ impl Tx<'_> {
                     .as_ref()
                     .and_then(|shape| shape.content.as_ref())
                     .map(Content::encode_to_vec),
+                slot,
             ])?;
         }
         let mut remove = self

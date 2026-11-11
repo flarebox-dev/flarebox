@@ -1092,7 +1092,7 @@ impl World {
                         trees.set_remote(id, node);
                     }
                 }
-                trees.forget_lost(trashed, edited, commits.held_through());
+                trees.forget_lost(trashed, edited, commits.held_through(), commits.accepted());
                 *last_seq = head;
                 *behind = false;
                 let backlog = self.resume(d)?;

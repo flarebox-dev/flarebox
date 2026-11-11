@@ -18,6 +18,26 @@ use crate::tree::{
 /// Every subset of a group is tried, so the search costs up to 2^n checks of n nodes.
 pub const SETTLE_GROUP_LIMIT: usize = 12;
 
+/// An S update of an acknowledged op that waits until S stays a valid tree with it
+/// ([`Trees::waiting`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Waiting {
+    /// The shape S takes, or `None` to remove the node from S.
+    pub shape: Option<Shape>,
+    pub origin: Origin,
+}
+
+/// Where a waiting S update came from, so that a server loss can tell whether the commit it
+/// belongs to is lost (design section 4.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// The acknowledged results of this device's commit with this `device_seq`.
+    Commit(u64),
+    /// No commit: a Discard, a restore the mass-delete guard made, an effect, an update both sides
+    /// agree on, or loss recovery.
+    Other,
+}
+
 /// Where a node stands against its merge base S.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Class {
@@ -157,7 +177,7 @@ pub struct Trees {
     unsearched: BTreeSet<NodeId>,
     reverted: BTreeSet<NodeId>,
     parked_as: BTreeMap<NodeId, NodeId>,
-    waiting: BTreeMap<NodeId, Option<Shape>>,
+    waiting: BTreeMap<NodeId, Waiting>,
     /// The nodes whose content the commit in flight creates or updates, each with whether S's content
     /// changed since the commit was built.
     watched: BTreeMap<NodeId, bool>,
@@ -514,7 +534,7 @@ impl Trees {
     /// drops it from S, with every reclaimed folder above it, and sends them again.
     pub fn reclaimed(&self, id: &str) -> bool {
         let synced = |id: &str| match self.waiting.get(id) {
-            Some(shape) => shape.as_ref(),
+            Some(waiting) => waiting.shape.as_ref(),
             None => self.s.live(id),
         };
         let (Some(local), Some(shape)) = (self.l.get(id), synced(id)) else {
@@ -762,7 +782,7 @@ impl Trees {
     /// layer makes each as soon as it fits, falls back to S's position once R and L have both left
     /// the waiting one, and drops one once neither L nor R holds the node; until then the node is
     /// left out of planning, unless L moved it away from the waiting position, where R still holds it.
-    pub fn waiting(&self) -> &BTreeMap<NodeId, Option<Shape>> {
+    pub fn waiting(&self) -> &BTreeMap<NodeId, Waiting> {
         &self.waiting
     }
 
@@ -794,13 +814,13 @@ impl Trees {
             .is_some_and(|rev| rev > seq)
     }
 
-    pub(crate) fn take_waiting(&mut self) -> BTreeMap<NodeId, Option<Shape>> {
+    pub(crate) fn take_waiting(&mut self) -> BTreeMap<NodeId, Waiting> {
         std::mem::take(&mut self.waiting)
     }
 
-    pub(crate) fn wait(&mut self, id: NodeId, shape: Option<Shape>) {
+    pub(crate) fn wait(&mut self, id: NodeId, shape: Option<Shape>, origin: Origin) {
         self.mark(&id);
-        self.waiting.insert(id, shape);
+        self.waiting.insert(id, Waiting { shape, origin });
     }
 
     /// Sets S, or clears it with `None` (S := ⊥).
@@ -891,18 +911,25 @@ impl Trees {
     /// which the engine cannot tell apart: the revived file can be deleted again, while an edit in
     /// the local trash would be missing from the server.
     ///
-    /// An S update that waits ([`Trees::waiting`]) for a node R now holds as S does, and not as
-    /// the update has it, came from a commit the server lost, unless another device changed the
-    /// node back since. With no revision of R's above `held_through`, the update is dropped, so
-    /// L's change is compared with S and sent again instead of R's rollback reading as a remote
-    /// change once the update fits. A node R does not hold at all is then no longer reverted, as
-    /// one S forgets. With a later revision, S forgets the node as it forgets one R
-    /// holds with another shape, so L's change is kept beside R's. An update for a node R holds in
-    /// the trash stays, and so does one for a node the person discarded on a first link, which no
-    /// commit sent.
+    /// `accepted` is the count of this device's commits the server still holds (*w*, section
+    /// 2.8). An S update that waits ([`Trees::waiting`]) from a commit above it came from a commit
+    /// the server lost. The update is dropped, a removal as well as a shape, so S keeps what it held: L's change is
+    /// compared with S and sent again when R holds the node as S does, and kept beside R's when R
+    /// holds it otherwise. A node R does not hold at all is then no longer reverted, as one S
+    /// forgets. An update from a kept commit, or from no commit, stays, so a change another device
+    /// made since reads as a remote change once the update fits. That holds for a node R holds in
+    /// the trash too: a lost update kept there would stand for S in the effects, which would then
+    /// replace an edit only L holds with content another device restores, and later commits take
+    /// its slot again. No update keeps a slot above `accepted` after a loss.
     ///
     /// [`Commits::held_through`]: crate::commit::Commits::held_through
-    pub fn forget_lost(&mut self, trashed: Vec<Trashed>, edited: Vec<NodeId>, held_through: u64) {
+    pub fn forget_lost(
+        &mut self,
+        trashed: Vec<Trashed>,
+        edited: Vec<NodeId>,
+        held_through: u64,
+        accepted: u64,
+    ) {
         let mut deletes: Vec<(NodeId, Shape)> = (trashed.into_iter())
             .filter(|deleted| {
                 self.l.get(&deleted.id).is_none() && self.s.get(&deleted.id).is_none()
@@ -931,23 +958,13 @@ impl Trees {
             };
             self.set_synced_if_valid(id, Some(remote));
         }
-        let (r, s, discarded) = (&self.r, &self.s, &self.discarded);
-        let (changed_later, dropped): (Vec<_>, Vec<_>) = (self.waiting.iter())
-            .filter(|(id, waiting)| {
-                let remote = r.live(id);
-                waiting.is_some()
-                    && !discarded.contains(id.as_str())
-                    && !r.get(id.as_str()).is_some_and(|remote| remote.trashed)
-                    && same(remote, s.live(id))
-                    && !same(remote, waiting.as_ref())
-            })
-            .map(|(id, _)| {
-                let later = (r.get(id.as_str()))
-                    .is_some_and(|remote| remote.content_rev.max(remote.meta_rev) > held_through);
-                (id.clone(), later)
-            })
-            .partition(|(_, later)| *later);
-        for (id, _) in dropped {
+        let dropped: Vec<NodeId> = (self.waiting.iter())
+            .filter(
+                |(_, waiting)| matches!(waiting.origin, Origin::Commit(slot) if slot > accepted),
+            )
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in dropped {
             if self.r.get(&id).is_none() {
                 self.reverted.remove(&id);
             }
@@ -964,7 +981,6 @@ impl Trees {
                     || (self.r.live(id)).is_some_and(|remote| !same(Some(remote), Some(*synced)))
             })
             .map(|(id, _)| id.as_str())
-            .chain(changed_later.iter().map(|(id, _)| id.as_str()))
             .collect();
         let mut below: Vec<&str> = lost.iter().copied().collect();
         while let Some(id) = below.pop() {
@@ -990,7 +1006,7 @@ impl Trees {
                 self.reverted.remove(&id);
             }
             if waits {
-                self.wait(id, None);
+                self.wait(id, None, Origin::Other);
             } else {
                 self.set_synced(id, None);
             }
@@ -1007,7 +1023,7 @@ impl Trees {
     pub fn edited(&self, id: &str) -> bool {
         let content = self.l.get(id).and_then(|node| node.shape.content.as_ref());
         let synced = match self.waiting.get(id) {
-            Some(shape) => shape.as_ref(),
+            Some(waiting) => waiting.shape.as_ref(),
             None => self.s.live(id),
         };
         match (content, synced.and_then(|shape| shape.content.as_ref())) {
@@ -1341,7 +1357,7 @@ impl Trees {
     }
 
     /// True when S stays a valid tree with `next` as the node's shape.
-    fn fits_synced(&self, id: &str, next: Option<&Shape>) -> bool {
+    pub(crate) fn fits_synced(&self, id: &str, next: Option<&Shape>) -> bool {
         let has_children = self.s_names.children(id).next().is_some();
         let Some(shape) = next else {
             return !has_children;
