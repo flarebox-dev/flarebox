@@ -74,7 +74,7 @@ These rules save disk space and bandwidth. They don't hide anything: the server 
 
 ## The local trash
 
-When sync replaces or removes a file in a linked folder, Koidrive moves the old file to `.koidrive/trash/` in that folder instead of deleting it. A file stays there for 7 days. While the trash holds more than 2048 MB, the oldest files leave first. Set another size in `config.toml`:
+When sync replaces or removes a file in a linked folder, Koidrive moves the old file to `.koidrive/trash/` in that folder instead of deleting it. A file stays there for 7 days. While the trash holds more than 2048 MB, the oldest files leave first. A megabyte here is 1,000,000 bytes. Set another size in `config.toml`:
 
 ```toml
 [trash]

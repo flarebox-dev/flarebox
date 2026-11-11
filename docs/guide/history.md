@@ -70,4 +70,4 @@ This lists the restores asked for in the folder's space and how each went:
 koi usage
 ```
 
-This shows, for each space, the bytes in live files, in the trash and in old versions. A chunk shared by several files counts once.
+This shows, for each space, the bytes in live files, in the trash and in old versions, then the unreferenced bytes and the total. Unreferenced chunks are uploads not committed yet and chunks that wait out a grace period before the server deletes them. A chunk shared by several files counts once.
