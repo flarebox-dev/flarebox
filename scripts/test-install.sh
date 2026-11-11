@@ -98,5 +98,33 @@ EOF
     pass 'noninteractive default does not install or start the service'
     printf 'Passed 13 installer tests on %s\n' "$(uname -s)"
 else
-    printf 'Passed 11 installer tests on %s\n' "$(uname -s)"
+    cat > "$tmp/bin/uname" <<'EOF'
+#!/bin/sh
+case "$1" in
+    -s) printf 'Darwin\n' ;;
+    -m) printf 'x86_64\n' ;;
+    *) exit 1 ;;
+esac
+EOF
+    cat > "$tmp/bin/sysctl" <<'EOF'
+#!/bin/sh
+[ "$*" = '-n hw.optional.arm64' ] || exit 1
+printf '%s\n' "$FLAREBOX_TEST_ARM64"
+EOF
+    chmod +x "$tmp/bin/uname" "$tmp/bin/sysctl"
+    hash=$(awk 'NR == 1 {print $1}' "$tmp/good-sums")
+    for candidate in aarch64 x86_64; do
+        selected=flarebox-$candidate-apple-darwin.tar.gz
+        if [ "$selected" != "$archive" ]; then
+            cp "$release/$archive" "$release/$selected"
+        fi
+        printf '%s  %s\n' "$hash" "$selected" > "$release/SHA256SUMS"
+        if [ "$candidate" = aarch64 ]; then arm64=1; else arm64=0; fi
+        PATH="$tmp/bin:$PATH" FLAREBOX_TEST_ARM64=$arm64 sh "$root/install.sh" --no-systemd > "$tmp/arch.log" 2>&1
+        cat "$tmp/arch.log"
+        grep -F "Downloading $selected" "$tmp/arch.log"
+        cmp "$binary" "$HOME/.local/bin/flarebox"
+        pass "macOS x86_64 shell selects $candidate with hw.optional.arm64=$arm64"
+    done
+    printf 'Passed 13 installer tests on %s\n' "$(uname -s)"
 fi

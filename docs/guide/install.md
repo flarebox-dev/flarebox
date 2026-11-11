@@ -10,13 +10,15 @@ This URL will move to flarebox.dev. Flarebox is not affiliated with Cloudflare, 
 
 Downloads become available with the first published CLI release. Until then, build from source below.
 
-The installer downloads the latest GitHub Release for x86_64 or arm64, checks its SHA256 checksum, and installs it in `~/.local/bin`. It needs `curl`, `tar`, and either `sha256sum` or `shasum`. It never needs root. Add `~/.local/bin` to your shell's `PATH` if the installer warns that it is missing, then run `flarebox --version`.
+The installer downloads the latest GitHub Release for x86_64 or arm64, checks its SHA256 checksum, and installs it in `~/.local/bin`. It needs `curl`, `tar`, `awk`, `grep`, `sed`, `mktemp`, and either `sha256sum` or `shasum`. It never needs root. Add `~/.local/bin` to your shell's `PATH` if the installer warns that it is missing, then run `flarebox --version`.
 
 Run the same command again to upgrade. To choose a version or another directory, set `FLAREBOX_VERSION` or `FLAREBOX_INSTALL_DIR` on the `sh` command:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/flarebox-dev/flarebox/main/install.sh | FLAREBOX_VERSION=v0.1.0 FLAREBOX_INSTALL_DIR="$HOME/bin" sh
 ```
+
+`FLAREBOX_RELEASE_BASE_URL` replaces `https://github.com/flarebox-dev/flarebox/releases` for a trusted mirror or local tests. The base must serve tarballs and `SHA256SUMS` under `latest/download/` and `download/v<version>/`. This changes the source of both the binary and its checksum, so use only a source you trust.
 
 On Linux with systemd, the installer offers to install a user service. For an unattended install, pass `sh -s -- --systemd` to install the unit or `sh -s -- --no-systemd` to skip it. Without a terminal, the default skips the unit. The installer reloads the units but does not start the daemon. Finish setup and link a folder before you enable it, as described below. Restart an existing service after an upgrade with `systemctl --user restart flarebox`.
 

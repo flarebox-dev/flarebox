@@ -28,11 +28,14 @@ main() {
         aarch64|arm64) arch=aarch64 ;;
         *) fail 'Supported architectures are x86_64 and arm64' ;;
     esac
+    if [ "$os" = apple-darwin ] && [ "$arch" = x86_64 ] && [ "$(sysctl -n hw.optional.arm64 2>/dev/null || true)" = 1 ]; then
+        arch=aarch64
+    fi
     if [ "$service" = yes ] && [ "$os" != unknown-linux-musl ]; then
         fail '--systemd is available only on Linux'
     fi
 
-    for command in curl tar mktemp awk; do
+    for command in curl tar mktemp awk grep sed; do
         command -v "$command" >/dev/null 2>&1 || fail "Required command not found: $command"
     done
     if command -v sha256sum >/dev/null 2>&1; then
