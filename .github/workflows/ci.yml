@@ -97,18 +97,34 @@ jobs:
         run: |
           hosted='["xcode-27"]'
           api() {
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "Counting the hosted macOS jobs took more than 90 seconds." >&2
+              return 1
+            fi
             curl -fsS --max-time 15 -H "Authorization: Bearer $GITHUB_TOKEN" -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "$GITHUB_API_URL/repos/$REPO/actions/$1"
           }
           count_hosted() {
-            local ids="" id page c n=0
+            local deadline=$((SECONDS + 90)) status p page got c ids="" id n=0
             for status in queued in_progress; do
-              page="$(api "runs?status=$status&per_page=100")" || return 1
-              ids="$ids $(jq -er '.workflow_runs | map(.id | tostring) | join(" ")' <<<"$page")" || return 1
+              p=1
+              while :; do
+                page="$(api "runs?status=$status&per_page=100&page=$p")" || return 1
+                got="$(jq -er '.workflow_runs | if type == "array" then length else error("no workflow_runs") end' <<<"$page")" || return 1
+                ids="$ids $(jq -r '.workflow_runs[].id' <<<"$page")"
+                [ "$got" = 100 ] || break
+                p=$((p + 1))
+              done
             done
-            for id in $ids; do
-              page="$(api "runs/$id/jobs?filter=latest&per_page=100")" || return 1
-              c="$(jq -er --argjson hosted "$hosted" '[.jobs[] | select(.status != "completed") | [.labels[] | ascii_downcase] | select((index("self-hosted") | not) and any(.[]; startswith("macos") or (. as $label | $hosted | index($label)) != null))] | length' <<<"$page")" || return 1
-              n=$((n + c))
+            for id in $(tr -s ' ' '\n' <<<"$ids" | sort -un); do
+              p=1
+              while :; do
+                page="$(api "runs/$id/jobs?filter=latest&per_page=100&page=$p")" || return 1
+                got="$(jq -er --argjson hosted "$hosted" '.jobs | if type != "array" then error("no jobs") else "\(length) \([.[] | select(.status != "completed") | [.labels[] | ascii_downcase] | select((index("self-hosted") | not) and any(.[]; startswith("macos") or (. as $label | $hosted | index($label)) != null))] | length)" end' <<<"$page")" || return 1
+                read -r got c <<<"$got"
+                n=$((n + c))
+                [ "$got" = 100 ] || break
+                p=$((p + 1))
+              done
             done
             echo "$n"
           }
