@@ -701,6 +701,7 @@ dependencies = [
  "flarebox-proto",
  "prost",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]

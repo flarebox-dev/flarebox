@@ -5,7 +5,9 @@ use std::path::Path;
 
 use flarebox_engine::commit::{Commits, Halt, InFlight, Reconnect};
 use flarebox_engine::effects::{Base, Dir, Displaced, Effect, EffectRecord, Location};
+use flarebox_engine::guard::{Counted, GuardState};
 use flarebox_engine::ids::uuid_v7;
+use flarebox_engine::question::{Answer, Held, Question, QuestionKind, RecoveryGroup, Revisions};
 use flarebox_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
 use flarebox_engine::state::{CommitsState, EffectsState, TreesState};
 use flarebox_engine::tree::{FileIdentity, Kind, Shape as EngineShape};
@@ -82,10 +84,16 @@ fn migrations_apply_from_empty() {
             "effect_state",
             "engine_state",
             "failed_effects",
+            "guard_confirmed",
+            "guard_confirmed_members",
+            "guard_ledger",
             "link",
             "local_nodes",
             "node_maps",
             "node_sets",
+            "open_question_items",
+            "open_question_members",
+            "open_questions",
             "questions",
             "remote_cursor",
             "remote_nodes",
@@ -268,6 +276,13 @@ fn engine_shape(parent: &str, name: &str) -> EngineShape {
     }
 }
 
+fn revisions(content_rev: u64, meta_rev: u64) -> Revisions {
+    Revisions {
+        content_rev,
+        meta_rev,
+    }
+}
+
 fn nodes<const N: usize>(ids: [&str; N]) -> BTreeSet<String> {
     ids.into_iter().map(String::from).collect()
 }
@@ -409,6 +424,57 @@ fn engine_state() -> EngineState {
             ]),
             resolved: resolved.collect(),
             slots: BTreeMap::from([(3, 7), (4, 9)]),
+            questions: vec![
+                Question {
+                    id: "q1".into(),
+                    asked_at_ms: 7,
+                    kind: QuestionKind::MassDelete {
+                        deletions: 1001,
+                        affected_files: 1002,
+                        space_files: 5000,
+                    },
+                    held: BTreeMap::from([(
+                        "held".into(),
+                        Held {
+                            members: BTreeMap::from([
+                                ("held".into(), Some(revisions(3, 4))),
+                                ("held-child".into(), Some(revisions(5, 6))),
+                                ("held-file".into(), Some(revisions(7, 8))),
+                            ]),
+                            files: 2,
+                        },
+                    )]),
+                    answer: Some(Answer::Restore),
+                },
+                Question {
+                    id: "q2".into(),
+                    asked_at_ms: 8,
+                    kind: QuestionKind::Recovery {
+                        group: RecoveryGroup::CreatedOnThisDevice,
+                    },
+                    held: BTreeMap::from([(
+                        "local".into(),
+                        Held {
+                            members: BTreeMap::from([("local".into(), None)]),
+                            files: 1,
+                        },
+                    )]),
+                    answer: None,
+                },
+            ],
+            guard: GuardState {
+                ledger: BTreeMap::from([
+                    ("held".into(), Counted { at_ms: 5, files: 2 }),
+                    ("kept".into(), Counted { at_ms: 6, files: 1 }),
+                ]),
+                confirmed: BTreeMap::from([(
+                    "yes".into(),
+                    Held {
+                        members: BTreeMap::from([("yes".into(), Some(revisions(1, 2)))]),
+                        files: 1,
+                    },
+                )]),
+            },
         },
         effects: EffectsState {
             in_flight: Some(EffectRecord {
@@ -476,7 +542,7 @@ fn engine_state_survives_a_reopen() {
 }
 
 /// The tables of the engine state besides the nodes of R, L and S.
-const ENGINE_TABLES: [&str; 13] = [
+const ENGINE_TABLES: [&str; 19] = [
     "node_sets",
     "node_maps",
     "waiting_updates",
@@ -490,6 +556,12 @@ const ENGINE_TABLES: [&str; 13] = [
     "effect_state",
     "failed_effects",
     "restore_intents",
+    "open_questions",
+    "open_question_items",
+    "open_question_members",
+    "guard_ledger",
+    "guard_confirmed",
+    "guard_confirmed_members",
 ];
 
 /// Counts each row inserted, updated or deleted in the engine's tables from now on in the table
@@ -767,7 +839,10 @@ fn a_cursor_stored_before_it_could_record_a_server_behind_it_records_none() {
         .unwrap();
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
-        "DROP TABLE trashed_here; DROP TABLE commit_slots; DROP TABLE watched_contents;
+        "DROP TABLE open_question_members; DROP TABLE open_question_items;
+         DROP TABLE open_questions; DROP TABLE guard_ledger;
+         DROP TABLE guard_confirmed_members; DROP TABLE guard_confirmed;
+         DROP TABLE trashed_here; DROP TABLE commit_slots; DROP TABLE watched_contents;
          ALTER TABLE remote_cursor DROP COLUMN ahead_of_server;",
     )
     .unwrap();
@@ -799,7 +874,10 @@ fn a_store_from_before_contents_were_watched_opens_with_nothing_watched() {
         .unwrap();
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
-        "DROP TABLE trashed_here; DROP TABLE commit_slots; DROP TABLE watched_contents;",
+        "DROP TABLE open_question_members; DROP TABLE open_question_items;
+         DROP TABLE open_questions; DROP TABLE guard_ledger;
+         DROP TABLE guard_confirmed_members; DROP TABLE guard_confirmed;
+         DROP TABLE trashed_here; DROP TABLE commit_slots; DROP TABLE watched_contents;",
     )
     .unwrap();
     conn.pragma_update(None, "user_version", 5).unwrap();
@@ -810,6 +888,8 @@ fn a_store_from_before_contents_were_watched_opens_with_nothing_watched() {
     before.trees.watched.clear();
     before.trees.trashed_here.clear();
     before.commits.slots.clear();
+    before.commits.questions.clear();
+    before.commits.guard = GuardState::default();
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
 }
 
@@ -825,9 +905,14 @@ fn a_store_from_before_deletes_were_recorded_opens_with_none_recorded() {
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("DROP TABLE trashed_here; DROP TABLE commit_slots;")
-        .unwrap();
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+    conn.execute_batch(
+        "DROP TABLE open_question_members; DROP TABLE open_question_items;
+         DROP TABLE open_questions; DROP TABLE guard_ledger;
+         DROP TABLE guard_confirmed_members; DROP TABLE guard_confirmed;
+         DROP TABLE trashed_here; DROP TABLE commit_slots;",
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION - 2)
         .unwrap();
     drop(conn);
 
@@ -835,6 +920,37 @@ fn a_store_from_before_deletes_were_recorded_opens_with_none_recorded() {
     assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
     before.trees.trashed_here.clear();
     before.commits.slots.clear();
+    before.commits.questions.clear();
+    before.commits.guard = GuardState::default();
+    assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
+}
+
+/// A database of the schema before the mass-delete guard keeps its engine state, with no open
+/// question and nothing in the guard's window.
+#[test]
+fn a_store_from_before_the_guard_opens_with_an_empty_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let mut before = engine_state();
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| tx.set_engine_state(&before))
+        .unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "DROP TABLE open_question_members; DROP TABLE open_question_items;
+         DROP TABLE open_questions; DROP TABLE guard_ledger;
+         DROP TABLE guard_confirmed_members; DROP TABLE guard_confirmed;",
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+        .unwrap();
+    drop(conn);
+
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    before.commits.questions.clear();
+    before.commits.guard = GuardState::default();
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
 }
 
@@ -851,6 +967,8 @@ fn a_version_3_store_opens_with_empty_restore_tables() {
     before.commits.slots.clear();
     before.commits.restores.clear();
     before.commits.resolved.clear();
+    before.commits.questions.clear();
+    before.commits.guard = GuardState::default();
     Store::open(&path)
         .unwrap()
         .transaction(|tx| tx.set_engine_state(&before))
@@ -858,6 +976,9 @@ fn a_version_3_store_opens_with_empty_restore_tables() {
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
         "DROP TABLE restore_requests; DROP TABLE restore_intents;
+         DROP TABLE open_question_members; DROP TABLE open_question_items;
+         DROP TABLE open_questions; DROP TABLE guard_ledger;
+         DROP TABLE guard_confirmed_members; DROP TABLE guard_confirmed;
          DROP TABLE watched_contents; DROP TABLE trashed_here; DROP TABLE commit_slots;
          ALTER TABLE remote_cursor DROP COLUMN ahead_of_server;",
     )
