@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# One-time setup for the site's Cloudflare Pages project. Safe to re-run: every
-# step reads the current state first and changes only what is missing.
+# Sets up the site's Cloudflare Pages project. Safe to re-run: every step reads
+# the current state first and changes only what is missing.
+# .github/workflows/site.yml runs it after each production deploy from main. To
+# run it by hand:
 #
 #   CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=... scripts/site-setup.sh
 #
 # The token needs Account > Cloudflare Pages > Edit, and on the koidrive.com zone
 # Zone > DNS > Edit and Zone > Single Redirect > Edit. It creates the Pages
-# project, serves it at koidrive.com, and redirects www.koidrive.com there.
-# .github/workflows/site.yml deploys to the project with the same token and
-# account ID, stored in the GitHub environment "site".
+# project, serves it at koidrive.com, and redirects www.koidrive.com there. The
+# workflow reads the token and account ID from the GitHub environment "site".
 
 set -euo pipefail
 
