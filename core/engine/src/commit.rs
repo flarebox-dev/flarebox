@@ -645,6 +645,10 @@ impl Commits {
             Some(op::Op::UpdateContent(update)) => Some(update.node_id.clone()),
             _ => None,
         }));
+        trees.watch_positions(ops.iter().filter_map(|op| match &op.op {
+            Some(op::Op::Move(moved)) => Some(moved.node_id.clone()),
+            _ => None,
+        }));
         self.in_flight = Some(InFlight {
             commit: proto::Commit {
                 commit_id: ids.uuid_v7(now_ms),
@@ -679,7 +683,11 @@ impl Commits {
     /// built is newer than what was sent: the server applies a content update only when no other
     /// device changed the content after the commit's `base_seq`, so that change came after the
     /// commit. When S's content changed since then ([`Trees::took_content`]), even back to what it
-    /// was, S keeps what it holds. A conflict copy is re-keyed in L, and so is
+    /// was, S keeps what it holds. A position S took from R after the commit was built is newer
+    /// than what was sent only when R's record of it came after the result's seq: the server
+    /// applies a move whatever another device did after `base_seq`, so the move replaced a position
+    /// from an earlier record. When S holds a newer position ([`Trees::took_position_after`]), S
+    /// keeps it. A conflict copy is re-keyed in L, and so is
     /// a directory merged into one L does not hold yet. When L already holds the conflict copy,
     /// because a log replay brought it before the result and the effects downloaded it, the local
     /// file keeps its ID and takes what was sent as its S, so the server's content replaces it. When L already holds the directory it was
@@ -801,6 +809,7 @@ impl Commits {
                     if let Some(shape) = synced.get(trees, id)
                         && applied
                         && target != *id
+                        && !trees.took_position_after(id, result.seq)
                     {
                         let shape = Shape {
                             parent: target,
@@ -850,6 +859,7 @@ impl Commits {
             self.resolve(id, Outcome::from_result(&result.results[index]));
         }
         trees.watch_content([]);
+        trees.watch_positions([]);
         self.retry_waiting(trees, BTreeSet::new(), Vec::new());
         self.accepted = flight.commit.device_seq;
         self.slots.insert(flight.commit.device_seq, result.seq);

@@ -161,6 +161,9 @@ pub struct Trees {
     /// The nodes whose content the commit in flight updates, each with whether S's content
     /// changed since the commit was built.
     watched: BTreeMap<NodeId, bool>,
+    /// The nodes the commit in flight moves, each with the revision of R's position that S took
+    /// since the commit was built, if S's position last changed to R's.
+    watched_positions: BTreeMap<NodeId, Option<u64>>,
     /// The nodes a delete of this device trashed, each with the seq of its commit, while R holds
     /// them trashed by that commit.
     trashed_here: BTreeMap<NodeId, u64>,
@@ -233,6 +236,7 @@ impl Trees {
             parked_as: BTreeMap::new(),
             waiting: BTreeMap::new(),
             watched: BTreeMap::new(),
+            watched_positions: BTreeMap::new(),
             trashed_here: BTreeMap::new(),
             discarded: BTreeSet::new(),
             edited_here: BTreeMap::new(),
@@ -772,6 +776,22 @@ impl Trees {
     /// even if it changed back.
     pub fn took_content(&self, id: &str) -> bool {
         self.watched.get(id) == Some(&true)
+    }
+
+    /// Watches S's position of `ids`, the nodes the commit just built moves, and stops watching any
+    /// other node.
+    pub fn watch_positions(&mut self, ids: impl IntoIterator<Item = NodeId>) {
+        self.watched_positions = ids.into_iter().map(|id| (id, None)).collect();
+    }
+
+    /// Whether S holds a position of `id` that it took from R, since
+    /// [`Trees::watch_positions`] started watching it, at a revision after `seq`.
+    pub fn took_position_after(&self, id: &str, seq: u64) -> bool {
+        self.watched_positions
+            .get(id)
+            .copied()
+            .flatten()
+            .is_some_and(|rev| rev > seq)
     }
 
     pub(crate) fn take_waiting(&mut self) -> BTreeMap<NodeId, Option<Shape>> {
@@ -1387,6 +1407,21 @@ impl Trees {
                 (before, after) => before.is_some() != after.is_some(),
             };
         }
+        if let Some(taken) = self.watched_positions.get_mut(id) {
+            let after = self.s.get(id);
+            let moved = match (old.as_ref(), after) {
+                (Some(before), Some(after)) => !before.same_position(after),
+                (before, after) => before.is_some() != after.is_some(),
+            };
+            if moved {
+                *taken = (self.r.get(id))
+                    .filter(|remote| {
+                        !remote.trashed
+                            && after.is_some_and(|after| after.same_position(&remote.shape))
+                    })
+                    .map(|remote| remote.meta_rev);
+            }
+        }
         if let Some(old) = old {
             let kept = self.s.get(id).is_some_and(|new| {
                 new.parent == old.parent && name_key(&new.name) == name_key(&old.name)
@@ -1440,6 +1475,7 @@ impl Trees {
             parked_as: self.parked_as.clone(),
             waiting: self.waiting.clone(),
             watched: self.watched.clone(),
+            watched_positions: self.watched_positions.clone(),
             trashed_here: self.trashed_here.clone(),
             discarded: self.discarded.clone(),
             outside: self.outside.clone(),
@@ -1502,6 +1538,7 @@ impl Trees {
             parked_as,
             waiting,
             watched,
+            watched_positions,
             trashed_here,
             discarded,
             outside,
@@ -1517,6 +1554,7 @@ impl Trees {
         self.parked_as = parked_as;
         self.waiting = waiting;
         self.watched = watched;
+        self.watched_positions = watched_positions;
         self.trashed_here = trashed_here;
         self.discarded = discarded;
         self.outside = outside;

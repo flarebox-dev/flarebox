@@ -101,6 +101,16 @@ impl Tx<'_> {
         }
         let mut stmt = self
             .0
+            .prepare_cached("SELECT node_id, rev FROM watched_positions")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            state
+                .trees
+                .watched_positions
+                .insert(row.get(0)?, row.get(1)?);
+        }
+        let mut stmt = self
+            .0
             .prepare_cached("SELECT node_id, seq FROM trashed_here")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
@@ -216,6 +226,7 @@ impl Tx<'_> {
             "commit_in_flight_deletes",
             "commit_in_flight_delete_members",
             "watched_contents",
+            "watched_positions",
             "trashed_here",
             "discarded_nodes",
             "recorded_nodes",
@@ -310,6 +321,22 @@ impl Tx<'_> {
         }
         for (node, took) in changed {
             put.execute(params![node, took])?;
+        }
+        let mut remove = self
+            .0
+            .prepare_cached("DELETE FROM watched_positions WHERE node_id = ?1")?;
+        let mut put = self.0.prepare_cached(
+            "INSERT OR REPLACE INTO watched_positions (node_id, rev) VALUES (?1, ?2)",
+        )?;
+        let (removed, changed) = differences(
+            &before.trees.watched_positions,
+            &after.trees.watched_positions,
+        );
+        for node in removed {
+            remove.execute([node])?;
+        }
+        for (node, rev) in changed {
+            put.execute(params![node, rev])?;
         }
         let mut remove = self
             .0
