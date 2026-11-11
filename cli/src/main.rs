@@ -170,6 +170,7 @@ enum SpaceAction {
     /// Create a space. Link a folder to it with flarebox link.
     Create {
         /// The space's name, at most 255 bytes.
+        #[arg(value_parser = short_name)]
         name: String,
     },
     /// List the spaces of the server.
@@ -198,8 +199,8 @@ enum DeviceAction {
 
 #[derive(clap::Args)]
 pub struct DeviceArgs {
-    /// A name for this device, shown on the others. Defaults to this machine's host name.
-    #[arg(long)]
+    /// A name for this device, shown on the others, at most 255 bytes. Defaults to this machine's host name.
+    #[arg(long, value_parser = short_name)]
     name: Option<String>,
 }
 
@@ -740,6 +741,19 @@ fn size(bytes: u64) -> String {
 }
 
 /// A device ID as the server issues it: a lowercase UUID. Checked here so that the argument cannot name another path.
+/// A space, device or user name as the server takes it: at most 255 bytes of UTF-8, measured before trimming (RFC 0007
+/// section 1). Checking it here names the argument instead of sending a request the server refuses.
+fn short_name(text: &str) -> Result<String, String> {
+    const MAX_NAME: usize = 255;
+    if text.len() > MAX_NAME {
+        return Err(format!(
+            "a name is at most {MAX_NAME} bytes of UTF-8, and this one has {}",
+            text.len()
+        ));
+    }
+    Ok(text.to_owned())
+}
+
 fn device_id(text: &str) -> Result<String, String> {
     let id = text.to_ascii_lowercase();
     let shaped = id.len() == 36
@@ -963,6 +977,42 @@ mod tests {
     use super::*;
 
     const ID: &str = "0190a0b0-0000-7000-8000-000000000001";
+
+    #[test]
+    fn a_name_longer_than_255_bytes_is_refused_before_anything_is_sent() {
+        let longest = "가".repeat(85);
+        let too_long = format!("{longest}a");
+        for args in [
+            vec!["flarebox", "space", "create", &too_long],
+            vec![
+                "flarebox",
+                "join",
+                "K7QM-2XPD@files.example.com",
+                "--name",
+                &too_long,
+            ],
+            vec![
+                "flarebox",
+                "server",
+                "claim",
+                "files.example.com",
+                "ABCD",
+                "--user",
+                &too_long,
+            ],
+        ] {
+            let error = Cli::try_parse_from(&args)
+                .err()
+                .expect("a 256-byte name is refused");
+            assert!(
+                error
+                    .to_string()
+                    .contains("a name is at most 255 bytes of UTF-8, and this one has 256"),
+                "{error}"
+            );
+        }
+        assert!(Cli::try_parse_from(["flarebox", "space", "create", &longest]).is_ok());
+    }
 
     #[test]
     fn a_device_id_is_a_uuid_and_nothing_that_could_name_another_path() {

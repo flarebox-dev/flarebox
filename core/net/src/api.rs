@@ -22,25 +22,16 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bounds a whole call to an HTTP endpoint.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-/// The longest name the server can store: it keeps a space or device name in one SQLite row of a Durable Object, which
-/// holds at most 8 MB. The server does not bound names yet; once it does (GUN-289), this and `MAX_ANSWER` shrink.
-const MAX_STORED_NAME: usize = 8 << 20;
-/// `JSON.stringify` writes a control character as `\u00XX`, six bytes for one.
-const JSON_ESCAPE_EXPANSION: usize = 6;
-/// Room for everything in a single answer besides its one name: ids, the token's key id and MAC, JSON keys and protobuf
-/// framing, which together take well under 1 KiB.
-const ANSWER_FRAMING: usize = 64 << 10;
-/// The most bytes read of a single answer. Like the other two limits, this is a memory ceiling, not a check of the
-/// answer's shape, so it covers the worst case the server can send today. The largest answer is an access token, which
-/// carries the device name JSON-escaped inside claims encoded as base64url (four bytes for every three): 64 MiB and
-/// framing for a name of control characters. GUN-289 lowers it.
-const MAX_ANSWER: usize =
-    (MAX_STORED_NAME * JSON_ESCAPE_EXPANSION).div_ceil(3) * 4 + ANSWER_FRAMING;
-/// The most bytes read of a `DeviceList` page, and the most a listing of `SpaceList` pages holds at once, the pages
-/// kept plus the one being read. A page holds at most 100 entries (RFC 0006 section 7, RFC 0007 section 2), but a
-/// server from before RFC 0007 bounds no names and sends every space in one answer. Such a Worker builds the whole
-/// answer in memory, and a Worker isolate has at most 128 MB, so it cannot send a larger one.
-const MAX_LIST_ANSWER: usize = 128 << 20;
+/// The most bytes read of a single answer of fixed shape. RFC 0007 section 3 bounds each at 4 KiB in binary protobuf,
+/// because every name the server stores is at most 255 bytes (section 1). The largest is `DeviceCredentials`, whose
+/// access token carries the device name JSON-escaped and base64url-encoded.
+const MAX_ANSWER: usize = 4 << 10;
+/// The most bytes read of one `SpaceList` page (RFC 0007 section 3).
+const MAX_SPACE_PAGE: usize = 32 << 10;
+/// The most bytes read of one `DeviceList` page (RFC 0007 section 3).
+const MAX_DEVICE_PAGE: usize = 64 << 10;
+/// The most a listing of `SpaceList` pages holds at once, the pages kept plus the one being read: about 400,000 spaces.
+const MAX_SPACE_LISTING: usize = 128 << 20;
 /// The most bytes read of an error. The server's error messages are sentences it writes itself, without names or other
 /// text from clients.
 const MAX_ERROR: usize = 1 << 20;
@@ -163,8 +154,8 @@ impl Api {
     }
 
     /// `GET /v1/spaces`, following `next_cursor` to the last page (RFC 0007 section 2). Each page is read up to
-    /// `MAX_LIST_ANSWER` minus the encoded size of the pages kept so far, so the listing never holds more than
-    /// `MAX_LIST_ANSWER` bytes at once. A page that repeats any earlier cursor ends the listing as undecodable.
+    /// `MAX_SPACE_PAGE`, and to no more than `MAX_SPACE_LISTING` minus the encoded size of the pages kept so far, so the
+    /// listing never holds more than `MAX_SPACE_LISTING` bytes at once. A page that repeats any earlier cursor ends the listing as undecodable.
     pub async fn list_spaces(&self, auth: &Auth) -> Result<SpaceList, ApiError> {
         let mut list = SpaceList::default();
         let mut read = 0;
@@ -186,7 +177,7 @@ impl Api {
                     &path,
                     None,
                     "SpaceList",
-                    MAX_LIST_ANSWER - read,
+                    MAX_SPACE_PAGE.min(MAX_SPACE_LISTING - read),
                 )
                 .await?;
             read += page.encoded_len();
@@ -255,7 +246,7 @@ impl Api {
             &format!("v1/spaces/{space_id}/rpc"),
             Some(request.encode_to_vec()),
             "RpcResponse",
-            MAX_ANSWER,
+            crate::session::MAX_SERVER_MESSAGE,
         )
         .await
     }
@@ -282,7 +273,7 @@ impl Api {
             &path,
             None,
             "DeviceList",
-            MAX_LIST_ANSWER,
+            MAX_DEVICE_PAGE,
         )
         .await
     }
@@ -430,6 +421,9 @@ fn loopback(url: &Url) -> bool {
 #[cfg(test)]
 mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The longest name the server stores (RFC 0007 section 1).
+    const MAX_NAME: usize = 255;
     use tokio::net::TcpListener;
 
     use super::*;
@@ -607,10 +601,9 @@ mod tests {
     fn a_single_answer_cap_covers_the_largest_answer_the_server_can_send() {
         let id = "0190a0b0-0000-7000-8000-000000000001";
         let claims = {
-            let name = "\\u0000".repeat(MAX_STORED_NAME);
+            let name = "\\u0000".repeat(MAX_NAME);
             format!(r#"{{"u":"{id}","d":"{id}","n":"{name}","e":{}}}"#, i64::MAX).len()
         };
-        assert!(claims > MAX_STORED_NAME * JSON_ESCAPE_EXPANSION);
         let token = format!(
             "v1.{}.{}.{}",
             "k".repeat(8),
@@ -627,7 +620,7 @@ mod tests {
                 ..Default::default()
             }),
             credential_expires_at_ms: i64::MAX,
-            user_name: String::new(),
+            user_name: "\u{1}".repeat(MAX_NAME),
         };
         assert!(
             credentials.encoded_len() <= MAX_ANSWER,
@@ -636,11 +629,20 @@ mod tests {
         );
         let space = SpaceInfo {
             space_id: id.into(),
-            name: "n".repeat(MAX_STORED_NAME),
+            name: "n".repeat(MAX_NAME),
             format_version: u32::MAX,
             created_at_ms: i64::MAX,
         };
+        let page = SpaceList {
+            spaces: vec![space.clone(); 100],
+            next_cursor: u64::MAX.to_string(),
+        };
         assert!(space.encoded_len() <= MAX_ANSWER);
+        assert!(
+            page.encoded_len() <= MAX_SPACE_PAGE,
+            "{}",
+            page.encoded_len()
+        );
     }
 
     #[tokio::test]
@@ -661,16 +663,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_space_list_may_be_longer_than_a_fixed_shape_answer() {
-        let spaces = SpaceList {
-            spaces: vec![SpaceInfo {
-                name: "n".repeat(MAX_ANSWER),
+    async fn a_space_list_page_may_be_longer_than_a_fixed_shape_answer_but_not_than_a_page() {
+        let page = |length: usize| {
+            SpaceList {
+                spaces: vec![SpaceInfo {
+                    name: "n".repeat(length),
+                    ..Default::default()
+                }],
                 ..Default::default()
-            }],
-            ..Default::default()
-        }
-        .encode_to_vec();
-        assert!(spaces.len() > MAX_ANSWER && spaces.len() <= MAX_LIST_ANSWER);
+            }
+            .encode_to_vec()
+        };
+        let spaces = page(MAX_ANSWER);
+        assert!(spaces.len() > MAX_ANSWER && spaces.len() <= MAX_SPACE_PAGE);
         let (base, _server) = answering(200, Some(spaces.clone())).await;
         let auth = signed_in(base);
         let list = auth.api().list_spaces(&auth).await.unwrap();
@@ -680,6 +685,39 @@ mod tests {
         let outcome = Api::local_development(base).unwrap().server_info().await;
         assert!(
             matches!(outcome, Err(ApiError::TooLarge { limit: MAX_ANSWER })),
+            "{outcome:?}"
+        );
+
+        let (base, _server) = answering(200, Some(page(MAX_SPACE_PAGE))).await;
+        let auth = signed_in(base);
+        let outcome = auth.api().list_spaces(&auth).await;
+        assert!(
+            matches!(
+                outcome,
+                Err(ApiError::TooLarge {
+                    limit: MAX_SPACE_PAGE
+                })
+            ),
+            "{outcome:?}"
+        );
+
+        let devices = DeviceList {
+            devices: vec![flarebox_proto::v1::DeviceInfo {
+                name: "n".repeat(MAX_DEVICE_PAGE),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (base, _server) = answering(200, Some(devices.encode_to_vec())).await;
+        let auth = signed_in(base);
+        let outcome = auth.api().list_devices(&auth, "").await;
+        assert!(
+            matches!(
+                outcome,
+                Err(ApiError::TooLarge {
+                    limit: MAX_DEVICE_PAGE
+                })
+            ),
             "{outcome:?}"
         );
     }

@@ -37,6 +37,7 @@ R2 holds the contents of your files, of the files in each space's trash and of o
 | What | Limit |
 |---|---|
 | A file or folder name | 1 to 255 bytes of UTF-8. Not `.` or `..`, and no `/` |
+| A space, device or user name | at most 255 bytes of UTF-8 |
 | Folder depth | 256 |
 | Trash and old versions | kept for 30 days |
 | Pairing code | works once, for 10 minutes |
