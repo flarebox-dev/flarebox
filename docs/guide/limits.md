@@ -30,7 +30,7 @@ R2 includes free usage each month. Beyond it, Cloudflare bills your account ([R2
 | Class B operations, such as downloads | 10 million |
 | Data transfer out | Free, without a limit |
 
-R2 holds the contents of your files, of the files in each space's trash and of old versions. `koi usage` shows how much each space stores. R2 also holds the server's own exports of each space's file tree, which `koi usage` doesn't count. The R2 page of the Cloudflare dashboard shows what you are billed for.
+R2 holds the contents of your files, of the files in each space's trash and of old versions. `koi space usage` shows how much each space stores. R2 also holds the server's own exports of each space's file tree, which `koi space usage` doesn't count. The R2 page of the Cloudflare dashboard shows what you are billed for.
 
 ## Koidrive's own limits
 

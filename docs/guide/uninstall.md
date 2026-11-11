@@ -7,7 +7,7 @@ Your files stay where they are.
 1. Unlink each folder. Find them with `koi status`:
 
    ```sh
-   koi unlink ~/Koidrive
+   koi folder unlink ~/Koidrive
    ```
 
 2. Stop the daemon. On Linux with the systemd unit, run `systemctl --user disable --now koidrive`.
@@ -22,16 +22,17 @@ The macOS app is a separate device with its own profile. To remove it, quit the 
 This deletes the server: the Worker, its Durable Objects and the R2 bucket with every file stored on the server, including the trash and old versions. It can't be undone. The copies in your linked folders stay on each device. To keep a copy of the bucket first, see [Back up the server](backup.md).
 
 ```sh
-koi server uninstall
+koi server delete
 ```
 
-You log in with Cloudflare. Koidrive finds the server, names the bucket and the number of objects in it, and asks before it deletes anything. It deletes the Worker, then empties and deletes the bucket. If another Worker in the account uses the same bucket, Koidrive keeps the bucket. If the uninstall stops halfway, run the command again to finish it.
+You log in with Cloudflare. Koidrive finds the server, names the bucket and the number of objects in it, and asks before it deletes anything. It deletes the Worker, then empties and deletes the bucket. If another Worker in the account uses the same bucket, Koidrive keeps the bucket. If the delete stops halfway, run the command again to finish it.
 
-- `--server <worker>` picks the server when the account holds several.
-- `--yes` deletes without asking, for scripts.
+- `--worker <name>` picks the server when the account holds several.
+- `--yes` deletes without asking.
+- The command logs in with Cloudflare in a browser, so it runs only with `--interactive` on a terminal. Otherwise it stops with exit status 4 and prints the same command with `--interactive`.
 - `--bucket <name>` empties and deletes a bucket whose Worker is already gone. Add `--jurisdiction` when the bucket is in the `eu`, `us`, `fedramp` or `fedramp-high` jurisdiction.
 
 Then remove Koidrive from each device as the previous section describes. Skip the revoke step, since the server is gone.
 
 > [!WARNING]
-> `koi server uninstall` needs the Cloudflare login, which isn't available outside the project's test account yet. Until then, delete the Worker and the R2 bucket in the Cloudflare dashboard. First check that no other Worker binds the bucket and that it holds nothing but the `spaces/` folder Koidrive writes, since emptying it deletes everything in it. R2 deletes a bucket only once it is empty ([Delete buckets](https://developers.cloudflare.com/r2/buckets/delete-buckets/)). Whether deleting the Worker in the dashboard also deletes its Durable Objects' data is unverified.
+> `koi server delete` needs the Cloudflare login, which isn't available outside the project's test account yet. Until then, delete the Worker and the R2 bucket in the Cloudflare dashboard. First check that no other Worker binds the bucket and that it holds nothing but the `spaces/` folder Koidrive writes, since emptying it deletes everything in it. R2 deletes a bucket only once it is empty ([Delete buckets](https://developers.cloudflare.com/r2/buckets/delete-buckets/)). Whether deleting the Worker in the dashboard also deletes its Durable Objects' data is unverified.

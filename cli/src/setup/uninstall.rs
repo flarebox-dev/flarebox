@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! `koi server uninstall` (docs/design/cli-setup.md section 5): record the Worker's and the bucket's identities,
+//! `koi server delete` (docs/design/cli-setup.md section 5): record the Worker's and the bucket's identities,
 //! delete the Worker, then empty and delete the bucket unless it turns out to be another one or someone else's. A
 //! missing identity stops the uninstall before it deletes anything.
 
@@ -8,6 +8,7 @@ use koidrive_cloudflare::{Jurisdiction, Script};
 
 use super::Cloud;
 use super::state::{SetupState, StateFile, Step};
+use crate::error::CliError;
 
 /// The server writes only keys under this prefix, so any other key belongs to another application.
 const SERVER_PREFIX: &str = "spaces/";
@@ -28,7 +29,7 @@ pub async fn plan(
     script: Option<&Script>,
     bucket: &str,
     jurisdiction: Jurisdiction,
-) -> Result<(SetupState, Contents), String> {
+) -> Result<(SetupState, Contents), CliError> {
     let script_created_on = match script {
         None => None,
         Some(script) => Some(script.created_on.clone().ok_or_else(|| {
@@ -45,11 +46,14 @@ pub async fn plan(
         .bucket(&account, bucket, jurisdiction)
         .await
         .map_err(|error| match error.status() {
-            Some(404) => format!(
+            Some(404) => CliError::usage(format!(
                 "there is no R2 bucket {bucket} in the {} jurisdiction",
                 jurisdiction.as_str()
+            )),
+            _ => CliError::caused(
+                format!("cannot read the bucket {bucket}: {error}; deleted nothing"),
+                error,
             ),
-            _ => format!("cannot read the bucket {bucket}: {error}; deleted nothing"),
         })?;
     if found.creation_date.is_empty()
         || found
@@ -59,7 +63,7 @@ pub async fn plan(
         return Err(format!(
             "Cloudflare did not describe the bucket {bucket} in the {} jurisdiction with its creation date; deleted nothing",
             jurisdiction.as_str()
-        ));
+        ).into());
     }
     let contents = scan(cloud, bucket, jurisdiction)
         .await?
@@ -82,7 +86,7 @@ pub async fn finish(
     cloud: &mut impl Cloud,
     file: &StateFile,
     mut state: SetupState,
-) -> Result<(), String> {
+) -> Result<(), CliError> {
     let account = cloud.account().to_owned();
     let jurisdiction = state.jurisdiction;
     if !state.script.is_empty() {
@@ -101,8 +105,9 @@ pub async fn finish(
         Ok(found) => found,
         Err(error) if error.status() == Some(404) => return gone(file, &bucket),
         Err(error) => {
-            return Err(format!(
-                "cannot read the bucket {bucket}: {error}; run the command again"
+            return Err(CliError::caused(
+                format!("cannot read the bucket {bucket}: {error}; run the command again"),
+                error,
             ));
         }
     };
@@ -120,7 +125,8 @@ pub async fn finish(
     if let Some(other) = binder(cloud, &bucket, jurisdiction).await? {
         file.remove()?;
         println!(
-            "Kept the bucket {bucket} and its files, because the Worker {other} also uses it."
+            "Kept the bucket {bucket} and its files, because the Worker {} also uses it.",
+            crate::printable(&other)
         );
         return Ok(());
     }
@@ -130,7 +136,8 @@ pub async fn finish(
     if let Some(key) = contents.foreign {
         file.remove()?;
         println!(
-            "Kept the bucket {bucket} and its files, because it holds {key}, which Koidrive does not write: another application stores data there."
+            "Kept the bucket {bucket} and its files, because it holds {}, which Koidrive does not write: another application stores data there.",
+            crate::printable(&key)
         );
         return Ok(());
     }
@@ -141,8 +148,9 @@ pub async fn finish(
             Ok(page) => page,
             Err(error) if error.status() == Some(404) => return gone(file, &bucket),
             Err(error) => {
-                return Err(format!(
-                    "cannot list the bucket {bucket}: {error}; run the command again"
+                return Err(CliError::caused(
+                    format!("cannot list the bucket {bucket}: {error}; run the command again"),
+                    error,
                 ));
             }
         };
@@ -153,12 +161,17 @@ pub async fn finish(
             if !key.starts_with(SERVER_PREFIX) {
                 return Err(format!(
                     "the bucket {bucket} now holds {key}, which Koidrive does not write, so it stopped emptying it; run the command again"
-                ));
+                ).into());
             }
             api.delete_object(&account, &bucket, jurisdiction, key)
                 .await
                 .map_err(|error| {
-                    format!("cannot delete {key} from {bucket}: {error}; run the command again")
+                    CliError::caused(
+                        format!(
+                            "cannot delete {key} from {bucket}: {error}; run the command again"
+                        ),
+                        error,
+                    )
                 })?;
         }
     }
@@ -168,25 +181,31 @@ pub async fn finish(
         .delete_bucket(&account, &bucket, jurisdiction)
         .await
         .map_err(|error| {
-            format!("cannot delete the bucket {bucket}: {error}; run the command again")
+            CliError::caused(
+                format!("cannot delete the bucket {bucket}: {error}; run the command again"),
+                error,
+            )
         })?;
     file.remove()?;
     println!("Deleted the bucket {bucket}. The uninstall is complete.");
     Ok(())
 }
 
-fn gone(file: &StateFile, bucket: &str) -> Result<(), String> {
+fn gone(file: &StateFile, bucket: &str) -> Result<(), CliError> {
     file.remove()?;
     println!("The bucket {bucket} is already gone. The uninstall is complete.");
     Ok(())
 }
 
 /// Step 3: deletes the Worker only if it is the one the state file recorded.
-async fn delete_worker(cloud: &mut impl Cloud, state: &SetupState) -> Result<(), String> {
+async fn delete_worker(cloud: &mut impl Cloud, state: &SetupState) -> Result<(), CliError> {
     let account = cloud.account().to_owned();
     let api = cloud.fresh().await?;
     let scripts = api.scripts(&account).await.map_err(|error| {
-        format!("cannot list the account's Workers: {error}; run the command again")
+        CliError::caused(
+            format!("cannot list the account's Workers: {error}; run the command again"),
+            error,
+        )
     })?;
     let Some(script) = scripts.iter().find(|script| script.id == state.script) else {
         println!("The Worker {} is already gone.", state.script);
@@ -198,10 +217,10 @@ async fn delete_worker(cloud: &mut impl Cloud, state: &SetupState) -> Result<(),
             api.delete_script(&account, &state.script)
                 .await
                 .map_err(|error| {
-                    format!(
+                    CliError::caused(format!(
                         "cannot delete the Worker {}: {error}; run the command again",
                         state.script
-                    )
+                    ), error)
                 })
         }
         (Some(_), Some(_)) => {
@@ -214,7 +233,7 @@ async fn delete_worker(cloud: &mut impl Cloud, state: &SetupState) -> Result<(),
         _ => Err(format!(
             "Cloudflare did not say when the Worker {} was created, so it cannot be told apart from a new Worker with that name; deleted nothing",
             state.script
-        )),
+        ).into()),
     }
 }
 
@@ -223,20 +242,26 @@ async fn binder(
     cloud: &mut impl Cloud,
     bucket: &str,
     jurisdiction: Jurisdiction,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, CliError> {
     let account = cloud.account().to_owned();
     let api = cloud.fresh().await?;
     let scripts = api.scripts(&account).await.map_err(|error| {
-        format!("cannot list the account's Workers: {error}; run the command again")
+        CliError::caused(
+            format!("cannot list the account's Workers: {error}; run the command again"),
+            error,
+        )
     })?;
     for script in scripts {
         let settings = api
             .script_settings(&account, &script.id)
             .await
             .map_err(|error| {
-                format!(
-                    "cannot read the settings of {}: {error}; run the command again",
-                    script.id
+                CliError::caused(
+                    format!(
+                        "cannot read the settings of {}: {error}; run the command again",
+                        script.id
+                    ),
+                    error,
                 )
             })?;
         let binds = settings.bindings.iter().any(|binding| {
@@ -256,7 +281,7 @@ async fn scan(
     cloud: &mut impl Cloud,
     bucket: &str,
     jurisdiction: Jurisdiction,
-) -> Result<Option<Contents>, String> {
+) -> Result<Option<Contents>, CliError> {
     let account = cloud.account().to_owned();
     let mut contents = Contents {
         objects: 0,
@@ -273,8 +298,9 @@ async fn scan(
             Ok(page) => page,
             Err(error) if error.status() == Some(404) => return Ok(None),
             Err(error) => {
-                return Err(format!(
-                    "cannot list the bucket {bucket}: {error}; deleted nothing"
+                return Err(CliError::caused(
+                    format!("cannot list the bucket {bucket}: {error}; deleted nothing"),
+                    error,
                 ));
             }
         };
@@ -312,7 +338,7 @@ mod tests {
             ACCOUNT
         }
 
-        async fn fresh(&mut self) -> Result<Cloudflare, String> {
+        async fn fresh(&mut self) -> Result<Cloudflare, CliError> {
             Ok(self.0.clone())
         }
     }
@@ -428,7 +454,8 @@ mod tests {
             Jurisdiction::Eu,
         )
         .await
-        .unwrap_err();
+        .unwrap_err()
+        .message;
         assert!(
             error.contains("did not say when the Worker koidrive was created"),
             "{error}"
@@ -452,7 +479,8 @@ mod tests {
             Jurisdiction::Eu,
         )
         .await
-        .unwrap_err();
+        .unwrap_err()
+        .message;
         assert!(error.ends_with("deleted nothing"), "{error}");
         assert!(!fake.sent(&["DELETE", "PUT", "POST"]));
     }
@@ -472,7 +500,8 @@ mod tests {
             Jurisdiction::Eu,
         )
         .await
-        .unwrap_err();
+        .unwrap_err()
+        .message;
         assert!(error.ends_with("deleted nothing"), "{error}");
         assert!(!fake.sent(&["DELETE"]));
     }
@@ -581,7 +610,8 @@ mod tests {
 
         let error = finish(&mut cloud, &file, recorded("koidrive"))
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .message;
 
         assert!(error.ends_with("deleted nothing"), "{error}");
         assert!(!fake.sent(&["DELETE"]));
@@ -673,7 +703,10 @@ mod tests {
         let (_dir, file) = state_file();
         file.save(&recorded("")).unwrap();
 
-        let error = finish(&mut cloud, &file, recorded("")).await.unwrap_err();
+        let error = finish(&mut cloud, &file, recorded(""))
+            .await
+            .unwrap_err()
+            .message;
 
         assert!(error.contains("same cursor"), "{error}");
         assert!(!fake.sent(&["DELETE"]));

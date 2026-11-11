@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `koi setup` and `koi server ...`: log in with Cloudflare, then deploy a server to the user's account, add
-//! this device to the server there, upgrade it or remove it (docs/design/cli-setup.md). The Cloudflare grant lives in
+//! this device to the server there, upgrade it or delete it (docs/design/cli-setup.md). The Cloudflare grant lives in
 //! memory for one command and is revoked when the command ends, also on failure, Ctrl-C and SIGTERM (section 7).
+//!
+//! Nothing here asks a question unless [`mode`] says the command is guided: stdin and stderr are terminals, and
+//! neither `--json` nor the `CI` variable rules it out, or `--interactive` asks for it.
 
 #[cfg(test)]
 mod bundle_files;
@@ -15,6 +18,7 @@ mod uninstall;
 use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::process::{Command as Process, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use koidrive_cloudflare::{
@@ -28,7 +32,10 @@ use tokio::signal::unix::{SignalKind, signal};
 use url::Url;
 
 use crate::DeviceArgs;
+use crate::error::{CliError, Code};
 use crate::ipc::{self, Request, Response};
+use crate::printable;
+use crate::report::{Choice, ChoicesData, Done, Next};
 use claim::Claim;
 use state::{SetupState, StateFile, Step};
 
@@ -48,9 +55,25 @@ const SERVE_WAIT: Duration = Duration::from_secs(90);
 
 include!(concat!(env!("OUT_DIR"), "/server_bundle.rs"));
 
+/// Whether this command may ask questions on the terminal; [`mode`] decides it once, before anything is asked.
+static GUIDED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a Cloudflare login session is live. Its own signal handling revokes the grant before the command ends,
+/// so main's Ctrl-C handling stands aside while it is.
+static SESSION: AtomicBool = AtomicBool::new(false);
+
+pub fn in_session() -> bool {
+    SESSION.load(Ordering::Relaxed)
+}
+
 #[derive(clap::Args)]
 pub struct LoginArgs {
+    /// Ask questions on the terminal, as the guided setup does. Needs a terminal on stdin and stderr, and cannot be
+    /// used with --json.
+    #[arg(long)]
+    interactive: bool,
     /// Print the login page instead of opening a browser, and read the address the browser ends on from the terminal.
+    /// Needs --interactive.
     #[arg(long)]
     no_browser: bool,
     /// The local port for the login callback, for example to forward it over SSH. Defaults to a free port.
@@ -67,11 +90,11 @@ pub enum ServerAction {
         #[command(flatten)]
         login: LoginArgs,
     },
-    /// Log in with Cloudflare and add this device to the server in the account.
+    /// Log in with Cloudflare and add this device to the server in the account, without a pairing code.
     AddDevice {
         /// The server's Worker name, when the account holds several.
         #[arg(long)]
-        server: Option<String>,
+        worker: Option<String>,
         #[command(flatten)]
         device: DeviceArgs,
         #[command(flatten)]
@@ -81,6 +104,7 @@ pub enum ServerAction {
     /// Worker's log. This device becomes the owner's first device.
     Claim {
         /// The server's address, such as https://koidrive.alice.workers.dev.
+        #[arg(value_name = "SERVER_URL")]
         server: String,
         /// The claim code from the Worker's log.
         code: String,
@@ -90,22 +114,23 @@ pub enum ServerAction {
         #[command(flatten)]
         device: DeviceArgs,
     },
-    /// Log in with Cloudflare and upload this CLI's server version.
+    /// Log in with Cloudflare and upload this CLI's server version. Without a terminal it needs --worker and --yes.
     Upgrade {
         /// The server's Worker name, when the account holds several.
         #[arg(long)]
-        server: Option<String>,
+        worker: Option<String>,
         /// Go on without asking, for example past the Workers Builds warning.
         #[arg(long)]
         yes: bool,
         #[command(flatten)]
         login: LoginArgs,
     },
-    /// Log in with Cloudflare, delete the server's Worker, then empty and delete its bucket.
-    Uninstall {
+    /// Log in with Cloudflare, delete the server's Worker, then empty and delete its bucket: every file, trashed file
+    /// and version on the server is lost. Without a terminal it needs --worker or --bucket, and --yes.
+    Delete {
         /// The server's Worker name, when the account holds several.
         #[arg(long)]
-        server: Option<String>,
+        worker: Option<String>,
         /// Empty and delete this bucket when its Worker is already gone.
         #[arg(long)]
         bucket: Option<String>,
@@ -120,12 +145,125 @@ pub enum ServerAction {
     },
 }
 
-/// `koi setup` without a code: asks whether to join with a code or log in with Cloudflare.
-pub async fn setup(paths: &Paths, device_name: &str, login: &LoginArgs) -> Result<(), String> {
-    if !std::io::stdin().is_terminal() {
-        return Err("koi setup asks questions; in a script use koi join, koi server deploy or koi server add-device".into());
+/// How a setup or server command runs: guided, asking questions on the terminal, or direct, never asking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Guided,
+    Direct,
+}
+
+/// The mode of a setup or server command. It is guided only with a terminal on both stdin and stderr, and then when
+/// `--interactive` asks for it, or when neither `--json` nor the `CI` variable rules it out. `--interactive` without
+/// those terminals is a usage error, since nobody could answer.
+pub fn mode(
+    stdin_tty: bool,
+    stderr_tty: bool,
+    json: bool,
+    ci: bool,
+    interactive: bool,
+) -> Result<Mode, CliError> {
+    let terminal = stdin_tty && stderr_tty;
+    if interactive && json {
+        return Err(CliError::usage("--interactive cannot be used with --json"));
+    }
+    if interactive && !terminal {
+        return Err(CliError::usage(
+            "--interactive asks questions, so it needs a terminal on stdin and stderr",
+        ));
+    }
+    match interactive || (terminal && !json && !ci) {
+        true => Ok(Mode::Guided),
+        false => Ok(Mode::Direct),
+    }
+}
+
+/// [`mode`] for this process, which it also records for [`prompt`] and [`confirm`].
+fn this_mode(json: bool, interactive: bool) -> Result<Mode, CliError> {
+    let mode = mode(
+        std::io::stdin().is_terminal(),
+        std::io::stderr().is_terminal(),
+        json,
+        std::env::var_os("CI").is_some(),
+        interactive,
+    )?;
+    GUIDED.store(mode == Mode::Guided, Ordering::Relaxed);
+    Ok(mode)
+}
+
+/// The ways to set up this machine, which `koi setup` lists when it does not guide.
+fn choices() -> Vec<Choice> {
+    let choice = |argv: &[&str], description| Choice {
+        argv: Next::of(argv).argv,
+        description,
+    };
+    vec![
+        choice(
+            &["koi", "join", "<CODE>"],
+            "Join a server with a pairing code from a device that is already paired",
+        ),
+        choice(
+            &["koi", "server", "deploy"],
+            "Log in with Cloudflare and deploy a server to your account",
+        ),
+        choice(
+            &["koi", "server", "add-device"],
+            "Log in with Cloudflare and add this device to the server there, without a pairing code",
+        ),
+        choice(
+            &[
+                "koi",
+                "server",
+                "claim",
+                "<SERVER_URL>",
+                "<CODE>",
+                "--user",
+                "<NAME>",
+            ],
+            "Claim a server deployed without koi, with the code in its Worker's log",
+        ),
+        choice(
+            &["koi", "setup", "--interactive"],
+            "Choose in the guided setup, on a terminal",
+        ),
+    ]
+}
+
+/// `koi setup`: on a terminal, asks whether to join with a code or log in with Cloudflare. Otherwise it lists the
+/// commands that set up this machine, and changes nothing.
+pub async fn setup(
+    paths: &Paths,
+    device_name: &str,
+    login: &LoginArgs,
+    json: bool,
+) -> Result<Done, CliError> {
+    let mode = this_mode(json, login.interactive)?;
+    if login.no_browser && !login.interactive {
+        return Err(CliError::new(
+            Code::AuthRequired,
+            "--no-browser reads the login address from the terminal, so it needs --interactive",
+        )
+        .then(&["koi", "setup", "--interactive", "--no-browser"]));
     }
     not_set_up(paths)?;
+    if mode == Mode::Direct {
+        let choices = choices();
+        let mut text = "Set up Koidrive on this machine with one of these commands:\n".to_owned();
+        for choice in &choices {
+            text.push_str(&format!(
+                "  {}\n      {}\n",
+                choice.argv.join(" "),
+                choice.description
+            ));
+        }
+        let next = (choices.iter())
+            .map(|choice| Next {
+                argv: choice.argv.clone(),
+            })
+            .collect();
+        let mut done = Done::ok(ChoicesData { choices }, text);
+        done.next = next;
+        return Ok(done);
+    }
     println!("How do you want to set up Koidrive on this machine?");
     println!(
         "  1. Log in with Cloudflare: deploy a server to your account, or add this device to the server there"
@@ -137,24 +275,106 @@ pub async fn setup(paths: &Paths, device_name: &str, login: &LoginArgs) -> Resul
             with_session(login, async |session| {
                 session.setup(paths, device_name).await
             })
-            .await
+            .await?;
         }
         "2" => {
             let code = prompt("Pairing code: ").await?;
-            let invitation = crate::pairing::parse(&code, None)?;
+            let invitation = crate::pairing::parse(&code, None).map_err(CliError::usage)?;
             let request = Request::Pair {
                 server: invitation.server,
                 code: invitation.code,
                 name: device_name.to_owned(),
             };
-            report_paired(paths, ipc::run(paths, request).await?)
+            report_paired(paths, ipc::run(paths, request).await?)?;
         }
-        other => Err(format!("{other:?} is not 1 or 2")),
+        other => return Err(CliError::usage(format!("{other:?} is not 1 or 2"))),
+    }
+    Ok(Done::printed())
+}
+
+impl ServerAction {
+    fn login(&self) -> Option<&LoginArgs> {
+        match self {
+            ServerAction::Deploy { login, .. }
+            | ServerAction::AddDevice { login, .. }
+            | ServerAction::Upgrade { login, .. }
+            | ServerAction::Delete { login, .. } => Some(login),
+            ServerAction::Claim { .. } => None,
+        }
+    }
+
+    /// The same command with `--interactive`, for a person to run on a terminal. It keeps every argument that picks
+    /// what the command acts on, so that it reaches the same Worker, bucket and jurisdiction, and drops `--yes`, so
+    /// that the person is asked.
+    fn interactive_argv(&self) -> Vec<String> {
+        let (name, worker, bucket, jurisdiction, device) = match self {
+            ServerAction::Deploy { device, .. } => ("deploy", None, None, None, Some(device)),
+            ServerAction::AddDevice { worker, device, .. } => {
+                ("add-device", worker.as_deref(), None, None, Some(device))
+            }
+            ServerAction::Upgrade { worker, .. } => {
+                ("upgrade", worker.as_deref(), None, None, None)
+            }
+            ServerAction::Delete {
+                worker,
+                bucket,
+                jurisdiction,
+                ..
+            } => (
+                "delete",
+                worker.as_deref(),
+                bucket.as_deref(),
+                Some(jurisdiction.as_str()).filter(|name| *name != "default"),
+                None,
+            ),
+            ServerAction::Claim { .. } => ("claim", None, None, None, None),
+        };
+        let mut argv = Next::of(&["koi", "server", name]).argv;
+        let port = self
+            .login()
+            .and_then(|login| login.port)
+            .map(|port| port.to_string());
+        let named = [
+            ("--worker", worker),
+            ("--bucket", bucket),
+            ("--jurisdiction", jurisdiction),
+            ("--name", device.and_then(|device| device.name.as_deref())),
+        ];
+        for (flag, value) in named {
+            if let Some(value) = value {
+                argv.extend([flag.to_owned(), value.to_owned()]);
+            }
+        }
+        argv.push("--interactive".to_owned());
+        if self.login().is_some_and(|login| login.no_browser) {
+            argv.push("--no-browser".to_owned());
+        }
+        if let Some(port) = port {
+            argv.extend(["--port".to_owned(), port]);
+        }
+        argv
     }
 }
 
-/// `koi server <action>`. These never ask unless a terminal is attached and the step needs a yes.
-pub async fn server(paths: &Paths, action: ServerAction) -> Result<(), String> {
+/// `koi server <action>`. Each logs in with Cloudflare in a browser, so it runs only with `--interactive` and a
+/// terminal on stdin and stderr. Otherwise, with or without `--json`, it stops before the login and names the
+/// `--interactive` command for a person to run.
+pub async fn server(paths: &Paths, action: ServerAction, json: bool) -> Result<Done, CliError> {
+    let login = action.login().expect("main sends a claim to the driver");
+    if login.interactive && json {
+        return Err(CliError::usage("--interactive cannot be used with --json"));
+    }
+    let terminal = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    if !(login.interactive && terminal) {
+        let argv = action.interactive_argv();
+        let words: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let message = format!(
+            "this command logs in with Cloudflare in a browser; a person runs {} on a terminal",
+            argv.join(" ")
+        );
+        return Err(CliError::new(Code::AuthRequired, message).then(&words));
+    }
+    GUIDED.store(true, Ordering::Relaxed);
     match action {
         ServerAction::Deploy { device, login } => {
             not_set_up(paths)?;
@@ -163,10 +383,10 @@ pub async fn server(paths: &Paths, action: ServerAction) -> Result<(), String> {
             with_session(&login, async |session| {
                 session.server_deploy(paths, &name).await
             })
-            .await
+            .await?;
         }
         ServerAction::AddDevice {
-            server,
+            worker,
             device,
             login,
         } => {
@@ -175,22 +395,22 @@ pub async fn server(paths: &Paths, action: ServerAction) -> Result<(), String> {
             let name = device.name();
             with_session(&login, async |session| {
                 session
-                    .server_add_device(paths, server.as_deref(), &name)
+                    .server_add_device(paths, worker.as_deref(), &name)
                     .await
             })
-            .await
+            .await?;
         }
         ServerAction::Claim { .. } => unreachable!("main sends a claim to the driver"),
-        ServerAction::Upgrade { server, yes, login } => {
+        ServerAction::Upgrade { worker, yes, login } => {
             bundled()?;
             with_session(&login, async |session| {
-                let found = session.pick(server.as_deref()).await?;
+                let found = session.pick(worker.as_deref()).await?;
                 session.upgrade(&found, yes).await
             })
-            .await
+            .await?;
         }
-        ServerAction::Uninstall {
-            server,
+        ServerAction::Delete {
+            worker,
             bucket,
             jurisdiction,
             yes,
@@ -206,16 +426,17 @@ pub async fn server(paths: &Paths, action: ServerAction) -> Result<(), String> {
                 session
                     .uninstall(
                         paths,
-                        server.as_deref(),
+                        worker.as_deref(),
                         bucket.as_deref(),
                         jurisdiction,
                         yes,
                     )
                     .await
             })
-            .await
+            .await?;
         }
     }
+    Ok(Done::printed())
 }
 
 fn jurisdiction(text: &str) -> Result<Jurisdiction, String> {
@@ -233,19 +454,20 @@ fn jurisdiction(text: &str) -> Result<Jurisdiction, String> {
 
 /// Refuses a machine that is already set up, unless a run that stopped halfway left its state file: that run checks
 /// the saved credential before it claims (section 4.6).
-fn not_set_up(paths: &Paths) -> Result<(), String> {
+fn not_set_up(paths: &Paths) -> Result<(), CliError> {
     if paths.credential().exists() && !StateFile::new(paths).path().exists() {
         return Err(format!(
             "this device is already set up; its credential is {}",
             paths.credential().display()
-        ));
+        )
+        .into());
     }
     Ok(())
 }
 
 /// Why a new deploy or claim must not replace `state`, the state file of a run in `account` or another one that has
 /// not finished: the file is that run's only record of what it created.
-fn unfinished(state: &SetupState, account: &str, file: &Path) -> String {
+fn unfinished(state: &SetupState, account: &str, file: &Path) -> CliError {
     let run = if state.account != account {
         format!(
             "a setup of {} in another Cloudflare account ({}) has not finished; run koi setup and log in to that account to finish it",
@@ -253,7 +475,7 @@ fn unfinished(state: &SetupState, account: &str, file: &Path) -> String {
         )
     } else if state.step == Step::Uninstalling {
         format!(
-            "the uninstall of {} has not finished; run koi server uninstall to finish it",
+            "the delete of {} has not finished; run koi server delete to finish it",
             state.script
         )
     } else {
@@ -262,23 +484,22 @@ fn unfinished(state: &SetupState, account: &str, file: &Path) -> String {
             state.script
         )
     };
-    format!("{run}, or delete {} to forget it", file.display())
+    format!("{run}, or delete {} to forget it", file.display()).into()
 }
 
-fn report_paired(paths: &Paths, response: Response) -> Result<(), String> {
+fn report_paired(paths: &Paths, response: Response) -> Result<(), CliError> {
     match response {
         Response::Paired { account } => {
             println!(
                 "This device is set up as {} ({}) with {}.\nThe credential is in {}.",
-                account.device_name,
-                account.device_id,
-                account.server,
+                printable(&account.device_name),
+                printable(&account.device_id),
+                printable(&account.server),
                 paths.credential().display()
             );
             Ok(())
         }
-        Response::Error { message } => Err(message),
-        other => Err(format!("the daemon answered {other:?}")),
+        other => Err(format!("the daemon answered {other:?}").into()),
     }
 }
 
@@ -286,8 +507,8 @@ fn report_paired(paths: &Paths, response: Response) -> Result<(), String> {
 /// signal it exits at once with 130 for Ctrl-C or 143 for SIGTERM, as a shell does for a command the signal ended.
 async fn with_session(
     args: &LoginArgs,
-    work: impl AsyncFnOnce(&mut Session) -> Result<(), String>,
-) -> Result<(), String> {
+    work: impl AsyncFnOnce(&mut Session) -> Result<(), CliError>,
+) -> Result<(), CliError> {
     let mut terminate = signal(SignalKind::terminate()).map_err(|error| error.to_string())?;
     let mut interrupt = signal(SignalKind::interrupt()).map_err(|error| error.to_string())?;
     let mut status = None;
@@ -299,9 +520,11 @@ async fn with_session(
         status = Some(code);
         how
     };
+    SESSION.store(true, Ordering::Relaxed);
     let outcome = guarded(Session::login(args), stopped, work).await;
-    if let (Err(message), Some(code)) = (&outcome, status) {
-        eprintln!("koi: {message}");
+    SESSION.store(false, Ordering::Relaxed);
+    if let (Err(error), Some(code)) = (&outcome, status) {
+        eprintln!("koi: {}", printable(&error.message));
         std::process::exit(code);
     }
     outcome
@@ -310,27 +533,34 @@ async fn with_session(
 /// Runs `work` on the session `login` returns, then revokes its grant. The grant exists once `login` returns, so
 /// everything after that, the account lookup included, ends with the revocation, also when `stopped` fires.
 async fn guarded(
-    login: impl Future<Output = Result<Session, String>>,
+    login: impl Future<Output = Result<Session, CliError>>,
     mut stopped: impl AsyncFnMut() -> &'static str,
-    work: impl AsyncFnOnce(&mut Session) -> Result<(), String>,
-) -> Result<(), String> {
+    work: impl AsyncFnOnce(&mut Session) -> Result<(), CliError>,
+) -> Result<(), CliError> {
     let mut session = tokio::select! {
         session = login => session?,
-        how = stopped() => return Err(format!("{how} before the login finished")),
+        how = stopped() => return Err(format!("{how} before the login finished").into()),
     };
     let outcome = tokio::select! {
         outcome = async {
             session.pick_account().await?;
             work(&mut session).await
         } => outcome,
-        how = stopped() => Err(format!("{how}; run the same command again to continue")),
+        how = stopped() => Err(format!("{how}; run the same command again to continue").into()),
     };
     session.end().await;
     outcome
 }
 
-/// Asks `question` on stdout and reads one line of the answer from stdin.
-async fn prompt(question: &str) -> Result<String, String> {
+/// Asks `question` on stdout and reads one line of the answer from stdin, in a guided command only.
+async fn prompt(question: &str) -> Result<String, CliError> {
+    if !GUIDED.load(Ordering::Relaxed) {
+        return Err(format!(
+            "{} needs an answer, and this command does not ask without a terminal",
+            question.trim_end().trim_end_matches(':')
+        )
+        .into());
+    }
     print!("{question}");
     std::io::stdout()
         .flush()
@@ -347,7 +577,7 @@ async fn prompt(question: &str) -> Result<String, String> {
 /// waits for when it is dropped, so a read nobody answers stays blocked until the process exits.
 async fn read_answer(
     read: impl FnOnce() -> std::io::Result<String> + Send + 'static,
-) -> Result<String, String> {
+) -> Result<String, CliError> {
     let (sender, answer) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
         let _ = sender.send(read());
@@ -359,15 +589,15 @@ async fn read_answer(
     Ok(line.trim().to_owned())
 }
 
-/// Asks a yes-or-no question on a terminal. Without a terminal it refuses, naming `flag`.
-async fn confirm(question: &str, yes: bool, flag: &str) -> Result<(), String> {
+/// Asks a yes-or-no question in a guided command. Otherwise it refuses, naming `flag`.
+async fn confirm(question: &str, yes: bool, flag: &str) -> Result<(), CliError> {
     if yes {
         return Ok(());
     }
-    if !std::io::stdin().is_terminal() {
-        return Err(format!(
-            "{question} Run again with {flag} to go on without a terminal."
-        ));
+    if !GUIDED.load(Ordering::Relaxed) {
+        return Err(
+            format!("{question} Run again with {flag} to go on without a terminal.").into(),
+        );
     }
     match prompt(&format!("{question} [y/N] ")).await?.as_str() {
         "y" | "Y" | "yes" => Ok(()),
@@ -408,7 +638,7 @@ struct Bound {
 /// The Cloudflare account a command acts on, with an access token that is fresh for the next calls.
 trait Cloud {
     fn account(&self) -> &str;
-    async fn fresh(&mut self) -> Result<Cloudflare, String>;
+    async fn fresh(&mut self) -> Result<Cloudflare, CliError>;
 }
 
 /// One command's Cloudflare login: the grant and the account the user picked on the consent page.
@@ -428,12 +658,14 @@ impl Cloud for Session {
 
     /// Refreshes the access token when it is about to expire. A refresh that fails ends the command, because a retry
     /// with the old refresh token would revoke the grant (section 2).
-    async fn fresh(&mut self) -> Result<Cloudflare, String> {
+    async fn fresh(&mut self) -> Result<Cloudflare, CliError> {
         if self.grant.expires_within(TOKEN_MARGIN) {
-            self.grant
-                .refresh(&self.http)
-                .await
-                .map_err(|error| format!("{error}; run the command again to log in again"))?;
+            self.grant.refresh(&self.http).await.map_err(|error| {
+                CliError::caused(
+                    format!("{error}; run the command again to log in again"),
+                    error,
+                )
+            })?;
         }
         Ok(self.api())
     }
@@ -441,16 +673,12 @@ impl Cloud for Session {
 
 impl Session {
     /// Logs in with Cloudflare and returns once the code is exchanged for a grant, before any other call.
-    async fn login(args: &LoginArgs) -> Result<Session, String> {
+    async fn login(args: &LoginArgs) -> Result<Session, CliError> {
         let http = koidrive_cloudflare::http_client().map_err(|error| error.to_string())?;
         let loopback = if args.no_browser {
             None
         } else {
-            Some(
-                Loopback::bind(args.port)
-                    .await
-                    .map_err(|error| error.to_string())?,
-            )
+            Some(Loopback::bind(args.port).await?)
         };
         let port = match &loopback {
             Some(loopback) => loopback.port(),
@@ -466,8 +694,12 @@ impl Session {
                 open_browser(&page);
                 tokio::time::timeout(LOGIN_WAIT, loopback.callback(&login))
                     .await
-                    .map_err(|_| "the login did not finish within 10 minutes".to_owned())?
-                    .map_err(|error| error.to_string())?
+                    .map_err(|_| {
+                        CliError::new(
+                            Code::AuthRequired,
+                            "the login did not finish within 10 minutes",
+                        )
+                    })??
             }
             None => {
                 println!(
@@ -478,14 +710,11 @@ impl Session {
                 );
                 let pasted = prompt("Address: ").await?;
                 let url = Url::parse(&pasted)
-                    .map_err(|error| format!("that is not an address: {error}"))?;
-                login.code_from(&url).map_err(|error| error.to_string())?
+                    .map_err(|error| CliError::usage(format!("that is not an address: {error}")))?;
+                login.code_from(&url)?
             }
         };
-        let grant = login
-            .exchange(&http, code)
-            .await
-            .map_err(|error| error.to_string())?;
+        let grant = login.exchange(&http, code).await?;
         Ok(Session {
             http,
             grant,
@@ -499,22 +728,26 @@ impl Session {
     }
 
     /// Reads the one account the user picked on the consent page.
-    async fn pick_account(&mut self) -> Result<(), String> {
+    async fn pick_account(&mut self) -> Result<(), CliError> {
         let accounts = self
             .api()
             .accounts()
             .await
-            .map_err(|error| format!("cannot list the account: {error}"))?;
+            .map_err(|error| CliError::from(error).context("cannot list the account"))?;
         match <[Account; 1]>::try_from(accounts) {
             Ok([account]) => self.account = account,
             Err(accounts) => {
                 return Err(format!(
                     "the login gave access to {} accounts; pick exactly one on the consent page",
                     accounts.len()
-                ));
+                )
+                .into());
             }
         }
-        println!("Logged in to the Cloudflare account {}.", self.account.name);
+        println!(
+            "Logged in to the Cloudflare account {}.",
+            printable(&self.account.name)
+        );
         Ok(())
     }
 
@@ -542,7 +775,7 @@ impl Session {
         )
     }
 
-    async fn subdomain(&mut self) -> Result<String, String> {
+    async fn subdomain(&mut self) -> Result<String, CliError> {
         if let Some(subdomain) = &self.subdomain {
             return Ok(subdomain.clone());
         }
@@ -550,20 +783,25 @@ impl Session {
             .api()
             .workers_subdomain(self.account())
             .await
-            .map_err(|error| format!("cannot read the account's workers.dev subdomain: {error}"))?;
+            .map_err(|error| {
+                CliError::from(error).context("cannot read the account's workers.dev subdomain")
+            })?;
         self.subdomain = Some(subdomain.clone());
         Ok(subdomain)
     }
 
-    async fn worker_url(&mut self, script: &str) -> Result<Url, String> {
+    async fn worker_url(&mut self, script: &str) -> Result<Url, CliError> {
         let subdomain = self.subdomain().await?;
-        Url::parse(&format!("https://{script}.{subdomain}.workers.dev/"))
-            .map_err(|error| format!("{script} does not make a workers.dev address: {error}"))
+        Url::parse(&format!("https://{script}.{subdomain}.workers.dev/")).map_err(|error| {
+            CliError::from(format!(
+                "{script} does not make a workers.dev address: {error}"
+            ))
+        })
     }
 
     /// Waits until R2 is enabled on the account. R2 cannot be enabled through the API, so the user completes the
     /// dashboard's checkout (section 4.1).
-    async fn require_r2(&mut self) -> Result<(), String> {
+    async fn require_r2(&mut self) -> Result<(), CliError> {
         let started = Instant::now();
         let mut told = false;
         loop {
@@ -596,7 +834,12 @@ impl Session {
                     }
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
-                Err(error) => return Err(format!("cannot list the account's R2 buckets: {error}")),
+                Err(error) => {
+                    return Err(CliError::caused(
+                        format!("cannot list the account's R2 buckets: {error}"),
+                        error,
+                    ));
+                }
             }
         }
     }
@@ -604,19 +847,24 @@ impl Session {
     /// The Koidrive servers in the account (section 6): scripts with the tag, and untagged scripts that bind the
     /// Koidrive Durable Object classes, each checked with `GET /v1/server`. A tagged script that binds a bucket but does
     /// not answer is a deploy that stopped halfway, and is kept without `info`.
-    async fn find_servers(&mut self) -> Result<Vec<Found>, String> {
+    async fn find_servers(&mut self) -> Result<Vec<Found>, CliError> {
         let binding = embedded_bundle()?.manifest.r2_binding;
         let api = self.fresh().await?;
         let scripts = api
             .scripts(self.account())
             .await
-            .map_err(|error| format!("cannot list the account's Workers: {error}"))?;
+            .map_err(|error| CliError::from(error).context("cannot list the account's Workers"))?;
         let mut found = Vec::new();
         for script in scripts {
             let settings = api
                 .script_settings(self.account(), &script.id)
                 .await
-                .map_err(|error| format!("cannot read the settings of {}: {error}", script.id))?;
+                .map_err(|error| {
+                    CliError::caused(
+                        format!("cannot read the settings of {}: {error}", script.id),
+                        error,
+                    )
+                })?;
             let tagged = script.tags.iter().any(|tag| tag == TAG);
             let binds = |class: &str| {
                 settings.bindings.iter().any(|bound| {
@@ -648,31 +896,32 @@ impl Session {
     }
 
     /// The one server a command acts on: the named one, or the only one.
-    async fn pick(&mut self, name: Option<&str>) -> Result<Found, String> {
+    async fn pick(&mut self, name: Option<&str>) -> Result<Found, CliError> {
         let mut found = self.find_servers().await?;
         if let Some(name) = name {
             found.retain(|server| server.script.id == name);
         }
         match found.len() {
-            0 => Err(match name {
+            0 => Err(CliError::from(match name {
                 Some(name) => format!("the account has no Koidrive server named {name}"),
                 None => "the account has no Koidrive server; run koi server deploy".into(),
-            }),
+            })),
             1 => Ok(found.remove(0)),
             _ => Err(format!(
-                "the account has several Koidrive servers; name one with --server: {}",
+                "the account has several Koidrive servers; name one with --worker: {}",
                 found
                     .iter()
                     .map(|server| server.script.id.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
-            )),
+            )
+            .into()),
         }
     }
 
     /// The state file of an unfinished deploy in this account, if there is one. Any other run that has not finished
     /// stops the command here, before it calls the account: its file is that run's only record of what it created.
-    fn resumable(&self, paths: &Paths) -> Result<Option<SetupState>, String> {
+    fn resumable(&self, paths: &Paths) -> Result<Option<SetupState>, CliError> {
         let file = StateFile::new(paths);
         match file.load()? {
             Some(state) if self.continues(&state) => Ok(Some(state)),
@@ -688,7 +937,7 @@ impl Session {
 
     /// `koi server deploy` after the login: finish an interrupted deploy, or deploy a new server into an account
     /// that has none.
-    async fn server_deploy(&mut self, paths: &Paths, device_name: &str) -> Result<(), String> {
+    async fn server_deploy(&mut self, paths: &Paths, device_name: &str) -> Result<(), CliError> {
         if let Some(state) = self.resumable(paths)? {
             return self.finish_deploy(paths, state, device_name).await;
         }
@@ -697,7 +946,8 @@ impl Session {
             return Err(format!(
                 "the account already has a Koidrive server, {} at {}; run koi server add-device",
                 server.script.id, server.url
-            ));
+            )
+            .into());
         }
         self.deploy(paths, device_name).await
     }
@@ -708,7 +958,7 @@ impl Session {
         paths: &Paths,
         server: Option<&str>,
         device_name: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), CliError> {
         if let (Some(state), Some(name)) = (self.resumable(paths)?, server)
             && state.script != name
         {
@@ -723,7 +973,7 @@ impl Session {
     }
 
     /// `koi setup` after the login: finish an interrupted deploy, deploy a new server, or add this device.
-    async fn setup(&mut self, paths: &Paths, device_name: &str) -> Result<(), String> {
+    async fn setup(&mut self, paths: &Paths, device_name: &str) -> Result<(), CliError> {
         if let Some(state) = self.resumable(paths)? {
             println!(
                 "Continuing the setup that stopped earlier ({}).",
@@ -739,7 +989,12 @@ impl Session {
             _ => {
                 println!("The account has several Koidrive servers:");
                 for (index, server) in found.iter().enumerate() {
-                    println!("  {}. {} at {}", index + 1, server.script.id, server.url);
+                    println!(
+                        "  {}. {} at {}",
+                        index + 1,
+                        printable(&server.script.id),
+                        printable(server.url.as_str())
+                    );
                 }
                 let choice = prompt("Which one? ").await?;
                 let index = choice
@@ -754,14 +1009,14 @@ impl Session {
     }
 
     /// Picks a free Worker name and a new bucket name, then deploys and claims a new server (sections 4.3 and 4.4).
-    async fn deploy(&mut self, paths: &Paths, device_name: &str) -> Result<(), String> {
+    async fn deploy(&mut self, paths: &Paths, device_name: &str) -> Result<(), CliError> {
         let bundle = embedded_bundle()?;
         self.require_r2().await?;
         let api = self.fresh().await?;
         let scripts: Vec<String> = api
             .scripts(self.account())
             .await
-            .map_err(|error| format!("cannot list the account's Workers: {error}"))?
+            .map_err(|error| CliError::from(error).context("cannot list the account's Workers"))?
             .into_iter()
             .map(|script| script.id)
             .collect();
@@ -782,7 +1037,7 @@ impl Session {
         paths: &Paths,
         mut state: SetupState,
         device_name: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), CliError> {
         let file = StateFile::new(paths);
         let bundle = embedded_bundle()?;
         let mut key = None;
@@ -849,7 +1104,7 @@ impl Session {
         mut server: Found,
         device_name: &str,
         interactive: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), CliError> {
         let file = StateFile::new(paths);
         let saved = match file.load()? {
             Some(state) if self.continues(&state) && state.script == server.script.id => {
@@ -873,7 +1128,8 @@ impl Session {
                 return Err(format!(
                     "{} stopped halfway through its deploy; run koi setup to finish it",
                     server.script.id
-                ));
+                )
+                .into());
             }
         };
         let mut window = Duration::from_secs(60);
@@ -885,17 +1141,17 @@ impl Session {
                 embedded_bundle()?.manifest.version
             );
             if !interactive {
-                return Err(format!(
-                    "{reason} Run koi server upgrade, then this command again."
-                ));
+                return Err(
+                    format!("{reason} Run koi server upgrade, then this command again.").into(),
+                );
             }
             if confirm(&format!("{reason} Upgrade it now?"), false, "--yes")
                 .await
                 .is_err()
             {
-                return Err(format!(
-                    "{reason} Run koi server upgrade, then koi setup again."
-                ));
+                return Err(
+                    format!("{reason} Run koi server upgrade, then koi setup again.").into(),
+                );
             }
             self.upgrade(&server, false).await?;
             wait_for_setup_attempts(&server.url).await?;
@@ -929,29 +1185,33 @@ impl Session {
     }
 
     /// Turns on the Worker's workers.dev route and waits until the server answers there.
-    async fn serve(&mut self, script: &str, url: &Url) -> Result<ServerInfo, String> {
+    async fn serve(&mut self, script: &str, url: &Url) -> Result<ServerInfo, CliError> {
         self.fresh()
             .await?
             .enable_workers_dev(self.account(), script)
             .await
-            .map_err(|error| format!("cannot turn on workers.dev for {script}: {error}"))?;
+            .map_err(|error| {
+                CliError::from(error).context(format!("cannot turn on workers.dev for {script}"))
+            })?;
         wait_until_serving(url, None).await
     }
 
     /// Uploads the embedded server over an existing one (section 5).
-    async fn upgrade(&mut self, server: &Found, yes: bool) -> Result<(), String> {
+    async fn upgrade(&mut self, server: &Found, yes: bool) -> Result<(), CliError> {
         let bundle = embedded_bundle()?;
         let Some(info) = &server.info else {
             return Err(format!(
                 "{} does not answer; run koi setup to finish its deploy",
                 server.script.id
-            ));
+            )
+            .into());
         };
         if newer(&info.server_version, &bundle.manifest.version) {
             return Err(format!(
                 "{} runs Koidrive {}, newer than this CLI's {}; install a newer koi",
                 server.script.id, info.server_version, bundle.manifest.version
-            ));
+            )
+            .into());
         }
         if !server.script.tags.iter().any(|tag| tag == TAG) {
             confirm(
@@ -994,12 +1254,12 @@ impl Session {
         bucket: &Bound,
         deployed_tag: Option<&str>,
         secret: Option<&Secret>,
-    ) -> Result<(), String> {
+    ) -> Result<(), CliError> {
         let api = self.fresh().await?;
         let jwt = api
             .upload_assets(self.account(), script, &bundle.assets)
             .await
-            .map_err(|error| format!("cannot upload the static assets: {error}"))?;
+            .map_err(|error| CliError::from(error).context("cannot upload the static assets"))?;
         let plan = UploadPlan::new(
             bundle,
             &bucket.name,
@@ -1011,7 +1271,9 @@ impl Session {
         .map_err(|error| error.to_string())?;
         api.upload_script(self.account(), script, &plan)
             .await
-            .map_err(|error| format!("cannot upload the Worker {script}: {error}"))?;
+            .map_err(|error| {
+                CliError::from(error).context(format!("cannot upload the Worker {script}"))
+            })?;
         Ok(())
     }
 
@@ -1024,7 +1286,7 @@ impl Session {
         bucket: Option<&str>,
         jurisdiction: Jurisdiction,
         yes: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), CliError> {
         let file = StateFile::new(paths);
         match file.load()? {
             Some(state)
@@ -1082,12 +1344,13 @@ fn bundled() -> Result<(), String> {
 
 /// The embedded server bundle, read through [`Bundle::from_dir`] from a private copy, so the release's bundle passes the
 /// same checks as one on disk.
-fn embedded_bundle() -> Result<Bundle, String> {
+pub(crate) fn embedded_bundle() -> Result<Bundle, CliError> {
     bundled()?;
-    let broken =
-        |error: &dyn std::fmt::Display| format!("this koi's server bundle is broken: {error}");
-    let dir =
-        tempfile::tempdir().map_err(|error| format!("cannot unpack the server bundle: {error}"))?;
+    let broken = |error: &dyn std::fmt::Display| {
+        CliError::from(format!("this koi's server bundle is broken: {error}"))
+    };
+    let dir = tempfile::tempdir()
+        .map_err(|error| CliError::from(format!("cannot unpack the server bundle: {error}")))?;
     for (path, bytes) in SERVER_BUNDLE {
         let target = dir.path().join(path);
         if let Some(parent) = target.parent() {
@@ -1104,7 +1367,7 @@ async fn create_bucket(
     cloud: &mut impl Cloud,
     file: &StateFile,
     state: &mut SetupState,
-) -> Result<(), String> {
+) -> Result<(), CliError> {
     println!("Creating the R2 bucket {}...", state.bucket);
     let account = cloud.account().to_owned();
     match cloud
@@ -1116,14 +1379,14 @@ async fn create_bucket(
         Ok(()) => {}
         Err(error) if error.status() == Some(409) => {}
         Err(error) => {
-            return Err(format!(
-                "cannot create the bucket {}: {error}",
-                state.bucket
+            return Err(CliError::caused(
+                format!("cannot create the bucket {}: {error}", state.bucket),
+                error,
             ));
         }
     }
     state.step = Step::BucketCreated;
-    file.save(state)
+    Ok(file.save(state)?)
 }
 
 /// A bucket name only this deploy produces: `base`, a hyphen and 16 random hex digits (64 bits). Another
@@ -1143,13 +1406,13 @@ async fn keep_script_name(
     state: &mut SetupState,
     binding: &str,
     base: &str,
-) -> Result<(), String> {
+) -> Result<(), CliError> {
     let api = cloud.fresh().await?;
     let account = cloud.account().to_owned();
     let scripts = api
         .scripts(&account)
         .await
-        .map_err(|error| format!("cannot list the account's Workers: {error}"))?;
+        .map_err(|error| CliError::from(error).context("cannot list the account's Workers"))?;
     let Some(current) = scripts.iter().find(|script| script.id == state.script) else {
         return Ok(());
     };
@@ -1157,7 +1420,12 @@ async fn keep_script_name(
         let settings = api
             .script_settings(&account, &state.script)
             .await
-            .map_err(|error| format!("cannot read the settings of {}: {error}", state.script))?;
+            .map_err(|error| {
+                CliError::caused(
+                    format!("cannot read the settings of {}: {error}", state.script),
+                    error,
+                )
+            })?;
         if settings.r2_bucket(binding).is_some_and(|bound| {
             bound.bucket_name.as_deref() == Some(state.bucket.as_str())
                 && bound.jurisdiction.unwrap_or_default() == state.jurisdiction
@@ -1213,7 +1481,7 @@ async fn server_info(url: &Url) -> Option<ServerInfo> {
 }
 
 /// Polls `GET /v1/server` until it answers, and until it reports `version` when one is given.
-async fn wait_until_serving(url: &Url, version: Option<&str>) -> Result<ServerInfo, String> {
+async fn wait_until_serving(url: &Url, version: Option<&str>) -> Result<ServerInfo, CliError> {
     let started = Instant::now();
     loop {
         if let Some(info) = server_info(url)
@@ -1226,14 +1494,15 @@ async fn wait_until_serving(url: &Url, version: Option<&str>) -> Result<ServerIn
             return Err(format!(
                 "{url} did not answer as expected within {} seconds",
                 SERVE_WAIT.as_secs()
-            ));
+            )
+            .into());
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
 }
 
 /// Polls until the Account DO reports `setup_attempts`, which can take up to 300 seconds after an upgrade.
-async fn wait_for_setup_attempts(url: &Url) -> Result<(), String> {
+async fn wait_for_setup_attempts(url: &Url) -> Result<(), CliError> {
     println!("Waiting for the server's storage to move to the new version (up to 330 seconds)...");
     let started = Instant::now();
     loop {
@@ -1252,11 +1521,134 @@ async fn wait_for_setup_attempts(url: &Url) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
     use koidrive_proto::v1::DeviceCredentials;
     use serde_json::json;
 
     use super::fake::{self, ACCOUNT, Fake, Reply, cf, proto, revoked, tokens};
     use super::*;
+
+    #[test]
+    fn setup_guides_only_on_two_terminals_without_json_or_ci() {
+        let guided = |stdin, stderr, json, ci| mode(stdin, stderr, json, ci, false).unwrap();
+        assert_eq!(guided(true, true, false, false), Mode::Guided);
+        for (stdin, stderr, json, ci) in [
+            (false, true, false, false),
+            (true, false, false, false),
+            (false, false, false, false),
+            (true, true, true, false),
+            (true, true, false, true),
+            (true, true, true, true),
+        ] {
+            assert_eq!(
+                guided(stdin, stderr, json, ci),
+                Mode::Direct,
+                "stdin {stdin}, stderr {stderr}, json {json}, CI {ci}"
+            );
+        }
+    }
+
+    #[test]
+    fn interactive_asks_for_the_guide_and_fails_without_terminals() {
+        assert_eq!(mode(true, true, false, true, true).unwrap(), Mode::Guided);
+        for (stdin, stderr) in [(false, true), (true, false), (false, false)] {
+            let error = mode(stdin, stderr, false, false, true).unwrap_err();
+            assert_eq!(error.code, Code::Usage);
+            assert!(error.message.contains("needs a terminal"), "{error:?}");
+        }
+        assert_eq!(
+            mode(true, true, true, false, true).unwrap_err().code,
+            Code::Usage
+        );
+    }
+
+    #[test]
+    fn setup_lists_every_way_in_with_its_argv() {
+        let argv: Vec<String> = choices()
+            .iter()
+            .map(|choice| choice.argv.join(" "))
+            .collect();
+        assert_eq!(
+            argv,
+            [
+                "koi join <CODE>",
+                "koi server deploy",
+                "koi server add-device",
+                "koi server claim <SERVER_URL> <CODE> --user <NAME>",
+                "koi setup --interactive",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn json_and_a_pasted_login_stop_before_the_login_and_name_the_interactive_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let parse = |args: &[&str]| match crate::Cli::try_parse_from(args).unwrap().command {
+            Some(crate::Command::Server { action }) => action,
+            _ => unreachable!(),
+        };
+
+        let error = server(&paths, parse(&["koi", "server", "deploy"]), true)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, Code::AuthRequired);
+        assert_eq!(
+            error.next,
+            [Next::of(&["koi", "server", "deploy", "--interactive"])]
+        );
+
+        let action = parse(&["koi", "server", "upgrade", "--worker", "fb", "--no-browser"]);
+        let error = server(&paths, action, false).await.unwrap_err();
+        assert_eq!(error.code, Code::AuthRequired);
+        assert_eq!(
+            error.next,
+            [Next::of(&[
+                "koi",
+                "server",
+                "upgrade",
+                "--worker",
+                "fb",
+                "--interactive",
+                "--no-browser"
+            ])]
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_commands_without_interactive_and_terminals_need_auth_and_name_the_interactive_command()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let parse = |args: &[&str]| match crate::Cli::try_parse_from(args).unwrap().command {
+            Some(crate::Command::Server { action }) => action,
+            _ => unreachable!(),
+        };
+        for (args, next) in [
+            (&["deploy"][..], &["deploy", "--interactive"][..]),
+            (&["add-device"], &["add-device", "--interactive"]),
+            (
+                &["upgrade", "--worker", "fb", "--yes"],
+                &["upgrade", "--worker", "fb", "--interactive"],
+            ),
+            (&["upgrade"], &["upgrade", "--interactive"]),
+            (
+                &["delete", "--bucket", "fb-1a2b", "--yes"],
+                &["delete", "--bucket", "fb-1a2b", "--interactive"],
+            ),
+            (&["deploy", "--interactive"], &["deploy", "--interactive"]),
+        ] {
+            let argv = [&["koi", "server"][..], args].concat();
+            let error = server(&paths, parse(&argv), false).await.unwrap_err();
+            assert_eq!(error.code, Code::AuthRequired, "{args:?}");
+            assert_eq!(
+                error.next,
+                [Next::of(&[&["koi", "server"][..], next].concat())],
+                "{args:?}"
+            );
+        }
+        assert!(!dir.path().join("state").exists(), "nothing was set up");
+    }
 
     fn deployed(fake: &Fake) -> Found {
         Found {
@@ -1295,7 +1687,10 @@ mod tests {
             async || "stopped",
             async |_: &mut Session| Ok(()),
         ));
-        assert_eq!(outcome.unwrap_err(), "stopped before the login finished");
+        assert_eq!(
+            outcome.unwrap_err().message,
+            "stopped before the login finished"
+        );
         let (dropped, done) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             drop(runtime);
@@ -1308,9 +1703,9 @@ mod tests {
     #[tokio::test]
     async fn an_answer_is_read_without_its_line_end() {
         let answer = read_answer(|| Ok(" y\n".to_owned())).await;
-        assert_eq!(answer.as_deref(), Ok("y"));
+        assert_eq!(answer.unwrap(), "y");
         let failed = read_answer(|| Err(std::io::Error::other("closed"))).await;
-        assert_eq!(failed.unwrap_err(), "closed");
+        assert_eq!(failed.unwrap_err().message, "closed");
     }
 
     #[tokio::test]
@@ -1333,7 +1728,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            outcome.unwrap_err(),
+            outcome.unwrap_err().message,
             "stopped; run the same command again to continue"
         );
         let revocations = oauth
@@ -1442,7 +1837,8 @@ mod tests {
         let mut state = file.load().unwrap().unwrap();
         let error = create_bucket(&mut fake::session(&lost).await, &file, &mut state)
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .message;
         assert!(error.contains("cannot create the bucket"), "{error}");
         assert_eq!(file.load().unwrap(), Some(planned));
 
@@ -1561,7 +1957,8 @@ mod tests {
             let error = session
                 .uninstall(&paths, None, named, Jurisdiction::Default, true)
                 .await
-                .unwrap_err();
+                .unwrap_err()
+                .message;
 
             assert!(error.contains("has not finished"), "{error}");
             assert_eq!(StateFile::new(&paths).load().unwrap(), Some(other));
@@ -1601,7 +1998,8 @@ mod tests {
                     "server deploy" => session.server_deploy(&paths, "desk").await,
                     _ => session.server_add_device(&paths, None, "desk").await,
                 }
-                .unwrap_err();
+                .unwrap_err()
+                .message;
 
                 assert!(error.contains("has not finished"), "{entry}: {error}");
                 assert_eq!(StateFile::new(&paths).load().unwrap(), Some(other.clone()));
@@ -1628,7 +2026,8 @@ mod tests {
         let error = session
             .add_device(&paths, deployed(&fake), "laptop", true)
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .message;
 
         assert!(
             error.contains("the deploy of koidrive-2 has not finished"),
@@ -1663,7 +2062,8 @@ mod tests {
         let error = session
             .server_add_device(&paths, Some("koidrive"), "laptop")
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .message;
 
         assert!(
             error.contains("the deploy of koidrive-2 has not finished"),
@@ -1686,6 +2086,7 @@ mod tests {
             None => assert!(
                 embedded_bundle()
                     .unwrap_err()
+                    .message
                     .contains("built without a server bundle")
             ),
             Some(_) => {

@@ -1,55 +1,95 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `koi` command: sets up a server or joins one, links folders, shows status and pending decisions, lists a folder's
-//! trash and a file's versions, manages the account's devices, shows what each space stores, and runs the sync daemon.
-//! Commands run in the daemon through its socket when it is running, and on their own otherwise. The device, usage,
-//! trash and versions commands talk to the server directly with the credential.
+//! The `koi` command: shows status and pending decisions, sets up a server or joins one, links folders, lists a
+//! folder's trash and a file's versions, manages the account's devices and spaces, and runs the sync daemon. Commands
+//! run in the daemon through its socket when it is running, and on their own otherwise. The device, space, trash and
+//! versions commands talk to the server directly with the credential. With `--json` every command prints one
+//! envelope (see [`report`]) and exits with the status of its [`error::Code`].
 
+mod error;
 mod history;
 mod ipc;
 mod notify;
 mod pairing;
+mod report;
 mod setup;
 
+use std::ffi::OsString;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use koidrive_driver::{
-    Answer, Credential, Driver, DriverError, FolderStatus, Limit, MAX_DELETIONS, Paths, Question,
-    QuestionKind, RecoveryGroup, SET_UP_AGAIN, Status,
+    Answer, Credential, Driver, DriverError, FolderState, FolderStatus, Limit, MAX_DELETIONS,
+    Paths, Question, QuestionKind, RecoveryGroup, Status,
 };
-use koidrive_net::{ApiError, Auth, Reload};
-use koidrive_proto::v1::{
-    CreateSpaceRequest, DeviceInfo, SpaceInfo, SpaceUsage, device_info::Kind,
-};
+use koidrive_net::{Auth, Reload};
+use koidrive_proto::v1::{CreateSpaceRequest, DeviceInfo, SpaceInfo, SpaceUsage};
+use serde_json::Value;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::EnvFilter;
 
+use crate::error::{CliError, Code};
 use crate::ipc::{Request, Response};
+use crate::report::{
+    AccountData, AnsweredData, Decision, DeviceData, DevicesData, Done, Envelope, FolderData,
+    HelpData, InvitationData, Lifecycle, RefusedSpace, RevokedData, SpaceData, SpacesData,
+    StatusData, UnlinkedData, UsageData, UsagesData, VersionInfoData,
+};
 
 #[derive(Parser)]
-#[command(name = "koi", version, about = "Koidrive sync client.")]
+#[command(
+    name = "koi",
+    version,
+    about = "Koidrive sync client.",
+    long_about = "Koidrive keeps your folders in sync through your own server.",
+    after_help = "Commands ask questions only when a terminal is attached to stdin and stderr.\nAgents: start with koi status --json."
+)]
 struct Cli {
+    /// Print one JSON object with the result. Only schema 1 exists.
+    #[arg(
+        long,
+        global = true,
+        value_name = "VERSION",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "1",
+        value_parser = schema_version
+    )]
+    json: Option<u32>,
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Set up Koidrive on this machine: join with a code from another device, or log in with Cloudflare to deploy a
-    /// server to your account or add this device to the server there.
+    /// Show sync state, pending decisions, and the commands to resolve them.
+    Status {
+        /// Exit with 4 when this device is not set up, 5 when a folder is halted or stopped, 3 when a decision needs a
+        /// choice, or 6 when a folder is offline, in that order.
+        #[arg(long)]
+        check: bool,
+    },
+    /// List pending decisions, or answer one by its ID.
+    Resolve {
+        /// The decision to make, as koi resolve lists it.
+        #[arg(requires = "answer")]
+        id: Option<String>,
+        /// One of the answers the decision lists.
+        #[arg(value_parser = |text: &str| text.parse::<Answer>())]
+        answer: Option<Answer>,
+    },
+    /// Show the setup choices, or run the guided setup on a terminal.
     Setup {
-        /// A pairing code from another device, such as K7QM-2XPD@koidrive.alice.workers.dev.
-        code: Option<String>,
         #[command(flatten)]
         device: DeviceArgs,
         #[command(flatten)]
         login: setup::LoginArgs,
     },
-    /// Join a server with a pairing code from a device that is already paired.
+    /// Add this device with a pairing code from a device that is already paired.
     Join {
         /// The pairing code, such as K7QM-2XPD@koidrive.alice.workers.dev.
         code: String,
@@ -59,16 +99,79 @@ enum Command {
         #[command(flatten)]
         device: DeviceArgs,
     },
-    /// Deploy, add this device to, upgrade or remove the Koidrive server in your Cloudflare account.
+    /// Deploy, claim, add this device to, upgrade or delete the server in your Cloudflare account.
+    #[command(arg_required_else_help = true)]
     Server {
         #[command(subcommand)]
         action: setup::ServerAction,
     },
-    /// Create a space, or list the spaces of the server.
+    /// Create and list spaces, or show their storage usage.
+    #[command(arg_required_else_help = true)]
     Space {
         #[command(subcommand)]
         action: SpaceAction,
     },
+    /// Link, unlink, restart, or retry a local folder.
+    #[command(arg_required_else_help = true)]
+    Folder {
+        #[command(subcommand)]
+        action: FolderAction,
+    },
+    /// Invite, list, or revoke devices.
+    #[command(arg_required_else_help = true)]
+    Device {
+        #[command(subcommand)]
+        action: DeviceAction,
+    },
+    /// List trash, versions, and restore requests, or request a restore.
+    #[command(arg_required_else_help = true)]
+    History {
+        #[command(subcommand)]
+        action: history::HistoryAction,
+    },
+    /// Run the sync daemon in the foreground until SIGTERM or SIGINT.
+    #[command(name = "_daemon", hide = true)]
+    Daemon {
+        #[arg(long, value_enum, default_value_t = LogFormat::Text)]
+        log_format: LogFormat,
+    },
+}
+
+impl Command {
+    /// Whether the command reports the decisions pending in the profile after its own output: on stderr as a banner,
+    /// or in the JSON envelope. `status` and `resolve` show the decisions themselves, and the daemon never ends.
+    fn reports_pending(&self) -> bool {
+        !matches!(
+            self,
+            Command::Daemon { .. } | Command::Status { .. } | Command::Resolve { .. }
+        )
+    }
+}
+
+impl Cli {
+    /// Whether the command ends with the pending-decision banner on stderr. JSON output carries decisions as data,
+    /// without decoration.
+    fn shows_banner(&self) -> bool {
+        self.json.is_none() && self.command.as_ref().is_some_and(Command::reports_pending)
+    }
+}
+
+#[derive(Subcommand)]
+enum SpaceAction {
+    /// Create a space. Link a folder to it with koi folder link.
+    Create {
+        /// The space's name, at most 255 bytes.
+        #[arg(value_parser = short_name)]
+        name: String,
+    },
+    /// List the spaces of the server.
+    List,
+    /// Show how many bytes each space stores: in live files, in the trash and in old versions.
+    Usage,
+}
+
+#[derive(Subcommand)]
+enum FolderAction {
     /// Link a folder to a space and start syncing it.
     Link {
         /// The folder to sync. It must exist and may already hold files.
@@ -89,7 +192,7 @@ enum Command {
     },
     /// Sync a folder again whose changes the server refused, after fixing the cause the status names.
     #[command(group = clap::ArgGroup::new("how").required(true).args(["resend", "replan"]))]
-    Lift {
+    Retry {
         /// The linked folder whose changes the server refused.
         folder: PathBuf,
         /// Send the refused changes again as they were, for a cause fixed on the server.
@@ -99,127 +202,14 @@ enum Command {
         #[arg(long)]
         replan: bool,
     },
-    /// Show this device and its linked folders.
-    Status {
-        /// Print JSON instead of text.
-        #[arg(long)]
-        json: bool,
-    },
-    /// List the decisions sync is waiting on, or make one.
-    Resolve {
-        /// The decision to make, as koi resolve lists it.
-        #[arg(requires = "answer")]
-        id: Option<String>,
-        /// One of the answers the decision lists.
-        #[arg(value_parser = |text: &str| text.parse::<Answer>())]
-        answer: Option<Answer>,
-        /// Print the list of decisions as JSON instead of text. Making a decision always prints text.
-        #[arg(long, conflicts_with = "id")]
-        json: bool,
-    },
-    /// List the devices paired with the server, or revoke a lost one.
-    Device {
-        #[command(subcommand)]
-        action: DeviceAction,
-    },
-    /// List what was deleted in a linked folder and is still in its space's trash.
-    Trash {
-        /// A linked folder, or a folder inside one.
-        #[arg(default_value = ".")]
-        folder: PathBuf,
-        /// Print JSON instead of text.
-        #[arg(long)]
-        json: bool,
-    },
-    /// List the versions the server keeps of a file in a linked folder, newest first.
-    Versions {
-        /// A file in a linked folder.
-        file: PathBuf,
-        /// Print JSON instead of text.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Bring a deleted file or folder back from its space's trash to where it was, or make an earlier version of a
-    /// file current again. The daemon sends the request with the folder's next commit.
-    Restore {
-        /// The deleted file or folder at the path it had, or the file whose version to restore.
-        path: PathBuf,
-        /// Restore this version of the file, as koi versions lists it.
-        #[arg(long)]
-        version: Option<String>,
-        /// The deleted node to restore, as koi trash --json lists it, when several deletions had this path.
-        #[arg(long, conflicts_with = "version")]
-        node: Option<String>,
-    },
-    /// List the restores asked for in a linked folder and how each one went.
-    Restores {
-        /// A linked folder, or a folder inside one.
-        #[arg(default_value = ".")]
-        folder: PathBuf,
-        /// Print JSON instead of text.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show how many bytes each space stores: in live files, in the trash, in old versions and in unreferenced chunks.
-    Usage {
-        /// Print JSON instead of text.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Run the sync daemon in the foreground until SIGTERM or SIGINT.
-    Daemon {
-        #[arg(long, value_enum, default_value_t = LogFormat::Text)]
-        log_format: LogFormat,
-    },
-}
-
-impl Command {
-    /// Whether the command ends with the pending-decision banner on stderr. `status` and `resolve` show the decisions
-    /// themselves, the daemon never ends, and JSON output carries decisions as data, without decoration.
-    fn shows_banner(&self) -> bool {
-        match self {
-            Command::Daemon { .. } | Command::Status { .. } | Command::Resolve { .. } => false,
-            Command::Trash { json, .. }
-            | Command::Versions { json, .. }
-            | Command::Restores { json, .. }
-            | Command::Usage { json }
-            | Command::Space {
-                action: SpaceAction::List { json },
-            }
-            | Command::Device {
-                action: DeviceAction::List { json },
-            } => !json,
-            _ => true,
-        }
-    }
-}
-
-#[derive(Subcommand)]
-enum SpaceAction {
-    /// Create a space. Link a folder to it with koi link.
-    Create {
-        /// The space's name, at most 255 bytes.
-        #[arg(value_parser = short_name)]
-        name: String,
-    },
-    /// List the spaces of the server.
-    List {
-        /// Print JSON instead of text.
-        #[arg(long)]
-        json: bool,
-    },
 }
 
 #[derive(Subcommand)]
 enum DeviceAction {
     /// Show a pairing code that adds another device to this server. It works once, for 10 minutes.
-    Add,
+    Invite,
     /// List the devices paired with the server, revoked ones included.
-    List {
-        /// Print JSON instead of text.
-        #[arg(long)]
-        json: bool,
-    },
+    List,
     /// Revoke another device, such as a lost one. It stops syncing at once, and the files on it stay there.
     Revoke {
         /// The device's ID, as koi device list shows it.
@@ -253,86 +243,316 @@ enum LogFormat {
     Json,
 }
 
+fn schema_version(text: &str) -> Result<u32, String> {
+    match text {
+        "1" => Ok(1),
+        _ => Err("only JSON schema 1 exists".to_owned()),
+    }
+}
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    let Some(command) = cli.command else {
-        println!("koi {}", env!("CARGO_PKG_VERSION"));
-        return ExitCode::SUCCESS;
+    let args: Vec<OsString> = std::env::args_os().collect();
+    let command = command_path(&args);
+    if let Some(error) = json_versions(&args).find_map(Result::err) {
+        return finish(&command, true, Err(CliError::usage(error)), Vec::new());
+    }
+    if let Some(names) = help_names(&args).filter(|_| json_requested(&args)) {
+        let path = names.join(" ");
+        let outcome = help_of(&path)
+            .map(help_done)
+            .ok_or_else(|| CliError::usage(format!("no command is named {}", printable(&path))));
+        return finish(format!("help {path}").trim_end(), true, outcome, Vec::new());
+    }
+    let cli = match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(error) => return parse_failure(error, &args, &command, json_requested(&args)),
     };
-    let log_format = match &command {
+    let json = cli.json.is_some();
+    let shows_banner = cli.shows_banner();
+    let Some(command_args) = cli.command else {
+        let help = Cli::command().render_help().to_string();
+        return finish(&command, json, Ok(help_done(help)), Vec::new());
+    };
+    let reports_pending = command_args.reports_pending();
+    let log_format = match &command_args {
+        Command::Daemon { .. } if json => Some(LogFormat::Json),
         Command::Daemon { log_format } => Some(*log_format),
         _ => None,
     };
-    init_logging(log_format);
+    init_logging(log_format, json);
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
     {
         Ok(runtime) => runtime,
-        Err(error) => return fail(format!("cannot start: {error}")),
+        Err(error) => {
+            let error = CliError::from(format!("cannot start: {error}"));
+            return finish(&command, json, Err(error), Vec::new());
+        }
     };
     let paths = match Paths::from_env() {
         Ok(paths) => paths,
-        Err(error) => return fail(error.to_string()),
+        Err(error) => return finish(&command, json, Err(error.to_string().into()), Vec::new()),
     };
-    let shows_banner = command.shows_banner();
-    let banner_paths = paths.clone();
-    let (outcome, banner) = runtime.block_on(async move {
-        let outcome = match command {
-            Command::Daemon { .. } => daemon(paths).await,
-            Command::Device { action } => device(paths, action).await,
-            Command::Space { action } => space(paths, action).await,
-            Command::Usage { json } => usage(paths, json).await,
-            Command::Trash { folder, json } => history::trash(&paths, &folder, json).await,
-            Command::Versions { file, json } => history::versions(&paths, &file, json).await,
-            Command::Restore {
-                path,
-                version,
-                node,
-            } => history::restore(&paths, &path, version, node).await,
-            Command::Restores { folder, json } => history::restores(&paths, &folder, json).await,
-            Command::Setup {
-                code: None,
-                device,
-                login,
-            } => setup::setup(&paths, &device.name(), &login).await,
-            command @ Command::Server {
-                action: setup::ServerAction::Claim { .. },
-            } => client(paths, command).await,
-            Command::Server { action } => setup::server(&paths, action).await,
-            command => client(paths, command).await,
+    let daemon_run = matches!(command_args, Command::Daemon { .. });
+    let pending_paths = paths.clone();
+    let (outcome, pending) = runtime.block_on(async {
+        let interrupt = async {
+            if daemon_run {
+                return std::future::pending().await;
+            }
+            loop {
+                let caught = tokio::signal::ctrl_c().await;
+                if caught.is_err() || !setup::in_session() {
+                    return caught;
+                }
+            }
         };
-        let banner = match shows_banner {
-            true => pending_banner(&banner_paths).await,
-            false => None,
-        };
-        (outcome, banner)
+        tokio::select! {
+            done = async move {
+                let outcome = run(paths, command_args, json).await;
+                let pending = match reports_pending && (json || shows_banner) {
+                    true => pending_questions(&pending_paths).await,
+                    false => Vec::new(),
+                };
+                (outcome, pending)
+            } => done,
+            Ok(()) = interrupt => {
+                let error = CliError::new(
+                    Code::Interrupted,
+                    "interrupted by Ctrl-C; what the command already did stays done",
+                );
+                finish(&command, json, Err(error), Vec::new());
+                let _ = io::Write::flush(&mut io::stdout());
+                std::process::exit(Code::Interrupted.exit().into());
+            }
+        }
     });
-    let code = match outcome {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(message) => fail(message),
-    };
-    if let Some(banner) = banner {
-        eprintln!("{banner}");
+    if json && daemon_run && outcome.is_ok() {
+        return ExitCode::SUCCESS;
     }
-    code
+    finish(&command, json, outcome, pending)
 }
 
-fn fail(message: String) -> ExitCode {
-    eprintln!("koi: {message}");
-    ExitCode::FAILURE
+async fn run(paths: Paths, command: Command, json: bool) -> Result<Done, CliError> {
+    match command {
+        Command::Daemon { .. } => daemon(paths, json).await,
+        Command::Status { check } => status(&paths, check).await,
+        Command::Resolve { id, answer } => resolve(&paths, id, answer).await,
+        Command::Setup { device, login } => {
+            setup::setup(&paths, &device.name(), &login, json).await
+        }
+        Command::Join {
+            code,
+            server,
+            device,
+        } => {
+            let invitation = pairing::parse(&code, server.as_deref()).map_err(CliError::usage)?;
+            let request = Request::Pair {
+                server: invitation.server,
+                code: invitation.code,
+                name: device.name(),
+            };
+            paired(&paths, ipc::run(&paths, request).await?)
+        }
+        Command::Server {
+            action:
+                setup::ServerAction::Claim {
+                    server,
+                    code,
+                    user,
+                    device,
+                },
+        } => {
+            let request = Request::Claim {
+                server: pairing::server_url(&server),
+                code: code.trim().to_owned(),
+                user_name: user,
+                name: device.name(),
+            };
+            paired(&paths, ipc::run(&paths, request).await?)
+        }
+        Command::Server { action } => setup::server(&paths, action, json).await,
+        Command::Space { action } => space(paths, action).await,
+        Command::Folder { action } => folder(&paths, action).await,
+        Command::Device { action } => device(paths, action).await,
+        Command::History { action } => history::run(&paths, action).await,
+    }
+}
+
+/// Prints what the command produced and returns its exit status. Without `--json` the text goes to stdout and an error
+/// to stderr; with it, one envelope goes to stdout. Pending decisions follow as a banner on stderr, or as the
+/// envelope's decisions.
+fn finish(
+    command: &str,
+    json: bool,
+    outcome: Result<Done, CliError>,
+    pending: Vec<Question>,
+) -> ExitCode {
+    let (exit, envelope, text, stderr) = match outcome {
+        Ok(done) => {
+            let exit = done.exit;
+            let (text, note) = (done.text.clone(), done.note.clone());
+            (exit, Envelope::of(command, done), text, note)
+        }
+        Err(mut error) => {
+            let partial = error.partial.take().map(|partial| *partial);
+            let text = (partial.as_ref()).map_or_else(String::new, |done| done.text.clone());
+            let message = format!("koi: {}\n", printable(&error.message));
+            let exit = error.code.exit();
+            (
+                exit,
+                Envelope::failed(command, error, partial),
+                text,
+                message,
+            )
+        }
+    };
+    if json && command == "_daemon" {
+        println!(
+            "{}",
+            serde_json::to_string(&envelope).expect("the envelope serializes")
+        );
+        return ExitCode::from(exit);
+    }
+    if json {
+        let mut envelope = envelope;
+        if envelope.decisions.is_empty() {
+            envelope.decisions = pending.iter().map(Decision::of).collect();
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&envelope).expect("the envelope serializes")
+        );
+        return ExitCode::from(exit);
+    }
+    print!("{text}");
+    eprint!("{stderr}");
+    if let Some(banner) = banner(&pending) {
+        eprintln!("{banner}");
+    }
+    ExitCode::from(exit)
+}
+
+/// What clap reports when it parses no command: help and the version are results, anything else a usage error.
+/// Without `--json` clap prints them itself, except that a group named without its subcommand shows its help on
+/// stdout and succeeds, like `koi` alone.
+fn parse_failure(error: clap::Error, args: &[OsString], command: &str, json: bool) -> ExitCode {
+    let kind = error.kind();
+    let bare_group = matches!(
+        kind,
+        ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand | ErrorKind::MissingSubcommand
+    );
+    let shown = matches!(kind, ErrorKind::DisplayHelp | ErrorKind::DisplayVersion);
+    if !json && shown {
+        error.exit();
+    }
+    let rendered = escape_echoed(&error, args);
+    if !json && !bare_group {
+        eprint!("{rendered}");
+        return ExitCode::from(2);
+    }
+    let outcome = match kind {
+        _ if bare_group => Ok(help_done(help_of(command).expect("clap parsed the path"))),
+        ErrorKind::DisplayHelp => Ok(help_done(rendered)),
+        ErrorKind::DisplayVersion => Ok(Done::ok(
+            VersionInfoData {
+                version: env!("CARGO_PKG_VERSION"),
+            },
+            rendered,
+        )),
+        _ => Err(CliError::usage(rendered.trim_end())),
+    };
+    finish(command, json, outcome, Vec::new())
+}
+
+/// Clap's message for arguments it refused, with every argument it echoes escaped so that a control character in one
+/// cannot forge a line. Clap echoes parts of an argument, so the message comes from parsing the escaped arguments
+/// again, which keeps the message's own line breaks; should those parse, the whole message is escaped instead.
+fn escape_echoed(error: &clap::Error, args: &[OsString]) -> String {
+    let escaped: Vec<OsString> = (args.iter())
+        .map(|arg| match arg.to_str() {
+            Some(text) => printable(text).into(),
+            None => arg.clone(),
+        })
+        .collect();
+    if escaped == args {
+        return error.render().to_string();
+    }
+    match Cli::try_parse_from(&escaped) {
+        Err(again) if again.kind() == error.kind() => again.render().to_string(),
+        _ => printable(&error.render().to_string()),
+    }
+}
+
+/// The help of the command at `path`, such as `folder`, or none when no command has that path.
+fn help_of(path: &str) -> Option<String> {
+    let mut root = Cli::command();
+    root.build();
+    let mut command = &mut root;
+    for name in path.split_whitespace() {
+        command = command.find_subcommand_mut(name)?;
+    }
+    Some(command.render_help().to_string())
+}
+
+/// The command names after `help` when `help` is the first command named, as in `koi help folder --json`.
+/// Clap's own `help` reads every argument as a command name, `--json` included.
+fn help_names(args: &[OsString]) -> Option<Vec<&str>> {
+    let mut names = (args.iter().skip(1))
+        .take_while(|arg| *arg != "--")
+        .filter_map(|arg| arg.to_str())
+        .filter(|arg| !arg.starts_with('-'));
+    (names.next() == Some("help")).then(|| names.collect())
+}
+
+fn help_done(help: String) -> Done {
+    Done::ok(HelpData { help: help.clone() }, help)
+}
+
+/// Whether the arguments ask for JSON, read before clap parses them so that a usage error is JSON too.
+/// The schema versions the arguments name with `--json=<version>`, each read as clap reads it.
+fn json_versions(args: &[OsString]) -> impl Iterator<Item = Result<u32, String>> + '_ {
+    (args.iter().skip(1))
+        .take_while(|arg| *arg != "--")
+        .filter_map(|arg| arg.to_str()?.strip_prefix("--json="))
+        .map(schema_version)
+}
+
+fn json_requested(args: &[OsString]) -> bool {
+    (args.iter().skip(1))
+        .take_while(|arg| *arg != "--")
+        .filter_map(|arg| arg.to_str())
+        .any(|arg| arg == "--json" || arg.starts_with("--json="))
+}
+
+/// The subcommand path the arguments name, such as `folder link`: each argument that names a subcommand of the one before.
+fn command_path(args: &[OsString]) -> String {
+    let mut command = Cli::command();
+    let mut path = Vec::new();
+    for arg in args.iter().skip(1).filter_map(|arg| arg.to_str()) {
+        if arg.starts_with('-') {
+            continue;
+        }
+        let Some(sub) = command.find_subcommand(arg).cloned() else {
+            break;
+        };
+        path.push(sub.get_name().to_owned());
+        command = sub;
+    }
+    path.join(" ")
 }
 
 /// Logs go to stderr: structured key-value text by default, one JSON object per line with `--log-format json`. The
 /// level comes from `KOIDRIVE_LOG` (`info` for the daemon, `warn` for other commands). No log line carries a
 /// credential, an access token or a pairing code.
-fn init_logging(daemon: Option<LogFormat>) {
+fn init_logging(daemon: Option<LogFormat>, json: bool) {
     let default = if daemon.is_some() { "info" } else { "warn" };
     let filter =
         EnvFilter::try_from_env("KOIDRIVE_LOG").unwrap_or_else(|_| EnvFilter::new(default));
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_ansi(std::io::stderr().is_terminal())
+        .with_ansi(log_ansi(std::io::stderr().is_terminal(), json))
         .with_writer(std::io::stderr);
     match daemon {
         Some(LogFormat::Json) => builder.json().with_current_span(false).init(),
@@ -340,12 +560,24 @@ fn init_logging(daemon: Option<LogFormat>) {
     }
 }
 
-async fn daemon(paths: Paths) -> Result<(), String> {
+/// Whether log lines carry ANSI colours: only on a terminal, and never under `--json`.
+fn log_ansi(stderr_tty: bool, json: bool) -> bool {
+    stderr_tty && !json
+}
+
+/// The sync daemon, until SIGTERM or SIGINT. With `json` it prints one JSON object per line on stdout as it starts,
+/// as a folder changes state, as it stops and once it stopped, and its logs on stderr are JSON lines too.
+async fn daemon(paths: Paths, json: bool) -> Result<Done, CliError> {
+    let emit = |event: Lifecycle| {
+        if json {
+            println!("{}", event.line());
+        }
+    };
     let driver = Driver::open(paths).map_err(|error| match error {
         DriverError::Busy(_) => {
-            "another Koidrive daemon or command is using this profile".to_owned()
+            CliError::from("another Koidrive daemon or command is using this profile")
         }
-        other => other.to_string(),
+        other => CliError::from(other),
     })?;
     let socket = driver.paths().socket();
     let listener = ipc::bind(&socket)
@@ -356,199 +588,219 @@ async fn daemon(paths: Paths) -> Result<(), String> {
     driver.start();
     let server = tokio::spawn(ipc::serve(listener, driver.clone()));
     let notifications = tokio::spawn(notifications);
+    let folders = driver.status().folders;
     tracing::info!(
         socket = %socket.display(),
         version = env!("CARGO_PKG_VERSION"),
-        folders = driver.status().folders.len(),
+        folders = folders.len(),
         "the daemon is running"
     );
+    emit(Lifecycle::Started {
+        version: env!("CARGO_PKG_VERSION"),
+        socket: socket.display().to_string(),
+        folders: folders.len(),
+    });
+    let states = json.then(|| tokio::spawn(folder_states(driver.clone(), folders)));
     let signal = tokio::select! {
         _ = terminate.recv() => "SIGTERM",
         _ = interrupt.recv() => "SIGINT",
     };
     tracing::info!(signal, "stopping the daemon");
+    if let Some(states) = states {
+        states.abort();
+    }
+    emit(Lifecycle::Stopping { signal });
     server.abort();
     notifications.abort();
     let _ = std::fs::remove_file(&socket);
     driver.stop().await;
     tracing::info!("the daemon stopped");
-    Ok(())
+    emit(Lifecycle::Stopped);
+    Ok(Done::printed())
 }
 
-async fn client(paths: Paths, command: Command) -> Result<(), String> {
-    let (request, json) = match command {
-        Command::Setup {
-            code: Some(code),
-            device,
-            ..
-        } => join_request(&code, None, &device)?,
-        Command::Join {
-            code,
-            server,
-            device,
-        } => join_request(&code, server.as_deref(), &device)?,
-        Command::Server {
-            action:
-                setup::ServerAction::Claim {
-                    server,
-                    code,
-                    user,
-                    device,
-                },
-        } => (
-            Request::Claim {
-                server: pairing::server_url(&server),
-                code: code.trim().to_owned(),
-                user_name: user,
-                name: device.name(),
-            },
-            false,
-        ),
-        Command::Link { folder, space } => (
-            Request::Link {
-                folder: absolute(&folder)?,
-                space,
-            },
-            false,
-        ),
-        Command::Unlink { folder } => (
-            Request::Unlink {
-                folder: absolute(&folder)?,
-            },
-            false,
-        ),
-        Command::Restart { folder } => (
-            Request::Restart {
-                folder: absolute(&folder)?,
-            },
-            false,
-        ),
-        Command::Lift { folder, replan, .. } => (
-            Request::Lift {
-                folder: absolute(&folder)?,
-                replan,
-            },
-            false,
-        ),
-        Command::Status { json } => (Request::Status, json),
-        Command::Resolve {
-            id: Some(id),
-            answer: Some(answer),
-            ..
-        } => (
-            Request::Answer {
-                question_id: id,
-                answer,
-            },
-            false,
-        ),
-        Command::Resolve { json, .. } => (Request::Questions, json),
-        Command::Daemon { .. }
-        | Command::Device { .. }
-        | Command::Usage { .. }
-        | Command::Space { .. }
-        | Command::Trash { .. }
-        | Command::Versions { .. }
-        | Command::Restore { .. }
-        | Command::Restores { .. }
-        | Command::Setup { code: None, .. }
-        | Command::Server { .. } => {
-            unreachable!("main runs these commands itself")
-        }
-    };
-    let credential = paths.credential();
-    match ipc::run(&paths, request).await? {
-        Response::Error { message } => Err(message),
-        Response::Paired { account } => {
-            println!(
-                "Paired as {} ({}) with {}.\nThe credential is in {}.",
-                account.device_name,
-                account.device_id,
-                account.server,
-                credential.display()
-            );
-            Ok(())
-        }
-        Response::Linked { folder } => {
-            println!(
-                "Linked {} to space {} ({}).",
-                folder.path, folder.space_name, folder.space_id
-            );
-            if folder.state == koidrive_driver::FolderState::Stopped {
-                println!("Run koi daemon to sync it.");
+/// Prints a `folder_state` line whenever a folder's state differs from the one last printed for it.
+async fn folder_states(driver: Driver, folders: Vec<FolderStatus>) {
+    let mut shown: std::collections::HashMap<String, FolderState> = (folders.into_iter())
+        .map(|folder| (folder.path, folder.state))
+        .collect();
+    let mut watch = driver.watch();
+    while watch.changed().await.is_ok() {
+        for folder in driver.status().folders {
+            if shown.get(&folder.path) == Some(&folder.state) {
+                continue;
             }
-            Ok(())
-        }
-        Response::Unlinked { space_id, path } => {
-            println!(
-                "Unlinked {} from space {space_id}. Its files and its .koidrive folder stay.",
-                path.display()
-            );
-            Ok(())
-        }
-        Response::Restarted { folder } => match folder.state {
-            koidrive_driver::FolderState::Stopped => {
-                println!("Run koi daemon to sync {}.", folder.path);
-                Ok(())
-            }
-            koidrive_driver::FolderState::Halted => Err(format!(
-                "{} cannot sync: {}",
-                folder.path,
-                folder.problem.unwrap_or_default()
-            )),
-            _ => {
-                println!("Syncing {} again.", folder.path);
-                Ok(())
-            }
-        },
-        Response::Status { status } if json => print_json(&status),
-        Response::Status { status } => {
-            let questions = match status.folders.iter().any(|folder| folder.questions > 0) {
-                true => match ipc::run(&paths, Request::Questions).await? {
-                    Response::Questions { questions } => questions,
-                    Response::Error { message } => {
-                        return Err(format!("cannot read the pending decisions: {message}"));
-                    }
-                    _ => Vec::new(),
-                },
-                false => Vec::new(),
+            shown.insert(folder.path.clone(), folder.state);
+            let data = FolderData::of(&folder);
+            let event = Lifecycle::FolderState {
+                folder: data.path,
+                space_id: data.space_id,
+                state: data.state,
             };
-            print_status(&status, &questions);
-            Ok(())
-        }
-        Response::Questions { questions } if json => {
-            let questions: Vec<serde_json::Value> = questions
-                .iter()
-                .map(|question| {
-                    let mut value = serde_json::to_value(question).expect("a question serializes");
-                    value["answers"] =
-                        serde_json::to_value(question.kind.answers()).expect("answers serialize");
-                    value
-                })
-                .collect();
-            print_json(&questions)
-        }
-        Response::Questions { questions } => {
-            print_questions(&questions);
-            Ok(())
-        }
-        Response::Answered => {
-            println!("Resolved.");
-            Ok(())
-        }
-        Response::SignedOut | Response::Restore { .. } | Response::Restores { .. } => {
-            Err("the daemon answered a request that this command did not send".into())
+            println!("{}", event.line());
         }
     }
 }
 
+/// An answer of the daemon that does not fit the request.
+fn unexpected(response: Response) -> CliError {
+    CliError::from(format!("the daemon answered {response:?}"))
+}
+
+fn paired(paths: &Paths, response: Response) -> Result<Done, CliError> {
+    let Response::Paired { account } = response else {
+        return Err(unexpected(response));
+    };
+    let text = format!(
+        "Paired as {} ({}) with {}.\nThe credential is in {}.\n",
+        printable(&account.device_name),
+        printable(&account.device_id),
+        printable(&account.server),
+        printable(&paths.credential().display().to_string())
+    );
+    Ok(Done::ok(AccountData::of(&account), text))
+}
+
+/// The decisions waiting in the profile.
+async fn questions(paths: &Paths) -> Result<Vec<Question>, CliError> {
+    match ipc::run(paths, Request::Questions).await? {
+        Response::Questions { questions } => Ok(questions),
+        other => Err(unexpected(other)),
+    }
+}
+
+/// `koi status`: this device, its folders and the decisions waiting in them. It succeeds whenever it reads the
+/// status; with `check` it exits with the status of the most urgent condition (see [`report::check_exit`]).
+async fn status(paths: &Paths, check: bool) -> Result<Done, CliError> {
+    let status = match ipc::run(paths, Request::Status).await? {
+        Response::Status { status } => status,
+        other => return Err(unexpected(other)),
+    };
+    let questions = match status.folders.iter().any(|folder| folder.questions > 0) {
+        true => questions(paths).await?,
+        false => Vec::new(),
+    };
+    let conditions = report::conditions(&status, &questions);
+    let exit = if check {
+        report::check_exit(&conditions)
+    } else {
+        0
+    };
+    let data = StatusData {
+        account: status.account.as_ref().map(AccountData::of),
+        running: status.running,
+        folders: status.folders.iter().map(FolderData::of).collect(),
+        conditions,
+    };
+    let mut done = Done::ok(data, status_text(&status, &questions));
+    done.decisions = questions.iter().map(Decision::of).collect();
+    done.exit = exit;
+    if status.account.is_none() {
+        done = done.then(&["koi", "setup"]);
+    }
+    Ok(done)
+}
+
+/// `koi resolve`: every pending decision, or the answer to one. An answer is recorded; sync carries it out later.
+async fn resolve(
+    paths: &Paths,
+    id: Option<String>,
+    answer: Option<Answer>,
+) -> Result<Done, CliError> {
+    let (Some(id), Some(answer)) = (id, answer) else {
+        let questions = questions(paths).await?;
+        let mut done = Done::ok(Value::Null, questions_text(&questions));
+        done.decisions = questions.iter().map(Decision::of).collect();
+        return Ok(done);
+    };
+    let request = Request::Answer {
+        question_id: id.clone(),
+        answer,
+    };
+    match ipc::run(paths, request).await? {
+        Response::Answered => Ok(Done::accepted(
+            AnsweredData {
+                decision_id: id,
+                answer: answer.as_str(),
+            },
+            "Resolved.\n",
+        )),
+        other => Err(unexpected(other)),
+    }
+}
+
+/// Runs a folder command in the daemon, or on its own when no daemon runs.
+async fn folder(paths: &Paths, action: FolderAction) -> Result<Done, CliError> {
+    let request = match action {
+        FolderAction::Link { folder, space } => Request::Link {
+            folder: absolute(&folder)?,
+            space,
+        },
+        FolderAction::Unlink { folder } => Request::Unlink {
+            folder: absolute(&folder)?,
+        },
+        FolderAction::Restart { folder } => Request::Restart {
+            folder: absolute(&folder)?,
+        },
+        FolderAction::Retry { folder, replan, .. } => Request::Lift {
+            folder: absolute(&folder)?,
+            replan,
+        },
+    };
+    match ipc::run(paths, request).await? {
+        Response::Linked { folder } => {
+            let mut text = format!(
+                "Linked {} to space {} ({}).\n",
+                printable(&folder.path),
+                printable(&folder.space_name),
+                printable(&folder.space_id)
+            );
+            if folder.state == FolderState::Stopped {
+                text.push_str("Run koi _daemon to sync it.\n");
+            }
+            Ok(Done::ok(FolderData::of(&folder), text))
+        }
+        Response::Unlinked { space_id, path } => {
+            let text = format!(
+                "Unlinked {} from space {}. Its files and its .koidrive folder stay.\n",
+                printable(&path.display().to_string()),
+                printable(&space_id)
+            );
+            let data = UnlinkedData {
+                space_id,
+                path: path.display().to_string(),
+            };
+            Ok(Done::ok(data, text))
+        }
+        Response::Restarted { folder } => restarted(folder),
+        other => Err(unexpected(other)),
+    }
+}
+
+/// What `folder restart` reports for the folder as the restart left it.
+fn restarted(folder: FolderStatus) -> Result<Done, CliError> {
+    let path = printable(&folder.path);
+    let text = match folder.state {
+        FolderState::Halted => {
+            let problem = printable(folder.problem.as_deref().unwrap_or_default());
+            return Err(CliError::new(
+                Code::Halted,
+                format!("{path} cannot sync: {problem}"),
+            ));
+        }
+        FolderState::Stopped => format!("Run koi _daemon to sync {path}.\n"),
+        _ => format!("Syncing {path} again.\n"),
+    };
+    Ok(Done::ok(FolderData::of(&folder), text))
+}
+
 /// This profile's credential, for the commands that talk to the server directly. They write nothing to the profile, so
 /// they run the same whether or not the daemon holds it.
-fn signed_in(paths: &Paths) -> Result<Auth, String> {
+fn signed_in(paths: &Paths) -> Result<Auth, CliError> {
     let credential = Credential::load(&paths.credential())
         .map_err(|error| error.to_string())?
-        .ok_or_else(|| DriverError::NotPaired.to_string())?;
-    reading(paths, &credential)
+        .ok_or(DriverError::NotPaired)?;
+    Ok(reading(paths, &credential)?)
 }
 
 /// An [`Auth`] for a command that only reads the profile's credential. The process that holds the profile may rotate
@@ -579,79 +831,78 @@ fn reading(paths: &Paths, credential: &Credential) -> Result<Auth, String> {
 }
 
 /// Runs a device command (RFC 0009).
-async fn device(paths: Paths, action: DeviceAction) -> Result<(), String> {
+async fn device(paths: Paths, action: DeviceAction) -> Result<Done, CliError> {
     let auth = signed_in(&paths)?;
     match action {
-        DeviceAction::List { json } => {
+        DeviceAction::List => {
             let mut devices = Vec::new();
             let mut cursor = String::new();
             loop {
-                let page = auth
-                    .api()
-                    .list_devices(&auth, &cursor)
-                    .await
-                    .map_err(refusal)?;
+                let page = auth.api().list_devices(&auth, &cursor).await?;
                 devices.extend(page.devices);
                 if page.next_cursor.is_empty() {
                     break;
                 }
                 cursor = page.next_cursor;
             }
-            if json {
-                return print_json(&devices.iter().map(device_json).collect::<Vec<_>>());
-            }
-            print!("{}", device_table(&devices, now_ms()));
-            Ok(())
+            let data = DevicesData {
+                devices: devices.iter().map(DeviceData::of).collect(),
+            };
+            Ok(Done::ok(data, device_table(&devices, now_ms())))
         }
-        DeviceAction::Add => {
-            let started = auth.api().pair_start(&auth).await.map_err(refusal)?;
+        DeviceAction::Invite => {
+            let started = auth.api().pair_start(&auth).await?;
             let minutes = ((started.expires_at_ms - now_ms() + 59_999) / 60_000).max(1);
-            println!(
-                "On the new device, run:\n  koi join {}\nThe code works once, for about {minutes} minutes.",
-                pairing::join_args(&started.code, auth.api().base())
+            let code = pairing::join_args(&started.code, auth.api().base());
+            let note = format!(
+                "On the new device, run:\n  koi join {code}\nThe code works once, for about {minutes} minutes.\n"
             );
-            Ok(())
+            let mut join_argv = vec!["koi".to_owned(), "join".to_owned()];
+            join_argv.extend(pairing::join_argv(&started.code, auth.api().base()));
+            let data = InvitationData {
+                join_argv,
+                expires_at_ms: started.expires_at_ms,
+            };
+            Ok(Done::value(data, &code, note))
         }
         DeviceAction::Revoke { id } => {
             if id == auth.credentials().device_id {
-                return Err(
-                    "this device cannot revoke itself; revoke it from another device".to_owned(),
-                );
+                return Err(CliError::usage(
+                    "this device cannot revoke itself; revoke it from another device",
+                ));
             }
-            auth.api()
-                .revoke_device(&auth, &id)
-                .await
-                .map_err(refusal)?;
-            println!(
-                "Revoked device {id}. It can no longer sync; the files already on it stay there."
+            auth.api().revoke_device(&auth, &id).await?;
+            let text = format!(
+                "Revoked device {id}. It can no longer sync; the files already on it stay there.\n"
             );
-            Ok(())
+            Ok(Done::ok(RevokedData { device_id: id }, text))
         }
     }
 }
 
-/// Runs a space command. Creating refuses a name another space has, since koi link names a space by its name.
-async fn space(paths: Paths, action: SpaceAction) -> Result<(), String> {
+/// Runs a space command. Creating refuses a name another space has, since koi folder link names a space by its
+/// name.
+async fn space(paths: Paths, action: SpaceAction) -> Result<Done, CliError> {
     let auth = signed_in(&paths)?;
-    let spaces = auth.api().list_spaces(&auth).await.map_err(refusal)?.spaces;
+    let spaces = auth.api().list_spaces(&auth).await?.spaces;
     match action {
-        SpaceAction::List { json } => {
-            if json {
-                return print_json(&spaces.iter().map(space_json).collect::<Vec<_>>());
-            }
-            print!("{}", space_table(&spaces));
-            Ok(())
+        SpaceAction::List => {
+            let data = SpacesData {
+                spaces: spaces.iter().map(SpaceData::of).collect(),
+            };
+            Ok(Done::ok(data, space_table(&spaces)))
         }
+        SpaceAction::Usage => usage(&auth, spaces).await,
         SpaceAction::Create { name } => {
             let name = name.trim();
             if name.is_empty() {
-                return Err("a space needs a name".to_owned());
+                return Err(CliError::usage("a space needs a name"));
             }
             if let Some(taken) = spaces.iter().find(|space| space.name == name) {
-                return Err(format!(
+                return Err(CliError::usage(format!(
                     "the space {} already has that name; link a folder to it, or pick another name",
                     printable(&taken.space_id)
-                ));
+                )));
             }
             let created = auth
                 .api()
@@ -661,25 +912,15 @@ async fn space(paths: Paths, action: SpaceAction) -> Result<(), String> {
                         name: name.to_owned(),
                     },
                 )
-                .await
-                .map_err(refusal)?;
-            println!(
-                "Created the space {} ({}).\nLink a folder to it with koi link <folder> --space {}.",
+                .await?;
+            let id = printable(&created.space_id);
+            let note = format!(
+                "Created the space {} ({id}).\nLink a folder to it with koi folder link <folder> --space {id}.\n",
                 printable(&created.name),
-                created.space_id,
-                created.space_id
             );
-            Ok(())
+            Ok(Done::value(SpaceData::of(&created), &id, note))
         }
     }
-}
-
-fn space_json(space: &SpaceInfo) -> serde_json::Value {
-    serde_json::json!({
-        "space_id": space.space_id,
-        "name": space.name,
-        "created_at_ms": space.created_at_ms,
-    })
 }
 
 /// One line per space: its ID and its name.
@@ -699,60 +940,83 @@ fn space_table(spaces: &[SpaceInfo]) -> String {
 }
 
 /// Shows what each space of the account stores (RFC 0010). A space the server refuses, such as one a rewind holds
-/// closed, does not hide the others: they are printed, and the command then fails naming the refused ones on stderr.
-async fn usage(paths: Paths, json: bool) -> Result<(), String> {
-    let auth = signed_in(&paths)?;
-    let spaces = auth.api().list_spaces(&auth).await.map_err(refusal)?.spaces;
+/// closed, does not hide the others: they are reported, and the command then fails naming the refused ones. A refused
+/// credential stops it, since every later space would refuse it too, and the failure keeps what was read before.
+async fn usage(auth: &Auth, spaces: Vec<SpaceInfo>) -> Result<Done, CliError> {
     let mut usages = Vec::new();
     let mut refused = Vec::new();
     for space in spaces {
-        match auth.api().space_usage(&auth, &space.space_id).await {
+        match auth.api().space_usage(auth, &space.space_id).await {
             Ok(usage) => usages.push((space, usage)),
-            Err(error) if error.is_unauthenticated() => return Err(refusal(error)),
-            Err(error) => refused.push(format!(
-                "{} ({}): {error}",
-                printable(&space.name),
-                space.space_id
-            )),
+            Err(error) if error.is_unauthenticated() => {
+                let mut error = CliError::from(error);
+                if !(usages.is_empty() && refused.is_empty()) {
+                    error.partial = Some(Box::new(usage_read(&usages, &refused)));
+                }
+                return Err(error);
+            }
+            Err(error) => refused.push((space, CliError::from(error))),
         }
     }
-    print!("{}", usage_output(&usages, refused.len(), json));
-    if refused.is_empty() {
-        Ok(())
-    } else {
-        Err(format!("no usage for {}", refused.join("; ")))
-    }
+    usage_done(&usages, &refused)
 }
 
-/// What `koi usage` prints on stdout: the spaces that answered, as text or as a JSON array. It prints nothing when
-/// every space refused, so that stdout never shows an empty account that is not empty; the error names them instead.
-fn usage_output(usages: &[(SpaceInfo, SpaceUsage)], refused: usize, json: bool) -> String {
+/// The usage of the spaces that answered, which fails naming the spaces the server refused. Those add nothing to the
+/// data but their names: unavailable when each refusal may pass, failed otherwise.
+fn usage_done(
+    usages: &[(SpaceInfo, SpaceUsage)],
+    refused: &[(SpaceInfo, CliError)],
+) -> Result<Done, CliError> {
+    let done = usage_read(usages, refused);
+    if refused.is_empty() {
+        return Ok(done);
+    }
+    let code = match refused
+        .iter()
+        .all(|(_, error)| error.code == Code::Unavailable)
+    {
+        true => Code::Unavailable,
+        false => Code::Failed,
+    };
+    let names: Vec<String> = (refused.iter())
+        .map(|(space, error)| {
+            format!(
+                "{} ({}): {}",
+                printable(&space.name),
+                space.space_id,
+                error.message
+            )
+        })
+        .collect();
+    let mut error = CliError::new(code, format!("no usage for {}", names.join("; ")));
+    error.partial = Some(Box::new(done));
+    Err(error)
+}
+
+/// What was read: the usage of the spaces that answered and the names of those the server refused.
+fn usage_read(usages: &[(SpaceInfo, SpaceUsage)], refused: &[(SpaceInfo, CliError)]) -> Done {
+    let data = UsagesData {
+        spaces: (usages.iter())
+            .map(|(space, usage)| UsageData::of(space, usage))
+            .collect(),
+        refused: (refused.iter())
+            .map(|(space, error)| RefusedSpace {
+                space_id: space.space_id.clone(),
+                name: space.name.clone(),
+                message: error.message.clone(),
+            })
+            .collect(),
+    };
+    Done::ok(data, usage_output(usages, refused.len()))
+}
+
+/// What `koi space usage` prints on stdout: the spaces that answered. It prints nothing when every space refused, so
+/// that stdout never shows an empty account that is not empty; the error names them instead.
+fn usage_output(usages: &[(SpaceInfo, SpaceUsage)], refused: usize) -> String {
     if usages.is_empty() && refused > 0 {
         return String::new();
     }
-    if !json {
-        return usage_report(usages);
-    }
-    let entries: Vec<_> = usages
-        .iter()
-        .map(|(space, usage)| usage_json(space, usage))
-        .collect();
-    serde_json::to_string_pretty(&entries).expect("usage serializes") + "\n"
-}
-
-fn usage_json(space: &SpaceInfo, usage: &SpaceUsage) -> serde_json::Value {
-    serde_json::json!({
-        "space_id": space.space_id,
-        "name": space.name,
-        "live_files": usage.live_files,
-        "live_bytes": usage.live_bytes,
-        "trashed_files": usage.trashed_files,
-        "trash_bytes": usage.trash_bytes,
-        "old_versions": usage.old_versions,
-        "old_version_bytes": usage.old_version_bytes,
-        "unreferenced_bytes": usage.unreferenced_bytes,
-        "total_bytes": total_bytes(usage),
-    })
+    usage_report(usages)
 }
 
 fn total_bytes(usage: &SpaceUsage) -> u64 {
@@ -820,7 +1084,6 @@ fn size(bytes: u64) -> String {
     format!("{:.1} PB", value / 1000.0)
 }
 
-/// A device ID as the server issues it: a lowercase UUID. Checked here so that the argument cannot name another path.
 /// A space, device or user name as the server takes it: at most 255 bytes of UTF-8, measured before trimming (RFC 0007
 /// section 1). Checking it here names the argument instead of sending a request the server refuses.
 fn short_name(text: &str) -> Result<String, String> {
@@ -834,6 +1097,7 @@ fn short_name(text: &str) -> Result<String, String> {
     Ok(text.to_owned())
 }
 
+/// A device ID as the server issues it: a lowercase UUID. Checked here so that the argument cannot name another path.
 fn device_id(text: &str) -> Result<String, String> {
     let id = text.to_ascii_lowercase();
     let shaped = id.len() == 36
@@ -848,39 +1112,10 @@ fn device_id(text: &str) -> Result<String, String> {
     }
 }
 
-fn refusal(error: ApiError) -> String {
-    if error.is_unauthenticated() {
-        return format!(
-            "the server refused this device's credential, so another device revoked it or the credential is wrong. To \
-             use this device again, {SET_UP_AGAIN}."
-        );
-    }
-    error.to_string()
-}
-
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis() as i64)
-}
-
-fn device_json(device: &DeviceInfo) -> serde_json::Value {
-    serde_json::json!({
-        "device_id": device.device_id,
-        "name": device.name,
-        "platform": device.platform,
-        "kind": match device.kind() {
-            Kind::Device => "device",
-            Kind::Agent => "agent",
-            Kind::Unspecified => "unspecified",
-        },
-        "created_at_ms": device.created_at_ms,
-        "last_seen_ms": device.last_seen_ms,
-        "revoked_at_ms": device.revoked_at_ms,
-        "credential_expires_at_ms": device.credential_expires_at_ms,
-        "issued_by": device.issued_by,
-        "current": device.current,
-    })
 }
 
 /// One line per device: its ID, name, platform, when it last refreshed a token, and whether it is this device, active
@@ -951,71 +1186,57 @@ fn ago(ms: i64, now_ms: i64) -> String {
     }
 }
 
-fn join_request(
-    code: &str,
-    server: Option<&str>,
-    device: &DeviceArgs,
-) -> Result<(Request, bool), String> {
-    let invitation = pairing::parse(code, server)?;
-    Ok((
-        Request::Pair {
-            server: invitation.server,
-            code: invitation.code,
-            name: device.name(),
-        },
-        false,
-    ))
-}
-
 /// The folder as an absolute path, since the daemon does not share this command's working directory.
-fn absolute(folder: &Path) -> Result<PathBuf, String> {
-    std::path::absolute(folder).map_err(|error| format!("{}: {error}", folder.display()))
+fn absolute(folder: &Path) -> Result<PathBuf, CliError> {
+    std::path::absolute(folder).map_err(|error| {
+        CliError::usage(format!(
+            "{}: {error}",
+            printable(&folder.display().to_string())
+        ))
+    })
 }
 
-fn print_json(value: &impl serde::Serialize) -> Result<(), String> {
-    let text = serde_json::to_string_pretty(value).map_err(|error| error.to_string())?;
-    println!("{text}");
-    Ok(())
-}
-
-fn print_status(status: &Status, questions: &[Question]) {
-    match &status.account {
-        Some(account) => println!(
-            "Device: {} ({}) on {}",
-            account.device_name, account.device_id, account.server
+fn status_text(status: &Status, questions: &[Question]) -> String {
+    let mut text = match &status.account {
+        Some(account) => format!(
+            "Device: {} ({}) on {}\n",
+            printable(&account.device_name),
+            printable(&account.device_id),
+            printable(&account.server)
         ),
-        None => println!("Device: not set up; run koi setup"),
-    }
-    println!(
-        "Daemon: {}",
+        None => "Device: not set up; run koi setup\n".to_owned(),
+    };
+    text.push_str(&format!(
+        "Daemon: {}\n",
         if status.running {
             "running"
         } else {
             "not running"
         }
-    );
+    ));
     if status.folders.is_empty() {
-        println!("No linked folders; run koi link.");
+        text.push_str("No linked folders; run koi folder link.\n");
     }
     for folder in &status.folders {
-        print_folder(folder);
+        text.push_str(&folder_text(folder));
         for question in (questions.iter()).filter(|question| question.space_id == folder.space_id) {
-            print!("{}", question_brief(question));
+            text.push_str(&question_brief(question));
         }
     }
+    text
 }
 
-fn print_folder(folder: &FolderStatus) {
+fn folder_text(folder: &FolderStatus) -> String {
     let seq = match (folder.last_seq, folder.head_seq) {
         (Some(last), Some(head)) => format!("seq {last} of {head}"),
         (Some(last), None) => format!("seq {last}"),
         _ => "not read yet".to_owned(),
     };
-    println!(
-        "{}  space {} ({})  {:?}  {seq}, {} remote nodes{}, {}",
-        folder.path,
-        folder.space_name,
-        folder.space_id,
+    let mut text = format!(
+        "{}  space {} ({})  {:?}  {seq}, {} remote nodes{}, {}\n",
+        printable(&folder.path),
+        printable(&folder.space_name),
+        printable(&folder.space_id),
         folder.state,
         folder.remote_nodes,
         folder
@@ -1025,17 +1246,16 @@ fn print_folder(folder: &FolderStatus) {
         count(folder.questions, "pending decision")
     );
     if let Some(problem) = &folder.problem {
-        println!("  {problem}");
+        text.push_str(&format!("  {}\n", printable(problem)));
     }
+    text
 }
 
-fn print_questions(questions: &[Question]) {
+fn questions_text(questions: &[Question]) -> String {
     if questions.is_empty() {
-        println!("No decisions are waiting.");
+        return "No decisions are waiting.\n".to_owned();
     }
-    for question in questions {
-        print!("{}", question_text(question));
-    }
+    questions.iter().map(question_text).collect()
 }
 
 /// The command that lists and answers decisions, as every message names it.
@@ -1192,24 +1412,267 @@ fn banner(questions: &[Question]) -> Option<String> {
     })
 }
 
-/// The banner for the decisions pending in the profile, asked of the daemon. Without a daemon there is none, because
-/// a command run on its own leaves the profile as it found it.
-async fn pending_banner(paths: &Paths) -> Option<String> {
+/// The decisions pending in the profile, asked of the daemon. Without a daemon there are none to report, because a
+/// command run on its own leaves the profile as it found it.
+async fn pending_questions(paths: &Paths) -> Vec<Question> {
     let asked = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         ipc::ask(paths, &Request::Questions),
     );
     match asked.await {
-        Ok(Ok(Some(Response::Questions { questions }))) => banner(&questions),
-        _ => None,
+        Ok(Ok(Some(Response::Questions { questions }))) => questions,
+        _ => Vec::new(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use koidrive_net::ApiError;
+    use koidrive_proto::v1::device_info::Kind;
 
     const ID: &str = "0190a0b0-0000-7000-8000-000000000001";
+
+    fn parse(args: &[&str]) -> Result<Option<Command>, clap::Error> {
+        Cli::try_parse_from(args).map(|cli| cli.command)
+    }
+
+    #[test]
+    fn the_status_text_escapes_every_name_path_and_problem() {
+        let folder = FolderStatus {
+            space_id: "s\u{1b}[2J".into(),
+            space_name: "Home\u{202e}gpj.exe".into(),
+            path: "/home/ada/\u{1b}]0;owned\u{7}Docs\nFake: up to date".into(),
+            state: FolderState::Halted,
+            history_id: None,
+            last_seq: None,
+            head_seq: None,
+            remote_nodes: 0,
+            local_entries: None,
+            questions: 0,
+            problem: Some("cannot read \u{1b}[31mred\u{9b}31m".into()),
+            wait: None,
+        };
+        let status = Status {
+            account: Some(koidrive_driver::Account {
+                server: "https://files.example.com/\u{1b}[1A".into(),
+                user_id: "u1".into(),
+                user_name: None,
+                device_id: "d\r1".into(),
+                device_name: "Ada\u{1b}[8m".into(),
+            }),
+            running: true,
+            folders: vec![folder],
+        };
+        let text = status_text(&status, &[]);
+        for raw in ['\u{1b}', '\u{7}', '\u{9b}', '\u{202e}', '\r'] {
+            assert!(
+                !text.contains(raw),
+                "{raw:?} reached the terminal: {text:?}"
+            );
+        }
+        assert_eq!(text.lines().count(), 4, "{text}");
+        assert!(text.contains("Ada\\u{1b}[8m"), "{text}");
+        assert!(text.contains("Docs\\u{a}Fake"), "{text}");
+        assert!(text.contains("red\\u{9b}31m"), "{text}");
+    }
+
+    #[test]
+    fn logs_carry_colours_only_on_a_terminal_and_never_under_json() {
+        assert!(log_ansi(true, false));
+        assert!(!log_ansi(true, true));
+        assert!(!log_ansi(false, false));
+        assert!(!log_ansi(false, true));
+    }
+
+    #[test]
+    fn the_restart_report_escapes_the_folder_and_its_problem() {
+        let folder = |state, problem: Option<&str>| FolderStatus {
+            space_id: "s1".into(),
+            space_name: "Home".into(),
+            path: "/home/ada/Docs\u{1b}[31m\nFORGED".into(),
+            state,
+            history_id: None,
+            last_seq: None,
+            head_seq: None,
+            remote_nodes: 0,
+            local_entries: None,
+            questions: 0,
+            problem: problem.map(str::to_owned),
+            wait: None,
+        };
+        for state in [FolderState::Stopped, FolderState::CatchingUp] {
+            let text = restarted(folder(state, None)).unwrap().text;
+            assert!(!text.contains('\u{1b}'), "{text:?}");
+            assert_eq!(text.lines().count(), 1, "{text:?}");
+            assert!(text.contains("Docs\\u{1b}[31m\\u{a}FORGED"), "{text:?}");
+        }
+        let error = restarted(folder(FolderState::Halted, Some("gone\n\u{7}"))).unwrap_err();
+        assert_eq!(error.code, Code::Halted);
+        assert!(
+            !error.message.contains(['\u{1b}', '\n', '\u{7}']),
+            "{:?}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn every_command_parses_in_its_group() {
+        let parses = [
+            &["koi", "status", "--check"][..],
+            &["koi", "resolve"],
+            &["koi", "setup", "--interactive"],
+            &["koi", "join", "K7QM-2XPD@files.example.com"],
+            &["koi", "server", "deploy"],
+            &["koi", "server", "add-device", "--worker", "koidrive"],
+            &[
+                "koi",
+                "server",
+                "claim",
+                "files.example.com",
+                "ABCD",
+                "--user",
+                "Ada",
+            ],
+            &["koi", "server", "upgrade", "--worker", "koidrive", "--yes"],
+            &["koi", "server", "delete", "--worker", "koidrive", "--yes"],
+            &[
+                "koi",
+                "server",
+                "delete",
+                "--bucket",
+                "koidrive-1a2b",
+                "--yes",
+            ],
+            &["koi", "space", "create", "Notes"],
+            &["koi", "space", "list"],
+            &["koi", "space", "usage"],
+            &["koi", "folder", "link", "dir", "--space", "s"],
+            &["koi", "folder", "unlink", "dir"],
+            &["koi", "folder", "restart", "dir"],
+            &["koi", "folder", "retry", "dir", "--resend"],
+            &["koi", "folder", "retry", "dir", "--replan"],
+            &["koi", "device", "invite"],
+            &["koi", "device", "list"],
+            &["koi", "device", "revoke", ID],
+            &["koi", "history", "trash"],
+            &["koi", "history", "versions", "a.txt"],
+            &["koi", "history", "restore", "a.txt", "--node", "n1"],
+            &["koi", "history", "requests"],
+            &["koi", "_daemon", "--log-format", "json"],
+        ];
+        for args in parses {
+            assert!(
+                parse(args).is_ok(),
+                "{args:?}: {}",
+                parse(args).err().unwrap()
+            );
+        }
+        assert!(matches!(
+            parse(&["koi", "history", "trash"]),
+            Ok(Some(Command::History {
+                action: history::HistoryAction::Trash { folder }
+            })) if folder == Path::new(".")
+        ));
+        assert!(matches!(
+            parse(&["koi", "history", "requests"]),
+            Ok(Some(Command::History {
+                action: history::HistoryAction::Requests { folder }
+            })) if folder == Path::new(".")
+        ));
+        assert!(parse(&["koi", "folder", "retry", "dir"]).is_err());
+        assert!(parse(&["koi", "folder", "retry", "dir", "--resend", "--replan"]).is_err());
+        assert!(parse(&["koi", "folder", "link", "--space", "s"]).is_err());
+        assert!(parse(&["koi", "history", "versions"]).is_err());
+    }
+
+    #[test]
+    fn the_old_command_names_are_gone_without_aliases() {
+        let old = [
+            &["koi", "setup", "K7QM-2XPD@files.example.com"][..],
+            &["koi", "link", "dir", "--space", "s"],
+            &["koi", "unlink", "dir"],
+            &["koi", "restart", "dir"],
+            &["koi", "lift", "dir", "--resend"],
+            &["koi", "folder", "lift", "dir", "--resend"],
+            &["koi", "questions"],
+            &["koi", "trash"],
+            &["koi", "versions", "a.txt"],
+            &["koi", "restore", "a.txt"],
+            &["koi", "restores"],
+            &["koi", "history", "restores"],
+            &["koi", "usage"],
+            &["koi", "daemon"],
+            &["koi", "device", "add"],
+            &["koi", "server", "uninstall"],
+            &["koi", "server", "upgrade", "--server", "koidrive"],
+            &["koi", "server", "add-device", "--server", "koidrive"],
+            &["koi", "status", "--json=2"],
+        ];
+        for args in old {
+            assert!(parse(args).is_err(), "{args:?} still parses");
+        }
+        let help = Cli::command().render_help().to_string();
+        assert!(!help.contains("_daemon"), "{help}");
+        for group in [
+            "status", "resolve", "setup", "join", "server", "space", "folder", "device", "history",
+        ] {
+            assert!(
+                help.contains(&format!("  {group} ")),
+                "{group} missing from {help}"
+            );
+        }
+        assert!(help.contains("Koidrive sync client"), "{help}");
+    }
+
+    #[test]
+    fn json_is_one_global_flag_for_schema_1() {
+        for args in [
+            &["koi", "--json", "status"][..],
+            &["koi", "status", "--json"],
+            &["koi", "status", "--json=1"],
+            &["koi", "folder", "link", "dir", "--json", "--space", "s"],
+            &["koi", "history", "versions", "a.txt", "--json"],
+        ] {
+            assert_eq!(Cli::try_parse_from(args).unwrap().json, Some(1), "{args:?}");
+        }
+        assert_eq!(Cli::try_parse_from(["koi", "status"]).unwrap().json, None);
+        assert!(Cli::try_parse_from(["koi", "status", "--json=0"]).is_err());
+    }
+
+    #[test]
+    fn a_group_without_its_subcommand_shows_help_and_does_nothing() {
+        for group in ["server", "space", "folder", "device", "history"] {
+            let error = Cli::try_parse_from(["koi", group]).err().expect("help");
+            assert_eq!(
+                error.kind(),
+                ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand,
+                "{group}"
+            );
+        }
+        assert!(matches!(parse(&["koi"]), Ok(None)));
+    }
+
+    #[test]
+    fn the_command_path_and_json_are_read_from_the_raw_arguments() {
+        let args = |words: &[&str]| -> Vec<OsString> { words.iter().map(OsString::from).collect() };
+        assert_eq!(
+            command_path(&args(&[
+                "koi", "--json", "folder", "link", "dir", "--space", "s"
+            ])),
+            "folder link"
+        );
+        assert_eq!(command_path(&args(&["koi", "status", "--check"])), "status");
+        assert_eq!(command_path(&args(&["koi", "history"])), "history");
+        assert_eq!(command_path(&args(&["koi", "nonsense", "x"])), "");
+        assert_eq!(command_path(&args(&["koi"])), "");
+        assert!(json_requested(&args(&["koi", "linky", "--json"])));
+        assert!(json_requested(&args(&["koi", "status", "--json=2"])));
+        assert!(!json_requested(&args(&["koi", "status"])));
+        assert!(!json_requested(&args(&[
+            "koi", "history", "versions", "--", "--json"
+        ])));
+    }
 
     #[tokio::test]
     async fn a_reload_refuses_a_credential_for_another_server() {
@@ -1428,24 +1891,18 @@ mod tests {
 
     #[test]
     fn json_output_and_the_commands_that_show_decisions_get_no_banner() {
-        let shows = |args: &[&str]| {
-            Cli::try_parse_from(args)
-                .unwrap()
-                .command
-                .unwrap()
-                .shows_banner()
-        };
-        assert!(shows(&["koi", "trash", "."]));
+        let shows = |args: &[&str]| Cli::try_parse_from(args).unwrap().shows_banner();
+        assert!(shows(&["koi", "history", "trash", "."]));
         assert!(shows(&["koi", "device", "list"]));
-        assert!(shows(&["koi", "link", "dir", "--space", "s"]));
+        assert!(shows(&["koi", "folder", "link", "dir", "--space", "s"]));
         for args in [
-            &["koi", "trash", ".", "--json"][..],
+            &["koi", "history", "trash", ".", "--json"][..],
             &["koi", "device", "list", "--json"],
             &["koi", "space", "list", "--json"],
-            &["koi", "usage", "--json"],
+            &["koi", "space", "usage", "--json"],
             &["koi", "status"],
             &["koi", "resolve"],
-            &["koi", "daemon"],
+            &["koi", "_daemon"],
         ] {
             assert!(!shows(args), "{args:?}");
         }
@@ -1484,7 +1941,6 @@ mod tests {
             Ok(Some(Command::Resolve {
                 id: None,
                 answer: None,
-                json: false
             }))
         ));
         assert!(matches!(
@@ -1497,7 +1953,10 @@ mod tests {
         ));
         assert!(parse(&["koi", "resolve", "q1"]).is_err());
         assert!(parse(&["koi", "resolve", "q1", "later"]).is_err());
-        assert!(parse(&["koi", "resolve", "q1", "delete", "--json"]).is_err());
+        assert!(matches!(
+            parse(&["koi", "resolve", "q1", "delete", "--json"]),
+            Ok(Some(Command::Resolve { id: Some(_), .. }))
+        ));
         assert!(parse(&["koi", "questions"]).is_err());
     }
 
@@ -1507,10 +1966,10 @@ mod tests {
             return;
         }
         for args in [
-            vec!["koi", "server", "deploy", "--no-browser"],
-            vec!["koi", "server", "add-device", "--no-browser"],
-            vec!["koi", "server", "upgrade", "--no-browser"],
-            vec!["koi", "server", "uninstall", "--no-browser"],
+            vec!["koi", "server", "deploy"],
+            vec!["koi", "server", "add-device"],
+            vec!["koi", "server", "upgrade"],
+            vec!["koi", "server", "delete"],
         ] {
             let Some(Command::Server { action }) = Cli::try_parse_from(&args).unwrap().command
             else {
@@ -1520,17 +1979,20 @@ mod tests {
             let paths = Paths::under(dir.path());
             let outcome = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                setup::server(&paths, action),
+                setup::server(&paths, action, false),
             )
             .await
             .unwrap_or_else(|_| panic!("{args:?} waited for a login"));
-            assert!(
-                outcome
-                    .unwrap_err()
-                    .contains("built without a server bundle"),
-                "{args:?}"
-            );
+            let error = outcome.unwrap_err();
+            assert_eq!(error.code, Code::AuthRequired, "{args:?}: {error:?}");
         }
+        let Err(missing) = setup::embedded_bundle() else {
+            panic!("a build without the server bundle unpacked one");
+        };
+        assert!(
+            missing.message.contains("built without a server bundle"),
+            "{missing:?}"
+        );
     }
 
     #[test]
@@ -1654,10 +2116,11 @@ mod tests {
             "{table}"
         );
         assert_eq!(
-            device_json(&DeviceInfo {
+            serde_json::to_value(DeviceData::of(&DeviceInfo {
                 name: "a\nb".into(),
                 ..Default::default()
-            })["name"],
+            }))
+            .unwrap()["name"],
             "a\nb"
         );
     }
@@ -1715,7 +2178,7 @@ mod tests {
             )
         );
         assert_eq!(usage_report(&[]), "No spaces.\n");
-        let json = usage_json(&space, &usage);
+        let json = serde_json::to_value(UsageData::of(&space, &usage)).unwrap();
         assert_eq!(json["total_bytes"], 3_253_600_000u64);
         assert_eq!(json["trashed_files"], 1);
     }
@@ -1751,28 +2214,116 @@ mod tests {
                 ..Default::default()
             },
         )];
-        let parse = |text: String| -> serde_json::Value { serde_json::from_str(&text).unwrap() };
+        let refused = || {
+            vec![(
+                SpaceInfo {
+                    space_id: "s2".into(),
+                    name: "Closed".into(),
+                    ..Default::default()
+                },
+                CliError::from(ApiError::Status { status: 503 }),
+            )]
+        };
 
-        assert_eq!(usage_output(&[], 0, false), "No spaces.\n");
+        let empty = usage_done(&[], &[]).unwrap();
+        assert_eq!(empty.text, "No spaces.\n");
         assert_eq!(
-            usage_output(&[], 0, true),
-            "[]\n",
+            empty.data["spaces"],
+            serde_json::json!([]),
             "an account with no spaces"
         );
 
-        assert_eq!(usage_output(&[], 2, false), "", "every space refused");
-        assert_eq!(usage_output(&[], 2, true), "", "every space refused");
-
-        let partial = parse(usage_output(&answered, 1, true));
-        assert_eq!(partial.as_array().unwrap().len(), 1, "{partial:#}");
-        assert_eq!(partial[0]["space_id"], ID);
-        assert_eq!(partial[0]["live_bytes"], 300);
-        assert!(usage_output(&answered, 1, false).starts_with(&format!("Home ({ID})\n")));
+        let none = usage_done(&[], &refused()).unwrap_err();
+        let none = none.partial.expect("the failure keeps what was read");
+        assert_eq!(none.text, "", "every space refused");
         assert_eq!(
-            usage_output(&answered, 1, true),
-            usage_output(&answered, 0, true),
-            "a refused space adds nothing to the JSON"
+            none.data["spaces"],
+            serde_json::json!([]),
+            "every space refused"
         );
+
+        let error = usage_done(&answered, &refused()).unwrap_err();
+        assert_eq!(error.code, Code::Unavailable);
+        assert!(
+            error.message.starts_with("no usage for Closed (s2): "),
+            "{error:?}"
+        );
+        let partial = error.partial.expect("the failure keeps what was read");
+        let spaces = partial.data["spaces"].as_array().unwrap();
+        assert_eq!(spaces.len(), 1, "{:#}", partial.data);
+        assert_eq!(spaces[0]["space_id"], ID);
+        assert_eq!(spaces[0]["live_bytes"], 300);
+        assert_eq!(partial.data["refused"][0]["space_id"], "s2");
+        assert!(partial.text.starts_with(&format!("Home ({ID})\n")));
+        assert_eq!(
+            partial.data["spaces"],
+            usage_done(&answered, &[]).unwrap().data["spaces"],
+            "a refused space adds nothing to the answered ones"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_credential_stops_the_usage_and_keeps_what_was_read() {
+        use crate::setup::fake::{Fake, proto};
+        use koidrive_proto::v1::{AccessToken, error::Code as ProtoCode};
+        let refusal = || {
+            let mut reply = proto(
+                "GET",
+                "/v1/spaces/b/usage",
+                koidrive_proto::v1::Error {
+                    code: ProtoCode::Unauthenticated as i32,
+                    ..Default::default()
+                },
+            );
+            reply.status = 401;
+            reply
+        };
+        let token = || {
+            let token = AccessToken {
+                token: "fixture-only".into(),
+                expires_at_ms: i64::MAX,
+                ..Default::default()
+            };
+            proto("POST", "/v1/token", token)
+        };
+        let read = SpaceUsage {
+            live_bytes: 42,
+            ..Default::default()
+        };
+        let fake = Fake::start(vec![
+            token(),
+            token(),
+            proto("GET", "/v1/spaces/a/usage", read),
+            refusal(),
+            refusal(),
+        ])
+        .await;
+        let auth = Auth::new(
+            koidrive_net::Api::local_development(fake.base.clone()).unwrap(),
+            koidrive_net::Credentials {
+                user_id: "fixture-user".into(),
+                device_id: "fixture-device".into(),
+                refresh_credential: "fixture-only".into(),
+            },
+        );
+        let spaces = ["a", "b", "c"]
+            .into_iter()
+            .map(|id| SpaceInfo {
+                space_id: id.into(),
+                name: id.into(),
+                ..Default::default()
+            })
+            .collect();
+
+        let error = usage(&auth, spaces).await.unwrap_err();
+
+        assert_eq!(error.code, Code::AuthRequired, "{error:?}");
+        let partial = error.partial.expect("the failure keeps what was read");
+        let spaces = partial.data["spaces"].as_array().unwrap();
+        assert_eq!(spaces.len(), 1, "{:#}", partial.data);
+        assert_eq!(spaces[0]["space_id"], "a");
+        assert_eq!(spaces[0]["live_bytes"], 42);
+        assert_eq!(partial.data["refused"], serde_json::json!([]));
     }
 
     #[test]

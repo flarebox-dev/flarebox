@@ -1032,10 +1032,22 @@ fn a_download_the_server_puts_off_for_an_hour_shows_in_the_status_until_it_goes_
         .problem
         .expect("the wait shows in the status");
     assert!(problem.contains("QUOTA_EXCEEDED"), "{problem}");
+    let wait = b
+        .folder
+        .view()
+        .wait
+        .expect("the wait is typed in the status");
+    assert_eq!(wait.kind, WaitKind::Quota);
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    assert!(wait.until_ms > now_ms + 3_500_000, "{wait:?}");
 
     *remote.chunks.refusal.lock().unwrap() = None;
     assert_eq!(b.run(&mut remote), ["stage again"]);
     assert_eq!(b.folder.view().problem, None);
+    assert_eq!(b.folder.view().wait, None);
     assert_eq!(
         fs::read(site.root.join("notes.txt")).unwrap(),
         b"written on a"
@@ -1162,23 +1174,36 @@ fn a_tree_listing_put_off_for_an_hour_shows_in_the_status_and_one_put_off_for_a_
     b.scan_until(|b| b.folder.scanned);
     assert!(matches!(b.work.pop_front(), Some(Work::List { .. })));
 
-    let later = |wait, why: &str| Listed::Later {
+    let later = |wait, why: &str, kind| Listed::Later {
         listing: Listing::default(),
         wait,
         why: format!("reading the space's tree failed: {why}"),
+        kind,
     };
-    let step = b
-        .folder
-        .listed(Ok(later(Duration::from_secs(1), "RETRY_LATER: busy")));
+    let step = b.folder.listed(Ok(later(
+        Duration::from_secs(1),
+        "RETRY_LATER: busy",
+        WaitKind::Retry,
+    )));
     b.take(step).unwrap();
     assert_eq!(b.folder.view().problem, None);
+    assert_eq!(
+        b.folder.view().wait.map(|wait| wait.kind),
+        Some(WaitKind::Retry)
+    );
     assert!(matches!(b.work.pop_front(), Some(Work::ListAfter(..))));
 
     let quota = "QUOTA_EXCEEDED: the daily limit is used up";
-    let step = b
-        .folder
-        .listed(Ok(later(Duration::from_secs(3_600), quota)));
+    let step = b.folder.listed(Ok(later(
+        Duration::from_secs(3_600),
+        quota,
+        WaitKind::Quota,
+    )));
     b.take(step).unwrap();
+    assert_eq!(
+        b.folder.view().wait.map(|wait| wait.kind),
+        Some(WaitKind::Quota)
+    );
     let problem = b
         .folder
         .view()
@@ -1189,8 +1214,45 @@ fn a_tree_listing_put_off_for_an_hour_shows_in_the_status_and_one_put_off_for_a_
 
     b.run(&mut remote);
     assert_eq!(b.folder.view().problem, None);
+    assert_eq!(b.folder.view().wait, None);
     assert_eq!(names(&site.root), ["one.txt"]);
     assert_eq!(b.state(), FolderState::UpToDate);
+}
+
+#[test]
+fn a_quota_wait_of_a_second_is_typed_in_the_status_without_a_problem() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("one.txt"), b"one");
+    let site = Site::new(&remote, "b");
+    let mut b = site.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    assert!(matches!(b.work.pop_front(), Some(Work::List { .. })));
+
+    let step = b.folder.listed(Ok(Listed::Later {
+        listing: Listing::default(),
+        wait: Duration::from_secs(1),
+        why: "reading the space's tree failed: QUOTA_EXCEEDED: the daily limit is used up".into(),
+        kind: WaitKind::Quota,
+    }));
+    b.take(step).unwrap();
+
+    let view = b.folder.view();
+    assert_eq!(view.problem, None);
+    let wait = view
+        .wait
+        .expect("a wait of a second is typed in the status");
+    assert_eq!(wait.kind, WaitKind::Quota);
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    assert!(wait.until_ms <= now_ms + 1_000, "{wait:?}");
+
+    b.run(&mut remote);
+    assert_eq!(b.folder.view().wait, None);
+    assert_eq!(names(&site.root), ["one.txt"]);
 }
 
 /// A refusal of the server that puts a call off for an hour.
@@ -3147,11 +3209,11 @@ fn restarted(site: &Site, remote: &mut Remote) -> Device {
 fn a_refused_commit_lifted_to_resend_goes_out_unchanged() {
     let mut remote = Remote::new();
     let (site, refused, halt) = refused_first_commit(&mut remote, Code::Forbidden);
-    assert!(halt.contains("koi lift"), "{halt}");
+    assert!(halt.contains("koi folder retry"), "{halt}");
     let a = restarted(&site, &mut remote);
     assert!(a.sent.is_empty(), "a restart lifts nothing");
     let problem = a.folder.view().problem.unwrap();
-    assert!(problem.contains("koi lift"), "{problem}");
+    assert!(problem.contains("koi folder retry"), "{problem}");
     drop(a);
 
     lift_halt(&site.db, Lift::Resend).unwrap();
@@ -4974,7 +5036,7 @@ fn the_status_names_a_node_the_server_rejected_an_op_for_and_why() {
     assert_eq!(
         a.folder.view().problem.as_deref(),
         Some(
-            "1 item could not be synced: notes.txt (the server rejected it: INVALID_NAME); run koi restart once it is fixed"
+            "1 item could not be synced: notes.txt (the server rejected it: INVALID_NAME); run koi folder restart once it is fixed"
         )
     );
 }
@@ -5004,7 +5066,7 @@ fn the_status_names_a_node_of_a_refused_commit_and_the_refusal() {
     assert_eq!(
         a.folder.view().problem.as_deref(),
         Some(
-            "1 item could not be synced: notes.txt (the server refused it: CODE_LIMIT_EXCEEDED: the commit is too large); run koi restart once it is fixed"
+            "1 item could not be synced: notes.txt (the server refused it: CODE_LIMIT_EXCEEDED: the commit is too large); run koi folder restart once it is fixed"
         )
     );
 }
@@ -5017,7 +5079,7 @@ fn the_status_names_a_node_whose_effect_failed_and_why() {
     assert_eq!(
         b.folder.view().problem.as_deref(),
         Some(
-            "1 item could not be synced: notes.txt (the server's change could not be made here: another entry holds its name); run koi restart once it is fixed"
+            "1 item could not be synced: notes.txt (the server's change could not be made here: another entry holds its name); run koi folder restart once it is fixed"
         )
     );
 }
@@ -5052,7 +5114,7 @@ fn the_status_names_a_failed_write_in_a_folder_by_its_whole_path() {
         b.folder.view().problem.as_deref(),
         Some(
             "1 item could not be synced: docs/notes.txt (the server's change could not be made here: another entry \
-             holds its name); run koi restart once it is fixed"
+             holds its name); run koi folder restart once it is fixed"
         )
     );
 }
@@ -5078,7 +5140,7 @@ fn the_status_names_a_node_stuck_for_two_reasons_once() {
         b.folder.view().problem.as_deref(),
         Some(
             "1 item could not be synced: notes.txt (the server's change could not be made here: another entry holds \
-             its name; the server rejected it: INVALID_NAME); run koi restart once it is fixed"
+             its name; the server rejected it: INVALID_NAME); run koi folder restart once it is fixed"
         )
     );
 }
@@ -5128,7 +5190,7 @@ fn the_reason_of_a_result_that_waits_for_the_log_outlasts_the_first_scan() {
     assert_eq!(
         a.folder.view().problem.as_deref(),
         Some(
-            "1 item could not be synced: notes.txt (the server rejected it: INVALID_NAME); run koi restart once \
+            "1 item could not be synced: notes.txt (the server rejected it: INVALID_NAME); run koi folder restart once \
              it is fixed"
         )
     );

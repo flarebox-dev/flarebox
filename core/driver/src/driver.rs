@@ -1210,6 +1210,7 @@ fn folder_status(
         local_entries: None,
         questions,
         problem: None,
+        wait: None,
     }
 }
 
@@ -1921,7 +1922,7 @@ mod tests {
             driver.status().folders[0]
                 .problem
                 .as_ref()
-                .is_some_and(|problem| problem.contains("koi restart"))
+                .is_some_and(|problem| problem.contains("koi folder restart"))
         })
         .await;
         tokio::time::sleep(Duration::from_secs(3)).await;

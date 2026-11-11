@@ -41,7 +41,7 @@ pub fn parse(text: &str, server: Option<&str>) -> Result<Invitation, String> {
 
 /// The arguments of `koi join` for `code` from `server`: `<code>@<host>`, which [`parse`] reads back, for an https
 /// address with no path, and the code with `--server` for any other.
-pub fn join_args(code: &str, server: &Url) -> String {
+pub fn join_argv(code: &str, server: &Url) -> Vec<String> {
     match (
         server.scheme(),
         server.host_str(),
@@ -49,15 +49,20 @@ pub fn join_args(code: &str, server: &Url) -> String {
         server.query(),
     ) {
         ("https", Some(host), "/", None) => match server.port() {
-            Some(port) => shell_word(&format!("{code}@{host}:{port}")),
-            None => shell_word(&format!("{code}@{host}")),
+            Some(port) => vec![format!("{code}@{host}:{port}")],
+            None => vec![format!("{code}@{host}")],
         },
-        _ => format!(
-            "{} --server {}",
-            shell_word(code),
-            shell_word(server.as_str())
-        ),
+        _ => vec![code.to_owned(), "--server".to_owned(), server.to_string()],
     }
+}
+
+/// [`join_argv`] as shell words.
+pub fn join_args(code: &str, server: &Url) -> String {
+    let words: Vec<String> = join_argv(code, server)
+        .iter()
+        .map(|word| shell_word(word))
+        .collect();
+    words.join(" ")
 }
 
 /// The text as one POSIX shell word: quoted unless every character is safe bare.

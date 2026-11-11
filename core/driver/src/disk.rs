@@ -61,6 +61,7 @@ use prost::Message;
 use crate::engine::{Engine, file_id, file_identity};
 use crate::observe::{FsObserver, Observation, Observed, Observer, Reset, open_under};
 use crate::policy::{self, Disposition};
+use crate::status::WaitKind;
 
 /// How many effect sections [`Disk`] remembers for batches that span them. A batch older than all of them is dropped
 /// whole, and the observer rescans the whole tree.
@@ -112,7 +113,11 @@ pub(crate) enum Stop {
 #[derive(Debug)]
 pub(crate) enum Stall {
     /// The transfer failed for now with `why`. Stage again after `wait`.
-    Later { wait: Duration, why: String },
+    Later {
+        wait: Duration,
+        why: String,
+        kind: WaitKind,
+    },
     /// Staging cannot go on: the root was withdrawn, a staged file could not be written, or the session ended.
     Halt(Stop),
 }
@@ -851,9 +856,18 @@ impl Pending {
             | ChunkError::Call(CallError::Server(refusal)) => policy::describe(refusal),
             other => other.to_string(),
         };
+        let kind = policy::wait_kind(match &error {
+            ChunkError::Refused {
+                error: Some(refusal),
+                ..
+            }
+            | ChunkError::Call(CallError::Server(refusal)) => Some(refusal),
+            _ => None,
+        });
         let later = |wait| Stall::Later {
             wait,
             why: format!("downloading a file's content failed: {why}"),
+            kind,
         };
         match disposition {
             None => Ok(self.staged(Some(format!("its content cannot be downloaded: {error}")))),

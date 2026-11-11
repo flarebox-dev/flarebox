@@ -24,7 +24,7 @@ Each linked folder has one line. Its state is one of these:
 | `Offline` | The server can't be reached. The folder keeps trying |
 | `Halted` | A problem stopped the folder. The line below says which |
 
-`seq` counts the changes the space has had: how many this device has applied, and how many the server has. A second line under the folder shows a problem, or the last failure the folder is retrying. Below that come the folder's pending decisions (see [Decisions](#decisions)). `--json` prints all of it, with only the number of decisions for each folder; `koi resolve --json` lists the decisions themselves.
+`seq` counts the changes the space has had: how many this device has applied, and how many the server has. A second line under the folder shows a problem, or the last failure the folder is retrying. Below that come the folder's pending decisions (see [Decisions](#decisions)). `--json` returns all of it, and `--check` makes the exit status say whether anything needs you. See [Agents and scripts](agents.md#check-health-with-status---check).
 
 ## Calls the server puts off
 
@@ -53,7 +53,7 @@ Some problems clear by themselves. A folder that was moved away, or whose root c
 Other problems need you. Fix what the problem names, then:
 
 ```sh
-koi restart ~/Koidrive
+koi folder restart ~/Koidrive
 ```
 
 This stops the folder and syncs it again from the start. While the daemon isn't running, the folder syncs at the next start.
@@ -67,16 +67,16 @@ When the server refuses a folder's changes for a reason that retrying won't fix,
 For a cause you fixed on the server, such as access restored to this device, send the refused changes again as they were:
 
 ```sh
-koi lift ~/Koidrive --resend
+koi folder retry ~/Koidrive --resend
 ```
 
 For a cause fixed on this device, plan the changes again into a new commit:
 
 ```sh
-koi lift ~/Koidrive --replan
+koi folder retry ~/Koidrive --replan
 ```
 
-If the fix is a newer `koi`, install it and restart the daemon before you run `lift`, because `lift` runs in the daemon when one is running. A restart alone doesn't send the refused changes again. When the problem says the space's owner must confirm the changes, `lift` can't help, because Koidrive can't ask for that confirmation yet.
+If the fix is a newer `koi`, install it and restart the daemon before you run `folder retry`, because it runs in the daemon when one is running. A restart alone doesn't send the refused changes again. When the problem says the space's owner must confirm the changes, `folder retry` can't help, because Koidrive can't ask for that confirmation yet.
 
 ## Decisions
 
@@ -96,7 +96,7 @@ koi resolve
 koi resolve <id> <answer>
 ```
 
-`koi resolve` lists every pending decision with the answers it accepts, and `koi resolve <id> <answer>` makes one. While a decision is pending and the daemon runs, every other command ends with a line on stderr that says so (except with `--json`, which prints no banner), and the daemon shows a desktop notification when a new one opens: through the notification service of the desktop session on Linux, and in Notification Center on macOS. A daemon started without a desktop session, such as a system service or one started over SSH, shows none.
+`koi resolve` lists every pending decision with the answers it accepts, and `koi resolve <id> <answer>` makes one. While a decision is pending and the daemon runs, every other command ends with a line on stderr that says so (with `--json`, the envelope lists them under `decisions` instead), and the daemon shows a desktop notification when a new one opens: through the notification service of the desktop session on Linux, and in Notification Center on macOS. A daemon started without a desktop session, such as a system service or one started over SSH, shows none.
 
 Sync asks before it deletes many files at once. It holds this device's deletions when, within 10 minutes, they number more than 1,000, or they would remove more than half of the files of a space that has at least 20. A removed folder counts as one deletion of all the files it held. Sync then holds every deletion it has not sent yet and waits for one decision. Until you answer, the files stay on the server and on your other devices, and every other change keeps syncing, also after a restart.
 

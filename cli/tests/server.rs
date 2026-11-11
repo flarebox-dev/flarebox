@@ -168,7 +168,16 @@ impl Machine {
     }
 
     fn status(&self) -> Value {
-        serde_json::from_str(&self.run(&["status", "--json"])).unwrap()
+        self.data(&["status"])
+    }
+
+    /// The data of the command's JSON envelope, after checking that the command succeeded.
+    fn data(&self, args: &[&str]) -> Value {
+        let args: Vec<&str> = args.iter().copied().chain(["--json"]).collect();
+        let envelope: Value = serde_json::from_str(&self.run(&args)).unwrap();
+        assert_eq!(envelope["schema_version"], 1, "{envelope:#}");
+        assert_eq!(envelope["error"], Value::Null, "{envelope:#}");
+        envelope["data"].clone()
     }
 
     /// Every entry of the profile's directories with its modification time and, for a file, its contents.
@@ -289,13 +298,14 @@ async fn a_headless_device_pairs_links_and_follows_the_change_stream() {
     fs::create_dir_all(folder.join("Projects")).unwrap();
     fs::write(folder.join("Projects/notes.txt"), b"agent notes").unwrap();
     let folder_arg = folder.to_str().unwrap();
-    let linked = machine.run(&["link", folder_arg, "--space", &space_name]);
+    let linked = machine.run(&["folder", "link", folder_arg, "--space", &space_name]);
     assert!(linked.contains(&space.space_id), "{linked}");
     let marker: Value =
         serde_json::from_str(&fs::read_to_string(folder.join(".koidrive/space.json")).unwrap())
             .unwrap();
     assert_eq!(marker["space_id"], space.space_id.as_str());
     let refused = machine.fails(&[
+        "folder",
         "link",
         machine.path("state").to_str().unwrap(),
         "--space",
@@ -310,7 +320,7 @@ async fn a_headless_device_pairs_links_and_follows_the_change_stream() {
 
     let log_path = machine.path("daemon.log");
     let daemon = machine
-        .command(&["daemon", "--log-format", "json"])
+        .command(&["_daemon", "--log-format", "json"])
         .stdout(Stdio::null())
         .stderr(File::create(&log_path).unwrap())
         .spawn()
@@ -327,7 +337,7 @@ async fn a_headless_device_pairs_links_and_follows_the_change_stream() {
     }
     assert_eq!(mode(&socket), 0o600);
     assert_eq!(mode(socket.parent().unwrap()), 0o700);
-    let second = machine.fails(&["daemon"]);
+    let second = machine.fails(&["_daemon"]);
     assert!(second.contains("another Koidrive daemon"), "{second}");
 
     let status = machine
@@ -391,14 +401,14 @@ async fn a_headless_device_pairs_links_and_follows_the_change_stream() {
     );
 
     let questions: Value = serde_json::from_str(&machine.run(&["resolve", "--json"])).unwrap();
-    assert_eq!(questions, Value::Array(vec![]));
+    assert_eq!(questions["decisions"], Value::Array(vec![]));
     assert!(
         machine
             .run(&["resolve"])
             .contains("No decisions are waiting.")
     );
 
-    let restarted = machine.run(&["restart", "Sync"]);
+    let restarted = machine.run(&["folder", "restart", "Sync"]);
     assert!(restarted.contains("again"), "{restarted}");
     machine
         .status_until("the restarted folder up to date", |status| {
@@ -406,7 +416,7 @@ async fn a_headless_device_pairs_links_and_follows_the_change_stream() {
         })
         .await;
 
-    let unlinked = machine.run(&["unlink", "Sync"]);
+    let unlinked = machine.run(&["folder", "unlink", "Sync"]);
     assert!(unlinked.contains(&space.space_id), "{unlinked}");
     assert_eq!(machine.status()["folders"], Value::Array(vec![]));
     assert!(
@@ -478,7 +488,7 @@ async fn a_device_revokes_a_lost_one_and_stops_syncing_when_another_revokes_it()
         .await
         .unwrap();
 
-    let listed: Value = serde_json::from_str(&machine.run(&["device", "list", "--json"])).unwrap();
+    let listed: Value = machine.data(&["device", "list"])["devices"].clone();
     let entry = |listed: &Value, id: &str| {
         listed
             .as_array()
@@ -515,7 +525,7 @@ async fn a_device_revokes_a_lost_one_and_stops_syncing_when_another_revokes_it()
         .await
         .unwrap_err();
     assert!(refresh.is_unauthenticated(), "{refresh:?}");
-    let listed: Value = serde_json::from_str(&machine.run(&["device", "list", "--json"])).unwrap();
+    let listed: Value = machine.data(&["device", "list"])["devices"].clone();
     assert!(entry(&listed, &lost.device_id)["revoked_at_ms"].as_i64() > Some(0));
     let table = machine.run(&["device", "list"]);
     assert!(
@@ -539,9 +549,15 @@ async fn a_device_revokes_a_lost_one_and_stops_syncing_when_another_revokes_it()
     let folder = machine.path("Sync");
     fs::create_dir_all(&folder).unwrap();
     fs::write(folder.join("kept.txt"), b"stays on the device").unwrap();
-    machine.run(&["link", folder.to_str().unwrap(), "--space", &space_name]);
+    machine.run(&[
+        "folder",
+        "link",
+        folder.to_str().unwrap(),
+        "--space",
+        &space_name,
+    ]);
     let daemon = machine
-        .command(&["daemon"])
+        .command(&["_daemon"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -643,7 +659,7 @@ async fn a_device_revokes_a_lost_one_and_stops_syncing_when_another_revokes_it()
 async fn usage_lists_what_each_space_stores() {
     let owner = Arc::new(Auth::new(api(), owner().await));
     let machine = Machine::new();
-    let unpaired = machine.fails(&["usage"]);
+    let unpaired = machine.fails(&["space", "usage"]);
     assert!(unpaired.contains("not set up"), "{unpaired}");
     let pairing = owner.api().pair_start(&owner).await.unwrap();
     let server = server_url().to_string();
@@ -655,7 +671,7 @@ async fn usage_lists_what_each_space_stores() {
         .await
         .unwrap();
 
-    let listed: Value = serde_json::from_str(&machine.run(&["usage", "--json"])).unwrap();
+    let listed: Value = machine.data(&["space", "usage"])["spaces"].clone();
     let entry = listed
         .as_array()
         .unwrap()
@@ -675,7 +691,7 @@ async fn usage_lists_what_each_space_stores() {
     ] {
         assert_eq!(entry[field], 0, "{field} of a new space: {entry:#}");
     }
-    let report = machine.run(&["usage"]);
+    let report = machine.run(&["space", "usage"]);
     assert!(
         report.contains(&format!("{name} ({})\n  Live files ", space.space_id)),
         "{report}"
@@ -724,7 +740,7 @@ async fn a_command_reads_the_credential_again_when_a_rotation_left_it_staged() {
     rotated_on_the_server(&machine).await;
     let before = machine.profile();
 
-    let listed: Value = serde_json::from_str(&machine.run(&["usage", "--json"])).unwrap();
+    let listed: Value = machine.data(&["space", "usage"])["spaces"].clone();
     assert!(listed.is_array(), "{listed:#}");
     assert!(machine.run(&["device", "list"]).contains("desk"));
     assert_eq!(
@@ -746,7 +762,7 @@ async fn of_two_copies_of_one_credential_only_the_one_that_rotates_it_keeps_work
     let copy = Machine::new();
     fs::create_dir_all(copy.path("state/koidrive")).unwrap();
     fs::copy(&credential, copy.path("state/koidrive/credential.json")).unwrap();
-    copy.run(&["usage", "--json"]);
+    copy.data(&["space", "usage"]);
     let original = koidrive_driver::Credential::load(&credential)
         .unwrap()
         .unwrap()
@@ -766,7 +782,7 @@ async fn of_two_copies_of_one_credential_only_the_one_that_rotates_it_keeps_work
     let folder = first.path("Rotation");
     fs::create_dir_all(&folder).unwrap();
 
-    first.run(&["link", folder.to_str().unwrap(), "--space", &name]);
+    first.run(&["folder", "link", folder.to_str().unwrap(), "--space", &name]);
     let rotated = koidrive_driver::Credential::load(&credential)
         .unwrap()
         .unwrap()
@@ -776,8 +792,8 @@ async fn of_two_copies_of_one_credential_only_the_one_that_rotates_it_keeps_work
         "linking the folder rotated the credential"
     );
     assert!(!first.path("state/koidrive/credential.next").exists());
-    first.run(&["usage", "--json"]);
-    let refused = copy.fails(&["usage"]);
+    first.data(&["space", "usage"]);
+    let refused = copy.fails(&["space", "usage"]);
     assert!(
         refused.contains("refused this device's credential"),
         "{refused}"
@@ -880,9 +896,9 @@ async fn trash_and_versions_list_what_the_space_keeps() {
     let folder = machine.path("Sync");
     fs::create_dir_all(&folder).unwrap();
     let folder_arg = folder.to_str().unwrap();
-    machine.run(&["link", folder_arg, "--space", &space_name]);
+    machine.run(&["folder", "link", folder_arg, "--space", &space_name]);
     let daemon = machine
-        .command(&["daemon"])
+        .command(&["_daemon"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -942,7 +958,7 @@ async fn trash_and_versions_list_what_the_space_keeps() {
         ],
     )
     .await;
-    let empty = machine.run(&["trash", folder_arg]);
+    let empty = machine.run(&["history", "trash", folder_arg]);
     assert!(empty.contains("Nothing from"), "{empty}");
 
     commit_as_owner(
@@ -960,30 +976,32 @@ async fn trash_and_versions_list_what_the_space_keeps() {
     .await;
     let note_path = folder.join("docs/note.txt");
     let note_arg = note_path.to_str().unwrap();
-    let versions: Value =
-        serde_json::from_str(&machine.run(&["versions", note_arg, "--json"])).unwrap();
+    let versions: Value = machine.data(&["history", "versions", note_arg])["versions"].clone();
     assert_eq!(versions.as_array().unwrap().len(), 2, "{versions:#}");
     assert_eq!(versions[0]["size"], 7, "{versions:#}");
     assert_eq!(versions[1]["size"], 5, "{versions:#}");
-    let trash: Value =
-        serde_json::from_str(&machine.run(&["trash", folder_arg, "--json"])).unwrap();
+    let trash: Value = machine.data(&["history", "trash", folder_arg])["entries"].clone();
     assert_eq!(trash.as_array().unwrap().len(), 1, "{trash:#}");
     assert_eq!(trash[0]["path"], "docs/gone.txt", "{trash:#}");
     assert_eq!(trash[0]["kind"], "file");
     assert_eq!(trash[0]["bytes"], 13);
-    let below = machine.run(&["trash", folder.join("docs").to_str().unwrap()]);
+    let below = machine.run(&["history", "trash", folder.join("docs").to_str().unwrap()]);
     assert!(below.contains("docs/gone.txt"), "{below}");
-    let report = machine.run(&["versions", note_arg]);
+    let report = machine.run(&["history", "versions", note_arg]);
     assert!(
         report.starts_with("docs/note.txt: 2 versions, newest first\ncurrent"),
         "{report}"
     );
-    let deleted = machine.fails(&["versions", folder.join("docs/gone.txt").to_str().unwrap()]);
+    let deleted = machine.fails(&[
+        "history",
+        "versions",
+        folder.join("docs/gone.txt").to_str().unwrap(),
+    ]);
     assert!(
-        deleted.contains("koi trash lists deleted ones"),
+        deleted.contains("koi history trash lists deleted ones"),
         "{deleted}"
     );
-    let outside = machine.fails(&["trash", machine.path("state").to_str().unwrap()]);
+    let outside = machine.fails(&["history", "trash", machine.path("state").to_str().unwrap()]);
     assert!(outside.contains("not in a linked folder"), "{outside}");
     let link = folder.join("docs/link.txt");
     let started = Instant::now();
@@ -1000,8 +1018,7 @@ async fn trash_and_versions_list_what_the_space_keeps() {
     fs::remove_file(&link).unwrap();
     let link_arg = link.to_str().unwrap();
     let size_of_link = |what: &str| {
-        let versions: Value =
-            serde_json::from_str(&machine.run(&["versions", link_arg, "--json"])).unwrap();
+        let versions: Value = machine.data(&["history", "versions", link_arg])["versions"].clone();
         assert_eq!(
             versions.as_array().unwrap().len(),
             1,
@@ -1016,11 +1033,15 @@ async fn trash_and_versions_list_what_the_space_keeps() {
     fs::write(&elsewhere, b"not synced").unwrap();
     std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
     assert_eq!(size_of_link("a link outside the folder"), 4);
-    let stopped = machine.run(&["trash", folder_arg, "--json"]);
+    let stopped = machine.run(&["history", "trash", folder_arg, "--json"]);
     assert!(stopped.contains("docs/gone.txt"), "{stopped}");
-    let unlinked = machine.fails(&["trash", machine.path("elsewhere").to_str().unwrap()]);
+    let unlinked = machine.fails(&[
+        "history",
+        "trash",
+        machine.path("elsewhere").to_str().unwrap(),
+    ]);
     assert!(unlinked.contains("not in a linked folder"), "{unlinked}");
-    let unlinked = machine.fails(&["versions", elsewhere.to_str().unwrap()]);
+    let unlinked = machine.fails(&["history", "versions", elsewhere.to_str().unwrap()]);
     assert!(unlinked.contains("not in a linked folder"), "{unlinked}");
     assert!(
         machine.profile() == profile,
@@ -1058,9 +1079,9 @@ async fn restore_brings_back_a_deleted_file_and_an_earlier_version() {
     let folder = machine.path("Sync");
     fs::create_dir_all(&folder).unwrap();
     let folder_arg = folder.to_str().unwrap();
-    machine.run(&["link", folder_arg, "--space", &space_name]);
+    machine.run(&["folder", "link", folder_arg, "--space", &space_name]);
     let daemon = machine
-        .command(&["daemon"])
+        .command(&["_daemon"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -1126,18 +1147,27 @@ async fn restore_brings_back_a_deleted_file_and_an_earlier_version() {
     .await;
 
     let note_arg = note_path.to_str().unwrap();
-    let versions: Value =
-        serde_json::from_str(&machine.run(&["versions", note_arg, "--json"])).unwrap();
+    let versions: Value = machine.data(&["history", "versions", note_arg])["versions"].clone();
     let current = versions[0]["version_id"].as_str().unwrap();
     let first = versions[1]["version_id"].as_str().unwrap();
-    let again = machine.fails(&["restore", note_arg, "--version", current]);
+    let again = machine.fails(&["history", "restore", note_arg, "--version", current]);
     assert!(again.contains("already the current version"), "{again}");
-    let asked = machine.run(&["restore", gone_path.to_str().unwrap()]);
+    let asked = machine.output(&["history", "restore", gone_path.to_str().unwrap()]);
+    assert!(asked.status.success(), "{asked:?}");
+    let stdout = String::from_utf8(asked.stdout).unwrap();
+    let id = stdout
+        .strip_suffix('\n')
+        .unwrap_or_else(|| panic!("{stdout:?}"));
     assert!(
-        asked.starts_with("Asked to restore docs/gone.txt (restore "),
-        "{asked}"
+        !id.is_empty() && !id.contains(char::is_whitespace),
+        "only the ID: {stdout:?}"
     );
-    machine.run(&["restore", note_arg, "--version", first]);
+    let note = String::from_utf8(asked.stderr).unwrap();
+    assert!(
+        note.starts_with(&format!("Asked to restore docs/gone.txt (restore {id}).\n")),
+        "{note}"
+    );
+    machine.run(&["history", "restore", note_arg, "--version", first]);
     eventually(
         "the deleted file and the first version to come back",
         || {
@@ -1146,9 +1176,8 @@ async fn restore_brings_back_a_deleted_file_and_an_earlier_version() {
         },
     )
     .await;
-    let restores = || -> Value {
-        serde_json::from_str(&machine.run(&["restores", folder_arg, "--json"])).unwrap()
-    };
+    let restores =
+        || -> Value { machine.data(&["history", "requests", folder_arg])["requests"].clone() };
     eventually("both restores to be reported", || {
         restores()
             .as_array()
@@ -1159,10 +1188,10 @@ async fn restore_brings_back_a_deleted_file_and_an_earlier_version() {
             == 2
     })
     .await;
-    let report = machine.run(&["restores", folder_arg]);
+    let report = machine.run(&["history", "requests", folder_arg]);
     assert!(report.contains("restored"), "{report}");
     assert!(!report.contains("pending"), "{report}");
-    let trash = machine.run(&["trash", folder_arg]);
+    let trash = machine.run(&["history", "trash", folder_arg]);
     assert!(trash.contains("Nothing from"), "{trash}");
     assert!(stop(daemon).success());
 }
@@ -1177,12 +1206,15 @@ async fn a_device_creates_a_space_and_links_a_folder_to_it() {
     machine.run(&["join", &pairing.code, "--server", &server, "--name", "desk"]);
     let name = format!("notes {}", uuidv7());
 
-    let created = machine.run(&["space", "create", &format!(" {name} ")]);
+    let created = machine.output(&["space", "create", &format!(" {name} ")]);
+    assert!(created.status.success(), "{created:?}");
+    let note = String::from_utf8(created.stderr).unwrap();
     assert!(
-        created.starts_with(&format!("Created the space {name} (")),
-        "{created}"
+        note.starts_with(&format!("Created the space {name} (")),
+        "{note}"
     );
-    let spaces: Value = serde_json::from_str(&machine.run(&["space", "list", "--json"])).unwrap();
+    let created = String::from_utf8(created.stdout).unwrap();
+    let spaces: Value = machine.data(&["space", "list"])["spaces"].clone();
     let ours: Vec<&Value> = spaces
         .as_array()
         .unwrap()
@@ -1191,7 +1223,7 @@ async fn a_device_creates_a_space_and_links_a_folder_to_it() {
         .collect();
     assert_eq!(ours.len(), 1, "{spaces:#}");
     let space_id = ours[0]["space_id"].as_str().unwrap();
-    assert!(created.contains(space_id), "{created}");
+    assert_eq!(created, format!("{space_id}\n"), "only the ID");
     let listed = machine.run(&["space", "list"]);
     assert!(listed.contains(&format!("{space_id}  {name}")), "{listed}");
     let again = machine.fails(&["space", "create", &name]);
@@ -1201,7 +1233,7 @@ async fn a_device_creates_a_space_and_links_a_folder_to_it() {
 
     let folder = machine.path("Notes");
     fs::create_dir_all(&folder).unwrap();
-    let linked = machine.run(&["link", folder.to_str().unwrap(), "--space", &name]);
+    let linked = machine.run(&["folder", "link", folder.to_str().unwrap(), "--space", &name]);
     assert!(linked.contains(space_id), "{linked}");
     let owners = owner.api().list_spaces(&owner).await.unwrap().spaces;
     assert!(
@@ -1330,7 +1362,7 @@ async fn two_creates_of_one_name_at_once_make_one_space() {
         .find(|space| space.name == name)
         .unwrap()
         .space_id;
-    let linked = machine.run(&["link", root.to_str().unwrap(), "--space", &name]);
+    let linked = machine.run(&["folder", "link", root.to_str().unwrap(), "--space", &name]);
     assert!(linked.contains(space_id.as_str()), "{linked}");
 }
 
@@ -1350,20 +1382,20 @@ async fn a_device_shows_a_pairing_code_that_adds_another() {
         "first",
     ]);
 
-    let shown = first.run(&["device", "add"]);
-    let args: Vec<&str> = shown
-        .lines()
-        .find_map(|line| line.strip_prefix("  koi join "))
-        .unwrap_or_else(|| panic!("no join command in {shown:?}"))
-        .split_whitespace()
-        .collect();
+    let shown = first.output(&["device", "invite"]);
+    assert!(shown.status.success(), "{shown:?}");
+    let code = String::from_utf8(shown.stdout).unwrap();
+    assert_eq!(code.lines().count(), 1, "only the code: {code:?}");
+    let note = String::from_utf8(shown.stderr).unwrap();
+    assert!(note.contains(&format!("  koi join {code}")), "{note}");
+    let args: Vec<&str> = code.split_whitespace().collect();
     let name = format!("second {}", uuidv7());
     let mut join = vec!["join"];
     join.extend(&args);
     join.extend(["--name", name.as_str()]);
     let paired = Machine::new().run(&join);
     assert!(paired.starts_with(&format!("Paired as {name}")), "{paired}");
-    let devices: Value = serde_json::from_str(&first.run(&["device", "list", "--json"])).unwrap();
+    let devices: Value = first.data(&["device", "list"])["devices"].clone();
     assert!(
         devices
             .as_array()
@@ -1415,7 +1447,7 @@ async fn a_name_longer_than_255_bytes_is_refused_before_it_reaches_the_server() 
         "--name",
         &longest,
     ]);
-    let devices: Value = serde_json::from_str(&machine.run(&["device", "list", "--json"])).unwrap();
+    let devices: Value = machine.data(&["device", "list"])["devices"].clone();
     assert!(
         devices
             .as_array()
@@ -1430,5 +1462,10 @@ async fn a_name_longer_than_255_bytes_is_refused_before_it_reaches_the_server() 
     let name = format!("{}{}", uuidv7(), "가".repeat(73));
     assert_eq!(name.len(), 255);
     let created = machine.run(&["space", "create", &name]);
-    assert!(created.contains(&name), "{created}");
+    let spaces: Value = machine.data(&["space", "list"])["spaces"].clone();
+    assert!(
+        (spaces.as_array().unwrap().iter()).any(|space| space["name"] == name.as_str()
+            && format!("{}\n", space["space_id"].as_str().unwrap()) == created),
+        "{created:?} {spaces:#}"
+    );
 }

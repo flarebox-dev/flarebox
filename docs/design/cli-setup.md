@@ -18,16 +18,17 @@ Every step below ran against the test account "Koidrive deploy test" on 2026-11-
 ## 1. Commands
 
 ```
-koi setup                  # asks: log in with Cloudflare, or enter a code from another device
-koi setup <pairing code>   # joins the server named in the code
-koi join <pairing code>    # the same, for scripts
+koi setup                  # on a terminal, asks: log in with Cloudflare, or enter a code from another device;
+                                # otherwise lists the commands below and asks nothing
+koi setup --interactive    # the guided setup, explicitly; fails without a terminal
+koi join <pairing code>    # joins the server named in the code
 koi server deploy          # Cloudflare login, then deploy and claim; fails if a server exists
 koi server add-device      # Cloudflare login, then add this device to the existing server
 koi server upgrade         # Cloudflare login, then upload this CLI's server bundle
-koi server uninstall       # Cloudflare login, then delete the Worker, empty and delete the bucket
+koi server delete          # Cloudflare login, then delete the Worker, empty and delete the bucket
 ```
 
-`koi setup` with no argument offers two choices. "Log in with Cloudflare" runs the OAuth flow (section 2), then looks for a Koidrive server in the chosen account (section 6):
+`koi setup` on a terminal (stdin and stderr, without `--json` or the `CI` variable) offers two choices. "Log in with Cloudflare" runs the OAuth flow (section 2), then looks for a Koidrive server in the chosen account (section 6):
 
 ```mermaid
 flowchart TD
@@ -45,9 +46,9 @@ flowchart TD
     F -->|Several| K[Ask which one] --> I
 ```
 
-The pairing code carries the server address, so a new device needs nothing else. Today `POST /v1/pair/start` returns an 8-character code such as `K7QM-2XPD` that is valid for 600 seconds (measured on the deployed server). The CLI shows it as `<code>@<host>`, for example `K7QM-2XPD@koidrive.alice.workers.dev` (decision 3). A QR code in the macOS app comes later. The CLI splits on the last `@` and prepends `https://`. The code alone still works with `--server`. The existing `koi pair --server --code --name` becomes `koi join`, and `pair` is removed in the same change.
+The pairing code carries the server address, so a new device needs nothing else. Today `POST /v1/pair/start` returns an 8-character code such as `K7QM-2XPD` that is valid for 600 seconds (measured on the deployed server). The CLI shows it as `<code>@<host>`, for example `K7QM-2XPD@koidrive.alice.workers.dev` (decision 3). A QR code in the macOS app comes later. The CLI splits on the last `@` and prepends `https://`. The code alone still works with `--server`. The existing `koi pair --server --code --name` becomes `koi join`, and `pair` is removed in the same change. `koi setup <code>`, a second spelling of `join`, was removed later.
 
-The explicit subcommands never ask questions, so scripts can use them. Where `koi setup` would ask, they stop instead and print the command or flag that goes on: `server add-device` on a server that needs an upgrade first (section 4.5) prints `koi server upgrade`, and `server uninstall` runs only with `--yes` when no terminal is attached (section 5). Each one that needs Cloudflare runs the login itself (section 5).
+The explicit subcommands that need no Cloudflare login never ask questions, so scripts can use them. Where `koi setup` would ask, they stop instead and print the command or flag that goes on: `server add-device` on a server that needs an upgrade first (section 4.5) prints `koi server upgrade`. Each one that needs Cloudflare runs the login itself (section 5), and only with `--interactive` and a terminal on stdin and stderr. Otherwise, with or without `--json`, it never opens a browser: it stops with `auth_required` (exit 4) and names the same command with `--interactive`.
 
 ## 2. Cloudflare login
 
@@ -85,7 +86,7 @@ Rules this gives the implementation:
 **Headless Linux.** The device grant is not available, so a machine without a browser has three options:
 
 1. Join with a pairing code from a device that has a browser. A server needs one Cloudflare login, not one per device. This is the default (decision 4).
-2. `koi setup --no-browser` (decision 4) prints the authorize URL. The user opens it on any machine, and the final redirect to `127.0.0.1` fails to load there. The user copies that page's address and pastes it into the CLI, which checks the state and exchanges the code. *Unverified* end to end; it relies only on the code and state in the URL, which the prototype received.
+2. `koi setup --interactive --no-browser` (decision 4) prints the authorize URL. Pasting needs `--interactive` and a terminal, and without them the command stops with `auth_required`. The user opens it on any machine, and the final redirect to `127.0.0.1` fails to load there. The user copies that page's address and pastes it into the CLI, which checks the state and exchanges the code. *Unverified* end to end; it relies only on the code and state in the URL, which the prototype received.
 3. SSH port forwarding (`ssh -L <port>:127.0.0.1:<port> host`) with `--port <port>`, so the laptop's browser reaches the CLI's listener.
 
 A hosted HTTPS page that shows the code to copy would also work, but it needs a domain and a server, and it is not needed while option 2 exists.
@@ -206,7 +207,7 @@ A run can also stop after it saved a claim's credentials and before it wrote tha
 
 The CLI never takes over a resource it cannot tie to Koidrive. A script counts as a Koidrive server when it has the tag and binds a bucket, or when it answers `GET /v1/server`. A bucket counts as Koidrive's when the state file names it or a Koidrive script binds it. A deploy names its bucket `koidrive-` and 16 random hex digits (64 bits), so it never creates or adopts a bucket another application made. The Worker gets the default name `koidrive` when it is free, and otherwise the next free name, `koidrive-2` and so on. The state file records both names. Before it uploads the script, a run checks the recorded Worker name again. A Worker under it that has the tag and binds the recorded bucket is this deploy's own upload, and the run uploads over it. Any other Worker under it means another application took the name since, so the run moves to the next free Worker name. An unbound bucket that the state file does not name is reported and left alone.
 
-## 5. Upgrade and uninstall
+## 5. Upgrade and delete
 
 `koi server upgrade`:
 
@@ -220,11 +221,11 @@ The measured upgrade from 0.0.1 to 0.0.2 kept the space created before it, and t
 
 Because of the deferred code update, an upgrade is complete for each Durable Object only after it adopts the new code, within 300 seconds by default. The CLI sets `code_update_strategy` explicitly (`{"mode": "deferred", "max_delay": 300}`), so the behaviour does not depend on Cloudflare's default, and it tells the user that open sync sessions move to the new release within 5 minutes. The API accepted `{"mode": "immediate"}` in a measured upload; it resets active objects at once and drops their WebSockets, so it is not the default.
 
-`koi server uninstall` must empty the bucket before it deletes it. `DELETE /r2/buckets/<bucket>` on a bucket the server had written to returned 409 with "10008 ... is not empty". Creating a space writes `spaces/<space id>/meta/<id>/space.json`. `GET /r2/buckets/<bucket>/objects` and `DELETE .../objects/<key>` worked under `workers-r2.write`. `DELETE /workers/scripts/<name>?force=true` also removed the Worker's two Durable Object namespaces, and the namespace list was empty afterwards.
+`koi server delete` must empty the bucket before it deletes it. `DELETE /r2/buckets/<bucket>` on a bucket the server had written to returned 409 with "10008 ... is not empty". Creating a space writes `spaces/<space id>/meta/<id>/space.json`. `GET /r2/buckets/<bucket>/objects` and `DELETE .../objects/<key>` worked under `workers-r2.write`. `DELETE /workers/scripts/<name>?force=true` also removed the Worker's two Durable Object namespaces, and the namespace list was empty afterwards.
 
 The Worker is the only place that names the bucket, so the CLI records the bucket before it deletes the Worker:
 
-1. Find the server (section 6), read the bucket name and its jurisdiction from the R2 binding in its settings, count the objects, and ask for confirmation, naming the bucket, its jurisdiction and the number of objects, because the uninstall deletes the owner's files. The prompt says that everything in the bucket is deleted, including anything another application stored there through R2's S3 API ([S3 API compatibility](#ref-r2-s3)), which no Worker binding shows. Without a terminal it needs `--yes` and stops otherwise.
+1. Find the server (section 6), read the bucket name and its jurisdiction from the R2 binding in its settings, count the objects, and ask for confirmation, naming the bucket, its jurisdiction and the number of objects, because the uninstall deletes the owner's files. The prompt says that everything in the bucket is deleted, including anything another application stored there through R2's S3 API ([S3 API compatibility](#ref-r2-s3)), which no Worker binding shows. `--yes` skips the confirmation.
 2. Write the state file with the script, its `created_on` time from the script list ([List Workers](#ref-scripts)), the bucket, its jurisdiction, and its `creation_date` from `GET /r2/buckets/<bucket>` ([Get Bucket](#ref-r2-bucket)).
 3. If a script with the recorded name exists, compare its `created_on` with the state file. A different time means a new Worker was deployed under that name after an earlier run deleted this one. The CLI then leaves that Worker alone, names it and goes on to step 4, whose check keeps the bucket if the new Worker binds it. Otherwise it deletes the Worker with `?force=true`, which stops all writes to the bucket from it. The API has no conditional delete, so a deploy in the moment between the check and the delete is not caught.
 4. Read the bucket with `GET /r2/buckets/<bucket>` and compare its `creation_date` with the state file. A different date means the bucket was deleted and a new one created under the same name, which R2 allows: the CLI deletes nothing in it, names it, deletes the state file and ends. Then read the settings of every script still in the account. If one binds the bucket in the same jurisdiction, another Worker uses it: the CLI keeps the bucket and its objects, names that Worker, deletes the state file and ends. It also lists the whole bucket. The server writes only keys under `spaces/`, so a key outside it means another application stores data there, and the CLI keeps the bucket the same way and names the first such key. The check runs here, after the Worker is gone and right before the first object is deleted, so every path to step 5 passes it.
@@ -233,11 +234,11 @@ The Worker is the only place that names the bucket, so the CLI records the bucke
 
 R2 allows buckets with the same name in different jurisdictions, and a bucket outside the default one needs the `cf-r2-jurisdiction` header on every API call ([Data location](#ref-r2-location)). The CLI sends the recorded jurisdiction on every R2 call of the uninstall. That the script settings return the binding's `jurisdiction`, as a Wrangler binding sets it, was not measured; *unverified*.
 
-Every delete treats 404 as done, so a rerun repeats a finished step without error. A rerun with the state file starts at step 3, so it passes the check of step 4 again before it deletes anything in the bucket. If step 4 or 5 finds that the bucket no longer exists, the bucket was deleted before the run stopped, so the CLI deletes the state file and reports the uninstall as complete. The exact R2 error for a missing bucket was not measured; *unverified*. Any other error, such as a 403 or a network failure, keeps the state file for the next rerun. On another machine, or after the state file is lost, the Worker is gone and nothing in the account links the bucket to it. `koi server uninstall --bucket <name>` then empties and deletes the named bucket after the same confirmation and the check of step 4, recording its `creation_date` first. `--jurisdiction <name>` names a jurisdiction other than the default one. The CLI does not guess the name or the jurisdiction.
+Every delete treats 404 as done, so a rerun repeats a finished step without error. A rerun with the state file starts at step 3, so it passes the check of step 4 again before it deletes anything in the bucket. If step 4 or 5 finds that the bucket no longer exists, the bucket was deleted before the run stopped, so the CLI deletes the state file and reports the uninstall as complete. The exact R2 error for a missing bucket was not measured; *unverified*. Any other error, such as a 403 or a network failure, keeps the state file for the next rerun. On another machine, or after the state file is lost, the Worker is gone and nothing in the account links the bucket to it. `koi server delete --bucket <name>` then empties and deletes the named bucket after the same confirmation and the check of step 4, recording its `creation_date` first. `--jurisdiction <name>` names a jurisdiction other than the default one. The CLI does not guess the name or the jurisdiction.
 
 ## 6. Finding a Koidrive server in an account
 
-An account may hold other Workers. The upload sets `tags: ["koidrive-server"]`, and `GET /workers/scripts` returns each script's `tags` (measured: `{"id": "koidrive-proto", "tags": ["koidrive-server"], "migration_tag": "v1", "has_assets": true}`). The CLI keeps the scripts with that tag, then calls `GET <workers.dev URL>/v1/server` on each and keeps those that answer with a valid `ServerInfo`. A tag alone is not proof, since anyone with the account can tag a script. A tagged script that binds a bucket but has no workers.dev route is a deploy that stopped halfway (section 4.6). `koi setup` finishes it: it turns on the route, waits for the server to answer and adds this device as section 4.5 describes. `koi server add-device` stops and names `koi setup`. A Worker deployed with the button has no tag, and the owner may have renamed it. So the CLI also reads the settings of each untagged script and keeps those that bind Durable Object namespaces of the classes `AccountDO` and `SpaceDO`, then checks them with `/v1/server` the same way. It adds the tag on the next upgrade. With several matches the CLI lists their names and URLs and asks. `--server <name>` picks one in scripts.
+An account may hold other Workers. The upload sets `tags: ["koidrive-server"]`, and `GET /workers/scripts` returns each script's `tags` (measured: `{"id": "koidrive-proto", "tags": ["koidrive-server"], "migration_tag": "v1", "has_assets": true}`). The CLI keeps the scripts with that tag, then calls `GET <workers.dev URL>/v1/server` on each and keeps those that answer with a valid `ServerInfo`. A tag alone is not proof, since anyone with the account can tag a script. A tagged script that binds a bucket but has no workers.dev route is a deploy that stopped halfway (section 4.6). `koi setup` finishes it: it turns on the route, waits for the server to answer and adds this device as section 4.5 describes. `koi server add-device` stops and names `koi setup`. A Worker deployed with the button has no tag, and the owner may have renamed it. So the CLI also reads the settings of each untagged script and keeps those that bind Durable Object namespaces of the classes `AccountDO` and `SpaceDO`, then checks them with `/v1/server` the same way. It adds the tag on the next upgrade. With several matches the CLI lists their names and URLs and asks. `--worker <name>` picks one in scripts.
 
 ## 7. Credentials on the device
 
@@ -273,7 +274,7 @@ The setup screen (`SetupModel`) gains "Log in with Cloudflare" next to "Enter a 
 
 **macOS app.** The DMG from `release-macos.yml` goes into the tap as the cask `koidrive-app` (decision 7): `brew install --cask koidrive/tap/koidrive-app`. homebrew/core does not accept formulae whose main output is a `.app` ([Acceptable formulae](#ref-core)).
 
-**Linux without Homebrew.** Each release also attaches static `x86_64` and `aarch64` musl binaries with SHA-256 checksums. `.deb`, `.rpm` and a systemd user unit for `koi daemon` can follow. Release work is out of scope here.
+**Linux without Homebrew.** Each release also attaches static `x86_64` and `aarch64` musl binaries with SHA-256 checksums. `.deb`, `.rpm` and a systemd user unit for `koi _daemon` can follow. Release work is out of scope here.
 
 ## 10. What a public client needs before launch
 

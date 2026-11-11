@@ -14,6 +14,7 @@ use koidrive_proto::v1::error::Code;
 
 use super::state::{SetupState, StateFile};
 use super::{Cloud, Found, Session, report_paired, server_api};
+use crate::error::CliError;
 use crate::ipc::{self, Request, Response};
 use url::Url;
 
@@ -70,7 +71,7 @@ impl<'a> Claim<'a> {
 
     /// Claims within `window` per key: 60 seconds for a server that already runs the key claim, up to 330 when an
     /// Account DO may still be moving to new code.
-    pub async fn run(mut self, window: Duration) -> Result<(), String> {
+    pub async fn run(mut self, window: Duration) -> Result<(), CliError> {
         let file = StateFile::new(self.paths);
         if self.state.setup_attempt.is_none() {
             self.state.setup_attempt = Some(Secret::random(16).expose().to_owned());
@@ -84,7 +85,7 @@ impl<'a> Claim<'a> {
             if self.state.secret_set {
                 self.delete_key().await?;
             }
-            return file.remove();
+            return Ok(file.remove()?);
         }
         let mut key = match self.key.take() {
             Some(key) => key,
@@ -108,24 +109,23 @@ impl<'a> Claim<'a> {
         self.state.setup_attempt = None;
         file.save(&self.state)?;
         self.delete_key().await?;
-        file.remove()
+        Ok(file.remove()?)
     }
 
     /// Sets a new one-time key on the Worker. Before the first one it checks that the owner has not set a key of
     /// their own for recovery, which this run must not replace.
-    async fn set_key(&mut self, file: &StateFile, first: bool) -> Result<Secret, String> {
+    async fn set_key(&mut self, file: &StateFile, first: bool) -> Result<Secret, CliError> {
         let account = self.session.account().to_owned();
         let script = self.state.script.clone();
         let api = self.session.fresh().await?;
         if first && !self.state.secret_set {
-            let secrets = api
-                .secrets(&account, &script)
-                .await
-                .map_err(|error| format!("cannot list the secrets of {script}: {error}"))?;
+            let secrets = api.secrets(&account, &script).await.map_err(|error| {
+                CliError::from(error).context(format!("cannot list the secrets of {script}"))
+            })?;
             if secrets.iter().any(|name| name == KEY_NAME) {
                 return Err(format!(
                     "{script} already has a {KEY_NAME} secret, which its owner set for recovery. Use that key, or delete the secret in the dashboard, then run this command again."
-                ));
+                ).into());
             }
         }
         self.state.secret_set = true;
@@ -133,12 +133,14 @@ impl<'a> Claim<'a> {
         let key = Secret::random(32);
         api.put_secret(&account, &script, KEY_NAME, &key)
             .await
-            .map_err(|error| format!("cannot set the one-time key on {script}: {error}"))?;
+            .map_err(|error| {
+                CliError::from(error).context(format!("cannot set the one-time key on {script}"))
+            })?;
         Ok(key)
     }
 
-    async fn claim(&self, key: &Secret, window: Duration) -> Result<Outcome, String> {
-        let api = server_api(&self.server.url).map_err(|error| error.to_string())?;
+    async fn claim(&self, key: &Secret, window: Duration) -> Result<Outcome, CliError> {
+        let api = server_api(&self.server.url)?;
         let request = ClaimRequest {
             code: key.expose().to_owned(),
             user_name: user_name(),
@@ -179,38 +181,39 @@ impl<'a> Claim<'a> {
                     | ApiError::Unreadable { .. },
                 ) => Duration::from_secs(3),
                 Err(ApiError::Status { status }) if status >= 500 => Duration::from_secs(3),
-                Err(error) => return Err(format!("the server refused the claim: {error}")),
+                Err(error) => {
+                    return Err(CliError::from(error).context("the server refused the claim"));
+                }
             };
             if started.elapsed() + wait > window {
                 return Err(format!(
                     "the server did not accept the claim within {} seconds; run the command again to continue",
                     window.as_secs()
-                ));
+                ).into());
             }
             tokio::time::sleep(wait).await;
         }
     }
 
     /// Deletes the one-time key and checks that it is gone. Other secrets stay.
-    async fn delete_key(&mut self) -> Result<(), String> {
+    async fn delete_key(&mut self) -> Result<(), CliError> {
         let account = self.session.account().to_owned();
         let script = self.state.script.clone();
         let api = self.session.fresh().await?;
         api.delete_secret(&account, &script, KEY_NAME)
             .await
             .map_err(|error| {
-                format!(
+                CliError::caused(format!(
                     "cannot delete the one-time key from {script}: {error}; run the command again"
-                )
+                ), error)
             })?;
-        let secrets = api
-            .secrets(&account, &script)
-            .await
-            .map_err(|error| format!("cannot list the secrets of {script}: {error}"))?;
+        let secrets = api.secrets(&account, &script).await.map_err(|error| {
+            CliError::from(error).context(format!("cannot list the secrets of {script}"))
+        })?;
         if secrets.iter().any(|name| name == KEY_NAME) {
-            return Err(format!(
-                "{KEY_NAME} is still set on {script}; run the command again"
-            ));
+            return Err(
+                format!("{KEY_NAME} is still set on {script}; run the command again").into(),
+            );
         }
         self.state.secret_set = false;
         Ok(())
@@ -220,7 +223,7 @@ impl<'a> Claim<'a> {
 /// Whether this profile already holds a working credential for `server`, which a run that stopped after saving its
 /// claim's credential leaves behind (section 4.6). The server decides with `POST /v1/token`: a credential it refuses
 /// as unknown or revoked is removed, so the claim can go on. Any other answer stops the run and changes nothing.
-pub async fn saved_device(paths: &Paths, server: &Url) -> Result<bool, String> {
+pub async fn saved_device(paths: &Paths, server: &Url) -> Result<bool, CliError> {
     let Some(credential) =
         Credential::load(&paths.credential()).map_err(|error| error.to_string())?
     else {
@@ -232,7 +235,8 @@ pub async fn saved_device(paths: &Paths, server: &Url) -> Result<bool, String> {
             "this device is already set up with {}; its credential is {}",
             credential.server,
             paths.credential().display()
-        ));
+        )
+        .into());
     }
     match crate::reading(paths, &credential)?.access_token().await {
         Ok(_) => Ok(true),
@@ -247,13 +251,15 @@ pub async fn saved_device(paths: &Paths, server: &Url) -> Result<bool, String> {
                     );
                     Ok(false)
                 }
-                Response::Error { message } => Err(message),
-                other => Err(format!("the daemon answered {other:?}")),
+                other => Err(format!("the daemon answered {other:?}").into()),
             }
         }
-        Err(error) => Err(format!(
-            "cannot check this device's saved credential with {}: {error}. Nothing was changed; run the command again",
-            credential.server
+        Err(error) => Err(CliError::caused(
+            format!(
+                "cannot check this device's saved credential with {}: {error}. Nothing was changed; run the command again",
+                credential.server
+            ),
+            error,
         )),
     }
 }
@@ -337,6 +343,8 @@ mod tests {
                 .unwrap();
             let refusal = Response::Error {
                 message: "the disk is full".into(),
+                code: crate::error::Code::Failed,
+                next: Vec::new(),
             };
             let line = format!("{}\n", serde_json::to_string(&refusal).unwrap());
             writer.write_all(line.as_bytes()).await.unwrap();
@@ -372,7 +380,8 @@ mod tests {
         )
         .run(Duration::from_secs(1))
         .await
-        .unwrap_err();
+        .unwrap_err()
+        .message;
 
         assert_eq!(error, "the disk is full");
         let saved = StateFile::new(&paths).load().unwrap().unwrap();
@@ -426,7 +435,7 @@ mod tests {
             let fake = Fake::start(vec![answer]).await;
             let (_dir, paths) = profile(&fake.base);
 
-            let error = saved_device(&paths, &fake.base).await.unwrap_err();
+            let error = saved_device(&paths, &fake.base).await.unwrap_err().message;
 
             assert!(error.contains("Nothing was changed"), "{error}");
             assert!(paths.credential().exists());
@@ -438,7 +447,7 @@ mod tests {
         let fake = Fake::start(vec![]).await;
         let (_dir, paths) = profile(&Url::parse("https://files.example.com/").unwrap());
 
-        let error = saved_device(&paths, &fake.base).await.unwrap_err();
+        let error = saved_device(&paths, &fake.base).await.unwrap_err().message;
 
         assert!(
             error.contains("already set up with https://files.example.com/"),

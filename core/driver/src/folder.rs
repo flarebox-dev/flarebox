@@ -49,7 +49,7 @@ use crate::engine::{Applied, Engine, Staging};
 use crate::ignore::Matcher;
 use crate::observe::{FsObserver, Observer};
 use crate::policy::{self, Disposition};
-use crate::status::{FolderState, FolderStatus};
+use crate::status::{FolderState, FolderStatus, Wait, WaitKind};
 
 /// The highest space format this build reads (spec v0 section 9.2).
 pub const MAX_FORMAT: u32 = 1;
@@ -87,7 +87,7 @@ const REPLACED: &str = "the folder at this path is no longer the folder this tas
 
 /// Why a folder halts when the folder at its path after a root halt is not the one the task locked before.
 const OTHER_FOLDER: &str = "the folder at this path is not the one this device synced before (it was replaced); run \
-                            koi restart to sync the folder that is there now";
+                            koi folder restart to sync the folder that is there now";
 
 /// One linked folder while it syncs.
 pub(crate) struct Folder {
@@ -218,6 +218,7 @@ pub(crate) enum Listed {
         listing: Listing,
         wait: Duration,
         why: String,
+        kind: WaitKind,
     },
 }
 
@@ -237,6 +238,7 @@ struct Retrying {
     why: String,
     wait: Duration,
     at: SystemTime,
+    kind: WaitKind,
 }
 
 /// The part of a folder's status the task knows.
@@ -249,6 +251,7 @@ pub(crate) struct View {
     pub remote_nodes: u64,
     pub local_entries: Option<u64>,
     pub problem: Option<String>,
+    pub wait: Option<Wait>,
     pub questions: u64,
 }
 
@@ -419,8 +422,13 @@ impl Folder {
                 self.retrying.remove(&Call::List);
                 (pages, trash)
             }
-            Listed::Later { listing, wait, why } => {
-                self.retry_after(Call::List, why, wait);
+            Listed::Later {
+                listing,
+                wait,
+                why,
+                kind,
+            } => {
+                self.retry_after(Call::List, why, wait, kind);
                 return Ok(vec![Work::ListAfter(wait, listing)]);
             }
         };
@@ -494,8 +502,8 @@ impl Folder {
                 self.retrying.remove(&Call::Download);
                 staged
             }
-            Err(Stall::Later { wait, why }) => {
-                self.retry_after(Call::Download, why, wait);
+            Err(Stall::Later { wait, why, kind }) => {
+                self.retry_after(Call::Download, why, wait, kind);
                 return Ok(vec![Work::StageAfter(wait, pending)]);
             }
             Err(Stall::Halt(stop)) => return Err(stop),
@@ -641,10 +649,19 @@ impl Folder {
             }
         };
         tracing::info!(space_id = self.link.space_id, %error, ?wait, "uploading again later");
+        let kind = policy::wait_kind(match &error {
+            ChunkError::Refused {
+                error: Some(refusal),
+                ..
+            }
+            | ChunkError::Call(CallError::Server(refusal)) => Some(refusal),
+            _ => None,
+        });
         self.retry_after(
             Call::Upload,
             format!("uploading a file's content failed: {error}"),
             wait,
+            kind,
         );
         self.failures += 1;
         self.flight = Flight::Waiting(Next::Upload);
@@ -727,7 +744,7 @@ impl Folder {
     }
 
     /// Records that a call of kind `call` failed with `why` and is sent again after `wait`.
-    fn retry_after(&mut self, call: Call, why: String, wait: Duration) {
+    fn retry_after(&mut self, call: Call, why: String, wait: Duration, kind: WaitKind) {
         let since = (self.retrying.get(&call)).map_or_else(Instant::now, |retrying| retrying.since);
         let at = SystemTime::now() + wait;
         let retrying = Retrying {
@@ -735,6 +752,7 @@ impl Folder {
             why,
             wait,
             at,
+            kind,
         };
         self.retrying.insert(call, retrying);
     }
@@ -772,11 +790,18 @@ impl Folder {
             .map(|(id, whys)| format!("{} ({})", named(id), whys.join("; ")))
             .collect();
         stuck.sort();
-        let retrying = (self.retrying.values())
-            .find(|retrying| {
-                retrying.wait >= RETRY_SHOWN || retrying.since.elapsed() >= RETRY_SHOWN
-            })
-            .map(|retrying| format!("{}; trying again at {}", retrying.why, utc(retrying.at)));
+        let shown = (self.retrying.values()).find(|retrying| {
+            retrying.wait >= RETRY_SHOWN || retrying.since.elapsed() >= RETRY_SHOWN
+        });
+        let wait = (self.retrying.values())
+            .max_by_key(|retrying| retrying.at)
+            .map(|retrying| Wait {
+                kind: retrying.kind,
+                until_ms: (retrying.at.duration_since(UNIX_EPOCH))
+                    .map_or(0, |at| at.as_millis() as i64),
+            });
+        let retrying =
+            shown.map(|retrying| format!("{}; trying again at {}", retrying.why, utc(retrying.at)));
         let problem = match self.engine.commits.halted() {
             _ if self.note.is_some() => self.note.clone(),
             _ if retrying.is_some() => retrying,
@@ -802,7 +827,7 @@ impl Folder {
                     more => format!(", and {more} more"),
                 };
                 Some(format!(
-                    "{count} could not be synced: {}{more}; run koi restart once {fixed} fixed",
+                    "{count} could not be synced: {}{more}; run koi folder restart once {fixed} fixed",
                     stuck.join(", ")
                 ))
             }
@@ -818,6 +843,7 @@ impl Folder {
             remote_nodes: self.remote_nodes,
             local_entries: self.local_entries,
             problem,
+            wait,
             questions: self.questions,
         }
     }
@@ -1172,6 +1198,7 @@ impl Folder {
                     Call::Commit,
                     format!("the server did not take a commit: {described}"),
                     wait,
+                    policy::wait_kind(Some(refusal)),
                 );
                 self.flight = Flight::Waiting(Next::Send(commit));
                 work.push(Work::ResendAfter(wait));
@@ -1375,7 +1402,7 @@ fn lift_hint(code: i32) -> &'static str {
     if code == Code::ConfirmationRequired as i32 {
         "; the space's owner must confirm them, which Koidrive cannot ask for yet"
     } else {
-        "; once the cause is fixed, run koi lift <folder> --resend to send them again, or --replan to plan them \
+        "; once the cause is fixed, run koi folder retry <folder> --resend to send them again, or --replan to plan them \
          again"
     }
 }
@@ -1801,6 +1828,7 @@ impl FolderTask {
             remote_nodes: status.remote_nodes,
             local_entries: status.local_entries,
             problem: status.problem.clone(),
+            wait: status.wait,
             questions: status.questions,
         };
         if shown == view && !asked {
@@ -1813,6 +1841,7 @@ impl FolderTask {
         status.remote_nodes = view.remote_nodes;
         status.local_entries = view.local_entries;
         status.problem = view.problem;
+        status.wait = view.wait;
         status.questions = view.questions;
         drop(status);
         self.changed.send_replace(());
@@ -1892,6 +1921,10 @@ fn later(
         listing,
         wait,
         why: format!("reading the space's {what} failed: {why}"),
+        kind: policy::wait_kind(match error {
+            CallError::Server(refusal) => Some(refusal),
+            _ => None,
+        }),
     })
 }
 

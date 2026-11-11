@@ -3,7 +3,7 @@
 ## Link a folder
 
 ```sh
-koi link ~/Koidrive --space Koidrive
+koi folder link ~/Koidrive --space Koidrive
 ```
 
 `--space` takes the space's name or its ID. If two spaces have the same name, use the ID. The folder must exist, and it may already hold files.
@@ -32,7 +32,7 @@ A space syncs to at most one folder on each device. Koidrive refuses a folder th
 The folder syncs while [the daemon](install.md#run-the-sync-daemon) runs. To stop syncing it:
 
 ```sh
-koi unlink ~/Koidrive
+koi folder unlink ~/Koidrive
 ```
 
 Unlinking keeps every file. It also keeps the folder's `.koidrive/` folder, whose [local trash](#the-local-trash) may still hold files that sync replaced. Delete `.koidrive/` yourself once you no longer need them.
@@ -46,7 +46,7 @@ It doesn't sync:
 - symbolic links, sockets, FIFOs and device files. Koidrive skips them and never follows a symbolic link inside a linked folder;
 - permissions other than the executable bit, the owner and group, ACLs and extended attributes such as macOS Finder tags;
 - hard links as links. Each name of a hard-linked file syncs as a separate file;
-- the platform files `.DS_Store`, `Thumbs.db`, `desktop.ini` and `Icon\r`, and the `.koidrive/` folder at the top of a linked folder. No rule can bring them back. When sync removes a folder that another device deleted, it deletes these platform files in it too, so that the folder can go. If the folder still holds anything else that Koidrive doesn't sync, such as a file your rules leave out or a symbolic link, Koidrive keeps the folder with those entries, and the status names them. Remove them and run `koi restart`, and the folder goes. A `.koidrive` folder deeper down is an ordinary folder and syncs.
+- the platform files `.DS_Store`, `Thumbs.db`, `desktop.ini` and `Icon\r`, and the `.koidrive/` folder at the top of a linked folder. No rule can bring them back. When sync removes a folder that another device deleted, it deletes these platform files in it too, so that the folder can go. If the folder still holds anything else that Koidrive doesn't sync, such as a file your rules leave out or a symbolic link, Koidrive keeps the folder with those entries, and the status names them. Remove them and run `koi folder restart <folder>`, and the folder goes. A `.koidrive` folder deeper down is an ordinary folder and syncs.
 
 Names compare without regard to case or Unicode normalization. Two names in one folder that differ only in case, such as `Report.txt` and `report.txt`, can exist on a Linux disk but not in a space, so the second to arrive is renamed as a [conflict](conflicts.md#two-files-with-the-same-name). A name is at most 255 bytes, and a path at most 256 folders deep.
 

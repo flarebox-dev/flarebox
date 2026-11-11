@@ -41,4 +41,4 @@ pub use observe::{FsObserver, Observation, Observed, Observer, RulesChange};
 pub use paths::{Paths, PathsError};
 pub use question::{Answer, HeldItem, Limit, Question, QuestionKind, RecoveryGroup};
 pub use restore::{RestoreRejection, RestoreRequest, RestoreState, RestoreStatus, RestoreWait};
-pub use status::{Account, FolderState, FolderStatus, Status};
+pub use status::{Account, FolderState, FolderStatus, Status, Wait, WaitKind};
