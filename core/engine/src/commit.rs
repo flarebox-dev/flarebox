@@ -16,7 +16,7 @@ use crate::ids::IdGen;
 use crate::names::{MAX_NAME_BYTES, name_key, nfc};
 use crate::question::{Answer, Question, QuestionKind};
 use crate::restore::{Outcome, RESOLVED_KEPT, Rejection, Resolved, RestoreId, RestoreIntent};
-use crate::state::{CommitsState, StateError};
+use crate::state::{Agreed, CommitsState, StateError};
 use crate::tree::{Content, Kind, Names, NodeId, Shape, same, same_content};
 
 /// The most ops one commit holds (spec v0 section 13).
@@ -692,8 +692,10 @@ impl Commits {
     /// `base_seq`, so the move replaced a position from an earlier record, and a position only R
     /// came back to is a remote change. When L and R agreed on a newer position
     /// ([`Trees::position_after`]), S takes that position, and a rename by the server does not
-    /// revert the node. When S cannot hold that position once the other updates are made, because
-    /// another node holds its name or its parent is gone, S takes what was sent instead. A conflict copy is re-keyed in L, and so is
+    /// revert the node. S first takes what every op sent, as without an agreement, and then each
+    /// agreed position S can hold, with the rest of the shape the ops gave the node. A node whose
+    /// agreed position S cannot hold, because another node holds its name or its parent is gone,
+    /// keeps what was sent, and is reverted when the server renamed it. A conflict copy is re-keyed in L, and so is
     /// a directory merged into one L does not hold yet. When L already holds the conflict copy,
     /// because a log replay brought it before the result and the effects downloaded it, the local
     /// file keeps its ID and takes what was sent as its S, so the server's content replaces it. When L already holds the directory it was
@@ -724,7 +726,7 @@ impl Commits {
         let result = flight.result.expect("taken with a result");
         let mut synced = Synced::default();
         let mut merged: BTreeMap<NodeId, NodeId> = BTreeMap::new();
-        let mut instead: BTreeMap<NodeId, Shape> = BTreeMap::new();
+        let mut agreed: BTreeMap<NodeId, Agreed> = BTreeMap::new();
         let mut unreverted: BTreeSet<NodeId> = BTreeSet::new();
         let aliases = self.aliases.clone();
         for (op, outcome) in flight.commit.ops.iter().zip(&result.results) {
@@ -762,7 +764,7 @@ impl Commits {
                         synced.set(into, Some(shape));
                         merged.insert(create.node_id.clone(), into.clone());
                     } else if applied {
-                        let shape = agreed(trees, &create.node_id, result.seq, shape, &mut instead);
+                        agreed.extend(agree(trees, &create.node_id, result.seq));
                         synced.set(&create.node_id, Some(shape));
                     }
                     let exists = taken && trees.remote().live(&create.node_id).is_some();
@@ -780,7 +782,7 @@ impl Commits {
                             content: create.content.clone(),
                         };
                         let shape = created(trees, &synced, &create.node_id, shape);
-                        let shape = agreed(trees, &create.node_id, result.seq, shape, &mut instead);
+                        agreed.extend(agree(trees, &create.node_id, result.seq));
                         synced.set(&create.node_id, Some(shape));
                     }
                     let exists = taken && trees.remote().live(&create.node_id).is_some();
@@ -826,7 +828,7 @@ impl Commits {
                             name: name(&moved.new_name),
                             ..shape
                         };
-                        let shape = agreed(trees, id, result.seq, shape, &mut instead);
+                        agreed.extend(agree(trees, id, result.seq));
                         synced.set(id, Some(shape));
                     }
                     if cycle {
@@ -855,7 +857,7 @@ impl Commits {
                     local.shape.parent != *parent || nfc(&local.shape.name) != nfc(name)
                 })
             });
-            let kept = instead.contains_key(node);
+            let kept = agreed.contains_key(node);
             if (renamed && !left && !kept) || (done && follows) {
                 trees.revert(node.clone());
             } else if renamed && !left {
@@ -865,20 +867,32 @@ impl Commits {
                 self.problems.insert(node.clone());
             }
         }
-        let mut again = Synced::default();
-        for (id, shape) in synced.apply(trees) {
-            let shape = match instead.remove(&id) {
-                Some(sent) => {
-                    if unreverted.contains(&id) {
-                        trees.revert(id.clone());
-                    }
-                    Some(sent)
-                }
-                None => shape,
+        let mut rest = synced.apply(trees);
+        let mut positions = Synced::default();
+        for (id, at) in &agreed {
+            let held = match rest.iter().find(|(other, _)| other == id) {
+                Some((_, shape)) => shape.clone(),
+                None => trees.synced().get(id).cloned(),
             };
-            again.set(&id, shape);
+            if let Some(shape) = held {
+                let shape = Shape {
+                    parent: at.parent.clone(),
+                    name: at.name.clone(),
+                    ..shape
+                };
+                positions.set(id, Some(shape));
+            }
         }
-        for (id, shape) in again.apply(trees) {
+        let tried: BTreeSet<NodeId> = positions.ids().collect();
+        let refused: BTreeSet<NodeId> = (positions.apply(trees).into_iter())
+            .map(|(id, _)| id)
+            .collect();
+        let taken: BTreeSet<&NodeId> = tried.difference(&refused).collect();
+        rest.retain(|(id, _)| !taken.contains(id));
+        for id in unreverted.iter().filter(|id| !taken.contains(id)) {
+            trees.revert(id.clone());
+        }
+        for (id, shape) in rest {
             trees.wait(id, shape);
         }
         let restored = carried(&self.restores, &flight.commit.ops);
@@ -1122,6 +1136,10 @@ impl Synced {
     }
 
     /// Makes the updates that leave S valid and returns the rest (see [`update_synced`]).
+    fn ids(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.updates.iter().map(|(id, _)| id.clone())
+    }
+
     fn apply(self, trees: &mut Trees) -> Vec<(NodeId, Option<Shape>)> {
         update_synced(trees, self.updates)
     }
@@ -1357,25 +1375,9 @@ fn created(trees: &Trees, synced: &Synced, id: &str, sent: Shape) -> Shape {
     }
 }
 
-/// `sent` at the position L and R agreed on after `seq` ([`Trees::position_after`]), if any. Then
-/// `sent` is kept in `instead`, for when S cannot hold the agreed position.
-fn agreed(
-    trees: &Trees,
-    id: &str,
-    seq: u64,
-    sent: Shape,
-    instead: &mut BTreeMap<NodeId, Shape>,
-) -> Shape {
-    let Some(agreed) = trees.position_after(id, seq) else {
-        return sent;
-    };
-    let shape = Shape {
-        parent: agreed.parent.clone(),
-        name: agreed.name.clone(),
-        ..sent.clone()
-    };
-    instead.insert(id.to_owned(), sent);
-    shape
+/// The position of `id` that L and R agreed on after `seq` ([`Trees::position_after`]), if any.
+fn agree(trees: &Trees, id: &str, seq: u64) -> Option<(NodeId, Agreed)> {
+    (trees.position_after(id, seq)).map(|at| (id.to_owned(), at.clone()))
 }
 
 /// What S holds for `id`, or its waiting update while one waits.
