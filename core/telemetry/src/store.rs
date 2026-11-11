@@ -144,8 +144,10 @@ impl Queue {
         self.out.iter().flat_map(|out| &out.batch.events)
     }
 
-    /// Drops what is older than [`KEEP_DAYS`] and the oldest events over [`MAX_EVENTS`].
+    /// Drops what is older than [`KEEP_DAYS`], in the batch that is out too, and the oldest events over
+    /// [`MAX_EVENTS`].
     fn trim(&mut self, today: u32) {
+        self.out = self.out.take().and_then(|out| out.trimmed(today));
         let oldest = today.saturating_sub(KEEP_DAYS);
         self.days
             .retain(|day, report| *day >= oldest && !report.is_empty());
@@ -285,9 +287,7 @@ impl Store {
         let held = (queue.days.len(), queue.events.len(), queue.out.is_some());
         queue.trim(today);
         let trimmed = held != (queue.days.len(), queue.events.len(), queue.out.is_some());
-        let left = (queue.out.take())
-            .filter(|out| out.id == id)
-            .and_then(|out| out.trimmed(today));
+        let left = queue.out.take().filter(|out| out.id == id);
         let out = match left {
             Some(out) => out,
             None => {
@@ -565,6 +565,20 @@ mod tests {
         drop(store.take(late).unwrap());
         assert!(store.queue().unwrap().days.is_empty());
         assert!(store.queue().unwrap().events.is_empty());
+    }
+
+    #[test]
+    fn an_expired_batch_out_makes_no_room_for_itself() {
+        let (_dir, store) = store();
+        store.set(true).unwrap();
+        store.absorb_at(pending(99, 1), 100, true).unwrap();
+        let sending = store.take(100).unwrap().unwrap();
+        store.give_back(sending).unwrap();
+        let late = 99 + KEEP_DAYS + 1;
+        store.absorb_at(pending(late, 1), late, true).unwrap();
+        let queue = store.queue().unwrap();
+        assert!(queue.out.is_none());
+        assert_eq!(queue.events.len(), 1);
     }
 
     #[test]
