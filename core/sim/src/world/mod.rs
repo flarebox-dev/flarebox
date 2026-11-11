@@ -703,6 +703,11 @@ impl World {
                     "recovery started with no rewind and no rolled-back store".into(),
                 ));
             }
+            Reconnect::AheadOfServer => {
+                return Err(Failure::Broken(
+                    "the server lost a device's commits with no server rolled back".into(),
+                ));
+            }
             Reconnect::Resend if welcome.device_seq > self.devices[d].engine.commits.accepted() => {
                 note(
                     &mut self.seen,
