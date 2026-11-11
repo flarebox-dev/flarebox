@@ -3597,6 +3597,45 @@ fn a_file_moved_into_an_ignored_folder_stays_on_the_server_when_its_folder_is_re
     assert_eq!(a.folder.engine.trees.check(), Ok(()));
 }
 
+/// The user moves `source/file` into the ignored folder and removes `source`, so L keeps `source` for the file.
+/// Then the user creates a folder named `source` again and a file in it. The new folder is the one L keeps, so the
+/// server keeps `file` in it and adds the new file there, also after a restart.
+#[test]
+fn a_folder_created_again_at_a_removed_folder_kept_for_an_ignored_file_keeps_the_file_on_the_server()
+ {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site.root.join("source")).unwrap();
+    a.create(&mut remote, &site.root.join("source/file"), b"kept");
+    a.create(&mut remote, &site.root.join(".fbignore"), b"ignored/\n");
+    fs::create_dir(site.root.join("ignored")).unwrap();
+    fs::rename(
+        site.root.join("source/file"),
+        site.root.join("ignored/file"),
+    )
+    .unwrap();
+    fs::remove_dir(site.root.join("source")).unwrap();
+    a.scan_until(|a| (a.folder.engine.trees.ignored_local().len()) == 2);
+    a.run(&mut remote);
+    fs::create_dir(site.root.join("source")).unwrap();
+    a.create(&mut remote, &site.root.join("source/new"), b"new");
+    a.settle();
+    a.run(&mut remote);
+    assert_eq!(remote.names(), [".fbignore", "file", "new", "source"]);
+    assert_eq!(a.folder.engine.trees.check(), Ok(()));
+    drop(a);
+
+    let mut a = site.start();
+    a.connect(&remote);
+    a.scan_until(|a| a.folder.scanned);
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    assert_eq!(fs::read(site.root.join("ignored/file")).unwrap(), b"kept");
+    assert_eq!(fs::read(site.root.join("source/new")).unwrap(), b"new");
+    assert_eq!(remote.names(), [".fbignore", "file", "new", "source"]);
+    assert_eq!(a.folder.engine.trees.check(), Ok(()));
+}
 /// The user hard-links `source/file` into the ignored folder, moves the file itself to `moved`, and removes
 /// `source`. The file is still synced at `moved`, so the server follows the move; the link stays out.
 #[test]
