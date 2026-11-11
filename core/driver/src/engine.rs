@@ -163,12 +163,30 @@ impl Engine {
 
     /// Stores each question the engine asked since the last checkpoint and removes the rows of the ones it no longer
     /// asks, for `Driver::questions` to show. A question whose counts changed under the same id, as a notice's do, is
-    /// shown with the new counts and keeps any answer it was given. Sets [`Engine::asked`] when it changed a row.
+    /// shown with the new counts and keeps any answer it was given. Sets [`Engine::asked`] when it changed a row. A new question that takes the place of one the
+    /// engine stopped asking, of the same kind and still unanswered, continues that one's lineage: the guard asks
+    /// again under a new id when the held set changes, and this is the one place that sees both in one step.
     pub fn ask(&mut self, tx: &Tx<'_>, space_id: &str) -> Result<(), Error> {
         let asked = &self.stored.commits.questions;
         let asking = self.commits.questions();
         let open = |questions: &[engine::Question], id: &str| questions.iter().any(|q| q.id == id);
         let mut changed = false;
+        let rows: BTreeMap<String, StoredQuestion> = (tx.questions()?.into_iter())
+            .map(|row| (row.question_id.clone(), row))
+            .collect();
+        let lineage = |row: &StoredQuestion| {
+            (serde_json::from_slice::<Question>(&row.body).ok())
+                .map(|shown| shown.lineage)
+                .filter(|lineage| !lineage.is_empty())
+                .unwrap_or_else(|| row.question_id.clone())
+        };
+        let replaced: Vec<(&engine::Question, String)> = (asked.iter())
+            .filter(|question| !open(asking, &question.id))
+            .filter_map(|question| {
+                let row = rows.get(&question.id).filter(|row| row.answer.is_none())?;
+                Some((question, lineage(row)))
+            })
+            .collect();
         for question in asked.iter().filter(|question| !open(asking, &question.id)) {
             tx.remove_question(&question.id)?;
             changed = true;
@@ -176,23 +194,30 @@ impl Engine {
         for question in asking.iter().filter(|question| {
             (asked.iter()).any(|before| before.id == question.id && before.kind != question.kind)
         }) {
-            let body =
-                serde_json::to_vec(&self.shown(space_id, question)).expect("a question serializes");
+            let kept = rows
+                .get(&question.id)
+                .map_or_else(|| question.id.clone(), lineage);
+            let body = serde_json::to_vec(&self.shown(space_id, question, kept))
+                .expect("a question serializes");
             tx.reshow_question(&question.id, &body)?;
             changed = true;
         }
         for question in asking.iter().filter(|question| !open(asked, &question.id)) {
+            let continued = (replaced.iter())
+                .find(|(before, _)| same_kind(&before.kind, &question.kind))
+                .map_or_else(|| question.id.clone(), |(_, lineage)| lineage.clone());
             tracing::warn!(
                 space_id,
                 question_id = question.id,
+                lineage = continued,
                 kind = ?question.kind,
                 items = question.held.len(),
-                "holds changes until it is answered with koi questions"
+                "holds changes until it is answered with koi resolve"
             );
             tx.put_question(&StoredQuestion {
                 question_id: question.id.clone(),
                 asked_at_ms: question.asked_at_ms as i64,
-                body: serde_json::to_vec(&self.shown(space_id, question))
+                body: serde_json::to_vec(&self.shown(space_id, question, continued))
                     .expect("a question serializes"),
                 answer: None,
             })?;
@@ -203,7 +228,7 @@ impl Engine {
     }
 
     /// The question as the person sees it: each item the engine holds with its path, in path order.
-    fn shown(&self, space_id: &str, asked: &engine::Question) -> Question {
+    fn shown(&self, space_id: &str, asked: &engine::Question, lineage: String) -> Question {
         let mut items: Vec<HeldItem> = (asked.held.iter())
             .map(|(id, held)| HeldItem {
                 node_id: id.clone(),
@@ -218,6 +243,7 @@ impl Engine {
             asked_at_ms: asked.asked_at_ms as i64,
             kind: asked.kind.clone(),
             items,
+            lineage,
         }
     }
 
@@ -1153,6 +1179,18 @@ pub(crate) fn file_id(identity: FileIdentity) -> FileId {
         dev: identity.dev,
         ino: identity.ino,
         birth_ns: identity.birth_ns,
+    }
+}
+
+/// Whether a question of kind `after` can take the place of one of kind `before`: the same kind, and for recovery the
+/// same group.
+fn same_kind(before: &engine::QuestionKind, after: &engine::QuestionKind) -> bool {
+    match (before, after) {
+        (
+            engine::QuestionKind::Recovery { group: a },
+            engine::QuestionKind::Recovery { group: b },
+        ) => a == b,
+        (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
     }
 }
 

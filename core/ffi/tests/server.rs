@@ -385,6 +385,7 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
 
     let held = driver::Question {
         id: "q-mass-delete".into(),
+        lineage: "q-mass-delete".into(),
         space_id: space.space_id.clone(),
         asked_at_ms: 1,
         kind: driver::QuestionKind::MassDelete {
@@ -401,6 +402,7 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
     };
     let noticed = driver::Question {
         id: "n-remote-mass-delete".into(),
+        lineage: "n-remote-mass-delete".into(),
         space_id: space.space_id.clone(),
         asked_at_ms: 2,
         kind: driver::QuestionKind::RemoteMassDelete {

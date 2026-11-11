@@ -1319,6 +1319,9 @@ fn decode_question(space_id: &str, stored: &StoredQuestion) -> Option<Question> 
                     exceeded.push(Limit::Deletions);
                 }
             }
+            if question.lineage.is_empty() {
+                question.lineage = question.id.clone();
+            }
             Some(question)
         }
         Err(error) => {
@@ -1468,6 +1471,7 @@ mod tests {
     fn mass_delete(id: &str) -> Question {
         Question {
             id: id.into(),
+            lineage: id.into(),
             space_id: SPACE.into(),
             asked_at_ms: 10,
             kind: QuestionKind::MassDelete {
@@ -3674,6 +3678,7 @@ mod tests {
                     exceeded: Vec::new(),
                 },
                 items: Vec::new(),
+                lineage: "q1".into(),
             };
             let body = serde_json::to_string(&question).unwrap();
             let stored = StoredQuestion {

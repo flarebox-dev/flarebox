@@ -20,7 +20,7 @@ Every other file and folder is held. Sync asks one question about the held entri
 - `publish` uploads the held files. If the space already has a file with the same name, the upload gets a [conflict name](conflicts.md#two-files-with-the-same-name).
 - `discard` moves the held files to the [local trash](#the-local-trash) and downloads the space's files at their paths.
 
-Answer it with `koi questions`, as [Questions](status.md#questions) describes. If the held entries change before sync applies your answer, sync replaces the question with a new one that has a new ID and drops your answer. An entry you edit or move stays held, and one you delete leaves the question. Run `koi questions` again and answer the new question.
+Answer it with `koi resolve`, as [Decisions](status.md#decisions) describes. If the held entries change before sync applies your answer, sync replaces the question with a new one that has a new ID and drops your answer. An entry you edit or move stays held, and one you delete leaves the question. Run `koi resolve` again and answer the new question.
 
 A space syncs to at most one folder on each device. Koidrive refuses a folder that:
 

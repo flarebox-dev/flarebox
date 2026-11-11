@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `koi` command: sets up a server or joins one, links folders, shows status and questions, lists a folder's
+//! The `koi` command: sets up a server or joins one, links folders, shows status and pending decisions, lists a folder's
 //! trash and a file's versions, manages the account's devices, shows what each space stores, and runs the sync daemon.
 //! Commands run in the daemon through its socket when it is running, and on their own otherwise. The device, usage,
 //! trash and versions commands talk to the server directly with the credential.
 
 mod history;
 mod ipc;
+mod notify;
 mod pairing;
 mod setup;
 
@@ -104,13 +105,17 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// List the questions sync is waiting on, or answer one.
-    Questions {
-        /// Print the list of questions as JSON instead of text. Answering a question always prints text.
-        #[arg(long)]
+    /// List the decisions sync is waiting on, or make one.
+    Resolve {
+        /// The decision to make, as koi resolve lists it.
+        #[arg(requires = "answer")]
+        id: Option<String>,
+        /// One of the answers the decision lists.
+        #[arg(value_parser = |text: &str| text.parse::<Answer>())]
+        answer: Option<Answer>,
+        /// Print the list of decisions as JSON instead of text. Making a decision always prints text.
+        #[arg(long, conflicts_with = "id")]
         json: bool,
-        #[command(subcommand)]
-        action: Option<QuestionAction>,
     },
     /// List the devices paired with the server, or revoke a lost one.
     Device {
@@ -168,17 +173,25 @@ enum Command {
     },
 }
 
-#[derive(Subcommand)]
-enum QuestionAction {
-    /// Answer a question with one of the answers it lists.
-    Answer {
-        /// The question's ID, as koi questions lists it.
-        id: String,
-        /// One of the two answers koi questions lists for it: delete, restore, keep, discard, publish, repeat or
-        /// cancel.
-        #[arg(value_parser = |text: &str| text.parse::<Answer>())]
-        answer: Answer,
-    },
+impl Command {
+    /// Whether the command ends with the pending-decision banner on stderr. `status` and `resolve` show the decisions
+    /// themselves, the daemon never ends, and JSON output carries decisions as data, without decoration.
+    fn shows_banner(&self) -> bool {
+        match self {
+            Command::Daemon { .. } | Command::Status { .. } | Command::Resolve { .. } => false,
+            Command::Trash { json, .. }
+            | Command::Versions { json, .. }
+            | Command::Restores { json, .. }
+            | Command::Usage { json }
+            | Command::Space {
+                action: SpaceAction::List { json },
+            }
+            | Command::Device {
+                action: DeviceAction::List { json },
+            } => !json,
+            _ => true,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -262,8 +275,10 @@ fn main() -> ExitCode {
         Ok(paths) => paths,
         Err(error) => return fail(error.to_string()),
     };
-    let outcome = runtime.block_on(async move {
-        match command {
+    let shows_banner = command.shows_banner();
+    let banner_paths = paths.clone();
+    let (outcome, banner) = runtime.block_on(async move {
+        let outcome = match command {
             Command::Daemon { .. } => daemon(paths).await,
             Command::Device { action } => device(paths, action).await,
             Command::Space { action } => space(paths, action).await,
@@ -286,12 +301,21 @@ fn main() -> ExitCode {
             } => client(paths, command).await,
             Command::Server { action } => setup::server(&paths, action).await,
             command => client(paths, command).await,
-        }
+        };
+        let banner = match shows_banner {
+            true => pending_banner(&banner_paths).await,
+            false => None,
+        };
+        (outcome, banner)
     });
-    match outcome {
+    let code = match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => fail(message),
+    };
+    if let Some(banner) = banner {
+        eprintln!("{banner}");
     }
+    code
 }
 
 fn fail(message: String) -> ExitCode {
@@ -330,6 +354,7 @@ async fn daemon(paths: Paths) -> Result<(), String> {
     let mut interrupt = signal(SignalKind::interrupt()).map_err(|error| error.to_string())?;
     driver.start();
     let server = tokio::spawn(ipc::serve(listener, driver.clone()));
+    let notifications = tokio::spawn(notify::decisions(driver.clone()));
     tracing::info!(
         socket = %socket.display(),
         version = env!("CARGO_PKG_VERSION"),
@@ -342,6 +367,7 @@ async fn daemon(paths: Paths) -> Result<(), String> {
     };
     tracing::info!(signal, "stopping the daemon");
     server.abort();
+    notifications.abort();
     let _ = std::fs::remove_file(&socket);
     driver.stop().await;
     tracing::info!("the daemon stopped");
@@ -404,9 +430,9 @@ async fn client(paths: Paths, command: Command) -> Result<(), String> {
             false,
         ),
         Command::Status { json } => (Request::Status, json),
-        Command::Questions { json, action: None } => (Request::Questions, json),
-        Command::Questions {
-            action: Some(QuestionAction::Answer { id, answer }),
+        Command::Resolve {
+            id: Some(id),
+            answer: Some(answer),
             ..
         } => (
             Request::Answer {
@@ -415,6 +441,7 @@ async fn client(paths: Paths, command: Command) -> Result<(), String> {
             },
             false,
         ),
+        Command::Resolve { json, .. } => (Request::Questions, json),
         Command::Daemon { .. }
         | Command::Device { .. }
         | Command::Usage { .. }
@@ -475,7 +502,14 @@ async fn client(paths: Paths, command: Command) -> Result<(), String> {
         },
         Response::Status { status } if json => print_json(&status),
         Response::Status { status } => {
-            print_status(&status);
+            let questions = match status.folders.iter().any(|folder| folder.questions > 0) {
+                true => match ipc::run(&paths, Request::Questions).await? {
+                    Response::Questions { questions } => questions,
+                    _ => Vec::new(),
+                },
+                false => Vec::new(),
+            };
+            print_status(&status, &questions);
             Ok(())
         }
         Response::Questions { questions } if json => {
@@ -495,7 +529,7 @@ async fn client(paths: Paths, command: Command) -> Result<(), String> {
             Ok(())
         }
         Response::Answered => {
-            println!("Answered.");
+            println!("Resolved.");
             Ok(())
         }
         Response::SignedOut | Response::Restore { .. } | Response::Restores { .. } => {
@@ -940,7 +974,7 @@ fn print_json(value: &impl serde::Serialize) -> Result<(), String> {
     Ok(())
 }
 
-fn print_status(status: &Status) {
+fn print_status(status: &Status, questions: &[Question]) {
     match &status.account {
         Some(account) => println!(
             "Device: {} ({}) on {}",
@@ -961,6 +995,9 @@ fn print_status(status: &Status) {
     }
     for folder in &status.folders {
         print_folder(folder);
+        for question in (questions.iter()).filter(|question| question.space_id == folder.space_id) {
+            print!("{}", question_brief(question));
+        }
     }
 }
 
@@ -971,7 +1008,7 @@ fn print_folder(folder: &FolderStatus) {
         _ => "not read yet".to_owned(),
     };
     println!(
-        "{}  space {} ({})  {:?}  {seq}, {} remote nodes{}, {} questions",
+        "{}  space {} ({})  {:?}  {seq}, {} remote nodes{}, {}",
         folder.path,
         folder.space_name,
         folder.space_id,
@@ -981,7 +1018,7 @@ fn print_folder(folder: &FolderStatus) {
             .local_entries
             .map(|entries| format!(", {entries} local entries"))
             .unwrap_or_default(),
-        folder.questions
+        count(folder.questions, "pending decision")
     );
     if let Some(problem) = &folder.problem {
         println!("  {problem}");
@@ -990,18 +1027,21 @@ fn print_folder(folder: &FolderStatus) {
 
 fn print_questions(questions: &[Question]) {
     if questions.is_empty() {
-        println!("No questions.");
+        println!("No decisions are waiting.");
     }
     for question in questions {
         print!("{}", question_text(question));
     }
 }
 
-/// The most items `koi questions` lists for one question.
+/// The command that lists and answers decisions, as every message names it.
+const RESOLVE: &str = "koi resolve";
+
+/// The most items `koi resolve` lists for one decision.
 const ITEMS_SHOWN: usize = 20;
 
-/// How `koi questions` shows one question: what it asks, how to answer it, and its first [`ITEMS_SHOWN`] items.
-fn question_text(question: &Question) -> String {
+/// What a decision is about, in one line.
+fn question_summary(question: &Question) -> String {
     let why = |exceeded: &[Limit]| {
         let limits: Vec<String> = (exceeded.iter())
             .map(|limit| match limit {
@@ -1014,7 +1054,7 @@ fn question_text(question: &Question) -> String {
             limits => format!(", {}", limits.join(" and ")),
         }
     };
-    let what = match &question.kind {
+    match &question.kind {
         QuestionKind::MassDelete {
             deletions,
             affected_files,
@@ -1055,14 +1095,63 @@ fn question_text(question: &Question) -> String {
             }
         }
         .to_owned(),
-    };
-    let answers: Vec<&str> = question.kind.answers().iter().map(|a| a.as_str()).collect();
+    }
+}
+
+/// The first path a decision holds, after its summary, or nothing for a decision that holds none.
+fn first_path(question: &Question) -> String {
+    (question.items.first())
+        .map(|item| format!("; first path: {}", printable(&item.path)))
+        .unwrap_or_default()
+}
+
+/// Each answer of a decision: what it does, and under it the full command that gives it.
+fn resolve_commands(question: &Question, indent: &str) -> String {
+    let id = printable(&question.id);
+    (question.kind.answers().iter())
+        .map(|answer| {
+            format!(
+                "{indent}{}:\n{indent}  {RESOLVE} {id} {}\n",
+                answer_effect(*answer),
+                answer.as_str()
+            )
+        })
+        .collect()
+}
+
+/// What an answer does.
+fn answer_effect(answer: Answer) -> &'static str {
+    match answer {
+        Answer::Delete => "Delete these files on the server and other devices",
+        Answer::Restore => "Download these files to this device again",
+        Answer::Keep => "Put these files back on the server",
+        Answer::Discard => "Move this device's copies to the local trash and follow the server",
+        Answer::Publish => "Send this device's version to the server",
+        Answer::Repeat => "Send the request again",
+        Answer::Cancel => "Drop the request",
+        Answer::Dismiss => "Close this notice",
+    }
+}
+
+/// How `koi status` shows a decision under its folder: what it is about, its first path, and how to make it.
+fn question_brief(question: &Question) -> String {
+    format!(
+        "  {}: {}{}\n{}",
+        printable(&question.id),
+        question_summary(question),
+        first_path(question),
+        resolve_commands(question, "  ")
+    )
+}
+
+/// How `koi resolve` shows a decision: what it is about, how to make it, and its first [`ITEMS_SHOWN`] items.
+fn question_text(question: &Question) -> String {
     let mut text = format!(
-        "{}  space {}  {what}\n  answer with: koi questions answer {} {}\n",
+        "{}  space {}  {}\n{}",
         printable(&question.id),
         printable(&question.space_id),
-        printable(&question.id),
-        answers.join("|")
+        question_summary(question),
+        resolve_commands(question, "  ")
     );
     for item in question.items.iter().take(ITEMS_SHOWN) {
         text += &format!(
@@ -1073,9 +1162,39 @@ fn question_text(question: &Question) -> String {
     }
     let more = question.items.len().saturating_sub(ITEMS_SHOWN);
     if more > 0 {
-        text += &format!("  and {more} more; koi questions --json lists them all\n");
+        text += &format!("  and {more} more; {RESOLVE} --json lists them all\n");
     }
     text
+}
+
+/// The text of a desktop notification for a decision: what it is about, its first path, and the command to run.
+fn question_notice(question: &Question) -> String {
+    format!(
+        "{}{}. Run {RESOLVE}.",
+        question_summary(question),
+        first_path(question)
+    )
+}
+
+/// The line every command but `status`, `resolve` and `daemon` prints on stderr while decisions are pending.
+fn banner(questions: &[Question]) -> Option<String> {
+    let n = questions.len() as u64;
+    let verb = if n == 1 { "is" } else { "are" };
+    (n > 0).then(|| {
+        format!(
+            "koi: {} {verb} waiting; run {RESOLVE}",
+            count(n, "sync decision")
+        )
+    })
+}
+
+/// The banner for the decisions pending in the profile, asked of the daemon. Without a daemon there is none, because
+/// a command run on its own leaves the profile as it found it.
+async fn pending_banner(paths: &Paths) -> Option<String> {
+    match ipc::ask(paths, &Request::Questions).await {
+        Ok(Some(Response::Questions { questions })) => banner(&questions),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1212,6 +1331,7 @@ mod tests {
     ) -> Question {
         Question {
             id: "q1".into(),
+            lineage: "q1".into(),
             space_id: "s1".into(),
             asked_at_ms: 1,
             kind: QuestionKind::MassDelete {
@@ -1234,9 +1354,14 @@ mod tests {
     fn a_held_path_is_shown_with_its_control_characters_escaped() {
         let mut question = held((1, 15, 20), &[Limit::Share], 1);
         question.items[0].path = "old/a\nforged line\u{1b}[2J".into();
-        let text = question_text(&question);
-        assert_eq!(text.lines().count(), 3, "{text}");
-        assert!(!text.contains('\u{1b}'), "{text}");
+        for text in [question_text(&question), question_brief(&question)] {
+            assert_eq!(
+                text.lines().count(),
+                6 - text.starts_with(' ') as usize,
+                "{text}"
+            );
+            assert!(!text.contains('\u{1b}'), "{text}");
+        }
     }
 
     #[test]
@@ -1244,19 +1369,19 @@ mod tests {
         let text = question_text(&held((1_001, 1_001, 5_000), &[Limit::Deletions], 25));
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
-            lines[..3],
+            lines[..6],
             [
                 "q1  space s1  held 1001 deletions that would remove 1001 of 5000 files, more than 1000 deletions in 10 minutes",
-                "  answer with: koi questions answer q1 delete|restore",
+                "  Delete these files on the server and other devices:",
+                "    koi resolve q1 delete",
+                "  Download these files to this device again:",
+                "    koi resolve q1 restore",
                 "  old/00 (1 file)",
             ]
         );
-        assert_eq!(lines.len(), 2 + ITEMS_SHOWN + 1);
-        assert_eq!(lines[21], "  old/19 (1 file)");
-        assert_eq!(
-            lines[22],
-            "  and 5 more; koi questions --json lists them all"
-        );
+        assert_eq!(lines.len(), 5 + ITEMS_SHOWN + 1);
+        assert_eq!(lines[24], "  old/19 (1 file)");
+        assert_eq!(lines[25], "  and 5 more; koi resolve --json lists them all");
 
         let text = question_text(&held((1, 15, 20), &[Limit::Share], 1));
         assert_eq!(
@@ -1265,7 +1390,107 @@ mod tests {
                 "q1  space s1  held 1 deletions that would remove 15 of 20 files, more than half of the space in 10 minutes"
             )
         );
-        assert_eq!(text.lines().count(), 3);
+        assert_eq!(text.lines().count(), 6);
+    }
+
+    #[test]
+    fn status_shows_a_decision_under_its_folder_with_its_first_path_and_one_full_command_per_answer()
+     {
+        assert_eq!(
+            question_brief(&held((30, 30, 40), &[Limit::Share], 3)),
+            [
+                "  q1: held 30 deletions that would remove 30 of 40 files, more than half of the space in 10 minutes; first path: old/00",
+                "  Delete these files on the server and other devices:",
+                "    koi resolve q1 delete",
+                "  Download these files to this device again:",
+                "    koi resolve q1 restore",
+                "",
+            ]
+            .join("\n")
+        );
+        assert_eq!(
+            question_brief(&held((30, 30, 40), &[Limit::Share], 0))
+                .lines()
+                .next(),
+            Some(
+                "  q1: held 30 deletions that would remove 30 of 40 files, more than half of the space in 10 minutes"
+            )
+        );
+    }
+
+    #[test]
+    fn json_output_and_the_commands_that_show_decisions_get_no_banner() {
+        let shows = |args: &[&str]| {
+            Cli::try_parse_from(args)
+                .unwrap()
+                .command
+                .unwrap()
+                .shows_banner()
+        };
+        assert!(shows(&["koi", "trash", "."]));
+        assert!(shows(&["koi", "device", "list"]));
+        assert!(shows(&["koi", "link", "dir", "--space", "s"]));
+        for args in [
+            &["koi", "trash", ".", "--json"][..],
+            &["koi", "device", "list", "--json"],
+            &["koi", "space", "list", "--json"],
+            &["koi", "usage", "--json"],
+            &["koi", "status"],
+            &["koi", "resolve"],
+            &["koi", "daemon"],
+        ] {
+            assert!(!shows(args), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn the_banner_counts_the_pending_decisions_and_names_resolve() {
+        assert_eq!(banner(&[]), None);
+        assert_eq!(
+            banner(&[held((30, 30, 40), &[Limit::Share], 1)]).as_deref(),
+            Some("koi: 1 sync decision is waiting; run koi resolve")
+        );
+        assert_eq!(
+            banner(&[
+                held((30, 30, 40), &[Limit::Share], 1),
+                held((2_000, 2_000, 9_000), &[Limit::Deletions], 1)
+            ])
+            .as_deref(),
+            Some("koi: 2 sync decisions are waiting; run koi resolve")
+        );
+    }
+
+    #[test]
+    fn a_notification_names_the_decision_its_first_path_and_resolve() {
+        assert_eq!(
+            question_notice(&held((30, 30, 40), &[Limit::Share], 2)),
+            "held 30 deletions that would remove 30 of 40 files, more than half of the space in 10 minutes; first path: old/00. Run koi resolve."
+        );
+    }
+
+    #[test]
+    fn resolve_lists_with_no_arguments_and_answers_with_an_id_and_an_answer() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).map(|cli| cli.command);
+        assert!(matches!(
+            parse(&["koi", "resolve"]),
+            Ok(Some(Command::Resolve {
+                id: None,
+                answer: None,
+                json: false
+            }))
+        ));
+        assert!(matches!(
+            parse(&["koi", "resolve", "q1", "restore"]),
+            Ok(Some(Command::Resolve {
+                id: Some(_),
+                answer: Some(Answer::Restore),
+                ..
+            }))
+        ));
+        assert!(parse(&["koi", "resolve", "q1"]).is_err());
+        assert!(parse(&["koi", "resolve", "q1", "later"]).is_err());
+        assert!(parse(&["koi", "resolve", "q1", "delete", "--json"]).is_err());
+        assert!(parse(&["koi", "questions"]).is_err());
     }
 
     #[tokio::test]
@@ -1325,7 +1550,8 @@ mod tests {
             text.lines().collect::<Vec<_>>(),
             [
                 "q1  space s1  applied 1 deletions from other devices that removed 15 of 20 files, more than half of the space in 10 minutes",
-                "  answer with: koi questions answer q1 dismiss",
+                "  Close this notice:",
+                "    koi resolve q1 dismiss",
             ]
         );
     }
@@ -1341,7 +1567,10 @@ mod tests {
             text.lines().collect::<Vec<_>>(),
             [
                 "q1  space s1  files on this device that the space does not hold",
-                "  answer with: koi questions answer q1 publish|discard",
+                "  Send this device's version to the server:",
+                "    koi resolve q1 publish",
+                "  Move this device's copies to the local trash and follow the server:",
+                "    koi resolve q1 discard",
                 "  old/00 (1 file)",
             ]
         );

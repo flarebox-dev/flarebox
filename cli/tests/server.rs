@@ -390,9 +390,13 @@ async fn a_headless_device_pairs_links_and_follows_the_change_stream() {
         welcome.history_id.as_str()
     );
 
-    let questions: Value = serde_json::from_str(&machine.run(&["questions", "--json"])).unwrap();
+    let questions: Value = serde_json::from_str(&machine.run(&["resolve", "--json"])).unwrap();
     assert_eq!(questions, Value::Array(vec![]));
-    assert!(machine.run(&["questions"]).contains("No questions."));
+    assert!(
+        machine
+            .run(&["resolve"])
+            .contains("No decisions are waiting.")
+    );
 
     let restarted = machine.run(&["restart", "Sync"]);
     assert!(restarted.contains("again"), "{restarted}");

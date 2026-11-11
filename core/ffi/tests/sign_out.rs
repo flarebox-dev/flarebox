@@ -68,6 +68,7 @@ fn paired_profile(base: &Path, spaces: &[&str], questions: usize) -> PathBuf {
                     let id = format!("{space}-{n}");
                     let question = Question {
                         id: id.clone(),
+                        lineage: id.clone(),
                         space_id: (*space).into(),
                         asked_at_ms: 1,
                         kind: QuestionKind::MassDelete {
