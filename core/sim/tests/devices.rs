@@ -136,13 +136,13 @@ proptest! {
     }
 
     #[test]
-    #[ignore = "a server restore still breaks these: a lost file two devices create again is refused with ID_EXISTS (GUN-437), a lost edit equal to the restored bytes is undone (GUN-438), and a device that saw a seq the server lost takes the commit that reuses it for the one it saw (GUN-423)"]
+    #[ignore = "a server restore still breaks these: an edit equal to the restored bytes is undone (GUN-438), a device that saw a seq the server lost takes the commit that reuses it for the one it saw (GUN-423), and a commit refused as ahead of the server leaves its edit unsent (GUN-442)"]
     fn devices_lose_no_write_across_server_restores(devices in 2..=3usize, phases in phases(true)) {
         keep(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
 
     #[test]
-    #[ignore = "a server restore still breaks these: a lost file two devices create again is refused with ID_EXISTS (GUN-437), a lost edit equal to the restored bytes is undone (GUN-438), and a device that saw a seq the server lost takes the commit that reuses it for the one it saw (GUN-423)"]
+    #[ignore = "a server restore still breaks these: an edit equal to the restored bytes is undone (GUN-438), a device that saw a seq the server lost takes the commit that reuses it for the one it saw (GUN-423), and a commit refused as ahead of the server leaves its edit unsent (GUN-442)"]
     fn devices_converge_across_server_restores(devices in 2..=3usize, phases in phases(true)) {
         converge(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
@@ -916,4 +916,31 @@ fn a_name_a_restore_lost_is_refused_after_the_recovery() {
     let ino = world.devices[0].disk.child(&Place::Root, "c.txt").unwrap();
     world.devices[0].disk.rename(ino, Place::Root, "b").unwrap();
     assert!(world.phase(5, &[]).is_err());
+}
+
+/// Both devices create a file the server lost again under its ID, and device 0's create comes
+/// first. The server refuses device 1's create with ID_EXISTS, and device 1 takes the file from R
+/// instead of leaving it a problem.
+#[test]
+fn a_lost_file_both_devices_create_again_is_kept_once() {
+    let lost = vec![(0, BACKUP), (0, file("a"))];
+    let again = vec![
+        (0, RESTORE),
+        (1, Step::Connect),
+        (1, DELIVER),
+        (1, COMMIT),
+        (0, Step::Connect),
+        (0, DELIVER),
+        (0, COMMIT),
+        (0, COMMIT),
+        (1, COMMIT),
+    ];
+    let world = converge(2, &[lost, again]).unwrap();
+    assert_eq!(world.seen["op rejected"], 1);
+    assert!(
+        world
+            .devices
+            .iter()
+            .all(|device| device.disk.entries().len() == 1)
+    );
 }

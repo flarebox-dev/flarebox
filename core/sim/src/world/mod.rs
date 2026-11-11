@@ -269,6 +269,24 @@ fn lost(held: &Held, d: usize, record: &EffectRecord, applied: &Applied) -> Resu
     }
 }
 
+/// Whether an effect that trashes a write the server never held downloads a lost write that its
+/// author sent again over a user's change back to the bytes a restore rolled the file back to. The
+/// engine takes such a change for the content R holds, so the resend replaces it, and the bytes
+/// stay only in the file's versions (design section 4.4).
+fn resent_over_revert(
+    exposed: &BTreeMap<i64, usize>,
+    rolled_back: &BTreeMap<NodeId, Vec<u8>>,
+    record: &EffectRecord,
+    applied: &Applied,
+) -> bool {
+    let (Effect::WriteFile { content, .. }, Some(trashed)) = (&record.effect, &applied.trashed)
+    else {
+        return false;
+    };
+    exposed.contains_key(&content.mtime_ns)
+        && (rolled_back.get(&record.node)).is_some_and(|digest| *digest == trashed.manifest_digest)
+}
+
 /// Applies the result of the commit in flight to R when it is the next commit, and acknowledges
 /// the commit once R holds its records (section 2.7).
 fn acknowledge(engine: &mut Engine) -> Result<(), Failure> {
@@ -370,6 +388,9 @@ pub struct World {
     /// that another device's lost commit gave it, or the name the server gave in place of the one
     /// L holds.
     restored_names: Vec<BTreeMap<NodeId, BTreeSet<String>>>,
+    /// The files whose content a restore rolled back, each with the digest of the content the
+    /// restored server holds.
+    rolled_back: BTreeMap<NodeId, Vec<u8>>,
 }
 
 impl World {
@@ -412,6 +433,7 @@ impl World {
             backup: None,
             retired: BTreeSet::new(),
             exposed: BTreeMap::new(),
+            rolled_back: BTreeMap::new(),
         }
     }
 
@@ -603,6 +625,15 @@ impl World {
         let before = shapes(&self.space);
         self.space.restore(&backup.space);
         let after = shapes(&self.space);
+        for (id, (.., digest)) in &after {
+            if let Some(digest) = digest
+                && before
+                    .get(id)
+                    .is_none_or(|(.., held)| held.as_ref() != Some(digest))
+            {
+                self.rolled_back.insert(id.clone(), digest.clone());
+            }
+        }
         let changed: BTreeSet<&NodeId> = (before.keys().chain(after.keys()))
             .filter(|id| before.get(*id) != after.get(*id))
             .collect();
@@ -688,7 +719,9 @@ impl World {
             Outcome::Crash(cut) if applies => Some(device.disk.apply(&record, cut)),
             _ => None,
         };
-        if let Some(applied) = &applied {
+        if let Some(applied) = applied.as_ref().filter(|applied| {
+            !resent_over_revert(&self.exposed, &self.rolled_back, &record, applied)
+        }) {
             lost(&self.held, d, &record, applied)?;
         }
         let applied = applied.map(|applied| applied.outcome);
@@ -760,7 +793,9 @@ impl World {
         if let Some(record) = device.engine.effects.in_flight().cloned() {
             let quarantined = device.disk.quarantine.is_some();
             let applied = device.disk.recover(&record);
-            lost(&self.held, d, &record, &applied)?;
+            if !resent_over_revert(&self.exposed, &self.rolled_back, &record, &applied) {
+                lost(&self.held, d, &record, &applied)?;
+            }
             let Engine { trees, effects, .. } = &mut device.engine;
             let download = match &record.effect {
                 Effect::WriteFile { content, .. } => Some(content),

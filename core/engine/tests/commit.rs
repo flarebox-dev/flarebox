@@ -3228,3 +3228,23 @@ fn a_late_acknowledgement_takes_what_was_sent_when_the_other_device_reverts_it()
     assert_eq!(trees.local().live("n"), Some(&file(ROOT, "a", 0)));
     assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
 }
+
+/// This device creates a lost file n again while another device does the same, and the other
+/// create comes first. R holds n when the result comes, and the server refused this create with
+/// ID_EXISTS. n is no problem, and the next commit sends L's name as a move.
+#[test]
+fn a_create_refused_because_another_device_created_the_node_again_is_no_problem() {
+    let mut trees = trees(&[("n", Some(file(ROOT, "a", 1)), None, None)]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id == "n"));
+    trees.set_remote("n".into(), remote(file(ROOT, "b", 1)));
+    let exists = OpResult {
+        reject_reason: "ID_EXISTS".into(),
+        ..outcome(op_result::Code::Rejected)
+    };
+    acknowledge(&mut commits, &mut trees, vec![exists]);
+    assert!(commits.problems().is_empty());
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", ROOT, "a")]);
+}
