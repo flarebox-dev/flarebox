@@ -86,6 +86,13 @@ pub enum QuestionKind {
     Conflict {
         original: ConflictFile,
         copy: ConflictFile,
+        /// The ID of the commit that carries the op of the answer, while it is in flight. Its result
+        /// is applied to this question alone, whatever R holds by then.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        sent_in: Option<String>,
     },
 }
 

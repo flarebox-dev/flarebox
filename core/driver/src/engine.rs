@@ -247,7 +247,7 @@ impl Engine {
         lineage: String,
     ) -> Result<Question, Error> {
         let mut items: Vec<HeldItem> = match &asked.kind {
-            engine::QuestionKind::Conflict { original, copy } => [original, copy]
+            engine::QuestionKind::Conflict { original, copy, .. } => [original, copy]
                 .into_iter()
                 .map(|file| {
                     Ok(HeldItem {
@@ -268,11 +268,15 @@ impl Engine {
                 .collect(),
         };
         items.sort_by(|a, b| a.path.cmp(&b.path));
+        let mut kind = asked.kind.clone();
+        if let engine::QuestionKind::Conflict { sent_in, .. } = &mut kind {
+            *sent_in = None;
+        }
         Ok(Question {
             id: asked.id.clone(),
             space_id: space_id.to_owned(),
             asked_at_ms: asked.asked_at_ms as i64,
-            kind: asked.kind.clone(),
+            kind,
             items,
             lineage,
         })
@@ -1282,10 +1286,11 @@ fn same_kind(before: &engine::QuestionKind, after: &engine::QuestionKind) -> boo
             engine::QuestionKind::Recovery { group: b },
         ) => a == b,
         (
-            engine::QuestionKind::Conflict { original, copy },
+            engine::QuestionKind::Conflict { original, copy, .. },
             engine::QuestionKind::Conflict {
                 original: other,
                 copy: other_copy,
+                ..
             },
         ) => original.node_id == other.node_id && copy.node_id == other_copy.node_id,
         (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),

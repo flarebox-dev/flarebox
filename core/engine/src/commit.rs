@@ -625,7 +625,10 @@ impl Commits {
         skip.extend(excluded);
         let needed = self.retry_waiting(trees, needed, agreed);
         let cap = self.cap.unwrap_or(MAX_OPS);
-        let answered = self.conflicts(trees, &skip, cap, ids, now_ms);
+        let (asking, answered): (Vec<String>, Vec<proto::Op>) = self
+            .conflicts(trees, &skip, cap, ids, now_ms)
+            .into_iter()
+            .unzip();
         skip.extend(
             (answered.iter().filter_map(|op| op.op.as_ref())).map(|op| op_node(op).to_owned()),
         );
@@ -686,9 +689,18 @@ impl Commits {
             Some(op::Op::Move(moved)) => Some(moved.node_id.clone()),
             _ => None,
         }));
+
+        let commit_id = ids.uuid_v7(now_ms);
+        for question in &mut self.questions {
+            if let QuestionKind::Conflict { sent_in, .. } = &mut question.kind
+                && asking.contains(&question.id)
+            {
+                *sent_in = Some(commit_id.clone());
+            }
+        }
         self.in_flight = Some(InFlight {
             commit: proto::Commit {
-                commit_id: ids.uuid_v7(now_ms),
+                commit_id,
                 base_seq: base.seq,
                 base_commit_id: base.commit_id,
                 base_committed_at_ms: base.committed_at_ms,
@@ -721,12 +733,12 @@ impl Commits {
         cap: usize,
         ids: &mut IdGen,
         now_ms: u64,
-    ) -> Vec<proto::Op> {
+    ) -> Vec<(String, proto::Op)> {
         let mut ops = Vec::new();
         let mut kept = Vec::new();
         let mut taken = BTreeSet::new();
         for mut question in std::mem::take(&mut self.questions) {
-            let QuestionKind::Conflict { original, copy } = &mut question.kind else {
+            let QuestionKind::Conflict { original, copy, .. } = &mut question.kind else {
                 kept.push(question);
                 continue;
             };
@@ -784,7 +796,7 @@ impl Commits {
             {
                 taken.insert(original.node_id.clone());
                 taken.insert(copy.node_id.clone());
-                ops.push(proto::Op { op: Some(op) });
+                ops.push((question.id.clone(), proto::Op { op: Some(op) }));
             }
             kept.push(question);
         }
@@ -797,7 +809,7 @@ impl Commits {
     /// ([`Commits::conflicts`]). The caller builds then even when nothing else changed.
     pub fn conflicts_due(&self, trees: &Trees) -> bool {
         self.questions.iter().any(|question| match &question.kind {
-            QuestionKind::Conflict { original, copy } => {
+            QuestionKind::Conflict { original, copy, .. } => {
                 drift(trees, original, copy) != Drift::None
                     || (question.answer.is_some() && in_sync(trees, original, copy))
             }
@@ -805,29 +817,27 @@ impl Commits {
         })
     }
 
-    /// The ID of the conflict question whose answer `op` carries out ([`Commits::conflicts`]): a
-    /// `Delete` of its copy, or for [`Answer::KeepCopy`] an `UpdateContent` of its original with the
-    /// copy's content in R. Such an op leaves S as it is when it is acknowledged, and its node is
-    /// not marked as a problem. Another op for either file, such as the upload of an edit, is
-    /// acknowledged as any op is.
-    fn answer_for(&self, trees: &Trees, op: &op::Op) -> Option<String> {
+    /// The ID of the conflict question whose answer `op` of commit `commit_id` carries out
+    /// ([`Commits::conflicts`]): the commit was built with it, and the op is its `Delete` of the copy
+    /// or `UpdateContent` of the original. Such an op leaves S as it is when it is acknowledged,
+    /// and its node is not marked as a problem. Another op for either file, such as the upload of
+    /// an edit, is acknowledged as any op is.
+    fn answer_for(&self, commit_id: &str, op: &op::Op) -> Option<String> {
         let question = self.questions.iter().find(|question| {
-            let QuestionKind::Conflict { original, copy } = &question.kind else {
+            let QuestionKind::Conflict {
+                original,
+                copy,
+                sent_in,
+            } = &question.kind
+            else {
                 return false;
             };
-            match (question.answer, op) {
-                (Some(Answer::KeepOriginal | Answer::KeepCopy), op::Op::Delete(delete)) => {
-                    delete.node_id == copy.node_id
+            sent_in.as_deref() == Some(commit_id)
+                && match op {
+                    op::Op::Delete(delete) => delete.node_id == copy.node_id,
+                    op::Op::UpdateContent(update) => update.node_id == original.node_id,
+                    _ => false,
                 }
-                (Some(Answer::KeepCopy), op::Op::UpdateContent(update)) => {
-                    let copied = trees.remote().get(&copy.node_id);
-                    let copied = copied.and_then(|node| node.shape.content.as_ref());
-                    update.node_id == original.node_id
-                        && (update.content.as_ref().zip(copied))
-                            .is_some_and(|(sent, copied)| same_content(sent, copied))
-                }
-                _ => false,
-            }
         });
         question.map(|question| question.id.clone())
     }
@@ -858,7 +868,7 @@ impl Commits {
             return;
         };
         let asked = self.questions.iter().any(|question| {
-            matches!(&question.kind, QuestionKind::Conflict { original: o, copy: c }
+            matches!(&question.kind, QuestionKind::Conflict { original: o, copy: c, .. }
                 if o.node_id == original.node_id && c.node_id == copy.node_id)
         });
         if asked {
@@ -867,7 +877,11 @@ impl Commits {
         self.questions.push(Question {
             id: format!("{commit_id}-{index}"),
             asked_at_ms: unix_ms(commit_id).unwrap_or_default(),
-            kind: QuestionKind::Conflict { original, copy },
+            kind: QuestionKind::Conflict {
+                original,
+                copy,
+                sent_in: None,
+            },
             held: BTreeMap::new(),
             answer: None,
             shown: BTreeMap::new(),
@@ -942,7 +956,7 @@ impl Commits {
             use op_result::Code;
             let code = Code::try_from(outcome.code).unwrap_or(Code::Unspecified);
             if let Some(sent) = &op.op
-                && let Some(id) = self.answer_for(trees, sent)
+                && let Some(id) = self.answer_for(&flight.commit.commit_id, sent)
             {
                 answers.push((id, index, sent, code, &outcome.node_id));
                 continue;
@@ -1131,9 +1145,13 @@ impl Commits {
             let Some(question) = question else {
                 continue;
             };
-            let QuestionKind::Conflict { original, .. } = &mut question.kind else {
+            let QuestionKind::Conflict {
+                original, sent_in, ..
+            } = &mut question.kind
+            else {
                 continue;
             };
+            *sent_in = None;
             match (sent, code) {
                 (op::Op::Delete(_), Code::Applied) => {
                     closed.insert(id);

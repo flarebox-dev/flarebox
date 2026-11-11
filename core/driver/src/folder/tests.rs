@@ -5940,7 +5940,7 @@ fn an_edit_that_became_a_conflict_copy_is_asked_about_with_both_files() {
         panic!("one question: {:?}", shown(&site_b));
     };
     let nodes = server_nodes(&remote);
-    let QuestionKind::Conflict { original, copy } = &question.kind else {
+    let QuestionKind::Conflict { original, copy, .. } = &question.kind else {
         panic!("a conflict: {question:?}");
     };
     assert_eq!(original.node_id, live_id(&nodes, "main.go"));
@@ -6202,6 +6202,7 @@ fn a_file_created_under_a_name_another_device_took_is_asked_about() {
     let QuestionKind::Conflict {
         original,
         copy: renamed,
+        ..
     } = &question.kind
     else {
         panic!("a conflict: {question:?}");
@@ -6310,4 +6311,37 @@ fn keeping_one_of_two_copies_of_an_original_asks_about_the_other_again() {
     };
     assert_ne!(remaining.id, other.id);
     assert!(!is_first(remaining));
+}
+
+/// Another device edits the copy while the commit that gives the original the copy's content is in flight. The
+/// applied answer stays applied: the original keeps the content it was given, the edited copy stays, and the
+/// conflict is asked again.
+#[test]
+fn an_edit_of_the_copy_while_the_original_takes_its_content_is_asked_about_again() {
+    let mut remote = Remote::new();
+    let ((site_a, mut a), (site_b, mut b)) = edited_on_both(&mut remote);
+    answer(&site_b, Answer::KeepCopy);
+    let step = b.folder.requested();
+    b.take(step).unwrap();
+    let Some(upload @ Work::Upload(_)) = b.work.pop_front() else {
+        panic!("the answer's content is checked first");
+    };
+    b.perform(upload, &mut remote).unwrap();
+    assert!(matches!(b.work.front(), Some(Work::Send(_))));
+    fs::write(site_a.root.join(COPY), b"copy edited meanwhile").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(&mut remote);
+    b.run(&mut remote);
+    let result = &remote.results[&b.sent.last().unwrap().commit_id];
+    assert_eq!(
+        result.results[0].code,
+        koidrive_proto::v1::op_result::Code::Applied as i32
+    );
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+
+    let kept = [(COPY, "copy edited meanwhile"), ("main.go", "from b")]
+        .map(|(path, text)| (path.to_owned(), text.to_owned()));
+    assert_eq!(files(&site_a.root), kept);
+    assert_eq!(files(&site_b.root), kept);
+    assert_eq!(shown(&site_b).len(), 1);
 }
