@@ -1321,6 +1321,15 @@ pub(crate) struct FolderTask {
     pub changed: Arc<watch::Sender<()>>,
     /// Notified when `Driver::restore` has recorded a request in the folder's store.
     pub requests: Arc<Notify>,
+    #[cfg(test)]
+    pub observe_fault: Option<Arc<ObserveFault>>,
+}
+
+/// Fails the next observation of a folder's observer in a test. The pause after that failure lasts a day, so a stop
+/// that waits it out never returns. `paused` hears when the pause begins.
+#[cfg(test)]
+pub(crate) struct ObserveFault {
+    pub paused: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 /// Why the task stopped syncing before it was asked to.
@@ -1690,6 +1699,8 @@ impl FolderTask {
         let (sender, receiver) = mpsc::unbounded_channel();
         let link = self.link.clone();
         let matcher = self.matcher.clone();
+        #[cfg(test)]
+        let fault = self.observe_fault.clone();
         let thread = std::thread::spawn(move || {
             let _lock = lock;
             let closed = sender.clone();
@@ -1713,7 +1724,17 @@ impl FolderTask {
             };
             let mut scanned = false;
             while !sender.is_closed() {
-                match sections.observe(&mut observer, Duration::from_secs(1)) {
+                let observed = sections.observe(&mut observer, Duration::from_secs(1));
+                #[cfg(test)]
+                let paused = (fault.as_ref()).and_then(|fault| fault.paused.lock().unwrap().take());
+                #[cfg(test)]
+                let observed = match paused {
+                    Some(_) => Err(koidrive_fs::Error::Io(io::Error::other(
+                        "a failure the test injected",
+                    ))),
+                    None => observed,
+                };
+                match observed {
                     Ok(None) => {}
                     Ok(Some(batch)) => {
                         tracing::debug!(
@@ -1730,6 +1751,14 @@ impl FolderTask {
                     Err(error) => {
                         tracing::warn!(space_id = link.space_id, %error, "observing the folder failed");
                         let again = Instant::now() + Duration::from_secs(5);
+                        #[cfg(test)]
+                        let again = match paused {
+                            Some(paused) => {
+                                let _ = paused.send(());
+                                Instant::now() + Duration::from_secs(24 * 60 * 60)
+                            }
+                            None => again,
+                        };
                         while !sender.is_closed() && Instant::now() < again {
                             std::thread::sleep(Duration::from_millis(50));
                         }
