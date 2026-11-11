@@ -7,9 +7,9 @@
 use koidrive_engine::classify::Trees;
 use koidrive_engine::commit::{Commits, Halt, InFlight, MAX_OPS};
 use koidrive_engine::effects::{Effect, EffectRecord, Effects, Location};
-use koidrive_engine::guard::{Counted, GuardState};
+use koidrive_engine::guard::{Counted, GuardState, RemoteDeletion, Trash};
 use koidrive_engine::ids::uuid_v7;
-use koidrive_engine::question::{Answer, Held, Question, QuestionKind, Revisions};
+use koidrive_engine::question::{Answer, Held, Limit, Question, QuestionKind, Revisions};
 use koidrive_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
 use koidrive_engine::state::{CommitsState, EffectsState, StateError, TreesState};
 use koidrive_engine::tree::{FileIdentity, Kind, LocalNode, RemoteNode, Shape, TreeError};
@@ -154,6 +154,7 @@ fn questions() -> Vec<Question> {
             deletions: 1,
             affected_files: 1,
             space_files: 1,
+            exceeded: vec![Limit::Share],
         },
         held: [(
             "h".into(),
@@ -177,6 +178,23 @@ fn guard_state() -> GuardState {
     GuardState {
         ledger: [("h".into(), Counted { at_ms: 7, files: 1 })].into(),
         confirmed: [("c".into(), held)].into(),
+        confirmed_limits: [Limit::Share].into(),
+        remote: [(
+            RemoteDeletion {
+                top: "r".into(),
+                trash: Trash::Group {
+                    group: "4:0".into(),
+                    seq: 4,
+                },
+            },
+            Counted { at_ms: 8, files: 2 },
+        )]
+        .into(),
+        dismissed: [RemoteDeletion {
+            top: "s".into(),
+            trash: Trash::Unknown { no_later_than: 6 },
+        }]
+        .into(),
     }
 }
 

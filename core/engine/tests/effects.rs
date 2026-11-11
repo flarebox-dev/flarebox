@@ -766,7 +766,7 @@ fn done_takes_only_the_effect_in_flight_and_a_created_entry_needs_its_identity()
         Err(EffectError::MissingIdentity)
     );
     assert!(effects.in_flight().is_some());
-    assert_eq!(effects.done(&mut trees, &id, Some(identity(5))), Ok(()));
+    assert_eq!(effects.done(&mut trees, &id, Some(identity(5))), Ok(None));
     assert_eq!(trees.local().get("d").unwrap().identity, identity(5));
     assert_eq!(effects.cleared(), 1);
     assert_in_sync(&mut trees);

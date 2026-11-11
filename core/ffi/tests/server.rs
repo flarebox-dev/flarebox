@@ -13,8 +13,9 @@ use std::time::{Duration, Instant};
 
 use koidrive_driver as driver;
 use koidrive_ffi::{
-    Answer, FolderState, LinkedFolder, Problem, ProblemKind, Question, QuestionKind, RecoveryGroup,
-    SessionError, SessionEvent, SessionListener, SessionState, SyncSession, SyncStatus,
+    Answer, FolderState, LinkedFolder, MassDeleteLimit, Notice, NoticeKind, Problem, ProblemKind,
+    Question, QuestionKind, RecoveryGroup, SessionError, SessionEvent, SessionListener,
+    SessionState, SyncSession, SyncStatus,
 };
 use koidrive_net::Auth;
 use koidrive_store::{Store, StoredQuestion};
@@ -92,6 +93,7 @@ struct Mirror {
     folders: Vec<LinkedFolder>,
     questions: Vec<Question>,
     problems: Vec<Problem>,
+    notices: Vec<Notice>,
 }
 
 impl Mirror {
@@ -102,6 +104,7 @@ impl Mirror {
             folders: opened.folders.clone(),
             questions: opened.questions.clone(),
             problems: opened.problems.clone(),
+            notices: opened.notices.clone(),
         };
         for event in events {
             match event {
@@ -110,6 +113,7 @@ impl Mirror {
                 SessionEvent::Folders { folders } => mirror.folders = folders.clone(),
                 SessionEvent::Questions { questions } => mirror.questions = questions.clone(),
                 SessionEvent::Problems { problems } => mirror.problems = problems.clone(),
+                SessionEvent::Notices { notices } => mirror.notices = notices.clone(),
                 _ => {}
             }
         }
@@ -387,12 +391,25 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
             deletions: 1_200,
             affected_files: 1_200,
             space_files: 2_000,
+            exceeded: vec![driver::Limit::Deletions, driver::Limit::Share],
         },
         items: vec![driver::HeldItem {
             node_id: "n1".into(),
             path: "Archive".into(),
             files: 1_200,
         }],
+    };
+    let noticed = driver::Question {
+        id: "n-remote-mass-delete".into(),
+        space_id: space.space_id.clone(),
+        asked_at_ms: 2,
+        kind: driver::QuestionKind::RemoteMassDelete {
+            deletions: 3,
+            affected_files: 40,
+            space_files: 60,
+            exceeded: vec![driver::Limit::Share],
+        },
+        items: Vec::new(),
     };
     let store = mac
         .profile()
@@ -401,16 +418,45 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
     Store::open(&store)
         .unwrap()
         .transaction(|tx| {
-            tx.put_question(&StoredQuestion {
-                question_id: held.id.clone(),
-                asked_at_ms: held.asked_at_ms,
-                body: serde_json::to_vec(&held).unwrap(),
-                answer: None,
-            })
+            for question in [&held, &noticed] {
+                tx.put_question(&StoredQuestion {
+                    question_id: question.id.clone(),
+                    asked_at_ms: question.asked_at_ms,
+                    body: serde_json::to_vec(question).unwrap(),
+                    answer: None,
+                })?;
+            }
+            Ok::<_, koidrive_store::Error>(())
         })
         .unwrap();
     mac.session().start();
-    let asked = mac.until("the stored question", |m| m.questions.len() == 1);
+    let asked = mac.until("the stored question and notice", |m| {
+        m.questions.len() == 1 && m.notices.len() == 1
+    });
+    assert_eq!(
+        asked.notices[0].kind,
+        NoticeKind::RemoteMassDelete {
+            deletions: 3,
+            affected_files: 40,
+            space_files: 60,
+            exceeded: vec![MassDeleteLimit::ShareOfSpace { percent: 50 }],
+        }
+    );
+    assert_eq!(
+        mac.session().dismiss_notice(held.id.clone()),
+        Err(SessionError::NoticeNotFound),
+        "a question is not a notice"
+    );
+    assert_eq!(
+        mac.session().answer(noticed.id.clone(), Answer::Delete),
+        Err(SessionError::AnswerNotAllowed)
+    );
+    mac.session().dismiss_notice(noticed.id.clone()).unwrap();
+    mac.until("the dismissed notice leaving", |m| m.notices.is_empty());
+    assert_eq!(
+        mac.session().dismiss_notice(noticed.id),
+        Err(SessionError::NoticeNotFound)
+    );
     assert_eq!(
         asked.questions[0].answers,
         vec![Answer::Delete, Answer::Restore]

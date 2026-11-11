@@ -502,6 +502,9 @@ impl Folder {
         };
         let node = (self.engine.effects.in_flight()).map(|record| record.node.clone());
         let settled = self.disk.apply(staged, &mut self.engine, &mut self.store)?;
+        if self.engine.asked {
+            self.questions = self.store.transaction(unanswered)?;
+        }
         let mut work = Vec::new();
         if let Some(node) = node {
             match settled {
@@ -734,6 +737,11 @@ impl Folder {
             at,
         };
         self.retrying.insert(call, retrying);
+    }
+
+    /// Whether a question changed since the last call, also when the number of questions did not.
+    pub fn take_questions_changed(&mut self) -> bool {
+        std::mem::take(&mut self.engine.asked)
     }
 
     /// The folder's status as the task knows it.
@@ -1199,10 +1207,12 @@ impl Folder {
         });
     }
 
-    /// Whether a bootstrap reads the trash too: when the server lost commits this device applied, so that a node
-    /// another device trashed since is not taken for one the server lost and published again (RFC 0002 §6).
+    /// Whether a bootstrap reads the trash too: once the folder has synced, since L may then hold nodes another
+    /// device trashed while this device missed the log. A node trashed since the server lost commits this device
+    /// applied is then not taken for one the server lost and published again (RFC 0002 §6), and the mass-delete
+    /// guard tells by each node's trash group which deletion its removal belongs to (design §6.1).
     fn lists_trash(&self) -> bool {
-        (self.engine.cursor.as_ref()).is_some_and(|cursor| cursor.ahead_of_server)
+        self.engine.cursor.is_some()
     }
 
     /// Starts the upload of what `commit` adds, or its send when it adds no content.
@@ -1526,7 +1536,7 @@ impl FolderTask {
             Err(reason) => return Halt::Person(reason.to_string()),
         };
         let transfer = Transfer::new(self.auth.api());
-        self.publish(&folder);
+        self.publish(&mut folder);
         let stop = {
             let (session, transfer) = (&session, &transfer);
             let mut list: Slot<'_, Result<Listed, Stop>> = None;
@@ -1632,7 +1642,7 @@ impl FolderTask {
                         }
                     }
                 }
-                self.publish(&folder);
+                self.publish(&mut folder);
             }
         };
         session.close().await;
@@ -1778,9 +1788,10 @@ impl FolderTask {
         receiver
     }
 
-    /// Shows what the folder knows in the status, and marks the status changed when it differs.
-    fn publish(&self, folder: &Folder) {
+    /// Shows what the folder knows in the status, and marks the status changed when it differs or a question changed.
+    fn publish(&self, folder: &mut Folder) {
         let view = folder.view();
+        let asked = folder.take_questions_changed();
         let mut status = self.status.lock().unwrap();
         let shown = View {
             state: status.state,
@@ -1792,7 +1803,7 @@ impl FolderTask {
             problem: status.problem.clone(),
             questions: status.questions,
         };
-        if shown == view {
+        if shown == view && !asked {
             return;
         }
         status.state = view.state;

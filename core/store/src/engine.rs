@@ -230,6 +230,9 @@ impl Tx<'_> {
             "guard_ledger",
             "guard_confirmed_members",
             "guard_confirmed",
+            "guard_confirmed_limits",
+            "guard_remote",
+            "guard_remote_dismissed",
         ] {
             self.0.execute(&format!("DELETE FROM {table}"), [])?;
         }
@@ -239,8 +242,8 @@ impl Tx<'_> {
     /// Changes the stored engine state from `before`, which must be the state the store holds, to
     /// `after`. Only the rows of what differs are written: a member of a node set or a node map, a
     /// waiting update and a failed effect by node, and each of the commit counters, the commit in
-    /// flight, the restores, the open questions, the mass-delete guard and the effect counters as a
-    /// whole.
+    /// flight, the restores, the open questions and the effect counters as a whole, and the
+    /// mass-delete guard as [`Tx::update_guard`] writes it.
     pub fn update_engine_state(&self, before: &EngineState, after: &EngineState) -> Result<()> {
         let (mut old, mut new) = (before.clone(), after.clone());
         let mut remove = self
@@ -435,7 +438,7 @@ impl Tx<'_> {
             self.set_open_questions(&new.questions)?;
         }
         if old.guard != new.guard {
-            self.set_guard(&new.guard)?;
+            self.update_guard(&old.guard, &new.guard)?;
         }
 
         let (old, new) = (&before.effects, &after.effects);

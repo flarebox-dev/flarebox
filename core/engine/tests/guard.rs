@@ -4,15 +4,18 @@
 
 use koidrive_engine::classify::{Class, Trees};
 use koidrive_engine::commit::Commits;
-use koidrive_engine::guard::{Limit, WINDOW_MS, Window};
+use koidrive_engine::effects::Effects;
+use koidrive_engine::guard::{WINDOW_MS, Window};
 use koidrive_engine::ids::IdGen;
-use koidrive_engine::question::{Answer, Held, Question, QuestionKind, RecoveryGroup};
+use koidrive_engine::question::{Answer, Held, Limit, Question, QuestionKind, RecoveryGroup};
 use koidrive_engine::state::CommitsState;
 use koidrive_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape};
 use koidrive_proto::v1::{CommitResult, OpResult, op, op_result};
 
 const ROOT: &str = "root";
 const NOW: u64 = 1_794_268_740_000;
+/// The seq up to which R holds every change: [`trash_remotely`] trashes at seq 2.
+const SEQ: u64 = 2;
 
 fn shape(parent: &str, name: &str, kind: Kind) -> Shape {
     Shape {
@@ -139,6 +142,7 @@ fn window(question: &Question) -> Window {
         deletions,
         affected_files,
         space_files,
+        ..
     } = question.kind
     else {
         panic!("a mass-delete question: {question:?}");
@@ -147,6 +151,14 @@ fn window(question: &Question) -> Window {
         deletions,
         affected_files,
         space_files,
+    }
+}
+
+/// The limits the question says were crossed.
+fn exceeded(question: &Question) -> &[Limit] {
+    match &question.kind {
+        QuestionKind::MassDelete { exceeded, .. } => exceeded,
+        _ => panic!("a mass-delete question: {question:?}"),
     }
 }
 
@@ -172,7 +184,7 @@ fn a_removed_folder_holding_most_of_the_space_is_held_while_the_rest_syncs() {
         "the new file is still uploaded: {ops:?}"
     );
     let question = asked(&commits).expect("a question");
-    assert_eq!(window(question).limit(), Some(Limit::Share));
+    assert_eq!(exceeded(question), [Limit::Share]);
     assert_eq!(
         window(question),
         Window {
@@ -248,7 +260,7 @@ fn more_than_1000_deletions_are_held_in_a_large_space_and_1000_are_not() {
     let ops = build_at(&mut commits, &mut trees, &mut ids, NOW);
     assert_eq!(deleted(&ops), Vec::<String>::new());
     let question = asked(&commits).expect("a question");
-    assert_eq!(window(question).limit(), Some(Limit::Deletions));
+    assert_eq!(exceeded(question), [Limit::Deletions]);
     assert_eq!(question.held.len(), 1001, "every pending deletion is held");
 }
 
@@ -611,7 +623,12 @@ fn an_unanswered_question_keeps_holding_what_is_left_when_it_shrinks() {
     );
     let question = asked(&commits).expect("a new question");
     assert_ne!(question.id, first);
-    assert_eq!(window(question).limit(), None);
+    assert_eq!(window(question).exceeded(), []);
+    assert_eq!(
+        exceeded(question),
+        [Limit::Share],
+        "the new question keeps the limit the first one crossed"
+    );
     let mut left = root_files(7..13);
     left.sort();
     assert_eq!(held(&commits), left);
@@ -777,5 +794,578 @@ fn a_confirmed_folder_whose_rest_changed_after_some_commits_is_asked_about_again
     let ops = build_at(&mut commits, &mut trees, &mut ids, NOW + 5);
 
     assert_eq!(deleted(&ops), Vec::<String>::new());
-    assert!(asked(&commits).is_some(), "the rest of d is held again");
+    let question = asked(&commits).expect("the rest of d is held again");
+    let QuestionKind::MassDelete { exceeded, .. } = &question.kind else {
+        panic!("a mass-delete question: {question:?}");
+    };
+    assert_eq!(exceeded, &[Limit::Share], "the limit the person confirmed");
+}
+
+/// Deletes each of `ids` in R, as another device's commit does: each trashes the live nodes
+/// below it under a trash group of its own, and a node trashed before keeps its group.
+fn trash_remotely(trees: &mut Trees, ids: &[&str]) {
+    let gone: Vec<(String, Shape, &str)> = (trees.synced().iter())
+        .filter(|(id, _)| trees.remote().live(id).is_some())
+        .filter_map(|(id, shape)| {
+            let top = (ids.iter()).find(|top| *id == **top || id.starts_with(&format!("{top}/")));
+            top.map(|top| (id.clone(), shape.clone(), *top))
+        })
+        .collect();
+    for (id, shape, top) in gone {
+        let node = RemoteNode {
+            shape,
+            trashed: true,
+            content_rev: 2,
+            meta_rev: 2,
+            trash_group: top.into(),
+        };
+        trees.set_remote(id, node);
+    }
+    trees.settle();
+}
+
+/// Does every effect the planner plans at `now`, and has the guard count each removal.
+fn apply_effects(commits: &mut Commits, trees: &mut Trees, ids: &mut IdGen, now: u64) {
+    let mut effects = Effects::default();
+    while let Some(record) = effects.plan(trees, ids, now).cloned() {
+        if let Some(removal) = effects.done(trees, &record.effect_id, None).unwrap() {
+            commits.count_remote(removal, trees, SEQ, ids, now);
+        }
+        trees.settle();
+    }
+}
+
+/// The notice about other devices' deletions, with its counts as a window.
+fn notice(commits: &Commits) -> Option<(&Question, Window, &[Limit])> {
+    commits
+        .questions()
+        .iter()
+        .find_map(|question| match &question.kind {
+            QuestionKind::RemoteMassDelete {
+                deletions,
+                affected_files,
+                space_files,
+                exceeded,
+            } => {
+                let window = Window {
+                    deletions: *deletions,
+                    affected_files: *affected_files,
+                    space_files: *space_files,
+                };
+                Some((question, window, &exceeded[..]))
+            }
+            _ => None,
+        })
+}
+
+#[test]
+fn another_devices_deletion_of_most_of_the_space_is_applied_and_noticed() {
+    let mut trees = space(10, 15);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    trash_remotely(&mut trees, &["d"]);
+
+    apply_effects(&mut commits, &mut trees, &mut ids, NOW);
+
+    assert_eq!(trees.local().get("d"), None, "the folder is removed");
+    assert_eq!(commits.questions().len(), 1);
+    let (question, window, exceeded) = notice(&commits).expect("a notice");
+    assert_eq!(
+        window,
+        Window {
+            deletions: 1,
+            affected_files: 15,
+            space_files: 25,
+        },
+        "the folder counts as one deletion"
+    );
+    assert_eq!(exceeded, [Limit::Share]);
+    assert!(question.held.is_empty(), "a notice holds nothing");
+    assert_eq!(question.kind.answers(), [Answer::Dismiss]);
+}
+
+#[test]
+fn an_open_notice_counts_every_removal_until_it_is_dismissed() {
+    let mut trees = space(10, 15);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    trash_remotely(&mut trees, &["d"]);
+    apply_effects(&mut commits, &mut trees, &mut ids, NOW);
+    let first = notice(&commits).unwrap().0.id.clone();
+
+    trash_remotely(&mut trees, &["f0", "f1", "f2", "f3", "f4"]);
+    apply_effects(&mut commits, &mut trees, &mut ids, NOW + WINDOW_MS);
+
+    let (question, window, exceeded) = notice(&commits).expect("the notice");
+    assert_eq!(question.id, first, "the same notice");
+    assert_eq!(
+        window,
+        Window {
+            deletions: 6,
+            affected_files: 20,
+            space_files: 25,
+        },
+        "the folder still counts after its window ended"
+    );
+    assert_eq!(exceeded, [Limit::Share]);
+}
+
+#[test]
+fn dismissing_the_notice_closes_it_and_counting_starts_again() {
+    let mut trees = space(10, 15);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    trash_remotely(&mut trees, &["d"]);
+    apply_effects(&mut commits, &mut trees, &mut ids, NOW);
+    let id = notice(&commits).unwrap().0.id.clone();
+
+    assert!(
+        !commits.decide(&id, Answer::Delete),
+        "a notice takes only dismiss"
+    );
+    assert!(commits.decide(&id, Answer::Dismiss));
+    assert_eq!(commits.questions(), []);
+    assert!(!commits.decide(&id, Answer::Dismiss), "the notice is gone");
+
+    trash_remotely(&mut trees, &["f0"]);
+    apply_effects(&mut commits, &mut trees, &mut ids, NOW + 1);
+    assert_eq!(commits.questions(), [], "1 of 10 files crosses no limit");
+}
+
+/// GUN-384 review: the person dismisses the notice while the folder it counted is still being
+/// removed. The rest of that folder opens no new notice, and a later deletion counts again.
+#[test]
+fn the_rest_of_a_folder_removed_after_its_notice_was_dismissed_is_not_noticed_again() {
+    let mut trees = space(30, 50);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    trash_remotely(&mut trees, &["d"]);
+    let mut effects = Effects::default();
+    while notice(&commits).is_none() {
+        let record = effects
+            .plan(&trees, &mut ids, NOW)
+            .cloned()
+            .expect("a removal");
+        if let Some(removal) = effects.done(&mut trees, &record.effect_id, None).unwrap() {
+            commits.count_remote(removal, &mut trees, SEQ, &mut ids, NOW);
+        }
+        trees.settle();
+    }
+    let (question, window, _) = notice(&commits).unwrap();
+    assert!(
+        window.affected_files < 50,
+        "the folder is still being removed"
+    );
+    let id = question.id.clone();
+    assert!(commits.decide(&id, Answer::Dismiss));
+
+    apply_effects(&mut commits, &mut trees, &mut ids, NOW + 1);
+
+    assert_eq!(trees.local().get("d"), None, "the folder is removed");
+    assert_eq!(
+        commits.questions(),
+        [],
+        "the same deletion is not noticed again"
+    );
+
+    let later = root_files(0..20);
+    trash_remotely(
+        &mut trees,
+        &later.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    apply_effects(&mut commits, &mut trees, &mut ids, NOW + 2);
+    let (_, window, exceeded) = notice(&commits).expect("a new deletion is counted");
+    assert_eq!(window.deletions, 20);
+    assert_eq!(exceeded, [Limit::Share]);
+}
+
+/// GUN-384 review: the person dismisses the notice in the middle of a folder's removal, and R
+/// restores the folder before L loses it. Deleting the folder again later is another deletion.
+#[test]
+fn a_folder_restored_after_its_notice_was_dismissed_is_noticed_when_deleted_again() {
+    let mut trees = space(0, 50);
+    let original: Vec<(String, Shape)> = (trees.synced().iter())
+        .map(|(id, shape)| (id.clone(), shape.clone()))
+        .collect();
+    let set_remote = |trees: &mut Trees, trashed: bool, rev: u64| {
+        for (id, shape) in &original {
+            let node = RemoteNode {
+                shape: shape.clone(),
+                trashed,
+                content_rev: rev,
+                meta_rev: rev,
+                trash_group: if trashed {
+                    "later".into()
+                } else {
+                    String::new()
+                },
+            };
+            trees.set_remote(id.clone(), node);
+        }
+        trees.settle();
+    };
+    let (mut commits, mut ids, mut effects) =
+        (Commits::default(), IdGen::new(1), Effects::default());
+    trash_remotely(&mut trees, &["d"]);
+    while notice(&commits).is_none() {
+        let record = effects
+            .plan(&trees, &mut ids, NOW)
+            .cloned()
+            .expect("a removal");
+        if let Some(removal) = effects.done(&mut trees, &record.effect_id, None).unwrap() {
+            commits.count_remote(removal, &mut trees, SEQ, &mut ids, NOW);
+        }
+        trees.settle();
+    }
+    let first = notice(&commits).unwrap().0.id.clone();
+    assert!(commits.decide(&first, Answer::Dismiss));
+
+    set_remote(&mut trees, false, 3);
+    let mut ino = 1000;
+    while let Some(record) = effects.plan(&trees, &mut ids, NOW + 1).cloned() {
+        ino += 1;
+        let identity = FileIdentity {
+            dev: 1,
+            ino,
+            birth_ns: Some(0),
+        };
+        if let Some(removal) =
+            (effects.done(&mut trees, &record.effect_id, Some(identity))).unwrap()
+        {
+            commits.count_remote(removal, &mut trees, SEQ, &mut ids, NOW + 1);
+        }
+        trees.settle();
+    }
+    let files = (trees.local().iter()).filter(|(_, node)| node.shape.kind == Kind::File);
+    assert_eq!(files.count(), 50, "the restored folder is downloaded again");
+    assert_eq!(notice(&commits), None);
+
+    set_remote(&mut trees, true, 4);
+    apply_effects(&mut commits, &mut trees, &mut ids, NOW + 2);
+
+    let (next, window, _) = notice(&commits).expect("the later deletion is noticed");
+    assert_ne!(next.id, first);
+    assert_eq!((window.deletions, window.affected_files), (1, 50));
+}
+
+/// GUN-384 review: a notice holds nothing, so uploads and this device's deletions go on.
+#[test]
+fn an_open_notice_holds_back_neither_uploads_nor_local_deletions() {
+    let mut trees = space(10, 15);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    trash_remotely(&mut trees, &["d"]);
+    apply_effects(&mut commits, &mut trees, &mut ids, NOW);
+    let id = notice(&commits).unwrap().0.id.clone();
+    put_back(&mut trees, "new", shape(ROOT, "new", Kind::File), 999);
+    trees.remove_local("f0");
+    trees.settle();
+
+    let ops = build_at(&mut commits, &mut trees, &mut ids, NOW + 1);
+
+    assert!(
+        ops.iter()
+            .any(|op| matches!(op, op::Op::CreateFile(create) if create.node_id == "new")),
+        "{ops:?}"
+    );
+    assert_eq!(deleted(&ops), ["f0"]);
+    assert_eq!(notice(&commits).unwrap().0.id, id);
+}
+
+/// GUN-384 review: after the person dismisses the notice in the middle of a folder's removal, a
+/// bootstrap that does not list the trash leaves R with no record of the folder. The rest of the
+/// folder is still the deletion the person dismissed.
+#[test]
+fn a_dismissed_folder_stays_dismissed_when_r_forgets_its_trashed_nodes() {
+    let mut trees = space(30, 50);
+    let (mut commits, mut ids, mut effects) =
+        (Commits::default(), IdGen::new(1), Effects::default());
+    trash_remotely(&mut trees, &["d"]);
+    while notice(&commits).is_none() {
+        let record = effects
+            .plan(&trees, &mut ids, NOW)
+            .cloned()
+            .expect("a removal");
+        if let Some(removal) = effects.done(&mut trees, &record.effect_id, None).unwrap() {
+            commits.count_remote(removal, &mut trees, SEQ, &mut ids, NOW);
+        }
+        trees.settle();
+    }
+    let id = notice(&commits).unwrap().0.id.clone();
+    assert!(commits.decide(&id, Answer::Dismiss));
+    let trashed: Vec<String> = (trees.remote().iter())
+        .filter(|(_, node)| node.trashed)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in &trashed {
+        trees.remove_remote(id);
+    }
+    trees.settle();
+
+    build_at(&mut commits, &mut trees, &mut ids, NOW + 1);
+    apply_effects(&mut commits, &mut trees, &mut ids, NOW + 1);
+
+    assert_eq!(trees.local().get("d"), None, "the folder is removed");
+    assert_eq!(
+        commits.questions(),
+        [],
+        "the same deletion is not noticed again"
+    );
+}
+
+/// Removes R's records of the trashed nodes, as a bootstrap that does not list the trash does, and
+/// returns them.
+fn forget_trashed(trees: &mut Trees) -> Vec<(String, RemoteNode)> {
+    let trashed: Vec<(String, RemoteNode)> = (trees.remote().iter())
+        .filter(|(_, node)| node.trashed)
+        .map(|(id, node)| (id.clone(), node.clone()))
+        .collect();
+    for (id, _) in &trashed {
+        trees.remove_remote(id);
+    }
+    trees.settle();
+    trashed
+}
+
+/// Applies removals until a notice opens, and dismisses it while the folder is still removed.
+fn dismiss_while_removing(commits: &mut Commits, trees: &mut Trees, ids: &mut IdGen) {
+    let mut effects = Effects::default();
+    while notice(commits).is_none() {
+        let record = (effects.plan(trees, ids, NOW).cloned()).expect("a removal");
+        if let Some(removal) = effects.done(trees, &record.effect_id, None).unwrap() {
+            commits.count_remote(removal, trees, SEQ, ids, NOW);
+        }
+        trees.settle();
+    }
+    let (question, window, _) = notice(commits).unwrap();
+    assert!(
+        window.affected_files < 50,
+        "the folder is still being removed"
+    );
+    let id = question.id.clone();
+    assert!(commits.decide(&id, Answer::Dismiss));
+}
+
+/// GUN-384 review: R holds no record of the trashed folder while it is removed, as after a
+/// bootstrap that did not list the trash, and the person dismisses the notice. A later bootstrap
+/// lists the trash, and R learns the folder was trashed at seq 2, which R already held. The rest
+/// of the folder is still the deletion the person dismissed.
+#[test]
+fn a_dismissed_folder_stays_dismissed_when_r_learns_its_trashed_nodes() {
+    let mut trees = space(0, 50);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    trash_remotely(&mut trees, &["d"]);
+    let trashed = forget_trashed(&mut trees);
+    dismiss_while_removing(&mut commits, &mut trees, &mut ids);
+    for (id, node) in trashed {
+        trees.set_remote(id, node);
+    }
+    trees.settle();
+
+    build_at(&mut commits, &mut trees, &mut ids, NOW + 1);
+    apply_effects(&mut commits, &mut trees, &mut ids, NOW + 1);
+
+    assert_eq!(trees.local().get("d"), None, "the folder is removed");
+    assert_eq!(
+        commits.questions(),
+        [],
+        "the same deletion is not noticed again"
+    );
+}
+
+/// GUN-384 review: as above, and R learns the folder was trashed after seq 2, so the server
+/// restored it and trashed it again since. The rest of the folder is another deletion.
+#[test]
+fn a_folder_trashed_again_after_a_dismissal_without_its_record_is_noticed() {
+    let mut trees = space(0, 50);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    trash_remotely(&mut trees, &["d"]);
+    let trashed = forget_trashed(&mut trees);
+    dismiss_while_removing(&mut commits, &mut trees, &mut ids);
+    let left = (trees.local().iter()).filter(|(_, node)| node.shape.kind == Kind::File);
+    let left = left.count() as u64;
+    for (id, node) in trashed {
+        let node = RemoteNode {
+            meta_rev: 4,
+            trash_group: "again".into(),
+            ..node
+        };
+        trees.set_remote(id, node);
+    }
+    trees.settle();
+
+    apply_effects(&mut commits, &mut trees, &mut ids, NOW + 1);
+
+    let (_, window, _) = notice(&commits).expect("the later deletion is noticed");
+    assert_eq!((window.deletions, window.affected_files), (1, left));
+}
+
+/// GUN-384 review: as in the first test, and R restores the folder before L loses it. Deleting
+/// the folder again later is another deletion.
+#[test]
+fn a_folder_restored_after_a_dismissal_without_its_record_is_noticed_when_deleted_again() {
+    let mut trees = space(0, 50);
+    let original: Vec<(String, Shape)> = (trees.synced().iter())
+        .map(|(id, shape)| (id.clone(), shape.clone()))
+        .collect();
+    let set_remote = |trees: &mut Trees, trashed: bool, rev: u64| {
+        for (id, shape) in &original {
+            let node = RemoteNode {
+                shape: shape.clone(),
+                trashed,
+                content_rev: rev,
+                meta_rev: rev,
+                trash_group: if trashed {
+                    "later".into()
+                } else {
+                    String::new()
+                },
+            };
+            trees.set_remote(id.clone(), node);
+        }
+        trees.settle();
+    };
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    trash_remotely(&mut trees, &["d"]);
+    forget_trashed(&mut trees);
+    dismiss_while_removing(&mut commits, &mut trees, &mut ids);
+
+    set_remote(&mut trees, false, 3);
+    let mut effects = Effects::default();
+    let mut ino = 1000;
+    while let Some(record) = effects.plan(&trees, &mut ids, NOW + 1).cloned() {
+        ino += 1;
+        let identity = FileIdentity {
+            dev: 1,
+            ino,
+            birth_ns: Some(0),
+        };
+        if let Some(removal) =
+            (effects.done(&mut trees, &record.effect_id, Some(identity))).unwrap()
+        {
+            commits.count_remote(removal, &mut trees, 3, &mut ids, NOW + 1);
+        }
+        trees.settle();
+    }
+    let files = (trees.local().iter()).filter(|(_, node)| node.shape.kind == Kind::File);
+    assert_eq!(files.count(), 50, "the restored folder is downloaded again");
+    assert_eq!(notice(&commits), None);
+
+    set_remote(&mut trees, true, 4);
+    apply_effects(&mut commits, &mut trees, &mut ids, NOW + 2);
+
+    let (_, window, _) = notice(&commits).expect("the later deletion is noticed");
+    assert_eq!((window.deletions, window.affected_files), (1, 50));
+}
+
+/// The space `root`: the files `r0` to `r9`, the folder `p` with the files `p/q0` to `p/q5`, and the
+/// folder `p/f` with the files `p/f/g0` to `p/f/g39`, 56 files.
+fn nested() -> Trees {
+    let mut nodes = vec![
+        ("p".to_owned(), shape(ROOT, "p", Kind::Dir)),
+        ("p/f".to_owned(), shape("p", "f", Kind::Dir)),
+    ];
+    nodes.extend((0..10).map(|i| (format!("r{i}"), shape(ROOT, &format!("r{i}"), Kind::File))));
+    nodes.extend((0..6).map(|i| (format!("p/q{i}"), shape("p", &format!("q{i}"), Kind::File))));
+    let inner = (0..40).map(|i| {
+        (
+            format!("p/f/g{i}"),
+            shape("p/f", &format!("g{i}"), Kind::File),
+        )
+    });
+    nodes.extend(inner);
+    let mut trees = Trees::new(ROOT);
+    for (ino, (id, shape)) in nodes.into_iter().enumerate() {
+        put_back(&mut trees, &id, shape.clone(), ino as u64 + 1);
+        trees.set_synced(id.clone(), Some(shape.clone()));
+        let node = RemoteNode {
+            shape,
+            trashed: false,
+            content_rev: 1,
+            meta_rev: 1,
+            trash_group: String::new(),
+        };
+        trees.set_remote(id, node);
+    }
+    trees.settle();
+    trees
+}
+
+/// GUN-384 review: another device deletes `p/f`, 40 of the 56 files, and the person dismisses the
+/// notice while `p/f` is still removed. The other device then deletes `p`, which holds 6 files of
+/// its own. The rest of `p/f` is still the deletion the person dismissed, and 6 of 16 files cross
+/// no limit.
+#[test]
+fn a_folder_deleted_above_a_dismissed_one_counts_only_its_own_files() {
+    let mut trees = nested();
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    trash_remotely(&mut trees, &["p/f"]);
+    dismiss_while_removing(&mut commits, &mut trees, &mut ids);
+    trash_remotely(&mut trees, &["p"]);
+
+    apply_effects(&mut commits, &mut trees, &mut ids, NOW + 1);
+
+    assert_eq!(trees.local().get("p"), None, "the folder is removed");
+    assert_eq!(commits.questions(), []);
+}
+
+/// GUN-384 review: this device removes 30 of the 60 files of a folder, stops for longer than the
+/// window, and removes the rest. The folder is one deletion of 60 of the 100 files.
+#[test]
+fn a_folder_removal_that_stops_past_the_window_is_noticed() {
+    let mut trees = space(40, 60);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    trash_remotely(&mut trees, &["d"]);
+    let mut effects = Effects::default();
+    for _ in 0..30 {
+        let record = (effects.plan(&trees, &mut ids, NOW).cloned()).expect("a removal");
+        if let Some(removal) = effects.done(&mut trees, &record.effect_id, None).unwrap() {
+            commits.count_remote(removal, &mut trees, SEQ, &mut ids, NOW);
+        }
+        trees.settle();
+    }
+    assert_eq!(notice(&commits), None, "30 of 100 files cross no limit");
+
+    apply_effects(&mut commits, &mut trees, &mut ids, NOW + WINDOW_MS);
+
+    assert_eq!(trees.local().get("d"), None, "the folder is removed");
+    let (_, window, _) = notice(&commits).expect("the folder is noticed");
+    assert_eq!((window.deletions, window.affected_files), (1, 60));
+}
+
+#[test]
+fn removals_whose_window_ended_open_no_notice() {
+    let mut trees = space(30, 0);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let first = root_files(0..10);
+    trash_remotely(
+        &mut trees,
+        &first.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    apply_effects(&mut commits, &mut trees, &mut ids, NOW);
+    assert_eq!(commits.questions(), [], "10 of 30 files");
+
+    let second = root_files(10..20);
+    trash_remotely(
+        &mut trees,
+        &second.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    apply_effects(&mut commits, &mut trees, &mut ids, NOW + WINDOW_MS);
+    assert_eq!(
+        commits.questions(),
+        [],
+        "10 of the 20 files left when the first 10 left the window"
+    );
+}
+
+#[test]
+fn a_notice_names_every_limit_the_removals_crossed() {
+    let mut trees = space(1001, 0);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let all = root_files(0..1001);
+    trash_remotely(
+        &mut trees,
+        &all.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+
+    apply_effects(&mut commits, &mut trees, &mut ids, NOW);
+
+    let (_, window, exceeded) = notice(&commits).expect("a notice");
+    assert_eq!(window.deletions, 1001);
+    assert_eq!(exceeded, [Limit::Deletions, Limit::Share]);
 }

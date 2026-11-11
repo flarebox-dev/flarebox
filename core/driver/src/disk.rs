@@ -375,7 +375,7 @@ impl Disk {
                 &mut |step| hook(Cut::Step(step)),
             )?;
             let outcome = confirmed(outcome, engine);
-            acknowledge(&record, &outcome, true, engine, store, hook)?;
+            acknowledge(&record, &outcome, true, &link.space_id, engine, store, hook)?;
             let (marker, cleared) = (disk.marker()?, engine.effects.cleared());
             if marker != cleared {
                 return Err(Stop::DiskBehind { marker, cleared });
@@ -491,7 +491,15 @@ impl Disk {
                 engine,
             ),
         };
-        let settled = acknowledge(&record, &outcome, false, engine, store, hook)?;
+        let settled = acknowledge(
+            &record,
+            &outcome,
+            false,
+            &self.space_id,
+            engine,
+            store,
+            hook,
+        )?;
         let end = self.sections.epoch.fetch_add(1, Ordering::SeqCst) + 1;
         let scopes = scopes(&effect.action, &outcome);
         let moved_folder = matches!(effect.action, Action::Move { .. })
@@ -864,13 +872,16 @@ fn halt(error: io::Error) -> Stall {
 }
 
 /// Records the outcome of the effect in flight in one transaction: done with the identity of the entry it created,
-/// or failed. With `retry`, an interrupted effect is unblocked in the same transaction, so it is planned again. An
-/// outcome that L no longer takes ([`EffectRecord::applies`]) is never written to L, whatever the disk holds. The effect
-/// fails and is unblocked, and the planner leaves it out until L changes.
+/// or failed. The mass-delete guard counts a removal done for another device's deletion, and a notice it opens or
+/// updates is stored in the same transaction. With `retry`, an interrupted effect is unblocked in the same
+/// transaction, so it is planned again. An outcome that L no longer takes ([`EffectRecord::applies`]) is never
+/// written to L, whatever the disk holds. The effect fails and is unblocked, and the planner leaves it out until L
+/// changes.
 fn acknowledge(
     record: &EffectRecord,
     outcome: &Outcome,
     retry: bool,
+    space_id: &str,
     engine: &mut Engine,
     store: &mut Store,
     hook: &mut Hook,
@@ -887,14 +898,27 @@ fn acknowledge(
                 Settled::Failed("L changed since it was planned".into())
             }
             Outcome::Done { identity } => {
-                engine
-                    .effects
+                let removal = (engine.effects)
                     .done(
                         &mut engine.trees,
                         &record.effect_id,
                         identity.map(file_identity),
                     )
                     .map_err(refused)?;
+                if let Some(removal) = removal {
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_or(0, |since| since.as_millis() as u64);
+                    let Engine {
+                        trees,
+                        commits,
+                        ids,
+                        cursor,
+                        ..
+                    } = engine;
+                    let last_seq = cursor.as_ref().map_or(0, |cursor| cursor.last_seq);
+                    commits.count_remote(removal, trees, last_seq, ids, now_ms);
+                }
                 Settled::Done
             }
             Outcome::Failed { reason, .. } => {
@@ -920,6 +944,7 @@ fn acknowledge(
                 }
             }
         };
+        engine.ask(tx, space_id)?;
         engine.checkpoint(tx)?;
         hook(Cut::BeforeAck);
         Ok(settled)

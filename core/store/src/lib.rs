@@ -327,6 +327,29 @@ const MIGRATIONS: &[&str] = &[
         seq INTEGER NOT NULL
     ) STRICT, WITHOUT ROWID;
 ",
+    "
+    CREATE TABLE guard_remote (
+        top_id TEXT NOT NULL,
+        known INTEGER NOT NULL CHECK (known IN (0, 1)),
+        trash_group TEXT NOT NULL,
+        trashed_seq INTEGER NOT NULL,
+        at_ms INTEGER NOT NULL,
+        files INTEGER NOT NULL,
+        PRIMARY KEY (top_id, known, trash_group, trashed_seq)
+    ) STRICT, WITHOUT ROWID;
+
+    CREATE TABLE guard_remote_dismissed (
+        top_id TEXT NOT NULL,
+        known INTEGER NOT NULL CHECK (known IN (0, 1)),
+        trash_group TEXT NOT NULL,
+        trashed_seq INTEGER NOT NULL,
+        PRIMARY KEY (top_id, known, trash_group, trashed_seq)
+    ) STRICT, WITHOUT ROWID;
+
+    CREATE TABLE guard_confirmed_limits (
+        limit_crossed TEXT PRIMARY KEY
+    ) STRICT, WITHOUT ROWID;
+",
 ];
 
 /// The schema version this build writes.
@@ -945,6 +968,15 @@ impl Tx<'_> {
              WHERE question_id = ?1 AND answer IS NULL",
             params![question_id, answer.answer, answer.answered_at_ms],
         )? > 0)
+    }
+
+    /// Replaces how a stored question is shown, keeping any answer it was given.
+    pub fn reshow_question(&self, question_id: &str, body: &[u8]) -> Result<()> {
+        self.0.execute(
+            "UPDATE questions SET body = ?2 WHERE question_id = ?1",
+            params![question_id, body],
+        )?;
+        Ok(())
     }
 
     pub fn remove_question(&self, question_id: &str) -> Result<bool> {

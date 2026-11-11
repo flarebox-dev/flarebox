@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use koidrive_engine::commit::{Commits, Lift, LiftError};
+use koidrive_engine::guard::Window;
 use koidrive_engine::ignore::LocalRules;
 use koidrive_fs::{Marker, probe_no_replace, read_marker, write_marker};
 use koidrive_ignore::LocalRulesError;
@@ -27,7 +28,7 @@ use crate::credential::{
 use crate::folder::FolderTask;
 use crate::ignore::{Matcher, local_rules, matcher};
 use crate::paths::{Paths, PathsError};
-use crate::question::{Answer, Question};
+use crate::question::{Answer, Limit, Question, QuestionKind};
 use crate::restore::{self, RestoreRequest, RestoreStatus};
 use crate::status::{Account, FolderState, FolderStatus, Status};
 
@@ -103,7 +104,7 @@ pub enum DriverError {
     #[error("no unanswered question has the id {0:?}")]
     QuestionNotFound(String),
     #[error("the question accepts only {}", allowed.iter().map(|a| a.as_str()).collect::<Vec<_>>().join(" or "))]
-    AnswerNotAllowed { allowed: [Answer; 2] },
+    AnswerNotAllowed { allowed: &'static [Answer] },
     #[error("no linked folder syncs the space {0:?}")]
     SpaceNotLinked(String),
     #[error("the restore's {0} is not an id the server gave")]
@@ -1295,9 +1296,31 @@ fn resolve_space(spaces: Vec<SpaceInfo>, wanted: &str) -> Result<SpaceInfo, Driv
     }
 }
 
+/// The question `stored` holds. A mass-delete question stored before questions kept the limits
+/// they crossed names those its counts cross, or the deletions limit when they cross none.
 fn decode_question(space_id: &str, stored: &StoredQuestion) -> Option<Question> {
     match serde_json::from_slice::<Question>(&stored.body) {
-        Ok(question) => Some(question),
+        Ok(mut question) => {
+            if let QuestionKind::MassDelete {
+                deletions,
+                affected_files,
+                space_files,
+                exceeded,
+            } = &mut question.kind
+                && exceeded.is_empty()
+            {
+                let window = Window {
+                    deletions: *deletions,
+                    affected_files: *affected_files,
+                    space_files: *space_files,
+                };
+                *exceeded = window.exceeded();
+                if exceeded.is_empty() {
+                    exceeded.push(Limit::Deletions);
+                }
+            }
+            Some(question)
+        }
         Err(error) => {
             tracing::warn!(space_id, question_id = stored.question_id, %error, "a stored question cannot be read");
             None
@@ -1451,6 +1474,7 @@ mod tests {
                 deletions: 1_001,
                 affected_files: 1_001,
                 space_files: 5_000,
+                exceeded: vec![crate::question::Limit::Deletions],
             },
             items: vec![HeldItem {
                 node_id: "n1".into(),
@@ -3632,5 +3656,42 @@ mod tests {
             serde_json::to_value(&problem).unwrap(),
             serde_json::json!({ "type": "pending", "waits_for": "node_problem" })
         );
+    }
+
+    /// A mass-delete question stored before questions kept the limits they crossed names the
+    /// limits its counts cross, or the deletions limit when they cross none.
+    #[test]
+    fn a_question_stored_without_its_limits_names_them() {
+        let decoded = |deletions, affected_files, space_files| {
+            let question = Question {
+                id: "q1".into(),
+                space_id: SPACE.into(),
+                asked_at_ms: 1,
+                kind: QuestionKind::MassDelete {
+                    deletions,
+                    affected_files,
+                    space_files,
+                    exceeded: Vec::new(),
+                },
+                items: Vec::new(),
+            };
+            let body = serde_json::to_string(&question).unwrap();
+            let stored = StoredQuestion {
+                question_id: "q1".into(),
+                asked_at_ms: 1,
+                body: body.replace(r#","exceeded":[]"#, "").into_bytes(),
+                answer: None,
+            };
+            match decode_question(SPACE, &stored).unwrap().kind {
+                QuestionKind::MassDelete { exceeded, .. } => exceeded,
+                kind => panic!("a mass-delete question: {kind:?}"),
+            }
+        };
+        assert_eq!(
+            decoded(1_200, 1_500, 2_000),
+            [Limit::Deletions, Limit::Share]
+        );
+        assert_eq!(decoded(3, 30, 40), [Limit::Share]);
+        assert_eq!(decoded(3, 3, 40), [Limit::Deletions]);
     }
 }

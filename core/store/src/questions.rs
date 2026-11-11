@@ -13,8 +13,8 @@
 
 use std::collections::BTreeMap;
 
-use koidrive_engine::guard::{Counted, GuardState};
-use koidrive_engine::question::{Answer, Held, Question, QuestionKind, Revisions};
+use koidrive_engine::guard::{Counted, GuardState, RemoteDeletion, Trash};
+use koidrive_engine::question::{Answer, Held, Limit, Question, QuestionKind, Revisions};
 use koidrive_engine::tree::{Content, NodeId, Shape};
 use prost::Message;
 use rusqlite::{Row, params};
@@ -152,32 +152,128 @@ impl Tx<'_> {
             "SELECT '', top_id, node_id, content_rev, meta_rev FROM guard_confirmed_members",
         )?;
         guard.confirmed = confirmed.remove("").unwrap_or_default();
+        let mut stmt = self
+            .0
+            .prepare_cached("SELECT limit_crossed FROM guard_confirmed_limits")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(0)?;
+            let limit = serde_json::from_value::<Limit>(serde_json::Value::String(name))
+                .map_err(|error| Error::InvalidEngineState(format!("unknown limit: {error}")))?;
+            guard.confirmed_limits.insert(limit);
+        }
+        let mut stmt = self.0.prepare_cached(
+            "SELECT top_id, known, trash_group, trashed_seq, at_ms, files FROM guard_remote",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let deletion = RemoteDeletion {
+                top: row.get(0)?,
+                trash: trash(row.get(1)?, row.get(2)?, row.get(3)?),
+            };
+            let counted = Counted {
+                at_ms: row.get(4)?,
+                files: row.get(5)?,
+            };
+            guard.remote.insert(deletion, counted);
+        }
+        let mut stmt = self.0.prepare_cached(
+            "SELECT top_id, known, trash_group, trashed_seq FROM guard_remote_dismissed",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            guard.dismissed.insert(RemoteDeletion {
+                top: row.get(0)?,
+                trash: trash(row.get(1)?, row.get(2)?, row.get(3)?),
+            });
+        }
         Ok(guard)
     }
 
-    pub(crate) fn set_guard(&self, guard: &GuardState) -> Result<()> {
-        for table in ["guard_ledger", "guard_confirmed_members", "guard_confirmed"] {
-            self.0.execute(&format!("DELETE FROM {table}"), [])?;
+    /// Changes the stored guard from `old` to `new`. The ledger, the confirmed deletions and their
+    /// limits are written whole when they changed, and the other devices' deletions row by row,
+    /// since each removal that applies one of them changes the guard.
+    pub(crate) fn update_guard(&self, old: &GuardState, new: &GuardState) -> Result<()> {
+        if old.ledger != new.ledger {
+            self.0.execute("DELETE FROM guard_ledger", [])?;
+            let mut stmt = self.0.prepare_cached(
+                "INSERT INTO guard_ledger (node_id, at_ms, files) VALUES (?1, ?2, ?3)",
+            )?;
+            for (id, counted) in &new.ledger {
+                stmt.execute(params![id, counted.at_ms, counted.files])?;
+            }
         }
-        let mut stmt = self.0.prepare_cached(
-            "INSERT INTO guard_ledger (node_id, at_ms, files) VALUES (?1, ?2, ?3)",
+        if old.confirmed != new.confirmed {
+            self.0.execute("DELETE FROM guard_confirmed_members", [])?;
+            self.0.execute("DELETE FROM guard_confirmed", [])?;
+            let mut items = self
+                .0
+                .prepare_cached("INSERT INTO guard_confirmed (top_id, files) VALUES (?1, ?2)")?;
+            let mut members = self.0.prepare_cached(
+                "INSERT INTO guard_confirmed_members (top_id, node_id, content_rev, meta_rev)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (top, item) in &new.confirmed {
+                items.execute(params![top, item.files])?;
+                for (node, revisions) in &item.members {
+                    let (content_rev, meta_rev) = split(revisions);
+                    members.execute(params![top, node, content_rev, meta_rev])?;
+                }
+            }
+        }
+        if old.confirmed_limits != new.confirmed_limits {
+            self.0.execute("DELETE FROM guard_confirmed_limits", [])?;
+            let mut stmt = self
+                .0
+                .prepare_cached("INSERT INTO guard_confirmed_limits (limit_crossed) VALUES (?1)")?;
+            for limit in &new.confirmed_limits {
+                stmt.execute(params![limit_name(*limit)])?;
+            }
+        }
+        let mut remove = self.0.prepare_cached(
+            "DELETE FROM guard_remote
+             WHERE top_id = ?1 AND known = ?2 AND trash_group = ?3 AND trashed_seq = ?4",
         )?;
-        for (id, counted) in &guard.ledger {
-            stmt.execute(params![id, counted.at_ms, counted.files])?;
+        for deletion in old.remote.keys() {
+            if !new.remote.contains_key(deletion) {
+                let (known, group, seq) = split_trash(&deletion.trash);
+                remove.execute(params![deletion.top, known, group, seq])?;
+            }
         }
-        let mut items = self
-            .0
-            .prepare_cached("INSERT INTO guard_confirmed (top_id, files) VALUES (?1, ?2)")?;
-        let mut members = self.0.prepare_cached(
-            "INSERT INTO guard_confirmed_members (top_id, node_id, content_rev, meta_rev)
+        let mut put = self.0.prepare_cached(
+            "INSERT OR REPLACE INTO guard_remote
+             (top_id, known, trash_group, trashed_seq, at_ms, files)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for (deletion, counted) in &new.remote {
+            if old.remote.get(deletion) != Some(counted) {
+                let (known, group, seq) = split_trash(&deletion.trash);
+                let top = &deletion.top;
+                put.execute(params![
+                    top,
+                    known,
+                    group,
+                    seq,
+                    counted.at_ms,
+                    counted.files
+                ])?;
+            }
+        }
+        let mut remove = self.0.prepare_cached(
+            "DELETE FROM guard_remote_dismissed
+             WHERE top_id = ?1 AND known = ?2 AND trash_group = ?3 AND trashed_seq = ?4",
+        )?;
+        for deletion in old.dismissed.difference(&new.dismissed) {
+            let (known, group, seq) = split_trash(&deletion.trash);
+            remove.execute(params![deletion.top, known, group, seq])?;
+        }
+        let mut put = self.0.prepare_cached(
+            "INSERT INTO guard_remote_dismissed (top_id, known, trash_group, trashed_seq)
              VALUES (?1, ?2, ?3, ?4)",
         )?;
-        for (top, item) in &guard.confirmed {
-            items.execute(params![top, item.files])?;
-            for (node, revisions) in &item.members {
-                let (content_rev, meta_rev) = split(revisions);
-                members.execute(params![top, node, content_rev, meta_rev])?;
-            }
+        for deletion in new.dismissed.difference(&old.dismissed) {
+            let (known, group, seq) = split_trash(&deletion.trash);
+            put.execute(params![deletion.top, known, group, seq])?;
         }
         Ok(())
     }
@@ -210,6 +306,29 @@ impl Tx<'_> {
             item.members.insert(row.get(2)?, revisions(row)?);
         }
         Ok(held)
+    }
+}
+
+fn limit_name(limit: Limit) -> String {
+    match serde_json::to_value(limit) {
+        Ok(serde_json::Value::String(name)) => name,
+        _ => unreachable!("a limit serializes as its name"),
+    }
+}
+
+/// A deletion's trash as the store keeps it: whether R told its group, the group or the empty
+/// string, and the seq of its commit or the bound on it.
+fn split_trash(trash: &Trash) -> (bool, &str, u64) {
+    match trash {
+        Trash::Group { group, seq } => (true, group, *seq),
+        Trash::Unknown { no_later_than } => (false, "", *no_later_than),
+    }
+}
+
+fn trash(known: bool, group: String, seq: u64) -> Trash {
+    match known {
+        true => Trash::Group { group, seq },
+        false => Trash::Unknown { no_later_than: seq },
     }
 }
 

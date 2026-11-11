@@ -5,7 +5,7 @@
 //! These types mirror the macOS surface in `core/ffi` (`Question`, `QuestionKind`, `Answer`), so one driver serves the
 //! app and the CLI.
 
-pub use koidrive_engine::question::{Answer, QuestionKind, RecoveryGroup};
+pub use koidrive_engine::question::{Answer, Limit, QuestionKind, RecoveryGroup};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +55,7 @@ mod tests {
                 deletions: 1_200,
                 affected_files: 1_200,
                 space_files: 2_000,
+                exceeded: vec![Limit::Deletions, Limit::Share],
             },
             items: vec![HeldItem {
                 node_id: "n1".into(),

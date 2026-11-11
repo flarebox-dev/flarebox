@@ -39,6 +39,9 @@ pub(crate) struct Engine {
     pub cursor: Option<Cursor>,
     /// The engine state as the store holds it, which the next checkpoint changes row by row.
     pub stored: EngineState,
+    /// Whether [`Engine::ask`] changed the stored questions since the folder last showed them, also when their
+    /// number did not, as when a question is asked again under a new id or a notice's counts grow.
+    pub asked: bool,
 }
 
 /// What applying a batch of the log did.
@@ -103,6 +106,7 @@ impl Engine {
             ids,
             cursor: tx.cursor()?,
             stored,
+            asked: false,
         })
     }
 
@@ -158,13 +162,24 @@ impl Engine {
     }
 
     /// Stores each question the engine asked since the last checkpoint and removes the rows of the ones it no longer
-    /// asks, for `Driver::questions` to show.
-    pub fn ask(&self, tx: &Tx<'_>, space_id: &str) -> Result<(), Error> {
+    /// asks, for `Driver::questions` to show. A question whose counts changed under the same id, as a notice's do, is
+    /// shown with the new counts and keeps any answer it was given. Sets [`Engine::asked`] when it changed a row.
+    pub fn ask(&mut self, tx: &Tx<'_>, space_id: &str) -> Result<(), Error> {
         let asked = &self.stored.commits.questions;
         let asking = self.commits.questions();
         let open = |questions: &[engine::Question], id: &str| questions.iter().any(|q| q.id == id);
+        let mut changed = false;
         for question in asked.iter().filter(|question| !open(asking, &question.id)) {
             tx.remove_question(&question.id)?;
+            changed = true;
+        }
+        for question in asking.iter().filter(|question| {
+            (asked.iter()).any(|before| before.id == question.id && before.kind != question.kind)
+        }) {
+            let body =
+                serde_json::to_vec(&self.shown(space_id, question)).expect("a question serializes");
+            tx.reshow_question(&question.id, &body)?;
+            changed = true;
         }
         for question in asking.iter().filter(|question| !open(asked, &question.id)) {
             tracing::warn!(
@@ -181,7 +196,9 @@ impl Engine {
                     .expect("a question serializes"),
                 answer: None,
             })?;
+            changed = true;
         }
+        self.asked |= changed;
         Ok(())
     }
 
@@ -1415,6 +1432,7 @@ mod tests {
             ids,
             cursor: None,
             stored: EngineState::default(),
+            asked: false,
         };
         Case {
             name,
