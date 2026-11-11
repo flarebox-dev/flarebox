@@ -2457,3 +2457,65 @@ fn a_needed_folder_whose_move_waits_is_brought_back() {
     );
     assert_eq!(trees.local().live("d"), Some(&dir(ROOT, "X")));
 }
+
+#[test]
+fn a_removal_that_waits_after_both_sides_dropped_the_node_is_kept_until_it_fits() {
+    let mut trees = trees(&[
+        ("d", Some(dir(ROOT, "d")), Some(dir(ROOT, "d")), None),
+        ("f", Some(file(ROOT, "f", 1)), Some(file("d", "f", 1)), None),
+    ]);
+    let (mut effects, mut ids, mut commits) =
+        (Effects::default(), IdGen::new(1), Commits::default());
+    assert_eq!(
+        commits.connected(&Welcome {
+            read_only: true,
+            ..welcome(0)
+        }),
+        Reconnect::Idle
+    );
+    let record = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    assert_eq!(record.node, "d");
+    assert!(matches!(record.effect, Effect::RemoveDir { .. }));
+    effects.done(&mut trees, &record.effect_id, None).unwrap();
+    trees.settle();
+    assert_eq!(trees.waiting().get("d"), Some(&None));
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    trees.set_remote("d".into(), remote(dir(ROOT, "d")));
+    trees.set_remote("f".into(), remote(file("d", "f", 1)));
+    trees.settle();
+    assert_eq!(commits.connected(&welcome(0)), Reconnect::Idle);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("f", ROOT, "f")]);
+}
+
+#[test]
+fn a_kept_removal_is_made_once_s_no_longer_holds_anything_under_it() {
+    let mut trees = trees(&[
+        ("d", Some(dir(ROOT, "d")), Some(dir(ROOT, "d")), None),
+        ("f", Some(file(ROOT, "f", 1)), Some(file("d", "f", 1)), None),
+    ]);
+    let (mut effects, mut ids, mut commits) =
+        (Effects::default(), IdGen::new(1), Commits::default());
+    assert_eq!(
+        commits.connected(&Welcome {
+            read_only: true,
+            ..welcome(0)
+        }),
+        Reconnect::Idle
+    );
+    let record = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    effects.done(&mut trees, &record.effect_id, None).unwrap();
+    trees.settle();
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    assert_eq!(commits.connected(&welcome(0)), Reconnect::Idle);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(matches!(ops(&commit)[..], [op::Op::CreateFile(_)]));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    assert!(trees.waiting().is_empty());
+    assert_eq!(trees.synced().live("d"), None);
+}
