@@ -614,6 +614,8 @@ fn same_version(meta: &std::fs::Metadata, entry: &Entry) -> bool {
 
 /// Opens the file at the relative `path` under `root` for reading, one folder at a time, following no symbolic link.
 fn open_beneath(root: &Path, path: &Path) -> io::Result<File> {
+    #[cfg(test)]
+    tests::before_open(path)?;
     let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
     open_under(rustix::fs::open(root, dir_flags, Mode::empty())?, path)
 }
@@ -647,6 +649,7 @@ pub(crate) fn open_under(root: impl AsFd, path: &Path) -> io::Result<File> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::fs;
     use std::os::unix::fs::MetadataExt;
     use std::time::Instant;
@@ -657,6 +660,18 @@ mod tests {
     use crate::ignore::Unfiltered;
 
     const SPACE: &str = "0190f0a0-0000-7000-8000-000000000001";
+
+    thread_local! {
+        /// The file whose next open on this thread fails with EINTR, as an open the OS interrupts does.
+        static INTERRUPTED_OPEN: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn before_open(path: &Path) -> io::Result<()> {
+        match INTERRUPTED_OPEN.with_borrow_mut(|next| next.take_if(|next| next == path)) {
+            Some(_) => Err(rustix::io::Errno::INTR.into()),
+            None => Ok(()),
+        }
+    }
 
     fn observer(root: &Path) -> FsObserver {
         let dev = fs::metadata(root).unwrap().dev();
@@ -963,23 +978,15 @@ mod tests {
 
     #[test]
     fn a_retry_the_caller_stopped_reads_no_further_and_keeps_every_file_due() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, Ordering};
         let dir = marked();
         for file in 0..20 {
             fs::write(dir.path().join(format!("{file:04}.txt")), b"x").unwrap();
         }
         let stop = Arc::new(AtomicBool::new(false));
-        let reads_after_stop = Arc::new(AtomicUsize::new(0));
         let stopped = {
             let stop = stop.clone();
-            let reads_after_stop = reads_after_stop.clone();
-            move || {
-                let stopped = stop.load(Ordering::SeqCst);
-                if stopped {
-                    reads_after_stop.fetch_add(1, Ordering::SeqCst);
-                }
-                stopped
-            }
+            move || stop.load(Ordering::SeqCst)
         };
         let dev = fs::metadata(dir.path()).unwrap().dev();
         let started = FsObserver::start(
@@ -1004,8 +1011,9 @@ mod tests {
         }
         stop.store(true, Ordering::SeqCst);
         let mut out = Vec::new();
-        observer.retry(now, &mut out, &mut Reads::default());
-        assert_eq!(reads_after_stop.load(Ordering::SeqCst), 1);
+        let mut reads = Reads::default();
+        observer.retry(now, &mut out, &mut reads);
+        assert_eq!(reads.files, 1);
         assert!(out.is_empty(), "{out:?}");
         assert_eq!(observer.unread.len(), 20);
         assert!(
@@ -1013,6 +1021,41 @@ mod tests {
             "{:?}",
             observer.unread
         );
+    }
+
+    #[test]
+    fn an_open_the_os_interrupts_is_a_failed_read_and_the_retry_goes_on() {
+        let dir = marked();
+        for file in 0..20 {
+            fs::write(dir.path().join(format!("{file:04}.txt")), b"x").unwrap();
+        }
+        let mut observer = observer(dir.path());
+        observe_until(&mut observer, |seen| seen.len() >= 20);
+        let now = Instant::now();
+        for file in 0..20 {
+            observer.unread.insert(
+                format!("{file:04}.txt").into(),
+                Retry {
+                    failures: 0,
+                    due: now,
+                },
+            );
+        }
+        INTERRUPTED_OPEN.set(Some("0000.txt".into()));
+        let mut out = Vec::new();
+        let mut reads = Reads::default();
+        observer.retry(now, &mut out, &mut reads);
+        assert_eq!(reads.files, 20);
+        assert_eq!(out.len(), 19, "{out:?}");
+        assert!(
+            (out.iter()).all(|change| matches!(change,
+                Observed::Modified { path, content: Some(_), .. } if path != Path::new("0000.txt"))),
+            "{out:?}"
+        );
+        let unread: Vec<(&Path, u32)> = (observer.unread.iter())
+            .map(|(path, retry)| (path.as_path(), retry.failures))
+            .collect();
+        assert_eq!(unread, [(Path::new("0000.txt"), 1)]);
     }
 
     #[test]
