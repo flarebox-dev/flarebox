@@ -247,6 +247,36 @@ private final class Fetches {
         #expect(model.folder(spaceID: "space-photos")?.state == .halted)
     }
 
+    @Test func headlineAndIconBadgeFollowThePriority() throws {
+        #expect(AppModel.fake(scenario: .firstRun).headline == .setup)
+        #expect(AppModel.fake(scenario: .firstRun).iconBadge == .none)
+        let expected: [(FakeScenario, Headline, IconBadge)] = [
+            (.upToDate, .status(.idle), .none),
+            (.syncing, .status(.syncing), .syncing),
+            (.paused, .status(.paused), .paused),
+            (.offline, .status(.offline), .offline),
+            (.massDelete, .questions, .question),
+            (.problems, .halted, .problem),
+        ]
+        for (scenario, headline, badge) in expected {
+            let model = AppModel.fake(scenario: scenario)
+            model.start()
+            #expect(model.headline == headline, "\(scenario)")
+            #expect(model.iconBadge == badge, "\(scenario)")
+        }
+
+        let model = AppModel.fake(scenario: .upToDate)
+        model.start()
+        let fake = try #require(model.session.fakeCore())
+        let file = try fake.reportProblem(spaceId: "space-documents", path: "log.txt", kind: .fileBusy)
+        model.apply(.problems(problems: model.session.state().problems))
+        #expect(model.headline == .status(.idle))
+        #expect(model.iconBadge == .problem)
+        try fake.resolveProblem(problemId: file)
+        model.apply(.problems(problems: model.session.state().problems))
+        #expect(model.iconBadge == .none)
+    }
+
     @Test func noticesStayUntilDismissed() async throws {
         let model = AppModel.fake(scenario: .remoteMassDelete)
         #expect(model.state.questions.isEmpty)

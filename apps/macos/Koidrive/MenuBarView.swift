@@ -5,16 +5,17 @@ import KoidriveFFI
 import KoidriveModel
 import SwiftUI
 
-/// The menu bar icon. It stays alive while the app runs, so it also opens the setup window on a
-/// first run and the questions window whenever there are questions the person has not seen,
-/// including the unanswered ones after a relaunch.
+/// The menu bar icon: the koi mark as a template image, with a badge for the state. It stays
+/// alive while the app runs, so it also opens the setup window on a first run and the questions
+/// window whenever there are questions the person has not seen, including the unanswered ones
+/// after a relaunch.
 struct MenuBarLabel: View {
     let model: AppModel
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        Image(systemName: model.attentionCount > 0 ? "exclamationmark.arrow.triangle.2.circlepath" : model.state.status.symbolName)
-            .accessibilityLabel(Text("Koidrive: \(model.state.status.title)"))
+        Image(model.iconBadge.imageName)
+            .accessibilityLabel(Text("Koidrive: \(model.headlineTitle)"))
             .task {
                 if model.needsSetup {
                     openWindow.show(WindowID.setup)
@@ -25,6 +26,78 @@ struct MenuBarLabel: View {
                     openWindow.show(WindowID.questions)
                 }
             }
+    }
+}
+
+extension IconBadge {
+    /// The template image in the asset catalog, from the GUN-420 handoff.
+    var imageName: String {
+        switch self {
+        case .none: "MenuBar/up-to-date"
+        case .syncing: "MenuBar/syncing"
+        case .paused: "MenuBar/paused"
+        case .offline: "MenuBar/offline"
+        case .question: "MenuBar/question"
+        case .problem: "MenuBar/problem"
+        }
+    }
+}
+
+extension AppModel {
+    /// The popover title, which the menu bar icon also reads out.
+    var headlineTitle: String {
+        switch headline {
+        case .setup: SyncStatus.needsSetup.title
+        case .halted: SyncStatus.halted.title
+        case .questions: String(localized: "Needs your answer")
+        case .status(let status): status.title
+        }
+    }
+
+    /// The line under the popover title, if any.
+    var headlineSubtitle: String? {
+        switch headline {
+        case .setup:
+            return String(localized: "Connect a server and choose a folder.")
+        case .halted:
+            let stopped = state.folders.filter { $0.state == .halted }.map { folder in
+                let missing = state.problems.contains { $0.spaceId == folder.spaceId && $0.kind == .folderMissing }
+                return missing
+                    ? String(localized: "\(folder.spaceName) is missing.")
+                    : String(localized: "\(folder.spaceName) stopped.")
+            }
+            let others = state.folders.filter { $0.state != .halted }
+            let rest: String? = switch others.count {
+            case 0: nil
+            case 1: String(localized: "\(others[0].spaceName) still syncs.")
+            default: String(localized: "The other folders still sync.")
+            }
+            return (stopped + [rest].compactMap { $0 }).joined(separator: " ")
+        case .questions:
+            return state.status == .idle ? String(localized: "Everything else is up to date.") : state.status.title
+        case .status(.paused):
+            return String(localized: "Changes sync when you resume.")
+        case .status(.offline):
+            guard let server = state.account?.serverUrl else { return nil }
+            let host = URL(string: server)?.host() ?? server
+            return String(localized: "Retrying \(host). Changes sync when it's back.")
+        case .status:
+            return nil
+        }
+    }
+
+    var headlineSymbol: (name: String, color: Color) {
+        switch headline {
+        case .setup: ("arrow.triangle.2.circlepath", .secondary)
+        case .halted: ("exclamationmark.triangle", .statusRed)
+        case .questions: ("questionmark.circle", .koiText)
+        case .status(.idle): ("checkmark.circle", .statusGreen)
+        case .status(.syncing), .status(.connecting): ("arrow.triangle.2.circlepath", .koi)
+        case .status(.paused), .status(.stopped): ("pause", .secondary)
+        case .status(.offline): ("bolt.circle", .statusYellow)
+        case .status(.needsSetup): ("arrow.triangle.2.circlepath", .secondary)
+        case .status(.halted): ("exclamationmark.triangle", .statusRed)
+        }
     }
 }
 
@@ -46,22 +119,34 @@ struct MenuContent: View {
         }
         .padding(14)
         .frame(width: 330)
+        .tint(.koi)
     }
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Label(model.state.status.title, systemImage: model.state.status.symbolName)
-                .font(.headline)
-            if let progress = model.state.progress {
+            Label {
+                Text(model.headlineTitle)
+            } icon: {
+                Image(systemName: model.headlineSymbol.name)
+                    .foregroundStyle(model.headlineSymbol.color)
+            }
+            .font(.system(size: 15, weight: .semibold))
+            if let subtitle = model.headlineSubtitle {
+                Text(subtitle)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let progress = model.state.progress, model.headline == .status(.syncing) {
                 if let fraction = model.progressFraction {
-                    ProgressView(value: fraction)
+                    ProgressBar(fraction: fraction)
                 }
-                Text("\(progress.filesToUpload.formatted()) to upload, \(progress.filesToDownload.formatted()) to download · \(Int64(progress.bytesDone).formatted(.byteCount(style: .file))) of \(Int64(progress.bytesTotal).formatted(.byteCount(style: .file)))")
-                    .font(.caption)
+                Text("\(progress.filesToUpload.formatted()) to upload, \(progress.filesToDownload.formatted()) to download · \(byteProgress(done: progress.bytesDone, total: progress.bytesTotal))")
+                    .font(.callout)
                     .foregroundStyle(.secondary)
                 if let current = progress.current {
-                    Text(current.path)
-                        .font(.caption)
+                    Text(verbatim: model.displayPath(current.path, spaceID: current.spaceId))
+                        .font(.caption.monospaced())
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -74,20 +159,26 @@ struct MenuContent: View {
     private var attention: some View {
         if !model.state.questions.isEmpty {
             AttentionRow(
-                text: "\(model.state.questions.count) questions need an answer",
-                systemImage: "questionmark.circle.fill",
+                text: "Answer questions",
+                systemImage: "questionmark.circle",
                 count: model.state.questions.count,
-                tint: .orange
+                tint: .koiText,
+                wash: .koiTint,
+                badge: .koi,
+                badgeText: .onKoi
             ) {
                 openWindow.show(WindowID.questions)
             }
         }
         if !model.state.problems.isEmpty {
             AttentionRow(
-                text: "\(model.state.problems.count) problems",
-                systemImage: "exclamationmark.triangle.fill",
+                text: "Review problems",
+                systemImage: "exclamationmark.triangle",
                 count: model.state.problems.count,
-                tint: .red
+                tint: .statusRed,
+                wash: .redTint,
+                badge: .redFill,
+                badgeText: .white
             ) {
                 settingsTab = .problems
                 openSettings()
@@ -110,9 +201,9 @@ struct MenuContent: View {
             }
         }
         if let error {
-            Label(error.message, systemImage: "exclamationmark.triangle.fill")
-                .font(.caption)
-                .foregroundStyle(.red)
+            Label(error.message, systemImage: "exclamationmark.triangle")
+                .font(.callout)
+                .foregroundStyle(Color.statusRed)
                 .fixedSize(horizontal: false, vertical: true)
         }
     }
@@ -120,11 +211,12 @@ struct MenuContent: View {
     @ViewBuilder
     private var recentChanges: some View {
         if !model.state.recentChanges.isEmpty {
+            let busy = model.headline != .status(.idle) || !model.state.notices.isEmpty || !model.state.problems.isEmpty
             VStack(alignment: .leading, spacing: 6) {
                 Text("Recent changes")
-                    .font(.caption.weight(.semibold))
+                    .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(.secondary)
-                ForEach(Array(model.state.recentChanges.prefix(5).enumerated()), id: \.offset) { _, change in
+                ForEach(Array(model.state.recentChanges.prefix(busy ? 3 : 5).enumerated()), id: \.offset) { _, change in
                     RecentChangeRow(change: change, folder: model.folder(spaceID: change.spaceId))
                 }
             }
@@ -132,7 +224,7 @@ struct MenuContent: View {
     }
 
     private var actions: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: 0) {
             ForEach(model.state.folders, id: \.spaceId) { folder in
                 MenuButton(title: "Open \(folder.spaceName)", systemImage: "folder") {
                     NSWorkspace.shared.open(URL(filePath: folder.path, directoryHint: .isDirectory))
@@ -145,7 +237,7 @@ struct MenuContent: View {
             } else {
                 MenuButton(
                     title: model.isPaused ? "Resume Sync" : "Pause Sync",
-                    systemImage: model.isPaused ? "play.fill" : "pause.fill"
+                    systemImage: model.isPaused ? "play" : "pause"
                 ) {
                     do {
                         try model.togglePause()
@@ -159,16 +251,60 @@ struct MenuContent: View {
             MenuButton(title: "Questions…", systemImage: "questionmark.circle") {
                 openWindow.show(WindowID.questions)
             }
-            MenuButton(title: "Settings…", systemImage: "gearshape") {
+            MenuButton(title: "Settings…", systemImage: "gearshape", shortcut: "⌘,") {
                 openSettings()
                 NSApp.activate()
             }
             Divider()
-            MenuButton(title: "Quit Koidrive", systemImage: "power") {
+                .padding(.vertical, 6)
+            MenuButton(title: "Quit Koidrive", systemImage: "power", shortcut: "⌘Q") {
                 NSApplication.shared.terminate(nil)
             }
             .keyboardShortcut("q")
         }
+    }
+
+    /// "148 of 240 MB": the done bytes in the total's unit.
+    private func byteProgress(done: UInt64, total: UInt64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        let units: [ByteCountFormatter.Units] = [.useBytes, .useKB, .useMB, .useGB, .useTB]
+        let power = min(units.count - 1, total < 1000 ? 0 : Int(log10(Double(total)) / 3))
+        formatter.allowedUnits = units[power]
+        let totalText = formatter.string(fromByteCount: Int64(clamping: total))
+        formatter.includesUnit = false
+        let doneText = formatter.string(fromByteCount: Int64(clamping: done))
+        return String(localized: "\(doneText) of \(totalText)")
+    }
+}
+
+extension AppModel {
+    /// A path inside a space as the person knows it, starting with the folder's name.
+    func displayPath(_ path: String, spaceID: String) -> String {
+        guard let folder = folder(spaceID: spaceID) else { return path }
+        return folder.spaceName + "/" + path
+    }
+}
+
+/// A thin koi-orange bar on a grey track. The system's linear progress view takes the
+/// system accent colour on macOS, not the tint.
+private struct ProgressBar: View {
+    let fraction: Double
+
+    var body: some View {
+        Capsule()
+            .fill(Color.primary.opacity(0.1))
+            .frame(height: 6)
+            .overlay(alignment: .leading) {
+                GeometryReader { geometry in
+                    Capsule()
+                        .fill(Color.koi)
+                        .frame(width: geometry.size.width * fraction)
+                }
+            }
+            .accessibilityElement()
+            .accessibilityValue(Text(fraction, format: .percent.precision(.fractionLength(0))))
+            .padding(.vertical, 2)
     }
 }
 
@@ -177,6 +313,9 @@ private struct AttentionRow: View {
     let systemImage: String
     let count: Int
     let tint: Color
+    let wash: Color
+    let badge: Color
+    let badgeText: Color
     let action: () -> Void
 
     var body: some View {
@@ -184,14 +323,13 @@ private struct AttentionRow: View {
             HStack {
                 Label(text, systemImage: systemImage)
                     .foregroundStyle(tint)
+                    .font(.body.weight(.medium))
                 Spacer()
-                Text(count.formatted())
-                    .font(.caption.weight(.bold))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 1)
-                    .background(Capsule().fill(tint))
+                CountBadge(count: count, fill: badge, text: badgeText)
             }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(RoundedRectangle(cornerRadius: 8).fill(wash))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -205,11 +343,12 @@ private struct NoticeRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "info.circle.fill")
-                .foregroundStyle(.blue)
+            Image(systemName: notice.symbolName)
+                .foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 2) {
                 Text(verbatim: [notice.title, folder?.spaceName].compactMap { $0 }.joined(separator: " · "))
                     .font(.callout.weight(.semibold))
+                    .fixedSize(horizontal: false, vertical: true)
                 Text(notice.text)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -217,14 +356,24 @@ private struct NoticeRow: View {
             }
             Spacer(minLength: 0)
             Button(action: dismiss) {
-                Image(systemName: "xmark.circle.fill")
+                Image(systemName: "xmark")
+                    .font(.caption)
                     .foregroundStyle(.secondary)
             }
             .buttonStyle(.plain)
             .help("Dismiss")
         }
-        .padding(8)
-        .background(RoundedRectangle(cornerRadius: 8).fill(.quaternary))
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(.quaternary.opacity(0.6)))
+    }
+}
+
+extension Notice {
+    var symbolName: String {
+        switch kind {
+        case .recovery: "clock.arrow.circlepath"
+        case .remoteMassDelete: "trash"
+        }
     }
 }
 
@@ -234,10 +383,11 @@ private struct RecentChangeRow: View {
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: change.direction == .uploaded ? "arrow.up.circle" : "arrow.down.circle")
+            Image(systemName: change.direction == .uploaded ? "arrow.up" : "arrow.down")
+                .font(.caption)
                 .foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 1) {
-                Text(change.path)
+                Text(verbatim: folder.map { $0.spaceName + "/" + change.path } ?? change.path)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Text("\(change.summary) · \(Date(milliseconds: change.atMs), format: .relative(presentation: .named))")
@@ -256,17 +406,32 @@ private struct RecentChangeRow: View {
 private struct MenuButton: View {
     let title: LocalizedStringKey
     let systemImage: String
+    var shortcut: String?
     let action: () -> Void
     @State private var hovering = false
+    @Environment(\.isEnabled) private var isEnabled
 
     var body: some View {
         Button(action: action) {
-            Label(title, systemImage: systemImage)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
-                .background(RoundedRectangle(cornerRadius: 5).fill(hovering ? Color.accentColor.opacity(0.2) : .clear))
-                .contentShape(Rectangle())
+            HStack {
+                Label {
+                    Text(title)
+                } icon: {
+                    Image(systemName: systemImage)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 16)
+                }
+                Spacer()
+                if let shortcut {
+                    Text(verbatim: shortcut)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(RoundedRectangle(cornerRadius: 6).fill(hovering && isEnabled ? Color.primary.opacity(0.1) : .clear))
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }

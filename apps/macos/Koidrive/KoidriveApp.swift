@@ -11,6 +11,17 @@ struct KoidriveApp: App {
 
     init() {
         let model: AppModel
+        #if DEBUG
+        if let directory = Snapshots.directory {
+            model = AppModel.fake(scenario: .upToDate)
+            Task {
+                await Snapshots.render(into: directory)
+                exit(0)
+            }
+            _model = State(initialValue: model)
+            return
+        }
+        #endif
         if let scenario = AppModel.launchScenario(in: .standard) {
             model = AppModel.fake(scenario: scenario)
         } else {

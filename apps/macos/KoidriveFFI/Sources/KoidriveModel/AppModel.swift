@@ -112,8 +112,32 @@ public final class AppModel {
     public var needsSetup: Bool { state.account == nil || state.folders.isEmpty }
     public var isPaused: Bool { state.status == .paused }
     public var hasUnseenQuestions: Bool { !unseenQuestionIDs.isEmpty }
-    /// Questions and problems together, for the menu bar badge.
+    /// Questions and problems together.
     public var attentionCount: Int { state.questions.count + state.problems.count }
+
+    /// What the menu bar popover leads with, in priority order: setup, then a folder that stopped,
+    /// then unanswered questions, then the sync status.
+    public var headline: Headline {
+        if needsSetup { return .setup }
+        if state.status == .halted { return .halted }
+        if !state.questions.isEmpty { return .questions }
+        return .status(state.status)
+    }
+
+    /// The badge on the menu bar icon. It follows the headline, except that a problem that
+    /// stopped no folder still shows the problem badge.
+    public var iconBadge: IconBadge {
+        switch headline {
+        case .setup: .none
+        case .halted: .problem
+        case _ where !state.problems.isEmpty: .problem
+        case .questions: .question
+        case .status(.offline): .offline
+        case .status(.paused): .paused
+        case .status(.syncing), .status(.connecting): .syncing
+        case .status: .none
+        }
+    }
 
     /// How far the current sync has got, from 0 to 1, or nil when nothing is being transferred.
     public var progressFraction: Double? {
@@ -257,6 +281,22 @@ public final class AppModel {
     public func unlinkFolder(spaceID: String) async throws {
         try await run { try $0.unlinkFolder(spaceId: spaceID) }
     }
+}
+
+public enum Headline: Equatable, Sendable {
+    case setup
+    case halted
+    case questions
+    case status(SyncStatus)
+}
+
+public enum IconBadge: String, Equatable, Sendable {
+    case none
+    case syncing
+    case paused
+    case offline
+    case question
+    case problem
 }
 
 /// What one space stores (RFC 0010), or why the server refused to say.

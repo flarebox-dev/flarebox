@@ -9,25 +9,16 @@ extension SyncStatus {
     var title: String {
         switch self {
         case .stopped: String(localized: "Sync is stopped")
-        case .needsSetup: String(localized: "Finish setting up Koidrive")
+        case .needsSetup: String(localized: "Set up Koidrive")
         case .connecting: String(localized: "Connecting…")
         case .syncing: String(localized: "Syncing…")
         case .idle: String(localized: "Up to date")
         case .paused: String(localized: "Sync is paused")
-        case .offline: String(localized: "Can't reach the server. Retrying…")
+        case .offline: String(localized: "Can't reach the server")
         case .halted: String(localized: "A folder stopped syncing")
         }
     }
 
-    var symbolName: String {
-        switch self {
-        case .stopped, .needsSetup: "arrow.triangle.2.circlepath.circle"
-        case .connecting, .syncing, .idle: "arrow.triangle.2.circlepath.circle.fill"
-        case .paused: "pause.circle"
-        case .offline: "bolt.horizontal.circle"
-        case .halted: "exclamationmark.triangle"
-        }
-    }
 }
 
 extension FolderState {
@@ -36,7 +27,7 @@ extension FolderState {
         case .waiting: String(localized: "Waiting")
         case .syncing: String(localized: "Syncing")
         case .upToDate: String(localized: "Up to date")
-        case .halted: String(localized: "Stopped by a problem")
+        case .halted: String(localized: "Stopped")
         case .recovering: String(localized: "Recovering")
         case .readOnly: String(localized: "Download only")
         }
@@ -58,30 +49,79 @@ extension Question {
             let limits = exceeded.map { limit in
                 switch limit {
                 case .deletions(let limit):
-                    String(localized: "more than \(limit.formatted()) deletions in 10 minutes")
+                    String(localized: "more than \(limit.formatted()) deletions within 10 minutes")
                 case .shareOfSpace(let percent):
-                    String(localized: "more than \(percent)% of the folder's files in 10 minutes")
+                    percent == 50 ? String(localized: "more than half the folder, within 10 minutes") : String(localized: "more than \(percent)% of the folder, within 10 minutes")
                 }
             }.formatted(.list(type: .or))
-            return String(localized: "Koidrive is holding these deletions instead of sending them, because they would make \(limits): \(deletionCount(deletions)) removing \(fileCount(affectedFiles)) from a folder of \(fileCount(spaceFiles)). Other changes keep syncing.")
+            return String(localized: "Koidrive held \(deletionCount(deletions)) that would remove \(affectedFiles.formatted()) of \(fileCount(spaceFiles)), \(limits).")
         case .ambiguousDisappearance:
-            return String(localized: "These files disappeared while Koidrive was not tracking changes. They may have been moved into an ignored folder rather than deleted, so they stay on the server and your other devices until you decide.")
+            return String(localized: "These files went missing while Koidrive wasn't watching. They may have moved to an ignored folder, so other devices keep them until you decide.")
         case .recovery(_, let group):
             return group.explanation
         }
     }
 
-    /// The title of an answer's button, which depends on the question.
+    /// The title of an answer's button, which depends on the question. Every answer applies to all of its items.
     func title(for answer: Answer) -> String {
         switch (answer, kind) {
-        case (.delete, .recovery): String(localized: "Delete on Server")
-        case (.delete, _): String(localized: "Delete Everywhere")
-        case (.restore, _): String(localized: "Restore Here")
-        case (.keep, _): String(localized: "Put Back on Server")
-        case (.discard, _): String(localized: "Move to Local Trash")
-        case (.publish, _): String(localized: "Upload This Version")
-        case (.repeat, _): String(localized: "Repeat Request")
-        case (.cancel, _): String(localized: "Cancel Request")
+        case (.delete, .recovery): String(localized: "Delete All on Server")
+        case (.delete, _): String(localized: "Delete All Everywhere")
+        case (.restore, .recovery): String(localized: "Download All Again")
+        case (.restore, _): String(localized: "Restore All Here")
+        case (.keep, _): String(localized: "Put All Back on Server")
+        case (.discard, _): String(localized: "Move All to Local Trash")
+        case (.publish, .recovery(_, .changedOnThisDevice)): String(localized: "Upload This Mac's Versions")
+        case (.publish, _): String(localized: "Upload All")
+        case (.repeat, _): String(localized: "Repeat All Requests")
+        case (.cancel, _): String(localized: "Cancel All Requests")
+        }
+    }
+
+    /// What the answers apply to, under the answer buttons: "Applies to all 3 items · 1,086 files".
+    var scope: String {
+        let files = fileCount(affectedFiles)
+        return switch items.count {
+        case 1: String(localized: "Applies to 1 item · \(files)")
+        case 2: String(localized: "Applies to both items · \(files)")
+        default: String(localized: "Applies to all \(items.count) items · \(files)")
+        }
+    }
+
+    /// The title of the sheet that asks again before a destructive answer.
+    func confirmation(for answer: Answer) -> String {
+        switch (answer, kind) {
+        case (.delete, .recovery): String(localized: "Delete \(itemCount(items.count)) on the server?")
+        case (.delete, _): items.count == 1
+            ? String(localized: "Delete 1 item everywhere?")
+            : String(localized: "Delete all \(items.count) items everywhere?")
+        default: String(localized: "\(title(for: answer))?")
+        }
+    }
+
+    /// The message of the sheet that asks again before a destructive answer.
+    func confirmationMessage(for answer: Answer) -> String {
+        switch (answer, kind) {
+        case (.delete, .recovery): String(localized: "This deletes \(fileCount(affectedFiles)) on the server and every device. The server keeps them in its trash.")
+        case (.delete, _): String(localized: "This deletes \(fileCount(affectedFiles)) on every device. The server keeps them in its trash.")
+        default: String(localized: "This applies to all \(itemCount(items.count)), \(fileCount(affectedFiles)).")
+        }
+    }
+
+    /// The heading above the held items.
+    var itemsHeading: String {
+        switch kind {
+        case .massDelete: String(localized: "Held deletions")
+        default: String(localized: "Held files")
+        }
+    }
+
+    /// The symbol beside the question in the questions sidebar.
+    var symbolName: String {
+        switch kind {
+        case .massDelete: "trash"
+        case .ambiguousDisappearance: "questionmark.circle"
+        case .recovery: "clock"
         }
     }
 }
@@ -100,31 +140,49 @@ extension RecoveryGroup {
     var explanation: String {
         switch self {
         case .createdAfterRestorePoint:
-            String(localized: "These files were created after the point the folder was restored to, so the restore removed them from the server. This Mac still has them.")
+            String(localized: "The restore removed these from the server. This Mac still has them.")
         case .changedOnThisDevice:
-            String(localized: "These files were edited or moved on this Mac since it last synced. Upload this Mac's versions, or move them to the local trash and take the server's.")
+            String(localized: "Edited or moved on this Mac since the last sync. Upload them, or trash them here and keep the server's.")
         case .createdOnThisDevice:
-            String(localized: "These files exist only on this Mac. Upload them, or move them to the local trash.")
+            String(localized: "Only this Mac has these files. Upload them or move them to the local trash.")
         case .deletedOnThisDevice:
-            String(localized: "These files were deleted on this Mac but are still on the server. Delete them on the server too, or download them again.")
+            String(localized: "Deleted on this Mac but still on the server. Delete them there too, or download them again.")
         case .requestedBeforeReset:
-            String(localized: "These restores were requested before the reset, and the server does not show them. Send them again, or drop them.")
+            String(localized: "The server lost these restore requests. Send them again or cancel them.")
         }
     }
 }
 
 extension RecoveryCause {
     var text: String {
+        if trigger == .spaceRewound, let ms = restorePointMs {
+            let date = Date(milliseconds: ms).formatted(.dateTime.day().month(.abbreviated).year().hour().minute())
+            return String(localized: "This folder was restored on the server to \(date).")
+        }
         let cause = switch trigger {
-        case .spaceRewound: String(localized: "This folder was restored to an earlier point on the server.")
-        case .storeRolledBack: String(localized: "This Mac's sync state is older than its history on the server, for example after restoring a backup.")
-        case .storeOlderThanDisk: String(localized: "This Mac's sync state is older than the files in the folder.")
-        case .spaceImported: String(localized: "This folder was linked to a space imported from an export.")
-        case .noSyncState: String(localized: "This folder already had files when it was linked, so Koidrive could not match them all with certainty.")
+        case .spaceRewound: String(localized: "This folder was restored on the server.")
+        case .storeRolledBack: String(localized: "This Mac's sync state is older than the server's, for example after a backup restore.")
+        case .storeOlderThanDisk: String(localized: "This Mac's sync state is older than the folder's files.")
+        case .spaceImported: String(localized: "This folder is linked to an imported space.")
+        case .noSyncState: String(localized: "The folder had files when linked, and Koidrive couldn't match them all.")
         }
         guard let ms = restorePointMs else { return cause }
-        let date = Date(milliseconds: ms).formatted(date: .abbreviated, time: .shortened)
-        return cause + " " + String(localized: "Restore point: \(date).")
+        let date = Date(milliseconds: ms).formatted(.dateTime.day().month(.abbreviated).year().hour().minute())
+        return cause + " " + String(localized: "Restored to \(date).")
+    }
+
+    /// The cause in a few words, for the questions sidebar.
+    var shortText: String {
+        guard let ms = restorePointMs else {
+            return switch trigger {
+            case .spaceRewound: String(localized: "Restored on the server")
+            case .storeRolledBack: String(localized: "Sync state from a backup")
+            case .storeOlderThanDisk: String(localized: "Sync state older than the folder")
+            case .spaceImported: String(localized: "Imported space")
+            case .noSyncState: String(localized: "Linked with files")
+            }
+        }
+        return String(localized: "Restored to \(Date(milliseconds: ms).formatted(.dateTime.day().month(.abbreviated).hour().minute()))")
     }
 }
 
@@ -132,7 +190,7 @@ extension Notice {
     var title: String {
         switch kind {
         case .recovery: String(localized: "Folder recovered")
-        case .remoteMassDelete: String(localized: "Many files were deleted on another device")
+        case .remoteMassDelete: String(localized: "Many files deleted on another device")
         }
     }
 
@@ -140,11 +198,11 @@ extension Notice {
         switch kind {
         case .recovery(let cause, let heldFiles):
             let held = heldFiles == 0
-                ? String(localized: "Nothing needed your decision.")
-                : String(localized: "\(fileCount(heldFiles)) wait for your answers in Questions.")
-            return cause.text + " " + String(localized: "Koidrive applied what this Mac had not changed and moved the files it removed to the local trash.") + " " + held
-        case .remoteMassDelete(let deletions, let affectedFiles, let spaceFiles, _):
-            return String(localized: "\(deletionCount(deletions)) on another device removed \(fileCount(affectedFiles)) of \(fileCount(spaceFiles)) in this folder. The server decides, so Koidrive applied them here; the files are in the folder's local trash.")
+                ? String(localized: "Nothing needs your answer.")
+                : String(localized: "Answer the questions to finish.")
+            return cause.text + " " + String(localized: "Koidrive applied the server's changes and moved removed files to the local trash.") + " " + held
+        case .remoteMassDelete(_, let affectedFiles, let spaceFiles, _):
+            return String(localized: "\(affectedFiles.formatted()) of \(fileCount(spaceFiles)) removed. Copies are in the folder's local trash.")
         }
     }
 }
@@ -158,7 +216,7 @@ extension ItemDetail {
         case .editedAndMoved(let from): String(localized: "Edited and moved from \(from)")
         case .restoreFromTrash: String(localized: "Restore from trash")
         case .restoreVersion(let ms):
-            String(localized: "Restore the version from \(Date(milliseconds: ms).formatted(date: .abbreviated, time: .shortened))")
+            String(localized: "Restore version from \(Date(milliseconds: ms).formatted(date: .abbreviated, time: .shortened))")
         }
     }
 }
@@ -167,11 +225,11 @@ extension ProblemKind {
     var title: String {
         switch self {
         case .folderMissing: String(localized: "The folder is missing")
-        case .folderNotAFolder: String(localized: "The linked path is not a folder")
+        case .folderNotAFolder: String(localized: "The linked path isn't a folder")
         case .folderUnreadable: String(localized: "The folder can't be read")
-        case .folderOnOtherVolume: String(localized: "A different disk is at the folder's location")
-        case .markerMissing: String(localized: "The folder's Koidrive marker is missing")
-        case .markerUnreadable: String(localized: "The folder's Koidrive marker can't be read")
+        case .folderOnOtherVolume: String(localized: "Another disk is at the folder's path")
+        case .markerMissing: String(localized: "The folder's .koidrive marker is missing")
+        case .markerUnreadable: String(localized: "The folder's .koidrive marker can't be read")
         case .markerOfOtherSpace: String(localized: "The folder belongs to another space")
         case .diskOlderThanSyncState: String(localized: "The folder was restored from an older backup")
         case .unsupportedFileSystem: String(localized: "The folder's file system isn't supported")
@@ -183,7 +241,7 @@ extension ProblemKind {
         case .nameTaken: String(localized: "A name is taken by an ignored item")
         case .changeRejected: String(localized: "The server rejected a change")
         case .ignoreRuleInvalid: String(localized: "An ignore rule can't be read")
-        case .signInRequired: String(localized: "Sign in again")
+        case .signInRequired: String(localized: "This Mac was removed")
         case .stateNotWritable: String(localized: "Koidrive can't save its sync state")
         case .folderHalted: String(localized: "Sync for this folder stopped")
         }
@@ -191,53 +249,34 @@ extension ProblemKind {
 
     var advice: String {
         switch self {
-        case .folderMissing:
-            String(localized: "Sync for this folder is stopped. If it is on an external disk, connect the disk. Otherwise, put the folder back or unlink it.")
-        case .folderNotAFolder:
-            String(localized: "Sync for this folder is stopped. Put the folder back at its path or unlink it.")
-        case .folderUnreadable(let reason):
-            String(localized: "Sync for this folder is stopped until Koidrive can read it: \(reason)")
-        case .folderOnOtherVolume:
-            String(localized: "Sync for this folder is stopped so that files on the other disk aren't taken as changes. Mount the original disk.")
-        case .markerMissing:
-            String(localized: "Sync for this folder is stopped, because without the .koidrive folder it can't tell an empty folder from a deleted one. Put .koidrive back or unlink the folder.")
-        case .markerUnreadable(let reason):
-            String(localized: "Sync for this folder is stopped: \(reason)")
-        case .markerOfOtherSpace(let spaceID):
-            String(localized: "Sync for this folder is stopped, because its marker names the space \(spaceID). Unlink the folder and link the right one.")
-        case .diskOlderThanSyncState:
-            String(localized: "Sync for this folder is stopped so that older files aren't uploaded as edits.")
-        case .unsupportedFileSystem:
-            String(localized: "Koidrive can only apply changes safely where the file system can rename without replacing. Move the folder to your Mac's disk.")
-        case .spaceFormatTooNew:
-            String(localized: "Downloads continue, but nothing is uploaded until you update Koidrive.")
-        case .fileUnreadable(let reason):
-            String(localized: "It isn't uploaded until Koidrive can read it: \(reason)")
-        case .fileNotWritable(let reason):
-            String(localized: "A change from the server can't be applied to it: \(reason)")
-        case .fileBusy:
-            String(localized: "It changes too often to be uploaded, as a log or a database being written does. Koidrive keeps retrying; consider ignoring it in .koiignore.")
-        case .nameNotAllowed:
-            String(localized: "A file from the server has a name this Mac's file system can't hold. Rename it on another device.")
-        case .nameTaken:
-            String(localized: "A file from the server can't be placed because an ignored or unsupported item, such as a symbolic link, already has its name. Rename or move that item.")
-        case .changeRejected(let reason):
-            String(localized: "The server gave this reason: \(reason)")
-        case .ignoreRuleInvalid(let line):
-            String(localized: "Line \(line) of this .koiignore file is ignored. Fix or remove it.")
+        case .folderMissing: String(localized: "Connect its disk, put it back, or unlink it.")
+        case .folderNotAFolder: String(localized: "Put the folder back or unlink it.")
+        case .folderUnreadable(let reason): reason
+        case .folderOnOtherVolume: String(localized: "Connect the original disk.")
+        case .markerMissing: String(localized: "Put .koidrive back or unlink the folder.")
+        case .markerUnreadable(let reason): reason
+        case .markerOfOtherSpace: String(localized: "Unlink it and link the right folder.")
+        case .diskOlderThanSyncState: String(localized: "Sync stopped so older files aren't uploaded as edits.")
+        case .unsupportedFileSystem: String(localized: "Move the folder to your Mac's disk.")
+        case .spaceFormatTooNew: String(localized: "Update Koidrive to upload again.")
+        case .fileUnreadable(let reason): reason
+        case .fileNotWritable(let reason): reason
+        case .fileBusy: String(localized: "It changes too often to upload. If it's a log or database, add it to .koiignore.")
+        case .nameNotAllowed: String(localized: "Rename the file on another device.")
+        case .nameTaken: String(localized: "Rename or move the item, such as a symbolic link, that has its name.")
+        case .changeRejected(let reason): reason
+        case .ignoreRuleInvalid(let line): String(localized: "Fix or remove line \(line) of .koiignore.")
         case .signInRequired:
-            String(localized: "The server no longer accepts this Mac. Sign out in the Account settings and sign in again.")
-        case .stateNotWritable(let reason):
-            String(localized: "Nothing syncs until Koidrive can save again: \(reason). Check that your disk has free space.")
-        case .folderHalted(let reason):
-            String(localized: "Koidrive stopped syncing this folder: \(reason)")
+            String(localized: "Another device removed this Mac, or its credential stopped working. Sign out in Account settings, then sign in with a pairing code from another device.")
+        case .stateNotWritable(let reason): String(localized: "Free up disk space. \(reason)")
+        case .folderHalted(let reason): reason
         }
     }
 }
 
 extension RecentChange {
     var summary: String {
-        let way = direction == .uploaded ? String(localized: "from this Mac") : String(localized: "from another device")
+        let way = direction == .uploaded ? String(localized: "on this Mac") : String(localized: "on another device")
         return switch change {
         case .added: String(localized: "Added \(way)")
         case .edited: String(localized: "Edited \(way)")
@@ -251,36 +290,36 @@ extension RecentChange {
 extension SessionError {
     var message: String {
         switch self {
-        case .InvalidServerUrl: String(localized: "Enter the server's address, starting with https://.")
+        case .InvalidServerUrl: String(localized: "Enter an address starting with https://.")
         case .ServerUnreachable(let reason): String(localized: "Can't reach the server: \(reason)")
-        case .ServerIncompatible(let version): String(localized: "The server runs version \(version), which this version of Koidrive can't use.")
+        case .ServerIncompatible(let version): String(localized: "Update Koidrive to use this server (version \(version)).")
         case .NoServer: String(localized: "Connect to a server first.")
-        case .AlreadyClaimed: String(localized: "This server already has an owner. Sign in with a pairing code instead.")
-        case .NotClaimed: String(localized: "This server has no owner yet. Claim it with the code from its log.")
-        case .InvalidCode: String(localized: "The code is wrong or has expired.")
+        case .AlreadyClaimed: String(localized: "This server has an owner. Sign in with a pairing code.")
+        case .NotClaimed: String(localized: "This server has no owner yet. Claim it with its claim code.")
+        case .InvalidCode: String(localized: "Wrong or expired code.")
         case .TooManyAttempts: String(localized: "Too many wrong codes. Try again in a few minutes.")
         case .CodeForOtherServer(let host, let server): String(localized: "This code is for another server (\(host)), not \(server).")
         case .EmptyName: String(localized: "Enter a name.")
         case .NotSignedIn: String(localized: "This Mac isn't signed in.")
-        case .LastDevice: String(localized: "This is the last device signed in to this server.")
-        case .NotRevoked(let reason): String(localized: "The server didn't confirm that it removed this Mac: \(reason)")
-        case .ThisDevice: String(localized: "This Mac can't remove itself. Sign out instead.")
-        case .DeviceNotFound: String(localized: "This device is no longer on the server.")
-        case .SpaceNotFound: String(localized: "The space no longer exists.")
+        case .LastDevice: String(localized: "This is the last signed-in device.")
+        case .NotRevoked(let reason): String(localized: "The server didn't confirm the removal: \(reason)")
+        case .ThisDevice: String(localized: "To remove this Mac, sign out.")
+        case .DeviceNotFound: String(localized: "This device was already removed.")
+        case .SpaceNotFound: String(localized: "This space no longer exists.")
         case .FolderNotFound: String(localized: "Choose an existing folder.")
-        case .SpaceAlreadyLinked: String(localized: "This space is already linked to a folder on this Mac.")
-        case .FolderOverlaps(let other): String(localized: "This folder contains, or is inside, the linked folder \(other).")
+        case .SpaceAlreadyLinked: String(localized: "This space is already linked on this Mac.")
+        case .FolderOverlaps(let other): String(localized: "This folder overlaps the linked folder \(other).")
         case .FolderNotLinked: String(localized: "This space isn't linked on this Mac.")
-        case .QuestionNotFound: String(localized: "This question was already answered or has changed.")
+        case .QuestionNotFound: String(localized: "This question was answered or changed.")
         case .AnswerNotAllowed: String(localized: "This question doesn't take that answer.")
-        case .NoticeNotFound: String(localized: "This notice was already dismissed.")
-        case .NotSaved(let reason): String(localized: "Koidrive couldn't save this change, so it wasn't made: \(reason)")
-        case .ProfileInUse: String(localized: "Another Koidrive process is already using this Mac's sync state.")
+        case .NoticeNotFound: String(localized: "Already dismissed.")
+        case .NotSaved(let reason): String(localized: "Change not saved: \(reason)")
+        case .ProfileInUse: String(localized: "Koidrive is already running.")
         case .NotAFolder: String(localized: "Choose a folder, not a file.")
         case .FolderInUse: String(localized: "Another Koidrive process is syncing this folder.")
-        case .FolderOfOtherDevice(let deviceID): String(localized: "Another device (\(deviceID)) syncs this folder. Unlink it there first.")
+        case .FolderOfOtherDevice: String(localized: "Another device syncs this folder. Unlink it there first.")
         case .MarkerOfOtherSpace: String(localized: "This folder belongs to another space. Unlink it there first.")
-        case .UnsupportedFileSystem: String(localized: "This folder's file system can't rename files safely. Choose a folder on your Mac's disk.")
+        case .UnsupportedFileSystem: String(localized: "Choose a folder on your Mac's disk. This file system isn't supported.")
         case .Failed(let reason): reason
         }
     }
@@ -307,4 +346,4 @@ extension Date {
     }
 }
 
-let independenceNotice = String(localized: "Koidrive is an independent project and is not affiliated with Cloudflare, Inc.")
+let independenceNotice = String(localized: "Koidrive is not affiliated with Cloudflare, Inc.")
