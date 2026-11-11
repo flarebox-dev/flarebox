@@ -195,6 +195,8 @@ struct Inner {
     folders: Mutex<BTreeMap<String, Folder>>,
     running: AtomicBool,
     changed: Arc<watch::Sender<()>>,
+    #[cfg(test)]
+    observe_fault: Option<Arc<crate::folder::ObserveFault>>,
 }
 
 /// A linked folder. It stays in the driver's map until unlinking it has finished, so a stop, an unlink or a sign-out
@@ -335,6 +337,8 @@ impl Driver {
                 folders: Mutex::new(folders),
                 running: AtomicBool::new(false),
                 changed: Arc::new(watch::Sender::new(())),
+                #[cfg(test)]
+                observe_fault: None,
             }),
         })
     }
@@ -1043,6 +1047,8 @@ impl Driver {
             observer: Mutex::default(),
             changed: self.inner.changed.clone(),
             requests: Arc::default(),
+            #[cfg(test)]
+            observe_fault: self.inner.observe_fault.clone(),
         };
         let requests = task.requests.clone();
         let (stop, stopped) = watch::channel(false);
@@ -1807,6 +1813,8 @@ mod tests {
         driver.stop().await;
     }
 
+    /// The observer's first observation fails, and the pause after it lasts a day, so a stop that waits it out never
+    /// returns.
     #[tokio::test]
     async fn stopping_does_not_wait_out_the_observers_pause_after_an_error() {
         let dir = tempfile::tempdir().unwrap();
@@ -1814,15 +1822,14 @@ mod tests {
         let root = base.join("Koidrive");
         let paths = Paths::under(&base.join("profile"));
         linked(&paths, &root, "d1");
-        let driver = Driver::open(paths).unwrap();
+        let mut driver = Driver::open(paths).unwrap();
+        let (paused, pausing) = tokio::sync::oneshot::channel();
+        Arc::get_mut(&mut driver.inner).unwrap().observe_fault =
+            Some(Arc::new(crate::folder::ObserveFault {
+                paused: Mutex::new(Some(paused)),
+            }));
         driver.start();
-        eventually("the folder is claimed", || {
-            claim::owner(&root).unwrap().is_some()
-        })
-        .await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        fs::rename(&root, base.join("Moved")).unwrap();
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        pausing.await.unwrap();
 
         driver.stop().await;
     }
