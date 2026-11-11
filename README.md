@@ -123,7 +123,7 @@ You need a Cloudflare account with R2 turned on, and a Mac or a Linux machine.
    koi _daemon
    ```
 
-4. **Add your other machines.** On a machine that is signed in, run `koi device add`. It prints a command with a pairing code. Run that command on the new machine, then link a folder there too.
+4. **Add your other machines.** On a machine that is signed in, run `koi device invite`. It prints a command with a pairing code. Run that command on the new machine, then link a folder there too.
 
 The [user guide](docs/guide/README.md) covers conflicts, the trash, devices, limits and how to remove everything.
 
