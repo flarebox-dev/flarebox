@@ -559,13 +559,9 @@ impl Core for DriverCore {
 
     fn telemetry(&self) -> TelemetrySetting {
         let store = koidrive_telemetry::Store::new(&self.paths.state_dir);
-        let settings = match store.settings() {
-            Ok(settings) => settings,
-            Err(error) => {
-                tracing::warn!(%error, "the telemetry settings cannot be read");
-                return TelemetrySetting::default();
-            }
-        };
+        let settings = (store.settings())
+            .inspect_err(|error| tracing::warn!(%error, "the telemetry settings cannot be read"))
+            .unwrap_or_default();
         let status = koidrive_telemetry::resolve(|name| std::env::var_os(name), settings.enabled);
         TelemetrySetting {
             enabled: status.mode != koidrive_telemetry::Mode::Off,
