@@ -128,7 +128,7 @@ main() {
                 mkdir -p "$unit_dir"
                 escaped=$(printf '%s' "$install_dir/koi" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g; s/\$/$$/g')
                 staged=$(mktemp "$unit_dir/.koidrive.XXXXXXXX")
-                KOIDRIVE_UNIT_BINARY=$escaped awk '{ if ($0 ~ /^ExecStart=/) printf "ExecStart=\"%s\" daemon\n", ENVIRON["KOIDRIVE_UNIT_BINARY"]; else print }' "$tmp/koidrive.service" > "$staged"
+                KOIDRIVE_UNIT_BINARY=$escaped awk '{ if ($0 ~ /^ExecStart=/) printf "ExecStart=\"%s\" _daemon\n", ENVIRON["KOIDRIVE_UNIT_BINARY"]; else print }' "$tmp/koidrive.service" > "$staged"
                 chmod 644 "$staged"
                 mv -f "$staged" "$unit_dir/koidrive.service"
                 staged=
