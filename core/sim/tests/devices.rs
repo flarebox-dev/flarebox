@@ -136,13 +136,13 @@ proptest! {
     }
 
     #[test]
-    #[ignore = "a server restore still breaks these: a lost file two devices create again is refused with ID_EXISTS (GUN-437), a lost edit equal to the restored bytes is undone (GUN-438), and a device that saw a seq the server lost takes the commit that reuses it for the one it saw (GUN-423)"]
+    #[ignore = "a server restore still breaks these: an edit equal to the restored bytes is undone (GUN-438), a device that saw a seq the server lost takes the commit that reuses it for the one it saw (GUN-423), a device that holds the result of a commit the server lost starts recovery when it connects again (GUN-444), and a commit refused as ahead of the server leaves its edit unsent (GUN-442)"]
     fn devices_lose_no_write_across_server_restores(devices in 2..=3usize, phases in phases(true)) {
         keep(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
 
     #[test]
-    #[ignore = "a server restore still breaks these: a lost file two devices create again is refused with ID_EXISTS (GUN-437), a lost edit equal to the restored bytes is undone (GUN-438), and a device that saw a seq the server lost takes the commit that reuses it for the one it saw (GUN-423)"]
+    #[ignore = "a server restore still breaks these: an edit equal to the restored bytes is undone (GUN-438), a device that saw a seq the server lost takes the commit that reuses it for the one it saw (GUN-423), a device that holds the result of a commit the server lost starts recovery when it connects again (GUN-444), a reverted file the server lost is created again under a new ID beside the original (GUN-448), and a commit refused as ahead of the server leaves its edit unsent (GUN-442)"]
     fn devices_converge_across_server_restores(devices in 2..=3usize, phases in phases(true)) {
         converge(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
@@ -905,6 +905,61 @@ fn a_copy_of_a_lost_write_after_the_recovery_is_refused() {
     assert!(world.phase(3, &[]).is_err());
 }
 
+/// A copy of a lost write that the engine makes while the devices still recover from the
+/// restore, past the files the restore lets the write end in, is a divergence.
+#[test]
+fn a_copy_of_a_lost_write_during_the_recovery_is_refused() {
+    let mut world = converge(2, &[Vec::new(), vec![(0, BACKUP), (0, file("a"))]]).unwrap();
+    world.run(2, &[(0, RESTORE)]).unwrap();
+    let bytes = (world.devices[0]
+        .disk
+        .entries()
+        .values()
+        .next()
+        .unwrap()
+        .content)
+        .clone();
+    world.devices[0]
+        .disk
+        .create(Place::Root, "b", bytes)
+        .unwrap();
+    let failure = world.phase(2, &[]).unwrap_err();
+    assert!(
+        failure.to_string().contains("is in more than one file"),
+        "{failure}"
+    );
+}
+
+/// Once the devices are quiet after a restore that rolled a file back, the write it took stays in
+/// the files the server holds it in, not in one file for each device that held it.
+#[test]
+fn a_copy_of_a_rolled_back_write_after_the_recovery_is_refused() {
+    let edit = Step::User(Action {
+        kind: 2,
+        target: 0,
+        parent: 0,
+        name: 0,
+        text: 0,
+    });
+    let mut world = converge(2, &[vec![(0, file("a"))], vec![(0, BACKUP), (0, edit)]]).unwrap();
+    world.phase(2, &[(0, RESTORE)]).unwrap();
+    let lost = (world.devices[0].disk.entries().values()).find_map(|entry| {
+        entry
+            .content
+            .clone()
+            .filter(|content| content.mtime_ns == 2)
+    });
+    world.devices[0]
+        .disk
+        .create(Place::Root, "b", lost)
+        .unwrap();
+    let failure = world.phase(3, &[]).unwrap_err();
+    assert!(
+        failure.to_string().contains("is in more than one file"),
+        "{failure}"
+    );
+}
+
 /// Once the devices are quiet after a restore that lost a rename, the old name is refused like
 /// any other name the user did not give.
 #[test]
@@ -916,4 +971,31 @@ fn a_name_a_restore_lost_is_refused_after_the_recovery() {
     let ino = world.devices[0].disk.child(&Place::Root, "c.txt").unwrap();
     world.devices[0].disk.rename(ino, Place::Root, "b").unwrap();
     assert!(world.phase(5, &[]).is_err());
+}
+
+/// Both devices create a file the server lost again under its ID, and device 0's create comes
+/// first. The server refuses device 1's create with ID_EXISTS, and device 1 takes the file from R
+/// instead of leaving it a problem.
+#[test]
+fn a_lost_file_both_devices_create_again_is_kept_once() {
+    let lost = vec![(0, BACKUP), (0, file("a"))];
+    let again = vec![
+        (0, RESTORE),
+        (1, Step::Connect),
+        (1, DELIVER),
+        (1, COMMIT),
+        (0, Step::Connect),
+        (0, DELIVER),
+        (0, COMMIT),
+        (0, COMMIT),
+        (1, COMMIT),
+    ];
+    let world = converge(2, &[lost, again]).unwrap();
+    assert_eq!(world.seen["op rejected"], 1);
+    assert!(
+        world
+            .devices
+            .iter()
+            .all(|device| device.disk.entries().len() == 1)
+    );
 }

@@ -42,8 +42,9 @@
 //!   of its device never overwrote or deleted.
 //! - No node keeps a pending name that no user gave.
 //! - No write is in two files of the server, except one a restore took from the server while a
-//!   disk held it, which each device that held it keeps (section 4.4), in the files the server
-//!   holds it in once the devices are quiet again.
+//!   disk held it (section 4.4). Until the devices are quiet again, it may be in one file for each
+//!   node that held it, or for each device that held it in a node the restore rolled back to
+//!   other content, and then in the files the server holds it in.
 //! - Every write was in the server's live tree at some time, unless the user who made it
 //!   overwrote or deleted it first.
 
@@ -269,6 +270,26 @@ fn lost(held: &Held, d: usize, record: &EffectRecord, applied: &Applied) -> Resu
     }
 }
 
+/// Whether an effect that trashes a write the server never held downloads a lost write of the same
+/// file that its author sent again over a user's change back to the bytes a restore rolled the
+/// file back to. The
+/// engine takes such a change for the content R holds, so the resend replaces it, and the bytes
+/// stay only in the file's versions (design section 4.4).
+fn resent_over_revert(
+    exposed: &BTreeMap<i64, Exposure>,
+    rolled_back: &BTreeMap<NodeId, Vec<u8>>,
+    record: &EffectRecord,
+    applied: &Applied,
+) -> bool {
+    let (Effect::WriteFile { content, .. }, Some(trashed)) = (&record.effect, &applied.trashed)
+    else {
+        return false;
+    };
+    (exposed.get(&content.mtime_ns))
+        .is_some_and(|exposure| exposure.nodes.contains_key(&record.node))
+        && (rolled_back.get(&record.node)).is_some_and(|digest| *digest == trashed.manifest_digest)
+}
+
 /// Applies the result of the commit in flight to R when it is the next commit, and acknowledges
 /// the commit once R holds its records (section 2.7).
 fn acknowledge(engine: &mut Engine) -> Result<(), Failure> {
@@ -318,6 +339,22 @@ fn listing(space: &SpaceDo) -> Message {
     }
 }
 
+/// The files a write a restore took from the server may end in, until the devices are quiet
+/// again (design sections 2.4 and 4.4).
+#[derive(Default)]
+struct Exposure {
+    /// For each node that held the write, on the server or on a device, the number of devices
+    /// that held it there, and whether the restore rolled the node back to other content. Such a
+    /// node is created again once, since the server refuses a second create of it with
+    /// ID_EXISTS. Once the node holds other content, from the restore or from a later commit,
+    /// it can end in one file for each of those devices: the author sends the write again over
+    /// the other content, and each other device keeps its copy beside R's. Once the devices are
+    /// quiet again, these are the nodes the server holds the write in, one file each.
+    nodes: BTreeMap<NodeId, (usize, bool)>,
+    /// The disk entries that held the write under no node of L at the restore.
+    loose: usize,
+}
+
 /// A copy of the server's storage, with what the server had held up to that time.
 struct Backup {
     space: SpaceDo,
@@ -359,17 +396,17 @@ pub struct World {
     /// them, and no engine can send them again.
     retired: BTreeSet<i64>,
     /// The writes that a restore took from the server while a disk still held them, each with
-    /// the number of files the server may hold it in. A device that held such a write, on its
-    /// disk or in R, cannot tell whether its author will send it again, so it keeps its copy, and
-    /// the server can end with the write in one file for each of those devices (design section
-    /// 4.4). Once the devices are quiet again, the number is that of the files the server holds.
-    exposed: BTreeMap<i64, usize>,
+    /// the files the server may hold it in.
+    exposed: BTreeMap<i64, Exposure>,
     /// For each device, the names that L and the server held for the nodes whose shape a restore
     /// took from the server, until the devices are quiet again. S forgets a node the restored
     /// server holds with another shape, so the device sends the position it holds again, also one
     /// that another device's lost commit gave it, or the name the server gave in place of the one
     /// L holds.
     restored_names: Vec<BTreeMap<NodeId, BTreeSet<String>>>,
+    /// The files whose content a restore rolled back, each with the digest of the content the
+    /// restored server holds, until the devices are quiet again.
+    rolled_back: BTreeMap<NodeId, Vec<u8>>,
 }
 
 impl World {
@@ -412,6 +449,7 @@ impl World {
             backup: None,
             retired: BTreeSet::new(),
             exposed: BTreeMap::new(),
+            rolled_back: BTreeMap::new(),
         }
     }
 
@@ -419,6 +457,23 @@ impl World {
     /// quiet and the end state is checked, so the next phase starts from trees that every device
     /// holds. A failure names the phase and the step that broke a property.
     pub fn phase(&mut self, phase: usize, schedule: &[(usize, Step)]) -> Result<(), Failure> {
+        self.run(phase, schedule)?;
+        let quiet = self.quiesce();
+        if self.trace {
+            eprintln!(
+                "after phase {phase}: {quiet:?}
+{}",
+                self.dump()
+            );
+        }
+        quiet.map_err(|failure| failure.at(format!("after phase {phase}")))?;
+        self.recovered();
+        Ok(())
+    }
+
+    /// Runs the steps of a phase without letting the devices become quiet, so that a test can
+    /// change a disk while the devices still recover from a restore.
+    pub fn run(&mut self, phase: usize, schedule: &[(usize, Step)]) -> Result<(), Failure> {
         for (index, (device, step)) in schedule.iter().enumerate() {
             let device = device % self.devices.len();
             let done = self.step(device, step);
@@ -432,33 +487,32 @@ impl World {
             let at = format!("phase {phase}, step {index} ({step:?} on device {device})");
             done.map_err(|failure| failure.at(at))?;
         }
-        let quiet = self.quiesce();
-        if self.trace {
-            eprintln!(
-                "after phase {phase}: {quiet:?}
-{}",
-                self.dump()
-            );
-        }
-        quiet.map_err(|failure| failure.at(format!("after phase {phase}")))?;
-        self.recovered()
+        Ok(())
     }
 
     /// Ends what a restore allowed once the devices are quiet again: no later commit sends a name
     /// the restore took from the server, and a write the restore took stays in the files the
     /// server holds it in now.
-    fn recovered(&mut self) -> Result<(), Failure> {
+    fn recovered(&mut self) {
         for names in &mut self.restored_names {
             names.clear();
         }
-        let mut files: BTreeMap<i64, usize> = BTreeMap::new();
-        for content in self.server_tree()?.into_values().flatten() {
-            *files.entry(content.mtime_ns).or_default() += 1;
+        self.rolled_back.clear();
+        let mut files: BTreeMap<i64, BTreeMap<NodeId, (usize, bool)>> = BTreeMap::new();
+        for node in self.space.nodes() {
+            if node.status != NodeStatus::Live as i32 {
+                continue;
+            }
+            if let Some(content) = node.current.and_then(|current| current.content) {
+                (files.entry(content.mtime_ns).or_default()).insert(node.node_id, (1, false));
+            }
         }
-        for (write, allowed) in &mut self.exposed {
-            *allowed = files.get(write).copied().unwrap_or(1);
+        for (write, exposure) in &mut self.exposed {
+            *exposure = Exposure {
+                nodes: files.remove(write).unwrap_or_default(),
+                loose: 0,
+            };
         }
-        Ok(())
     }
 
     fn step(&mut self, d: usize, step: &Step) -> Result<(), Failure> {
@@ -578,8 +632,9 @@ impl World {
         }
     }
 
-    /// Restores the server from the last copy. A write the server held only after the copy is
-    /// lost with the restore: it is retired when no disk holds it, and exposed otherwise.
+    /// Restores the server from the last copy. A write is lost with the restore when the server
+    /// held it only after the copy, or when a file of the server held it before the restore and
+    /// no longer holds it after: it is retired when no disk holds it, and exposed otherwise.
     fn restore(&mut self) {
         let Some(backup) = &self.backup else {
             return;
@@ -600,9 +655,25 @@ impl World {
                 })
                 .collect()
         };
+        let writes = |space: &SpaceDo| -> BTreeSet<(NodeId, i64)> {
+            (space.nodes().into_iter())
+                .filter_map(|node| Some((node.node_id, node.current?.content?.mtime_ns)))
+                .collect()
+        };
         let before = shapes(&self.space);
+        let held_before = writes(&self.space);
         self.space.restore(&backup.space);
         let after = shapes(&self.space);
+        let held_after = writes(&self.space);
+        for (id, (.., digest)) in &after {
+            if let Some(digest) = digest
+                && before
+                    .get(id)
+                    .is_none_or(|(.., held)| held.as_ref() != Some(digest))
+            {
+                self.rolled_back.insert(id.clone(), digest.clone());
+            }
+        }
         let changed: BTreeSet<&NodeId> = (before.keys().chain(after.keys()))
             .filter(|id| before.get(*id) != after.get(*id))
             .collect();
@@ -623,22 +694,58 @@ impl World {
             }
         }
         for write in self.writers.keys() {
-            if !stored(&self.held, *write) || stored(&backup.held, *write) {
+            let taken = (held_before.difference(&held_after)).any(|(_, held)| held == write);
+            if !taken && (!stored(&self.held, *write) || stored(&backup.held, *write)) {
                 continue;
             }
             if !self.devices.iter().any(|device| device.disk.holds(*write)) {
                 self.retired.insert(*write);
                 continue;
             }
-            let learned = |device: &Device| {
-                device.disk.holds(*write)
-                    || (device.engine.trees.remote().iter()).any(|(_, node)| {
-                        (node.shape.content.as_ref()).is_some_and(|c| c.mtime_ns == *write)
-                    })
+            let holds =
+                |content: &Option<Content>| content.as_ref().is_some_and(|c| c.mtime_ns == *write);
+            let mut holders: BTreeMap<&NodeId, usize> = (held_before.iter())
+                .filter(|(_, held)| held == write)
+                .map(|(id, _)| (id, 0))
+                .collect();
+            let mut unknown = 0;
+            for device in &self.devices {
+                let mut nodes: BTreeSet<&NodeId> = BTreeSet::new();
+                let trees = &device.engine.trees;
+                let local = trees
+                    .local()
+                    .iter()
+                    .filter(|(_, node)| holds(&node.shape.content));
+                let remote = trees
+                    .remote()
+                    .iter()
+                    .filter(|(_, node)| holds(&node.shape.content));
+                nodes.extend(local.map(|(id, _)| id).chain(remote.map(|(id, _)| id)));
+                for (ino, entry) in device.disk.entries() {
+                    if !holds(&entry.content) {
+                        continue;
+                    }
+                    match (trees.local().iter()).find(|(_, node)| node.identity.ino == *ino) {
+                        Some((id, _)) => {
+                            nodes.insert(id);
+                        }
+                        None => unknown += 1,
+                    }
+                }
+                for id in nodes {
+                    *holders.entry(id).or_default() += 1;
+                }
+            }
+            let kept = |id: &NodeId| {
+                held_after.contains(&(id.clone(), *write)) && after[id].2 == NodeStatus::Live as i32
             };
-            let holders = self.devices.iter().filter(|device| learned(device)).count();
-            let exposed = self.exposed.entry(*write).or_default();
-            *exposed = holders.max(*exposed);
+            let exposure = self.exposed.entry(*write).or_default();
+            exposure.loose = unknown.max(exposure.loose);
+            for (id, devices) in holders {
+                let (held, rolled_back) = exposure.nodes.entry(id.clone()).or_default();
+                *held = devices.max(*held);
+                *rolled_back |= after.contains_key(id) && !kept(id);
+            }
         }
     }
 
@@ -688,7 +795,9 @@ impl World {
             Outcome::Crash(cut) if applies => Some(device.disk.apply(&record, cut)),
             _ => None,
         };
-        if let Some(applied) = &applied {
+        if let Some(applied) = applied.as_ref().filter(|applied| {
+            !resent_over_revert(&self.exposed, &self.rolled_back, &record, applied)
+        }) {
             lost(&self.held, d, &record, applied)?;
         }
         let applied = applied.map(|applied| applied.outcome);
@@ -760,7 +869,9 @@ impl World {
         if let Some(record) = device.engine.effects.in_flight().cloned() {
             let quarantined = device.disk.quarantine.is_some();
             let applied = device.disk.recover(&record);
-            lost(&self.held, d, &record, &applied)?;
+            if !resent_over_revert(&self.exposed, &self.rolled_back, &record, &applied) {
+                lost(&self.held, d, &record, &applied)?;
+            }
             let Engine { trees, effects, .. } = &mut device.engine;
             let download = match &record.effect {
                 Effect::WriteFile { content, .. } => Some(content),
@@ -1605,9 +1716,28 @@ impl World {
                 files.entry(content.mtime_ns).or_default().push(path);
             }
         }
+        let allowed = |write: i64| {
+            let Some(exposure) = self.exposed.get(&write) else {
+                return 1;
+            };
+            let replaced = |id: &NodeId| {
+                (nodes.iter()).any(|(other, node)| {
+                    other == id
+                        && !node.trashed
+                        && (node.shape.content.as_ref()).is_some_and(|c| c.mtime_ns != write)
+                })
+            };
+            let files = (exposure.nodes.iter()).map(|(id, (devices, rolled_back))| {
+                if *rolled_back || replaced(id) {
+                    (*devices).max(1)
+                } else {
+                    1
+                }
+            });
+            (exposure.loose + files.sum::<usize>()).max(1)
+        };
         let twice = |(write, paths): &(&i64, &Vec<_>)| {
-            paths.len() > self.exposed.get(*write).copied().unwrap_or(1)
-                && !self.copied.contains(*write)
+            paths.len() > allowed(**write) && !self.copied.contains(*write)
         };
         if let Some((write, paths)) = files.iter().find(twice) {
             return Err(Failure::Diverged(format!(
@@ -1626,6 +1756,61 @@ impl World {
                  overwrote or deleted it"
             ))),
             None => Ok(()),
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use koidrive_engine::effects::{Base, Displaced, Location};
+    use koidrive_engine::tree::{Kind, Shape};
+
+    use super::*;
+
+    /// A write a restore took from another file does not excuse an overwrite of a's change back
+    /// to its rolled-back bytes.
+    #[test]
+    fn a_resend_over_a_revert_comes_from_the_rolled_back_file() {
+        let (old, unseen, incoming) = (content(0, 0, 1), content(0, 0, 99), content(1, 1, 2));
+        let at = Location::At {
+            base: Base::Root,
+            dirs: Vec::new(),
+            name: "a".into(),
+        };
+        let mut disk = Disk::default();
+        let ino = disk.create(Place::Root, "a", Some(unseen.clone())).unwrap();
+        let record = EffectRecord {
+            effect_id: "download".into(),
+            node: "a".into(),
+            counter: 1,
+            effect: Effect::WriteFile {
+                at: at.clone(),
+                content: incoming.clone(),
+                replaces: Some(Displaced {
+                    at,
+                    identity: disk::identity(ino),
+                    content: unseen,
+                }),
+            },
+            after: Some(Shape {
+                parent: "root".into(),
+                name: "a".into(),
+                kind: Kind::File,
+                content: Some(incoming),
+            }),
+        };
+        let applied = disk.apply(&record, Cut::Done);
+        assert!(lost(&Held::new(), 0, &record, &applied).is_err());
+        let rolled_back = BTreeMap::from([("a".into(), old.manifest_digest)]);
+        for file in ["a", "b"] {
+            let exposed = BTreeMap::from([(
+                2,
+                Exposure {
+                    nodes: BTreeMap::from([(file.into(), (1, true))]),
+                    loose: 0,
+                },
+            )]);
+            let accepted = resent_over_revert(&exposed, &rolled_back, &record, &applied);
+            assert_eq!(accepted, file == "a", "write 2 exposed at {file}");
         }
     }
 }

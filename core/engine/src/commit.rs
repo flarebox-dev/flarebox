@@ -621,6 +621,12 @@ impl Commits {
     /// move into the merged directory and the emptied one is removed. The accepted counter takes
     /// the commit's slot. Returns false while there is nothing to acknowledge.
     ///
+    /// A create the server refuses with ID_EXISTS while R holds the node live is no problem. Only
+    /// another device can have created a node under this device's ID first, as when both send a
+    /// file the server lost again (section 4.4). S stays without the node, so the next plan
+    /// compares L with what R holds instead of sending the create again: equal content leaves
+    /// nothing to send, and other content is kept beside R's as a new node (section 2.4).
+    ///
     /// A `Restore` op changes neither S nor L. What it sent is an instruction, and only the server
     /// knows the nodes and the content it brought back, so all of it is a remote change that R
     /// already holds and the effects apply. The restore leaves the queue with its outcome,
@@ -643,6 +649,7 @@ impl Commits {
             use op_result::Code;
             let code = Code::try_from(outcome.code).unwrap_or(Code::Unspecified);
             let applied = matches!(code, Code::Applied | Code::AppliedRenamed);
+            let taken = code == Code::Rejected && outcome.reject_reason == "ID_EXISTS";
             let parent = |sent: &str| merged.get(sent).cloned().unwrap_or_else(|| sent.to_owned());
             let renamed = code == Code::AppliedRenamed && !outcome.name.is_empty();
             let name = |sent: &str| match renamed {
@@ -675,7 +682,11 @@ impl Commits {
                     } else if applied {
                         synced.set(&create.node_id, Some(shape));
                     }
-                    (&create.node_id, applied || code == Code::MergedInto)
+                    let exists = taken && trees.remote().live(&create.node_id).is_some();
+                    (
+                        &create.node_id,
+                        applied || exists || code == Code::MergedInto,
+                    )
                 }
                 Some(op::Op::CreateFile(create)) => {
                     if applied {
@@ -687,7 +698,8 @@ impl Commits {
                         };
                         synced.set(&create.node_id, Some(shape));
                     }
-                    (&create.node_id, applied)
+                    let exists = taken && trees.remote().live(&create.node_id).is_some();
+                    (&create.node_id, applied || exists)
                 }
                 Some(op::Op::UpdateContent(update)) => {
                     let id = &update.node_id;
