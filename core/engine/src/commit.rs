@@ -1045,9 +1045,10 @@ fn keep(trees: &mut Trees, id: &str, needed: &mut BTreeSet<NodeId>) {
 /// hold the node, so L's and R's positions are compared with the S they came from, as for any
 /// change both sides made. Its content stays, so the acknowledged content remains the base L's
 /// content is compared with. None when nothing is left: the update comes to what S holds, or
-/// neither L nor R holds the node. A removal of a node S still holds stays even then when what S
-/// holds under it leaves S with L's next commits ([`leaves_s`]), so that R taking the node back
-/// meanwhile does not read as L removing it.
+/// neither L nor R holds the node. A removal of a node S still holds stays, even then and while R
+/// holds the node, only as long as what S holds under it leaves S with L's next commits
+/// ([`leaves_s`]), so that R taking the node back meanwhile does not read as L removing it. Once
+/// it cannot leave, the removal could never be made, and the keep rule brings the node back.
 fn outstanding(trees: &Trees, id: &str, waiting: Option<Shape>) -> Option<Option<Shape>> {
     let local = trees.local().get(id).map(|node| &node.shape);
     let synced = trees.synced().live(id);
@@ -1056,7 +1057,7 @@ fn outstanding(trees: &Trees, id: &str, waiting: Option<Shape>) -> Option<Option
         return (local.is_some() || removal).then_some(waiting);
     };
     let Some(mut left) = waiting else {
-        return Some(None);
+        return leaves_s(trees, id).then_some(None);
     };
     if !left.same_position(remote) && !local.is_some_and(|local| local.same_position(&left)) {
         let base = synced.unwrap_or(remote);
@@ -1069,13 +1070,18 @@ fn outstanding(trees: &Trees, id: &str, waiting: Option<Shape>) -> Option<Option
 /// Whether everything S holds under `id` leaves S with L's commits: each node L holds there is
 /// elsewhere in L, and each one L does not hold leaves with what S holds under it in turn. A node
 /// L still holds where S has it, such as one parked under a folder the disk removed, keeps `id`
-/// in S.
+/// in S, and so does a reverted node R holds there, since no commit sends its local position and
+/// the effects move it back.
 fn leaves_s(trees: &Trees, id: &str) -> bool {
+    let stays = |child: &str, parent: &str| {
+        trees.reverted().contains(child)
+            && (trees.remote().live(child)).is_some_and(|remote| remote.parent == parent)
+    };
     let mut below = vec![id];
     while let Some(parent) = below.pop() {
         for child in trees.synced_children(parent) {
             match trees.local().get(child) {
-                Some(node) if node.shape.parent == *parent => return false,
+                Some(node) if node.shape.parent == *parent || stays(child, parent) => return false,
                 Some(_) => {}
                 None => below.push(child),
             }
