@@ -370,7 +370,8 @@ impl FsObserver {
 
     /// Reads again the unread files that are due, the longest due first and as many as `reads` has room for, and
     /// reports each one that can now be read. An observation retries before it reads its own changes, so a file the
-    /// budget left out gets the first turn of a later observation, also when it is larger than the budget.
+    /// budget left out gets the first turn of a later observation, also when it is larger than the budget. A read that
+    /// fails once the caller has stopped ends the retry and leaves that file and the rest due as they were.
     fn retry(&mut self, now: Instant, out: &mut Vec<Observed>, reads: &mut Reads) {
         let mut due: Vec<(Instant, PathBuf)> = (self.unread.iter())
             .filter(|(_, retry)| retry.due <= now)
@@ -396,6 +397,7 @@ impl FsObserver {
                         content: Some(content),
                     });
                 }
+                Err(_) if (self.stopped)() => break,
                 _ => {
                     let failures = self.unread[&path].failures + 1;
                     self.unread.insert(path, Retry::after(failures, now));
@@ -612,6 +614,8 @@ fn same_version(meta: &std::fs::Metadata, entry: &Entry) -> bool {
 
 /// Opens the file at the relative `path` under `root` for reading, one folder at a time, following no symbolic link.
 fn open_beneath(root: &Path, path: &Path) -> io::Result<File> {
+    #[cfg(test)]
+    tests::before_open(path)?;
     let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
     open_under(rustix::fs::open(root, dir_flags, Mode::empty())?, path)
 }
@@ -645,6 +649,7 @@ pub(crate) fn open_under(root: impl AsFd, path: &Path) -> io::Result<File> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::fs;
     use std::os::unix::fs::MetadataExt;
     use std::time::Instant;
@@ -655,6 +660,18 @@ mod tests {
     use crate::ignore::Unfiltered;
 
     const SPACE: &str = "0190f0a0-0000-7000-8000-000000000001";
+
+    thread_local! {
+        /// The file whose next open on this thread fails with EINTR, as an open the OS interrupts does.
+        static INTERRUPTED_OPEN: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn before_open(path: &Path) -> io::Result<()> {
+        match INTERRUPTED_OPEN.with_borrow_mut(|next| next.take_if(|next| next == path)) {
+            Some(_) => Err(rustix::io::Errno::INTR.into()),
+            None => Ok(()),
+        }
+    }
 
     fn observer(root: &Path) -> FsObserver {
         let dev = fs::metadata(root).unwrap().dev();
@@ -957,6 +974,88 @@ mod tests {
             "{out:?}"
         );
         assert!(observer.unread.contains_key(Path::new("a.txt")));
+    }
+
+    #[test]
+    fn a_retry_the_caller_stopped_reads_no_further_and_keeps_every_file_due() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = marked();
+        for file in 0..20 {
+            fs::write(dir.path().join(format!("{file:04}.txt")), b"x").unwrap();
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = {
+            let stop = stop.clone();
+            move || stop.load(Ordering::SeqCst)
+        };
+        let dev = fs::metadata(dir.path()).unwrap().dev();
+        let started = FsObserver::start(
+            dir.path(),
+            SPACE,
+            dev,
+            Snapshot::default(),
+            Arc::new(Unfiltered),
+            stopped,
+        );
+        let mut observer = started.unwrap();
+        observe_until(&mut observer, |seen| seen.len() >= 20);
+        let now = Instant::now();
+        for file in 0..20 {
+            observer.unread.insert(
+                format!("{file:04}.txt").into(),
+                Retry {
+                    failures: 0,
+                    due: now,
+                },
+            );
+        }
+        stop.store(true, Ordering::SeqCst);
+        let mut out = Vec::new();
+        let mut reads = Reads::default();
+        observer.retry(now, &mut out, &mut reads);
+        assert_eq!(reads.files, 1);
+        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(observer.unread.len(), 20);
+        assert!(
+            (observer.unread.values()).all(|retry| retry.failures == 0 && retry.due == now),
+            "{:?}",
+            observer.unread
+        );
+    }
+
+    #[test]
+    fn an_open_the_os_interrupts_is_a_failed_read_and_the_retry_goes_on() {
+        let dir = marked();
+        for file in 0..20 {
+            fs::write(dir.path().join(format!("{file:04}.txt")), b"x").unwrap();
+        }
+        let mut observer = observer(dir.path());
+        observe_until(&mut observer, |seen| seen.len() >= 20);
+        let now = Instant::now();
+        for file in 0..20 {
+            observer.unread.insert(
+                format!("{file:04}.txt").into(),
+                Retry {
+                    failures: 0,
+                    due: now,
+                },
+            );
+        }
+        INTERRUPTED_OPEN.set(Some("0000.txt".into()));
+        let mut out = Vec::new();
+        let mut reads = Reads::default();
+        observer.retry(now, &mut out, &mut reads);
+        assert_eq!(reads.files, 20);
+        assert_eq!(out.len(), 19, "{out:?}");
+        assert!(
+            (out.iter()).all(|change| matches!(change,
+                Observed::Modified { path, content: Some(_), .. } if path != Path::new("0000.txt"))),
+            "{out:?}"
+        );
+        let unread: Vec<(&Path, u32)> = (observer.unread.iter())
+            .map(|(path, retry)| (path.as_path(), retry.failures))
+            .collect();
+        assert_eq!(unread, [(Path::new("0000.txt"), 1)]);
     }
 
     #[test]
