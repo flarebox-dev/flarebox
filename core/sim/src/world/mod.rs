@@ -36,12 +36,14 @@
 //! - Every disk equals the server's live tree, and every engine reports L = S = R with nothing
 //!   in flight, blocked, parked or halted.
 //! - No commit moved a node to a name that the user of its device never gave to anything, other
-//!   than the pending name a swap goes through (design section 2.6) and a name its disk held when
-//!   a restore took commits from the server (section 4.4), and no commit took a write
-//!   out of the server's live tree that the user of its device never overwrote or deleted.
+//!   than the pending name a swap goes through (design section 2.6) and, until the devices are
+//!   quiet again, a name that L or the server held for a node whose shape a restore took from the
+//!   server (section 4.4), and no commit took a write out of the server's live tree that the user
+//!   of its device never overwrote or deleted.
 //! - No node keeps a pending name that no user gave.
 //! - No write is in two files of the server, except one a restore took from the server while a
-//!   disk held it, which each device that held it keeps (section 4.4).
+//!   disk held it, which each device that held it keeps (section 4.4), in the files the server
+//!   holds it in once the devices are quiet again.
 //! - Every write was in the server's live tree at some time, unless the user who made it
 //!   overwrote or deleted it first.
 
@@ -357,15 +359,16 @@ pub struct World {
     /// them, and no engine can send them again.
     retired: BTreeSet<i64>,
     /// The writes that a restore took from the server while a disk still held them, each with
-    /// the number of devices whose disk or R held it. A device that held such a write, or
-    /// downloads it after the restore, cannot tell whether its author will send it again, so it
-    /// keeps its copy, and the server can end with the write in one file for each of those
-    /// devices (design section 4.4).
+    /// the number of files the server may hold it in. A device that held such a write, on its
+    /// disk or in R, cannot tell whether its author will send it again, so it keeps its copy, and
+    /// the server can end with the write in one file for each of those devices (design section
+    /// 4.4). Once the devices are quiet again, the number is that of the files the server holds.
     exposed: BTreeMap<i64, usize>,
-    /// For each device, the names that L and the server held for the nodes whose position a
-    /// restore took from the server. S forgets a node the restored server holds with another
-    /// shape, so the device sends the position it holds again, also one that another device's
-    /// lost commit gave it, or the name the server gave in place of the one L holds.
+    /// For each device, the names that L and the server held for the nodes whose shape a restore
+    /// took from the server, until the devices are quiet again. S forgets a node the restored
+    /// server holds with another shape, so the device sends the position it holds again, also one
+    /// that another device's lost commit gave it, or the name the server gave in place of the one
+    /// L holds.
     restored_names: Vec<BTreeMap<NodeId, BTreeSet<String>>>,
 }
 
@@ -437,7 +440,25 @@ impl World {
                 self.dump()
             );
         }
-        quiet.map_err(|failure| failure.at(format!("after phase {phase}")))
+        quiet.map_err(|failure| failure.at(format!("after phase {phase}")))?;
+        self.recovered()
+    }
+
+    /// Ends what a restore allowed once the devices are quiet again: no later commit sends a name
+    /// the restore took from the server, and a write the restore took stays in the files the
+    /// server holds it in now.
+    fn recovered(&mut self) -> Result<(), Failure> {
+        for names in &mut self.restored_names {
+            names.clear();
+        }
+        let mut files: BTreeMap<i64, usize> = BTreeMap::new();
+        for content in self.server_tree()?.into_values().flatten() {
+            *files.entry(content.mtime_ns).or_default() += 1;
+        }
+        for (write, allowed) in &mut self.exposed {
+            *allowed = files.get(write).copied().unwrap_or(1);
+        }
+        Ok(())
     }
 
     fn step(&mut self, d: usize, step: &Step) -> Result<(), Failure> {
@@ -566,26 +587,34 @@ impl World {
         if backup.space.head_seq() < self.space.head_seq() {
             note(&mut self.seen, "server restored, commits lost");
         }
-        let positions = |space: &SpaceDo| -> BTreeMap<NodeId, (String, String, i32)> {
+        type Shape = (String, String, i32, Option<Vec<u8>>);
+        let shapes = |space: &SpaceDo| -> BTreeMap<NodeId, Shape> {
             (space.nodes().into_iter())
-                .map(|node| (node.node_id, (node.parent_id, node.name, node.status)))
+                .map(|node| {
+                    let digest = node.current.and_then(|current| current.content);
+                    let digest = digest.map(|content| content.manifest_digest);
+                    (
+                        node.node_id,
+                        (node.parent_id, node.name, node.status, digest),
+                    )
+                })
                 .collect()
         };
-        let before = positions(&self.space);
+        let before = shapes(&self.space);
         self.space.restore(&backup.space);
-        let after = positions(&self.space);
-        let moved: BTreeSet<&NodeId> = (before.keys().chain(after.keys()))
+        let after = shapes(&self.space);
+        let changed: BTreeSet<&NodeId> = (before.keys().chain(after.keys()))
             .filter(|id| before.get(*id) != after.get(*id))
             .collect();
         for (device, names) in self.devices.iter_mut().zip(&mut self.restored_names) {
             device.link = None;
-            for id in &moved {
-                if let Some((_, name, _)) = before.get(*id) {
+            for id in &changed {
+                if let Some((_, name, ..)) = before.get(*id) {
                     names.entry((*id).clone()).or_default().insert(name.clone());
                 }
             }
             for (id, node) in device.engine.trees.local().iter() {
-                if moved.contains(id) {
+                if changed.contains(id) {
                     names
                         .entry(id.clone())
                         .or_default()

@@ -136,13 +136,13 @@ proptest! {
     }
 
     #[test]
-    #[ignore = "a server restore still breaks these: a lost file two devices create again is refused with ID_EXISTS, a lost edit equal to the restored bytes is undone, and a commit sent again from a forked base deletes a change it never saw"]
+    #[ignore = "a server restore still breaks these: a lost file two devices create again is refused with ID_EXISTS (GUN-437), a lost edit equal to the restored bytes is undone (GUN-438), and a device that saw a seq the server lost takes the commit that reuses it for the one it saw (GUN-423)"]
     fn devices_lose_no_write_across_server_restores(devices in 2..=3usize, phases in phases(true)) {
         keep(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
 
     #[test]
-    #[ignore = "a server restore still breaks these: a lost file two devices create again is refused with ID_EXISTS, a lost edit equal to the restored bytes is undone, and a commit sent again from a forked base deletes a change it never saw"]
+    #[ignore = "a server restore still breaks these: a lost file two devices create again is refused with ID_EXISTS (GUN-437), a lost edit equal to the restored bytes is undone (GUN-438), and a device that saw a seq the server lost takes the commit that reuses it for the one it saw (GUN-423)"]
     fn devices_converge_across_server_restores(devices in 2..=3usize, phases in phases(true)) {
         converge(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
@@ -841,4 +841,79 @@ fn a_restore_that_loses_no_rename_allows_no_unasked_rename() {
     let a = world.devices[0].disk.child(&Place::Root, "a").unwrap();
     world.devices[0].disk.rename(a, Place::Root, "b").unwrap();
     assert!(world.phase(3, &[]).is_err());
+}
+/// A restore that loses an edit lets a device send the position L holds for the file again, here
+/// when it revives the file that another device's delete trashed after the restore.
+#[test]
+fn a_restore_that_loses_an_edit_lets_its_file_be_revived() {
+    let u = |kind, target, parent, name, text| {
+        Step::User(Action {
+            kind,
+            target,
+            parent,
+            name,
+            text,
+        })
+    };
+    let phases = vec![
+        vec![
+            (0, u(1, 0, 0, 6, 0)),
+            (0, Step::Work(0)),
+            (2, u(0, 0, 0, 0, 0)),
+        ],
+        vec![
+            (0, u(1, 0, 0, 2, 0)),
+            (2, u(0, 0, 0, 2, 0)),
+            (2, u(1, 0, 0, 3, 0)),
+            (0, Step::Work(0)),
+            (0, u(2, 925163541728872510, 0, 0, 0)),
+            (0, u(0, 0, 11523797806819799120, 0, 0)),
+        ],
+        vec![
+            (0, u(0, 0, 0, 0, 0)),
+            (0, BACKUP),
+            (1, u(2, 10499357163619158257, 0, 0, 0)),
+            (0, u(0, 0, 20731787025803467, 0, 0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (0, u(4, 4907598952368571970, 0, 0, 0)),
+            (1, Step::Work(0)),
+            (0, RESTORE),
+        ],
+    ];
+    converge(3, &phases).unwrap();
+}
+
+/// Once the devices are quiet after a restore, a copy of a write the restore took from the server
+/// is refused like any other copy.
+#[test]
+fn a_copy_of_a_lost_write_after_the_recovery_is_refused() {
+    let mut world = restored(2, Vec::new(), vec![(0, file("a"))]);
+    let bytes = (world.devices[0]
+        .disk
+        .entries()
+        .values()
+        .next()
+        .unwrap()
+        .content)
+        .clone();
+    world.devices[0]
+        .disk
+        .create(Place::Root, "b", bytes)
+        .unwrap();
+    assert!(world.phase(3, &[]).is_err());
+}
+
+/// Once the devices are quiet after a restore that lost a rename, the old name is refused like
+/// any other name the user did not give.
+#[test]
+fn a_name_a_restore_lost_is_refused_after_the_recovery() {
+    let mut world = converge(2, &[vec![(0, file("a"))], vec![(0, BACKUP)]]).unwrap();
+    world.phase(2, &[(1, rename(0, 0, "b"))]).unwrap();
+    world.phase(3, &[(0, RESTORE)]).unwrap();
+    world.phase(4, &[(1, rename(0, 0, "c.txt"))]).unwrap();
+    let ino = world.devices[0].disk.child(&Place::Root, "c.txt").unwrap();
+    world.devices[0].disk.rename(ino, Place::Root, "b").unwrap();
+    assert!(world.phase(5, &[]).is_err());
 }
