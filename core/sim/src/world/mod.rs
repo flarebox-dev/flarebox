@@ -356,14 +356,16 @@ pub struct World {
     /// The writes that a restore took from the server while no disk held them. The server lost
     /// them, and no engine can send them again.
     retired: BTreeSet<i64>,
-    /// The writes that a restore took from the server while a disk still held them. A device
-    /// that held such a write cannot tell whether its author will send it again, so it keeps its
-    /// copy, and the server can end with the write in more than one file (design section 4.4).
-    exposed: BTreeSet<i64>,
-    /// For each device, the names its disk held when a restore took commits from the server. S
-    /// forgets a node the restored server holds with another shape, so the device sends the
-    /// position its disk holds again, also one that another device's lost commit gave it.
-    restored_names: Vec<BTreeSet<String>>,
+    /// The writes that a restore took from the server while a disk still held them, each with
+    /// the number of devices whose disk held it. A device that held such a write cannot tell
+    /// whether its author will send it again, so it keeps its copy, and the server can end with
+    /// the write in one file for each of those devices (design section 4.4).
+    exposed: BTreeMap<i64, usize>,
+    /// For each device, the names that L and the server held for the nodes whose position a
+    /// restore took from the server. S forgets a node the restored server holds with another
+    /// shape, so the device sends the position it holds again, also one that another device's
+    /// lost commit gave it, or the name the server gave in place of the one L holds.
+    restored_names: Vec<BTreeMap<NodeId, BTreeSet<String>>>,
 }
 
 impl World {
@@ -393,7 +395,7 @@ impl World {
             space,
             removed: vec![BTreeSet::new(); devices.len()],
             named: vec![BTreeSet::new(); devices.len()],
-            restored_names: vec![BTreeSet::new(); devices.len()],
+            restored_names: vec![BTreeMap::new(); devices.len()],
             devices,
             seen: BTreeMap::new(),
             trace: false,
@@ -405,7 +407,7 @@ impl World {
             copied: BTreeSet::new(),
             backup: None,
             retired: BTreeSet::new(),
-            exposed: BTreeSet::new(),
+            exposed: BTreeMap::new(),
         }
     }
 
@@ -563,25 +565,51 @@ impl World {
         if backup.space.head_seq() < self.space.head_seq() {
             note(&mut self.seen, "server restored, commits lost");
         }
+        let positions = |space: &SpaceDo| -> BTreeMap<NodeId, (String, String, i32)> {
+            (space.nodes().into_iter())
+                .map(|node| (node.node_id, (node.parent_id, node.name, node.status)))
+                .collect()
+        };
+        let before = positions(&self.space);
         self.space.restore(&backup.space);
+        let after = positions(&self.space);
+        let moved: BTreeSet<&NodeId> = (before.keys().chain(after.keys()))
+            .filter(|id| before.get(*id) != after.get(*id))
+            .collect();
         for (device, names) in self.devices.iter_mut().zip(&mut self.restored_names) {
             device.link = None;
-            names.extend(
-                device
-                    .disk
-                    .entries()
-                    .values()
-                    .map(|entry| entry.name.clone()),
-            );
+            for id in &moved {
+                if let Some((_, name, _)) = before.get(*id) {
+                    names.entry((*id).clone()).or_default().insert(name.clone());
+                }
+            }
+            for (id, node) in device.engine.trees.local().iter() {
+                if moved.contains(id) {
+                    names
+                        .entry(id.clone())
+                        .or_default()
+                        .insert(node.shape.name.clone());
+                }
+            }
         }
         for write in self.writers.keys() {
             if !stored(&self.held, *write) || stored(&backup.held, *write) {
                 continue;
             }
-            match self.devices.iter().any(|device| device.disk.holds(*write)) {
-                true => self.exposed.insert(*write),
-                false => self.retired.insert(*write),
-            };
+            match self
+                .devices
+                .iter()
+                .filter(|device| device.disk.holds(*write))
+                .count()
+            {
+                0 => {
+                    self.retired.insert(*write);
+                }
+                holders => {
+                    let exposed = self.exposed.entry(*write).or_default();
+                    *exposed = holders.max(*exposed);
+                }
+            }
         }
     }
 
@@ -1059,7 +1087,8 @@ impl World {
                 let made_up = sent.ops.iter().find_map(|op| match &op.op {
                     Some(op::Op::Move(moved))
                         if !given(&self.named[d], &moved.new_name)
-                            && !self.restored_names[d].contains(&moved.new_name) =>
+                            && !(self.restored_names[d].get(&moved.node_id))
+                                .is_some_and(|names| names.contains(&moved.new_name)) =>
                     {
                         Some(moved)
                     }
@@ -1384,7 +1413,7 @@ impl World {
         let server: BTreeSet<i64> = (self.space.nodes().into_iter())
             .filter_map(|node| Some(node.current?.content?.mtime_ns))
             .collect();
-        let gone = (self.exposed.iter()).find(|write| {
+        let gone = (self.exposed.keys()).find(|write| {
             !server.contains(write) && !self.removed.iter().any(|removed| removed.contains(write))
         });
         match gone {
@@ -1537,7 +1566,8 @@ impl World {
             }
         }
         let twice = |(write, paths): &(&i64, &Vec<_>)| {
-            paths.len() > 1 && !self.copied.contains(*write) && !self.exposed.contains(*write)
+            paths.len() > self.exposed.get(*write).copied().unwrap_or(1)
+                && !self.copied.contains(*write)
         };
         if let Some((write, paths)) = files.iter().find(twice) {
             return Err(Failure::Diverged(format!(

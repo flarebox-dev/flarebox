@@ -806,3 +806,39 @@ fn a_file_whose_rename_the_server_lost_keeps_its_new_name() {
         assert_eq!(names, ["b"]);
     }
 }
+/// The server loses the create of a file, and the devices create it again. A copy of its bytes
+/// that the engine makes later, with no user asking for one, is still a divergence.
+#[test]
+fn a_later_copy_of_a_write_the_server_lost_is_still_refused() {
+    let mut world = restored(2, Vec::new(), vec![(0, file("a"))]);
+    let bytes = (world.devices[0]
+        .disk
+        .entries()
+        .values()
+        .next()
+        .unwrap()
+        .content)
+        .clone();
+    for name in ["b", "c", "d"] {
+        world.devices[0]
+            .disk
+            .create(Place::Root, name, bytes.clone())
+            .unwrap();
+    }
+    assert!(world.phase(3, &[]).is_err());
+}
+
+/// A restore that loses no rename allows no later rename to a name the user never gave.
+#[test]
+fn a_restore_that_loses_no_rename_allows_no_unasked_rename() {
+    let mut world = converge(2, &[vec![(0, file("a")), (1, file("b"))]]).unwrap();
+    world.phase(1, &[(0, BACKUP), (0, RESTORE)]).unwrap();
+    let disk = &world.devices[1].disk;
+    let b = (disk.visible().iter()).position(|ino| disk.entries()[ino].name == "b");
+    world
+        .phase(2, &[(1, rename(b.unwrap(), 0, "c.txt"))])
+        .unwrap();
+    let a = world.devices[0].disk.child(&Place::Root, "a").unwrap();
+    world.devices[0].disk.rename(a, Place::Root, "b").unwrap();
+    assert!(world.phase(3, &[]).is_err());
+}
