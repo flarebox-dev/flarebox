@@ -538,11 +538,48 @@ fn a_file_moved_into_an_ignored_folder_before_a_folder_above_it_was_renamed_is_i
     let rescan = snapshot
         .rescan_with_rules(root, whole(), &mut rules)
         .unwrap();
-    let ignored = |change: &Change| {
+    let ignored = |change: &&Change| {
         matches!(change, Change::Ignored { from, to, .. }
             if from == Path::new("d/a/b/file") && to == Path::new("ig/file"))
     };
-    assert!(rescan.changes.iter().any(ignored), "{:?}", rescan.changes);
+    let found = rescan.changes.iter().filter(ignored).count();
+    assert_eq!(found, 1, "{:?}", rescan.changes);
+}
+
+/// As above, with the folder that held the file moved into the ignored folder: it is ignored once, and the file
+/// it holds goes with it.
+#[test]
+fn a_folder_moved_into_an_ignored_folder_before_a_folder_above_it_was_renamed_is_ignored_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, RULES_FILE, "ig/\n");
+    write(root, "d/a/b/file", "kept");
+    fs::create_dir(root.join("ig")).unwrap();
+    fs::create_dir(root.join("dest")).unwrap();
+    let mut snapshot = Snapshot::default();
+    let mut rules = rules();
+    snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    fs::rename(root.join("d/a/b"), root.join("ig/b")).unwrap();
+    fs::rename(root.join("d/a"), root.join("dest/a")).unwrap();
+    fs::remove_dir(root.join("d")).unwrap();
+
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    let ignored: Vec<(&Path, &Path)> = (rescan.changes.iter())
+        .filter_map(|change| match change {
+            Change::Ignored { from, to, .. } => Some((from.as_path(), to.as_path())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ignored,
+        [(Path::new("d/a/b"), Path::new("ig/b"))],
+        "{:?}",
+        rescan.changes
+    );
 }
 
 #[test]
