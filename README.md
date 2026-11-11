@@ -1,4 +1,10 @@
 <p align="center">
+  <img src="docs/assets/koidrive-logo.svg" alt="Koidrive logo" width="96">
+</p>
+
+<h1 align="center">Koidrive</h1>
+
+<p align="center">
   <strong>File sync you deploy to your own Cloudflare account.</strong><br>
   Koidrive keeps folders in sync between your Macs and Linux machines and stores the files in your own R2 bucket.
 </p>
