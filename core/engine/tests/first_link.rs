@@ -4,14 +4,14 @@
 //! section 6.4).
 
 use flarebox_engine::classify::Trees;
-use flarebox_engine::commit::Commits;
+use flarebox_engine::commit::{Commits, Reconnect};
 use flarebox_engine::effects::{Effect, Effects};
 use flarebox_engine::first_link::adopt;
 use flarebox_engine::ids::IdGen;
 use flarebox_engine::ignore::RuleFile;
 use flarebox_engine::question::{Answer, Question, QuestionKind, RecoveryGroup};
 use flarebox_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape};
-use flarebox_proto::v1::op;
+use flarebox_proto::v1::{CommitResult, OpResult, Welcome, op, op_result};
 
 const ROOT: &str = "root";
 const NOW: u64 = 1_794_268_740_000;
@@ -665,4 +665,70 @@ fn an_adopted_folder_keeps_its_rules_unknown() {
     );
     assert!(trees.held("r-new"));
     assert_eq!(Effects::default().plan(&trees, &mut ids, NOW), None);
+}
+
+/// On a first link, the person discards A, which takes the name key of the adopted a, so its S
+/// update waits. A commit of this device that creates `pad` was applied at seq 2 before the
+/// server lost it. The waiting update came from the person's answer, not from a commit, so the
+/// rollback keeps it and A is not uploaded.
+#[test]
+fn a_discard_whose_s_update_waits_stays_after_a_server_loss() {
+    let mut trees = trees(
+        &[("l-a", file(ROOT, "a", 1)), ("l-A", file(ROOT, "A", 2))],
+        &[("r-a", file(ROOT, "a", 1))],
+    );
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(7));
+    commits.first_link(&mut trees, &mut ids, NOW);
+    trees.settle();
+    let asked = question(&commits);
+    assert_eq!(asked.shown.keys().collect::<Vec<_>>(), ["l-A"]);
+    let pad = LocalNode {
+        shape: file(ROOT, "pad", 3),
+        identity: FileIdentity {
+            dev: 1,
+            ino: 99,
+            birth_ns: Some(0),
+        },
+        parked: false,
+    };
+    trees.set_local("pad".into(), pad);
+    trees.settle();
+    let sent = ops(&mut commits, &mut trees, &mut ids);
+    assert_eq!(sent, [("create file", "pad".to_owned())]);
+    let pad = RemoteNode {
+        shape: file(ROOT, "pad", 3),
+        trashed: false,
+        content_rev: 2,
+        meta_rev: 2,
+        trash_group: String::new(),
+    };
+    trees.set_remote("pad".into(), pad);
+    let applied = OpResult {
+        code: op_result::Code::Applied as i32,
+        ..Default::default()
+    };
+    let result = CommitResult {
+        seq: 2,
+        results: vec![applied],
+        changes: vec![],
+    };
+    commits.received(result).unwrap();
+    assert!(commits.acknowledge(&mut trees, 2));
+    trees.settle();
+    assert!(commits.decide(&asked.id, Answer::Discard));
+    assert_eq!(ops(&mut commits, &mut trees, &mut ids), []);
+    assert!(trees.waiting().contains_key("l-A"));
+    let welcome = Welcome {
+        history_id: HISTORY.into(),
+        device_seq: 0,
+        ..Default::default()
+    };
+    assert_eq!(commits.connected(&welcome), Reconnect::AheadOfServer);
+    let (trashed, edited) = (trees.trashed_here(), trees.edited_here());
+    trees.remove_remote("pad");
+    trees.forget_lost(trashed, edited, commits.held_through());
+    trees.settle();
+    assert!(trees.waiting().contains_key("l-A"));
+    let sent = ops(&mut commits, &mut trees, &mut ids);
+    assert!(!sent.iter().any(|(_, id)| id == "l-A"), "{sent:?}");
 }

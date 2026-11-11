@@ -810,9 +810,13 @@ impl Trees {
     /// copy.
     ///
     /// An S update that waits ([`Trees::waiting`]) for a node R now holds as S does, and not as
-    /// the update has it, came from a commit the server lost. It is dropped, so that L's change is
-    /// compared with S and sent again, instead of R's rollback reading as a remote change once the
-    /// update fits. One for a node R holds in the trash stays.
+    /// the update has it, came from a commit the server lost, unless another device changed the
+    /// node back since. With no revision of R's above `held_through`, the update is dropped, so
+    /// L's change is compared with S and sent again instead of R's rollback reading as a remote
+    /// change once the update fits. With a later revision, S forgets the node as it forgets one R
+    /// holds with another shape, so L's change is kept beside R's. An update for a node R holds in
+    /// the trash stays, and so does one for a node the person discarded on a first link, which no
+    /// commit sent.
     ///
     /// [`Commits::held_through`]: crate::commit::Commits::held_through
     pub fn forget_lost(&mut self, trashed: Vec<Trashed>, edited: Vec<NodeId>, held_through: u64) {
@@ -844,18 +848,23 @@ impl Trees {
             };
             self.set_synced_if_valid(id, Some(remote));
         }
-        let (r, s) = (&self.r, &self.s);
-        let dropped: Vec<NodeId> = (self.waiting.iter())
+        let (r, s, discarded) = (&self.r, &self.s, &self.discarded);
+        let (changed_later, dropped): (Vec<_>, Vec<_>) = (self.waiting.iter())
             .filter(|(id, waiting)| {
                 let remote = r.live(id);
                 waiting.is_some()
+                    && !discarded.contains(id.as_str())
                     && !r.get(id.as_str()).is_some_and(|remote| remote.trashed)
                     && same(remote, s.live(id))
                     && !same(remote, waiting.as_ref())
             })
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in dropped {
+            .map(|(id, _)| {
+                let later = (r.get(id.as_str()))
+                    .is_some_and(|remote| remote.content_rev.max(remote.meta_rev) > held_through);
+                (id.clone(), later)
+            })
+            .partition(|(_, later)| *later);
+        for (id, _) in dropped {
             self.waiting.remove(&id);
             self.mark(&id);
         }
@@ -869,6 +878,7 @@ impl Trees {
                     || (self.r.live(id)).is_some_and(|remote| !same(Some(remote), Some(*synced)))
             })
             .map(|(id, _)| id.as_str())
+            .chain(changed_later.iter().map(|(id, _)| id.as_str()))
             .collect();
         let mut below: Vec<&str> = lost.iter().copied().collect();
         while let Some(id) = below.pop() {
