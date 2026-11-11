@@ -158,7 +158,7 @@ pub struct Trees {
     reverted: BTreeSet<NodeId>,
     parked_as: BTreeMap<NodeId, NodeId>,
     waiting: BTreeMap<NodeId, Option<Shape>>,
-    /// The nodes whose content the commit in flight updates, each with whether S's content
+    /// The nodes whose content the commit in flight creates or updates, each with whether S's content
     /// changed since the commit was built.
     watched: BTreeMap<NodeId, bool>,
     /// The nodes the commit in flight creates or moves, each with the latest revision at which L and R agreed
@@ -766,7 +766,7 @@ impl Trees {
         &self.waiting
     }
 
-    /// Watches S's content of `ids`, the nodes whose content the commit just built updates, and
+    /// Watches S's content of `ids`, the nodes whose content the commit just built creates or updates, and
     /// stops watching any other node.
     pub fn watch_content(&mut self, ids: impl IntoIterator<Item = NodeId>) {
         self.watched = ids.into_iter().map(|id| (id, false)).collect();
