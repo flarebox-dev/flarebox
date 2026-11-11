@@ -524,10 +524,15 @@ impl World {
     /// As in the driver, the disk gets an effect only while L still takes its outcome
     /// (`EffectRecord::applies`). An effect that L no longer takes fails, and is planned again once
     /// L has changed. The outcome goes to the store in its own transaction, before the disk is
-    /// observed again.
+    /// observed again. As in the driver, no effect is planned while a commit is in flight, unless
+    /// committing has stopped.
     fn effect(&mut self, d: usize, outcome: Outcome) -> Result<bool, Failure> {
         let device = &mut self.devices[d];
         let Some(record) = device.engine.effects.in_flight().cloned() else {
+            let commits = &device.engine.commits;
+            if commits.in_flight().is_some() && commits.halted().is_none() {
+                return Ok(false);
+            }
             let Engine {
                 trees,
                 effects,
