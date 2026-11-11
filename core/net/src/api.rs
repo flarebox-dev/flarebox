@@ -94,17 +94,24 @@ impl Api {
         &self.http
     }
 
-    /// Joins a path relative to the base, such as `v1/server`.
-    pub(crate) fn url(&self, path: &str) -> Url {
-        self.base
-            .join(path)
-            .expect("a relative path joins onto an http URL")
+    /// The URL of the path `segments` below the base. Each segment is percent-encoded, so an ID holding `/`, `?` or `#`
+    /// stays one segment of the path. An empty segment, `.` or `..` would name another path, so it is refused.
+    pub(crate) fn url(&self, segments: &[&str]) -> Result<Url, ApiError> {
+        if let Some(segment) = segments.iter().find(|s| matches!(**s, "" | "." | "..")) {
+            return Err(ApiError::PathSegment((*segment).to_owned()));
+        }
+        let mut url = self.base.clone();
+        url.path_segments_mut()
+            .expect("an http URL has a path")
+            .pop_if_empty()
+            .extend(segments);
+        Ok(url)
     }
 
     /// `GET /v1/server`.
     pub async fn server_info(&self) -> Result<ServerInfo, ApiError> {
         self.send(
-            self.http.get(self.url("v1/server")),
+            self.http.get(self.url(&["v1", "server"])?),
             "ServerInfo",
             MAX_ANSWER,
         )
@@ -114,7 +121,7 @@ impl Api {
     /// `POST /v1/claim`: registers the first owner with the one-time claim code from the Worker log.
     pub async fn claim(&self, request: &ClaimRequest) -> Result<DeviceCredentials, ApiError> {
         self.send(
-            self.post("v1/claim", request),
+            self.post(self.url(&["v1", "claim"])?, request),
             "DeviceCredentials",
             MAX_ANSWER,
         )
@@ -127,7 +134,7 @@ impl Api {
         request: &PairCompleteRequest,
     ) -> Result<DeviceCredentials, ApiError> {
         self.send(
-            self.post("v1/pair/complete", request),
+            self.post(self.url(&["v1", "pair", "complete"])?, request),
             "DeviceCredentials",
             MAX_ANSWER,
         )
@@ -136,8 +143,12 @@ impl Api {
 
     /// `POST /v1/token`: exchanges the refresh credential for an access token.
     pub async fn token(&self, request: &TokenRequest) -> Result<AccessToken, ApiError> {
-        self.send(self.post("v1/token", request), "AccessToken", MAX_ANSWER)
-            .await
+        self.send(
+            self.post(self.url(&["v1", "token"])?, request),
+            "AccessToken",
+            MAX_ANSWER,
+        )
+        .await
     }
 
     /// `POST /v1/pair/start`, called by an already paired device.
@@ -145,7 +156,7 @@ impl Api {
         self.authed(
             auth,
             Method::POST,
-            "v1/pair/start",
+            self.url(&["v1", "pair", "start"])?,
             None,
             "PairStartResponse",
             MAX_ANSWER,
@@ -161,20 +172,16 @@ impl Api {
         let mut read = 0;
         let mut seen = std::collections::HashSet::new();
         loop {
-            let path = match list.next_cursor.as_str() {
-                "" => "v1/spaces".to_owned(),
-                cursor => format!(
-                    "v1/spaces?{}",
-                    url::form_urlencoded::Serializer::new(String::new())
-                        .append_pair("cursor", cursor)
-                        .finish()
-                ),
-            };
+            let mut url = self.url(&["v1", "spaces"])?;
+            if !list.next_cursor.is_empty() {
+                url.query_pairs_mut()
+                    .append_pair("cursor", &list.next_cursor);
+            }
             let page: SpaceList = self
                 .authed(
                     auth,
                     Method::GET,
-                    &path,
+                    url,
                     None,
                     "SpaceList",
                     MAX_SPACE_PAGE.min(MAX_SPACE_LISTING - read),
@@ -201,7 +208,7 @@ impl Api {
         self.authed(
             auth,
             Method::POST,
-            "v1/spaces",
+            self.url(&["v1", "spaces"])?,
             Some(request.encode_to_vec()),
             "SpaceInfo",
             MAX_ANSWER,
@@ -216,11 +223,10 @@ impl Api {
         space_id: &str,
         request: &RewindRequest,
     ) -> Result<RewindResult, ApiError> {
-        let path = format!("v1/spaces/{space_id}/rewind");
         self.authed(
             auth,
             Method::POST,
-            &path,
+            self.url(&["v1", "spaces", space_id, "rewind"])?,
             Some(request.encode_to_vec()),
             "RewindResult",
             MAX_ANSWER,
@@ -243,7 +249,7 @@ impl Api {
         self.authed(
             auth,
             Method::POST,
-            &format!("v1/spaces/{space_id}/rpc"),
+            self.url(&["v1", "spaces", space_id, "rpc"])?,
             Some(request.encode_to_vec()),
             "RpcResponse",
             crate::session::MAX_SERVER_MESSAGE,
@@ -254,35 +260,27 @@ impl Api {
     /// `GET /v1/spaces/{space_id}/usage`, owner only (RFC 0010): the bytes of the chunks the space holds, split by
     /// live files, the trash and old versions, with each chunk counted once.
     pub async fn space_usage(&self, auth: &Auth, space_id: &str) -> Result<SpaceUsage, ApiError> {
-        let path = format!("v1/spaces/{space_id}/usage");
-        self.authed(auth, Method::GET, &path, None, "SpaceUsage", MAX_ANSWER)
+        let url = self.url(&["v1", "spaces", space_id, "usage"])?;
+        self.authed(auth, Method::GET, url, None, "SpaceUsage", MAX_ANSWER)
             .await
     }
 
     /// `GET /v1/devices`: one page of the devices of this device's user, revoked ones included (RFC 0006 section 7).
     /// Pass an empty `cursor` for the first page and the previous page's `next_cursor` for the next.
     pub async fn list_devices(&self, auth: &Auth, cursor: &str) -> Result<DeviceList, ApiError> {
-        let mut path = "v1/devices".to_owned();
+        let mut url = self.url(&["v1", "devices"])?;
         if !cursor.is_empty() {
-            path.push_str("?cursor=");
-            path.extend(url::form_urlencoded::byte_serialize(cursor.as_bytes()));
+            url.query_pairs_mut().append_pair("cursor", cursor);
         }
-        self.authed(
-            auth,
-            Method::GET,
-            &path,
-            None,
-            "DeviceList",
-            MAX_DEVICE_PAGE,
-        )
-        .await
+        self.authed(auth, Method::GET, url, None, "DeviceList", MAX_DEVICE_PAGE)
+            .await
     }
 
     /// `DELETE /v1/devices/{device_id}`: revokes another device of this device's user (RFC 0009). `device_id` is an ID
     /// from [`Api::list_devices`]. To revoke this device, use [`Api::revoke_self`].
     pub async fn revoke_device(&self, auth: &Auth, device_id: &str) -> Result<(), ApiError> {
-        let path = format!("v1/devices/{device_id}");
-        self.authed(auth, Method::DELETE, &path, None, "empty reply", MAX_ANSWER)
+        let url = self.url(&["v1", "devices", device_id])?;
+        self.authed(auth, Method::DELETE, url, None, "empty reply", MAX_ANSWER)
             .await
     }
 
@@ -294,17 +292,17 @@ impl Api {
         auth: &Auth,
         confirm_last_device: bool,
     ) -> Result<(), ApiError> {
-        let mut path = format!("v1/devices/{}", auth.credentials().device_id);
+        let mut url = self.url(&["v1", "devices", &auth.credentials().device_id])?;
         if confirm_last_device {
-            path.push_str("?confirm=last-device");
+            url.query_pairs_mut().append_pair("confirm", "last-device");
         }
-        self.authed(auth, Method::DELETE, &path, None, "empty reply", MAX_ANSWER)
+        self.authed(auth, Method::DELETE, url, None, "empty reply", MAX_ANSWER)
             .await
     }
 
-    fn post(&self, path: &str, body: &impl Message) -> RequestBuilder {
+    fn post(&self, url: Url, body: &impl Message) -> RequestBuilder {
         self.http
-            .post(self.url(path))
+            .post(url)
             .header(CONTENT_TYPE, PROTOBUF)
             .body(body.encode_to_vec())
     }
@@ -315,7 +313,7 @@ impl Api {
         &self,
         auth: &Auth,
         method: Method,
-        path: &str,
+        url: Url,
         body: Option<Vec<u8>>,
         what: &'static str,
         limit: usize,
@@ -325,7 +323,7 @@ impl Api {
         loop {
             let mut request = self
                 .http
-                .request(method.clone(), self.url(path))
+                .request(method.clone(), url.clone())
                 .bearer_auth(&token.token);
             if let Some(body) = &body {
                 request = request.header(CONTENT_TYPE, PROTOBUF).body(body.clone());
@@ -843,6 +841,55 @@ mod tests {
                 .contains("authorization: bearer token"),
             "{request}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_id_is_sent_as_one_path_segment() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let read = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 404 X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let head = String::from_utf8_lossy(&request[..read]);
+            head.lines().next().unwrap().to_owned()
+        });
+        let auth = signed_in(base);
+        let outcome = (auth.api())
+            .space_usage(&auth, "../devices/d?confirm=last-device#")
+            .await;
+        assert!(
+            matches!(outcome, Err(ApiError::Status { status: 404 })),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            server.await.unwrap(),
+            "GET /v1/spaces/..%2Fdevices%2Fd%3Fconfirm=last-device%23/usage HTTP/1.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_id_that_would_name_another_path_is_refused_before_anything_is_sent() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let auth = signed_in(base);
+        for id in ["", ".", ".."] {
+            let outcome = auth.api().revoke_device(&auth, id).await;
+            assert!(
+                matches!(&outcome, Err(ApiError::PathSegment(segment)) if segment == id),
+                "{id:?}: {outcome:?}"
+            );
+        }
+        let sent = tokio::time::timeout(Duration::from_millis(100), listener.accept()).await;
+        assert!(sent.is_err(), "nothing was sent");
     }
 
     #[tokio::test]

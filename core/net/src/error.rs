@@ -92,6 +92,9 @@ pub enum ApiError {
     Decode(&'static str),
     #[error("the server URL cannot be used: {0}")]
     Url(String),
+    /// An ID that cannot be one segment of a request path: empty, `.` or `..`. Nothing was sent.
+    #[error("{0:?} cannot be one segment of a request path")]
+    PathSegment(String),
     /// The stored credential could not be read again after the server refused the one this process held.
     #[error("could not read the stored credential")]
     Credential(#[source] std::io::Error),
