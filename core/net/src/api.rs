@@ -95,9 +95,13 @@ impl Api {
     }
 
     /// The URL of the path `segments` below the base. Each segment is percent-encoded, so an ID holding `/`, `?` or `#`
-    /// stays one segment of the path. An empty segment, `.` or `..` would name another path, so it is refused.
+    /// stays one segment of the path. An empty segment, `.`, `..`, or one that holds an ASCII control character would name
+    /// another path, so it is refused: the `url` crate drops tabs and line breaks, so `.\t.` would be read as `..`.
     pub(crate) fn url(&self, segments: &[&str]) -> Result<Url, ApiError> {
-        if let Some(segment) = segments.iter().find(|s| matches!(**s, "" | "." | "..")) {
+        let another_path = segments.iter().find(|segment| {
+            matches!(**segment, "" | "." | "..") || segment.contains(|c: char| c.is_ascii_control())
+        });
+        if let Some(segment) = another_path {
             return Err(ApiError::PathSegment((*segment).to_owned()));
         }
         let mut url = self.base.clone();
@@ -881,7 +885,7 @@ mod tests {
             .parse()
             .unwrap();
         let auth = signed_in(base);
-        for id in ["", ".", ".."] {
+        for id in ["", ".", "..", ".\t.", "..\n", "\r.."] {
             let outcome = auth.api().revoke_device(&auth, id).await;
             assert!(
                 matches!(&outcome, Err(ApiError::PathSegment(segment)) if segment == id),
