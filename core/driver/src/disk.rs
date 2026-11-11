@@ -896,7 +896,16 @@ fn acknowledge(
                 if retry && *reason == Reason::Interrupted {
                     engine.effects.unblock(&record.node);
                 }
-                Settled::Failed(format!("{reason:?}"))
+                Settled::Failed(
+                    match reason {
+                        Reason::Moved => "a folder on its path is missing or was replaced",
+                        Reason::Missing => "the entry is not there",
+                        Reason::Changed => "the entry changed on this device",
+                        Reason::Taken => "another entry holds its name",
+                        Reason::Interrupted => "it was interrupted",
+                    }
+                    .into(),
+                )
             }
         };
         engine.checkpoint(tx)?;

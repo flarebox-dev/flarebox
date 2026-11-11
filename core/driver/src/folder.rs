@@ -26,6 +26,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use flarebox_engine::commit::{Commits, Failure, Halt as CommitHalt, Reconnect};
 use flarebox_engine::ignore::LocalRules;
 use flarebox_engine::state::CommitsState;
+use flarebox_engine::tree::{RemoteNode, Tree};
 use flarebox_fs::{Snapshot, check_root};
 use flarebox_net::{
     Auth, Backoff, CallError, ChunkError, Event, NotResent, ServerError, Session, SessionConfig,
@@ -35,7 +36,7 @@ use flarebox_proto::v1::error::Code;
 use flarebox_proto::v1::resync_required::Reason;
 use flarebox_proto::v1::{
     ChunkRef, Commit, CommitRecord, CommitResult, Error as ProtoError, TrashPage, TreePage,
-    UploadReceipt, Welcome,
+    UploadReceipt, Welcome, op, op_result,
 };
 use flarebox_store::{Cursor, Link, Store, Tx};
 use tokio::sync::{Notify, mpsc, watch};
@@ -76,6 +77,9 @@ const EFFECT_RETRY: Backoff = Backoff {
 /// least this long.
 const RETRY_SHOWN: Duration = Duration::from_secs(60);
 
+/// How many of the items that could not be synced the status names.
+const STUCK_SHOWN: usize = 5;
+
 /// Why a folder halts once its path no longer leads to the folder its task locked.
 const REPLACED: &str = "the folder at this path is no longer the folder this task locked (it was moved, replaced or \
                         removed)";
@@ -109,8 +113,11 @@ pub(crate) struct Folder {
     /// The calls that failed and are sent again, by kind, until one of the kind goes through. The status shows
     /// them once they have failed for [`RETRY_SHOWN`], or at once when the wait is that long.
     retrying: BTreeMap<Call, Retrying>,
-    /// The disk effects of each node that failed in a row in this task, for [`EFFECT_RETRY`].
-    effect_failures: BTreeMap<String, u32>,
+    /// The disk effects of each node that failed in a row in this task, for [`EFFECT_RETRY`], and why the last one
+    /// failed.
+    effect_failures: BTreeMap<String, (u32, String)>,
+    /// Why the server did not take a change of each node, for the nodes it may have left out of commits.
+    refused_nodes: BTreeMap<String, String>,
     /// When the [`Work::RetryAfter`] that is out ends.
     retry_at: Option<Instant>,
     /// Tests stop the task after this many more store transactions, as a crash right after one would.
@@ -281,6 +288,7 @@ impl Folder {
             note: None,
             retrying: BTreeMap::new(),
             effect_failures: BTreeMap::new(),
+            refused_nodes: BTreeMap::new(),
             retry_at: None,
             #[cfg(test)]
             crash_after: None,
@@ -436,14 +444,16 @@ impl Folder {
     /// here on. Nothing else clears them.
     pub fn scanned(&mut self) -> Result<Vec<Work>, Stop> {
         self.scanned = true;
-        if !self.engine.commits.problems().is_empty() {
+        let cleared = self.engine.commits.problems().clone();
+        if !cleared.is_empty() {
             self.step(|engine, _| {
-                for node in engine.commits.problems().clone() {
-                    engine.commits.clear_problem(&node);
+                for node in &cleared {
+                    engine.commits.clear_problem(node);
                 }
                 Ok(())
             })?;
         }
+        self.refused_nodes.retain(|id, _| !cleared.contains(id));
         self.publish_remote()?;
         let mut work = Vec::new();
         self.drive(&mut work)?;
@@ -487,9 +497,10 @@ impl Folder {
                     self.effect_failures.remove(&node);
                 }
                 Settled::Failed(why) if self.engine.effects.blocked().contains_key(&node) => {
-                    let failures = self.effect_failures.entry(node).or_default();
+                    let (failures, last) = self.effect_failures.entry(node).or_default();
                     let wait = EFFECT_RETRY.delay(*failures);
                     *failures += 1;
+                    last.clone_from(&why);
                     tracing::warn!(
                         space_id = self.link.space_id,
                         why,
@@ -704,7 +715,25 @@ impl Folder {
             Stream::Following { .. } if self.settled() => FolderState::UpToDate,
             Stream::Following { .. } => FolderState::CatchingUp,
         };
-        let stuck = self.engine.effects.blocked().len() + self.engine.commits.problems().len();
+        let named = |id: &String| {
+            (self.item_path(id))
+                .map_or_else(|| format!("node {id}"), |path| path.display().to_string())
+        };
+        let mut reasons: BTreeMap<&String, Vec<String>> = BTreeMap::new();
+        for id in self.engine.effects.blocked().keys() {
+            let why = (self.effect_failures.get(id)).map_or("it failed earlier", |(_, why)| why);
+            let why = format!("the server's change could not be made here: {why}");
+            reasons.entry(id).or_default().push(why);
+        }
+        for id in self.engine.commits.problems() {
+            let why =
+                (self.refused_nodes.get(id)).map_or("the server did not take it", String::as_str);
+            reasons.entry(id).or_default().push(why.to_owned());
+        }
+        let mut stuck: Vec<String> = (reasons.into_iter())
+            .map(|(id, whys)| format!("{} ({})", named(id), whys.join("; ")))
+            .collect();
+        stuck.sort();
         let retrying = (self.retrying.values())
             .find(|retrying| {
                 retrying.wait >= RETRY_SHOWN || retrying.since.elapsed() >= RETRY_SHOWN
@@ -723,9 +752,22 @@ impl Folder {
             Some(CommitHalt::Recovery) => {
                 Some("the folder's sync state does not match the server".into())
             }
-            None if stuck > 0 => Some(format!(
-                "{stuck} items could not be synced; run flarebox restart once they are fixed"
-            )),
+            None if !stuck.is_empty() => {
+                let (count, fixed) = match stuck.len() {
+                    1 => ("1 item".to_owned(), "it is"),
+                    n => (format!("{n} items"), "they are"),
+                };
+                let more = stuck.len().saturating_sub(STUCK_SHOWN);
+                stuck.truncate(STUCK_SHOWN);
+                let more = match more {
+                    0 => String::new(),
+                    more => format!(", and {more} more"),
+                };
+                Some(format!(
+                    "{count} could not be synced: {}{more}; run flarebox restart once {fixed} fixed",
+                    stuck.join(", ")
+                ))
+            }
             None => None,
         };
         let last_seq = self.engine.cursor.as_ref().map(|c| c.last_seq);
@@ -739,6 +781,12 @@ impl Folder {
             local_entries: self.local_entries,
             problem,
         }
+    }
+
+    /// The path of a node relative to the root: where L holds it, or else where R does, as for a file whose download
+    /// failed or that this device deleted.
+    fn item_path(&self, id: &str) -> Option<PathBuf> {
+        (self.engine.path_of(id)).or_else(|| remote_path(self.engine.trees.remote(), id))
     }
 
     /// True when nothing is left to move: R holds the server's head, the folder was scanned, no effect and no
@@ -946,6 +994,21 @@ impl Folder {
     fn result(&mut self, commit_id: &str, result: CommitResult) -> Result<(), Stop> {
         let ours = (self.engine.commits.in_flight())
             .is_some_and(|flight| flight.commit.commit_id == commit_id && flight.result.is_none());
+        let flight = self.engine.commits.in_flight().filter(|_| ours);
+        if let Some(refused) = flight.map(|flight| not_applied(&flight.commit, &result)) {
+            let problems = self.engine.commits.problems();
+            self.refused_nodes.retain(|id, _| problems.contains(id));
+            for (node, why) in refused {
+                tracing::info!(
+                    space_id = self.link.space_id,
+                    node,
+                    path = ?self.item_path(&node),
+                    why,
+                    "the server did not apply a change"
+                );
+                self.refused_nodes.insert(node, why);
+            }
+        }
         let receive = |engine: &mut Engine, result: CommitResult| {
             (engine.commits.received(result)).map_err(|error| {
                 Stop::Protocol(format!("the result of commit {commit_id}: {error:?}"))
@@ -1024,6 +1087,7 @@ impl Folder {
         refusal: &ServerError,
         work: &mut Vec<Work>,
     ) -> Result<(), Stop> {
+        let before = self.engine.commits.problems().clone();
         let failure = self.step(|engine, tx| {
             let failure = (engine.commits.failed(&refusal.0))
                 .map_err(|error| Stop::Protocol(format!("a refused commit: {error:?}")))?;
@@ -1039,6 +1103,10 @@ impl Folder {
             ?failure,
             "a commit was refused"
         );
+        for id in self.engine.commits.problems().difference(&before) {
+            let why = format!("the server refused it: {described}");
+            self.refused_nodes.insert(id.clone(), why);
+        }
         match failure {
             Failure::Resend if refusal.code() == Code::MissingChunks => {
                 if let Some(commit) = self.in_flight() {
@@ -1239,6 +1307,54 @@ fn lift_hint(code: i32) -> &'static str {
         "; once the cause is fixed, run flarebox lift <folder> --resend to send them again, or --replan to plan them \
          again"
     }
+}
+
+/// The path of a node R holds, relative to the root, for a node L does not hold, such as one whose download failed.
+fn remote_path(remote: &Tree<RemoteNode>, id: &str) -> Option<PathBuf> {
+    let mut names = Vec::new();
+    let mut current = id;
+    while current != remote.root {
+        let node = remote.get(current)?;
+        names.push(node.shape.name.as_str());
+        current = &node.shape.parent;
+        if names.len() > remote.len() {
+            return None;
+        }
+    }
+    Some(names.into_iter().rev().collect())
+}
+
+/// The node of each op of `commit` that `result` says the server did not apply, with why. A `Restore` op is left out:
+/// its node never stays out of commits.
+fn not_applied(commit: &Commit, result: &CommitResult) -> Vec<(String, String)> {
+    use op_result::Code as Outcome;
+    (commit.ops.iter().zip(&result.results))
+        .filter_map(|(sent, outcome)| {
+            let code = Outcome::try_from(outcome.code).unwrap_or(Outcome::Unspecified);
+            if matches!(
+                code,
+                Outcome::Applied
+                    | Outcome::AppliedRenamed
+                    | Outcome::ConflictCopy
+                    | Outcome::MergedInto
+            ) {
+                return None;
+            }
+            let node = match sent.op.as_ref()? {
+                op::Op::CreateDir(op) => &op.node_id,
+                op::Op::CreateFile(op) => &op.node_id,
+                op::Op::UpdateContent(op) => &op.node_id,
+                op::Op::Move(op) => &op.node_id,
+                op::Op::Delete(op) => &op.node_id,
+                op::Op::Restore(_) => return None,
+            };
+            let why = match outcome.reject_reason.as_str() {
+                "" => format!("the server did not apply it: {}", code.as_str_name()),
+                reason => format!("the server rejected it: {reason}"),
+            };
+            Some((node.clone(), why))
+        })
+        .collect()
 }
 
 /// A finished `Session::commit`, after the session events `queued` before it. The session emits a connection's
