@@ -900,16 +900,18 @@ impl Trees {
     /// commit sent.
     ///
     /// A position L and R agreed on while the commit in flight was watched
-    /// ([`Trees::position_after`]), at a revision above `held_through`, is recorded again from the
-    /// new R, since the server may have lost the record that held it. The nodes stay watched.
+    /// ([`Trees::position_after`]) is recorded again from the new R when R no longer reaches the
+    /// record that held it: R holds the node at an older revision or not at all, so the server lost
+    /// that record. An agreement R still reaches stays, also when L has left it since. The nodes
+    /// stay watched.
     ///
     /// [`Commits::held_through`]: crate::commit::Commits::held_through
     pub fn forget_lost(&mut self, trashed: Vec<Trashed>, edited: Vec<NodeId>, held_through: u64) {
         let lost: Vec<NodeId> = (self.watched_positions.iter())
-            .filter(|(_, agreed)| {
-                agreed
-                    .as_ref()
-                    .is_some_and(|agreed| agreed.rev > held_through)
+            .filter(|(id, agreed)| {
+                agreed.as_ref().is_some_and(|agreed| {
+                    (self.r.get(id)).is_none_or(|remote| remote.meta_rev < agreed.rev)
+                })
             })
             .map(|(id, _)| id.clone())
             .collect();
