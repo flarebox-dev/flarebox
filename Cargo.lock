@@ -1124,6 +1124,7 @@ dependencies = [
  "koidrive-net",
  "koidrive-proto",
  "koidrive-store",
+ "koidrive-telemetry",
  "prost",
  "reqwest",
  "serde_json",

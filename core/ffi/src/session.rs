@@ -9,7 +9,7 @@ use crate::driver::DriverCore;
 use crate::fake::FakeCore;
 use crate::types::{
     Account, Answer, Device, LinkedFolder, PairingCode, ServerInfo, SessionError, SessionState,
-    Space, SpaceUsage,
+    Space, SpaceUsage, TelemetrySetting,
 };
 
 /// A sync session: the one object the app talks to. Each method forwards to the session's
@@ -148,5 +148,13 @@ impl SyncSession {
 
     pub fn dismiss_notice(&self, notice_id: String) -> Result<(), SessionError> {
         self.core.dismiss_notice(&notice_id)
+    }
+
+    pub fn telemetry(&self) -> TelemetrySetting {
+        self.core.telemetry()
+    }
+
+    pub fn set_telemetry(&self, enabled: bool) -> Result<(), SessionError> {
+        self.core.set_telemetry(enabled)
     }
 }

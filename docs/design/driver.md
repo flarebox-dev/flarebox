@@ -91,6 +91,7 @@ How `core/ffi`'s `Core` trait maps onto it in step D:
 | `connect`, `start_pairing`, `spaces`, `create_space` | not in the driver yet; each is one `core/net` `Api` call |
 | `dismiss_notice` | `answer(id, Dismiss)`; `state` lists the questions of kind `RemoteMassDelete` as notices |
 | `pause`, `resume`, `devices` | not in the driver yet; the pause needs state the engine produces, and no server lists devices |
+| `telemetry`, `set_telemetry` | not the driver: `koidrive-telemetry`'s `Store` on the profile's state directory, the same file `koi telemetry` uses (docs/guide/telemetry.md) |
 
 ## A folder's task
 
