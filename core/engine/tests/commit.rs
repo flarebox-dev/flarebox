@@ -3263,8 +3263,9 @@ fn a_create_refused_because_another_device_created_the_node_again_is_no_problem(
 /// server took after the commit. When the other device then moves n to d, the user's move back to b
 /// is a local move of its own: the disk keeps n at b and the move is sent, instead of n being moved
 /// to d. With `restart`, the commit side and the trees are restored from their stored state before
-/// the acknowledgement.
-fn a_late_acknowledgement_keeps_the_position_s_took_after_the_commit(restart: bool) {
+/// the acknowledgement. With `renamed`, the server gave the move another name: n is not reverted
+/// to it, since S keeps the newer position.
+fn a_late_acknowledgement_keeps_the_position_s_took_after_the_commit(restart: bool, renamed: bool) {
     let mut trees = trees(&[(
         "n",
         Some(file(ROOT, "b", 1)),
@@ -3284,12 +3285,18 @@ fn a_late_acknowledgement_keeps_the_position_s_took_after_the_commit(restart: bo
         trees.restore(trees.state()).unwrap();
         trees.rules_scanned();
     }
-    commits
-        .received(result(2, vec![outcome(op_result::Code::Applied)]))
-        .unwrap();
+    let applied = match renamed {
+        true => OpResult {
+            name: "b 2".into(),
+            ..outcome(op_result::Code::AppliedRenamed)
+        },
+        false => outcome(op_result::Code::Applied),
+    };
+    commits.received(result(2, vec![applied])).unwrap();
     assert!(commits.acknowledge(&mut trees, 3));
     trees.settle();
     assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "c", 1)));
+    assert!(!trees.reverted().contains("n"));
     trees.set_remote("n".into(), remote_at(file(ROOT, "d", 1), 4));
     trees.settle();
     assert_eq!(effects_for(&mut trees, &mut ids, "n"), []);
@@ -3300,12 +3307,57 @@ fn a_late_acknowledgement_keeps_the_position_s_took_after_the_commit(restart: bo
 
 #[test]
 fn a_late_acknowledgement_keeps_the_position_s_took_after_the_commit_was_built() {
-    a_late_acknowledgement_keeps_the_position_s_took_after_the_commit(false);
+    a_late_acknowledgement_keeps_the_position_s_took_after_the_commit(false, false);
 }
 
 #[test]
 fn a_late_acknowledgement_after_a_restart_keeps_the_position_s_took_after_the_commit_was_built() {
-    a_late_acknowledgement_keeps_the_position_s_took_after_the_commit(true);
+    a_late_acknowledgement_keeps_the_position_s_took_after_the_commit(true, false);
+}
+
+#[test]
+fn a_late_acknowledgement_renamed_by_the_server_keeps_the_position_s_took_after_the_commit_was_built()
+ {
+    a_late_acknowledgement_keeps_the_position_s_took_after_the_commit(false, true);
+}
+
+/// n's move to b is in flight when the user and the other device both move it to c, in a commit
+/// the server applied before this one, so S takes c. A log replay then brings the commit at seq 3
+/// and the other device's move back to c at seq 4, which L and S already hold. The user moves n
+/// back to b, and the commit is acknowledged. S keeps c, which the server holds after the commit,
+/// so the user's move back to b is sent when the other device then moves n to d.
+#[test]
+fn a_late_acknowledgement_keeps_a_position_r_took_again_after_the_commit() {
+    let mut trees = trees(&[(
+        "n",
+        Some(file(ROOT, "b", 1)),
+        Some(file(ROOT, "a", 1)),
+        Some(remote(file(ROOT, "a", 1))),
+    )]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", ROOT, "b")]);
+    trees.set_local("n".into(), local(file(ROOT, "c", 1), 1));
+    trees.set_remote("n".into(), remote_at(file(ROOT, "c", 1), 2));
+    trees.settle();
+    trees.set_remote("n".into(), remote_at(file(ROOT, "b", 1), 3));
+    trees.settle();
+    trees.set_remote("n".into(), remote_at(file(ROOT, "c", 1), 4));
+    trees.settle();
+    assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "c", 1)));
+    trees.set_local("n".into(), local(file(ROOT, "b", 1), 1));
+    commits
+        .received(result(3, vec![outcome(op_result::Code::Applied)]))
+        .unwrap();
+    assert!(commits.acknowledge(&mut trees, 4));
+    trees.settle();
+    assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "c", 1)));
+    trees.set_remote("n".into(), remote_at(file(ROOT, "d", 1), 5));
+    trees.settle();
+    assert_eq!(effects_for(&mut trees, &mut ids, "n"), []);
+    assert_eq!(trees.local().live("n"), Some(&file(ROOT, "b", 1)));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", ROOT, "b")]);
 }
 
 /// n's move to b is in flight when the user and the other device both move it to c, in a commit
