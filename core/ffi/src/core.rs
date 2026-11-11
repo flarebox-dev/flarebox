@@ -12,23 +12,29 @@ use crate::types::{
 };
 
 /// The code part of a pairing code as typed or pasted. `koi device add` prints the code as
-/// `<code>@<host>`, so the text is split on its last `@` as `koi join` does. A host other than that of
-/// `server_url`, the server this device connected to, is refused, comparing host and port without case.
+/// `<code>@<host>`, with `:<port>` after the host when the server's port isn't the default, so the
+/// text is split on its last `@` as `koi join` does. A host and port other than those of `server_url`,
+/// the server this device connected to, are refused; host names compare without case.
 pub(crate) fn pairing_code<'a>(text: &'a str, server_url: &str) -> Result<&'a str, SessionError> {
     let text = text.trim();
     let Some((code, host)) = text.rsplit_once('@') else {
         return Ok(text);
     };
-    let server = server_url
-        .split_once("://")
-        .map_or(server_url, |(_, rest)| rest)
-        .split('/')
-        .next()
-        .unwrap_or_default();
-    if !host.trim().eq_ignore_ascii_case(server) {
+    let server = url::Url::parse(server_url)
+        .ok()
+        .and_then(|url| {
+            let host = url.host_str()?.to_owned();
+            Some(match url.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host,
+            })
+        })
+        .unwrap_or_else(|| server_url.to_owned());
+    let host = host.trim();
+    if !host.eq_ignore_ascii_case(&server) {
         return Err(SessionError::CodeForOtherServer {
-            host: host.trim().to_owned(),
-            server: server.to_owned(),
+            host: host.to_owned(),
+            server,
         });
     }
     Ok(code.trim())
