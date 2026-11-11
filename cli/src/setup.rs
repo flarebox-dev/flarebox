@@ -84,8 +84,8 @@ pub enum ServerAction {
         server: String,
         /// The claim code from the Worker's log.
         code: String,
-        /// Your name, which the server keeps for its owner.
-        #[arg(long)]
+        /// Your name, which the server keeps for its owner, at most 255 bytes.
+        #[arg(long, value_parser = crate::short_name)]
         user: String,
         #[command(flatten)]
         device: DeviceArgs,

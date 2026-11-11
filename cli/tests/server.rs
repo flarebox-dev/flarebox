@@ -1223,3 +1223,48 @@ async fn a_claim_of_a_claimed_server_is_refused_and_sets_nothing_up() {
     let status = machine.run(&["status"]);
     assert!(status.starts_with("Device: not set up"), "{status}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Worker; run cli/scripts/integration-test.sh"]
+async fn a_name_longer_than_255_bytes_is_refused_before_it_reaches_the_server() {
+    let owner = Arc::new(Auth::new(api(), owner().await));
+    let pairing = owner.api().pair_start(&owner).await.unwrap();
+    let server = server_url().to_string();
+    let machine = Machine::new();
+    let longest = "가".repeat(85);
+    let too_long = format!("{longest}a");
+
+    let refused = machine.fails(&[
+        "join",
+        &pairing.code,
+        "--server",
+        &server,
+        "--name",
+        &too_long,
+    ]);
+    assert!(refused.contains("at most 255 bytes"), "{refused}");
+    machine.run(&[
+        "join",
+        &pairing.code,
+        "--server",
+        &server,
+        "--name",
+        &longest,
+    ]);
+    let devices: Value = serde_json::from_str(&machine.run(&["device", "list", "--json"])).unwrap();
+    assert!(
+        devices
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|device| device["name"] == longest.as_str()),
+        "{devices:#}"
+    );
+
+    let refused = machine.fails(&["space", "create", &too_long]);
+    assert!(refused.contains("at most 255 bytes"), "{refused}");
+    let name = format!("{}{}", uuidv7(), "가".repeat(73));
+    assert_eq!(name.len(), 255);
+    let created = machine.run(&["space", "create", &name]);
+    assert!(created.contains(&name), "{created}");
+}
