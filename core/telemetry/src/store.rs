@@ -182,23 +182,21 @@ impl Store {
 
     /// Stores the person's choice. Turning it on keeps the install id or draws one. Turning it off deletes the id and
     /// everything waiting to be sent. A `settings.json` that cannot be parsed is replaced, so a broken file never
-    /// stops someone from choosing, least of all from turning reports off. Its install id is lost with it, so the queue
-    /// goes too: nothing recorded under the old id is ever sent under a new one.
+    /// stops someone from choosing, least of all from turning reports off. Whenever no id is kept, the queue goes too,
+    /// so nothing recorded under a lost id, with a broken or a deleted file, is ever sent under a new one.
     pub fn set(&self, on: bool) -> io::Result<Settings> {
         let _lock = self.lock(true)?;
         let mut settings = match self.settings() {
-            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                remove(&self.dir.join("queue.json"))?;
-                Settings::default()
-            }
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => Settings::default(),
             settings => settings?,
         };
         settings.enabled = Some(on);
+        settings.install_id = settings.install_id.filter(|_| on);
+        if settings.install_id.is_none() {
+            remove(&self.dir.join("queue.json"))?;
+        }
         if on {
             settings.install_id.get_or_insert_with(InstallId::generate);
-        } else {
-            settings.install_id = None;
-            remove(&self.dir.join("queue.json"))?;
         }
         write(&self.dir.join("settings.json"), &settings)?;
         Ok(settings)
@@ -226,6 +224,7 @@ impl Store {
         if let Some(id) = &settings.install_id {
             return Ok(id.clone());
         }
+        remove(&self.dir.join("queue.json"))?;
         let id = InstallId::generate();
         settings.install_id = Some(id.clone());
         write(&self.dir.join("settings.json"), &settings)?;
@@ -505,6 +504,23 @@ mod tests {
         assert!(store.set(true).unwrap().install_id.is_some());
         assert!(store.peek().unwrap().is_empty());
         assert!(store.take(101).unwrap().unwrap().batch.is_empty());
+    }
+
+    #[test]
+    fn a_new_id_over_a_deleted_settings_file_drops_the_old_queue() {
+        for draw in [
+            |store: &Store| drop(store.set(true).unwrap()),
+            |store: &Store| drop(store.install_id().unwrap()),
+        ] {
+            let (_dir, store) = store();
+            store.set(true).unwrap();
+            store.absorb_at(pending(99, 1), 100, true).unwrap();
+            drop(store.take(100).unwrap());
+            store.absorb_at(pending(100, 1), 100, true).unwrap();
+            fs::remove_file(store.dir.join("settings.json")).unwrap();
+            draw(&store);
+            assert!(store.peek().unwrap().is_empty());
+        }
     }
 
     #[test]
