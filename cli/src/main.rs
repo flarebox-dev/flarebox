@@ -111,7 +111,7 @@ enum Command {
     },
     /// List the questions sync is waiting on, or answer one.
     Questions {
-        /// Print JSON instead of text.
+        /// Print the list of questions as JSON instead of text. Answering a question always prints text.
         #[arg(long)]
         json: bool,
         #[command(subcommand)]
