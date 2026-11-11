@@ -13,7 +13,7 @@
 //! A future owns what it needs and borrows only the session and the transfer client, so none holds the store or
 //! the engine across an await.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::future::Future;
 use std::io;
@@ -118,6 +118,8 @@ pub(crate) struct Folder {
     /// The disk effects of each node that failed in a row in this task, for [`EFFECT_RETRY`], and why the last one
     /// failed.
     effect_failures: BTreeMap<String, (u32, String)>,
+    /// The nodes whose last effect ended [`Settled::Stuck`]. A [`Work::RetryAfter`] leaves them blocked.
+    stuck_effects: BTreeSet<String>,
     /// Why the server did not take a change of each node, for the nodes it may have left out of commits.
     refused_nodes: BTreeMap<String, String>,
     /// When the [`Work::RetryAfter`] that is out ends.
@@ -293,6 +295,7 @@ impl Folder {
             note: None,
             retrying: BTreeMap::new(),
             effect_failures: BTreeMap::new(),
+            stuck_effects: BTreeSet::new(),
             refused_nodes: BTreeMap::new(),
             retry_at: None,
             #[cfg(test)]
@@ -503,8 +506,10 @@ impl Folder {
             match settled {
                 Settled::Done => {
                     self.effect_failures.remove(&node);
+                    self.stuck_effects.remove(&node);
                 }
                 Settled::Failed(why) if self.engine.effects.blocked().contains_key(&node) => {
+                    self.stuck_effects.remove(&node);
                     let (failures, last) = self.effect_failures.entry(node).or_default();
                     let wait = EFFECT_RETRY.delay(*failures);
                     *failures += 1;
@@ -523,6 +528,7 @@ impl Folder {
                     }
                 }
                 Settled::Failed(why) => {
+                    self.stuck_effects.remove(&node);
                     tracing::info!(
                         space_id = self.link.space_id,
                         why,
@@ -536,7 +542,8 @@ impl Folder {
                         "an effect failed; its node is planned again once what is planned for it changes or the folder \
                          restarts"
                     );
-                    self.effect_failures.entry(node).or_default().1 = why;
+                    self.effect_failures.entry(node.clone()).or_default().1 = why;
+                    self.stuck_effects.insert(node);
                 }
             }
         }
@@ -546,13 +553,18 @@ impl Folder {
 
     /// A [`Work::RetryAfter`] ended. Every node whose effect failed is unblocked, so the engine plans its effect again
     /// even when it is the one that failed: the disk may have changed in a way the observer does not report, such as
-    /// a name that was taken for a moment. A node that fails again waits longer the next time.
+    /// a name that was taken for a moment. A node that fails again waits longer the next time. A node whose last
+    /// effect was stuck stays blocked, since no wait changes what keeps it.
     pub fn retry(&mut self) -> Result<Vec<Work>, Stop> {
         self.retry_at = None;
-        if !self.engine.effects.blocked().is_empty() {
+        let timed: Vec<String> = (self.engine.effects.blocked().keys())
+            .filter(|node| !self.stuck_effects.contains(*node))
+            .cloned()
+            .collect();
+        if !timed.is_empty() {
             self.step(|engine, _| {
-                for node in engine.effects.blocked().clone().into_keys() {
-                    engine.effects.unblock(&node);
+                for node in &timed {
+                    engine.effects.unblock(node);
                 }
                 Ok(())
             })?;
@@ -809,14 +821,30 @@ impl Folder {
 
     /// True when nothing is left to move: R holds the server's head, the folder was scanned, no effect and no
     /// commit is in flight, no rules are awaited, every node the trees still differ on is one that cannot be synced
-    /// as it is, that this device leaves out, or a folder the user deleted that stays on the server for what this
-    /// device leaves out, and so is the node of every restore that waits.
+    /// as it is, that this device leaves out, a folder the user deleted that stays on the server for what this
+    /// device leaves out, or a folder to remove that L holds above a node that cannot be synced, and so is the node of
+    /// every restore that waits.
     fn settled(&self) -> bool {
+        let trees = &self.engine.trees;
+        let mut above_blocked = BTreeSet::new();
+        for node in self.engine.effects.blocked().keys() {
+            let mut current = node.as_str();
+            for _ in 0..trees.local().len() {
+                match trees.local().get(current) {
+                    Some(local) if local.shape.parent != trees.local().root => {
+                        current = &local.shape.parent;
+                        above_blocked.insert(current);
+                    }
+                    _ => break,
+                }
+            }
+        }
         let stuck = |id: &String| {
             self.engine.effects.blocked().contains_key(id)
                 || self.engine.commits.problems().contains(id)
-                || self.engine.trees.excluded(id)
-                || self.engine.trees.kept_for_excluded(id)
+                || trees.excluded(id)
+                || trees.kept_for_excluded(id)
+                || (above_blocked.contains(id.as_str()) && trees.remote().live(id).is_none())
         };
         let commits = &self.engine.commits;
         self.caught_up()

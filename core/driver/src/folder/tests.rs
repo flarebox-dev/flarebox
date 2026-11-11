@@ -2528,6 +2528,116 @@ fn a_remote_delete_of_a_folder_holding_an_entry_l_does_not_know_names_the_entry_
     }
 }
 
+/// As above, with the excluded file one folder deeper. `held/sub` is the folder that cannot go, and `held` waits behind
+/// it, so the folder is still up to date. Once the person removes the file, a restart removes both folders.
+#[test]
+fn a_remote_delete_of_a_folder_whose_subfolder_holds_an_entry_l_does_not_know_leaves_the_folder_up_to_date()
+ {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    fs::create_dir_all(site_a.root.join("held/sub")).unwrap();
+    a.create(&mut remote, &site_a.root.join("held/a.txt"), b"synced");
+    a.create(&mut remote, &site_a.root.join("held/sub/b.txt"), b"in sub");
+    let sync = SyncRules {
+        include: Vec::new(),
+        exclude: vec!["*.log".into()],
+    };
+    let site = Site::new(&remote, "b");
+    let mut b = site.start_with(&sync);
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    b.run(&mut remote);
+    b.settle();
+    assert!(site.root.join("held/sub/b.txt").exists());
+    let entry = site.root.join("held/sub/build.log");
+    fs::write(&entry, b"left out").unwrap();
+    b.settle();
+
+    fs::remove_dir_all(site_a.root.join("held")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(&mut remote);
+    b.pull(&remote);
+    let mut steps = 0;
+    while let Some(work) = b.work.pop_front() {
+        steps += 1;
+        assert!(steps < 20, "the removal is planned again and again");
+        b.perform(work, &mut remote).unwrap();
+    }
+    b.settle();
+    assert!(fs::read(&entry).is_ok());
+    assert!(!site.root.join("held/sub/b.txt").exists());
+    let view = b.folder.view();
+    assert_eq!(view.state, FolderState::UpToDate);
+    let problem = view.problem.unwrap_or_default();
+    assert!(
+        problem.contains(&format!(
+            "{} (the server's change could not be made here: the folder holds entries this device does not sync: \
+             build.log)",
+            Path::new("held").join("sub").display()
+        )),
+        "{problem}"
+    );
+
+    drop(b);
+    fs::remove_file(&entry).unwrap();
+    let mut b = site.start_with(&sync);
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    assert!(!site.root.join("held").exists());
+    let view = b.folder.view();
+    assert_eq!((view.state, view.problem), (FolderState::UpToDate, None));
+}
+
+/// As above, with a second effect that fails for a moment: a download whose name an unobserved local file takes. Its
+/// wait ends and unblocks it, while the stuck folder removal stays blocked.
+#[test]
+fn a_wait_for_another_failed_effect_leaves_a_folder_removal_that_entries_l_does_not_know_block_blocked()
+ {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site_a.root.join("held")).unwrap();
+    a.create(&mut remote, &site_a.root.join("held/a.txt"), b"synced");
+    let sync = SyncRules {
+        include: Vec::new(),
+        exclude: vec!["*.log".into()],
+    };
+    let site = Site::new(&remote, "b");
+    let mut b = site.start_with(&sync);
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    b.run(&mut remote);
+    b.settle();
+    let held = node_named(&b, "held");
+    fs::write(site.root.join("held/build.log"), b"left out").unwrap();
+    b.settle();
+    fs::remove_dir_all(site_a.root.join("held")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(&mut remote);
+    b.pull(&remote);
+    b.run(&mut remote);
+    b.settle();
+    assert!(b.folder.engine.effects.blocked().contains_key(&held));
+    assert!(b.work.is_empty());
+
+    a.create(&mut remote, &site_a.root.join("later.txt"), b"written on a");
+    b.pull(&remote);
+    fs::write(site.root.join("later.txt"), b"not observed yet").unwrap();
+    let stage = b.work.pop_front().unwrap();
+    assert!(matches!(stage, Work::Stage(_)));
+    b.perform(stage, &mut remote).unwrap();
+    let wait = b.work.pop_front().unwrap();
+    assert!(matches!(wait, Work::RetryAfter(_)));
+    b.perform(wait, &mut remote).unwrap();
+    assert!(b.folder.engine.effects.blocked().contains_key(&held));
+    assert_eq!(
+        fs::read(site.root.join("held/build.log")).unwrap(),
+        b"left out"
+    );
+}
+
 /// Whether L, as the site's store holds it, has an entry named `name`.
 fn local_holds(site: &Site, name: &str) -> bool {
     (site.stored().trees.local().iter()).any(|(_, node)| node.shape.name == name)
