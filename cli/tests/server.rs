@@ -593,15 +593,26 @@ async fn a_device_revokes_a_lost_one_and_stops_syncing_when_another_revokes_it()
     machine.run(&join);
     assert_ne!(machine.status()["account"]["device_id"], device_id.as_str());
     machine.run(&["link", folder.to_str().unwrap(), "--space", &space_name]);
-    let daemon = machine
+    let socket = machine.path("run/koidrive/daemon.sock");
+    if socket.exists() {
+        fs::remove_file(&socket).unwrap();
+    }
+    let mut daemon = machine
         .command(&["daemon"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
     let started = Instant::now();
-    while !machine.output(&["status", "--json"]).status.success() {
-        assert!(started.elapsed() < WAIT, "the daemon did not answer");
+    while !socket.exists() {
+        assert!(
+            daemon.try_wait().unwrap().is_none(),
+            "the daemon exited before it opened its socket"
+        );
+        assert!(
+            started.elapsed() < WAIT,
+            "the daemon did not open its socket"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     machine

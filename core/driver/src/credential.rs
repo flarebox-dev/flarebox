@@ -15,7 +15,7 @@ use url::Url;
 use crate::status::Account;
 
 /// How to use a device again once the server refuses its credential: pairing refuses a profile that holds one.
-pub const SET_UP_AGAIN: &str = "delete this device's Koidrive state as docs/guide/uninstall.md describes, then set it up again";
+pub const SET_UP_AGAIN: &str = "delete this device's Koidrive state as https://github.com/koidrive/koidrive/blob/main/docs/guide/uninstall.md#remove-koidrive-from-one-device describes, then set it up again and link its folders again";
 
 /// A device's long-lived credential, as `POST /v1/claim` or `POST /v1/pair/complete` returned it, with the server it
 /// belongs to. It lives
