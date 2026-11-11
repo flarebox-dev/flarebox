@@ -148,6 +148,18 @@ private struct ServerStep: View {
             )
             Field(label: "Server address", text: $setup.serverURL, prompt: Text(verbatim: "https://"))
                 .onSubmit(connect)
+            if setup.asksForUsageReports {
+                Toggle(isOn: $setup.sendsUsageReports) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Send anonymous usage reports")
+                        Text("It never shares file names, paths or contents.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .toggleStyle(.checkbox)
+                .tint(.koi)
+            }
             if let error = setup.error {
                 ErrorBanner(message: error.message)
             }
@@ -367,6 +379,28 @@ private struct DoneStep: View {
 
 #Preview("Server") {
     SetupView().environment(AppModel.preview(.firstRun))
+}
+
+#Preview("Server: usage reports undecided") {
+    serverStep(TelemetrySetting(enabled: false, decided: false, locked: false))
+}
+
+#Preview("Server: usage reports on") {
+    serverStep(TelemetrySetting(enabled: true, decided: true, locked: false))
+}
+
+#Preview("Server: usage reports off") {
+    serverStep(TelemetrySetting(enabled: false, decided: true, locked: false))
+}
+
+#Preview("Server: usage reports locked") {
+    serverStep(TelemetrySetting(enabled: false, decided: false, locked: true))
+}
+
+@MainActor
+private func serverStep(_ telemetry: TelemetrySetting) -> some View {
+    let app = AppModel.preview(.firstRun, telemetry: telemetry)
+    return SetupSteps(setup: SetupModel(app: app, mode: .firstRun, deviceName: "Mac")).frame(width: 480).environment(app)
 }
 
 #Preview("Folder") {

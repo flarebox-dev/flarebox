@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 
-use koidrive_engine::classify::Trees;
+use koidrive_engine::classify::{Origin, Trees, Waiting};
 use koidrive_engine::commit::Commits;
 use koidrive_engine::effects::{Base, Effect, Effects, Location};
 use koidrive_engine::ids::IdGen;
@@ -743,7 +743,10 @@ fn an_excluded_node_whose_s_update_waits_is_not_parked_to_make_room() {
         ),
     ]);
     let mut state = trees.state();
-    let acknowledged = Some(file(ROOT, "notes.txt", 5));
+    let acknowledged = Waiting {
+        shape: Some(file(ROOT, "notes.txt", 5)),
+        origin: Origin::Other,
+    };
     state.waiting.insert("old".into(), acknowledged);
     assert_eq!(trees.restore(state), Ok(()));
     trees.set_rules(&AT_ROOT, rules("*.log\n"));

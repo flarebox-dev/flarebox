@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use koidrive_proto::v1::{self as proto, error, op, op_result};
 use prost::Message;
 
-use crate::classify::{Class, Trees, classify};
+use crate::classify::{Class, Origin, Trees, Waiting, classify};
 use crate::first_link;
 use crate::guard::{self, GuardState, RemoteRemoval};
 use crate::ids::IdGen;
@@ -464,7 +464,7 @@ impl Commits {
                         .map(|(id, shape)| (id, Some(shape)))
                         .collect();
                     for (id, shape) in update_synced(trees, updates) {
-                        trees.wait(id, shape);
+                        trees.wait(id, shape, Origin::Other);
                     }
                 }
             }
@@ -614,7 +614,7 @@ impl Commits {
         skip.extend(restored.iter().cloned());
         let updates = restored.into_iter().map(|id| (id, None)).collect();
         for (id, shape) in update_synced(trees, updates) {
-            trees.wait(id, shape);
+            trees.wait(id, shape, Origin::Other);
         }
         if let Some(question) = asked {
             let kept = index.filter(|_| open.as_ref() == Some(&question.id));
@@ -893,7 +893,7 @@ impl Commits {
             trees.revert(id.clone());
         }
         for (id, shape) in rest {
-            trees.wait(id, shape);
+            trees.wait(id, shape, Origin::Commit(flight.commit.device_seq));
         }
         let restored = carried(&self.restores, &flight.commit.ops);
         for (index, id) in restored.expect("a Restore op in flight is queued") {
@@ -917,33 +917,35 @@ impl Commits {
     /// dropped, since the next rebase finds them again, except that one for a node whose update
     /// waited waits in its place, since the rebase took it from the waiting shape. A needed node whose own update waited
     /// keeps that update waiting, so it is made once it fits, also after the keep rule no longer
-    /// needs the node.
+    /// needs the node. Each update that waits again keeps its origin.
     fn retry_waiting(
         &mut self,
         trees: &mut Trees,
         needed: BTreeSet<NodeId>,
         agreed: Vec<(NodeId, Option<Shape>)>,
     ) -> BTreeSet<NodeId> {
-        let waiting: Vec<_> = trees
-            .take_waiting()
-            .into_iter()
-            .filter_map(|(id, shape)| Some((id.clone(), outstanding(trees, &id, shape)?)))
+        let mut waited: BTreeMap<NodeId, Waiting> = (trees.take_waiting().into_iter())
+            .filter_map(|(id, Waiting { shape, origin })| {
+                let shape = outstanding(trees, &id, shape)?;
+                Some((id, Waiting { shape, origin }))
+            })
             .collect();
-        let waited: BTreeMap<NodeId, Option<Shape>> = waiting.iter().cloned().collect();
-        let updates = waiting
-            .into_iter()
+        let updates = (waited.iter())
+            .map(|(id, waiting)| (id.clone(), waiting.shape.clone()))
             .chain(needed.iter().map(|id| (id.clone(), None)))
             .chain(agreed.iter().cloned())
             .collect();
         let mut still = BTreeSet::new();
         for (id, shape) in update_synced(trees, updates) {
             if needed.contains(&id) {
-                if let Some(waited) = waited.get(&id) {
-                    trees.wait(id.clone(), waited.clone());
+                if let Some(waiting) = waited.remove(&id) {
+                    trees.wait(id.clone(), waiting.shape, waiting.origin);
                 }
                 still.insert(id);
-            } else if waited.contains_key(&id) || !agreed.iter().any(|(other, _)| *other == id) {
-                trees.wait(id, shape);
+            } else if let Some(waiting) = waited.get(&id) {
+                trees.wait(id, shape, waiting.origin);
+            } else if !agreed.iter().any(|(other, _)| *other == id) {
+                trees.wait(id, shape, Origin::Other);
             }
         }
         still
@@ -1383,7 +1385,7 @@ fn agree(trees: &Trees, id: &str, seq: u64) -> Option<(NodeId, Agreed)> {
 /// What S holds for `id`, or its waiting update while one waits.
 fn acknowledged<'a>(trees: &'a Trees, id: &str) -> Option<&'a Shape> {
     match trees.waiting().get(id) {
-        Some(waiting) => waiting.as_ref(),
+        Some(waiting) => waiting.shape.as_ref(),
         None => trees.synced().live(id),
     }
 }
@@ -1399,7 +1401,13 @@ fn acknowledged_class(trees: &Trees, id: &str) -> Class {
 /// never fit while L holds the node elsewhere, as when a folder R trashed takes its name key in S
 /// and L cannot remove that folder while the node is inside it.
 fn moved_locally(trees: &Trees, id: &str) -> bool {
-    let (Some(local), Some(Some(waiting))) = (trees.local().live(id), trees.waiting().get(id))
+    let (
+        Some(local),
+        Some(Waiting {
+            shape: Some(waiting),
+            ..
+        }),
+    ) = (trees.local().live(id), trees.waiting().get(id))
     else {
         return false;
     };

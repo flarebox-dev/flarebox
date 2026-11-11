@@ -5,15 +5,21 @@
 //! its SHA-256 and size before it is sent and after it is received.
 
 use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::io;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use hyper::body::{Body, Frame, SizeHint};
 use koidrive_proto::v1::{ChunkRef, Target, UploadReceipt, chunk_plan::Action};
 use prost::Message;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::{Method, StatusCode};
 use sha2::{Digest, Sha256};
+use tokio::time::Instant;
 
 use crate::api::Api;
 use crate::backoff::Backoff;
@@ -29,6 +35,8 @@ const TARGET_MARGIN: Duration = Duration::from_secs(60);
 const MAX_PREALLOCATION: usize = 4 << 20;
 /// The most bytes read of an answer other than chunk bytes: a receipt or an error. Anything longer is not read.
 const SMALL_ANSWER: usize = 64 << 10;
+/// An upload's body goes to the connection in slices of this size, so that its progress can be seen.
+const SLICE: usize = 64 << 10;
 
 /// True when `bytes` are the chunk: their SHA-256 is its hash and their length its size.
 pub fn matches(chunk: &ChunkRef, bytes: &[u8]) -> bool {
@@ -83,20 +91,26 @@ enum Attempt<T> {
 #[derive(Clone, Debug)]
 pub struct Transfer {
     http: reqwest::Client,
+    uploads: reqwest::Client,
     pub backoff: Backoff,
     /// Attempts per chunk, and rounds of asking the server again for chunks it deferred or whose target expired.
     pub attempts: u32,
-    /// Bounds one attempt, from sending the request to the last byte of the answer.
+    /// Bounds a download from sending the request to the last byte of the answer, and an upload from the last slice
+    /// of its body to the last byte of the answer.
     pub attempt_timeout: Duration,
+    /// Bounds the wait for the connection to take the next slice of an upload's body.
+    pub stall_timeout: Duration,
 }
 
 impl Transfer {
     pub fn new(api: &Api) -> Self {
         Transfer {
             http: api.http().clone(),
+            uploads: api.uploads().clone(),
             backoff: Backoff::default(),
             attempts: 5,
             attempt_timeout: Duration::from_secs(120),
+            stall_timeout: Duration::from_secs(60),
         }
     }
 
@@ -283,16 +297,25 @@ impl Transfer {
         }
     }
 
-    /// One upload within `attempt_timeout`. The relay answers with an `UploadReceipt`; a presigned URL answers
-    /// without a body to keep.
+    /// One upload. It ends when the connection takes no slice of the body for `stall_timeout`, or when the answer is
+    /// not complete `attempt_timeout` after the last slice. The connection takes slices into its send buffers, so
+    /// the answer wait also covers sending what those buffers still hold. On an uplink too slow to empty them within
+    /// `attempt_timeout`, an upload that keeps moving still ends. The relay answers with an `UploadReceipt`; a
+    /// presigned URL answers without a body to keep.
     async fn put(
         &self,
         target: &Target,
         chunk: &ChunkRef,
         bytes: Bytes,
     ) -> Attempt<Option<UploadReceipt>> {
+        let progress = Arc::new(Mutex::new(Progress::Body(Instant::now())));
+        let body = reqwest::Body::wrap(Sending {
+            rest: bytes,
+            progress: progress.clone(),
+        });
         let attempt = async {
-            let response = match self.request(target, "PUT").body(bytes).send().await {
+            let request = self.request(&self.uploads, target, "PUT").body(body);
+            let response = match request.send().await {
                 Ok(response) => response,
                 Err(error) => return Attempt::Retry(unavailable(chunk, error)),
             };
@@ -337,13 +360,48 @@ impl Transfer {
                 _ => Attempt::Fail(refused),
             }
         };
-        self.bounded(chunk, attempt).await
+        tokio::select! {
+            attempt = attempt => attempt,
+            message = self.stalled(&progress) => Attempt::Retry(ChunkError::Unavailable {
+                hash: chunk.hash.clone(),
+                message,
+            }),
+        }
+    }
+
+    /// Returns once the upload behind `progress` has passed its deadline, with what it was waiting for. While the body
+    /// is sent, it also wakes by the time an answer deadline starting now would pass, because the last slice can be
+    /// taken at any moment and start that shorter wait.
+    async fn stalled(&self, progress: &Mutex<Progress>) -> String {
+        loop {
+            let now = *progress.lock().unwrap();
+            let (deadline, wake) = match now {
+                Progress::Body(at) => {
+                    let deadline = at + self.stall_timeout;
+                    (
+                        deadline,
+                        deadline.min(Instant::now() + self.attempt_timeout),
+                    )
+                }
+                Progress::Answer(at) => (at + self.attempt_timeout, at + self.attempt_timeout),
+            };
+            if Instant::now() < deadline {
+                tokio::time::sleep_until(wake).await;
+                continue;
+            }
+            return match now {
+                Progress::Body(_) => format!("the body did not move for {:?}", self.stall_timeout),
+                Progress::Answer(_) => {
+                    format!("no complete answer within {:?}", self.attempt_timeout)
+                }
+            };
+        }
     }
 
     /// One download within `attempt_timeout`, read up to the chunk's size and checked against its hash.
     async fn get(&self, target: &Target, chunk: &ChunkRef) -> Attempt<Bytes> {
         let attempt = async {
-            let mut response = match self.request(target, "GET").send().await {
+            let mut response = match self.request(&self.http, target, "GET").send().await {
                 Ok(response) => response,
                 Err(error) => return Attempt::Retry(unavailable(chunk, error)),
             };
@@ -413,18 +471,69 @@ impl Transfer {
         }
     }
 
-    fn request(&self, target: &Target, default_method: &str) -> reqwest::RequestBuilder {
+    fn request(
+        &self,
+        client: &reqwest::Client,
+        target: &Target,
+        default_method: &str,
+    ) -> reqwest::RequestBuilder {
         let method = if target.method.is_empty() {
             default_method
         } else {
             &target.method
         };
         let method = Method::from_bytes(method.as_bytes()).unwrap_or(Method::GET);
-        let mut request = self.http.request(method, &target.url);
+        let mut request = client.request(method, &target.url);
         for (name, value) in &target.headers {
             request = request.header(name, value);
         }
         request
+    }
+}
+
+/// Where an upload is, for its deadline.
+#[derive(Clone, Copy)]
+enum Progress {
+    /// Sending the body; the connection took a slice at this time.
+    Body(Instant),
+    /// Waiting for the answer since the connection took the last slice.
+    Answer(Instant),
+}
+
+/// An upload's body, handed out a slice at a time, noting when the connection takes each one.
+struct Sending {
+    rest: Bytes,
+    progress: Arc<Mutex<Progress>>,
+}
+
+impl Body for Sending {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+        if self.rest.is_empty() {
+            return Poll::Ready(None);
+        }
+        let take = self.rest.len().min(SLICE);
+        let slice = self.rest.split_to(take);
+        let now = Instant::now();
+        *self.progress.lock().unwrap() = if self.rest.is_empty() {
+            Progress::Answer(now)
+        } else {
+            Progress::Body(now)
+        };
+        Poll::Ready(Some(Ok(Frame::data(slice))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.rest.is_empty()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.rest.len() as u64)
     }
 }
 

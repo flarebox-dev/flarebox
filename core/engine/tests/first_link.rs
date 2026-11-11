@@ -726,7 +726,7 @@ fn a_discard_whose_s_update_waits_stays_after_a_server_loss() {
     assert_eq!(commits.connected(&welcome), Reconnect::AheadOfServer);
     let (trashed, edited) = (trees.trashed_here(), trees.edited_here());
     trees.remove_remote("pad");
-    trees.forget_lost(trashed, edited, commits.held_through());
+    trees.forget_lost(trashed, edited, commits.held_through(), commits.accepted());
     trees.settle();
     assert!(trees.waiting().contains_key("l-A"));
     let sent = ops(&mut commits, &mut trees, &mut ids);

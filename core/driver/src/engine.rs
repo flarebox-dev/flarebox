@@ -365,7 +365,12 @@ impl Engine {
             }
         }
         if behind {
-            (self.trees).forget_lost(trashed, edited, self.commits.held_through());
+            (self.trees).forget_lost(
+                trashed,
+                edited,
+                self.commits.held_through(),
+                self.commits.accepted(),
+            );
         }
         tx.clear_remote_nodes()?;
         for state in staging.nodes.values() {

@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use koidrive_engine::classify::{Origin, Waiting};
 use koidrive_engine::commit::{Commits, Halt, InFlight, Reconnect};
 use koidrive_engine::effects::{Base, Dir, Displaced, Effect, EffectRecord, Location};
 use koidrive_engine::guard::{Counted, GuardState, RemoteDeletion, Trash};
@@ -277,6 +278,13 @@ fn identity(ino: u64) -> FileIdentity {
     }
 }
 
+fn from_commit(slot: u64, shape: Option<EngineShape>) -> Waiting {
+    Waiting {
+        shape,
+        origin: Origin::Commit(slot),
+    }
+}
+
 fn engine_shape(parent: &str, name: &str) -> EngineShape {
     EngineShape {
         parent: parent.into(),
@@ -418,8 +426,11 @@ fn engine_state() -> EngineState {
             reverted: nodes(["r"]),
             parked_as: BTreeMap::from([("p".into(), "p-before".into())]),
             waiting: BTreeMap::from([
-                ("w".into(), Some(engine_shape("root", "w.txt"))),
-                ("gone".into(), None),
+                (
+                    "w".into(),
+                    from_commit(4, Some(engine_shape("root", "w.txt"))),
+                ),
+                ("gone".into(), from_commit(4, None)),
             ]),
             watched: BTreeMap::from([("edited".into(), true), ("kept".into(), false)]),
             watched_positions: BTreeMap::from([
@@ -700,7 +711,10 @@ fn engine_state_of(n: usize) -> EngineState {
             .parked_as
             .insert(node.clone(), format!("parked-{i}"));
         let shape = engine_shape("p", &format!("{i}.txt"));
-        state.trees.waiting.insert(node.clone(), Some(shape));
+        state
+            .trees
+            .waiting
+            .insert(node.clone(), from_commit(4, Some(shape)));
         state.commits.problems.insert(node.clone());
         state.commits.split.insert(node.clone());
         state
@@ -770,7 +784,10 @@ fn an_engine_state_update_writes_rows_for_the_change_alone() {
             .parked_as
             .insert("node-1".into(), "parked-new".into());
         after.trees.waiting.remove("node-2");
-        after.trees.waiting.insert("node-3".into(), None);
+        after
+            .trees
+            .waiting
+            .insert("node-3".into(), from_commit(4, None));
         after.commits.problems.insert("node-new".into());
         after.commits.accepted += 1;
         after.commits.in_flight = None;
@@ -1001,6 +1018,8 @@ fn a_cursor_stored_before_it_could_record_a_server_behind_it_records_none() {
          ALTER TABLE remote_cursor DROP COLUMN ahead_of_server;",
     )
     .unwrap();
+    conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
+        .unwrap();
     conn.pragma_update(None, "user_version", 4).unwrap();
     drop(conn);
 
@@ -1040,6 +1059,8 @@ fn a_store_from_before_contents_were_watched_opens_with_nothing_watched() {
          DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions;",
     )
     .unwrap();
+    conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
+        .unwrap();
     conn.pragma_update(None, "user_version", 5).unwrap();
     drop(conn);
 
@@ -1079,6 +1100,8 @@ fn a_store_from_before_edits_were_recorded_opens_with_none_recorded() {
          DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions;",
     )
     .unwrap();
+    conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
+        .unwrap();
     conn.pragma_update(None, "user_version", 10).unwrap();
     drop(conn);
 
@@ -1112,6 +1135,8 @@ fn a_store_from_before_deletes_were_recorded_opens_with_none_recorded() {
          DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions;",
     )
     .unwrap();
+    conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
+        .unwrap();
     conn.pragma_update(None, "user_version", 6).unwrap();
     drop(conn);
 
@@ -1152,6 +1177,8 @@ fn a_store_from_before_the_guard_opens_with_an_empty_guard() {
          DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions;",
     )
     .unwrap();
+    conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
+        .unwrap();
     conn.pragma_update(None, "user_version", 7).unwrap();
     drop(conn);
 
@@ -1198,6 +1225,8 @@ fn a_store_from_before_questions_showed_local_shapes_keeps_its_questions() {
          DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions;",
     )
     .unwrap();
+    conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
+        .unwrap();
     conn.pragma_update(None, "user_version", 8).unwrap();
     drop(conn);
 
@@ -1228,6 +1257,8 @@ fn a_store_from_before_nodes_in_ignored_folders_were_stored_opens_with_none_reco
          DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions;",
     )
     .unwrap();
+    conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
+        .unwrap();
     conn.pragma_update(None, "user_version", 9).unwrap();
     drop(conn);
 
@@ -1263,6 +1294,8 @@ fn a_store_from_before_remote_removals_were_counted_opens_with_none_counted() {
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch("DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed; DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions;")
         .unwrap();
+    conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
+        .unwrap();
     conn.pragma_update(None, "user_version", 11).unwrap();
     drop(conn);
 
@@ -1288,8 +1321,9 @@ fn a_store_from_before_positions_were_watched_opens_with_none_watched() {
         .unwrap();
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch("DROP TABLE watched_positions;").unwrap();
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION - 2)
+    conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
         .unwrap();
+    conn.pragma_update(None, "user_version", 12).unwrap();
     drop(conn);
 
     let mut store = Store::open(&path).unwrap();
@@ -1298,7 +1332,79 @@ fn a_store_from_before_positions_were_watched_opens_with_none_watched() {
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
 }
 
-/// A database of the schema that kept only the revision of a watched position takes the position
+/// Each waiting S update keeps where it came from: a commit's slot, or no commit.
+#[test]
+fn waiting_updates_keep_their_origin() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path().join("state.db")).unwrap();
+    let mut state = engine_state();
+    state.trees.waiting = BTreeMap::from([
+        (
+            "kept".into(),
+            from_commit(3, Some(engine_shape("root", "k.txt"))),
+        ),
+        ("removed".into(), from_commit(1, None)),
+        (
+            "other".into(),
+            Waiting {
+                shape: Some(engine_shape("root", "o.txt")),
+                origin: Origin::Other,
+            },
+        ),
+    ]);
+    store.transaction(|tx| tx.set_engine_state(&state)).unwrap();
+    assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), state);
+}
+
+/// A database of the schema before waiting updates kept their origin gives each the slot of the
+/// newest acknowledged commit, except the update of a node the person discarded on a first link,
+/// which no commit made.
+#[test]
+fn a_store_from_before_waiting_updates_kept_their_origin_takes_the_accepted_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let mut before = engine_state();
+    before.trees.waiting = BTreeMap::from([
+        (
+            "w".into(),
+            from_commit(4, Some(engine_shape("root", "w.txt"))),
+        ),
+        (
+            "d".into(),
+            Waiting {
+                shape: Some(engine_shape("root", "d.txt")),
+                origin: Origin::Other,
+            },
+        ),
+    ]);
+    assert!(before.trees.discarded.contains("d"));
+    assert_eq!(before.commits.accepted, 4);
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| {
+            tx.put_synced_node(&SyncedNode {
+                node_id: "moved".into(),
+                shape: file_shape("root", "moved.txt"),
+            })?;
+            tx.set_engine_state(&before)
+        })
+        .unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "ALTER TABLE waiting_updates DROP COLUMN slot;
+         ALTER TABLE watched_positions DROP COLUMN parent_id;
+         ALTER TABLE watched_positions DROP COLUMN name;",
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 13).unwrap();
+    drop(conn);
+
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
+}
+
+/// A database of schema 14, which kept only the revision of a watched position, takes the position
 /// from S, which held it whenever a revision was recorded. A revision whose node S does not hold
 /// is dropped, and the commit in flight takes what it sent for that node.
 #[test]
@@ -1331,8 +1437,7 @@ fn a_store_from_before_watched_positions_were_kept_takes_them_from_s() {
          ALTER TABLE watched_positions DROP COLUMN name;",
     )
     .unwrap();
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
-        .unwrap();
+    conn.pragma_update(None, "user_version", 14).unwrap();
     drop(conn);
 
     let mut store = Store::open(&path).unwrap();
@@ -1380,6 +1485,8 @@ fn a_version_3_store_opens_with_empty_restore_tables() {
          ALTER TABLE remote_cursor DROP COLUMN ahead_of_server;",
     )
     .unwrap();
+    conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
+        .unwrap();
     conn.pragma_update(None, "user_version", 3).unwrap();
     drop(conn);
 

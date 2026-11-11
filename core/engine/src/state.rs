@@ -13,12 +13,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::classify::Waiting;
 use crate::commit::{Halt, InFlight};
 use crate::effects::{Effect, EffectRecord};
 use crate::guard::GuardState;
 use crate::question::Question;
 use crate::restore::{Resolved, RestoreId, RestoreIntent};
-use crate::tree::{FileIdentity, NodeId, Shape, TreeError};
+use crate::tree::{FileIdentity, NodeId, TreeError};
 
 /// A position L and R agreed on, with the revision of R's record that held it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,7 +43,7 @@ pub struct TreesState {
     pub parked_as: BTreeMap<NodeId, NodeId>,
     /// S updates of acknowledged ops that wait until S stays a valid tree with them, by node.
     /// `None` removes the node from S.
-    pub waiting: BTreeMap<NodeId, Option<Shape>>,
+    pub waiting: BTreeMap<NodeId, Waiting>,
     /// The nodes whose content the commit in flight creates or updates, each with whether S's
     /// content changed since the commit was built.
     pub watched: BTreeMap<NodeId, bool>,

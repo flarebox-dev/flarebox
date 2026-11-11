@@ -695,7 +695,7 @@ fn stored(space: &SpaceDo) -> BTreeSet<(String, Vec<u8>)> {
 /// S's otherwise.
 fn acknowledged(trees: &Trees, id: &str) -> Option<Vec<u8>> {
     let shape = match trees.waiting().get(id) {
-        Some(waiting) => waiting.as_ref(),
+        Some(waiting) => waiting.shape.as_ref(),
         None => trees.synced().live(id),
     }?;
     Some(shape.content.as_ref()?.manifest_digest.clone())

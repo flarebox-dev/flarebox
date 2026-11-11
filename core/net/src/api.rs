@@ -44,6 +44,7 @@ const MAX_ERROR: usize = 1 << 20;
 #[derive(Clone, Debug)]
 pub struct Api {
     http: reqwest::Client,
+    uploads: reqwest::Client,
     base: Url,
 }
 
@@ -75,15 +76,24 @@ impl Api {
             let path = format!("{}/", base.path());
             base.set_path(&path);
         }
-        let http = reqwest::Client::builder()
-            .user_agent(concat!("koidrive-net/", env!("CARGO_PKG_VERSION")))
-            .https_only(!local_development)
-            .redirect(redirect::Policy::none())
-            .connect_timeout(CONNECT_TIMEOUT)
-            .read_timeout(READ_TIMEOUT)
+        let client = |read_timeout: Option<Duration>| {
+            let builder = reqwest::Client::builder()
+                .user_agent(concat!("koidrive-net/", env!("CARGO_PKG_VERSION")))
+                .https_only(!local_development)
+                .redirect(redirect::Policy::none())
+                .connect_timeout(CONNECT_TIMEOUT);
+            match read_timeout {
+                Some(timeout) => builder.read_timeout(timeout),
+                None => builder,
+            }
             .build()
-            .map_err(ApiError::Transport)?;
-        Ok(Api { http, base })
+            .map_err(ApiError::Transport)
+        };
+        Ok(Api {
+            http: client(Some(READ_TIMEOUT))?,
+            uploads: client(None)?,
+            base,
+        })
     }
 
     pub fn base(&self) -> &Url {
@@ -92,6 +102,13 @@ impl Api {
 
     pub(crate) fn http(&self) -> &reqwest::Client {
         &self.http
+    }
+
+    /// The client for chunk uploads. It has no read timeout, because reqwest starts that timer when it sends the
+    /// request and would end an upload whose body takes longer than that to send. [`crate::Transfer`] bounds an
+    /// upload by its progress instead.
+    pub(crate) fn uploads(&self) -> &reqwest::Client {
+        &self.uploads
     }
 
     /// The URL of the path `segments` below the base. Each segment is percent-encoded, so an ID holding `/`, `?` or `#`
