@@ -80,4 +80,4 @@ If you deleted the bucket itself, create a bucket with the same name, in the sam
 
 A copy can't bring back a server. A new server starts with empty Durable Objects and never reads `meta/`, so copying the backup into a new server's bucket restores nothing.
 
-The copy still keeps every space's tree, trash and old versions, with the chunks they name. RFC 0004 describes how to read it, but 0.1.0 has no tool that does. The live files in your linked folders stay on each device.
+The copy still holds each space's tree, trash and old versions as of the export it caught, with the chunks the copy saved. It misses changes the server hadn't exported yet, and the chunks of old versions or trashed files that the server deleted while the copy ran. RFC 0004 describes how to read it, but 0.1.0 has no tool that does. The live files in your linked folders stay on each device.
