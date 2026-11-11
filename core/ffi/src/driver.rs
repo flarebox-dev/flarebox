@@ -31,7 +31,7 @@ use crate::types::{
     Account, Answer, Device, FolderState, HeldItem, ItemDetail, LinkedFolder, MassDeleteLimit,
     NodeKind, Notice, NoticeKind, PairingCode, Problem, ProblemKind, Question, QuestionKind,
     RecoveryCause, RecoveryGroup, RecoveryTrigger, ServerInfo, SessionError, SessionEvent,
-    SessionState, Space, SpaceUsage, SyncStatus,
+    SessionState, Space, SpaceUsage, SyncStatus, TelemetrySetting,
 };
 
 pub(crate) struct DriverCore {
@@ -555,6 +555,32 @@ impl Core for DriverCore {
                 done => done.map_err(driver_error),
             },
         )
+    }
+
+    fn telemetry(&self) -> TelemetrySetting {
+        let store = koidrive_telemetry::Store::new(&self.paths.state_dir);
+        let var = |name: &str| std::env::var_os(name);
+        match (store.settings(), store.status(var)) {
+            (Ok(settings), Ok(status)) => TelemetrySetting {
+                enabled: status.mode != koidrive_telemetry::Mode::Off,
+                decided: settings.enabled.is_some(),
+                locked: matches!(
+                    status.source,
+                    koidrive_telemetry::Source::DoNotTrack | koidrive_telemetry::Source::Variable
+                ),
+            },
+            (Err(error), _) | (_, Err(error)) => {
+                tracing::warn!(%error, "the telemetry settings cannot be read");
+                TelemetrySetting::default()
+            }
+        }
+    }
+
+    fn set_telemetry(&self, enabled: bool) -> Result<(), SessionError> {
+        let dir = self.paths.state_dir.join("telemetry");
+        (koidrive_telemetry::Store::new(&self.paths.state_dir).set(enabled))
+            .map(drop)
+            .map_err(not_saved(&dir))
     }
 
     fn close(&self) {
@@ -1432,6 +1458,33 @@ mod tests {
                 .exists(),
             "the late refresh wrote credential.next"
         );
+    }
+
+    /// The setting lives in the same file the CLI writes, so a choice made on either side shows on the other.
+    #[test]
+    fn the_telemetry_choice_is_the_profile_s_shared_with_the_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().to_str().unwrap().to_owned();
+        let session = SyncSession::open(
+            Box::new(Recorder(Arc::new(StdMutex::new(Vec::new())))),
+            profile,
+        )
+        .unwrap();
+        let store = koidrive_telemetry::Store::new(&Paths::under(dir.path()).state_dir);
+        let locked = session.telemetry().locked;
+        assert!(!session.telemetry().decided);
+
+        session.set_telemetry(true).unwrap();
+        let setting = session.telemetry();
+        assert!(setting.decided);
+        assert!(setting.enabled || locked);
+        assert_eq!(store.settings().unwrap().enabled, Some(true));
+        assert!(store.settings().unwrap().install_id.is_some());
+
+        store.set(false).unwrap();
+        assert!(!session.telemetry().enabled || locked);
+        session.set_telemetry(false).unwrap();
+        assert_eq!(store.settings().unwrap().install_id, None);
     }
 
     #[test]

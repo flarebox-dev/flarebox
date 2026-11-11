@@ -16,7 +16,7 @@ use crate::types::{
     LinkedFolder, MassDeleteLimit, NodeKind, Notice, NoticeKind, PairingCode, Problem, ProblemKind,
     Question, QuestionKind, RECENT_CHANGES, RecentChange, RecoveryCause, RecoveryGroup,
     RecoveryTrigger, ServerInfo, SessionError, SessionEvent, SessionState, Space, SpaceUsage,
-    SyncProgress, SyncStatus,
+    SyncProgress, SyncStatus, TelemetrySetting,
 };
 
 const CLAIM_CODE_LEN: usize = 12;
@@ -108,6 +108,8 @@ struct State {
     /// not saved itself.
     not_writable: Option<Problem>,
     status: SyncStatus,
+    /// Kept in memory only: a first run is undecided and off, every other scenario decided and on.
+    telemetry: TelemetrySetting,
 }
 
 impl Saved {
@@ -220,6 +222,7 @@ impl FakeCore {
                 fail_saves: false,
                 not_writable: None,
                 status: SyncStatus::Stopped,
+                telemetry: TelemetrySetting::default(),
             }),
             events,
         }
@@ -351,8 +354,18 @@ impl FakeCore {
         state.answers.clear();
         state.fail_next = None;
         state.usage_refusals.clear();
+        state.telemetry = TelemetrySetting {
+            enabled: scenario != FakeScenario::FirstRun,
+            decided: scenario != FakeScenario::FirstRun,
+            locked: false,
+        };
         self.publish(&mut state, &ALL_PARTS, cleared);
         Ok(())
+    }
+
+    /// Sets the usage-report setting as it is, such as a locked one, which [`Core::set_telemetry`] cannot make.
+    pub fn set_telemetry_setting(&self, setting: TelemetrySetting) {
+        self.lock().telemetry = setting;
     }
 
     pub fn set_activity(&self, activity: FakeActivity) {
@@ -863,6 +876,21 @@ impl Core for FakeCore {
         Ok(())
     }
 
+    fn telemetry(&self) -> TelemetrySetting {
+        self.lock().telemetry
+    }
+
+    fn set_telemetry(&self, enabled: bool) -> Result<(), SessionError> {
+        let mut state = self.lock();
+        state.take_failure()?;
+        let telemetry = &mut state.telemetry;
+        telemetry.decided = true;
+        if !telemetry.locked {
+            telemetry.enabled = enabled;
+        }
+        Ok(())
+    }
+
     fn dismiss_notice(&self, notice_id: &str) -> Result<(), SessionError> {
         let mut state = self.lock();
         state.take_failure()?;
@@ -971,6 +999,40 @@ mod tests {
                 SyncStatus::Offline,
                 SyncStatus::Stopped,
             ]
+        );
+    }
+
+    #[test]
+    fn telemetry_starts_undecided_and_a_locked_setting_keeps_its_state() {
+        let h = Harness::new();
+        assert_eq!(h.core.telemetry(), TelemetrySetting::default());
+        h.core.set_telemetry(true).unwrap();
+        assert_eq!(
+            h.core.telemetry(),
+            TelemetrySetting {
+                enabled: true,
+                decided: true,
+                locked: false
+            }
+        );
+        h.core.load_scenario(FakeScenario::FirstRun).unwrap();
+        assert!(!h.core.telemetry().decided);
+        h.core.load_scenario(FakeScenario::UpToDate).unwrap();
+        assert!(h.core.telemetry().enabled);
+
+        let locked = TelemetrySetting {
+            enabled: false,
+            decided: false,
+            locked: true,
+        };
+        h.core.set_telemetry_setting(locked);
+        h.core.set_telemetry(true).unwrap();
+        assert_eq!(
+            h.core.telemetry(),
+            TelemetrySetting {
+                decided: true,
+                ..locked
+            }
         );
     }
 

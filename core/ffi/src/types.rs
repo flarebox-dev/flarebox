@@ -472,6 +472,17 @@ pub enum ProblemKind {
     FolderHalted { reason: String },
 }
 
+/// Whether this profile sends anonymous usage reports (docs/guide/telemetry.md).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, uniffi::Record)]
+pub struct TelemetrySetting {
+    /// Reports are recorded and sent: the stored choice, unless an environment variable decides.
+    pub enabled: bool,
+    /// Someone chose already, in the app's setup or settings or with the CLI, which shares the profile.
+    pub decided: bool,
+    /// `DO_NOT_TRACK` or `KOIDRIVE_TELEMETRY` decides, so the stored choice has no effect until it is gone.
+    pub locked: bool,
+}
+
 /// The whole state the app shows. [`SessionEvent`]s replace one part of it at a time.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct SessionState {

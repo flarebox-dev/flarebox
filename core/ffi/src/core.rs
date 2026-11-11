@@ -8,7 +8,7 @@ use std::sync::{Arc, Weak};
 
 use crate::types::{
     Account, Answer, Device, LinkedFolder, PairingCode, ServerInfo, SessionError, SessionEvent,
-    SessionState, Space, SpaceUsage,
+    SessionState, Space, SpaceUsage, TelemetrySetting,
 };
 
 /// The code part of a pairing code as typed or pasted. `koi device add` prints the code as
@@ -154,6 +154,13 @@ pub trait Core: Send + Sync {
     fn answer(&self, question_id: &str, answer: Answer) -> Result<(), SessionError>;
     /// Dismisses a notice.
     fn dismiss_notice(&self, notice_id: &str) -> Result<(), SessionError>;
+
+    /// The usage-report setting. It reads a small file and never talks to the network.
+    fn telemetry(&self) -> TelemetrySetting;
+    /// Stores the person's choice of usage reports, in the same file the CLI uses. Turning it on draws the install id;
+    /// turning it off deletes the id and every report not sent yet. While [`TelemetrySetting::locked`], the choice is
+    /// stored anyway and takes effect once the environment variable is gone.
+    fn set_telemetry(&self, enabled: bool) -> Result<(), SessionError>;
 
     /// Stops syncing and releases what the core holds outside memory, such as the lock on this
     /// device's sync state, so that the state can be opened again at once. The session calls it

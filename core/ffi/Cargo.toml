@@ -24,6 +24,7 @@ bindgen = ["uniffi/cli"]
 koidrive-driver = { path = "../driver" }
 koidrive-net = { path = "../net" }
 koidrive-proto = { path = "../proto" }
+koidrive-telemetry = { path = "../telemetry" }
 thiserror = "2.0.21"
 tokio = { version = "1.48", features = ["net", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1.41"
