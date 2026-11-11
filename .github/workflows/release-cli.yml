@@ -17,6 +17,57 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  changes:
+    name: CLI targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      targets: ${{ steps.targets.outputs.targets }}
+      count: ${{ steps.targets.outputs.count }}
+      macos: ${{ steps.targets.outputs.macos }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Decide which targets the change needs
+        id: targets
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          LINUX: '[{"target":"x86_64-unknown-linux-musl","runner":"ubuntu-latest"},{"target":"aarch64-unknown-linux-musl","runner":"ubuntu-latest"}]'
+          MACOS: '[{"target":"aarch64-apple-darwin","runner":"macos-15"},{"target":"x86_64-apple-darwin","runner":"macos-15-intel"}]'
+        run: |
+          macos=true
+          if [ "$EVENT" = pull_request ]; then
+            git fetch --no-tags --depth=1 origin "$BASE"
+            if ! changed="$(git diff --name-only --no-renames "$BASE" HEAD)"; then
+              echo "::error::git diff between $BASE and HEAD failed, so the changed paths are unknown."
+              exit 1
+            fi
+            echo "Files this pull request changes against $BASE:"
+            printf '%s\n' "$changed"
+            pattern='^(cli/|install\.sh$|scripts/test-install\.sh$|\.github/workflows/release-cli\.yml$|Cargo\.(toml|lock)$|rust-toolchain\.toml$)'
+            if grep -Eq "$pattern" <<<"$changed"; then
+              echo "macOS targets: build, because a changed file matches $pattern"
+            else
+              echo "macOS targets: skipped, because no changed file matches $pattern. The merge queue builds them."
+              macos=false
+            fi
+          else
+            echo "$EVENT run: every target builds."
+          fi
+          if [ "$macos" = true ]; then
+            targets="$(jq -cn --argjson linux "$LINUX" --argjson macos "$MACOS" '$linux + $macos')"
+          else
+            targets="$(jq -c . <<<"$LINUX")"
+          fi
+          echo "Targets: $targets"
+          {
+            echo "targets=$targets"
+            echo "count=$(jq length <<<"$targets")"
+            echo "macos=$macos"
+          } >> "$GITHUB_OUTPUT"
+
   release-ref:
     name: CLI release tag on main
     if: github.event_name == 'push'
@@ -37,20 +88,13 @@ jobs:
 
   build:
     name: CLI (${{ matrix.target }})
+    needs: changes
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            runner: ubuntu-latest
-          - target: aarch64-unknown-linux-musl
-            runner: ubuntu-latest
-          - target: aarch64-apple-darwin
-            runner: macos-15
-          - target: x86_64-apple-darwin
-            runner: macos-15-intel
+        include: ${{ fromJSON(needs.changes.outputs.targets) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -186,7 +230,7 @@ jobs:
 
   checksums:
     name: CLI checksums
-    needs: [build, sign-macos]
+    needs: [changes, build, sign-macos]
     if: always() && needs.build.result == 'success' && (needs.sign-macos.result == 'success' || (github.event_name != 'push' && needs.sign-macos.result == 'skipped'))
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -202,15 +246,21 @@ jobs:
           name: cli-macos-release
           path: dist
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        if: needs.sign-macos.result == 'skipped'
+        if: needs.sign-macos.result == 'skipped' && needs.changes.outputs.macos == 'true'
         with:
           pattern: cli-*-apple-darwin
           merge-multiple: true
           path: dist
       - name: Write and verify SHA256SUMS
+        env:
+          COUNT: ${{ needs.changes.outputs.count }}
         run: |
           cd dist
-          test "$(find . -name '*.tar.gz' | wc -l)" -eq 4
+          found="$(find . -name '*.tar.gz' | wc -l | tr -d ' ')"
+          if [ "$found" != "$COUNT" ]; then
+            echo "::error::Expected $COUNT CLI tarballs, one per built target, but found $found."
+            exit 1
+          fi
           sha256sum koidrive-*.tar.gz > SHA256SUMS
           sha256sum -c SHA256SUMS
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
