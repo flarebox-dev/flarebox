@@ -13,6 +13,8 @@ public final class AppModel {
     /// Questions not shown to the person yet. Every unanswered question counts as unseen when the
     /// app launches, so the questions window opens again after a relaunch.
     public private(set) var unseenQuestionIDs: Set<String>
+    /// Whether this profile sends anonymous usage reports, read again after every session call.
+    public private(set) var telemetry: TelemetrySetting
     public let session: SyncSession
     @ObservationIgnored private var consumer: Task<Void, Never>?
 
@@ -21,6 +23,7 @@ public final class AppModel {
         let state = session.state()
         self.state = state
         unseenQuestionIDs = Set(state.questions.map(\.id))
+        telemetry = session.telemetry()
         consumer = Task { [weak self] in
             for await event in events {
                 self?.apply(event)
@@ -95,6 +98,7 @@ public final class AppModel {
         apply(.questions(questions: latest.questions))
         apply(.problems(problems: latest.problems))
         apply(.notices(notices: latest.notices))
+        telemetry = session.telemetry()
     }
 
     /// Runs a session call off the main actor, then takes the session's latest state, so the
@@ -202,6 +206,13 @@ public final class AppModel {
     public func togglePause() throws {
         defer { refresh() }
         if isPaused { try session.resume() } else { try session.pause() }
+    }
+
+    /// Stores the usage-report choice, then reads the setting again. Throws `NotSaved` when the choice cannot be
+    /// saved. While the setting is locked, the choice is stored but applies only once the environment variable is gone.
+    public func setTelemetry(enabled: Bool) throws {
+        defer { refresh() }
+        try session.setTelemetry(enabled: enabled)
     }
 
     /// Records that the questions window showed every current question.

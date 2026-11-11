@@ -603,9 +603,11 @@ extension ProblemKind {
 // MARK: General
 
 struct GeneralSettings: View {
+    @Environment(AppModel.self) private var app
     @State private var loginItemStatus = SMAppService.mainApp.status
     @State private var openAtLogin = false
     @State private var loginItemError: String?
+    @State private var telemetryError: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -639,6 +641,28 @@ struct GeneralSettings: View {
                         }
                 }
             }
+            RowGroup {
+                SettingsRow {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Send anonymous usage reports")
+                        Text("It never shares file names, paths or contents.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        if let telemetryError {
+                            Text(telemetryError)
+                                .font(.caption)
+                                .foregroundStyle(Color.statusRed)
+                        }
+                    }
+                    Spacer()
+                    Toggle("Send anonymous usage reports", isOn: Binding(get: { app.telemetry.enabled }, set: setTelemetry))
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .tint(.koi)
+                        .disabled(app.telemetry.locked)
+                }
+            }
+            .padding(.top, 8)
             SectionHeading("About")
                 .padding(.top, 8)
             RowGroup {
@@ -680,6 +704,15 @@ struct GeneralSettings: View {
         }
         readStatus()
     }
+
+    private func setTelemetry(_ on: Bool) {
+        do {
+            try app.setTelemetry(enabled: on)
+            telemetryError = nil
+        } catch {
+            telemetryError = (error as? SessionError)?.message ?? error.localizedDescription
+        }
+    }
 }
 
 #Preview("Folders") {
@@ -700,4 +733,24 @@ struct GeneralSettings: View {
 
 #Preview("Account") {
     AccountSettings().environment(AppModel.preview(.upToDate)).frame(width: 600, height: 440)
+}
+
+#Preview("General: usage reports on") {
+    GeneralSettings().environment(AppModel.preview(.upToDate, telemetry: TelemetrySetting(enabled: true, decided: true, locked: false)))
+        .frame(width: 600, height: 440)
+}
+
+#Preview("General: usage reports off") {
+    GeneralSettings().environment(AppModel.preview(.upToDate, telemetry: TelemetrySetting(enabled: false, decided: true, locked: false)))
+        .frame(width: 600, height: 440)
+}
+
+#Preview("General: usage reports undecided") {
+    GeneralSettings().environment(AppModel.preview(.upToDate, telemetry: TelemetrySetting(enabled: false, decided: false, locked: false)))
+        .frame(width: 600, height: 440)
+}
+
+#Preview("General: usage reports locked") {
+    GeneralSettings().environment(AppModel.preview(.upToDate, telemetry: TelemetrySetting(enabled: false, decided: false, locked: true)))
+        .frame(width: 600, height: 440)
 }

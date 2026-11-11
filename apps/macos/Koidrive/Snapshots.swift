@@ -85,6 +85,10 @@ enum Snapshots {
         let (server, serverApp) = start(claimed: false)
         server.serverURL = "https://koi.example.com"
 
+        let decidedApp = AppModel.preview(.firstRun, telemetry: TelemetrySetting(enabled: true, decided: true, locked: false))
+        let decided = SetupModel(app: decidedApp, mode: .firstRun, deviceName: "Gunwoo's MacBook Pro")
+        decided.serverURL = "https://koi.example.com"
+
         let (pair, pairApp) = start(claimed: true)
         pair.serverURL = "https://koi.example.com"
         await pair.connect()
@@ -119,7 +123,7 @@ enum Snapshots {
         done.folderPath = projects.path(percentEncoded: false)
         await done.link()
 
-        return [("1-server", server, serverApp), ("2a-sign-in-error", pair, pairApp), ("2b-claim", claim, claimApp),
+        return [("1-server", server, serverApp), ("1b-server-decided", decided, decidedApp), ("2a-sign-in-error", pair, pairApp), ("2b-claim", claim, claimApp),
                 ("3-folder", folder, folderApp), ("4-done", done, doneApp)]
     }
 
@@ -134,7 +138,13 @@ enum Snapshots {
             ("1b-folders-empty", AnyView(FoldersSettings().environment(AppModel.preview(.firstRun)))),
             ("2-account", AnyView(AccountSettings(pairing: pairing).environment(AppModel.preview(.upToDate)))),
             ("3-problems", AnyView(ProblemsSettings().environment(AppModel.preview(.problems)))),
-            ("4-general", AnyView(GeneralSettings())),
+            ("4-general", AnyView(GeneralSettings().environment(AppModel.preview(.upToDate)))),
+            ("4b-general-usage-reports-off", AnyView(GeneralSettings().environment(
+                AppModel.preview(.upToDate, telemetry: TelemetrySetting(enabled: false, decided: true, locked: false)))
+            )),
+            ("4c-general-usage-reports-locked", AnyView(GeneralSettings().environment(
+                AppModel.preview(.upToDate, telemetry: TelemetrySetting(enabled: false, decided: false, locked: true)))
+            )),
             ("5a-storage-one-space", AnyView(StorageSettings().environment(AppModel.previewWithOneSpace()))),
             ("5b-storage-two-spaces", AnyView(StorageSettings().environment(AppModel.preview(.upToDate)))),
         ]
