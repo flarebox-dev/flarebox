@@ -3629,3 +3629,51 @@ fn a_late_create_acknowledgement_takes_the_sent_position_when_only_r_moved_after
     assert_eq!(trees.local().live("n"), Some(&file(ROOT, "c", 1)));
     assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
 }
+
+/// GUN-450. n is synced at b with content 2 when the user edits it to content 3 and the server
+/// purges it, so the next commit creates n again at b with content 3 while S still holds content 2.
+/// The user reverts n to content 2 while the create is in flight, and a log replay brings the
+/// create at seq 8 and the other device's moves to c and back to b. S keeps b, the position L and
+/// R came back to, and takes the content that was sent, so the user's revert is sent and nothing
+/// is downloaded.
+#[test]
+fn a_late_create_acknowledgement_that_keeps_a_position_takes_the_sent_content() {
+    let mut trees = trees(&[(
+        "n",
+        Some(file(ROOT, "b", 3)),
+        Some(file(ROOT, "b", 2)),
+        Some(remote(file(ROOT, "b", 2))),
+    )]);
+    trees.remove_remote("n");
+    trees.settle();
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(
+        matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id == "n"),
+        "{:?}",
+        ops(&commit)
+    );
+    trees.set_local("n".into(), local(file(ROOT, "b", 2), 1));
+    for (rev, name) in [(8, "b"), (9, "c"), (10, "b")] {
+        let node = RemoteNode {
+            content_rev: 8,
+            ..remote_at(file(ROOT, name, 3), rev)
+        };
+        trees.set_remote("n".into(), node);
+        trees.settle();
+    }
+    commits
+        .received(result(8, vec![outcome(op_result::Code::Applied)]))
+        .unwrap();
+    assert!(commits.acknowledge(&mut trees, 10));
+    trees.settle();
+    assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "b", 3)));
+    assert_eq!(effects_for(&mut trees, &mut ids, "n"), []);
+    assert_eq!(trees.local().live("n"), Some(&file(ROOT, "b", 2)));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(
+        matches!(&ops(&commit)[..], [op::Op::UpdateContent(u)] if u.node_id == "n"),
+        "{:?}",
+        ops(&commit)
+    );
+}
