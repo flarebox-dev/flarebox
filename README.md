@@ -16,7 +16,7 @@
 
 ## Why Koidrive
 
-**Pay for storage, not for seats.** Koidrive is free and open source. It runs on your Cloudflare account, so your only bill is Cloudflare's, for the storage you use. R2 gives you 10 GB a month free and charges $0.015 per GB-month after that. Downloads cost nothing. Dropbox sells storage in fixed tiers, and its team plans charge for every person.
+**Pay for storage, not for seats.** Koidrive is free and open source. It runs on your Cloudflare account, so Cloudflare bills you for the storage you use, plus requests past R2's free monthly allowance, with no egress fee. R2 gives you 10 GB a month free and charges $0.015 per GB-month after that. Dropbox sells storage in fixed tiers, and its team plans charge for every person.
 
 **Your files, in your account.** Koidrive stores your files as chunks in an R2 bucket you own. A Durable Object in the same account keeps each space's history. Cloudflare hosts both, in your account, and no other company stores your files. The code is yours to read, change and run. If you stop using Koidrive, every linked folder still holds ordinary files.
 
@@ -73,7 +73,7 @@ Dropbox does much more, and charges per person for it. Koidrive does the core of
 | **Admin tools** | No | Device approvals, remote wipe and account transfer |
 | **Support** | GitHub issues | Yes |
 
-Choose Dropbox if you share folders with a team or open your files on a phone. Choose Koidrive if you want your folders on your own machines, stored in an account you control, with a bill for storage only.
+Choose Dropbox if you share folders with a team or open your files on a phone. Choose Koidrive if you want your folders on your own machines, stored in an account you control, with a bill only from Cloudflare.
 
 ## What it costs
 
@@ -83,7 +83,8 @@ Koidrive is free. Cloudflare runs it, at its own prices:
 |---|---|
 | **The server** | $0 on the [Workers Free](https://developers.cloudflare.com/workers/platform/pricing/) plan, within its daily allowances. When a space reaches one, its folders wait until the allowance resets at 00:00 UTC, and your changes stay on disk until then. See [Limits](docs/guide/limits.md) |
 | **Storage** | The first 10 GB-month on [R2](https://developers.cloudflare.com/r2/pricing/) is free, then $0.015 per GB-month. 100 GB costs about $1.35 a month, and 500 GB about $7.35 |
-| **Downloads** | $0, with no limit |
+| **Requests** | R2 includes 1 million writes and 10 million reads a month, then charges $4.50 per million writes and $0.36 per million reads |
+| **Downloads** | No egress fee. Each download counts as read requests |
 
 Files in the trash and old versions count as storage for the 30 days Koidrive keeps them. `koi usage` shows how much each space stores.
 
@@ -110,6 +111,7 @@ You need a Cloudflare account with R2 turned on, and a Mac or a Linux machine.
 3. **Link a folder and start syncing.**
 
    ```sh
+   mkdir -p ~/Koidrive
    koi space create Koidrive
    koi link ~/Koidrive --space Koidrive
    koi daemon
