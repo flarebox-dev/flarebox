@@ -297,14 +297,17 @@ fn main() -> ExitCode {
     let daemon_run = matches!(command_args, Command::Daemon { .. });
     let pending_paths = paths.clone();
     let (outcome, pending) = runtime.block_on(async {
-        let interrupt = async {
-            if daemon_run {
+        let sigint = (!daemon_run).then(|| signal(SignalKind::interrupt()));
+        let interrupt = async move {
+            let Some(Ok(mut sigint)) = sigint else {
                 return std::future::pending().await;
-            }
+            };
             loop {
-                let caught = tokio::signal::ctrl_c().await;
-                if caught.is_err() || !setup::in_session() {
-                    return caught;
+                if sigint.recv().await.is_none() {
+                    return std::future::pending().await;
+                }
+                if !setup::in_session() {
+                    return Ok::<(), ()>(());
                 }
             }
         };
