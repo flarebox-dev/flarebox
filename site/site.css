@@ -109,10 +109,6 @@ a:hover {
   text-decoration-color: var(--color-accent);
 }
 
-a:active {
-  color: var(--color-ink);
-}
-
 /* Edge-aligned nav: the wordmark and the links at opposite edges, no rule under them. */
 .nav {
   display: flex;

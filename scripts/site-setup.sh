@@ -9,7 +9,7 @@
 #   CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=... scripts/site-setup.sh
 #
 # The token needs Account > Cloudflare Pages > Edit, and on the koidrive.com zone
-# Zone > DNS > Edit and Zone > Single Redirect > Edit. It creates the Pages
+# Zone > Zone > Read, Zone > DNS > Edit and Zone > Single Redirect > Edit. It creates the Pages
 # project, serves it at koidrive.com, and redirects www.koidrive.com there. The
 # workflow reads the token and account ID from the GitHub environment "site".
 
@@ -26,7 +26,8 @@ REDIRECT_REF=site_www_to_apex
 command -v jq >/dev/null || { echo "This script needs jq." >&2; exit 1; }
 
 # Calls the API and prints .result. Exits with the API's errors on a failure,
-# except that a 404 returns 1 when the call is a lookup.
+# except that a lookup prints nothing on a 404. Assign a lookup's output on its
+# own line, so that set -e stops the script on any other failure.
 request() {
   local lookup=$1 method=$2 path=$3 body=${4:-} response status
   local args=(--silent --show-error --write-out '\n%{http_code}' --request "$method"
@@ -36,7 +37,7 @@ request() {
   status="${response##*$'\n'}"
   response="${response%$'\n'*}"
   if [ "$lookup" = lookup ] && [ "$status" = 404 ]; then
-    return 1
+    return 0
   fi
   if [ "$(jq -r '.success' <<<"$response" 2>/dev/null)" != true ]; then
     echo "$method $path failed with HTTP $status:" >&2
@@ -51,7 +52,8 @@ lookup() { request lookup GET "$1"; }
 account="/accounts/$CLOUDFLARE_ACCOUNT_ID"
 
 echo "Pages project $PROJECT"
-if project="$(lookup "$account/pages/projects/$PROJECT")"; then
+project="$(lookup "$account/pages/projects/$PROJECT")"
+if [ -n "$project" ]; then
   branch="$(jq -r '.production_branch' <<<"$project")"
   if [ "$branch" = "$PRODUCTION_BRANCH" ]; then
     echo "  exists, production branch $branch"
@@ -66,7 +68,8 @@ fi
 subdomain="$(jq -r '.subdomain' <<<"$project")"
 
 echo "Custom domain $DOMAIN"
-if lookup "$account/pages/projects/$PROJECT/domains/$DOMAIN" >/dev/null; then
+attached="$(lookup "$account/pages/projects/$PROJECT/domains/$DOMAIN")"
+if [ -n "$attached" ]; then
   echo "  already attached"
 else
   call POST "$account/pages/projects/$PROJECT/domains" "$(jq -n --arg n "$DOMAIN" '{name: $n}')" >/dev/null
@@ -110,7 +113,8 @@ rule="$(jq -n --arg ref "$REDIRECT_REF" --arg www "$WWW" --arg domain "$DOMAIN" 
   }}
 }')"
 phase="/zones/$zone/rulesets/phases/http_request_dynamic_redirect/entrypoint"
-if ruleset="$(lookup "$phase")"; then
+ruleset="$(lookup "$phase")"
+if [ -n "$ruleset" ]; then
   ruleset_id="$(jq -r '.id' <<<"$ruleset")"
   current="$(jq -c --arg ref "$REDIRECT_REF" '.rules[]? | select(.ref == $ref)' <<<"$ruleset")"
   wanted='{expression, action, action_parameters}'
