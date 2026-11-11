@@ -360,6 +360,11 @@ fn a_node_whose_name_another_entry_took_stays_excluded_until_it_returns_or_is_tr
     assert!(["d", "a", "b"].iter().all(|id| restored.ignored(id)));
 
     assert_eq!(trees.displaced_with_identity(&held), Some(&"a".to_owned()));
+    let undated = FileIdentity {
+        birth_ns: None,
+        ..held
+    };
+    assert_eq!(trees.displaced_with_identity(&undated), None);
     trees.set_local("a".into(), local(file(ROOT, "back.txt", 1), 2));
     assert!(!trees.excluded("a") && trees.displaced_with_identity(&held).is_none());
     trash(&mut trees, "b");

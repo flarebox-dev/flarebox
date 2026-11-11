@@ -548,10 +548,12 @@ impl Trees {
         &self.displaced
     }
 
-    /// The node [`Trees::displace_local`] took out of L with `identity`: the greatest ID when several have it.
+    /// The node [`Trees::displace_local`] took out of L with `identity`: the greatest ID when several have it. An
+    /// identity without a birth time finds none: the record can outlive the node's copy, and the file system may
+    /// give its inode to another file, which only the birth time tells apart.
     pub fn displaced_with_identity(&self, identity: &FileIdentity) -> Option<&NodeId> {
         (self.displaced.iter().rev())
-            .find(|(_, held)| *held == identity)
+            .find(|(_, held)| *held == identity && identity.birth_ns.is_some())
             .map(|(id, _)| id)
     }
 
