@@ -25,39 +25,11 @@ jobs:
       server_macos: ${{ steps.paths.outputs.server_macos }}
       spec_macos: ${{ steps.paths.outputs.spec_macos }}
       macos_app: ${{ steps.paths.outputs.macos_app }}
-      macos_runs_on: ${{ steps.runners.outputs.macos_runs_on }}
-      macos_developer_dir: ${{ steps.runners.outputs.macos_developer_dir }}
       site_only: ${{ steps.paths.outputs.site_only }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Choose the macOS runners
-        id: runners
-        env:
-          EVENT: ${{ github.event_name }}
-          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
-          REPO: ${{ github.repository }}
-          RUNS_ON: ${{ vars.MACOS_RUNS_ON || '["self-hosted","flarebox-mini"]' }}
-        run: |
-          if [ "$EVENT" = pull_request ] && { [ "$REPO" != koidrive/koidrive ] || [ "$HEAD_REPO" != "$REPO" ]; }; then
-            echo "Pull request in $REPO from ${HEAD_REPO:-a deleted repository}: its macOS jobs run on GitHub-hosted runners."
-            RUNS_ON='["xcode-27"]'
-          fi
-          if ! jq -e 'type == "array" and length > 0 and all(.[]; type == "string")' <<<"$RUNS_ON" >/dev/null 2>&1; then
-            echo "::error::The MACOS_RUNS_ON variable must be a JSON array of runner labels, such as [\"xcode-27\"], but it is: $RUNS_ON"
-            exit 1
-          fi
-          if jq -e 'index("self-hosted")' <<<"$RUNS_ON" >/dev/null; then
-            developer_dir=/Applications/Xcode.app/Contents/Developer
-          else
-            developer_dir=/Applications/Xcode_27.2.app/Contents/Developer
-          fi
-          echo "macOS jobs run on $RUNS_ON with DEVELOPER_DIR=$developer_dir."
-          {
-            echo "macos_runs_on=$(jq -c . <<<"$RUNS_ON")"
-            echo "macos_developer_dir=$developer_dir"
-          } >> "$GITHUB_OUTPUT"
       - name: Decide which jobs the change needs
         id: paths
         env:
@@ -98,18 +70,170 @@ jobs:
           printf '%s=false\n' server_macos spec_macos >> "$GITHUB_OUTPUT"
           decide macos_app '^(\.github/workflows/ci\.yml$|Cargo\.(toml|lock)$|cli/Cargo\.toml$|rust-toolchain\.toml$|\.cargo/|core/|apps/macos/)'
 
+  pick-macos:
+    name: pick-macos
+    needs: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    outputs:
+      macos_app: ${{ steps.pick.outputs.macos_app }}
+      rust: ${{ steps.pick.outputs.rust }}
+      server: ${{ steps.pick.outputs.server }}
+      spec: ${{ steps.pick.outputs.spec }}
+      runner_hook: ${{ steps.pick.outputs.runner_hook }}
+    steps:
+      - name: Pick a runner for each macOS job
+        id: pick
+        env:
+          EVENT: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
+          RUNS_ON: ${{ vars.MACOS_RUNS_ON || '["self-hosted","flarebox-mini"]' }}
+          RUNNER_STATUS_TOKEN: ${{ secrets.RUNNER_STATUS_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          WANTED: macos_app=${{ needs.changes.outputs.macos_app }} rust=${{ needs.changes.outputs.rust_macos }} server=${{ needs.changes.outputs.server_macos }} spec=${{ needs.changes.outputs.spec_macos }} runner_hook=${{ needs.changes.outputs.site_only != 'true' }}
+        run: |
+          hosted='["xcode-27"]'
+          api() {
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "Counting the hosted macOS jobs took more than 90 seconds." >&2
+              return 1
+            fi
+            curl -fsS --max-time 15 -H "Authorization: Bearer $GITHUB_TOKEN" -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "$GITHUB_API_URL/repos/$REPO/actions/$1"
+          }
+          count_hosted() {
+            local deadline=$((SECONDS + 90)) status p page got c ids="" id n=0
+            for status in queued in_progress; do
+              p=1
+              while :; do
+                page="$(api "runs?status=$status&per_page=100&page=$p")" || return 1
+                got="$(jq -er '.workflow_runs | if type == "array" then length else error("no workflow_runs") end' <<<"$page")" || return 1
+                ids="$ids $(jq -r '.workflow_runs[].id' <<<"$page")"
+                [ "$got" = 100 ] || break
+                p=$((p + 1))
+              done
+            done
+            for id in $(tr -s ' ' '\n' <<<"$ids" | sort -un); do
+              p=1
+              while :; do
+                page="$(api "runs/$id/jobs?filter=latest&per_page=100&page=$p")" || return 1
+                got="$(jq -er --argjson hosted "$hosted" '.jobs | if type != "array" then error("no jobs") else "\(length) \([.[] | select(.status != "completed") | [.labels[] | ascii_downcase] | select((index("self-hosted") | not) and any(.[]; startswith("macos") or (. as $label | $hosted | index($label)) != null))] | length)" end' <<<"$page")" || return 1
+                read -r got c <<<"$got"
+                n=$((n + c))
+                [ "$got" = 100 ] || break
+                p=$((p + 1))
+              done
+            done
+            echo "$n"
+          }
+          pool=false
+          idle=n/a
+          online=n/a
+          total=n/a
+          if [ "$EVENT" = pull_request ] && { [ "$REPO" != koidrive/koidrive ] || [ "$HEAD_REPO" != "$REPO" ]; }; then
+            reason="Pull request in $REPO from ${HEAD_REPO:-a deleted repository}: its macOS jobs run on GitHub-hosted runners."
+            RUNS_ON=$hosted
+          elif ! jq -e 'type == "array" and length > 0 and all(.[]; type == "string")' <<<"$RUNS_ON" >/dev/null 2>&1; then
+            echo "::error::The MACOS_RUNS_ON variable must be a JSON array of runner labels, such as [\"xcode-27\"], but it is: $RUNS_ON"
+            exit 1
+          elif [ "$EVENT" != pull_request ]; then
+            reason="A $EVENT run keeps the configured macOS runners."
+          elif ! jq -e 'map(ascii_downcase) | index("self-hosted")' <<<"$RUNS_ON" >/dev/null; then
+            reason="MACOS_RUNS_ON is $RUNS_ON, which names no self-hosted runner, so there is nothing to pool."
+          elif [ -z "$RUNNER_STATUS_TOKEN" ]; then
+            reason="The RUNNER_STATUS_TOKEN secret is not set, so the self-hosted runners cannot be checked and every macOS job runs on GitHub-hosted runners."
+            RUNS_ON=$hosted
+          elif ! runners="$(curl -fsS --max-time 15 -H "Authorization: Bearer $RUNNER_STATUS_TOKEN" -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "$GITHUB_API_URL/repos/$REPO/actions/runners?per_page=100")"; then
+            reason="Listing the self-hosted runners failed (see the curl error above), so every macOS job runs on GitHub-hosted runners."
+            RUNS_ON=$hosted
+          elif ! counts="$(jq -er --argjson want "$RUNS_ON" '[.runners[] | select(($want | map(ascii_downcase)) - [.labels[].name | ascii_downcase] == [])] | "\(map(select(.status == "online" and .busy == false)) | length) \(map(select(.status == "online")) | length) \(length)"' <<<"$runners" 2>&1)"; then
+            reason="The runner list is not in the expected shape ($counts), so every macOS job runs on GitHub-hosted runners."
+            RUNS_ON=$hosted
+          else
+            read -r idle online total <<<"$counts"
+            if [ "$online" = 0 ]; then
+              reason="None of the $total self-hosted runners labelled $RUNS_ON is online, so every macOS job runs on GitHub-hosted runners."
+              RUNS_ON=$hosted
+            else
+              pool=true
+              reason="$idle of the $total self-hosted runners labelled $RUNS_ON are online and idle, and $online are online."
+            fi
+          fi
+          RUNS_ON="$(jq -c . <<<"$RUNS_ON")"
+          wanted_jobs=0
+          for job in macos_app rust server spec runner_hook; do
+            case " $WANTED " in *" $job=true "*) wanted_jobs=$((wanted_jobs + 1)) ;; esac
+          done
+          hosted_cap=5
+          hosted_load=n/a
+          if [ "$pool" = true ] && [ "$wanted_jobs" -gt "$idle" ]; then
+            if hosted_load="$(count_hosted)"; then
+              reason="$reason $hosted_load hosted macOS jobs of this repository are queued or running. A job without an idle self-hosted runner runs on GitHub-hosted runners while that count is below $hosted_cap, and queues for a self-hosted runner otherwise."
+            else
+              hosted_load=unknown
+              reason="$reason Counting the hosted macOS jobs failed (see the error above), so every job without an idle self-hosted runner runs on GitHub-hosted runners."
+            fi
+          fi
+          echo "$reason"
+          {
+            echo "### macOS runners"
+            echo
+            echo "$reason"
+            echo
+            echo "| Job | Runs | Runner labels | DEVELOPER_DIR |"
+            echo "| --- | --- | --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          to_self_hosted=0
+          to_hosted=0
+          idle_left=$idle
+          hosted_busy=$hosted_load
+          for job in macos_app rust server spec runner_hook; do
+            case " $WANTED " in
+              *" $job=true "*) wanted=true ;;
+              *) wanted=false ;;
+            esac
+            runs_on=$RUNS_ON
+            if [ "$pool" = true ]; then
+              if [ "$wanted" != true ]; then
+                runs_on=$hosted
+              elif [ "$idle_left" -gt 0 ]; then
+                idle_left=$((idle_left - 1))
+              elif [ "$hosted_busy" = unknown ]; then
+                runs_on=$hosted
+              elif [ "$hosted_busy" -lt "$hosted_cap" ]; then
+                runs_on=$hosted
+                hosted_busy=$((hosted_busy + 1))
+              fi
+            fi
+            if jq -e 'map(ascii_downcase) | index("self-hosted")' <<<"$runs_on" >/dev/null; then
+              developer_dir=/Applications/Xcode.app/Contents/Developer
+              if [ "$wanted" = true ]; then to_self_hosted=$((to_self_hosted + 1)); fi
+            else
+              developer_dir=/Applications/Xcode_27.2.app/Contents/Developer
+              if [ "$wanted" = true ]; then to_hosted=$((to_hosted + 1)); fi
+            fi
+            echo "$job: runs $wanted, on $runs_on with DEVELOPER_DIR=$developer_dir"
+            echo "| $job | $wanted | \`$runs_on\` | \`$developer_dir\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "$job=$(jq -nc --argjson runs_on "$runs_on" --arg developer_dir "$developer_dir" '{runs_on: $runs_on, developer_dir: $developer_dir}')" >> "$GITHUB_OUTPUT"
+          done
+          decision="pick-macos: event=$EVENT pooled=$pool idle=$idle online=$online total=$total hosted_load=$hosted_load hosted_cap=$hosted_cap to_self_hosted=$to_self_hosted to_hosted=$to_hosted"
+          echo "$decision"
+          printf '\n%s\n' "$decision" >> "$GITHUB_STEP_SUMMARY"
+
   rust:
     name: rust (${{ matrix.os }})
-    needs: changes
+    needs: [changes, pick-macos]
     if: needs.changes.outputs.site_only != 'true'
     strategy:
       fail-fast: false
       matrix:
         os: ${{ fromJSON(needs.changes.outputs.rust_macos == 'true' && '["ubuntu-latest","macos"]' || '["ubuntu-latest"]') }}
-    runs-on: ${{ matrix.os == 'macos' && fromJSON(needs.changes.outputs.macos_runs_on) || matrix.os }}
+    runs-on: ${{ matrix.os == 'macos' && fromJSON(needs.pick-macos.outputs.rust).runs_on || matrix.os }}
     timeout-minutes: 60
     env:
-      DEVELOPER_DIR: ${{ matrix.os == 'macos' && needs.changes.outputs.macos_developer_dir || '' }}
+      DEVELOPER_DIR: ${{ matrix.os == 'macos' && fromJSON(needs.pick-macos.outputs.rust).developer_dir || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -135,15 +259,15 @@ jobs:
 
   server:
     name: server (${{ matrix.os }})
-    needs: changes
+    needs: [changes, pick-macos]
     if: needs.changes.outputs.site_only != 'true'
     strategy:
       fail-fast: false
       matrix:
         os: ${{ fromJSON(needs.changes.outputs.server_macos == 'true' && '["ubuntu-latest","macos"]' || '["ubuntu-latest"]') }}
-    runs-on: ${{ matrix.os == 'macos' && fromJSON(needs.changes.outputs.macos_runs_on) || matrix.os }}
+    runs-on: ${{ matrix.os == 'macos' && fromJSON(needs.pick-macos.outputs.server).runs_on || matrix.os }}
     env:
-      DEVELOPER_DIR: ${{ matrix.os == 'macos' && needs.changes.outputs.macos_developer_dir || '' }}
+      DEVELOPER_DIR: ${{ matrix.os == 'macos' && fromJSON(needs.pick-macos.outputs.server).developer_dir || '' }}
     defaults:
       run:
         working-directory: server
@@ -296,15 +420,15 @@ jobs:
 
   spec:
     name: spec (${{ matrix.os }})
-    needs: changes
+    needs: [changes, pick-macos]
     if: needs.changes.outputs.site_only != 'true'
     strategy:
       fail-fast: false
       matrix:
         os: ${{ fromJSON(needs.changes.outputs.spec_macos == 'true' && '["ubuntu-latest","macos"]' || '["ubuntu-latest"]') }}
-    runs-on: ${{ matrix.os == 'macos' && fromJSON(needs.changes.outputs.macos_runs_on) || matrix.os }}
+    runs-on: ${{ matrix.os == 'macos' && fromJSON(needs.pick-macos.outputs.spec).runs_on || matrix.os }}
     env:
-      DEVELOPER_DIR: ${{ matrix.os == 'macos' && needs.changes.outputs.macos_developer_dir || '' }}
+      DEVELOPER_DIR: ${{ matrix.os == 'macos' && fromJSON(needs.pick-macos.outputs.spec).developer_dir || '' }}
     defaults:
       run:
         working-directory: spec
@@ -337,12 +461,12 @@ jobs:
 
   macos-app:
     name: macos app
-    needs: changes
+    needs: [changes, pick-macos]
     if: needs.changes.outputs.macos_app == 'true'
-    runs-on: ${{ fromJSON(needs.changes.outputs.macos_runs_on) }}
+    runs-on: ${{ fromJSON(needs.pick-macos.outputs.macos_app).runs_on }}
     timeout-minutes: 45
     env:
-      DEVELOPER_DIR: ${{ needs.changes.outputs.macos_developer_dir }}
+      DEVELOPER_DIR: ${{ fromJSON(needs.pick-macos.outputs.macos_app).developer_dir }}
     defaults:
       run:
         working-directory: apps/macos
@@ -395,9 +519,9 @@ jobs:
 
   runner-hook:
     name: runner hook
-    needs: changes
+    needs: [changes, pick-macos]
     if: needs.changes.outputs.site_only != 'true'
-    runs-on: ${{ fromJSON(needs.changes.outputs.macos_runs_on) }}
+    runs-on: ${{ fromJSON(needs.pick-macos.outputs.runner_hook).runs_on }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -411,12 +535,13 @@ jobs:
   ci-report:
     name: ci-report
     if: always()
-    needs: [changes, rust, server, server-deploy, net-integration, driver-integration, cli-integration, ffi-integration, spec, macos-app, runner-hook]
+    needs: [changes, pick-macos, rust, server, server-deploy, net-integration, driver-integration, cli-integration, ffi-integration, spec, macos-app, runner-hook]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any CI job failed or was cancelled
         env:
           CHANGES: ${{ needs.changes.result }}
+          PICK_MACOS: ${{ needs.pick-macos.result }}
           SITE_ONLY: ${{ needs.changes.outputs.site_only }}
           RUST: ${{ needs.rust.result }}
           SERVER: ${{ needs.server.result }}
@@ -431,9 +556,9 @@ jobs:
           FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
         run: |
           echo "site-only change: ${SITE_ONLY:-unknown}. Build and test jobs that skip for a site-only change report skipped."
-          echo "changes: $CHANGES, rust: $RUST, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, driver-integration: $DRIVER_INTEGRATION, cli-integration: $CLI_INTEGRATION, ffi-integration: $FFI_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP, runner-hook: $RUNNER_HOOK"
+          echo "changes: $CHANGES, pick-macos: $PICK_MACOS, rust: $RUST, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, driver-integration: $DRIVER_INTEGRATION, cli-integration: $CLI_INTEGRATION, ffi-integration: $FFI_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP, runner-hook: $RUNNER_HOOK"
           if [ "$FAILED" = "true" ]; then
-            echo "::error::At least one CI job failed or was cancelled (changes: $CHANGES, rust: $RUST, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, driver-integration: $DRIVER_INTEGRATION, cli-integration: $CLI_INTEGRATION, ffi-integration: $FFI_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP, runner-hook: $RUNNER_HOOK). Open that job's log for the cause."
+            echo "::error::At least one CI job failed or was cancelled (changes: $CHANGES, pick-macos: $PICK_MACOS, rust: $RUST, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, driver-integration: $DRIVER_INTEGRATION, cli-integration: $CLI_INTEGRATION, ffi-integration: $FFI_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP, runner-hook: $RUNNER_HOOK). Open that job's log for the cause."
             exit 1
           fi
       - name: Fail unless the build and test jobs ran for a change outside site/
