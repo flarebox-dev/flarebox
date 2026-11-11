@@ -86,6 +86,24 @@ grep -F "koi on PATH runs $tmp/other/koi, another program" "$tmp/other.log"
 PATH="$HOME/.local/bin:$tmp/other:$PATH" sh "$root/install.sh" --no-systemd > "$tmp/first.log" 2>&1
 if grep -q 'another program' "$tmp/first.log"; then exit 1; fi
 pass 'another koi on PATH is reported'
+PATH="$HOME/.local/bin:$PATH" KOIDRIVE_INSTALL_DIR="$HOME/.local/bin/" sh "$root/install.sh" --no-systemd > "$tmp/slash.log" 2>&1
+cat "$tmp/slash.log"
+if grep -q -e 'Warning' "$tmp/slash.log"; then exit 1; fi
+cmp "$binary" "$HOME/.local/bin/koi"
+pass 'trailing slash in the install directory is the same directory'
+ln -s "$HOME/.local/bin" "$tmp/linked"
+PATH="$tmp/linked:$PATH" sh "$root/install.sh" --no-systemd > "$tmp/linked.log" 2>&1
+cat "$tmp/linked.log"
+if grep -q -e 'Warning' "$tmp/linked.log"; then exit 1; fi
+pass 'install directory reached through a symlink on PATH'
+mkdir -p "$tmp/older"
+printf '#!/bin/sh\n# Koidrive sync client\n' > "$tmp/older/koi"
+chmod +x "$tmp/older/koi"
+PATH="$tmp/older:$HOME/.local/bin:$PATH" sh "$root/install.sh" --no-systemd > "$tmp/older.log" 2>&1
+cat "$tmp/older.log"
+grep -F "koi on PATH runs $tmp/older/koi, another Koidrive install" "$tmp/older.log"
+if grep -q 'another program' "$tmp/older.log"; then exit 1; fi
+pass 'an older Koidrive koi on PATH is named as one'
 export KOIDRIVE_VERSION=0.0.0
 printf '%064d  %s\n' 0 "$archive" > "$release/SHA256SUMS"
 reject 'checksum mismatch preserves the installed binary' 'Checksum mismatch'
@@ -117,7 +135,7 @@ EOF
     [ ! -e "$tmp/no-tty/systemd/user/koidrive.service" ]
     [ "$(wc -l < "$HOME/systemctl.log" | tr -d ' ')" = 1 ]
     pass 'noninteractive default does not install or start the service'
-    printf 'Passed 15 installer tests on %s\n' "$(uname -s)"
+    printf 'Passed 18 installer tests on %s\n' "$(uname -s)"
 else
     cat > "$tmp/bin/uname" <<'EOF'
 #!/bin/sh
@@ -147,5 +165,5 @@ EOF
         cmp "$binary" "$HOME/.local/bin/koi"
         pass "macOS x86_64 shell selects $candidate with hw.optional.arm64=$arm64"
     done
-    printf 'Passed 15 installer tests on %s\n' "$(uname -s)"
+    printf 'Passed 18 installer tests on %s\n' "$(uname -s)"
 fi
