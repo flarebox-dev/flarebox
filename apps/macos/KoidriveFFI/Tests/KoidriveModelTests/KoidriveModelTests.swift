@@ -566,6 +566,37 @@ private final class Fetches {
         #expect(app.telemetry == locked)
     }
 
+    @Test func aHiddenChoiceIsNotStoredWhenTheSettingBecomesUndecidedDuringConnect() async throws {
+        let app = AppModel.fake(scenario: .firstRun)
+        let fake = try #require(app.session.fakeCore())
+        fake.setTelemetrySetting(setting: TelemetrySetting(enabled: false, decided: true, locked: false))
+        app.start()
+        let setup = SetupModel(app: app, mode: .firstRun, deviceName: "Mac")
+        #expect(!setup.asksForUsageReports)
+
+        let undecided = TelemetrySetting(enabled: false, decided: false, locked: false)
+        fake.setTelemetrySetting(setting: undecided)
+        setup.serverURL = "https://box.example.com"
+        await setup.connect()
+        #expect(setup.step == .signIn)
+        #expect(app.telemetry == undecided)
+    }
+
+    @Test func aChoiceTheCLIMakesDuringConnectIsKept() async throws {
+        let app = AppModel.fake(scenario: .firstRun)
+        let fake = try #require(app.session.fakeCore())
+        let setup = SetupModel(app: app, mode: .firstRun, deviceName: "Mac")
+        #expect(setup.asksForUsageReports)
+        #expect(setup.sendsUsageReports)
+
+        let cli = TelemetrySetting(enabled: false, decided: true, locked: false)
+        fake.setTelemetrySetting(setting: cli)
+        setup.serverURL = "https://box.example.com"
+        await setup.connect()
+        #expect(setup.step == .signIn)
+        #expect(app.telemetry == cli)
+    }
+
     @Test func incompleteStepsMakeNoCall() async throws {
         let app = AppModel.fake(scenario: .firstRun)
         let setup = SetupModel(app: app, mode: .firstRun, deviceName: "Mac")

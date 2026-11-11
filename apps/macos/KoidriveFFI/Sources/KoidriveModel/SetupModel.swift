@@ -76,9 +76,11 @@ public final class SetupModel {
 
     public func connect() async {
         guard canConnect else { return }
+        let offered = asksForUsageReports
+        let sendsUsageReports = sendsUsageReports
         await attempt {
             server = try await app.connect(url: serverURL)
-            if asksForUsageReports {
+            if offered && asksForUsageReports {
                 try? app.setTelemetry(enabled: sendsUsageReports)
             }
             step = .signIn
