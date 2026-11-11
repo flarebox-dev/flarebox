@@ -41,6 +41,9 @@ pub struct TreesState {
     /// The nodes a delete of this device trashed, each with the seq of its commit, while R holds
     /// them trashed by that commit.
     pub trashed_here: BTreeMap<NodeId, u64>,
+    /// The nodes S took from a Discard answer to a first-link question (section 6.4), while S, or
+    /// the S update waiting for them, still holds them.
+    pub discarded: BTreeSet<NodeId>,
 }
 
 /// What [`Commits`](crate::commit::Commits) holds.

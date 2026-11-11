@@ -519,10 +519,11 @@ fn recovery_question(trees: &Trees) -> CommitsState {
             id: "other".into(),
             asked_at_ms: NOW,
             kind: QuestionKind::Recovery {
-                group: RecoveryGroup::CreatedOnThisDevice,
+                group: RecoveryGroup::ChangedOnThisDevice,
             },
             held: [("d".into(), Held { members, files: 15 })].into(),
             answer: None,
+            shown: Default::default(),
         }],
         ..Default::default()
     }

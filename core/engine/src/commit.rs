@@ -10,6 +10,7 @@ use flarebox_proto::v1::{self as proto, error, op, op_result};
 use prost::Message;
 
 use crate::classify::{Class, Trees};
+use crate::first_link;
 use crate::guard::{self, GuardState};
 use crate::ids::IdGen;
 use crate::names::{MAX_NAME_BYTES, name_key, nfc};
@@ -328,27 +329,94 @@ impl Commits {
         &self.questions
     }
 
-    /// Takes the person's answer to the open question `id`, routed by its kind. Only the
-    /// mass-delete guard asks questions so far (section 6.1). The answer stays on the question
-    /// until the next build has counted what is pending. [`Answer::Delete`] then makes the held
-    /// deletions without counting them again if they are still exactly the ones the question
-    /// listed, and asks a new question otherwise. [`Answer::Restore`] clears S for every node of
-    /// the question that is still deleted, so the effects download them again, and holds any other
-    /// pending deletion under a new question. An S update that would leave S invalid, such as for
-    /// a folder whose child was moved out and is not acknowledged yet, waits ([`Trees::waiting`]).
-    /// False, and nothing changes, when no open question has the ID, its kind does not take the
-    /// answer, or it already took one.
+    /// Matches L against R on the first link of the folder, once R holds the server's tree and L
+    /// the first scan's (section 6.4): every local entry R holds at the same path with the same
+    /// kind and content is adopted, and the others are held under one question about what was
+    /// created on this device. A space with nothing live has nothing to match, and L syncs as it is.
+    pub fn first_link(&mut self, trees: &mut Trees, ids: &mut IdGen, now_ms: u64) {
+        if trees.remote().iter().all(|(_, node)| node.trashed) {
+            return;
+        }
+        let tops = first_link::adopt(trees);
+        if let Some(question) = first_link::ask(trees, tops, None, ids, now_ms) {
+            self.questions.push(question);
+        }
+        self.hold(trees);
+    }
+
+    /// Takes the person's answer to the open question `id`, routed by its kind. The answer stays
+    /// on the question until the next build, which takes it only if the question still holds what
+    /// it listed, and asks a new question otherwise.
+    ///
+    /// For the mass-delete guard's question (section 6.1), the next build counts what is pending
+    /// first. [`Answer::Delete`] then makes the held deletions without counting them again.
+    /// [`Answer::Restore`] clears S for every node of the question that is still deleted, so the
+    /// effects download them again, and holds any other pending deletion under a new question.
+    ///
+    /// For a first link's question about entries created on this device (section 6.4),
+    /// [`Answer::Publish`] lets the build send them as creates, and the server renames one whose
+    /// name R holds. [`Answer::Discard`] sets S to L for every entry, so that, R holding none of
+    /// them, the effects move them to the local trash, and then download what R holds at their
+    /// paths.
+    ///
+    /// An S update that would leave S invalid, such as for a folder whose child was moved out and
+    /// is not acknowledged yet, waits ([`Trees::waiting`]). False, and nothing changes, when no
+    /// open question has the ID, its kind does not take the answer, or it already took one.
     pub fn decide(&mut self, id: &str, answer: Answer) -> bool {
         let Some(index) = (self.questions.iter()).position(|question| {
             question.id == id
                 && question.answer.is_none()
                 && question.kind.answers().contains(&answer)
-                && matches!(question.kind, QuestionKind::MassDelete { .. })
+                && (matches!(question.kind, QuestionKind::MassDelete { .. })
+                    || first_link::asks(question))
         }) else {
             return false;
         };
         self.questions[index].answer = Some(answer);
         true
+    }
+
+    /// Asks again about what a first link holds, as L holds it now (section 6.4), and takes the
+    /// answer to the question if it still holds what it listed. A held entry the user deleted
+    /// leaves the question, one the user edited or moved stays, and either change replaces the
+    /// question with a new one, which drops the answer.
+    fn ask_again(&mut self, trees: &mut Trees, ids: &mut IdGen, now_ms: u64) {
+        let shows = |question: &Question| first_link::asks(question) && !question.shown.is_empty();
+        let Some(index) = self.questions.iter().position(shows) else {
+            return;
+        };
+        let asked = &self.questions[index];
+        let held = asked.holds().cloned().collect::<Vec<_>>();
+        match first_link::ask(trees, held, Some(asked), ids, now_ms) {
+            Some(question) if question.answer.is_none() => self.questions[index] = question,
+            Some(question) => {
+                self.questions.remove(index);
+                if question.answer == Some(Answer::Discard) {
+                    trees.discard(question.shown.keys().cloned());
+                    let updates = (question.shown.into_iter())
+                        .map(|(id, shape)| (id, Some(shape)))
+                        .collect();
+                    for (id, shape) in update_synced(trees, updates) {
+                        trees.wait(id, shape);
+                    }
+                }
+            }
+            None => {
+                self.questions.remove(index);
+            }
+        }
+        self.hold(trees);
+    }
+
+    /// Tells the trees which local entries the open questions hold ([`Question::shown`],
+    /// [`Trees::set_asked`]). The planner does whenever its questions change; a caller that
+    /// restores it from a state calls this.
+    pub fn hold(&self, trees: &mut Trees) {
+        let shown = self
+            .questions
+            .iter()
+            .flat_map(|question| question.shown.keys());
+        trees.set_asked(shown.cloned().collect());
     }
 
     fn resolve(&mut self, id: RestoreId, outcome: Outcome) {
@@ -441,6 +509,8 @@ impl Commits {
         if self.halted.is_some() || !trees.rules_known() {
             return None;
         }
+        self.ask_again(trees, ids, now_ms);
+        trees.reclaim();
         let parked = trees.local().iter().filter(|(_, node)| node.parked);
         let mut skip: BTreeSet<NodeId> = self
             .problems
@@ -482,6 +552,7 @@ impl Commits {
             self.questions
                 .insert(kept.unwrap_or(self.questions.len()), question);
         }
+        self.hold(trees);
         self.split.retain(|id| trees.synced().live(id).is_some());
         self.aliases
             .retain(|id, _| trees.local().get(id).is_some() && trees.reverted().contains(id));
@@ -971,7 +1042,7 @@ fn update_synced(
 }
 
 /// Gives the local node `from` the ID `to`; its children follow.
-fn rekey(trees: &mut Trees, from: &str, to: &str) {
+pub(crate) fn rekey(trees: &mut Trees, from: &str, to: &str) {
     let Some(node) = trees.local().get(from).cloned() else {
         return;
     };

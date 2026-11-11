@@ -462,7 +462,7 @@ fn candidate(trees: &Trees, id: &str) -> bool {
         || (trees.waiting().contains_key(id)
             && trees.remote().live(id).is_none()
             && !trees.edited(id));
-    changed && !forgets && !trees.excluded(id)
+    changed && !forgets && !trees.excluded(id) && !trees.reclaimed(id)
 }
 
 /// Whether L holds a node whose way to the root passes `id`. Each node on that way goes to its R

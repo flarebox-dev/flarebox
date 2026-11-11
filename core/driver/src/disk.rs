@@ -106,8 +106,6 @@ pub(crate) enum Stop {
     /// The server sent something this build cannot apply.
     #[error("{0}")]
     Protocol(String),
-    #[error("{0}; this build cannot sync that yet")]
-    Unsupported(String),
 }
 
 /// Why [`Pending::stage`] returned without a staged file. The effect stays in flight.

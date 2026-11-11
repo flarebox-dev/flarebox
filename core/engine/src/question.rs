@@ -9,10 +9,10 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
-use crate::tree::NodeId;
+use crate::tree::{NodeId, Shape};
 
 /// An open question and what it holds.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Question {
     /// Unique per question. A question whose held nodes change is replaced by one with a new id, so
     /// an answer always refers to what the person saw.
@@ -24,6 +24,9 @@ pub struct Question {
     /// An answer the engine took but applies only when it next plans, if what the question holds
     /// has not changed by then.
     pub answer: Option<Answer>,
+    /// The shape L had for each held node R does not hold, when the question was asked. A change
+    /// to any of them replaces the question.
+    pub shown: BTreeMap<NodeId, Shape>,
 }
 
 impl Question {

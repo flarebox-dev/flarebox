@@ -106,6 +106,13 @@ impl Tx<'_> {
         while let Some(row) = rows.next()? {
             state.trees.trashed_here.insert(row.get(0)?, row.get(1)?);
         }
+        let mut stmt = self
+            .0
+            .prepare_cached("SELECT node_id FROM discarded_nodes")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            state.trees.discarded.insert(row.get(0)?);
+        }
 
         if let Some((accepted, halt, code, cap)) = self
             .0
@@ -180,9 +187,11 @@ impl Tx<'_> {
             "commit_in_flight_delete_members",
             "watched_contents",
             "trashed_here",
+            "discarded_nodes",
             "effect_state",
             "failed_effects",
             "restore_intents",
+            "open_question_shapes",
             "open_question_members",
             "open_question_items",
             "open_questions",
@@ -279,6 +288,19 @@ impl Tx<'_> {
         }
         for (node, seq) in changed {
             put.execute(params![node, seq])?;
+        }
+        let (old, new) = (&before.trees.discarded, &after.trees.discarded);
+        let mut remove = self
+            .0
+            .prepare_cached("DELETE FROM discarded_nodes WHERE node_id = ?1")?;
+        for node in old.difference(new) {
+            remove.execute([node])?;
+        }
+        let mut insert = self
+            .0
+            .prepare_cached("INSERT INTO discarded_nodes (node_id) VALUES (?1)")?;
+        for node in new.difference(old) {
+            insert.execute([node])?;
         }
 
         let (old, new) = (&before.commits, &after.commits);
@@ -449,14 +471,14 @@ fn halt_from_row(halt: Option<String>, code: Option<i32>) -> Result<Option<Halt>
     })
 }
 
-fn node_kind(kind: Kind) -> i32 {
+pub(crate) fn node_kind(kind: Kind) -> i32 {
     match kind {
         Kind::Dir => NodeKind::Dir as i32,
         Kind::File => NodeKind::File as i32,
     }
 }
 
-fn kind(value: i32) -> Result<Kind> {
+pub(crate) fn kind(value: i32) -> Result<Kind> {
     match NodeKind::try_from(value) {
         Ok(NodeKind::Dir) => Ok(Kind::Dir),
         Ok(NodeKind::File) => Ok(Kind::File),

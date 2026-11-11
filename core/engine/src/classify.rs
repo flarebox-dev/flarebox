@@ -158,6 +158,8 @@ pub struct Trees {
     /// The nodes a delete of this device trashed, each with the seq of its commit, while R holds
     /// them trashed by that commit.
     trashed_here: BTreeMap<NodeId, u64>,
+    /// See [`TreesState::discarded`].
+    discarded: BTreeSet<NodeId>,
     ignore: Matcher,
     /// Nodes whose local copy the user moved into an ignored folder that is no node. L keeps the
     /// entry each had before the move.
@@ -167,6 +169,8 @@ pub struct Trees {
     /// The folders whose rules the last scan of each could not read, by node: a folder renamed is the same folder,
     /// and two folders whose names differ only in case are two folders.
     unknown_rules: BTreeSet<NodeId>,
+    /// The local entries the open questions hold ([`Trees::set_asked`]).
+    asked: BTreeSet<NodeId>,
     /// Dirty nodes marked since the last settle, the only ones whose class can have changed.
     unsettled: BTreeSet<NodeId>,
     /// Dirty nodes the last settle left as [`Class::Same`], which the next one tries again.
@@ -215,10 +219,12 @@ impl Trees {
             waiting: BTreeMap::new(),
             watched: BTreeMap::new(),
             trashed_here: BTreeMap::new(),
+            discarded: BTreeSet::new(),
             ignore: Matcher::new(LocalRules::default()),
             outside: BTreeSet::new(),
             rules_known: true,
             unknown_rules: BTreeSet::new(),
+            asked: BTreeSet::new(),
             unsettled: BTreeSet::new(),
             same: BTreeSet::new(),
             changed: BTreeSet::new(),
@@ -408,13 +414,68 @@ impl Trees {
         self.unknown_rules.remove(id);
     }
 
-    /// Whether L, S or R places the node below a folder whose rules are unknown
-    /// ([`Trees::set_rules_unknown`]). Neither an effect nor a commit is planned for it.
+    /// Sets the local entries R does not hold that the open questions hold (the commit planner's
+    /// questions), which stay on disk as they are until the person answers.
+    pub fn set_asked(&mut self, asked: BTreeSet<NodeId>) {
+        self.asked = asked;
+    }
+
+    /// Whether an open question holds the node's local entry ([`Trees::set_asked`]), or L, S or R
+    /// places it below a folder whose rules are unknown ([`Trees::set_rules_unknown`]). Neither an effect nor a
+    /// commit is planned for it, and no effect parks it to make room for another node.
     pub fn held(&self, id: &str) -> bool {
-        !self.unknown_rules.is_empty()
-            && (below(&self.l, id, &self.unknown_rules)
-                || below(&self.s, id, &self.unknown_rules)
-                || below(&self.r, id, &self.unknown_rules))
+        self.asked.contains(id)
+            || !self.unknown_rules.is_empty()
+                && (below(&self.l, id, &self.unknown_rules)
+                    || below(&self.s, id, &self.unknown_rules)
+                    || below(&self.r, id, &self.unknown_rules))
+    }
+
+    /// Whether `id` is an entry the person discarded on a first link (section 6.4), that R does not
+    /// hold and the user changed since: L holds it at another place or with other content than S,
+    /// or its waiting S update, or holds an entry below it that S does not hold there or that is
+    /// reclaimed itself. The entry is the user's again, so it is not removed: the commit planner
+    /// drops it from S, with every reclaimed folder above it, and sends them again.
+    pub fn reclaimed(&self, id: &str) -> bool {
+        let synced = |id: &str| match self.waiting.get(id) {
+            Some(shape) => shape.as_ref(),
+            None => self.s.live(id),
+        };
+        let (Some(local), Some(shape)) = (self.l.get(id), synced(id)) else {
+            return false;
+        };
+        self.discarded.contains(id)
+            && self.r.get(id).is_none()
+            && !self.excluded(id)
+            && (!local.shape.same(shape)
+                || (self.local_children(id)).any(|child| {
+                    !self.excluded(child)
+                        && (synced(child).is_none_or(|shape| shape.parent != id)
+                            || self.reclaimed(child))
+                }))
+    }
+
+    /// Records that S took `ids` from a Discard answer to a first-link question.
+    pub(crate) fn discard(&mut self, ids: impl IntoIterator<Item = NodeId>) {
+        self.discarded.extend(ids);
+    }
+
+    /// S drops every reclaimed entry ([`Trees::reclaimed`]), and the S update waiting for it, once
+    /// S stays a valid tree without it, so an entry below a reclaimed folder goes first. A
+    /// discarded node that neither S nor a waiting update holds any more is forgotten.
+    pub(crate) fn reclaim(&mut self) {
+        let discarded = self.discarded.iter();
+        let mut reclaimed: Vec<NodeId> =
+            discarded.filter(|id| self.reclaimed(id)).cloned().collect();
+        loop {
+            let before = reclaimed.len();
+            reclaimed.retain(|id| !self.set_synced_if_valid(id.clone(), None));
+            if reclaimed.len() == before {
+                break;
+            }
+        }
+        let (s, waiting) = (&self.s, &self.waiting);
+        (self.discarded).retain(|id| s.live(id).is_some() || waiting.contains_key(id));
     }
 
     /// The caller has passed the rules files of a full scan made since the last restore, and the
@@ -1170,6 +1231,7 @@ impl Trees {
             waiting: self.waiting.clone(),
             watched: self.watched.clone(),
             trashed_here: self.trashed_here.clone(),
+            discarded: self.discarded.clone(),
         }
     }
 
@@ -1215,6 +1277,7 @@ impl Trees {
             waiting,
             watched,
             trashed_here,
+            discarded,
         } = state;
         self.unsettled = dirty.clone();
         self.same.clear();
@@ -1226,6 +1289,7 @@ impl Trees {
         self.waiting = waiting;
         self.watched = watched;
         self.trashed_here = trashed_here;
+        self.discarded = discarded;
         self.rules_known = false;
         self.unknown_rules.clear();
         Ok(())
