@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 
 use flarebox_proto::v1::error;
+use flarebox_sim::world::disk::Place;
 use flarebox_sim::world::{Action, Cut, Failure, NAMES, Outcome, Reply, Step, TEXTS, World};
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
@@ -715,5 +716,14 @@ fn a_folder_moved_into_a_deleted_folder_while_its_create_waits_is_sent() {
         ],
     ];
     let world = converge(3, &phases).unwrap();
-    assert_eq!(world.devices[0].disk.entries().len(), 2);
+    let entries = world.devices[0].disk.entries();
+    assert_eq!(entries.len(), 2);
+    let moved = (entries.values())
+        .find(|entry| matches!(entry.place, Place::In(_)))
+        .expect("A is inside a");
+    let Place::In(folder) = moved.place else {
+        unreachable!()
+    };
+    assert_eq!(moved.name, "a");
+    assert_eq!(entries[&folder].place, Place::Root);
 }
