@@ -3393,7 +3393,7 @@ fn a_late_acknowledgement_takes_the_sent_position_over_one_s_took_from_before_th
 }
 
 /// n's move to b is in flight when a log replay brings the commit at seq 2 and the other device's
-/// move back to a, through each of `stops` first, with a settle after each record. S still holds
+/// move back to a, through each of `stops` first, settling after each record but the commit's. S still holds
 /// the a it held when the commit was built, and L never took a again, so S takes the b that was
 /// sent. The other device's later move then reaches the disk, and the move to b is not sent again.
 fn a_late_acknowledgement_takes_the_sent_position_when_only_r_returned(stops: &[&str]) {
@@ -3406,8 +3406,8 @@ fn a_late_acknowledgement_takes_the_sent_position_when_only_r_returned(stops: &[
     let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert_eq!(ops(&commit), [mv("n", ROOT, "b")]);
-    let names = ["b"].iter().chain(stops).chain(&["a"]);
-    for (rev, name) in (2..).zip(names) {
+    trees.set_remote("n".into(), remote_at(file(ROOT, "b", 1), 2));
+    for (rev, name) in (3..).zip(stops.iter().chain(&["a"])) {
         trees.set_remote("n".into(), remote_at(file(ROOT, name, 1), rev));
         trees.settle();
     }
