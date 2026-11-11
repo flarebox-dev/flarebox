@@ -1020,6 +1020,7 @@ mod tests {
     fn driver_questions_keep_their_answers_and_items() {
         let mapped = question(driver::Question {
             id: "q1".into(),
+            lineage: "q1".into(),
             space_id: "s1".into(),
             asked_at_ms: 7,
             kind: driver::QuestionKind::MassDelete {
@@ -1060,6 +1061,7 @@ mod tests {
 
         let recovery = question(driver::Question {
             id: "q2".into(),
+            lineage: "q2".into(),
             space_id: "s1".into(),
             asked_at_ms: 8,
             kind: driver::QuestionKind::Recovery {
@@ -1089,6 +1091,7 @@ mod tests {
     fn a_remote_mass_delete_is_a_notice_and_no_question() {
         let asked = driver::Question {
             id: "n1".into(),
+            lineage: "n1".into(),
             space_id: "s1".into(),
             asked_at_ms: 9,
             kind: driver::QuestionKind::RemoteMassDelete {

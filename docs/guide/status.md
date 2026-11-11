@@ -9,7 +9,7 @@ koi status
 ```
 Device: laptop (019a...) on https://koidrive.alice.workers.dev
 Daemon: running
-/home/alice/Koidrive  space Koidrive (019a...)  UpToDate  seq 1204 of 1204, 3120 remote nodes, 3118 local entries, 0 questions
+/home/alice/Koidrive  space Koidrive (019a...)  UpToDate  seq 1204 of 1204, 3120 remote nodes, 3118 local entries, 0 pending decisions
 ```
 
 Each linked folder has one line. Its state is one of these:
@@ -24,7 +24,7 @@ Each linked folder has one line. Its state is one of these:
 | `Offline` | The server can't be reached. The folder keeps trying |
 | `Halted` | A problem stopped the folder. The line below says which |
 
-`seq` counts the changes the space has had: how many this device has applied, and how many the server has. A second line under the folder shows a problem, or the last failure the folder is retrying. `--json` prints all of it.
+`seq` counts the changes the space has had: how many this device has applied, and how many the server has. A second line under the folder shows a problem, or the last failure the folder is retrying. Below that come the folder's pending decisions (see [Decisions](#decisions)). `--json` prints all of it, with only the number of decisions for each folder; `koi resolve --json` lists the decisions themselves.
 
 ## Calls the server puts off
 
@@ -78,22 +78,33 @@ koi lift ~/Koidrive --replan
 
 If the fix is a newer `koi`, install it and restart the daemon before you run `lift`, because `lift` runs in the daemon when one is running. A restart alone doesn't send the refused changes again. When the problem says the space's owner must confirm the changes, `lift` can't help, because Koidrive can't ask for that confirmation yet.
 
-## Questions
+## Decisions
 
-```sh
-koi questions
-koi questions answer <id> <answer>
+Some changes wait for you to decide. `koi status` shows each pending decision under its folder: what it holds, and for each answer what it does and the command that gives it:
+
+```
+/home/alice/Koidrive  space Koidrive (019a...)  UpToDate  seq 1210 of 1210, 3120 remote nodes, 2002 local entries, 1 pending decision
+  019b...: held 1 deletions that would remove 1116 of 3118 files, more than half of the space in 10 minutes; first path: Photos
+  Delete these files on the server and other devices:
+    koi resolve 019b... delete
+  Download these files to this device again:
+    koi resolve 019b... restore
 ```
 
-`koi questions` lists the questions a folder is waiting on, with the answers each accepts, and `answer` gives one. The number of open questions, notices included, is at the end of each folder's status line.
+```sh
+koi resolve
+koi resolve <id> <answer>
+```
 
-Sync asks before it deletes many files at once. It holds this device's deletions when, within 10 minutes, they number more than 1,000, or they would remove more than half of the files of a space that has at least 20. A removed folder counts as one deletion of all the files it held. Sync then holds every deletion it has not sent yet and asks one question. Until you answer, the files stay on the server and on your other devices, and every other change keeps syncing, also after a restart.
+`koi resolve` lists every pending decision with the answers it accepts, and `koi resolve <id> <answer>` makes one. While a decision is pending and the daemon runs, every other command ends with a line on stderr that says so (except with `--json`, which prints no banner), and the daemon shows a desktop notification when a new one opens: through the notification service of the desktop session on Linux, and in Notification Center on macOS. A daemon started without a desktop session, such as a system service or one started over SSH, shows none.
+
+Sync asks before it deletes many files at once. It holds this device's deletions when, within 10 minutes, they number more than 1,000, or they would remove more than half of the files of a space that has at least 20. A removed folder counts as one deletion of all the files it held. Sync then holds every deletion it has not sent yet and waits for one decision. Until you answer, the files stay on the server and on your other devices, and every other change keeps syncing, also after a restart.
 
 - `delete` deletes the held files on the server and on every device.
 - `restore` downloads them to this device again.
 
-`koi questions` lists the first 20 held files and folders, and `--json` lists all of them. If the held deletions change before you answer, for example because you put a file back or deleted more, the question is replaced by a new one with a new ID. Sync keeps holding what is left until you answer, even when it no longer crosses a limit. An answer covers only the files its question listed: if you deleted more before sync took your answer, it asks again.
+`koi resolve` lists the first 20 held files and folders, and `--json` lists all of them. If the held deletions change before you answer, for example because you put a file back or deleted more, the decision is replaced by a new one with a new ID. Sync keeps holding what is left until you answer, even when it no longer crosses a limit. An answer covers only the files its decision listed: if you deleted more before sync took your answer, it asks again.
 
-Deletions made on your other devices are applied here without asking, and the removed files go to this folder's [local trash](folders.md#the-local-trash). When they cross the same limits, `koi questions` lists a notice once enough files are removed, which can be before a removed folder is gone. Its counts grow while more deletions arrive, and it waits until you answer `dismiss`, which only closes it. The rest of a deletion it counted, such as the rest of that folder, opens no new notice. To bring the files back, [restore](history.md#restore-a-deleted-file-or-folder) them from the space's trash.
+Deletions made on your other devices are applied here without asking, and the removed files go to this folder's [local trash](folders.md#the-local-trash). When they cross the same limits, `koi status` and `koi resolve` show a notice once enough files are removed, which can be before a removed folder is gone. Its counts grow while more deletions arrive, and it waits until you answer `dismiss`, which only closes it. The rest of a deletion it counted, such as the rest of that folder, opens no new notice. To bring the files back, [restore](history.md#restore-a-deleted-file-or-folder) them from the space's trash.
 
-Sync also asks after the first link of a folder to a space that already held live files or folders, when the comparison holds some of the folder's files, as [Link a folder](folders.md#link-a-folder) describes. `koi questions` shows that question as "files on this device that the space does not hold", and it takes `publish` or `discard`.
+Sync also asks after the first link of a folder to a space that already held live files or folders, when the comparison holds some of the folder's files, as [Link a folder](folders.md#link-a-folder) describes. `koi status` and `koi resolve` show that decision as "files on this device that the space does not hold", and it takes `publish` or `discard`.

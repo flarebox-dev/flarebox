@@ -18,6 +18,12 @@ pub struct Question {
     pub kind: QuestionKind,
     /// Every node the answer applies to, in path order.
     pub items: Vec<HeldItem>,
+    /// The id of the first question in this one's line. A question asked in place of an open, unanswered question of
+    /// the same kind, as when its held set changes, continues that question's line; any other question starts its own,
+    /// with its id. A client tells a new question from a replaced one by it, even when it never saw the one replaced.
+    /// Rows stored before this field read as their own line.
+    #[serde(default)]
+    pub lineage: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +68,7 @@ mod tests {
                 path: "a/b".into(),
                 files: 1,
             }],
+            lineage: "q1".into(),
         };
         let json = serde_json::to_value(&question).unwrap();
         assert_eq!(json["kind"]["type"], "mass_delete");

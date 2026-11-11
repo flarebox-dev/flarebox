@@ -5655,3 +5655,101 @@ fn a_taken_answer_survives_a_second_restart_before_it_is_applied() {
     );
     assert_eq!(a.folder.view().questions, 1);
 }
+
+/// The questions of the site's store as `Driver::questions` shows them.
+fn shown(site: &Site) -> Vec<crate::question::Question> {
+    let mut store = Store::open(&site.db).unwrap();
+    let rows = store.transaction(|tx| tx.questions()).unwrap();
+    (rows.iter())
+        .map(|row| serde_json::from_slice(&row.body).unwrap())
+        .collect()
+}
+
+/// The guard holds 11 of the 20 files in `d`, then the person deletes the rest of `d`. The
+/// guard asks again under a new id about `d` alone, and the new question continues the first one's lineage, so the
+/// daemon does not tell it again.
+#[test]
+fn a_held_folder_that_takes_the_place_of_its_held_children_continues_their_question() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site.root.join("d")).unwrap();
+    for i in 0..20 {
+        fs::write(site.root.join(format!("d/{i}.txt")), format!("in d {i}")).unwrap();
+    }
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    assert_eq!(remote.names().len(), 21);
+    for i in 0..11 {
+        fs::remove_file(site.root.join(format!("d/{i}.txt"))).unwrap();
+    }
+    a.scan_until(|a| a.folder.view().questions == 1);
+    let [first] = &shown(&site)[..] else {
+        panic!("one question");
+    };
+    let first = first.clone();
+    assert_eq!(first.items.len(), 11);
+    assert_eq!(first.lineage, first.id);
+
+    fs::remove_dir_all(site.root.join("d")).unwrap();
+    a.scan_until(|_| shown(&site).iter().all(|question| question.id != first.id));
+
+    let [second] = &shown(&site)[..] else {
+        panic!("one question");
+    };
+    let held: Vec<_> = (second.items.iter())
+        .map(|item| (item.path.as_str(), item.files))
+        .collect();
+    assert_eq!(held, [("d", 20)]);
+    assert_ne!(second.id, first.id);
+    assert_eq!(second.lineage, first.id);
+}
+
+/// The person answers restore, the files come back, and the same 11 files are deleted again.
+/// The new question holds the same files but starts its own lineage, so the daemon tells it even when it never saw
+/// the first one close.
+#[test]
+fn a_question_asked_again_about_the_same_files_after_an_answer_starts_its_own_lineage() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    for i in 0..20 {
+        fs::write(site.root.join(format!("{i}.txt")), format!("file {i}")).unwrap();
+    }
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    assert_eq!(remote.names().len(), 20);
+    for i in 0..11 {
+        fs::remove_file(site.root.join(format!("{i}.txt"))).unwrap();
+    }
+    a.scan_until(|a| a.folder.view().questions == 1);
+    let first = answer(&site, Answer::Restore);
+    let step = a.folder.requested();
+    a.take(step).unwrap();
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    assert_eq!(files(&site.root).len(), 20);
+    assert_eq!(a.folder.view().questions, 0);
+
+    for i in 0..11 {
+        fs::remove_file(site.root.join(format!("{i}.txt"))).unwrap();
+    }
+    a.scan_until(|a| a.folder.view().questions == 1);
+
+    let [second] = &shown(&site)[..] else {
+        panic!("one question");
+    };
+    let paths = |question: &crate::question::Question| -> Vec<String> {
+        question
+            .items
+            .iter()
+            .map(|item| item.path.clone())
+            .collect()
+    };
+    assert_eq!(paths(second), paths(&first));
+    assert_ne!(second.id, first.id);
+    assert_eq!(second.lineage, second.id);
+}

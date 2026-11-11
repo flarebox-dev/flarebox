@@ -28,7 +28,7 @@
 
 **Built not to lose your files.** When two machines edit the same file, Koidrive keeps both versions. When one machine deletes a file that another just edited, the edit stays. A large delete waits for your answer before it reaches your other machines. Deleted files and old versions stay in the trash for 30 days. Every pull request runs a simulation that loses, repeats and reorders messages and crashes devices. It fails if any device loses a write.
 
-**Agents work in the same folder.** A linked folder holds plain files. An agent that edits files can work in it, and Koidrive syncs its changes like yours. The `koi` command prints JSON for status, questions, trash, versions, restores, usage, devices and spaces, and an agent can answer a held delete with `koi questions answer`. See [Coming next](#coming-next) for what we're adding.
+**Agents work in the same folder.** A linked folder holds plain files. An agent that edits files can work in it, and Koidrive syncs its changes like yours. The `koi` command prints JSON for status, decisions, trash, versions, restores, usage, devices and spaces, and an agent can answer a held delete with `koi resolve`. See [Coming next](#coming-next) for what we're adding.
 
 ## What you get
 
