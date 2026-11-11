@@ -3677,3 +3677,44 @@ fn a_late_create_acknowledgement_that_keeps_a_position_takes_the_sent_content() 
         ops(&commit)
     );
 }
+
+/// GUN-450. n is created at b with content 1, and before the acknowledgement the user and the
+/// other device both move n to c and edit it to content 2 at seq 9, so S takes c with content 2.
+/// The user moves n back to b and reverts it to content 1. S keeps the position and the content it
+/// took after the create was sent, so the next commit sends both the move back and the revert.
+#[test]
+fn a_late_create_acknowledgement_keeps_the_content_s_took_after_the_commit() {
+    let mut trees = trees(&[("n", Some(file(ROOT, "b", 1)), None, None)]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(
+        matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id == "n" && c.content == Some(content(1))),
+        "{:?}",
+        ops(&commit)
+    );
+    trees.set_remote("n".into(), remote_at(file(ROOT, "b", 1), 8));
+    trees.settle();
+    trees.set_local("n".into(), local(file(ROOT, "c", 2), 1));
+    let node = RemoteNode {
+        content_rev: 9,
+        ..remote_at(file(ROOT, "c", 2), 9)
+    };
+    trees.set_remote("n".into(), node);
+    trees.settle();
+    assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "c", 2)));
+    trees.set_local("n".into(), local(file(ROOT, "b", 1), 1));
+    commits
+        .received(result(8, vec![outcome(op_result::Code::Applied)]))
+        .unwrap();
+    assert!(commits.acknowledge(&mut trees, 9));
+    trees.settle();
+    assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "c", 2)));
+    assert_eq!(effects_for(&mut trees, &mut ids, "n"), []);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    let sent = ops(&commit);
+    assert!(sent.contains(&mv("n", ROOT, "b")), "{sent:?}");
+    assert!(
+        sent.iter().any(|op| matches!(op, op::Op::UpdateContent(u) if u.node_id == "n" && u.content == Some(content(1)))),
+        "{sent:?}"
+    );
+}
