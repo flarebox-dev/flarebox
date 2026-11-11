@@ -182,11 +182,15 @@ impl Store {
 
     /// Stores the person's choice. Turning it on keeps the install id or draws one. Turning it off deletes the id and
     /// everything waiting to be sent. A `settings.json` that cannot be parsed is replaced, so a broken file never
-    /// stops someone from choosing, least of all from turning reports off.
+    /// stops someone from choosing, least of all from turning reports off. Its install id is lost with it, so the queue
+    /// goes too: nothing recorded under the old id is ever sent under a new one.
     pub fn set(&self, on: bool) -> io::Result<Settings> {
         let _lock = self.lock(true)?;
         let mut settings = match self.settings() {
-            Err(error) if error.kind() == io::ErrorKind::InvalidData => Settings::default(),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                remove(&self.dir.join("queue.json"))?;
+                Settings::default()
+            }
             settings => settings?,
         };
         settings.enabled = Some(on);
@@ -488,6 +492,19 @@ mod tests {
         assert_eq!(store.set(false).unwrap().enabled, Some(false));
         assert!(store.peek().unwrap().is_empty());
         assert_eq!(store.settings().unwrap().install_id, None);
+    }
+
+    #[test]
+    fn turning_it_on_over_a_broken_settings_file_drops_the_old_queue() {
+        let (_dir, store) = store();
+        store.set(true).unwrap();
+        store.absorb_at(pending(99, 1), 100, true).unwrap();
+        drop(store.take(100).unwrap());
+        store.absorb_at(pending(100, 1), 100, true).unwrap();
+        fs::write(store.dir.join("settings.json"), b"{").unwrap();
+        assert!(store.set(true).unwrap().install_id.is_some());
+        assert!(store.peek().unwrap().is_empty());
+        assert!(store.take(101).unwrap().unwrap().batch.is_empty());
     }
 
     #[test]
