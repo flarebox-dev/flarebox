@@ -161,7 +161,7 @@ pub struct Trees {
     /// The nodes whose content the commit in flight updates, each with whether S's content
     /// changed since the commit was built.
     watched: BTreeMap<NodeId, bool>,
-    /// The nodes the commit in flight moves, each with the latest revision at which L and R agreed
+    /// The nodes the commit in flight creates or moves, each with the latest revision at which L and R agreed
     /// on the position S holds, since the commit was built.
     watched_positions: BTreeMap<NodeId, Option<u64>>,
     /// The nodes a delete of this device trashed, each with the seq of its commit, while R holds
@@ -778,7 +778,7 @@ impl Trees {
         self.watched.get(id) == Some(&true)
     }
 
-    /// Watches S's position of `ids`, the nodes the commit just built moves, and stops watching any
+    /// Watches S's position of `ids`, the nodes the commit just built creates or moves, and stops watching any
     /// other node.
     pub fn watch_positions(&mut self, ids: impl IntoIterator<Item = NodeId>) {
         self.watched_positions = ids.into_iter().map(|id| (id, None)).collect();

@@ -646,6 +646,8 @@ impl Commits {
             _ => None,
         }));
         trees.watch_positions(ops.iter().filter_map(|op| match &op.op {
+            Some(op::Op::CreateDir(create)) => Some(create.node_id.clone()),
+            Some(op::Op::CreateFile(create)) => Some(create.node_id.clone()),
             Some(op::Op::Move(moved)) => Some(moved.node_id.clone()),
             _ => None,
         }));
@@ -683,7 +685,7 @@ impl Commits {
     /// built is newer than what was sent: the server applies a content update only when no other
     /// device changed the content after the commit's `base_seq`, so that change came after the
     /// commit. When S's content changed since then ([`Trees::took_content`]), even back to what it
-    /// was, S keeps what it holds. A position S holds is newer than what was sent only when L and R
+    /// was, S keeps what it holds. A position S holds is newer than the one a create or move sent only when L and R
     /// agreed on it, after the commit was built, at a revision of R after the result's seq: the
     /// server applies a move whatever another device did after `base_seq`, so the move replaced a
     /// position from an earlier record, and a position only R came back to is a remote change. When S holds a
@@ -754,7 +756,7 @@ impl Commits {
                         rekey(trees, &create.node_id, into);
                         synced.set(into, Some(shape));
                         merged.insert(create.node_id.clone(), into.clone());
-                    } else if applied {
+                    } else if applied && !trees.took_position_after(&create.node_id, result.seq) {
                         synced.set(&create.node_id, Some(shape));
                     }
                     let exists = taken && trees.remote().live(&create.node_id).is_some();
@@ -764,7 +766,7 @@ impl Commits {
                     )
                 }
                 Some(op::Op::CreateFile(create)) => {
-                    if applied {
+                    if applied && !trees.took_position_after(&create.node_id, result.seq) {
                         let shape = Shape {
                             parent: parent(&create.parent_id),
                             name: name(&create.name),
@@ -845,8 +847,7 @@ impl Commits {
                     local.shape.parent != *parent || nfc(&local.shape.name) != nfc(name)
                 })
             });
-            let kept = matches!(&op.op, Some(op::Op::Move(_)))
-                && trees.took_position_after(node, result.seq);
+            let kept = sent.is_some() && trees.took_position_after(node, result.seq);
             if (renamed && !left && !kept) || (done && follows) {
                 trees.revert(node.clone());
             }
