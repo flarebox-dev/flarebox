@@ -3191,3 +3191,35 @@ fn a_waiting_folder_the_user_deleted_is_brought_back_for_a_file_moved_into_it() 
     ];
     run(&seed, &local, &remote, fits, fresh_dir_names, &during).unwrap();
 }
+
+/// The user moves folder A into folder B, while the other device moves B into A and then trashes
+/// the folder both are in. The effects remove A's old parent C, whose removal from S waits because
+/// S still holds A there. A folder the user creates in A makes the server revive A, C and the folder
+/// above them (R8), and A's move would close a cycle, so A is reverted. C is created again for A to
+/// go back into, instead of C, A and B each waiting for another.
+#[test]
+fn a_removed_folder_the_server_revives_is_created_again_while_its_removal_waits() {
+    let seed = [
+        act(0, 0, 0, 0, 0),
+        act(1, 0, 0, 0, 0),
+        act(1, 0, 0, 0, 0),
+        act(1, 0, 0, 0, 0),
+        act(0, 0, 980740372666386433, 2, 0),
+        act(1, 0, 0, 0, 0),
+        act(0, 0, 4216774371197345119, 0, 0),
+        act(1, 0, 2882081015209338574, 3, 0),
+        act(1, 0, 0, 0, 0),
+        act(0, 0, 15439864200780996302, 0, 0),
+        act(0, 0, 9289856371756041619, 0, 0),
+    ];
+    let local = [
+        act(0, 0, 1052871606481788707, 0, 0),
+        act(3, 8922599260003921418, 12502836504135289280, 0, 0),
+    ];
+    let remote = [
+        act(3, 1802799855454195272, 10126529284027281386, 0, 0),
+        act(4, 8617856007053871336, 0, 0, 0),
+    ];
+    let during = [(true, vec![act(0, 0, 14856899963116643210, 0, 0)])];
+    run(&seed, &local, &remote, 1000, true, &during).unwrap();
+}
