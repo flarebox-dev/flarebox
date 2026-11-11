@@ -534,3 +534,96 @@ async fn refusals_follow_the_server_error_code_before_the_http_status() {
     );
     server.await.unwrap();
 }
+
+/// Accepts one upload and returns its target, the socket and the bytes of the body already read with the head, and
+/// the body's length.
+async fn accept_upload() -> (Target, tokio::task::JoinHandle<(TcpStream, usize, usize)>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/chunk", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let n = socket.read(&mut buffer).await.unwrap();
+            head.extend_from_slice(&buffer[..n]);
+            if let Some(end) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+                let text = String::from_utf8_lossy(&head[..end]).to_lowercase();
+                let length = text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .map_or(0, |value| value.trim().parse::<usize>().unwrap());
+                return (socket, head.len() - end - 4, length);
+            }
+        }
+    });
+    let target = Target {
+        url,
+        ..Default::default()
+    };
+    (target, server)
+}
+
+fn outcome<T>(attempt: &Attempt<T>) -> String {
+    match attempt {
+        Attempt::Done(_) => "done".into(),
+        Attempt::Expired => "expired".into(),
+        Attempt::Retry(error) => format!("retry: {error}"),
+        Attempt::Fail(error) => format!("fail: {error}"),
+    }
+}
+
+#[tokio::test]
+async fn an_upload_that_takes_longer_than_the_read_timeout_completes_while_it_moves() {
+    let body = vec![7; 3_500_000];
+    let sent = chunk(&body);
+    let (target, server) = accept_upload().await;
+    let server = tokio::spawn(async move {
+        let (mut socket, mut received, length) = server.await.unwrap();
+        let mut buffer = [0u8; 10_000];
+        while received < length {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let n = socket.read(&mut buffer).await.unwrap();
+            assert!(n > 0, "the client left after {received} bytes");
+            received += n;
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        received
+    });
+    let started = Instant::now();
+    let put = transfer().put(&target, &sent, Bytes::from(body)).await;
+    assert!(matches!(put, Attempt::Done(None)), "{}", outcome(&put));
+    assert_eq!(server.await.unwrap(), 3_500_000);
+    assert!(
+        started.elapsed() > Duration::from_secs(30),
+        "the body is read at 0.8 Mbit/s, so it takes longer than the client's 30 s read timeout: {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn an_upload_whose_body_stops_moving_is_retried_after_the_stall_timeout() {
+    let body = vec![7; 32 << 20];
+    let sent = chunk(&body);
+    let transfer = Transfer {
+        stall_timeout: Duration::from_millis(300),
+        ..transfer()
+    };
+    let (target, server) = accept_upload().await;
+    let started = Instant::now();
+    let put = transfer.put(&target, &sent, Bytes::from(body)).await;
+    assert!(
+        matches!(&put, Attempt::Retry(ChunkError::Unavailable { message, .. }) if message.contains("did not move")),
+        "{}",
+        outcome(&put)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    server.abort();
+}
