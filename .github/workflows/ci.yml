@@ -43,10 +43,11 @@ jobs:
             exit 0
           fi
           git fetch --no-tags --depth=1 origin "$BASE"
-          if ! changed="$(git diff --name-only --no-renames "$BASE" HEAD)"; then
+          if ! git diff -z --name-only --no-renames "$BASE" HEAD > "$RUNNER_TEMP/changed"; then
             echo "::error::git diff between $BASE and HEAD failed, so the changed paths are unknown."
             exit 1
           fi
+          changed="$(tr '\0' '\n' < "$RUNNER_TEMP/changed")"
           echo "Files this $EVENT run changes against $BASE:"
           printf '%s\n' "$changed"
           if [ -n "$changed" ] && ! grep -qv '^site/' <<<"$changed"; then
