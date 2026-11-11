@@ -1487,7 +1487,10 @@ impl FolderTask {
                     }
                     Err(error) => {
                         tracing::warn!(space_id = link.space_id, %error, "observing the folder failed");
-                        std::thread::sleep(Duration::from_secs(5));
+                        let again = Instant::now() + Duration::from_secs(5);
+                        while !sender.is_closed() && Instant::now() < again {
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
                     }
                 }
                 if !scanned && observer.scanned().is_some() {
