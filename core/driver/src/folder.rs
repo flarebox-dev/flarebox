@@ -28,7 +28,8 @@ use flarebox_engine::ignore::LocalRules;
 use flarebox_engine::state::CommitsState;
 use flarebox_fs::{Snapshot, check_root};
 use flarebox_net::{
-    Auth, Backoff, CallError, ChunkError, Event, ServerError, Session, SessionConfig, Transfer,
+    Auth, Backoff, CallError, ChunkError, Event, NotResent, ServerError, Session, SessionConfig,
+    Transfer,
 };
 use flarebox_proto::v1::error::Code;
 use flarebox_proto::v1::resync_required::Reason;
@@ -122,8 +123,10 @@ pub(crate) struct Folder {
 enum Stream {
     /// No `Welcome` yet.
     Connecting,
-    /// The tree is being listed for a bootstrap. R is untouched.
-    Listing,
+    /// The tree is being listed for a bootstrap. R is untouched. `superseded` is set when something calls for a new
+    /// listing while this one is out, such as a `Welcome` from a server that lost commits: the pages may have been
+    /// read from the server before it, so they are dropped and the tree is listed again.
+    Listing { superseded: bool },
     /// The listing follows the log until it may replace R.
     Replaying(Staging),
     /// R follows the log. `head` is the server's head as of the last `CaughtUp` of this connection.
@@ -316,7 +319,7 @@ impl Folder {
                 match &mut self.stream {
                     Stream::Replaying(staging) => staging.caught_up(head_seq),
                     Stream::Following { head } => *head = Some(head_seq),
-                    Stream::Connecting | Stream::Listing => {}
+                    Stream::Connecting | Stream::Listing { .. } => {}
                 }
                 self.publish_remote()?;
             }
@@ -374,8 +377,14 @@ impl Folder {
     /// The pages of a bootstrap, read in order. The log is replayed onto them from the first page's `head_seq`
     /// before they replace R.
     pub fn listed(&mut self, listed: Result<Listed, Stop>) -> Result<Vec<Work>, Stop> {
+        if let Stream::Listing { superseded } = &mut self.stream
+            && *superseded
+        {
+            *superseded = false;
+            return Ok(vec![Work::List]);
+        }
         let listed = listed?;
-        if !matches!(self.stream, Stream::Listing) {
+        if !matches!(self.stream, Stream::Listing { .. }) {
             return Ok(Vec::new());
         }
         let pages = match listed {
@@ -590,7 +599,9 @@ impl Folder {
     }
 
     /// `Session::commit` returned. A result is acknowledged once R has reached it. A refusal goes to the engine,
-    /// which says whether the same commit is sent again, its changes are planned again, or committing stops.
+    /// which says whether the same commit is sent again, its changes are planned again, or committing stops. A
+    /// commit the session did not send again because the server counts fewer commits than its slot accounts for
+    /// waits for the `Welcome` that reported the count, which drops it ([`Folder::connected`]).
     pub fn sent(&mut self, result: Result<CommitResult, CallError>) -> Result<Vec<Work>, Stop> {
         let mut work = Vec::new();
         let Flight::Sending(commit) = std::mem::replace(&mut self.flight, Flight::Idle) else {
@@ -604,6 +615,12 @@ impl Folder {
             }
             Err(CallError::Server(refusal)) => self.refused(commit, &refusal, &mut work)?,
             Err(CallError::Stopped(_)) => {
+                self.flight = Flight::Unknown;
+                return Ok(work);
+            }
+            Err(CallError::NotResent(NotResent::DeviceSeqMismatch { slot, welcome }))
+                if welcome + 1 < slot =>
+            {
                 self.flight = Flight::Unknown;
                 return Ok(work);
             }
@@ -673,7 +690,7 @@ impl Folder {
         let state = match &self.stream {
             _ if self.offline => FolderState::Offline,
             Stream::Connecting => FolderState::Connecting,
-            Stream::Listing | Stream::Replaying(_) => FolderState::Bootstrapping,
+            Stream::Listing { .. } | Stream::Replaying(_) => FolderState::Bootstrapping,
             Stream::Following { .. } if self.settled() => FolderState::UpToDate,
             Stream::Following { .. } => FolderState::CatchingUp,
         };
@@ -779,6 +796,11 @@ impl Folder {
     /// synced the space with a store that is gone, as after an unlink and a second link, and the new store continues
     /// from the server's count (design §6.4, step 2). RFC 0002 section 2 sends every count but the store's own to
     /// recovery, and every other store still goes there.
+    ///
+    /// A server whose count is below the store's lost commits of this device that it had accepted, as when its
+    /// storage was restored from a backup (design §2.8). The store then continues from the server's count, drops
+    /// the commit in flight, and lists the tree again as for `AHEAD_OF_SERVER`, so that what the server lost is sent
+    /// again.
     fn connected(&mut self, welcome: &Welcome, work: &mut Vec<Work>) -> Result<(), Stop> {
         self.offline = false;
         self.note = None;
@@ -805,7 +827,7 @@ impl Folder {
                 "this device synced the space with a store that is gone; continuing from the server's count"
             );
         }
-        let reconnect = self.step(|engine, _| {
+        let reconnect = self.step(|engine, tx| {
             if adopt {
                 let state = CommitsState {
                     accepted: welcome.device_seq,
@@ -813,7 +835,11 @@ impl Folder {
                 };
                 engine.commits = Commits::from_state(state).expect("no commit is in flight");
             }
-            Ok(engine.commits.connected(welcome))
+            let reconnect = engine.commits.connected(welcome);
+            if reconnect == Reconnect::AheadOfServer {
+                engine.server_behind(tx)?;
+            }
+            Ok(reconnect)
         })?;
         match reconnect {
             Reconnect::Recovery => {
@@ -821,6 +847,15 @@ impl Folder {
                     "the server's count of this device's commits does not match the folder's sync state"
                         .into(),
                 ));
+            }
+            Reconnect::AheadOfServer => {
+                tracing::info!(
+                    space_id = self.link.space_id,
+                    device_seq = welcome.device_seq,
+                    "the server lost commits of this device; reading the tree again"
+                );
+                self.flight = Flight::Idle;
+                self.list_again(work);
             }
             Reconnect::Resend => {
                 if let (Flight::Unknown, Some(commit)) = (&self.flight, self.in_flight()) {
@@ -845,7 +880,7 @@ impl Folder {
                     ..
                 }),
             ) => {
-                self.stream = Stream::Listing;
+                self.stream = Stream::Listing { superseded: false };
                 work.push(Work::List);
             }
             (Stream::Connecting, Some(cursor)) => {
@@ -856,7 +891,7 @@ impl Folder {
                 self.stream = Stream::Following { head: None };
             }
             (Stream::Following { head }, _) => *head = None,
-            (Stream::Listing | Stream::Replaying(_), _) => {}
+            (Stream::Listing { .. } | Stream::Replaying(_), _) => {}
         }
         Ok(())
     }
@@ -864,7 +899,7 @@ impl Folder {
     /// Commits of the log. A gap subscribes again from the last commit applied.
     fn changes(&mut self, records: &[CommitRecord], work: &mut Vec<Work>) -> Result<(), Stop> {
         let (applied, history_id, since_seq) = match &mut self.stream {
-            Stream::Connecting | Stream::Listing => return Ok(()),
+            Stream::Connecting | Stream::Listing { .. } => return Ok(()),
             Stream::Replaying(staging) => (
                 staging.replay(records)?,
                 staging.history_id().to_owned(),
@@ -1031,10 +1066,12 @@ impl Folder {
     /// Bootstraps again (design §4.4): the tree is listed and replayed into a staging tree that replaces R, while L
     /// and S stay.
     fn list_again(&mut self, work: &mut Vec<Work>) {
-        if !matches!(self.stream, Stream::Listing) {
-            self.stream = Stream::Listing;
-            work.push(Work::List);
+        if let Stream::Listing { superseded } = &mut self.stream {
+            *superseded = true;
+            return;
         }
+        self.stream = Stream::Listing { superseded: false };
+        work.push(Work::List);
     }
 
     /// Starts the upload of what `commit` adds, or its send when it adds no content.
@@ -1184,6 +1221,22 @@ fn lift_hint(code: i32) -> &'static str {
     }
 }
 
+/// A finished `Session::commit`, after the session events `queued` before it. The session emits a connection's
+/// `Connected` before it answers a commit on that connection, so the folder takes the `Welcome` before the result, and
+/// the server's count in it is never older than a commit the folder acknowledged (design §2.8).
+fn sent_in_order(
+    folder: &mut Folder,
+    queued: impl IntoIterator<Item = Event>,
+    result: Result<CommitResult, CallError>,
+) -> Result<Vec<Work>, Stop> {
+    let mut work = Vec::new();
+    for event in queued {
+        work.extend(folder.event(event)?);
+    }
+    work.extend(folder.sent(result)?);
+    Ok(work)
+}
+
 /// Waits for the work in `slot` and empties it. Never returns for an empty slot.
 async fn finished<T>(slot: &mut Slot<'_, T>) -> T {
     match slot {
@@ -1312,7 +1365,9 @@ impl FolderTask {
                     pages = finished(&mut list) => folder.listed(pages),
                     (pending, staged) = finished(&mut stage) => folder.staged(pending, staged),
                     receipts = finished(&mut upload) => folder.uploaded(receipts),
-                    result = finished(&mut send) => folder.sent(result),
+                    result = finished(&mut send) => {
+                        sent_in_order(&mut folder, std::iter::from_fn(|| events.try_next()), result)
+                    }
                     () = finished(&mut wait) => folder.resend(),
                     () = finished(&mut retry) => folder.retry(),
                     () = self.requests.notified() => folder.requested(),
