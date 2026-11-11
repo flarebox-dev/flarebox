@@ -1,13 +1,13 @@
 {
   "format": "flarebox.space-conformance",
   "version": 1,
-  "spec": "Flarebox spec v0 with RFC 0001, RFC 0002 sections 1 to 4 and 11, and RFC 0006 section 8",
+  "spec": "Flarebox spec v0 with RFC 0001, RFC 0002 sections 1 to 4, 9 and 11, and RFC 0006 section 8",
   "unicode": "18.0.0",
   "now_ms": 1794268740000,
   "mtime_ns": "1794268740123456789",
   "conventions": [
     "Each scenario starts from empty spaces (one named main unless the scenario lists spaces) and runs its steps in order. A step runs in the space named by its space field, main by default, at at_ms, or now_ms when absent; the runner pins the server clock to that time.",
-    "A scenario or step with reference_only checks behaviour that the server and the reference share but spec v0 and RFC 0001 do not define; its value says what is undefined. A runner for another implementation may skip it, and no later step depends on it. Every other expectation follows from the spec, RFC 0001 and RFC 0002 sections 1 to 4 and 11.",
+    "A scenario or step with reference_only checks behaviour that the server and the reference share but spec v0 and RFC 0001 do not define; its value says what is undefined. A runner for another implementation may skip it, and no later step depends on it. Every other expectation follows from the spec, RFC 0001 and RFC 0002 sections 1 to 4, 9 and 11.",
     "devices maps a device symbol to its session: name (the device name used in conflict names), role (owner by default, editor or viewer) and max_format (the newest space format the client supports, 1 by default).",
     "Every ID in a scenario is a symbol. root is the space's root (its space_id). A symbol that starts with = is the literal text after it. An op symbol not seen before is bound to a fresh UUIDv7 that the runner mints. A symbol in an expectation that is not bound yet is bound to the value the server returned; one already bound must equal it. Two different symbols never bind the same value.",
     "contents maps a content symbol to a file content. chunks lists its chunks: {text} is a chunk of those UTF-8 bytes, {counter_le32: n} is n chunks whose bytes are the 4-byte little-endian encodings of 0 to n-1. A chunk's hash is the SHA-256 of its bytes and its size is its byte length unless size overrides it. The content's size is the sum of its chunk sizes unless size overrides it; mtime_ns is the file-level mtime_ns (an int64 written as a string, as in proto3 JSON), executable is false, encoding is 0, chunker is fastcdc2020-1m-4m-16m, and manifest_digest follows spec v0 section 5.1 over the listed (hash, size) pairs.",
@@ -17,7 +17,7 @@
     "Commit expectations: error is the whole-call error code; missing lists content symbols whose chunk hashes must be exactly the error's missing_chunks; missing_some {contents, count, total} requires that missing_chunks holds exactly count hashes, each a chunk of those contents, and that the first decimal number in the error's message is total. Otherwise seq, results (one per op, in order; code, and where given node, name and reason, compared exactly) and changed (the node symbols with a NodeState in the result's changes, compared as a set).",
     "list_versions {node, cursor, limit}: cursor is absent (empty), a literal written with =, or {returned: k}, the next_cursor an earlier step bound to k; limit is 0 when absent. Expectations: error, count (the number of versions), versions (each with version symbol, seq and content) and next_cursor, which is either empty (the last page) or {bind: k}, which requires another page and keeps its cursor as k without looking inside it.",
     "nodes: each entry names a node and the fields it must have: parent, name, kind (DIR or FILE), status (LIVE or TRASHED), content_rev, meta_rev, trash_group (a symbol, or null for none), content (a content symbol, compared by size, manifest digest, executable bit and mtime_ns), or absent: true when the server must not know the node. live lists every live node other than the root, as a set. head is the space's head_seq.",
-    "Expected values are written by hand from the spec, RFC 0001 and RFC 0002 sections 1 to 4 and 11, not produced by either implementation.",
+    "Expected values are written by hand from the spec, RFC 0001 and RFC 0002 sections 1 to 4, 9 and 11, not produced by either implementation.",
     "Every field a scenario uses is listed here. A runner fails a scenario that has an unknown field, or a field of the wrong type, rather than skipping the check."
   ],
   "scenarios": [
@@ -1434,6 +1434,1611 @@
             }
           ],
           "live": []
+        }
+      ]
+    },
+    {
+      "name": "r7-a-delete-keeps-a-conflict-copy-its-own-commit-made-inside-the-folder",
+      "covers": [
+        "R3",
+        "R7"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "1"
+            }
+          ]
+        },
+        "c2": {
+          "chunks": [
+            {
+              "text": "2 from b"
+            }
+          ]
+        },
+        "c3": {
+          "chunks": [
+            {
+              "text": "3 from a"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "b",
+                  "content": "c1"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": "a"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "move": {
+                  "node": "f",
+                  "parent": "d",
+                  "name": "c.txt"
+                }
+              },
+              {
+                "update_content": {
+                  "node": "f",
+                  "content": "c3"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "update_content": {
+                  "node": "f",
+                  "content": "c2"
+                }
+              },
+              {
+                "delete": {
+                  "node": "d"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "CONFLICT_COPY",
+                "node": "y",
+                "name": "c (conflict from Desk 2026-11-09).txt"
+              },
+              {
+                "code": "SUPERSEDED"
+              }
+            ],
+            "changed": [
+              "y"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "d",
+              "status": "LIVE"
+            },
+            {
+              "node": "f",
+              "status": "LIVE",
+              "parent": "d",
+              "content": "c3"
+            },
+            {
+              "node": "y",
+              "status": "LIVE",
+              "parent": "d",
+              "content": "c2"
+            }
+          ],
+          "live": [
+            "d",
+            "f",
+            "y"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "r7-a-delete-keeps-a-folder-another-device-moved-into-it-with-everything-inside",
+      "covers": [
+        "R7"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "1"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "da",
+                  "parent": "root",
+                  "name": "a"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "da",
+                  "name": "c.txt",
+                  "content": "c1"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "db",
+                  "parent": "root",
+                  "name": "b"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "move": {
+                  "node": "da",
+                  "parent": "db",
+                  "name": "a"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "delete": {
+                  "node": "db"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "SUPERSEDED"
+              }
+            ],
+            "changed": []
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "db",
+              "status": "LIVE"
+            },
+            {
+              "node": "da",
+              "status": "LIVE",
+              "parent": "db"
+            },
+            {
+              "node": "f",
+              "status": "LIVE",
+              "parent": "da"
+            }
+          ],
+          "live": [
+            "db",
+            "da",
+            "f"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "r7-a-delete-keeps-a-folder-another-device-moved-between-two-folders-inside-it",
+      "covers": [
+        "R7"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "1"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": "d"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "s",
+                  "parent": "d",
+                  "name": "s"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "t",
+                  "parent": "d",
+                  "name": "t"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "s",
+                  "name": "f",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "move": {
+                  "node": "s",
+                  "parent": "t",
+                  "name": "s"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "delete": {
+                  "node": "d"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "SUPERSEDED"
+              }
+            ],
+            "changed": []
+          }
+        },
+        {
+          "live": [
+            "d",
+            "t",
+            "s",
+            "f"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "r7-a-delete-trashes-the-unchanged-children-of-a-node-renamed-inside-it",
+      "covers": [
+        "R7"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "1"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": "d"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "s",
+                  "parent": "d",
+                  "name": "s"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "s",
+                  "name": "f",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "move": {
+                  "node": "s",
+                  "parent": "d",
+                  "name": "t"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "delete": {
+                  "node": "d"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "SUPERSEDED"
+              }
+            ],
+            "changed": [
+              "f"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "d",
+              "status": "LIVE"
+            },
+            {
+              "node": "s",
+              "status": "LIVE",
+              "parent": "d",
+              "name": "t"
+            },
+            {
+              "node": "f",
+              "status": "TRASHED",
+              "parent": "s"
+            }
+          ],
+          "live": [
+            "d",
+            "s"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "r7-a-delete-trashes-the-unchanged-children-of-a-folder-it-moved-in-that-another-device-renamed",
+      "covers": [
+        "R7"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "1"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "da",
+                  "parent": "root",
+                  "name": "a"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "da",
+                  "name": "f",
+                  "content": "c1"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "db",
+                  "parent": "root",
+                  "name": "b"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "move": {
+                  "node": "da",
+                  "parent": "db",
+                  "name": "a"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 2,
+            "ops": [
+              {
+                "move": {
+                  "node": "da",
+                  "parent": "db",
+                  "name": "c"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "delete": {
+                  "node": "db"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 4,
+            "results": [
+              {
+                "code": "SUPERSEDED"
+              }
+            ],
+            "changed": [
+              "f"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "db",
+              "status": "LIVE"
+            },
+            {
+              "node": "da",
+              "status": "LIVE",
+              "parent": "db",
+              "name": "c"
+            },
+            {
+              "node": "f",
+              "status": "TRASHED",
+              "parent": "da"
+            }
+          ],
+          "live": [
+            "db",
+            "da"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "r7-a-delete-trashes-a-folder-its-commit-moved-in-after-another-device-moved-it-there",
+      "covers": [
+        "R7"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "1"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "da",
+                  "parent": "root",
+                  "name": "a"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "da",
+                  "name": "f",
+                  "content": "c1"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "db",
+                  "parent": "root",
+                  "name": "b"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "move": {
+                  "node": "da",
+                  "parent": "db",
+                  "name": "a"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "move": {
+                  "node": "da",
+                  "parent": "db",
+                  "name": "c"
+                }
+              },
+              {
+                "delete": {
+                  "node": "db"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "db",
+              "da",
+              "f"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "db",
+              "status": "TRASHED"
+            },
+            {
+              "node": "da",
+              "status": "TRASHED",
+              "parent": "db",
+              "name": "c"
+            },
+            {
+              "node": "f",
+              "status": "TRASHED",
+              "parent": "da"
+            }
+          ],
+          "live": []
+        }
+      ]
+    },
+    {
+      "name": "r7-a-delete-trashes-the-unchanged-files-of-a-folder-its-commit-moved-in-with-a-no-op-move",
+      "covers": [
+        "R7"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "1"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "da",
+                  "parent": "root",
+                  "name": "a"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "da",
+                  "name": "f",
+                  "content": "c1"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "db",
+                  "parent": "root",
+                  "name": "b"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "move": {
+                  "node": "da",
+                  "parent": "db",
+                  "name": "a"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "move": {
+                  "node": "da",
+                  "parent": "db",
+                  "name": "a"
+                }
+              },
+              {
+                "delete": {
+                  "node": "db"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "SUPERSEDED"
+              }
+            ],
+            "changed": [
+              "f"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "db",
+              "status": "LIVE"
+            },
+            {
+              "node": "da",
+              "status": "LIVE",
+              "parent": "db",
+              "name": "a"
+            },
+            {
+              "node": "f",
+              "status": "TRASHED",
+              "parent": "da"
+            }
+          ],
+          "live": [
+            "db",
+            "da"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "r7-a-delete-keeps-a-moved-in-folder-its-commit-merged-into-with-everything-inside",
+      "covers": [
+        "R2",
+        "R7"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "1"
+            }
+          ]
+        },
+        "c2": {
+          "chunks": [
+            {
+              "text": "2"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "da",
+                  "parent": "root",
+                  "name": "a"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "da",
+                  "name": "f",
+                  "content": "c1"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "db",
+                  "parent": "root",
+                  "name": "b"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "move": {
+                  "node": "da",
+                  "parent": "db",
+                  "name": "a"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "local",
+                  "parent": "db",
+                  "name": "a"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "g",
+                  "parent": "local",
+                  "name": "g",
+                  "content": "c2"
+                }
+              },
+              {
+                "delete": {
+                  "node": "db"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "MERGED_INTO",
+                "node": "da",
+                "name": "a"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "SUPERSEDED"
+              }
+            ],
+            "changed": [
+              "g"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "db",
+              "status": "LIVE"
+            },
+            {
+              "node": "da",
+              "status": "LIVE",
+              "parent": "db"
+            },
+            {
+              "node": "f",
+              "status": "LIVE",
+              "parent": "da"
+            },
+            {
+              "node": "g",
+              "status": "LIVE",
+              "parent": "da"
+            },
+            {
+              "node": "local",
+              "absent": true
+            }
+          ],
+          "live": [
+            "db",
+            "da",
+            "f",
+            "g"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "r7-a-delete-keeps-a-file-its-commit-brought-back-with-a-trash-group-it-never-saw-there",
+      "covers": [
+        "R7",
+        "R8"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "1"
+            }
+          ]
+        },
+        "c2": {
+          "chunks": [
+            {
+              "text": "2"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "o",
+                  "parent": "root",
+                  "name": "o"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "k",
+                  "parent": "o",
+                  "name": "k",
+                  "content": "c1"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": "d"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "t",
+                  "parent": "d",
+                  "name": "t"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "move": {
+                  "node": "k",
+                  "parent": "t",
+                  "name": "k"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 2,
+            "ops": [
+              {
+                "delete": {
+                  "node": "t"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "t",
+              "k"
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "move": {
+                  "node": "t",
+                  "parent": "d",
+                  "name": "u"
+                }
+              },
+              {
+                "delete": {
+                  "node": "d"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 4,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "SUPERSEDED"
+              }
+            ],
+            "changed": [
+              "t",
+              "k"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "d",
+              "status": "LIVE"
+            },
+            {
+              "node": "t",
+              "status": "LIVE",
+              "parent": "d",
+              "name": "u"
+            },
+            {
+              "node": "k",
+              "status": "LIVE",
+              "parent": "t",
+              "content": "c1"
+            }
+          ],
+          "live": [
+            "o",
+            "d",
+            "t",
+            "k"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "r7-a-delete-keeps-the-file-it-names-when-its-commit-brought-it-back-with-a-trash-group-it-never-saw-there",
+      "covers": [
+        "R7",
+        "R8"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "1"
+            }
+          ]
+        },
+        "c2": {
+          "chunks": [
+            {
+              "text": "2"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "o",
+                  "parent": "root",
+                  "name": "o"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "k",
+                  "parent": "o",
+                  "name": "k",
+                  "content": "c1"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "d",
+                  "parent": "root",
+                  "name": "d"
+                }
+              },
+              {
+                "create_dir": {
+                  "node": "t",
+                  "parent": "d",
+                  "name": "t"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "move": {
+                  "node": "k",
+                  "parent": "t",
+                  "name": "k"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 2,
+            "ops": [
+              {
+                "delete": {
+                  "node": "t"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "t",
+              "k"
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "move": {
+                  "node": "t",
+                  "parent": "d",
+                  "name": "u"
+                }
+              },
+              {
+                "delete": {
+                  "node": "k"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 4,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "SUPERSEDED"
+              }
+            ],
+            "changed": [
+              "t",
+              "k"
+            ]
+          }
+        },
+        {
+          "nodes": [
+            {
+              "node": "d",
+              "status": "LIVE"
+            },
+            {
+              "node": "t",
+              "status": "LIVE",
+              "parent": "d",
+              "name": "u"
+            },
+            {
+              "node": "k",
+              "status": "LIVE",
+              "parent": "t",
+              "content": "c1"
+            }
+          ],
+          "live": [
+            "o",
+            "d",
+            "t",
+            "k"
+          ]
         }
       ]
     },

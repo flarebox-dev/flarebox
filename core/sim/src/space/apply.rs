@@ -133,6 +133,13 @@ impl<'a> Applier<'a> {
         node.meta_rev > self.ctx.base_seq && node.meta_dev != self.dev()
     }
 
+    /// Whether this commit's device has not seen where `node` is now (RFC 0002 section 9). The commit
+    /// that last put `node` under its parent or brought it back from the trash came after the base,
+    /// and its device is another one or not recorded.
+    fn unseen_parent(&self, node: &Node) -> bool {
+        node.parent_rev > self.ctx.base_seq && node.parent_dev != self.dev()
+    }
+
     fn depth(&self, node: &Node) -> usize {
         let mut depth = 0;
         let mut cur = node.parent_id.as_ref().and_then(|id| self.st.nodes.get(id));
@@ -245,13 +252,22 @@ impl<'a> Applier<'a> {
             .expect("an unbounded search finds a free name")
     }
 
-    /// Brings one trashed node back under `parent_id`, renaming it on a name clash.
-    fn revive_one(&mut self, node_id: &str, parent_id: &str, desired: &str) -> (String, bool) {
+    /// Brings one trashed node back under `parent_id`, renaming it on a name clash. `parent_dev` is
+    /// empty unless the op named both.
+    fn revive_one(
+        &mut self,
+        node_id: &str,
+        parent_id: &str,
+        desired: &str,
+        parent_dev: &str,
+    ) -> (String, bool) {
         let (name, renamed) = self.pick_name(parent_id, desired, node_id);
         let (seq, dev) = (self.ctx.seq, self.dev().to_string());
         let node = self.st.nodes.get_mut(node_id).expect("revived node exists");
         node.status = NodeStatus::Live;
         node.parent_id = Some(parent_id.to_string());
+        node.parent_rev = seq;
+        node.parent_dev = parent_dev.to_string();
         node.name_key = name_key(&name);
         node.name = name.clone();
         node.trash_group = None;
@@ -274,6 +290,7 @@ impl<'a> Applier<'a> {
                 &n.node_id,
                 n.parent_id.as_deref().expect("a trashed node has a parent"),
                 &n.name,
+                "",
             );
         }
     }
@@ -285,7 +302,7 @@ impl<'a> Applier<'a> {
             .into_iter()
             .filter(|c| c.trash_group.as_deref() == Some(group))
         {
-            self.revive_one(&child.node_id, parent_id, &child.name);
+            self.revive_one(&child.node_id, parent_id, &child.name, "");
             self.revive_group(&child.node_id, group);
         }
     }
@@ -303,7 +320,7 @@ impl<'a> Applier<'a> {
             .expect("a trashed node has a trash group");
         let parent_id = node.parent_id.clone().expect("a trashed node has a parent");
         self.revive_chain(&parent_id);
-        let (_, renamed) = self.revive_one(&node.node_id, &parent_id, &node.name);
+        let (_, renamed) = self.revive_one(&node.node_id, &parent_id, &node.name, "");
         self.revive_group(&node.node_id, &group);
         (self.st.nodes[&node.node_id].clone(), renamed)
     }
@@ -330,6 +347,7 @@ impl<'a> Applier<'a> {
         name: &str,
         kind: NodeKind,
         version_id: Option<String>,
+        parent_dev: &str,
     ) {
         let row = self.st.next_row();
         let node = Node {
@@ -343,6 +361,8 @@ impl<'a> Applier<'a> {
             content_dev: self.dev().into(),
             meta_rev: self.ctx.seq,
             meta_dev: self.dev().into(),
+            parent_rev: self.ctx.seq,
+            parent_dev: parent_dev.into(),
             cur_version_id: version_id,
             trash_group: None,
             row,
@@ -402,7 +422,15 @@ impl<'a> Applier<'a> {
             return Ok(result(op_result::Code::MergedInto, &id, &existing_name));
         }
         let (name, renamed) = self.pick_name(&parent.node_id, &name, "");
-        self.insert_node(&op.node_id, &parent.node_id, &name, NodeKind::Dir, None);
+        let dev = self.dev().to_string();
+        self.insert_node(
+            &op.node_id,
+            &parent.node_id,
+            &name,
+            NodeKind::Dir,
+            None,
+            &dev,
+        );
         Ok(applied(renamed, &name))
     }
 
@@ -423,12 +451,14 @@ impl<'a> Applier<'a> {
         let (name, renamed) = self.pick_name(&parent.node_id, &name, "");
         let content = op.content.as_ref().expect("checked before applying");
         let version_id = self.insert_version(&op.node_id, content, &content.chunks);
+        let dev = self.dev().to_string();
         self.insert_node(
             &op.node_id,
             &parent.node_id,
             &name,
             NodeKind::File,
             Some(version_id),
+            &dev,
         );
         Ok(applied(renamed, &name))
     }
@@ -457,6 +487,7 @@ impl<'a> Applier<'a> {
                 &name,
                 NodeKind::File,
                 Some(version_id),
+                "",
             );
             return Ok(result(op_result::Code::ConflictCopy, &copy_id, &name));
         }
@@ -511,6 +542,16 @@ impl<'a> Applier<'a> {
             && found.parent_id.as_deref() == Some(target.node_id.as_str())
             && found.name == name
         {
+            if self.unseen_parent(&found) {
+                let (seq, dev) = (self.ctx.seq, self.dev().to_string());
+                let stored = self
+                    .st
+                    .nodes
+                    .get_mut(&found.node_id)
+                    .expect("moved node exists");
+                stored.parent_rev = seq;
+                stored.parent_dev = dev;
+            }
             return Ok(result(op_result::Code::Applied, "", &name));
         }
         let parent = self
@@ -522,17 +563,24 @@ impl<'a> Applier<'a> {
                 .trash_group
                 .clone()
                 .expect("a trashed node has a trash group");
-            let (name, renamed) = self.revive_one(&found.node_id, &parent.node_id, &name);
+            let dev = self.dev().to_string();
+            let (name, renamed) = self.revive_one(&found.node_id, &parent.node_id, &name, &dev);
             self.revive_group(&found.node_id, &group);
             return Ok(applied(renamed, &name));
         }
         let (name, renamed) = self.pick_name(&parent.node_id, &name, &found.node_id);
+        let placed = found.parent_id.as_deref() != Some(parent.node_id.as_str())
+            || self.unseen_parent(&found);
         let (seq, dev) = (self.ctx.seq, self.dev().to_string());
         let stored = self
             .st
             .nodes
             .get_mut(&found.node_id)
             .expect("moved node exists");
+        if placed {
+            stored.parent_rev = seq;
+            stored.parent_dev = dev.clone();
+        }
         stored.parent_id = Some(parent.node_id.clone());
         stored.name_key = name_key(&name);
         stored.name = name.clone();
@@ -542,8 +590,13 @@ impl<'a> Applier<'a> {
         Ok(applied(renamed, &name))
     }
 
-    /// R7: trashes the subtree except nodes with unseen changes and their ancestors. Returns true when the node stays.
+    /// R7 and RFC 0002 section 9: trashes the part of the subtree whose placement this commit's device
+    /// has seen. Nodes with unseen changes stay with their ancestors, and a node with an unseen
+    /// placement stays with its whole subtree. Returns true when the node stays.
     fn trash_subtree(&mut self, node: &Node, group: &str) -> bool {
+        if self.unseen_parent(node) {
+            return true;
+        }
         let mut keep = self.unseen_content(node) || self.unseen_meta(node);
         for child in self.st.children(&node.node_id, NodeStatus::Live) {
             keep = self.trash_subtree(&child, group) || keep;
@@ -650,7 +703,8 @@ impl<'a> Applier<'a> {
             .trash_group
             .clone()
             .expect("a trashed node has a trash group");
-        let (name, renamed) = self.revive_one(&node.node_id, &parent.node_id, &name);
+        let dev = self.dev().to_string();
+        let (name, renamed) = self.revive_one(&node.node_id, &parent.node_id, &name, &dev);
         self.revive_group(&node.node_id, &group);
         Ok(applied(renamed, &name))
     }

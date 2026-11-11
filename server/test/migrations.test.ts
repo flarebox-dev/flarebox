@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import type { AccountDO } from "../src/account-do";
 import { MIGRATIONS as ACCOUNT_MIGRATIONS } from "../src/account/schema";
 import { sha256 } from "../src/crypto";
+import { OpResult_Code } from "../src/gen/flarebox/v1/commit_pb";
 import { toHex, uuidv7 } from "../src/ids";
 import type { Migration } from "../src/migrations";
 import type { SpaceDO } from "../src/space-do";
@@ -23,6 +24,7 @@ const SPACE_SCHEMA_DIGESTS = [
   "4f47c847b7d5734cb4a21738c70e6a8f1837c5b44e73f81115afd6c38d188aa3",
   "bace53ef766c53ef40805288c138d854ac27628cd5674daf517d2abe81547c56",
   "857a54a49b2c3ee1fa6b96cd0aca389f4eb674174ccd90dd9de9bf1ee16c7ac2",
+  "f3fd30e63a5e7d34587553333ac4d0e9f72403d7a6b2f7bb6030286b84facefc",
 ];
 const ACCOUNT_SCHEMA_DIGESTS = [
   "cdd5988fc835119f5b6ad96ebde0be7f38aac621215c10844fdb4fb99f4a7fcf",
@@ -206,6 +208,27 @@ describe("upgraded objects keep working", () => {
       expect([...(await device.tree()).values()].map((node) => node.name).sort()).toEqual(["", "Docs"]);
     });
   }
+
+  it("keeps what is under a folder moved before parent_rev existed when another device deletes the folder it moved into", async () => {
+    const spaceId = uuidv7();
+    const stub = SPACE.stub(spaceId) as DurableObjectStub<SpaceDO>;
+    await stub.init({ spaceId, name: "Upgraded", ownerUserId: OWNER, spaceKey: SPACE_KEY });
+    const laptop = await client({ spaceId, stub }, "Laptop");
+    const desk = await client({ spaceId, stub }, "Desk");
+    const [moved, inside, target] = [uuidv7(), uuidv7(), uuidv7()];
+    await laptop.commit([op.mkdir(moved, spaceId, "a"), op.mkdir(inside, moved, "inside"), op.mkdir(target, spaceId, "b")]);
+    desk.baseSeq = laptop.baseSeq;
+    await laptop.commit([op.move(moved, target, "a")]);
+    await inObject(stub, (sql) => {
+      sql.exec("ALTER TABLE nodes DROP COLUMN parent_rev");
+      sql.exec("ALTER TABLE nodes DROP COLUMN parent_dev");
+      sql.exec("UPDATE meta SET value = ? WHERE key = 'schema_version'", SPACE_MIGRATIONS.length - 1);
+    });
+    await evictDurableObject(stub);
+    const deleted = await desk.commit([op.delete(target)]);
+    expect(deleted.results.map((result) => result.code)).toEqual([OpResult_Code.SUPERSEDED]);
+    expect([...(await desk.tree()).values()].map((node) => node.name).sort()).toEqual(["", "a", "b", "inside"]);
+  });
 
   for (const state of oldStates(ACCOUNT)) {
     it(`claims a deployment whose Account DO storage was at ${state.label}`, async () => {
