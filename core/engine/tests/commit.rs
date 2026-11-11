@@ -873,6 +873,23 @@ fn an_edit_the_server_lost_is_not_sent_again_over_a_later_edit() {
     assert_eq!(trees.class("a"), Class::Concurrent);
 }
 
+/// As above, but another device that never saw the edit trashed a after the loss, at seq 3. An
+/// edit beats a delete (R8), so the edit is sent again and revives a.
+#[test]
+fn an_edit_the_server_lost_is_sent_again_over_a_later_delete() {
+    let (mut commits, mut trees, mut ids) = edited_at_5_then_lost();
+    let edited = trees.edited_here();
+    let deleted = RemoteNode {
+        meta_rev: 3,
+        ..trashed(file(ROOT, "a", 1))
+    };
+    trees.set_remote("a".into(), deleted);
+    trees.forget_lost(Vec::new(), edited, commits.held_through());
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("a", 2)]);
+}
+
 #[test]
 fn a_local_edit_on_a_reverted_file_is_kept_on_disk_and_uploaded() {
     let mut trees = trees(&[("a", Some(file(ROOT, "x", 1)), None, None)]);
