@@ -446,16 +446,16 @@ impl World {
         let name = NAMES[action.name % NAMES.len()];
         let target = (!visible.is_empty()).then(|| visible[action.target % visible.len()]);
         let write = self.writes + 1;
-        if matches!(action.kind % 5, 0 | 1 | 3) {
-            self.named[d].insert(name);
-        }
         match (action.kind % 5, target) {
             (0, _) => {
-                disk.create(place, name, None);
+                if disk.create(place, name, None).is_some() {
+                    self.named[d].insert(name);
+                }
             }
             (1, _) => {
                 let content = content(d as u8, action.text % TEXTS, write);
                 if disk.create(place, name, Some(content)).is_some() {
+                    self.named[d].insert(name);
                     self.writes = write;
                     self.writers.insert(write, d);
                 }
@@ -474,7 +474,9 @@ impl World {
                 }
             }
             (3, Some(ino)) => {
-                let _ = disk.rename(ino, place, name);
+                if disk.rename(ino, place, name).is_ok() {
+                    self.named[d].insert(name);
+                }
             }
             (4, Some(ino)) => {
                 let deleted = disk.delete(ino);
