@@ -108,9 +108,6 @@ pub(crate) struct Folder {
     remote_nodes: u64,
     /// The questions in the store that wait for an answer.
     questions: u64,
-    /// Whether a question changed since the status last showed the questions, also when their number did not, as
-    /// when a notice's counts grow.
-    questions_changed: bool,
     /// Commit sends and uploads that failed in a row, for the backoff.
     failures: u32,
     backoff: Backoff,
@@ -294,7 +291,6 @@ impl Folder {
             local_entries: None,
             remote_nodes,
             questions,
-            questions_changed: false,
             failures: 0,
             backoff: Backoff::default(),
             note: None,
@@ -505,16 +501,9 @@ impl Folder {
             Err(Stall::Halt(stop)) => return Err(stop),
         };
         let node = (self.engine.effects.in_flight()).map(|record| record.node.clone());
-        let asked = |commits: &Commits| -> Vec<_> {
-            (commits.questions().iter())
-                .map(|question| (question.id.clone(), question.kind.clone()))
-                .collect()
-        };
-        let before = asked(&self.engine.commits);
         let settled = self.disk.apply(staged, &mut self.engine, &mut self.store)?;
-        if asked(&self.engine.commits) != before {
+        if self.engine.asked {
             self.questions = self.store.transaction(unanswered)?;
-            self.questions_changed = true;
         }
         let mut work = Vec::new();
         if let Some(node) = node {
@@ -752,7 +741,7 @@ impl Folder {
 
     /// Whether a question changed since the last call, also when the number of questions did not.
     pub fn take_questions_changed(&mut self) -> bool {
-        std::mem::take(&mut self.questions_changed)
+        std::mem::take(&mut self.engine.asked)
     }
 
     /// The folder's status as the task knows it.

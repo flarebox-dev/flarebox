@@ -5488,6 +5488,38 @@ fn a_notice_whose_counts_grow_marks_the_questions_changed() {
     }
 }
 
+/// GUN-384 review: while a mass-delete question holds the folder, two more local deletions make the guard ask again
+/// under a new id. The number of questions stays 1, and the folder still marks the questions changed for the status.
+#[test]
+fn a_question_asked_again_under_a_new_id_marks_the_questions_changed() {
+    let mut remote = Remote::new();
+    let (site, mut a) = with_a_held_folder(&mut remote);
+    let asked = |site: &Site| -> Vec<String> {
+        let mut store = Store::open(&site.db).unwrap();
+        let questions = store.transaction(|tx| tx.questions()).unwrap();
+        questions.into_iter().map(|q| q.question_id).collect()
+    };
+    let before = asked(&site);
+    a.folder.take_questions_changed();
+
+    for i in 0..2 {
+        fs::remove_file(site.root.join(format!("{i}.txt"))).unwrap();
+    }
+    for _ in 0..20 {
+        a.scan(Duration::from_millis(100));
+        a.run(&mut remote);
+        if asked(&site) != before {
+            break;
+        }
+    }
+
+    let after = asked(&site);
+    assert_eq!(after.len(), 1);
+    assert_ne!(after, before, "the guard asks again under a new id");
+    assert_eq!(a.folder.view().questions, 1);
+    assert!(a.folder.take_questions_changed());
+}
+
 /// Device a deletes the folder `d`, which holds 15 of the 20 files, and the person confirms it there. Device b removes
 /// the folder and its store holds a notice about it (design §6.1) until the person dismisses it.
 #[test]
