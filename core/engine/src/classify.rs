@@ -808,9 +808,11 @@ impl Trees {
     /// ([`Trees::edited_here`]). A file of it that R now holds, live or in the trash, at the
     /// position S holds, with content of no revision above `held_through`, lost the edit. S takes
     /// R's shape for it, so the content L holds is sent again as an edit instead of being kept
-    /// beside R's as a conflict copy. A delete R holds came from a device that never saw the edit,
-    /// so the edit beats it (R8): the server revives the file instead of this device moving the
-    /// edit to the local trash.
+    /// beside R's as a conflict copy. A delete R holds trashed the content from before the edit, so
+    /// the edit beats it (R8): the server revives the file instead of this device moving the edit
+    /// to the local trash. That also undoes a delete by a device that saw the edit before the loss,
+    /// which the engine cannot tell apart: the revived file can be deleted again, while an edit in
+    /// the local trash would be missing from the server.
     ///
     /// [`Commits::held_through`]: crate::commit::Commits::held_through
     pub fn forget_lost(&mut self, trashed: Vec<Trashed>, edited: Vec<NodeId>, held_through: u64) {
