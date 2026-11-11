@@ -2359,10 +2359,11 @@ fn a_waiting_folder_the_user_deleted_is_brought_back_for_a_remote_move_into_it()
 
 /// GUN-375. n's edit to 1 is in flight when the user and the other device both write 2, so S
 /// takes 2. The user writes 1 again before the commit is acknowledged, and the other device then
-/// writes 3. S keeps 2, which it took after the commit was built, so the user's 1 is an edit of
-/// its own and is kept beside the other device's 3. With `restart`, the commit side is restored
-/// from its stored state between the send and the acknowledgement.
-fn a_late_acknowledgement_keeps_the_content_s_took_since(restart: bool) {
+/// writes 3, before the acknowledgement with `overtaken` and after it otherwise. S keeps 2, which
+/// it took after the commit was built, so the user's 1 is an edit of its own and is kept beside
+/// the other device's 3. With `restart`, the commit side is restored from its stored state
+/// between the send and the acknowledgement.
+fn a_late_acknowledgement_keeps_the_content_s_took_since(restart: bool, overtaken: bool) {
     let mut trees = trees(&[(
         "n",
         Some(file(ROOT, "a", 1)),
@@ -2377,6 +2378,10 @@ fn a_late_acknowledgement_keeps_the_content_s_took_since(restart: bool) {
     trees.settle();
     assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "a", 2)));
     trees.set_local("n".into(), local(file(ROOT, "a", 1), 1));
+    if overtaken {
+        trees.set_remote("n".into(), remote(file(ROOT, "a", 3)));
+        trees.settle();
+    }
     if restart {
         commits = Commits::from_state(commits.state()).unwrap();
     }
@@ -2399,12 +2404,23 @@ fn a_late_acknowledgement_keeps_the_content_s_took_since(restart: bool) {
 
 #[test]
 fn a_late_acknowledgement_keeps_the_content_s_took_after_the_commit_was_built() {
-    a_late_acknowledgement_keeps_the_content_s_took_since(false);
+    a_late_acknowledgement_keeps_the_content_s_took_since(false, false);
 }
 
 #[test]
 fn a_late_acknowledgement_after_a_restart_keeps_the_content_s_took_after_the_commit_was_built() {
-    a_late_acknowledgement_keeps_the_content_s_took_since(true);
+    a_late_acknowledgement_keeps_the_content_s_took_since(true, false);
+}
+
+#[test]
+fn a_late_acknowledgement_overtaken_by_the_next_remote_edit_keeps_the_content_s_took() {
+    a_late_acknowledgement_keeps_the_content_s_took_since(false, true);
+}
+
+#[test]
+fn a_late_acknowledgement_overtaken_by_the_next_remote_edit_after_a_restart_keeps_the_content_s_took()
+ {
+    a_late_acknowledgement_keeps_the_content_s_took_since(true, true);
 }
 
 /// n's edit to 1 is in flight when the other device writes 0 again. S never took anything after
