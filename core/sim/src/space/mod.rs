@@ -372,6 +372,7 @@ fn covered(commit: &Commit) -> Commit {
     }
 }
 
+#[derive(Clone)]
 pub struct SpaceDo {
     space_id: String,
     history_id: String,
@@ -511,6 +512,18 @@ impl SpaceDo {
             .filter(|r| r.seq > resume.since_seq)
             .cloned()
             .collect())
+    }
+
+    /// Takes the storage of `backup`, a copy of this space from earlier in the same history, as a
+    /// restore of the Durable Object's storage does: the commits since are lost and their seqs and
+    /// device slots are given again. IDs are random on the server, so the IDs minted since are not
+    /// minted again, and the chunk objects stay in the bucket.
+    pub fn restore(&mut self, backup: &SpaceDo) {
+        let ids = self.state.ids.clone();
+        let objects = std::mem::take(&mut self.objects);
+        *self = backup.clone();
+        self.state.ids = ids;
+        self.objects = objects;
     }
 
     /// Forgets the log up to and including `floor_seq`, so that older resumes need a bootstrap.
