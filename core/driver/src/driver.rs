@@ -1814,7 +1814,7 @@ mod tests {
     }
 
     /// The observer's first observation fails, and the pause after it lasts a day, so a stop that waits it out never
-    /// returns.
+    /// returns, and a stop that leaves the observer's thread in it leaves the folder locked.
     #[tokio::test]
     async fn stopping_does_not_wait_out_the_observers_pause_after_an_error() {
         let dir = tempfile::tempdir().unwrap();
@@ -1832,6 +1832,7 @@ mod tests {
         pausing.await.unwrap();
 
         driver.stop().await;
+        assert!(lockable(&root), "the observer's thread released the folder");
     }
 
     #[tokio::test]
