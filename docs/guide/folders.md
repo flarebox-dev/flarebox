@@ -8,14 +8,14 @@ koi link ~/Koidrive --space Koidrive
 
 `--space` takes the space's name or its ID. If two spaces have the same name, use the ID. The folder must exist, and it may already hold files.
 
-If the space holds no live files or folders, the folder's files are uploaded as they are. Otherwise the first sync compares the folder with the space, path by path:
+If the space holds no live files or folders, the folder's files are uploaded as they are. Otherwise the first sync compares the folder with the space, path by path. Here names must match exactly, including case and Unicode normalization, so `Report.txt` doesn't match `report.txt`:
 
 - A folder that the space also holds at the same path stays, and its contents are compared one by one.
-- A file that the space holds at the same path, with the same content, stays as it is.
+- A file that the space holds at the same path, with the same content and the same executable bit, stays as it is.
 - Files and folders that only the space holds are downloaded, except where a held entry has the same name.
 - Entries that `.koiignore` or this device's rules leave out are skipped.
 
-Every other file and folder is held. Sync asks one question about the held entries and uploads none of them until you answer. Files you create after the comparison sync as usual. The question takes one of two answers:
+Every other file and folder is held. Sync asks one question about the held entries and uploads none of them until you answer. A file you create later inside a held folder joins the question. Files you create anywhere else sync as usual. The question takes one of two answers:
 
 - `publish` uploads the held files. If the space already has a file with the same name, the upload gets a [conflict name](conflicts.md#two-files-with-the-same-name).
 - `discard` moves the held files to the [local trash](#the-local-trash) and downloads the space's files at their paths.
