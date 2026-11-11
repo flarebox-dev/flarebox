@@ -541,6 +541,11 @@ impl Disk {
             self.rules_after = None;
         }
         if stamp.0 < self.forgotten {
+            tracing::debug!(
+                space_id = self.space_id.as_str(),
+                changes = observation.changes.len(),
+                "dropped an observation older than the effects the folder remembers, and reset the whole folder"
+            );
             engine.read(&observation.read, &observation.unreadable);
             self.sections.request(engine.resets([PathBuf::new()]));
             return Ok(());
@@ -582,6 +587,11 @@ impl Disk {
         }
         engine.read(&observation.read, &observation.unreadable);
         if !dropped.is_empty() {
+            tracing::debug!(
+                space_id = self.space_id.as_str(),
+                ?dropped,
+                "dropped the changes an effect made after the observation began, and reset their paths"
+            );
             self.sections.request(engine.resets(dropped));
         }
         Ok(())

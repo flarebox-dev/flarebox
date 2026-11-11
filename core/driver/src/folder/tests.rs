@@ -414,6 +414,50 @@ fn a_file_replaced_by_a_hard_link_to_another_leaves_the_other_on_the_server() {
     assert_eq!(names(&site.root), ["one.txt", "two.txt"]);
 }
 
+/// Device b makes a folder and moves a file it downloaded into it before its observer looks. The scan lists the move
+/// before the new folder, and the move still reaches the server and device a.
+#[test]
+fn a_file_moved_into_a_folder_made_in_the_same_batch_reaches_the_other_device() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("report.txt"), b"the report");
+    let (site, mut b) = linked(&mut remote, "b");
+    b.settle();
+    fs::create_dir(site.root.join("docs")).unwrap();
+    fs::rename(
+        site.root.join("report.txt"),
+        site.root.join("docs/renamed.txt"),
+    )
+    .unwrap();
+    sync(&mut remote, (&site_a, &mut a), (&site, &mut b));
+    assert_eq!(remote.names(), ["docs", "renamed.txt"]);
+    assert_eq!(
+        files(&site_a.root),
+        [("docs/renamed.txt".to_owned(), "the report".to_owned())]
+    );
+}
+
+/// Device b moves the file `a` into a new folder and renames the folder `b` to `a` before its observer looks. The folder
+/// takes the name only after the file left it, so the file is not lost.
+#[test]
+fn a_folder_renamed_to_the_name_a_file_left_for_a_new_folder_keeps_the_file() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("a"), b"the file");
+    fs::create_dir(site_a.root.join("b")).unwrap();
+    a.create(&mut remote, &site_a.root.join("b/f"), b"in b");
+    let (site, mut b) = linked(&mut remote, "b");
+    b.settle();
+    fs::create_dir(site.root.join("docs")).unwrap();
+    fs::rename(site.root.join("a"), site.root.join("docs/a")).unwrap();
+    fs::rename(site.root.join("b"), site.root.join("a")).unwrap();
+    sync(&mut remote, (&site_a, &mut a), (&site, &mut b));
+    assert_eq!(remote.names(), ["a", "a", "docs", "f"]);
+    let both = [("a/f", "in b"), ("docs/a", "the file")]
+        .map(|(path, text)| (path.to_owned(), text.to_owned()));
+    assert_eq!(files(&site_a.root), both);
+}
+
 /// Device b holds an untracked symlink at e. The server moves d to e and creates another file at d.
 /// The move fails because e is taken, but d is parked out of the way, so the new file arrives at d
 /// and the symlink stays.
