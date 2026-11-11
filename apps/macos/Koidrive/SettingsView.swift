@@ -41,62 +41,49 @@ struct SettingsView: View {
 
 // MARK: Folders
 
-private struct FoldersSettings: View {
+struct FoldersSettings: View {
     @Environment(AppModel.self) private var model
     @State private var adding: SetupModel?
     @State private var unlinking: LinkedFolder?
-    @State private var isUnlinking = false
     @State private var error: SessionError?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             if model.state.folders.isEmpty {
-                ContentUnavailableView("No Linked Folders", systemImage: "folder.badge.questionmark")
+                ContentUnavailableView {
+                    Label("No folders", systemImage: "folder")
+                } description: {
+                    Text(model.state.account == nil ? "Sign in first in the Account tab." : "Add a folder to start syncing.")
+                } actions: {
+                    addButton
+                }
             } else {
-                List(model.state.folders, id: \.spaceId) { folder in
-                    HStack {
-                        Image(systemName: "folder.fill").foregroundStyle(.tint)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(folder.spaceName).font(.headline)
-                            Text(folder.path)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                        }
-                        Spacer()
-                        Text(folder.state.title)
-                            .font(.caption)
-                            .foregroundStyle(folder.state == .halted ? .red : .secondary)
-                        Button("Show in Finder") {
-                            NSWorkspace.shared.open(URL(filePath: folder.path, directoryHint: .isDirectory))
-                        }
-                        Button("Unlink…") {
-                            unlinking = folder
-                            isUnlinking = true
-                        }
+                RowGroup {
+                    ForEach(Array(model.state.folders.enumerated()), id: \.element.spaceId) { index, folder in
+                        if index > 0 { Divider().padding(.leading, 44) }
+                        FolderRow(folder: folder) { unlinking = folder }
                     }
-                    .padding(.vertical, 4)
                 }
-            }
-            if let error {
-                Label(error.message, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red)
-            }
-            HStack {
+                if let error {
+                    Label(error.message, systemImage: "exclamationmark.triangle").foregroundStyle(Color.statusRed)
+                }
+                HStack {
+                    Text("Linked folders can't be inside one another.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    addButton
+                }
                 Spacer()
-                Button("Add Folder…") {
-                    adding = SetupModel(app: model, mode: .addFolder, deviceName: Host.current().localizedName ?? "Mac")
-                }
-                .disabled(model.state.account == nil)
             }
         }
         .padding(20)
         .sheet(item: $adding) { setup in
             AddFolderSheet(setup: setup) { adding = nil }
         }
-        .confirmationDialog(
+        .alert(
             "Unlink \(unlinking?.spaceName ?? "")?",
-            isPresented: $isUnlinking,
+            isPresented: Binding(get: { unlinking != nil }, set: { if !$0 { unlinking = nil } }),
             presenting: unlinking
         ) { folder in
             Button("Unlink", role: .destructive) {
@@ -109,8 +96,66 @@ private struct FoldersSettings: View {
                     } catch {}
                 }
             }
+            Button("Cancel", role: .cancel) {}
         } message: { _ in
-            Text("Koidrive stops syncing this folder on this Mac. The files stay in the folder and on the server.")
+            Text("Files stay in the folder and on the server.")
+        }
+    }
+
+    private var addButton: some View {
+        Button("Add Folder…") {
+            adding = SetupModel(app: model, mode: .addFolder, deviceName: Host.current().localizedName ?? "Mac")
+        }
+        .disabled(model.state.account == nil)
+    }
+}
+
+private struct FolderRow: View {
+    let folder: LinkedFolder
+    let unlink: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "folder")
+                .font(.title3)
+                .foregroundStyle(Color.koi)
+                .frame(width: 20)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(folder.spaceName)
+                    .fontWeight(.medium)
+                Text(verbatim: abbreviatingHome(folder.path))
+                    .font(.callout.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer()
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(folder.state.color)
+                    .frame(width: 7, height: 7)
+                Text(folder.state.title)
+                    .foregroundStyle(folder.state == .halted ? Color.statusRed : .secondary)
+            }
+            .font(.callout)
+            Button("Show in Finder") {
+                NSWorkspace.shared.open(URL(filePath: folder.path, directoryHint: .isDirectory))
+            }
+            Button("Unlink…", action: unlink)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+}
+
+extension FolderState {
+    var color: Color {
+        switch self {
+        case .upToDate: .statusGreen
+        case .syncing, .recovering: .koi
+        case .halted: .statusRed
+        case .waiting: .statusYellow
+        case .readOnly: .secondary
         }
     }
 }
@@ -124,9 +169,6 @@ private struct AddFolderSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             FolderStep(setup: setup)
-            if let error = setup.error {
-                Label(error.message, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red)
-            }
             HStack {
                 Button("Cancel", action: close).keyboardShortcut(.cancelAction)
                 Spacer()
@@ -143,7 +185,7 @@ private struct AddFolderSheet: View {
 
 // MARK: Account
 
-private struct AccountSettings: View {
+struct AccountSettings: View {
     @Environment(AppModel.self) private var model
     @State private var devices: [Device] = []
     @State private var revoking: Device?
@@ -153,72 +195,77 @@ private struct AccountSettings: View {
     @State private var confirmingOffline = false
     @State private var error: SessionError?
 
+    /// `pairing` shows a pairing code from the start, for previews.
+    init(pairing: PairingCode? = nil) {
+        _pairing = State(initialValue: pairing)
+    }
+
     var body: some View {
         Group {
             if let account = model.state.account {
-                Form {
-                    Section("Account") {
-                        LabeledContent("Server", value: account.serverUrl)
-                        if !account.userName.isEmpty {
-                            LabeledContent("Owner", value: account.userName)
-                        }
-                        LabeledContent("This Mac", value: account.deviceName)
-                    }
-                    Section("Devices") {
-                        ForEach(devices, id: \.deviceId) { device in
-                            LabeledContent {
-                                HStack {
-                                    Text("Added \(Date(milliseconds: device.addedAtMs), format: .dateTime.year().month().day())")
-                                    if !device.thisDevice {
-                                        Button("Remove…") { revoking = device }
-                                    }
-                                }
-                            } label: {
-                                Label {
-                                    Text(device.thisDevice ? String(localized: "\(device.name) (this Mac)") : device.name)
-                                } icon: {
-                                    Image(systemName: device.platform == "macos" ? "desktopcomputer" : "server.rack")
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        SectionHeading("Account")
+                        RowGroup {
+                            SettingsRow {
+                                Text("Server").foregroundStyle(.secondary)
+                                Spacer()
+                                Text(verbatim: account.serverUrl)
+                                    .font(.body.monospaced())
+                                    .textSelection(.enabled)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                            if !account.userName.isEmpty {
+                                Divider()
+                                SettingsRow {
+                                    Text("Owner").foregroundStyle(.secondary)
+                                    Spacer()
+                                    Text(verbatim: account.userName)
                                 }
                             }
                         }
-                        if let pairing {
-                            LabeledContent("Pairing code") {
-                                VStack(alignment: .trailing) {
-                                    Text(pairing.code)
-                                        .font(.title3.monospaced())
-                                        .textSelection(.enabled)
-                                    Text("Expires \(Date(milliseconds: pairing.expiresAtMs), format: .dateTime.hour().minute())")
+                        SectionHeading("Devices")
+                            .padding(.top, 8)
+                        RowGroup {
+                            ForEach(devices, id: \.deviceId) { device in
+                                DeviceRow(device: device) { revoking = device }
+                                Divider()
+                            }
+                            SettingsRow {
+                                if let pairing {
+                                    PairingCodeLabel(code: pairing.code)
+                                    Text("Enter it on the new device. Expires \(Date(milliseconds: pairing.expiresAtMs), format: .dateTime.hour().minute()).")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                                Spacer()
+                                Button("Add a Device…") {
+                                    perform { pairing = try await model.startPairing() }
                                 }
                             }
                         }
-                        HStack {
-                            Text("Enter the pairing code on the new device while setting it up.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            Button("Add a Device…") {
-                                perform { pairing = try await model.startPairing() }
-                            }
-                        }
-                    }
-                    Section {
                         if let error {
-                            Label(error.message, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red)
+                            Label(error.message, systemImage: "exclamationmark.triangle").foregroundStyle(Color.statusRed)
                         }
-                        Button("Sign Out…", role: .destructive) { confirmingSignOut = true }
+                        HStack {
+                            Spacer()
+                            Button("Sign Out…") { confirmingSignOut = true }
+                                .foregroundStyle(Color.statusRed)
+                        }
+                        .padding(.top, 8)
                     }
+                    .padding(20)
                 }
-                .formStyle(.grouped)
                 .task(id: account.deviceId) {
                     perform { devices = try await model.devices() }
                 }
             } else {
-                ContentUnavailableView("Not Signed In", systemImage: "person.crop.circle.badge.questionmark")
+                ContentUnavailableView("Not signed in", systemImage: "person.crop.circle.badge.questionmark")
             }
         }
-        .confirmationDialog(
+        .alert(
             "Remove \(revoking?.name ?? "")?",
             isPresented: Binding(get: { revoking != nil }, set: { if !$0 { revoking = nil } }),
             presenting: revoking
@@ -229,10 +276,11 @@ private struct AccountSettings: View {
                     devices.removeAll { $0.deviceId == device.deviceId }
                 }
             }
+            Button("Cancel", role: .cancel) {}
         } message: { _ in
-            Text("The device stops syncing and is removed from the server's devices. The files already on it stay there.")
+            Text("It stops syncing. Files already on it stay there.")
         }
-        .confirmationDialog("Sign out of Koidrive?", isPresented: $confirmingSignOut) {
+        .alert("Sign out of Koidrive?", isPresented: $confirmingSignOut) {
             Button("Sign Out", role: .destructive) {
                 perform {
                     do {
@@ -244,22 +292,25 @@ private struct AccountSettings: View {
                     }
                 }
             }
+            Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This Mac stops syncing, unlinks every folder and is removed from the server's devices. The files stay in the folders and on the server.")
+            Text("This Mac stops syncing and unlinks every folder. Files stay in the folders and on the server.")
         }
-        .confirmationDialog("Sign out of your last device?", isPresented: $confirmingLastDevice) {
+        .alert("Sign out of your last device?", isPresented: $confirmingLastDevice) {
             Button("Sign Out", role: .destructive) {
                 perform { try await model.signOut(confirmLastDevice: true) }
             }
+            Button("Cancel", role: .cancel) {}
         } message: {
-            Text("No other device is signed in to this server. After this Mac signs out, you can't sign back in from the Koidrive app. Getting back in needs the owner recovery steps from the deployment guide, run outside the app with administrator access to the server's deployment.")
+            Text("No other device is signed in. To get back in, run koi server add-device on any computer, as the guide's Devices page describes.")
         }
-        .confirmationDialog("Sign out without the server?", isPresented: $confirmingOffline) {
+        .alert("Sign out without the server?", isPresented: $confirmingOffline) {
             Button("Sign Out", role: .destructive) {
                 perform { try await model.signOut(confirmLastDevice: true) }
             }
+            Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Koidrive can't reach the server, so it can't tell whether another device is still signed in, and the server keeps this Mac listed until another device removes it. If this Mac is the last one, after it signs out you can't sign back in from the Koidrive app. Getting back in needs the owner recovery steps from the deployment guide, run outside the app with administrator access to the server's deployment.")
+            Text("Koidrive can't reach the server to check for other devices, and this Mac stays listed there until another device removes it. If it's the last device, run koi server add-device to get back in.")
         }
     }
 
@@ -272,6 +323,104 @@ private struct AccountSettings: View {
                 error = failure
             } catch {}
         }
+    }
+}
+
+private struct SectionHeading: View {
+    let title: LocalizedStringKey
+
+    init(_ title: LocalizedStringKey) {
+        self.title = title
+    }
+
+    var body: some View {
+        Text(title)
+            .fontWeight(.semibold)
+            .foregroundStyle(.secondary)
+    }
+}
+
+/// One row of a settings group.
+private struct SettingsRow<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        HStack(spacing: 10) {
+            content
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+}
+
+private struct DeviceRow: View {
+    let device: Device
+    let remove: () -> Void
+
+    var body: some View {
+        SettingsRow {
+            Image(systemName: "laptopcomputer")
+                .foregroundStyle(.secondary)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 4) {
+                    Text(verbatim: device.name)
+                    if device.thisDevice {
+                        Text("(this Mac)").foregroundStyle(.secondary)
+                    }
+                }
+                Text("\(device.platformName) · Added \(Date(milliseconds: device.addedAtMs), format: .dateTime.day().month(.abbreviated).year())")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            if !device.thisDevice {
+                Button("Remove…", action: remove)
+                    .foregroundStyle(Color.statusRed)
+            }
+        }
+    }
+}
+
+extension Device {
+    var platformName: String {
+        switch platform {
+        case "macos": "macOS"
+        case "linux": "Linux"
+        case "windows": "Windows"
+        default: platform
+        }
+    }
+}
+
+private struct PairingCodeLabel: View {
+    let code: String
+    @State private var copied = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text("Pairing code")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(verbatim: code)
+                .font(.body.monospaced().weight(.semibold))
+                .textSelection(.enabled)
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(code, forType: .string)
+                copied = true
+            } label: {
+                Image(systemName: copied ? "checkmark" : "doc.on.doc")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Copy")
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(RoundedRectangle(cornerRadius: 6).fill(.quaternary.opacity(0.6)))
+        .fixedSize()
+        .onChange(of: code) { copied = false }
     }
 }
 
@@ -322,7 +471,7 @@ private struct StorageSettings: View {
                 .formStyle(.grouped)
                 .task(id: account.deviceId) { await storage.load(model.storage) }
             } else {
-                ContentUnavailableView("Not Signed In", systemImage: "person.crop.circle.badge.questionmark")
+                ContentUnavailableView("Not signed in", systemImage: "person.crop.circle.badge.questionmark")
             }
         }
     }
@@ -349,21 +498,29 @@ private struct StorageRow: View {
 
 // MARK: Problems
 
-private struct ProblemsSettings: View {
+struct ProblemsSettings: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
         if model.state.problems.isEmpty {
-            ContentUnavailableView("No Problems", systemImage: "checkmark.circle")
+            ContentUnavailableView("No problems", systemImage: "checkmark.circle")
         } else {
-            List {
-                ForEach(model.problemSections) { section in
-                    Section(section.folder?.spaceName ?? section.spaceID ?? String(localized: "Koidrive")) {
-                        ForEach(section.problems) { problem in
-                            ProblemRow(problem: problem, folder: section.folder)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(model.problemSections) { section in
+                        SpaceHeading(spaceID: section.spaceID, folder: section.folder)
+                            .fontWeight(.semibold)
+                            .foregroundStyle(.secondary)
+                            .padding(.top, section.id == model.problemSections.first?.id ? 0 : 8)
+                        RowGroup {
+                            ForEach(Array(section.problems.enumerated()), id: \.element.id) { index, problem in
+                                if index > 0 { Divider() }
+                                ProblemRow(problem: problem, folder: section.folder)
+                            }
                         }
                     }
                 }
+                .padding(20)
             }
         }
     }
@@ -374,71 +531,126 @@ private struct ProblemRow: View {
     let folder: LinkedFolder?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Label(problem.kind.title, systemImage: "exclamationmark.triangle.fill")
-                .font(.headline)
-                .foregroundStyle(.red)
-            if let path = problem.path {
-                Text(path)
-                    .font(.callout.monospaced())
-                    .textSelection(.enabled)
-            }
-            Text(problem.kind.advice)
-                .fixedSize(horizontal: false, vertical: true)
-            HStack {
-                Text("Since \(Date(milliseconds: problem.sinceMs), format: .dateTime.month().day().hour().minute())")
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle")
+                .foregroundStyle(Color.statusRed)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(problem.kind.title)
+                    .fontWeight(.semibold)
+                if let path = problem.path {
+                    Text(verbatim: path)
+                        .font(.callout.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                } else if let folder, problem.kind.concernsTheFolder {
+                    Text(verbatim: abbreviatingHome(folder.path))
+                        .font(.callout.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+                Text(problem.kind.advice)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("Since \(Date(milliseconds: problem.sinceMs), format: .dateTime.day().month(.abbreviated).hour().minute())")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Spacer()
-                if let folder, let path = problem.path {
-                    Button("Show in Finder") {
-                        NSWorkspace.shared.activateFileViewerSelecting([URL(filePath: folder.path).appending(path: path)])
+            }
+            Spacer()
+            if let folder {
+                Button("Show in Finder") {
+                    let url = URL(filePath: folder.path)
+                    if let path = problem.path {
+                        NSWorkspace.shared.activateFileViewerSelecting([url.appending(path: path)])
+                    } else if FileManager.default.fileExists(atPath: folder.path) {
+                        NSWorkspace.shared.open(url)
+                    } else {
+                        var parent = url.deletingLastPathComponent()
+                        while !FileManager.default.fileExists(atPath: parent.path(percentEncoded: false)) {
+                            parent.deleteLastPathComponent()
+                        }
+                        NSWorkspace.shared.open(parent)
                     }
-                    .controlSize(.small)
                 }
             }
         }
-        .padding(.vertical, 4)
+        .padding(12)
+    }
+}
+
+extension ProblemKind {
+    /// Whether the problem is about the linked folder itself, so its path says where.
+    var concernsTheFolder: Bool {
+        switch self {
+        case .folderMissing, .folderNotAFolder, .folderUnreadable, .folderOnOtherVolume, .markerMissing,
+             .markerUnreadable, .markerOfOtherSpace, .diskOlderThanSyncState, .unsupportedFileSystem:
+            true
+        default:
+            false
+        }
     }
 }
 
 // MARK: General
 
-private struct GeneralSettings: View {
+struct GeneralSettings: View {
     @State private var loginItemStatus = SMAppService.mainApp.status
     @State private var openAtLogin = false
     @State private var loginItemError: String?
 
     var body: some View {
-        Form {
-            Section {
-                Toggle("Open Koidrive at login", isOn: $openAtLogin)
-                    .onChange(of: openAtLogin) { _, on in
-                        if on != isRegistered {
-                            setOpenAtLogin(on)
+        VStack(alignment: .leading, spacing: 8) {
+            RowGroup {
+                SettingsRow {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Open Koidrive at login")
+                        if loginItemStatus == .requiresApproval {
+                            Text("Allow Koidrive in Login Items.")
+                                .font(.caption)
+                                .foregroundStyle(Color.koiText)
+                        }
+                        if let loginItemError {
+                            Text(loginItemError)
+                                .font(.caption)
+                                .foregroundStyle(Color.statusRed)
                         }
                     }
-                if loginItemStatus == .requiresApproval {
-                    HStack {
-                        Text("Allow Koidrive in Login Items to finish.")
-                            .foregroundStyle(.secondary)
-                        Spacer()
+                    Spacer()
+                    if loginItemStatus == .requiresApproval {
                         Button("Open Login Items") { SMAppService.openSystemSettingsLoginItems() }
                     }
-                }
-                if let loginItemError {
-                    Label(loginItemError, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red)
+                    Toggle("Open Koidrive at login", isOn: $openAtLogin)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .tint(.koi)
+                        .onChange(of: openAtLogin) { _, on in
+                            if on != isRegistered {
+                                setOpenAtLogin(on)
+                            }
+                        }
                 }
             }
-            Section("About") {
-                LabeledContent("Version", value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")
-                LabeledContent("Core", value: KoidriveFFI.version())
+            SectionHeading("About")
+                .padding(.top, 8)
+            RowGroup {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(verbatim: "Koidrive " + (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""))
+                    Text("Command-line tool: koi")
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .help(Text(verbatim: "Core \(KoidriveFFI.version())"))
+                Divider()
                 Text(independenceNotice)
-                    .font(.caption)
+                    .font(.callout)
                     .foregroundStyle(.secondary)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
             }
+            Spacer()
         }
-        .formStyle(.grouped)
+        .padding(20)
         .onAppear(perform: readStatus)
     }
 
