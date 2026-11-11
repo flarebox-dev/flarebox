@@ -75,7 +75,8 @@ jobs:
     needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    permissions: {}
+    permissions:
+      actions: read
     outputs:
       macos_app: ${{ steps.pick.outputs.macos_app }}
       rust: ${{ steps.pick.outputs.rust }}
@@ -91,9 +92,26 @@ jobs:
           REPO: ${{ github.repository }}
           RUNS_ON: ${{ vars.MACOS_RUNS_ON || '["self-hosted","flarebox-mini"]' }}
           RUNNER_STATUS_TOKEN: ${{ secrets.RUNNER_STATUS_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
           WANTED: macos_app=${{ needs.changes.outputs.macos_app }} rust=${{ needs.changes.outputs.rust_macos }} server=${{ needs.changes.outputs.server_macos }} spec=${{ needs.changes.outputs.spec_macos }} runner_hook=${{ needs.changes.outputs.site_only != 'true' }}
         run: |
           hosted='["xcode-27"]'
+          api() {
+            curl -fsS --max-time 15 -H "Authorization: Bearer $GITHUB_TOKEN" -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "$GITHUB_API_URL/repos/$REPO/actions/$1"
+          }
+          count_hosted() {
+            local ids="" id page c n=0
+            for status in queued in_progress; do
+              page="$(api "runs?status=$status&per_page=100")" || return 1
+              ids="$ids $(jq -er '.workflow_runs | map(.id | tostring) | join(" ")' <<<"$page")" || return 1
+            done
+            for id in $ids; do
+              page="$(api "runs/$id/jobs?filter=latest&per_page=100")" || return 1
+              c="$(jq -er --argjson hosted "$hosted" '[.jobs[] | select(.status != "completed") | [.labels[] | ascii_downcase] | select((index("self-hosted") | not) and any(.[]; startswith("macos") or (. as $label | $hosted | index($label)) != null))] | length' <<<"$page")" || return 1
+              n=$((n + c))
+            done
+            echo "$n"
+          }
           pool=false
           idle=n/a
           total=n/a
@@ -119,9 +137,23 @@ jobs:
           else
             read -r idle total <<<"$counts"
             pool=true
-            reason="$idle of the $total self-hosted runners labelled $RUNS_ON are online and idle, so at most $idle macOS jobs run there and the rest on GitHub-hosted runners."
+            reason="$idle of the $total self-hosted runners labelled $RUNS_ON are online and idle."
           fi
           RUNS_ON="$(jq -c . <<<"$RUNS_ON")"
+          wanted_jobs=0
+          for job in macos_app rust server spec runner_hook; do
+            case " $WANTED " in *" $job=true "*) wanted_jobs=$((wanted_jobs + 1)) ;; esac
+          done
+          hosted_cap=5
+          hosted_load=n/a
+          if [ "$pool" = true ] && [ "$wanted_jobs" -gt "$idle" ]; then
+            if hosted_load="$(count_hosted)"; then
+              reason="$reason $hosted_load hosted macOS jobs of this repository are queued or running. A job without an idle self-hosted runner runs on GitHub-hosted runners while that count is below $hosted_cap, and queues for a self-hosted runner otherwise."
+            else
+              hosted_load=unknown
+              reason="$reason Counting the hosted macOS jobs failed (see the error above), so every job without an idle self-hosted runner runs on GitHub-hosted runners."
+            fi
+          fi
           echo "$reason"
           {
             echo "### macOS runners"
@@ -133,14 +165,25 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           to_self_hosted=0
           to_hosted=0
+          idle_left=$idle
+          hosted_busy=$hosted_load
           for job in macos_app rust server spec runner_hook; do
             case " $WANTED " in
               *" $job=true "*) wanted=true ;;
               *) wanted=false ;;
             esac
             runs_on=$RUNS_ON
-            if [ "$pool" = true ] && { [ "$wanted" != true ] || [ "$to_self_hosted" -ge "$idle" ]; }; then
-              runs_on=$hosted
+            if [ "$pool" = true ]; then
+              if [ "$wanted" != true ]; then
+                runs_on=$hosted
+              elif [ "$idle_left" -gt 0 ]; then
+                idle_left=$((idle_left - 1))
+              elif [ "$hosted_busy" = unknown ]; then
+                runs_on=$hosted
+              elif [ "$hosted_busy" -lt "$hosted_cap" ]; then
+                runs_on=$hosted
+                hosted_busy=$((hosted_busy + 1))
+              fi
             fi
             if jq -e 'map(ascii_downcase) | index("self-hosted")' <<<"$runs_on" >/dev/null; then
               developer_dir=/Applications/Xcode.app/Contents/Developer
@@ -153,7 +196,7 @@ jobs:
             echo "| $job | $wanted | \`$runs_on\` | \`$developer_dir\` |" >> "$GITHUB_STEP_SUMMARY"
             echo "$job=$(jq -nc --argjson runs_on "$runs_on" --arg developer_dir "$developer_dir" '{runs_on: $runs_on, developer_dir: $developer_dir}')" >> "$GITHUB_OUTPUT"
           done
-          decision="pick-macos: event=$EVENT pooled=$pool idle=$idle total=$total to_self_hosted=$to_self_hosted to_hosted=$to_hosted"
+          decision="pick-macos: event=$EVENT pooled=$pool idle=$idle total=$total hosted_load=$hosted_load hosted_cap=$hosted_cap to_self_hosted=$to_self_hosted to_hosted=$to_hosted"
           echo "$decision"
           printf '\n%s\n' "$decision" >> "$GITHUB_STEP_SUMMARY"
 
