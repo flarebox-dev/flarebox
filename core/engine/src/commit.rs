@@ -626,7 +626,9 @@ impl Commits {
         let needed = self.retry_waiting(trees, needed, agreed);
         let cap = self.cap.unwrap_or(MAX_OPS);
         let answered = self.conflicts(trees, &skip, cap, ids, now_ms);
-        skip.extend(answered.iter().filter_map(target).cloned());
+        skip.extend(
+            (answered.iter().filter_map(|op| op.op.as_ref())).map(|op| op_node(op).to_owned()),
+        );
         let guarded =
             |question: &Question| matches!(question.kind, QuestionKind::MassDelete { .. });
         let index = self.questions.iter().position(guarded);
@@ -706,10 +708,12 @@ impl Commits {
     /// file live with the meta revision it was asked with, or L moved or deleted a file S holds:
     /// someone renamed, moved or deleted one by hand. It is asked again, under a new ID and
     /// without its answer, once R holds another content revision of either file. An answer waits
-    /// until both files are in sync and planned (`skip` lists the nodes that are not):
-    /// [`Answer::KeepOriginal`] deletes the copy, and [`Answer::KeepCopy`] deletes the original and
-    /// moves the copy to the original's name. S is left as it is, so the result reaches the disk
-    /// as a remote change would, and only a file L still holds as S does is removed or moved.
+    /// until both files are in sync and planned (`skip` lists the nodes that are not), and a
+    /// build carries out one op per conflict and none for a node another answer already took.
+    /// [`Answer::KeepOriginal`] deletes the copy. [`Answer::KeepCopy`] first gives the original
+    /// the copy's content, so the original's own content stays in its version history, and once
+    /// that has reached L it deletes the copy. S is left as it is, so the result reaches the disk
+    /// as a remote change would, and only a file L still holds as S does is changed or removed.
     fn conflicts(
         &mut self,
         trees: &Trees,
@@ -720,6 +724,7 @@ impl Commits {
     ) -> Vec<proto::Op> {
         let mut ops = Vec::new();
         let mut kept = Vec::new();
+        let mut taken = BTreeSet::new();
         for mut question in std::mem::take(&mut self.questions) {
             let QuestionKind::Conflict { original, copy } = &mut question.kind else {
                 kept.push(question);
@@ -743,26 +748,35 @@ impl Commits {
             let ready = in_sync(trees, original, copy)
                 && !skip.contains(&original.node_id)
                 && !skip.contains(&copy.node_id);
-            let remote = |id: &str| trees.remote().get(id).filter(|node| !node.trashed);
-            let delete = |file: &ConflictFile| proto::Op {
-                op: Some(op::Op::Delete(proto::Delete {
-                    node_id: file.node_id.clone(),
-                })),
+            let free = !taken.contains(&original.node_id) && !taken.contains(&copy.node_id);
+            let content = |file: &ConflictFile| {
+                let remote = trees.remote().get(&file.node_id).expect("live in R");
+                remote.shape.content.clone()
             };
-            match question.answer {
-                Some(Answer::KeepOriginal) if ready && ops.len() < cap => ops.push(delete(copy)),
-                Some(Answer::KeepCopy) if ready && ops.len() + 2 <= cap => {
-                    let name = &remote(&original.node_id).expect("live in R").shape;
-                    ops.push(delete(original));
-                    ops.push(proto::Op {
-                        op: Some(op::Op::Move(proto::Move {
-                            node_id: copy.node_id.clone(),
-                            new_parent_id: name.parent.clone(),
-                            new_name: name.name.clone(),
-                        })),
-                    });
-                }
-                _ => {}
+            let delete_copy = op::Op::Delete(proto::Delete {
+                node_id: copy.node_id.clone(),
+            });
+            let op = match question.answer {
+                Some(Answer::KeepOriginal) => Some(delete_copy),
+                Some(Answer::KeepCopy) => match (content(original), content(copy)) {
+                    (Some(current), Some(copied)) if !same_content(&current, &copied) => {
+                        Some(op::Op::UpdateContent(proto::UpdateContent {
+                            node_id: original.node_id.clone(),
+                            content: Some(copied),
+                        }))
+                    }
+                    _ => Some(delete_copy),
+                },
+                _ => None,
+            };
+            if let Some(op) = op
+                && ready
+                && free
+                && ops.len() < cap
+            {
+                taken.insert(original.node_id.clone());
+                taken.insert(copy.node_id.clone());
+                ops.push(proto::Op { op: Some(op) });
             }
             kept.push(question);
         }
@@ -783,7 +797,7 @@ impl Commits {
         })
     }
 
-    /// The nodes that the answers to conflicts delete or move ([`Commits::conflicts`]). An op of the
+    /// The nodes that the answers to conflicts change or delete ([`Commits::conflicts`]). An op of the
     /// commit in flight for one of them leaves S as it is when it is acknowledged, and its node is
     /// not marked as a problem.
     fn answered(&self) -> BTreeSet<NodeId> {
@@ -909,10 +923,14 @@ impl Commits {
         let aliases = self.aliases.clone();
         let answered = self.answered();
         let mut conflicts: Vec<(usize, NodeId, NodeId)> = Vec::new();
+        let mut answers = Vec::new();
         for (index, (op, outcome)) in flight.commit.ops.iter().zip(&result.results).enumerate() {
             use op_result::Code;
             let code = Code::try_from(outcome.code).unwrap_or(Code::Unspecified);
-            if target(op).is_some_and(|id| answered.contains(id)) {
+            if let Some(sent) = &op.op
+                && answered.contains(op_node(sent))
+            {
+                answers.push((index, sent, code, &outcome.node_id));
                 continue;
             }
             let applied = matches!(code, Code::Applied | Code::AppliedRenamed);
@@ -1092,20 +1110,45 @@ impl Commits {
         for (id, shape) in rest {
             trees.wait(id, shape, Origin::Commit(flight.commit.device_seq));
         }
-        let deleted: BTreeSet<&NodeId> = (flight.commit.ops.iter())
-            .filter(|op| matches!(op.op, Some(op::Op::Delete(_))))
-            .filter_map(target)
-            .collect();
+        let mut closed = BTreeSet::new();
+        for question in &mut self.questions {
+            let QuestionKind::Conflict { original, copy } = &mut question.kind else {
+                continue;
+            };
+            for &(index, sent, code, made) in &answers {
+                use op_result::Code;
+                let applied = matches!(code, Code::Applied | Code::AppliedRenamed);
+                match sent {
+                    op::Op::Delete(delete) if delete.node_id == copy.node_id && applied => {
+                        closed.insert(question.id.clone());
+                    }
+                    op::Op::UpdateContent(update)
+                        if update.node_id == original.node_id && applied =>
+                    {
+                        let remote = trees.remote().get(&original.node_id);
+                        let took = remote.filter(|node| {
+                            (node.shape.content.as_ref().zip(update.content.as_ref()))
+                                .is_some_and(|(now, sent)| same_content(now, sent))
+                        });
+                        if let Some(node) = took {
+                            original.revisions.content_rev = node.content_rev;
+                        }
+                    }
+                    op::Op::UpdateContent(update)
+                        if update.node_id == original.node_id && code == Code::ConflictCopy =>
+                    {
+                        question.answer = None;
+                        conflicts.push((index, original.node_id.clone(), made.clone()));
+                    }
+                    _ if op_node(sent) == original.node_id || op_node(sent) == copy.node_id => {
+                        question.answer = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
         self.questions
-            .retain(|question| match (&question.kind, question.answer) {
-                (QuestionKind::Conflict { copy, .. }, Some(Answer::KeepOriginal)) => {
-                    !deleted.contains(&copy.node_id)
-                }
-                (QuestionKind::Conflict { original, .. }, Some(Answer::KeepCopy)) => {
-                    !deleted.contains(&original.node_id)
-                }
-                _ => true,
-            });
+            .retain(|question| !closed.contains(&question.id));
         for (index, original, copy) in conflicts {
             self.ask_conflict(trees, &flight.commit.commit_id, index, original, copy);
         }
@@ -1448,15 +1491,6 @@ fn in_sync(trees: &Trees, original: &ConflictFile, copy: &ConflictFile) -> bool 
     [original, copy]
         .iter()
         .all(|file| trees.class(&file.node_id) == Class::InSync)
-}
-
-/// The node a `Delete` or `Move` op is for.
-fn target(op: &proto::Op) -> Option<&NodeId> {
-    match &op.op {
-        Some(op::Op::Delete(delete)) => Some(&delete.node_id),
-        Some(op::Op::Move(moved)) => Some(&moved.node_id),
-        _ => None,
-    }
 }
 
 /// The node other than `other` that R holds live under `parent` with the name key of `name`.

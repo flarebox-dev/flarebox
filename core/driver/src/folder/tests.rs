@@ -6014,28 +6014,100 @@ fn keeping_the_original_of_a_conflict_moves_the_copy_to_the_trash() {
     assert_eq!(asked(&site_b), []);
 }
 
-/// Keep the copy moves the original to the server's trash and gives the copy the original's name on every device.
+/// Keep the copy gives the original the copy's content, so the original's own content stays in its version history,
+/// and then moves the copy to the server's trash. Each step is a commit of one op.
 #[test]
-fn keeping_the_copy_of_a_conflict_gives_it_the_name_and_moves_the_original_to_the_trash() {
+fn keeping_the_copy_of_a_conflict_gives_the_original_its_content_and_moves_the_copy_to_the_trash() {
     let mut remote = Remote::new();
     let ((site_a, mut a), (site_b, mut b)) = edited_on_both(&mut remote);
     let before = server_nodes(&remote);
     answer(&site_b, Answer::KeepCopy);
     let step = b.folder.requested();
     b.take(step).unwrap();
+    let sent = b.sent.len();
     sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
 
     let kept = [("main.go".to_owned(), "from b".to_owned())];
     assert_eq!(files(&site_a.root), kept);
     assert_eq!(files(&site_b.root), kept);
+    let answers: Vec<_> = b.sent[sent..].iter().map(kinds).collect();
+    assert_eq!(answers, [["update content"], ["delete"]]);
     let after = server_nodes(&remote);
-    assert_eq!(live_id(&after, "main.go"), live_id(&before, COPY));
     let original = live_id(&before, "main.go");
+    assert_eq!(live_id(&after, "main.go"), original);
     assert!(
-        after.contains(&("main.go".to_owned(), original, false)),
+        after.contains(&(COPY.to_owned(), live_id(&before, COPY), false)),
         "{after:?}"
     );
+    let request = ListVersions {
+        node_id: original,
+        ..Default::default()
+    };
+    let versions = remote.space.list_versions(&request).unwrap().versions;
+    let writers: Vec<_> = (versions.iter())
+        .map(|version| version.device_id.as_str())
+        .collect();
+    assert_eq!(writers, ["b", "a", "a"]);
     assert_eq!(asked(&site_b), []);
+}
+
+/// Another device edits the copy before the server takes the answer to delete it. The server keeps the copy, and
+/// the conflict is asked again.
+#[test]
+fn a_conflict_whose_file_changes_before_the_answer_reaches_the_server_is_asked_again() {
+    let mut remote = Remote::new();
+    let ((site_a, mut a), (site_b, mut b)) = edited_on_both(&mut remote);
+    let [first] = &asked(&site_b)[..] else {
+        panic!("one question");
+    };
+    answer(&site_b, Answer::KeepOriginal);
+    let step = b.folder.requested();
+    b.take(step).unwrap();
+    assert!(matches!(b.work.front(), Some(Work::Send(_))));
+    fs::write(site_a.root.join(COPY), b"copy edited after the answer").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(&mut remote);
+    b.run(&mut remote);
+    let result = &remote.results[&b.sent.last().unwrap().commit_id];
+    assert_eq!(
+        result.results[0].code,
+        koidrive_proto::v1::op_result::Code::Superseded as i32
+    );
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+
+    assert_eq!(remote.names(), [COPY, "main.go"]);
+    assert_eq!(
+        fs::read(site_b.root.join(COPY)).unwrap(),
+        b"copy edited after the answer"
+    );
+    let [second] = &asked(&site_b)[..] else {
+        panic!("one question: {:?}", asked(&site_b));
+    };
+    assert_ne!(second.id, first.id);
+}
+
+/// Device `a` edits the original, and its observer has not seen the edit when `b`'s answer to keep the copy
+/// reaches it. The edit is kept in a file the person sees, on both devices, and both come to rest.
+#[test]
+fn an_edit_of_the_original_on_another_device_is_kept_when_the_copy_is_kept() {
+    let mut remote = Remote::new();
+    let ((site_a, mut a), (site_b, mut b)) = edited_on_both(&mut remote);
+    answer(&site_b, Answer::KeepCopy);
+    let step = b.folder.requested();
+    b.take(step).unwrap();
+    b.run(&mut remote);
+    fs::write(site_a.root.join("main.go"), b"edited on a").unwrap();
+    a.pull(&remote);
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+
+    for site in [&site_a, &site_b] {
+        let files = files(&site.root);
+        assert!(
+            files.iter().any(|(_, text)| text == "edited on a"),
+            "{files:?}"
+        );
+        assert!(files.iter().any(|(_, text)| text == "from b"), "{files:?}");
+    }
 }
 
 /// Renaming the copy by hand, here on the other device, ends the conflict.

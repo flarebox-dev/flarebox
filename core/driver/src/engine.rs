@@ -1023,7 +1023,6 @@ impl Engine {
 /// The nodes a batch took out of L, by the path each had, with the identity it had.
 type Gone = BTreeMap<PathBuf, (NodeId, FileIdentity)>;
 
-/// The placed node of L at `path`, or the root for the empty path.
 /// The path of a node `tree` holds live, relative to the linked folder.
 fn path<N: Node>(tree: &Tree<N>, id: &str) -> String {
     let mut names = Vec::new();
@@ -1036,6 +1035,7 @@ fn path<N: Node>(tree: &Tree<N>, id: &str) -> String {
     names.join("/")
 }
 
+/// The placed node of L at `path`, or the root for the empty path.
 fn local_at(trees: &Trees, path: &Path) -> Option<NodeId> {
     let mut current = trees.local().root.clone();
     for component in path.components() {
