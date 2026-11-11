@@ -75,7 +75,6 @@ fn migrations_apply_from_empty() {
         [
             "chunk_cache",
             "commit_in_flight",
-            "commit_in_flight_bases",
             "commit_in_flight_delete_members",
             "commit_in_flight_deletes",
             "commit_state",
@@ -93,6 +92,7 @@ fn migrations_apply_from_empty() {
             "restore_requests",
             "synced_nodes",
             "waiting_updates",
+            "watched_contents",
         ]
     );
     let journal: String = conn
@@ -375,6 +375,7 @@ fn engine_state() -> EngineState {
                 ("w".into(), Some(engine_shape("root", "w.txt"))),
                 ("gone".into(), None),
             ]),
+            watched: BTreeMap::from([("edited".into(), true), ("kept".into(), false)]),
         },
         commits: CommitsState {
             accepted: 4,
@@ -386,16 +387,6 @@ fn engine_state() -> EngineState {
                         vec!["old".into(), "old-child".into(), "old-grandchild".into()],
                     ),
                     ("empty".into(), vec![]),
-                ]),
-                bases: BTreeMap::from([
-                    (
-                        "edited".into(),
-                        Some(Content {
-                            size: 3,
-                            ..Default::default()
-                        }),
-                    ),
-                    ("emptied".into(), None),
                 ]),
                 result: Some(CommitResult {
                     seq: 30,
@@ -489,7 +480,7 @@ const ENGINE_TABLES: [&str; 11] = [
     "commit_in_flight",
     "commit_in_flight_deletes",
     "commit_in_flight_delete_members",
-    "commit_in_flight_bases",
+    "watched_contents",
     "effect_state",
     "failed_effects",
     "restore_intents",
@@ -667,7 +658,6 @@ fn a_policy_halt_outlasts_a_restart_and_resends_nothing() {
                     ..Default::default()
                 },
                 deletes: BTreeMap::new(),
-                bases: BTreeMap::new(),
                 result: None,
             }),
             halted: Some(halt),
@@ -771,7 +761,7 @@ fn a_cursor_stored_before_it_could_record_a_server_behind_it_records_none() {
         .unwrap();
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
-        "DROP TABLE commit_in_flight_bases;
+        "DROP TABLE watched_contents;
          ALTER TABLE remote_cursor DROP COLUMN ahead_of_server;",
     )
     .unwrap();
@@ -790,10 +780,10 @@ fn a_cursor_stored_before_it_could_record_a_server_behind_it_records_none() {
     );
 }
 
-/// A database of the schema before the commit in flight records the content S held for each of
-/// its content updates keeps its commit in flight, with none recorded.
+/// A database of the schema before S's content is watched for the commit in flight keeps its
+/// engine state, with nothing watched.
 #[test]
-fn a_commit_in_flight_stored_before_it_recorded_its_bases_is_kept_without_them() {
+fn a_store_from_before_contents_were_watched_opens_with_nothing_watched() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
     let mut before = engine_state();
@@ -802,15 +792,14 @@ fn a_commit_in_flight_stored_before_it_recorded_its_bases_is_kept_without_them()
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("DROP TABLE commit_in_flight_bases;")
-        .unwrap();
+    conn.execute_batch("DROP TABLE watched_contents;").unwrap();
     conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
         .unwrap();
     drop(conn);
 
     let mut store = Store::open(&path).unwrap();
     assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
-    before.commits.in_flight.as_mut().unwrap().bases.clear();
+    before.trees.watched.clear();
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
 }
 
@@ -822,7 +811,7 @@ fn a_version_3_store_opens_with_empty_restore_tables() {
     let path = dir.path().join("state.db");
     let mut before = engine_state();
     before.commits.in_flight.as_mut().unwrap().commit.ops.pop();
-    before.commits.in_flight.as_mut().unwrap().bases.clear();
+    before.trees.watched.clear();
     before.commits.restores.clear();
     before.commits.resolved.clear();
     Store::open(&path)
@@ -832,7 +821,7 @@ fn a_version_3_store_opens_with_empty_restore_tables() {
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
         "DROP TABLE restore_requests; DROP TABLE restore_intents;
-         DROP TABLE commit_in_flight_bases;
+         DROP TABLE watched_contents;
          ALTER TABLE remote_cursor DROP COLUMN ahead_of_server;",
     )
     .unwrap();

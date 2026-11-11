@@ -144,6 +144,9 @@ pub struct Trees {
     reverted: BTreeSet<NodeId>,
     parked_as: BTreeMap<NodeId, NodeId>,
     waiting: BTreeMap<NodeId, Option<Shape>>,
+    /// The nodes whose content the commit in flight updates, each with whether S's content
+    /// changed since the commit was built.
+    watched: BTreeMap<NodeId, bool>,
     ignore: Matcher,
     /// Nodes whose local copy the user moved into an ignored folder that is no node. L keeps the
     /// entry each had before the move.
@@ -199,6 +202,7 @@ impl Trees {
             reverted: BTreeSet::new(),
             parked_as: BTreeMap::new(),
             waiting: BTreeMap::new(),
+            watched: BTreeMap::new(),
             ignore: Matcher::new(LocalRules::default()),
             outside: BTreeSet::new(),
             rules_known: true,
@@ -564,6 +568,18 @@ impl Trees {
     /// left out of planning.
     pub fn waiting(&self) -> &BTreeMap<NodeId, Option<Shape>> {
         &self.waiting
+    }
+
+    /// Watches S's content of `ids`, the nodes whose content the commit just built updates, and
+    /// stops watching any other node.
+    pub fn watch_content(&mut self, ids: impl IntoIterator<Item = NodeId>) {
+        self.watched = ids.into_iter().map(|id| (id, false)).collect();
+    }
+
+    /// Whether S's content of `id` changed since [`Trees::watch_content`] started watching it,
+    /// even if it changed back.
+    pub fn took_content(&self, id: &str) -> bool {
+        self.watched.get(id) == Some(&true)
     }
 
     pub(crate) fn take_waiting(&mut self) -> BTreeMap<NodeId, Option<Shape>> {
@@ -1047,6 +1063,14 @@ impl Trees {
             }
             None => self.s.remove(id),
         };
+        if let Some(changed) = self.watched.get_mut(id) {
+            let before = old.as_ref().and_then(|shape| shape.content.as_ref());
+            let after = self.s.get(id).and_then(|shape| shape.content.as_ref());
+            *changed |= match (before, after) {
+                (Some(before), Some(after)) => !same_content(before, after),
+                (before, after) => before.is_some() != after.is_some(),
+            };
+        }
         if let Some(old) = old {
             let kept = self.s.get(id).is_some_and(|new| {
                 new.parent == old.parent && name_key(&new.name) == name_key(&old.name)
@@ -1072,11 +1096,13 @@ impl Trees {
             reverted: self.reverted.clone(),
             parked_as: self.parked_as.clone(),
             waiting: self.waiting.clone(),
+            watched: self.watched.clone(),
         }
     }
 
-    /// Replaces the dirty, unsearched, reverted, parked and waiting nodes with `state`, once the
-    /// store has loaded every node. The rules are unknown from here until [`Trees::rules_scanned`].
+    /// Replaces the dirty, unsearched, reverted, parked, waiting and watched nodes with `state`,
+    /// once the store has loaded every node. The rules are unknown from here until
+    /// [`Trees::rules_scanned`].
     /// Refuses trees that break section 2.2, a node that is not dirty
     /// although it is parked or not in sync, an unsearched node that is not dirty, and a parked
     /// name for a node L does not hold as parked.
@@ -1108,6 +1134,7 @@ impl Trees {
             reverted,
             parked_as,
             waiting,
+            watched,
         } = state;
         self.unsettled = dirty.clone();
         self.same.clear();
@@ -1117,6 +1144,7 @@ impl Trees {
         self.reverted = reverted;
         self.parked_as = parked_as;
         self.waiting = waiting;
+        self.watched = watched;
         self.rules_known = false;
         self.unknown_rules.clear();
         Ok(())

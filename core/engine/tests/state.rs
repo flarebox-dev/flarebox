@@ -65,6 +65,7 @@ fn trees_state() -> TreesState {
         reverted: ["a".into()].into(),
         parked_as: [("b".into(), "c".into())].into(),
         waiting: [("a".into(), Some(dir(ROOT, "x")))].into(),
+        watched: [("u".into(), true), ("v".into(), false)].into(),
     }
 }
 
@@ -104,7 +105,6 @@ fn commits_state() -> CommitsState {
                 ..Default::default()
             },
             deletes: [("d".into(), vec!["d".into(), "e".into()])].into(),
-            bases: [("u".into(), None)].into(),
             result: Some(CommitResult {
                 results: vec![OpResult::default(); 3],
                 ..Default::default()

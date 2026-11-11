@@ -2384,6 +2384,8 @@ fn a_late_acknowledgement_keeps_the_content_s_took_since(restart: bool, overtake
     }
     if restart {
         commits = Commits::from_state(commits.state()).unwrap();
+        trees.restore(trees.state()).unwrap();
+        trees.rules_scanned();
     }
     acknowledge(
         &mut commits,
@@ -2421,6 +2423,60 @@ fn a_late_acknowledgement_overtaken_by_the_next_remote_edit_keeps_the_content_s_
 fn a_late_acknowledgement_overtaken_by_the_next_remote_edit_after_a_restart_keeps_the_content_s_took()
  {
     a_late_acknowledgement_keeps_the_content_s_took_since(true, true);
+}
+
+/// n's edit to 1 is in flight when the user and the other device both write 2, so S takes 2. The
+/// other device then writes 0 again, which is downloaded, so S is back at the content it held
+/// when the commit was built. The user writes 1 again before the acknowledgement. S keeps 0,
+/// since it changed after the commit was built, and the user's 1 is uploaded. With \`restart\`,
+/// the commit side and the trees are restored from their stored state before the acknowledgement.
+fn a_late_acknowledgement_keeps_the_content_s_took_back(restart: bool) {
+    let mut trees = trees(&[(
+        "n",
+        Some(file(ROOT, "a", 1)),
+        Some(file(ROOT, "a", 0)),
+        Some(remote(file(ROOT, "a", 0))),
+    )]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("n", 1)]);
+    trees.set_local("n".into(), local(file(ROOT, "a", 2), 1));
+    trees.set_remote("n".into(), remote(file(ROOT, "a", 2)));
+    trees.settle();
+    trees.set_remote("n".into(), remote(file(ROOT, "a", 0)));
+    trees.settle();
+    let download = effects_for(&mut trees, &mut ids, "n");
+    assert!(
+        matches!(&download[..], [Effect::WriteFile { content: written, .. }] if *written == content(0)),
+        "{download:?}"
+    );
+    assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "a", 0)));
+    trees.set_local("n".into(), local(file(ROOT, "a", 1), 100));
+    if restart {
+        commits = Commits::from_state(commits.state()).unwrap();
+        trees.restore(trees.state()).unwrap();
+        trees.rules_scanned();
+    }
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "a", 0)));
+    assert_eq!(effects_for(&mut trees, &mut ids, "n"), []);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("n", 1)]);
+}
+
+#[test]
+fn a_late_acknowledgement_keeps_the_content_s_took_back_to_what_it_held_at_the_build() {
+    a_late_acknowledgement_keeps_the_content_s_took_back(false);
+}
+
+#[test]
+fn a_late_acknowledgement_after_a_restart_keeps_the_content_s_took_back_to_what_it_held_at_the_build()
+ {
+    a_late_acknowledgement_keeps_the_content_s_took_back(true);
 }
 
 /// n's edit to 1 is in flight when the other device writes 0 again. S never took anything after

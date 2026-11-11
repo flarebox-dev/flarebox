@@ -230,9 +230,9 @@ const MIGRATIONS: &[&str] = &[
         CHECK (ahead_of_server IN (0, 1));
 ",
     "
-    CREATE TABLE commit_in_flight_bases (
+    CREATE TABLE watched_contents (
         node_id TEXT PRIMARY KEY,
-        content BLOB
+        changed INTEGER NOT NULL CHECK (changed IN (0, 1))
     ) STRICT, WITHOUT ROWID;
 ",
 ];

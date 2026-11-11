@@ -34,8 +34,6 @@ pub struct InFlight {
     pub commit: proto::Commit,
     /// For each `Delete` op, by its target, every node the client planned to delete with it.
     pub deletes: BTreeMap<NodeId, Vec<NodeId>>,
-    /// For each `UpdateContent` op, by its node, the content S held when the commit was built.
-    pub bases: BTreeMap<NodeId, Option<Content>>,
     /// The result once it has arrived, kept until R holds its records.
     pub result: Option<proto::CommitResult>,
 }
@@ -411,16 +409,10 @@ impl Commits {
         if ops.is_empty() {
             return None;
         }
-        let bases = (ops.iter())
-            .filter_map(|op| match &op.op {
-                Some(op::Op::UpdateContent(update)) => Some(update.node_id.clone()),
-                _ => None,
-            })
-            .map(|id| {
-                let content = trees.synced().live(&id).and_then(|s| s.content.clone());
-                (id, content)
-            })
-            .collect();
+        trees.watch_content(ops.iter().filter_map(|op| match &op.op {
+            Some(op::Op::UpdateContent(update)) => Some(update.node_id.clone()),
+            _ => None,
+        }));
         self.in_flight = Some(InFlight {
             commit: proto::Commit {
                 commit_id: ids.uuid_v7(now_ms),
@@ -431,7 +423,6 @@ impl Commits {
                 ..Default::default()
             },
             deletes,
-            bases,
             result: None,
         });
         self.in_flight.as_ref().map(|flight| &flight.commit)
@@ -455,8 +446,8 @@ impl Commits {
     /// node is reverted so that the disk takes it too. Content S took from R after the commit was
     /// built is newer than what was sent: the server applies a content update only when no other
     /// device changed the content after the commit's `base_seq`, so that change came after the
-    /// commit. When S's content differs from the one it held then ([`InFlight::bases`]), S keeps
-    /// it. A conflict copy is re-keyed in L, and so is
+    /// commit. When S's content changed since then ([`Trees::took_content`]), even back to what it
+    /// was, S keeps what it holds. A conflict copy is re-keyed in L, and so is
     /// a directory merged into one L does not hold yet. When L already holds the conflict copy,
     /// because a log replay brought it before the result and the effects downloaded it, the local
     /// file keeps its ID and takes what was sent as its S, so the server's content replaces it. When L already holds the directory it was
@@ -539,15 +530,9 @@ impl Commits {
                         ..shape
                     });
                     let current = trees.synced().live(id).and_then(|s| s.content.as_ref());
-                    let same = |a: Option<&Content>, b: Option<&Content>| match (a, b) {
-                        (Some(a), Some(b)) => same_content(a, b),
-                        (a, b) => a.is_none() && b.is_none(),
-                    };
-                    let newer =
-                        (flight.bases.get(id)).is_some_and(|base| !same(base.as_ref(), current));
                     let downloaded =
                         code == Code::ConflictCopy && trees.local().get(&outcome.node_id).is_some();
-                    if applied && newer {
+                    if applied && trees.took_content(id) {
                         let kept = synced.get(trees, id).map(|shape| Shape {
                             content: current.cloned(),
                             ..shape
@@ -616,6 +601,7 @@ impl Commits {
         for (index, id) in restored.expect("a Restore op in flight is queued") {
             self.resolve(id, Outcome::from_result(&result.results[index]));
         }
+        trees.watch_content([]);
         self.retry_waiting(trees, BTreeSet::new(), Vec::new());
         self.accepted = flight.commit.device_seq;
         self.cap = self.cap.map(|cap| cap * 2).filter(|cap| *cap < MAX_OPS);

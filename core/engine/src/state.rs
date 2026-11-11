@@ -33,6 +33,9 @@ pub struct TreesState {
     /// S updates of acknowledged ops that wait until S stays a valid tree with them, by node.
     /// `None` removes the node from S.
     pub waiting: BTreeMap<NodeId, Option<Shape>>,
+    /// The nodes whose content the commit in flight updates, each with whether S's content
+    /// changed since the commit was built.
+    pub watched: BTreeMap<NodeId, bool>,
 }
 
 /// What [`Commits`](crate::commit::Commits) holds.

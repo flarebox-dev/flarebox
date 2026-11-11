@@ -91,6 +91,13 @@ impl Tx<'_> {
             };
             state.trees.waiting.insert(row.get(0)?, shape);
         }
+        let mut stmt = self
+            .0
+            .prepare_cached("SELECT node_id, changed FROM watched_contents")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            state.trees.watched.insert(row.get(0)?, row.get(1)?);
+        }
 
         if let Some((accepted, halt, code, cap)) = self
             .0
@@ -153,7 +160,7 @@ impl Tx<'_> {
             "commit_in_flight",
             "commit_in_flight_deletes",
             "commit_in_flight_delete_members",
-            "commit_in_flight_bases",
+            "watched_contents",
             "effect_state",
             "failed_effects",
             "restore_intents",
@@ -221,6 +228,19 @@ impl Tx<'_> {
                     .map(Content::encode_to_vec),
             ])?;
         }
+        let mut remove = self
+            .0
+            .prepare_cached("DELETE FROM watched_contents WHERE node_id = ?1")?;
+        let mut put = self.0.prepare_cached(
+            "INSERT OR REPLACE INTO watched_contents (node_id, changed) VALUES (?1, ?2)",
+        )?;
+        let (removed, changed) = differences(&before.trees.watched, &after.trees.watched);
+        for node in removed {
+            remove.execute([node])?;
+        }
+        for (node, took) in changed {
+            put.execute(params![node, took])?;
+        }
 
         let (old, new) = (&before.commits, &after.commits);
         if (old.accepted, old.halted, old.cap) != (new.accepted, new.halted, new.cap) {
@@ -236,7 +256,6 @@ impl Tx<'_> {
                 "commit_in_flight",
                 "commit_in_flight_deletes",
                 "commit_in_flight_delete_members",
-                "commit_in_flight_bases",
             ] {
                 self.0.execute(&format!("DELETE FROM {table}"), [])?;
             }
@@ -259,12 +278,6 @@ impl Tx<'_> {
                     for (position, node) in nodes.iter().enumerate() {
                         members.execute(params![target, position, node])?;
                     }
-                }
-                let mut bases = self.0.prepare_cached(
-                    "INSERT INTO commit_in_flight_bases (node_id, content) VALUES (?1, ?2)",
-                )?;
-                for (node, content) in &flight.bases {
-                    bases.execute(params![node, content.as_ref().map(Content::encode_to_vec)])?;
                 }
             }
         }
@@ -331,19 +344,9 @@ impl Tx<'_> {
             };
             nodes.push(row.get(1)?);
         }
-        let bases = self
-            .0
-            .prepare_cached("SELECT node_id, content FROM commit_in_flight_bases")?
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .map(|row| {
-                let (node, content): (NodeId, Option<Vec<u8>>) = row?;
-                Ok((node, decode(content)?))
-            })
-            .collect::<Result<_>>()?;
         Ok(Some(InFlight {
             commit: Commit::decode(commit.as_slice())?,
             deletes,
-            bases,
             result: decode(result)?,
         }))
     }
