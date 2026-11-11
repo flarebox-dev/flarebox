@@ -122,7 +122,7 @@ impl Space {
     ) -> CommitResult {
         let result = self.commit_raw(c, ops, c.base_seq, receipts, None).unwrap();
         c.base_seq = result.seq;
-        result
+        result..Default::default()
     }
 
     fn create_file(
@@ -945,6 +945,7 @@ fn resumes_from_the_log_or_asks_for_a_resync() {
     let since = |since_seq| Resume {
         history_id: history_id.clone(),
         since_seq,
+        ..Default::default()
     };
     let backlog = s.space.resume(&since(1)).unwrap();
     assert_eq!(backlog.iter().map(|r| r.seq).collect::<Vec<_>>(), [2, 3]);
@@ -953,7 +954,7 @@ fn resumes_from_the_log_or_asks_for_a_resync() {
     assert_eq!(
         reason(Resume {
             history_id: "other".into(),
-            since_seq: 0
+            ..Default::default()
         }),
         resync_required::Reason::HistoryChanged
     );

@@ -11,8 +11,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use koidrive_net::{Api, Auth, Backoff, ChunkError, Event, Session, Transfer, matches};
 use koidrive_proto::v1::{
-    ChunkRef, CommitResult, Content, CreateFile, Op, UploadReceipt, change_record, error::Code, op,
-    op_result,
+    ChunkRef, CommitResult, Content, CreateFile, Op, Resume, UploadReceipt, change_record,
+    error::Code, op, op_result,
 };
 use sha2::{Digest, Sha256};
 
@@ -183,7 +183,11 @@ async fn upload_commit_and_download_round_trip() {
     let reader_auth = auth(new_device("reader").await);
     let (reader, mut reader_events) = start(reader_auth.clone(), &space);
     connected(&mut reader_events).await;
-    reader.subscribe(&history, 0);
+    reader.subscribe(Resume {
+        history_id: history.clone(),
+        since_seq: 0,
+        ..Default::default()
+    });
     let records = until(&mut reader_events, |e| match e {
         Event::Changes(records) => Some(records.clone()),
         _ => None,
@@ -329,7 +333,11 @@ async fn commits_are_bound_by_the_1_mib_server_message() {
 
     let (reader, mut reader_events) = start(auth(new_device("reader").await), &space);
     connected(&mut reader_events).await;
-    reader.subscribe(&history, 0);
+    reader.subscribe(Resume {
+        history_id: history.clone(),
+        since_seq: 0,
+        ..Default::default()
+    });
     let records = until(&mut reader_events, |e| match e {
         Event::Changes(records) => Some(records.clone()),
         _ => None,

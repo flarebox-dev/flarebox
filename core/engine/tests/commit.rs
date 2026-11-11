@@ -154,6 +154,7 @@ fn result(seq: u64, results: Vec<OpResult>) -> CommitResult {
         seq,
         results,
         changes: vec![],
+        ..Default::default()..Default::default()
     }
 }
 

@@ -990,6 +990,7 @@ fn run_ignoring(
         .resume(&Resume {
             history_id: history.clone(),
             since_seq: last_seq,
+            ..Default::default()
         })
         .unwrap();
     for record in backlog {
@@ -1047,6 +1048,7 @@ fn run_ignoring(
                     .resume(&Resume {
                         history_id: history.clone(),
                         since_seq: last_seq,
+                        ..Default::default()
                     })
                     .unwrap();
                 for record in backlog {

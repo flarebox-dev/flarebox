@@ -18,8 +18,8 @@ use hyper_util::rt::TokioIo;
 use koidrive_proto::v1::{
     AccessToken, ChunkRef, ClientMessage, Commit, CommitResult, DownloadTargets,
     GetDownloadTargets, GetVersionChunks, Hello, ListTrash, ListTree, ListVersions, PrepareUpload,
-    PrepareUploadResult, Reauth, RpcRequest, RpcResponse, ServerMessage, TrashPage, TreePage,
-    VersionChunks, VersionList, Welcome, client_message, rpc_request::Call, rpc_response,
+    PrepareUploadResult, Reauth, Resume, RpcRequest, RpcResponse, ServerMessage, TrashPage,
+    TreePage, VersionChunks, VersionList, Welcome, client_message, rpc_request::Call, rpc_response,
     server_message::Msg,
 };
 use prost::Message as _;
@@ -189,13 +189,12 @@ impl Session {
         Ok((session, Events(event_rx)))
     }
 
-    /// Streams the log after `since_seq` of `history_id`: the last seq the driver applied completely, or the first
-    /// `TreePage.head_seq` of a bootstrap (spec v0 section 7.5). The session resumes from the last seq it passed on
-    /// after every reconnect, until a `ResyncRequired` stops the stream.
-    pub fn subscribe(&self, history_id: impl Into<String>, since_seq: u64) {
-        let _ = self
-            .commands
-            .send(Command::Subscribe(history_id.into(), since_seq));
+    /// Streams the log after `since.since_seq` of `since.history_id`: the last seq the driver applied completely, or
+    /// the first `TreePage.head_seq` of a bootstrap (spec v0 section 7.5), with the commit token there (RFC 0013). The
+    /// session resumes from the last seq it passed on, and its token, after every reconnect, until a
+    /// `ResyncRequired` stops the stream.
+    pub fn subscribe(&self, since: Resume) {
+        let _ = self.commands.send(Command::Subscribe(since));
     }
 
     /// Sends a commit and waits for its result. One commit is in flight at a time (spec v0 section 8). If the
@@ -413,7 +412,7 @@ enum Command {
         commit: Option<CommitSlot>,
         reply: Reply,
     },
-    Subscribe(String, u64),
+    Subscribe(Resume),
     Close,
 }
 
@@ -540,8 +539,8 @@ impl Task {
                         let req_id = self.req_id();
                         self.pending.insert(req_id, PendingCall { call, commit, reply, sent: false });
                     }
-                    Some(Command::Subscribe(history_id, since_seq)) => {
-                        self.stream.subscribe(history_id, since_seq);
+                    Some(Command::Subscribe(since)) => {
+                        self.stream.subscribe(since);
                     }
                 },
             }
@@ -875,8 +874,8 @@ impl Task {
                             let _ = socket.close(None).await;
                             return Exit::Closed;
                         }
-                        Some(Command::Subscribe(history_id, since_seq)) => {
-                            let resume = self.stream.subscribe(history_id, since_seq);
+                        Some(Command::Subscribe(since)) => {
+                            let resume = self.stream.subscribe(since);
                             self.send(&mut socket, client_message::Msg::Resume(resume)).await
                         }
                         Some(Command::Call { call, commit, reply }) => {
@@ -1028,7 +1027,7 @@ impl Task {
                 self.feed(fed, socket).await
             }
             Msg::CaughtUp(caught_up) => {
-                let fed = self.stream.caught_up(caught_up.head_seq);
+                let fed = self.stream.caught_up(caught_up);
                 self.feed(fed, socket).await
             }
             Msg::ResyncRequired(resync) => {

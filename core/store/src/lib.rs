@@ -372,6 +372,10 @@ const MIGRATIONS: &[&str] = &[
     WHERE synced_nodes.node_id = watched_positions.node_id AND watched_positions.rev IS NOT NULL;
     UPDATE watched_positions SET rev = NULL WHERE name IS NULL;
 ",
+    "
+    ALTER TABLE remote_cursor ADD COLUMN commit_id TEXT NOT NULL DEFAULT '';
+    ALTER TABLE remote_cursor ADD COLUMN committed_at_ms INTEGER NOT NULL DEFAULT 0;
+",
 ];
 
 /// The schema version this build writes.
@@ -422,10 +426,14 @@ impl Durability {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Where this device stands in the space's commit log (spec §7.4).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Cursor {
     pub history_id: String,
     pub last_seq: u64,
+    /// The commit token at `last_seq` (RFC 0013): the `commit_id` and `committed_at_ms` of the commit R applied
+    /// there. Empty at seq 0, and in a store from before tokens until the device learns it.
+    pub commit_id: String,
+    pub committed_at_ms: i64,
     /// The server reported its log below `last_seq` (`AHEAD_OF_SERVER`), and no bootstrap has replaced R
     /// since: the server lost commits this device applied.
     pub ahead_of_server: bool,
@@ -632,13 +640,16 @@ impl Tx<'_> {
         Ok(self
             .0
             .query_row(
-                "SELECT history_id, last_seq, ahead_of_server FROM remote_cursor WHERE id = 1",
+                "SELECT history_id, last_seq, ahead_of_server, commit_id, committed_at_ms FROM remote_cursor
+                 WHERE id = 1",
                 [],
                 |row| {
                     Ok(Cursor {
                         history_id: row.get(0)?,
                         last_seq: row.get(1)?,
                         ahead_of_server: row.get(2)?,
+                        commit_id: row.get(3)?,
+                        committed_at_ms: row.get(4)?,
                     })
                 },
             )
@@ -647,9 +658,16 @@ impl Tx<'_> {
 
     pub fn set_cursor(&self, cursor: &Cursor) -> Result<()> {
         self.0.execute(
-            "INSERT OR REPLACE INTO remote_cursor (id, history_id, last_seq, ahead_of_server)
-             VALUES (1, ?1, ?2, ?3)",
-            params![cursor.history_id, cursor.last_seq, cursor.ahead_of_server],
+            "INSERT OR REPLACE INTO remote_cursor
+             (id, history_id, last_seq, ahead_of_server, commit_id, committed_at_ms)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+            params![
+                cursor.history_id,
+                cursor.last_seq,
+                cursor.ahead_of_server,
+                cursor.commit_id,
+                cursor.committed_at_ms
+            ],
         )?;
         Ok(())
     }

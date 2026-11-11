@@ -391,6 +391,8 @@ pub struct SpaceDo {
     objects: HashMap<Vec<u8>, u32>,
     head_seq: u64,
     log_floor_seq: u64,
+    /// The commit token at `log_floor_seq` (RFC 0013), kept when the log is truncated past it.
+    floor_token: Option<(String, i64)>,
 }
 
 impl SpaceDo {
@@ -434,7 +436,30 @@ impl SpaceDo {
             objects: HashMap::new(),
             head_seq: 0,
             log_floor_seq: 0,
+            floor_token: None,
         }
+    }
+
+    /// The commit token at `seq` (RFC 0013): the `commit_id` and `committed_at_ms` of the commit
+    /// applied there. Empty at seq 0, and `None` below the log's floor.
+    pub fn token_at(&self, seq: u64) -> Option<(String, i64)> {
+        if seq == 0 {
+            return Some((String::new(), 0));
+        }
+        if seq == self.log_floor_seq {
+            return self.floor_token.clone();
+        }
+        (self.log.iter())
+            .find(|record| record.seq == seq)
+            .map(|record| (record.commit_id.clone(), record.committed_at_ms))
+    }
+
+    /// Whether a client's token at `seq` names the commit this server holds there. An empty token
+    /// claims nothing.
+    fn holds_token(&self, seq: u64, commit_id: &str, committed_at_ms: i64) -> bool {
+        commit_id.is_empty()
+            || seq == 0
+            || self.token_at(seq) == Some((commit_id.to_owned(), committed_at_ms))
     }
 
     /// Also the root node's ID.
@@ -497,6 +522,12 @@ impl SpaceDo {
             Some(resync_required::Reason::AheadOfServer)
         } else if resume.since_seq < self.log_floor_seq {
             Some(resync_required::Reason::LogTruncated)
+        } else if !self.holds_token(
+            resume.since_seq,
+            &resume.since_commit_id,
+            resume.since_committed_at_ms,
+        ) {
+            Some(resync_required::Reason::AheadOfServer)
         } else {
             None
         };
@@ -528,8 +559,11 @@ impl SpaceDo {
 
     /// Forgets the log up to and including `floor_seq`, so that older resumes need a bootstrap.
     pub fn truncate_log(&mut self, floor_seq: u64) {
-        self.log_floor_seq = floor_seq.min(self.head_seq).max(self.log_floor_seq);
-        let floor = self.log_floor_seq;
+        let floor = floor_seq.min(self.head_seq).max(self.log_floor_seq);
+        if floor != self.log_floor_seq {
+            self.floor_token = self.token_at(floor);
+            self.log_floor_seq = floor;
+        }
         self.log.retain(|r| r.seq > floor);
     }
 
@@ -646,6 +680,16 @@ impl SpaceDo {
                 "base_seq is ahead of the server",
             ));
         }
+        if !self.holds_token(
+            commit.base_seq,
+            &commit.base_commit_id,
+            commit.base_committed_at_ms,
+        ) {
+            return Err(fail(
+                error::Code::AheadOfServer,
+                "the server holds another commit at base_seq",
+            ));
+        }
         if commit.require_head && commit.base_seq < self.head_seq {
             return Err(fail(
                 error::Code::HeadMoved,
@@ -756,6 +800,7 @@ impl SpaceDo {
             seq,
             results,
             changes,
+            committed_at_ms: now_ms,
         };
         let pushed = ServerMessage {
             msg: Some(server_message::Msg::Changes(Changes {
@@ -1035,10 +1080,14 @@ impl SpaceDo {
     /// One page of the live tree in `node_id` order (spec v0 section 7.5).
     pub fn list_tree(&self, request: &ListTree) -> TreePage {
         let (nodes, next_cursor) = self.node_page(NodeStatus::Live, &request.cursor, request.limit);
+        let (head_commit_id, head_committed_at_ms) =
+            self.token_at(self.head_seq).unwrap_or_default();
         TreePage {
             nodes,
             next_cursor,
             head_seq: self.head_seq,
+            head_commit_id,
+            head_committed_at_ms,
         }
     }
 

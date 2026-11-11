@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use koidrive_proto::v1::{CommitRecord, CommitResult, Notice, ResyncRequired, Welcome};
+use koidrive_proto::v1::{CaughtUp, CommitRecord, CommitResult, Notice, ResyncRequired, Welcome};
 
 use crate::error::StopReason;
 
@@ -19,9 +19,7 @@ pub enum Event {
     /// arrived by replay, because the result still has to be acknowledged.
     Committed(Committed),
     /// The backlog after a `Resume` is delivered; live pushes follow.
-    CaughtUp {
-        head_seq: u64,
-    },
+    CaughtUp(CaughtUp),
     /// The server cannot continue from the subscribed point. The stream stops until the driver subscribes again.
     ResyncRequired(ResyncRequired),
     Notice(Notice),

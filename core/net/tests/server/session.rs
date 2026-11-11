@@ -11,8 +11,8 @@ use koidrive_net::{
     Api, ApiError, Auth, CallError, Credentials, Event, Events, NotResent, StopReason,
 };
 use koidrive_proto::v1::{
-    ClaimRequest, CommitResult, CreateDir, Move, Op, ResyncRequired, Welcome, error::Code, op,
-    op_result, resync_required::Reason, server_info::DataPath,
+    ClaimRequest, CommitResult, CreateDir, Move, Op, Resume, ResyncRequired, Welcome, error::Code,
+    op, op_result, resync_required::Reason, server_info::DataPath,
 };
 
 fn mkdir(parent_id: &str, name: &str) -> (String, Op) {
@@ -148,14 +148,22 @@ async fn a_commit_round_trips_to_another_device() {
     );
     connected(&mut b_events).await;
     let history = welcome.history_id.clone();
-    a.subscribe(&history, 0);
-    b.subscribe(&history, 0);
+    a.subscribe(Resume {
+        history_id: history.clone(),
+        since_seq: 0,
+        ..Default::default()
+    });
+    b.subscribe(Resume {
+        history_id: history.clone(),
+        since_seq: 0,
+        ..Default::default()
+    });
     until(&mut a_events, |e| {
-        matches!(e, Event::CaughtUp { head_seq: 0 }).then_some(())
+        matches!(e, Event::CaughtUp(c) if c.head_seq == 0).then_some(())
     })
     .await;
     until(&mut b_events, |e| {
-        matches!(e, Event::CaughtUp { head_seq: 0 }).then_some(())
+        matches!(e, Event::CaughtUp(c) if c.head_seq == 0).then_some(())
     })
     .await;
 
@@ -239,9 +247,13 @@ async fn a_connection_dropped_mid_rpc_resends_what_rfc_0002_allows() {
     ));
     let (session, mut events) = start(through_proxy, &space);
     let history = connected(&mut events).await.history_id;
-    session.subscribe(&history, 0);
+    session.subscribe(Resume {
+        history_id: history.clone(),
+        since_seq: 0,
+        ..Default::default()
+    });
     until(&mut events, |e| {
-        matches!(e, Event::CaughtUp { .. }).then_some(())
+        matches!(e, Event::CaughtUp(_)).then_some(())
     })
     .await;
 
@@ -285,7 +297,7 @@ async fn a_connection_dropped_mid_rpc_resends_what_rfc_0002_allows() {
     );
 
     until(&mut events, |e| {
-        matches!(e, Event::CaughtUp { head_seq: 2 }).then_some(())
+        matches!(e, Event::CaughtUp(c) if c.head_seq == 2).then_some(())
     })
     .await;
 
@@ -359,10 +371,18 @@ async fn resync_required_then_a_bootstrap_resumes_the_stream() {
         Event::ResyncRequired(r) => Some(*r),
         _ => None,
     };
-    session.subscribe(&history, 9);
+    session.subscribe(Resume {
+        history_id: history.clone(),
+        since_seq: 9,
+        ..Default::default()
+    });
     let ahead = until(&mut events, resync).await;
     assert_eq!(ahead.reason(), Reason::AheadOfServer);
-    session.subscribe("0190a0b0-0000-7000-8000-000000000000", 1);
+    session.subscribe(Resume {
+        history_id: "0190a0b0-0000-7000-8000-000000000000".to_string(),
+        since_seq: 1,
+        ..Default::default()
+    });
     let changed = until(&mut events, resync).await;
     assert_eq!(
         changed,
@@ -390,7 +410,11 @@ async fn resync_required_then_a_bootstrap_resumes_the_stream() {
         .commit(commit(&history, 3, 4, vec![op]))
         .await
         .unwrap();
-    session.subscribe(&history, start_seq);
+    session.subscribe(Resume {
+        history_id: history.clone(),
+        since_seq: start_seq,
+        ..Default::default()
+    });
     let replayed = until(&mut events, |e| match e {
         Event::Changes(records) => Some(records.iter().map(|r| r.seq).collect::<Vec<_>>()),
         _ => None,
@@ -398,7 +422,7 @@ async fn resync_required_then_a_bootstrap_resumes_the_stream() {
     .await;
     assert_eq!(replayed, [4], "the log after the first page's head_seq");
     until(&mut events, |e| {
-        matches!(e, Event::CaughtUp { head_seq: 4 }).then_some(())
+        matches!(e, Event::CaughtUp(c) if c.head_seq == 4).then_some(())
     })
     .await;
 }
