@@ -117,7 +117,6 @@ proptest! {
     }
 
     #[test]
-    #[ignore = "GUN-383: intermittent unexpected-name divergence on main"]
     fn devices_converge_once_the_faults_stop(devices in 2..=3usize, phases in phases()) {
         converge(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
