@@ -791,7 +791,8 @@ impl Trees {
     /// live with another shape, and every node S holds below one. A node L still holds is then
     /// created again instead of being taken for a remote delete, and one whose content differs from
     /// R's is kept beside R's as a conflict copy instead of being replaced by R's older content. A
-    /// node R holds in the trash keeps S, so it stays a remote delete, also below a node S forgets.
+    /// node R holds in the trash keeps S, so it stays a remote delete, also below a node S forgets,
+    /// unless it is a file whose edit the server lost (see `edited` below).
     /// S then forgets each such ancestor only once the delete has taken what it held: the update
     /// waits ([`Trees::waiting`]) and is made as soon as it fits.
     ///
@@ -804,10 +805,12 @@ impl Trees {
     /// since a restore or another change after the loss can take a seq the lost commits had.
     ///
     /// `edited` lists the files whose content an edit of this device set before the bootstrap
-    /// ([`Trees::edited_here`]). A file of it that R now holds live at the position S holds, with
-    /// content of no revision above `held_through`, lost the edit. S takes R's shape for it, so
-    /// the content L holds is sent again as an edit instead of being kept beside R's as a conflict
-    /// copy.
+    /// ([`Trees::edited_here`]). A file of it that R now holds, live or in the trash, at the
+    /// position S holds, with content of no revision above `held_through`, lost the edit. S takes
+    /// R's shape for it, so the content L holds is sent again as an edit instead of being kept
+    /// beside R's as a conflict copy. A delete R holds came from a device that never saw the edit,
+    /// so the edit beats it (R8): the server revives the file instead of this device moving the
+    /// edit to the local trash.
     ///
     /// [`Commits::held_through`]: crate::commit::Commits::held_through
     pub fn forget_lost(&mut self, trashed: Vec<Trashed>, edited: Vec<NodeId>, held_through: u64) {
@@ -831,7 +834,7 @@ impl Trees {
         }
         for id in edited {
             let Some(remote) = (self.r.get(&id))
-                .filter(|remote| !remote.trashed && remote.content_rev <= held_through)
+                .filter(|remote| remote.content_rev <= held_through)
                 .filter(|remote| (self.s.live(&id)).is_some_and(|s| s.same_position(&remote.shape)))
                 .map(|remote| remote.shape.clone())
             else {
