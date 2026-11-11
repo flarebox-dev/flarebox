@@ -2,7 +2,7 @@
 
 The design rules for this site. Every page follows them. Change a rule here before a page breaks it.
 
-The system is coreav-dev/site's (its DESIGN.md, src/styles/tokens.css, src/pages/index.astro and its Nav, Footer and Base layout): Hallmark's Ultraviolet theme for type, pills and hairlines, on the colours of Hallmark's Rim theme at night. The nav, the hero and the footer take its markup and its values. Flarebox keeps its own copy and logo, and every place it differs is in the table under "Departures from coreav-dev/site". The page has had a Hallmark v2.0.0 polish against this file; the run record is the stamp at the top of `site.css`.
+The system is coreav-dev/site's (its DESIGN.md, src/styles/tokens.css, src/pages/index.astro and its Nav, Footer and Base layout): Hallmark's Ultraviolet theme for type, pills and hairlines, on the colours of Hallmark's Rim theme at night. The nav, the hero and the footer take its markup and its values. Koidrive keeps its own copy and logo, and every place it differs is in the table under "Departures from coreav-dev/site". The page has had a Hallmark v2.0.0 polish against this file; the run record is the stamp at the top of `site.css`.
 
 ## System
 - Genre: modern-minimal. Dark only. Every head, button and label keeps the copy's own case.
@@ -39,12 +39,14 @@ The spacing scale, the type scale, the easings and the durations live in `tokens
 - JetBrains Mono 400 is for commands only, at 14px on a 24px line, so they are never smaller than the 14px labels around them.
 
 ## Logo
-- The wordmark is "Flarebox" in Outfit 500, outlined so it needs no font load, with the font's own kerning and -0.01em of tracking, in the ink (`logo/wordmark.svg`).
-- The mark is a cube: three faces in three strengths of the orange (top `#fea47c`, left `#f97c3d`, right `#dd6222`), split by a seam whose diagonals are 1.125 times its vertical. Each icon size is fitted to whole pixels.
-- The nav shows the lockup: the cube, then the wordmark. The cube is 7/6 of the wordmark's height and centred on it, and the gap is 5/12 of that height: a 24px wordmark, a 28px cube and a 10px gap, or 20px, 23.33px and 8.33px on a phone. The cube is inline SVG in index.html, so it stays sharp and needs no request.
-- Icons: `favicon.svg` is the 32px drawing; `favicon.ico` holds the 16 and 32px drawings, both on a clear ground; `apple-touch-icon.png` (180px) and the manifest's 192 and 512px icons sit on the paper.
-- `logo/draw.py` draws the wordmark from `fonts/outfit-latin-500-normal.woff2` (it needs fonttools and brotli). `logo/icons.mjs` draws the cube, renders every icon and prints the nav's 28px drawing (it needs sharp). Install both tools outside the repository.
-- The shapes and spacing are Flarebox's own. Don't reuse CoreAV's wordmark setting, its AV monogram or its icons.
+- The wordmark is "Koidrive" in Outfit 500, outlined so it needs no font load, with the font's own kerning and -0.01em of tracking, in the ink (`logo/wordmark.svg`).
+- The mark is the owner's supplied `logo/koidrive-bold-icon.svg`, orange koi on a transparent ground. `logo/koidrive-bold-appicon.svg` is the supplied white koi on an orange rounded tile. Both source SVGs are kept unchanged. Their orange is `#FF6A13`; it belongs to the supplied artwork, while the page's accent token stays unchanged.
+- The nav shows the transparent icon before the wordmark. The icon box is 7/6 of the wordmark's height, centred on it, with a gap of 5/12 of that height: 24px wordmark, 28px icon and 10px gap, or 20px, 23.33px and 8.33px on a phone. The supplied SVG retains its own internal whitespace.
+- `favicon.svg` is the supplied app-icon SVG; `favicon.ico` holds 16 and 32px renders of it. `apple-touch-icon.png` and the manifest's 192 and 512px icons also render that SVG, without redrawing the fish.
+- `og.png` is a 1200 by 630 image with the transparent icon and outlined wordmark on the dark paper. The page names it in the Open Graph and Twitter card metadata. Its URL is relative in this undeployed preview; use an absolute deployment URL when a hostname is chosen.
+- `logo/draw.py` draws the wordmark from `fonts/outfit-latin-500-normal.woff2`, using fonttools and brotli. `logo/icons.mjs` renders the supplied icons and OG image using sharp. Install these tools outside the repository.
+- The installation commands and GitHub links still name flarebox-dev/flarebox. This preview changes the landing-page identity, not the repository or CLI name.
+- Don't reuse CoreAV's wordmark setting, its AV monogram or its icons.
 
 ## Controls
 - Primary: the orange pill, `--color-accent-ink` text, `--color-accent-deep` on hover, 48px, Outfit 500. Once per page: "See GitHub", 40px under the headline (24px under 60rem).
@@ -60,11 +62,11 @@ The spacing scale, the type scale, the easings and the durations live in `tokens
 ## Copy
 - Every word passes the project's unslop skill. The page reads as it will on launch day, with no status caveats and no roadmap lines.
 - The ® sits 0.2 of its own size (0.064em of the headline) after "Cloudflare", with its top on the cap line.
-- The trademark notice follows Cloudflare's trademark guidelines (https://www.cloudflare.com/trademark/): the first "Cloudflare" in visible text carries ®, set small at the cap line (`.reg`), and the footer names the marks the page uses and their owners: Cloudflare, Inc. for Cloudflare and Dropbox, Inc. for Dropbox. It ends "Flarebox is not affiliated with or endorsed by either company." Keep it, and name a mark there only when the page uses it.
+- The trademark notice follows Cloudflare's trademark guidelines (https://www.cloudflare.com/trademark/): the first "Cloudflare" in visible text carries ®, set small at the cap line (`.reg`), and the footer names the marks the page uses and their owners: Cloudflare, Inc. for Cloudflare and Dropbox, Inc. for Dropbox. It ends "Koidrive is not affiliated with or endorsed by either company." Keep it, and name a mark there only when the page uses it.
 - Never put "Cloudflare" in the product name.
 
 ## Departures from coreav-dev/site
-| Where | coreav-dev/site | Flarebox | Reason |
+| Where | coreav-dev/site | Koidrive | Reason |
 | --- | --- | --- | --- |
 | Hero | Ledge with the speed chart as its field when there is data, the bare form without it | The bare form only | Our copy: there is no chart to draw |
 | Headline | A forced break (`<br>`) before the orange word's line | No forced break; balanced lines break it as "Your own Dropbox / on Cloudflare" | Our copy |
@@ -77,7 +79,7 @@ The spacing scale, the type scale, the easings and the durations live in `tokens
 | Install block fill | `--color-paper-2` | `--color-surface` | Gunwoo's request: the block was close to invisible on the paper |
 | Gap above the primary pill | 16px (`.cta`), under the install note | 40px under the headline, 24px under 60rem (`.claim .cta`) | Gunwoo's request: 16px was too tight under the headline |
 | Primary pill | "GitHub", in the right column under the note | "See GitHub", in the left column under the headline | Our copy (the label) and Gunwoo's See GitHub move (the place) |
-| Nav | The CoreAV wordmark; Docs, Blog and GitHub | The Flarebox lockup (the cube and the wordmark); GitHub, hidden under 40rem | Brand rules (the wordmark) and our copy (no docs or blog); hiding the link on a phone is Gunwoo's request |
+| Nav | The CoreAV wordmark; Docs, Blog and GitHub | The Koidrive lockup (the supplied koi icon and the wordmark); GitHub, hidden under 40rem | Brand rules (the wordmark) and our copy (no docs or blog); hiding the link on a phone is Gunwoo's request |
 | Footer | The licence and the Blog and GitHub links | The trademark notice | Trademark rules (the notice) and our copy (no blog) |
 
 ## Files

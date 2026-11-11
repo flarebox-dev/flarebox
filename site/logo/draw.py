@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Draws the Flarebox wordmark as outlines, so it doesn't depend on a font load: "Flarebox" in Outfit 500, read from
+"""Draws the Koidrive wordmark as outlines, so it doesn't depend on a font load: "Koidrive" in Outfit 500, read from
 ../fonts/outfit-latin-500-normal.woff2.
 
     python3 -m venv .venv && .venv/bin/pip install fonttools brotli
     .venv/bin/python site/logo/draw.py
 
 Setting: the font's own pair kerning and -0.01 em of tracking after every letter. Writes wordmark.svg next to this
-file: the wordmark in the ink, for the dark paper, cropped to its ink. icons.mjs draws the cube mark.
+file: the wordmark in the ink, for the dark paper, cropped to its ink. icons.mjs renders the owner's koi assets.
 """
 from pathlib import Path
 
@@ -62,7 +62,7 @@ def main():
     font = TTFont(FONT)
     cap = font['OS/2'].sCapHeight
 
-    d, (x0, y0, x1, y1) = outline(font, 'Flarebox', WORDMARK_CAP / cap, 0, 0)
+    d, (x0, y0, x1, y1) = outline(font, 'Koidrive', WORDMARK_CAP / cap, 0, 0)
     (HERE / 'wordmark.svg').write_text(
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{x0:.2f} {y0:.2f} {x1 - x0:.2f} {y1 - y0:.2f}">'
         f'<path d="{d}" fill="{INK}"/></svg>\n')
