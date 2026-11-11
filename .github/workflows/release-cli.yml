@@ -50,7 +50,7 @@ jobs:
             if grep -Eq "$pattern" <<<"$changed"; then
               echo "macOS targets: build, because a changed file matches $pattern"
             else
-              echo "macOS targets: skipped, because no changed file matches $pattern. The merge queue builds them."
+              echo "macOS targets: skipped, because no changed file matches $pattern. The merge queue run of this workflow builds them, but the merge queue does not wait for that run."
               macos=false
             fi
           else
