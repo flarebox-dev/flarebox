@@ -182,12 +182,12 @@ async function peer(): Promise<Job | undefined> {
 
 let peerCheckedAt = 0;
 
-/** Fails once the other job has ended, since nothing this job waits for can happen after that. */
+/** Fails once the other job has ended without success, since nothing this job waits for from it can happen after that. */
 async function checkPeer(): Promise<void> {
   if (!process.env.GITHUB_RUN_ID || Date.now() - peerCheckedAt < PEER_CHECK_MS) return;
   peerCheckedAt = Date.now();
   const job = await peer();
-  if (job?.status === "completed") fail("the job " + job.name + " ended (" + job.conclusion + ") while this one still needed it");
+  if (job?.status === "completed" && job.conclusion !== "success") fail("the job " + job.name + " ended (" + job.conclusion + ") while this one still needed it");
 }
 
 async function until<T>(what: string, ms: number, check: () => T | undefined | Promise<T | undefined>, everyMs = 1000): Promise<T> {
@@ -410,16 +410,28 @@ function passed(scenario: string, on: Device, files: Map<string, string>): void 
   if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, "| " + scenario + " | " + on.name + " | " + files.size + " | " + hash + " |\n");
 }
 
-/** Waits until the rewind halts the folder, restarts it, and waits until it holds the tree the recovery left. */
+/** The device with the folder it links after the rewind in place of its first one. */
+function rewound(name: string): Device {
+  const on = device(name);
+  return { ...on, folder: join(on.dir, "rewound") };
+}
+
+/**
+ * Waits until the rewind halts the folder, which this build cannot recover, then does what docs/guide/status.md tells an
+ * owner to do: unlinks it and links a new, empty folder, which must get the restore point's tree.
+ */
 async function recover(on: Device): Promise<void> {
   const halted = await until("the rewind to halt the folder on " + on.name, HALT_MS, () => {
     const status = folder(on);
     return status.state === "halted" ? status : undefined;
   });
   console.log("The folder on " + on.name + " halted: " + halted.problem);
-  koi(on, ["restart", on.folder]);
-  const [tree, files] = await reach(on, "conflicted", "afterPoint");
-  passed("7. Rewind (" + (tree === "conflicted" ? "the restore point's tree" : "the tree with the writes after the restore point") + ")", on, files);
+  if (!halted.problem?.endsWith("this build cannot recover the folder yet")) fail("the folder on " + on.name + " halted for another reason");
+  koi(on, ["unlink", on.folder]);
+  const fresh = rewound(on.name);
+  mkdirSync(fresh.folder, { recursive: true, mode: 0o700 });
+  koi(fresh, ["link", fresh.folder, "--space", SPACE]);
+  passed("7. Rewind", fresh, (await reach(fresh, "conflicted"))[1]);
 }
 
 const restorePointFile = () => temp("restore-point");
@@ -596,18 +608,18 @@ const phases: Record<string, (step: string) => Promise<void>> = {
   },
 
   async "mac-final"(step) {
-    const mac = device("mac");
+    const mac = rewound("mac");
     await afterPeerStep(step);
-    const [, files] = await reach(mac, "conflicted", "afterPoint");
+    const [, files] = await reach(mac, "conflicted");
     mkdirSync(temp("mac-listing"), { recursive: true });
     writeFileSync(temp("mac-listing", "listing.txt"), format(files));
     await stopDaemon(mac);
   },
 
   async "linux-final"(step) {
-    const linux = device("linux");
+    const linux = rewound("linux");
     await afterPeerStep(step);
-    const [, files] = await reach(linux, "conflicted", "afterPoint");
+    const [, files] = await reach(linux, "conflicted");
     await download("e2e-macos-listing", temp("mac-listing"));
     const mac = readFileSync(temp("mac-listing", "listing.txt"), "utf8");
     if (mac !== format(files)) fail("macOS and Linux ended with different trees.\nmacOS:\n" + mac + "Linux:\n" + format(files));
