@@ -820,7 +820,8 @@ impl Trees {
     /// the update has it, came from a commit the server lost, unless another device changed the
     /// node back since. With no revision of R's above `held_through`, the update is dropped, so
     /// L's change is compared with S and sent again instead of R's rollback reading as a remote
-    /// change once the update fits. With a later revision, S forgets the node as it forgets one R
+    /// change once the update fits. A node R does not hold at all is then no longer reverted, as
+    /// one S forgets. With a later revision, S forgets the node as it forgets one R
     /// holds with another shape, so L's change is kept beside R's. An update for a node R holds in
     /// the trash stays, and so does one for a node the person discarded on a first link, which no
     /// commit sent.
@@ -872,6 +873,9 @@ impl Trees {
             })
             .partition(|(_, later)| *later);
         for (id, _) in dropped {
+            if self.r.get(&id).is_none() {
+                self.reverted.remove(&id);
+            }
             self.waiting.remove(&id);
             self.mark(&id);
         }
