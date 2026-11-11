@@ -53,8 +53,12 @@ impl Stream {
         self.resume_message().expect("just subscribed")
     }
 
-    /// The `Resume` a new connection sends, if the stream is subscribed.
+    /// The `Resume` a new connection sends, if the stream is subscribed. Results held from the previous connection
+    /// are dropped, so every event after the new `Connected` comes from the new connection: the server sends their
+    /// records again from the cursor, their callers got them already, and a server that lost them must not release
+    /// them with records of its own.
     pub fn reconnected(&mut self) -> Option<Resume> {
+        self.held.clear();
         self.resuming = self.cursor.is_some();
         self.resume_message()
     }
@@ -329,5 +333,19 @@ mod tests {
                 since_seq: 3
             })
         );
+    }
+
+    #[test]
+    fn a_reconnect_drops_results_held_from_the_previous_connection() {
+        let mut stream = subscribed(1);
+        stream.caught_up(1);
+        assert!(stream.committed(committed(3)).events.is_empty());
+        stream.reconnected();
+        assert_eq!(
+            seqs(&stream.changes(vec![record(2)])),
+            ["r2"],
+            "a restored server's record 2 does not release the old connection's result 3"
+        );
+        assert_eq!(seqs(&stream.caught_up(2)), ["caught_up2"]);
     }
 }

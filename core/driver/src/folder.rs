@@ -1211,6 +1211,22 @@ fn lift_hint(code: i32) -> &'static str {
     }
 }
 
+/// A finished `Session::commit`, after the session events `queued` before it. The session emits a connection's
+/// `Connected` before it answers a commit on that connection, so the folder takes the `Welcome` before the result, and
+/// the server's count in it is never older than a commit the folder acknowledged (design §2.8).
+fn sent_in_order(
+    folder: &mut Folder,
+    queued: impl IntoIterator<Item = Event>,
+    result: Result<CommitResult, CallError>,
+) -> Result<Vec<Work>, Stop> {
+    let mut work = Vec::new();
+    for event in queued {
+        work.extend(folder.event(event)?);
+    }
+    work.extend(folder.sent(result)?);
+    Ok(work)
+}
+
 /// Waits for the work in `slot` and empties it. Never returns for an empty slot.
 async fn finished<T>(slot: &mut Slot<'_, T>) -> T {
     match slot {
@@ -1339,7 +1355,9 @@ impl FolderTask {
                     pages = finished(&mut list) => folder.listed(pages),
                     (pending, staged) = finished(&mut stage) => folder.staged(pending, staged),
                     receipts = finished(&mut upload) => folder.uploaded(receipts),
-                    result = finished(&mut send) => folder.sent(result),
+                    result = finished(&mut send) => {
+                        sent_in_order(&mut folder, std::iter::from_fn(|| events.try_next()), result)
+                    }
                     () = finished(&mut wait) => folder.resend(),
                     () = finished(&mut retry) => folder.retry(),
                     () = self.requests.notified() => folder.requested(),

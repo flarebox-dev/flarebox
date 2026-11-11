@@ -7,10 +7,12 @@ use std::time::Duration;
 
 use crate::support::proxy::{Fault, Proxy};
 use crate::support::*;
-use flarebox_net::{Api, ApiError, Auth, CallError, Credentials, Event, NotResent, StopReason};
+use flarebox_net::{
+    Api, ApiError, Auth, CallError, Credentials, Event, Events, NotResent, StopReason,
+};
 use flarebox_proto::v1::{
-    ClaimRequest, CommitResult, CreateDir, Move, Op, ResyncRequired, error::Code, op, op_result,
-    resync_required::Reason, server_info::DataPath,
+    ClaimRequest, CommitResult, CreateDir, Move, Op, ResyncRequired, Welcome, error::Code, op,
+    op_result, resync_required::Reason, server_info::DataPath,
 };
 
 fn mkdir(parent_id: &str, name: &str) -> (String, Op) {
@@ -30,6 +32,16 @@ fn applied(result: &CommitResult) -> bool {
         .results
         .iter()
         .all(|r| r.code == op_result::Code::Applied as i32)
+}
+
+/// The `Welcome` of the connection a call was answered on, which the session queued before the answer.
+fn queued_welcome(events: &mut Events) -> Welcome {
+    while let Some(event) = events.try_next() {
+        if let Event::Connected(welcome) = event {
+            return welcome;
+        }
+    }
+    panic!("the Welcome was not queued before the answer");
 }
 
 async fn tree_names(session: &flarebox_net::Session) -> Vec<String> {
@@ -241,7 +253,7 @@ async fn a_connection_dropped_mid_rpc_resends_what_rfc_0002_allows() {
         .unwrap();
     assert!(proxy.fired(), "the response was dropped");
     assert_eq!(result.seq, 1);
-    let welcome = connected(&mut events).await;
+    let welcome = queued_welcome(&mut events);
     assert_eq!(
         welcome.device_seq, 1,
         "the server had accepted the commit before the drop"
@@ -256,7 +268,7 @@ async fn a_connection_dropped_mid_rpc_resends_what_rfc_0002_allows() {
     assert!(proxy.fired(), "the request was dropped");
     assert_eq!(result.seq, 2);
     assert_eq!(
-        connected(&mut events).await.device_seq,
+        queued_welcome(&mut events).device_seq,
         1,
         "the first attempt never reached the server"
     );

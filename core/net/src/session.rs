@@ -126,6 +126,11 @@ impl Events {
     pub async fn next(&mut self) -> Option<Event> {
         self.0.recv().await
     }
+
+    /// The next event if one is queued already, without waiting.
+    pub fn try_next(&mut self) -> Option<Event> {
+        self.0.try_recv().ok()
+    }
 }
 
 /// A session with one space. It keeps reconnecting until it is closed or stopped. Dropping it closes it.
@@ -196,7 +201,8 @@ impl Session {
     /// Sends a commit and waits for its result. One commit is in flight at a time (spec v0 section 8). If the
     /// connection drops, the identical commit is resent only when the next `Welcome` accounts for its slot
     /// (RFC 0002 section 2); otherwise the call fails with `CallError::NotResent`. The result also arrives as
-    /// `Event::Committed` in seq order.
+    /// `Event::Committed` in seq order. The session emits the events of a connection, its `Event::Connected` first,
+    /// before it answers a call on it, so every event emitted before the answer is in `Events` once this returns.
     pub async fn commit(&self, commit: Commit) -> Result<CommitResult, CallError> {
         let _one_at_a_time = self.commit_lock.lock().await;
         let slot = CommitSlot {

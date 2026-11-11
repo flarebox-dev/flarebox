@@ -43,7 +43,8 @@ The server keeps this row when log truncation removes the commit from `commits`.
 |---|---|---|
 | *w* = *a* | The commit in flight, if there is one, was not accepted | Resend it unchanged |
 | *w* = *a* + 1, and the commit in flight has slot *a* + 1 | The commit was accepted and its response was lost | Resend it unchanged; the server returns its stored result |
-| Any other value | The store cannot account for the server's counter: it was restored from a backup or cloned, or the server lost commits | Plan nothing from this store and enter recovery (§6) |
+| *w* = *a* + 1 with no commit in flight, or *w* > *a* + 1 | The store is behind the server: it was restored from a backup or cloned | Plan nothing from this store and enter recovery (§6) |
+| *w* < *a* | The server lost commits of this device that it had accepted: its counter only grows, and the store learns a slot only from its result | Take *a* := *w*, drop the commit in flight, and list the tree again as for `AHEAD_OF_SERVER`, which sends again what was lost |
 
 ## 3. Check order (§8 step 4)
 

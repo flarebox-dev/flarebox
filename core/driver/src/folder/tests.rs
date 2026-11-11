@@ -3025,6 +3025,38 @@ fn a_server_that_lost_a_commit_of_this_device_gets_it_back_after_others_committe
     assert_eq!(a.state(), FolderState::UpToDate);
 }
 
+/// A reconnect's `Welcome` counts one commit of `a`, and the commit in flight is accepted after it. When the send
+/// finishes while the `Connected` event is still queued, the folder takes the event first, so the count is not older
+/// than what it acknowledged, and the healthy server is not taken for one that lost a commit.
+#[test]
+fn a_welcome_queued_before_a_finished_send_is_taken_first() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site.root.join("one.txt"), b"one");
+    fs::write(site.root.join("two.txt"), b"two").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    let upload = a.work.pop_front().unwrap();
+    a.perform(upload, &mut remote).unwrap();
+    let Some(Work::Send(commit)) = a.work.pop_front() else {
+        panic!("the commit is sent after its upload");
+    };
+    let queued = remote.space.welcome(&a.caller);
+    assert_eq!(queued.device_seq, 1);
+    let result = remote.commit(&a.caller, &commit).unwrap();
+    let step = sent_in_order(&mut a.folder, [Event::Connected(queued)], Ok(result));
+    a.take(step).unwrap();
+    assert_eq!(a.folder.engine.commits.accepted(), 2);
+    assert!(!a.work.iter().any(|work| matches!(work, Work::List)));
+    a.pull(&remote);
+    a.run(&mut remote);
+    a.settle();
+    fs::write(site.root.join("three.txt"), b"three").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.try_run(&mut remote).unwrap();
+    assert_eq!(remote.names(), ["one.txt", "three.txt", "two.txt"]);
+    assert_eq!(a.folder.engine.commits.accepted(), 3);
+}
+
 /// A commit in flight when the task stopped has a slot the restored server cannot account for. It is dropped
 /// rather than sent, and what it held is planned again once the tree is listed.
 #[test]
