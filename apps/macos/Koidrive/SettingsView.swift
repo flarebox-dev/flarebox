@@ -420,6 +420,7 @@ private struct PairingCodeLabel: View {
         .padding(.vertical, 4)
         .background(RoundedRectangle(cornerRadius: 6).fill(.quaternary.opacity(0.6)))
         .fixedSize()
+        .onChange(of: code) { copied = false }
     }
 }
 
@@ -560,8 +561,14 @@ private struct ProblemRow: View {
                     let url = URL(filePath: folder.path)
                     if let path = problem.path {
                         NSWorkspace.shared.activateFileViewerSelecting([url.appending(path: path)])
-                    } else {
+                    } else if FileManager.default.fileExists(atPath: folder.path) {
                         NSWorkspace.shared.open(url)
+                    } else {
+                        var parent = url.deletingLastPathComponent()
+                        while !FileManager.default.fileExists(atPath: parent.path(percentEncoded: false)) {
+                            parent.deleteLastPathComponent()
+                        }
+                        NSWorkspace.shared.open(parent)
                     }
                 }
             }
