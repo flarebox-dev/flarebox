@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::core::{Core, Events};
+use crate::core::{Core, Events, pairing_code};
 use crate::types::{
     Account, Answer, ChangeKind, Device, Direction, FolderPath, FolderState, HeldItem, ItemDetail,
     LinkedFolder, MassDeleteLimit, NodeKind, Notice, NoticeKind, PairingCode, Problem, ProblemKind,
@@ -617,6 +617,7 @@ impl Core for FakeCore {
             if !saved.claimed {
                 return Err(SessionError::NotClaimed);
             }
+            let code = pairing_code(code, &server.url)?;
             if normalize_code(code).len() != PAIRING_CODE_LEN {
                 return Err(SessionError::InvalidCode);
             }
@@ -1050,7 +1051,14 @@ mod tests {
             h.core.pair("ABCDEFGHJ", "Mac"),
             Err(SessionError::InvalidCode)
         );
-        let account = h.core.pair("abcd efgh", "Mac").unwrap();
+        assert_eq!(
+            h.core.pair("ABCD-EFGH@koidrive.alice.workers.dev", "Mac"),
+            Err(SessionError::CodeForOtherServer {
+                host: "koidrive.alice.workers.dev".to_owned(),
+                server: "box.example.com".to_owned(),
+            })
+        );
+        let account = h.core.pair(" abcd efgh@Box.Example.com ", "Mac").unwrap();
         let devices = h.core.devices().unwrap();
         assert_eq!(
             (devices.iter())

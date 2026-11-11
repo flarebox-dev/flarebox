@@ -259,6 +259,7 @@ extension SessionError {
         case .NotClaimed: String(localized: "This server has no owner yet. Claim it with the code from its log.")
         case .InvalidCode: String(localized: "The code is wrong or has expired.")
         case .TooManyAttempts: String(localized: "Too many wrong codes. Try again in a few minutes.")
+        case .CodeForOtherServer(let host, let server): String(localized: "This code is for another server (\(host)), not \(server).")
         case .EmptyName: String(localized: "Enter a name.")
         case .NotSignedIn: String(localized: "This Mac isn't signed in.")
         case .LastDevice: String(localized: "This is the last device signed in to this server.")

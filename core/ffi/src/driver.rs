@@ -26,7 +26,7 @@ use koidrive_proto::v1::{CreateSpaceRequest, error::Code};
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::watch;
 
-use crate::core::{Core, Events};
+use crate::core::{Core, Events, pairing_code};
 use crate::types::{
     Account, Answer, Device, FolderState, HeldItem, ItemDetail, LinkedFolder, MassDeleteLimit,
     NodeKind, PairingCode, Problem, ProblemKind, Question, QuestionKind, RecoveryCause,
@@ -367,9 +367,10 @@ impl Core for DriverCore {
     fn pair(&self, code: &str, device_name: &str) -> Result<Account, SessionError> {
         self.change(|driver| {
             let api = self.lock().server.clone().ok_or(SessionError::NoServer)?;
+            let code = pairing_code(code, api.base().as_str())?;
             let paired = self
                 .runtime
-                .block_on(driver.pair(api.base().as_str(), code.trim(), device_name))
+                .block_on(driver.pair(api.base().as_str(), code, device_name))
                 .map_err(sign_in_error)?;
             Ok(account(&paired))
         })
