@@ -4009,3 +4009,194 @@ fn a_late_create_acknowledgement_follows_a_purge_after_l_and_r_agreed_on_a_posit
     }
     assert!(trees.local().get("n").is_none());
 }
+
+/// GUN-453. The ack of a create or move of n whose agreed position c may collide with other nodes:
+/// none, a sibling S already holds at c, or another node the same commit moves to c, with its op
+/// before or after n's. With `edited`, the commit also updates n's content. With `purged`, R
+/// deletes and purges n before the result arrives. The
+/// user moves n to y and the other node back to z after the agreement. Every applied node ends
+/// with what it sent or with its agreed position, never with S from before the commit, n takes c
+/// whenever no other node of S holds it, and n keeps the content the commit sent either way.
+#[test]
+fn a_late_acknowledgement_takes_an_agreed_position_only_where_s_can_hold_it() {
+    #[derive(Clone, Copy, Debug)]
+    enum Other {
+        None,
+        InS,
+        Sent(&'static str),
+    }
+    let others = [Other::None, Other::InS, Other::Sent("m"), Other::Sent("q")];
+    let cases = [(true, false), (false, false), (false, true)];
+    for (created, edited) in cases {
+        for other in others {
+            for purged in [false, true] {
+                let case =
+                    format!("created={created} edited={edited} other={other:?} purged={purged}");
+                let digest = if edited { 2 } else { 1 };
+                let n = match created {
+                    true => ("n", Some(file(ROOT, "b", 1)), None, None),
+                    false => (
+                        "n",
+                        Some(file(ROOT, "b", digest)),
+                        Some(file(ROOT, "a", 1)),
+                        Some(remote(file(ROOT, "a", 1))),
+                    ),
+                };
+                let o = match other {
+                    Other::Sent(id) => Some((
+                        id,
+                        Some(file(ROOT, "c", 2)),
+                        Some(file(ROOT, "z", 2)),
+                        Some(remote(file(ROOT, "z", 2))),
+                    )),
+                    Other::InS => Some((
+                        "m",
+                        Some(file(ROOT, "z", 2)),
+                        Some(file(ROOT, "z", 2)),
+                        Some(remote(file(ROOT, "z", 2))),
+                    )),
+                    Other::None => None,
+                };
+                let mut trees = trees(&[Some(n), o].into_iter().flatten().collect::<Vec<_>>());
+                let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+                let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+                let sent = ops(&commit);
+                let at = |op: &op::Op| match op {
+                    op::Op::Move(m) => m.node_id.clone(),
+                    op::Op::CreateFile(c) => c.node_id.clone(),
+                    op::Op::UpdateContent(u) => u.node_id.clone(),
+                    other => panic!("{case}: {other:?}"),
+                };
+                let order: Vec<String> = sent.iter().map(at).collect();
+                assert_eq!(
+                    order.contains(&"n".to_owned()) && edited,
+                    sent.contains(&update("n", 2)),
+                    "{case}"
+                );
+                if let Other::Sent(id) = other {
+                    let first = |id: &str| order.iter().position(|other| other == id);
+                    assert_eq!(first(id) < first("n"), id < "n", "{case}: {order:?}");
+                }
+                trees.set_remote("n".into(), remote_at(file(ROOT, "b", 1), 2));
+                if let Other::Sent(id) = other {
+                    trees.set_remote(id.into(), remote_at(file(ROOT, "c", 2), 2));
+                    trees.set_local(id.into(), local(file(ROOT, "w", 2), 2));
+                    trees.set_remote(id.into(), remote_at(file(ROOT, "v", 2), 3));
+                }
+                trees.set_local("n".into(), local(file(ROOT, "c", 1), 1));
+                let edited = RemoteNode {
+                    content_rev: 4,
+                    ..remote_at(file(ROOT, "c", 3), 4)
+                };
+                trees.set_remote("n".into(), edited.clone());
+                trees.set_remote(
+                    "n".into(),
+                    RemoteNode {
+                        meta_rev: 5,
+                        ..remote_at(file(ROOT, "x", 3), 5)
+                    },
+                );
+                trees.set_local("n".into(), local(file(ROOT, "y", 1), 1));
+                if let Other::Sent(id) = other {
+                    trees.set_local(id.into(), local(file(ROOT, "z", 2), 2));
+                }
+                if let Other::InS = other {
+                    trees.set_local("m".into(), local(file(ROOT, "c", 2), 2));
+                    trees.set_remote("m".into(), remote_at(file(ROOT, "c", 2), 6));
+                }
+                if purged {
+                    trees.set_remote(
+                        "n".into(),
+                        RemoteNode {
+                            meta_rev: 7,
+                            trashed: true,
+                            trash_group: "7:0".into(),
+                            ..remote_at(file(ROOT, "x", 3), 7)
+                        },
+                    );
+                    trees.remove_remote("n");
+                }
+                trees.settle();
+                let applied = sent
+                    .iter()
+                    .map(|_| outcome(op_result::Code::Applied))
+                    .collect();
+                commits.received(result(2, applied)).unwrap();
+                assert!(commits.acknowledge(&mut trees, 8), "{case}");
+                let held = |trees: &Trees, id: &str| match trees.waiting().get(id) {
+                    Some(shape) => shape.clone(),
+                    None => trees.synced().get(id).cloned(),
+                };
+                let position = |shape: Option<Shape>| shape.map(|s| (s.parent, s.name));
+                let s = |name: &str| Some((ROOT.to_owned(), name.to_owned()));
+                if let Other::Sent(id) = other {
+                    assert_eq!(position(held(&trees, id)), s("c"), "{case}: {id}");
+                }
+                let free = !(trees.synced().iter())
+                    .any(|(id, node)| id != "n" && node.parent == ROOT && node.name == "c");
+                let expected = match free {
+                    true => s("c"),
+                    false => s("b"),
+                };
+                let n = held(&trees, "n");
+                assert_eq!(
+                    n.as_ref().and_then(|s| s.content.clone()),
+                    Some(content(digest)),
+                    "{case}"
+                );
+                assert_eq!(position(n), expected, "{case}");
+            }
+        }
+    }
+}
+
+/// GUN-453. One commit moves n to b and updates its content to 2. Before the acknowledgement, the
+/// user and the other device both move n to c, which another node m then takes, and the user moves
+/// n back to b and reverts its content to 1. S cannot hold c for n, so n keeps the b that was sent
+/// with the content 2 that was sent, and the user's content 1 is uploaded rather than overwritten.
+#[test]
+fn a_late_acknowledgement_keeps_the_sent_content_when_s_cannot_hold_the_agreed_position() {
+    let mut trees = trees(&[
+        (
+            "n",
+            Some(file(ROOT, "b", 2)),
+            Some(file(ROOT, "a", 1)),
+            Some(remote(file(ROOT, "a", 1))),
+        ),
+        (
+            "m",
+            Some(file(ROOT, "z", 9)),
+            Some(file(ROOT, "z", 9)),
+            Some(remote(file(ROOT, "z", 9))),
+        ),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", ROOT, "b"), update("n", 2)]);
+    let at = |name: &str, digest: u8, rev: u64, content_rev: u64| RemoteNode {
+        content_rev,
+        ..remote_at(file(ROOT, name, digest), rev)
+    };
+    trees.set_remote("n".into(), at("b", 2, 2, 2));
+    trees.set_local("n".into(), local(file(ROOT, "c", 2), 1));
+    trees.set_remote("n".into(), at("c", 2, 3, 2));
+    trees.set_remote("n".into(), at("x", 3, 4, 4));
+    trees.set_local("n".into(), local(file(ROOT, "b", 1), 1));
+    trees.set_local("m".into(), local(file(ROOT, "c", 9), 2));
+    trees.set_remote("m".into(), remote_at(file(ROOT, "c", 9), 5));
+    trees.settle();
+    let applied = vec![outcome(op_result::Code::Applied); 2];
+    commits.received(result(2, applied)).unwrap();
+    assert!(commits.acknowledge(&mut trees, 5));
+    trees.settle();
+    assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "b", 2)));
+    effects_for(&mut trees, &mut ids, "n");
+    assert_eq!(trees.local().live("n"), Some(&file(ROOT, "b", 1)));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    let uploaded = |op: &op::Op| match op {
+        op::Op::CreateFile(c) => c.content == Some(content(1)),
+        op::Op::UpdateContent(u) => u.content == Some(content(1)),
+        _ => false,
+    };
+    assert!(ops(&commit).iter().any(uploaded), "{:?}", ops(&commit));
+}
