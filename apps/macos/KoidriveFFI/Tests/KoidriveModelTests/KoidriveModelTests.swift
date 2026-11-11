@@ -277,6 +277,31 @@ private final class Fetches {
         #expect(model.iconBadge == .none)
     }
 
+    @Test func questionsInTheOnlyLinkedFolderShowNoSpace() async throws {
+        let model = AppModel.fake(scenario: .massDelete)
+        try await model.unlinkFolder(spaceID: "space-photos")
+        #expect(model.state.folders.map(\.spaceName) == ["Documents"])
+        #expect(model.questionSections.map(\.folder?.spaceName) == ["Documents"])
+        #expect(!model.questionSectionsShowSpace)
+    }
+
+    @Test func questionsShowTheirSpaceWhenTwoFoldersAreLinked() throws {
+        let model = AppModel.fake(scenario: .massDelete)
+        #expect(model.state.folders.count == 2)
+        #expect(model.questionSections.map(\.folder?.spaceName) == ["Documents"])
+        #expect(model.questionSectionsShowSpace)
+    }
+
+    @Test func aQuestionOfAnUnlinkedSpaceShowsTheSpace() async throws {
+        let model = AppModel.fake(scenario: .massDelete)
+        try await model.unlinkFolder(spaceID: "space-photos")
+        _ = try #require(model.session.fakeCore()).ask(spaceId: "space-gone", kind: .ambiguousDisappearance, items: [item("a")])
+        model.apply(.questions(questions: model.session.state().questions))
+        #expect(model.state.folders.count == 1)
+        #expect(model.questionSections.map(\.spaceID) == ["space-documents", "space-gone"])
+        #expect(model.questionSectionsShowSpace)
+    }
+
     @Test func noticesStayUntilDismissed() async throws {
         let model = AppModel.fake(scenario: .remoteMassDelete)
         #expect(model.state.questions.isEmpty)

@@ -29,11 +29,16 @@ enum Snapshots {
                               titled: "Set Up Koidrive", dark: dark, to: directory.appending(path: "setup-\(name)-\(suffix).png"))
             }
             for (name, scenario) in [("mass-delete", FakeScenario.massDelete), ("recovery", .recovery),
-                                     ("ambiguous", .ambiguousDisappearance), ("none", .upToDate)] {
+                                     ("ambiguous", .ambiguousDisappearance), ("two-spaces", .manyQuestions),
+                                     ("none", .upToDate)] {
                 let model = AppModel.preview(scenario)
-                await capture(QuestionsView().environment(model).frame(width: 860, height: 560), width: 860, height: 560, titled: "Questions",
+                await capture(QuestionsView().environment(model).frame(width: 860, height: 560), width: 860, height: 560, titled: "Needs You",
                               dark: dark, to: directory.appending(path: "questions-\(name)-\(suffix).png"))
             }
+            let oneSpace = AppModel.preview(.massDelete)
+            try? oneSpace.session.unlinkFolder(spaceId: "space-photos")
+            await capture(QuestionsView().environment(oneSpace).frame(width: 860, height: 560), width: 860, height: 560,
+                          titled: "Needs You", dark: dark, to: directory.appending(path: "questions-one-space-\(suffix).png"))
             let mass = AppModel.preview(.massDelete)
             if let question = mass.state.questions.first {
                 await capture(ConfirmSheet(title: question.confirmation(for: .delete),
@@ -130,6 +135,8 @@ enum Snapshots {
             ("2-account", AnyView(AccountSettings(pairing: pairing).environment(AppModel.preview(.upToDate)))),
             ("3-problems", AnyView(ProblemsSettings().environment(AppModel.preview(.problems)))),
             ("4-general", AnyView(GeneralSettings())),
+            ("5a-storage-one-space", AnyView(StorageSettings().environment(AppModel.previewWithOneSpace()))),
+            ("5b-storage-two-spaces", AnyView(StorageSettings().environment(AppModel.preview(.upToDate)))),
         ]
     }
 

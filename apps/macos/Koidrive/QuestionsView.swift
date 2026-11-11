@@ -15,20 +15,17 @@ struct QuestionsView: View {
     var body: some View {
         NavigationSplitView {
             List(selection: $selection) {
-                ForEach(model.questionSections) { section in
-                    Section {
-                        if let cause = section.recoveryCause {
-                            Label(cause.shortText, systemImage: "clock")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .selectionDisabled()
+                if model.questionSectionsShowSpace {
+                    ForEach(model.questionSections) { section in
+                        Section {
+                            rows(of: section)
+                        } header: {
+                            SpaceHeading(spaceID: section.spaceID, folder: section.folder)
                         }
-                        ForEach(section.questions) { question in
-                            QuestionRow(question: question, selected: selection == question.id)
-                                .tag(question.id)
-                        }
-                    } header: {
-                        SpaceHeading(spaceID: section.spaceID, folder: section.folder)
+                    }
+                } else {
+                    ForEach(model.questionSections) { section in
+                        rows(of: section)
                     }
                 }
             }
@@ -40,19 +37,35 @@ struct QuestionsView: View {
                     .frame(minWidth: 480, minHeight: 360)
             } else {
                 ContentUnavailableView(
-                    "No questions",
+                    "Nothing needs you",
                     systemImage: "checkmark.circle",
                     description: Text("Decisions Koidrive needs from you appear here.")
                 )
             }
         }
-        .navigationTitle("Questions")
+        .navigationTitle("Needs You")
         .onAppear(perform: seen)
         .onChange(of: model.unseenQuestionIDs) { seen() }
         .onChange(of: model.state.questions.map(\.id), initial: true) { _, ids in
             if selection == nil || !ids.contains(selection!) {
                 selection = model.questionSections.first?.questions.first?.id
             }
+        }
+    }
+
+    /// A space's questions, under its recovery cause if it has one. Without space headings the rows
+    /// stand at the top level of the list.
+    @ViewBuilder
+    private func rows(of section: QuestionSection) -> some View {
+        if let cause = section.recoveryCause {
+            Label(cause.shortText, systemImage: "clock")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .selectionDisabled()
+        }
+        ForEach(section.questions) { question in
+            QuestionRow(question: question, selected: selection == question.id)
+                .tag(question.id)
         }
     }
 
@@ -355,11 +368,17 @@ private struct HeldItemRow: View {
     QuestionsView().environment(AppModel.preview(.massDelete))
 }
 
+#Preview("One linked space") {
+    let model = AppModel.preview(.massDelete)
+    try? model.session.unlinkFolder(spaceId: "space-photos")
+    return QuestionsView().environment(model)
+}
+
 #Preview("Recovery") {
     QuestionsView().environment(AppModel.preview(.recovery))
 }
 
-#Preview("Many questions") {
+#Preview("Two spaces: many questions") {
     QuestionsView().environment(AppModel.preview(.manyQuestions))
 }
 

@@ -15,7 +15,7 @@ struct MenuBarLabel: View {
 
     var body: some View {
         Image(model.iconBadge.imageName)
-            .accessibilityLabel(Text("Koidrive: \(model.headlineTitle)"))
+            .accessibilityLabel(Text("Koidrive: \(model.headline == .questions ? String(localized: "Needs you") : model.headlineTitle)"))
             .task {
                 if model.needsSetup {
                     openWindow.show(WindowID.setup)
@@ -159,9 +159,9 @@ struct MenuContent: View {
     private var attention: some View {
         if !model.state.questions.isEmpty {
             AttentionRow(
-                text: "Answer questions",
+                text: "\(model.state.questions.count) need you",
                 systemImage: "questionmark.circle",
-                count: model.state.questions.count,
+                count: nil,
                 tint: .koiText,
                 wash: .koiTint,
                 badge: .koi,
@@ -248,7 +248,7 @@ struct MenuContent: View {
                 }
                 .disabled(model.state.status == .stopped)
             }
-            MenuButton(title: "Questions…", systemImage: "questionmark.circle") {
+            MenuButton(title: "Needs You…", systemImage: "questionmark.circle") {
                 openWindow.show(WindowID.questions)
             }
             MenuButton(title: "Settings…", systemImage: "gearshape", shortcut: "⌘,") {
@@ -311,7 +311,7 @@ private struct ProgressBar: View {
 private struct AttentionRow: View {
     let text: LocalizedStringKey
     let systemImage: String
-    let count: Int
+    let count: Int?
     let tint: Color
     let wash: Color
     let badge: Color
@@ -325,7 +325,9 @@ private struct AttentionRow: View {
                     .foregroundStyle(tint)
                     .font(.body.weight(.medium))
                 Spacer()
-                CountBadge(count: count, fill: badge, text: badgeText)
+                if let count {
+                    CountBadge(count: count, fill: badge, text: badgeText)
+                }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 7)
