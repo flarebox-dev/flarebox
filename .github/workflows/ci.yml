@@ -105,7 +105,7 @@ jobs:
             exit 1
           elif [ "$EVENT" != pull_request ]; then
             reason="A $EVENT run keeps the configured macOS runners."
-          elif ! jq -e 'index("self-hosted")' <<<"$RUNS_ON" >/dev/null; then
+          elif ! jq -e 'map(ascii_downcase) | index("self-hosted")' <<<"$RUNS_ON" >/dev/null; then
             reason="MACOS_RUNS_ON is $RUNS_ON, which names no self-hosted runner, so there is nothing to pool."
           elif [ -z "$RUNNER_STATUS_TOKEN" ]; then
             reason="The RUNNER_STATUS_TOKEN secret is not set, so the self-hosted runners cannot be checked and every macOS job runs on GitHub-hosted runners."
@@ -142,7 +142,7 @@ jobs:
             if [ "$pool" = true ] && { [ "$wanted" != true ] || [ "$to_self_hosted" -ge "$idle" ]; }; then
               runs_on=$hosted
             fi
-            if jq -e 'index("self-hosted")' <<<"$runs_on" >/dev/null; then
+            if jq -e 'map(ascii_downcase) | index("self-hosted")' <<<"$runs_on" >/dev/null; then
               developer_dir=/Applications/Xcode.app/Contents/Developer
               if [ "$wanted" = true ]; then to_self_hosted=$((to_self_hosted + 1)); fi
             else
