@@ -4658,7 +4658,6 @@ fn a_synced_file_moved_onto_the_name_of_a_file_moved_into_an_ignored_folder_keep
 /// The user hard-links `source/file` into the ignored folder, moves the file itself to `moved`, and removes
 /// `source`. The file is still synced at `moved`, so the server follows the move; the link stays out.
 #[test]
-#[ignore = "GUN-368"]
 fn a_file_moved_out_of_a_removed_folder_with_a_link_in_an_ignored_folder_is_moved_on_the_server() {
     let mut remote = Remote::new();
     let (site, mut a) = linked(&mut remote, "a");
