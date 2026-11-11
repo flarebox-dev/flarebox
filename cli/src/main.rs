@@ -18,7 +18,7 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand, ValueEnum};
 use koidrive_driver::{
     Answer, Credential, Driver, DriverError, FolderStatus, Paths, Question, QuestionKind,
-    SET_UP_AGAIN, Status,
+    RecoveryGroup, SET_UP_AGAIN, Status,
 };
 use koidrive_engine::guard::{Limit, MAX_DELETIONS, Window};
 use koidrive_net::{ApiError, Auth, Reload};
@@ -71,18 +71,26 @@ enum Command {
     },
     /// Link a folder to a space and start syncing it.
     Link {
+        /// The folder to sync. It must exist and may already hold files.
         folder: PathBuf,
         /// The space's id or name.
         #[arg(long)]
         space: String,
     },
     /// Stop syncing a folder. Its files stay where they are.
-    Unlink { folder: PathBuf },
+    Unlink {
+        /// The linked folder.
+        folder: PathBuf,
+    },
     /// Sync a linked folder again from the start, after fixing the problem that halted it.
-    Restart { folder: PathBuf },
+    Restart {
+        /// The linked folder.
+        folder: PathBuf,
+    },
     /// Sync a folder again whose changes the server refused, after fixing the cause the status names.
     #[command(group = clap::ArgGroup::new("how").required(true).args(["resend", "replan"]))]
     Lift {
+        /// The linked folder whose changes the server refused.
         folder: PathBuf,
         /// Send the refused changes again as they were, for a cause fixed on the server.
         #[arg(long)]
@@ -93,11 +101,13 @@ enum Command {
     },
     /// Show this device and its linked folders.
     Status {
+        /// Print JSON instead of text.
         #[arg(long)]
         json: bool,
     },
     /// List the questions sync is waiting on, or answer one.
     Questions {
+        /// Print the list of questions as JSON instead of text. Answering a question always prints text.
         #[arg(long)]
         json: bool,
         #[command(subcommand)]
@@ -113,12 +123,15 @@ enum Command {
         /// A linked folder, or a folder inside one.
         #[arg(default_value = ".")]
         folder: PathBuf,
+        /// Print JSON instead of text.
         #[arg(long)]
         json: bool,
     },
     /// List the versions the server keeps of a file in a linked folder, newest first.
     Versions {
+        /// A file in a linked folder.
         file: PathBuf,
+        /// Print JSON instead of text.
         #[arg(long)]
         json: bool,
     },
@@ -139,11 +152,13 @@ enum Command {
         /// A linked folder, or a folder inside one.
         #[arg(default_value = ".")]
         folder: PathBuf,
+        /// Print JSON instead of text.
         #[arg(long)]
         json: bool,
     },
-    /// Show how many bytes each space stores: in live files, in the trash and in old versions.
+    /// Show how many bytes each space stores: in live files, in the trash, in old versions and in unreferenced chunks.
     Usage {
+        /// Print JSON instead of text.
         #[arg(long)]
         json: bool,
     },
@@ -158,7 +173,10 @@ enum Command {
 enum QuestionAction {
     /// Answer a question with one of the answers it lists.
     Answer {
+        /// The question's ID, as koi questions lists it.
         id: String,
+        /// One of the two answers koi questions lists for it: delete, restore, keep, discard, publish, repeat or
+        /// cancel.
         #[arg(value_parser = |text: &str| text.parse::<Answer>())]
         answer: Answer,
     },
@@ -174,6 +192,7 @@ enum SpaceAction {
     },
     /// List the spaces of the server.
     List {
+        /// Print JSON instead of text.
         #[arg(long)]
         json: bool,
     },
@@ -181,10 +200,11 @@ enum SpaceAction {
 
 #[derive(Subcommand)]
 enum DeviceAction {
-    /// Show a pairing code that adds another device to this server. It works once, for a few minutes.
+    /// Show a pairing code that adds another device to this server. It works once, for 10 minutes.
     Add,
     /// List the devices paired with the server, revoked ones included.
     List {
+        /// Print JSON instead of text.
         #[arg(long)]
         json: bool,
     },
@@ -548,7 +568,7 @@ async fn device(paths: Paths, action: DeviceAction) -> Result<(), String> {
         }
         DeviceAction::Add => {
             let started = auth.api().pair_start(&auth).await.map_err(refusal)?;
-            let minutes = ((started.expires_at_ms - now_ms()) / 60_000).max(1);
+            let minutes = ((started.expires_at_ms - now_ms() + 59_999) / 60_000).max(1);
             println!(
                 "On the new device, run:\n  koi join {}\nThe code works once, for about {minutes} minutes.",
                 pairing::join_args(&started.code, auth.api().base())
@@ -1008,7 +1028,24 @@ fn question_text(question: &Question) -> String {
         QuestionKind::AmbiguousDisappearance => {
             "files disappeared while changes were not tracked".to_owned()
         }
-        QuestionKind::Recovery { group } => format!("recovery: {group:?}"),
+        QuestionKind::Recovery { group } => match group {
+            RecoveryGroup::CreatedAfterRestorePoint => {
+                "files created after the restore point, which the restore removed from the server"
+            }
+            RecoveryGroup::ChangedOnThisDevice => {
+                "files changed on this device since it last synced"
+            }
+            RecoveryGroup::CreatedOnThisDevice => {
+                "files on this device that the space does not hold"
+            }
+            RecoveryGroup::DeletedOnThisDevice => {
+                "files deleted on this device that the server still holds"
+            }
+            RecoveryGroup::RequestedBeforeReset => {
+                "restores asked for before the reset, which the server does not show"
+            }
+        }
+        .to_owned(),
     };
     let [first, second] = question.kind.answers();
     let mut text = format!(
@@ -1018,7 +1055,11 @@ fn question_text(question: &Question) -> String {
         printable(&question.id)
     );
     for item in question.items.iter().take(ITEMS_SHOWN) {
-        text += &format!("  {} ({} files)\n", printable(&item.path), item.files);
+        text += &format!(
+            "  {} ({})\n",
+            printable(&item.path),
+            count(item.files, "file")
+        );
     }
     let more = question.items.len().saturating_sub(ITEMS_SHOWN);
     if more > 0 {
@@ -1192,11 +1233,11 @@ mod tests {
             [
                 "q1  space s1  held 1001 deletions that would remove 1001 of 5000 files, more than 1000 deletions in 10 minutes",
                 "  answer with: koi questions answer q1 delete|restore",
-                "  old/00 (1 files)",
+                "  old/00 (1 file)",
             ]
         );
         assert_eq!(lines.len(), 2 + ITEMS_SHOWN + 1);
-        assert_eq!(lines[21], "  old/19 (1 files)");
+        assert_eq!(lines[21], "  old/19 (1 file)");
         assert_eq!(
             lines[22],
             "  and 5 more; koi questions --json lists them all"
@@ -1242,6 +1283,23 @@ mod tests {
                 "{args:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_first_link_question_reads_as_a_sentence_with_its_answers() {
+        let mut question = held(0, 0, 0, 1);
+        question.kind = QuestionKind::Recovery {
+            group: RecoveryGroup::CreatedOnThisDevice,
+        };
+        let text = question_text(&question);
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            [
+                "q1  space s1  files on this device that the space does not hold",
+                "  answer with: koi questions answer q1 publish|discard",
+                "  old/00 (1 file)",
+            ]
+        );
     }
 
     #[test]
