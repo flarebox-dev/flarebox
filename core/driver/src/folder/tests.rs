@@ -25,6 +25,7 @@ use crate::disk::tests::{Server, ready};
 use crate::driver::{DriverError, lift_halt};
 use crate::ignore::{local_rules, matcher};
 use crate::observe::Observed;
+use crate::question::Answer;
 
 const NOW: i64 = 1_700_000_000_000;
 
@@ -896,6 +897,7 @@ fn kinds(commit: &Commit) -> Vec<&'static str> {
             Some(op::Op::CreateFile(_)) => "create file",
             Some(op::Op::UpdateContent(_)) => "update content",
             Some(op::Op::Restore(_)) => "restore",
+            Some(op::Op::Delete(_)) => "delete",
             _ => "another op",
         })
         .collect()
@@ -4075,4 +4077,191 @@ fn the_reason_of_a_result_that_waits_for_the_log_outlasts_the_first_scan() {
              it is fixed"
         )
     );
+}
+
+/// Device `a` synced the folder `d` with 15 files and 5 files beside it. The folder was removed while `a` was
+/// stopped, so the first scan of the next start reports the whole removal. The guard holds it (design §6.1): the
+/// server keeps every file and the store holds one question about `d`.
+fn with_a_held_folder(remote: &mut Remote) -> (Site, Device) {
+    let (site, mut a) = linked(remote, "a");
+    fs::create_dir(site.root.join("d")).unwrap();
+    for i in 0..15 {
+        fs::write(site.root.join(format!("d/{i}.txt")), format!("in d {i}")).unwrap();
+    }
+    for i in 0..5 {
+        fs::write(site.root.join(format!("{i}.txt")), format!("beside d {i}")).unwrap();
+    }
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(remote);
+    a.settle();
+    a.run(remote);
+    assert_eq!(remote.names().len(), 21);
+    drop(a);
+    fs::remove_dir_all(site.root.join("d")).unwrap();
+
+    let mut a = restarted(&site, remote);
+    a.settle();
+    a.run(remote);
+    assert!(
+        a.sent
+            .iter()
+            .all(|commit| !kinds(commit).contains(&"delete"))
+    );
+    assert_eq!(remote.names().len(), 21, "nothing is deleted on the server");
+    assert_eq!(a.folder.view().questions, 1);
+    (site, a)
+}
+
+/// Answers the one question of the site's store, as `Driver::answer` records it, and returns it.
+fn answer(site: &Site, answer: Answer) -> crate::question::Question {
+    let mut store = Store::open(&site.db).unwrap();
+    store
+        .transaction(|tx| {
+            let questions = tx.questions()?;
+            let [stored] = &questions[..] else {
+                panic!("one question: {questions:?}");
+            };
+            let given = flarebox_store::GivenAnswer {
+                answer: answer.as_str().into(),
+                answered_at_ms: NOW,
+            };
+            assert!(tx.answer_question(&stored.question_id, &given)?);
+            Ok::<_, flarebox_store::Error>(serde_json::from_slice(&stored.body).unwrap())
+        })
+        .unwrap()
+}
+
+#[test]
+fn a_removed_folder_that_holds_most_of_the_space_comes_back_when_the_person_restores_it() {
+    let mut remote = Remote::new();
+    let (site, mut a) = with_a_held_folder(&mut remote);
+
+    let question = answer(&site, Answer::Restore);
+    assert_eq!(
+        question.kind,
+        crate::question::QuestionKind::MassDelete {
+            deletions: 1,
+            affected_files: 15,
+            space_files: 20,
+        }
+    );
+    let held: Vec<_> = (question.items.iter())
+        .map(|item| (item.path.as_str(), item.files))
+        .collect();
+    assert_eq!(held, [("d", 15)]);
+    let step = a.folder.requested();
+    a.take(step).unwrap();
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+
+    assert_eq!(names(&site.root.join("d")).len(), 15);
+    assert_eq!(remote.names().len(), 21);
+    assert!(
+        a.sent
+            .iter()
+            .all(|commit| !kinds(commit).contains(&"delete"))
+    );
+    assert_eq!(a.folder.view().questions, 0);
+    let mut store = Store::open(&site.db).unwrap();
+    assert_eq!(store.transaction(|tx| tx.questions()).unwrap(), vec![]);
+}
+
+#[test]
+fn a_removed_folder_that_holds_most_of_the_space_is_deleted_when_the_person_says_so() {
+    let mut remote = Remote::new();
+    let (site, mut a) = with_a_held_folder(&mut remote);
+
+    answer(&site, Answer::Delete);
+    let step = a.folder.requested();
+    a.take(step).unwrap();
+    assert_eq!(a.run(&mut remote), ["send"]);
+
+    assert_eq!(kinds(a.sent.last().unwrap()), ["delete"]);
+    assert_eq!(remote.names().len(), 5);
+    assert_eq!(a.folder.view().questions, 0);
+}
+
+/// A folder held while the device was stopped, a file removed beside it, and an answer given before
+/// the device starts again.
+fn answered_while_stopped(remote: &mut Remote, given: Answer) -> Device {
+    let (site, a) = with_a_held_folder(remote);
+    drop(a);
+    fs::remove_file(site.root.join("0.txt")).unwrap();
+    assert_eq!(answer(&site, given).items.len(), 1);
+    let mut a = restarted(&site, remote);
+    a.settle();
+    a.run(remote);
+    a
+}
+
+#[test]
+fn a_delete_given_while_stopped_covers_only_the_deletions_its_question_listed() {
+    let mut remote = Remote::new();
+    let a = answered_while_stopped(&mut remote, Answer::Delete);
+
+    assert!(
+        remote.names().contains(&"0.txt".to_owned()),
+        "{:?}",
+        remote.names()
+    );
+    assert!(
+        a.sent
+            .iter()
+            .all(|commit| !kinds(commit).contains(&"delete"))
+    );
+    assert_eq!(
+        a.folder.view().questions,
+        1,
+        "asked again about d and 0.txt"
+    );
+}
+
+#[test]
+fn a_restore_given_while_stopped_holds_a_deletion_made_since() {
+    let mut remote = Remote::new();
+    let a = answered_while_stopped(&mut remote, Answer::Restore);
+
+    assert!(
+        remote.names().contains(&"0.txt".to_owned()),
+        "{:?}",
+        remote.names()
+    );
+    assert!(
+        a.sent
+            .iter()
+            .all(|commit| !kinds(commit).contains(&"delete"))
+    );
+    assert_eq!(a.folder.view().questions, 1, "asked about 0.txt");
+}
+
+#[test]
+fn a_taken_answer_survives_a_second_restart_before_it_is_applied() {
+    let mut remote = Remote::new();
+    let (site, a) = with_a_held_folder(&mut remote);
+    drop(a);
+    answer(&site, Answer::Delete);
+    let a = site.start();
+    assert_eq!(
+        a.folder.engine.commits.questions()[0].answer,
+        Some(Answer::Delete)
+    );
+    drop(a);
+    fs::remove_file(site.root.join("0.txt")).unwrap();
+
+    let mut a = restarted(&site, &mut remote);
+    a.settle();
+    a.run(&mut remote);
+
+    assert!(
+        remote.names().contains(&"0.txt".to_owned()),
+        "{:?}",
+        remote.names()
+    );
+    assert!(
+        a.sent
+            .iter()
+            .all(|commit| !kinds(commit).contains(&"delete"))
+    );
+    assert_eq!(a.folder.view().questions, 1);
 }

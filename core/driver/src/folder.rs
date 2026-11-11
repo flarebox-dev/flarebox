@@ -105,6 +105,8 @@ pub(crate) struct Folder {
     head_seq: Option<u64>,
     local_entries: Option<u64>,
     remote_nodes: u64,
+    /// The questions in the store that wait for an answer.
+    questions: u64,
     /// Commit sends and uploads that failed in a row, for the backoff.
     failures: u32,
     backoff: Backoff,
@@ -244,6 +246,7 @@ pub(crate) struct View {
     pub remote_nodes: u64,
     pub local_entries: Option<u64>,
     pub problem: Option<String>,
+    pub questions: u64,
 }
 
 impl Folder {
@@ -261,10 +264,11 @@ impl Folder {
         for node in engine.effects.blocked().clone().into_keys() {
             engine.effects.unblock(&node);
         }
-        let remote_nodes = store.transaction(|tx| {
+        let (remote_nodes, questions) = store.transaction(|tx| {
             engine.accept_restores(tx)?;
+            engine.accept_answers(tx)?;
             engine.checkpoint(tx)?;
-            tx.remote_node_count()
+            Ok::<_, flarebox_store::Error>((tx.remote_node_count()?, unanswered(tx)?))
         })?;
         let flight = match engine.commits.in_flight() {
             Some(flight) if flight.result.is_none() => Flight::Unknown,
@@ -283,6 +287,7 @@ impl Folder {
             head_seq: None,
             local_entries: None,
             remote_nodes,
+            questions,
             failures: 0,
             backoff: Backoff::default(),
             note: None,
@@ -460,10 +465,13 @@ impl Folder {
         Ok(work)
     }
 
-    /// `Driver::restore` recorded a request. The engine takes what the inbox holds, and the next commit carries
-    /// its `Restore` op (design §6.3).
+    /// `Driver::restore` recorded a request, or `Driver::answer` an answer. The engine takes what the inbox holds,
+    /// and the next commit carries its `Restore` op (design §6.3), and it takes the answers to its questions (§6.1).
     pub fn requested(&mut self) -> Result<Vec<Work>, Stop> {
-        self.step(|engine, tx| Ok(engine.accept_restores(tx)?))?;
+        self.step(|engine, tx| {
+            engine.accept_restores(tx)?;
+            Ok(engine.accept_answers(tx)?)
+        })?;
         let mut work = Vec::new();
         self.drive(&mut work)?;
         Ok(work)
@@ -780,6 +788,7 @@ impl Folder {
             remote_nodes: self.remote_nodes,
             local_entries: self.local_entries,
             problem,
+            questions: self.questions,
         }
     }
 
@@ -829,11 +838,14 @@ impl Folder {
         change: impl FnOnce(&mut Engine, &Tx<'_>) -> Result<T, Stop>,
     ) -> Result<T, Stop> {
         let engine = &mut self.engine;
-        let out = self.store.transaction(|tx| -> Result<T, Stop> {
+        let space_id = &self.link.space_id;
+        let (out, questions) = self.store.transaction(|tx| -> Result<_, Stop> {
             let out = change(engine, tx)?;
+            engine.ask(tx, space_id)?;
             engine.checkpoint(tx)?;
-            Ok(out)
+            Ok((out, unanswered(tx)?))
         })?;
+        self.questions = questions;
         #[cfg(test)]
         if let Some(left) = &mut self.crash_after {
             if *left == 0 {
@@ -1239,6 +1251,12 @@ impl Folder {
         work.push(Work::Stage(pending));
         Ok(true)
     }
+}
+
+/// The questions in the store that wait for an answer.
+fn unanswered(tx: &Tx<'_>) -> Result<u64, flarebox_store::Error> {
+    let questions = tx.questions()?;
+    Ok(questions.iter().filter(|q| q.answer.is_none()).count() as u64)
 }
 
 /// What the observer's thread sends to the task.
@@ -1709,6 +1727,7 @@ impl FolderTask {
             remote_nodes: status.remote_nodes,
             local_entries: status.local_entries,
             problem: status.problem.clone(),
+            questions: status.questions,
         };
         if shown == view {
             return;
@@ -1720,6 +1739,7 @@ impl FolderTask {
         status.remote_nodes = view.remote_nodes;
         status.local_entries = view.local_entries;
         status.problem = view.problem;
+        status.questions = view.questions;
         drop(status);
         self.changed.send_replace(());
     }

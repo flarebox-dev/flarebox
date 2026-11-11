@@ -792,7 +792,8 @@ impl Driver {
         Ok(questions)
     }
 
-    /// Records the answer to a question. The engine takes it as a `UserDecision` input.
+    /// Records the answer to a question. The folder's task takes it as the engine's `UserDecision` input, now if it
+    /// runs and otherwise when it next opens the folder.
     pub fn answer(&self, question_id: &str, answer: Answer) -> Result<(), DriverError> {
         for space_id in self.space_ids() {
             let path = self.inner.paths.store(&space_id)?;
@@ -830,6 +831,9 @@ impl Driver {
                 Some(Ok(left)) => {
                     if let Some(folder) = self.inner.folders.lock().unwrap().get(&space_id) {
                         folder.status.lock().unwrap().questions = left;
+                        if let Some(run) = &folder.run {
+                            run.requests.notify_one();
+                        }
                     }
                     tracing::info!(space_id, question_id, %answer, "answered a question");
                     self.changed();
