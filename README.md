@@ -46,7 +46,7 @@ Dropbox does much more, and charges per person for it. Koidrive does the core of
 
 | | Koidrive | Dropbox |
 |---|---|---|
-| **Price** | Free and open source. You pay Cloudflare for storage. The first 10 GB is free, then $0.015 per GB-month | Basic is free with 2 GB. Plus is $9.99 a month for one person with 2 TB. Standard is $15 and Advanced $24 per person a month |
+| **Price** | Free and open source. You pay Cloudflare for storage. The first 10 GB is free, then $0.015 per GB-month | Basic is free with 2 GB. Plus is $9.99 a month for one person with 2 TB, and Standard $15 and Advanced $24 per person a month, all billed yearly |
 | **Where your files live** | An R2 bucket in your Cloudflare account | Dropbox's cloud |
 | **Source code** | Apache-2.0, with the server under AGPL-3.0, on GitHub | Closed |
 | **Deleted files and old versions** | 30 days | 30 days on Plus, 180 days on Standard, 1 year on Advanced |
