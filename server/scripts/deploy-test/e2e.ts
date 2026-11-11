@@ -367,7 +367,7 @@ function remove(on: Device, path: string): void {
 /** Prints what a person needs to see why the device did not get where it should. */
 function explain(on: Device, files: Map<string, string>): void {
   console.log("\nThe last listing on " + on.name + ":\n" + format(files));
-  for (const args of [["status"], ["questions", "--json"]]) {
+  for (const args of [["status"], ["resolve", "--json"]]) {
     try {
       koi(on, args);
     } catch (error) {
