@@ -2615,6 +2615,43 @@ fn a_commit_that_waits_for_the_owners_confirmation_is_not_lifted() {
     assert_eq!(flight.commit.commit_id, refused.commit_id);
 }
 
+/// GUN-349. Device `b` is moving `old.txt` to `remote.txt` after `a` renamed it, when `a` renames it back and the
+/// user edits it on `b`. Only the edit was the user's, so the file ends as `old.txt` with the edit on both sides.
+#[test]
+fn a_file_edited_while_a_move_the_server_undid_was_in_flight_keeps_its_name() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("old.txt"), b"one");
+    let (site_b, mut b) = linked(&mut remote, "b");
+    b.settle();
+    fs::rename(site_a.root.join("old.txt"), site_a.root.join("remote.txt")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(&mut remote);
+    b.pull(&remote);
+    assert!(matches!(
+        b.folder.engine.effects.in_flight().unwrap().effect,
+        flarebox_engine::effects::Effect::Move { .. }
+    ));
+    fs::rename(site_a.root.join("remote.txt"), site_a.root.join("old.txt")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(&mut remote);
+    b.pull(&remote);
+    fs::write(site_b.root.join("old.txt"), b"user edit").unwrap();
+    b.scan_until(|b| {
+        (b.folder.engine.trees.local().iter())
+            .any(|(_, node)| (node.shape.content.as_ref()).is_some_and(|content| content.size == 9))
+    });
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    assert_eq!(
+        files(&site_b.root),
+        [("old.txt".to_owned(), "user edit".to_owned())]
+    );
+    assert_eq!(remote.names(), ["old.txt"]);
+    assert_eq!(b.state(), FolderState::UpToDate);
+}
+
 /// Device `b` synced `one.txt` from `a`. The server then lost its log: a space with the same history and no
 /// commits takes its place.
 fn behind_the_device(remote: &mut Remote) -> (Site, Device) {
