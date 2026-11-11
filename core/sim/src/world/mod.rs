@@ -33,8 +33,9 @@
 //! - Every disk equals the server's live tree, and every engine reports L = S = R with nothing
 //!   in flight, blocked, parked or halted.
 //! - No commit moved a node to a name that the user of its device never gave to anything, other
-//!   than the pending name a swap goes through (design section 2.6), and no commit took a write out of the server's live tree that the user of its device never
-//!   overwrote or deleted.
+//!   than the pending name a swap goes through (design section 2.6), and no commit took a write
+//!   out of the server's live tree that the user of its device never overwrote or deleted.
+//! - No node keeps a pending name that no user gave.
 //! - No write is in two files of the server.
 //! - Every write was in the server's live tree at some time, unless the user who made it
 //!   overwrote or deleted it first.
@@ -226,20 +227,24 @@ fn stored(held: &Held, write: i64) -> bool {
     held.values().any(|writes| writes.contains_key(&write))
 }
 
-/// Fails when an effect sent a file to the local trash that held a write the server never held.
-/// Whether a user gave `name` to something, or `name` is the pending name of such a name, which
-/// a swap goes through on the server (design section 2.6).
-fn given(named: &BTreeSet<&str>, name: &str) -> bool {
-    let pending = (name.strip_suffix(')'))
-        .and_then(|rest| rest.rsplit_once(" (pending"))
-        .filter(|(_, n)| {
-            n.is_empty()
-                || n.strip_prefix(' ')
-                    .is_some_and(|n| n.parse::<u32>().is_ok())
-        });
-    named.contains(name) || pending.is_some_and(|(stem, _)| named.contains(stem))
+/// The name that `name` is the pending name of, which a swap goes through on the server (design
+/// section 2.6).
+fn pending_stem(name: &str) -> Option<&str> {
+    let (stem, n) = name.strip_suffix(')')?.rsplit_once(" (pending")?;
+    let numbered = |n: &str| {
+        n.strip_prefix(' ')
+            .is_some_and(|n| n.parse::<u32>().is_ok())
+    };
+    (n.is_empty() || numbered(n)).then_some(stem)
 }
 
+/// Whether a user gave `name` to something, or `name` is the pending name of such a name. A
+/// pending name may only be passed through: [`World::converged`] fails on a node that keeps one.
+fn given(named: &BTreeSet<&str>, name: &str) -> bool {
+    named.contains(name) || pending_stem(name).is_some_and(|stem| named.contains(stem))
+}
+
+/// Fails when an effect sent a file to the local trash that held a write the server never held.
 fn lost(held: &Held, d: usize, record: &EffectRecord, applied: &Applied) -> Result<(), Failure> {
     let trashed = applied.trashed.as_ref();
     match trashed.filter(|content| !stored(held, content.mtime_ns)) {
@@ -1351,6 +1356,17 @@ impl World {
                     }
                 }
             }
+        }
+        let named: BTreeSet<&str> = self.named.iter().flatten().copied().collect();
+        let kept = (nodes.iter()).find(|(_, node)| {
+            let name = node.shape.name.as_str();
+            !node.trashed && pending_stem(name).is_some() && !named.contains(name)
+        });
+        if let Some((id, node)) = kept {
+            return Err(Failure::Diverged(format!(
+                "node {id} keeps the pending name {:?}, which no user gave to anything",
+                node.shape.name
+            )));
         }
         let mut files: BTreeMap<i64, Vec<&Vec<String>>> = BTreeMap::new();
         for (path, content) in &server {
