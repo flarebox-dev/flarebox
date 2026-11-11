@@ -6,9 +6,14 @@
 koi link ~/Koidrive --space Koidrive
 ```
 
-`--space` takes the space's name or its ID. If two spaces have the same name, use the ID. The folder must exist. It may already hold files, and those files are uploaded. Files the space already holds are downloaded into it.
+`--space` takes the space's name or its ID. If two spaces have the same name, use the ID. The folder must exist, and it may already hold files.
 
-The first sync can't yet merge a folder and a space that hold the same name at their top level. If both hold `Notes`, for example, the folder halts with `the folder and the space it was linked to both hold "Notes"`. To combine such a folder with a space, link an empty folder, wait until the space has downloaded, then move your files in.
+If the space holds no files, the folder's files are uploaded as they are. Otherwise the first sync compares the folder with the space. A file or folder that the space holds at the same path, with the same content, stays as it is. Files that only the space holds are downloaded. Everything else in the folder is held, and sync asks one question about it before it uploads anything:
+
+- `publish` uploads the held files. If the space already has a file with the same name, the upload gets a [conflict name](conflicts.md#two-files-with-the-same-name).
+- `discard` moves the held files to the [local trash](#the-local-trash) and downloads the space's files at their paths.
+
+Answer it with `koi questions`, as [Questions](status.md#questions) describes.
 
 A space syncs to at most one folder on each device. Koidrive refuses a folder that:
 
