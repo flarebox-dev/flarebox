@@ -844,7 +844,9 @@ impl Trees {
     /// Forgets what the server may have lost, after a bootstrap from a server that is behind what
     /// this device applied (design §4.4). S forgets every node that R does not hold at all or holds
     /// live with another shape, and every node S holds below one. A node L still holds is then
-    /// created again instead of being taken for a remote delete, and one whose content differs from
+    /// created again instead of being taken for a remote delete, under its own ID and at the
+    /// position L holds: a node R does not hold at all is no longer reverted, since the server's
+    /// rename or merge that reverted it was lost too. One whose content differs from
     /// R's is kept beside R's as a conflict copy instead of being replaced by R's older content. A
     /// node R holds in the trash keeps S, so it stays a remote delete, also below a node S forgets,
     /// unless it is a file whose edit the server lost (see `edited` below).
@@ -873,7 +875,8 @@ impl Trees {
     /// the update has it, came from a commit the server lost, unless another device changed the
     /// node back since. With no revision of R's above `held_through`, the update is dropped, so
     /// L's change is compared with S and sent again instead of R's rollback reading as a remote
-    /// change once the update fits. With a later revision, S forgets the node as it forgets one R
+    /// change once the update fits. A node R does not hold at all is then no longer reverted, as
+    /// one S forgets. With a later revision, S forgets the node as it forgets one R
     /// holds with another shape, so L's change is kept beside R's. An update for a node R holds in
     /// the trash stays, and so does one for a node the person discarded on a first link, which no
     /// commit sent.
@@ -925,6 +928,9 @@ impl Trees {
             })
             .partition(|(_, later)| *later);
         for (id, _) in dropped {
+            if self.r.get(&id).is_none() {
+                self.reverted.remove(&id);
+            }
             self.waiting.remove(&id);
             self.mark(&id);
         }
@@ -960,6 +966,9 @@ impl Trees {
             .map(|id| (id.to_owned(), waits.contains(id)))
             .collect();
         for (id, waits) in lost {
+            if self.r.get(&id).is_none() {
+                self.reverted.remove(&id);
+            }
             if waits {
                 self.wait(id, None);
             } else {

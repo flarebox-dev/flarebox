@@ -1224,6 +1224,63 @@ fn a_parked_file_rekeyed_for_its_edit_is_moved_out_from_where_it_was_parked() {
     assert_eq!(b, &file(ROOT, "x (new conflict)", 3));
 }
 
+/// The server renamed the create of x to y, and the file is reverted until the effects move it
+/// there. Then the server loses the create. Once S forgets the file, it is no longer reverted, so
+/// it is created again under its own ID at x, instead of as a new node beside the one another
+/// device creates again (section 4.4).
+#[test]
+fn a_reverted_file_the_server_lost_is_created_again_under_its_id() {
+    let renamed = file(ROOT, "y", 1);
+    let mut trees = trees(&[(
+        "h",
+        Some(file(ROOT, "x", 1)),
+        Some(renamed.clone()),
+        Some(remote(renamed)),
+    )]);
+    trees.revert("h".into());
+    trees.remove_remote("h");
+    trees.forget_lost(Vec::new(), Vec::new(), 0);
+    trees.settle();
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(
+        matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id == "h" && c.name == "x"),
+        "{:?}",
+        ops(&commit)
+    );
+}
+
+#[test]
+fn a_reverted_file_whose_s_update_waits_is_created_again_under_its_id_once_the_server_lost_it() {
+    let mut trees = trees(&[(
+        "h",
+        Some(file(ROOT, "y", 9)),
+        Some(file(ROOT, "y", 9)),
+        Some(trashed(file(ROOT, "y", 9))),
+    )]);
+    trees.set_local("n".into(), local(file(ROOT, "x", 1), 2));
+    trees.settle();
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    trees.set_remote("n".into(), remote(file(ROOT, "y", 1)));
+    let renamed = OpResult {
+        name: "y".into(),
+        ..outcome(op_result::Code::AppliedRenamed)
+    };
+    acknowledge(&mut commits, &mut trees, vec![renamed]);
+    assert!(trees.waiting().contains_key("n"), "S still has h at y");
+    assert!(trees.reverted().contains("n"));
+    trees.remove_remote("n");
+    trees.forget_lost(Vec::new(), Vec::new(), 0);
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(
+        matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id == "n" && c.name == "x"),
+        "{:?}",
+        ops(&commit)
+    );
+}
+
 #[test]
 fn a_file_whose_s_update_waits_is_removed_or_uploaded_anew_after_a_remote_delete() {
     for (edit, parked) in [(None, false), (None, true), (Some(2), false)] {
