@@ -84,7 +84,8 @@ enum Attempt<T> {
 pub struct Transfer {
     http: reqwest::Client,
     pub backoff: Backoff,
-    /// Attempts per chunk, and rounds of asking the server again for chunks it deferred or whose target expired.
+    /// Attempts per chunk, and rounds of asking the server again for chunks it deferred or whose target expired. Only a
+    /// round in which no chunk was uploaded or found present counts.
     pub attempts: u32,
     /// Bounds one attempt, from sending the request to the last byte of the answer.
     pub attempt_timeout: Duration,
@@ -170,7 +171,8 @@ impl Transfer {
             if deferred.is_empty() {
                 break;
             }
-            if round >= self.attempts {
+            let progressed = deferred.len() < todo.len();
+            if !progressed && round >= self.attempts {
                 let message =
                     "the server kept deferring the upload or refusing its ticket".to_owned();
                 return Err(ChunkError::Unavailable {
@@ -184,7 +186,9 @@ impl Transfer {
                 wait
             })
             .await;
-            round += 1;
+            if !progressed {
+                round += 1;
+            }
             todo = deferred;
         }
         Ok(receipts)

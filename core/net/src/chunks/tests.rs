@@ -629,6 +629,87 @@ async fn an_upload_target_already_inside_the_expiry_margin_when_prepared_is_sent
     assert_eq!(receipts, [(a.hash, "skewed".to_owned())]);
 }
 
+fn retry_later(chunk: &ChunkRef) -> ChunkPlan {
+    ChunkPlan {
+        hash: chunk.hash.clone(),
+        action: Action::RetryLater as i32,
+        retry_after_ms: 1,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn upload_rounds_that_make_progress_do_not_count_towards_the_round_limit() {
+    let [a, b, c] = [b"chunk a", b"chunk b", b"chunk c"].map(|bytes| chunk(bytes));
+    let (relay, tickets) = relay().await;
+    let (session, _events, asked) = scripted_session({
+        let (a, b, c) = (a.clone(), b.clone(), c.clone());
+        let hour = Duration::from_secs(3600);
+        move |round| match round {
+            0 => vec![
+                upload_plan(relay, &a, "a", hour),
+                retry_later(&b),
+                retry_later(&c),
+            ],
+            1 => vec![upload_plan(relay, &b, "b", hour), retry_later(&c)],
+            _ => vec![upload_plan(relay, &c, "c", hour)],
+        }
+    })
+    .await;
+
+    let receipts = Transfer {
+        attempts: 1,
+        ..transfer()
+    }
+    .upload(&session, &[a.clone(), b.clone(), c.clone()], |chunk| {
+        let bytes: &'static [u8] = if chunk.hash == a.hash {
+            b"chunk a"
+        } else if chunk.hash == b.hash {
+            b"chunk b"
+        } else {
+            b"chunk c"
+        };
+        async move { Ok(Bytes::from_static(bytes)) }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(asked.lock().unwrap().len(), 3);
+    assert_eq!(*tickets.lock().unwrap(), ["a", "b", "c"]);
+    let receipts: Vec<_> = receipts.into_iter().map(|receipt| receipt.hash).collect();
+    assert_eq!(receipts, [a.hash, b.hash, c.hash]);
+}
+
+#[tokio::test]
+async fn upload_rounds_without_progress_count_towards_the_round_limit() {
+    let a = chunk(b"chunk a");
+    let b = chunk(b"chunk b");
+    let (relay, _tickets) = relay().await;
+    let (session, _events, asked) = scripted_session({
+        let (a, b) = (a.clone(), b.clone());
+        move |round| match round {
+            0 => vec![
+                upload_plan(relay, &a, "a", Duration::from_secs(3600)),
+                retry_later(&b),
+            ],
+            _ => vec![retry_later(&b)],
+        }
+    })
+    .await;
+
+    let outcome = Transfer {
+        attempts: 1,
+        ..transfer()
+    }
+    .upload(&session, &[a.clone(), b.clone()], |_| async {
+        Ok(Bytes::from_static(b"chunk a"))
+    })
+    .await;
+
+    assert!(matches!(outcome, Err(ChunkError::Unavailable { hash, .. }) if hash == b.hash));
+    assert_eq!(asked.lock().unwrap().len(), 3);
+}
+
 #[tokio::test]
 async fn refusals_follow_the_server_error_code_before_the_http_status() {
     let sent = chunk(b"payload");
