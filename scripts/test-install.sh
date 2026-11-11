@@ -57,14 +57,35 @@ pass 'piped install, checksum, executable, and PATH warning'
 sh "$root/install.sh" --no-systemd
 cmp "$binary" "$HOME/.local/bin/koi"
 pass 'repeat installation'
-printf 'old binary\n' > "$HOME/.local/bin/koi"
+printf 'old Koidrive sync client\n' > "$HOME/.local/bin/koi"
 sh "$root/install.sh" --no-systemd
 cmp "$binary" "$HOME/.local/bin/koi"
 pass 'upgrade replaces the old binary'
+printf '#!/bin/sh\n' > "$HOME/.local/bin/koi"
+cp "$HOME/.local/bin/koi" "$tmp/unrelated"
+if sh "$root/install.sh" --no-systemd > "$tmp/unrelated.log" 2>&1; then
+    cat "$tmp/unrelated.log"
+    printf 'Expected installation over another koi to fail\n' >&2
+    exit 1
+fi
+cat "$tmp/unrelated.log"
+grep -F "$HOME/.local/bin/koi is another program" "$tmp/unrelated.log"
+cmp "$tmp/unrelated" "$HOME/.local/bin/koi"
+cp "$binary" "$HOME/.local/bin/koi"
+pass 'another program named koi in the install directory is kept'
 unset KOIDRIVE_VERSION
 KOIDRIVE_INSTALL_DIR="$HOME/custom bin" sh "$root/install.sh" --no-systemd
 cmp "$binary" "$HOME/custom bin/koi"
 pass 'latest release and custom install directory'
+mkdir -p "$tmp/other"
+printf '#!/bin/sh\n' > "$tmp/other/koi"
+chmod +x "$tmp/other/koi"
+PATH="$tmp/other:$PATH" sh "$root/install.sh" --no-systemd > "$tmp/other.log" 2>&1
+cat "$tmp/other.log"
+grep -F "koi on PATH runs $tmp/other/koi, another program" "$tmp/other.log"
+PATH="$HOME/.local/bin:$tmp/other:$PATH" sh "$root/install.sh" --no-systemd > "$tmp/first.log" 2>&1
+if grep -q 'another program' "$tmp/first.log"; then exit 1; fi
+pass 'another koi on PATH is reported'
 export KOIDRIVE_VERSION=0.0.0
 printf '%064d  %s\n' 0 "$archive" > "$release/SHA256SUMS"
 reject 'checksum mismatch preserves the installed binary' 'Checksum mismatch'
@@ -96,7 +117,7 @@ EOF
     [ ! -e "$tmp/no-tty/systemd/user/koidrive.service" ]
     [ "$(wc -l < "$HOME/systemctl.log" | tr -d ' ')" = 1 ]
     pass 'noninteractive default does not install or start the service'
-    printf 'Passed 13 installer tests on %s\n' "$(uname -s)"
+    printf 'Passed 15 installer tests on %s\n' "$(uname -s)"
 else
     cat > "$tmp/bin/uname" <<'EOF'
 #!/bin/sh
@@ -126,5 +147,5 @@ EOF
         cmp "$binary" "$HOME/.local/bin/koi"
         pass "macOS x86_64 shell selects $candidate with hw.optional.arm64=$arm64"
     done
-    printf 'Passed 13 installer tests on %s\n' "$(uname -s)"
+    printf 'Passed 15 installer tests on %s\n' "$(uname -s)"
 fi

@@ -10,7 +10,7 @@ This URL will move to koidrive.com. Koidrive is not affiliated with Cloudflare, 
 
 Downloads become available with the first published CLI release. Until then, build from source below.
 
-The installer downloads the latest GitHub Release for x86_64 or arm64, checks its SHA256 checksum, and installs it in `~/.local/bin`. It needs `curl`, `tar`, `awk`, `grep`, `sed`, `mktemp`, and either `sha256sum` or `shasum`. It never needs root. Add `~/.local/bin` to your shell's `PATH` if the installer warns that it is missing, then run `koi --version`.
+The installer downloads the latest GitHub Release for x86_64 or arm64, checks its SHA256 checksum, and installs it in `~/.local/bin`. It needs `curl`, `tar`, `awk`, `grep`, `sed`, `mktemp`, and either `sha256sum` or `shasum`. It never needs root. Add `~/.local/bin` to your shell's `PATH` if the installer warns that it is missing, then run `koi --version`. The installer also warns when another program named `koi` comes first on `PATH`, such as the Koi theme switcher for KDE; put `~/.local/bin` before it. It refuses to replace a `koi` in the install directory that is another program.
 
 Run the same command again to upgrade. To choose a version or another directory, set `KOIDRIVE_VERSION` or `KOIDRIVE_INSTALL_DIR` on the `sh` command:
 

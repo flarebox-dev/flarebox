@@ -82,6 +82,9 @@ main() {
     case "$install_dir" in /*) ;; *) fail 'KOIDRIVE_INSTALL_DIR must be an absolute path' ;; esac
     case "$install_dir" in *[[:cntrl:]]*) fail 'KOIDRIVE_INSTALL_DIR cannot contain control characters' ;; esac
     [ ! -d "$install_dir/koi" ] || fail 'The destination koi is a directory'
+    if [ -f "$install_dir/koi" ] && ! grep -q 'Koidrive sync client' "$install_dir/koi"; then
+        fail "$install_dir/koi is another program. Move it away, or install elsewhere with KOIDRIVE_INSTALL_DIR"
+    fi
     mkdir -p "$install_dir"
     staged=$(mktemp "$install_dir/.koidrive.XXXXXXXX")
     cat "$tmp/koi" > "$staged"
@@ -93,6 +96,10 @@ main() {
         *":$install_dir:"*) ;;
         *) printf 'Warning: %s is not on PATH. Add it to your shell profile.\n' "$install_dir" >&2 ;;
     esac
+    other=$(command -v koi 2>/dev/null || true)
+    if [ -n "$other" ] && [ "$other" != "$install_dir/koi" ]; then
+        printf 'Warning: koi on PATH runs %s, another program. Put %s before it on PATH.\n' "$other" "$install_dir" >&2
+    fi
 
     if [ "$os" = unknown-linux-musl ] && [ "$service" != no ]; then
         if ! command -v systemctl >/dev/null 2>&1; then
