@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use flarebox_driver as driver;
 use flarebox_ffi::{
-    Answer, FolderState, LinkedFolder, Problem, ProblemKind, Question, SessionError, SessionEvent,
-    SessionListener, SessionState, SyncSession, SyncStatus,
+    Answer, FolderState, LinkedFolder, Problem, ProblemKind, Question, QuestionKind, RecoveryGroup,
+    SessionError, SessionEvent, SessionListener, SessionState, SyncSession, SyncStatus,
 };
 use flarebox_net::Auth;
 use flarebox_store::{Store, StoredQuestion};
@@ -405,7 +405,25 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
     mac.session()
         .link_folder(space.space_id, path_str(&again))
         .unwrap();
-    mac.until("the second link's sync", |m| m.status == SyncStatus::Idle);
+    let asked = mac.until("the second link's question", |m| m.questions.len() == 1);
+    let question = &asked.questions[0];
+    assert!(matches!(
+        question.kind,
+        QuestionKind::Recovery {
+            group: RecoveryGroup::CreatedOnThisDevice,
+            ..
+        }
+    ));
+    let held: Vec<&str> = (question.items.iter())
+        .map(|item| item.path.as_str())
+        .collect();
+    assert_eq!(held, ["kept.txt"]);
+    mac.session()
+        .answer(question.id.clone(), Answer::Publish)
+        .unwrap();
+    mac.until("the second link's sync", |m| {
+        m.status == SyncStatus::Idle && m.questions.is_empty()
+    });
     let spare = Device::new();
     spare.session().connect(server).unwrap();
     let pairing = mac.session().start_pairing().unwrap();
