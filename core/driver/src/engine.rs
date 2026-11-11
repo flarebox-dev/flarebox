@@ -367,7 +367,9 @@ impl Engine {
     /// L as the snapshot a scan of the folder would give if nothing changed since L was written, for the observer to
     /// start from: every placed node at its path, a folder with the zero size and time `core/fs` gives every
     /// folder, a file with the size, time and executable bit of its content. The first scan then reports what
-    /// changed while nothing observed the folder, removals included, and reads only the files that differ.
+    /// changed while nothing observed the folder, removals included, and reads only the files that differ. A node
+    /// [`Trees::ignore_local`] recorded is left out with what is under it, since the disk does not hold it there: an
+    /// entry the scan finds at its path is reported as created.
     pub fn snapshot(&self) -> Snapshot {
         let local = self.trees.local();
         let mut entries = BTreeMap::new();
@@ -377,6 +379,9 @@ impl Engine {
                 let Some(node) = local.get(child) else {
                     continue;
                 };
+                if self.trees.ignored_local().contains(child) {
+                    continue;
+                }
                 let (kind, size, mtime_ns, executable) =
                     match (&node.shape.kind, &node.shape.content) {
                         (Kind::Dir, _) => (EntryKind::Dir, 0, 0, false),
@@ -487,8 +492,11 @@ impl Engine {
     /// leaves L. A new folder that arrives where L keeps a recorded folder ([`Trees::ignore_local`]) that R holds
     /// live is that folder placed again: it keeps the folder's node, and what is recorded under it stays recorded, so
     /// the server keeps it. A recorded folder R no longer holds live leaves L instead, and the new folder is a new
-    /// node, so it does not bring back a folder another device deleted. A file whose content could not be read is
-    /// left out until the observer reports it with its content.
+    /// node, so it does not bring back a folder another device deleted. Any other entry that arrives where L keeps a
+    /// recorded node has taken its name: the recorded node leaves L with what L holds under it, and each stays
+    /// recorded ([`Trees::displace_local`]), so the server keeps it. An entry with the identity of such a node is the
+    /// node placed again. A file whose content could not be read is left out until the observer reports it with its
+    /// content.
     /// A rename to a path the rules exclude is a move out of what this device syncs: the node takes that position
     /// when its folder is in L or arrives in the batch, and keeps its entry otherwise ([`Trees::ignore_local`]); an
     /// entry L never held stays out.
@@ -646,6 +654,7 @@ impl Engine {
                     }
                     let identity = file_identity(*id);
                     let node = (self.trees.local_with_identity(&identity))
+                        .or_else(|| self.trees.displaced_with_identity(&identity))
                         .filter(|_| !linked)
                         .cloned()
                         .or_else(|| {
@@ -717,6 +726,7 @@ impl Engine {
             .map(|scope| {
                 let mut known = BTreeMap::new();
                 let mut pending: Vec<(PathBuf, NodeId)> = local_at(&self.trees, &scope)
+                    .filter(|id| !self.trees.recorded_local(id))
                     .map(|id| (scope.clone(), id))
                     .into_iter()
                     .collect();
@@ -732,7 +742,9 @@ impl Engine {
                         known.insert(path.clone(), Known { kind, id });
                     }
                     for child in self.trees.local_children(&id).cloned().collect::<Vec<_>>() {
-                        if let Some(node) = local.get(&child) {
+                        if let Some(node) = (local.get(&child))
+                            .filter(|_| !self.trees.ignored_local().contains(&child))
+                        {
                             pending.push((path.join(&node.shape.name), child));
                         }
                     }
@@ -778,6 +790,10 @@ impl Engine {
                 Kind::Dir => None,
             },
         };
+        let node = node.filter(|id| {
+            !(self.trees.recorded_local(id)
+                && (self.trees.local().get(id)).is_some_and(|held| held.identity != identity))
+        });
         let existing = node.as_ref().and_then(|id| self.trees.local().get(id));
         let unchanged = existing.is_some_and(|old| {
             !old.parked
@@ -817,7 +833,8 @@ impl Engine {
                 self.trees.synced().get(&id).is_some() || self.trees.remote().get(&id).is_some();
             let kept = self.trees.ignored_local().contains(&holder)
                 && self.trees.remote().live(&holder).is_some();
-            if kind == Kind::File && replaced == Some(Kind::File) && !synced {
+            let recorded = self.trees.recorded_local(&holder);
+            if kind == Kind::File && replaced == Some(Kind::File) && !synced && !recorded {
                 if self.trees.local().get(&id).is_some() {
                     self.remove(&id, moving, false, touched, gone);
                 }
@@ -848,7 +865,8 @@ impl Engine {
     /// elsewhere, with what is placed under them, and adds each node it removes to `gone`. When the disk lost the
     /// entry (`outside`), a node that [`Trees::ignore_local`] recorded keeps its entry with what is under it, and so
     /// do the folders on its way to `id`, which are recorded too: the node's local copy is in an ignored folder, so
-    /// L must keep it and its folders for the server to keep them (design §5.10).
+    /// L must keep it and its folders for the server to keep them (design §5.10). When the disk did not lose the
+    /// entry, each recorded node leaves L and stays recorded ([`Trees::displace_local`]).
     fn remove(
         &mut self,
         id: &NodeId,
@@ -870,6 +888,10 @@ impl Engine {
             }
             next += 1;
         }
+        let displaced: Vec<NodeId> = (doomed.iter())
+            .filter(|node| !outside && self.trees.recorded_local(node))
+            .cloned()
+            .collect();
         let mut kept = BTreeSet::new();
         for node in &held {
             let mut above = self.trees.local().get(node).map(|n| n.shape.parent.clone());
@@ -894,7 +916,10 @@ impl Engine {
             }
         }
         for id in doomed {
-            self.trees.remove_local(&id);
+            match displaced.contains(&id) {
+                true => self.trees.displace_local(&id),
+                false => self.trees.remove_local(&id),
+            }
             touched.insert(id);
         }
     }
@@ -925,6 +950,7 @@ fn resolve(trees: &Trees, path: &Path, identity: &FileIdentity, linked: bool) ->
         .or_else(|| {
             trees
                 .local_with_identity(identity)
+                .or_else(|| trees.displaced_with_identity(identity))
                 .filter(|_| !linked)
                 .cloned()
         })

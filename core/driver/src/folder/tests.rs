@@ -3976,6 +3976,52 @@ fn a_file_created_in_a_folder_created_again_does_not_replace_the_file_moved_into
     }
 }
 
+/// Another entry took the name of `source/file` while the file was in the ignored folder. When the user moves the
+/// file back out, to a path that is synced, it is the same node again: the server moves it and takes no second copy,
+/// also when the device restarted in between.
+#[test]
+fn a_file_moved_back_out_of_an_ignored_folder_after_its_name_was_taken_is_moved_on_the_server() {
+    for restart in [false, true] {
+        let mut remote = Remote::new();
+        let (site, mut a) = linked(&mut remote, "a");
+        fs::create_dir(site.root.join("source")).unwrap();
+        a.create(&mut remote, &site.root.join("source/file"), b"kept");
+        a.create(&mut remote, &site.root.join(".fbignore"), b"ignored/\n");
+        let file = live_id(&server_nodes(&remote), "file");
+        fs::create_dir(site.root.join("ignored")).unwrap();
+        fs::rename(
+            site.root.join("source/file"),
+            site.root.join("ignored/file"),
+        )
+        .unwrap();
+        a.scan_until(|a| a.folder.engine.trees.ignored_local().len() == 1);
+        a.run(&mut remote);
+        fs::create_dir(site.root.join("source/file")).unwrap();
+        a.scan_until(|a| a.folder.engine.trees.displaced_local().len() == 1);
+        for _ in 0..2 {
+            a.run(&mut remote);
+            a.settle();
+        }
+        if restart {
+            drop(a);
+            a = site.start();
+            a.connect(&remote);
+            a.scan_until(|a| a.folder.scanned);
+            a.run(&mut remote);
+        }
+        fs::rename(site.root.join("ignored/file"), site.root.join("back")).unwrap();
+        for _ in 0..3 {
+            a.settle();
+            a.run(&mut remote);
+        }
+        let after = server_nodes(&remote);
+        assert_eq!(live_id(&after, "back"), file, "{restart}: {after:?}");
+        assert!(a.folder.engine.trees.displaced_local().is_empty());
+        assert_eq!(fs::read(site.root.join("back")).unwrap(), b"kept");
+        assert_eq!(a.folder.engine.trees.check(), Ok(()));
+    }
+}
+
 #[test]
 fn a_folder_created_at_the_name_of_a_file_moved_into_an_ignored_folder_keeps_the_file_on_the_server()
  {

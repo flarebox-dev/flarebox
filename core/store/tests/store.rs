@@ -97,6 +97,7 @@ fn migrations_apply_from_empty() {
             "open_question_shapes",
             "open_questions",
             "questions",
+            "recorded_nodes",
             "remote_cursor",
             "remote_nodes",
             "restore_intents",
@@ -397,6 +398,15 @@ fn engine_state() -> EngineState {
             watched: BTreeMap::from([("edited".into(), true), ("kept".into(), false)]),
             trashed_here: BTreeMap::from([("t".into(), 5)]),
             discarded: nodes(["d"]),
+            outside: nodes(["kept"]),
+            displaced: BTreeMap::from([(
+                "displaced".into(),
+                FileIdentity {
+                    dev: u64::MAX,
+                    ino: 9,
+                    birth_ns: Some(-1),
+                },
+            )]),
         },
         commits: CommitsState {
             accepted: 4,
@@ -555,7 +565,7 @@ fn engine_state_survives_a_reopen() {
 }
 
 /// The tables of the engine state besides the nodes of R, L and S.
-const ENGINE_TABLES: [&str; 19] = [
+const ENGINE_TABLES: [&str; 20] = [
     "node_sets",
     "node_maps",
     "waiting_updates",
@@ -565,6 +575,7 @@ const ENGINE_TABLES: [&str; 19] = [
     "commit_in_flight_delete_members",
     "watched_contents",
     "trashed_here",
+    "recorded_nodes",
     "commit_slots",
     "effect_state",
     "failed_effects",
@@ -852,8 +863,9 @@ fn a_cursor_stored_before_it_could_record_a_server_behind_it_records_none() {
         .unwrap();
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
-        "DROP TABLE open_question_shapes; DROP TABLE discarded_nodes;
-         DROP TABLE open_question_members; DROP TABLE open_question_items;
+        "DROP TABLE recorded_nodes; DROP TABLE open_question_shapes;
+         DROP TABLE discarded_nodes; DROP TABLE open_question_members;
+         DROP TABLE open_question_items;
          DROP TABLE open_questions; DROP TABLE guard_ledger;
          DROP TABLE guard_confirmed_members; DROP TABLE guard_confirmed;
          DROP TABLE trashed_here; DROP TABLE commit_slots; DROP TABLE watched_contents;
@@ -888,8 +900,9 @@ fn a_store_from_before_contents_were_watched_opens_with_nothing_watched() {
         .unwrap();
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
-        "DROP TABLE open_question_shapes; DROP TABLE discarded_nodes;
-         DROP TABLE open_question_members; DROP TABLE open_question_items;
+        "DROP TABLE recorded_nodes; DROP TABLE open_question_shapes;
+         DROP TABLE discarded_nodes; DROP TABLE open_question_members;
+         DROP TABLE open_question_items;
          DROP TABLE open_questions; DROP TABLE guard_ledger;
          DROP TABLE guard_confirmed_members; DROP TABLE guard_confirmed;
          DROP TABLE trashed_here; DROP TABLE commit_slots; DROP TABLE watched_contents;",
@@ -906,6 +919,8 @@ fn a_store_from_before_contents_were_watched_opens_with_nothing_watched() {
     before.commits.slots.clear();
     before.commits.questions.clear();
     before.commits.guard = GuardState::default();
+    before.trees.outside.clear();
+    before.trees.displaced.clear();
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
 }
 
@@ -922,15 +937,15 @@ fn a_store_from_before_deletes_were_recorded_opens_with_none_recorded() {
         .unwrap();
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
-        "DROP TABLE open_question_shapes; DROP TABLE discarded_nodes;
-         DROP TABLE open_question_members; DROP TABLE open_question_items;
+        "DROP TABLE recorded_nodes; DROP TABLE open_question_shapes;
+         DROP TABLE discarded_nodes; DROP TABLE open_question_members;
+         DROP TABLE open_question_items;
          DROP TABLE open_questions; DROP TABLE guard_ledger;
          DROP TABLE guard_confirmed_members; DROP TABLE guard_confirmed;
          DROP TABLE trashed_here; DROP TABLE commit_slots;",
     )
     .unwrap();
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION - 3)
-        .unwrap();
+    conn.pragma_update(None, "user_version", 6).unwrap();
     drop(conn);
 
     let mut store = Store::open(&path).unwrap();
@@ -940,6 +955,8 @@ fn a_store_from_before_deletes_were_recorded_opens_with_none_recorded() {
     before.commits.slots.clear();
     before.commits.questions.clear();
     before.commits.guard = GuardState::default();
+    before.trees.outside.clear();
+    before.trees.displaced.clear();
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
 }
 
@@ -956,19 +973,21 @@ fn a_store_from_before_the_guard_opens_with_an_empty_guard() {
         .unwrap();
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
-        "DROP TABLE open_question_shapes; DROP TABLE discarded_nodes;
-         DROP TABLE open_question_members; DROP TABLE open_question_items;
+        "DROP TABLE recorded_nodes; DROP TABLE open_question_shapes;
+         DROP TABLE discarded_nodes; DROP TABLE open_question_members;
+         DROP TABLE open_question_items;
          DROP TABLE open_questions; DROP TABLE guard_ledger;
          DROP TABLE guard_confirmed_members; DROP TABLE guard_confirmed;",
     )
     .unwrap();
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION - 2)
-        .unwrap();
+    conn.pragma_update(None, "user_version", 7).unwrap();
     drop(conn);
 
     let mut store = Store::open(&path).unwrap();
     assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
     before.trees.discarded.clear();
+    before.trees.outside.clear();
+    before.trees.displaced.clear();
     before.commits.questions.clear();
     before.commits.guard = GuardState::default();
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
@@ -985,20 +1004,56 @@ fn a_store_from_before_questions_showed_local_shapes_keeps_its_questions() {
         question.shown.clear();
     }
     before.trees.discarded.clear();
+    before.trees.outside.clear();
+    before.trees.displaced.clear();
     Store::open(&path)
         .unwrap()
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("DROP TABLE open_question_shapes; DROP TABLE discarded_nodes;")
+    conn.execute_batch(
+        "DROP TABLE recorded_nodes; DROP TABLE open_question_shapes;
+         DROP TABLE discarded_nodes;",
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 8).unwrap();
+    drop(conn);
+
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
+}
+
+/// A database of the schema before the nodes moved into an ignored folder are stored keeps its engine state, with
+/// none recorded, and then stores and loads the ones the engine records.
+#[test]
+fn a_store_from_before_nodes_in_ignored_folders_were_stored_opens_with_none_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let mut before = engine_state();
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("DROP TABLE recorded_nodes;").unwrap();
     conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
         .unwrap();
     drop(conn);
 
     let mut store = Store::open(&path).unwrap();
     assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    let after = before.clone();
+    before.trees.outside.clear();
+    before.trees.displaced.clear();
+    assert!(!after.trees.outside.is_empty() && !after.trees.displaced.is_empty());
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
+    store
+        .transaction(|tx| tx.update_engine_state(&before, &after))
+        .unwrap();
+    drop(store);
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), after);
 }
 
 /// A database of the schema before restores gains the two restore tables, empty, and keeps the
@@ -1017,6 +1072,8 @@ fn a_version_3_store_opens_with_empty_restore_tables() {
     before.commits.resolved.clear();
     before.commits.questions.clear();
     before.commits.guard = GuardState::default();
+    before.trees.outside.clear();
+    before.trees.displaced.clear();
     Store::open(&path)
         .unwrap()
         .transaction(|tx| tx.set_engine_state(&before))
@@ -1024,8 +1081,9 @@ fn a_version_3_store_opens_with_empty_restore_tables() {
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
         "DROP TABLE restore_requests; DROP TABLE restore_intents;
-         DROP TABLE open_question_shapes; DROP TABLE discarded_nodes;
-         DROP TABLE open_question_members; DROP TABLE open_question_items;
+         DROP TABLE recorded_nodes; DROP TABLE open_question_shapes;
+         DROP TABLE discarded_nodes; DROP TABLE open_question_members;
+         DROP TABLE open_question_items;
          DROP TABLE open_questions; DROP TABLE guard_ledger;
          DROP TABLE guard_confirmed_members; DROP TABLE guard_confirmed;
          DROP TABLE watched_contents; DROP TABLE trashed_here; DROP TABLE commit_slots;

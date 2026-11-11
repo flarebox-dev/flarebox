@@ -77,6 +77,8 @@ fn trees_state() -> TreesState {
         watched: [("u".into(), true), ("v".into(), false)].into(),
         trashed_here: [("t".into(), 5)].into(),
         discarded: ["a".into()].into(),
+        outside: ["a".into()].into(),
+        displaced: Default::default(),
     }
 }
 
@@ -224,6 +226,11 @@ fn trees_restore_a_valid_state_and_refuse_each_broken_one() {
         };
         trees.set_local("n".into(), node);
     });
+    let held = FileIdentity {
+        dev: 1,
+        ino: 7,
+        birth_ns: None,
+    };
     let cases = [
         (
             "a node of R whose parent is missing",
@@ -284,6 +291,30 @@ fn trees_restore_a_valid_state_and_refuse_each_broken_one() {
                 state.trashed_here.insert("t".into(), 4);
             }),
             StateError::NotTrashedHere("t".into()),
+        ),
+        (
+            "a node recorded in an ignored folder that L does not hold",
+            trees(),
+            broken(trees_state(), |state| {
+                state.outside.insert("t".into());
+            }),
+            StateError::NotIgnoredLocal("t".into()),
+        ),
+        (
+            "a displaced node that L holds",
+            trees(),
+            broken(trees_state(), |state| {
+                state.displaced.insert("a".into(), held);
+            }),
+            StateError::NotDisplaced("a".into()),
+        ),
+        (
+            "a displaced node that R holds trashed",
+            trees(),
+            broken(trees_state(), |state| {
+                state.displaced.insert("t".into(), held);
+            }),
+            StateError::NotDisplaced("t".into()),
         ),
     ];
     for (name, mut trees, state, error) in cases {

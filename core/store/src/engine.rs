@@ -113,6 +113,29 @@ impl Tx<'_> {
         while let Some(row) = rows.next()? {
             state.trees.discarded.insert(row.get(0)?);
         }
+        let mut stmt = self
+            .0
+            .prepare_cached("SELECT node_id, dev, ino, birth_ns FROM recorded_nodes")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let node: NodeId = row.get(0)?;
+            match row
+                .get::<_, Option<i64>>(1)?
+                .zip(row.get::<_, Option<i64>>(2)?)
+            {
+                Some((dev, ino)) => {
+                    let identity = FileIdentity {
+                        dev: dev as u64,
+                        ino: ino as u64,
+                        birth_ns: row.get(3)?,
+                    };
+                    state.trees.displaced.insert(node, identity);
+                }
+                None => {
+                    state.trees.outside.insert(node);
+                }
+            }
+        }
 
         if let Some((accepted, halt, code, cap)) = self
             .0
@@ -188,6 +211,7 @@ impl Tx<'_> {
             "watched_contents",
             "trashed_here",
             "discarded_nodes",
+            "recorded_nodes",
             "effect_state",
             "failed_effects",
             "restore_intents",
@@ -301,6 +325,33 @@ impl Tx<'_> {
             .prepare_cached("INSERT INTO discarded_nodes (node_id) VALUES (?1)")?;
         for node in new.difference(old) {
             insert.execute([node])?;
+        }
+        let recorded = |trees: &TreesState| -> BTreeMap<NodeId, Option<FileIdentity>> {
+            let kept = trees.outside.iter().map(|node| (node.clone(), None));
+            let displaced =
+                (trees.displaced.iter()).map(|(node, held)| (node.clone(), Some(*held)));
+            kept.chain(displaced).collect()
+        };
+        let (old, new) = (recorded(&before.trees), recorded(&after.trees));
+        let mut remove = self
+            .0
+            .prepare_cached("DELETE FROM recorded_nodes WHERE node_id = ?1")?;
+        let mut put = self.0.prepare_cached(
+            "INSERT OR REPLACE INTO recorded_nodes (node_id, displaced, dev, ino, birth_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        let (removed, changed) = differences(&old, &new);
+        for node in removed {
+            remove.execute([node])?;
+        }
+        for (node, identity) in changed {
+            put.execute(params![
+                node,
+                identity.is_some(),
+                identity.map(|held| held.dev as i64),
+                identity.map(|held| held.ino as i64),
+                identity.and_then(|held| held.birth_ns),
+            ])?;
         }
 
         let (old, new) = (&before.commits, &after.commits);
