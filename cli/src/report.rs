@@ -185,8 +185,8 @@ pub struct Item {
 
 #[derive(Debug, PartialEq, Serialize)]
 pub struct AnswerChoice {
-    pub token: &'static str,
-    pub consequence: &'static str,
+    pub token: String,
+    pub consequence: String,
     pub argv: Vec<String>,
 }
 
@@ -256,11 +256,11 @@ impl Decision {
                     files: item.files,
                 })
                 .collect(),
-            answers: (question.kind.answers().iter())
-                .map(|answer| AnswerChoice {
-                    token: answer.as_str(),
-                    consequence: crate::answer_effect(*answer),
-                    argv: Next::of(&["koi", "resolve", &question.id, answer.as_str()]).argv,
+            answers: (crate::choices(question).into_iter())
+                .map(|choice| AnswerChoice {
+                    argv: Next::of(&["koi", "resolve", &question.id, &choice.word]).argv,
+                    token: choice.word,
+                    consequence: choice.effect,
                 })
                 .collect(),
         }
@@ -507,7 +507,7 @@ pub struct UnlinkedData {
 #[derive(Debug, PartialEq, Serialize)]
 pub struct AnsweredData {
     pub decision_id: String,
-    pub answer: &'static str,
+    pub answer: String,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -868,7 +868,7 @@ mod tests {
         let done = Done::accepted(
             AnsweredData {
                 decision_id: "q1".into(),
-                answer: "restore",
+                answer: "restore".into(),
             },
             "Resolved.\n",
         )
@@ -956,6 +956,47 @@ mod tests {
             ("recovery", Some("requested_before_reset"), None)
         );
         assert!(!Decision::of(&question("q3", notice())).requires_choice);
+    }
+
+    #[test]
+    fn a_conflict_answers_with_the_node_to_keep_or_keep_both() {
+        use koidrive_engine::question::{ConflictFile, Revisions};
+
+        let file = |node_id: &str| ConflictFile {
+            node_id: node_id.into(),
+            revisions: Revisions {
+                content_rev: 2,
+                meta_rev: 1,
+            },
+        };
+        let conflict = QuestionKind::Conflict {
+            original: file("n1"),
+            copy: file("n2"),
+            sent_in: None,
+        };
+        let decision = Decision::of(&question("q1", conflict));
+        assert_eq!(
+            (decision.kind, decision.group, decision.counts),
+            ("conflict", None, None)
+        );
+        let answers: Vec<(&str, Vec<&str>)> = (decision.answers.iter())
+            .map(|answer| {
+                let argv = answer.argv.iter().map(String::as_str).collect();
+                (answer.token.as_str(), argv)
+            })
+            .collect();
+        assert_eq!(
+            answers,
+            [
+                ("keep-node:n1", vec!["koi", "resolve", "q1", "keep-node:n1"]),
+                ("keep-node:n2", vec!["koi", "resolve", "q1", "keep-node:n2"]),
+                ("keep-both", vec!["koi", "resolve", "q1", "keep-both"]),
+            ]
+        );
+        assert_eq!(
+            decision.answers[0].consequence,
+            "Keep archive/a and move archive/b to the trash"
+        );
     }
 
     #[test]

@@ -66,7 +66,7 @@ pub fn join_args(code: &str, server: &Url) -> String {
 }
 
 /// The text as one POSIX shell word: quoted unless every character is safe bare.
-fn shell_word(text: &str) -> String {
+pub fn shell_word(text: &str) -> String {
     if !text.is_empty()
         && text
             .chars()

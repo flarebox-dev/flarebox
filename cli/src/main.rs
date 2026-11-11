@@ -78,9 +78,9 @@ enum Command {
         /// The decision to make, as koi resolve lists it.
         #[arg(requires = "answer")]
         id: Option<String>,
-        /// One of the answers the decision lists.
-        #[arg(value_parser = |text: &str| text.parse::<Answer>())]
-        answer: Option<Answer>,
+        /// One of the answers the decision lists, such as restore or keep-node:<node id>.
+        #[arg(value_parser = answer_word)]
+        answer: Option<String>,
     },
     /// Show the setup choices, or run the guided setup on a terminal.
     Setup {
@@ -718,14 +718,19 @@ async fn status(paths: &Paths, check: bool) -> Result<Done, CliError> {
 async fn resolve(
     paths: &Paths,
     id: Option<String>,
-    answer: Option<Answer>,
+    word: Option<String>,
 ) -> Result<Done, CliError> {
-    let (Some(id), Some(answer)) = (id, answer) else {
-        let questions = questions(paths).await?;
+    let questions = questions(paths).await?;
+    let (Some(id), Some(word)) = (id, word) else {
         let mut done = Done::ok(Value::Null, questions_text(&questions));
         done.decisions = questions.iter().map(Decision::of).collect();
         return Ok(done);
     };
+    let question = (questions.iter())
+        .find(|question| question.id == id)
+        .ok_or_else(|| DriverError::QuestionNotFound(id.clone()))?;
+    let answer = answer_to(question, &word)
+        .map_err(|message| CliError::usage(message).then(&["koi", "resolve", "--json"]))?;
     let request = Request::Answer {
         question_id: id.clone(),
         answer,
@@ -734,7 +739,7 @@ async fn resolve(
         Response::Answered => Ok(Done::accepted(
             AnsweredData {
                 decision_id: id,
-                answer: answer.as_str(),
+                answer: word,
             },
             "Resolved.\n",
         )),
@@ -1337,32 +1342,162 @@ fn question_summary(question: &Question) -> String {
             }
         }
         .to_owned(),
-        QuestionKind::Conflict { .. } => "two files conflict".to_owned(),
+        QuestionKind::Conflict { original, .. } => format!(
+            "{} has a conflict copy",
+            conflict_path(question, &original.node_id)
+        ),
     }
 }
 
-/// The first path a decision holds, after its summary, or nothing for a decision that holds none.
+/// The first path a decision holds, after its summary, or nothing for a decision that holds none or a conflict, whose
+/// summary names its file.
 fn first_path(question: &Question) -> String {
+    if let QuestionKind::Conflict { .. } = question.kind {
+        return String::new();
+    }
     (question.items.first())
         .map(|item| format!("; first path: {}", printable(&item.path)))
         .unwrap_or_default()
 }
 
-/// Each answer of a decision: what it does, and under it the full command that gives it.
-fn resolve_commands(question: &Question, indent: &str) -> String {
-    let id = printable(&question.id);
-    (question.kind.answers().iter())
-        .map(|answer| {
+/// A file of a conflict as a shell word with its control characters escaped, or its node ID if the decision does not
+/// list it.
+fn conflict_path(question: &Question, node_id: &str) -> String {
+    (question.items.iter())
+        .find(|item| item.node_id == node_id)
+        .map(|item| printable(&pairing::shell_word(&item.path)))
+        .unwrap_or_else(|| format!("node {}", printable(node_id)))
+}
+
+/// The two files of a conflict, each with the device that wrote its current version, or nothing for another decision.
+fn conflict_files(question: &Question, indent: &str) -> String {
+    let QuestionKind::Conflict { original, copy, .. } = &question.kind else {
+        return String::new();
+    };
+    [("Original", original), ("Conflict copy", copy)]
+        .into_iter()
+        .map(|(role, file)| {
+            let writer = (question.items.iter())
+                .find(|item| item.node_id == file.node_id)
+                .and_then(|item| item.device_id.as_deref())
+                .map_or("an unknown device".to_owned(), |device_id| {
+                    format!("device {}", printable(device_id))
+                });
             format!(
-                "{indent}{}:\n{indent}  {RESOLVE} {id} {}\n",
-                answer_effect(*answer),
-                answer.as_str()
+                "{indent}{role}: {}, written by {writer}\n",
+                conflict_path(question, &file.node_id)
             )
         })
         .collect()
 }
 
-/// What an answer does.
+/// The word `koi resolve` takes for a conflict's answer that keeps both files.
+const KEEP_BOTH: &str = "keep-both";
+
+/// One answer as `koi resolve` offers it: the word that gives it, what it does, and the engine's answer it stands
+/// for.
+struct Choice {
+    word: String,
+    effect: String,
+    answer: Answer,
+}
+
+/// The answers a decision takes, in the order to offer them. A conflict's answers name the node ID of the file to keep,
+/// so that no one has to tell which device's file is "mine".
+fn choices(question: &Question) -> Vec<Choice> {
+    let QuestionKind::Conflict { original, copy, .. } = &question.kind else {
+        return (question.kind.answers().iter())
+            .map(|&answer| Choice {
+                word: answer.as_str().to_owned(),
+                effect: answer_effect(answer).to_owned(),
+                answer,
+            })
+            .collect();
+    };
+    let kept = conflict_path(question, &original.node_id);
+    let copied = conflict_path(question, &copy.node_id);
+    vec![
+        Choice {
+            word: format!("keep-node:{}", original.node_id),
+            effect: format!("Keep {kept} and move {copied} to the trash"),
+            answer: Answer::KeepOriginal,
+        },
+        Choice {
+            word: format!("keep-node:{}", copy.node_id),
+            effect: format!(
+                "Give {kept} the content of {copied}, keeping the old content in its version history, and move \
+                 {copied} to the trash"
+            ),
+            answer: Answer::KeepCopy,
+        },
+        Choice {
+            word: KEEP_BOTH.to_owned(),
+            effect: "Keep both files".to_owned(),
+            answer: Answer::KeepBoth,
+        },
+    ]
+}
+
+/// An answer as `koi resolve` reads it, before it knows the decision: an answer's name, keep-node:<node id>, or
+/// keep-both. The engine's names for a conflict's answers are not among them.
+fn answer_word(text: &str) -> Result<String, String> {
+    let conflict = |answer: &Answer| {
+        matches!(
+            answer,
+            Answer::KeepOriginal | Answer::KeepCopy | Answer::KeepBoth
+        )
+    };
+    let named = text
+        .parse::<Answer>()
+        .is_ok_and(|answer| !conflict(&answer));
+    let node = text
+        .strip_prefix("keep-node:")
+        .is_some_and(|id| !id.is_empty());
+    if named || node || text == KEEP_BOTH {
+        return Ok(text.to_owned());
+    }
+    let names: Vec<&str> = (Answer::ALL.iter())
+        .filter(|answer| !conflict(answer))
+        .map(|answer| answer.as_str())
+        .collect();
+    Err(format!(
+        "{text:?} is not an answer; use one of {}, keep-node:<node id> or {KEEP_BOTH}",
+        names.join(", ")
+    ))
+}
+
+/// The engine's answer that `word` gives `question`, or an error that lists the words it takes.
+fn answer_to(question: &Question, word: &str) -> Result<Answer, String> {
+    let choices = choices(question);
+    if let Some(choice) = choices.iter().find(|choice| choice.word == word) {
+        return Ok(choice.answer);
+    }
+    let words: Vec<String> = (choices.iter())
+        .map(|choice| printable(&choice.word))
+        .collect();
+    Err(format!(
+        "{} is not an answer to {}; use {}",
+        printable(word),
+        printable(&question.id),
+        words.join(" or ")
+    ))
+}
+
+/// Each answer of a decision: what it does, and under it the full command that gives it.
+fn resolve_commands(question: &Question, indent: &str) -> String {
+    let id = printable(&question.id);
+    (choices(question).iter())
+        .map(|choice| {
+            format!(
+                "{indent}{}:\n{indent}  {RESOLVE} {id} {}\n",
+                choice.effect,
+                printable(&choice.word)
+            )
+        })
+        .collect()
+}
+
+/// What an answer to a decision other than a conflict does.
 fn answer_effect(answer: Answer) -> &'static str {
     match answer {
         Answer::Delete => "Delete these files on the server and other devices",
@@ -1373,19 +1508,20 @@ fn answer_effect(answer: Answer) -> &'static str {
         Answer::Repeat => "Send the request again",
         Answer::Cancel => "Drop the request",
         Answer::Dismiss => "Close this notice",
-        Answer::KeepOriginal => "Keep the original and move the conflict copy to the trash",
-        Answer::KeepCopy => "Keep the conflict copy's content in the original and trash the copy",
-        Answer::KeepBoth => "Keep both files",
+        Answer::KeepOriginal | Answer::KeepCopy | Answer::KeepBoth => {
+            unreachable!("a conflict's answers name its files")
+        }
     }
 }
 
 /// How `koi status` shows a decision under its folder: what it is about, its first path, and how to make it.
 fn question_brief(question: &Question) -> String {
     format!(
-        "  {}: {}{}\n{}",
+        "  {}: {}{}\n{}{}",
         printable(&question.id),
         question_summary(question),
         first_path(question),
+        conflict_files(question, "    "),
         resolve_commands(question, "  ")
     )
 }
@@ -1393,12 +1529,16 @@ fn question_brief(question: &Question) -> String {
 /// How `koi resolve` shows a decision: what it is about, how to make it, and its first [`ITEMS_SHOWN`] items.
 fn question_text(question: &Question) -> String {
     let mut text = format!(
-        "{}  space {}  {}\n{}",
+        "{}  space {}  {}\n{}{}",
         printable(&question.id),
         printable(&question.space_id),
         question_summary(question),
+        conflict_files(question, "    "),
         resolve_commands(question, "  ")
     );
+    if let QuestionKind::Conflict { .. } = question.kind {
+        return text;
+    }
     for item in question.items.iter().take(ITEMS_SHOWN) {
         text += &format!(
             "  {} ({})\n",
@@ -1838,6 +1978,184 @@ mod tests {
         }
     }
 
+    const ORIGINAL: &str = "0190a0b0-0000-7000-8000-00000000000a";
+    const COPY: &str = "0190a0b0-0000-7000-8000-00000000000b";
+    const DESK: &str = "0190a0b0-0000-7000-8000-0000000000d1";
+    const LAPTOP: &str = "0190a0b0-0000-7000-8000-0000000000d2";
+
+    /// A conflict between docs/notes.txt, written by DESK, and its conflict copy written by LAPTOP, with the items in
+    /// path order as the driver lists them.
+    fn conflict(copy_path: &str) -> Question {
+        use koidrive_engine::question::{ConflictFile, Revisions};
+
+        let file = |node_id: &str| ConflictFile {
+            node_id: node_id.into(),
+            revisions: Revisions {
+                content_rev: 2,
+                meta_rev: 1,
+            },
+        };
+        let item = |node_id: &str, path: &str, device_id: &str| koidrive_driver::HeldItem {
+            node_id: node_id.into(),
+            path: path.into(),
+            files: 1,
+            device_id: Some(device_id.into()),
+        };
+        Question {
+            kind: QuestionKind::Conflict {
+                original: file(ORIGINAL),
+                copy: file(COPY),
+                sent_in: None,
+            },
+            items: vec![
+                item(COPY, copy_path, LAPTOP),
+                item(ORIGINAL, "docs/notes.txt", DESK),
+            ],
+            ..held((0, 0, 0), &[], 0)
+        }
+    }
+
+    #[test]
+    fn a_conflict_answer_keeps_the_node_it_names_or_both() {
+        let question = conflict("docs/notes (conflict).txt");
+        assert_eq!(
+            answer_to(&question, &format!("keep-node:{ORIGINAL}")),
+            Ok(Answer::KeepOriginal)
+        );
+        assert_eq!(
+            answer_to(&question, &format!("keep-node:{COPY}")),
+            Ok(Answer::KeepCopy)
+        );
+        assert_eq!(answer_to(&question, "keep-both"), Ok(Answer::KeepBoth));
+        let expected = format!(
+            "is not an answer to q1; use keep-node:{ORIGINAL} or keep-node:{COPY} or keep-both"
+        );
+        for word in [
+            format!("keep-node:{DESK}"),
+            "restore".to_owned(),
+            "keep_both".to_owned(),
+        ] {
+            let error = answer_to(&question, &word).unwrap_err();
+            assert_eq!(error, format!("{word} {expected}"));
+        }
+    }
+
+    #[test]
+    fn a_decision_other_than_a_conflict_takes_the_answers_it_did() {
+        let question = held((30, 30, 40), &[Limit::Share], 1);
+        assert_eq!(answer_to(&question, "delete"), Ok(Answer::Delete));
+        assert_eq!(answer_to(&question, "restore"), Ok(Answer::Restore));
+        assert_eq!(
+            answer_to(&question, "keep-both"),
+            Err("keep-both is not an answer to q1; use delete or restore".to_owned())
+        );
+        assert_eq!(
+            answer_to(&question, &format!("keep-node:{ORIGINAL}")),
+            Err(format!(
+                "keep-node:{ORIGINAL} is not an answer to q1; use delete or restore"
+            ))
+        );
+    }
+
+    #[test]
+    fn resolve_reads_keep_node_and_keep_both_but_not_the_engine_names_of_a_conflict_answer() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).map(|cli| cli.command);
+        for word in ["keep-both", "keep-node:n1", "dismiss"] {
+            assert!(
+                matches!(
+                    parse(&["koi", "resolve", "q1", word]),
+                    Ok(Some(Command::Resolve { answer: Some(answer), .. })) if answer == word
+                ),
+                "{word}"
+            );
+        }
+        for word in [
+            "keep-node:",
+            "keep_original",
+            "keep_copy",
+            "keep_both",
+            "keep",
+        ] {
+            let error = parse(&["koi", "resolve", "q1", word]).err();
+            if word == "keep" {
+                assert!(error.is_none(), "keep answers a recovery group");
+                continue;
+            }
+            assert!(
+                error.is_some_and(|error| error
+                    .to_string()
+                    .contains("keep-node:<node id> or keep-both")),
+                "{word}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_lists_both_files_of_a_conflict_with_their_writers_and_one_command_per_answer() {
+        assert_eq!(
+            question_text(&conflict("docs/notes (conflict).txt")),
+            format!(
+                "q1  space s1  docs/notes.txt has a conflict copy\n\
+                 \x20   Original: docs/notes.txt, written by device {DESK}\n\
+                 \x20   Conflict copy: 'docs/notes (conflict).txt', written by device {LAPTOP}\n\
+                 \x20 Keep docs/notes.txt and move 'docs/notes (conflict).txt' to the trash:\n\
+                 \x20   koi resolve q1 keep-node:{ORIGINAL}\n\
+                 \x20 Give docs/notes.txt the content of 'docs/notes (conflict).txt', keeping the old content in its \
+                 version history, and move 'docs/notes (conflict).txt' to the trash:\n\
+                 \x20   koi resolve q1 keep-node:{COPY}\n\
+                 \x20 Keep both files:\n\
+                 \x20   koi resolve q1 keep-both\n"
+            )
+        );
+    }
+
+    #[test]
+    fn status_shows_a_conflict_under_its_folder_and_a_notification_names_its_file() {
+        let question = conflict("docs/notes (conflict).txt");
+        let brief = question_brief(&question);
+        let lines: Vec<&str> = brief.lines().collect();
+        assert_eq!(
+            lines[..3],
+            [
+                "  q1: docs/notes.txt has a conflict copy",
+                &format!("    Original: docs/notes.txt, written by device {DESK}"),
+                &format!(
+                    "    Conflict copy: 'docs/notes (conflict).txt', written by device {LAPTOP}"
+                ),
+            ]
+        );
+        assert_eq!(
+            lines[3..]
+                .iter()
+                .filter(|line| line.starts_with("    koi resolve q1 "))
+                .count(),
+            3
+        );
+        assert_eq!(lines.len(), 9);
+        assert_eq!(
+            question_notice(&question),
+            "docs/notes.txt has a conflict copy. Run koi resolve."
+        );
+    }
+
+    #[test]
+    fn a_conflict_path_is_quoted_with_its_control_characters_escaped() {
+        let question = conflict("docs/it's\nforged\u{1b}[2J");
+        for text in [question_text(&question), question_brief(&question)] {
+            assert_eq!(text.lines().count(), 9, "{text}");
+            assert!(!text.contains('\u{1b}'), "{text}");
+            assert!(
+                text.contains(r"Conflict copy: 'docs/it'\''s\u{a}forged\u{1b}[2J', written by"),
+                "{text}"
+            );
+        }
+        let mut unwritten = conflict("docs/notes (conflict).txt");
+        unwritten.items[0].device_id = None;
+        assert!(question_text(&unwritten).contains(
+            "Conflict copy: 'docs/notes (conflict).txt', written by an unknown device\n"
+        ));
+    }
+
     #[test]
     fn a_held_path_is_shown_with_its_control_characters_escaped() {
         let mut question = held((1, 15, 20), &[Limit::Share], 1);
@@ -1972,9 +2290,9 @@ mod tests {
             parse(&["koi", "resolve", "q1", "restore"]),
             Ok(Some(Command::Resolve {
                 id: Some(_),
-                answer: Some(Answer::Restore),
+                answer: Some(answer),
                 ..
-            }))
+            })) if answer == "restore"
         ));
         assert!(parse(&["koi", "resolve", "q1"]).is_err());
         assert!(parse(&["koi", "resolve", "q1", "later"]).is_err());
