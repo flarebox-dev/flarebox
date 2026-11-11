@@ -3636,6 +3636,64 @@ fn a_folder_created_again_at_a_removed_folder_kept_for_an_ignored_file_keeps_the
     assert_eq!(remote.names(), [".fbignore", "file", "new", "source"]);
     assert_eq!(a.folder.engine.trees.check(), Ok(()));
 }
+
+/// As above, but another device deletes `source` with `file` in it, and this device takes in the deletion before the
+/// user creates `source` again. The new folder is a new node: the deleted folder and file stay in the trash, with or
+/// without a restart in between.
+#[test]
+fn a_folder_created_again_at_a_kept_folder_another_device_deleted_is_a_new_folder() {
+    for restart in [false, true] {
+        let mut remote = Remote::new();
+        let (site, mut a) = linked(&mut remote, "a");
+        fs::create_dir(site.root.join("source")).unwrap();
+        a.create(&mut remote, &site.root.join("source/file"), b"kept");
+        a.create(&mut remote, &site.root.join(".fbignore"), b"ignored/\n");
+        let before = server_nodes(&remote);
+        let (source, file) = (live_id(&before, "source"), live_id(&before, "file"));
+        fs::create_dir(site.root.join("ignored")).unwrap();
+        fs::rename(
+            site.root.join("source/file"),
+            site.root.join("ignored/file"),
+        )
+        .unwrap();
+        fs::remove_dir(site.root.join("source")).unwrap();
+        a.scan_until(|a| (a.folder.engine.trees.ignored_local().len()) == 2);
+        a.run(&mut remote);
+        let (other, mut b) = linked(&mut remote, "b");
+        b.settle();
+        b.run(&mut remote);
+        b.settle();
+        b.run(&mut remote);
+        assert_eq!(fs::read(other.root.join("source/file")).unwrap(), b"kept");
+        fs::remove_dir_all(other.root.join("source")).unwrap();
+        b.scan_until(|b| !b.work.is_empty());
+        b.run(&mut remote);
+        a.pull(&remote);
+        a.run(&mut remote);
+        a.settle();
+        a.run(&mut remote);
+        assert!(a.folder.engine.trees.remote().live(&source).is_none());
+        if restart {
+            drop(a);
+            a = site.start();
+            a.connect(&remote);
+            a.scan_until(|a| a.folder.scanned);
+            a.run(&mut remote);
+        }
+        fs::create_dir(site.root.join("source")).unwrap();
+        fs::write(site.root.join("source/new"), b"new").unwrap();
+        a.scan_until(|a| (a.observer.snapshot().entries).contains_key(Path::new("source/new")));
+        a.run(&mut remote);
+        a.settle();
+        a.run(&mut remote);
+        let after = server_nodes(&remote);
+        let revived = |id: &String| after.iter().any(|(_, node, live)| node == id && *live);
+        assert!(!revived(&source) && !revived(&file), "{restart}: {after:?}");
+        assert_eq!(remote.names(), [".fbignore", "new", "source"], "{restart}");
+        assert_eq!(fs::read(site.root.join("ignored/file")).unwrap(), b"kept");
+        assert_eq!(a.folder.engine.trees.check(), Ok(()));
+    }
+}
 /// The user hard-links `source/file` into the ignored folder, moves the file itself to `moved`, and removes
 /// `source`. The file is still synced at `moved`, so the server follows the move; the link stays out.
 #[test]
