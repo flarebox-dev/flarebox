@@ -2357,6 +2357,169 @@ fn a_waiting_folder_the_user_deleted_is_brought_back_for_a_remote_move_into_it()
     assert_eq!((&h.shape, h.parked), (&file("d", "h", 9), false));
 }
 
+/// GUN-350. The user moves f out of folder d while the other device removes both. The removal of
+/// the empty d is in flight when R restores d with f in it. S cannot drop d while it holds f, so
+/// that update waits instead of being lost. The commit sends only the user's move, and once it is
+/// acknowledged S drops d, the effects bring d back, and the trees end in sync.
+#[test]
+fn a_removal_r_undid_whose_s_update_does_not_fit_yet_waits() {
+    let mut trees = trees(&[
+        ("d", Some(dir(ROOT, "d")), Some(dir(ROOT, "d")), None),
+        ("f", Some(file(ROOT, "f", 1)), Some(file("d", "f", 1)), None),
+    ]);
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    let record = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    assert_eq!(record.node, "d");
+    assert!(
+        matches!(record.effect, Effect::RemoveDir { .. }),
+        "{record:?}"
+    );
+    trees.set_remote("d".into(), remote(dir(ROOT, "d")));
+    trees.set_remote("f".into(), remote(file("d", "f", 1)));
+    effects.done(&mut trees, &record.effect_id, None).unwrap();
+    trees.settle();
+
+    assert_eq!(effects_for(&mut trees, &mut ids, "d"), []);
+
+    let mut commits = Commits::default();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("f", ROOT, "f")]);
+    trees.set_remote("f".into(), remote(file(ROOT, "f", 1)));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    assert_eq!(trees.waiting(), &Default::default());
+    let effects = effects_for(&mut trees, &mut ids, "d");
+    assert!(
+        matches!(effects[..], [Effect::CreateDir { .. }]),
+        "{effects:?}"
+    );
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    assert_eq!(trees.class("d"), Class::InSync);
+}
+
+/// S still holds parked h at x when d's move to X is acknowledged, so d's update waits, and S
+/// still holds m in d. The user deletes d and parks m, and the other device moves h into d. The
+/// keep rule needs d but cannot clear it from S yet. d's acknowledged move keeps waiting, so the
+/// effects bring d back at X for h.
+#[test]
+fn a_needed_folder_whose_move_waits_is_brought_back() {
+    let mut trees = trees(&[
+        (
+            "d",
+            Some(dir(ROOT, "X")),
+            Some(dir(ROOT, "old")),
+            Some(remote(dir(ROOT, "old"))),
+        ),
+        (
+            "h",
+            Some(file(ROOT, "x", 9)),
+            Some(file(ROOT, "x", 9)),
+            Some(remote(file(ROOT, "y", 9))),
+        ),
+        synced("m", file("d", "c", 1)),
+    ]);
+    trees.set_local(
+        "h".into(),
+        LocalNode {
+            parked: true,
+            ..local(file(ROOT, "x", 9), 2)
+        },
+    );
+    trees.settle();
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("d", ROOT, "X")]);
+    trees.set_remote("d".into(), remote(dir(ROOT, "X")));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    assert_eq!(trees.waiting().get("d"), Some(&Some(dir(ROOT, "X"))));
+    trees.set_local(
+        "m".into(),
+        LocalNode {
+            parked: true,
+            ..local(file("d", "c", 1), 3)
+        },
+    );
+    trees.remove_local("d");
+    trees.set_remote("h".into(), remote(file("d", "h", 9)));
+    trees.settle();
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    let effects = effects_for(&mut trees, &mut ids, "d");
+    assert!(
+        matches!(effects[..], [Effect::CreateDir { .. }]),
+        "{effects:?}"
+    );
+    assert_eq!(trees.local().live("d"), Some(&dir(ROOT, "X")));
+}
+
+#[test]
+fn a_removal_that_waits_after_both_sides_dropped_the_node_is_kept_until_it_fits() {
+    let mut trees = trees(&[
+        ("d", Some(dir(ROOT, "d")), Some(dir(ROOT, "d")), None),
+        ("f", Some(file(ROOT, "f", 1)), Some(file("d", "f", 1)), None),
+    ]);
+    let (mut effects, mut ids, mut commits) =
+        (Effects::default(), IdGen::new(1), Commits::default());
+    assert_eq!(
+        commits.connected(&Welcome {
+            read_only: true,
+            ..welcome(0)
+        }),
+        Reconnect::Idle
+    );
+    let record = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    assert_eq!(record.node, "d");
+    assert!(matches!(record.effect, Effect::RemoveDir { .. }));
+    effects.done(&mut trees, &record.effect_id, None).unwrap();
+    trees.settle();
+    assert_eq!(trees.waiting().get("d"), Some(&None));
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    trees.set_remote("d".into(), remote(dir(ROOT, "d")));
+    trees.set_remote("f".into(), remote(file("d", "f", 1)));
+    trees.settle();
+    assert_eq!(commits.connected(&welcome(0)), Reconnect::Idle);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("f", ROOT, "f")]);
+}
+
+#[test]
+fn a_kept_removal_is_made_once_s_no_longer_holds_anything_under_it() {
+    let mut trees = trees(&[
+        ("d", Some(dir(ROOT, "d")), Some(dir(ROOT, "d")), None),
+        ("f", Some(file(ROOT, "f", 1)), Some(file("d", "f", 1)), None),
+    ]);
+    let (mut effects, mut ids, mut commits) =
+        (Effects::default(), IdGen::new(1), Commits::default());
+    assert_eq!(
+        commits.connected(&Welcome {
+            read_only: true,
+            ..welcome(0)
+        }),
+        Reconnect::Idle
+    );
+    let record = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    effects.done(&mut trees, &record.effect_id, None).unwrap();
+    trees.settle();
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    assert_eq!(commits.connected(&welcome(0)), Reconnect::Idle);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(matches!(ops(&commit)[..], [op::Op::CreateFile(_)]));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    assert!(trees.waiting().is_empty());
+    assert_eq!(trees.synced().live("d"), None);
+}
+
 /// GUN-375. n's edit to 1 is in flight when the user and the other device both write 2, so S
 /// takes 2. The user writes 1 again before the commit is acknowledged, and the other device then
 /// writes 3, before the acknowledgement with `overtaken` and after it otherwise. S keeps 2, which

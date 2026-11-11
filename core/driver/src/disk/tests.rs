@@ -32,7 +32,7 @@ use flarebox_store::{EngineState, SyncedNode};
 use super::*;
 use crate::claim;
 use crate::ignore::Unfiltered;
-use crate::observe::{FsObserver, Observer};
+use crate::observe::{FsObserver, Observer, READ_FILES};
 
 const SPACE: &str = "0190f0a0-0000-7000-8000-000000000001";
 const NODE: &str = "0190f0a0-0000-7000-8000-0000000000a1";
@@ -1216,6 +1216,127 @@ fn an_effect_that_met_a_taken_name_or_a_changed_file_stays_blocked() {
         assert_eq!(running.step(&server), None, "{disturb}");
         assert_eq!(folder.marker(), 1);
     }
+}
+
+/// The user edits a synced file that the other device also edited, in a scan of more files than one observation
+/// reads, so the edit is reported without its content and L keeps the synced content. The download of the other
+/// device's edit must not replace the file. Once the edit is read, the download waits and the next commit forks the
+/// edit off the node into a file of its own, which the server keeps apart as a conflict copy.
+#[test]
+fn a_remote_edit_never_replaces_a_file_whose_read_was_deferred() {
+    let folder = Folder::new();
+    let mut server = Server::default();
+    (SCENARIOS[2].setup)(&folder, &mut server);
+    let previous = Snapshot::scan(&folder.root).unwrap();
+    for i in 0..READ_FILES {
+        fs::write(folder.root.join(format!("{i:04}.txt")), b"x").unwrap();
+    }
+    let report = folder.root.join("report.txt");
+    fs::write(&report, b"the user's own words").unwrap();
+    let mut running = folder.start(no_hook()).unwrap();
+    let sections = running.disk.sections();
+    let mut watching = observer(&folder.root, previous);
+
+    let deferred = observe_until(&mut watching, sections.stamp(), |seen| !seen.is_empty());
+    assert!(
+        deferred.observation.changes.iter().any(|change| matches!(
+            change,
+            Observed::Modified { path, content: None, .. } if path == Path::new("report.txt")
+        )),
+        "the edit is past the budget"
+    );
+    running
+        .disk
+        .observed(deferred, &mut running.engine, &mut running.store)
+        .unwrap();
+    assert_eq!(
+        running.step(&server),
+        Some(Settled::Failed("Changed".into()))
+    );
+    assert_eq!(fs::read(&report).unwrap(), b"the user's own words");
+
+    catch_up(&mut watching, &sections);
+    let read = observe_until(&mut watching, sections.stamp(), |seen| {
+        seen.iter().any(|change| {
+            matches!(change, Observed::Modified { path, content: Some(_), .. } if path == Path::new("report.txt"))
+        })
+    });
+    running
+        .disk
+        .observed(read, &mut running.engine, &mut running.store)
+        .unwrap();
+    assert_eq!(running.step(&server), None);
+    let engine = &mut running.engine;
+    engine
+        .commits
+        .build(&mut engine.trees, &mut engine.ids, 1, "history", 2);
+    let edit = disk_content(&report);
+    let at_report: Vec<(&String, &LocalNode)> = (running.engine.trees.local().iter())
+        .filter(|(_, node)| node.shape.name == "report.txt")
+        .collect();
+    assert!(
+        matches!(
+            at_report.as_slice(),
+            [(id, node)] if id.as_str() != NODE
+                && node.shape.content.as_ref().map(|content| &content.manifest_digest)
+                    == Some(&edit.manifest_digest)
+        ),
+        "the edit is forked off the node: {at_report:?}"
+    );
+    assert_eq!(running.step(&server), None);
+    assert_eq!(fs::read(&report).unwrap(), b"the user's own words");
+}
+
+/// The user replaces a synced folder with another one and moves the folder's synced file back into it, while the
+/// observer's snapshot predates the file, in a scan of more files than one observation reads. The batch takes the
+/// replaced folder out of L, so the file is read at once although it is past the budget, and keeps its node.
+#[test]
+fn a_file_created_under_a_replaced_folder_is_read_at_once_and_keeps_its_node() {
+    let folder = Folder::new();
+    let d = "0190f0a0-0000-7000-8000-0000000000d1";
+    let incoming = "0190f0a0-0000-7000-8000-0000000000d2";
+    fs::create_dir(folder.root.join("d")).unwrap();
+    fs::create_dir(folder.root.join("incoming")).unwrap();
+    let previous = Snapshot::scan(&folder.root).unwrap();
+    fs::write(folder.root.join("d/x"), SYNCED).unwrap();
+    let mut child = remote(NODE, "x", Some(disk_content(&folder.root.join("d/x"))));
+    child.parent_id = d.into();
+    folder.seed(
+        &[
+            remote(d, "d", None),
+            remote(incoming, "incoming", None),
+            child,
+        ],
+        &[
+            (d, SPACE, "d"),
+            (incoming, SPACE, "incoming"),
+            (NODE, d, "d/x"),
+        ],
+        0,
+    );
+    let mut running = folder.start(no_hook()).unwrap();
+    fs::rename(folder.root.join("d/x"), folder.dir.path().join("x")).unwrap();
+    fs::rename(folder.root.join("incoming"), folder.root.join("d")).unwrap();
+    fs::rename(folder.dir.path().join("x"), folder.root.join("d/x")).unwrap();
+    for i in 0..READ_FILES {
+        fs::write(folder.root.join(format!("{i:04}.txt")), b"a").unwrap();
+    }
+    let mut watching = observer(&folder.root, previous);
+    let stamp = running.disk.sections().stamp();
+
+    let first = observe_until(&mut watching, stamp, |seen| !seen.is_empty());
+    assert!(
+        first.observation.changes.iter().any(|change| matches!(
+            change,
+            Observed::Created { path, content: Some(_), .. } if path == Path::new("d/x")
+        )),
+        "the file is read although it is past the budget"
+    );
+    running
+        .disk
+        .observed(first, &mut running.engine, &mut running.store)
+        .unwrap();
+    assert_eq!(running.engine.path_of(NODE), Some(PathBuf::from("d/x")));
 }
 
 /// The user renames a synced file, which has the bytes of a download that stopped before it touched the disk, onto

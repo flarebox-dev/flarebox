@@ -26,7 +26,7 @@ Until someone claims it, a new server has no owner, and the first valid claim ma
 
 1. Open `<your server>/setup` in a browser. It writes a one-time claim code, valid for one hour, to the Worker's log.
 2. In the Cloudflare dashboard, open **Workers & Pages**, select your Worker, open **Observability** and search for `Flarebox claim code`.
-3. Enter the server address and the code in the setup window of the macOS app. That Mac becomes your first device. The `flarebox` command can't claim a server with this code yet; `flarebox setup` deploys and claims a server in one step instead ([Set up](guide/setup.md)).
+3. Claim the server with `flarebox server claim <your server> <code> --user "<your name>"`, or enter the address and the code in the setup window of the macOS app. That device becomes your first device ([Set up](guide/setup.md#without-the-cloudflare-login)).
 
 If the code expired, open `/setup` again for a new one. Someone who found your address cannot see the code, and their wrong guesses do not affect yours.
 
@@ -34,7 +34,12 @@ If the code expired, open `/setup` again for a new one. Someone who found your a
 
 ## If you lose every device
 
-The one recovery path is `flarebox server add-device`, which needs the Cloudflare login ([Devices](guide/devices.md#if-you-lose-every-device)). It sets a one-time recovery key on your Worker, adds the new device to your existing account and deletes the key. Until Flarebox has a public OAuth client, that login works only for the project's test account, so for everyone else there is no way yet to add a device to a server that has none left. No client lets you enter a recovery key by hand.
+`flarebox server add-device` adds a new device for you, with the Cloudflare login and a `flarebox` built with the server bundle ([Devices](guide/devices.md#if-you-lose-every-device)). It sets a one-time recovery key on your Worker, adds the device to your existing account and deletes the key. Until Flarebox has a public OAuth client, that login works only for the project's test account. Without it, do the same steps by hand, as long as you can still change the Worker's settings:
+
+1. Make a long random key, for example with `openssl rand -hex 32`. It must be at least 32 characters.
+2. In the dashboard, open your Worker's **Settings**. Under **Variables and Secrets**, select **Add**, choose the type **Secret**, name it `FLAREBOX_RECOVERY_KEY` with that value, and select **Deploy** ([Secrets](https://developers.cloudflare.com/workers/configuration/secrets/)). Or, in `server/`, run `pnpm exec wrangler secret put FLAREBOX_RECOVERY_KEY --name <your Worker>`; without `--name`, Wrangler uses the name in `wrangler.jsonc`, which is `flarebox` unless you changed it.
+3. On the new device, claim the server with the key instead of a claim code: `flarebox server claim <your server> <key> --user "<your name>"`. The device joins your existing account, which keeps its name. A new secret can take a moment to reach the server: if the claim says the deployment already has an owner right after you set the key, wait a minute and run it again.
+4. Delete the secret. Each key works once; set a new one to recover again.
 
 Recovery does not sign out your other devices. If a lost device may be in someone else's hands, it keeps working until you revoke it with `flarebox device revoke` ([Devices](guide/devices.md#revoke-a-device)).
 

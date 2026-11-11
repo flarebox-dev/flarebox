@@ -46,24 +46,44 @@ Until the public client exists, deploy the server and claim it without `flarebox
 
 1. Deploy the server with the deploy button or with `pnpm run deploy` in `server/`, as [Deploying and upgrading a Flarebox server](../deploy.md#deploy) describes.
 2. Open `<your server>/setup` in a browser. The server writes a one-time claim code, valid for one hour, to the Worker's log. In the Cloudflare dashboard, open your Worker, then Observability, and search for `Flarebox claim code`.
-3. Claim the server in the macOS app: enter the server's address and the claim code in its setup window. The app is not published yet, so build it as [apps/macos/README.md](../../apps/macos/README.md) describes.
-4. Add the machines that use the command with a pairing code from the app, as the next section describes.
+3. Claim the server with this device, which becomes your first device:
+
+   ```sh
+   flarebox server claim flarebox.alice.workers.dev ABCD-EFGH-JKLM --user "Alice Park"
+   ```
+
+   Give the server's address, the claim code and your name. The device takes this machine's host name; give it another with `--name`. A server that already has an owner refuses the claim code.
+4. Add your other machines with a pairing code, as the next section describes.
 
 ## Add another device
 
-On a device that is already signed in to the macOS app, open Settings, choose Account and click Add a Device. The app shows a pairing code, which works once and for 10 minutes. On the new machine run:
+On a device that is already signed in, run:
 
 ```sh
-flarebox join K7QM-2XPD@flarebox.alice.workers.dev
+flarebox device add
 ```
+
+It prints a pairing code, which works once and for 10 minutes, as the command to run on the new machine:
+
+```
+On the new device, run:
+  flarebox join K7QM-2XPD@flarebox.alice.workers.dev
+The code works once, for about 10 minutes.
+```
+
+In the macOS app, Settings, Account, Add a Device shows the same kind of code.
 
 A code written as `<code>@<host>` carries the server's address. For a code without it, add the address with `--server https://flarebox.alice.workers.dev`. `flarebox setup <code>` does the same as `flarebox join`.
 
-The command can't create a pairing code yet. With the Cloudflare login, `flarebox server add-device` adds a device without one.
+With the Cloudflare login, `flarebox server add-device` adds a device without a code.
 
 ## Create a space
 
-The command can't create a space yet. The macOS app creates one during its setup, named Flarebox unless you change it. `flarebox usage` lists the spaces of your server. Then [link a folder](folders.md#link-a-folder) to one.
+```sh
+flarebox space create Photos
+```
+
+This prints the new space's ID. Each of your spaces needs its own name, because `flarebox link --space` finds a space by its name: the server refuses a name you already use. Names are compared exactly after leading and trailing whitespace is removed, so `Photos` and `photos` are two names. `flarebox space list` lists your spaces with their IDs, and `--json` prints the same. Then [link a folder](folders.md#link-a-folder) to a space.
 
 ## Upgrade the server
 

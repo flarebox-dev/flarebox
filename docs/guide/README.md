@@ -5,11 +5,10 @@ Flarebox keeps folders in sync between your computers through a server that you 
 This guide covers the `flarebox` command on macOS and Linux, version 0.1.0.
 
 > [!IMPORTANT]
-> 0.1.0 is not released yet, and three parts of the setup are still missing:
+> 0.1.0 is not released yet, and two parts of the setup are still missing:
 >
 > - There is no packaged release. You [build the command from source](install.md).
-> - The Cloudflare login that `flarebox setup` uses needs Flarebox's public OAuth client, which doesn't exist yet. Until it does, only members of the project's own test account can log in. Everyone else deploys the server with the deploy button and claims it in the macOS app, as [Set up](setup.md#without-the-cloudflare-login) describes.
-> - The command can't create a space yet. You create spaces in the macOS app.
+> - The Cloudflare login that `flarebox setup` uses needs Flarebox's public OAuth client, which doesn't exist yet. Until it does, only members of the project's own test account can log in. Everyone else deploys the server with the deploy button and claims it with `flarebox server claim`, as [Set up](setup.md#without-the-cloudflare-login) describes.
 
 ## Words this guide uses
 
@@ -21,11 +20,11 @@ This guide covers the `flarebox` command on macOS and Linux, version 0.1.0.
 ## Pages
 
 1. [Install](install.md): build the command and run the sync daemon.
-2. [Set up](setup.md): deploy a server, add devices and upgrade the server.
+2. [Set up](setup.md): deploy a server, add devices, create spaces and upgrade the server.
 3. [Folders](folders.md): link a folder, choose what syncs with `.fbignore`, and what Flarebox doesn't sync.
 4. [Conflicts](conflicts.md): what happens when two devices change the same file.
 5. [Trash, versions and restore](history.md): get back a deleted file or an earlier version.
-6. [Status and problems](status.md): read `flarebox status`, wait out a quota and restart a folder.
+6. [Status and problems](status.md): read `flarebox status`, wait out a quota, restart a folder and send refused changes again.
 7. [Devices](devices.md): list and revoke devices, and get back in after losing every device.
 8. [Limits](limits.md): what the Workers Free plan allows, and Flarebox's own limits.
 9. [Uninstall](uninstall.md): remove a device, or remove everything.

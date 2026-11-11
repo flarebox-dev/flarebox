@@ -20,7 +20,7 @@ A revoked device can't sync any more. To use that machine again, remove Flarebox
 
 ## If you lose every device
 
-Your files stay on the server. Add a new device with:
+Your files stay on the server. Add a new device with a `flarebox` [built with the server inside it](install.md#build):
 
 ```sh
 flarebox server add-device
@@ -29,4 +29,4 @@ flarebox server add-device
 You log in with the Cloudflare account that holds the server. That proves you own the server, so Flarebox needs no other device. It sets a one-time recovery key on the Worker, adds this machine as a new device of your account, and deletes the key again. Then revoke the lost devices with `flarebox device revoke`, since recovery doesn't sign them out.
 
 > [!WARNING]
-> This needs the Cloudflare login, which isn't available outside the project's test account yet (see [Set up](setup.md#with-flarebox-setup)). Until then, no Flarebox client can add a device to a server that has no signed-in device left. Keep at least two devices signed in.
+> This needs the Cloudflare login, which isn't available outside the project's test account yet (see [Set up](setup.md#with-flarebox-setup)). Until then, set a recovery key on the Worker yourself and claim the server with it, as [If you lose every device](../deploy.md#if-you-lose-every-device) in the deploy guide describes.

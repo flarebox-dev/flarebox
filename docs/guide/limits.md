@@ -41,3 +41,7 @@ R2 holds the contents of your files, of the files in each space's trash and of o
 | Trash and old versions | kept for 30 days |
 | Pairing code | works once, for 10 minutes |
 | Claim code | works for one hour |
+
+## Known issues
+
+A file with a hard link inside an ignored folder may not have its moves synced (GUN-368).

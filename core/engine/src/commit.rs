@@ -611,7 +611,9 @@ impl Commits {
     /// Makes the waiting S updates that fit now, together with S := ⊥ for the `needed` nodes the
     /// keep rule could not clear yet and the `agreed` updates of the rebase, which may depend on
     /// each other. Returns the needed nodes still not cleared; agreed updates that do not fit are
-    /// dropped, since the next rebase finds them again.
+    /// dropped, since the next rebase finds them again. A needed node whose own update waited
+    /// keeps that update waiting, so it is made once it fits, also after the keep rule no longer
+    /// needs the node.
     fn retry_waiting(
         &mut self,
         trees: &mut Trees,
@@ -623,6 +625,7 @@ impl Commits {
             .into_iter()
             .filter_map(|(id, shape)| Some((id.clone(), outstanding(trees, &id, shape)?)))
             .collect();
+        let waited: BTreeMap<NodeId, Option<Shape>> = waiting.iter().cloned().collect();
         let updates = waiting
             .into_iter()
             .chain(needed.iter().map(|id| (id.clone(), None)))
@@ -631,6 +634,9 @@ impl Commits {
         let mut still = BTreeSet::new();
         for (id, shape) in update_synced(trees, updates) {
             if needed.contains(&id) {
+                if let Some(waited) = waited.get(&id) {
+                    trees.wait(id.clone(), waited.clone());
+                }
                 still.insert(id);
             } else if !agreed.iter().any(|(other, _)| *other == id) {
                 trees.wait(id, shape);
@@ -1025,12 +1031,15 @@ fn keep(trees: &mut Trees, id: &str, needed: &mut BTreeSet<NodeId>) {
 /// hold the node, so L's and R's positions are compared with the S they came from, as for any
 /// change both sides made. Its content stays, so the acknowledged content remains the base L's
 /// content is compared with. None when nothing is left: the update comes to what S holds, or
-/// neither L nor R holds the node.
+/// neither L nor R holds the node. A removal of a node S still holds stays even then when what S
+/// holds under it leaves S with L's next commits ([`leaves_s`]), so that R taking the node back
+/// meanwhile does not read as L removing it.
 fn outstanding(trees: &Trees, id: &str, waiting: Option<Shape>) -> Option<Option<Shape>> {
     let local = trees.local().get(id).map(|node| &node.shape);
     let synced = trees.synced().live(id);
     let Some(remote) = trees.remote().live(id) else {
-        return local.is_some().then_some(waiting);
+        let removal = waiting.is_none() && synced.is_some() && leaves_s(trees, id);
+        return (local.is_some() || removal).then_some(waiting);
     };
     let Some(mut left) = waiting else {
         return Some(None);
@@ -1041,6 +1050,24 @@ fn outstanding(trees: &Trees, id: &str, waiting: Option<Shape>) -> Option<Option
         left.name = base.name.clone();
     }
     (synced != Some(&left)).then_some(Some(left))
+}
+
+/// Whether everything S holds under `id` leaves S with L's commits: each node L holds there is
+/// elsewhere in L, and each one L does not hold leaves with what S holds under it in turn. A node
+/// L still holds where S has it, such as one parked under a folder the disk removed, keeps `id`
+/// in S.
+fn leaves_s(trees: &Trees, id: &str) -> bool {
+    let mut below = vec![id];
+    while let Some(parent) = below.pop() {
+        for child in trees.synced_children(parent) {
+            match trees.local().get(child) {
+                Some(node) if node.shape.parent == *parent => return false,
+                Some(_) => {}
+                None => below.push(child),
+            }
+        }
+    }
+    true
 }
 
 /// The bytes a change record of a node with this shape takes, roughly.
