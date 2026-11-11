@@ -50,6 +50,9 @@ pub struct TreesState {
     /// The nodes whose local copy is in an ignored folder and whose name in L another entry took, each with the
     /// identity L held for it. L holds none of them, and R holds each live.
     pub displaced: BTreeMap<NodeId, FileIdentity>,
+    /// The files whose content an edit of this device set, each with the seq of its commit, while
+    /// R holds that content.
+    pub edited_here: BTreeMap<NodeId, u64>,
 }
 
 /// What [`Commits`](crate::commit::Commits) holds.
@@ -115,6 +118,9 @@ pub enum StateError {
     NotIgnoredLocal(NodeId),
     /// A node is recorded as displaced, but L holds it or R does not hold it live.
     NotDisplaced(NodeId),
+    /// A file is recorded as edited by this device, but R does not hold the content of that
+    /// commit.
+    NotEditedHere(NodeId),
     /// The commit in flight does not take the slot after the accepted counter.
     DeviceSeq { accepted: u64, device_seq: u64 },
     /// The result of the commit in flight does not have one outcome per op.

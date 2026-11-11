@@ -82,6 +82,7 @@ fn migrations_apply_from_empty() {
             "commit_slots",
             "commit_state",
             "discarded_nodes",
+            "edited_here",
             "effect_state",
             "engine_state",
             "failed_effects",
@@ -407,6 +408,7 @@ fn engine_state() -> EngineState {
                     birth_ns: Some(-1),
                 },
             )]),
+            edited_here: BTreeMap::from([("e".into(), 6)]),
         },
         commits: CommitsState {
             accepted: 4,
@@ -565,7 +567,7 @@ fn engine_state_survives_a_reopen() {
 }
 
 /// The tables of the engine state besides the nodes of R, L and S.
-const ENGINE_TABLES: [&str; 20] = [
+const ENGINE_TABLES: [&str; 21] = [
     "node_sets",
     "node_maps",
     "waiting_updates",
@@ -577,6 +579,7 @@ const ENGINE_TABLES: [&str; 20] = [
     "trashed_here",
     "recorded_nodes",
     "commit_slots",
+    "edited_here",
     "effect_state",
     "failed_effects",
     "restore_intents",
@@ -868,7 +871,8 @@ fn a_cursor_stored_before_it_could_record_a_server_behind_it_records_none() {
          DROP TABLE open_question_items;
          DROP TABLE open_questions; DROP TABLE guard_ledger;
          DROP TABLE guard_confirmed_members; DROP TABLE guard_confirmed;
-         DROP TABLE trashed_here; DROP TABLE commit_slots; DROP TABLE watched_contents;
+         DROP TABLE edited_here; DROP TABLE trashed_here; DROP TABLE commit_slots;
+         DROP TABLE watched_contents;
          ALTER TABLE remote_cursor DROP COLUMN ahead_of_server;",
     )
     .unwrap();
@@ -905,7 +909,8 @@ fn a_store_from_before_contents_were_watched_opens_with_nothing_watched() {
          DROP TABLE open_question_items;
          DROP TABLE open_questions; DROP TABLE guard_ledger;
          DROP TABLE guard_confirmed_members; DROP TABLE guard_confirmed;
-         DROP TABLE trashed_here; DROP TABLE commit_slots; DROP TABLE watched_contents;",
+         DROP TABLE edited_here; DROP TABLE trashed_here; DROP TABLE commit_slots;
+         DROP TABLE watched_contents;",
     )
     .unwrap();
     conn.pragma_update(None, "user_version", 5).unwrap();
@@ -916,11 +921,35 @@ fn a_store_from_before_contents_were_watched_opens_with_nothing_watched() {
     before.trees.watched.clear();
     before.trees.trashed_here.clear();
     before.trees.discarded.clear();
+    before.trees.edited_here.clear();
     before.commits.slots.clear();
     before.commits.questions.clear();
     before.commits.guard = GuardState::default();
     before.trees.outside.clear();
     before.trees.displaced.clear();
+    assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
+}
+
+/// A database of the schema before the edits of this device are recorded keeps its engine state,
+/// with no edit recorded.
+#[test]
+fn a_store_from_before_edits_were_recorded_opens_with_none_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let mut before = engine_state();
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| tx.set_engine_state(&before))
+        .unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("DROP TABLE edited_here;").unwrap();
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+        .unwrap();
+    drop(conn);
+
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    before.trees.edited_here.clear();
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
 }
 
@@ -942,7 +971,7 @@ fn a_store_from_before_deletes_were_recorded_opens_with_none_recorded() {
          DROP TABLE open_question_items;
          DROP TABLE open_questions; DROP TABLE guard_ledger;
          DROP TABLE guard_confirmed_members; DROP TABLE guard_confirmed;
-         DROP TABLE trashed_here; DROP TABLE commit_slots;",
+         DROP TABLE edited_here; DROP TABLE trashed_here; DROP TABLE commit_slots;",
     )
     .unwrap();
     conn.pragma_update(None, "user_version", 6).unwrap();
@@ -952,6 +981,7 @@ fn a_store_from_before_deletes_were_recorded_opens_with_none_recorded() {
     assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
     before.trees.trashed_here.clear();
     before.trees.discarded.clear();
+    before.trees.edited_here.clear();
     before.commits.slots.clear();
     before.commits.questions.clear();
     before.commits.guard = GuardState::default();
@@ -977,7 +1007,8 @@ fn a_store_from_before_the_guard_opens_with_an_empty_guard() {
          DROP TABLE discarded_nodes; DROP TABLE open_question_members;
          DROP TABLE open_question_items;
          DROP TABLE open_questions; DROP TABLE guard_ledger;
-         DROP TABLE guard_confirmed_members; DROP TABLE guard_confirmed;",
+         DROP TABLE guard_confirmed_members; DROP TABLE guard_confirmed;
+         DROP TABLE edited_here;",
     )
     .unwrap();
     conn.pragma_update(None, "user_version", 7).unwrap();
@@ -988,6 +1019,7 @@ fn a_store_from_before_the_guard_opens_with_an_empty_guard() {
     before.trees.discarded.clear();
     before.trees.outside.clear();
     before.trees.displaced.clear();
+    before.trees.edited_here.clear();
     before.commits.questions.clear();
     before.commits.guard = GuardState::default();
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
@@ -1006,6 +1038,7 @@ fn a_store_from_before_questions_showed_local_shapes_keeps_its_questions() {
     before.trees.discarded.clear();
     before.trees.outside.clear();
     before.trees.displaced.clear();
+    before.trees.edited_here.clear();
     Store::open(&path)
         .unwrap()
         .transaction(|tx| tx.set_engine_state(&before))
@@ -1013,7 +1046,7 @@ fn a_store_from_before_questions_showed_local_shapes_keeps_its_questions() {
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
         "DROP TABLE recorded_nodes; DROP TABLE open_question_shapes;
-         DROP TABLE discarded_nodes;",
+         DROP TABLE discarded_nodes; DROP TABLE edited_here;",
     )
     .unwrap();
     conn.pragma_update(None, "user_version", 8).unwrap();
@@ -1036,9 +1069,9 @@ fn a_store_from_before_nodes_in_ignored_folders_were_stored_opens_with_none_reco
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("DROP TABLE recorded_nodes;").unwrap();
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+    conn.execute_batch("DROP TABLE recorded_nodes; DROP TABLE edited_here;")
         .unwrap();
+    conn.pragma_update(None, "user_version", 9).unwrap();
     drop(conn);
 
     let mut store = Store::open(&path).unwrap();
@@ -1046,6 +1079,7 @@ fn a_store_from_before_nodes_in_ignored_folders_were_stored_opens_with_none_reco
     let after = before.clone();
     before.trees.outside.clear();
     before.trees.displaced.clear();
+    before.trees.edited_here.clear();
     assert!(!after.trees.outside.is_empty() && !after.trees.displaced.is_empty());
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
     store
@@ -1067,6 +1101,7 @@ fn a_version_3_store_opens_with_empty_restore_tables() {
     before.trees.watched.clear();
     before.trees.trashed_here.clear();
     before.trees.discarded.clear();
+    before.trees.edited_here.clear();
     before.commits.slots.clear();
     before.commits.restores.clear();
     before.commits.resolved.clear();
@@ -1086,7 +1121,8 @@ fn a_version_3_store_opens_with_empty_restore_tables() {
          DROP TABLE open_question_items;
          DROP TABLE open_questions; DROP TABLE guard_ledger;
          DROP TABLE guard_confirmed_members; DROP TABLE guard_confirmed;
-         DROP TABLE watched_contents; DROP TABLE trashed_here; DROP TABLE commit_slots;
+         DROP TABLE watched_contents; DROP TABLE edited_here; DROP TABLE trashed_here;
+         DROP TABLE commit_slots;
          ALTER TABLE remote_cursor DROP COLUMN ahead_of_server;",
     )
     .unwrap();

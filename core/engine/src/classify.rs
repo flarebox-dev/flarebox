@@ -160,6 +160,9 @@ pub struct Trees {
     trashed_here: BTreeMap<NodeId, u64>,
     /// See [`TreesState::discarded`].
     discarded: BTreeSet<NodeId>,
+    /// The files whose content an edit of this device set, each with the seq of its commit, while
+    /// R holds that content.
+    edited_here: BTreeMap<NodeId, u64>,
     ignore: Matcher,
     /// Nodes whose local copy the user moved into an ignored folder that is no node. L keeps the
     /// entry each had before the move.
@@ -223,6 +226,7 @@ impl Trees {
             watched: BTreeMap::new(),
             trashed_here: BTreeMap::new(),
             discarded: BTreeSet::new(),
+            edited_here: BTreeMap::new(),
             ignore: Matcher::new(LocalRules::default()),
             outside: BTreeSet::new(),
             displaced: BTreeMap::new(),
@@ -308,6 +312,9 @@ impl Trees {
         if node.trashed {
             self.displaced.remove(&id);
         }
+        if (self.edited_here.get(&id)).is_some_and(|&seq| node.trashed || node.content_rev != seq) {
+            self.edited_here.remove(&id);
+        }
         if node.is_live() && node.shape.kind == Kind::File && is_rules_file(&node.shape.name) {
             self.remote_rules_files.insert(id.clone());
         } else {
@@ -320,6 +327,7 @@ impl Trees {
         self.remote_rules_files.remove(id);
         self.trashed_here.remove(id);
         self.displaced.remove(id);
+        self.edited_here.remove(id);
         if self.r.remove(id).is_some() {
             self.mark(id);
         }
@@ -743,6 +751,27 @@ impl Trees {
         }
     }
 
+    /// Records that an edit of this device, in the commit at `seq`, set the content of `id`, if R
+    /// holds the content of that commit.
+    pub fn record_edited(&mut self, id: &str, seq: u64) {
+        if (self.r.get(id)).is_some_and(|remote| !remote.trashed && remote.content_rev == seq) {
+            self.edited_here.insert(id.to_owned(), seq);
+        }
+    }
+
+    /// The files whose content an edit of this device set, and whose content S and R still hold,
+    /// for [`Trees::forget_lost`] once a bootstrap has replaced R.
+    pub fn edited_here(&self) -> Vec<NodeId> {
+        (self.edited_here.keys())
+            .filter(|id| {
+                let content = |shape: Option<&Shape>| shape.and_then(|shape| shape.content.clone());
+                let remote = content(self.r.live(id));
+                remote.is_some() && remote == content(self.s.live(id))
+            })
+            .cloned()
+            .collect()
+    }
+
     /// The nodes a delete of this device trashed and R still holds trashed by it, for
     /// [`Trees::forget_lost`] once a bootstrap has replaced R.
     pub fn trashed_here(&self) -> Vec<Trashed> {
@@ -774,8 +803,14 @@ impl Trees {
     /// for it, parents first, so the delete is sent again. Any other node of it is downloaded again,
     /// since a restore or another change after the loss can take a seq the lost commits had.
     ///
+    /// `edited` lists the files whose content an edit of this device set before the bootstrap
+    /// ([`Trees::edited_here`]). A file of it that R now holds live at the position S holds, with
+    /// content of no revision above `held_through`, lost the edit. S takes R's shape for it, so
+    /// the content L holds is sent again as an edit instead of being kept beside R's as a conflict
+    /// copy.
+    ///
     /// [`Commits::held_through`]: crate::commit::Commits::held_through
-    pub fn forget_lost(&mut self, trashed: Vec<Trashed>, held_through: u64) {
+    pub fn forget_lost(&mut self, trashed: Vec<Trashed>, edited: Vec<NodeId>, held_through: u64) {
         let mut deletes: Vec<(NodeId, Shape)> = (trashed.into_iter())
             .filter(|deleted| {
                 self.l.get(&deleted.id).is_none() && self.s.get(&deleted.id).is_none()
@@ -793,6 +828,16 @@ impl Trees {
         }) {
             let (id, shape) = deletes.swap_remove(at);
             self.set_synced(id, Some(shape));
+        }
+        for id in edited {
+            let Some(remote) = (self.r.get(&id))
+                .filter(|remote| !remote.trashed && remote.content_rev <= held_through)
+                .filter(|remote| (self.s.live(&id)).is_some_and(|s| s.same_position(&remote.shape)))
+                .map(|remote| remote.shape.clone())
+            else {
+                continue;
+            };
+            self.set_synced_if_valid(id, Some(remote));
         }
         let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for (id, shape) in self.s.iter() {
@@ -1280,6 +1325,7 @@ impl Trees {
             discarded: self.discarded.clone(),
             outside: self.outside.clone(),
             displaced: self.displaced.clone(),
+            edited_here: self.edited_here.clone(),
         }
     }
 
@@ -1324,6 +1370,12 @@ impl Trees {
         if let Some(id) = state.displaced.keys().find(|id| !kept(id)) {
             return Err(StateError::NotDisplaced(id.clone()));
         }
+        let edited = |(id, seq): &(&NodeId, &u64)| {
+            (self.r.get(id)).is_some_and(|remote| !remote.trashed && remote.content_rev == **seq)
+        };
+        if let Some((id, _)) = state.edited_here.iter().find(|entry| !edited(entry)) {
+            return Err(StateError::NotEditedHere(id.clone()));
+        }
         let TreesState {
             dirty,
             unsearched,
@@ -1335,6 +1387,7 @@ impl Trees {
             discarded,
             outside,
             displaced,
+            edited_here,
         } = state;
         self.unsettled = dirty.clone();
         self.same.clear();
@@ -1349,6 +1402,7 @@ impl Trees {
         self.discarded = discarded;
         self.outside = outside;
         self.displaced = displaced;
+        self.edited_here = edited_here;
         self.rules_known = false;
         self.unknown_rules.clear();
         Ok(())

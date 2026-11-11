@@ -79,6 +79,7 @@ fn trees_state() -> TreesState {
         discarded: ["a".into()].into(),
         outside: ["a".into()].into(),
         displaced: Default::default(),
+        edited_here: [("a".into(), 1)].into(),
     }
 }
 
@@ -315,6 +316,22 @@ fn trees_restore_a_valid_state_and_refuse_each_broken_one() {
                 state.displaced.insert("t".into(), held);
             }),
             StateError::NotDisplaced("t".into()),
+        ),
+        (
+            "a file edited here that R holds trashed",
+            trees(),
+            broken(trees_state(), |state| {
+                state.edited_here.insert("t".into(), 1);
+            }),
+            StateError::NotEditedHere("t".into()),
+        ),
+        (
+            "a file edited here whose content R holds from another commit",
+            trees(),
+            broken(trees_state(), |state| {
+                state.edited_here.insert("a".into(), 2);
+            }),
+            StateError::NotEditedHere("a".into()),
         ),
     ];
     for (name, mut trees, state, error) in cases {
