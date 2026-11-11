@@ -3874,3 +3874,54 @@ fn a_late_move_acknowledgement_takes_the_sent_position_when_another_node_took_th
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert_eq!(ops(&commit), [mv("n", ROOT, "a")]);
 }
+
+/// GUN-453. One commit moves n to b and m to c. Before the acknowledgement, the user and the other
+/// device both move n to c, which the commit gives to m, and the other device moves n on to x. The
+/// user moves n back to a. S cannot hold both n and m at c, so n takes the b that was sent, and the
+/// user's move back to a is sent rather than the disk following n to x.
+#[test]
+fn a_late_move_acknowledgement_takes_the_sent_position_when_the_commit_gives_the_agreed_one_away() {
+    let mut trees = trees(&[
+        (
+            "n",
+            Some(file(ROOT, "b", 1)),
+            Some(file(ROOT, "a", 1)),
+            Some(remote(file(ROOT, "a", 1))),
+        ),
+        (
+            "m",
+            Some(file(ROOT, "c", 2)),
+            Some(file(ROOT, "z", 2)),
+            Some(remote(file(ROOT, "z", 2))),
+        ),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    let sent = ops(&commit);
+    assert!(
+        sent.contains(&mv("n", ROOT, "b")) && sent.contains(&mv("m", ROOT, "c")),
+        "{sent:?}"
+    );
+    trees.set_remote("n".into(), remote_at(file(ROOT, "b", 1), 2));
+    trees.set_remote("m".into(), remote_at(file(ROOT, "c", 2), 2));
+    trees.set_local("m".into(), local(file(ROOT, "w", 2), 2));
+    trees.set_remote("m".into(), remote_at(file(ROOT, "v", 2), 3));
+    trees.set_local("n".into(), local(file(ROOT, "c", 1), 1));
+    trees.set_remote("n".into(), remote_at(file(ROOT, "c", 1), 4));
+    trees.set_remote("n".into(), remote_at(file(ROOT, "x", 1), 5));
+    trees.set_local("n".into(), local(file(ROOT, "a", 1), 1));
+    trees.settle();
+    let applied = sent
+        .iter()
+        .map(|_| outcome(op_result::Code::Applied))
+        .collect();
+    commits.received(result(2, applied)).unwrap();
+    assert!(commits.acknowledge(&mut trees, 5));
+    trees.settle();
+    assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "b", 1)));
+    assert_eq!(effects_for(&mut trees, &mut ids, "n"), []);
+    assert_eq!(trees.local().live("n"), Some(&file(ROOT, "a", 1)));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    let sent = ops(&commit);
+    assert!(sent.contains(&mv("n", ROOT, "a")), "{sent:?}");
+}
