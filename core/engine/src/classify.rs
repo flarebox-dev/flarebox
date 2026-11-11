@@ -899,8 +899,17 @@ impl Trees {
     /// the trash stays, and so does one for a node the person discarded on a first link, which no
     /// commit sent.
     ///
+    /// The positions L and R agreed on while the commit in flight was watched
+    /// ([`Trees::position_after`]) are recorded again from the new R, since the server may have
+    /// lost the records that held them. The nodes stay watched.
+    ///
     /// [`Commits::held_through`]: crate::commit::Commits::held_through
     pub fn forget_lost(&mut self, trashed: Vec<Trashed>, edited: Vec<NodeId>, held_through: u64) {
+        let watched: Vec<NodeId> = self.watched_positions.keys().cloned().collect();
+        for id in watched {
+            self.watched_positions.insert(id.clone(), None);
+            self.note_position(&id);
+        }
         let mut deletes: Vec<(NodeId, Shape)> = (trashed.into_iter())
             .filter(|deleted| {
                 self.l.get(&deleted.id).is_none() && self.s.get(&deleted.id).is_none()
