@@ -458,6 +458,63 @@ fn a_folder_renamed_to_the_name_a_file_left_for_a_new_folder_keeps_the_file() {
     assert_eq!(files(&site_a.root), both);
 }
 
+/// Device b swaps the file `a` and the folder `b` through a third name before its observer looks. The scan reports
+/// two renames that each take the other's name. The folder keeps its child, and the file keeps its bytes, under the
+/// name the server gives one side of a name swap (design §2.6).
+#[test]
+fn a_file_and_a_folder_swapped_in_one_batch_keep_the_folders_child() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("a"), b"file A");
+    fs::create_dir(site_a.root.join("b")).unwrap();
+    a.create(
+        &mut remote,
+        &site_a.root.join("b/child"),
+        b"directory child",
+    );
+    let (site, mut b) = linked(&mut remote, "b");
+    b.settle();
+    fs::rename(site.root.join("a"), site.root.join("tmp")).unwrap();
+    fs::rename(site.root.join("b"), site.root.join("a")).unwrap();
+    fs::rename(site.root.join("tmp"), site.root.join("b")).unwrap();
+    sync(&mut remote, (&site_a, &mut a), (&site, &mut b));
+    let both = files(&site_a.root);
+    assert_eq!(files(&site.root), both);
+    assert!(both.contains(&("a/child".to_owned(), "directory child".to_owned())));
+    assert_eq!(both.iter().filter(|(_, text)| text == "file A").count(), 1);
+}
+
+/// Device b swaps two files, and two folders with a file each, through a third name before its observer looks.
+/// Every file keeps its bytes at its new path on both devices.
+#[test]
+fn files_and_folders_swapped_in_one_batch_keep_every_byte() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("one"), b"first file");
+    a.create(&mut remote, &site_a.root.join("two"), b"second file");
+    fs::create_dir(site_a.root.join("x")).unwrap();
+    a.create(&mut remote, &site_a.root.join("x/in-x"), b"in x");
+    fs::create_dir(site_a.root.join("y")).unwrap();
+    a.create(&mut remote, &site_a.root.join("y/in-y"), b"in y");
+    let (site, mut b) = linked(&mut remote, "b");
+    b.settle();
+    for (first, second) in [("one", "two"), ("x", "y")] {
+        fs::rename(site.root.join(first), site.root.join("tmp")).unwrap();
+        fs::rename(site.root.join(second), site.root.join(first)).unwrap();
+        fs::rename(site.root.join("tmp"), site.root.join(second)).unwrap();
+    }
+    sync(&mut remote, (&site_a, &mut a), (&site, &mut b));
+    let swapped = [
+        ("one", "second file"),
+        ("two", "first file"),
+        ("x/in-y", "in y"),
+        ("y/in-x", "in x"),
+    ]
+    .map(|(path, text)| (path.to_owned(), text.to_owned()));
+    assert_eq!(files(&site_a.root), swapped);
+    assert_eq!(files(&site.root), swapped);
+}
+
 /// Device b holds an untracked symlink at e. The server moves d to e and creates another file at d.
 /// The move fails because e is taken, but d is parked out of the way, so the new file arrives at d
 /// and the symlink stays.

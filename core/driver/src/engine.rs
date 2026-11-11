@@ -382,7 +382,9 @@ impl Engine {
     /// (`Removed::path`, `Renamed::from`) are resolved before any change applies. The changes apply in batch order,
     /// except that a change waits for the change of the batch that creates or moves its folder into place, and for
     /// the rename that moves the entry at its path away. A scan lists renames before creations, so otherwise a file
-    /// moved into a new folder would find no folder. A cycle of such waits applies in batch order. A renamed or
+    /// moved into a new folder would find no folder. A cycle of such waits, as in a swap, applies in batch order, and
+    /// a node whose rename is still to come is set aside while another entry takes its name, with what is under it,
+    /// until its own rename places it. A renamed or
     /// modified entry is the node L holds at its path with its identity, else the node with its identity, else the
     /// node at its path. A
     /// created entry with the identity of a node L holds is that node, wherever L had it. So is a created entry with
@@ -483,8 +485,24 @@ impl Engine {
         }
         let mut touched = BTreeSet::new();
         let mut gone = Gone::new();
+        let mut parked = Vec::new();
         for at in order {
             let (change, before) = (&changes[at], before[at].take());
+            if let Observed::Created { path, .. } | Observed::Renamed { to: path, .. } = change
+                && let Some(holder) = local_at(&self.trees, path)
+                && moving.contains(&holder)
+                && before.as_ref() != Some(&holder)
+                && let Some(node) = self.trees.local().get(&holder).cloned()
+            {
+                self.trees.set_local(
+                    holder.clone(),
+                    LocalNode {
+                        parked: true,
+                        ..node
+                    },
+                );
+                parked.push(holder);
+            }
             match change {
                 Observed::Removed { .. } => {
                     if let Some(id) = before {
@@ -578,6 +596,11 @@ impl Engine {
                         &mut gone,
                     );
                 }
+            }
+        }
+        for id in parked {
+            if self.trees.local().get(&id).is_some_and(|node| node.parked) {
+                self.remove(&id, &moving, false, &mut touched, &mut gone);
             }
         }
         for id in &moving {
