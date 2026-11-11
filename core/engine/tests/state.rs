@@ -104,6 +104,7 @@ fn commits_state() -> CommitsState {
                 ..Default::default()
             },
             deletes: [("d".into(), vec!["d".into(), "e".into()])].into(),
+            bases: [("u".into(), None)].into(),
             result: Some(CommitResult {
                 results: vec![OpResult::default(); 3],
                 ..Default::default()

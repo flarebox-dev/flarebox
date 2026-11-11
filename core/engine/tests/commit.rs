@@ -2356,3 +2356,84 @@ fn a_waiting_folder_the_user_deleted_is_brought_back_for_a_remote_move_into_it()
     let h = trees.local().get("h").unwrap();
     assert_eq!((&h.shape, h.parked), (&file("d", "h", 9), false));
 }
+
+/// GUN-375. n's edit to 1 is in flight when the user and the other device both write 2, so S
+/// takes 2. The user writes 1 again before the commit is acknowledged, and the other device then
+/// writes 3. S keeps 2, which it took after the commit was built, so the user's 1 is an edit of
+/// its own and is kept beside the other device's 3. With `restart`, the commit side is restored
+/// from its stored state between the send and the acknowledgement.
+fn a_late_acknowledgement_keeps_the_content_s_took_since(restart: bool) {
+    let mut trees = trees(&[(
+        "n",
+        Some(file(ROOT, "a", 1)),
+        Some(file(ROOT, "a", 0)),
+        Some(remote(file(ROOT, "a", 0))),
+    )]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("n", 1)]);
+    trees.set_local("n".into(), local(file(ROOT, "a", 2), 1));
+    trees.set_remote("n".into(), remote(file(ROOT, "a", 2)));
+    trees.settle();
+    assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "a", 2)));
+    trees.set_local("n".into(), local(file(ROOT, "a", 1), 1));
+    if restart {
+        commits = Commits::from_state(commits.state()).unwrap();
+    }
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "a", 2)));
+    trees.set_remote("n".into(), remote(file(ROOT, "a", 3)));
+    trees.settle();
+    assert_eq!(effects_for(&mut trees, &mut ids, "n"), []);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(
+        matches!(&ops(&commit)[..], [op::Op::CreateFile(copy)] if copy.content == Some(content(1))),
+        "{:?}",
+        ops(&commit)
+    );
+}
+
+#[test]
+fn a_late_acknowledgement_keeps_the_content_s_took_after_the_commit_was_built() {
+    a_late_acknowledgement_keeps_the_content_s_took_since(false);
+}
+
+#[test]
+fn a_late_acknowledgement_after_a_restart_keeps_the_content_s_took_after_the_commit_was_built() {
+    a_late_acknowledgement_keeps_the_content_s_took_since(true);
+}
+
+/// n's edit to 1 is in flight when the other device writes 0 again. S never took anything after
+/// the commit was built, so it takes the 1 that was sent, and the other device's 0 is downloaded.
+#[test]
+fn a_late_acknowledgement_takes_what_was_sent_when_the_other_device_reverts_it() {
+    let mut trees = trees(&[(
+        "n",
+        Some(file(ROOT, "a", 1)),
+        Some(file(ROOT, "a", 0)),
+        Some(remote(file(ROOT, "a", 0))),
+    )]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("n", 1)]);
+    trees.set_remote("n".into(), remote(file(ROOT, "a", 1)));
+    trees.set_remote("n".into(), remote(file(ROOT, "a", 0)));
+    trees.settle();
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "a", 1)));
+    let effects = effects_for(&mut trees, &mut ids, "n");
+    assert!(
+        matches!(&effects[..], [Effect::WriteFile { content: written, .. }] if *written == content(0)),
+        "{effects:?}"
+    );
+    assert_eq!(trees.local().live("n"), Some(&file(ROOT, "a", 0)));
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+}

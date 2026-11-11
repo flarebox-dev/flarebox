@@ -75,6 +75,7 @@ fn migrations_apply_from_empty() {
         [
             "chunk_cache",
             "commit_in_flight",
+            "commit_in_flight_bases",
             "commit_in_flight_delete_members",
             "commit_in_flight_deletes",
             "commit_state",
@@ -386,6 +387,16 @@ fn engine_state() -> EngineState {
                     ),
                     ("empty".into(), vec![]),
                 ]),
+                bases: BTreeMap::from([
+                    (
+                        "edited".into(),
+                        Some(Content {
+                            size: 3,
+                            ..Default::default()
+                        }),
+                    ),
+                    ("emptied".into(), None),
+                ]),
                 result: Some(CommitResult {
                     seq: 30,
                     results: vec![applied.clone(), applied.clone(), applied],
@@ -470,7 +481,7 @@ fn engine_state_survives_a_reopen() {
 }
 
 /// The tables of the engine state besides the nodes of R, L and S.
-const ENGINE_TABLES: [&str; 10] = [
+const ENGINE_TABLES: [&str; 11] = [
     "node_sets",
     "node_maps",
     "waiting_updates",
@@ -478,6 +489,7 @@ const ENGINE_TABLES: [&str; 10] = [
     "commit_in_flight",
     "commit_in_flight_deletes",
     "commit_in_flight_delete_members",
+    "commit_in_flight_bases",
     "effect_state",
     "failed_effects",
     "restore_intents",
@@ -655,6 +667,7 @@ fn a_policy_halt_outlasts_a_restart_and_resends_nothing() {
                     ..Default::default()
                 },
                 deletes: BTreeMap::new(),
+                bases: BTreeMap::new(),
                 result: None,
             }),
             halted: Some(halt),
@@ -757,10 +770,12 @@ fn a_cursor_stored_before_it_could_record_a_server_behind_it_records_none() {
         .transaction(|tx| tx.set_cursor(&cursor))
         .unwrap();
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("ALTER TABLE remote_cursor DROP COLUMN ahead_of_server;")
-        .unwrap();
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
-        .unwrap();
+    conn.execute_batch(
+        "DROP TABLE commit_in_flight_bases;
+         ALTER TABLE remote_cursor DROP COLUMN ahead_of_server;",
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 4).unwrap();
     drop(conn);
 
     let mut store = Store::open(&path).unwrap();
@@ -775,6 +790,30 @@ fn a_cursor_stored_before_it_could_record_a_server_behind_it_records_none() {
     );
 }
 
+/// A database of the schema before the commit in flight records the content S held for each of
+/// its content updates keeps its commit in flight, with none recorded.
+#[test]
+fn a_commit_in_flight_stored_before_it_recorded_its_bases_is_kept_without_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let mut before = engine_state();
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| tx.set_engine_state(&before))
+        .unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("DROP TABLE commit_in_flight_bases;")
+        .unwrap();
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+        .unwrap();
+    drop(conn);
+
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    before.commits.in_flight.as_mut().unwrap().bases.clear();
+    assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
+}
+
 /// A database of the schema before restores gains the two restore tables, empty, and keeps the
 /// engine state it held.
 #[test]
@@ -783,6 +822,7 @@ fn a_version_3_store_opens_with_empty_restore_tables() {
     let path = dir.path().join("state.db");
     let mut before = engine_state();
     before.commits.in_flight.as_mut().unwrap().commit.ops.pop();
+    before.commits.in_flight.as_mut().unwrap().bases.clear();
     before.commits.restores.clear();
     before.commits.resolved.clear();
     Store::open(&path)
@@ -792,6 +832,7 @@ fn a_version_3_store_opens_with_empty_restore_tables() {
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
         "DROP TABLE restore_requests; DROP TABLE restore_intents;
+         DROP TABLE commit_in_flight_bases;
          ALTER TABLE remote_cursor DROP COLUMN ahead_of_server;",
     )
     .unwrap();

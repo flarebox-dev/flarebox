@@ -153,6 +153,7 @@ impl Tx<'_> {
             "commit_in_flight",
             "commit_in_flight_deletes",
             "commit_in_flight_delete_members",
+            "commit_in_flight_bases",
             "effect_state",
             "failed_effects",
             "restore_intents",
@@ -235,6 +236,7 @@ impl Tx<'_> {
                 "commit_in_flight",
                 "commit_in_flight_deletes",
                 "commit_in_flight_delete_members",
+                "commit_in_flight_bases",
             ] {
                 self.0.execute(&format!("DELETE FROM {table}"), [])?;
             }
@@ -257,6 +259,12 @@ impl Tx<'_> {
                     for (position, node) in nodes.iter().enumerate() {
                         members.execute(params![target, position, node])?;
                     }
+                }
+                let mut bases = self.0.prepare_cached(
+                    "INSERT INTO commit_in_flight_bases (node_id, content) VALUES (?1, ?2)",
+                )?;
+                for (node, content) in &flight.bases {
+                    bases.execute(params![node, content.as_ref().map(Content::encode_to_vec)])?;
                 }
             }
         }
@@ -323,9 +331,19 @@ impl Tx<'_> {
             };
             nodes.push(row.get(1)?);
         }
+        let bases = self
+            .0
+            .prepare_cached("SELECT node_id, content FROM commit_in_flight_bases")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .map(|row| {
+                let (node, content): (NodeId, Option<Vec<u8>>) = row?;
+                Ok((node, decode(content)?))
+            })
+            .collect::<Result<_>>()?;
         Ok(Some(InFlight {
             commit: Commit::decode(commit.as_slice())?,
             deletes,
+            bases,
             result: decode(result)?,
         }))
     }

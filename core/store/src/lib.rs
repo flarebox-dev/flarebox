@@ -229,6 +229,12 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE remote_cursor ADD COLUMN ahead_of_server INTEGER NOT NULL DEFAULT 0
         CHECK (ahead_of_server IN (0, 1));
 ",
+    "
+    CREATE TABLE commit_in_flight_bases (
+        node_id TEXT PRIMARY KEY,
+        content BLOB
+    ) STRICT, WITHOUT ROWID;
+",
 ];
 
 /// The schema version this build writes.
