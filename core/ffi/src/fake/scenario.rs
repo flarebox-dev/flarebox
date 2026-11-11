@@ -88,7 +88,23 @@ fn signed_in() -> Saved {
             device_id: "device-1".to_owned(),
             device_name: "Ada's Mac mini".to_owned(),
         }),
-        devices: None,
+        devices: vec![
+            Device {
+                device_id: "device-1".to_owned(),
+                name: "Ada's Mac mini".to_owned(),
+                platform: "macos".to_owned(),
+                this_device: true,
+                added_at_ms: now_ms() - 30 * DAY_MS,
+            },
+            Device {
+                device_id: "device-2".to_owned(),
+                name: "Ada's MacBook Air".to_owned(),
+                platform: "macos".to_owned(),
+                this_device: false,
+                added_at_ms: now_ms() - 7 * DAY_MS,
+            },
+        ],
+        revoked: Vec::new(),
         spaces: vec![
             Space {
                 space_id: DOCUMENTS.to_owned(),

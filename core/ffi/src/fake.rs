@@ -12,11 +12,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::core::{Core, Events};
 use crate::types::{
-    Account, Answer, ChangeKind, Device, DeviceList, Direction, FolderPath, FolderState, HeldItem,
-    ItemDetail, LinkedFolder, MassDeleteLimit, NodeKind, Notice, NoticeKind, PairingCode, Problem,
-    ProblemKind, Question, QuestionKind, RECENT_CHANGES, RecentChange, RecoveryCause,
-    RecoveryGroup, RecoveryTrigger, ServerInfo, SessionError, SessionEvent, SessionState, Space,
-    SpaceUsage, SyncProgress, SyncStatus,
+    Account, Answer, ChangeKind, Device, Direction, FolderPath, FolderState, HeldItem, ItemDetail,
+    LinkedFolder, MassDeleteLimit, NodeKind, Notice, NoticeKind, PairingCode, Problem, ProblemKind,
+    Question, QuestionKind, RECENT_CHANGES, RecentChange, RecoveryCause, RecoveryGroup,
+    RecoveryTrigger, ServerInfo, SessionError, SessionEvent, SessionState, Space, SpaceUsage,
+    SyncProgress, SyncStatus,
 };
 
 const CLAIM_CODE_LEN: usize = 12;
@@ -35,8 +35,8 @@ pub enum FakeActivity {
 }
 
 /// A whole state the fake can switch to at once. Every scenario but [`FakeScenario::FirstRun`]
-/// is signed in to `https://box.example.com` with two linked folders, Documents and Photos. The
-/// device list is unavailable in every scenario, as it is with every server today.
+/// is signed in to `https://box.example.com` with two linked folders, Documents and Photos, from
+/// one of the account's two devices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum FakeScenario {
     /// A fresh install: no server, no account, no folders, and the server is not claimed yet.
@@ -82,8 +82,8 @@ struct Saved {
     server: Option<ServerInfo>,
     claimed: bool,
     account: Option<Account>,
-    /// None while the server cannot list devices.
-    devices: Option<Vec<Device>>,
+    devices: Vec<Device>,
+    revoked: Vec<String>,
     spaces: Vec<Space>,
     folders: Vec<LinkedFolder>,
     questions: Vec<Question>,
@@ -315,6 +315,16 @@ fn normalize_code(code: &str) -> String {
         .collect()
 }
 
+fn this_device(account: &Account) -> Device {
+    Device {
+        device_id: account.device_id.clone(),
+        name: account.device_name.clone(),
+        platform: "macos".to_owned(),
+        this_device: true,
+        added_at_ms: now_ms(),
+    }
+}
+
 fn required(name: &str) -> Result<String, SessionError> {
     let name = name.trim();
     if name.is_empty() {
@@ -378,8 +388,8 @@ impl FakeCore {
         })
     }
 
-    /// Sets the device list the server reports, or none for a server that cannot list devices.
-    pub fn set_devices(&self, devices: Option<Vec<Device>>) -> Result<(), SessionError> {
+    /// Sets the devices the server lists for the account.
+    pub fn set_devices(&self, devices: Vec<Device>) -> Result<(), SessionError> {
         self.update(&mut self.lock(), &[], |saved| {
             saved.devices = devices;
             Ok(())
@@ -593,6 +603,7 @@ impl Core for FakeCore {
                 device_name,
             };
             saved.claimed = true;
+            saved.devices = vec![this_device(&account)];
             saved.account = Some(account.clone());
             Ok(account)
         })
@@ -622,6 +633,14 @@ impl Core for FakeCore {
                     name: "Shared".to_owned(),
                 }];
             }
+            let pairer = Device {
+                device_id: saved.next_id("device"),
+                name: "Other device".to_owned(),
+                platform: "macos".to_owned(),
+                this_device: false,
+                added_at_ms: now_ms(),
+            };
+            saved.devices = vec![pairer, this_device(&account)];
             saved.account = Some(account.clone());
             Ok(account)
         })
@@ -630,11 +649,7 @@ impl Core for FakeCore {
     fn sign_out(&self, confirm_last_device: bool) -> Result<(), SessionError> {
         let mut state = self.lock();
         state.take_failure()?;
-        let last = state
-            .saved
-            .devices
-            .as_ref()
-            .is_some_and(|devices| devices.iter().all(|device| device.this_device));
+        let last = (state.saved.devices.iter()).all(|device| device.this_device);
         if last && !confirm_last_device && state.saved.account.is_some() {
             return Err(SessionError::LastDevice);
         }
@@ -645,7 +660,6 @@ impl Core for FakeCore {
             *saved = Saved {
                 server: saved.server.take(),
                 claimed: saved.claimed,
-                devices: saved.devices.take(),
                 next_id: saved.next_id,
                 ..Saved::default()
             };
@@ -658,15 +672,30 @@ impl Core for FakeCore {
         result
     }
 
-    fn devices(&self) -> Result<DeviceList, SessionError> {
+    fn devices(&self) -> Result<Vec<Device>, SessionError> {
         let mut state = self.lock();
         state.take_failure()?;
         state.saved.account()?;
-        Ok(match &state.saved.devices {
-            None => DeviceList::Unavailable,
-            Some(devices) => DeviceList::Available {
-                devices: devices.clone(),
-            },
+        Ok(state.saved.devices.clone())
+    }
+
+    fn revoke_device(&self, device_id: &str) -> Result<(), SessionError> {
+        let mut state = self.lock();
+        state.take_failure()?;
+        self.update(&mut state, &[], |saved| {
+            if saved.account()?.device_id == device_id {
+                return Err(SessionError::ThisDevice);
+            }
+            if saved.revoked.iter().any(|revoked| revoked == device_id) {
+                return Ok(());
+            }
+            let listed = saved.devices.len();
+            saved.devices.retain(|device| device.device_id != device_id);
+            if saved.devices.len() == listed {
+                return Err(SessionError::DeviceNotFound);
+            }
+            saved.revoked.push(device_id.to_owned());
+            Ok(())
         })
     }
 
@@ -994,7 +1023,13 @@ mod tests {
         assert_eq!(account.server_url, "https://box.example.com");
         assert_eq!(account.user_name, "Ada");
         assert_eq!(h.core.state().account, Some(account.clone()));
-        assert_eq!(h.core.devices(), Ok(DeviceList::Unavailable));
+        let devices = h.core.devices().unwrap();
+        assert_eq!(
+            (devices.iter())
+                .map(|device| (device.device_id.as_str(), device.this_device))
+                .collect::<Vec<_>>(),
+            [(account.device_id.as_str(), true)]
+        );
         assert!(h.take().contains(&SessionEvent::Account {
             account: Some(account)
         }));
@@ -1015,8 +1050,16 @@ mod tests {
             h.core.pair("ABCDEFGHJ", "Mac"),
             Err(SessionError::InvalidCode)
         );
-        h.core.pair("abcd efgh", "Mac").unwrap();
-        assert_eq!(h.core.devices(), Ok(DeviceList::Unavailable));
+        let account = h.core.pair("abcd efgh", "Mac").unwrap();
+        let devices = h.core.devices().unwrap();
+        assert_eq!(
+            (devices.iter())
+                .filter(|device| device.this_device)
+                .map(|device| device.device_id.as_str())
+                .collect::<Vec<_>>(),
+            [account.device_id.as_str()]
+        );
+        assert_eq!(devices.len(), 2);
         assert_eq!(h.core.spaces().unwrap().len(), 1);
 
         let code = h.core.start_pairing().unwrap();
@@ -1332,23 +1375,25 @@ mod tests {
     }
 
     #[test]
-    fn the_device_list_is_an_optional_capability() {
+    fn another_device_is_revoked_but_not_this_one() {
         let h = Harness::new();
         h.core.load_scenario(FakeScenario::UpToDate).unwrap();
-        assert_eq!(h.core.devices(), Ok(DeviceList::Unavailable));
-        let device = Device {
-            device_id: "device-1".to_owned(),
-            name: "Mac".to_owned(),
-            platform: "macos".to_owned(),
-            this_device: true,
-            added_at_ms: 1,
+        let listed = |h: &Harness| {
+            (h.core.devices().unwrap().into_iter())
+                .map(|device| device.device_id)
+                .collect::<Vec<_>>()
         };
-        h.core.set_devices(Some(vec![device.clone()])).unwrap();
+        assert_eq!(listed(&h), ["device-1", "device-2"]);
         assert_eq!(
-            h.core.devices(),
-            Ok(DeviceList::Available {
-                devices: vec![device]
-            })
+            h.core.revoke_device("device-1"),
+            Err(SessionError::ThisDevice)
+        );
+        h.core.revoke_device("device-2").unwrap();
+        assert_eq!(listed(&h), ["device-1"]);
+        h.core.revoke_device("device-2").unwrap();
+        assert_eq!(
+            h.core.revoke_device("device-9"),
+            Err(SessionError::DeviceNotFound)
         );
     }
 
@@ -1363,9 +1408,7 @@ mod tests {
             this_device,
             added_at_ms: 1,
         };
-        h.core
-            .set_devices(Some(vec![device("device-1", true)]))
-            .unwrap();
+        h.core.set_devices(vec![device("device-1", true)]).unwrap();
         assert_eq!(h.core.sign_out(false), Err(SessionError::LastDevice));
         assert!(h.core.state().account.is_some());
         h.core.sign_out(true).unwrap();
@@ -1373,10 +1416,7 @@ mod tests {
 
         h.core.load_scenario(FakeScenario::UpToDate).unwrap();
         h.core
-            .set_devices(Some(vec![
-                device("device-1", true),
-                device("device-2", false),
-            ]))
+            .set_devices(vec![device("device-1", true), device("device-2", false)])
             .unwrap();
         h.core.sign_out(false).unwrap();
         assert_eq!(h.core.state().account, None);

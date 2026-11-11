@@ -7,7 +7,7 @@
 use std::sync::{Arc, Weak};
 
 use crate::types::{
-    Account, Answer, DeviceList, LinkedFolder, PairingCode, ServerInfo, SessionError, SessionEvent,
+    Account, Answer, Device, LinkedFolder, PairingCode, ServerInfo, SessionError, SessionEvent,
     SessionState, Space, SpaceUsage,
 };
 
@@ -92,8 +92,13 @@ pub trait Core: Send + Sync {
     /// [`SessionError::NotRevoked`] when the server cannot be reached, so the app can tell the person
     /// first. With it, a sign-out without the server finishes on the device.
     fn sign_out(&self, confirm_last_device: bool) -> Result<(), SessionError>;
-    /// The account's devices, or [`DeviceList::Unavailable`] when the server cannot list them.
-    fn devices(&self) -> Result<DeviceList, SessionError>;
+    /// The account's devices that are not revoked.
+    fn devices(&self) -> Result<Vec<Device>, SessionError>;
+    /// Revokes another device of the account on the server. It can no longer sync, and the files already on it stay
+    /// there. This device leaves with [`Core::sign_out`], so its own ID returns [`SessionError::ThisDevice`]. An ID
+    /// unlike those the server issues (36 lowercase hexadecimal digits and hyphens) returns
+    /// [`SessionError::DeviceNotFound`] without a request.
+    fn revoke_device(&self, device_id: &str) -> Result<(), SessionError>;
     /// Creates a code that signs in another device.
     fn start_pairing(&self) -> Result<PairingCode, SessionError>;
 

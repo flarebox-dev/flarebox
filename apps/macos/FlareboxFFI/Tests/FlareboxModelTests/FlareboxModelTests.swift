@@ -280,7 +280,7 @@ private final class Fetches {
 
     @Test func accountActions() async throws {
         let model = AppModel.fake(scenario: .upToDate)
-        #expect(try await model.devices() == .unavailable)
+        #expect(try await model.devices().map(\.deviceId) == ["device-1", "device-2"])
         let code = try await model.startPairing()
         #expect(code.code.count == 8)
         try await model.unlinkFolder(spaceID: "space-photos")
@@ -289,6 +289,17 @@ private final class Fetches {
         #expect(model.state.account == nil)
         #expect(model.needsSetup)
         await #expect(throws: SessionError.NotSignedIn) { try await model.devices() }
+    }
+
+    @Test func anotherDeviceIsRevokedButNotThisMac() async throws {
+        let model = AppModel.fake(scenario: .upToDate)
+        let devices = try await model.devices()
+        await #expect(throws: SessionError.ThisDevice) { try await model.revokeDevice(devices[0]) }
+        try await model.revokeDevice(devices[1])
+        #expect(try await model.devices().map(\.deviceId) == ["device-1"])
+        try await model.revokeDevice(devices[1])
+        let unknown = Device(deviceId: "device-9", name: "Mac", platform: "macos", thisDevice: false, addedAtMs: 1)
+        await #expect(throws: SessionError.DeviceNotFound) { try await model.revokeDevice(unknown) }
     }
 
     @Test func theLastDeviceSignsOutOnlyOnceConfirmed() async throws {

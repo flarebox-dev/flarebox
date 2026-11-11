@@ -8,7 +8,7 @@ use crate::core::{Core, Events, SessionListener};
 use crate::driver::DriverCore;
 use crate::fake::FakeCore;
 use crate::types::{
-    Account, Answer, DeviceList, LinkedFolder, PairingCode, ServerInfo, SessionError, SessionState,
+    Account, Answer, Device, LinkedFolder, PairingCode, ServerInfo, SessionError, SessionState,
     Space, SpaceUsage,
 };
 
@@ -106,8 +106,12 @@ impl SyncSession {
         self.core.sign_out(confirm_last_device)
     }
 
-    pub fn devices(&self) -> Result<DeviceList, SessionError> {
+    pub fn devices(&self) -> Result<Vec<Device>, SessionError> {
         self.core.devices()
+    }
+
+    pub fn revoke_device(&self, device_id: String) -> Result<(), SessionError> {
+        self.core.revoke_device(&device_id)
     }
 
     pub fn start_pairing(&self) -> Result<PairingCode, SessionError> {
