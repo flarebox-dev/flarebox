@@ -405,8 +405,9 @@ impl Disk {
     }
 
     /// Plans the next effect and records it, with the ID generator, in one store transaction. Returns `None` when
-    /// nothing is planned, including while an effect is in flight. A record that cannot become a `core/fs` effect
-    /// (a name that is not a single file name) is never committed, and stops the task.
+    /// nothing is planned, including while an effect is in flight. The nodes planning unblocks are stored unblocked
+    /// also then. A record that cannot become a `core/fs` effect (a name that is not a single file name) is never
+    /// committed, and stops the task.
     pub fn next(
         &mut self,
         engine: &mut Engine,
@@ -418,11 +419,15 @@ impl Disk {
         let space = &self.space;
         let hook = &mut self.hook;
         let pending = store.transaction(|tx| -> Result<_, Stop> {
+            let blocked = engine.effects.blocked().len();
             let Some(record) = engine
                 .effects
                 .plan(&engine.trees, &mut engine.ids, now_ms)
                 .cloned()
             else {
+                if engine.effects.blocked().len() != blocked {
+                    engine.checkpoint(tx)?;
+                }
                 return Ok(None);
             };
             let (effect, contents) = translate(&record)?;
