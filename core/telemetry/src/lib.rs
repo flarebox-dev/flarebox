@@ -22,7 +22,7 @@ pub use send::{
     ENDPOINT, ENDPOINT_VARIABLE, PROJECT_TOKEN, Sent, TOKEN_VARIABLE, UploadError, Uploader, batch,
     send,
 };
-pub use store::{Batch, Settings, Store};
+pub use store::{Batch, Sending, Settings, Store};
 pub use system::Environment;
 
 /// Days since 1970-01-01 in UTC, the only time a report carries.

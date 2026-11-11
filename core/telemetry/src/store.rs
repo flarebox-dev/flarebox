@@ -3,7 +3,8 @@
 //! The files of telemetry under the profile's state directory, which belongs to one machine and is never copied
 //! (`koidrive_driver::Paths`): the choice and the install id in `settings.json`, and what waits to be sent in
 //! `queue.json`. Every process of the profile writes the queue under `lock`, so the daemon and a command that runs
-//! next to it do not lose each other's sums.
+//! next to it do not lose each other's sums. A batch being sent stays in the queue, marked as out, until its send
+//! ends, so a send that is cancelled or killed before an answer loses nothing.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -47,6 +48,16 @@ impl Batch {
     }
 }
 
+/// A batch [`Store::take`] handed out. It stays in the queue until [`Store::sent`] or [`Store::give_back`] settles
+/// it, and holds `send.lock` meanwhile, so one send runs at a time. Dropped without either, as when its send is
+/// cancelled or its process ends, it goes back to the queue at the next take.
+#[derive(Debug)]
+pub struct Sending {
+    pub id: InstallId,
+    pub batch: Batch,
+    _lock: File,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Queue {
@@ -54,6 +65,49 @@ struct Queue {
     days: BTreeMap<u32, DailyReport>,
     #[serde(default)]
     events: Vec<Event>,
+    /// The batch a send took and has not settled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    out: Option<Out>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Out {
+    id: InstallId,
+    batch: Batch,
+}
+
+impl Queue {
+    fn put(&mut self, days: impl IntoIterator<Item = DailyReport>, events: Vec<Event>) {
+        for report in days {
+            let day = report.day;
+            self.days
+                .entry(day)
+                .or_insert_with(|| DailyReport {
+                    day,
+                    ..DailyReport::default()
+                })
+                .merge(report);
+        }
+        for event in events {
+            let same = (self.events.iter())
+                .filter(|held| held.kind() == event.kind() && held.day() == event.day())
+                .count();
+            if same < Event::PER_KIND_PER_DAY {
+                self.events.push(event);
+            }
+        }
+    }
+
+    /// Drops what is older than [`KEEP_DAYS`] and the oldest events over [`MAX_EVENTS`].
+    fn trim(&mut self, today: u32) {
+        let oldest = today.saturating_sub(KEEP_DAYS);
+        self.days
+            .retain(|day, report| *day >= oldest && !report.is_empty());
+        self.events.retain(|event| event.day() >= oldest);
+        let over = self.events.len().saturating_sub(MAX_EVENTS);
+        self.events.drain(..over);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,6 +187,12 @@ impl Store {
         self.absorb_at(pending, crate::today(), false)
     }
 
+    /// Like [`Store::absorb`], but only while the profile's install id is still `id`. A process that recorded under one
+    /// id uses it, so its sums are dropped instead of moving to the new id after a reset, or after off and on.
+    pub fn absorb_as(&self, pending: Pending, id: &InstallId) -> io::Result<()> {
+        self.absorb_for(pending, crate::today(), true, Some(id))
+    }
+
     pub(crate) fn absorb_at(&self, pending: Pending, today: u32, wait: bool) -> io::Result<()> {
         self.absorb_for(pending, today, wait, None)
     }
@@ -156,42 +216,30 @@ impl Store {
             _ => {}
         }
         let mut queue = self.queue();
-        for (day, report) in pending.days {
-            queue
-                .days
-                .entry(day)
-                .or_insert_with(|| DailyReport {
-                    day,
-                    ..DailyReport::default()
-                })
-                .merge(report);
-        }
-        for event in pending.events {
-            let same = (queue.events.iter())
-                .filter(|held| held.kind() == event.kind() && held.day() == event.day())
-                .count();
-            if same < Event::PER_KIND_PER_DAY {
-                queue.events.push(event);
-            }
-        }
-        let oldest = today.saturating_sub(KEEP_DAYS);
-        queue
-            .days
-            .retain(|day, report| *day >= oldest && !report.is_empty());
-        queue.events.retain(|event| event.day() >= oldest);
-        let over = queue.events.len().saturating_sub(MAX_EVENTS);
-        queue.events.drain(..over);
+        queue.put(pending.days.into_values(), pending.events);
+        queue.trim(today);
         write(&self.dir.join("queue.json"), &queue)
     }
 
-    /// Takes the reports of days before `today` and every event out of the queue, with the install id they belong
-    /// to. None while the profile has no id. The caller gives them back with [`Store::give_back`] if sending fails.
-    pub fn take(&self, today: u32) -> io::Result<Option<(InstallId, Batch)>> {
+    /// Marks the reports of days before `today` and every event as out, and hands them over with the install id they
+    /// belong to. A batch an earlier send left out joins them. None while the profile has no id, or while another
+    /// send has a batch out. The caller settles it with [`Store::sent`] or [`Store::give_back`].
+    pub fn take(&self, today: u32) -> io::Result<Option<Sending>> {
+        let sending = match self.send_lock() {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(error),
+        };
         let _lock = self.lock(true)?;
         let Some(id) = self.settings()?.install_id else {
             return Ok(None);
         };
         let mut queue = self.queue();
+        if let Some(out) = queue.out.take()
+            && out.id == id
+        {
+            queue.put(out.batch.days, out.batch.events);
+        }
         let later = queue.days.split_off(&today);
         let batch = Batch {
             days: std::mem::replace(&mut queue.days, later)
@@ -200,29 +248,54 @@ impl Store {
             events: std::mem::take(&mut queue.events),
         };
         if !batch.is_empty() {
+            queue.out = Some(Out {
+                id: id.clone(),
+                batch: batch.clone(),
+            });
             write(&self.dir.join("queue.json"), &queue)?;
         }
-        Ok(Some((id, batch)))
+        Ok(Some(Sending {
+            id,
+            batch,
+            _lock: sending,
+        }))
+    }
+
+    /// Removes a batch the endpoint accepted, or refused for good.
+    pub fn sent(&self, sending: Sending) -> io::Result<()> {
+        self.settle(sending, None)
     }
 
     /// Puts a batch that was not sent back into the queue, as of `today`. It is dropped when the profile's install
-    /// id is no longer `id`: telemetry was turned off or reset while the batch was out, so it must not be sent
+    /// id is no longer the batch's: telemetry was turned off or reset while the batch was out, so it must not be sent
     /// again, under the old id or a new one.
-    pub fn give_back(&self, id: &InstallId, batch: Batch, today: u32) -> io::Result<()> {
-        let pending = Pending {
-            days: batch
-                .days
-                .into_iter()
-                .map(|report| (report.day, report))
-                .collect(),
-            events: batch.events,
-        };
-        self.absorb_for(pending, today, true, Some(id))
+    pub fn give_back(&self, sending: Sending, today: u32) -> io::Result<()> {
+        self.settle(sending, Some(today))
     }
 
-    /// Everything in the queue, today included, without taking it.
+    fn settle(&self, sending: Sending, back: Option<u32>) -> io::Result<()> {
+        let _lock = self.lock(true)?;
+        let id = self.settings()?.install_id;
+        let mut queue = self.queue();
+        let Some(out) = queue.out.take() else {
+            return Ok(());
+        };
+        if let Some(today) = back
+            && id.as_ref() == Some(&sending.id)
+            && out.id == sending.id
+        {
+            queue.put(out.batch.days, out.batch.events);
+            queue.trim(today);
+        }
+        write(&self.dir.join("queue.json"), &queue)
+    }
+
+    /// Everything in the queue, today and a batch that is out included, without taking it.
     pub fn peek(&self) -> io::Result<Batch> {
-        let queue = self.queue();
+        let mut queue = self.queue();
+        if let Some(out) = queue.out.take() {
+            queue.put(out.batch.days, out.batch.events);
+        }
         Ok(Batch {
             days: queue.days.into_values().collect(),
             events: queue.events,
@@ -239,12 +312,21 @@ impl Store {
     }
 
     fn lock(&self, wait: bool) -> io::Result<File> {
+        self.flock("lock", wait)
+    }
+
+    /// Held by a send from its take until it settles, never while the queue's lock is waited for elsewhere.
+    fn send_lock(&self) -> io::Result<File> {
+        self.flock("send.lock", false)
+    }
+
+    fn flock(&self, name: &str, wait: bool) -> io::Result<File> {
         fs::create_dir_all(&self.dir)?;
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(self.dir.join("lock"))?;
+            .open(self.dir.join(name))?;
         let operation = if wait {
             FlockOperation::LockExclusive
         } else {
@@ -356,34 +438,61 @@ mod tests {
         assert_eq!(queued.events.len(), 2);
     }
 
+    fn days(queue: &Queue) -> Vec<u32> {
+        queue.days.keys().copied().collect()
+    }
+
     #[test]
     fn take_leaves_today_and_give_back_restores_the_rest() {
         let (_dir, store) = store();
         store.set(true).unwrap();
         store.absorb_at(pending(99, 1), 100, true).unwrap();
         store.absorb_at(pending(100, 5), 100, true).unwrap();
-        let (id, batch) = store.take(100).unwrap().unwrap();
+        let sending = store.take(100).unwrap().unwrap();
         assert_eq!(
-            batch
-                .days
-                .iter()
+            (sending.batch.days.iter())
                 .map(|report| report.day)
                 .collect::<Vec<_>>(),
             [99]
         );
-        assert_eq!(batch.events.len(), 2);
-        let left = store.peek().unwrap();
-        assert_eq!(
-            left.days
-                .iter()
-                .map(|report| report.day)
-                .collect::<Vec<_>>(),
-            [100]
-        );
+        assert_eq!(sending.batch.events.len(), 2);
+        let left = store.queue();
+        assert_eq!(days(&left), [100]);
         assert!(left.events.is_empty());
-
-        store.give_back(&id, batch, 100).unwrap();
+        assert_eq!(left.out.unwrap().batch, sending.batch);
         assert_eq!(store.peek().unwrap().days.len(), 2);
+
+        store.give_back(sending, 100).unwrap();
+        let queue = store.queue();
+        assert_eq!(days(&queue), [99, 100]);
+        assert!(queue.out.is_none());
+    }
+
+    #[test]
+    fn a_sent_batch_leaves_the_queue() {
+        let (_dir, store) = store();
+        store.set(true).unwrap();
+        store.absorb_at(pending(99, 1), 100, true).unwrap();
+        let sending = store.take(100).unwrap().unwrap();
+        store.sent(sending).unwrap();
+        assert!(store.peek().unwrap().is_empty());
+    }
+
+    #[test]
+    fn one_send_at_a_time_and_a_dropped_one_loses_nothing() {
+        let (_dir, store) = store();
+        store.set(true).unwrap();
+        store.absorb_at(pending(99, 1), 100, true).unwrap();
+        let sending = store.take(100).unwrap().unwrap();
+        assert!(store.take(100).unwrap().is_none());
+        let batch = sending.batch.clone();
+        drop(sending);
+
+        store.absorb_at(pending(99, 2), 100, true).unwrap();
+        let again = store.take(100).unwrap().unwrap();
+        assert_eq!(again.batch.days.len(), 1);
+        assert_eq!(again.batch.days[0].counters["command"]["status"], 3);
+        assert_eq!(again.batch.events.len(), batch.events.len() + 1);
     }
 
     #[test]
@@ -391,16 +500,29 @@ mod tests {
         let (_dir, store) = store();
         store.set(true).unwrap();
         store.absorb_at(pending(99, 1), 100, true).unwrap();
-        let (id, batch) = store.take(100).unwrap().unwrap();
+        let sending = store.take(100).unwrap().unwrap();
         store.reset().unwrap();
-        store.give_back(&id, batch.clone(), 100).unwrap();
+        store.give_back(sending, 100).unwrap();
         assert!(store.peek().unwrap().is_empty());
 
+        store.absorb_at(pending(99, 1), 100, true).unwrap();
+        let sending = store.take(100).unwrap().unwrap();
         store.set(false).unwrap();
-        store.give_back(&id, batch, 100).unwrap();
+        store.give_back(sending, 100).unwrap();
         assert!(store.peek().unwrap().is_empty());
-        assert_eq!(store.take(100).unwrap(), None);
+        assert!(store.take(100).unwrap().is_none());
         assert_eq!(store.settings().unwrap().install_id, None);
+
+        let id = store.set(true).unwrap().install_id.unwrap();
+        let new = store.reset().unwrap().unwrap();
+        store
+            .absorb_for(pending(99, 1), 100, true, Some(&id))
+            .unwrap();
+        assert!(store.peek().unwrap().is_empty());
+        store
+            .absorb_for(pending(99, 1), 100, true, Some(&new))
+            .unwrap();
+        assert!(!store.peek().unwrap().is_empty());
     }
 
     #[test]

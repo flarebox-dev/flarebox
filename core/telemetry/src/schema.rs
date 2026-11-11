@@ -11,17 +11,60 @@ use serde::{Deserialize, Serialize};
 /// The layout version of the properties a report sends. It changes when a property changes meaning.
 pub const SCHEMA: u16 = 1;
 
-/// What one install recorded on one UTC day.
+/// What one install recorded on one UTC day. Its keys are always those of a [`Counter`] or a [`Measure`]: only a
+/// [`Recorder`](crate::Recorder) fills it, and reading one from JSON keeps only the keys of the closed set.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(from = "StoredReport")]
 pub struct DailyReport {
     /// Days since 1970-01-01.
     pub day: u32,
     /// Sums, by metric and then by label.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub counters: BTreeMap<String, BTreeMap<String, u64>>,
+    pub(crate) counters: BTreeMap<String, BTreeMap<String, u64>>,
     /// Distributions, by metric and then by label.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub histograms: BTreeMap<String, BTreeMap<String, Histogram>>,
+    pub(crate) histograms: BTreeMap<String, BTreeMap<String, Histogram>>,
+}
+
+/// A [`DailyReport`] as a file holds it, before its keys are checked.
+#[derive(Deserialize)]
+struct StoredReport {
+    day: u32,
+    #[serde(default)]
+    counters: BTreeMap<String, BTreeMap<String, u64>>,
+    #[serde(default)]
+    histograms: BTreeMap<String, BTreeMap<String, Histogram>>,
+}
+
+/// Rebuilds the report from the closed set of counters and measures, so a key that is not one of theirs, or a
+/// histogram with another shift, is dropped.
+impl From<StoredReport> for DailyReport {
+    fn from(stored: StoredReport) -> Self {
+        let mut report = DailyReport {
+            day: stored.day,
+            ..DailyReport::default()
+        };
+        for (metric, label) in Counter::all().map(Counter::key) {
+            if let Some(&count) = stored
+                .counters
+                .get(metric)
+                .and_then(|labels| labels.get(label))
+            {
+                (report.counters.entry(metric.to_owned()).or_default())
+                    .insert(label.to_owned(), count);
+            }
+        }
+        for (metric, label, shift) in Measure::all().map(Measure::key) {
+            if let Some(histogram) = (stored.histograms.get(metric))
+                .and_then(|labels| labels.get(label))
+                .filter(|histogram| histogram.shift == shift)
+            {
+                (report.histograms.entry(metric.to_owned()).or_default())
+                    .insert(label.to_owned(), histogram.clone());
+            }
+        }
+        report
+    }
 }
 
 impl DailyReport {
@@ -184,6 +227,11 @@ pub enum Counter {
 }
 
 impl Counter {
+    /// Every counter, for checking the keys of a stored report.
+    pub fn all() -> impl Iterator<Item = Counter> {
+        Command::ALL.into_iter().map(Counter::Command)
+    }
+
     pub(crate) fn key(self) -> (&'static str, &'static str) {
         match self {
             Counter::Command(command) => ("command", command.name()),
@@ -196,6 +244,10 @@ impl Counter {
 pub enum Measure {}
 
 impl Measure {
+    pub fn all() -> impl Iterator<Item = Measure> {
+        std::iter::empty()
+    }
+
     /// The metric, the label and the histogram's shift.
     pub(crate) fn key(self) -> (&'static str, &'static str, u8) {
         match self {}
@@ -226,6 +278,27 @@ pub enum Command {
 }
 
 impl Command {
+    pub const ALL: [Command; 18] = [
+        Command::Setup,
+        Command::Join,
+        Command::Server,
+        Command::Space,
+        Command::Link,
+        Command::Unlink,
+        Command::Restart,
+        Command::Lift,
+        Command::Status,
+        Command::Questions,
+        Command::Device,
+        Command::Trash,
+        Command::Versions,
+        Command::Restore,
+        Command::Restores,
+        Command::Usage,
+        Command::Daemon,
+        Command::Telemetry,
+    ];
+
     pub fn name(self) -> &'static str {
         match self {
             Command::Setup => "setup",
@@ -451,6 +524,31 @@ mod tests {
         let same = ms.clone();
         ms.merge(&same);
         assert_eq!(ms.count, 2);
+    }
+
+    #[test]
+    fn a_stored_report_keeps_only_known_keys() {
+        let stored = serde_json::json!({
+            "day": 100,
+            "counters": {
+                "command": { "status": 3, "/home/alice/private": 1 },
+                "/home/alice/private": { "confidential.txt": 1 },
+            },
+            "histograms": {
+                "/home/alice": { "notes.txt": { "shift": 0, "buckets": vec![0u64; 16], "count": 1, "sum": 1 } },
+            },
+        });
+        let report: DailyReport = serde_json::from_value(stored).unwrap();
+        assert_eq!(
+            serde_json::to_value(&report).unwrap(),
+            serde_json::json!({ "day": 100, "counters": { "command": { "status": 3 } } })
+        );
+    }
+
+    #[test]
+    fn every_command_is_listed_once() {
+        let names: std::collections::BTreeSet<_> = Command::ALL.map(Command::name).into();
+        assert_eq!(names.len(), Command::ALL.len());
     }
 
     #[test]

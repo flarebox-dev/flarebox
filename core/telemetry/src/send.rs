@@ -89,8 +89,8 @@ impl Uploader {
     }
 }
 
-/// Sends what the queue holds for days before `today`, with every event. A failure to send leaves it in the queue;
-/// only a failure to read or write the queue is an error.
+/// Sends what the queue holds for days before `today`, with every event. A failure to send leaves it in the queue,
+/// and so does cancelling the send before an answer; only a failure to read or write the queue is an error.
 pub async fn send(
     store: &Store,
     uploader: Option<&Uploader>,
@@ -101,23 +101,24 @@ pub async fn send(
     if mode == Mode::Off {
         return Ok(Sent::Nothing);
     }
-    let Some((id, batch)) = store.take(today)? else {
+    let Some(sending) = store.take(today)? else {
         return Ok(Sent::Nothing);
     };
-    if batch.is_empty() {
+    if sending.batch.is_empty() {
         return Ok(Sent::Nothing);
     }
     let token = uploader.map_or("", Uploader::token);
-    let body = self::batch(token, &id, environment, &batch);
+    let body = self::batch(token, &sending.id, environment, &sending.batch);
     if mode == Mode::Debug {
         eprintln!(
             "[telemetry] {}",
             serde_json::to_string_pretty(&body).unwrap_or_default()
         );
+        store.sent(sending)?;
         return Ok(Sent::Printed);
     }
     let Some(uploader) = uploader else {
-        store.give_back(&id, batch, today)?;
+        store.give_back(sending, today)?;
         return Ok(Sent::Later);
     };
     let sent = match uploader
@@ -140,7 +141,9 @@ pub async fn send(
         }
     };
     if sent == Sent::Later {
-        store.give_back(&id, batch, today)?;
+        store.give_back(sending, today)?;
+    } else {
+        store.sent(sending)?;
     }
     Ok(sent)
 }
@@ -320,6 +323,80 @@ mod tests {
                     && closed(&string.replace('/', "."));
             assert!(allowed, "free text in a batch: {string:?}");
         }
+    }
+
+    /// A queue file with paths and names for keys, as a bug or another program could leave, sends none of them.
+    #[tokio::test]
+    async fn keys_outside_the_closed_set_never_reach_a_request() {
+        let (address, bodies) = server(200).await;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        queued(&store, 20_404);
+        let path = dir.path().join("telemetry/queue.json");
+        let mut queue: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let report = &mut queue["days"]["20404"];
+        report["counters"]["/home/fixture/private"] = json!({ "confidential.txt": 1 });
+        report["counters"]["command"]["Alice Notes"] = json!(1);
+        report["histograms"]["/home/fixture"] = json!({
+            "notes.txt": { "shift": 0, "buckets": vec![0u64; 16], "count": 1, "sum": 1 }
+        });
+        std::fs::write(&path, serde_json::to_vec(&queue).unwrap()).unwrap();
+
+        let sent = send(
+            &store,
+            Some(&uploader(&address)),
+            &environment(),
+            Mode::On,
+            20_405,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sent, Sent::Accepted);
+        let request = serde_json::to_string(&bodies.lock().unwrap()[0]).unwrap();
+        for secret in ["fixture", "private", "confidential", "Alice", "notes"] {
+            assert!(!request.contains(secret), "{secret} in {request}");
+        }
+        assert!(request.contains("c.command.setup"));
+    }
+
+    /// A send cancelled before any answer, as by a timeout around it, leaves its batch to the next send.
+    #[tokio::test]
+    async fn a_cancelled_send_keeps_the_batch() {
+        let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", silent.local_addr().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        queued(&store, 20_404);
+        let waited = tokio::time::timeout(
+            Duration::from_millis(300),
+            send(
+                &store,
+                Some(&uploader(&address)),
+                &environment(),
+                Mode::On,
+                20_405,
+            ),
+        )
+        .await;
+        assert!(waited.is_err());
+        drop(silent);
+
+        let (address, bodies) = server(200).await;
+        let sent = send(
+            &store,
+            Some(&uploader(&address)),
+            &environment(),
+            Mode::On,
+            20_405,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sent, Sent::Accepted);
+        assert_eq!(
+            bodies.lock().unwrap()[0]["batch"].as_array().unwrap().len(),
+            3
+        );
+        assert!(store.peek().unwrap().is_empty());
     }
 
     fn collect(value: &Value, strings: &mut Vec<String>) {
