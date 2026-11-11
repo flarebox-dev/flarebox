@@ -10,7 +10,9 @@ use koidrive_engine::commit::Commits;
 use koidrive_engine::effects::Effects;
 use koidrive_engine::ids::IdGen;
 use koidrive_engine::tree::{Kind, LocalNode, NodeId, RemoteNode, Shape};
-use koidrive_proto::v1::{ChangeRecord, CommitRecord, CommitResult, Error, change_record};
+use koidrive_proto::v1::{
+    ChangeRecord, CommitRecord, CommitResult, Error, NodeState, change_record,
+};
 
 use super::disk::{Disk, Place, identity};
 use super::{Failure, NOW};
@@ -25,6 +27,9 @@ pub struct Engine {
     pub ids: IdGen,
     /// The highest seq up to which R holds every record.
     pub last_seq: u64,
+    /// The server lost commits that R holds, so R waits for a listing of the server's tree and
+    /// nothing is planned until it comes (section 4.4).
+    pub behind: bool,
 }
 
 impl Engine {
@@ -35,6 +40,7 @@ impl Engine {
             effects: Effects::default(),
             ids: IdGen::new(seed),
             last_seq: 0,
+            behind: false,
         }
     }
 
@@ -63,6 +69,7 @@ impl Engine {
             effects: Effects::from_state(self.effects.state()).map_err(refused)?,
             ids: IdGen::new(self.ids.state),
             last_seq: self.last_seq,
+            behind: self.behind,
         };
         if loaded != *self {
             return Err(Failure::Broken(
@@ -167,6 +174,8 @@ pub enum Message {
         request: u64,
         result: Result<CommitResult, Error>,
     },
+    /// The server's tree and trash at `head`, listed for a device whose R the server is behind.
+    Listing { nodes: Vec<NodeState>, head: u64 },
 }
 
 /// A connection. Breaking it loses every message still on its way.

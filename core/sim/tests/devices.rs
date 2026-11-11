@@ -35,7 +35,8 @@ fn action() -> impl Strategy<Value = Action> {
         })
 }
 
-fn step() -> impl Strategy<Value = Step> {
+/// One step. With `restores`, also a backup or a restore of the server.
+fn step(restores: bool) -> BoxedStrategy<Step> {
     let cut = prop_oneof![Just(Cut::Quarantined), Just(Cut::Placed), Just(Cut::Done)];
     let outcome = prop_oneof![
         5 => Just(Outcome::Run),
@@ -53,7 +54,7 @@ fn step() -> impl Strategy<Value = Step> {
         1 => refused.prop_map(Reply::Refused),
         1 => Just(Reply::NoChunks),
     ];
-    prop_oneof![
+    let steps = prop_oneof![
         8 => action().prop_map(Step::User),
         12 => any::<usize>().prop_map(Step::Work),
         2 => Just(Step::Scan),
@@ -65,10 +66,22 @@ fn step() -> impl Strategy<Value = Step> {
         1 => Just(Step::Drop),
         1 => Just(Step::Crash),
     ]
+    .boxed();
+    if !restores {
+        return steps;
+    }
+    prop_oneof![
+        19 => steps,
+        1 => prop_oneof![Just(Step::Backup), Just(Step::Restore)],
+    ]
+    .boxed()
 }
 
-fn phases() -> impl Strategy<Value = Vec<Vec<(usize, Step)>>> {
-    prop::collection::vec(prop::collection::vec((0..3usize, step()), 0..48), 1..=3)
+fn phases(restores: bool) -> impl Strategy<Value = Vec<Vec<(usize, Step)>>> {
+    prop::collection::vec(
+        prop::collection::vec((0..3usize, step(restores)), 0..48),
+        1..=3,
+    )
 }
 
 /// Devices that print every step with the state it leaves when `KOIDRIVE_SIM_TRACE` is set.
@@ -113,12 +126,24 @@ proptest! {
     ))]
 
     #[test]
-    fn devices_lose_no_write(devices in 2..=3usize, phases in phases()) {
+    fn devices_lose_no_write(devices in 2..=3usize, phases in phases(false)) {
         keep(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
 
     #[test]
-    fn devices_converge_once_the_faults_stop(devices in 2..=3usize, phases in phases()) {
+    fn devices_converge_once_the_faults_stop(devices in 2..=3usize, phases in phases(false)) {
+        converge(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
+    }
+
+    #[test]
+    #[ignore = "a server restore still breaks these: a lost file two devices create again is refused with ID_EXISTS (GUN-437), a lost edit equal to the restored bytes is undone (GUN-438), and a device that saw a seq the server lost takes the commit that reuses it for the one it saw (GUN-423)"]
+    fn devices_lose_no_write_across_server_restores(devices in 2..=3usize, phases in phases(true)) {
+        keep(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
+    }
+
+    #[test]
+    #[ignore = "a server restore still breaks these: a lost file two devices create again is refused with ID_EXISTS (GUN-437), a lost edit equal to the restored bytes is undone (GUN-438), and a device that saw a seq the server lost takes the commit that reuses it for the one it saw (GUN-423)"]
+    fn devices_converge_across_server_restores(devices in 2..=3usize, phases in phases(true)) {
         converge(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
 }
@@ -128,7 +153,7 @@ proptest! {
 #[test]
 fn the_schedules_reach_every_fault() {
     let mut runner = TestRunner::deterministic();
-    let strategy = (2..=3usize, phases());
+    let strategy = (2..=3usize, phases(false));
     let mut seen: BTreeMap<&str, u64> = BTreeMap::new();
     for _ in 0..256 {
         let (devices, phases) = strategy.new_tree(&mut runner).unwrap().current();
@@ -726,4 +751,169 @@ fn a_folder_moved_into_a_deleted_folder_while_its_create_waits_is_sent() {
     };
     assert_eq!(moved.name, "a");
     assert_eq!(entries[&folder].place, Place::Root);
+}
+
+const BACKUP: Step = Step::Backup;
+const RESTORE: Step = Step::Restore;
+
+/// Runs the phases, with a restore of the server to a backup taken at the start of the second one
+/// as the third, and checks that the devices handled the loss as the design says.
+fn restored(devices: usize, synced: Vec<(usize, Step)>, lost: Vec<(usize, Step)>) -> World {
+    let lost = std::iter::once((0, BACKUP)).chain(lost).collect();
+    let world = converge(devices, &[synced, lost, vec![(0, RESTORE)]]).unwrap();
+    for what in [
+        "server restored, commits lost",
+        "reconnect finds the server lost commits",
+        "resume finds the server behind",
+        "listing replaces R",
+    ] {
+        assert!(
+            world.seen.contains_key(what),
+            "the run did not reach: {what}"
+        );
+    }
+    world
+}
+
+/// The server loses the commit that created a file. Its author sends the create again.
+#[test]
+fn a_file_whose_create_the_server_lost_is_created_again() {
+    let world = restored(2, Vec::new(), vec![(0, file("a"))]);
+    assert_eq!(world.devices[1].disk.entries().len(), 1);
+}
+
+/// The server loses a delete. Its author sends the delete again, and the file comes back on no
+/// device.
+#[test]
+fn a_file_whose_delete_the_server_lost_stays_deleted() {
+    let world = restored(2, vec![(0, file("a"))], vec![(0, delete(0))]);
+    assert!(
+        world
+            .devices
+            .iter()
+            .all(|device| device.disk.entries().is_empty())
+    );
+}
+
+/// The server loses a rename. Both devices hold the new name, so both send it again.
+#[test]
+fn a_file_whose_rename_the_server_lost_keeps_its_new_name() {
+    let world = restored(2, vec![(0, file("a"))], vec![(0, rename(0, 0, "b"))]);
+    for device in &world.devices {
+        let names: Vec<&str> = (device.disk.entries().values())
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["b"]);
+    }
+}
+/// The server loses the create of a file, and the devices create it again. A copy of its bytes
+/// that the engine makes later, with no user asking for one, is still a divergence.
+#[test]
+fn a_later_copy_of_a_write_the_server_lost_is_still_refused() {
+    let mut world = restored(2, Vec::new(), vec![(0, file("a"))]);
+    let bytes = (world.devices[0]
+        .disk
+        .entries()
+        .values()
+        .next()
+        .unwrap()
+        .content)
+        .clone();
+    for name in ["b", "c", "d"] {
+        world.devices[0]
+            .disk
+            .create(Place::Root, name, bytes.clone())
+            .unwrap();
+    }
+    assert!(world.phase(3, &[]).is_err());
+}
+
+/// A restore that loses no rename allows no later rename to a name the user never gave.
+#[test]
+fn a_restore_that_loses_no_rename_allows_no_unasked_rename() {
+    let mut world = converge(2, &[vec![(0, file("a")), (1, file("b"))]]).unwrap();
+    world.phase(1, &[(0, BACKUP), (0, RESTORE)]).unwrap();
+    let disk = &world.devices[1].disk;
+    let b = (disk.visible().iter()).position(|ino| disk.entries()[ino].name == "b");
+    world
+        .phase(2, &[(1, rename(b.unwrap(), 0, "c.txt"))])
+        .unwrap();
+    let a = world.devices[0].disk.child(&Place::Root, "a").unwrap();
+    world.devices[0].disk.rename(a, Place::Root, "b").unwrap();
+    assert!(world.phase(3, &[]).is_err());
+}
+/// A restore that loses an edit lets a device send the position L holds for the file again, here
+/// when it revives the file that another device's delete trashed after the restore.
+#[test]
+fn a_restore_that_loses_an_edit_lets_its_file_be_revived() {
+    let u = |kind, target, parent, name, text| {
+        Step::User(Action {
+            kind,
+            target,
+            parent,
+            name,
+            text,
+        })
+    };
+    let phases = vec![
+        vec![
+            (0, u(1, 0, 0, 6, 0)),
+            (0, Step::Work(0)),
+            (2, u(0, 0, 0, 0, 0)),
+        ],
+        vec![
+            (0, u(1, 0, 0, 2, 0)),
+            (2, u(0, 0, 0, 2, 0)),
+            (2, u(1, 0, 0, 3, 0)),
+            (0, Step::Work(0)),
+            (0, u(2, 925163541728872510, 0, 0, 0)),
+            (0, u(0, 0, 11523797806819799120, 0, 0)),
+        ],
+        vec![
+            (0, u(0, 0, 0, 0, 0)),
+            (0, BACKUP),
+            (1, u(2, 10499357163619158257, 0, 0, 0)),
+            (0, u(0, 0, 20731787025803467, 0, 0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (0, u(4, 4907598952368571970, 0, 0, 0)),
+            (1, Step::Work(0)),
+            (0, RESTORE),
+        ],
+    ];
+    converge(3, &phases).unwrap();
+}
+
+/// Once the devices are quiet after a restore, a copy of a write the restore took from the server
+/// is refused like any other copy.
+#[test]
+fn a_copy_of_a_lost_write_after_the_recovery_is_refused() {
+    let mut world = restored(2, Vec::new(), vec![(0, file("a"))]);
+    let bytes = (world.devices[0]
+        .disk
+        .entries()
+        .values()
+        .next()
+        .unwrap()
+        .content)
+        .clone();
+    world.devices[0]
+        .disk
+        .create(Place::Root, "b", bytes)
+        .unwrap();
+    assert!(world.phase(3, &[]).is_err());
+}
+
+/// Once the devices are quiet after a restore that lost a rename, the old name is refused like
+/// any other name the user did not give.
+#[test]
+fn a_name_a_restore_lost_is_refused_after_the_recovery() {
+    let mut world = converge(2, &[vec![(0, file("a"))], vec![(0, BACKUP)]]).unwrap();
+    world.phase(2, &[(1, rename(0, 0, "b"))]).unwrap();
+    world.phase(3, &[(0, RESTORE)]).unwrap();
+    world.phase(4, &[(1, rename(0, 0, "c.txt"))]).unwrap();
+    let ino = world.devices[0].disk.child(&Place::Root, "c.txt").unwrap();
+    world.devices[0].disk.rename(ino, Place::Root, "b").unwrap();
+    assert!(world.phase(5, &[]).is_err());
 }

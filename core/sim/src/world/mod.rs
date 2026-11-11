@@ -3,8 +3,9 @@
 //! Whole devices against the reference server in one thread (docs/design/sync-engine.md section
 //! 7.3). Each device has a disk, an engine, the copy of the engine state its store holds, and a
 //! connection. A schedule names one step at a time: a user action on a disk, a rescan, an
-//! effect, a commit, the delivery of any one message, or a fault. After the schedule the faults
-//! stop and the devices run until nothing is left to do.
+//! effect, a commit, the delivery of any one message, or a fault. A fault can also restore the
+//! server from an earlier copy in the same history, which loses the commits since (section 2.8).
+//! After the schedule the faults stop and the devices run until nothing is left to do.
 //!
 //! The oracle uses the harness's own records and the server's state, never the engine's
 //! bookkeeping. Every user write carries a tag in its content's `mtime_ns`, which the engine
@@ -22,6 +23,8 @@
 //!   bytes to that file.
 //! - A write the server does not hold stays on the disk of the device it was made on until that
 //!   device's user overwrites or deletes it.
+//! - A write that a restore took from the server while a disk held it is on the server again
+//!   once the devices are quiet, unless a user overwrote or deleted it.
 //! - L, S and R are valid trees after every step, the store gives back the state it was given,
 //!   and the engine and the server accept every outcome and message the harness reports.
 //! - The engine loads what the store holds after every transaction. The transaction that records
@@ -33,10 +36,14 @@
 //! - Every disk equals the server's live tree, and every engine reports L = S = R with nothing
 //!   in flight, blocked, parked or halted.
 //! - No commit moved a node to a name that the user of its device never gave to anything, other
-//!   than the pending name a swap goes through (design section 2.6), and no commit took a write
-//!   out of the server's live tree that the user of its device never overwrote or deleted.
+//!   than the pending name a swap goes through (design section 2.6) and, until the devices are
+//!   quiet again, a name that L or the server held for a node whose shape a restore took from the
+//!   server (section 4.4), and no commit took a write out of the server's live tree that the user
+//!   of its device never overwrote or deleted.
 //! - No node keeps a pending name that no user gave.
-//! - No write is in two files of the server.
+//! - No write is in two files of the server, except one a restore took from the server while a
+//!   disk held it, which each device that held it keeps (section 4.4), in the files the server
+//!   holds it in once the devices are quiet again.
 //! - Every write was in the server's live tree at some time, unless the user who made it
 //!   overwrote or deleted it first.
 
@@ -50,7 +57,7 @@ use koidrive_engine::effects::{Effect, EffectRecord};
 use koidrive_engine::tree::{Content, NodeId, RemoteNode, same, same_content};
 use koidrive_proto::v1::{
     ChunkRef, Commit, Error, NodeKind, NodeStatus, PrepareUpload, Resume, UploadReceipt,
-    chunk_plan, error, op, op_result,
+    chunk_plan, error, op, op_result, resync_required,
 };
 use sha2::{Digest, Sha256};
 
@@ -155,6 +162,12 @@ pub enum Step {
     /// Does the first of these that has something to do, starting at the one the number picks:
     /// deliver a message, plan or end an effect, build or send a commit, rescan.
     Work(usize),
+    /// Copies the server's storage. Any device may take the step; it does not touch the device.
+    Backup,
+    /// Restores the server's storage from the last copy, in the same history, and restarts the
+    /// server, so every connection breaks. The commits since the copy are lost, and the server
+    /// gives their seqs and device slots again (design section 2.8).
+    Restore,
 }
 
 /// The content of a write: three bytes that name the device and the text, so writes of different
@@ -296,6 +309,21 @@ fn trashed_under(space: &SpaceDo, write: i64, folders: &BTreeSet<&str>) -> bool 
     false
 }
 
+/// The listing a device whose R the server is behind reads in place of the log: every node of the
+/// server's tree and trash at its head (section 4.4).
+fn listing(space: &SpaceDo) -> Message {
+    Message::Listing {
+        nodes: space.nodes(),
+        head: space.head_seq(),
+    }
+}
+
+/// A copy of the server's storage, with what the server had held up to that time.
+struct Backup {
+    space: SpaceDo,
+    held: Held,
+}
+
 fn note(seen: &mut BTreeMap<&'static str, u64>, what: &'static str) {
     *seen.entry(what).or_default() += 1;
 }
@@ -325,6 +353,23 @@ pub struct World {
     /// crash kept the store from hearing of the download, and the user renamed the file before
     /// the restart (section 5.3). The server holds such a write in two files.
     copied: BTreeSet<i64>,
+    /// The last copy of the server's storage.
+    backup: Option<Backup>,
+    /// The writes that a restore took from the server while no disk held them. The server lost
+    /// them, and no engine can send them again.
+    retired: BTreeSet<i64>,
+    /// The writes that a restore took from the server while a disk still held them, each with
+    /// the number of files the server may hold it in. A device that held such a write, on its
+    /// disk or in R, cannot tell whether its author will send it again, so it keeps its copy, and
+    /// the server can end with the write in one file for each of those devices (design section
+    /// 4.4). Once the devices are quiet again, the number is that of the files the server holds.
+    exposed: BTreeMap<i64, usize>,
+    /// For each device, the names that L and the server held for the nodes whose shape a restore
+    /// took from the server, until the devices are quiet again. S forgets a node the restored
+    /// server holds with another shape, so the device sends the position it holds again, also one
+    /// that another device's lost commit gave it, or the name the server gave in place of the one
+    /// L holds.
+    restored_names: Vec<BTreeMap<NodeId, BTreeSet<String>>>,
 }
 
 impl World {
@@ -354,6 +399,7 @@ impl World {
             space,
             removed: vec![BTreeSet::new(); devices.len()],
             named: vec![BTreeSet::new(); devices.len()],
+            restored_names: vec![BTreeMap::new(); devices.len()],
             devices,
             seen: BTreeMap::new(),
             trace: false,
@@ -363,6 +409,9 @@ impl World {
             held: Held::new(),
             unasked: None,
             copied: BTreeSet::new(),
+            backup: None,
+            retired: BTreeSet::new(),
+            exposed: BTreeMap::new(),
         }
     }
 
@@ -391,12 +440,37 @@ impl World {
                 self.dump()
             );
         }
-        quiet.map_err(|failure| failure.at(format!("after phase {phase}")))
+        quiet.map_err(|failure| failure.at(format!("after phase {phase}")))?;
+        self.recovered()
+    }
+
+    /// Ends what a restore allowed once the devices are quiet again: no later commit sends a name
+    /// the restore took from the server, and a write the restore took stays in the files the
+    /// server holds it in now.
+    fn recovered(&mut self) -> Result<(), Failure> {
+        for names in &mut self.restored_names {
+            names.clear();
+        }
+        let mut files: BTreeMap<i64, usize> = BTreeMap::new();
+        for content in self.server_tree()?.into_values().flatten() {
+            *files.entry(content.mtime_ns).or_default() += 1;
+        }
+        for (write, allowed) in &mut self.exposed {
+            *allowed = files.get(write).copied().unwrap_or(1);
+        }
+        Ok(())
     }
 
     fn step(&mut self, d: usize, step: &Step) -> Result<(), Failure> {
         match step {
             Step::User(action) => self.act(d, action),
+            Step::Backup => {
+                self.backup = Some(Backup {
+                    space: self.space.clone(),
+                    held: self.held.clone(),
+                });
+            }
+            Step::Restore => self.restore(),
             _ if self.devices[d].down => self.restart(d)?,
             Step::Scan => {
                 self.scan(d)?;
@@ -504,6 +578,70 @@ impl World {
         }
     }
 
+    /// Restores the server from the last copy. A write the server held only after the copy is
+    /// lost with the restore: it is retired when no disk holds it, and exposed otherwise.
+    fn restore(&mut self) {
+        let Some(backup) = &self.backup else {
+            return;
+        };
+        if backup.space.head_seq() < self.space.head_seq() {
+            note(&mut self.seen, "server restored, commits lost");
+        }
+        type Shape = (String, String, i32, Option<Vec<u8>>);
+        let shapes = |space: &SpaceDo| -> BTreeMap<NodeId, Shape> {
+            (space.nodes().into_iter())
+                .map(|node| {
+                    let digest = node.current.and_then(|current| current.content);
+                    let digest = digest.map(|content| content.manifest_digest);
+                    (
+                        node.node_id,
+                        (node.parent_id, node.name, node.status, digest),
+                    )
+                })
+                .collect()
+        };
+        let before = shapes(&self.space);
+        self.space.restore(&backup.space);
+        let after = shapes(&self.space);
+        let changed: BTreeSet<&NodeId> = (before.keys().chain(after.keys()))
+            .filter(|id| before.get(*id) != after.get(*id))
+            .collect();
+        for (device, names) in self.devices.iter_mut().zip(&mut self.restored_names) {
+            device.link = None;
+            for id in &changed {
+                if let Some((_, name, ..)) = before.get(*id) {
+                    names.entry((*id).clone()).or_default().insert(name.clone());
+                }
+            }
+            for (id, node) in device.engine.trees.local().iter() {
+                if changed.contains(id) {
+                    names
+                        .entry(id.clone())
+                        .or_default()
+                        .insert(node.shape.name.clone());
+                }
+            }
+        }
+        for write in self.writers.keys() {
+            if !stored(&self.held, *write) || stored(&backup.held, *write) {
+                continue;
+            }
+            if !self.devices.iter().any(|device| device.disk.holds(*write)) {
+                self.retired.insert(*write);
+                continue;
+            }
+            let learned = |device: &Device| {
+                device.disk.holds(*write)
+                    || (device.engine.trees.remote().iter()).any(|(_, node)| {
+                        (node.shape.content.as_ref()).is_some_and(|c| c.mtime_ns == *write)
+                    })
+            };
+            let holders = self.devices.iter().filter(|device| learned(device)).count();
+            let exposed = self.exposed.entry(*write).or_default();
+            *exposed = holders.max(*exposed);
+        }
+    }
+
     /// A full rescan. True when L changed.
     fn scan(&mut self, d: usize) -> Result<bool, Failure> {
         let device = &mut self.devices[d];
@@ -530,7 +668,7 @@ impl World {
         let device = &mut self.devices[d];
         let Some(record) = device.engine.effects.in_flight().cloned() else {
             let commits = &device.engine.commits;
-            if commits.in_flight().is_some() && commits.halted().is_none() {
+            if device.engine.behind || commits.in_flight().is_some() && commits.halted().is_none() {
                 return Ok(false);
             }
             let Engine {
@@ -704,15 +842,27 @@ impl World {
         device.persist()
     }
 
-    fn resume(&self, d: usize) -> Result<Message, Failure> {
+    /// The backlog after R's last seq, or the listing when the server is behind R.
+    fn resume(&mut self, d: usize) -> Result<Message, Failure> {
+        let engine = &mut self.devices[d].engine;
+        if engine.behind {
+            return Ok(listing(&self.space));
+        }
         let resume = Resume {
             history_id: self.space.history_id().to_owned(),
-            since_seq: self.devices[d].engine.last_seq,
+            since_seq: engine.last_seq,
         };
-        let backlog = self.space.resume(&resume);
-        backlog
-            .map(Message::Records)
-            .map_err(|error| Failure::Broken(format!("the server refused a resume: {error:?}")))
+        match self.space.resume(&resume) {
+            Ok(backlog) => Ok(Message::Records(backlog)),
+            Err(resync) if resync.reason() == resync_required::Reason::AheadOfServer => {
+                note(&mut self.seen, "resume finds the server behind");
+                engine.behind = true;
+                Ok(listing(&self.space))
+            }
+            Err(error) => Err(Failure::Broken(format!(
+                "the server refused a resume: {error:?}"
+            ))),
+        }
     }
 
     fn connect(&mut self, d: usize) -> Result<(), Failure> {
@@ -727,9 +877,8 @@ impl World {
                 ));
             }
             Reconnect::AheadOfServer => {
-                return Err(Failure::Broken(
-                    "the server lost a device's commits with no server rolled back".into(),
-                ));
+                note(&mut self.seen, "reconnect finds the server lost commits");
+                self.devices[d].engine.behind = true;
             }
             Reconnect::Resend if welcome.device_seq > self.devices[d].engine.commits.accepted() => {
                 note(
@@ -754,7 +903,10 @@ impl World {
 
     /// Receives one message as section 4.4 asks: commits apply in seq order, a commit R already
     /// holds is skipped, and a gap asks for the backlog again and drops the rest of the batch.
+    /// Records that arrive while R waits for a listing are dropped, and the listing asks for the
+    /// backlog after its head, as the driver subscribes again from the listing's seq.
     fn deliver(&mut self, d: usize, index: usize) -> Result<bool, Failure> {
+        let behind = self.devices[d].engine.behind;
         let Some(link) = self.devices[d]
             .link
             .as_mut()
@@ -764,6 +916,54 @@ impl World {
         };
         let message = link.inbox.remove(index % link.inbox.len());
         match message {
+            Message::Records(_) if behind => {
+                note(
+                    &mut self.seen,
+                    "records dropped while R waits for a listing",
+                );
+            }
+            Message::Listing { .. } if !behind => {
+                note(&mut self.seen, "listing arrives twice");
+            }
+            Message::Listing { nodes, head } => {
+                note(&mut self.seen, "listing replaces R");
+                let Engine {
+                    trees,
+                    commits,
+                    last_seq,
+                    behind,
+                    ..
+                } = &mut self.devices[d].engine;
+                let trashed = trees.trashed_here();
+                let edited = trees.edited_here();
+                let root = trees.remote().root.clone();
+                let mut listed = BTreeMap::new();
+                for state in nodes.iter().filter(|state| state.node_id != root) {
+                    let (id, node) = RemoteNode::from_state(state).map_err(|error| {
+                        Failure::Broken(format!("unreadable node state: {error:?}"))
+                    })?;
+                    listed.insert(id, node);
+                }
+                let gone: Vec<NodeId> = (trees.remote().iter())
+                    .map(|(id, _)| id)
+                    .filter(|id| !listed.contains_key(*id))
+                    .cloned()
+                    .collect();
+                for id in gone {
+                    trees.remove_remote(&id);
+                }
+                for (id, node) in listed {
+                    if trees.remote().get(&id) != Some(&node) {
+                        trees.set_remote(id, node);
+                    }
+                }
+                trees.forget_lost(trashed, edited, commits.held_through());
+                *last_seq = head;
+                *behind = false;
+                let backlog = self.resume(d)?;
+                let link = self.devices[d].link.as_mut().expect("checked above");
+                link.inbox.push(backlog);
+            }
             Message::Records(records) => {
                 for record in records {
                     let engine = &mut self.devices[d].engine;
@@ -838,6 +1038,12 @@ impl World {
                                 false => "commit refused for its size, planned again in parts",
                             },
                         ),
+                        commit::Failure::Resync => {
+                            note(&mut self.seen, "commit ahead of the server, R listed again");
+                            device.engine.behind = true;
+                            let listed = listing(&self.space);
+                            (device.link.as_mut()).expect("answered").inbox.push(listed);
+                        }
                         failure => {
                             return Err(Failure::Broken(format!(
                                 "{error:?} on a commit led to {failure:?}"
@@ -861,7 +1067,7 @@ impl World {
             return Ok(false);
         };
         let engine = &mut device.engine;
-        if engine.last_seq < link.head {
+        if engine.behind || engine.last_seq < link.head {
             return Ok(false);
         }
         let Some(flight) = engine.commits.in_flight() else {
@@ -919,7 +1125,11 @@ impl World {
                 let session = device.session.clone();
                 let sent = Commit { receipts, ..commit };
                 let made_up = sent.ops.iter().find_map(|op| match &op.op {
-                    Some(op::Op::Move(moved)) if !given(&self.named[d], &moved.new_name) => {
+                    Some(op::Op::Move(moved))
+                        if !given(&self.named[d], &moved.new_name)
+                            && !(self.restored_names[d].get(&moved.node_id))
+                                .is_some_and(|names| names.contains(&moved.new_name)) =>
+                    {
                         Some(moved)
                     }
                     _ => None,
@@ -1226,17 +1436,30 @@ impl World {
     }
 
     /// Every write is on the disk of the device whose user made it, unless the server has held it
-    /// or that user overwrote or deleted it.
+    /// or that user overwrote or deleted it. A write a restore took from the server while a disk
+    /// held it is on the server again, unless a user overwrote or deleted it.
     fn kept(&self) -> Result<(), Failure> {
         let lost = (self.writers.iter()).find(|(write, writer)| {
             !stored(&self.held, **write)
                 && !self.removed[**writer].contains(write)
                 && !self.devices[**writer].disk.holds(**write)
         });
-        match lost {
-            Some((write, writer)) => Err(Failure::Broken(format!(
+        if let Some((write, writer)) = lost {
+            return Err(Failure::Broken(format!(
                 "write {write} left the disk of device {writer}: the server never held it, and \
                  its user never overwrote or deleted it"
+            )));
+        }
+        let server: BTreeSet<i64> = (self.space.nodes().into_iter())
+            .filter_map(|node| Some(node.current?.content?.mtime_ns))
+            .collect();
+        let gone = (self.exposed.keys()).find(|write| {
+            !server.contains(write) && !self.removed.iter().any(|removed| removed.contains(write))
+        });
+        match gone {
+            Some(write) => Err(Failure::Broken(format!(
+                "a restore took write {write} from the server while a disk held it, and the \
+                 server does not hold it again, though no user overwrote or deleted it"
             ))),
             None => Ok(()),
         }
@@ -1295,6 +1518,9 @@ impl World {
             }
             if let Some(record) = engine.effects.in_flight() {
                 return fail(format!("an effect is in flight: {record:?}"));
+            }
+            if engine.behind {
+                return fail("R waits for a listing".into());
             }
             if !engine.effects.blocked().is_empty() {
                 return fail(format!(
@@ -1379,8 +1605,10 @@ impl World {
                 files.entry(content.mtime_ns).or_default().push(path);
             }
         }
-        let twice =
-            |(write, paths): &(&i64, &Vec<_>)| paths.len() > 1 && !self.copied.contains(*write);
+        let twice = |(write, paths): &(&i64, &Vec<_>)| {
+            paths.len() > self.exposed.get(*write).copied().unwrap_or(1)
+                && !self.copied.contains(*write)
+        };
         if let Some((write, paths)) = files.iter().find(twice) {
             return Err(Failure::Diverged(format!(
                 "write {write} is in more than one file on the server, and no user copied it: {paths:?}"
