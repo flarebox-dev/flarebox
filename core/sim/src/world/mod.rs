@@ -299,10 +299,13 @@ fn acknowledge(engine: &mut Engine) -> Result<(), Failure> {
         next.filter(|(_, result)| result.seq == engine.cursor.seq + 1)
     {
         engine.apply(&result.changes)?;
-        engine.cursor = Base {
-            seq: result.seq,
-            commit_id,
-            committed_at_ms: result.committed_at_ms,
+        engine.cursor = match result.committed_at_ms {
+            0 => Base::from(result.seq),
+            committed_at_ms => Base {
+                seq: result.seq,
+                commit_id,
+                committed_at_ms,
+            },
         };
     }
     engine

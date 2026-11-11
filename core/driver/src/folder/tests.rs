@@ -973,6 +973,38 @@ fn a_commit_result_is_acknowledged_once_whether_the_call_or_the_stream_brings_it
     }
 }
 
+/// RFC 0013 §6: a server from before commit tokens sends results with no time. The cursor then
+/// holds no token at the result's seq instead of a commit ID paired with time 0, which a server
+/// that checks tokens would take for another commit.
+#[test]
+fn a_result_without_a_time_leaves_the_cursor_token_unknown() {
+    for legacy in [false, true] {
+        let mut remote = Remote::new();
+        let (site, mut a) = linked(&mut remote, "legacy-result");
+        fs::write(site.root.join("notes.txt"), b"a retained commit").unwrap();
+        a.scan_until(|a| !a.work.is_empty());
+        let upload = a.work.pop_front().unwrap();
+        a.perform(upload, &mut remote).unwrap();
+        let Some(Work::Send(commit)) = a.work.pop_front() else {
+            panic!("the commit is sent after its upload");
+        };
+        let mut result = remote.commit(&a.caller, &commit).unwrap();
+        if legacy {
+            result.committed_at_ms = 0;
+        }
+        let step = a.folder.sent(Ok(result));
+        a.take(step).unwrap();
+        let cursor = site.stored().cursor.unwrap();
+        assert_eq!(cursor.last_seq, 1);
+        assert_eq!(cursor.commit_id.is_empty(), legacy);
+        let since = resume(&cursor.history_id, &cursor.base());
+        assert!(
+            remote.space.resume(&since).is_ok(),
+            "legacy={legacy}, resume={since:?}"
+        );
+    }
+}
+
 #[test]
 fn a_remote_file_becomes_one_effect_and_its_observation_changes_nothing() {
     let mut remote = Remote::new();

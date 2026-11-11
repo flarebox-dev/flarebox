@@ -22,11 +22,11 @@ New fields only:
 - `Commit`: `base_commit_id = 9`, `base_committed_at_ms = 10`, the token at `base_seq`.
 - `CaughtUp`: `head_commit_id = 2`, `head_committed_at_ms = 3`, the token at `head_seq`.
 - `TreePage`: `head_commit_id = 4`, `head_committed_at_ms = 5`, the token at `head_seq`.
-- `CommitResult`: `committed_at_ms = 4`, the commit's own time, also in a stored result. With the client's `commit_id` it is the token at `seq`.
+- `CommitResult`: `committed_at_ms = 4`, the commit's own time, also in a stored result. With the client's `commit_id` it is the token at `seq`. A server returns a result stored before this RFC with its commit's time from the log.
 
 ## 3. The check
 
-A token claims nothing when its `commit_id` is empty or its seq is 0. Otherwise the server reads its commit at that seq, and the token holds when that commit's token is equal. A seq the log holds no commit for never holds a token.
+A token claims nothing when its `commit_id` is empty, its seq is 0, or its seq is below `log_floor_seq`, where the log no longer holds the commit. Otherwise the server reads its commit at that seq, and the token holds when that commit's token is equal. Any other seq the log holds no commit for never holds a token.
 
 - `Resume`: the check runs after the history fence, `since_seq` above the head and `since_seq` below the floor (spec v0 §7.3). A token that does not hold is answered with `ResyncRequired`, reason `AHEAD_OF_SERVER`.
 - `Commit`: the check is part of RFC 0002 §3 step 4, after `base_seq` above the head and before `require_head`. A token that does not hold is refused with `AHEAD_OF_SERVER`, and nothing is applied. The stored result for the `commit_id` (step 2) comes first, so a resend of a commit the server holds gets its stored result.
@@ -35,14 +35,14 @@ A token claims nothing when its `commit_id` is empty or its seq is 0. Otherwise 
 
 ## 4. Truncation
 
-`log_floor_seq` is the oldest seq a `Resume` can start after, so the token at the floor stays checkable. A server that truncates its log keeps the floor commit's token, written in the same transaction that moves `log_floor_seq`, and checks a `Resume` or a `Commit` at the floor against it. A `Resume` below the floor gets `LOG_TRUNCATED` before the token check. The server does not truncate yet; the sim does, and keeps the floor token.
+`log_floor_seq` is the oldest seq a `Resume` can start after, so the token at the floor stays checkable. A server that truncates its log keeps the floor commit's token, written in the same transaction that moves `log_floor_seq`, and checks a `Resume` or a `Commit` at the floor against it. A `Resume` below the floor gets `LOG_TRUNCATED` before the token check. A `Commit` based below the floor is not checked: its token claims nothing (§3), so a truncated log is not read as a loss. The server does not truncate yet; the sim does, and keeps the floor token.
 
 ## 5. Clients
 
 The client keeps the token at its cursor and always pairs it with the seq it names. A token paired with another seq makes every `Resume` fail the check, and the client would list the tree forever. The client learns the token:
 
 - from each record it applies, as its cursor moves to that record's seq;
-- from the result of its own commit, with that commit's `commit_id`, only when the cursor moves to the result's seq;
+- from the result of its own commit, with that commit's `commit_id`, only when the cursor moves to the result's seq. A result with no `committed_at_ms`, from a server before this RFC, gives no token;
 - from the first `TreePage` of a listing, whose `head_seq` the following `Resume` starts from, and from each record replayed onto the listing;
 - from a `CaughtUp` whose `head_seq` equals the cursor's seq, when the cursor holds no token, as one stored before this RFC.
 
@@ -53,7 +53,7 @@ A commit names the token at its `base_seq` when it is built, and a resend keeps 
 An empty token claims nothing in either direction, so no `Welcome` feature announces this RFC.
 
 - An old client sends no token, and the server skips both checks.
-- A new client of an old server learns tokens from records only, and nothing checks them.
+- A new client of an old server learns tokens from records only, and nothing checks them. Its own results carry no `committed_at_ms`, so they give no token (§5).
 - A client upgraded from a store without tokens resumes with an empty token until it applies a record or catches up at its cursor's seq.
 
 ## 7. Cost

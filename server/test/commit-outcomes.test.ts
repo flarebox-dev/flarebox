@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { fromBinary, toBinary } from "@bufbuild/protobuf";
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { OpResult_Code } from "../src/gen/koidrive/v1/commit_pb";
+import { CommitResultSchema, OpResult_Code } from "../src/gen/koidrive/v1/commit_pb";
 import { Error_Code } from "../src/gen/koidrive/v1/rpc_pb";
 import { toHex, uuidv7 } from "../src/ids";
 import { MAX_HEAD_CHECKS, type SpaceDO } from "../src/space-do";
@@ -146,6 +147,39 @@ describe("RFC 0013 commit tokens", () => {
     await runInDurableObject(a.stub, (_instance, state) => state.storage.sql.exec("DELETE FROM commits WHERE seq = 1"));
     expect(code(await b.commitRaw([op.mkdir(uuidv7(), root, "Forked")], { baseSeq: 1n, ...base(one) }))).toBe(Error_Code.AHEAD_OF_SERVER);
     expect((await heads(b)).head).toBe(2);
+  });
+
+  it("gives a stored result from before commit tokens its commit's committed_at_ms", async () => {
+    const { a, b, root } = await setup();
+    const commitId = uuidv7();
+    const ops = [op.mkdir(uuidv7(), root, "One")];
+    const first = await a.commit(ops, { commitId });
+    await runInDurableObject(a.stub, (_instance, state) => {
+      for (const table of ["commits", "device_commits"]) {
+        const row = state.storage.sql.exec(`SELECT results FROM ${table} WHERE commit_id = ?`, commitId).one();
+        const result = fromBinary(CommitResultSchema, new Uint8Array(row.results as ArrayBuffer));
+        result.committedAtMs = 0n;
+        state.storage.sql.exec(`UPDATE ${table} SET results = ? WHERE commit_id = ?`, toBinary(CommitResultSchema, result), commitId);
+      }
+    });
+    const retry = await a.commit(ops, { commitId });
+    expect(retry).toEqual(first);
+    const next = { baseSeq: retry.seq, baseCommitId: commitId, baseCommittedAtMs: retry.committedAtMs };
+    expect((await b.commit([op.mkdir(uuidv7(), root, "Two")], next)).seq).toBe(2n);
+  });
+
+  it("does not check a base token below the log's floor, whose commit the log no longer holds", async () => {
+    const { a, b, root } = await setup();
+    for (const name of ["One", "Two", "Three"]) await a.commit([op.mkdir(uuidv7(), root, name)]);
+    const one = await tokenAt(a, 1);
+    const two = await tokenAt(a, 2);
+    await runInDurableObject(a.stub, (_instance, state) => {
+      state.storage.sql.exec("UPDATE meta SET value = 2 WHERE key = 'log_floor_seq'");
+      state.storage.sql.exec("DELETE FROM commits WHERE seq < 2");
+    });
+    const stale = { ...base(two), baseCommittedAtMs: two.committedAtMs + 1n };
+    expect(code(await b.commitRaw([op.mkdir(uuidv7(), root, "Four")], { baseSeq: 2n, ...stale }))).toBe(Error_Code.AHEAD_OF_SERVER);
+    expect((await b.commit([op.mkdir(uuidv7(), root, "Five")], { baseSeq: 1n, ...base(one) })).seq).toBe(4n);
   });
 
   it("returns the stored result to a retried commit_id whose base token no longer matches", async () => {

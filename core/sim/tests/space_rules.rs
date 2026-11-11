@@ -1571,3 +1571,98 @@ fn a_base_naming_a_commit_the_server_lost_is_ahead_of_the_server() {
     assert_eq!(s.space.head_seq(), 2);
     assert_eq!(on(&mut s, &kept_id, kept.committed_at_ms).unwrap().seq, 3);
 }
+
+/// RFC 0006 section 8: a retry is matched by digest v1, which covers neither base token field, so
+/// a retry that changes only them gets the stored result, as on the server.
+#[test]
+fn a_retry_that_changes_only_its_base_token_gets_the_stored_result() {
+    let mut s = Space::new();
+    let root = s.root();
+    let mut a = s.client("A");
+    let one = s.id();
+    s.commit(&mut a, vec![mkdir(&one, &root, "one")], vec![]);
+    let (base_commit_id, base_committed_at_ms) = s.space.token_at(1).unwrap();
+    let two = s.id();
+    let commit = Commit {
+        commit_id: s.id(),
+        history_id: s.space.history_id().into(),
+        device_seq: 2,
+        base_seq: 1,
+        base_commit_id,
+        base_committed_at_ms,
+        ops: vec![mkdir(&two, &root, "two")],
+        ..Default::default()
+    };
+    let first = s.space.commit(&a.session, NOW, &commit).unwrap().result;
+    let other_time = Commit {
+        base_committed_at_ms: base_committed_at_ms + 1,
+        ..commit.clone()
+    };
+    let other_id = Commit {
+        base_commit_id: s.id(),
+        ..commit.clone()
+    };
+    for retry in [commit, other_time, other_id] {
+        assert_eq!(
+            s.space.commit(&a.session, NOW + 1, &retry).unwrap().result,
+            first
+        );
+    }
+}
+
+/// RFC 0013 sections 3 and 4: the log keeps the floor commit's token, so a resume or a commit at
+/// the floor is checked, while a commit based below it is not: its commit is gone from the log, so
+/// the token claims nothing and a truncated log is not read as a loss.
+#[test]
+fn a_token_below_the_floor_claims_nothing() {
+    let mut s = Space::new();
+    let root = s.root();
+    let mut a = s.client("A");
+    for name in ["one", "two", "three"] {
+        let id = s.id();
+        s.commit(&mut a, vec![mkdir(&id, &root, name)], vec![]);
+    }
+    let tokens: Vec<_> = (0..=2).map(|seq| s.space.token_at(seq).unwrap()).collect();
+    s.space.truncate_log(2);
+    let history_id = s.space.history_id().to_string();
+    let wrong = |(id, at): &(String, i64)| (id.clone(), at + 1);
+    let resume = |seq: u64, (id, at): (String, i64)| Resume {
+        history_id: history_id.clone(),
+        since_seq: seq,
+        since_commit_id: id,
+        since_committed_at_ms: at,
+    };
+    assert_eq!(
+        s.space.resume(&resume(2, tokens[2].clone())).unwrap().len(),
+        1
+    );
+    assert_eq!(
+        s.space
+            .resume(&resume(2, wrong(&tokens[2])))
+            .unwrap_err()
+            .reason(),
+        resync_required::Reason::AheadOfServer
+    );
+    let based = |s: &mut Space, seq: u64, (id, at): (String, i64)| {
+        let node = s.id();
+        let commit = Commit {
+            commit_id: s.id(),
+            history_id: s.space.history_id().into(),
+            device_seq: s.space.device_seq(&a.session.device_id) + 1,
+            base_seq: seq,
+            base_commit_id: id,
+            base_committed_at_ms: at,
+            ops: vec![mkdir(&node, &root, &node)],
+            ..Default::default()
+        };
+        s.space
+            .commit(&a.session, NOW, &commit)
+            .map(|done| done.result)
+    };
+    assert_eq!(
+        error_code(based(&mut s, 2, wrong(&tokens[2]))),
+        error::Code::AheadOfServer
+    );
+    assert_eq!(based(&mut s, 1, tokens[1].clone()).unwrap().seq, 4);
+    assert_eq!(based(&mut s, 2, tokens[2].clone()).unwrap().seq, 5);
+}

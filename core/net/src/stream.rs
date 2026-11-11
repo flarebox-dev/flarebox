@@ -20,9 +20,14 @@ pub(crate) struct Cursor {
 }
 
 impl Cursor {
+    /// Moves to `seq` with its commit token. A token with no time is unknown, as in the result of a server from before
+    /// RFC 0013, so the cursor then holds none and may take the head's from a `CaughtUp`.
     fn advance(&mut self, seq: u64, commit_id: &str, committed_at_ms: i64) {
         self.seq = seq;
-        self.commit_id = commit_id.to_owned();
+        self.commit_id = match committed_at_ms {
+            0 => String::new(),
+            _ => commit_id.to_owned(),
+        };
         self.committed_at_ms = committed_at_ms;
     }
 }
@@ -400,5 +405,33 @@ mod tests {
         };
         stream.caught_up(other);
         assert_eq!(stream.reconnected(), Some(since(4)));
+    }
+    /// A result with no time, from a server before RFC 0013, leaves the token unknown, and the next
+    /// `CaughtUp` at that seq supplies it, also for a result held until the records before it came.
+    #[test]
+    fn a_result_without_a_time_takes_its_token_from_caught_up() {
+        for held in [false, true] {
+            let mut stream = subscribed(4);
+            stream.caught_up(head(4));
+            let seq = if held { 7 } else { 5 };
+            let mut own = committed(seq);
+            own.result.committed_at_ms = 0;
+            stream.committed(own);
+            if held {
+                stream.changes(vec![record(5), record(6)]);
+            }
+            stream.caught_up(CaughtUp {
+                head_commit_id: format!("own{seq}"),
+                ..head(seq)
+            });
+            assert_eq!(
+                stream.reconnected(),
+                Some(Resume {
+                    since_commit_id: format!("own{seq}"),
+                    ..since(seq)
+                }),
+                "held={held}"
+            );
+        }
     }
 }

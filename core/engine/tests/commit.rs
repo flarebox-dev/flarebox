@@ -4768,3 +4768,45 @@ fn a_reused_revision_does_not_keep_an_agreement_the_server_lost() {
     .unwrap();
     assert_eq!(ops(&next), [mv("n", ROOT, "c")]);
 }
+
+/// GUN-457: after a loss, an agreement on c at revision 10 is kept only when the server provably
+/// holds its record: its revision is at or below `held_through`, or the new R holds the node live at
+/// c with that very revision. A later revision at c, another name, the trash or no record drops it.
+#[test]
+fn an_agreement_survives_a_loss_only_on_a_kept_seq_or_its_exact_record() {
+    for (held_through, rev, name, trashed, kept) in [
+        (10, 12, "z", false, true),
+        (9, 10, "c", false, true),
+        (9, 10, "z", false, false),
+        (9, 12, "c", false, false),
+        (9, 10, "c", true, false),
+        (9, 0, "missing", false, false),
+    ] {
+        let mut trees = trees(&[("n", Some(file(ROOT, "b", 1)), None, None)]);
+        let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+        build(&mut commits, &mut trees, &mut ids).unwrap();
+        trees.set_remote("n".into(), remote_at(file(ROOT, "b", 1), 8));
+        trees.set_local("n".into(), local(file(ROOT, "c", 1), 1));
+        trees.set_remote("n".into(), remote_at(file(ROOT, "c", 2), 10));
+        assert_eq!(trees.position_after("n", 8).unwrap().rev, 10);
+        trees.set_local("n".into(), local(file(ROOT, "d", 1), 1));
+        trees.remove_remote("n");
+        if rev != 0 {
+            trees.set_remote(
+                "n".into(),
+                RemoteNode {
+                    trashed,
+                    trash_group: if trashed { "g:0".into() } else { String::new() },
+                    ..remote_at(file(ROOT, name, 2), rev)
+                },
+            );
+        }
+        trees.forget_lost(Vec::new(), Vec::new(), held_through, commits.accepted());
+        trees.settle();
+        assert_eq!(
+            trees.position_after("n", 8).map(|agreed| agreed.rev),
+            kept.then_some(10),
+            "held_through={held_through} rev={rev} name={name} trashed={trashed}"
+        );
+    }
+}

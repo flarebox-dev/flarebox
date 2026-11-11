@@ -757,15 +757,21 @@ export class SpaceDO extends DurableObject<Env> {
 
   /**
    * The result stored for a commit, in the log or as its device's latest accepted commit (RFC 0002 section 2), with the
-   * device that made it and the digest of its request, which rows stored before RFC 0006 lack.
+   * device that made it and the digest of its request, which rows stored before RFC 0006 lack. A result stored before
+   * RFC 0013 has no committed_at_ms, so it takes its commit's from the log.
    */
   private storedResult(commitId: string): { result: CommitResult; deviceId: string; digest: Uint8Array | null } | undefined {
     const row =
       this.sql.exec("SELECT results, device_id, request_digest FROM commits WHERE commit_id = ?", commitId).toArray()[0] ??
       this.sql.exec("SELECT results, device_id, request_digest FROM device_commits WHERE commit_id = ?", commitId).toArray()[0];
     if (!row) return undefined;
+    const result = fromBinary(CommitResultSchema, new Uint8Array(row.results as ArrayBuffer));
+    if (result.committedAtMs === 0n) {
+      const logged = this.sql.exec("SELECT committed_at_ms FROM commits WHERE commit_id = ?", commitId).toArray()[0];
+      result.committedAtMs = BigInt(Number(logged?.committed_at_ms ?? 0));
+    }
     return {
-      result: fromBinary(CommitResultSchema, new Uint8Array(row.results as ArrayBuffer)),
+      result,
       deviceId: String(row.device_id ?? ""),
       digest: row.request_digest === null ? null : new Uint8Array(row.request_digest as ArrayBuffer),
     };
@@ -778,11 +784,11 @@ export class SpaceDO extends DurableObject<Env> {
   }
 
   /**
-   * Whether a client's token at seq names another commit than the one the log holds there (RFC 0013). An empty token and
-   * seq 0 claim nothing; a seq the log holds no commit for never matches.
+   * Whether a client's token at seq names another commit than the one the log holds there (RFC 0013). An empty token,
+   * seq 0 and a seq below the log's floor claim nothing; any other seq the log holds no commit for never matches.
    */
   private tokenDiffers(seq: bigint, commitId: string, committedAtMs: bigint): boolean {
-    if (commitId === "" || seq === 0n) return false;
+    if (commitId === "" || seq === 0n || seq < BigInt(Number(getMeta(this.sql, "log_floor_seq")))) return false;
     const held = this.tokenAt(Number(seq));
     return held.commitId !== commitId || held.committedAtMs !== committedAtMs;
   }

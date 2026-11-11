@@ -1066,10 +1066,13 @@ impl Folder {
                 Stop::Protocol(format!("the result of commit {commit_id}: {error:?}"))
             })
         };
-        let at = Base {
-            seq: result.seq,
-            commit_id: commit_id.to_owned(),
-            committed_at_ms: result.committed_at_ms,
+        let at = match result.committed_at_ms {
+            0 => Base::from(result.seq),
+            committed_at_ms => Base {
+                seq: result.seq,
+                commit_id: commit_id.to_owned(),
+                committed_at_ms,
+            },
         };
         if let Stream::Replaying(staging) = &mut self.stream {
             if result.seq == staging.last_seq() + 1 {

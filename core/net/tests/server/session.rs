@@ -413,7 +413,8 @@ async fn resync_required_then_a_bootstrap_resumes_the_stream() {
     session.subscribe(Resume {
         history_id: history.clone(),
         since_seq: start_seq,
-        ..Default::default()
+        since_commit_id: first.head_commit_id.clone(),
+        since_committed_at_ms: first.head_committed_at_ms,
     });
     let replayed = until(&mut events, |e| match e {
         Event::Changes(records) => Some(records.iter().map(|r| r.seq).collect::<Vec<_>>()),

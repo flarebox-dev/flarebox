@@ -360,15 +360,15 @@ struct StoredResult {
     result: CommitResult,
 }
 
-/// The part of a commit request that digest v1 covers: everything but `commit_id`, `receipts`,
-/// `history_id` and `run_id`.
+/// The part of a commit request that digest v1 covers: `base_seq`, `ops`, `device_seq` and
+/// `require_head`. Fields added later, such as the base token of RFC 0013, stay out of it.
 fn covered(commit: &Commit) -> Commit {
     Commit {
-        commit_id: String::new(),
-        receipts: Vec::new(),
-        history_id: String::new(),
-        run_id: String::new(),
-        ..commit.clone()
+        base_seq: commit.base_seq,
+        ops: commit.ops.clone(),
+        device_seq: commit.device_seq,
+        require_head: commit.require_head,
+        ..Commit::default()
     }
 }
 
@@ -455,10 +455,11 @@ impl SpaceDo {
     }
 
     /// Whether a client's token at `seq` names the commit this server holds there. An empty token
-    /// claims nothing.
+    /// claims nothing, and neither does one below the floor, whose commit the log no longer holds.
     fn holds_token(&self, seq: u64, commit_id: &str, committed_at_ms: i64) -> bool {
         commit_id.is_empty()
             || seq == 0
+            || seq < self.log_floor_seq
             || self.token_at(seq) == Some((commit_id.to_owned(), committed_at_ms))
     }
 
