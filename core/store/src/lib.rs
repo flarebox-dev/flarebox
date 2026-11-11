@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub use engine::EngineState;
+use koidrive_engine::commit::Base;
 use koidrive_fs::FileId;
 use koidrive_proto::v1::{Content, NodeState, VersionInfo};
 use prost::Message;
@@ -437,6 +438,17 @@ pub struct Cursor {
     /// The server reported its log below `last_seq` (`AHEAD_OF_SERVER`), and no bootstrap has replaced R
     /// since: the server lost commits this device applied.
     pub ahead_of_server: bool,
+}
+
+impl Cursor {
+    /// The seq and commit token R holds, as the base of a commit or a `Resume` (RFC 0013).
+    pub fn base(&self) -> Base {
+        Base {
+            seq: self.last_seq,
+            commit_id: self.commit_id.clone(),
+            committed_at_ms: self.committed_at_ms,
+        }
+    }
 }
 
 /// A node's position, kind and content: what the synced tree records per node

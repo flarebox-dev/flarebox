@@ -122,7 +122,7 @@ impl Space {
     ) -> CommitResult {
         let result = self.commit_raw(c, ops, c.base_seq, receipts, None).unwrap();
         c.base_seq = result.seq;
-        result..Default::default()
+        result
     }
 
     fn create_file(
@@ -1490,4 +1490,84 @@ fn a_receipt_holds_only_for_its_space_and_size_and_a_stored_object_outlasts_it()
     }
     let receipts = vec![s.space.put_chunk(hash, size, NOW)];
     assert!(attempt(&mut s, receipts, NOW + 3_600_001).is_ok());
+}
+
+/// GUN-454. A's commit at seq 2 is lost when the space is restored from a backup at seq 1, and B's
+/// commit then takes seq 2. A commit or a resume of A from seq 2 names A's lost commit by its
+/// token, so the server answers `AHEAD_OF_SERVER` instead of reading B's seq 2 as the base A saw
+/// (RFC 0013). One that names B's commit is taken.
+#[test]
+fn a_base_naming_a_commit_the_server_lost_is_ahead_of_the_server() {
+    let mut s = Space::new();
+    let root = s.root();
+    let (mut a, mut b) = (s.client("A"), s.client("B"));
+    let first = s.id();
+    s.commit(&mut a, vec![mkdir(&first, &root, "first")], vec![]);
+    let backup = s.space.clone();
+    let lost_id = s.id();
+    let lost = s
+        .commit_raw(
+            &a,
+            vec![mkdir(&lost_id, &root, "lost")],
+            1,
+            vec![],
+            Some(lost_id.clone()),
+        )
+        .unwrap();
+    assert_eq!(lost.seq, 2);
+    s.space.restore(&backup);
+    b.base_seq = 1;
+    let kept_id = s.id();
+    let kept = s
+        .commit_raw(
+            &b,
+            vec![mkdir(&kept_id, &root, "kept")],
+            1,
+            vec![],
+            Some(kept_id.clone()),
+        )
+        .unwrap();
+    assert_eq!(kept.seq, 2);
+    let history_id = s.space.history_id().to_string();
+    let from = |commit_id: &str, committed_at_ms: i64| Resume {
+        history_id: history_id.clone(),
+        since_seq: 2,
+        since_commit_id: commit_id.into(),
+        since_committed_at_ms: committed_at_ms,
+    };
+    assert_eq!(
+        s.space
+            .resume(&from(&lost_id, lost.committed_at_ms))
+            .unwrap_err()
+            .reason(),
+        resync_required::Reason::AheadOfServer
+    );
+    assert_eq!(
+        s.space
+            .resume(&from(&kept_id, kept.committed_at_ms))
+            .unwrap(),
+        []
+    );
+    let on = |s: &mut Space, commit_id: &str, committed_at_ms: i64| {
+        let id = s.id();
+        let commit = Commit {
+            commit_id: s.id(),
+            base_seq: 2,
+            base_commit_id: commit_id.into(),
+            base_committed_at_ms: committed_at_ms,
+            ops: vec![mkdir(&id, &root, &id)],
+            history_id: s.space.history_id().into(),
+            device_seq: s.space.device_seq(&a.session.device_id) + 1,
+            ..Default::default()
+        };
+        s.space
+            .commit(&a.session, NOW, &commit)
+            .map(|done| done.result)
+    };
+    assert_eq!(
+        error_code(on(&mut s, &lost_id, lost.committed_at_ms)),
+        error::Code::AheadOfServer
+    );
+    assert_eq!(s.space.head_seq(), 2);
+    assert_eq!(on(&mut s, &kept_id, kept.committed_at_ms).unwrap().seq, 3);
 }
