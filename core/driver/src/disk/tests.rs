@@ -1185,7 +1185,10 @@ fn a_start_that_recovers_an_effect_has_its_paths_read_again() {
 
 #[test]
 fn an_effect_that_met_a_taken_name_or_a_changed_file_stays_blocked() {
-    for (scenario, disturb) in [(&SCENARIOS[1], "Taken"), (&SCENARIOS[2], "Changed")] {
+    for (scenario, disturb) in [
+        (&SCENARIOS[1], "another entry holds its name"),
+        (&SCENARIOS[2], "the entry changed on this device"),
+    ] {
         let folder = Folder::new();
         let mut server = Server::default();
         (scenario.setup)(&folder, &mut server);
@@ -1251,7 +1254,7 @@ fn a_remote_edit_never_replaces_a_file_whose_read_was_deferred() {
         .unwrap();
     assert_eq!(
         running.step(&server),
-        Some(Settled::Failed("Changed".into()))
+        Some(Settled::Failed("the entry changed on this device".into()))
     );
     assert_eq!(fs::read(&report).unwrap(), b"the user's own words");
 
@@ -2008,7 +2011,7 @@ fn a_rename_dropped_with_a_stale_batch_reaches_l_after_the_rescan() {
             .disk
             .apply(staged, &mut running.engine, &mut running.store)
             .unwrap(),
-        Settled::Failed("Missing".into())
+        Settled::Failed("the entry is not there".into())
     );
     let before = running.local(NODE).unwrap().clone();
     assert_eq!(before.shape.name, "report.txt");
