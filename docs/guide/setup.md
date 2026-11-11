@@ -49,7 +49,7 @@ Until the public client exists, deploy the server and claim it without `flarebox
 3. Claim the server with this device, which becomes your first device:
 
    ```sh
-   flarebox server claim flarebox.alice.workers.dev ABCD-EFGH-JKLM --user Alice
+   flarebox server claim flarebox.alice.workers.dev ABCD-EFGH-JKLM --user "Alice Park"
    ```
 
    Give the server's address, the claim code and your name. The device takes this machine's host name; give it another with `--name`. A server that already has an owner refuses the claim code.
