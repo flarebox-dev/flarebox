@@ -901,7 +901,10 @@ impl Commits {
     /// its result: *a* takes *w*, and the commit in flight is dropped, its restores staying queued,
     /// so that its changes are planned again once R is listed again. Any other *w*, or a commit
     /// built in another history, starts recovery. A read-only device resends nothing, and a
-    /// device under a policy halt resends nothing whatever the `Welcome` says. Whether R itself
+    /// device under a policy halt resends nothing whatever the `Welcome` says. With *w* < *a* the
+    /// slots above *w* are forgotten in every case, a policy halt included: the server does not hold
+    /// those commits, so [`Commits::held_through`] must not count them for a listing taken under the
+    /// halt. Whether R itself
     /// belongs to the `Welcome`'s history is checked where R is kept.
     ///
     /// Recovery keeps the queued restores with the commit in flight: nothing is built under that
@@ -909,10 +912,13 @@ impl Commits {
     /// (section 6.4). On a read-only device the restores no commit in flight carries end as
     /// rejected.
     pub fn connected(&mut self, welcome: &proto::Welcome) -> Reconnect {
+        let (a, w) = (self.accepted, welcome.device_seq);
+        if w < a {
+            self.slots.split_off(&(w + 1));
+        }
         if matches!(self.halted, Some(Halt::Policy { .. })) {
             return Reconnect::Idle;
         }
-        let (a, w) = (self.accepted, welcome.device_seq);
         let reconnect = match &self.in_flight {
             _ if self.halted == Some(Halt::Recovery) => Reconnect::Recovery,
             Some(flight) if flight.commit.history_id != welcome.history_id => Reconnect::Recovery,
@@ -929,7 +935,6 @@ impl Commits {
         if reconnect == Reconnect::AheadOfServer {
             self.accepted = w;
             self.in_flight = None;
-            self.slots.split_off(&(w + 1));
         }
         if welcome.read_only {
             self.halted = Some(Halt::ReadOnly);

@@ -688,8 +688,8 @@ fn a_parked_folder_the_server_lost_is_created_again_after_a_delete_empties_it() 
     assert!(matches!(&ops(&commit)[..], [op::Op::CreateDir(c)] if c.node_id == "albums"));
 }
 
-/// Trees with @@rows@@, synced at seq 1. A commit of this device at slot 1 creates @@pad@@ and is
-/// applied at seq 2. The user then deletes @@rows@@ here, and the commit at slot 2 that deletes them
+/// Trees with `rows`, synced at seq 1. A commit of this device at slot 1 creates `pad` and is
+/// applied at seq 2. The user then deletes `rows` here, and the commit at slot 2 that deletes them
 /// is applied at seq 5, which trashes each row. A server restored from a backup taken at seq 2
 /// counts only slot 1, so every seq up to 2 is from before the loss. Returns the delete's ops.
 fn deleted_at_5_then_lost(rows: &[Row]) -> (Commits, Trees, IdGen, Vec<op::Op>) {
@@ -759,9 +759,9 @@ fn a_delete_the_server_lost_is_sent_again() {
 }
 
 /// Of three files this device deleted at seq 5, a bootstrap from a server restored from seq 2 lists
-/// @@same@@ as it was deleted, @@edited@@ with other content, and @@restored@@ as it was deleted but
+/// `same` as it was deleted, `edited` with other content, and `restored` as it was deleted but
 /// restored after the loss at seq 3, a seq below the lost delete's that the lost commits had. Only
-/// @@same@@ is deleted again; the other two are downloaded.
+/// `same` is deleted again; the other two are downloaded.
 #[test]
 fn a_delete_the_server_lost_is_sent_again_only_for_what_it_saw() {
     let rows = [
@@ -1972,6 +1972,42 @@ fn a_policy_refusal_keeps_the_commit_and_outlasts_any_welcome() {
             "{error:?}"
         );
     }
+}
+
+/// A device under a policy halt does not compare the `Welcome` with its counter, but it still
+/// forgets the slots of the commits a server that counts fewer of them lost, so a listing taken
+/// under the halt does not count those commits as held.
+#[test]
+fn a_policy_halt_forgets_the_slots_the_server_lost() {
+    let mut trees = trees(&[("a", Some(file(ROOT, "x", 1)), None, None)]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    let a = RemoteNode {
+        content_rev: 4,
+        meta_rev: 4,
+        ..remote(file(ROOT, "x", 1))
+    };
+    trees.set_remote("a".into(), a);
+    commits
+        .received(result(4, vec![outcome(op_result::Code::Applied)]))
+        .unwrap();
+    assert!(commits.acknowledge(&mut trees, 4));
+    trees.settle();
+    trees.set_local("b".into(), local(file(ROOT, "y", 2), 98));
+    trees.settle();
+    let refused = build(&mut commits, &mut trees, &mut ids).unwrap();
+    commits.failed(&refusal(error::Code::Forbidden, 0)).unwrap();
+    assert_eq!(commits.held_through(), 4);
+    assert_eq!(commits.connected(&welcome(1)), Reconnect::Idle);
+    assert_eq!(commits.held_through(), 4);
+    assert_eq!(commits.connected(&welcome(0)), Reconnect::Idle);
+    assert_eq!(commits.held_through(), 0);
+    let halt = Halt::Policy {
+        code: error::Code::Forbidden as i32,
+    };
+    assert_eq!(commits.halted(), Some(halt));
+    assert_eq!(commits.accepted(), 1);
+    assert_eq!(commits.in_flight().unwrap().commit, refused);
 }
 
 #[test]

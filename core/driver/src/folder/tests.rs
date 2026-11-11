@@ -3458,6 +3458,73 @@ fn a_restore_after_the_server_lost_a_delete_is_kept() {
     assert_eq!(a.state(), FolderState::UpToDate);
 }
 
+/// As above, but the server refused a later commit of `a` with `FORBIDDEN`, so `a` is under a policy halt when it
+/// meets the restored server. The halted `a` lists the tree after a restart, and once the halt is lifted it still
+/// keeps the restore instead of sending its delete again.
+#[test]
+fn a_restore_after_the_server_lost_a_delete_under_a_policy_halt_is_kept() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site.root.join("one.txt"), b"one");
+    let mut restored = backup(&remote, &a);
+    for pad in ["pad-two.txt", "pad-three.txt", "pad-four.txt"] {
+        a.create(&mut remote, &site.root.join(pad), pad.as_bytes());
+    }
+    fs::remove_file(site.root.join("one.txt")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    assert_eq!(a.run(&mut remote), ["send"]);
+    assert_eq!(remote.space.head_seq(), 5);
+    fs::write(site.root.join("refused.txt"), b"refused").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    let upload = a.work.pop_front().unwrap();
+    a.perform(upload, &mut remote).unwrap();
+    assert!(matches!(a.work.pop_front(), Some(Work::Send(_))));
+    let step = a.folder.sent(Err(CallError::Server(ServerError(
+        flarebox_proto::v1::Error {
+            code: Code::Forbidden as i32,
+            message: "refused".into(),
+            ..Default::default()
+        },
+    ))));
+    assert!(a.take(step).is_err());
+    let (other, mut b) = linked(&mut restored, "b");
+    let node = (b.folder.engine.trees.local().iter())
+        .find(|(_, node)| node.shape.name == "one.txt")
+        .unwrap()
+        .0
+        .clone();
+    fs::remove_file(other.root.join("one.txt")).unwrap();
+    b.scan_until(|b| !b.work.is_empty());
+    assert_eq!(b.run(&mut restored), ["send"]);
+    let intent = RestoreIntent::from_trash(node, None, None).unwrap();
+    let request = ask(&other, &intent);
+    let step = b.folder.requested();
+    b.take(step).unwrap();
+    b.run(&mut restored);
+    assert_eq!(ended(&other), [(request, Outcome::Restored)]);
+    drop(a);
+    let mut halted = restarted(&site, &mut restored);
+    halted.settle();
+    halted.run(&mut restored);
+    assert!(halted.sent.is_empty());
+    drop(halted);
+    lift_halt(&site.db, Lift::Replan).unwrap();
+    let mut a = restarted(&site, &mut restored);
+    a.settle();
+    a.run(&mut restored);
+    let all = [
+        "one.txt",
+        "pad-four.txt",
+        "pad-three.txt",
+        "pad-two.txt",
+        "refused.txt",
+    ];
+    assert_eq!(restored.names(), all);
+    assert_eq!(names(&site.root), all);
+    assert_eq!(fs::read(site.root.join("one.txt")).unwrap(), b"one");
+    assert_eq!(a.state(), FolderState::UpToDate);
+}
+
 /// The server's storage is restored from a backup taken before `a` wrote new content into `one.txt` (GUN-387).
 /// `a` lists the tree again, which holds `one.txt` with its older content, and sends its edit again instead of
 /// keeping it beside `one.txt` as a conflict copy.
@@ -3479,6 +3546,59 @@ fn an_edit_the_server_lost_is_sent_again() {
     assert_eq!(a.state(), FolderState::UpToDate);
     let (other, _b) = linked(&mut restored, "b");
     assert_eq!(fs::read(other.root.join("one.txt")).unwrap(), b"edited");
+}
+
+/// `a` edited `one.txt` in a commit the server lost, and the server refused a later commit of `a` with
+/// `FORBIDDEN`, so `a` is under a policy halt when it meets the restored server. `b` edits `one.txt` there at seq
+/// 2, a seq `a`'s lost commits had. The halted `a` lists the tree after a restart, and once the halt is lifted it
+/// keeps `b`'s content in `one.txt` and its own as a conflict copy, instead of sending its edit again over `b`'s.
+#[test]
+fn an_edit_the_server_lost_under_a_policy_halt_is_not_sent_again_over_a_later_edit() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site.root.join("one.txt"), b"original");
+    let mut restored = backup(&remote, &a);
+    for pad in ["pad-two.txt", "pad-three.txt", "pad-four.txt"] {
+        a.create(&mut remote, &site.root.join(pad), pad.as_bytes());
+    }
+    a.create(&mut remote, &site.root.join("one.txt"), b"authored");
+    assert_eq!(remote.space.head_seq(), 5);
+    fs::write(site.root.join("refused.txt"), b"refused").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    let upload = a.work.pop_front().unwrap();
+    a.perform(upload, &mut remote).unwrap();
+    assert!(matches!(a.work.pop_front(), Some(Work::Send(_))));
+    let step = a.folder.sent(Err(CallError::Server(ServerError(
+        flarebox_proto::v1::Error {
+            code: Code::Forbidden as i32,
+            message: "refused".into(),
+            ..Default::default()
+        },
+    ))));
+    assert!(a.take(step).is_err());
+    let halt = Some(CommitHalt::Policy {
+        code: Code::Forbidden as i32,
+    });
+    assert_eq!(site.stored().commits.halted(), halt);
+    let (other, mut b) = linked(&mut restored, "b");
+    b.create(&mut restored, &other.root.join("one.txt"), b"post-loss");
+    assert_eq!(restored.space.head_seq(), 2);
+    drop(a);
+    let mut halted = restarted(&site, &mut restored);
+    halted.settle();
+    halted.run(&mut restored);
+    assert!(halted.sent.is_empty());
+    assert_eq!(site.stored().commits.halted(), halt);
+    drop(halted);
+    lift_halt(&site.db, Lift::Replan).unwrap();
+    let mut a = restarted(&site, &mut restored);
+    a.settle();
+    a.run(&mut restored);
+    assert_eq!(a.state(), FolderState::UpToDate);
+    let (fresh, _c) = linked(&mut restored, "c");
+    assert_eq!(fs::read(fresh.root.join("one.txt")).unwrap(), b"post-loss");
+    let copy = fresh.root.join("one (conflict from a 2023-11-14).txt");
+    assert_eq!(fs::read(copy).unwrap(), b"authored");
 }
 
 /// The server lost `a`'s commit of `two.txt`, and `b` deleted `one.txt` on the restored server. The listing reads
