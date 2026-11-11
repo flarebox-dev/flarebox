@@ -357,9 +357,10 @@ pub struct World {
     /// them, and no engine can send them again.
     retired: BTreeSet<i64>,
     /// The writes that a restore took from the server while a disk still held them, each with
-    /// the number of devices whose disk held it. A device that held such a write cannot tell
-    /// whether its author will send it again, so it keeps its copy, and the server can end with
-    /// the write in one file for each of those devices (design section 4.4).
+    /// the number of devices whose disk or R held it. A device that held such a write, or
+    /// downloads it after the restore, cannot tell whether its author will send it again, so it
+    /// keeps its copy, and the server can end with the write in one file for each of those
+    /// devices (design section 4.4).
     exposed: BTreeMap<i64, usize>,
     /// For each device, the names that L and the server held for the nodes whose position a
     /// restore took from the server. S forgets a node the restored server holds with another
@@ -596,20 +597,19 @@ impl World {
             if !stored(&self.held, *write) || stored(&backup.held, *write) {
                 continue;
             }
-            match self
-                .devices
-                .iter()
-                .filter(|device| device.disk.holds(*write))
-                .count()
-            {
-                0 => {
-                    self.retired.insert(*write);
-                }
-                holders => {
-                    let exposed = self.exposed.entry(*write).or_default();
-                    *exposed = holders.max(*exposed);
-                }
+            if !self.devices.iter().any(|device| device.disk.holds(*write)) {
+                self.retired.insert(*write);
+                continue;
             }
+            let learned = |device: &Device| {
+                device.disk.holds(*write)
+                    || (device.engine.trees.remote().iter()).any(|(_, node)| {
+                        (node.shape.content.as_ref()).is_some_and(|c| c.mtime_ns == *write)
+                    })
+            };
+            let holders = self.devices.iter().filter(|device| learned(device)).count();
+            let exposed = self.exposed.entry(*write).or_default();
+            *exposed = holders.max(*exposed);
         }
     }
 
@@ -1004,6 +1004,12 @@ impl World {
                                 false => "commit refused for its size, planned again in parts",
                             },
                         ),
+                        commit::Failure::Resync => {
+                            note(&mut self.seen, "commit ahead of the server, R listed again");
+                            device.engine.behind = true;
+                            let listed = listing(&self.space);
+                            (device.link.as_mut()).expect("answered").inbox.push(listed);
+                        }
                         failure => {
                             return Err(Failure::Broken(format!(
                                 "{error:?} on a commit led to {failure:?}"
