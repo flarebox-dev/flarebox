@@ -968,3 +968,51 @@ fn a_folder_moved_onto_the_path_of_a_folder_that_moved_away_is_renamed_onto_it()
     );
     assert_eq!(snapshot, Snapshot::scan(root).unwrap());
 }
+
+/// Files and folders that swap paths through a third name are renames, so the
+/// engine keeps each entry's node. A folder holds an entry of the same name as
+/// the other one, as a swap of two project folders does.
+#[test]
+fn entries_swapped_through_a_third_name_are_renamed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("one"), "one").unwrap();
+    fs::write(root.join("two"), "two").unwrap();
+    for folder in ["x", "y"] {
+        fs::create_dir(root.join(folder)).unwrap();
+        fs::write(root.join(folder).join("note"), folder).unwrap();
+    }
+    let mut snapshot = Snapshot::scan(root).unwrap();
+
+    for (first, second) in [("one", "two"), ("x", "y")] {
+        for (from, to) in [(first, "tmp"), (second, first), ("tmp", second)] {
+            fs::rename(root.join(from), root.join(to)).unwrap();
+        }
+    }
+    let changes = snapshot.rescan(root, [PathBuf::new()]).unwrap().changes;
+    assert_eq!(
+        changes,
+        [
+            renamed("one", "two", File),
+            renamed("two", "one", File),
+            renamed("x", "y", Dir),
+            renamed("y", "x", Dir)
+        ]
+    );
+    assert_eq!(snapshot, Snapshot::scan(root).unwrap());
+}
+
+/// A file written over by renaming a new file onto it keeps its path: the
+/// old file is gone, so nothing was swapped.
+#[test]
+fn a_file_replaced_by_a_rename_is_modified_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("doc"), "first").unwrap();
+    let mut snapshot = Snapshot::scan(root).unwrap();
+
+    fs::write(root.join(".doc.tmp"), "second").unwrap();
+    fs::rename(root.join(".doc.tmp"), root.join("doc")).unwrap();
+    let changes = snapshot.rescan(root, [PathBuf::new()]).unwrap().changes;
+    assert_eq!(changes, [Change::Modified { path: "doc".into() }]);
+}
