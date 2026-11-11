@@ -2306,6 +2306,144 @@ fn a_remote_edit_of_a_node_whose_update_waits_does_not_hold_back_its_local_move(
     assert_eq!(ops(&commit), [mv("n", ROOT, "z")]);
 }
 
+/// As in `a_move_and_edit_whose_s_update_waits`, but a commit of this device that creates `pad`
+/// is applied at seq 2 first, and the move and edit of n at seq 5. A server restored from a backup
+/// taken at seq 2 counts only the first, and a bootstrap lists n back at root/old with content 0
+/// of seq 1, as S holds it.
+fn a_move_and_edit_whose_s_update_waits_lost_at_5() -> (Trees, Commits, IdGen) {
+    let mut trees = trees(&[
+        (
+            "h",
+            Some(file(ROOT, "x", 9)),
+            Some(file(ROOT, "x", 9)),
+            Some(remote(file(ROOT, "y", 9))),
+        ),
+        (
+            "n",
+            Some(file(ROOT, "old", 0)),
+            Some(file(ROOT, "old", 0)),
+            Some(remote(file(ROOT, "old", 0))),
+        ),
+    ]);
+    trees.set_local(
+        "h".into(),
+        LocalNode {
+            parked: true,
+            ..local(file(ROOT, "x", 9), 1)
+        },
+    );
+    trees.set_local("pad".into(), local(file(ROOT, "pad", 7), 99));
+    trees.settle();
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    let pad = RemoteNode {
+        content_rev: 2,
+        meta_rev: 2,
+        ..remote(file(ROOT, "pad", 7))
+    };
+    trees.set_remote("pad".into(), pad);
+    commits
+        .received(result(2, vec![outcome(op_result::Code::Applied)]))
+        .unwrap();
+    assert!(commits.acknowledge(&mut trees, 2));
+    trees.set_local("n".into(), local(file(ROOT, "x", 1), 2));
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", ROOT, "x"), update("n", 1)]);
+    let moved = RemoteNode {
+        content_rev: 5,
+        meta_rev: 5,
+        ..remote(file(ROOT, "x", 1))
+    };
+    trees.set_remote("n".into(), moved);
+    let applied = vec![outcome(op_result::Code::Applied); 2];
+    commits.received(result(5, applied)).unwrap();
+    assert!(commits.acknowledge(&mut trees, 5));
+    trees.settle();
+    assert_eq!(trees.waiting().get("n"), Some(&Some(file(ROOT, "x", 1))));
+    assert_eq!(commits.connected(&welcome(1)), Reconnect::AheadOfServer);
+    assert_eq!(commits.held_through(), 2);
+    let (trashed, edited) = (trees.trashed_here(), trees.edited_here());
+    trees.set_remote("n".into(), remote(file(ROOT, "old", 0)));
+    trees.forget_lost(trashed, edited, commits.held_through());
+    trees.settle();
+    (trees, commits, ids)
+}
+
+/// Once h leaves x, the waiting update could be made, and R's rollback would read as a remote
+/// change that moves n back and writes content 0 over the edit. The update is dropped instead, so
+/// the move and the edit are sent again.
+#[test]
+fn a_move_and_edit_the_server_lost_while_its_s_update_waits_is_sent_again() {
+    let (mut trees, mut commits, mut ids) = a_move_and_edit_whose_s_update_waits_lost_at_5();
+    trees.set_local("h".into(), local(file(ROOT, "y", 9), 1));
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::Local);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", ROOT, "x"), update("n", 1)]);
+}
+
+/// As in `a_move_and_edit_whose_s_update_waits`, but the server loses every commit of this device,
+/// and a bootstrap lists n at root/old with content 0 of seq 1, a seq the lost commit had. Another
+/// device may have put n back after the loss, so the edit is not sent over it, and R's content is
+/// not written over the edit either: n is a concurrent change.
+#[test]
+fn a_move_and_edit_whose_s_update_waits_is_not_overwritten_by_a_change_after_the_loss() {
+    let (mut trees, mut commits, _) = a_move_and_edit_whose_s_update_waits();
+    assert_eq!(commits.connected(&welcome(0)), Reconnect::AheadOfServer);
+    let (trashed, edited) = (trees.trashed_here(), trees.edited_here());
+    trees.set_remote("n".into(), remote(file(ROOT, "old", 0)));
+    trees.forget_lost(trashed, edited, commits.held_through());
+    trees.settle();
+    trees.set_local("h".into(), local(file(ROOT, "y", 9), 1));
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::Concurrent);
+}
+
+/// A parked file h holds root/x in S while R has it at y, and the user creates n at x. The server
+/// applies the create, but S cannot take n at x, so its update waits. The server then loses the
+/// commit, and a bootstrap lists no n. Once h leaves x, the waiting update would put n in S, and
+/// R's rollback would read as a remote delete of the only copy. The update is dropped instead, so
+/// n is created again.
+#[test]
+fn a_create_the_server_lost_while_its_s_update_waits_is_sent_again() {
+    let mut trees = trees(&[(
+        "h",
+        Some(file(ROOT, "x", 9)),
+        Some(file(ROOT, "x", 9)),
+        Some(remote(file(ROOT, "y", 9))),
+    )]);
+    trees.set_local(
+        "h".into(),
+        LocalNode {
+            parked: true,
+            ..local(file(ROOT, "x", 9), 1)
+        },
+    );
+    trees.set_local("n".into(), local(file(ROOT, "x", 1), 2));
+    trees.settle();
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id == "n"));
+    trees.set_remote("n".into(), remote(file(ROOT, "x", 1)));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    assert!(trees.waiting().contains_key("n"));
+    assert_eq!(commits.connected(&welcome(0)), Reconnect::AheadOfServer);
+    let (trashed, edited) = (trees.trashed_here(), trees.edited_here());
+    trees.remove_remote("n");
+    trees.forget_lost(trashed, edited, commits.held_through());
+    trees.settle();
+    trees.set_local("h".into(), local(file(ROOT, "y", 9), 1));
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::Local);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id == "n"));
+}
+
 /// Folder h at root/x is trashed remotely, and the user moves and edits its file n to root/X. The
 /// server applies both ops, but S cannot take n at X while h holds the name key x, so the update
 /// waits.
