@@ -3828,6 +3828,34 @@ fn an_edit_the_server_lost_is_sent_again() {
     assert_eq!(fs::read(other.root.join("one.txt")).unwrap(), b"edited");
 }
 
+/// As above, but device `b`, which never saw `a`'s edit, deletes `one.txt` on the restored server first. An edit
+/// beats a delete (R8): `a` sends its edit again, the server revives `one.txt`, and `a` keeps it in the folder.
+#[test]
+fn an_edit_the_server_lost_revives_a_file_another_device_deleted() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site.root.join("one.txt"), b"one");
+    let mut restored = backup(&remote, &a);
+    a.create(&mut remote, &site.root.join("one.txt"), b"edited");
+    let (other, mut b) = linked(&mut restored, "b");
+    fs::remove_file(other.root.join("one.txt")).unwrap();
+    b.scan_until(|b| !b.work.is_empty());
+    assert_eq!(b.run(&mut restored), ["send"]);
+    assert!(restored.names().is_empty());
+    a.event(Event::Connected(restored.space.welcome(&a.caller)))
+        .unwrap();
+    a.run(&mut restored);
+    a.settle();
+    a.run(&mut restored);
+    assert_eq!(restored.names(), ["one.txt"]);
+    assert_eq!(names(&site.root), ["one.txt"]);
+    assert_eq!(fs::read(site.root.join("one.txt")).unwrap(), b"edited");
+    assert!(trashed(&site.root).is_empty());
+    assert_eq!(a.state(), FolderState::UpToDate);
+    let (fresh, _c) = linked(&mut restored, "c");
+    assert_eq!(fs::read(fresh.root.join("one.txt")).unwrap(), b"edited");
+}
+
 /// `a` edited `one.txt` in a commit the server lost, and the server refused a later commit of `a` with
 /// `FORBIDDEN`, so `a` is under a policy halt when it meets the restored server. `b` edits `one.txt` there at seq
 /// 2, a seq `a`'s lost commits had. The halted `a` lists the tree after a restart, and once the halt is lifted it
