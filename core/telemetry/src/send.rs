@@ -1,0 +1,644 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Posting the queue to PostHog's batch API (https://posthog.com/docs/api/capture) through `tel.koidrive.com`,
+//! PostHog's managed reverse proxy for the project (https://posthog.com/docs/advanced/proxy). Events are anonymous:
+//! no person profile is made and no location is looked up from the address.
+
+use std::ffi::OsString;
+use std::io;
+use std::time::Duration;
+
+use serde_json::{Map, Value, json};
+use url::Url;
+
+use crate::consent::Mode;
+use crate::schema::{DailyReport, EventUuid, InstallId, SCHEMA};
+use crate::store::{Batch, Store};
+use crate::system::Environment;
+
+/// The project's host, a CNAME to PostHog's managed reverse proxy.
+pub const ENDPOINT: &str = "https://tel.koidrive.com";
+/// The PostHog project token. It only lets a client add events to the project, and PostHog documents it as public.
+/// Empty until the project exists; without a token nothing is sent and the queue waits.
+pub const PROJECT_TOKEN: &str = "";
+pub const ENDPOINT_VARIABLE: &str = "KOIDRIVE_TELEMETRY_URL";
+pub const TOKEN_VARIABLE: &str = "KOIDRIVE_TELEMETRY_TOKEN";
+
+const TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, thiserror::Error)]
+pub enum UploadError {
+    #[error("{0} is not an https address")]
+    Endpoint(String),
+    #[error("the HTTP client cannot start: {0}")]
+    Client(reqwest::Error),
+}
+
+/// What became of a batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sent {
+    /// The queue held nothing to send.
+    Nothing,
+    Accepted,
+    /// Printed to stderr, in [`Mode::Debug`].
+    Printed,
+    /// It went back to the queue, to be sent later: no token, a network error, a 408, a 429 or a 5xx.
+    Later,
+    /// The endpoint refused it with this status. It is dropped, since sending it again would be refused again.
+    Refused(u16),
+}
+
+pub struct Uploader {
+    http: reqwest::Client,
+    url: Url,
+    token: String,
+}
+
+impl Uploader {
+    /// The endpoint and token from `KOIDRIVE_TELEMETRY_URL` and `KOIDRIVE_TELEMETRY_TOKEN`, or the built-in ones. None
+    /// without a token. Requests go to `batch/` under the endpoint's path. Plain HTTP is accepted only for a loopback
+    /// address, for tests.
+    pub fn from_env(var: impl Fn(&str) -> Option<OsString>) -> Result<Option<Self>, UploadError> {
+        let text = |name: &str| {
+            var(name)
+                .and_then(|value| value.into_string().ok())
+                .filter(|value| !value.is_empty())
+        };
+        let token = text(TOKEN_VARIABLE).unwrap_or_else(|| PROJECT_TOKEN.to_owned());
+        if token.is_empty() {
+            return Ok(None);
+        }
+        let endpoint = text(ENDPOINT_VARIABLE).unwrap_or_else(|| ENDPOINT.to_owned());
+        let url = Url::parse(&endpoint)
+            .and_then(|mut base| {
+                if !base.path().ends_with('/') {
+                    base.set_path(&format!("{}/", base.path()));
+                }
+                base.join("batch/")
+            })
+            .map_err(|_| UploadError::Endpoint(endpoint.clone()))?;
+        let loopback = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
+        if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+            return Err(UploadError::Endpoint(endpoint));
+        }
+        let http = reqwest::Client::builder()
+            .user_agent(concat!("koidrive-telemetry/", env!("CARGO_PKG_VERSION")))
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(TIMEOUT)
+            .build()
+            .map_err(UploadError::Client)?;
+        Ok(Some(Uploader { http, url, token }))
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+}
+
+/// Sends what the queue holds for days before `today`, with every event. A failure to send leaves it in the queue,
+/// and so does cancelling the send before an answer; only a failure to read or write the queue is an error.
+pub async fn send(
+    store: &Store,
+    uploader: Option<&Uploader>,
+    environment: &Environment,
+    mode: Mode,
+    today: u32,
+) -> io::Result<Sent> {
+    if mode == Mode::Off {
+        return Ok(Sent::Nothing);
+    }
+    let Some(sending) = store.take(today)? else {
+        return Ok(Sent::Nothing);
+    };
+    if sending.batch.is_empty() {
+        return Ok(Sent::Nothing);
+    }
+    let token = uploader.map_or("", Uploader::token);
+    let body = self::batch(
+        token,
+        &sending.id,
+        environment,
+        &sending.batch,
+        &sending.uuids,
+    );
+    if mode == Mode::Debug {
+        eprintln!(
+            "[telemetry] {}",
+            serde_json::to_string_pretty(&body).unwrap_or_default()
+        );
+        store.sent(sending)?;
+        return Ok(Sent::Printed);
+    }
+    let Some(uploader) = uploader else {
+        store.give_back(sending)?;
+        return Ok(Sent::Later);
+    };
+    let sent = match uploader
+        .http
+        .post(uploader.url.clone())
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => Sent::Accepted,
+        Ok(response)
+            if matches!(response.status().as_u16(), 408 | 429)
+                || response.status().is_server_error() =>
+        {
+            Sent::Later
+        }
+        Ok(response) => Sent::Refused(response.status().as_u16()),
+        Err(error) => {
+            tracing::debug!(%error, "telemetry was not sent; trying again later");
+            Sent::Later
+        }
+    };
+    if sent == Sent::Later {
+        store.give_back(sending)?;
+    } else {
+        store.sent(sending)?;
+    }
+    Ok(sent)
+}
+
+/// The body of a PostHog batch request: one `daily_report` event per day and one event per [`Event`], each with
+/// the install id as its `distinct_id`, the environment as properties and the start of its UTC day as its time.
+/// `uuids` holds one per day and then one per event, as [`Sending`](crate::Sending) does; without them, as in a
+/// preview, the events have no uuid.
+pub fn batch(
+    token: &str,
+    id: &InstallId,
+    environment: &Environment,
+    batch: &Batch,
+    uuids: &[EventUuid],
+) -> Value {
+    let mut events = Vec::new();
+    for report in &batch.days {
+        let mut properties = common(id, environment);
+        properties.extend(daily(report));
+        events.push(json!({ "event": "daily_report", "properties": properties, "timestamp": midnight(report.day) }));
+    }
+    for event in &batch.events {
+        let Value::Object(mut fields) = serde_json::to_value(event).unwrap_or_default() else {
+            continue;
+        };
+        let name = fields.remove("type").unwrap_or_default();
+        fields.remove("day");
+        let mut properties = common(id, environment);
+        properties.extend(fields);
+        events.push(
+            json!({ "event": name, "properties": properties, "timestamp": midnight(event.day()) }),
+        );
+    }
+    if uuids.len() == events.len() {
+        for (event, uuid) in events.iter_mut().zip(uuids) {
+            event["uuid"] = json!(uuid.as_str());
+        }
+    }
+    json!({ "api_key": token, "historical_migration": false, "batch": events })
+}
+
+fn common(id: &InstallId, environment: &Environment) -> Map<String, Value> {
+    let mut properties = Map::new();
+    properties.insert("distinct_id".into(), json!(id));
+    properties.insert("$process_person_profile".into(), json!(false));
+    properties.insert("$geoip_disable".into(), json!(true));
+    properties.insert("schema".into(), json!(SCHEMA));
+    properties.insert("client".into(), json!(environment.client));
+    properties.insert("koi_version".into(), json!(environment.koi_version));
+    properties.insert("build".into(), json!(environment.build));
+    properties.insert("os".into(), json!(environment.os));
+    if let Some(version) = environment.os_version {
+        properties.insert("os_major".into(), json!(version.major));
+        properties.insert("os_minor".into(), json!(version.minor));
+    }
+    if let Some(distro) = environment.distro {
+        properties.insert("distro".into(), json!(distro));
+    }
+    properties.insert("arch".into(), json!(environment.arch));
+    properties
+}
+
+/// Counters as `c.<metric>.<label>` numbers and histograms as `h.<metric>.<label>` objects, so each is one column
+/// in PostHog.
+fn daily(report: &DailyReport) -> Map<String, Value> {
+    let mut properties = Map::new();
+    for (metric, labels) in &report.counters {
+        for (label, count) in labels {
+            properties.insert(format!("c.{metric}.{label}"), json!(count));
+        }
+    }
+    for (metric, labels) in &report.histograms {
+        for (label, histogram) in labels {
+            properties.insert(format!("h.{metric}.{label}"), json!(histogram));
+        }
+    }
+    properties
+}
+
+/// The start of a day as ISO 8601, from days since 1970-01-01 (the civil-from-days algorithm of
+/// https://howardhinnant.github.io/date_algorithms.html).
+fn midnight(day: u32) -> String {
+    let z = i64::from(day) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}T00:00:00Z")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::*;
+    use crate::recorder::Recorder;
+    use crate::schema::{
+        Client, Command, Counter, Event, Outcome, SetupFlow, SetupStep, SourceFile,
+    };
+
+    fn environment() -> Environment {
+        Environment::detect(Client::CliDaemon, "0.1.0")
+    }
+
+    fn queued(store: &Store, day: u32) {
+        store.set(true).unwrap();
+        let recorder = Recorder::on();
+        recorder.count_on(day, Counter::Command(Command::Setup), 2);
+        recorder.event(Event::SetupStep {
+            day,
+            flow: SetupFlow::Cloudflare,
+            step: SetupStep::R2Checkout,
+            outcome: Outcome::Failed,
+            cloudflare_code: Some(10042),
+            seconds_magnitude: 7,
+        });
+        recorder.event(Event::Panic {
+            day,
+            file: SourceFile::from_location("/Users/alice/.cargo/registry/x.rs"),
+            line: 3,
+        });
+        store.absorb_at(recorder.take(), day + 1, true).unwrap();
+    }
+
+    #[test]
+    fn days_since_the_epoch_become_dates() {
+        assert_eq!(midnight(0), "1970-01-01T00:00:00Z");
+        assert_eq!(midnight(20_404), "2025-11-12T00:00:00Z");
+        assert_eq!(midnight(11_016), "2000-02-29T00:00:00Z");
+    }
+
+    #[test]
+    fn a_batch_is_anonymous_posthog_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        queued(&store, 20_404);
+        let id = store.install_id().unwrap();
+        let body = batch("phc_test", &id, &environment(), &store.peek().unwrap(), &[]);
+        assert_eq!(body["api_key"], "phc_test");
+        let events = body["batch"].as_array().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["event"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["daily_report", "setup_step", "panic"]
+        );
+        for event in events {
+            assert_eq!(event["properties"]["distinct_id"], id.as_str());
+            assert_eq!(event["properties"]["$process_person_profile"], false);
+            assert_eq!(event["properties"]["$geoip_disable"], true);
+            assert_eq!(event["timestamp"], "2025-11-12T00:00:00Z");
+            assert!(event["properties"].get("day").is_none());
+        }
+        assert_eq!(events[0]["properties"]["c.command.setup"], 2);
+        assert_eq!(events[1]["properties"]["cloudflare_code"], 10042);
+        assert_eq!(events[2]["properties"]["file"], SourceFile::EXTERNAL);
+    }
+
+    /// Every string a batch can carry is the install id, the token, a time, a version number or a name from a closed
+    /// set, so no path, name or message can be in it.
+    #[test]
+    fn a_batch_holds_no_free_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        queued(&store, 20_404);
+        let id = store.install_id().unwrap();
+        let sending = store.take(20_405).unwrap().unwrap();
+        let body = batch(
+            "phc_test",
+            &id,
+            &environment(),
+            &sending.batch,
+            &sending.uuids,
+        );
+        assert_eq!(body["batch"][0]["uuid"], sending.uuids[0].as_str());
+        let mut strings = Vec::new();
+        collect(&body, &mut strings);
+        let closed = |s: &str| {
+            !s.is_empty()
+                && s.bytes()
+                    .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'.' | b'$'))
+        };
+        for string in strings {
+            let allowed = string == id.as_str()
+                || sending.uuids.iter().any(|uuid| uuid.as_str() == string)
+                || string == "phc_test"
+                || string == "2025-11-12T00:00:00Z"
+                || string == "0.1.0"
+                || closed(&string)
+                || (string.starts_with("cli/") || string.starts_with("core/"))
+                    && closed(&string.replace('/', "."));
+            assert!(allowed, "free text in a batch: {string:?}");
+        }
+    }
+
+    /// A queue file with paths and names for keys, as a bug or another program could leave, sends none of them.
+    #[tokio::test]
+    async fn keys_outside_the_closed_set_never_reach_a_request() {
+        let (address, bodies) = server(200).await;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        queued(&store, 20_404);
+        let path = dir.path().join("telemetry/queue.json");
+        let mut queue: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let report = &mut queue["days"]["20404"];
+        report["counters"]["/home/fixture/private"] = json!({ "confidential.txt": 1 });
+        report["counters"]["command"]["Alice Notes"] = json!(1);
+        report["histograms"]["/home/fixture"] = json!({
+            "notes.txt": { "shift": 0, "buckets": vec![0u64; 16], "count": 1, "sum": 1 }
+        });
+        std::fs::write(&path, serde_json::to_vec(&queue).unwrap()).unwrap();
+
+        let sent = send(
+            &store,
+            Some(&uploader(&address)),
+            &environment(),
+            Mode::On,
+            20_405,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sent, Sent::Accepted);
+        let request = serde_json::to_string(&bodies.lock().unwrap()[0]).unwrap();
+        for secret in ["fixture", "private", "confidential", "Alice", "notes"] {
+            assert!(!request.contains(secret), "{secret} in {request}");
+        }
+        assert!(request.contains("c.command.setup"));
+    }
+
+    /// A batch that was not accepted goes again with the same uuids, so PostHog keeps one copy if both arrived.
+    #[tokio::test]
+    async fn a_retry_sends_the_same_uuids() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        queued(&store, 20_404);
+        let mut uuids = Vec::new();
+        for status in [503, 200] {
+            let (address, bodies) = server(status).await;
+            send(
+                &store,
+                Some(&uploader(&address)),
+                &environment(),
+                Mode::On,
+                20_405,
+            )
+            .await
+            .unwrap();
+            let body = bodies.lock().unwrap()[0].clone();
+            uuids.push(
+                (body["batch"].as_array().unwrap().iter())
+                    .map(|event| event["uuid"].as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(uuids[0].len(), 3);
+        assert_eq!(uuids[0], uuids[1]);
+        assert!(store.peek().unwrap().is_empty());
+    }
+
+    /// A send cancelled before any answer, as by a timeout around it, leaves its batch to the next send.
+    #[tokio::test]
+    async fn a_cancelled_send_keeps_the_batch() {
+        let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", silent.local_addr().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        queued(&store, 20_404);
+        let waited = tokio::time::timeout(
+            Duration::from_millis(300),
+            send(
+                &store,
+                Some(&uploader(&address)),
+                &environment(),
+                Mode::On,
+                20_405,
+            ),
+        )
+        .await;
+        assert!(waited.is_err());
+        drop(silent);
+
+        let (address, bodies) = server(200).await;
+        let sent = send(
+            &store,
+            Some(&uploader(&address)),
+            &environment(),
+            Mode::On,
+            20_405,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sent, Sent::Accepted);
+        assert_eq!(
+            bodies.lock().unwrap()[0]["batch"].as_array().unwrap().len(),
+            3
+        );
+        assert!(store.peek().unwrap().is_empty());
+    }
+
+    fn collect(value: &Value, strings: &mut Vec<String>) {
+        match value {
+            Value::String(s) => strings.push(s.clone()),
+            Value::Array(items) => items.iter().for_each(|item| collect(item, strings)),
+            Value::Object(fields) => fields.iter().for_each(|(key, item)| {
+                strings.push(key.clone());
+                collect(item, strings);
+            }),
+            _ => {}
+        }
+    }
+
+    /// A server that answers every request with `status` and keeps the bodies it got.
+    async fn server(status: u16) -> (String, Arc<Mutex<Vec<Value>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let kept = bodies.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 8192];
+                loop {
+                    let read = socket.read(&mut buffer).await.unwrap();
+                    request.extend_from_slice(&buffer[..read]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = (text.lines())
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            kept.lock()
+                                .unwrap()
+                                .push(serde_json::from_slice(&request[end + 4..]).unwrap());
+                            break;
+                        }
+                    }
+                    if read == 0 {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (address, bodies)
+    }
+
+    fn uploader(address: &str) -> Uploader {
+        let vars = [
+            (ENDPOINT_VARIABLE, address.to_owned()),
+            (TOKEN_VARIABLE, "phc_test".to_owned()),
+        ];
+        Uploader::from_env(|name| vars.iter().find(|(k, _)| *k == name).map(|(_, v)| v.into()))
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_accepted_batch_leaves_the_queue() {
+        let (address, bodies) = server(200).await;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        queued(&store, 20_404);
+        let sent = send(
+            &store,
+            Some(&uploader(&address)),
+            &environment(),
+            Mode::On,
+            20_405,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sent, Sent::Accepted);
+        assert!(store.peek().unwrap().is_empty());
+        assert_eq!(
+            bodies.lock().unwrap()[0]["batch"].as_array().unwrap().len(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_error_keeps_the_batch_and_a_refusal_drops_it() {
+        for (status, expected, kept) in [
+            (503, Sent::Later, true),
+            (408, Sent::Later, true),
+            (429, Sent::Later, true),
+            (400, Sent::Refused(400), false),
+        ] {
+            let (address, _) = server(status).await;
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::new(dir.path());
+            queued(&store, 20_404);
+            let sent = send(
+                &store,
+                Some(&uploader(&address)),
+                &environment(),
+                Mode::On,
+                20_405,
+            )
+            .await
+            .unwrap();
+            assert_eq!(sent, expected, "{status}");
+            assert_eq!(!store.peek().unwrap().is_empty(), kept, "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_endpoint_keeps_the_batch() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        queued(&store, 20_404);
+        let sent = send(
+            &store,
+            Some(&uploader(&address)),
+            &environment(),
+            Mode::On,
+            20_405,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sent, Sent::Later);
+        assert_eq!(store.peek().unwrap().days.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn without_a_token_nothing_is_sent_and_off_reads_nothing() {
+        assert!(Uploader::from_env(|_| None).unwrap().is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        queued(&store, 20_404);
+        assert_eq!(
+            send(&store, None, &environment(), Mode::On, 20_405)
+                .await
+                .unwrap(),
+            Sent::Later
+        );
+        assert_eq!(
+            send(&store, None, &environment(), Mode::Off, 20_405)
+                .await
+                .unwrap(),
+            Sent::Nothing
+        );
+        assert_eq!(store.peek().unwrap().events.len(), 2);
+    }
+
+    #[test]
+    fn only_https_or_a_loopback_endpoint_is_accepted() {
+        let with = |url: &str| {
+            let vars = [
+                (ENDPOINT_VARIABLE, url.to_owned()),
+                (TOKEN_VARIABLE, "phc_test".to_owned()),
+            ];
+            Uploader::from_env(|name| vars.iter().find(|(k, _)| *k == name).map(|(_, v)| v.into()))
+                .map(|uploader| uploader.map(|u| u.url.to_string()))
+        };
+        assert_eq!(
+            with("https://tel.koidrive.com").unwrap().unwrap(),
+            "https://tel.koidrive.com/batch/"
+        );
+        assert!(with("http://127.0.0.1:9").unwrap().is_some());
+        assert_eq!(
+            with("https://example.com/posthog").unwrap().unwrap(),
+            "https://example.com/posthog/batch/"
+        );
+        assert!(with("http://tel.koidrive.com").is_err());
+    }
+}
