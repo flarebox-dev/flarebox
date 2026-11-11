@@ -5903,15 +5903,6 @@ fn a_cursor_the_restored_head_caught_up_with_lists_the_tree_again() {
     );
 }
 
-/// The questions in the site's store, as `Driver::questions` shows them.
-fn asked(site: &Site) -> Vec<crate::question::Question> {
-    let mut store = Store::open(&site.db).unwrap();
-    let stored = store.transaction(|tx| tx.questions()).unwrap();
-    (stored.iter())
-        .map(|stored| serde_json::from_slice(&stored.body).unwrap())
-        .collect()
-}
-
 const COPY: &str = "main (conflict from b 2023-11-14).go";
 
 /// Devices `a` and `b` hold `main.go`, and both edit it. `a` commits first, and `b` commits before it hears of
@@ -5944,9 +5935,9 @@ fn an_edit_that_became_a_conflict_copy_is_asked_about_with_both_files() {
         .map(|(path, text)| (path.to_owned(), text.to_owned()));
     assert_eq!(files(&site_a.root), both);
     assert_eq!(files(&site_b.root), both);
-    assert_eq!(asked(&site_a), []);
-    let [question] = &asked(&site_b)[..] else {
-        panic!("one question: {:?}", asked(&site_b));
+    assert_eq!(shown(&site_a), []);
+    let [question] = &shown(&site_b)[..] else {
+        panic!("one question: {:?}", shown(&site_b));
     };
     let nodes = server_nodes(&remote);
     let QuestionKind::Conflict { original, copy } = &question.kind else {
@@ -5982,7 +5973,7 @@ fn keeping_both_files_of_a_conflict_changes_nothing() {
     b.take(step).unwrap();
     sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
 
-    assert_eq!(asked(&site_b), []);
+    assert_eq!(shown(&site_b), []);
 
     let both = [(COPY, "from b"), ("main.go", "from a")]
         .map(|(path, text)| (path.to_owned(), text.to_owned()));
@@ -6011,7 +6002,7 @@ fn keeping_the_original_of_a_conflict_moves_the_copy_to_the_trash() {
         after.contains(&(COPY.to_owned(), live_id(&before, COPY), false)),
         "{after:?}"
     );
-    assert_eq!(asked(&site_b), []);
+    assert_eq!(shown(&site_b), []);
 }
 
 /// Keep the copy gives the original the copy's content, so the original's own content stays in its version history,
@@ -6048,7 +6039,7 @@ fn keeping_the_copy_of_a_conflict_gives_the_original_its_content_and_moves_the_c
         .map(|version| version.device_id.as_str())
         .collect();
     assert_eq!(writers, ["b", "a", "a"]);
-    assert_eq!(asked(&site_b), []);
+    assert_eq!(shown(&site_b), []);
 }
 
 /// Another device edits the copy before the server takes the answer to delete it. The server keeps the copy, and
@@ -6057,7 +6048,7 @@ fn keeping_the_copy_of_a_conflict_gives_the_original_its_content_and_moves_the_c
 fn a_conflict_whose_file_changes_before_the_answer_reaches_the_server_is_asked_again() {
     let mut remote = Remote::new();
     let ((site_a, mut a), (site_b, mut b)) = edited_on_both(&mut remote);
-    let [first] = &asked(&site_b)[..] else {
+    let [first] = &shown(&site_b)[..] else {
         panic!("one question");
     };
     answer(&site_b, Answer::KeepOriginal);
@@ -6080,8 +6071,8 @@ fn a_conflict_whose_file_changes_before_the_answer_reaches_the_server_is_asked_a
         fs::read(site_b.root.join(COPY)).unwrap(),
         b"copy edited after the answer"
     );
-    let [second] = &asked(&site_b)[..] else {
-        panic!("one question: {:?}", asked(&site_b));
+    let [second] = &shown(&site_b)[..] else {
+        panic!("one question: {:?}", shown(&site_b));
     };
     assert_ne!(second.id, first.id);
 }
@@ -6118,7 +6109,7 @@ fn a_conflict_ends_when_someone_renames_a_file_by_hand() {
     fs::rename(site_a.root.join(COPY), site_a.root.join("other.go")).unwrap();
     sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
 
-    assert_eq!(asked(&site_b), []);
+    assert_eq!(shown(&site_b), []);
     assert_eq!(remote.names(), ["main.go", "other.go"]);
 }
 
@@ -6130,7 +6121,7 @@ fn a_conflict_ends_when_the_person_deletes_a_file_by_hand() {
     fs::remove_file(site_b.root.join(COPY)).unwrap();
     sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
 
-    assert_eq!(asked(&site_b), []);
+    assert_eq!(shown(&site_b), []);
     assert_eq!(remote.names(), ["main.go"]);
 }
 
@@ -6142,14 +6133,14 @@ fn a_conflict_whose_file_changes_is_asked_again() {
 
     let mut remote = Remote::new();
     let ((site_a, mut a), (site_b, mut b)) = edited_on_both(&mut remote);
-    let [first] = &asked(&site_b)[..] else {
+    let [first] = &shown(&site_b)[..] else {
         panic!("one question");
     };
     fs::write(site_a.root.join("main.go"), b"from a again").unwrap();
     sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
 
-    let [second] = &asked(&site_b)[..] else {
-        panic!("one question: {:?}", asked(&site_b));
+    let [second] = &shown(&site_b)[..] else {
+        panic!("one question: {:?}", shown(&site_b));
     };
     assert_ne!(second.id, first.id);
     let revisions = |question: &crate::question::Question| match &question.kind {
@@ -6172,13 +6163,13 @@ fn a_conflict_whose_file_changes_is_asked_again() {
 fn a_conflict_is_asked_again_after_a_restart_and_answered_then() {
     let mut remote = Remote::new();
     let ((site_a, mut a), (site_b, b)) = edited_on_both(&mut remote);
-    let before = asked(&site_b);
+    let before = shown(&site_b);
     drop(b);
     let mut b = site_b.start();
     b.connect(&remote);
     b.scan_until(|b| b.folder.scanned);
     assert_eq!(b.folder.view().questions, 1);
-    assert_eq!(asked(&site_b), before);
+    assert_eq!(shown(&site_b), before);
     answer(&site_b, Answer::KeepCopy);
     let step = b.folder.requested();
     b.take(step).unwrap();
@@ -6205,8 +6196,8 @@ fn a_file_created_under_a_name_another_device_took_is_asked_about() {
     let copy = "notes (conflict from b 2023-11-14).txt";
     assert_eq!(remote.names(), [copy, "notes.txt"]);
     let nodes = server_nodes(&remote);
-    let [question] = &asked(&site_b)[..] else {
-        panic!("one question: {:?}", asked(&site_b));
+    let [question] = &shown(&site_b)[..] else {
+        panic!("one question: {:?}", shown(&site_b));
     };
     let QuestionKind::Conflict {
         original,
@@ -6217,7 +6208,7 @@ fn a_file_created_under_a_name_another_device_took_is_asked_about() {
     };
     assert_eq!(original.node_id, live_id(&nodes, "notes.txt"));
     assert_eq!(renamed.node_id, live_id(&nodes, copy));
-    assert_eq!(asked(&site_a), []);
+    assert_eq!(shown(&site_a), []);
 }
 
 /// The person edits the copy on `b`, and the observer has not seen it when the answer to delete the copy is
@@ -6252,7 +6243,7 @@ fn an_edit_of_the_copy_the_answer_would_delete_is_kept() {
 fn an_edit_of_the_original_sent_before_the_answer_asks_again() {
     let mut remote = Remote::new();
     let ((site_a, mut a), (site_b, mut b)) = edited_on_both(&mut remote);
-    let [first] = &asked(&site_b)[..] else {
+    let [first] = &shown(&site_b)[..] else {
         panic!("one question");
     };
     fs::write(site_b.root.join("main.go"), b"edited before the answer").unwrap();
@@ -6268,8 +6259,8 @@ fn an_edit_of_the_original_sent_before_the_answer_asks_again() {
         fs::read(site_b.root.join("main.go")).unwrap(),
         b"edited before the answer"
     );
-    let [second] = &asked(&site_b)[..] else {
-        panic!("one question: {:?}", asked(&site_b));
+    let [second] = &shown(&site_b)[..] else {
+        panic!("one question: {:?}", shown(&site_b));
     };
     assert_ne!(second.id, first.id);
 }
@@ -6290,7 +6281,7 @@ fn keeping_one_of_two_copies_of_an_original_asks_about_the_other_again() {
     b.scan_until(|b| !b.work.is_empty());
     b.run(&mut remote);
     sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
-    let questions = asked(&site_b);
+    let questions = shown(&site_b);
     assert_eq!(questions.len(), 2, "{questions:?}");
     let is_first = |question: &crate::question::Question| matches!(&question.kind, QuestionKind::Conflict { copy, .. } if copy.node_id == first_copy);
     let chosen = questions
@@ -6314,8 +6305,8 @@ fn keeping_one_of_two_copies_of_an_original_asks_about_the_other_again() {
     b.take(step).unwrap();
     sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
 
-    let [remaining] = &asked(&site_b)[..] else {
-        panic!("one question: {:?}", asked(&site_b));
+    let [remaining] = &shown(&site_b)[..] else {
+        panic!("one question: {:?}", shown(&site_b));
     };
     assert_ne!(remaining.id, other.id);
     assert!(!is_first(remaining));
