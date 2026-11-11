@@ -809,6 +809,11 @@ impl Trees {
     /// the content L holds is sent again as an edit instead of being kept beside R's as a conflict
     /// copy.
     ///
+    /// An S update that waits ([`Trees::waiting`]) for a node R now holds as S does, and not as
+    /// the update has it, came from a commit the server lost. It is dropped, so that L's change is
+    /// compared with S and sent again, instead of R's rollback reading as a remote change once the
+    /// update fits. One for a node R holds in the trash stays.
+    ///
     /// [`Commits::held_through`]: crate::commit::Commits::held_through
     pub fn forget_lost(&mut self, trashed: Vec<Trashed>, edited: Vec<NodeId>, held_through: u64) {
         let mut deletes: Vec<(NodeId, Shape)> = (trashed.into_iter())
@@ -838,6 +843,21 @@ impl Trees {
                 continue;
             };
             self.set_synced_if_valid(id, Some(remote));
+        }
+        let (r, s) = (&self.r, &self.s);
+        let dropped: Vec<NodeId> = (self.waiting.iter())
+            .filter(|(id, waiting)| {
+                let remote = r.live(id);
+                waiting.is_some()
+                    && !r.get(id.as_str()).is_some_and(|remote| remote.trashed)
+                    && same(remote, s.live(id))
+                    && !same(remote, waiting.as_ref())
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in dropped {
+            self.waiting.remove(&id);
+            self.mark(&id);
         }
         let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for (id, shape) in self.s.iter() {
