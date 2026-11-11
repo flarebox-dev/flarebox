@@ -627,6 +627,7 @@ export class SpaceDO extends DurableObject<Env> {
     if (resume.historyId !== getMeta(this.sql, "history_id")) reason = ResyncRequired_Reason.HISTORY_CHANGED;
     else if (resume.sinceSeq > BigInt(head)) reason = ResyncRequired_Reason.AHEAD_OF_SERVER;
     else if (resume.sinceSeq < BigInt(Number(getMeta(this.sql, "log_floor_seq")))) reason = ResyncRequired_Reason.LOG_TRUNCATED;
+    else if (this.tokenDiffers(resume.sinceSeq, resume.sinceCommitId, resume.sinceCommittedAtMs)) reason = ResyncRequired_Reason.AHEAD_OF_SERVER;
     if (reason !== undefined) {
       const resync = create(ResyncRequiredSchema, { reason });
       if (reason === ResyncRequired_Reason.HISTORY_CHANGED) {
@@ -651,7 +652,11 @@ export class SpaceDO extends DurableObject<Env> {
       bytes += framed;
     }
     flush();
-    this.send(ws, { case: "caughtUp", value: create(CaughtUpSchema, { headSeq: BigInt(head) }) });
+    const token = this.tokenAt(head);
+    this.send(ws, {
+      case: "caughtUp",
+      value: create(CaughtUpSchema, { headSeq: BigInt(head), headCommitId: token.commitId, headCommittedAtMs: token.committedAtMs }),
+    });
     attachment.live = true;
     ws.serializeAttachment(attachment);
   }
@@ -766,6 +771,22 @@ export class SpaceDO extends DurableObject<Env> {
     };
   }
 
+  /** The commit token at seq (RFC 0013): the commit_id and committed_at_ms of the commit there, empty where the log holds none. */
+  private tokenAt(seq: number): { commitId: string; committedAtMs: bigint } {
+    const row = this.sql.exec("SELECT commit_id, committed_at_ms FROM commits WHERE seq = ?", seq).toArray()[0];
+    return { commitId: String(row?.commit_id ?? ""), committedAtMs: BigInt(Number(row?.committed_at_ms ?? 0)) };
+  }
+
+  /**
+   * Whether a client's token at seq names another commit than the one the log holds there (RFC 0013). An empty token and
+   * seq 0 claim nothing; a seq the log holds no commit for never matches.
+   */
+  private tokenDiffers(seq: bigint, commitId: string, committedAtMs: bigint): boolean {
+    if (commitId === "" || seq === 0n) return false;
+    const held = this.tokenAt(Number(seq));
+    return held.commitId !== commitId || held.committedAtMs !== committedAtMs;
+  }
+
   private acceptedDeviceSeq(deviceId: string): bigint {
     const row = this.sql.exec("SELECT device_seq FROM device_commits WHERE device_id = ?", deviceId).toArray()[0];
     return BigInt(Number(row?.device_seq ?? 0));
@@ -792,6 +813,9 @@ export class SpaceDO extends DurableObject<Env> {
     if (commit.deviceSeq > accepted + 1n) fail(Error_Code.INVALID_ARGUMENT, `device_seq must be ${accepted + 1n}`);
     const head = BigInt(this.headSeq);
     if (commit.baseSeq > head) fail(Error_Code.AHEAD_OF_SERVER, "base_seq is ahead of the server");
+    if (this.tokenDiffers(commit.baseSeq, commit.baseCommitId, commit.baseCommittedAtMs)) {
+      fail(Error_Code.AHEAD_OF_SERVER, "the server does not hold the commit this commit's base names");
+    }
     if (commit.requireHead && commit.baseSeq < head) fail(Error_Code.HEAD_MOVED, "the space changed after base_seq");
     return undefined;
   }
@@ -891,7 +915,7 @@ export class SpaceDO extends DurableObject<Env> {
         committedAtMs: BigInt(nowMs),
         changes,
       });
-      const result = create(CommitResultSchema, { seq: BigInt(ctx.seq), results, changes });
+      const result = create(CommitResultSchema, { seq: BigInt(ctx.seq), results, changes, committedAtMs: BigInt(nowMs) });
       this.appendCommit(record, result, digest);
       this.sql.exec(
         `INSERT INTO device_commits (device_id, device_seq, commit_id, results, request_digest) VALUES (?, ?, ?, ?, ?)
@@ -1099,7 +1123,14 @@ export class SpaceDO extends DurableObject<Env> {
   }
 
   private listTree(request: ListTree) {
-    return create(TreePageSchema, { ...this.nodePage(1, request.cursor, request.limit), headSeq: BigInt(this.headSeq) });
+    const head = this.headSeq;
+    const token = this.tokenAt(head);
+    return create(TreePageSchema, {
+      ...this.nodePage(1, request.cursor, request.limit),
+      headSeq: BigInt(head),
+      headCommitId: token.commitId,
+      headCommittedAtMs: token.committedAtMs,
+    });
   }
 
   private listTrash(request: ListTrash) {
@@ -1162,7 +1193,7 @@ export class SpaceDO extends DurableObject<Env> {
       if (changes.length > 0) {
         const seq = BigInt(this.headSeq + 1);
         record = create(CommitRecordSchema, { seq, commitId: uuidv7(nowMs), committedAtMs: BigInt(nowMs), changes });
-        this.appendCommit(record, create(CommitResultSchema, { seq, changes }), null);
+        this.appendCommit(record, create(CommitResultSchema, { seq, changes, committedAtMs: BigInt(nowMs) }), null);
         noteCommitted(this.sql, record);
       }
       return { expiredVersions: expired.length, purgedNodes: changes.length, record };

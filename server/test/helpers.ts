@@ -117,6 +117,8 @@ export interface CommitInit {
   historyId?: string;
   deviceSeq?: bigint;
   requireHead?: boolean;
+  baseCommitId?: string;
+  baseCommittedAtMs?: bigint;
 }
 
 /** A device talking to one space through the binary RPC entry point. */
@@ -196,6 +198,8 @@ export class TestClient {
         historyId: init.historyId ?? (await this.history()),
         deviceSeq,
         requireHead: init.requireHead ?? false,
+        baseCommitId: init.baseCommitId ?? "",
+        baseCommittedAtMs: init.baseCommittedAtMs ?? 0n,
       },
     });
     if (result.case === "commit" && deviceSeq > this.acceptedSeq) this.acceptedSeq = deviceSeq;

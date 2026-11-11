@@ -114,6 +114,16 @@ async function createSpace(owner: DeviceCredentials): Promise<string> {
   return created.message!.spaceId;
 }
 
+/** The commit_id and committed_at_ms of the commit at a seq (RFC 0013). */
+interface CommitToken {
+  commitId: string;
+  committedAtMs: bigint;
+}
+
+function tokenOf(record: CommitRecord): CommitToken {
+  return { commitId: record.commitId, committedAtMs: record.committedAtMs };
+}
+
 /** A WebSocket client speaking the binary session protocol. */
 class Socket {
   private readonly queue: ServerMessage[] = [];
@@ -193,13 +203,19 @@ class Socket {
   }
 
   /** Sends Resume and collects the backlog until CaughtUp. */
-  async resume(historyId: string, sinceSeq: bigint): Promise<{ records: CommitRecord[]; head: bigint }> {
-    this.send({ case: "resume", value: { historyId, sinceSeq } });
+  async resume(
+    historyId: string,
+    sinceSeq: bigint,
+    since: CommitToken = { commitId: "", committedAtMs: 0n },
+  ): Promise<{ records: CommitRecord[]; head: bigint; token: CommitToken }> {
+    this.send({ case: "resume", value: { historyId, sinceSeq, sinceCommitId: since.commitId, sinceCommittedAtMs: since.committedAtMs } });
     const records: CommitRecord[] = [];
     for (;;) {
       const msg = await this.next();
       if (msg.case === "changes") records.push(...msg.value.commits);
-      else if (msg.case === "caughtUp") return { records, head: msg.value.headSeq };
+      else if (msg.case === "caughtUp") {
+        return { records, head: msg.value.headSeq, token: { commitId: msg.value.headCommitId, committedAtMs: msg.value.headCommittedAtMs } };
+      }
       else throw new Error("unexpected " + msg.case);
     }
   }
@@ -1451,6 +1467,47 @@ describe("WebSocket session", () => {
     expect(await socket.next()).toMatchObject({ case: "resyncRequired", value: { reason: ResyncRequired_Reason.HISTORY_CHANGED } });
     socket.send({ case: "resume", value: { historyId: welcome.historyId, sinceSeq: 9n } });
     expect(await socket.next()).toMatchObject({ case: "resyncRequired", value: { reason: ResyncRequired_Reason.AHEAD_OF_SERVER } });
+  });
+
+  it("resumes from a token that names the commit at since_seq or from no token, and names the head's commit in CaughtUp (RFC 0013)", async () => {
+    const { a, b, spaceId } = await twoDevices();
+    const sa = await Socket.connect(spaceId, a);
+    const welcome = await sa.hello();
+    expect((await sa.resume(welcome.historyId, 0n)).token).toEqual({ commitId: "", committedAtMs: 0n });
+    for (const [i, name] of ["one", "two", "three"].entries()) await sa.commit(BigInt(i), [op.mkdir(uuidv7(), spaceId, name)]);
+
+    const sb = await Socket.connect(spaceId, b);
+    await sb.hello();
+    const all = await sb.resume(welcome.historyId, 0n);
+    const tokens = all.records.map(tokenOf);
+    expect(all.token).toEqual(tokens[2]);
+    const fromOne = await sb.resume(welcome.historyId, 1n, tokens[0]);
+    expect(fromOne.records.map((r) => r.seq)).toEqual([2n, 3n]);
+    expect(fromOne.token).toEqual(tokens[2]);
+    expect(await sb.resume(welcome.historyId, 3n, tokens[2])).toMatchObject({ records: [], head: 3n, token: tokens[2] });
+    expect((await sb.resume(welcome.historyId, 1n)).records.map((r) => r.seq)).toEqual([2n, 3n]);
+  });
+
+  it("asks for a resync with AHEAD_OF_SERVER when the token at since_seq names another commit, at the head too (RFC 0013)", async () => {
+    const { a, b, spaceId } = await twoDevices();
+    const sa = await Socket.connect(spaceId, a);
+    const welcome = await sa.hello();
+    await sa.commit(0n, [op.mkdir(uuidv7(), spaceId, "one")]);
+    await sa.commit(1n, [op.mkdir(uuidv7(), spaceId, "two")]);
+    const [one, two] = (await sa.resume(welcome.historyId, 0n)).records.map(tokenOf);
+
+    const sb = await Socket.connect(spaceId, b);
+    await sb.hello();
+    const forks: [bigint, CommitToken][] = [
+      [1n, { ...one!, commitId: uuidv7() }],
+      [1n, { ...one!, committedAtMs: one!.committedAtMs + 1n }],
+      [2n, { ...two!, commitId: one!.commitId }],
+      [2n, { ...two!, committedAtMs: two!.committedAtMs - 1n }],
+    ];
+    for (const [sinceSeq, since] of forks) {
+      sb.send({ case: "resume", value: { historyId: welcome.historyId, sinceSeq, sinceCommitId: since.commitId, sinceCommittedAtMs: since.committedAtMs } });
+      expect(await sb.next()).toMatchObject({ case: "resyncRequired", value: { reason: ResyncRequired_Reason.AHEAD_OF_SERVER } });
+    }
   });
 
   it("closes a connection whose token expired, and one that reauthenticates as another device", async () => {
