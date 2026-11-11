@@ -309,14 +309,14 @@ function join_(on: Device, code: string): void {
 }
 
 function folder(on: Device): Folder {
-  const status = JSON.parse(koi(on, ["status", "--json"], null)) as { folders: Folder[] };
-  return status.folders[0] ?? fail(on.name + " has no linked folder");
+  const status = JSON.parse(koi(on, ["status", "--json"], null)) as { data: { folders: Folder[] } };
+  return status.data.folders[0] ?? fail(on.name + " has no linked folder");
 }
 
 async function startDaemon(on: Device): Promise<void> {
-  console.log("\n$ koi daemon >> daemon.log &   # " + on.name);
+  console.log("\n$ koi _daemon >> daemon.log &   # " + on.name);
   const log = openSync(join(on.dir, "daemon.log"), "a");
-  const daemon = spawn(env("KOI"), ["daemon"], { env: { ...on.env, KOIDRIVE_LOG: "info,koidrive_driver=debug,koidrive_engine=debug" }, detached: true, stdio: ["ignore", log, log] });
+  const daemon = spawn(env("KOI"), ["_daemon"], { env: { ...on.env, KOIDRIVE_LOG: "info,koidrive_driver=debug,koidrive_engine=debug" }, detached: true, stdio: ["ignore", log, log] });
   daemon.unref();
   writeFileSync(join(on.dir, "daemon.pid"), String(daemon.pid));
   const socket = join(on.env.XDG_RUNTIME_DIR!, "koidrive", "daemon.sock");
@@ -324,7 +324,7 @@ async function startDaemon(on: Device): Promise<void> {
     if (daemon.exitCode !== null) fail(on.name + "'s daemon exited with " + daemon.exitCode + ": " + readFileSync(join(on.dir, "daemon.log"), "utf8").slice(-2000));
     if (!existsSync(socket)) return undefined;
     try {
-      return (JSON.parse(koi(on, ["status", "--json"], null)) as { running: boolean }).running ? true : undefined;
+      return (JSON.parse(koi(on, ["status", "--json"], null)) as { data: { running: boolean } }).data.running ? true : undefined;
     } catch {
       return undefined;
     }
@@ -427,10 +427,10 @@ async function recover(on: Device): Promise<void> {
   });
   console.log("The folder on " + on.name + " halted: " + halted.problem);
   if (!halted.problem?.endsWith("this build cannot recover the folder yet")) fail("the folder on " + on.name + " halted for another reason");
-  koi(on, ["unlink", on.folder]);
+  koi(on, ["folder", "unlink", on.folder]);
   const fresh = rewound(on.name);
   mkdirSync(fresh.folder, { recursive: true, mode: 0o700 });
-  koi(fresh, ["link", fresh.folder, "--space", SPACE]);
+  koi(fresh, ["folder", "link", fresh.folder, "--space", SPACE]);
   passed("7. Rewind", fresh, (await reach(fresh, "conflicted"))[1]);
 }
 
@@ -450,7 +450,7 @@ const phases: Record<string, (step: string) => Promise<void>> = {
     const linux = device("linux");
     join_(linux, await invitation());
     koi(linux, ["space", "create", SPACE]);
-    koi(linux, ["link", linux.folder, "--space", SPACE]);
+    koi(linux, ["folder", "link", linux.folder, "--space", SPACE]);
     await startDaemon(linux);
     await download("e2e-macos-key", temp("mac-key"));
     mkdirSync(temp("mac-join"), { recursive: true });
@@ -465,7 +465,7 @@ const phases: Record<string, (step: string) => Promise<void>> = {
     const code = unseal(readFileSync(temp("mac-private.pem"), "utf8"), readFileSync(temp("mac-join", "join.bin")));
     rmSync(temp("mac-join"), { recursive: true });
     join_(mac, code);
-    koi(mac, ["link", mac.folder, "--space", SPACE]);
+    koi(mac, ["folder", "link", mac.folder, "--space", SPACE]);
     await startDaemon(mac);
   },
 
@@ -522,7 +522,7 @@ const phases: Record<string, (step: string) => Promise<void>> = {
   async "linux-4"() {
     const linux = device("linux");
     passed("4. Delete", linux, (await reach(linux, "deleted"))[1]);
-    if (!koi(linux, ["trash", linux.folder, "--json"]).includes("from-linux.txt")) fail("the trash does not list notes/from-linux.txt");
+    if (!koi(linux, ["history", "trash", linux.folder, "--json"]).includes("from-linux.txt")) fail("the trash does not list notes/from-linux.txt");
   },
 
   async "linux-5-offline"() {
@@ -558,11 +558,11 @@ const phases: Record<string, (step: string) => Promise<void>> = {
   async "linux-6"() {
     const third = device("third");
     join_(third, await invitation());
-    koi(third, ["link", third.folder, "--space", SPACE]);
+    koi(third, ["folder", "link", third.folder, "--space", SPACE]);
     await startDaemon(third);
     passed("6. A third device reads the space", third, (await reach(third, "conflicted"))[1]);
-    koi(third, ["versions", join(third.folder, "docs", "from-mac-renamed.txt")]);
-    koi(third, ["trash", third.folder]);
+    koi(third, ["history", "versions", join(third.folder, "docs", "from-mac-renamed.txt")]);
+    koi(third, ["history", "trash", third.folder]);
     await stopDaemon(third);
   },
 
