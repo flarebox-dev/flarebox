@@ -79,7 +79,6 @@ enum Command {
         #[arg(requires = "answer")]
         id: Option<String>,
         /// One of the answers the decision lists, such as restore or keep-node:<node id>.
-        #[arg(value_parser = answer_word)]
         answer: Option<String>,
     },
     /// Show the setup choices, or run the guided setup on a terminal.
@@ -1438,34 +1437,6 @@ fn choices(question: &Question) -> Vec<Choice> {
     ]
 }
 
-/// An answer as `koi resolve` reads it, before it knows the decision: an answer's name, keep-node:<node id>, or
-/// keep-both. The engine's names for a conflict's answers are not among them.
-fn answer_word(text: &str) -> Result<String, String> {
-    let conflict = |answer: &Answer| {
-        matches!(
-            answer,
-            Answer::KeepOriginal | Answer::KeepCopy | Answer::KeepBoth
-        )
-    };
-    let named = text
-        .parse::<Answer>()
-        .is_ok_and(|answer| !conflict(&answer));
-    let node = text
-        .strip_prefix("keep-node:")
-        .is_some_and(|id| !id.is_empty());
-    if named || node || text == KEEP_BOTH {
-        return Ok(text.to_owned());
-    }
-    let names: Vec<&str> = (Answer::ALL.iter())
-        .filter(|answer| !conflict(answer))
-        .map(|answer| answer.as_str())
-        .collect();
-    Err(format!(
-        "{text:?} is not an answer; use one of {}, keep-node:<node id> or {KEEP_BOTH}",
-        names.join(", ")
-    ))
-}
-
 /// The engine's answer that `word` gives `question`, or an error that lists the words it takes.
 fn answer_to(question: &Question, word: &str) -> Result<Answer, String> {
     let choices = choices(question);
@@ -2058,35 +2029,31 @@ mod tests {
     }
 
     #[test]
-    fn resolve_reads_keep_node_and_keep_both_but_not_the_engine_names_of_a_conflict_answer() {
-        let parse = |args: &[&str]| Cli::try_parse_from(args).map(|cli| cli.command);
-        for word in ["keep-both", "keep-node:n1", "dismiss"] {
-            assert!(
-                matches!(
-                    parse(&["koi", "resolve", "q1", word]),
-                    Ok(Some(Command::Resolve { answer: Some(answer), .. })) if answer == word
-                ),
-                "{word}"
-            );
-        }
-        for word in [
-            "keep-node:",
-            "keep_original",
-            "keep_copy",
-            "keep_both",
-            "keep",
-        ] {
-            let error = parse(&["koi", "resolve", "q1", word]).err();
-            if word == "keep" {
-                assert!(error.is_none(), "keep answers a recovery group");
-                continue;
-            }
-            assert!(
-                error.is_some_and(|error| error
-                    .to_string()
-                    .contains("keep-node:<node id> or keep-both")),
-                "{word}"
-            );
+    fn resolve_answers_a_conflict_only_with_its_own_words_and_names_them_otherwise() {
+        let parse = |word: &str| match Cli::try_parse_from(["koi", "resolve", "q1", word]) {
+            Ok(Cli {
+                command:
+                    Some(Command::Resolve {
+                        answer: Some(answer),
+                        ..
+                    }),
+                ..
+            }) => answer,
+            _ => panic!("resolve q1 {word} parses as an answer"),
+        };
+        let question = conflict("docs/notes (conflict).txt");
+        assert_eq!(
+            answer_to(&question, &parse(&format!("keep-node:{COPY}"))),
+            Ok(Answer::KeepCopy)
+        );
+        assert_eq!(
+            answer_to(&question, &parse("keep-both")),
+            Ok(Answer::KeepBoth)
+        );
+        let valid = format!("use keep-node:{ORIGINAL} or keep-node:{COPY} or keep-both");
+        for word in ["nonsense", "keep_original", "keep-node:", "delete"] {
+            let error = answer_to(&question, &parse(word)).unwrap_err();
+            assert_eq!(error, format!("{word} is not an answer to q1; {valid}"));
         }
     }
 
@@ -2295,7 +2262,10 @@ mod tests {
             })) if answer == "restore"
         ));
         assert!(parse(&["koi", "resolve", "q1"]).is_err());
-        assert!(parse(&["koi", "resolve", "q1", "later"]).is_err());
+        assert_eq!(
+            answer_to(&held((30, 30, 40), &[Limit::Share], 1), "later"),
+            Err("later is not an answer to q1; use delete or restore".to_owned())
+        );
         assert!(matches!(
             parse(&["koi", "resolve", "q1", "delete", "--json"]),
             Ok(Some(Command::Resolve { id: Some(_), .. }))
