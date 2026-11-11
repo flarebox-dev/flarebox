@@ -338,6 +338,9 @@ fn a_node_whose_name_another_entry_took_stays_excluded_until_it_returns_or_is_tr
         synced("a", file("d", "a.txt", 1)),
         synced("b", file("d", "b.txt", 2)),
     ]);
+    let mut undated = trees.local().get("b").unwrap().clone();
+    undated.identity.birth_ns = None;
+    trees.set_local("b".into(), undated);
     trees.ignore_local("d");
     let held = trees.local().get("a").unwrap().identity;
     assert!(["d", "a", "b"].iter().all(|id| trees.recorded_local(id)));
@@ -360,11 +363,13 @@ fn a_node_whose_name_another_entry_took_stays_excluded_until_it_returns_or_is_tr
     assert!(["d", "a", "b"].iter().all(|id| restored.ignored(id)));
 
     assert_eq!(trees.displaced_with_identity(&held), Some(&"a".to_owned()));
-    let undated = FileIdentity {
-        birth_ns: None,
-        ..held
-    };
-    assert_eq!(trees.displaced_with_identity(&undated), None);
+    let undated = trees.displaced_local()["b"];
+    assert_eq!(undated.birth_ns, None);
+    assert_eq!(
+        trees.displaced_with_identity(&undated),
+        None,
+        "a record without a birth time matches no file"
+    );
     trees.set_local("a".into(), local(file(ROOT, "back.txt", 1), 2));
     assert!(!trees.excluded("a") && trees.displaced_with_identity(&held).is_none());
     trash(&mut trees, "b");
