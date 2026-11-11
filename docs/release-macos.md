@@ -14,16 +14,16 @@ The [macOS release](../.github/workflows/release-macos.yml) workflow builds the 
 2. Waits for a required reviewer to approve the `macos-release` environment, which releases the secrets to the signing job.
 3. Builds the Release app with Xcode 27.2 on an `xcode-27` runner, without signing. `xcode-27` is a GitHub [preview image](https://github.com/actions/runner-images/issues/14404) with macOS 27.
 4. Creates a temporary keychain with a random password, imports the Developer ID certificate into it, and writes the notary key to a file readable only by the runner user.
-5. Signs the app with the Developer ID Application identity, the hardened runtime, a secure timestamp and [`apps/macos/Flarebox.entitlements`](../apps/macos/Flarebox.entitlements).
+5. Signs the app with the Developer ID Application identity, the hardened runtime, a secure timestamp and [`apps/macos/Koidrive.entitlements`](../apps/macos/Koidrive.entitlements).
 6. Notarizes the app with `notarytool` and the App Store Connect API key, then staples the ticket to the app. It submits the app without waiting, prints the submission id, and then asks Apple for the submission's status every minute for up to 2.5 hours. When a request fails with a network error, it tries again after 15 seconds, doubling the wait up to 5 minutes.
 7. Packages the stapled app in a DMG, signs the DMG, notarizes it the same way and staples it.
 8. Verifies the DMG and the app inside it with `codesign --verify --deep --strict`, `xcrun stapler validate` and `spctl --assess`, and checks for the hardened runtime, the Developer ID authority and the absence of `get-task-allow`.
-9. Uploads `Flarebox-<version>-arm64.dmg` as an artifact and writes its SHA-256 to the run summary.
+9. Uploads `Koidrive-<version>-arm64.dmg` as an artifact and writes its SHA-256 to the run summary.
 10. Deletes the keychain and the key files, even when a step failed.
 
 If Apple reports a submission as Invalid or Rejected, the log shows Apple's notarization log for it. If Apple gives no final answer within 2.5 hours, the step fails and names the submission id.
 
-When none of the signing secrets are set, the run still builds the DMG but signs it ad hoc only, names it `Flarebox-<version>-arm64-unsigned.dmg`, and says "Signing skipped" in a warning and in the run summary. Gatekeeper blocks such a DMG on other Macs. When only some of the secrets are set, the run fails and names the missing ones.
+When none of the signing secrets are set, the run still builds the DMG but signs it ad hoc only, names it `Koidrive-<version>-arm64-unsigned.dmg`, and says "Signing skipped" in a warning and in the run summary. Gatekeeper blocks such a DMG on other Macs. When only some of the secrets are set, the run fails and names the missing ones.
 
 ## Before you add any secret
 
@@ -95,7 +95,7 @@ GitHub never shows a secret again after you save it. If the secret is lost, crea
 `notarytool` needs a team API key; individual API keys cannot use it ([Creating API Keys for App Store Connect API](https://developer.apple.com/documentation/appstoreconnectapi/creating-api-keys-for-app-store-connect-api)). Generating team keys needs the Admin role in App Store Connect, and the Account Holder must first request access to the App Store Connect API ([Role permissions](https://developer.apple.com/help/app-store-connect/reference/account-management/role-permissions/)).
 
 1. In [App Store Connect](https://appstoreconnect.apple.com/), open **Users and Access**, **Integrations**, **App Store Connect API**. If the page asks you to request access, do that first.
-2. On **Team Keys**, click **Generate API Key**, name it, for example, "Flarebox notarization", and choose the **Developer** role. That is the least privileged role commonly used for notarization; *unverified*: Apple's role table does not render as text, so if `notarytool` reports that the key is not authorized, generate a key with the **App Manager** role instead and revoke the first one.
+2. On **Team Keys**, click **Generate API Key**, name it, for example, "Koidrive notarization", and choose the **Developer** role. That is the least privileged role commonly used for notarization; *unverified*: Apple's role table does not render as text, so if `notarytool` reports that the key is not authorized, generate a key with the **App Manager** role instead and revoke the first one.
 3. Click **Download API Key**. Apple offers the `.p8` file only once and keeps no copy.
 4. Copy the key's **Key ID** from its row and the **Issuer ID** shown above the list of keys.
 5. Store the three secrets:
@@ -116,11 +116,11 @@ Either way, approve the deployment to `macos-release` on the run page when it as
 Download the DMG from the **Artifacts** section of the run's page. To check it on your Mac:
 
 ```sh
-hdiutil attach Flarebox-0.1.0-arm64.dmg -nobrowse -readonly
-codesign --verify --deep --strict --verbose=2 /Volumes/Flarebox/Flarebox.app
-xcrun stapler validate /Volumes/Flarebox/Flarebox.app
-spctl --assess --type execute --verbose=2 /Volumes/Flarebox/Flarebox.app   # expect "source=Notarized Developer ID"
-hdiutil detach /Volumes/Flarebox
+hdiutil attach Koidrive-0.1.0-arm64.dmg -nobrowse -readonly
+codesign --verify --deep --strict --verbose=2 /Volumes/Koidrive/Koidrive.app
+xcrun stapler validate /Volumes/Koidrive/Koidrive.app
+spctl --assess --type execute --verbose=2 /Volumes/Koidrive/Koidrive.app   # expect "source=Notarized Developer ID"
+hdiutil detach /Volumes/Koidrive
 ```
 
 ### If the app's notarization was interrupted
@@ -131,7 +131,7 @@ The disk image always goes through a new submission, because a rebuilt disk imag
 
 ## Entitlements
 
-`apps/macos/Flarebox.entitlements` is deliberately empty. The app is distributed with Developer ID, not through the Mac App Store, so it is not sandboxed: it syncs folders the person chooses anywhere in their home folder. The hardened runtime needs an entitlement only to turn off one of its protections ([Hardened Runtime](https://developer.apple.com/documentation/security/hardened-runtime)), and the app needs none of them: the Rust core is linked statically, and the app uses no JIT, unsigned executable memory, DYLD environment variables or libraries signed by someone else. Open at login uses `SMAppService.mainApp`, which needs no entitlement outside the sandbox. Apple recommends leaving false entitlements out rather than listing them as false. The File Provider extension planned for a later version will need the sandbox and an app group, and with them a Developer ID provisioning profile, which this workflow does not handle yet.
+`apps/macos/Koidrive.entitlements` is deliberately empty. The app is distributed with Developer ID, not through the Mac App Store, so it is not sandboxed: it syncs folders the person chooses anywhere in their home folder. The hardened runtime needs an entitlement only to turn off one of its protections ([Hardened Runtime](https://developer.apple.com/documentation/security/hardened-runtime)), and the app needs none of them: the Rust core is linked statically, and the app uses no JIT, unsigned executable memory, DYLD environment variables or libraries signed by someone else. Open at login uses `SMAppService.mainApp`, which needs no entitlement outside the sandbox. Apple recommends leaving false entitlements out rather than listing them as false. The File Provider extension planned for a later version will need the sandbox and an app group, and with them a Developer ID provisioning profile, which this workflow does not handle yet.
 
 ## Limits
 

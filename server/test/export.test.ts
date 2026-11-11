@@ -4,7 +4,7 @@ import { create, fromBinary } from "@bufbuild/protobuf";
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
-import { ChunkRefSchema, CommitRecordSchema, ContentSchema } from "../src/gen/flarebox/v1/model_pb";
+import { ChunkRefSchema, CommitRecordSchema, ContentSchema } from "../src/gen/koidrive/v1/model_pb";
 import { sha256 } from "../src/crypto";
 import { uuidv7, uuidv7Ms } from "../src/ids";
 import { SpaceDO } from "../src/space-do";
@@ -120,7 +120,7 @@ describe("R2 metadata export (spec v0 section 11, RFC 0004)", () => {
     const prefix = await historyPrefix(space, a);
     expect(await listKeys(`spaces/${space.spaceId}/meta/`)).toEqual([prefix + "space.json"]);
     expect(await (await env.BUCKET.get(prefix + "space.json"))!.json()).toEqual({
-      format: "flarebox.space",
+      format: "koidrive.space",
       format_version: 1,
       space_id: space.spaceId,
       name: "Photos",
@@ -184,7 +184,7 @@ describe("R2 metadata export (spec v0 section 11, RFC 0004)", () => {
     pause.released = true;
     await running;
     const [manifest] = await manifests(prefix);
-    expect(manifest).toMatchObject({ format: "flarebox.snapshot", format_version: 1, space_id: spaceId, start_seq: 5, end_seq: Number(during) });
+    expect(manifest).toMatchObject({ format: "koidrive.snapshot", format_version: 1, space_id: spaceId, start_seq: 5, end_seq: Number(during) });
     expect(manifest!.pages.map((page) => page.name)).toEqual(["0.fbsnap", "1.fbsnap", "2.fbsnap", "3.fbsnap"]);
     expect(manifest!.pages.reduce((sum, page) => sum + page.records, 0)).toBe(7);
     expect(await listKeys(prefix + "log/")).toEqual([segmentKey(prefix, 1, 4), segmentKey(prefix, 5, 5), segmentKey(prefix, 6, 6)]);

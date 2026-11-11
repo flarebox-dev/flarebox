@@ -14,7 +14,7 @@ use common::{
     Bytes, EDITED, ID, REMOTE, SCENARIOS, SYNCED, assert_settled, at, bind, contents, entries,
     marker, now, prepare, private_names, rewrite_keeping_mtime, same, stage, trashed,
 };
-use flarebox_fs::{
+use koidrive_fs::{
     Action, Base, Displaced, Effect, Location, Outcome, PARKED_DIR, PRIVATE_DIR, QUARANTINE_DIR,
     Reason, STAGING_DIR, Snapshot, Step, TRASH_RETENTION, Unresolved, read_marker,
 };

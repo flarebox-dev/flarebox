@@ -33,10 +33,10 @@ pub fn name_key(name: &str) -> String {
     casefold(&name.nfd().collect::<String>()).nfd().collect()
 }
 
-/// RFC 0001 section 2: clients keep their local state in `.flarebox/` at the root of the synced
+/// RFC 0001 section 2: clients keep their local state in `.koidrive/` at the root of the synced
 /// folder, so no node may take that name, in any case or normalization, directly under the root.
 pub fn is_reserved_at_root(name: &str) -> bool {
-    name_key(name) == ".flarebox"
+    name_key(name) == ".koidrive"
 }
 
 /// The NFC form of a valid node name, or `None` when the name is not allowed.

@@ -4,16 +4,16 @@ import { create, fromBinary, type MessageInitShape, toBinary } from "@bufbuild/p
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { vi } from "vitest";
-import { type CommitResult, type Op, OpSchema, UploadReceiptSchema, type UploadReceipt } from "../src/gen/flarebox/v1/commit_pb";
-import { type RpcRequest, RpcRequestSchema, type RpcResponse, RpcResponseSchema } from "../src/gen/flarebox/v1/messages_pb";
-import { type ChunkRef, ChunkRefSchema, type Content, ContentSchema, type NodeState } from "../src/gen/flarebox/v1/model_pb";
-import { ChunkPlan_Action, type Error as RpcError } from "../src/gen/flarebox/v1/rpc_pb";
+import { type CommitResult, type Op, OpSchema, UploadReceiptSchema, type UploadReceipt } from "../src/gen/koidrive/v1/commit_pb";
+import { type RpcRequest, RpcRequestSchema, type RpcResponse, RpcResponseSchema } from "../src/gen/koidrive/v1/messages_pb";
+import { type ChunkRef, ChunkRefSchema, type Content, ContentSchema, type NodeState } from "../src/gen/koidrive/v1/model_pb";
+import { ChunkPlan_Action, type Error as RpcError } from "../src/gen/koidrive/v1/rpc_pb";
 import { sha256, signChunkGrant } from "../src/crypto";
 import { toHex, uuidv7 } from "../src/ids";
 import type { Session, SpaceDO } from "../src/space-do";
 import { chunkKey, encodeChunkList } from "../src/space/store";
 
-export const ORIGIN = "https://flarebox.test";
+export const ORIGIN = "https://koidrive.test";
 export const OWNER = uuidv7();
 export const SPACE_KEY = crypto.getRandomValues(new Uint8Array(32));
 const encoder = new TextEncoder();

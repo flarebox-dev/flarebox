@@ -32,8 +32,8 @@ cleanup() {
 }
 trap cleanup EXIT
 hdiutil attach "$dmg" -readonly -nobrowse -noautoopen -mountpoint "$mountpoint" >/dev/null
-app="$mountpoint/Flarebox.app"
-[ -x "$app/Contents/MacOS/Flarebox" ] || fail "$dmg does not contain Flarebox.app with its executable."
+app="$mountpoint/Koidrive.app"
+[ -x "$app/Contents/MacOS/Koidrive" ] || fail "$dmg does not contain Koidrive.app with its executable."
 [ -L "$mountpoint/Applications" ] || fail "$dmg has no link to /Applications."
 
 echo "== Info.plist"

@@ -7,13 +7,13 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use flarebox_engine::ids::IdGen;
-use flarebox_proto::v1::{
+use koidrive_engine::ids::IdGen;
+use koidrive_proto::v1::{
     ChunkRef, Commit, Content, CreateDir, CreateFile, Delete, Error, ListVersions, Move, NodeKind,
     NodeState, NodeStatus, Op, PrepareUpload, Restore, RpcRequest, UpdateContent, UploadReceipt,
     VersionInfo, chunk_plan, error, op, op_result, rpc_request, rpc_response,
 };
-use flarebox_sim::space::{Role, Session, SpaceDo, node_states};
+use koidrive_sim::space::{Role, Session, SpaceDo, node_states};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -229,7 +229,7 @@ fn check_doc(doc: &Value) -> Outcome {
             "scenarios",
         ],
     )?;
-    if doc["format"] != "flarebox.space-conformance" || doc["version"] != 1 {
+    if doc["format"] != "koidrive.space-conformance" || doc["version"] != 1 {
         return Err("unsupported format or version".into());
     }
     req(opt_list(doc, "scenarios"), "scenarios")?;
@@ -987,7 +987,7 @@ impl Run {
         &mut self,
         space: &str,
         want: &Value,
-        got: &flarebox_proto::v1::OpResult,
+        got: &koidrive_proto::v1::OpResult,
     ) -> Outcome {
         keys(want, "a result", &["code", "node", "name", "reason"])?;
         let code = op_result::Code::try_from(got.code)

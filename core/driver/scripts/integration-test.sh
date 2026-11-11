@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# Runs the flarebox-driver sync tests, two drivers in one process, against the Worker in server/ under wrangler dev
+# Runs the koidrive-driver sync tests, two drivers in one process, against the Worker in server/ under wrangler dev
 # with fresh local state. Needs the server's dependencies (pnpm install in server/). Extra arguments go to the test
 # binary.
 
@@ -10,7 +10,7 @@ set -m
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 work="$(mktemp -d)"
-port="${FLAREBOX_TEST_PORT:-$(node -e 'const s = require("net").createServer().listen(0, "127.0.0.1", () => { console.log(s.address().port); s.close(); })')}"
+port="${KOIDRIVE_TEST_PORT:-$(node -e 'const s = require("net").createServer().listen(0, "127.0.0.1", () => { console.log(s.address().port); s.close(); })')}"
 log="$work/wrangler.log"
 wrangler="$root/server/node_modules/.bin/wrangler"
 
@@ -54,5 +54,5 @@ if ! grep -q "Ready on" "$log"; then
 fi
 
 cd "$root"
-FLAREBOX_TEST_SERVER="http://127.0.0.1:$port" FLAREBOX_TEST_SERVER_LOG="$log" \
-  cargo test -p flarebox-driver --locked --test sync -- --ignored "$@"
+KOIDRIVE_TEST_SERVER="http://127.0.0.1:$port" KOIDRIVE_TEST_SERVER_LOG="$log" \
+  cargo test -p koidrive-driver --locked --test sync -- --ignored "$@"

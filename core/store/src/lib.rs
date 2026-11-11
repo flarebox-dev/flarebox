@@ -35,8 +35,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub use engine::EngineState;
-use flarebox_fs::FileId;
-use flarebox_proto::v1::{Content, NodeState, VersionInfo};
+use koidrive_fs::FileId;
+use koidrive_proto::v1::{Content, NodeState, VersionInfo};
 use prost::Message;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
@@ -404,7 +404,7 @@ pub struct SyncedNode {
 }
 
 /// A node of the local tree. `shape.name` is the exact name on disk. A parked
-/// node sits in `.flarebox/parked/<node_id>` while `shape` keeps the
+/// node sits in `.koidrive/parked/<node_id>` while `shape` keeps the
 /// position the engine compares it at.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalNode {

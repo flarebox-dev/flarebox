@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
-use flarebox_proto::v1::{self as proto, error, op, op_result};
+use koidrive_proto::v1::{self as proto, error, op, op_result};
 use prost::Message;
 
 use crate::classify::{Class, Trees, classify};

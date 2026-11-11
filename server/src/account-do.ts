@@ -21,9 +21,9 @@ import {
   SpaceInfoSchema,
   type SpaceList,
   SpaceListSchema,
-} from "./gen/flarebox/v1/auth_pb";
-import { Error_Code } from "./gen/flarebox/v1/rpc_pb";
-import type { ShareLink, ShareLinkList } from "./gen/flarebox/v1/share_pb";
+} from "./gen/koidrive/v1/auth_pb";
+import { Error_Code } from "./gen/koidrive/v1/rpc_pb";
+import type { ShareLink, ShareLinkList } from "./gen/koidrive/v1/share_pb";
 import { isUuidV7, uuidv7 } from "./ids";
 import { knownPrincipal } from "./policy";
 import { FORMAT_VERSION } from "./space-do";
@@ -511,14 +511,14 @@ export class AccountDO extends DurableObject<Env> {
   }
 
   /**
-   * Creates a space, refusing a name the owner already uses. Names compare exactly after trimming, as `flarebox link
+   * Creates a space, refusing a name the owner already uses. Names compare exactly after trimming, as `koi link
    * --space` resolves them. While the Space DO is set up, the name is held in memory, so a concurrent create of it is
    * refused and an aborted create leaves nothing behind; the row is stored once the Space DO holds the space.
    */
   async createSpace(args: { userId: string; name: string }): Promise<Outcome<SpaceInfo>> {
     const nowMs = Date.now();
     const spaceId = uuidv7(nowMs);
-    const name = args.name.trim() || "Flarebox";
+    const name = args.name.trim() || "Koidrive";
     const held = JSON.stringify([args.userId, name]);
     if (this.creating.has(held) || this.sql.exec("SELECT 1 FROM spaces WHERE owner_id = ? AND name = ?", args.userId, name).toArray().length > 0) {
       return failure(Error_Code.INVALID_ARGUMENT, "you already have a space with this name");

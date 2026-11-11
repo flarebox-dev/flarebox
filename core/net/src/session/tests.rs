@@ -4,7 +4,7 @@
 
 use std::time::{Duration, UNIX_EPOCH};
 
-use flarebox_proto::v1::{
+use koidrive_proto::v1::{
     CaughtUp, Changes, CommitRecord, Error as ProtoError, Goodbye, Notice, Resume, ServerMessage,
     TreePage, client_message, server_message,
 };
@@ -14,7 +14,7 @@ use tokio_tungstenite::WebSocketStream;
 
 use super::*;
 use crate::{Api, Credentials};
-use flarebox_proto::v1::error::Code;
+use koidrive_proto::v1::error::Code;
 
 type Server = WebSocketStream<TcpStream>;
 

@@ -3,13 +3,13 @@
 //! Building commits from local changes and acknowledging their results (docs/design/sync-engine.md
 //! sections 2.4, 2.6, 2.7, 2.8 and 4.2, and RFC 0002), on hand-built trees and results.
 
-use flarebox_engine::classify::{Class, Trees};
-use flarebox_engine::commit::{Commits, Failure, Halt, Lift, LiftError, MAX_OPS, Reconnect};
-use flarebox_engine::effects::{Effect, EffectError, Effects, Location};
-use flarebox_engine::ids::IdGen;
-use flarebox_engine::names::{MAX_NAME_BYTES, nfc, normalize_name};
-use flarebox_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape};
-use flarebox_proto::v1::{self as proto, CommitResult, OpResult, Welcome, error, op, op_result};
+use koidrive_engine::classify::{Class, Trees};
+use koidrive_engine::commit::{Commits, Failure, Halt, Lift, LiftError, MAX_OPS, Reconnect};
+use koidrive_engine::effects::{Effect, EffectError, Effects, Location};
+use koidrive_engine::ids::IdGen;
+use koidrive_engine::names::{MAX_NAME_BYTES, nfc, normalize_name};
+use koidrive_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape};
+use koidrive_proto::v1::{self as proto, CommitResult, OpResult, Welcome, error, op, op_result};
 
 const ROOT: &str = "root";
 const NOW: u64 = 1_794_268_740_000;
@@ -237,7 +237,7 @@ fn a_name_swap_that_does_not_fit_the_commit_waits_for_the_next_one() {
     let mut rows = swapped();
     rows.push(("n", Some(file(ROOT, "new", 3)), None, None));
     let mut trees = trees(&rows);
-    let state = flarebox_engine::state::CommitsState {
+    let state = koidrive_engine::state::CommitsState {
         cap: Some(2),
         ..Commits::default().state()
     };

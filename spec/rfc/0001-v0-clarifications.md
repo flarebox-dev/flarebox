@@ -27,7 +27,7 @@ The versions belong to the space format (§9.2). Moving to a newer Unicode versi
 
 ## 2. Reserved name at the root
 
-`.flarebox` is reserved directly under the space root, compared by `name_key`, so `.Flarebox` and `.ﬂarebox` are reserved too. A `CreateDir`, `CreateFile`, `Move` or `Restore` that would put a live node with that name directly under the root is rejected with `REJECTED` and reason `INVALID_NAME`. A node that R8 revives directly under the root with a reserved stored name is treated as an R1 clash and gets a conflict name. The name is allowed at any other depth. Clients keep their local state in `.flarebox/` at the root of the synced folder and never sync it.
+`.koidrive` is reserved directly under the space root, compared by `name_key`, so `.Koidrive` and `.Koidrive` (with the Kelvin sign) are reserved too. A `CreateDir`, `CreateFile`, `Move` or `Restore` that would put a live node with that name directly under the root is rejected with `REJECTED` and reason `INVALID_NAME`. A node that R8 revives directly under the root with a reserved stored name is treated as an R1 clash and gets a conflict name. The name is allowed at any other depth. Clients keep their local state in `.koidrive/` at the root of the synced folder and never sync it.
 
 ## 3. UpdateContent on a directory
 

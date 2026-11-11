@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! An in-memory Space DO written from spec v0 sections 6 to 8 and checked against the TypeScript
-//! server (flarebox#6): commit idempotency and the commit checks of RFC 0002 section 3 (history fence,
+//! server (koidrive#6): commit idempotency and the commit checks of RFC 0002 section 3 (history fence,
 //! device counter, `base_seq`, `require_head`), chunk presence and receipts, rules R1 to R11, trash
 //! groups, revisions and post-image change records, resume and the paged listings.
 //! Garbage collection and retention are not modelled.
@@ -10,8 +10,8 @@ mod apply;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use flarebox_engine::ids::{IdGen, is_uuid_v7};
-use flarebox_proto::v1::{
+use koidrive_engine::ids::{IdGen, is_uuid_v7};
+use koidrive_proto::v1::{
     ChangeRecord, Changes, ChunkPlan, ChunkRef, ChunkTarget, Commit, CommitRecord, CommitResult,
     Content, DownloadTargets, Error, GetDownloadTargets, GetVersionChunks, ListTrash, ListTree,
     ListVersions, NodeKind, NodeState, NodeStatus, Op, PrepareUpload, PrepareUploadResult, Resume,
@@ -472,7 +472,7 @@ impl SpaceDo {
     pub fn welcome(&self, session: &Session) -> Welcome {
         Welcome {
             proto: 0,
-            server_version: "flarebox-sim".into(),
+            server_version: "koidrive-sim".into(),
             format_version: self.format_version,
             history_id: self.history_id.clone(),
             head_seq: self.head_seq,
@@ -1038,19 +1038,19 @@ impl SpaceDo {
 /// Every record a commit can carry is a `NodeState` in this model.
 pub fn node_states(changes: &[ChangeRecord]) -> impl Iterator<Item = &NodeState> {
     changes.iter().filter_map(|c| match &c.change {
-        Some(flarebox_proto::v1::change_record::Change::Node(n)) => Some(n),
+        Some(koidrive_proto::v1::change_record::Change::Node(n)) => Some(n),
         _ => None,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use flarebox_engine::names::name_key;
-    use flarebox_proto::v1::{CreateDir, Delete, op_result};
+    use koidrive_engine::names::name_key;
+    use koidrive_proto::v1::{CreateDir, Delete, op_result};
 
     use super::*;
 
-    /// A name stored before the `.flarebox` reservation is renamed when R8 brings it back to the root.
+    /// A name stored before the `.koidrive` reservation is renamed when R8 brings it back to the root.
     #[test]
     fn r8_revival_renames_a_stored_reserved_root_name() {
         let mut space = SpaceDo::new(1, 0);
@@ -1090,8 +1090,8 @@ mod tests {
             }),
         );
         let stored = space.state.nodes.get_mut(&dir).unwrap();
-        stored.name = ".FlareBox".into();
-        stored.name_key = name_key(".FlareBox");
+        stored.name = ".KoiDrive".into();
+        stored.name_key = name_key(".KoiDrive");
 
         let result = commit(
             &mut space,
@@ -1104,7 +1104,7 @@ mod tests {
         assert_eq!(result.results[0].code(), op_result::Code::Applied);
         let name = space.node(&dir).unwrap().name;
         assert!(
-            name.starts_with(".FlareBox (conflict from Laptop A "),
+            name.starts_with(".KoiDrive (conflict from Laptop A "),
             "{name}"
         );
     }

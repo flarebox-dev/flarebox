@@ -7,8 +7,8 @@
 
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { ServerInfoSchema, SpaceListSchema } from "../../src/gen/flarebox/v1/auth_pb";
-import { ShareInfoSchema, ShareLinkSchema } from "../../src/gen/flarebox/v1/share_pb";
+import { ServerInfoSchema, SpaceListSchema } from "../../src/gen/koidrive/v1/auth_pb";
+import { ShareInfoSchema, ShareLinkSchema } from "../../src/gen/koidrive/v1/share_pb";
 import { Device, fileData, op, readBytes, send, Server, sha256, SpaceClient, stats, toHex, uuidv7 } from "./client";
 import { addStats, readState } from "./state.ts";
 

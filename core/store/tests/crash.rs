@@ -10,16 +10,16 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use flarebox_engine::commit::InFlight;
-use flarebox_engine::ids::uuid_v7;
-use flarebox_engine::restore::{RestoreId, RestoreIntent};
-use flarebox_engine::state::{CommitsState, EffectsState};
-use flarebox_fs::FileId;
-use flarebox_proto::v1::{Commit, NodeKind, NodeState, NodeStatus, Op, op};
-use flarebox_store::{Cursor, EngineState, Error, LocalNode, Shape, Store, SyncedNode, Tx};
+use koidrive_engine::commit::InFlight;
+use koidrive_engine::ids::uuid_v7;
+use koidrive_engine::restore::{RestoreId, RestoreIntent};
+use koidrive_engine::state::{CommitsState, EffectsState};
+use koidrive_fs::FileId;
+use koidrive_proto::v1::{Commit, NodeKind, NodeState, NodeStatus, Op, op};
+use koidrive_store::{Cursor, EngineState, Error, LocalNode, Shape, Store, SyncedNode, Tx};
 use rusqlite::Connection;
 
-const CHILD_DB: &str = "FLAREBOX_STORE_CRASH_CHILD_DB";
+const CHILD_DB: &str = "KOIDRIVE_STORE_CRASH_CHILD_DB";
 const NODES_PER_INPUT: u64 = 500;
 
 fn remote(n: u64) -> NodeState {

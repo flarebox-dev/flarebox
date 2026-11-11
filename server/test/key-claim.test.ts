@@ -5,12 +5,12 @@ import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AccountDO } from "../src/account-do";
-import { AccessTokenSchema, ClaimRequestSchema, DeviceCredentialsSchema, ServerInfoSchema, TokenRequestSchema } from "../src/gen/flarebox/v1/auth_pb";
-import { Error_Code, ErrorSchema } from "../src/gen/flarebox/v1/rpc_pb";
+import { AccessTokenSchema, ClaimRequestSchema, DeviceCredentialsSchema, ServerInfoSchema, TokenRequestSchema } from "../src/gen/koidrive/v1/auth_pb";
+import { Error_Code, ErrorSchema } from "../src/gen/koidrive/v1/rpc_pb";
 
-const BASE = "https://flarebox.test";
+const BASE = "https://koidrive.test";
 const ADDRESS = "198.51.100.7";
-/** The key vitest.config.ts gives the Worker as FLAREBOX_RECOVERY_KEY. */
+/** The key vitest.config.ts gives the Worker as KOIDRIVE_RECOVERY_KEY. */
 const RECOVERY_KEY = "test-recovery-key-for-local-workerd-only";
 const request = { userName: "Owner", deviceName: "Laptop", platform: "macos" };
 
@@ -47,7 +47,7 @@ async function claimed(): Promise<boolean> {
 async function setupCode(): Promise<string | undefined> {
   const log = vi.spyOn(console, "log");
   await exports.default.fetch(BASE + "/setup").then((response) => response.text());
-  const line = log.mock.calls.map((args) => String(args[0])).find((entry) => entry.startsWith("Flarebox claim code"));
+  const line = log.mock.calls.map((args) => String(args[0])).find((entry) => entry.startsWith("Koidrive claim code"));
   log.mockRestore();
   return line?.split(": ")[1];
 }

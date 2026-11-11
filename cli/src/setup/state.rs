@@ -8,8 +8,8 @@ use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::PathBuf;
 
-use flarebox_cloudflare::Jurisdiction;
-use flarebox_driver::Paths;
+use koidrive_cloudflare::Jurisdiction;
+use koidrive_driver::Paths;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -33,7 +33,7 @@ pub struct SetupState {
     pub script: String,
     pub bucket: String,
     pub step: Step,
-    /// This CLI may have set a one-time `FLAREBOX_RECOVERY_KEY` that is not deleted yet.
+    /// This CLI may have set a one-time `KOIDRIVE_RECOVERY_KEY` that is not deleted yet.
     pub secret_set: bool,
     /// The setup attempt id the claims of this run send, until one claim's credential is saved.
     pub setup_attempt: Option<String>,
@@ -118,8 +118,8 @@ mod tests {
         assert_eq!(file.load().unwrap(), None);
         let state = SetupState {
             account: "account".into(),
-            script: "flarebox".into(),
-            bucket: "flarebox-2".into(),
+            script: "koidrive".into(),
+            bucket: "koidrive-2".into(),
             step: Step::ScriptUploaded,
             secret_set: true,
             setup_attempt: Some("attempt".into()),

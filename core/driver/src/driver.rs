@@ -9,13 +9,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use flarebox_engine::commit::{Commits, Lift, LiftError};
-use flarebox_engine::ignore::LocalRules;
-use flarebox_fs::{Marker, probe_no_replace, read_marker, write_marker};
-use flarebox_ignore::LocalRulesError;
-use flarebox_net::{ApiError, Auth, ROTATION_PERIOD};
-use flarebox_proto::v1::{ClaimRequest, DeviceCredentials, PairCompleteRequest, SpaceInfo};
-use flarebox_store::{EngineState, GivenAnswer, Link, Store, StoredQuestion};
+use koidrive_engine::commit::{Commits, Lift, LiftError};
+use koidrive_engine::ignore::LocalRules;
+use koidrive_fs::{Marker, probe_no_replace, read_marker, write_marker};
+use koidrive_ignore::LocalRulesError;
+use koidrive_net::{ApiError, Auth, ROTATION_PERIOD};
+use koidrive_proto::v1::{ClaimRequest, DeviceCredentials, PairCompleteRequest, SpaceInfo};
+use koidrive_store::{EngineState, GivenAnswer, Link, Store, StoredQuestion};
 use tokio::sync::{Notify, watch};
 
 use crate::claim::{self, Flock, Owner};
@@ -36,9 +36,9 @@ const SERVER_WAIT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, thiserror::Error)]
 pub enum DriverError {
-    #[error("another Flarebox process is using this profile ({0})")]
+    #[error("another Koidrive process is using this profile ({0})")]
     Busy(PathBuf),
-    #[error("this device is not set up; run flarebox setup first")]
+    #[error("this device is not set up; run koi setup first")]
     NotPaired,
     #[error(
         "this profile is already paired as device {device_id}; a profile holds one device credential"
@@ -77,21 +77,21 @@ pub enum DriverError {
     #[error("{0} is not a folder")]
     NotAFolder(PathBuf),
     #[error(
-        "the folder overlaps Flarebox's own files at {0}; link a folder that neither holds nor sits inside it"
+        "the folder overlaps Koidrive's own files at {0}; link a folder that neither holds nor sits inside it"
     )]
     FolderHoldsProfile(PathBuf),
     #[error("the folder overlaps the linked folder {0}")]
     FolderOverlaps(PathBuf),
-    #[error("another Flarebox process is syncing {0}; stop it, or unlink the folder there")]
+    #[error("another Koidrive process is syncing {0}; stop it, or unlink the folder there")]
     FolderInUse(PathBuf),
     #[error(
-        "the folder is linked by device {device_id} of {server}; unlink it there first, or remove its .flarebox/device.json"
+        "the folder is linked by device {device_id} of {server}; unlink it there first, or remove its .koidrive/device.json"
     )]
     FolderOfOtherDevice { device_id: String, server: String },
     #[error("the space is already linked to {0} on this device")]
     SpaceAlreadyLinked(PathBuf),
     #[error(
-        "the folder is marked for space {0}; unlink it there first, or remove its .flarebox folder"
+        "the folder is marked for space {0}; unlink it there first, or remove its .koidrive folder"
     )]
     MarkerOfOtherSpace(String),
     #[error(
@@ -111,13 +111,13 @@ pub enum DriverError {
     #[error("the folder holds no changes the server refused")]
     NothingToLift,
     #[error(
-        "the server waits for the space's owner to confirm the folder's changes, and Flarebox cannot ask for that yet"
+        "the server waits for the space's owner to confirm the folder's changes, and Koidrive cannot ask for that yet"
     )]
     NeedsConfirmation,
     #[error("the sync state at {path} cannot be used: {error}")]
     Store {
         path: PathBuf,
-        error: flarebox_store::Error,
+        error: koidrive_store::Error,
     },
     #[error("{path}: {error}")]
     Io { path: PathBuf, error: io::Error },
@@ -130,7 +130,7 @@ fn io_error(path: &Path) -> impl FnOnce(io::Error) -> DriverError + '_ {
     }
 }
 
-fn store_error(path: &Path) -> impl FnOnce(flarebox_store::Error) -> DriverError + '_ {
+fn store_error(path: &Path) -> impl FnOnce(koidrive_store::Error) -> DriverError + '_ {
     move |error| DriverError::Store {
         path: path.to_path_buf(),
         error,
@@ -144,7 +144,7 @@ pub(crate) fn lift_halt(path: &Path, lift: Lift) -> Result<(), DriverError> {
             store.transaction(|tx| {
                 let before = tx.engine_state()?;
                 let mut commits = Commits::from_state(before.commits.clone()).map_err(|error| {
-                    flarebox_store::Error::InvalidEngineState(format!("{error:?}"))
+                    koidrive_store::Error::InvalidEngineState(format!("{error:?}"))
                 })?;
                 let lifted = commits.lift(lift);
                 if lifted.is_ok() {
@@ -575,7 +575,7 @@ impl Driver {
         Ok(account)
     }
 
-    /// Stores a credential this profile was issued elsewhere, such as by `flarebox setup`'s claim, the same way
+    /// Stores a credential this profile was issued elsewhere, such as by `koi setup`'s claim, the same way
     /// [`Driver::pair`] and [`Driver::claim`] store theirs, unless another one was stored meanwhile. Like them, it first
     /// unlinks the folders of a credential that was lost. The file is written before this returns, so a caller can clean
     /// up after it. Like every change to the credential, it waits for the lifecycle lock, so a sign-out that checked the
@@ -710,7 +710,7 @@ impl Driver {
     }
 
     /// Stops syncing the folder at `folder` and forgets its sync state. The files stay, and so does the folder's
-    /// `.flarebox` directory, whose local trash may hold displaced files. If the owner record or the store cannot be
+    /// `.koidrive` directory, whose local trash may hold displaced files. If the owner record or the store cannot be
     /// removed, the folder stays linked and halted with the error, so unlinking it again finishes the job.
     pub async fn unlink(&self, folder: &Path) -> Result<Link, DriverError> {
         let _lifecycle = self.inner.lifecycle.lock().await;
@@ -1187,7 +1187,7 @@ fn halt(folder: &mut Folder, problem: String) {
 
 fn folder_status(
     link: &Link,
-    cursor: Option<flarebox_store::Cursor>,
+    cursor: Option<koidrive_store::Cursor>,
     nodes: u64,
     questions: u64,
 ) -> FolderStatus {
@@ -1228,7 +1228,7 @@ fn load_folders(paths: &Paths) -> Result<BTreeMap<String, Folder>, DriverError> 
 /// with `open`.
 fn read_folders(
     paths: &Paths,
-    open: impl Fn(&Path) -> Result<Store, flarebox_store::Error>,
+    open: impl Fn(&Path) -> Result<Store, koidrive_store::Error>,
 ) -> Result<Vec<(Link, FolderStatus)>, DriverError> {
     let spaces = paths.spaces();
     let entries = match fs::read_dir(&spaces) {
@@ -1253,7 +1253,7 @@ fn read_folders(
                     .iter()
                     .filter(|q| q.answer.is_none())
                     .count();
-                Ok::<_, flarebox_store::Error>((
+                Ok::<_, koidrive_store::Error>((
                     tx.link()?,
                     tx.cursor()?,
                     tx.remote_node_count()?,
@@ -1406,7 +1406,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
         let paths = Paths::under(&base.join("profile"));
-        let root = base.join("Flarebox");
+        let root = base.join("Koidrive");
         fs::create_dir_all(&root).unwrap();
         let store_path = paths.store(SPACE).unwrap();
         fs::create_dir_all(store_path.parent().unwrap()).unwrap();
@@ -1430,7 +1430,7 @@ mod tests {
                         answer: None,
                     })?;
                 }
-                Ok::<_, flarebox_store::Error>(())
+                Ok::<_, koidrive_store::Error>(())
             })
             .unwrap();
         (dir, paths, root)
@@ -1636,7 +1636,7 @@ mod tests {
     #[tokio::test]
     async fn a_folder_that_holds_a_reopened_profile_halts_before_it_is_observed() {
         let dir = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(dir.path()).unwrap().join("Flarebox");
+        let root = fs::canonicalize(dir.path()).unwrap().join("Koidrive");
         let paths = Paths::under(&root.join("moved-profile"));
         linked(&paths, &root, "d1");
         fs::write(root.join("file"), b"synced").unwrap();
@@ -1645,7 +1645,7 @@ mod tests {
         driver.start();
         let problem = halted(&driver).await;
         assert!(
-            problem.contains("overlaps Flarebox's own files"),
+            problem.contains("overlaps Koidrive's own files"),
             "{problem}"
         );
         assert_eq!(driver.status().folders[0].local_entries, None);
@@ -1657,7 +1657,7 @@ mod tests {
     fn an_overlap_is_found_through_a_symbolic_link() {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
-        let root = base.join("Flarebox");
+        let root = base.join("Koidrive");
         let state = root.join("profile/state");
         fs::create_dir_all(&state).unwrap();
         let alias = base.join("alias");
@@ -1676,7 +1676,7 @@ mod tests {
     async fn two_profiles_never_sync_one_folder_at_once_or_in_turn() {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
-        let root = base.join("Flarebox");
+        let root = base.join("Koidrive");
         let (a, b) = (Paths::under(&base.join("a")), Paths::under(&base.join("b")));
         linked(&a, &root, "d1");
         linked(&b, &root, "d2");
@@ -1692,7 +1692,7 @@ mod tests {
         .await;
         second.start();
         let problem = halted(&second).await;
-        assert!(problem.contains("another Flarebox process"), "{problem}");
+        assert!(problem.contains("another Koidrive process"), "{problem}");
         second.stop().await;
 
         first.stop().await;
@@ -1710,7 +1710,7 @@ mod tests {
         assert_ne!(first.status().folders[0].state, FolderState::Halted);
         second.start();
         let problem = halted(&second).await;
-        assert!(problem.contains("another Flarebox process"), "{problem}");
+        assert!(problem.contains("another Koidrive process"), "{problem}");
         second.stop().await;
         first.stop().await;
 
@@ -1725,7 +1725,7 @@ mod tests {
     async fn deleting_the_private_directory_does_not_let_another_profile_in() {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
-        let root = base.join("Flarebox");
+        let root = base.join("Koidrive");
         let (a, b) = (Paths::under(&base.join("a")), Paths::under(&base.join("b")));
         linked(&a, &root, "d1");
         linked(&b, &root, "d2");
@@ -1737,7 +1737,7 @@ mod tests {
         })
         .await;
 
-        fs::remove_dir_all(root.join(flarebox_fs::PRIVATE_DIR)).unwrap();
+        fs::remove_dir_all(root.join(koidrive_fs::PRIVATE_DIR)).unwrap();
         let third = Paths::under(&base.join("c"));
         paired(&third, "d3");
         assert!(matches!(
@@ -1755,7 +1755,7 @@ mod tests {
         let second = Driver::open(b).unwrap();
         second.start();
         let problem = halted(&second).await;
-        assert!(problem.contains("another Flarebox process"), "{problem}");
+        assert!(problem.contains("another Koidrive process"), "{problem}");
         assert_ne!(first.status().folders[0].state, FolderState::Halted);
         second.stop().await;
         first.stop().await;
@@ -1765,7 +1765,7 @@ mod tests {
     async fn a_folder_replaced_under_its_task_halts_it() {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
-        let root = base.join("Flarebox");
+        let root = base.join("Koidrive");
         let paths = Paths::under(&base.join("profile"));
         linked(&paths, &root, "d1");
         let driver = Driver::open(paths).unwrap();
@@ -1787,7 +1787,7 @@ mod tests {
     async fn stopping_does_not_wait_for_the_first_scan_to_read_every_file() {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
-        let root = base.join("Flarebox");
+        let root = base.join("Koidrive");
         let paths = Paths::under(&base.join("profile"));
         linked(&paths, &root, "d1");
         for n in 0..16 {
@@ -1811,7 +1811,7 @@ mod tests {
     async fn stopping_does_not_wait_out_the_observers_pause_after_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
-        let root = base.join("Flarebox");
+        let root = base.join("Koidrive");
         let paths = Paths::under(&base.join("profile"));
         linked(&paths, &root, "d1");
         let driver = Driver::open(paths).unwrap();
@@ -1831,7 +1831,7 @@ mod tests {
     async fn a_folder_moved_away_and_back_syncs_again() {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
-        let root = base.join("Flarebox");
+        let root = base.join("Koidrive");
         let paths = Paths::under(&base.join("profile"));
         linked(&paths, &root, "d1");
         let driver = Driver::open(paths).unwrap();
@@ -1858,7 +1858,7 @@ mod tests {
     async fn another_folder_with_the_spaces_marker_waits_for_a_restart() {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
-        let root = base.join("Flarebox");
+        let root = base.join("Koidrive");
         let paths = Paths::under(&base.join("profile"));
         linked(&paths, &root, "d1");
         let original = fs::metadata(&root).unwrap().ino();
@@ -1885,7 +1885,7 @@ mod tests {
             driver.status().folders[0]
                 .problem
                 .as_ref()
-                .is_some_and(|problem| problem.contains("flarebox restart"))
+                .is_some_and(|problem| problem.contains("koi restart"))
         })
         .await;
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -1906,7 +1906,7 @@ mod tests {
     async fn a_restart_syncs_a_folder_again_once_its_problem_is_fixed() {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
-        let root = base.join("Flarebox");
+        let root = base.join("Koidrive");
         let paths = Paths::under(&base.join("profile"));
         linked(&paths, &root, "d1");
         let other = Owner {
@@ -2121,7 +2121,7 @@ mod tests {
     async fn watchers_wake_when_status_or_questions_change() {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
-        let root = base.join("Flarebox");
+        let root = base.join("Koidrive");
         let paths = Paths::under(&base.join("profile"));
         linked(&paths, &root, "d1");
         fs::write(root.join("one"), b"1").unwrap();
@@ -2161,7 +2161,7 @@ mod tests {
     async fn signing_out_unlinks_every_folder_and_forgets_the_credential() {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
-        let root = base.join("Flarebox");
+        let root = base.join("Koidrive");
         let paths = Paths::under(&base.join("profile"));
         linked(&paths, &root, "d1");
         fs::write(root.join("keep.txt"), b"mine").unwrap();
@@ -2198,7 +2198,7 @@ mod tests {
     async fn saving_a_credential_unlinks_only_the_folders_of_a_lost_one() {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
-        let root = base.join("Flarebox");
+        let root = base.join("Koidrive");
         let paths = Paths::under(&base.join("profile"));
         linked(&paths, &root, "d1");
         fs::write(root.join("notes.txt"), b"kept").unwrap();
@@ -2289,7 +2289,7 @@ mod tests {
     fn linked_folders_are_read_without_writing_to_the_profile() {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
-        let root = base.join("Flarebox");
+        let root = base.join("Koidrive");
         let paths = Paths::under(&base.join("profile"));
         linked(&paths, &root, "d1");
         drop(Driver::open(paths.clone()).unwrap());
@@ -2318,7 +2318,7 @@ mod tests {
     async fn signing_out_a_refused_device_keeps_a_credential_saved_for_another() {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
-        let root = base.join("Flarebox");
+        let root = base.join("Koidrive");
         let paths = Paths::under(&base.join("profile"));
         linked(&paths, &root, "d2");
         let driver = Driver::open(paths.clone()).unwrap();
@@ -2364,7 +2364,7 @@ mod tests {
     }
 
     fn access_token() -> (u16, Vec<u8>) {
-        let token = flarebox_proto::v1::AccessToken {
+        let token = koidrive_proto::v1::AccessToken {
             token: "token".into(),
             expires_at_ms: i64::MAX,
             ..Default::default()
@@ -2374,18 +2374,18 @@ mod tests {
 
     /// The server's refusal to revoke the user's last active device without a confirmation.
     fn last_device_refused() -> (u16, Vec<u8>) {
-        let refusal = flarebox_proto::v1::Error {
-            code: flarebox_proto::v1::error::Code::ConfirmationRequired.into(),
+        let refusal = koidrive_proto::v1::Error {
+            code: koidrive_proto::v1::error::Code::ConfirmationRequired.into(),
             message: "this is the user's last active device; confirm to revoke it".into(),
             ..Default::default()
         };
         (409, prost::Message::encode_to_vec(&refusal))
     }
 
-    /// A profile in `base` paired as `d1` with the server at `server`, with a folder linked at `base/Flarebox`.
+    /// A profile in `base` paired as `d1` with the server at `server`, with a folder linked at `base/Koidrive`.
     fn linked_with_server(base: &Path, server: String) -> Paths {
         let paths = Paths::under(&base.join("profile"));
-        linked(&paths, &base.join("Flarebox"), "d1");
+        linked(&paths, &base.join("Koidrive"), "d1");
         fs::remove_file(paths.credential()).unwrap();
         Credential {
             server,
@@ -2462,7 +2462,7 @@ mod tests {
      {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
-        let root = base.join("Flarebox");
+        let root = base.join("Koidrive");
         let paths = Paths::under(&base.join("profile"));
         linked(&paths, &root, "d1");
         let driver = Driver::open(paths.clone()).unwrap();
@@ -2610,15 +2610,15 @@ mod tests {
     async fn signing_out_waits_for_a_link_in_flight_and_then_unlinks_it() {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
-        let root = base.join("Flarebox");
+        let root = base.join("Koidrive");
         fs::create_dir(&root).unwrap();
         let paths = Paths::under(&base.join("profile"));
-        let token = prost::Message::encode_to_vec(&flarebox_proto::v1::AccessToken {
+        let token = prost::Message::encode_to_vec(&koidrive_proto::v1::AccessToken {
             token: "token".into(),
             expires_at_ms: i64::MAX,
             ..Default::default()
         });
-        let spaces = prost::Message::encode_to_vec(&flarebox_proto::v1::SpaceList {
+        let spaces = prost::Message::encode_to_vec(&koidrive_proto::v1::SpaceList {
             spaces: vec![SpaceInfo {
                 space_id: SPACE.into(),
                 name: "Projects".into(),
@@ -2663,7 +2663,7 @@ mod tests {
     {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
-        let root = base.join("Flarebox");
+        let root = base.join("Koidrive");
         let paths = Paths::under(&base.join("profile"));
         linked(&paths, &root, "d1");
         claim::set_owner(
@@ -2676,7 +2676,7 @@ mod tests {
         .unwrap();
         let driver = Driver::open(paths.clone()).unwrap();
         let mut watch = driver.watch();
-        let private = root.join(flarebox_fs::PRIVATE_DIR);
+        let private = root.join(koidrive_fs::PRIVATE_DIR);
         if !close_dir(&private) {
             return;
         }
@@ -2707,7 +2707,7 @@ mod tests {
     async fn a_failed_unlink_wakes_watchers_and_can_be_retried() {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
-        let root = base.join("Flarebox");
+        let root = base.join("Koidrive");
         let paths = Paths::under(&base.join("profile"));
         linked(&paths, &root, "d1");
         let driver = Driver::open(paths.clone()).unwrap();
@@ -2804,7 +2804,7 @@ mod tests {
     async fn signing_out_waits_for_a_stop_already_in_progress() {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
-        let root = base.join("Flarebox");
+        let root = base.join("Koidrive");
         let paths = Paths::under(&base.join("profile"));
         let (driver, gate) = paused_driver(&paths, &root).await;
         let stop = tokio::spawn({
@@ -2829,7 +2829,7 @@ mod tests {
     async fn signing_out_finishes_a_cancelled_unlink() {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
-        let root = base.join("Flarebox");
+        let root = base.join("Koidrive");
         let paths = Paths::under(&base.join("profile"));
         let (driver, gate) = paused_driver(&paths, &root).await;
         let unlink = tokio::spawn({
@@ -2856,7 +2856,7 @@ mod tests {
     async fn no_task_starts_while_an_unlink_is_unfinished() {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
-        let root = base.join("Flarebox");
+        let root = base.join("Koidrive");
         let paths = Paths::under(&base.join("profile"));
         let (driver, gate) = paused_driver(&paths, &root).await;
         let unlink = tokio::spawn({
@@ -2887,7 +2887,7 @@ mod tests {
     async fn a_start_during_a_sign_out_leaves_the_driver_stopped() {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
-        let root = base.join("Flarebox");
+        let root = base.join("Koidrive");
         let paths = Paths::under(&base.join("profile"));
         let (driver, gate) = paused_driver(&paths, &root).await;
         let sign_out = tokio::spawn({
@@ -2907,19 +2907,19 @@ mod tests {
      {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
-        let root = base.join("Flarebox");
+        let root = base.join("Koidrive");
         fs::create_dir(&root).unwrap();
         fs::write(root.join("notes.txt"), b"kept").unwrap();
         let paths = Paths::under(&base.join("profile"));
         let token = || {
-            prost::Message::encode_to_vec(&flarebox_proto::v1::AccessToken {
+            prost::Message::encode_to_vec(&koidrive_proto::v1::AccessToken {
                 token: "token".into(),
                 expires_at_ms: i64::MAX,
                 ..Default::default()
             })
         };
         let spaces = || {
-            prost::Message::encode_to_vec(&flarebox_proto::v1::SpaceList {
+            prost::Message::encode_to_vec(&koidrive_proto::v1::SpaceList {
                 spaces: vec![SpaceInfo {
                     space_id: SPACE.into(),
                     name: "Projects".into(),
@@ -3024,7 +3024,7 @@ mod tests {
             "{error}"
         );
         assert!(error.to_string().contains("Time Machine"), "{error}");
-        assert!(error.to_string().contains("restart Flarebox"), "{error}");
+        assert!(error.to_string().contains("restart Koidrive"), "{error}");
 
         drop(Driver::open(paths.clone()).unwrap());
         assert!(time_machine_excludes(&paths.credential()));
@@ -3096,7 +3096,7 @@ mod tests {
 
     /// A token answer of a server with RFC 0011, at server time `server_time_ms`.
     fn rotation_answer(server_time_ms: i64, rotated: bool) -> (u16, Vec<u8>) {
-        let token = flarebox_proto::v1::AccessToken {
+        let token = koidrive_proto::v1::AccessToken {
             token: "token".into(),
             expires_at_ms: i64::MAX,
             server_time_ms,
@@ -3105,7 +3105,7 @@ mod tests {
         (200, prost::Message::encode_to_vec(&token))
     }
 
-    fn token_request(body: &[u8]) -> flarebox_proto::v1::TokenRequest {
+    fn token_request(body: &[u8]) -> koidrive_proto::v1::TokenRequest {
         prost::Message::decode(body).unwrap()
     }
 
@@ -3113,10 +3113,10 @@ mod tests {
     async fn a_rotation_reaches_linking_and_signing_out_through_the_one_auth() {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
-        let root = base.join("Flarebox");
+        let root = base.join("Koidrive");
         fs::create_dir(&root).unwrap();
         let paths = Paths::under(&base.join("profile"));
-        let spaces = prost::Message::encode_to_vec(&flarebox_proto::v1::SpaceList {
+        let spaces = prost::Message::encode_to_vec(&koidrive_proto::v1::SpaceList {
             spaces: vec![SpaceInfo {
                 space_id: SPACE.into(),
                 name: "Projects".into(),
@@ -3188,11 +3188,11 @@ mod tests {
                 ..credential("d1")
             };
             promoted.save_new(&paths.credential()).unwrap();
-            let staged = flarebox_net::Staged {
+            let staged = koidrive_net::Staged {
                 refresh_credential: "promoted".into(),
                 rotate_before_ms: 1_000,
             };
-            flarebox_net::CredentialStore::stage(
+            koidrive_net::CredentialStore::stage(
                 &CredentialFiles::new(&paths.credential(), promoted.clone(), Arc::default()),
                 &staged,
             )
@@ -3228,9 +3228,9 @@ mod tests {
             ..credential("d1")
         };
         current.save_new(&paths.credential()).unwrap();
-        flarebox_net::CredentialStore::stage(
+        koidrive_net::CredentialStore::stage(
             &CredentialFiles::new(&paths.credential(), current.clone(), Arc::default()),
-            &flarebox_net::Staged {
+            &koidrive_net::Staged {
                 refresh_credential: "staged".into(),
                 rotate_before_ms: 1_000,
             },
@@ -3256,9 +3256,9 @@ mod tests {
         let paths = Paths::under(dir.path());
         paired(&paths, "d1");
         let stored = Credential::load(&paths.credential()).unwrap().unwrap();
-        flarebox_net::CredentialStore::stage(
+        koidrive_net::CredentialStore::stage(
             &CredentialFiles::new(&paths.credential(), stored, Arc::default()),
-            &flarebox_net::Staged {
+            &koidrive_net::Staged {
                 refresh_credential: "next".into(),
                 rotate_before_ms: 1,
             },
@@ -3274,12 +3274,12 @@ mod tests {
     async fn linking_refuses_a_folder_of_another_device_or_another_process() {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
-        let root = base.join("Flarebox");
+        let root = base.join("Koidrive");
         fs::create_dir(&root).unwrap();
         let paths = Paths::under(&base.join("profile"));
         paired(&paths, "d2");
         let driver = Driver::open(paths).unwrap();
-        fs::create_dir(root.join(flarebox_fs::PRIVATE_DIR)).unwrap();
+        fs::create_dir(root.join(koidrive_fs::PRIVATE_DIR)).unwrap();
         let first = Owner {
             server: NOWHERE.into(),
             device_id: "d1".into(),
@@ -3384,7 +3384,7 @@ mod tests {
 
     /// A node or version ID as the server gives it.
     fn server_id(n: u128) -> String {
-        flarebox_engine::ids::uuid_v7(1, n)
+        koidrive_engine::ids::uuid_v7(1, n)
     }
 
     fn from_trash(node: u128) -> RestoreRequest {
@@ -3477,7 +3477,7 @@ mod tests {
 
     #[test]
     fn restores_lists_what_ended_and_then_what_waits() {
-        use flarebox_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
+        use koidrive_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
 
         let (_dir, paths, _root) = profile(&[]);
         let driver = Driver::open(paths.clone()).unwrap();
@@ -3521,7 +3521,7 @@ mod tests {
         ];
         // The engine's side of the store, as the folder task saves it: one restore queued, the rest ended, the
         // newest first by ID so that the listed order is the order they ended in.
-        let mut state = flarebox_store::EngineState::default();
+        let mut state = koidrive_store::EngineState::default();
         state.commits.restores.insert("queued".into(), intent(8));
         for (n, (outcome, _)) in outcomes.iter().enumerate() {
             state.commits.resolved.push(Resolved {
@@ -3558,7 +3558,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
         let paths = Paths::under(&base.join("profile"));
-        linked(&paths, &base.join("Flarebox"), "d1");
+        linked(&paths, &base.join("Koidrive"), "d1");
         let driver = Driver::open(paths.clone()).unwrap();
         driver.start();
         eventually("the folder's task runs its loop", || {
@@ -3572,7 +3572,7 @@ mod tests {
             let (inbox, (queued, _)) = Store::open(&path)
                 .unwrap()
                 .transaction(|tx| {
-                    Ok::<_, flarebox_store::Error>((tx.restore_requests()?, tx.restores()?))
+                    Ok::<_, koidrive_store::Error>((tx.restore_requests()?, tx.restores()?))
                 })
                 .unwrap();
             inbox.is_empty() && queued.contains_key(&id)
@@ -3586,13 +3586,13 @@ mod tests {
 
     #[test]
     fn a_restore_held_by_a_problem_node_reads_as_pending_with_the_reason() {
-        use flarebox_engine::restore::RestoreIntent;
+        use koidrive_engine::restore::RestoreIntent;
 
         let (_dir, paths, _root) = profile(&[]);
         let driver = Driver::open(paths.clone()).unwrap();
         // The engine's side of the store: the server refused a change to node 1, which is a problem since, and
         // the engine holds a restore of an earlier version of it and a restore of node 2.
-        let mut state = flarebox_store::EngineState::default();
+        let mut state = koidrive_store::EngineState::default();
         state.commits.problems.insert(server_id(1));
         let held = RestoreIntent::version(server_id(1), server_id(40)).unwrap();
         let free = RestoreIntent::from_trash(server_id(2), None, None).unwrap();

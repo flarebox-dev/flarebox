@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! `flarebox server uninstall` (docs/design/cli-setup.md section 5): record the Worker's and the bucket's identities,
+//! `koi server uninstall` (docs/design/cli-setup.md section 5): record the Worker's and the bucket's identities,
 //! delete the Worker, then empty and delete the bucket unless it turns out to be another one or someone else's. A
 //! missing identity stops the uninstall before it deletes anything.
 
-use flarebox_cloudflare::{Jurisdiction, Script};
+use koidrive_cloudflare::{Jurisdiction, Script};
 
 use super::Cloud;
 use super::state::{SetupState, StateFile, Step};
@@ -130,7 +130,7 @@ pub async fn finish(
     if let Some(key) = contents.foreign {
         file.remove()?;
         println!(
-            "Kept the bucket {bucket} and its files, because it holds {key}, which Flarebox does not write: another application stores data there."
+            "Kept the bucket {bucket} and its files, because it holds {key}, which Koidrive does not write: another application stores data there."
         );
         return Ok(());
     }
@@ -152,7 +152,7 @@ pub async fn finish(
         for key in &page.keys {
             if !key.starts_with(SERVER_PREFIX) {
                 return Err(format!(
-                    "the bucket {bucket} now holds {key}, which Flarebox does not write, so it stopped emptying it; run the command again"
+                    "the bucket {bucket} now holds {key}, which Koidrive does not write, so it stopped emptying it; run the command again"
                 ));
             }
             api.delete_object(&account, &bucket, jurisdiction, key)
@@ -294,8 +294,8 @@ async fn scan(
 
 #[cfg(test)]
 mod tests {
-    use flarebox_cloudflare::{Cloudflare, Secret};
-    use flarebox_driver::Paths;
+    use koidrive_cloudflare::{Cloudflare, Secret};
+    use koidrive_driver::Paths;
     use serde_json::{Value, json};
 
     use super::*;
@@ -351,7 +351,7 @@ mod tests {
         body["result_info"] = json!({ "cursor": "", "is_truncated": false });
         cf_status(
             "GET",
-            "/r2/buckets/flarebox/objects?per_page=1000",
+            "/r2/buckets/koidrive/objects?per_page=1000",
             200,
             body,
         )
@@ -360,15 +360,15 @@ mod tests {
     fn bucket(date: &str) -> Reply {
         cf(
             "GET",
-            "/r2/buckets/flarebox",
-            json!({ "name": "flarebox", "creation_date": date, "jurisdiction": "eu" }),
+            "/r2/buckets/koidrive",
+            json!({ "name": "koidrive", "creation_date": date, "jurisdiction": "eu" }),
         )
     }
 
     fn delete_object(key: &str) -> Reply {
         cf(
             "DELETE",
-            &format!("/r2/buckets/flarebox/objects/{}", key.replace('/', "%2F")),
+            &format!("/r2/buckets/koidrive/objects/{}", key.replace('/', "%2F")),
             Value::Null,
         )
     }
@@ -385,7 +385,7 @@ mod tests {
 
     fn script(created_on: Option<&str>) -> Script {
         serde_json::from_value(
-            json!({ "id": "flarebox", "created_on": created_on, "tags": ["flarebox-server"] }),
+            json!({ "id": "koidrive", "created_on": created_on, "tags": ["koidrive-server"] }),
         )
         .unwrap()
     }
@@ -394,7 +394,7 @@ mod tests {
         SetupState {
             account: ACCOUNT.into(),
             script: script.into(),
-            bucket: "flarebox".into(),
+            bucket: "koidrive".into(),
             step: Step::Uninstalling,
             script_created_on: (!script.is_empty()).then(|| CREATED.to_owned()),
             jurisdiction: Jurisdiction::Eu,
@@ -424,13 +424,13 @@ mod tests {
         let error = plan(
             &mut cloud,
             Some(&script(None)),
-            "flarebox",
+            "koidrive",
             Jurisdiction::Eu,
         )
         .await
         .unwrap_err();
         assert!(
-            error.contains("did not say when the Worker flarebox was created"),
+            error.contains("did not say when the Worker koidrive was created"),
             "{error}"
         );
         assert!(error.ends_with("deleted nothing"), "{error}");
@@ -441,14 +441,14 @@ mod tests {
     async fn a_bucket_without_its_creation_date_is_not_planned() {
         let (fake, mut cloud) = start(vec![cf(
             "GET",
-            "/r2/buckets/flarebox",
-            json!({ "name": "flarebox" }),
+            "/r2/buckets/koidrive",
+            json!({ "name": "koidrive" }),
         )])
         .await;
         let error = plan(
             &mut cloud,
             Some(&script(Some(CREATED))),
-            "flarebox",
+            "koidrive",
             Jurisdiction::Eu,
         )
         .await
@@ -461,14 +461,14 @@ mod tests {
     async fn a_bucket_in_another_jurisdiction_is_not_planned() {
         let (fake, mut cloud) = start(vec![cf(
             "GET",
-            "/r2/buckets/flarebox",
-            json!({ "name": "flarebox", "creation_date": BUCKET_CREATED, "jurisdiction": "us" }),
+            "/r2/buckets/koidrive",
+            json!({ "name": "koidrive", "creation_date": BUCKET_CREATED, "jurisdiction": "us" }),
         )])
         .await;
         let error = plan(
             &mut cloud,
             Some(&script(Some(CREATED))),
-            "flarebox",
+            "koidrive",
             Jurisdiction::Eu,
         )
         .await
@@ -487,12 +487,12 @@ mod tests {
         let (state, contents) = plan(
             &mut cloud,
             Some(&script(Some(CREATED))),
-            "flarebox",
+            "koidrive",
             Jurisdiction::Eu,
         )
         .await
         .unwrap();
-        assert_eq!(state, recorded("flarebox"));
+        assert_eq!(state, recorded("koidrive"));
         assert_eq!(
             contents,
             Contents {
@@ -510,11 +510,11 @@ mod tests {
             cf(
                 "GET",
                 "/workers/scripts",
-                json!([{ "id": "flarebox", "created_on": CREATED }]),
+                json!([{ "id": "koidrive", "created_on": CREATED }]),
             ),
             cf(
                 "DELETE",
-                "/workers/scripts/flarebox?force=true",
+                "/workers/scripts/koidrive?force=true",
                 Value::Null,
             ),
             bucket(BUCKET_CREATED),
@@ -524,13 +524,13 @@ mod tests {
             delete_object(keys[0]),
             delete_object(keys[1]),
             page(&[]),
-            cf("DELETE", "/r2/buckets/flarebox", Value::Null),
+            cf("DELETE", "/r2/buckets/koidrive", Value::Null),
         ])
         .await;
         let (_dir, file) = state_file();
-        file.save(&recorded("flarebox")).unwrap();
+        file.save(&recorded("koidrive")).unwrap();
 
-        finish(&mut cloud, &file, recorded("flarebox"))
+        finish(&mut cloud, &file, recorded("koidrive"))
             .await
             .unwrap();
 
@@ -541,7 +541,7 @@ mod tests {
             .map(|seen| seen.path)
             .collect();
         assert_eq!(deletes.len(), 4, "{deletes:?}");
-        assert!(deletes.last().unwrap().ends_with("/r2/buckets/flarebox"));
+        assert!(deletes.last().unwrap().ends_with("/r2/buckets/koidrive"));
         assert_r2_in(&fake, "eu");
         assert_eq!(file.load().unwrap(), None);
     }
@@ -552,15 +552,15 @@ mod tests {
             cf(
                 "GET",
                 "/workers/scripts",
-                json!([{ "id": "flarebox", "created_on": "2026-11-11T00:00:00Z" }]),
+                json!([{ "id": "koidrive", "created_on": "2026-11-11T00:00:00Z" }]),
             ),
             bucket("2026-11-11T00:00:00Z"),
         ])
         .await;
         let (_dir, file) = state_file();
-        file.save(&recorded("flarebox")).unwrap();
+        file.save(&recorded("koidrive")).unwrap();
 
-        finish(&mut cloud, &file, recorded("flarebox"))
+        finish(&mut cloud, &file, recorded("koidrive"))
             .await
             .unwrap();
 
@@ -573,19 +573,19 @@ mod tests {
         let (fake, mut cloud) = start(vec![cf(
             "GET",
             "/workers/scripts",
-            json!([{ "id": "flarebox" }]),
+            json!([{ "id": "koidrive" }]),
         )])
         .await;
         let (_dir, file) = state_file();
-        file.save(&recorded("flarebox")).unwrap();
+        file.save(&recorded("koidrive")).unwrap();
 
-        let error = finish(&mut cloud, &file, recorded("flarebox"))
+        let error = finish(&mut cloud, &file, recorded("koidrive"))
             .await
             .unwrap_err();
 
         assert!(error.ends_with("deleted nothing"), "{error}");
         assert!(!fake.sent(&["DELETE"]));
-        assert_eq!(file.load().unwrap(), Some(recorded("flarebox")));
+        assert_eq!(file.load().unwrap(), Some(recorded("koidrive")));
     }
 
     #[tokio::test]
@@ -596,7 +596,7 @@ mod tests {
             cf(
                 "GET",
                 "/workers/scripts/photos/settings",
-                json!({ "bindings": [{ "type": "r2_bucket", "name": "STORE", "bucket_name": "flarebox", "jurisdiction": "eu" }] }),
+                json!({ "bindings": [{ "type": "r2_bucket", "name": "STORE", "bucket_name": "koidrive", "jurisdiction": "eu" }] }),
             ),
         ])
         .await;
@@ -616,11 +616,11 @@ mod tests {
             cf(
                 "GET",
                 "/workers/scripts/photos/settings",
-                json!({ "bindings": [{ "type": "r2_bucket", "name": "STORE", "bucket_name": "flarebox" }] }),
+                json!({ "bindings": [{ "type": "r2_bucket", "name": "STORE", "bucket_name": "koidrive" }] }),
             ),
             page(&[]),
             page(&[]),
-            cf("DELETE", "/r2/buckets/flarebox", Value::Null),
+            cf("DELETE", "/r2/buckets/koidrive", Value::Null),
         ])
         .await;
         let (_dir, file) = state_file();
@@ -632,7 +632,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_bucket_with_keys_flarebox_does_not_write_is_kept() {
+    async fn a_bucket_with_keys_koidrive_does_not_write_is_kept() {
         let (fake, mut cloud) = start(vec![
             bucket(BUCKET_CREATED),
             cf("GET", "/workers/scripts", json!([])),
@@ -658,7 +658,7 @@ mod tests {
             });
             cf_status(
                 "GET",
-                &format!("/r2/buckets/flarebox/objects?per_page=1000{query}"),
+                &format!("/r2/buckets/koidrive/objects?per_page=1000{query}"),
                 200,
                 body,
             )
@@ -682,7 +682,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_bucket_that_is_gone_completes_the_uninstall() {
-        let (fake, mut cloud) = start(vec![missing("GET", "/r2/buckets/flarebox")]).await;
+        let (fake, mut cloud) = start(vec![missing("GET", "/r2/buckets/koidrive")]).await;
         let (_dir, file) = state_file();
         file.save(&recorded("")).unwrap();
 
@@ -696,7 +696,7 @@ mod tests {
     async fn an_unreadable_bucket_keeps_the_state_file() {
         let (fake, mut cloud) = start(vec![cf_status(
             "GET",
-            "/r2/buckets/flarebox",
+            "/r2/buckets/koidrive",
             403,
             json!({ "success": false, "errors": [{ "code": 10000, "message": "Authentication error" }], "result": null }),
         )])

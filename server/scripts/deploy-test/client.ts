@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// A small client for a deployed Flarebox server over HTTPS and WebSocket, built on the generated protobuf code. It
+// A small client for a deployed Koidrive server over HTTPS and WebSocket, built on the generated protobuf code. It
 // counts every request for the cost summary. Error messages name the method and path only: chunk targets carry
 // their tickets in the query string.
 
 import { create, type DescMessage, fromBinary, fromJson, type MessageInitShape, type MessageShape, toBinary, toJson } from "@bufbuild/protobuf";
-import { AccessTokenSchema, DeviceCredentialsSchema, PairStartResponseSchema, TokenRequestSchema } from "../../src/gen/flarebox/v1/auth_pb";
-import { type CommitResult, type Op, OpSchema, type UploadReceipt, UploadReceiptSchema } from "../../src/gen/flarebox/v1/commit_pb";
-import { ClientMessageSchema, RpcRequestSchema, type RpcResponse, RpcResponseSchema, ServerMessageSchema, type Welcome } from "../../src/gen/flarebox/v1/messages_pb";
-import { ChunkRefSchema, type Content, ContentSchema, type NodeState } from "../../src/gen/flarebox/v1/model_pb";
-import { ChunkPlan_Action, ErrorSchema } from "../../src/gen/flarebox/v1/rpc_pb";
+import { AccessTokenSchema, DeviceCredentialsSchema, PairStartResponseSchema, TokenRequestSchema } from "../../src/gen/koidrive/v1/auth_pb";
+import { type CommitResult, type Op, OpSchema, type UploadReceipt, UploadReceiptSchema } from "../../src/gen/koidrive/v1/commit_pb";
+import { ClientMessageSchema, RpcRequestSchema, type RpcResponse, RpcResponseSchema, ServerMessageSchema, type Welcome } from "../../src/gen/koidrive/v1/messages_pb";
+import { ChunkRefSchema, type Content, ContentSchema, type NodeState } from "../../src/gen/koidrive/v1/model_pb";
+import { ChunkPlan_Action, ErrorSchema } from "../../src/gen/koidrive/v1/rpc_pb";
 import { toHex, uuidv7 } from "../../src/ids";
 import type { Credentials, Stats } from "./state.ts";
 
@@ -70,7 +70,7 @@ async function failure(what: string, response: Response): Promise<HttpError> {
   return new HttpError(what + " returned HTTP " + response.status + ": " + message, response.status, code);
 }
 
-/** A deployed server at base, for example https://flarebox-test-1-1.example.workers.dev. */
+/** A deployed server at base, for example https://koidrive-test-1-1.example.workers.dev. */
 export class Server {
   readonly base: string;
   constructor(base: string) {
@@ -213,7 +213,7 @@ export class SpaceClient {
       const welcome = await new Promise<Welcome>((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error("no Welcome within 30 s on /v1/spaces/" + this.spaceId + "/ws")), 30_000);
         socket.addEventListener("open", () => {
-          const hello = create(ClientMessageSchema, { msg: { case: "hello", value: { clientName: "flarebox-deploy-test", clientVersion: "0", protoMin: 1, protoMax: 1, maxFormat: 1 } } });
+          const hello = create(ClientMessageSchema, { msg: { case: "hello", value: { clientName: "koidrive-deploy-test", clientVersion: "0", protoMin: 1, protoMax: 1, maxFormat: 1 } } });
           const frame = toBinary(ClientMessageSchema, hello);
           stats.bytesUp += frame.byteLength;
           socket.send(frame);

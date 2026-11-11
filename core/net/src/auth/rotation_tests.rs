@@ -6,8 +6,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use flarebox_proto::v1::error::Code;
-use flarebox_proto::v1::{AccessToken, TokenRequest};
+use koidrive_proto::v1::error::Code;
+use koidrive_proto::v1::{AccessToken, TokenRequest};
 use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -128,7 +128,7 @@ impl Stub {
             Ok(token) => (200, token.encode_to_vec()),
             Err(()) => (
                 401,
-                flarebox_proto::v1::Error {
+                koidrive_proto::v1::Error {
                     code: Code::Unauthenticated as i32,
                     message: "unknown device or refresh credential".into(),
                     ..Default::default()

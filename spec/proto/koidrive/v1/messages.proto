@@ -1,0 +1,144 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package koidrive.v1;
+
+import "koidrive/v1/commit.proto";
+import "koidrive/v1/model.proto";
+import "koidrive/v1/rpc.proto";
+
+// A binary WebSocket frame from client to server.
+message ClientMessage {
+  oneof msg {
+    Hello hello = 1;
+    Resume resume = 2;
+    RpcRequest rpc = 3;
+    Reauth reauth = 4;
+  }
+}
+
+// A binary WebSocket frame from server to client.
+message ServerMessage {
+  oneof msg {
+    Welcome welcome = 1;
+    Changes changes = 2;
+    CaughtUp caught_up = 3;
+    RpcResponse rpc = 4;
+    ResyncRequired resync_required = 5;
+    Notice notice = 6;
+    Goodbye goodbye = 7;
+  }
+}
+
+// First message on a connection.
+message Hello {
+  string client_name = 1;
+  string client_version = 2;
+  // Supported protocol minor versions, inclusive.
+  uint32 proto_min = 3;
+  uint32 proto_max = 4;
+  // Highest space format version this client can write.
+  uint32 max_format = 5;
+  repeated string features = 6;
+}
+
+message Welcome {
+  // The protocol minor version chosen for this connection.
+  uint32 proto = 1;
+  string server_version = 2;
+  uint32 format_version = 3;
+  string history_id = 4;
+  uint64 head_seq = 5;
+  // The oldest seq a Resume can start after.
+  uint64 log_floor_seq = 6;
+  // True when this device may not commit, for example because its max_format is below the space format.
+  bool read_only = 7;
+  repeated string features = 8;
+  // Newest known server release, empty when unknown or current.
+  string latest_release = 9;
+  // The highest device_seq the server accepted from this device in the current history, 0 if none.
+  uint64 device_seq = 10;
+}
+
+message Resume {
+  string history_id = 1;
+  // The last seq the client applied completely.
+  uint64 since_seq = 2;
+}
+
+message Changes {
+  repeated CommitRecord commits = 1;
+}
+
+// Sent once the backlog after a Resume is delivered; live pushes follow.
+message CaughtUp {
+  uint64 head_seq = 1;
+}
+
+message RpcRequest {
+  // Chosen by the client and echoed in the response.
+  uint64 req_id = 1;
+  oneof call {
+    PrepareUpload prepare_upload = 2;
+    Commit commit = 3;
+    GetDownloadTargets get_download_targets = 4;
+    GetVersionChunks get_version_chunks = 5;
+    ListVersions list_versions = 6;
+    ListTree list_tree = 7;
+    ListTrash list_trash = 8;
+  }
+}
+
+message RpcResponse {
+  uint64 req_id = 1;
+  oneof result {
+    Error error = 2;
+    PrepareUploadResult prepare_upload = 3;
+    CommitResult commit = 4;
+    DownloadTargets download_targets = 5;
+    VersionChunks version_chunks = 6;
+    VersionList versions = 7;
+    TreePage tree = 8;
+    TrashPage trash = 9;
+  }
+}
+
+// Replaces the access token of a connection before it expires.
+message Reauth {
+  string access_token = 1;
+}
+
+message ResyncRequired {
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    REASON_LOG_TRUNCATED = 1;
+    REASON_HISTORY_CHANGED = 2;
+    REASON_AHEAD_OF_SERVER = 3;
+  }
+  Reason reason = 1;
+  // With REASON_HISTORY_CHANGED, when the current history began with a rewind: the head_seq right after the rewind
+  // and the point in time it restored, in Unix milliseconds. Both 0 otherwise.
+  uint64 restore_seq = 2;
+  int64 restore_point_ms = 3;
+}
+
+message Notice {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_NEW_RELEASE = 1;
+    KIND_QUOTA_NEAR = 2;
+    KIND_QUOTA_EXCEEDED = 3;
+    KIND_READ_ONLY = 4;
+  }
+  Kind kind = 1;
+  string message = 2;
+  uint64 retry_after_ms = 3;
+}
+
+// Sent right before the server closes the connection with the same code.
+message Goodbye {
+  // WebSocket close code, for example 4001 for an expired token.
+  uint32 code = 1;
+  string reason = 2;
+}

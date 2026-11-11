@@ -2,7 +2,7 @@
 
 Status: proposed. Applies to spec v0 (format_version 1). Amends RFC 0006 §7.
 
-An owner who loses a computer, or has one stolen, removes it from the deployment so that it stops syncing. Adding a device through owner recovery (docs/design/deploy-and-upgrade.md §2) does not remove any device, and `flarebox setup` makes recovery the normal way to add one, so revocation ships in the same release. This RFC defines who may revoke a device, what a revocation stops and how fast, what the revoked device does, and when a device may revoke itself. It uses the routes of RFC 0006 §7 and changes no schema. A bare section number such as §2 refers to this RFC; sections of spec v0 are written as spec v0 §N.
+An owner who loses a computer, or has one stolen, removes it from the deployment so that it stops syncing. Adding a device through owner recovery (docs/design/deploy-and-upgrade.md §2) does not remove any device, and `koi setup` makes recovery the normal way to add one, so revocation ships in the same release. This RFC defines who may revoke a device, what a revocation stops and how fast, what the revoked device does, and when a device may revoke itself. It uses the routes of RFC 0006 §7 and changes no schema. A bare section number such as §2 refers to this RFC; sections of spec v0 are written as spec v0 §N.
 
 ## 1. Who may revoke
 
@@ -16,7 +16,7 @@ The Account DO checks rule 1 again in the same step that stores the revocation, 
 
 Revoking a principal that is already revoked succeeds with 204 and changes nothing.
 
-An owner who has lost every device first adds a new one with owner recovery (deploy-and-upgrade.md §2), or with `flarebox setup`, which runs the same recovery after a Cloudflare login. The owner then lists the devices from the new one and revokes the lost ones.
+An owner who has lost every device first adds a new one with owner recovery (deploy-and-upgrade.md §2), or with `koi setup`, which runs the same recovery after a Cloudflare login. The owner then lists the devices from the new one and revokes the lost ones.
 
 ## 2. What a revocation stops
 
@@ -34,7 +34,7 @@ The bound is therefore zero for every request that starts after the 204: no acce
 A revocation does not stop or undo these:
 
 - **Chunk tickets.** A download or upload ticket from `GetDownloadTargets` or `PrepareUpload` is signed for one chunk and does not name a device. It works until it expires, at most one hour after it was issued (spec v0 §8 and §10). A ticket covers only a chunk the device could already read or was uploading, and the device cannot get a new ticket.
-- **Data already on the device.** Revocation stops access to the server. It cannot delete files the device already downloaded. Flarebox has no remote wipe.
+- **Data already on the device.** Revocation stops access to the server. It cannot delete files the device already downloaded. Koidrive has no remote wipe.
 - **Commits.** Commits the device made stay in each space's history and keep its `device_id`.
 - **Share links.** Links belong to the owner (RFC 0005), not to the device that created them. The owner lists and revokes them separately.
 - **Principals the device paired.** Revoking a principal does not revoke the principals it issued (RFC 0006 §6).
@@ -69,10 +69,10 @@ In RFC 0006 §7, "**Revoke.**" paragraph, the sentence "A principal may revoke i
 
 ## 7. Clients in 0.1.0
 
-The command-line client adds two commands on `flarebox-net`'s `Api::list_devices` and `Api::revoke_device`:
+The command-line client adds two commands on `koidrive-net`'s `Api::list_devices` and `Api::revoke_device`:
 
-- `flarebox device list [--json]` lists the principals of the device's user, marks this one, and shows each device's state and when it last refreshed a token.
-- `flarebox device revoke <device_id>` revokes one by its ID. It takes no names, because two devices may share one. It refuses this device's own ID, because revoking it would leave the credential on disk unusable instead of signing the device out.
+- `koi device list [--json]` lists the principals of the device's user, marks this one, and shows each device's state and when it last refreshed a token.
+- `koi device revoke <device_id>` revokes one by its ID. It takes no names, because two devices may share one. It refuses this device's own ID, because revoking it would leave the credential on disk unusable instead of signing the device out.
 
 Signing out through `core/driver` (`Driver::sign_out`, which the macOS app's Sign Out uses) revokes the device as §5 describes, with `Api::revoke_self`. When the server answers that this is the last active device, the app asks the person a second time, and says that they cannot sign back in from the app, before it confirms.
 

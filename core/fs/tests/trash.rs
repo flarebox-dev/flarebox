@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::{bind, rewrite_keeping_mtime, same};
-use flarebox_fs::{
+use koidrive_fs::{
     Base, Location, PRIVATE_DIR, Reclaimed, Space, TRASH_DIR, TRASH_RETENTION, recovered_name,
 };
 

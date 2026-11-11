@@ -3,7 +3,7 @@
 import { cloudflareTest } from "@cloudflare/vitest-plugin";
 import { configDefaults, defineConfig } from "vitest/config";
 
-const bindings = { FLAREBOX_RECOVERY_KEY: "test-recovery-key-for-local-workerd-only" };
+const bindings = { KOIDRIVE_RECOVERY_KEY: "test-recovery-key-for-local-workerd-only" };
 /** Fills a Durable Object with sql.setMaxPageCountForTest, which workerd offers only under its experimental flag. */
 const STORAGE_FULL = "test/storage-full.test.ts";
 

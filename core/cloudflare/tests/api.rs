@@ -7,16 +7,16 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use flarebox_cloudflare::{
-    ApiError, Asset, Bucket, Bundle, Cloudflare, Jurisdiction, Manifest, ObjectPage, Script,
-    Secret, UploadPlan,
-};
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
+use koidrive_cloudflare::{
+    ApiError, Asset, Bucket, Bundle, Cloudflare, Jurisdiction, Manifest, ObjectPage, Script,
+    Secret, UploadPlan,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
@@ -293,7 +293,7 @@ async fn buckets_follow_the_cursor_while_pages_are_full() {
             200,
             {
                 let mut page =
-                    ok(json!({ "buckets": [{ "name": "flarebox", "location": "apac" }] }));
+                    ok(json!({ "buckets": [{ "name": "koidrive", "location": "apac" }] }));
                 page["result_info"] =
                     json!({ "cursor": "ignored-on-a-short-page", "per_page": 1000 });
                 page
@@ -309,7 +309,7 @@ async fn buckets_follow_the_cursor_while_pages_are_full() {
         .unwrap();
 
     assert_eq!(buckets.len(), 1001);
-    assert_eq!(buckets.last().map(String::as_str), Some("flarebox"));
+    assert_eq!(buckets.last().map(String::as_str), Some("koidrive"));
     assert_eq!(fake.calls().len(), 2);
 }
 
@@ -379,11 +379,11 @@ async fn buckets_are_created_and_deleted() {
             "POST",
             &format!("/accounts/{ACCOUNT}/r2/buckets"),
             200,
-            ok(json!({ "name": "flarebox" })),
+            ok(json!({ "name": "koidrive" })),
         ),
         reply(
             "DELETE",
-            &format!("/accounts/{ACCOUNT}/r2/buckets/flarebox"),
+            &format!("/accounts/{ACCOUNT}/r2/buckets/koidrive"),
             200,
             ok(json!({})),
         ),
@@ -405,11 +405,11 @@ async fn buckets_are_created_and_deleted() {
 
     let default = Jurisdiction::Default;
     client
-        .create_bucket(ACCOUNT, "flarebox", default)
+        .create_bucket(ACCOUNT, "koidrive", default)
         .await
         .unwrap();
     client
-        .delete_bucket(ACCOUNT, "flarebox", default)
+        .delete_bucket(ACCOUNT, "koidrive", default)
         .await
         .unwrap();
     client
@@ -424,13 +424,13 @@ async fn buckets_are_created_and_deleted() {
     assert!(error.has_code(10008), "{error}");
     let seen = fake.seen();
     assert_eq!(seen[0].content_type.as_deref(), Some("application/json"));
-    assert_eq!(seen[0].json(), json!({ "name": "flarebox" }));
+    assert_eq!(seen[0].json(), json!({ "name": "koidrive" }));
     assert_eq!(
         fake.calls()[1..],
         [
             (
                 "DELETE".to_owned(),
-                format!("/accounts/{ACCOUNT}/r2/buckets/flarebox")
+                format!("/accounts/{ACCOUNT}/r2/buckets/koidrive")
             ),
             (
                 "DELETE".to_owned(),
@@ -446,7 +446,7 @@ async fn buckets_are_created_and_deleted() {
 
 #[tokio::test]
 async fn objects_are_listed_page_by_page() {
-    let objects = format!("/accounts/{ACCOUNT}/r2/buckets/flarebox/objects");
+    let objects = format!("/accounts/{ACCOUNT}/r2/buckets/koidrive/objects");
     let fake = Fake::start(vec![
         reply("GET", &format!("{objects}?per_page=1000"), 200, {
             let mut page =
@@ -471,13 +471,13 @@ async fn objects_are_listed_page_by_page() {
     let client = fake.client();
 
     let first = client
-        .objects(ACCOUNT, "flarebox", Jurisdiction::Default, None)
+        .objects(ACCOUNT, "koidrive", Jurisdiction::Default, None)
         .await
         .unwrap();
     let second = client
         .objects(
             ACCOUNT,
-            "flarebox",
+            "koidrive",
             Jurisdiction::Default,
             first.cursor.as_deref(),
         )
@@ -506,7 +506,7 @@ async fn names_from_users_are_percent_encoded() {
         reply(
             "DELETE",
             &format!(
-                "/accounts/{ACCOUNT}/r2/buckets/flarebox/objects/spaces%2Fa%20b%2F%3Fq%3D1%23x%25"
+                "/accounts/{ACCOUNT}/r2/buckets/koidrive/objects/spaces%2Fa%20b%2F%3Fq%3D1%23x%25"
             ),
             404,
             refused(10007, "The specified key does not exist."),
@@ -524,7 +524,7 @@ async fn names_from_users_are_percent_encoded() {
     client
         .delete_object(
             ACCOUNT,
-            "flarebox",
+            "koidrive",
             Jurisdiction::Default,
             "spaces/a b/?q=1#x%",
         )
@@ -532,7 +532,7 @@ async fn names_from_users_are_percent_encoded() {
         .unwrap();
     client.delete_script(ACCOUNT, "a/../b").await.unwrap();
     let error = client
-        .delete_object(ACCOUNT, "flarebox", Jurisdiction::Default, "..")
+        .delete_object(ACCOUNT, "koidrive", Jurisdiction::Default, "..")
         .await
         .unwrap_err();
 
@@ -550,7 +550,7 @@ async fn scripts_are_listed_with_their_tags() {
         &format!("/accounts/{ACCOUNT}/workers/scripts"),
         200,
         ok(json!([
-            { "id": "flarebox", "tags": ["flarebox-server"], "migration_tag": "v1", "has_assets": true, "etag": "x", "created_on": "2026-11-10T05:00:00.000000Z" },
+            { "id": "koidrive", "tags": ["koidrive-server"], "migration_tag": "v1", "has_assets": true, "etag": "x", "created_on": "2026-11-10T05:00:00.000000Z" },
             { "id": "other", "tags": null, "has_modules": true }
         ])),
     )])
@@ -562,9 +562,9 @@ async fn scripts_are_listed_with_their_tags() {
         scripts,
         [
             Script {
-                id: "flarebox".to_owned(),
+                id: "koidrive".to_owned(),
                 created_on: Some("2026-11-10T05:00:00.000000Z".to_owned()),
-                tags: vec!["flarebox-server".to_owned()],
+                tags: vec!["koidrive-server".to_owned()],
                 migration_tag: Some("v1".to_owned()),
                 has_assets: true
             },
@@ -583,14 +583,14 @@ async fn scripts_are_listed_with_their_tags() {
 async fn script_settings_name_the_bound_bucket() {
     let fake = Fake::start(vec![reply(
         "GET",
-        &format!("/accounts/{ACCOUNT}/workers/scripts/flarebox/settings"),
+        &format!("/accounts/{ACCOUNT}/workers/scripts/koidrive/settings"),
         200,
         ok(json!({
             "bindings": [
                 { "type": "durable_object_namespace", "name": "ACCOUNT", "class_name": "AccountDO", "namespace_id": "n1" },
-                { "type": "r2_bucket", "name": "BUCKET", "bucket_name": "flarebox-2" },
-                { "type": "r2_bucket", "name": "ARCHIVE", "bucket_name": "flarebox-2", "jurisdiction": "eu" },
-                { "type": "secret_text", "name": "FLAREBOX_RECOVERY_KEY" },
+                { "type": "r2_bucket", "name": "BUCKET", "bucket_name": "koidrive-2" },
+                { "type": "r2_bucket", "name": "ARCHIVE", "bucket_name": "koidrive-2", "jurisdiction": "eu" },
+                { "type": "secret_text", "name": "KOIDRIVE_RECOVERY_KEY" },
                 { "type": "assets", "name": "ASSETS" }
             ],
             "compatibility_date": "2026-11-01",
@@ -601,19 +601,19 @@ async fn script_settings_name_the_bound_bucket() {
 
     let settings = fake
         .client()
-        .script_settings(ACCOUNT, "flarebox")
+        .script_settings(ACCOUNT, "koidrive")
         .await
         .unwrap();
 
     let bucket = settings.r2_bucket("BUCKET").unwrap();
     assert_eq!(
         (bucket.bucket_name.as_deref(), bucket.jurisdiction),
-        (Some("flarebox-2"), None)
+        (Some("koidrive-2"), None)
     );
     let archive = settings.r2_bucket("ARCHIVE").unwrap();
     assert_eq!(
         (archive.bucket_name.as_deref(), archive.jurisdiction),
-        (Some("flarebox-2"), Some(Jurisdiction::Eu))
+        (Some("koidrive-2"), Some(Jurisdiction::Eu))
     );
     assert!(settings.r2_bucket("ASSETS").is_none());
     assert_eq!(
@@ -631,7 +631,7 @@ async fn script_settings_name_the_bound_bucket() {
             "ACCOUNT",
             "BUCKET",
             "ARCHIVE",
-            "FLAREBOX_RECOVERY_KEY",
+            "KOIDRIVE_RECOVERY_KEY",
             "ASSETS"
         ]
     );
@@ -644,7 +644,7 @@ fn bundle() -> Bundle {
         "compatibility_date": "2026-11-01",
         "durable_objects": [{ "name": "ACCOUNT", "class_name": "AccountDO" }],
         "r2_binding": "BUCKET",
-        "default_bucket": "flarebox",
+        "default_bucket": "koidrive",
         "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AccountDO"] }],
         "assets": { "binding": "ASSETS" }
     }))
@@ -661,16 +661,16 @@ fn bundle() -> Bundle {
 async fn a_script_upload_sends_the_metadata_and_the_module() {
     let fake = Fake::start(vec![reply(
         "PUT",
-        &format!("/accounts/{ACCOUNT}/workers/scripts/flarebox"),
+        &format!("/accounts/{ACCOUNT}/workers/scripts/koidrive"),
         200,
-        ok(json!({ "id": "flarebox", "tags": ["flarebox-server"], "migration_tag": "v1", "has_assets": true, "startup_time_ms": 12 })),
+        ok(json!({ "id": "koidrive", "tags": ["koidrive-server"], "migration_tag": "v1", "has_assets": true, "startup_time_ms": 12 })),
     )])
     .await;
     let secret = Secret::new("one-time-key".to_owned());
     let jwt = Secret::new("completion-jwt".to_owned());
     let plan = UploadPlan::new(
         &bundle(),
-        "flarebox",
+        "koidrive",
         Jurisdiction::Default,
         None,
         Some(&secret),
@@ -680,7 +680,7 @@ async fn a_script_upload_sends_the_metadata_and_the_module() {
 
     let script = fake
         .client()
-        .upload_script(ACCOUNT, "flarebox", &plan)
+        .upload_script(ACCOUNT, "koidrive", &plan)
         .await
         .unwrap();
 
@@ -696,14 +696,14 @@ async fn a_script_upload_sends_the_metadata_and_the_module() {
     assert_eq!(parts[0].content_type.as_deref(), Some("application/json"));
     let metadata: Value = serde_json::from_slice(&parts[0].body).unwrap();
     assert_eq!(metadata["main_module"], "worker.js");
-    assert_eq!(metadata["tags"], json!(["flarebox-server"]));
+    assert_eq!(metadata["tags"], json!(["koidrive-server"]));
     assert_eq!(
         metadata["migrations"],
         json!({ "new_tag": "v1", "steps": [{ "new_sqlite_classes": ["AccountDO"] }] })
     );
     assert_eq!(
         metadata["bindings"][2],
-        json!({ "type": "secret_text", "name": "FLAREBOX_RECOVERY_KEY", "text": "one-time-key" })
+        json!({ "type": "secret_text", "name": "KOIDRIVE_RECOVERY_KEY", "text": "one-time-key" })
     );
     assert_eq!(metadata["assets"], json!({ "jwt": "completion-jwt" }));
     assert_eq!(
@@ -719,29 +719,29 @@ async fn a_script_upload_sends_the_metadata_and_the_module() {
 
 #[tokio::test]
 async fn secrets_are_set_listed_and_deleted() {
-    let secrets = format!("/accounts/{ACCOUNT}/workers/scripts/flarebox/secrets");
+    let secrets = format!("/accounts/{ACCOUNT}/workers/scripts/koidrive/secrets");
     let fake = Fake::start(vec![
         reply(
             "PUT",
             &secrets,
             200,
-            ok(json!({ "name": "FLAREBOX_RECOVERY_KEY", "type": "secret_text" })),
+            ok(json!({ "name": "KOIDRIVE_RECOVERY_KEY", "type": "secret_text" })),
         ),
         reply(
             "GET",
             &secrets,
             200,
-            ok(json!([{ "name": "FLAREBOX_RECOVERY_KEY", "type": "secret_text" }])),
+            ok(json!([{ "name": "KOIDRIVE_RECOVERY_KEY", "type": "secret_text" }])),
         ),
         reply(
             "DELETE",
-            &format!("{secrets}/FLAREBOX_RECOVERY_KEY"),
+            &format!("{secrets}/KOIDRIVE_RECOVERY_KEY"),
             200,
             ok(Value::Null),
         ),
         reply(
             "DELETE",
-            &format!("{secrets}/FLAREBOX_RECOVERY_KEY"),
+            &format!("{secrets}/KOIDRIVE_RECOVERY_KEY"),
             404,
             refused(10056, "Secret not found"),
         ),
@@ -752,33 +752,33 @@ async fn secrets_are_set_listed_and_deleted() {
     client
         .put_secret(
             ACCOUNT,
-            "flarebox",
-            "FLAREBOX_RECOVERY_KEY",
+            "koidrive",
+            "KOIDRIVE_RECOVERY_KEY",
             &Secret::new("one-time-key".to_owned()),
         )
         .await
         .unwrap();
-    let names = client.secrets(ACCOUNT, "flarebox").await.unwrap();
+    let names = client.secrets(ACCOUNT, "koidrive").await.unwrap();
     client
-        .delete_secret(ACCOUNT, "flarebox", "FLAREBOX_RECOVERY_KEY")
+        .delete_secret(ACCOUNT, "koidrive", "KOIDRIVE_RECOVERY_KEY")
         .await
         .unwrap();
     client
-        .delete_secret(ACCOUNT, "flarebox", "FLAREBOX_RECOVERY_KEY")
+        .delete_secret(ACCOUNT, "koidrive", "KOIDRIVE_RECOVERY_KEY")
         .await
         .unwrap();
 
-    assert_eq!(names, ["FLAREBOX_RECOVERY_KEY"]);
+    assert_eq!(names, ["KOIDRIVE_RECOVERY_KEY"]);
     assert_eq!(
         fake.seen()[0].json(),
-        json!({ "name": "FLAREBOX_RECOVERY_KEY", "text": "one-time-key", "type": "secret_text" })
+        json!({ "name": "KOIDRIVE_RECOVERY_KEY", "text": "one-time-key", "type": "secret_text" })
     );
     assert_eq!(fake.calls().len(), 4);
 }
 
 #[tokio::test]
 async fn a_script_is_deleted_with_force_and_a_missing_one_counts_as_deleted() {
-    let script = format!("/accounts/{ACCOUNT}/workers/scripts/flarebox?force=true");
+    let script = format!("/accounts/{ACCOUNT}/workers/scripts/koidrive?force=true");
     let fake = Fake::start(vec![
         reply("DELETE", &script, 200, ok(Value::Null)),
         reply(
@@ -797,9 +797,9 @@ async fn a_script_is_deleted_with_force_and_a_missing_one_counts_as_deleted() {
     .await;
     let client = fake.client();
 
-    client.delete_script(ACCOUNT, "flarebox").await.unwrap();
-    client.delete_script(ACCOUNT, "flarebox").await.unwrap();
-    let error = client.delete_script(ACCOUNT, "flarebox").await.unwrap_err();
+    client.delete_script(ACCOUNT, "koidrive").await.unwrap();
+    client.delete_script(ACCOUNT, "koidrive").await.unwrap();
+    let error = client.delete_script(ACCOUNT, "koidrive").await.unwrap_err();
 
     assert_eq!(error.status(), Some(500));
     assert_eq!(fake.calls().len(), 3);
@@ -810,7 +810,7 @@ async fn workers_dev_is_enabled_and_the_subdomain_read() {
     let fake = Fake::start(vec![
         reply(
             "POST",
-            &format!("/accounts/{ACCOUNT}/workers/scripts/flarebox/subdomain"),
+            &format!("/accounts/{ACCOUNT}/workers/scripts/koidrive/subdomain"),
             200,
             ok(json!({ "enabled": true, "previews_enabled": false })),
         ),
@@ -825,7 +825,7 @@ async fn workers_dev_is_enabled_and_the_subdomain_read() {
     let client = fake.client();
 
     client
-        .enable_workers_dev(ACCOUNT, "flarebox")
+        .enable_workers_dev(ACCOUNT, "koidrive")
         .await
         .unwrap();
     let subdomain = client.workers_subdomain(ACCOUNT).await.unwrap();
@@ -869,7 +869,7 @@ async fn assets_upload_the_files_cloudflare_asks_for() {
     let fake = Fake::start(vec![
         reply(
             "POST",
-            &format!("/accounts/{ACCOUNT}/workers/scripts/flarebox/assets-upload-session"),
+            &format!("/accounts/{ACCOUNT}/workers/scripts/koidrive/assets-upload-session"),
             200,
             ok(json!({ "jwt": "upload-jwt", "buckets": [[html]] })),
         ),
@@ -884,7 +884,7 @@ async fn assets_upload_the_files_cloudflare_asks_for() {
 
     let completion = fake
         .client()
-        .upload_assets(ACCOUNT, "flarebox", &assets())
+        .upload_assets(ACCOUNT, "koidrive", &assets())
         .await
         .unwrap();
 
@@ -923,7 +923,7 @@ async fn assets_upload_the_files_cloudflare_asks_for() {
 async fn assets_cloudflare_already_holds_need_no_upload() {
     let fake = Fake::start(vec![reply(
         "POST",
-        &format!("/accounts/{ACCOUNT}/workers/scripts/flarebox/assets-upload-session"),
+        &format!("/accounts/{ACCOUNT}/workers/scripts/koidrive/assets-upload-session"),
         200,
         ok(json!({ "jwt": "completion-jwt", "buckets": [] })),
     )])
@@ -931,7 +931,7 @@ async fn assets_cloudflare_already_holds_need_no_upload() {
 
     let completion = fake
         .client()
-        .upload_assets(ACCOUNT, "flarebox", &assets())
+        .upload_assets(ACCOUNT, "koidrive", &assets())
         .await
         .unwrap();
 
@@ -945,7 +945,7 @@ async fn an_asset_upload_without_a_completion_token_fails() {
     let fake = Fake::start(vec![
         reply(
             "POST",
-            &format!("/accounts/{ACCOUNT}/workers/scripts/flarebox/assets-upload-session"),
+            &format!("/accounts/{ACCOUNT}/workers/scripts/koidrive/assets-upload-session"),
             200,
             ok(json!({ "jwt": "upload-jwt", "buckets": [[html]] })),
         ),
@@ -960,7 +960,7 @@ async fn an_asset_upload_without_a_completion_token_fails() {
 
     let error = fake
         .client()
-        .upload_assets(ACCOUNT, "flarebox", &assets())
+        .upload_assets(ACCOUNT, "koidrive", &assets())
         .await
         .unwrap_err();
 
@@ -970,11 +970,11 @@ async fn an_asset_upload_without_a_completion_token_fails() {
 
 #[tokio::test]
 async fn every_r2_call_names_the_jurisdiction() {
-    let bucket = format!("/accounts/{ACCOUNT}/r2/buckets/flarebox");
+    let bucket = format!("/accounts/{ACCOUNT}/r2/buckets/koidrive");
     let fake = Fake::start(vec![
         reply("GET", &format!("/accounts/{ACCOUNT}/r2/buckets?per_page=1000"), 200, ok(json!({ "buckets": [] }))),
-        reply("POST", &format!("/accounts/{ACCOUNT}/r2/buckets"), 200, ok(json!({ "name": "flarebox" }))),
-        reply("GET", &bucket, 200, ok(json!({ "name": "flarebox", "creation_date": "2026-11-10T05:00:00.000Z", "jurisdiction": "eu", "location": "weur" }))),
+        reply("POST", &format!("/accounts/{ACCOUNT}/r2/buckets"), 200, ok(json!({ "name": "koidrive" }))),
+        reply("GET", &bucket, 200, ok(json!({ "name": "koidrive", "creation_date": "2026-11-10T05:00:00.000Z", "jurisdiction": "eu", "location": "weur" }))),
         reply("GET", &format!("{bucket}/objects?per_page=1000"), 200, ok(json!([]))),
         reply("DELETE", &format!("{bucket}/objects/k"), 200, ok(json!({}))),
         reply("DELETE", &bucket, 200, ok(json!({}))),
@@ -984,19 +984,19 @@ async fn every_r2_call_names_the_jurisdiction() {
     let eu = Jurisdiction::Eu;
 
     client.buckets(ACCOUNT, eu).await.unwrap();
-    client.create_bucket(ACCOUNT, "flarebox", eu).await.unwrap();
-    let read = client.bucket(ACCOUNT, "flarebox", eu).await.unwrap();
-    client.objects(ACCOUNT, "flarebox", eu, None).await.unwrap();
+    client.create_bucket(ACCOUNT, "koidrive", eu).await.unwrap();
+    let read = client.bucket(ACCOUNT, "koidrive", eu).await.unwrap();
+    client.objects(ACCOUNT, "koidrive", eu, None).await.unwrap();
     client
-        .delete_object(ACCOUNT, "flarebox", eu, "k")
+        .delete_object(ACCOUNT, "koidrive", eu, "k")
         .await
         .unwrap();
-    client.delete_bucket(ACCOUNT, "flarebox", eu).await.unwrap();
+    client.delete_bucket(ACCOUNT, "koidrive", eu).await.unwrap();
 
     assert_eq!(
         read,
         Bucket {
-            name: "flarebox".to_owned(),
+            name: "koidrive".to_owned(),
             creation_date: "2026-11-10T05:00:00.000Z".to_owned(),
             jurisdiction: Some(eu)
         }
@@ -1014,22 +1014,22 @@ async fn an_unknown_jurisdiction_or_a_bucket_without_a_creation_date_is_unreadab
     let fake = Fake::start(vec![
         reply(
             "GET",
-            &format!("/accounts/{ACCOUNT}/workers/scripts/flarebox/settings"),
+            &format!("/accounts/{ACCOUNT}/workers/scripts/koidrive/settings"),
             200,
-            ok(json!({ "bindings": [{ "type": "r2_bucket", "name": "BUCKET", "bucket_name": "flarebox", "jurisdiction": "mars" }] })),
+            ok(json!({ "bindings": [{ "type": "r2_bucket", "name": "BUCKET", "bucket_name": "koidrive", "jurisdiction": "mars" }] })),
         ),
-        reply("GET", &format!("/accounts/{ACCOUNT}/r2/buckets/flarebox"), 200, ok(json!({ "name": "flarebox" }))),
+        reply("GET", &format!("/accounts/{ACCOUNT}/r2/buckets/koidrive"), 200, ok(json!({ "name": "koidrive" }))),
     ])
     .await;
     let client = fake.client();
 
     let error = client
-        .script_settings(ACCOUNT, "flarebox")
+        .script_settings(ACCOUNT, "koidrive")
         .await
         .unwrap_err();
     assert!(matches!(error, ApiError::Unreadable { .. }), "{error:?}");
     let error = client
-        .bucket(ACCOUNT, "flarebox", Jurisdiction::Default)
+        .bucket(ACCOUNT, "koidrive", Jurisdiction::Default)
         .await
         .unwrap_err();
     assert!(matches!(error, ApiError::Unreadable { .. }), "{error:?}");
@@ -1039,7 +1039,7 @@ async fn an_unknown_jurisdiction_or_a_bucket_without_a_creation_date_is_unreadab
 async fn a_truncated_object_page_without_a_cursor_is_unreadable() {
     let fake = Fake::start(vec![reply(
         "GET",
-        &format!("/accounts/{ACCOUNT}/r2/buckets/flarebox/objects?per_page=1000"),
+        &format!("/accounts/{ACCOUNT}/r2/buckets/koidrive/objects?per_page=1000"),
         200,
         {
             let mut page = ok(json!([{ "key": "a" }]));
@@ -1051,7 +1051,7 @@ async fn a_truncated_object_page_without_a_cursor_is_unreadable() {
 
     let error = fake
         .client()
-        .objects(ACCOUNT, "flarebox", Jurisdiction::Default, None)
+        .objects(ACCOUNT, "koidrive", Jurisdiction::Default, None)
         .await
         .unwrap_err();
 
@@ -1063,7 +1063,7 @@ async fn every_asset_path_is_in_the_manifest_even_with_the_same_contents() {
     let html = prototype_hash(b"<!doctype html>", "html");
     let fake = Fake::start(vec![reply(
         "POST",
-        &format!("/accounts/{ACCOUNT}/workers/scripts/flarebox/assets-upload-session"),
+        &format!("/accounts/{ACCOUNT}/workers/scripts/koidrive/assets-upload-session"),
         200,
         ok(json!({ "jwt": "completion-jwt", "buckets": [] })),
     )])
@@ -1080,7 +1080,7 @@ async fn every_asset_path_is_in_the_manifest_even_with_the_same_contents() {
     ];
 
     fake.client()
-        .upload_assets(ACCOUNT, "flarebox", &same)
+        .upload_assets(ACCOUNT, "koidrive", &same)
         .await
         .unwrap();
 
@@ -1095,7 +1095,7 @@ async fn every_asset_path_is_in_the_manifest_even_with_the_same_contents() {
 
 #[tokio::test]
 async fn a_session_without_a_buckets_list_is_not_a_completion() {
-    let session = format!("/accounts/{ACCOUNT}/workers/scripts/flarebox/assets-upload-session");
+    let session = format!("/accounts/{ACCOUNT}/workers/scripts/koidrive/assets-upload-session");
     let fake = Fake::start(vec![
         reply("POST", &session, 200, ok(json!({ "jwt": "upload-jwt" }))),
         reply(
@@ -1110,7 +1110,7 @@ async fn a_session_without_a_buckets_list_is_not_a_completion() {
 
     for _ in 0..2 {
         let error = client
-            .upload_assets(ACCOUNT, "flarebox", &assets())
+            .upload_assets(ACCOUNT, "koidrive", &assets())
             .await
             .unwrap_err();
         assert!(matches!(error, ApiError::Unreadable { .. }), "{error:?}");
@@ -1130,7 +1130,7 @@ async fn a_repeated_cursor_or_endless_full_pages_are_unreadable() {
     };
     let buckets = format!("/accounts/{ACCOUNT}/r2/buckets?per_page=1000");
     let objects =
-        format!("/accounts/{ACCOUNT}/r2/buckets/flarebox/objects?per_page=1000&cursor=same");
+        format!("/accounts/{ACCOUNT}/r2/buckets/koidrive/objects?per_page=1000&cursor=same");
     let account = json!({ "id": ACCOUNT, "name": "Alice" });
     let mut replies = vec![
         reply("GET", &buckets, 200, page("same")),
@@ -1158,7 +1158,7 @@ async fn a_repeated_cursor_or_endless_full_pages_are_unreadable() {
         .unwrap_err();
     assert!(matches!(error, ApiError::Unreadable { .. }), "{error:?}");
     let error = client
-        .objects(ACCOUNT, "flarebox", Jurisdiction::Default, Some("same"))
+        .objects(ACCOUNT, "koidrive", Jurisdiction::Default, Some("same"))
         .await
         .unwrap_err();
     assert!(matches!(error, ApiError::Unreadable { .. }), "{error:?}");

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `flarebox` command against the real Worker in `server/`, run by `cli/scripts/integration-test.sh`, which starts
-//! `wrangler dev` and sets `FLAREBOX_TEST_SERVER` (its URL) and `FLAREBOX_TEST_SERVER_LOG` (its output, where the
-//! Worker prints the claim code). The owner's device is driven through `flarebox-net`; the device under test only
+//! The `koi` command against the real Worker in `server/`, run by `cli/scripts/integration-test.sh`, which starts
+//! `wrangler dev` and sets `KOIDRIVE_TEST_SERVER` (its URL) and `KOIDRIVE_TEST_SERVER_LOG` (its output, where the
+//! Worker prints the claim code). The owner's device is driven through `koidrive-net`; the device under test only
 //! through the command.
 
 use std::fs::{self, File};
@@ -13,9 +13,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use flarebox_chunk::{ChunkerConfig, chunk_hash};
-use flarebox_net::{Api, Auth, Credentials, Event, Session, SessionConfig, Transfer};
-use flarebox_proto::v1::{
+use koidrive_chunk::{ChunkerConfig, chunk_hash};
+use koidrive_net::{Api, Auth, Credentials, Event, Session, SessionConfig, Transfer};
+use koidrive_proto::v1::{
     ChunkRef, Commit, Content, CreateDir, CreateFile, CreateSpaceRequest, Delete, Op,
     PairCompleteRequest, TokenRequest, UpdateContent, op, op_result,
 };
@@ -26,10 +26,10 @@ use url::Url;
 const WAIT: Duration = Duration::from_secs(30);
 
 fn server_url() -> Url {
-    std::env::var("FLAREBOX_TEST_SERVER")
-        .expect("FLAREBOX_TEST_SERVER is not set; run cli/scripts/integration-test.sh, which starts the Worker")
+    std::env::var("KOIDRIVE_TEST_SERVER")
+        .expect("KOIDRIVE_TEST_SERVER is not set; run cli/scripts/integration-test.sh, which starts the Worker")
         .parse()
-        .expect("FLAREBOX_TEST_SERVER is a URL")
+        .expect("KOIDRIVE_TEST_SERVER is a URL")
 }
 
 fn api() -> Api {
@@ -43,10 +43,10 @@ async fn owner() -> Credentials {
     OWNER.get_or_init(claim).await.clone()
 }
 
-/// Claims the deployment with `flarebox server claim` and the code the Worker prints to its log.
+/// Claims the deployment with `koi server claim` and the code the Worker prints to its log.
 async fn claim() -> Credentials {
     let log =
-        std::env::var("FLAREBOX_TEST_SERVER_LOG").expect("FLAREBOX_TEST_SERVER_LOG is not set");
+        std::env::var("KOIDRIVE_TEST_SERVER_LOG").expect("KOIDRIVE_TEST_SERVER_LOG is not set");
     let setup = reqwest::get(server_url().join("setup").unwrap())
         .await
         .unwrap();
@@ -76,7 +76,7 @@ async fn claim() -> Credentials {
         "owner",
     ]);
     assert!(claimed.starts_with("Paired as owner"), "{claimed}");
-    flarebox_driver::Credential::load(&machine.path("state/flarebox/credential.json"))
+    koidrive_driver::Credential::load(&machine.path("state/koidrive/credential.json"))
         .unwrap()
         .expect("the claim saved a credential")
         .net()
@@ -135,7 +135,7 @@ impl Machine {
     }
 
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_flarebox"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_koi"));
         command
             .args(args)
             .current_dir(self.home.path())
@@ -143,19 +143,19 @@ impl Machine {
             .env("XDG_CONFIG_HOME", self.path("config"))
             .env("XDG_STATE_HOME", self.path("state"))
             .env("XDG_RUNTIME_DIR", self.path("run"))
-            .env_remove("FLAREBOX_LOG");
+            .env_remove("KOIDRIVE_LOG");
         command
     }
 
     fn output(&self, args: &[&str]) -> Output {
-        self.command(args).output().expect("run flarebox")
+        self.command(args).output().expect("run koi")
     }
 
     fn run(&self, args: &[&str]) -> String {
         let output = self.output(args);
         assert!(
             output.status.success(),
-            "flarebox {args:?} failed: {}",
+            "koi {args:?} failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).unwrap()
@@ -163,7 +163,7 @@ impl Machine {
 
     fn fails(&self, args: &[&str]) -> String {
         let output = self.output(args);
-        assert!(!output.status.success(), "flarebox {args:?} succeeded");
+        assert!(!output.status.success(), "koi {args:?} succeeded");
         String::from_utf8(output.stderr).unwrap()
     }
 
@@ -198,7 +198,7 @@ impl Machine {
         found
     }
 
-    /// Polls `flarebox status --json` until `done` accepts it.
+    /// Polls `koi status --json` until `done` accepts it.
     async fn status_until(&self, what: &str, done: impl Fn(&Value) -> bool) -> Value {
         let started = Instant::now();
         loop {
@@ -266,7 +266,7 @@ async fn a_headless_device_pairs_links_and_follows_the_change_stream() {
         "agent-vm",
     ]);
     assert!(paired.starts_with("Paired as agent-vm"), "{paired}");
-    let credential_file = machine.path("state/flarebox/credential.json");
+    let credential_file = machine.path("state/koidrive/credential.json");
     assert_eq!(mode(&credential_file), 0o600);
     assert_eq!(mode(credential_file.parent().unwrap()), 0o700);
     let credential: Value =
@@ -279,9 +279,9 @@ async fn a_headless_device_pairs_links_and_follows_the_change_stream() {
     let again = machine.fails(&["join", "AAAA-BBBB", "--server", &server, "--name", "again"]);
     assert!(again.contains("already paired"), "{again}");
 
-    fs::create_dir_all(machine.path("config/flarebox")).unwrap();
+    fs::create_dir_all(machine.path("config/koidrive")).unwrap();
     fs::write(
-        machine.path("config/flarebox/config.toml"),
+        machine.path("config/koidrive/config.toml"),
         "[sync]\ninclude = [\"Projects/\"]\nexclude = [\"*.tmp\"]\n",
     )
     .unwrap();
@@ -292,7 +292,7 @@ async fn a_headless_device_pairs_links_and_follows_the_change_stream() {
     let linked = machine.run(&["link", folder_arg, "--space", &space_name]);
     assert!(linked.contains(&space.space_id), "{linked}");
     let marker: Value =
-        serde_json::from_str(&fs::read_to_string(folder.join(".flarebox/space.json")).unwrap())
+        serde_json::from_str(&fs::read_to_string(folder.join(".koidrive/space.json")).unwrap())
             .unwrap();
     assert_eq!(marker["space_id"], space.space_id.as_str());
     let refused = machine.fails(&[
@@ -301,7 +301,7 @@ async fn a_headless_device_pairs_links_and_follows_the_change_stream() {
         "--space",
         &space.space_id,
     ]);
-    assert!(refused.contains("Flarebox's own files"), "{refused}");
+    assert!(refused.contains("Koidrive's own files"), "{refused}");
 
     let status = machine.status();
     assert_eq!(status["running"], false);
@@ -315,7 +315,7 @@ async fn a_headless_device_pairs_links_and_follows_the_change_stream() {
         .stderr(File::create(&log_path).unwrap())
         .spawn()
         .unwrap();
-    let socket = machine.path("run/flarebox/daemon.sock");
+    let socket = machine.path("run/koidrive/daemon.sock");
     let started = Instant::now();
     while !socket.exists() {
         assert!(
@@ -328,7 +328,7 @@ async fn a_headless_device_pairs_links_and_follows_the_change_stream() {
     assert_eq!(mode(&socket), 0o600);
     assert_eq!(mode(socket.parent().unwrap()), 0o700);
     let second = machine.fails(&["daemon"]);
-    assert!(second.contains("another Flarebox daemon"), "{second}");
+    assert!(second.contains("another Koidrive daemon"), "{second}");
 
     let status = machine
         .status_until("the first sync", |status| {
@@ -407,7 +407,7 @@ async fn a_headless_device_pairs_links_and_follows_the_change_stream() {
     assert_eq!(machine.status()["folders"], Value::Array(vec![]));
     assert!(
         !machine
-            .path(&format!("state/flarebox/spaces/{}", space.space_id))
+            .path(&format!("state/koidrive/spaces/{}", space.space_id))
             .exists()
     );
     assert_eq!(
@@ -543,7 +543,7 @@ async fn a_device_revokes_a_lost_one_and_stops_syncing_when_another_revokes_it()
         .spawn()
         .unwrap();
     let started = Instant::now();
-    while !machine.path("run/flarebox/daemon.sock").exists() {
+    while !machine.path("run/koidrive/daemon.sock").exists() {
         assert!(
             started.elapsed() < WAIT,
             "the daemon did not open its socket"
@@ -625,7 +625,7 @@ async fn usage_lists_what_each_space_stores() {
 /// one is staged, as the process that holds the profile leaves them until it hears the answer (RFC 0011 section 2).
 async fn rotated_on_the_server(machine: &Machine) -> String {
     let current =
-        flarebox_driver::Credential::load(&machine.path("state/flarebox/credential.json"))
+        koidrive_driver::Credential::load(&machine.path("state/koidrive/credential.json"))
             .unwrap()
             .unwrap();
     let staged: String = std::iter::repeat_with(fastrand::alphanumeric)
@@ -646,7 +646,7 @@ async fn rotated_on_the_server(machine: &Machine) -> String {
         fs::OpenOptions::new().write(true).create_new(true),
         0o600,
     )
-    .open(machine.path("state/flarebox/credential.next"))
+    .open(machine.path("state/koidrive/credential.next"))
     .unwrap();
     std::io::Write::write_all(&mut file, next.to_string().as_bytes()).unwrap();
     staged
@@ -681,12 +681,12 @@ async fn of_two_copies_of_one_credential_only_the_one_that_rotates_it_keeps_work
     let server = server_url().to_string();
     let first = Machine::new();
     first.run(&["join", &pairing.code, "--server", &server, "--name", "desk"]);
-    let credential = first.path("state/flarebox/credential.json");
+    let credential = first.path("state/koidrive/credential.json");
     let copy = Machine::new();
-    fs::create_dir_all(copy.path("state/flarebox")).unwrap();
-    fs::copy(&credential, copy.path("state/flarebox/credential.json")).unwrap();
+    fs::create_dir_all(copy.path("state/koidrive")).unwrap();
+    fs::copy(&credential, copy.path("state/koidrive/credential.json")).unwrap();
     copy.run(&["usage", "--json"]);
-    let original = flarebox_driver::Credential::load(&credential)
+    let original = koidrive_driver::Credential::load(&credential)
         .unwrap()
         .unwrap()
         .refresh_credential;
@@ -706,7 +706,7 @@ async fn of_two_copies_of_one_credential_only_the_one_that_rotates_it_keeps_work
     fs::create_dir_all(&folder).unwrap();
 
     first.run(&["link", folder.to_str().unwrap(), "--space", &name]);
-    let rotated = flarebox_driver::Credential::load(&credential)
+    let rotated = koidrive_driver::Credential::load(&credential)
         .unwrap()
         .unwrap()
         .refresh_credential;
@@ -714,7 +714,7 @@ async fn of_two_copies_of_one_credential_only_the_one_that_rotates_it_keeps_work
         rotated, original,
         "linking the folder rotated the credential"
     );
-    assert!(!first.path("state/flarebox/credential.next").exists());
+    assert!(!first.path("state/koidrive/credential.next").exists());
     first.run(&["usage", "--json"]);
     let refused = copy.fails(&["usage"]);
     assert!(
@@ -730,7 +730,7 @@ fn file_content(bytes: &[u8]) -> Content {
         size: bytes.len() as u32,
         encoding: 0,
     };
-    flarebox_chunk::content(
+    koidrive_chunk::content(
         vec![chunk],
         1_700_000_000_000_000_000,
         false,
@@ -826,7 +826,7 @@ async fn trash_and_versions_list_what_the_space_keeps() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let socket = machine.path("run/flarebox/daemon.sock");
+    let socket = machine.path("run/koidrive/daemon.sock");
     let started = Instant::now();
     while !socket.exists() {
         assert!(
@@ -919,7 +919,7 @@ async fn trash_and_versions_list_what_the_space_keeps() {
     );
     let deleted = machine.fails(&["versions", folder.join("docs/gone.txt").to_str().unwrap()]);
     assert!(
-        deleted.contains("flarebox trash lists deleted ones"),
+        deleted.contains("koi trash lists deleted ones"),
         "{deleted}"
     );
     let outside = machine.fails(&["trash", machine.path("state").to_str().unwrap()]);
@@ -1004,7 +1004,7 @@ async fn restore_brings_back_a_deleted_file_and_an_earlier_version() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let socket = machine.path("run/flarebox/daemon.sock");
+    let socket = machine.path("run/koidrive/daemon.sock");
     eventually("the daemon to open its socket", || socket.exists()).await;
     machine
         .status_until("the first sync", |status| {
@@ -1216,7 +1216,7 @@ async fn two_creates_of_one_name_at_once_make_one_space() {
             });
         }
     });
-    let path = machine.path("state/flarebox/credential.json");
+    let path = machine.path("state/koidrive/credential.json");
     let mut credential: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     credential["server"] = proxy.into();
     fs::write(&path, serde_json::to_vec(&credential).unwrap()).unwrap();
@@ -1292,7 +1292,7 @@ async fn a_device_shows_a_pairing_code_that_adds_another() {
     let shown = first.run(&["device", "add"]);
     let args: Vec<&str> = shown
         .lines()
-        .find_map(|line| line.strip_prefix("  flarebox join "))
+        .find_map(|line| line.strip_prefix("  koi join "))
         .unwrap_or_else(|| panic!("no join command in {shown:?}"))
         .split_whitespace()
         .collect();

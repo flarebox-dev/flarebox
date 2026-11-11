@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use flarebox_cloudflare::{
+use koidrive_cloudflare::{
     AuthorizationCode, CLIENT_ID, Endpoints, Login, Loopback, OauthError, SCOPES, http_client,
 };
 use sha2::{Digest, Sha256};
@@ -367,7 +367,7 @@ async fn loopback_round_trip_returns_the_callback_code() {
     );
     assert!(
         page.1
-            .contains("Flarebox is not affiliated with Cloudflare, Inc."),
+            .contains("Koidrive is not affiliated with Cloudflare, Inc."),
         "{}",
         page.1
     );
@@ -507,7 +507,7 @@ async fn token_errors_show_only_error_and_error_description() {
     }
 }
 
-async fn grant_from(server: &FakeServer) -> flarebox_cloudflare::Grant {
+async fn grant_from(server: &FakeServer) -> koidrive_cloudflare::Grant {
     let login = Login::new(server.endpoints.clone(), CLIENT_ID, PORT);
     let code = login
         .code_from(&callback(

@@ -10,7 +10,7 @@ Include the affected version or commit, the steps to reproduce the problem, and 
 
 ## Supported versions
 
-Flarebox is pre-1.0. Only the latest release and the `main` branch get security fixes.
+Koidrive is pre-1.0. Only the latest release and the `main` branch get security fixes.
 
 ## What to expect
 

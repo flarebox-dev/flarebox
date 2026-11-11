@@ -6,8 +6,8 @@
 
 use std::time::Duration;
 
-use flarebox_net::{CallError, ServerError};
-use flarebox_proto::v1::error::Code;
+use koidrive_net::{CallError, ServerError};
+use koidrive_proto::v1::error::Code;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Disposition {
@@ -52,7 +52,7 @@ pub fn describe(error: &ServerError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use flarebox_proto::v1::Error as ProtoError;
+    use koidrive_proto::v1::Error as ProtoError;
 
     use super::*;
 

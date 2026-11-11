@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Evaluating paths against the built-in exclusions, the device-local list and the tree of
-//! `.fbignore` files.
+//! `.koiignore` files.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -13,7 +13,7 @@ use crate::{NameKey, RULES_FILE};
 /// that a folder still holds when an effect removes it (design §5.2).
 pub const PLATFORM_FILES: [&str; 4] = [".DS_Store", "Thumbs.db", "desktop.ini", "Icon\r"];
 /// The engine's state directory, excluded at the root (RFC 0001 §2).
-const STATE_DIR: &str = ".flarebox";
+const STATE_DIR: &str = ".koidrive";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -31,11 +31,11 @@ pub enum Status {
 /// excluded ancestor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reason {
-    /// `.flarebox` at the root or a platform file. Nothing can include it.
+    /// `.koidrive` at the root or a platform file. Nothing can include it.
     BuiltIn,
     /// The device-local include or exclude list.
     Local,
-    /// Line `line` of the `.fbignore` file in the path's ancestor at `depth` (0 is the root).
+    /// Line `line` of the `.koiignore` file in the path's ancestor at `depth` (0 is the root).
     Rule { depth: usize, line: u32 },
 }
 
@@ -54,7 +54,7 @@ pub enum Change {
 pub enum LocalRulesError {
     /// An include entry is empty, or has an empty, `.` or `..` component.
     Include { index: usize, entry: String },
-    /// An exclude entry holds a line break, or is a line a `.fbignore` file could not use.
+    /// An exclude entry holds a line break, or is a line a `.koiignore` file could not use.
     Exclude {
         index: usize,
         entry: String,
@@ -91,7 +91,7 @@ impl fmt::Display for LocalRulesError {
 impl std::error::Error for LocalRulesError {}
 
 /// This device's include and exclude lists. They are never synced; see the crate documentation
-/// for how they combine with `.fbignore` files.
+/// for how they combine with `.koiignore` files.
 pub struct LocalRules<K> {
     include: Vec<IncludePath>,
     exclude: RuleFile<K>,
@@ -138,7 +138,7 @@ struct IncludePath {
 
 impl<K: NameKey> LocalRules<K> {
     /// `include` holds paths relative to the root, with an optional leading `/` and an optional
-    /// trailing `/` that limits the entry to a directory. `exclude` holds one `.fbignore` line
+    /// trailing `/` that limits the entry to a directory. `exclude` holds one `.koiignore` line
     /// per entry, relative to the root.
     pub fn new<I: AsRef<str>, E: AsRef<str>>(
         include: &[I],
@@ -201,7 +201,7 @@ impl<K: NameKey> LocalRules<K> {
 }
 
 /// The rules in force on this device: the built-in exclusions, the device-local list and the
-/// `.fbignore` files known so far, by directory.
+/// `.koiignore` files known so far, by directory.
 pub struct Matcher<K> {
     local: LocalRules<K>,
     files: HashMap<Vec<String>, RuleFile<K>>,

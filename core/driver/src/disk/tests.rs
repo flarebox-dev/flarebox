@@ -16,18 +16,18 @@ use std::sync::Mutex;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use flarebox_chunk::{ChunkerConfig, chunks, content};
-use flarebox_engine::classify::Trees;
-use flarebox_engine::effects::{Base as EngineBase, Dir as EngineDir};
-use flarebox_engine::state::{EffectsState, TreesState};
-use flarebox_engine::tree::{FileIdentity, Kind, LocalNode, Shape};
-use flarebox_fs::{
+use koidrive_chunk::{ChunkerConfig, chunks, content};
+use koidrive_engine::classify::Trees;
+use koidrive_engine::effects::{Base as EngineBase, Dir as EngineDir};
+use koidrive_engine::state::{EffectsState, TreesState};
+use koidrive_engine::tree::{FileIdentity, Kind, LocalNode, Shape};
+use koidrive_fs::{
     FileId, Known, PRIVATE_DIR, QUARANTINE_DIR, STAGING_DIR, Snapshot, TRASH_DIR, read_marker,
     write_marker,
 };
-use flarebox_net::ServerError;
-use flarebox_proto::v1::{NodeKind, NodeState, NodeStatus, VersionInfo};
-use flarebox_store::{EngineState, SyncedNode};
+use koidrive_net::ServerError;
+use koidrive_proto::v1::{NodeKind, NodeState, NodeStatus, VersionInfo};
+use koidrive_store::{EngineState, SyncedNode};
 
 use super::*;
 use crate::claim;
@@ -60,7 +60,7 @@ fn a_delete_the_user_made_before_a_recovered_removal_stays_local() {
         EngineEffect::RemoveFile { .. }
     ));
     let restored = remote(NODE, "report.txt", Some(saved));
-    let (_, restored_tree) = flarebox_engine::tree::RemoteNode::from_state(&restored).unwrap();
+    let (_, restored_tree) = koidrive_engine::tree::RemoteNode::from_state(&restored).unwrap();
     running.engine.trees.set_remote(NODE.into(), restored_tree);
     let Running { engine, store, .. } = &mut running;
     store
@@ -73,13 +73,13 @@ fn a_delete_the_user_made_before_a_recovered_removal_stays_local() {
     batch(&mut running, |trees| trees.remove_local(NODE));
     assert_eq!(
         running.engine.trees.class(NODE),
-        flarebox_engine::classify::Class::Local
+        koidrive_engine::classify::Class::Local
     );
     drop((pending, running));
     let running = folder.start(no_hook()).unwrap();
     assert_eq!(
         running.engine.trees.class(NODE),
-        flarebox_engine::classify::Class::Local
+        koidrive_engine::classify::Class::Local
     );
 }
 
@@ -106,7 +106,7 @@ fn an_edit_the_user_made_before_a_recovered_download_stays_an_edit() {
         "report.txt",
         Some(server.hold(b"a newer remote version", ChunkerConfig::V0)),
     );
-    let (_, advanced_tree) = flarebox_engine::tree::RemoteNode::from_state(&advanced).unwrap();
+    let (_, advanced_tree) = koidrive_engine::tree::RemoteNode::from_state(&advanced).unwrap();
     running.engine.trees.set_remote(NODE.into(), advanced_tree);
     let Running { engine, store, .. } = &mut running;
     store
@@ -121,7 +121,7 @@ fn an_edit_the_user_made_before_a_recovered_download_stays_an_edit() {
     batch(&mut running, |trees| trees.set_local(NODE.into(), edited));
     assert_eq!(
         running.engine.trees.class(NODE),
-        flarebox_engine::classify::Class::Concurrent
+        koidrive_engine::classify::Class::Concurrent
     );
     drop((pending, running));
     let running = folder.start(no_hook()).unwrap();
@@ -165,7 +165,7 @@ fn a_same_byte_save_before_a_removal_does_not_delete_the_restored_file() {
         .disk
         .observed(fresh, &mut running.engine, &mut running.store)
         .unwrap();
-    assert!(flarebox_engine::tree::same(
+    assert!(koidrive_engine::tree::same(
         running.engine.trees.local().live(NODE),
         running.engine.trees.synced().live(NODE)
     ));
@@ -183,7 +183,7 @@ fn a_same_byte_save_before_a_removal_does_not_delete_the_restored_file() {
         EngineEffect::RemoveFile { .. }
     ));
     let restored = remote(NODE, "report.txt", Some(saved));
-    let (_, restored_tree) = flarebox_engine::tree::RemoteNode::from_state(&restored).unwrap();
+    let (_, restored_tree) = koidrive_engine::tree::RemoteNode::from_state(&restored).unwrap();
     running.engine.trees.set_remote(NODE.into(), restored_tree);
     let Running { engine, store, .. } = &mut running;
     store
@@ -261,7 +261,7 @@ impl Folder {
                         node_id: (*id).into(),
                         shape: shape.clone(),
                     })?;
-                    tx.put_local_node(&flarebox_store::LocalNode {
+                    tx.put_local_node(&koidrive_store::LocalNode {
                         node_id: (*id).into(),
                         shape,
                         identity: Snapshot::scan(&self.root).unwrap().entries[Path::new(path)].id,
@@ -483,10 +483,10 @@ fn disk_content(path: &Path) -> Content {
     )
 }
 
-fn disk_shape(root: &Path, parent: &str, path: &str) -> flarebox_store::Shape {
+fn disk_shape(root: &Path, parent: &str, path: &str) -> koidrive_store::Shape {
     let full = root.join(path);
     let dir = fs::symlink_metadata(&full).unwrap().is_dir();
-    flarebox_store::Shape {
+    koidrive_store::Shape {
         parent_id: parent.into(),
         name: Path::new(path)
             .file_name()
@@ -722,7 +722,7 @@ fn assert_done(scenario: &Scenario, folder: &Folder, running: &Running, context:
     let remote = running.engine.trees.remote().live(NODE);
     let local = running.local(NODE).map(|node| &node.shape);
     assert!(
-        flarebox_engine::tree::same(local, remote),
+        koidrive_engine::tree::same(local, remote),
         "{context}: L {local:?}, R {remote:?}"
     );
     // The acknowledgement settles the trees in its own transaction. With S left behind, the node's next change
@@ -2240,7 +2240,7 @@ fn nothing_is_planned_before_the_first_batch_and_its_rules_keep_a_match_from_bei
     let folder = Folder::new();
     let mut server = Server::default();
     let content = server.hold(REMOTE, ChunkerConfig::V0);
-    fs::write(folder.root.join(".fbignore"), "*.log\n").unwrap();
+    fs::write(folder.root.join(".koiignore"), "*.log\n").unwrap();
     folder.seed(
         &[
             remote(LOG, "build.log", Some(content.clone())),
@@ -2272,7 +2272,7 @@ fn a_file_moved_into_an_ignored_folder_keeps_its_entry_in_l() {
     let folder = Folder::new();
     let report = folder.root.join("report.txt");
     fs::write(&report, SYNCED).unwrap();
-    fs::write(folder.root.join(".fbignore"), "/build/\n").unwrap();
+    fs::write(folder.root.join(".koiignore"), "/build/\n").unwrap();
     fs::create_dir(folder.root.join("build")).unwrap();
     folder.seed(
         &[remote(NODE, "report.txt", Some(disk_content(&report)))],
@@ -2323,7 +2323,7 @@ fn a_trashed_file_whose_metadata_alone_changed_is_reclaimed_when_due() {
     let mode = fs::metadata(&entries[0]).unwrap().permissions().mode();
     fs::set_permissions(&entries[0], fs::Permissions::from_mode(mode ^ 0o004)).unwrap();
 
-    let due = SystemTime::now() + flarebox_fs::TRASH_RETENTION + Duration::from_secs(60);
+    let due = SystemTime::now() + koidrive_fs::TRASH_RETENTION + Duration::from_secs(60);
     let reclaimed = running.disk.reclaim_trash(due, u64::MAX).unwrap();
     assert_eq!(reclaimed.removed.len(), 1, "{reclaimed:?}");
     assert!(reclaimed.recovered.is_empty(), "{reclaimed:?}");

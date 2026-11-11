@@ -2,8 +2,8 @@
 
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { DurableObject } from "cloudflare:workers";
-import type { SpaceUsage } from "./gen/flarebox/v1/auth_pb";
-import { type Commit, type CommitResult, CommitResultSchema, type Op, type UploadReceipt } from "./gen/flarebox/v1/commit_pb";
+import type { SpaceUsage } from "./gen/koidrive/v1/auth_pb";
+import { type Commit, type CommitResult, CommitResultSchema, type Op, type UploadReceipt } from "./gen/koidrive/v1/commit_pb";
 import {
   CaughtUpSchema,
   ChangesSchema,
@@ -22,7 +22,7 @@ import {
   type ServerMessage,
   ServerMessageSchema,
   WelcomeSchema,
-} from "./gen/flarebox/v1/messages_pb";
+} from "./gen/koidrive/v1/messages_pb";
 import {
   type ChangeRecord,
   ChangeRecordSchema,
@@ -33,7 +33,7 @@ import {
   NodePurgedSchema,
   NodeStateSchema,
   VersionInfoSchema,
-} from "./gen/flarebox/v1/model_pb";
+} from "./gen/koidrive/v1/model_pb";
 import {
   ChunkPlan_Action,
   ChunkPlanSchema,
@@ -53,7 +53,7 @@ import {
   TreePageSchema,
   VersionChunksSchema,
   VersionListSchema,
-} from "./gen/flarebox/v1/rpc_pb";
+} from "./gen/koidrive/v1/rpc_pb";
 import type { SessionCheck } from "./account-do";
 import { type Identity, verifyAccessToken } from "./auth";
 import { type ChunkObject, sha256, signChunkGrant, verifyChunkGrant } from "./crypto";
@@ -63,7 +63,7 @@ import { quotaRefusal } from "./quota";
 import { type ApplyContext, CallFailure, CommitApplier } from "./space/commit";
 import { commitDigest } from "./space/digest";
 import { bootstrapExport, descriptorDurable, Exporter, noteCommitted, startExport } from "./space/export";
-import type { ShareInfo, ShareListing } from "./gen/flarebox/v1/share_pb";
+import type { ShareInfo, ShareListing } from "./gen/koidrive/v1/share_pb";
 import type { ShareOutcome } from "./share/links";
 import { checkFence, checkLinkRoot, type DownloadFence, type ShareFile, shareFile, shareInfo, shareListing } from "./share/space";
 import { type Pitr, pitrBackend } from "./space/pitr";
@@ -127,7 +127,7 @@ export type Role = "owner" | "editor" | "viewer";
 const SHARE_CLOSED = { ok: false, code: Error_Code.RETRY_LATER, message: "this link is temporarily unavailable; retry later", status: 503 } as const;
 
 /** Header the Worker sets on the WebSocket upgrade it forwards: JSON of {@link Connect}. */
-export const CONNECT_HEADER = "X-Flarebox-Connect";
+export const CONNECT_HEADER = "X-Koidrive-Connect";
 /** How long past its access token's expiry a connection may stay open (spec v0 section 7.1). */
 export const TOKEN_GRACE_MS = 60_000;
 

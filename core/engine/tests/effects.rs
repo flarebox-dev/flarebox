@@ -6,11 +6,11 @@
 
 use std::collections::BTreeMap;
 
-use flarebox_engine::classify::{Class, Trees};
-use flarebox_engine::effects::{Base, Dir, Displaced, Effect, EffectError, Effects, Location};
-use flarebox_engine::ids::IdGen;
-use flarebox_engine::names::name_key;
-use flarebox_engine::tree::{
+use koidrive_engine::classify::{Class, Trees};
+use koidrive_engine::effects::{Base, Dir, Displaced, Effect, EffectError, Effects, Location};
+use koidrive_engine::ids::IdGen;
+use koidrive_engine::names::name_key;
+use koidrive_engine::tree::{
     Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape, same_content,
 };
 use proptest::prelude::*;
@@ -907,17 +907,17 @@ fn an_edit_made_while_a_move_r_undid_was_in_flight_is_uploaded_without_the_move(
     trees.settle();
     assert_eq!(trees.local().live("f"), Some(&file(ROOT, "b", 2)));
     assert_eq!(trees.synced().live("f"), Some(&file(ROOT, "b", 1)));
-    let mut commits = flarebox_engine::commit::Commits::default();
+    let mut commits = koidrive_engine::commit::Commits::default();
     let commit = commits
         .build(&mut trees, &mut ids, NOW, "history", 1)
         .unwrap();
     assert!(
-        !(commit.ops.iter()).any(|op| matches!(&op.op, Some(flarebox_proto::v1::op::Op::Move(_)))),
+        !(commit.ops.iter()).any(|op| matches!(&op.op, Some(koidrive_proto::v1::op::Op::Move(_)))),
         "{:?}",
         commit.ops
     );
     assert!(commit.ops.iter().any(|op| matches!(&op.op,
-        Some(flarebox_proto::v1::op::Op::UpdateContent(update)) if update.node_id == "f" && update.content == Some(content(2)))),
+        Some(koidrive_proto::v1::op::Op::UpdateContent(update)) if update.node_id == "f" && update.content == Some(content(2)))),
         "{:?}", commit.ops);
 }
 
@@ -942,12 +942,12 @@ fn a_reverted_move_keeps_an_edit_that_was_not_uploaded() {
     trees.settle();
     assert!(trees.edited("f"));
     assert_eq!(trees.local().live("f").unwrap().content, Some(content(2)));
-    let mut commits = flarebox_engine::commit::Commits::default();
+    let mut commits = koidrive_engine::commit::Commits::default();
     let commit = commits
         .build(&mut trees, &mut ids, NOW, "history", 1)
         .unwrap();
     assert!(commit.ops.iter().any(|op| matches!(&op.op,
-        Some(flarebox_proto::v1::op::Op::UpdateContent(update)) if update.node_id == "f" && update.content == Some(content(2)))),
+        Some(koidrive_proto::v1::op::Op::UpdateContent(update)) if update.node_id == "f" && update.content == Some(content(2)))),
         "{:?}", commit.ops);
 }
 
@@ -1006,13 +1006,13 @@ fn a_parked_edit_brings_back_its_deleted_folder_after_a_remote_trash() {
     assert!(!trees.local().get("f").unwrap().parked);
     assert_eq!(trees.local().live("f").unwrap().content, Some(content(2)));
     assert!(trees.edited("f"));
-    let (mut commits, mut ids) = (flarebox_engine::commit::Commits::default(), IdGen::new(1));
+    let (mut commits, mut ids) = (koidrive_engine::commit::Commits::default(), IdGen::new(1));
     let commit = commits
         .build(&mut trees, &mut ids, NOW, "history", 7)
         .unwrap();
     assert!(commit.ops.iter().any(|op| match &op.op {
-        Some(flarebox_proto::v1::op::Op::UpdateContent(op)) => op.content == Some(content(2)),
-        Some(flarebox_proto::v1::op::Op::CreateFile(op)) => op.content == Some(content(2)),
+        Some(koidrive_proto::v1::op::Op::UpdateContent(op)) => op.content == Some(content(2)),
+        Some(koidrive_proto::v1::op::Op::CreateFile(op)) => op.content == Some(content(2)),
         _ => false,
     }));
 }
@@ -1029,7 +1029,7 @@ fn a_parked_edit_brings_back_its_deleted_folder_after_a_remote_move_into_an_igno
     ]);
     trees.set_rules(
         &[] as &[&str],
-        Some(flarebox_engine::ignore::RuleFile::parse(b"logs/\n")),
+        Some(koidrive_engine::ignore::RuleFile::parse(b"logs/\n")),
     );
     let mut local = trees.local().get("f").unwrap().clone();
     local.parked = true;

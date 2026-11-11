@@ -11,7 +11,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use common::bind;
-use flarebox_fs::{
+use koidrive_fs::{
     Base, Dir, FileId, Location, PARKED_DIR, PRIVATE_DIR, Snapshot, Space, Unresolved,
 };
 
@@ -217,7 +217,7 @@ fn parked_base_checks_the_parked_folder_identity() {
     let parked_entry = Location::Parked("node-2".into());
     let (holder, name) = space.parent(&parked_entry).unwrap();
     assert_eq!(name, "node-2");
-    assert_eq!(holder.path(), Path::new(".flarebox/parked"));
+    assert_eq!(holder.path(), Path::new(".koidrive/parked"));
 
     let wrong = Location::At {
         base: Base::Parked {
@@ -229,7 +229,7 @@ fn parked_base_checks_the_parked_folder_identity() {
     };
     assert!(matches!(
         space.parent(&wrong),
-        Err(Unresolved::Replaced { path, .. }) if path == Path::new(".flarebox/parked/node-1")
+        Err(Unresolved::Replaced { path, .. }) if path == Path::new(".koidrive/parked/node-1")
     ));
 }
 
@@ -294,7 +294,7 @@ fn private_folders_are_single_names_inside_the_private_folder() {
     fs::create_dir_all(root.join(PRIVATE_DIR).join(PARKED_DIR)).unwrap();
     let space = bind(root);
     let parked = space.private(&[PARKED_DIR]).unwrap();
-    assert_eq!(parked.path(), Path::new(".flarebox/parked"));
+    assert_eq!(parked.path(), Path::new(".koidrive/parked"));
 
     let absolute = outside.path().to_str().unwrap();
     for parts in [

@@ -15,7 +15,7 @@ use rustix::fs::{FileType, Mode, OFlags};
 use crate::{EntryKind, FileId, Stat, is_gone, list, open_attached, open_dir_at, stat_at, stat_fd};
 
 /// The name of a rules file.
-pub const RULES_FILE: &str = ".fbignore";
+pub const RULES_FILE: &str = ".koiignore";
 
 /// The largest rules file a scan reads.
 const MAX_RULES: u64 = 1 << 20;
@@ -26,12 +26,12 @@ pub enum Ignored {
     No,
     /// A platform file such as `.DS_Store`. No rule can bring it back.
     BuiltIn,
-    /// A `.fbignore` rule or the device's own list.
+    /// A `.koiignore` rule or the device's own list.
     Rule,
 }
 
 /// The matcher scans ask. The driver implements it over
-/// `flarebox_ignore::Matcher`.
+/// `koidrive_ignore::Matcher`.
 pub trait Ignore {
     /// The rules file of folder `dir` (relative to the root, empty for the
     /// root) holds `rules`, or the folder has none.
@@ -141,7 +141,7 @@ impl<'r> Pending<'r> {
 
     /// Reads the rules file of the folder `dir` at `rel`, which lists
     /// `names`: the regular file among the names the matcher takes for
-    /// `.fbignore`, such as `.FBIGNORE`. A folder or a link of such a name is
+    /// `.koiignore`, such as `.KOIIGNORE`. A folder or a link of such a name is
     /// not one. A rules file that cannot be read keeps the rules the folder
     /// last had. When the folder had none, its rules are [`RulesRead::Unknown`],
     /// and so are they when it holds two rules files.

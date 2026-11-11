@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use flarebox_ignore::Status;
+use koidrive_ignore::Status;
 
 use crate::ignore::{LocalRules, Matcher, RuleFile, is_rules_file};
 use crate::names::name_key;
@@ -400,14 +400,14 @@ impl Trees {
         self.ignore.set_local(local, std::iter::empty());
     }
 
-    /// Sets the rules of the `.fbignore` file in the folder at `dir`, the names from the root to
+    /// Sets the rules of the `.koiignore` file in the folder at `dir`, the names from the root to
     /// it, or removes them with `None`. The driver parses each rules file it observes on this
     /// device's disk and passes the rules here with the observation.
     pub fn set_rules<S: AsRef<str>>(&mut self, dir: &[S], rules: Option<RuleFile>) {
         self.ignore.set_rules(dir, rules, std::iter::empty());
     }
 
-    /// Forgets the rules of every `.fbignore` file, for a caller about to pass all of them again.
+    /// Forgets the rules of every `.koiignore` file, for a caller about to pass all of them again.
     pub fn clear_rules(&mut self) {
         self.ignore.clear_rules();
     }
@@ -624,8 +624,8 @@ impl Trees {
     /// Whether the rules exclude the entry of `kind` at `path`, the names from the root to it.
     pub fn ignores<S: AsRef<str>>(&self, path: &[S], kind: Kind) -> bool {
         let kind = match kind {
-            Kind::Dir => flarebox_ignore::Kind::Dir,
-            Kind::File => flarebox_ignore::Kind::File,
+            Kind::Dir => koidrive_ignore::Kind::Dir,
+            Kind::File => koidrive_ignore::Kind::File,
         };
         self.ignore.status(path, kind) != Status::Included
     }

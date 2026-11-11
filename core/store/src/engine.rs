@@ -7,11 +7,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flarebox_engine::commit::{Halt, InFlight};
-use flarebox_engine::effects::{Base, Dir, Displaced, Effect, EffectRecord, Location};
-use flarebox_engine::state::{CommitsState, EffectsState, TreesState};
-use flarebox_engine::tree::{FileIdentity, Kind, NodeId, Shape};
-use flarebox_proto::v1::{Commit, CommitResult, Content, NodeKind};
+use koidrive_engine::commit::{Halt, InFlight};
+use koidrive_engine::effects::{Base, Dir, Displaced, Effect, EffectRecord, Location};
+use koidrive_engine::state::{CommitsState, EffectsState, TreesState};
+use koidrive_engine::tree::{FileIdentity, Kind, NodeId, Shape};
+use koidrive_proto::v1::{Commit, CommitResult, Content, NodeKind};
 use prost::{Message, Oneof};
 use rusqlite::{OptionalExtension, params};
 
@@ -645,7 +645,7 @@ struct StoredLocation {
 
 #[derive(Clone, PartialEq, Oneof)]
 enum Place {
-    /// `.flarebox/parked/<node>` itself.
+    /// `.koidrive/parked/<node>` itself.
     #[prost(string, tag = "1")]
     Parked(String),
     #[prost(message, tag = "2")]

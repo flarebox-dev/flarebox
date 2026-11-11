@@ -11,17 +11,17 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
-use flarebox_proto::v1::{
+use futures_util::{SinkExt, StreamExt};
+use http_body_util::{BodyExt, Collected, Empty, Limited};
+use hyper::client::conn::http1;
+use hyper_util::rt::TokioIo;
+use koidrive_proto::v1::{
     AccessToken, ChunkRef, ClientMessage, Commit, CommitResult, DownloadTargets,
     GetDownloadTargets, GetVersionChunks, Hello, ListTrash, ListTree, ListVersions, PrepareUpload,
     PrepareUploadResult, Reauth, RpcRequest, RpcResponse, ServerMessage, TrashPage, TreePage,
     VersionChunks, VersionList, Welcome, client_message, rpc_request::Call, rpc_response,
     server_message::Msg,
 };
-use futures_util::{SinkExt, StreamExt};
-use http_body_util::{BodyExt, Collected, Empty, Limited};
-use hyper::client::conn::http1;
-use hyper_util::rt::TokioIo;
 use prost::Message as _;
 use rustls::pki_types::ServerName;
 use rustls_platform_verifier::BuilderVerifierExt;
@@ -509,13 +509,13 @@ impl Task {
             }
             .max(self.asked_wait.take().unwrap_or_default());
             self.attempt = self.attempt.saturating_add(1);
-            tracing::debug!(?reason, ?retry_in, "flarebox session disconnected");
+            tracing::debug!(?reason, ?retry_in, "koidrive session disconnected");
             self.emit(Event::Disconnected { reason, retry_in });
             if !self.idle(retry_in).await {
                 break StopReason::Closed;
             }
         };
-        tracing::debug!(%reason, "flarebox session stopped");
+        tracing::debug!(%reason, "koidrive session stopped");
         let _ = self.stopped.set(reason.clone());
         let pending = std::mem::take(&mut self.pending);
         for (_, call) in pending
@@ -783,7 +783,7 @@ impl Task {
                 .collect();
             for (req_id, reason) in refused {
                 if let Some(call) = calls.remove(&req_id) {
-                    tracing::debug!(%reason, "flarebox session did not resend a commit");
+                    tracing::debug!(%reason, "koidrive session did not resend a commit");
                     let _ = call.reply.send(Err(CallError::NotResent(reason)));
                 }
             }
@@ -834,7 +834,7 @@ impl Task {
             Err(error) => match error.server() {
                 Some(refusal) => Some(rpc_response::Result::Error(refusal.0.clone())),
                 None => {
-                    tracing::debug!(%error, "flarebox session could not resend a commit over HTTP; sending it on the socket");
+                    tracing::debug!(%error, "koidrive session could not resend a commit over HTTP; sending it on the socket");
                     let request = RpcRequest {
                         req_id,
                         call: Some(call.call.clone()),
@@ -911,7 +911,7 @@ impl Task {
                 refreshed = refreshed(&mut refreshing) => {
                     refreshing = None;
                     let Ok(refreshed) = refreshed else {
-                        tracing::debug!("flarebox session timed out refreshing its access token");
+                        tracing::debug!("koidrive session timed out refreshing its access token");
                         reauth.as_mut().reset(Instant::now() + self.config.backoff.delay(0));
                         continue;
                     };
@@ -940,7 +940,7 @@ impl Task {
                             if let Some(server) = server && server.resend() == Resend::Never {
                                 return Exit::Stop(StopReason::Refused(server.to_string()));
                             }
-                            tracing::debug!(%error, "flarebox session could not refresh its access token");
+                            tracing::debug!(%error, "koidrive session could not refresh its access token");
                             let wait = server.and_then(ServerError::retry_after);
                             reauth.as_mut().reset(Instant::now() + wait.unwrap_or(self.config.backoff.delay(0)));
                         }
@@ -1049,7 +1049,7 @@ impl Task {
         let Some(call) = self.pending.remove(&response.req_id) else {
             tracing::debug!(
                 req_id = response.req_id,
-                "flarebox session got a response to no pending call"
+                "koidrive session got a response to no pending call"
             );
             return Ok(());
         };

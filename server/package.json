@@ -1,8 +1,8 @@
 {
-  "name": "flarebox-server",
+  "name": "koidrive-server",
   "version": "0.0.0",
   "private": true,
-  "description": "Flarebox server: a Worker with Durable Objects and R2.",
+  "description": "Koidrive server: a Worker with Durable Objects and R2.",
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "packageManager": "pnpm@12.18.0",
@@ -10,8 +10,8 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "check:deploy": "node scripts/check-deploy.mjs",
-    "typecheck": "wrangler types && tsc --noEmit && tsc --noEmit -p test && tsc --noEmit -p scripts/deploy-test && pnpm --filter flarebox-web typecheck",
-    "build:web": "pnpm --filter flarebox-web build",
+    "typecheck": "wrangler types && tsc --noEmit && tsc --noEmit -p test && tsc --noEmit -p scripts/deploy-test && pnpm --filter koidrive-web typecheck",
+    "build:web": "pnpm --filter koidrive-web build",
     "test": "pnpm build:web && vitest run"
   },
   "cloudflare": {

@@ -8,7 +8,7 @@
 //! [`FsObserver`] runs the watchers of `core/fs`: inotify on Linux and FSEvents on macOS, which only choose what to
 //! rescan, with a periodic full rescan when the platform watcher cannot cover the tree (design §5.1).
 //!
-//! The scans leave out excluded paths (design §5.10) and read the `.fbignore` files, whose rules each batch passes
+//! The scans leave out excluded paths (design §5.10) and read the `.koiignore` files, whose rules each batch passes
 //! on. A move across the boundary still reaches the engine: a move into an excluded path is reported as a rename, so
 //! the engine can freeze the node at its synced position, and what a move out of one brings into the sync tree is
 //! reported as created, each entry with its identity and every file with its content.
@@ -22,13 +22,13 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use flarebox_chunk::ChunkerConfig;
-use flarebox_engine::ignore::RuleFile;
-use flarebox_fs::{
+use koidrive_chunk::ChunkerConfig;
+use koidrive_engine::ignore::RuleFile;
+use koidrive_fs::{
     Change, Entry, EntryKind, Error as FsError, FileId, Known, NativeWatcher, RescanWatcher,
     RootProblem, Snapshot, Watcher, check_root,
 };
-use flarebox_proto::v1::{ChunkRef, Content};
+use koidrive_proto::v1::{ChunkRef, Content};
 use rustix::fs::{Mode, OFlags};
 
 use crate::ignore::{Matcher, scan_rules};
@@ -66,7 +66,7 @@ pub struct Observation {
     /// reports a `Modified` with the content once a read succeeds, unless a later change to the path replaces it
     /// (design §5.8).
     pub busy: Vec<PathBuf>,
-    /// The folders whose `.fbignore` file the scans of this batch found changed, each with the rules it holds now.
+    /// The folders whose `.koiignore` file the scans of this batch found changed, each with the rules it holds now.
     /// The engine takes them before the changes of the batch. The first batch of an observer follows its scan of the
     /// whole tree and lists every rules file there is, also when nothing else changed.
     pub rules: Vec<RulesChange>,
@@ -76,7 +76,7 @@ pub struct Observation {
     pub all_rules: bool,
 }
 
-/// The rules of the `.fbignore` file in `dir`, a folder relative to the root and empty for the root, or `None` when
+/// The rules of the `.koiignore` file in `dir`, a folder relative to the root and empty for the root, or `None` when
 /// the folder has no rules file any more. A line the file cannot use is among [`RuleFile::invalid_lines`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct RulesChange {
@@ -206,7 +206,7 @@ impl Retry {
 
 impl FsObserver {
     /// Starts watching the folder of space `space_id` on device `dev`. The first observation compares the whole tree
-    /// with `previous`. The scans leave out what `matcher`, the built-in exclusions and the `.fbignore` files of the
+    /// with `previous`. The scans leave out what `matcher`, the built-in exclusions and the `.koiignore` files of the
     /// folder exclude. Once `stopped` holds, the scan walking the tree is left at its next entry and the file being
     /// read at its next chunk, and `observe` returns `None` without the rest, so a caller that stops waits neither
     /// for a walk of the whole tree nor for every file of a scan to be read. The observer's snapshot then counts
@@ -586,7 +586,7 @@ fn read_content(
         return Ok(None);
     }
     let config = ChunkerConfig::V0;
-    let chunks = flarebox_chunk::chunks(io::Read::take(&file, entry.size), config)
+    let chunks = koidrive_chunk::chunks(io::Read::take(&file, entry.size), config)
         .map(|chunk| match stopped() {
             true => Err(io::ErrorKind::Interrupted.into()),
             false => chunk.map(|chunk| chunk.chunk_ref()),
@@ -596,7 +596,7 @@ fn read_content(
     if !same_version(&after, entry) {
         return Ok(None);
     }
-    Ok(Some(flarebox_chunk::content(
+    Ok(Some(koidrive_chunk::content(
         chunks,
         mtime_ns(&after) as i64,
         entry.executable,
@@ -654,7 +654,7 @@ mod tests {
     use std::os::unix::fs::MetadataExt;
     use std::time::Instant;
 
-    use flarebox_fs::{Marker, Poll, write_marker};
+    use koidrive_fs::{Marker, Poll, write_marker};
 
     use super::*;
     use crate::ignore::Unfiltered;
@@ -777,11 +777,11 @@ mod tests {
         assert_eq!(content.chunks.len(), 1);
         assert_eq!(
             content.chunks[0].hash,
-            flarebox_chunk::chunk_hash(b"hello").to_vec()
+            koidrive_chunk::chunk_hash(b"hello").to_vec()
         );
         assert_eq!(created("empty").1.unwrap().chunks.len(), 0);
         assert!(
-            seen.iter().all(|change| !matches!(change, Observed::Created { path, .. } if path.starts_with(".flarebox"))),
+            seen.iter().all(|change| !matches!(change, Observed::Created { path, .. } if path.starts_with(".koidrive"))),
             "{seen:?}"
         );
     }
@@ -830,7 +830,7 @@ mod tests {
         let mut observer = observer(dir.path());
         observe_until(&mut observer, |seen| !seen.is_empty());
 
-        fs::remove_dir_all(dir.path().join(".flarebox")).unwrap();
+        fs::remove_dir_all(dir.path().join(".koidrive")).unwrap();
         fs::remove_file(dir.path().join("a.txt")).unwrap();
         let (_, last) = observe_until(&mut observer, |seen| {
             seen.iter()
@@ -1334,7 +1334,7 @@ mod tests {
         let dir = marked();
         let root = dir.path();
         fs::create_dir(root.join("proj")).unwrap();
-        fs::write(root.join("proj/.fbignore"), b"*.log\n").unwrap();
+        fs::write(root.join("proj/.koiignore"), b"*.log\n").unwrap();
         fs::write(root.join("proj/build.log"), b"log").unwrap();
         let mut observer = observer(root);
         let first = (observer.observe(Duration::from_secs(10)).unwrap())
@@ -1345,7 +1345,7 @@ mod tests {
             snapshot: observer.watcher.snapshot().clone(),
             polls: Vec::new(),
         });
-        fs::remove_file(root.join("proj/.fbignore")).unwrap();
+        fs::remove_file(root.join("proj/.koiignore")).unwrap();
         assert!(observer.observe(Duration::ZERO).unwrap().is_none());
         let after = (observer.observe(Duration::from_secs(10)).unwrap())
             .expect("the batch of the rescanning watcher's first scan");
@@ -1353,7 +1353,7 @@ mod tests {
         assert_eq!(after.rules, []);
         assert_eq!(
             paths(&after.changes),
-            [Path::new("proj/.fbignore"), Path::new("proj/build.log")]
+            [Path::new("proj/.koiignore"), Path::new("proj/build.log")]
         );
         assert!(
             !observer
@@ -1368,8 +1368,8 @@ mod tests {
         let dir = marked();
         let root = dir.path();
         fs::create_dir(root.join("sub")).unwrap();
-        fs::write(root.join(".fbignore"), b"*.log\nbroken[\n").unwrap();
-        fs::write(root.join("sub/.fbignore"), b"/secret\n").unwrap();
+        fs::write(root.join(".koiignore"), b"*.log\nbroken[\n").unwrap();
+        fs::write(root.join("sub/.koiignore"), b"/secret\n").unwrap();
         for name in [
             "a.log",
             "b.txt",
@@ -1384,7 +1384,7 @@ mod tests {
             .observe(Duration::from_secs(10))
             .unwrap()
             .expect("the batch of the first scan");
-        let expected = [".fbignore", "b.txt", "sub", "sub/.fbignore", "sub/d.txt"];
+        let expected = [".koiignore", "b.txt", "sub", "sub/.koiignore", "sub/d.txt"];
         assert_eq!(paths(&observation.changes), expected.map(Path::new));
         let dirs: Vec<&Path> = (observation.rules.iter())
             .map(|change| change.dir.as_path())
@@ -1429,7 +1429,7 @@ mod tests {
             ["build", "build/out.bin", "notes.txt"].map(Path::new)
         );
 
-        fs::write(root.join(".fbignore"), b"/build/\n").unwrap();
+        fs::write(root.join(".koiignore"), b"/build/\n").unwrap();
         let mut rules = Vec::new();
         let mut seen = Vec::new();
         while rules.is_empty() {
@@ -1447,7 +1447,7 @@ mod tests {
         );
         assert!(!observer.snapshot().entries.contains_key(Path::new("build")));
 
-        fs::remove_file(root.join(".fbignore")).unwrap();
+        fs::remove_file(root.join(".koiignore")).unwrap();
         let (seen, observation) = observe_until(&mut observer, |seen| {
             paths(seen).contains(&Path::new("build/out.bin"))
         });
@@ -1463,7 +1463,7 @@ mod tests {
     fn an_observer_started_again_finds_a_file_that_was_moved_into_an_ignored_folder() {
         let dir = marked();
         let root = dir.path();
-        fs::write(root.join(".fbignore"), b"/build/\n").unwrap();
+        fs::write(root.join(".koiignore"), b"/build/\n").unwrap();
         fs::create_dir(root.join("build")).unwrap();
         fs::write(root.join("notes.txt"), b"notes").unwrap();
         let mut stopped = observer(root);

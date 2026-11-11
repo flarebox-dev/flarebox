@@ -21,7 +21,7 @@ PITR behaves as [the SQLite storage API documentation](https://developers.cloudf
 
 ## 1. API (§15.1)
 
-`POST /v1/spaces/{space_id}/rewind` takes a `RewindRequest` and returns a `RewindResult`. The body is protobuf, like the other endpoints of §15.1. The CLI command `flarebox space rewind` calls this endpoint and nothing else, so this request and response are the CLI's stable interface.
+`POST /v1/spaces/{space_id}/rewind` takes a `RewindRequest` and returns a `RewindResult`. The body is protobuf, like the other endpoints of §15.1. The CLI command `koi space rewind` calls this endpoint and nothing else, so this request and response are the CLI's stable interface.
 
 `rewind_id` is a UUIDv7 that the caller chooses once per intended rewind and reuses on every retry. The Account DO looks it up before checking anything else:
 

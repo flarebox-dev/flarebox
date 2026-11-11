@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use flarebox_net::{Api, ApiError, CredentialStore, Credentials, Staged, Stored};
+use koidrive_net::{Api, ApiError, CredentialStore, Credentials, Staged, Stored};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -63,7 +63,7 @@ pub enum CredentialError {
     #[error("this profile already has a credential at {path}")]
     Exists { path: PathBuf },
     #[error(
-        "cannot keep the credential file {path} out of Time Machine backups ({source}); Flarebox does not use a credential that backups would copy. Restore write access to the file (it may be locked), keep the profile on storage that supports extended attributes, then restart Flarebox"
+        "cannot keep the credential file {path} out of Time Machine backups ({source}); Koidrive does not use a credential that backups would copy. Restore write access to the file (it may be locked), keep the profile on storage that supports extended attributes, then restart Koidrive"
     )]
     NotExcludedFromBackups {
         path: PathBuf,

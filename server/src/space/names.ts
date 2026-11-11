@@ -32,9 +32,9 @@ export function nameKey(name: string): string {
   return casefold(name.normalize("NFD")).normalize("NFD");
 }
 
-/** Spec RFC 0001 section 2: clients keep their local state in .flarebox/ at the root of the synced folder. */
+/** Spec RFC 0001 section 2: clients keep their local state in .koidrive/ at the root of the synced folder. */
 export function isReservedAtRoot(name: string): boolean {
-  return nameKey(name) === ".flarebox";
+  return nameKey(name) === ".koidrive";
 }
 
 /** Returns the NFC form of a valid node name, or undefined when the name is not allowed (spec v0 section 6.1). */

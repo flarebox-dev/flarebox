@@ -3,20 +3,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use flarebox_engine::commit::{Commits, Halt, InFlight, Reconnect};
-use flarebox_engine::effects::{Base, Dir, Displaced, Effect, EffectRecord, Location};
-use flarebox_engine::guard::{Counted, GuardState};
-use flarebox_engine::ids::uuid_v7;
-use flarebox_engine::question::{Answer, Held, Question, QuestionKind, RecoveryGroup, Revisions};
-use flarebox_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
-use flarebox_engine::state::{CommitsState, EffectsState, TreesState};
-use flarebox_engine::tree::{FileIdentity, Kind, Shape as EngineShape};
-use flarebox_fs::FileId;
-use flarebox_proto::v1::{
+use koidrive_engine::commit::{Commits, Halt, InFlight, Reconnect};
+use koidrive_engine::effects::{Base, Dir, Displaced, Effect, EffectRecord, Location};
+use koidrive_engine::guard::{Counted, GuardState};
+use koidrive_engine::ids::uuid_v7;
+use koidrive_engine::question::{Answer, Held, Question, QuestionKind, RecoveryGroup, Revisions};
+use koidrive_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
+use koidrive_engine::state::{CommitsState, EffectsState, TreesState};
+use koidrive_engine::tree::{FileIdentity, Kind, Shape as EngineShape};
+use koidrive_fs::FileId;
+use koidrive_proto::v1::{
     ChunkRef, Commit, CommitResult, Content, CreateFile, Delete, NodeKind, NodeState, NodeStatus,
     Op, OpResult, VersionInfo, Welcome, op, op_result,
 };
-use flarebox_store::{
+use koidrive_store::{
     CachedChunk, Cursor, Durability, EngineState, Error, GivenAnswer, Link, LocalNode,
     SCHEMA_VERSION, Shape, Store, StoredQuestion, SyncedNode,
 };
@@ -1279,7 +1279,7 @@ fn a_read_only_open_reads_the_link_and_writes_nothing() {
     let link = Link {
         space_id: "0190f0a0-0000-7000-8000-000000000001".into(),
         space_name: "Projects".into(),
-        root: std::path::PathBuf::from("/home/ada/Flarebox"),
+        root: std::path::PathBuf::from("/home/ada/Koidrive"),
         root_dev: 66306,
         server_url: "https://files.example.com/".into(),
         device_id: "d1".into(),
@@ -1337,7 +1337,7 @@ fn link_and_questions_persist() {
     let link = Link {
         space_id: "0190f0a0-0000-7000-8000-000000000001".into(),
         space_name: "Projects".into(),
-        root: std::path::PathBuf::from("/home/ada/Flarebox"),
+        root: std::path::PathBuf::from("/home/ada/Koidrive"),
         root_dev: 66306,
         server_url: "https://files.example.com/".into(),
         device_id: "d1".into(),

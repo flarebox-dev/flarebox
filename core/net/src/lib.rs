@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Network client for a Flarebox server, the client side of spec v0 and RFC 0001 to 0003. It does I/O only and has
-//! no dependency on the sync engine: requests and events are `flarebox-proto` types, and a driver feeds them to the
+//! Network client for a Koidrive server, the client side of spec v0 and RFC 0001 to 0003. It does I/O only and has
+//! no dependency on the sync engine: requests and events are `koidrive-proto` types, and a driver feeds them to the
 //! engine and stores what must survive a restart (credentials, the stream position, the commit slot).
 //!
 //! - [`Api`] calls the HTTP endpoints of spec v0 section 15.1, and [`Auth`] keeps a device's access token fresh.

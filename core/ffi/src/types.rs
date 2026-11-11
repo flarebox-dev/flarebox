@@ -432,7 +432,7 @@ pub enum ProblemKind {
     FolderUnreadable { reason: String },
     /// A different volume is mounted at the linked folder's path.
     FolderOnOtherVolume,
-    /// The folder's marker `.flarebox/space.json` is missing.
+    /// The folder's marker `.koidrive/space.json` is missing.
     MarkerMissing,
     /// The folder's marker cannot be read.
     MarkerUnreadable { reason: String },
@@ -460,7 +460,7 @@ pub enum ProblemKind {
     NameTaken,
     /// The server rejected a change to this node, with the reason it gave (design §2.7).
     ChangeRejected { reason: String },
-    /// A line in a `.fbignore` file cannot be parsed and is ignored (design §5.10).
+    /// A line in a `.koiignore` file cannot be parsed and is ignored (design §5.10).
     IgnoreRuleInvalid { line: u32 },
     /// The server no longer accepts this device's credentials. Sign in again.
     SignInRequired,
@@ -562,11 +562,11 @@ pub enum SessionError {
     NoticeNotFound,
     #[error("the change could not be saved on this device, so it was not made: {reason}")]
     NotSaved { reason: String },
-    #[error("another Flarebox process is using this device's sync state")]
+    #[error("another Koidrive process is using this device's sync state")]
     ProfileInUse,
     #[error("the path is not a folder")]
     NotAFolder,
-    #[error("another Flarebox process is syncing the folder")]
+    #[error("another Koidrive process is syncing the folder")]
     FolderInUse,
     #[error("the folder is linked by device {device_id}; unlink it there first")]
     FolderOfOtherDevice { device_id: String },

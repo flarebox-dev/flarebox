@@ -4,16 +4,16 @@
 //! valid state restores to the same value, and a state that breaks one invariant is refused with
 //! the error that names it.
 
-use flarebox_engine::classify::Trees;
-use flarebox_engine::commit::{Commits, Halt, InFlight, MAX_OPS};
-use flarebox_engine::effects::{Effect, EffectRecord, Effects, Location};
-use flarebox_engine::guard::{Counted, GuardState};
-use flarebox_engine::ids::uuid_v7;
-use flarebox_engine::question::{Answer, Held, Question, QuestionKind, Revisions};
-use flarebox_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
-use flarebox_engine::state::{CommitsState, EffectsState, StateError, TreesState};
-use flarebox_engine::tree::{FileIdentity, Kind, LocalNode, RemoteNode, Shape, TreeError};
-use flarebox_proto::v1::{Commit, CommitResult, Delete, Move, Op, OpResult, op};
+use koidrive_engine::classify::Trees;
+use koidrive_engine::commit::{Commits, Halt, InFlight, MAX_OPS};
+use koidrive_engine::effects::{Effect, EffectRecord, Effects, Location};
+use koidrive_engine::guard::{Counted, GuardState};
+use koidrive_engine::ids::uuid_v7;
+use koidrive_engine::question::{Answer, Held, Question, QuestionKind, Revisions};
+use koidrive_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
+use koidrive_engine::state::{CommitsState, EffectsState, StateError, TreesState};
+use koidrive_engine::tree::{FileIdentity, Kind, LocalNode, RemoteNode, Shape, TreeError};
+use koidrive_proto::v1::{Commit, CommitResult, Delete, Move, Op, OpResult, op};
 
 const ROOT: &str = "root";
 

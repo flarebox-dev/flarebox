@@ -1,17 +1,17 @@
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# Job-started hook for Flarebox's self-hosted Mac runners (ACTIONS_RUNNER_HOOK_JOB_STARTED).
+# Job-started hook for Koidrive's self-hosted Mac runners (ACTIONS_RUNNER_HOOK_JOB_STARTED).
 # The runner runs it with `bash -e` before every job, and a nonzero exit fails the job before
 # any step runs. It enforces what ci.yml routes to these runners: a push to refs/heads/main, a
 # merge queue run for main (refs/heads/gh-readonly-queue/main/...), or a pull request whose head
-# branch is in flarebox-dev/flarebox. It refuses every other event, pull requests from forks
+# branch is in koidrive/koidrive. It refuses every other event, pull requests from forks
 # included, whatever runs-on the workflow asked for. It fails closed: a job whose event it cannot
 # read does not run. It uses only
 # the macOS base system (/bin/bash and /usr/bin/jq). CONTRIBUTING.md says how to install it.
 set -u
 
-repository=flarebox-dev/flarebox
+repository=koidrive/koidrive
 
 refuse() {
   echo "::error::Self-hosted runner ${RUNNER_NAME:-unknown} refuses this job: $1"

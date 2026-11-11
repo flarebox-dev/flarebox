@@ -26,7 +26,7 @@ Seqs are 20-digit zero-padded decimals, as in §11. A page number `n` is a decim
 
 | Field | Value |
 |---|---|
-| `format` | `"flarebox.space"` |
+| `format` | `"koidrive.space"` |
 | `format_version` | `1` |
 | `space_id` | the space's id |
 | `name` | the space's name when the descriptor was written |
@@ -45,8 +45,8 @@ Both kinds of file are a gzip stream (RFC 1952) of size-delimited protobuf messa
 
 | File | `format` | Then |
 |---|---|---|
-| `.fblog` | `"flarebox.log"` | the `CommitRecord`s from `first_seq` through `last_seq`, in seq order with no gap |
-| `.fbsnap` | `"flarebox.snapshot"` | `NodeSnapshot` records |
+| `.fblog` | `"koidrive.log"` | the `CommitRecord`s from `first_seq` through `last_seq`, in seq order with no gap |
+| `.fbsnap` | `"koidrive.snapshot"` | `NodeSnapshot` records |
 
 The header's `format_version` is 1 and its `space_id` and `history_id` name the file's space and history. A reader refuses a file whose header has another `format`, a `format_version` other than 1, or another space or history. The same holds for the `format` and `format_version` of `space.json` and `manifest.json`.
 
@@ -67,7 +67,7 @@ Every chunk list in a snapshot is complete: `content.chunks` lists all `chunk_co
 
 | Field | Value |
 |---|---|
-| `format` | `"flarebox.snapshot"` |
+| `format` | `"koidrive.snapshot"` |
 | `format_version` | `1` |
 | `space_id`, `history_id` | the snapshot's space and history |
 | `start_seq` | `head_seq` when the first page was read, a JSON number |

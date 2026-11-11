@@ -12,12 +12,12 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use flarebox_fs::{
+use koidrive_fs::{
     Action, Base, Contents, Dir, Displaced, Effect, Entry, EntryKind, FileId, Location, Marker,
     Outcome, PRIVATE_DIR, QUARANTINE_DIR, STAGING_DIR, Snapshot, Space, Step, TRASH_DIR,
     read_marker,
 };
-use flarebox_ignore::PLATFORM_FILES;
+use koidrive_ignore::PLATFORM_FILES;
 
 pub const SPACE: &str = "space-1";
 pub const COUNTER: u64 = 5;
@@ -127,7 +127,7 @@ pub fn rewrite_keeping_mtime(path: &Path, bytes: &[u8]) {
     file.set_modified(before.modified().unwrap()).unwrap();
 }
 
-/// The names in `.flarebox/<folder>`, or none when it does not exist.
+/// The names in `.koidrive/<folder>`, or none when it does not exist.
 pub fn private_names(root: &Path, folder: &str) -> Vec<String> {
     let Ok(listing) = fs::read_dir(root.join(PRIVATE_DIR).join(folder)) else {
         return Vec::new();

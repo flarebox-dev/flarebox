@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { create } from "@bufbuild/protobuf";
-import { type SpaceUsage, SpaceUsageSchema } from "../gen/flarebox/v1/auth_pb";
+import { type SpaceUsage, SpaceUsageSchema } from "../gen/koidrive/v1/auth_pb";
 import { toHex } from "../ids";
 import { NodeStatusValue } from "./schema";
 import { type VersionRow, versionChunks } from "./store";

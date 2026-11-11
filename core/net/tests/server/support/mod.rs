@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Shared setup for the tests against a local Worker. `core/net/scripts/integration-test.sh` starts `wrangler dev`
-//! from `server/` and sets `FLAREBOX_TEST_SERVER` (its URL) and `FLAREBOX_TEST_SERVER_LOG` (its output, where the
+//! from `server/` and sets `KOIDRIVE_TEST_SERVER` (its URL) and `KOIDRIVE_TEST_SERVER_LOG` (its output, where the
 //! Worker prints the claim code).
 
 #![allow(dead_code)]
@@ -11,8 +11,8 @@ pub mod proxy;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use flarebox_net::{Api, Auth, Credentials, Event, Events, Session, SessionConfig};
-use flarebox_proto::v1::{
+use koidrive_net::{Api, Auth, Credentials, Event, Events, Session, SessionConfig};
+use koidrive_proto::v1::{
     ClaimRequest, Commit, CreateSpaceRequest, DeviceCredentials, Op, PairCompleteRequest, SpaceInfo,
 };
 use tokio::sync::OnceCell;
@@ -21,9 +21,9 @@ use url::Url;
 pub const WAIT: Duration = Duration::from_secs(15);
 
 pub fn server_url() -> Url {
-    let url = std::env::var("FLAREBOX_TEST_SERVER")
-        .expect("FLAREBOX_TEST_SERVER is not set; run core/net/scripts/integration-test.sh, which starts the Worker");
-    url.parse().expect("FLAREBOX_TEST_SERVER is a URL")
+    let url = std::env::var("KOIDRIVE_TEST_SERVER")
+        .expect("KOIDRIVE_TEST_SERVER is not set; run core/net/scripts/integration-test.sh, which starts the Worker");
+    url.parse().expect("KOIDRIVE_TEST_SERVER is a URL")
 }
 
 pub fn api() -> Api {
@@ -40,7 +40,7 @@ pub async fn owner() -> Credentials {
 
 async fn claim() -> DeviceCredentials {
     let log =
-        std::env::var("FLAREBOX_TEST_SERVER_LOG").expect("FLAREBOX_TEST_SERVER_LOG is not set");
+        std::env::var("KOIDRIVE_TEST_SERVER_LOG").expect("KOIDRIVE_TEST_SERVER_LOG is not set");
     let setup = reqwest::get(server_url().join("setup").unwrap())
         .await
         .unwrap();
@@ -119,11 +119,11 @@ pub async fn new_space() -> SpaceInfo {
 pub fn config(space: &SpaceInfo) -> SessionConfig {
     let mut config = SessionConfig::new(
         &space.space_id,
-        "flarebox-net tests",
+        "koidrive-net tests",
         env!("CARGO_PKG_VERSION"),
         1,
     );
-    config.backoff = flarebox_net::Backoff {
+    config.backoff = koidrive_net::Backoff {
         initial: Duration::from_millis(50),
         max: Duration::from_millis(500),
     };
@@ -148,7 +148,7 @@ pub async fn until<T>(events: &mut Events, mut pick: impl FnMut(&Event) -> Optio
     }
 }
 
-pub async fn connected(events: &mut Events) -> flarebox_proto::v1::Welcome {
+pub async fn connected(events: &mut Events) -> koidrive_proto::v1::Welcome {
     until(events, |event| match event {
         Event::Connected(welcome) => Some(welcome.clone()),
         _ => None,

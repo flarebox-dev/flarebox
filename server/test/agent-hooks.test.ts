@@ -6,9 +6,9 @@
 import { create, fromBinary } from "@bufbuild/protobuf";
 import { runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { type CommitResult, CommitSchema, OpResult_Code, OpSchema } from "../src/gen/flarebox/v1/commit_pb";
-import { ContentSchema } from "../src/gen/flarebox/v1/model_pb";
-import { Error_Code } from "../src/gen/flarebox/v1/rpc_pb";
+import { type CommitResult, CommitSchema, OpResult_Code, OpSchema } from "../src/gen/koidrive/v1/commit_pb";
+import { ContentSchema } from "../src/gen/koidrive/v1/model_pb";
+import { Error_Code } from "../src/gen/koidrive/v1/rpc_pb";
 import { sha256 } from "../src/crypto";
 import { errorReply } from "../src/http";
 import { toHex, uuidv7 } from "../src/ids";
@@ -305,6 +305,6 @@ describe("RFC 0006 section 10: delete count", () => {
   });
 
   it("maps CONFIRMATION_REQUIRED to 409 over HTTP", () => {
-    expect(errorReply(new Request("https://flarebox.test/v1/spaces"), Error_Code.CONFIRMATION_REQUIRED, "confirm").status).toBe(409);
+    expect(errorReply(new Request("https://koidrive.test/v1/spaces"), Error_Code.CONFIRMATION_REQUIRED, "confirm").status).toBe(409);
   });
 });

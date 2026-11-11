@@ -5,12 +5,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use flarebox_engine::classify::Trees;
-use flarebox_engine::commit::Commits;
-use flarebox_engine::effects::Effects;
-use flarebox_engine::ids::IdGen;
-use flarebox_engine::tree::{Kind, LocalNode, NodeId, RemoteNode, Shape};
-use flarebox_proto::v1::{ChangeRecord, CommitRecord, CommitResult, Error, change_record};
+use koidrive_engine::classify::Trees;
+use koidrive_engine::commit::Commits;
+use koidrive_engine::effects::Effects;
+use koidrive_engine::ids::IdGen;
+use koidrive_engine::tree::{Kind, LocalNode, NodeId, RemoteNode, Shape};
+use koidrive_proto::v1::{ChangeRecord, CommitRecord, CommitResult, Error, change_record};
 
 use super::disk::{Disk, Place, identity};
 use super::{Failure, NOW};

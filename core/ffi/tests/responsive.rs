@@ -11,11 +11,11 @@ use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use flarebox_driver::{Credential, Paths};
-use flarebox_ffi::{
+use koidrive_driver::{Credential, Paths};
+use koidrive_ffi::{
     FolderState, ProblemKind, SessionEvent, SessionListener, SyncSession, SyncStatus,
 };
-use flarebox_store::{Link, Store};
+use koidrive_store::{Link, Store};
 
 /// Longer than any main-thread call may take, and shorter than the server waits for the test.
 const PROMPT: Duration = Duration::from_secs(1);

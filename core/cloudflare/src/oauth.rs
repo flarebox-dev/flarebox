@@ -19,11 +19,11 @@ use url::Url;
 
 use crate::secret::Secret;
 
-/// The private development client, until the public client on flarebox.dev exists (cli-setup.md section 11,
+/// The private development client, until the public client on koidrive.com exists (cli-setup.md section 11,
 /// decision 9). Change it here only.
 pub const CLIENT_ID: &str = "ba83f6f3a70d657a488265284052a549";
 
-/// The scopes `flarebox setup` needs (cli-setup.md section 3).
+/// The scopes `koi setup` needs (cli-setup.md section 3).
 pub const SCOPES: [&str; 4] = [
     "account-settings.read",
     "workers-scripts.admin",
@@ -39,15 +39,15 @@ const MAX_REQUEST_HEAD: usize = 64 * 1024;
 /// How long the loopback listener waits for one connection's request head, or for its answer to be written.
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
-const CALLBACK_PAGE: &str = "<!doctype html>\n<meta charset=\"utf-8\">\n<title>Flarebox</title>\n\
+const CALLBACK_PAGE: &str = "<!doctype html>\n<meta charset=\"utf-8\">\n<title>Koidrive</title>\n\
 <p>You can close this tab and return to the terminal.</p>\n\
-<p>Flarebox is not affiliated with Cloudflare, Inc.</p>\n";
+<p>Koidrive is not affiliated with Cloudflare, Inc.</p>\n";
 
 /// The HTTP client for the OAuth endpoints and the Cloudflare API: HTTPS only, no redirects, a 15 s connect timeout
 /// and a 60 s limit per request. It fails only when the TLS backend cannot load the platform's certificate verifier.
 pub fn http_client() -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
-        .user_agent(concat!("flarebox-cloudflare/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("koidrive-cloudflare/", env!("CARGO_PKG_VERSION")))
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(15))
@@ -124,7 +124,7 @@ pub enum OauthError {
     #[error("the grant can no longer be refreshed after a failed refresh; log in again")]
     Spent,
     #[error(
-        "Cloudflare did not revoke the {token} (HTTP {status}); revoke Flarebox under Manage OAuth authorizations in the dashboard"
+        "Cloudflare did not revoke the {token} (HTTP {status}); revoke Koidrive under Manage OAuth authorizations in the dashboard"
     )]
     RevokeRefused { token: &'static str, status: u16 },
 }
@@ -161,7 +161,7 @@ impl Login {
         }
     }
 
-    /// The page the user opens to sign in and authorize Flarebox.
+    /// The page the user opens to sign in and authorize Koidrive.
     pub fn authorize_url(&self) -> Url {
         let mut url = self.endpoints.authorize.clone();
         url.query_pairs_mut()

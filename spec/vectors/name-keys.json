@@ -123,16 +123,16 @@
       "note": "canonical reordering of combining marks"
     },
     {
-      "name": ".FlareBox",
-      "nfc": ".FlareBox",
-      "name_key": ".flarebox",
+      "name": ".KoiDrive",
+      "nfc": ".KoiDrive",
+      "name_key": ".koidrive",
       "note": "reserved at the root"
     },
     {
-      "name": ".\ufb02arebox",
-      "nfc": ".\ufb02arebox",
-      "name_key": ".flarebox",
-      "note": "reserved at the root through full folding"
+      "name": ".\u212aoidrive",
+      "nfc": ".Koidrive",
+      "name_key": ".koidrive",
+      "note": "reserved at the root through the Kelvin sign"
     }
   ]
 }

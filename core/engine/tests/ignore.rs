@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Excluded nodes (docs/design/sync-engine.md section 5.10), on hand-built trees: the rules of
-//! `.fbignore` files, the built-in exclusions and the device-local list decide which nodes this
+//! `.koiignore` files, the built-in exclusions and the device-local list decide which nodes this
 //! device leaves alone, and becoming excluded never plans a delete or a removal.
 
 use std::collections::BTreeSet;
 
-use flarebox_engine::classify::Trees;
-use flarebox_engine::commit::Commits;
-use flarebox_engine::effects::{Base, Effect, Effects, Location};
-use flarebox_engine::ids::IdGen;
-use flarebox_engine::ignore::{LocalRules, RuleFile};
-use flarebox_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape};
-use flarebox_proto::v1::{self as proto, op};
+use koidrive_engine::classify::Trees;
+use koidrive_engine::commit::Commits;
+use koidrive_engine::effects::{Base, Effect, Effects, Location};
+use koidrive_engine::ids::IdGen;
+use koidrive_engine::ignore::{LocalRules, RuleFile};
+use koidrive_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape};
+use koidrive_proto::v1::{self as proto, op};
 
 const ROOT: &str = "root";
 const NOW: u64 = 1_794_268_740_000;
@@ -162,14 +162,14 @@ fn a_rule_excludes_what_it_matches_in_any_tree_and_everything_below_a_folder() {
         synced("old", file("logs", "old.txt", 1)),
         incoming("new", file("logs", "new.txt", 2)),
         synced("kept", file(ROOT, "kept.txt", 3)),
-        synced("rules", file(ROOT, ".fbignore", 4)),
+        synced("rules", file(ROOT, ".koiignore", 4)),
     ]);
     assert!(
         ["logs", "old", "new", "kept", "rules"]
             .iter()
             .all(|id| !trees.excluded(id))
     );
-    trees.set_rules(&AT_ROOT, rules("logs/\n.fbignore\n"));
+    trees.set_rules(&AT_ROOT, rules("logs/\n.koiignore\n"));
     assert!(["logs", "old", "new"].iter().all(|id| trees.excluded(id)));
     assert!(!trees.excluded("kept"));
     assert!(!trees.excluded("rules"), "a rules file cannot hide itself");
@@ -264,8 +264,8 @@ fn the_platform_files_and_the_state_folder_are_excluded_without_any_rule() {
         incoming("p3", file("docs", "desktop.ini", 3)),
         incoming("p4", file(ROOT, "Icon\r", 4)),
         incoming("p5", file("docs", ".ds_store", 5)),
-        incoming("state", dir(ROOT, ".flarebox")),
-        incoming("inner", dir("docs", ".flarebox")),
+        incoming("state", dir(ROOT, ".koidrive")),
+        incoming("inner", dir("docs", ".koidrive")),
         ("mine", Some(file("docs", ".DS_Store", 6)), None, None),
     ]);
     let done = effects(&mut trees);
@@ -279,7 +279,7 @@ fn the_platform_files_and_the_state_folder_are_excluded_without_any_rule() {
         [],
         "a platform file on disk is not uploaded"
     );
-    trees.set_rules(&AT_ROOT, rules("!.DS_Store\n!Thumbs.db\n!.flarebox/\n"));
+    trees.set_rules(&AT_ROOT, rules("!.DS_Store\n!Thumbs.db\n!.koidrive/\n"));
     assert_eq!(
         effects(&mut trees),
         [],
@@ -779,7 +779,7 @@ fn a_remote_rules_file_is_written_before_anything_else_below_its_folder() {
         incoming("b-secret", file("d", "secret.txt", 2)),
         incoming("c-sub", dir("d", "sub")),
         incoming("d-deep", file("c-sub", "deep.txt", 3)),
-        incoming("z-rules", file("d", ".fbignore", 4)),
+        incoming("z-rules", file("d", ".koiignore", 4)),
     ]);
     let (mut effects, mut ids, mut order) = (Effects::default(), IdGen::new(2), Vec::new());
     loop {

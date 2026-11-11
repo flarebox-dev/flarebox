@@ -7,9 +7,9 @@
 # devices runs the tests of several devices up to three times.
 # shellcheck shell=bash disable=SC2034
 
-unit=(cargo test -q --locked -p flarebox-engine --test commit)
-property=(cargo test -q --locked -p flarebox-sim --test engine_sync)
-devices=(cargo test -q --locked -p flarebox-sim --test devices)
+unit=(cargo test -q --locked -p koidrive-engine --test commit)
+property=(cargo test -q --locked -p koidrive-sim --test engine_sync)
+devices=(cargo test -q --locked -p koidrive-sim --test devices)
 
 C=core/engine/src/commit.rs
 E=core/engine/src/effects.rs

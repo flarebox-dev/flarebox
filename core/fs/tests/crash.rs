@@ -19,9 +19,9 @@ use common::{
     Bytes, RETURNS, SCENARIOS, Scenario, assert_settled, bind, decode, encode, entries, marker,
     now, prepare, scenario,
 };
-use flarebox_fs::{Effect, Outcome, Step};
+use koidrive_fs::{Effect, Outcome, Step};
 
-const CHILD: &str = "FLAREBOX_FS_CRASH_CHILD";
+const CHILD: &str = "KOIDRIVE_FS_CRASH_CHILD";
 const RECOVERY_STEPS: [Step; 5] = [
     Step::Marked,
     Step::Compared,

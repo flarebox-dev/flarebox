@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The app's session against the real Worker in `server/`, run by `core/ffi/scripts/integration-test.sh`,
-//! which starts `wrangler dev` and sets `FLAREBOX_TEST_SERVER` (its URL) and `FLAREBOX_TEST_SERVER_LOG`
+//! which starts `wrangler dev` and sets `KOIDRIVE_TEST_SERVER` (its URL) and `KOIDRIVE_TEST_SERVER_LOG`
 //! (its output, where the Worker prints the claim code). Each device is a [`SyncSession`] on a profile
 //! of its own, driven only through the calls the app makes.
 
@@ -11,26 +11,26 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use flarebox_driver as driver;
-use flarebox_ffi::{
+use koidrive_driver as driver;
+use koidrive_ffi::{
     Answer, FolderState, LinkedFolder, Problem, ProblemKind, Question, QuestionKind, RecoveryGroup,
     SessionError, SessionEvent, SessionListener, SessionState, SyncSession, SyncStatus,
 };
-use flarebox_net::Auth;
-use flarebox_store::{Store, StoredQuestion};
+use koidrive_net::Auth;
+use koidrive_store::{Store, StoredQuestion};
 
 const WAIT: Duration = Duration::from_secs(30);
 
 fn server_url() -> String {
-    std::env::var("FLAREBOX_TEST_SERVER").expect(
-        "FLAREBOX_TEST_SERVER is not set; run core/ffi/scripts/integration-test.sh, which starts the Worker",
+    std::env::var("KOIDRIVE_TEST_SERVER").expect(
+        "KOIDRIVE_TEST_SERVER is not set; run core/ffi/scripts/integration-test.sh, which starts the Worker",
     )
 }
 
 /// Issues a claim code through `GET /setup` and reads it from the Worker's log.
 fn claim_code() -> String {
     let log =
-        std::env::var("FLAREBOX_TEST_SERVER_LOG").expect("FLAREBOX_TEST_SERVER_LOG is not set");
+        std::env::var("KOIDRIVE_TEST_SERVER_LOG").expect("KOIDRIVE_TEST_SERVER_LOG is not set");
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let setup = runtime
         .block_on(reqwest::get(format!("{}/setup", server_url())))
@@ -429,7 +429,7 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
     );
 
     mac.session().stop();
-    fs::remove_file(folder.join(".flarebox/space.json")).unwrap();
+    fs::remove_file(folder.join(".koidrive/space.json")).unwrap();
     mac.session().start();
     let halted = mac.until("the missing marker halting the folder", |m| {
         m.folders.first().map(|folder| folder.state) == Some(FolderState::Halted)

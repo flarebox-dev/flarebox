@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The Koidrive sync daemon as a systemd user service. Set up and link first (koi setup, koi link), then:
+#
+#   install -Dm644 koidrive.service ~/.config/systemd/user/koidrive.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now koidrive
+#
+# Change ExecStart if the koi binary is not in ~/.local/bin. Logs: journalctl --user -u koidrive
+# To keep syncing while you are logged out: loginctl enable-linger "$USER"
+
+[Unit]
+Description=Koidrive sync daemon
+Documentation=https://github.com/koidrive/koidrive
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/koi daemon
+Restart=on-failure
+RestartSec=10s
+Environment=KOIDRIVE_LOG=info
+
+[Install]
+WantedBy=default.target

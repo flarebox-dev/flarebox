@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "flarebox",
+  "name": "koidrive",
   "main": "src/worker.ts",
   "compatibility_date": "2026-11-01",
   "observability": { "enabled": true, "redact_query_string": true },
@@ -12,9 +12,9 @@
     ],
     "code_update_strategy": { "mode": "deferred", "max_delay": 300 }
   },
-  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "flarebox" }],
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "koidrive" }],
   "assets": { "directory": "./web/dist", "binding": "ASSETS" },
-  "build": { "command": "pnpm --filter flarebox-web build" },
+  "build": { "command": "pnpm --filter koidrive-web build" },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["AccountDO", "SpaceDO"] }
   ]

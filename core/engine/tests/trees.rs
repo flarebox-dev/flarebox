@@ -2,14 +2,14 @@
 
 //! The three trees and the classification table of docs/design/sync-engine.md sections 2.2 and 2.3.
 
-use flarebox_engine::classify::{Class, SETTLE_GROUP_LIMIT, Trees, classify};
-use flarebox_engine::ignore::RuleFile;
-use flarebox_engine::names::{name_key, nfc};
-use flarebox_engine::tree::{
+use koidrive_engine::classify::{Class, SETTLE_GROUP_LIMIT, Trees, classify};
+use koidrive_engine::ignore::RuleFile;
+use koidrive_engine::names::{name_key, nfc};
+use koidrive_engine::tree::{
     Content, FileIdentity, Kind, LocalNode, Names, RemoteNode, Shape, StateError, Tree, TreeError,
     same_content,
 };
-use flarebox_proto::v1::{NodeKind, NodeState, NodeStatus, VersionInfo};
+use koidrive_proto::v1::{NodeKind, NodeState, NodeStatus, VersionInfo};
 use proptest::prelude::*;
 
 const ROOT: &str = "root";

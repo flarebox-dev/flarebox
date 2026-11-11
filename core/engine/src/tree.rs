@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flarebox_proto::v1::{self as proto, NodeKind, NodeStatus};
+use koidrive_proto::v1::{self as proto, NodeKind, NodeStatus};
 
 use crate::names::{name_key, nfc};
 

@@ -3,15 +3,15 @@
 //! Matching a first link's local entries against the server's tree (docs/design/sync-engine.md
 //! section 6.4).
 
-use flarebox_engine::classify::Trees;
-use flarebox_engine::commit::{Commits, Reconnect};
-use flarebox_engine::effects::{Effect, Effects};
-use flarebox_engine::first_link::adopt;
-use flarebox_engine::ids::IdGen;
-use flarebox_engine::ignore::RuleFile;
-use flarebox_engine::question::{Answer, Question, QuestionKind, RecoveryGroup};
-use flarebox_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape};
-use flarebox_proto::v1::{CommitResult, OpResult, Welcome, op, op_result};
+use koidrive_engine::classify::Trees;
+use koidrive_engine::commit::{Commits, Reconnect};
+use koidrive_engine::effects::{Effect, Effects};
+use koidrive_engine::first_link::adopt;
+use koidrive_engine::ids::IdGen;
+use koidrive_engine::ignore::RuleFile;
+use koidrive_engine::question::{Answer, Question, QuestionKind, RecoveryGroup};
+use koidrive_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape};
+use koidrive_proto::v1::{CommitResult, OpResult, Welcome, op, op_result};
 
 const ROOT: &str = "root";
 const NOW: u64 = 1_794_268_740_000;

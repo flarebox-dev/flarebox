@@ -22,7 +22,7 @@ The server refuses a request with `INVALID_ARGUMENT` (HTTP 400) when one of thes
 
 The server measures each field as the request carries it, before it trims the field or replaces an empty one. It checks the fields before anything else, so a refused request changes nothing. A claim code or a pairing code stays valid, and no failure is counted against the client.
 
-Every space name, device name, user name and platform the server stores is therefore at most 255 bytes. That includes the defaults for empty fields, `Flarebox` for a space and `Unnamed device` for a device. Node names keep their own rule from spec v0 §6.1.
+Every space name, device name, user name and platform the server stores is therefore at most 255 bytes. That includes the defaults for empty fields, `Koidrive` for a space and `Unnamed device` for a device. Node names keep their own rule from spec v0 §6.1.
 
 Known limitation: a deployment that stored a longer name before this rule keeps it. The server does not shorten stored names, so the bounds of section 3 do not hold for its answers that carry such a name.
 

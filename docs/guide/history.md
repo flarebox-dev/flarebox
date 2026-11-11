@@ -10,15 +10,15 @@ After that, the server removes them the next time it cleans up, so don't count o
 ## See what is in the trash
 
 ```sh
-flarebox trash ~/Flarebox
+koi trash ~/Koidrive
 ```
 
-This lists what was deleted in the linked folder and is still in the trash, with the size of each item. A deleted folder is one line, with the number of files and bytes that went to the trash with it. Name a folder inside a linked folder to list only what was deleted under it. A folder deleted as a whole is listed only at its own path: if `notes/` went to the trash with everything in it, `flarebox trash ~/Flarebox/notes/drafts` lists nothing, and `flarebox trash ~/Flarebox` shows `notes/`. Without a path, the command uses the current folder. `--json` prints each item with its node ID.
+This lists what was deleted in the linked folder and is still in the trash, with the size of each item. A deleted folder is one line, with the number of files and bytes that went to the trash with it. Name a folder inside a linked folder to list only what was deleted under it. A folder deleted as a whole is listed only at its own path: if `notes/` went to the trash with everything in it, `koi trash ~/Koidrive/notes/drafts` lists nothing, and `koi trash ~/Koidrive` shows `notes/`. Without a path, the command uses the current folder. `--json` prints each item with its node ID.
 
 ## See the versions of a file
 
 ```sh
-flarebox versions ~/Flarebox/notes.txt
+koi versions ~/Koidrive/notes.txt
 ```
 
 ```
@@ -32,27 +32,27 @@ The last column is the version ID. `--json` prints each version with its size, t
 ## Restore a deleted file or folder
 
 ```sh
-flarebox restore ~/Flarebox/notes/old.txt
+koi restore ~/Koidrive/notes/old.txt
 ```
 
-Name the path the file or folder had. Flarebox finds the deletion in the trash and brings it back where it was, with its versions. A folder comes back with everything that went to the trash with it. A file that went to the trash with its folder can come back alone: the folders above it come back too, without their other files.
+Name the path the file or folder had. Koidrive finds the deletion in the trash and brings it back where it was, with its versions. A folder comes back with everything that went to the trash with it. A file that went to the trash with its folder can come back alone: the folders above it come back too, without their other files.
 
-When several deletions had the same path, the command lists them and asks you to pick one with `--node <id>`. `flarebox trash --json` shows the node IDs.
+When several deletions had the same path, the command lists them and asks you to pick one with `--node <id>`. `koi trash --json` shows the node IDs.
 
 ## Restore an earlier version
 
 ```sh
-flarebox restore ~/Flarebox/notes.txt --version 019a...7c
+koi restore ~/Koidrive/notes.txt --version 019a...7c
 ```
 
-Take the version ID from `flarebox versions`. The old content becomes the file's current content, as a new version. The content it replaces stays as an earlier version for 30 days.
+Take the version ID from `koi versions`. The old content becomes the file's current content, as a new version. The content it replaces stays as an earlier version for 30 days.
 
 ## How a restore goes
 
-`flarebox restore` checks the request against the server, records it, and returns. The daemon sends it with the folder's next change to the server, after any changes to the same file that this device hasn't sent yet. The restored file then arrives in the folder like a change from another device. If the daemon isn't running, the request waits until it starts.
+`koi restore` checks the request against the server, records it, and returns. The daemon sends it with the folder's next change to the server, after any changes to the same file that this device hasn't sent yet. The restored file then arrives in the folder like a change from another device. If the daemon isn't running, the request waits until it starts.
 
 ```sh
-flarebox restores ~/Flarebox
+koi restores ~/Koidrive
 ```
 
 This lists the restores asked for in the folder's space and how each went:
@@ -67,7 +67,7 @@ This lists the restores asked for in the folder's space and how each went:
 ## See what each space stores
 
 ```sh
-flarebox usage
+koi usage
 ```
 
 This shows, for each space, the bytes in live files, in the trash and in old versions. A chunk shared by several files counts once.

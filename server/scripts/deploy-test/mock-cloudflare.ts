@@ -88,7 +88,7 @@ export class MockCloudflare {
       scriptName: "mock",
       eventTimestamp: Date.now(),
       event: { request: { url, method: "GET", headers: {} } },
-      logs: [{ message: ["Flarebox claim code (valid for 1 hour): " + this.claimCode], level: "log", timestamp: Date.now() }],
+      logs: [{ message: ["Koidrive claim code (valid for 1 hour): " + this.claimCode], level: "log", timestamp: Date.now() }],
       exceptions: [],
     });
     const payload = Buffer.from(event);
@@ -116,7 +116,7 @@ export class MockCloudflare {
       if (path === "/setup") {
         this.pushClaimCode(this.url + "/setup");
         response.writeHead(200, { "Content-Type": "text/plain" });
-        response.end("A one-time claim code, valid for one hour, is in this Worker's logs.\n\nFlarebox is not affiliated with Cloudflare, Inc.\n");
+        response.end("A one-time claim code, valid for one hour, is in this Worker's logs.\n\nKoidrive is not affiliated with Cloudflare, Inc.\n");
         return;
       }
       if ((match = /^\/mock\/workers\/([^/]+)$/.exec(path)) && method === "POST") {

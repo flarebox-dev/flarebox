@@ -1,0 +1,84 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package koidrive.v1;
+
+import "koidrive/v1/model.proto";
+
+// Bodies of the share-link endpoints in RFC 0005.
+
+// POST /v1/spaces/{space_id}/links
+message CreateShareLinkRequest {
+  // A live file or folder of the space, the root included.
+  string node_id = 1;
+  // Unix milliseconds. 0 with no_expiry false means 7 days after creation.
+  int64 expires_at_ms = 2;
+  // A link that never expires. Refused together with a nonzero expires_at_ms.
+  bool no_expiry = 3;
+  // Empty for a link without a password; otherwise 8 to 256 Unicode scalar values.
+  string password = 4;
+}
+
+// One link, as the owner sees it.
+message ShareLink {
+  // The link's 128-bit secret, unpadded base64url (22 characters).
+  string link_id = 1;
+  // <origin>/s/<link_id>
+  string url = 2;
+  string space_id = 3;
+  string node_id = 4;
+  int64 created_at_ms = 5;
+  // 0 when the link never expires.
+  int64 expires_at_ms = 6;
+  bool has_password = 7;
+  // 0 while the link is not revoked.
+  int64 revoked_at_ms = 8;
+}
+
+// GET /v1/spaces/{space_id}/links
+message ShareLinkList {
+  // Newest first.
+  repeated ShareLink links = 1;
+  // Empty on the last page.
+  string next_cursor = 2;
+}
+
+// GET /v1/share/{link_id}
+message ShareInfo {
+  // Set, with no other field, when the link has a password and the request has no valid session.
+  bool password_required = 1;
+  NodeKind kind = 2;
+  string name = 3;
+  // The node_id of the link's root.
+  string root_id = 4;
+  // For a file: the size and modification time of its current version.
+  uint64 size = 5;
+  int64 mtime_ms = 6;
+  // 0 when the link never expires.
+  int64 expires_at_ms = 7;
+}
+
+// POST /v1/share/{link_id}/unlock
+message ShareUnlockRequest {
+  string password = 1;
+}
+
+message ShareEntry {
+  string node_id = 1;
+  string name = 2;
+  NodeKind kind = 3;
+  // For a file: the size and modification time of its current version. 0 for a folder.
+  uint64 size = 4;
+  int64 mtime_ms = 5;
+}
+
+// GET /v1/share/{link_id}/list
+message ShareListing {
+  // The live children of the listed folder, sorted by name_key and then node_id.
+  repeated ShareEntry entries = 1;
+  // The folders from the link's root down to the listed folder, both included.
+  repeated ShareEntry path = 2;
+  // Empty on the last page.
+  string next_cursor = 3;
+}

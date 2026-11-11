@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The conflict rules of spec v0 section 6 on the reference Space DO, following the scenarios of the
-//! TypeScript server's tests (server/test/space-do.test.ts in flarebox#6).
+//! TypeScript server's tests (server/test/space-do.test.ts in koidrive#6).
 
 use std::collections::HashMap;
 
-use flarebox_engine::ids::IdGen;
-use flarebox_engine::names::conflict_name;
-use flarebox_proto::v1::{
+use koidrive_engine::ids::IdGen;
+use koidrive_engine::names::conflict_name;
+use koidrive_proto::v1::{
     ChunkRef, Commit, CommitResult, Content, CreateDir, CreateFile, Delete, Error, ListTrash,
     ListTree, ListVersions, Move, NodeState, NodeStatus, Op, PrepareUpload, Restore, Resume,
     RpcRequest, UpdateContent, UploadReceipt, chunk_plan, error, op, op_result, resync_required,
     rpc_request, rpc_response,
 };
-use flarebox_sim::space::{Role, Session, SpaceDo, node_states};
+use koidrive_sim::space::{Role, Session, SpaceDo, node_states};
 use sha2::{Digest, Sha256};
 
 const NOW: i64 = 1_794_268_740_000;
@@ -934,7 +934,7 @@ fn lists_the_live_tree_in_pages() {
 
 #[test]
 fn answers_rpcs_and_returns_the_record_only_for_a_new_commit() {
-    use flarebox_proto::v1::{RpcRequest, rpc_request, rpc_response};
+    use koidrive_proto::v1::{RpcRequest, rpc_request, rpc_response};
     let mut s = Space::new();
     let root = s.root();
     let a = s.client("A");
@@ -986,7 +986,7 @@ fn answers_rpcs_and_returns_the_record_only_for_a_new_commit() {
 
 #[test]
 fn serves_downloads_only_for_committed_chunks() {
-    use flarebox_proto::v1::{GetDownloadTargets, GetVersionChunks};
+    use koidrive_proto::v1::{GetDownloadTargets, GetVersionChunks};
     let mut s = Space::new();
     let root = s.root();
     let mut a = s.client("A");
@@ -1302,7 +1302,7 @@ fn a_no_op_move_changes_nothing_so_a_concurrent_delete_applies() {
 }
 
 #[test]
-fn the_root_reserves_flarebox_in_every_case_for_every_op() {
+fn the_root_reserves_koidrive_in_every_case_for_every_op() {
     let mut s = Space::new();
     let root = s.root();
     let mut a = s.client("A");
@@ -1324,12 +1324,12 @@ fn the_root_reserves_flarebox_in_every_case_for_every_op() {
     let result = s.commit(
         &mut a,
         vec![
-            mkdir(&dir, &root, ".Flarebox"),
-            create_file(&file, &root, ".FLAREBOX", content),
-            mv(&moved, &root, ".flarebox"),
-            mv(&trashed, &root, ".fLaReBoX"),
-            restore_to(&trashed, &root, ".flarebox"),
-            mkdir(&alias, &root, ".\u{FB02}arebox"),
+            mkdir(&dir, &root, ".Koidrive"),
+            create_file(&file, &root, ".KOIDRIVE", content),
+            mv(&moved, &root, ".koidrive"),
+            mv(&trashed, &root, ".kOiDrIvE"),
+            restore_to(&trashed, &root, ".koidrive"),
+            mkdir(&alias, &root, ".\u{212A}oidrive"),
         ],
         receipts,
     );
@@ -1339,7 +1339,7 @@ fn the_root_reserves_flarebox_in_every_case_for_every_op() {
     assert!(!s.live(&trashed));
 
     let below = s.id();
-    let allowed = s.commit(&mut a, vec![mkdir(&below, &docs, ".flarebox")], vec![]);
+    let allowed = s.commit(&mut a, vec![mkdir(&below, &docs, ".koidrive")], vec![]);
     assert_eq!(codes(&allowed), [op_result::Code::Applied]);
 }
 

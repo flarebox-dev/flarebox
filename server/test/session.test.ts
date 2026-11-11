@@ -20,8 +20,8 @@ import {
   type SpaceList,
   SpaceListSchema,
   TokenRequestSchema,
-} from "../src/gen/flarebox/v1/auth_pb";
-import { OpResult_Code, type UploadReceipt, UploadReceiptSchema } from "../src/gen/flarebox/v1/commit_pb";
+} from "../src/gen/koidrive/v1/auth_pb";
+import { OpResult_Code, type UploadReceipt, UploadReceiptSchema } from "../src/gen/koidrive/v1/commit_pb";
 import {
   type ClientMessage,
   ClientMessageSchema,
@@ -32,12 +32,12 @@ import {
   type ServerMessage,
   ServerMessageSchema,
   type Welcome,
-} from "../src/gen/flarebox/v1/messages_pb";
-import { ChunkRefSchema, type CommitRecord, ContentSchema } from "../src/gen/flarebox/v1/model_pb";
-import { ChunkPlan_Action, Error_Code, ErrorSchema, type Target } from "../src/gen/flarebox/v1/rpc_pb";
+} from "../src/gen/koidrive/v1/messages_pb";
+import { ChunkRefSchema, type CommitRecord, ContentSchema } from "../src/gen/koidrive/v1/model_pb";
+import { ChunkPlan_Action, Error_Code, ErrorSchema, type Target } from "../src/gen/koidrive/v1/rpc_pb";
 import { type Identity, type ServerKey, signAccessToken, verifyAccessToken } from "../src/auth";
 import { fromBase64url, sha256 } from "../src/crypto";
-import { ShareLinkListSchema } from "../src/gen/flarebox/v1/share_pb";
+import { ShareLinkListSchema } from "../src/gen/koidrive/v1/share_pb";
 import { toHex, uuidv7, uuidv7Ms } from "../src/ids";
 import { type Principal, policy } from "../src/policy";
 import { Close, HOLD_MS, type SpaceDO } from "../src/space-do";
@@ -46,7 +46,7 @@ import { chunkKey, encodeChunkList } from "../src/space/store";
 import worker from "../src/worker";
 import { content, op, storedObjects, targetIncarnation } from "./helpers";
 
-const BASE = "https://flarebox.test";
+const BASE = "https://koidrive.test";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -96,7 +96,7 @@ async function getOwner(): Promise<DeviceCredentials> {
 async function claimOwner(): Promise<DeviceCredentials> {
   const log = vi.spyOn(console, "log");
   await exports.default.fetch(BASE + "/setup");
-  const line = log.mock.calls.map((args) => String(args[0])).find((text) => text.startsWith("Flarebox claim code"));
+  const line = log.mock.calls.map((args) => String(args[0])).find((text) => text.startsWith("Koidrive claim code"));
   const code = line!.split(": ")[1]!;
   const claimed = await call("/v1/claim", { body: body(ClaimRequestSchema, { code, userName: "Owner", deviceName: "Laptop A", platform: "macos" }) }, DeviceCredentialsSchema);
   return claimed.message!;

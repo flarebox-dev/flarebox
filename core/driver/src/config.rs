@@ -26,7 +26,7 @@ pub struct Config {
 }
 
 /// The local trash of every folder the profile links (design §5.2), which holds what sync effects displaced. An
-/// entry leaves it after [`flarebox_fs::TRASH_RETENTION`], or earlier, oldest first, while the folder's trash holds
+/// entry leaves it after [`koidrive_fs::TRASH_RETENTION`], or earlier, oldest first, while the folder's trash holds
 /// more than `max_size_mb` megabytes (2048 when unset).
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -53,9 +53,9 @@ impl LocalTrash {
 ///
 /// - `include`: paths relative to the folder's root. When the list is not empty, only these paths and what is under
 ///   them are synced.
-/// - `exclude`: patterns in `.fbignore` syntax (`.gitignore` syntax, design §5.10), relative to the folder's root.
+/// - `exclude`: patterns in `.koiignore` syntax (`.gitignore` syntax, design §5.10), relative to the folder's root.
 ///
-/// Both turn into the same matcher input as a `.fbignore` file (see [`SyncRules::lines`]), so they follow the
+/// Both turn into the same matcher input as a `.koiignore` file (see [`SyncRules::lines`]), so they follow the
 /// same rule: becoming ignored never deletes anything, on either side.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -110,7 +110,7 @@ struct Included {
 }
 
 impl SyncRules {
-    /// The rules as lines of a root `.fbignore` file. An include list becomes `/*` followed by negations that
+    /// The rules as lines of a root `.koiignore` file. An include list becomes `/*` followed by negations that
     /// re-include each listed path and the folders leading to it, since a path cannot be re-included once one of
     /// its parents is excluded. The exclude patterns follow, so they win over the include list.
     pub fn lines(&self) -> Result<Vec<String>, String> {

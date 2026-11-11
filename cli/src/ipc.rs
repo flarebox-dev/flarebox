@@ -10,11 +10,11 @@ use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
-use flarebox_driver::{
+use koidrive_driver::{
     Account, Answer, Credential, Driver, DriverError, FolderStatus, Paths, Question,
     RestoreRequest, RestoreStatus, Status,
 };
-use flarebox_engine::commit::Lift;
+use koidrive_engine::commit::Lift;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -38,7 +38,7 @@ pub enum Request {
         user_name: String,
         name: String,
     },
-    /// Stores the credential that `flarebox setup` claimed.
+    /// Stores the credential that `koi setup` claimed.
     SaveCredential {
         credential: Credential,
     },
@@ -412,7 +412,7 @@ pub async fn ask(paths: &Paths, request: &Request) -> Result<Option<Response>, S
 /// The error for a profile that a process holds while its socket does not answer.
 pub fn busy(paths: &Paths) -> String {
     format!(
-        "a Flarebox process holds this profile, but its socket {} does not answer",
+        "a Koidrive process holds this profile, but its socket {} does not answer",
         paths.socket().display()
     )
 }

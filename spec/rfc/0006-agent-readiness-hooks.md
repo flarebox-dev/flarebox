@@ -2,7 +2,7 @@
 
 Status: proposed. Applies to spec v0 (format_version 1). Tracks GUN-279.
 
-Flarebox 0.1.0 does not support AI agents or other automated clients. This RFC adds the hooks that let agent support come later as an additive change: without a format bump, without a migration that rewrites existing rows, and without old clients misbehaving against a newer server. On the server, every hook keeps what 0.1.0 clients see unchanged, except the device routes of section 7 and the refusals of section 8. Section 1 is a rule for clients, which 0.1.0 clients follow. A bare section number such as section 3 refers to this RFC; sections of spec v0 are written as spec v0 §N.
+Koidrive 0.1.0 does not support AI agents or other automated clients. This RFC adds the hooks that let agent support come later as an additive change: without a format bump, without a migration that rewrites existing rows, and without old clients misbehaving against a newer server. On the server, every hook keeps what 0.1.0 clients see unchanged, except the device routes of section 7 and the refusals of section 8. Section 1 is a rule for clients, which 0.1.0 clients follow. A bare section number such as section 3 refers to this RFC; sections of spec v0 are written as spec v0 §N.
 
 The schema changes add fields, messages and one error code:
 

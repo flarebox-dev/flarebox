@@ -1,7 +1,7 @@
 build/
 .build/
 .swiftpm/
-Flarebox.xcodeproj/
-FlareboxFFI/Frameworks/
-FlareboxFFI/Sources/FlareboxFFI/flarebox_ffi.swift
+Koidrive.xcodeproj/
+KoidriveFFI/Frameworks/
+KoidriveFFI/Sources/KoidriveFFI/koidrive_ffi.swift
 xcuserdata/

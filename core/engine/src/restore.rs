@@ -8,7 +8,7 @@
 
 use std::collections::BTreeSet;
 
-use flarebox_proto::v1::{self as proto, op_result};
+use koidrive_proto::v1::{self as proto, op_result};
 
 use crate::commit::MAX_OPS;
 use crate::ids::is_uuid_v7;

@@ -5,7 +5,7 @@ main() {
     set -eu
 
     fail() {
-        printf 'flarebox install: %s\n' "$*" >&2
+        printf 'koi install: %s\n' "$*" >&2
         exit 1
     }
 
@@ -46,18 +46,18 @@ main() {
         fail 'Install sha256sum or shasum to verify the download'
     fi
 
-    base=${FLAREBOX_RELEASE_BASE_URL:-https://github.com/flarebox-dev/flarebox/releases}
+    base=${KOIDRIVE_RELEASE_BASE_URL:-https://github.com/koidrive/koidrive/releases}
     base=${base%/}
-    version=${FLAREBOX_VERSION:-latest}
+    version=${KOIDRIVE_VERSION:-latest}
     if [ "$version" = latest ]; then
         download=$base/latest/download
     else
         version=${version#v}
-        printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' || fail 'FLAREBOX_VERSION must be a version such as v0.1.0'
+        printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' || fail 'KOIDRIVE_VERSION must be a version such as v0.1.0'
         download=$base/download/v$version
     fi
 
-    archive=flarebox-$arch-$os.tar.gz
+    archive=koidrive-$arch-$os.tar.gz
     tmp=$(mktemp -d)
     staged=
     trap 'rm -rf "$tmp"; if [ -n "$staged" ]; then rm -f "$staged"; fi' EXIT
@@ -75,24 +75,31 @@ main() {
     fi
     [ "${actual%% *}" = "$expected" ] || fail 'Checksum mismatch; the existing installation has not changed'
     printf 'SHA256 verified for %s\n' "$archive"
-    tar -xzOf "$tmp/$archive" flarebox > "$tmp/flarebox"
-    [ -s "$tmp/flarebox" ] || fail 'The tarball contains no flarebox binary'
+    tar -xzOf "$tmp/$archive" koi > "$tmp/koi"
+    [ -s "$tmp/koi" ] || fail 'The tarball contains no koi binary'
 
-    install_dir=${FLAREBOX_INSTALL_DIR:-$HOME/.local/bin}
-    case "$install_dir" in /*) ;; *) fail 'FLAREBOX_INSTALL_DIR must be an absolute path' ;; esac
-    case "$install_dir" in *[[:cntrl:]]*) fail 'FLAREBOX_INSTALL_DIR cannot contain control characters' ;; esac
-    [ ! -d "$install_dir/flarebox" ] || fail 'The destination flarebox is a directory'
+    install_dir=${KOIDRIVE_INSTALL_DIR:-$HOME/.local/bin}
+    case "$install_dir" in /*) ;; *) fail 'KOIDRIVE_INSTALL_DIR must be an absolute path' ;; esac
+    case "$install_dir" in *[[:cntrl:]]*) fail 'KOIDRIVE_INSTALL_DIR cannot contain control characters' ;; esac
+    [ ! -d "$install_dir/koi" ] || fail 'The destination koi is a directory'
+    if [ -f "$install_dir/koi" ] && ! grep -q 'Koidrive sync client' "$install_dir/koi"; then
+        fail "$install_dir/koi is another program. Move it away, or install elsewhere with KOIDRIVE_INSTALL_DIR"
+    fi
     mkdir -p "$install_dir"
-    staged=$(mktemp "$install_dir/.flarebox.XXXXXXXX")
-    cat "$tmp/flarebox" > "$staged"
+    staged=$(mktemp "$install_dir/.koidrive.XXXXXXXX")
+    cat "$tmp/koi" > "$staged"
     chmod 755 "$staged"
-    mv -f "$staged" "$install_dir/flarebox"
+    mv -f "$staged" "$install_dir/koi"
     staged=
-    printf 'Installed flarebox to %s/flarebox\n' "$install_dir"
+    printf 'Installed koi to %s/koi\n' "$install_dir"
     case ":${PATH:-}:" in
         *":$install_dir:"*) ;;
         *) printf 'Warning: %s is not on PATH. Add it to your shell profile.\n' "$install_dir" >&2 ;;
     esac
+    other=$(command -v koi 2>/dev/null || true)
+    if [ -n "$other" ] && [ "$other" != "$install_dir/koi" ]; then
+        printf 'Warning: koi on PATH runs %s, another program. Put %s before it on PATH.\n' "$other" "$install_dir" >&2
+    fi
 
     if [ "$os" = unknown-linux-musl ] && [ "$service" != no ]; then
         if ! command -v systemctl >/dev/null 2>&1; then
@@ -109,19 +116,19 @@ main() {
                 case "$answer" in y|Y|yes|YES) service=yes ;; esac
             fi
             if [ "$service" = yes ]; then
-                tar -xzOf "$tmp/$archive" flarebox.service > "$tmp/flarebox.service"
+                tar -xzOf "$tmp/$archive" koidrive.service > "$tmp/koidrive.service"
                 unit_dir=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
                 mkdir -p "$unit_dir"
-                escaped=$(printf '%s' "$install_dir/flarebox" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g; s/\$/$$/g')
-                staged=$(mktemp "$unit_dir/.flarebox.XXXXXXXX")
-                FLAREBOX_UNIT_BINARY=$escaped awk '{ if ($0 ~ /^ExecStart=/) printf "ExecStart=\"%s\" daemon\n", ENVIRON["FLAREBOX_UNIT_BINARY"]; else print }' "$tmp/flarebox.service" > "$staged"
+                escaped=$(printf '%s' "$install_dir/koi" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g; s/\$/$$/g')
+                staged=$(mktemp "$unit_dir/.koidrive.XXXXXXXX")
+                KOIDRIVE_UNIT_BINARY=$escaped awk '{ if ($0 ~ /^ExecStart=/) printf "ExecStart=\"%s\" daemon\n", ENVIRON["KOIDRIVE_UNIT_BINARY"]; else print }' "$tmp/koidrive.service" > "$staged"
                 chmod 644 "$staged"
-                mv -f "$staged" "$unit_dir/flarebox.service"
+                mv -f "$staged" "$unit_dir/koidrive.service"
                 staged=
                 systemctl --user daemon-reload
-                printf 'Installed %s/flarebox.service\n' "$unit_dir"
-                printf 'After setup and link, start syncing with: systemctl --user enable --now flarebox\n'
-                printf 'If the service is already running, restart it with: systemctl --user restart flarebox\n'
+                printf 'Installed %s/koidrive.service\n' "$unit_dir"
+                printf 'After setup and link, start syncing with: systemctl --user enable --now koidrive\n'
+                printf 'If the service is already running, restart it with: systemctl --user restart koidrive\n'
             fi
         fi
     fi

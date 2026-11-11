@@ -3,7 +3,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use flarebox_proto::v1::{Error as ProtoError, error::Code};
+use koidrive_proto::v1::{Error as ProtoError, error::Code};
 use prost::Message;
 
 /// A refusal from the server: the `Error` of an RPC response or of an HTTP reply.

@@ -1028,8 +1028,8 @@ fn a_failed_scan_leaves_the_rules_as_they_were() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("space");
     for (path, body) in [
-        (".fbignore", "ig\n"),
-        ("a/.fbignore", "long-name\n"),
+        (".koiignore", "ig\n"),
+        ("a/.koiignore", "long-name\n"),
         ("a/long-name", "x"),
         ("a/y", "y"),
         ("ig/f", "f"),
@@ -1047,8 +1047,8 @@ fn a_failed_scan_leaves_the_rules_as_they_were() {
     let given = matcher.0.lock().unwrap().clone();
     assert_eq!(given.len(), 2);
 
-    fs::write(root.join(".fbignore"), "z\n").unwrap();
-    fs::write(root.join("a/.fbignore"), "y\n").unwrap();
+    fs::write(root.join(".koiignore"), "z\n").unwrap();
+    fs::write(root.join("a/.koiignore"), "y\n").unwrap();
     let result = snapshot.rescan_under(
         &root,
         [PathBuf::new()],
@@ -1090,10 +1090,10 @@ fn a_failed_scan_leaves_the_rules_as_they_were() {
             created("ig", EntryKind::Dir),
             created("ig/f", EntryKind::File),
             Change::Modified {
-                path: ".fbignore".into()
+                path: ".koiignore".into()
             },
             Change::Modified {
-                path: "a/.fbignore".into()
+                path: "a/.koiignore".into()
             },
         ]
     );

@@ -4,8 +4,8 @@
 // that section lists, so a field added to the schema later never changes a digest a Space DO has stored.
 
 import { create, toBinary } from "@bufbuild/protobuf";
-import { type Commit, CommitSchema, type Op, OpSchema } from "../gen/flarebox/v1/commit_pb";
-import { type Content, ContentSchema } from "../gen/flarebox/v1/model_pb";
+import { type Commit, CommitSchema, type Op, OpSchema } from "../gen/koidrive/v1/commit_pb";
+import { type Content, ContentSchema } from "../gen/koidrive/v1/model_pb";
 import { sha256 } from "../crypto";
 
 function content(value: Content | undefined): Content | undefined {

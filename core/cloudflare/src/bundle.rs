@@ -13,11 +13,11 @@ use serde_json::{Map, Value};
 use crate::api::Jurisdiction;
 use crate::secret::Secret;
 
-/// The tag every upload sets, which `flarebox setup` looks for to find a Flarebox server in an account (section 6).
-pub const SERVER_TAG: &str = "flarebox-server";
+/// The tag every upload sets, which `koi setup` looks for to find a Koidrive server in an account (section 6).
+pub const SERVER_TAG: &str = "koidrive-server";
 
 /// The name of the one-time claim secret (section 4.4).
-pub const RECOVERY_KEY_SECRET: &str = "FLAREBOX_RECOVERY_KEY";
+pub const RECOVERY_KEY_SECRET: &str = "KOIDRIVE_RECOVERY_KEY";
 
 /// `manifest.json` of a server bundle, written by `server/scripts/pack-bundle.mjs` from `server/wrangler.jsonc`.
 #[derive(Clone, Debug, Deserialize)]
@@ -31,7 +31,7 @@ pub struct Manifest {
     pub(crate) durable_objects: Vec<DurableObject>,
     /// The name of the R2 bucket binding, such as `BUCKET`.
     pub r2_binding: String,
-    /// The bucket a new deployment creates, such as `flarebox`.
+    /// The bucket a new deployment creates, such as `koidrive`.
     pub default_bucket: String,
     pub(crate) migrations: Vec<Migration>,
     pub(crate) assets: Option<AssetsBinding>,
@@ -85,7 +85,7 @@ pub enum BundleError {
         #[source]
         source: io::Error,
     },
-    #[error("{} is not a server bundle manifest that this flarebox release can read", path.display())]
+    #[error("{} is not a server bundle manifest that this koi release can read", path.display())]
     Manifest {
         path: PathBuf,
         #[source]
@@ -220,8 +220,8 @@ pub struct UploadPlan {
 /// The deployed script is at a migration tag that the bundle does not list.
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "the deployed server is at storage migration {deployed_tag:?}, which this flarebox release does not know, so the \
-     deployment is newer than this CLI; install a newer flarebox and run the command again"
+    "the deployed server is at storage migration {deployed_tag:?}, which this koi release does not know, so the \
+     deployment is newer than this CLI; install a newer koi and run the command again"
 )]
 pub struct NewerDeployment {
     pub deployed_tag: String,
@@ -297,7 +297,7 @@ fn expose<S: Serializer>(secret: &Secret, serializer: S) -> Result<S::Ok, S::Err
 impl UploadPlan {
     /// `bucket` is the R2 bucket to bind, in `jurisdiction`, which an upgrade keeps from the deployed binding.
     /// `deployed_tag` is the script's current migration tag, if it exists.
-    /// `secret` is a one-time `FLAREBOX_RECOVERY_KEY` sent in the same upload. `assets_jwt` is the completion token of
+    /// `secret` is a one-time `KOIDRIVE_RECOVERY_KEY` sent in the same upload. `assets_jwt` is the completion token of
     /// the asset upload, which a bundle with assets needs.
     pub fn new(
         bundle: &Bundle,
@@ -412,7 +412,7 @@ mod tests {
                 { "name": "SPACE", "class_name": "SpaceDO" }
             ],
             "r2_binding": "BUCKET",
-            "default_bucket": "flarebox",
+            "default_bucket": "koidrive",
             "migrations": [
                 { "tag": "v1", "new_sqlite_classes": ["AccountDO", "SpaceDO"] },
                 { "tag": "v2", "renamed_classes": [{ "from": "SpaceDO", "to": "Space" }] },
@@ -463,10 +463,10 @@ mod tests {
                     { "type": "durable_object_namespace", "name": "ACCOUNT", "class_name": "AccountDO" },
                     { "type": "durable_object_namespace", "name": "SPACE", "class_name": "SpaceDO" },
                     { "type": "r2_bucket", "name": "BUCKET", "bucket_name": "my-bucket" },
-                    { "type": "secret_text", "name": "FLAREBOX_RECOVERY_KEY", "text": "one-time-key" },
+                    { "type": "secret_text", "name": "KOIDRIVE_RECOVERY_KEY", "text": "one-time-key" },
                     { "type": "assets", "name": "ASSETS" }
                 ],
-                "tags": ["flarebox-server"],
+                "tags": ["koidrive-server"],
                 "keep_bindings": ["secret_text", "secret_key"],
                 "migrations": {
                     "new_tag": "v3",

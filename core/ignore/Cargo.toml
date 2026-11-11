@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-name = "flarebox-ignore"
-description = "The .fbignore matcher: gitignore syntax over a tree of rules files, built-in exclusions and the device-local list."
+name = "koidrive-ignore"
+description = "The .koiignore matcher: gitignore syntax over a tree of rules files, built-in exclusions and the device-local list."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,6 +13,6 @@ publish.workspace = true
 unicode-normalization = "0.1"
 
 [dev-dependencies]
-flarebox-engine = { path = "../engine" }
+koidrive-engine = { path = "../engine" }
 proptest = "1.12.0"
 tempfile = "3.27.0"

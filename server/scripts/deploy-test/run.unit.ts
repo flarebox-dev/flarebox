@@ -16,7 +16,7 @@ import type { State } from "./state.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const server = join(here, "..", "..");
-const NAME = "flarebox-test-1-1";
+const NAME = "koidrive-test-1-1";
 
 let mock: MockCloudflare;
 let work: string;
@@ -24,7 +24,7 @@ let work: string;
 beforeEach(async () => {
   mock = new MockCloudflare();
   await mock.start();
-  work = mkdtempSync(join(tmpdir(), "flarebox-run-unit-"));
+  work = mkdtempSync(join(tmpdir(), "koidrive-run-unit-"));
   mkdirSync(join(work, "home"));
   mkdirSync(join(work, "tmp"));
   mkdirSync(join(work, "bin"));
@@ -70,8 +70,8 @@ function runTs(...args: string[]): Promise<{ status: number | null; output: stri
       CLOUDFLARE_API_BASE_URL: mock.url + "/client/v4",
       CLOUDFLARE_API_TOKEN: "dummy-token",
       CLOUDFLARE_ACCOUNT_ID: "0123456789abcdef0123456789abcdef",
-      FLAREBOX_TEST_NAME: NAME,
-      FLAREBOX_DEPLOY_TEST_STATE: join(work, "state.json"),
+      KOIDRIVE_TEST_NAME: NAME,
+      KOIDRIVE_DEPLOY_TEST_STATE: join(work, "state.json"),
       WRANGLER_SEND_METRICS: "false",
   });
 }

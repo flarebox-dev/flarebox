@@ -1,7 +1,7 @@
 {
-  "format": "flarebox.space-conformance",
+  "format": "koidrive.space-conformance",
   "version": 1,
-  "spec": "Flarebox spec v0 with RFC 0001, RFC 0002 sections 1 to 4, 9 and 11, and RFC 0006 section 8",
+  "spec": "Koidrive spec v0 with RFC 0001, RFC 0002 sections 1 to 4, 9 and 11, and RFC 0006 section 8",
   "unicode": "18.0.0",
   "now_ms": 1794268740000,
   "mtime_ns": "1794268740123456789",
@@ -6922,7 +6922,7 @@
       ]
     },
     {
-      "name": "flarebox-is-reserved-at-the-root-only",
+      "name": "koidrive-is-reserved-at-the-root-only",
       "covers": [
         "regression 6",
         "RFC 0001 section 2"
@@ -7006,14 +7006,14 @@
                 "create_dir": {
                   "node": "x",
                   "parent": "root",
-                  "name": ".Flarebox"
+                  "name": ".Koidrive"
                 }
               },
               {
                 "create_file": {
                   "node": "y",
                   "parent": "root",
-                  "name": ".ﬂarebox",
+                  "name": ".Koidrive",
                   "content": "c1"
                 }
               },
@@ -7021,21 +7021,21 @@
                 "move": {
                   "node": "d",
                   "parent": "root",
-                  "name": ".flarebox"
+                  "name": ".koidrive"
                 }
               },
               {
                 "restore": {
                   "node": "t",
                   "parent": "root",
-                  "name": ".FLAREBOX"
+                  "name": ".KOIDRIVE"
                 }
               },
               {
                 "create_dir": {
                   "node": "z",
                   "parent": "d",
-                  "name": ".flarebox"
+                  "name": ".koidrive"
                 }
               }
             ]
@@ -7091,7 +7091,7 @@
             {
               "node": "z",
               "parent": "d",
-              "name": ".flarebox",
+              "name": ".koidrive",
               "status": "LIVE"
             }
           ],

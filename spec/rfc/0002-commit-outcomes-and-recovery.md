@@ -2,7 +2,7 @@
 
 Status: proposed. Applies to spec v0 (format_version 1).
 
-These are the protocol changes that the sync engine design ([`docs/design/sync-engine.md`](../../docs/design/sync-engine.md) §10, flarebox#7) needs. Section and rule numbers refer to spec v0 unless they name the design. Sections 6 and 7 support recovery (design §6.4). Recovery is a draft, and it has to pass the simulation scenarios of design §7.5 before 0.1.0, so those two sections may still change.
+These are the protocol changes that the sync engine design ([`docs/design/sync-engine.md`](../../docs/design/sync-engine.md) §10, koidrive#7) needs. Section and rule numbers refer to spec v0 unless they name the design. Sections 6 and 7 support recovery (design §6.4). Recovery is a draft, and it has to pass the simulation scenarios of design §7.5 before 0.1.0, so those two sections may still change.
 
 The schema changes add fields and enum values only:
 
@@ -13,7 +13,7 @@ The schema changes add fields and enum values only:
 | `Welcome` | `device_seq = 10` | 2 |
 | `ResyncRequired` | `restore_seq = 2`, `restore_point_ms = 3` | 8 |
 
-RFC 0001 already covers design §10 items 5 to 7: the Unicode 18.0.0 pin for NFC and case folding (RFC 0001 §1), the reject reason `NOT_FILE` (§3) and the reserved `.flarebox` name (§2). It also covers two of the design's open questions: `CreateDir` onto a live file (§4) and conflict names longer than 255 bytes (§5). This RFC does not repeat them.
+RFC 0001 already covers design §10 items 5 to 7: the Unicode 18.0.0 pin for NFC and case folding (RFC 0001 §1), the reject reason `NOT_FILE` (§3) and the reserved `.koidrive` name (§2). It also covers two of the design's open questions: `CreateDir` onto a live file (§4) and conflict names longer than 255 bytes (§5). This RFC does not repeat them.
 
 ## 1. History fence (§8)
 

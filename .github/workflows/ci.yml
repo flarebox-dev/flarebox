@@ -40,7 +40,7 @@ jobs:
           REPO: ${{ github.repository }}
           RUNS_ON: ${{ vars.MACOS_RUNS_ON || '["self-hosted","flarebox-mini"]' }}
         run: |
-          if [ "$EVENT" = pull_request ] && { [ "$REPO" != flarebox-dev/flarebox ] || [ "$HEAD_REPO" != "$REPO" ]; }; then
+          if [ "$EVENT" = pull_request ] && { [ "$REPO" != koidrive/koidrive ] || [ "$HEAD_REPO" != "$REPO" ]; }; then
             echo "Pull request in $REPO from ${HEAD_REPO:-a deleted repository}: its macOS jobs run on GitHub-hosted runners."
             RUNS_ON='["xcode-27"]'
           fi
@@ -216,7 +216,7 @@ jobs:
           cache-dependency-path: server/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
         working-directory: server
-      - name: Test flarebox-net against the Worker under wrangler dev
+      - name: Test koidrive-net against the Worker under wrangler dev
         run: core/net/scripts/integration-test.sh
 
   driver-integration:
@@ -266,7 +266,7 @@ jobs:
           cache-dependency-path: server/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
         working-directory: server
-      - name: Test the flarebox command and daemon against the Worker under wrangler dev
+      - name: Test the koi command and daemon against the Worker under wrangler dev
         run: cli/scripts/integration-test.sh
 
   ffi-integration:
@@ -372,23 +372,23 @@ jobs:
       - name: Build the Rust core, the Swift bindings and the app (unsigned)
         run: scripts/build-release.sh
       - name: Test the Swift bindings
-        run: swift test --package-path FlareboxFFI
+        run: swift test --package-path KoidriveFFI
       - name: Test the Swift bindings in the release configuration, which has no DEBUG condition
-        run: swift test --package-path FlareboxFFI -c release
+        run: swift test --package-path KoidriveFFI -c release
       - name: Check the app bundle
-        run: plutil -p build/release/Flarebox.app/Contents/Info.plist
+        run: plutil -p build/release/Koidrive.app/Contents/Info.plist
       - name: Sign the app ad hoc (pull requests are never signed with the Developer ID)
-        run: scripts/sign-app.sh build/release/Flarebox.app -
+        run: scripts/sign-app.sh build/release/Koidrive.app -
       - name: Package the disk image
-        run: scripts/make-dmg.sh build/release/Flarebox.app build/release/Flarebox-unsigned.dmg
+        run: scripts/make-dmg.sh build/release/Koidrive.app build/release/Koidrive-unsigned.dmg
       - name: Verify the disk image
         run: |
-          scripts/verify-release.sh build/release/Flarebox-unsigned.dmg unsigned
-          echo "Unsigned build: pull requests and the merge queue never sign or notarize. SHA-256 $(shasum -a 256 build/release/Flarebox-unsigned.dmg | cut -d ' ' -f 1)" >> "$GITHUB_STEP_SUMMARY"
+          scripts/verify-release.sh build/release/Koidrive-unsigned.dmg unsigned
+          echo "Unsigned build: pull requests and the merge queue never sign or notarize. SHA-256 $(shasum -a 256 build/release/Koidrive-unsigned.dmg | cut -d ' ' -f 1)" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: Flarebox-unsigned
-          path: apps/macos/build/release/Flarebox-unsigned.dmg
+          name: Koidrive-unsigned
+          path: apps/macos/build/release/Koidrive-unsigned.dmg
           if-no-files-found: error
           compression-level: 0
           retention-days: 7

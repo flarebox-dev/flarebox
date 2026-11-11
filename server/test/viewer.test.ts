@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { VIEWER_HEADERS } from "../src/share/routes";
 import worker from "../src/worker";
 
-const BASE = "https://flarebox.test";
+const BASE = "https://koidrive.test";
 const LINK = "AAECAwQFBgcICQoLDA0ODw";
 
 function expectViewerHeaders(response: Response) {

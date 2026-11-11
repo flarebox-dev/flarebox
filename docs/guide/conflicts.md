@@ -1,6 +1,6 @@
 # Conflicts
 
-Each change that a device sends reaches the server in some order. When two devices change the same file and neither had seen the other's change, the server keeps both. Flarebox never picks one edit and drops the other.
+Each change that a device sends reaches the server in some order. When two devices change the same file and neither had seen the other's change, the server keeps both. Koidrive never picks one edit and drops the other.
 
 ## Two edits of one file
 
@@ -11,7 +11,7 @@ report.txt
 report (conflict from laptop 2026-11-10).txt
 ```
 
-Both files sync to every device. Compare them, keep what you need, and delete the copy. If that name is taken too, Flarebox adds a number before the closing parenthesis: `report (conflict from laptop 2026-11-10 2).txt`. Flarebox shortens a long device name, and then the file name, so the result fits in 255 bytes.
+Both files sync to every device. Compare them, keep what you need, and delete the copy. If that name is taken too, Koidrive adds a number before the closing parenthesis: `report (conflict from laptop 2026-11-10 2).txt`. Koidrive shortens a long device name, and then the file name, so the result fits in 255 bytes.
 
 An edit and a rename of the same file don't conflict. The file keeps the new content under the new name.
 

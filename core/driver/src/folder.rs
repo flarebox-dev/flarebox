@@ -23,22 +23,22 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use flarebox_engine::commit::{Commits, Failure, Halt as CommitHalt, Reconnect};
-use flarebox_engine::ignore::LocalRules;
-use flarebox_engine::state::CommitsState;
-use flarebox_engine::tree::{RemoteNode, Tree};
-use flarebox_fs::{Snapshot, check_root};
-use flarebox_net::{
+use koidrive_engine::commit::{Commits, Failure, Halt as CommitHalt, Reconnect};
+use koidrive_engine::ignore::LocalRules;
+use koidrive_engine::state::CommitsState;
+use koidrive_engine::tree::{RemoteNode, Tree};
+use koidrive_fs::{Snapshot, check_root};
+use koidrive_net::{
     Auth, Backoff, CallError, ChunkError, Event, NotResent, ServerError, Session, SessionConfig,
     Transfer,
 };
-use flarebox_proto::v1::error::Code;
-use flarebox_proto::v1::resync_required::Reason;
-use flarebox_proto::v1::{
+use koidrive_proto::v1::error::Code;
+use koidrive_proto::v1::resync_required::Reason;
+use koidrive_proto::v1::{
     ChunkRef, Commit, CommitRecord, CommitResult, Error as ProtoError, TrashPage, TreePage,
     UploadReceipt, Welcome, op, op_result,
 };
-use flarebox_store::{Cursor, Link, Store, Tx};
+use koidrive_store::{Cursor, Link, Store, Tx};
 use tokio::sync::{Notify, mpsc, watch};
 
 use crate::claim::{self, Flock, Identity, Owner};
@@ -86,7 +86,7 @@ const REPLACED: &str = "the folder at this path is no longer the folder this tas
 
 /// Why a folder halts when the folder at its path after a root halt is not the one the task locked before.
 const OTHER_FOLDER: &str = "the folder at this path is not the one this device synced before (it was replaced); run \
-                            flarebox restart to sync the folder that is there now";
+                            koi restart to sync the folder that is there now";
 
 /// One linked folder while it syncs.
 pub(crate) struct Folder {
@@ -270,7 +270,7 @@ impl Folder {
             engine.accept_restores(tx)?;
             engine.accept_answers(tx)?;
             engine.checkpoint(tx)?;
-            Ok::<_, flarebox_store::Error>((tx.remote_node_count()?, unanswered(tx)?))
+            Ok::<_, koidrive_store::Error>((tx.remote_node_count()?, unanswered(tx)?))
         })?;
         let flight = match engine.commits.in_flight() {
             Some(flight) if flight.result.is_none() => Flight::Unknown,
@@ -793,7 +793,7 @@ impl Folder {
                     more => format!(", and {more} more"),
                 };
                 Some(format!(
-                    "{count} could not be synced: {}{more}; run flarebox restart once {fixed} fixed",
+                    "{count} could not be synced: {}{more}; run koi restart once {fixed} fixed",
                     stuck.join(", ")
                 ))
             }
@@ -1284,7 +1284,7 @@ impl Folder {
 }
 
 /// The questions in the store that wait for an answer.
-fn unanswered(tx: &Tx<'_>) -> Result<u64, flarebox_store::Error> {
+fn unanswered(tx: &Tx<'_>) -> Result<u64, koidrive_store::Error> {
     let questions = tx.questions()?;
     Ok(questions.iter().filter(|q| q.answer.is_none()).count() as u64)
 }
@@ -1350,9 +1350,9 @@ type Slot<'a, T> = Option<Pin<Box<dyn Future<Output = T> + Send + 'a>>>;
 /// What lifts a halt for a refusal with `code` (RFC 0006 section 1, point 5, and section 10).
 fn lift_hint(code: i32) -> &'static str {
     if code == Code::ConfirmationRequired as i32 {
-        "; the space's owner must confirm them, which Flarebox cannot ask for yet"
+        "; the space's owner must confirm them, which Koidrive cannot ask for yet"
     } else {
-        "; once the cause is fixed, run flarebox lift <folder> --resend to send them again, or --replan to plan them \
+        "; once the cause is fixed, run koi lift <folder> --resend to send them again, or --replan to plan them \
          again"
     }
 }
@@ -1502,7 +1502,7 @@ impl FolderTask {
         let mut from_disk = self.observe(lock.clone(), folder.sections(), folder.snapshot());
         let mut config = SessionConfig::new(
             &self.link.space_id,
-            "flarebox",
+            "koidrive",
             env!("CARGO_PKG_VERSION"),
             MAX_FORMAT,
         );
@@ -1655,7 +1655,7 @@ impl FolderTask {
         let root = &self.link.root;
         let lock = claim::lock(root)
             .map_err(|error| format!("the folder's lock cannot be taken: {error}"))?
-            .ok_or("another Flarebox process is syncing this folder; stop it, or unlink the folder there")?;
+            .ok_or("another Koidrive process is syncing this folder; stop it, or unlink the folder there")?;
         let found = Identity::of(
             &lock
                 .metadata()
@@ -1667,7 +1667,7 @@ impl FolderTask {
         *locked = Some(found);
         match claim::owner(root) {
             Ok(Some(owner)) if owner != self.owner => Err(format!(
-                "the folder is linked by device {} of {}; unlink it there first, or remove its .flarebox/device.json",
+                "the folder is linked by device {} of {}; unlink it there first, or remove its .koidrive/device.json",
                 owner.device_id, owner.server
             )),
             Ok(Some(_)) => Ok(lock),

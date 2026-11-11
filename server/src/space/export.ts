@@ -5,8 +5,8 @@
 
 import { create, toBinary } from "@bufbuild/protobuf";
 import { BinaryWriter } from "@bufbuild/protobuf/wire";
-import { ExportHeaderSchema, NodeSnapshotSchema, RetainedVersionSchema } from "../gen/flarebox/v1/export_pb";
-import type { CommitRecord } from "../gen/flarebox/v1/model_pb";
+import { ExportHeaderSchema, NodeSnapshotSchema, RetainedVersionSchema } from "../gen/koidrive/v1/export_pb";
+import type { CommitRecord } from "../gen/koidrive/v1/model_pb";
 import { sha256 } from "../crypto";
 import { toHex, uuidv7Ms } from "../ids";
 import { getMeta, INLINE_CHUNKS, type NodeRow, nodeState, rows, setMeta, type VersionRow, versionInfo } from "./store";
@@ -290,7 +290,7 @@ export class Exporter {
   private async writeSegment(): Promise<void> {
     const { first, last } = readState(this.sql).segment!;
     const writer = new BinaryWriter();
-    writer.bytes(this.header("flarebox.log"));
+    writer.bytes(this.header("koidrive.log"));
     let expected = first;
     for (const row of this.sql.exec("SELECT seq, record FROM commits WHERE seq BETWEEN ? AND ? ORDER BY seq", first, last)) {
       if (Number(row.seq) !== expected++) throw new Error(`commit ${expected - 1} is missing from the log`);
@@ -324,7 +324,7 @@ export class Exporter {
     const head = this.headSeq;
     const found = rows<NodeRow>(this.sql.exec("SELECT * FROM nodes WHERE node_id > ? ORDER BY node_id LIMIT ?", running.cursor, this.pageNodes));
     const writer = new BinaryWriter();
-    writer.bytes(this.header("flarebox.snapshot"));
+    writer.bytes(this.header("koidrive.snapshot"));
     let records = 0;
     let bytes = 0;
     for (const node of found) {
@@ -363,7 +363,7 @@ export class Exporter {
     let running = readState(this.sql).running!;
     if (running.manifest === undefined) {
       const manifest = JSON.stringify({
-        format: "flarebox.snapshot",
+        format: "koidrive.snapshot",
         format_version: 1,
         space_id: this.spaceId,
         history_id: this.historyId,
@@ -404,7 +404,7 @@ export class Exporter {
   private async writeDescriptor(): Promise<void> {
     const spaceId = this.spaceId;
     const descriptor = {
-      format: "flarebox.space",
+      format: "koidrive.space",
       format_version: 1,
       space_id: spaceId,
       name: String(getMeta(this.sql, "name")),

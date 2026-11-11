@@ -45,10 +45,10 @@ pub mod disk;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flarebox_engine::commit::{self, Reconnect};
-use flarebox_engine::effects::{Effect, EffectRecord};
-use flarebox_engine::tree::{Content, NodeId, RemoteNode, same, same_content};
-use flarebox_proto::v1::{
+use koidrive_engine::commit::{self, Reconnect};
+use koidrive_engine::effects::{Effect, EffectRecord};
+use koidrive_engine::tree::{Content, NodeId, RemoteNode, same, same_content};
+use koidrive_proto::v1::{
     ChunkRef, Commit, Error, NodeKind, NodeStatus, PrepareUpload, Resume, UploadReceipt,
     chunk_plan, error, op, op_result,
 };
@@ -1160,7 +1160,7 @@ impl World {
             ids.extend(trees.synced().iter().map(|(id, _)| id));
             ids.extend(trees.remote().iter().map(|(id, _)| id));
             for id in ids {
-                let shape = |shape: Option<&flarebox_engine::tree::Shape>| match shape {
+                let shape = |shape: Option<&koidrive_engine::tree::Shape>| match shape {
                     Some(shape) => format!(
                         "{} {:?} {}",
                         short(&shape.parent),

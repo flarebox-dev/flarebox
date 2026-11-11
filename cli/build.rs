@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Embeds the server bundle in the `FLAREBOX_SERVER_BUNDLE` directory, which `server/scripts/pack-bundle.mjs` writes,
-//! so that `flarebox setup` deploys the server of its own release (docs/design/cli-setup.md section 4.2). Without the
+//! Embeds the server bundle in the `KOIDRIVE_SERVER_BUNDLE` directory, which `server/scripts/pack-bundle.mjs` writes,
+//! so that `koi setup` deploys the server of its own release (docs/design/cli-setup.md section 4.2). Without the
 //! variable the binary embeds nothing, and deploy and upgrade say so.
 
 #[path = "src/setup/bundle_files.rs"]
@@ -12,18 +12,18 @@ use std::fs;
 use std::path::PathBuf;
 
 fn main() {
-    println!("cargo::rerun-if-env-changed=FLAREBOX_SERVER_BUNDLE");
-    let files = match env::var_os("FLAREBOX_SERVER_BUNDLE") {
+    println!("cargo::rerun-if-env-changed=KOIDRIVE_SERVER_BUNDLE");
+    let files = match env::var_os("KOIDRIVE_SERVER_BUNDLE") {
         Some(dir) => {
             let dir = fs::canonicalize(&dir).unwrap_or_else(|error| {
                 panic!(
-                    "FLAREBOX_SERVER_BUNDLE={}: {error}",
+                    "KOIDRIVE_SERVER_BUNDLE={}: {error}",
                     PathBuf::from(&dir).display()
                 )
             });
             println!("cargo::rerun-if-changed={}", dir.display());
             bundle_files::bundle_files(&dir)
-                .unwrap_or_else(|error| panic!("FLAREBOX_SERVER_BUNDLE={}: {error}", dir.display()))
+                .unwrap_or_else(|error| panic!("KOIDRIVE_SERVER_BUNDLE={}: {error}", dir.display()))
         }
         None => Vec::new(),
     };

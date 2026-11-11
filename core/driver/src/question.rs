@@ -5,7 +5,7 @@
 //! These types mirror the macOS surface in `core/ffi` (`Question`, `QuestionKind`, `Answer`), so one driver serves the
 //! app and the CLI.
 
-pub use flarebox_engine::question::{Answer, QuestionKind, RecoveryGroup};
+pub use koidrive_engine::question::{Answer, QuestionKind, RecoveryGroup};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

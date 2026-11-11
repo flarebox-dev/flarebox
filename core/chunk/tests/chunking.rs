@@ -2,8 +2,8 @@
 
 use std::io::{self, Read};
 
-use flarebox_chunk::{Chunk, ChunkerConfig, chunk_hash, chunks, content, manifest_digest};
-use flarebox_proto::v1::ChunkRef;
+use koidrive_chunk::{Chunk, ChunkerConfig, chunk_hash, chunks, content, manifest_digest};
+use koidrive_proto::v1::ChunkRef;
 use proptest::prelude::*;
 use sha2::{Digest, Sha256};
 

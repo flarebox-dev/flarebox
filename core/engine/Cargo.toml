@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-name = "flarebox-engine"
+name = "koidrive-engine"
 description = "Sync state machine and conflict rules, free of I/O."
 version.workspace = true
 edition.workspace = true
@@ -13,8 +13,8 @@ publish.workspace = true
 serde = ["dep:serde"]
 
 [dependencies]
-flarebox-ignore = { path = "../ignore" }
-flarebox-proto = { path = "../proto" }
+koidrive-ignore = { path = "../ignore" }
+koidrive-proto = { path = "../proto" }
 prost.workspace = true
 serde = { version = "1.0.229", features = ["derive"], optional = true }
 unicode-normalization = "0.1"

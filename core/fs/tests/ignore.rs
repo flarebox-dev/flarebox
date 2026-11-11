@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Scans and watchers that apply the rules of design §5.10, with the matcher
-//! of `flarebox-ignore` over the engine's name key.
+//! of `koidrive-ignore` over the engine's name key.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -9,11 +9,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use flarebox_fs::{
+use koidrive_fs::{
     Change, EntryKind, Ignore, Ignored, Known, NativeWatcher, Poll, RULES_FILE, RescanWatcher,
     Rules, Snapshot, Watcher,
 };
-use flarebox_ignore::{Kind, LocalRules, Matcher, NameKey, Reason, RuleFile, Status};
+use koidrive_ignore::{Kind, LocalRules, Matcher, NameKey, Reason, RuleFile, Status};
 
 use EntryKind::{Dir, File};
 
@@ -23,7 +23,7 @@ struct Folded;
 
 impl NameKey for Folded {
     fn key(name: &str) -> String {
-        flarebox_engine::names::name_key(name)
+        koidrive_engine::names::name_key(name)
     }
 }
 
@@ -145,7 +145,7 @@ fn a_root_rule_leaves_out_a_file_and_a_folder_with_everything_below_it() {
 fn a_nested_rules_file_applies_to_its_folder_only() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    write(root, "docs/.fbignore", "draft\n");
+    write(root, "docs/.koiignore", "draft\n");
     write(root, "docs/draft", "d");
     write(root, "docs/deep/draft/x", "x");
     write(root, "docs/final", "f");
@@ -160,7 +160,7 @@ fn a_nested_rules_file_applies_to_its_folder_only() {
         known(&snapshot),
         [
             "docs",
-            "docs/.fbignore",
+            "docs/.koiignore",
             "docs/deep",
             "docs/final",
             "other",
@@ -258,7 +258,7 @@ fn removing_a_rule_reports_the_entries_as_created_also_deep_below_the_rules_file
 fn rules_inside_a_folder_that_becomes_left_out_are_dropped() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    write(root, "ig/.fbignore", "x\n");
+    write(root, "ig/.koiignore", "x\n");
     write(root, "ig/x", "x");
     write(root, "ig/y", "y");
     let mut rules = rules();
@@ -267,7 +267,7 @@ fn rules_inside_a_folder_that_becomes_left_out_are_dropped() {
         .rescan_with_rules(root, whole(), &mut rules)
         .unwrap();
     assert_eq!(rescan.rules, [rule("ig", Some("x\n"))]);
-    assert_eq!(known(&snapshot), ["ig", "ig/.fbignore", "ig/y"]);
+    assert_eq!(known(&snapshot), ["ig", "ig/.koiignore", "ig/y"]);
 
     write(root, RULES_FILE, "ig/\n");
     let rescan = snapshot
@@ -282,7 +282,7 @@ fn rules_inside_a_folder_that_becomes_left_out_are_dropped() {
         .rescan_with_rules(root, [PathBuf::from(RULES_FILE)], &mut rules)
         .unwrap();
     assert_eq!(rescan.rules, [rule("", None), rule("ig", Some("x\n"))]);
-    assert_eq!(known(&snapshot), ["ig", "ig/.fbignore", "ig/y"]);
+    assert_eq!(known(&snapshot), ["ig", "ig/.koiignore", "ig/y"]);
 }
 
 #[test]
@@ -291,11 +291,11 @@ fn a_symbolic_link_or_a_folder_named_like_a_rules_file_is_not_one() {
     let root = dir.path().join("space");
     write(dir.path(), "outside-rules", "x\n");
     write(&root, "linked/x", "x");
-    write(&root, "folder/.fbignore/x", "x");
+    write(&root, "folder/.koiignore/x", "x");
     write(&root, "folder/x", "x");
     std::os::unix::fs::symlink(
         dir.path().join("outside-rules"),
-        root.join("linked/.fbignore"),
+        root.join("linked/.koiignore"),
     )
     .unwrap();
 
@@ -309,8 +309,8 @@ fn a_symbolic_link_or_a_folder_named_like_a_rules_file_is_not_one() {
         known(&snapshot),
         [
             "folder",
-            "folder/.fbignore",
-            "folder/.fbignore/x",
+            "folder/.koiignore",
+            "folder/.koiignore/x",
             "folder/x",
             "linked",
             "linked/x"
@@ -659,12 +659,12 @@ fn a_removal_beside_an_ignored_folder_that_does_not_hold_the_entry_is_removed() 
 fn renaming_a_folder_that_holds_a_rules_file_moves_its_rules() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    write(root, "a/.fbignore", "x\n");
+    write(root, "a/.koiignore", "x\n");
     write(root, "a/x", "x");
     write(root, "a/y", "y");
     let mut rules = rules();
     let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
-    assert_eq!(known(&snapshot), ["a", "a/.fbignore", "a/y"]);
+    assert_eq!(known(&snapshot), ["a", "a/.koiignore", "a/y"]);
 
     fs::rename(root.join("a"), root.join("b")).unwrap();
     let rescan = snapshot
@@ -679,7 +679,7 @@ fn renaming_a_folder_that_holds_a_rules_file_moves_its_rules() {
         }]
     );
     assert_eq!(rescan.rules, [rule("a", None), rule("b", Some("x\n"))]);
-    assert_eq!(known(&snapshot), ["b", "b/.fbignore", "b/y"]);
+    assert_eq!(known(&snapshot), ["b", "b/.koiignore", "b/y"]);
 
     write(root, "a/x", "x");
     let rescan = snapshot
@@ -693,11 +693,11 @@ fn renaming_a_folder_that_holds_a_rules_file_moves_its_rules() {
 fn a_folder_renamed_only_in_case_keeps_its_rules() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    write(root, "a/.fbignore", "x\n");
+    write(root, "a/.koiignore", "x\n");
     write(root, "a/x", "left out");
     let mut rules = rules();
     let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
-    assert_eq!(known(&snapshot), ["a", "a/.fbignore"]);
+    assert_eq!(known(&snapshot), ["a", "a/.koiignore"]);
 
     fs::rename(root.join("a"), root.join("A")).unwrap();
     for _ in 0..2 {
@@ -709,7 +709,7 @@ fn a_folder_renamed_only_in_case_keeps_its_rules() {
             [],
             "the matcher holds one folder for both names"
         );
-        assert_eq!(known(&snapshot), ["A", "A/.fbignore"]);
+        assert_eq!(known(&snapshot), ["A", "A/.koiignore"]);
     }
     assert_eq!(rules.status(Path::new("A/x"), File), Ignored::Rule);
 }
@@ -724,19 +724,19 @@ fn a_rules_file_renamed_only_in_case_keeps_its_rules() {
     let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
     assert_eq!(known(&snapshot), [RULES_FILE]);
 
-    fs::rename(root.join(RULES_FILE), root.join(".FBIGNORE")).unwrap();
+    fs::rename(root.join(RULES_FILE), root.join(".KOIIGNORE")).unwrap();
     let rescan = snapshot
         .rescan_with_rules(root, whole(), &mut rules)
         .unwrap();
     assert_eq!(rescan.rules, []);
-    assert_eq!(known(&snapshot), [".FBIGNORE"]);
+    assert_eq!(known(&snapshot), [".KOIIGNORE"]);
 
-    write(root, ".FBIGNORE", "y\n");
+    write(root, ".KOIIGNORE", "y\n");
     let rescan = snapshot
         .rescan_with_rules(root, whole(), &mut rules)
         .unwrap();
     assert_eq!(rescan.rules, [rule("", Some("y\n"))]);
-    assert_eq!(known(&snapshot), [".FBIGNORE", "x"]);
+    assert_eq!(known(&snapshot), [".KOIIGNORE", "x"]);
 }
 
 #[test]
@@ -744,7 +744,7 @@ fn a_rules_file_that_cannot_be_read_at_the_first_scan_leaves_its_folder_unknown(
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(root, "keep.txt", "k");
-    write(root, "sub/.fbignore", &"x\n".repeat((1 << 19) + 1));
+    write(root, "sub/.koiignore", &"x\n".repeat((1 << 19) + 1));
     write(root, "sub/x", "left out");
     let mut rules = rules();
     let mut snapshot = Snapshot::default();
@@ -755,14 +755,14 @@ fn a_rules_file_that_cannot_be_read_at_the_first_scan_leaves_its_folder_unknown(
     assert_eq!(rescan.rules, []);
     assert_eq!(known(&snapshot), ["keep.txt", "sub"]);
 
-    write(root, "sub/.fbignore", "x\n");
+    write(root, "sub/.koiignore", "x\n");
     let rescan = snapshot
         .rescan_with_rules(root, whole(), &mut rules)
         .unwrap();
     assert_eq!(rescan.unreadable, Vec::<PathBuf>::new());
     assert_eq!(rescan.rules, [rule("sub", Some("x\n"))]);
-    assert_eq!(rescan.changes, [created("sub/.fbignore", File)]);
-    assert_eq!(known(&snapshot), ["keep.txt", "sub", "sub/.fbignore"]);
+    assert_eq!(rescan.changes, [created("sub/.koiignore", File)]);
+    assert_eq!(known(&snapshot), ["keep.txt", "sub", "sub/.koiignore"]);
 }
 
 /// A folder whose rules were unknown is reported read once a scan lists it, also with no rules file left to read and
@@ -772,7 +772,7 @@ fn a_folder_whose_rules_were_unknown_is_reported_once_they_are_known() {
     for how in ["the rules file is deleted", "the folder is deleted"] {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        write(root, "sub/.fbignore", &"x\n".repeat((1 << 19) + 1));
+        write(root, "sub/.koiignore", &"x\n".repeat((1 << 19) + 1));
         write(root, "sub/x", "kept");
         let mut rules = rules();
         let mut snapshot = Snapshot::default();
@@ -785,7 +785,7 @@ fn a_folder_whose_rules_were_unknown_is_reported_once_they_are_known() {
         let sub = root.join("sub");
         match how {
             "the folder is deleted" => fs::remove_dir_all(sub).unwrap(),
-            _ => fs::remove_file(sub.join(".fbignore")).unwrap(),
+            _ => fs::remove_file(sub.join(".koiignore")).unwrap(),
         }
         let rescan = snapshot
             .rescan_with_rules(root, whole(), &mut rules)
@@ -811,7 +811,7 @@ fn scans_without_rules_leave_out_nothing_but_the_private_folder() {
     write(root, RULES_FILE, "ig/\n");
     write(root, "ig/x", "x");
     write(root, ".DS_Store", "finder");
-    write(root, ".flarebox/space.json", "{}");
+    write(root, ".koidrive/space.json", "{}");
     let mut snapshot = Snapshot::default();
     let rescan = snapshot.rescan(root, whole()).unwrap();
     assert_eq!(known(&snapshot), [".DS_Store", RULES_FILE, "ig", "ig/x"]);
@@ -826,7 +826,7 @@ fn reading_a_folder_leaves_its_unread_namesake_in_another_case_unknown() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(root, "proj/ok", "ok");
-    write(root, "PROJ/.fbignore", &"x\n".repeat((1 << 19) + 1));
+    write(root, "PROJ/.koiignore", &"x\n".repeat((1 << 19) + 1));
     write(root, "PROJ/x", "unknown rules apply here");
     let mut rules = rules();
     let mut snapshot = Snapshot::default();
@@ -839,16 +839,16 @@ fn reading_a_folder_leaves_its_unread_namesake_in_another_case_unknown() {
     assert_eq!(partial.rules, [], "only proj was read");
 }
 
-/// On a case-sensitive volume a folder can hold `.fbignore` and `.FBIGNORE`, two rules files. Which of them other
+/// On a case-sensitive volume a folder can hold `.koiignore` and `.KOIIGNORE`, two rules files. Which of them other
 /// devices would see is not known, so the folder's rules are unknown until one of them is gone.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_folder_with_two_rules_files_that_differ_only_in_case_is_unknown_until_one_is_gone() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    write(root, "sub/.fbignore", "a\n");
-    write(root, "sub/.FBIGNORE", "b\n");
-    write(root, "sub/b", "left out by .FBIGNORE only");
+    write(root, "sub/.koiignore", "a\n");
+    write(root, "sub/.KOIIGNORE", "b\n");
+    write(root, "sub/b", "left out by .KOIIGNORE only");
     let mut rules = rules();
     let mut snapshot = Snapshot::default();
     let first = snapshot
@@ -858,26 +858,26 @@ fn a_folder_with_two_rules_files_that_differ_only_in_case_is_unknown_until_one_i
     assert_eq!(first.read, [PathBuf::new()]);
     assert_eq!(known(&snapshot), ["sub"]);
 
-    fs::remove_file(root.join("sub/.FBIGNORE")).unwrap();
+    fs::remove_file(root.join("sub/.KOIIGNORE")).unwrap();
     let resolved = snapshot
         .rescan_with_rules(root, whole(), &mut rules)
         .unwrap();
     assert!(resolved.unreadable.is_empty());
     assert_eq!(resolved.read, [PathBuf::new(), PathBuf::from("sub")]);
     assert_eq!(resolved.rules, [rule("sub", Some("a\n"))]);
-    assert_eq!(known(&snapshot), ["sub", "sub/.fbignore", "sub/b"]);
+    assert_eq!(known(&snapshot), ["sub", "sub/.koiignore", "sub/b"]);
 }
 
-/// On a case-sensitive volume a folder can hold a folder named `.fbignore` beside the regular file `.FBIGNORE`. Only
+/// On a case-sensitive volume a folder can hold a folder named `.koiignore` beside the regular file `.KOIIGNORE`. Only
 /// the regular file is a rules file, so its rules are in force.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_folder_named_like_the_rules_file_does_not_hide_a_rules_file_in_another_case() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    write(root, "sub/.fbignore/x", "x");
-    write(root, "sub/.FBIGNORE", "b\n");
-    write(root, "sub/b", "left out by .FBIGNORE");
+    write(root, "sub/.koiignore/x", "x");
+    write(root, "sub/.KOIIGNORE", "b\n");
+    write(root, "sub/b", "left out by .KOIIGNORE");
     let mut rules = rules();
     let mut snapshot = Snapshot::default();
     let rescan = snapshot
@@ -887,7 +887,12 @@ fn a_folder_named_like_the_rules_file_does_not_hide_a_rules_file_in_another_case
     assert_eq!(rescan.rules, [rule("sub", Some("b\n"))]);
     assert_eq!(
         known(&snapshot),
-        ["sub", "sub/.FBIGNORE", "sub/.fbignore", "sub/.fbignore/x"]
+        [
+            "sub",
+            "sub/.KOIIGNORE",
+            "sub/.koiignore",
+            "sub/.koiignore/x"
+        ]
     );
 }
 
@@ -895,7 +900,7 @@ fn a_folder_named_like_the_rules_file_does_not_hide_a_rules_file_in_another_case
 fn review_renaming_an_unread_folder_and_removing_its_rules_reports_the_current_path_known() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    write(root, "proj/.fbignore", &"x\n".repeat((1 << 19) + 1));
+    write(root, "proj/.koiignore", &"x\n".repeat((1 << 19) + 1));
     write(root, "proj/ok", "ok");
     let mut rules = rules();
     let mut snapshot = Snapshot::default();
@@ -904,7 +909,7 @@ fn review_renaming_an_unread_folder_and_removing_its_rules_reports_the_current_p
         .unwrap();
     assert_eq!(first.unreadable, [PathBuf::from("proj")]);
     fs::rename(root.join("proj"), root.join("PROJ")).unwrap();
-    fs::remove_file(root.join("PROJ/.fbignore")).unwrap();
+    fs::remove_file(root.join("PROJ/.koiignore")).unwrap();
     let recovered = snapshot
         .rescan_with_rules(root, whole(), &mut rules)
         .unwrap();
@@ -1185,13 +1190,13 @@ fn native_watcher_reports_a_change_below_a_folder_that_a_reset_made_known() {
 fn a_folder_moved_over_an_empty_folder_with_unreadable_rules_keeps_its_entries() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    write(root, "drafts/.fbignore", "*.tmp\n");
+    write(root, "drafts/.koiignore", "*.tmp\n");
     write(root, "drafts/one.txt", "one");
     write(root, "drafts/inner/two.txt", "two");
     fs::create_dir(root.join("final")).unwrap();
     let mut rules = rules();
     let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
-    write(root, "drafts/.fbignore", &"x\n".repeat((1 << 19) + 1));
+    write(root, "drafts/.koiignore", &"x\n".repeat((1 << 19) + 1));
     let rescan = snapshot
         .rescan_with_rules(root, whole(), &mut rules)
         .unwrap();
@@ -1215,21 +1220,21 @@ fn a_folder_moved_over_an_empty_folder_with_unreadable_rules_keeps_its_entries()
     assert_eq!(rescan.unreadable, [PathBuf::from("final")]);
     let moved = [
         "final",
-        "final/.fbignore",
+        "final/.koiignore",
         "final/inner",
         "final/inner/two.txt",
         "final/one.txt",
     ];
     assert_eq!(known(&snapshot), moved);
 
-    write(root, "final/.fbignore", "*.tmp\n");
+    write(root, "final/.koiignore", "*.tmp\n");
     let rescan = snapshot
         .rescan_with_rules(root, whole(), &mut rules)
         .unwrap();
     assert_eq!(
         rescan.changes,
         [Change::Modified {
-            path: "final/.fbignore".into()
+            path: "final/.koiignore".into()
         }]
     );
     assert_eq!(rescan.unreadable, Vec::<PathBuf>::new());

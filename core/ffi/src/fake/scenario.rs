@@ -71,7 +71,7 @@ fn signed_in() -> Saved {
     let linked = |space_id: &str, name: &str| LinkedFolder {
         space_id: space_id.to_owned(),
         space_name: name.to_owned(),
-        path: format!("{home}/Flarebox/{name}"),
+        path: format!("{home}/Koidrive/{name}"),
         state: FolderState::UpToDate,
     };
     Saved {
@@ -432,7 +432,7 @@ pub(super) fn build(scenario: FakeScenario, now: i64) -> Script {
                 ),
                 (
                     documents,
-                    Some(".fbignore"),
+                    Some(".koiignore"),
                     ProblemKind::IgnoreRuleInvalid { line: 7 },
                 ),
                 (Some(PHOTOS), None, ProblemKind::FolderMissing),

@@ -5,8 +5,8 @@ import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import type { AccountDO } from "../src/account-do";
-import { AccessTokenSchema, type DeviceCredentials, TokenRequestSchema } from "../src/gen/flarebox/v1/auth_pb";
-import { Error_Code } from "../src/gen/flarebox/v1/rpc_pb";
+import { AccessTokenSchema, type DeviceCredentials, TokenRequestSchema } from "../src/gen/koidrive/v1/auth_pb";
+import { Error_Code } from "../src/gen/koidrive/v1/rpc_pb";
 import { base64url } from "../src/crypto";
 
 // RFC 0011 section 1: refresh credential rotation on POST /v1/token.
@@ -246,7 +246,7 @@ describe("refresh credential rotation (RFC 0011 section 1)", () => {
       return claimed.value;
     });
     const post = (body: BodyInit, contentType: string) =>
-      exports.default.fetch("https://flarebox.test/v1/token", { method: "POST", headers: { "Content-Type": contentType, Accept: contentType }, body });
+      exports.default.fetch("https://koidrive.test/v1/token", { method: "POST", headers: { "Content-Type": contentType, Accept: contentType }, body });
 
     const plainJson = await post(JSON.stringify({ deviceId: device.deviceId, refreshCredential: device.refreshCredential }), "application/json");
     expect(plainJson.status).toBe(200);
