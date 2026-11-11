@@ -292,7 +292,7 @@ fn folder_that_gained_an_entry_is_put_back() {
             fs::write(root.join("docs/empty/late.txt"), "late").unwrap();
         }
     });
-    assert_eq!(outcome, failed(Reason::Changed));
+    assert_eq!(outcome, failed(Reason::Holds(vec!["late.txt".into()])));
     assert_eq!(fs::read(root.join("docs/empty/late.txt")).unwrap(), b"late");
     assert!(private_names(root, "trash").is_empty());
     assert_settled(root);
@@ -317,6 +317,7 @@ fn folder_that_holds_only_platform_files_enters_the_trash_empty() {
 
 /// A file a rule leaves out, a folder with a platform file's name and a
 /// symbolic link with one each keep the folder, and nothing in it is deleted.
+/// The removal fails naming the entry, but not the platform file.
 #[test]
 fn folder_that_holds_anything_but_platform_files_is_put_back_as_it_was() {
     let others: [fn(&Path); 3] = [
@@ -324,7 +325,8 @@ fn folder_that_holds_anything_but_platform_files_is_put_back_as_it_was() {
         |folder| fs::create_dir(folder.join("Thumbs.db")).unwrap(),
         |folder| std::os::unix::fs::symlink("build.log", folder.join("desktop.ini")).unwrap(),
     ];
-    for other in others {
+    let names = ["build.log", "Thumbs.db", "desktop.ini"];
+    for (other, name) in others.into_iter().zip(names) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let effect = prepare(&SCENARIOS[5], root);
@@ -334,7 +336,8 @@ fn folder_that_holds_anything_but_platform_files_is_put_back_as_it_was() {
         let before = listing(&folder);
         assert_eq!(before.len(), 2);
 
-        assert_eq!(apply(root, &effect, |_| {}), failed(Reason::Changed));
+        let held = Reason::Holds(vec![name.into()]);
+        assert_eq!(apply(root, &effect, |_| {}), failed(held));
         assert_eq!(listing(&folder), before);
         assert_eq!(fs::read(folder.join(".DS_Store")).unwrap(), b"view");
         assert!(private_names(root, "trash").is_empty());

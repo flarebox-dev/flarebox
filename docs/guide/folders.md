@@ -34,7 +34,7 @@ It doesn't sync:
 - symbolic links, sockets, FIFOs and device files. Flarebox skips them and never follows a symbolic link inside a linked folder;
 - permissions other than the executable bit, the owner and group, ACLs and extended attributes such as macOS Finder tags;
 - hard links as links. Each name of a hard-linked file syncs as a separate file;
-- the platform files `.DS_Store`, `Thumbs.db`, `desktop.ini` and `Icon\r`, and the `.flarebox/` folder at the top of a linked folder. No rule can bring them back. When sync removes a folder that another device deleted, it deletes these platform files in it too, so that the folder can go. A `.flarebox` folder deeper down is an ordinary folder and syncs.
+- the platform files `.DS_Store`, `Thumbs.db`, `desktop.ini` and `Icon\r`, and the `.flarebox/` folder at the top of a linked folder. No rule can bring them back. When sync removes a folder that another device deleted, it deletes these platform files in it too, so that the folder can go. If the folder still holds anything else that Flarebox doesn't sync, such as a file your rules leave out or a symbolic link, Flarebox keeps the folder with those entries, and the status names them. Remove them and run `flarebox restart`, and the folder goes. A `.flarebox` folder deeper down is an ordinary folder and syncs.
 
 Names compare without regard to case or Unicode normalization. Two names in one folder that differ only in case, such as `Report.txt` and `report.txt`, can exist on a Linux disk but not in a space, so the second to arrive is renamed as a [conflict](conflicts.md#two-files-with-the-same-name). A name is at most 255 bytes, and a path at most 256 folders deep.
 

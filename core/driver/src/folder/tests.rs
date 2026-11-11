@@ -1695,6 +1695,68 @@ fn discarding_what_a_first_link_holds_moves_it_to_the_local_trash_and_downloads_
     assert_eq!(b.state(), FolderState::UpToDate);
 }
 
+/// Discard on a first link whose held folder also holds an entry L does not know: a file the device's rules exclude,
+/// or a symlink. Discard moves the listed file to the local trash and keeps the folder with that entry. The folder's
+/// removal is not planned again on a timer, and the status names the entry.
+#[test]
+fn discarding_a_held_folder_that_holds_an_entry_l_does_not_know_keeps_the_folder_and_names_the_entry()
+ {
+    for unknown in ["build.log", "link"] {
+        let mut remote = Remote::new();
+        let (site_a, mut a) = linked(&mut remote, "a");
+        a.create(&mut remote, &site_a.root.join("notes.txt"), b"written on a");
+        let site = Site::new(&remote, "b");
+        fs::create_dir(site.root.join("held")).unwrap();
+        fs::write(site.root.join("held/a.txt"), b"listed").unwrap();
+        let entry = site.root.join("held").join(unknown);
+        match unknown {
+            "link" => std::os::unix::fs::symlink("/etc/hosts", &entry).unwrap(),
+            _ => fs::write(&entry, b"left out").unwrap(),
+        }
+        let sync = SyncRules {
+            include: Vec::new(),
+            exclude: vec!["*.log".into()],
+        };
+        let mut b = site.start_with(&sync);
+        b.connect(&remote);
+        b.scan_until(|b| b.folder.scanned);
+        b.run(&mut remote);
+        b.settle();
+        b.run(&mut remote);
+        answer(&site, Answer::Discard);
+        let step = b.folder.requested();
+        b.take(step).unwrap();
+        let mut steps = 0;
+        while let Some(work) = b.work.pop_front() {
+            steps += 1;
+            assert!(
+                steps < 20,
+                "{unknown}: the removal is planned again and again"
+            );
+            b.perform(work, &mut remote).unwrap();
+        }
+
+        assert!(
+            b.sent.is_empty(),
+            "{unknown}: nothing is sent for a discarded entry"
+        );
+        assert!(fs::symlink_metadata(&entry).is_ok(), "{unknown} is kept");
+        assert!(!site.root.join("held/a.txt").exists());
+        assert_eq!(trashed(&site.root).len(), 1, "{unknown}");
+        let view = b.folder.view();
+        assert_eq!(
+            (view.state, view.questions),
+            (FolderState::UpToDate, 0),
+            "{unknown}"
+        );
+        let problem = view.problem.unwrap_or_default();
+        assert!(
+            problem.contains(&format!("held (the server's change could not be made here: the folder holds entries this device does not sync: {unknown})")),
+            "{problem}"
+        );
+    }
+}
+
 #[test]
 fn a_first_link_adopts_what_the_space_holds_alike_and_publishes_the_rest_when_asked() {
     let mut remote = Remote::new();
@@ -2392,6 +2454,78 @@ fn a_deleted_folder_that_keeps_an_excluded_file_on_the_server_leaves_the_folder_
     live.sort();
     assert_eq!(live, [".fbignore", "a.log", "d"]);
     assert_eq!(a.state(), FolderState::UpToDate);
+}
+
+/// Device `a` deletes the folder `held` while `b` holds an entry L does not know there: a file `b`'s rules exclude,
+/// or a symlink. `b` removes `held/a.txt` and keeps the folder with that entry, so the folder's removal fails and
+/// is not planned again on a timer. The folder is up to date, and the status names the entry. Once the person removes
+/// it, a restart removes the folder.
+#[test]
+fn a_remote_delete_of_a_folder_holding_an_entry_l_does_not_know_names_the_entry_until_it_is_removed()
+ {
+    for unknown in ["build.log", "link"] {
+        let mut remote = Remote::new();
+        let (site_a, mut a) = linked(&mut remote, "a");
+        fs::create_dir(site_a.root.join("held")).unwrap();
+        a.create(&mut remote, &site_a.root.join("held/a.txt"), b"synced");
+        let sync = SyncRules {
+            include: Vec::new(),
+            exclude: vec!["*.log".into()],
+        };
+        let site = Site::new(&remote, "b");
+        let mut b = site.start_with(&sync);
+        b.connect(&remote);
+        b.scan_until(|b| b.folder.scanned);
+        b.run(&mut remote);
+        b.settle();
+        let entry = site.root.join("held").join(unknown);
+        match unknown {
+            "link" => std::os::unix::fs::symlink("/etc/hosts", &entry).unwrap(),
+            _ => fs::write(&entry, b"left out").unwrap(),
+        }
+        b.settle();
+        assert_eq!(b.state(), FolderState::UpToDate, "{unknown}");
+
+        fs::remove_dir_all(site_a.root.join("held")).unwrap();
+        a.scan_until(|a| !a.work.is_empty());
+        a.run(&mut remote);
+        b.pull(&remote);
+        let mut steps = 0;
+        while let Some(work) = b.work.pop_front() {
+            steps += 1;
+            assert!(
+                steps < 20,
+                "{unknown}: the removal is planned again and again"
+            );
+            b.perform(work, &mut remote).unwrap();
+        }
+        b.settle();
+        assert!(b.work.is_empty(), "{unknown}");
+        assert!(fs::symlink_metadata(&entry).is_ok(), "{unknown} is kept");
+        assert!(!site.root.join("held/a.txt").exists());
+        let view = b.folder.view();
+        assert_eq!(view.state, FolderState::UpToDate, "{unknown}");
+        let problem = view.problem.unwrap_or_default();
+        assert!(
+            problem.contains(&format!("held (the server's change could not be made here: the folder holds entries this device does not sync: {unknown})")),
+            "{problem}"
+        );
+
+        drop(b);
+        fs::remove_file(&entry).unwrap();
+        let mut b = site.start_with(&sync);
+        b.connect(&remote);
+        b.scan_until(|b| b.folder.scanned);
+        b.run(&mut remote);
+        b.settle();
+        assert!(!site.root.join("held").exists(), "{unknown}");
+        let view = b.folder.view();
+        assert_eq!(
+            (view.state, view.problem),
+            (FolderState::UpToDate, None),
+            "{unknown}"
+        );
+    }
 }
 
 /// Whether L, as the site's store holds it, has an entry named `name`.

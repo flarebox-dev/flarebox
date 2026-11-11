@@ -529,6 +529,15 @@ impl Folder {
                         "an effect failed and is planned again"
                     );
                 }
+                Settled::Stuck(why) => {
+                    tracing::warn!(
+                        space_id = self.link.space_id,
+                        why,
+                        "an effect failed; its node is planned again once what is planned for it changes or the folder \
+                         restarts"
+                    );
+                    self.effect_failures.entry(node).or_default().1 = why;
+                }
             }
         }
         self.drive(&mut work)?;
