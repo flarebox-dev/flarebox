@@ -7,7 +7,7 @@
 
 use std::fs::{self, DirBuilder};
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 use flarebox_driver::{
@@ -164,8 +164,10 @@ pub async fn handle(driver: &Driver, request: Request) -> Response {
 /// before its mode is set. The socket is bound under a temporary name and renamed once it is 0600, so it never
 /// appears at `path` with another mode. Setting the umask instead would change it for every thread of the process.
 /// The temporary name is `.tmp` and the process id, at most 11 bytes like `daemon.sock`, so it fits the socket address
-/// limit wherever the socket path does.
+/// limit wherever the socket path does. A socket path too long for that limit is refused, since no client could
+/// connect to it.
 pub fn bind(path: &Path) -> io::Result<UnixListener> {
+    std::os::unix::net::SocketAddr::from_pathname(path)?;
     let dir = path.parent().unwrap_or(Path::new("."));
     DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     let metadata = fs::metadata(dir)?;
@@ -186,7 +188,7 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
         )));
     }
     #[cfg(target_os = "macos")]
-    if acl_allows_others(dir, uid)? {
+    if acl::allows_others(dir, uid)? {
         return Err(refuse(
             "lets other users in through an ACL; remove it with chmod -N".to_owned(),
         ));
@@ -197,9 +199,11 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    let listener = bind_socket(&temp)?;
-    fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))
-        .and_then(|()| fs::rename(&temp, path))
+    // A socket left by an earlier version can carry an inherited deny-delete entry, which blocks the rename.
+    #[cfg(target_os = "macos")]
+    let _ = acl::clear(path);
+    let listener = bind_socket(&temp)
+        .and_then(|listener| fs::rename(&temp, path).map(|()| listener))
         .inspect_err(|_| {
             let _ = fs::remove_file(&temp);
         })?;
@@ -208,7 +212,8 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
 }
 
 /// Creates the socket 0600 before binding it, so it is closed to other users from its first moment even if the
-/// directory was swapped after it was checked. Linux takes the new file's mode from the socket; macOS ignores it.
+/// directory was swapped after it was checked. Linux takes the new file's mode from the socket, so no chmod by path is
+/// needed. One could follow a symlink planted in a swapped directory.
 #[cfg(target_os = "linux")]
 fn bind_socket(path: &Path) -> io::Result<std::os::unix::net::UnixListener> {
     use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
@@ -224,17 +229,29 @@ fn bind_socket(path: &Path) -> io::Result<std::os::unix::net::UnixListener> {
     Ok(socket.into())
 }
 
-#[cfg(not(target_os = "linux"))]
+/// macOS takes the new socket file's mode from the umask, so the file is set to 0600 right after binding, without
+/// following a symlink, and any ACL it inherited from the directory is cleared, since an inherited deny-delete entry
+/// would block replacing and removing it. Until then the directory check keeps other users out.
+#[cfg(target_os = "macos")]
 fn bind_socket(path: &Path) -> io::Result<std::os::unix::net::UnixListener> {
-    std::os::unix::net::UnixListener::bind(path)
+    use rustix::fs::{AtFlags, CWD, Mode};
+    let listener = std::os::unix::net::UnixListener::bind(path)?;
+    rustix::fs::chmodat(
+        CWD,
+        path,
+        Mode::from_raw_mode(0o600),
+        AtFlags::SYMLINK_NOFOLLOW,
+    )?;
+    acl::clear(path)?;
+    Ok(listener)
 }
 
-/// Whether the extended ACL of `dir` has an allow entry for anyone but `owner`. Such an entry grants access the mode
-/// bits do not show, and an inheritable one is copied onto the socket. Deny entries only take access away.
 #[cfg(target_os = "macos")]
-fn acl_allows_others(dir: &Path, owner: u32) -> io::Result<bool> {
+mod acl {
     use std::ffi::{CString, c_char, c_int, c_void};
+    use std::io;
     use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
 
     const ACL_TYPE_EXTENDED: c_int = 0x100;
     const ACL_FIRST_ENTRY: c_int = 0;
@@ -242,7 +259,9 @@ fn acl_allows_others(dir: &Path, owner: u32) -> io::Result<bool> {
     const ACL_EXTENDED_ALLOW: c_int = 1;
     const ID_TYPE_UID: c_int = 0;
     unsafe extern "C" {
+        fn acl_init(count: c_int) -> *mut c_void;
         fn acl_get_file(path: *const c_char, kind: c_int) -> *mut c_void;
+        fn acl_set_link_np(path: *const c_char, kind: c_int, acl: *mut c_void) -> c_int;
         fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry: *mut *mut c_void) -> c_int;
         fn acl_get_tag_type(entry: *mut c_void, tag: *mut c_int) -> c_int;
         fn acl_get_qualifier(entry: *mut c_void) -> *mut c_void;
@@ -250,44 +269,67 @@ fn acl_allows_others(dir: &Path, owner: u32) -> io::Result<bool> {
         fn mbr_uuid_to_id(uuid: *const u8, id: *mut u32, id_type: *mut c_int) -> c_int;
     }
 
-    let path = CString::new(dir.as_os_str().as_bytes())?;
-    // SAFETY: `path` is a valid C string for the duration of the call.
-    let acl = unsafe { acl_get_file(path.as_ptr(), ACL_TYPE_EXTENDED) };
-    if acl.is_null() {
-        let error = io::Error::last_os_error();
-        return match error.kind() {
-            io::ErrorKind::NotFound => Ok(false),
-            _ => Err(error),
-        };
-    }
-    let mut allows_others = false;
-    let mut entry = std::ptr::null_mut();
-    let mut which = ACL_FIRST_ENTRY;
-    // SAFETY: `acl` is a live ACL from acl_get_file, `entry` points into it, and each qualifier is freed once.
-    unsafe {
-        while acl_get_entry(acl, which, &mut entry) == 0 {
-            which = ACL_NEXT_ENTRY;
-            let mut tag = 0;
-            if acl_get_tag_type(entry, &mut tag) == 0 && tag != ACL_EXTENDED_ALLOW {
-                continue;
+    /// Removes every extended ACL entry from `path`, without following a symlink.
+    pub fn clear(path: &Path) -> io::Result<()> {
+        let path = CString::new(path.as_os_str().as_bytes())?;
+        // SAFETY: `path` is a valid C string, and the empty ACL from acl_init is freed once after use.
+        unsafe {
+            let empty = acl_init(0);
+            if empty.is_null() {
+                return Err(io::Error::last_os_error());
             }
-            let qualifier = acl_get_qualifier(entry);
-            let (mut id, mut id_type) = (0, -1);
-            let owner_only = !qualifier.is_null()
-                && mbr_uuid_to_id(qualifier.cast(), &mut id, &mut id_type) == 0
-                && id_type == ID_TYPE_UID
-                && id == owner;
-            if !qualifier.is_null() {
-                acl_free(qualifier);
-            }
-            if !owner_only {
-                allows_others = true;
-                break;
+            let result = acl_set_link_np(path.as_ptr(), ACL_TYPE_EXTENDED, empty);
+            let error = io::Error::last_os_error();
+            acl_free(empty);
+            if result != 0 {
+                return Err(error);
             }
         }
-        acl_free(acl);
+        Ok(())
     }
-    Ok(allows_others)
+
+    /// Whether the extended ACL of `dir` has an allow entry for anyone but `owner`. Such an entry grants access the
+    /// mode bits do not show. Deny entries only take access away.
+    pub fn allows_others(dir: &Path, owner: u32) -> io::Result<bool> {
+        let path = CString::new(dir.as_os_str().as_bytes())?;
+        // SAFETY: `path` is a valid C string for the duration of the call.
+        let acl = unsafe { acl_get_file(path.as_ptr(), ACL_TYPE_EXTENDED) };
+        if acl.is_null() {
+            let error = io::Error::last_os_error();
+            return match error.kind() {
+                io::ErrorKind::NotFound => Ok(false),
+                _ => Err(error),
+            };
+        }
+        let mut allows_others = false;
+        let mut entry = std::ptr::null_mut();
+        let mut which = ACL_FIRST_ENTRY;
+        // SAFETY: `acl` is a live ACL from acl_get_file, `entry` points into it, and each qualifier is freed once.
+        unsafe {
+            while acl_get_entry(acl, which, &mut entry) == 0 {
+                which = ACL_NEXT_ENTRY;
+                let mut tag = 0;
+                if acl_get_tag_type(entry, &mut tag) == 0 && tag != ACL_EXTENDED_ALLOW {
+                    continue;
+                }
+                let qualifier = acl_get_qualifier(entry);
+                let (mut id, mut id_type) = (0, -1);
+                let owner_only = !qualifier.is_null()
+                    && mbr_uuid_to_id(qualifier.cast(), &mut id, &mut id_type) == 0
+                    && id_type == ID_TYPE_UID
+                    && id == owner;
+                if !qualifier.is_null() {
+                    acl_free(qualifier);
+                }
+                if !owner_only {
+                    allows_others = true;
+                    break;
+                }
+            }
+            acl_free(acl);
+        }
+        Ok(allows_others)
+    }
 }
 
 /// Serves requests until the task is dropped.
@@ -329,8 +371,9 @@ async fn answer(stream: UnixStream, driver: &Driver) -> io::Result<()> {
     write_line(&mut writer, &response).await
 }
 
-/// Sends a request to the daemon at `socket`, or returns `None` when no daemon listens there.
-pub async fn send(socket: &Path, request: &Request) -> io::Result<Option<Response>> {
+/// Sends a request to the daemon at `socket`, or returns `None` when no daemon listens there. A socket served by
+/// anyone but the user `owner` gets nothing: requests carry pairing codes and the credential.
+pub async fn send(socket: &Path, request: &Request, owner: u32) -> io::Result<Option<Response>> {
     let stream = match UnixStream::connect(socket).await {
         Ok(stream) => stream,
         Err(error)
@@ -343,6 +386,13 @@ pub async fn send(socket: &Path, request: &Request) -> io::Result<Option<Respons
         }
         Err(error) => return Err(error),
     };
+    let peer = stream.peer_cred()?.uid();
+    if peer != owner {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("it is served by another user (uid {peer})"),
+        ));
+    }
     let (reader, mut writer) = stream.into_split();
     write_line(&mut writer, request).await?;
     let line = read_line(reader).await?;
@@ -354,7 +404,7 @@ pub async fn send(socket: &Path, request: &Request) -> io::Result<Option<Respons
 /// Runs a request in the daemon, or returns `None` when no daemon answers on the profile's socket.
 pub async fn ask(paths: &Paths, request: &Request) -> Result<Option<Response>, String> {
     let socket = paths.socket();
-    send(&socket, request)
+    send(&socket, request, rustix::process::getuid().as_raw())
         .await
         .map_err(|error| format!("the daemon's socket {} failed: {error}", socket.display()))
 }
@@ -400,6 +450,7 @@ async fn write_line(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -449,6 +500,27 @@ mod tests {
         let _held = Driver::open(paths.clone()).unwrap();
         let error = run(&paths, Request::Status).await.unwrap_err();
         assert!(error.contains("does not answer"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_socket_served_by_another_user_gets_no_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let daemon = UnixListener::bind(&socket).unwrap();
+        let received = tokio::spawn(async move {
+            let (stream, _) = daemon.accept().await.unwrap();
+            read_line(stream).await.unwrap()
+        });
+        let someone_else = rustix::process::getuid().as_raw() + 1;
+        let request = Request::Pair {
+            server: "https://example.com".into(),
+            code: "AAAA-BBBB".into(),
+            name: "laptop".into(),
+        };
+        let error = send(&socket, &request, someone_else).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("another user"), "{error}");
+        assert_eq!(received.await.unwrap(), "");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -507,6 +579,19 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(error.to_string().contains("open to other users"), "{error}");
         assert_eq!(fs::read_dir(&run).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_socket_path_too_long_to_connect_to_gets_no_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let limit = if cfg!(target_os = "macos") { 104 } else { 108 };
+        let fixed = dir.path().as_os_str().len() + "/".len() + "/daemon.sock".len();
+        let run = dir.path().join("r".repeat(limit - fixed));
+        let socket = run.join("daemon.sock");
+        assert_eq!(socket.as_os_str().len(), limit);
+        let error = bind(&socket).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!run.exists());
     }
 
     #[tokio::test]
@@ -577,6 +662,26 @@ mod tests {
         let listener = bind(&socket).unwrap();
         let mode = fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+        let _client = UnixStream::connect(&socket).await.unwrap();
+        listener.accept().await.unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_directory_whose_acl_denies_deleting_new_files_still_gets_the_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        DirBuilder::new().mode(0o700).create(&run).unwrap();
+        add_acl_entries(&run, &["everyone deny delete,file_inherit"]);
+        let socket = run.join("daemon.sock");
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        drop(bind(&socket).unwrap());
+        let listener = bind(&socket).unwrap();
+        let names: Vec<_> = fs::read_dir(&run)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["daemon.sock"]);
         let _client = UnixStream::connect(&socket).await.unwrap();
         listener.accept().await.unwrap();
     }
