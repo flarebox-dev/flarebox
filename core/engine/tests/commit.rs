@@ -3391,3 +3391,32 @@ fn a_late_acknowledgement_takes_the_sent_position_over_one_s_took_from_before_th
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert_eq!(ops(&commit), [mv("n", ROOT, "c")]);
 }
+
+/// n's move to b is in flight when a log replay brings the commit at seq 2 and the other device's
+/// move back to a at seq 3. S still holds the a it held when the commit was built, and L never
+/// took a again, so S takes the b that was sent. The other device's later move then reaches the
+/// disk, and the move to b is not sent again.
+#[test]
+fn a_late_acknowledgement_takes_the_sent_position_when_only_r_returned_to_the_one_s_holds() {
+    let mut trees = trees(&[(
+        "n",
+        Some(file(ROOT, "b", 1)),
+        Some(file(ROOT, "a", 1)),
+        Some(remote(file(ROOT, "a", 1))),
+    )]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", ROOT, "b")]);
+    trees.set_remote("n".into(), remote_at(file(ROOT, "b", 1), 2));
+    trees.set_remote("n".into(), remote_at(file(ROOT, "a", 1), 3));
+    trees.settle();
+    commits
+        .received(result(2, vec![outcome(op_result::Code::Applied)]))
+        .unwrap();
+    assert!(commits.acknowledge(&mut trees, 3));
+    trees.settle();
+    assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "b", 1)));
+    effects_for(&mut trees, &mut ids, "n");
+    assert_eq!(trees.local().live("n"), Some(&file(ROOT, "a", 1)));
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+}
