@@ -1199,19 +1199,20 @@ fn a_folder_moved_over_an_empty_folder_with_unreadable_rules_keeps_its_entries()
     assert_eq!(known(&snapshot), moved);
 }
 
-/// A file swapped through a third name with a file in an ignored folder: the
-/// file that took its path is created, and the file itself is ignored, not
-/// modified into the other file.
+/// A file swapped through a third name with a file the rules leave out by
+/// name: the file that took its path is created, and the file itself is
+/// ignored, not modified into the other file.
 #[test]
 fn a_file_swapped_with_an_ignored_file_is_ignored_and_the_other_created() {
-    let (dir, mut snapshot, mut rules) = tree_with_an_ignored_folder();
+    let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
+    write(root, RULES_FILE, "old.txt\n");
+    write(root, "old.txt", "o");
+    write(root, "f.txt", "f");
+    let mut rules = rules();
+    let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
     let id = snapshot.entries[Path::new("f.txt")].id;
-    for (from, to) in [
-        ("f.txt", "tmp"),
-        ("ig/deep/old.txt", "f.txt"),
-        ("tmp", "ig/deep/old.txt"),
-    ] {
+    for (from, to) in [("f.txt", "tmp"), ("old.txt", "f.txt"), ("tmp", "old.txt")] {
         fs::rename(root.join(from), root.join(to)).unwrap();
     }
 
@@ -1224,7 +1225,7 @@ fn a_file_swapped_with_an_ignored_file_is_ignored_and_the_other_created() {
             created("f.txt", File),
             Change::Ignored {
                 from: "f.txt".into(),
-                to: "ig/deep/old.txt".into(),
+                to: "old.txt".into(),
                 kind: File,
                 id,
             }

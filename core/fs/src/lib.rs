@@ -1140,8 +1140,10 @@ fn take_left_out(
 /// there, and not inside a folder that was found, was moved out before its
 /// folder went, and is reported as ignored beside the folder's removal. A
 /// removal the search does not find stands. So does a file another file took
-/// the path of, as in a swap through a third name: when the search finds the
-/// old file, it is reported as ignored and the new one as created.
+/// the path of, as in a swap through a third name: when the old file sits at
+/// a name the rules leave out, it is reported as ignored and the new one as
+/// created. That search looks only at those names and not below them, since
+/// a save by rename takes a path the same way and leaves no old file to find.
 fn find_ignored(
     changes: &mut Vec<Change>,
     old: &BTreeMap<PathBuf, Entry>,
@@ -1178,10 +1180,14 @@ fn find_ignored(
                 .map(|(path, _)| path)
         })
         .collect();
-    let mut wanted: Wanted = (removed.iter().chain(&held).copied().chain(&replaced))
-        .map(|path| ((old[path].id, old[path].kind), None))
+    let key = |path: &PathBuf| ((old[path].id, old[path].kind), None);
+    let mut wanted: Wanted = (removed.iter().chain(&held).copied()).map(key).collect();
+    rules.find(root, &mut wanted, true);
+    let mut swapped: Wanted = (replaced.iter().map(key))
+        .filter(|(id, _)| !wanted.contains_key(id))
         .collect();
-    rules.find(root, &mut wanted);
+    rules.find(root, &mut swapped, false);
+    wanted.extend(swapped);
     let found = |path: &Path| {
         let entry = &old[path];
         (wanted.get(&(entry.id, entry.kind)).cloned().flatten()).map(|to| Change::Ignored {
