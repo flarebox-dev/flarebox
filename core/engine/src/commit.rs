@@ -683,9 +683,10 @@ impl Commits {
     /// built is newer than what was sent: the server applies a content update only when no other
     /// device changed the content after the commit's `base_seq`, so that change came after the
     /// commit. When S's content changed since then ([`Trees::took_content`]), even back to what it
-    /// was, S keeps what it holds. A position S holds is newer than what was sent only when R held
-    /// it at a revision after the result's seq: the server applies a move whatever another device
-    /// did after `base_seq`, so the move replaced a position from an earlier record. When S holds a
+    /// was, S keeps what it holds. A position S holds is newer than what was sent only when L and R
+    /// agreed on it, after the commit was built, at a revision of R after the result's seq: the
+    /// server applies a move whatever another device did after `base_seq`, so the move replaced a
+    /// position from an earlier record, and a position only R came back to is a remote change. When S holds a
     /// newer position ([`Trees::took_position_after`]), S keeps it, and a rename by the server
     /// does not revert the node. A conflict copy is re-keyed in L, and so is
     /// a directory merged into one L does not hold yet. When L already holds the conflict copy,

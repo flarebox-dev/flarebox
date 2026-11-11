@@ -3393,11 +3393,10 @@ fn a_late_acknowledgement_takes_the_sent_position_over_one_s_took_from_before_th
 }
 
 /// n's move to b is in flight when a log replay brings the commit at seq 2 and the other device's
-/// move back to a at seq 3. S still holds the a it held when the commit was built, and L never
-/// took a again, so S takes the b that was sent. The other device's later move then reaches the
-/// disk, and the move to b is not sent again.
-#[test]
-fn a_late_acknowledgement_takes_the_sent_position_when_only_r_returned_to_the_one_s_holds() {
+/// move back to a, through each of `stops` first, with a settle after each record. S still holds
+/// the a it held when the commit was built, and L never took a again, so S takes the b that was
+/// sent. The other device's later move then reaches the disk, and the move to b is not sent again.
+fn a_late_acknowledgement_takes_the_sent_position_when_only_r_returned(stops: &[&str]) {
     let mut trees = trees(&[(
         "n",
         Some(file(ROOT, "b", 1)),
@@ -3407,16 +3406,30 @@ fn a_late_acknowledgement_takes_the_sent_position_when_only_r_returned_to_the_on
     let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert_eq!(ops(&commit), [mv("n", ROOT, "b")]);
-    trees.set_remote("n".into(), remote_at(file(ROOT, "b", 1), 2));
-    trees.set_remote("n".into(), remote_at(file(ROOT, "a", 1), 3));
-    trees.settle();
+    let names = ["b"].iter().chain(stops).chain(&["a"]);
+    for (rev, name) in (2..).zip(names) {
+        trees.set_remote("n".into(), remote_at(file(ROOT, name, 1), rev));
+        trees.settle();
+    }
+    let last = 3 + stops.len() as u64;
     commits
         .received(result(2, vec![outcome(op_result::Code::Applied)]))
         .unwrap();
-    assert!(commits.acknowledge(&mut trees, 3));
+    assert!(commits.acknowledge(&mut trees, last));
     trees.settle();
     assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "b", 1)));
-    effects_for(&mut trees, &mut ids, "n");
+    let effects = effects_for(&mut trees, &mut ids, "n");
+    assert!(matches!(&effects[..], [Effect::Move { .. }]), "{effects:?}");
     assert_eq!(trees.local().live("n"), Some(&file(ROOT, "a", 1)));
     assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+}
+
+#[test]
+fn a_late_acknowledgement_takes_the_sent_position_when_only_r_returned_to_the_one_s_holds() {
+    a_late_acknowledgement_takes_the_sent_position_when_only_r_returned(&[]);
+}
+
+#[test]
+fn a_late_acknowledgement_takes_the_sent_position_when_r_returned_through_another_position() {
+    a_late_acknowledgement_takes_the_sent_position_when_only_r_returned(&["x"]);
 }

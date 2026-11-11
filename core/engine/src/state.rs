@@ -38,8 +38,8 @@ pub struct TreesState {
     /// The nodes whose content the commit in flight updates, each with whether S's content
     /// changed since the commit was built.
     pub watched: BTreeMap<NodeId, bool>,
-    /// The nodes the commit in flight moves, each with the latest revision at which R held the
-    /// position S holds, since the commit was built.
+    /// The nodes the commit in flight moves, each with the latest revision at which L and R agreed
+    /// on the position S holds, since the commit was built.
     pub watched_positions: BTreeMap<NodeId, Option<u64>>,
     /// The nodes a delete of this device trashed, each with the seq of its commit, while R holds
     /// them trashed by that commit.

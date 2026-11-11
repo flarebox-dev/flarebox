@@ -161,8 +161,8 @@ pub struct Trees {
     /// The nodes whose content the commit in flight updates, each with whether S's content
     /// changed since the commit was built.
     watched: BTreeMap<NodeId, bool>,
-    /// The nodes the commit in flight moves, each with the latest revision at which R held the
-    /// position S holds, since the commit was built.
+    /// The nodes the commit in flight moves, each with the latest revision at which L and R agreed
+    /// on the position S holds, since the commit was built.
     watched_positions: BTreeMap<NodeId, Option<u64>>,
     /// The nodes a delete of this device trashed, each with the seq of its commit, while R holds
     /// them trashed by that commit.
@@ -784,8 +784,8 @@ impl Trees {
         self.watched_positions = ids.into_iter().map(|id| (id, None)).collect();
     }
 
-    /// Whether S holds a position of `id` that R held at a revision after `seq`, since
-    /// [`Trees::watch_positions`] started watching it.
+    /// Whether S holds a position of `id` that L and R agreed on at a revision of R after `seq`,
+    /// since [`Trees::watch_positions`] started watching it.
     pub fn took_position_after(&self, id: &str, seq: u64) -> bool {
         self.watched_positions
             .get(id)
@@ -1388,13 +1388,15 @@ impl Trees {
         below.split_off(1)
     }
 
-    /// Records, for a node whose position is watched, the revision of R's position while S holds it,
-    /// and forgets the revision once S's position `moved` to one R does not hold.
+    /// Records, for a node whose position is watched, the revision of R's position while L and S
+    /// hold it too, and forgets the revision once S's position `moved` to one they do not agree on.
     fn note_position(&mut self, id: &str, moved: bool) {
         let held = (self.r.get(id))
             .filter(|remote| {
                 !remote.trashed
                     && (self.s.get(id)).is_some_and(|shape| shape.same_position(&remote.shape))
+                    && (self.l.get(id))
+                        .is_some_and(|local| local.shape.same_position(&remote.shape))
             })
             .map(|remote| remote.meta_rev);
         if let Some(taken) = self.watched_positions.get_mut(id)
