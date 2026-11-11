@@ -9,7 +9,14 @@ If you delete the bucket or lose the Cloudflare account and have no copy elsewhe
 
 ## What the bucket holds
 
-Koidrive writes only under `spaces/`. The bucket is named `koidrive` unless you chose another name when you deployed.
+Koidrive writes only under `spaces/`. The commands on this page write the bucket's name as `<bucket>`:
+
+- `koi setup` names it `koidrive-` followed by 16 hex digits, and prints the name when it creates the bucket ("Creating the R2 bucket ...").
+- The deploy button uses the name you kept or chose when you deployed, `koidrive` by default.
+
+The **R2 object storage** page of the Cloudflare dashboard lists the account's buckets.
+
+The bucket holds:
 
 - `spaces/<space_id>/chunks/<2 hex>/<hex>/<incarnation>`: the pieces of file content, each stored as it is and named by its SHA-256.
 - `spaces/<space_id>/meta/<history_id>/`: the export of the space's tree, trash and old versions, in the format [RFC 0004](../../spec/rfc/0004-r2-export-format.md) describes.
@@ -23,8 +30,8 @@ Koidrive doesn't encrypt chunks. Anyone who can read the copy can read your file
 > [!NOTE]
 > Nobody has run these steps against R2 yet. They follow Cloudflare's [rclone guide](https://developers.cloudflare.com/r2/examples/rclone/) and [R2 authentication](https://developers.cloudflare.com/r2/api/tokens/) pages. The filters and the copy behaviour were checked with rclone 1.76 between local folders.
 
-1. In the Cloudflare dashboard, go to **R2 object storage**, then **Manage** next to **API Tokens**. Create a token with the **Object Read only** permission, scoped to the Koidrive bucket. Note its **Access Key ID** and **Secret Access Key**, and your account ID.
-2. Install rclone 1.59 or later. Earlier versions can fail with `HTTP 401: Unauthorized` against R2.
+1. In the Cloudflare dashboard, go to **R2 object storage**, then **Manage** next to **API Tokens**. Create a token with the **Object Read only** permission, scoped to `<bucket>`. Note its **Access Key ID** and **Secret Access Key**, and your account ID.
+2. Install rclone 1.59 or later. Earlier versions can fail with `HTTP 401: Unauthorized` against R2, as Cloudflare's [rclone guide](https://developers.cloudflare.com/r2/examples/rclone/) notes.
 3. Add a remote for R2 to the rclone configuration file. `rclone config file` prints where it is.
 
    ```ini
@@ -42,8 +49,8 @@ Koidrive doesn't encrypt chunks. Anyone who can read the copy can read your file
 4. Copy the export first and the chunks second. Here the copy goes to `/backup/koidrive`; any rclone remote works as the destination.
 
    ```sh
-   rclone copy r2:koidrive /backup/koidrive --include "/spaces/*/meta/**"
-   rclone copy r2:koidrive /backup/koidrive --include "/spaces/*/chunks/**"
+   rclone copy r2:<bucket> /backup/koidrive --include "/spaces/*/meta/**"
+   rclone copy r2:<bucket> /backup/koidrive --include "/spaces/*/chunks/**"
    ```
 
    A device uploads a file's chunks before the server accepts the change that uses them, and the export comes after that. So when the export is copied first, the chunks it names are already in the bucket when the second command starts. The exception is a chunk the server deletes in between, because its version expired or its file left the trash.
@@ -60,7 +67,7 @@ This works while the server still runs, with its Worker and Durable Objects, but
 2. Copy everything back:
 
    ```sh
-   rclone copy /backup/koidrive r2:koidrive
+   rclone copy /backup/koidrive r2:<bucket>
    ```
 
 The objects return under the same names, and the server serves each chunk again. `rclone copy` skips objects that are still in the bucket. The server deletes restored chunks that it had already deleted before the loss, after its grace period, 30 days by default.
