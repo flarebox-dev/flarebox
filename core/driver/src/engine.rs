@@ -16,7 +16,6 @@ use flarebox_engine::classify::Trees;
 use flarebox_engine::commit::Commits;
 use flarebox_engine::effects::Effects;
 use flarebox_engine::ids::IdGen;
-use flarebox_engine::names::name_key;
 use flarebox_engine::question as engine;
 use flarebox_engine::tree::{
     Content, FileIdentity, Kind, LocalNode, Names, NodeId, RemoteNode, Shape, Tree, same_content,
@@ -82,6 +81,7 @@ impl Engine {
         trees.take_changed();
         let commits = Commits::from_state(stored.commits.clone())
             .map_err(|error| invalid(format!("{error:?}")))?;
+        commits.hold(&mut trees);
         let effects = Effects::from_state(stored.effects.clone())
             .map_err(|error| invalid(format!("{error:?}")))?;
         let ids = match tx.id_generator()? {
@@ -190,7 +190,7 @@ impl Engine {
         let mut items: Vec<HeldItem> = (asked.held.iter())
             .map(|(id, held)| HeldItem {
                 node_id: id.clone(),
-                path: self.synced_path(id),
+                path: self.path(id),
                 files: held.files,
             })
             .collect();
@@ -204,12 +204,18 @@ impl Engine {
         }
     }
 
-    /// The path of a node S holds, relative to the linked folder.
-    fn synced_path(&self, id: &str) -> String {
-        let synced = self.trees.synced();
+    /// The path of a node relative to the linked folder: where L holds it, or where S holds it when L does not, as
+    /// for a deletion the guard holds.
+    fn path(&self, id: &str) -> String {
+        let (local, synced) = (self.trees.local(), self.trees.synced());
+        let shape = |id: &str| match local.get(id) {
+            Some(node) => Some(&node.shape),
+            None => synced.live(id),
+        };
         let mut names = Vec::new();
         let mut current = id;
-        while let Some(shape) = synced.live(current).filter(|_| names.len() <= synced.len()) {
+        while let Some(shape) = shape(current).filter(|_| names.len() <= local.len() + synced.len())
+        {
             names.push(shape.name.as_str());
             current = &shape.parent;
         }
@@ -1085,17 +1091,6 @@ impl Staging {
     pub fn ready(&self) -> bool {
         self.last_seq >= self.highest_page_seq
             && self.caught_up.is_some_and(|head| self.last_seq >= head)
-    }
-
-    /// True when the tree holds a live node directly under `root` whose name is `name`, as the server compares
-    /// names.
-    pub fn holds(&self, root: &str, name: &str) -> bool {
-        let key = name_key(name);
-        self.nodes.values().any(|node| {
-            node.parent_id == root
-                && node.status == flarebox_proto::v1::NodeStatus::Live as i32
-                && name_key(&node.name) == key
-        })
     }
 }
 

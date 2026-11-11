@@ -55,9 +55,11 @@ impl Engine {
         let refused = |error| Failure::Broken(format!("the stored state was refused: {error:?}"));
         trees.restore(self.trees.state()).map_err(refused)?;
         trees.rules_scanned();
+        let commits = Commits::from_state(self.commits.state()).map_err(refused)?;
+        commits.hold(&mut trees);
         let loaded = Engine {
             trees,
-            commits: Commits::from_state(self.commits.state()).map_err(refused)?,
+            commits,
             effects: Effects::from_state(self.effects.state()).map_err(refused)?,
             ids: IdGen::new(self.ids.state),
             last_seq: self.last_seq,

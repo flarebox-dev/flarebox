@@ -180,6 +180,7 @@ impl GuardState {
             },
             held: open,
             answer: None,
+            shown: BTreeMap::new(),
         });
         checked
     }

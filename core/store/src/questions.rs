@@ -4,7 +4,8 @@
 //! (§6.1): each question with its kind, the items it holds and an answer it took but has not
 //! applied yet, the deletions in the guard's window
 //! and the deletions the person confirmed. Every held node keeps the revisions R held for it when
-//! it was asked, or none when R did not hold it. They are engine state, part of
+//! it was asked, or none when R did not hold it, and a held node R did not hold keeps the shape L
+//! had for it. They are engine state, part of
 //! [`CommitsState`], and [`Tx::set_engine_state`] writes them with the commit or the hold that
 //! changes them.
 //!
@@ -14,10 +15,12 @@ use std::collections::BTreeMap;
 
 use flarebox_engine::guard::{Counted, GuardState};
 use flarebox_engine::question::{Answer, Held, Question, QuestionKind, Revisions};
-use flarebox_engine::tree::NodeId;
+use flarebox_engine::tree::{Content, NodeId, Shape};
+use prost::Message;
 use rusqlite::{Row, params};
 
-use crate::{Error, Result, Tx};
+use crate::engine::{kind, node_kind};
+use crate::{Error, Result, Tx, decode};
 
 /// Held items by owner: a question's ID, or the empty string for the guard's confirmed deletions.
 type HeldBy = BTreeMap<String, BTreeMap<NodeId, Held>>;
@@ -28,6 +31,20 @@ impl Tx<'_> {
             "SELECT question_id, top_id, files FROM open_question_items",
             "SELECT question_id, top_id, node_id, content_rev, meta_rev FROM open_question_members",
         )?;
+        let mut shown: BTreeMap<String, BTreeMap<NodeId, Shape>> = BTreeMap::new();
+        let mut stmt = self.0.prepare_cached(
+            "SELECT question_id, node_id, parent_id, name, kind, content FROM open_question_shapes",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let shape = Shape {
+                parent: row.get(2)?,
+                name: row.get(3)?,
+                kind: kind(row.get(4)?)?,
+                content: decode(row.get(5)?)?,
+            };
+            (shown.entry(row.get(0)?).or_default()).insert(row.get(1)?, shape);
+        }
         let mut stmt = self.0.prepare_cached(
             "SELECT question_id, asked_at_ms, kind, answer FROM open_questions ORDER BY position",
         )?;
@@ -48,13 +65,14 @@ impl Tx<'_> {
                 .map_err(Error::InvalidEngineState)?;
             questions.push(Question {
                 held: held.remove(&id).unwrap_or_default(),
+                shown: shown.remove(&id).unwrap_or_default(),
                 id,
                 asked_at_ms: row.get(1)?,
                 kind,
                 answer,
             });
         }
-        if let Some(id) = held.keys().next() {
+        if let Some(id) = held.keys().chain(shown.keys()).next() {
             return Err(Error::InvalidEngineState(format!(
                 "items held by an unknown question {id:?}"
             )));
@@ -64,6 +82,7 @@ impl Tx<'_> {
 
     pub(crate) fn set_open_questions(&self, questions: &[Question]) -> Result<()> {
         for table in [
+            "open_question_shapes",
             "open_question_members",
             "open_question_items",
             "open_questions",
@@ -81,6 +100,10 @@ impl Tx<'_> {
             "INSERT INTO open_question_members (question_id, top_id, node_id, content_rev, meta_rev)
              VALUES (?1, ?2, ?3, ?4, ?5)",
         )?;
+        let mut shapes = self.0.prepare_cached(
+            "INSERT INTO open_question_shapes (question_id, node_id, parent_id, name, kind, content)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
         for (position, question) in questions.iter().enumerate() {
             let kind = serde_json::to_string(&question.kind).expect("a question kind serializes");
             stmt.execute(params![
@@ -96,6 +119,16 @@ impl Tx<'_> {
                     let (content_rev, meta_rev) = split(revisions);
                     members.execute(params![question.id, top, node, content_rev, meta_rev])?;
                 }
+            }
+            for (node, shape) in &question.shown {
+                shapes.execute(params![
+                    question.id,
+                    node,
+                    shape.parent,
+                    shape.name,
+                    node_kind(shape.kind),
+                    shape.content.as_ref().map(Content::encode_to_vec),
+                ])?;
             }
         }
         Ok(())

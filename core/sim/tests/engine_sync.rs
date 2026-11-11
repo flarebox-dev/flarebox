@@ -764,6 +764,7 @@ fn reload(
         loaded.ignore_local(id);
     }
     let restored_commits = Commits::from_state(commits.state()).map_err(refused)?;
+    restored_commits.hold(&mut loaded);
     let restored_effects = Effects::from_state(effects.state()).map_err(refused)?;
     prop_assert_eq!(&loaded, trees);
     prop_assert_eq!(&restored_commits, commits);
@@ -794,7 +795,7 @@ struct Ran {
     removals: usize,
     /// The nodes the server holds trashed at the end.
     trashed: usize,
-    /// The questions of the mass-delete guard the run answered.
+    /// The questions the run answered.
     asked: usize,
     space: SpaceDo,
 }
@@ -822,7 +823,7 @@ fn run(
     Ok(ran.parked_reverted)
 }
 
-/// Every node a question of the mass-delete guard holds.
+/// Every node a question holds.
 fn members(question: &Question) -> impl Iterator<Item = String> + '_ {
     (question.held.values()).flat_map(|held| held.members.keys().cloned())
 }
@@ -902,6 +903,7 @@ fn run_cut(
         cut,
         &[],
         Answer::Delete,
+        false,
     )
 }
 
@@ -920,6 +922,7 @@ fn run_ignoring(
     cut: Cut,
     rulings: &[Ruling],
     answer: Answer,
+    first_link: bool,
 ) -> Result<Ran, TestCaseError> {
     let (mut space, mut other) = seeded(seed);
     let root = space.space_id().to_owned();
@@ -933,7 +936,7 @@ fn run_ignoring(
     };
     for state in space.nodes().iter().filter(|n| n.node_id != root) {
         let (id, node) = RemoteNode::from_state(state).unwrap();
-        if !node.trashed {
+        if !node.trashed && !first_link {
             device
                 .trees
                 .set_synced(id.clone(), Some(node.shape.clone()));
@@ -962,6 +965,10 @@ fn run_ignoring(
             }
             _ => device.act(action),
         }
+    }
+    if first_link {
+        device.trees.settle();
+        commits.first_link(&mut device.trees, &mut device.ids, NOW as u64);
     }
     let mut local_writes = written(
         device
@@ -999,6 +1006,9 @@ fn run_ignoring(
     let (mut steps, mut quiet, mut due, mut parked_reverted) = (0, false, false, 0);
     let (mut deletes, mut removals) = (0, 0);
     let (mut asked, mut held_once, mut confirmed) = (0, BTreeSet::new(), BTreeSet::new());
+    let mut discarded: BTreeMap<String, flarebox_engine::tree::Shape> = BTreeMap::new();
+    let mut revived: BTreeSet<String> = BTreeSet::new();
+    let mut pending: Option<Question> = None;
     let mut during = during.iter();
     while !quiet {
         steps += 1;
@@ -1097,15 +1107,50 @@ fn run_ignoring(
             device.trees.synced().check(Names::ByKey).is_ok(),
             "S is not a valid tree"
         );
+        let open = |question: &Question| commits.questions().iter().any(|o| o.id == question.id);
+        if let Some(question) = pending.take_if(|question| !open(question)) {
+            let asked_again = (commits.questions().iter().flat_map(Question::holds))
+                .any(|id| question.shown.contains_key(id));
+            if !asked_again {
+                let contents = (question.shown.values()).map(|shape| shape.content.clone());
+                let contents = written(contents, 1);
+                local_writes.retain(|write| !contents.contains(write));
+                discarded.extend(question.shown);
+            }
+        }
+        // A discarded entry the user changed, or a discarded folder that holds an entry the answer
+        // did not discard there, is the user's, and so is every discarded folder above it.
+        let trees = &device.trees;
+        let reclaimed = |id: &&String| {
+            let changed =
+                (trees.local().get(id)).is_some_and(|node| !node.shape.same(&discarded[*id]));
+            changed
+                || (trees.local_children(id)).any(|child| {
+                    !trees.excluded(child)
+                        && discarded
+                            .get(child)
+                            .is_none_or(|shown| &shown.parent != *id)
+                })
+        };
+        for id in discarded.keys().filter(reclaimed) {
+            let mut next = Some(id.clone());
+            while let Some(id) = next.take_if(|id| discarded.contains_key(id)) {
+                next = (trees.local().get(&id)).map(|node| node.shape.parent.clone());
+                revived.insert(id);
+            }
+        }
         if let Some(question) = commits.questions().first() {
             held_once.extend(members(question));
         }
         let Some(commit) = built else {
             if let Some(question) = commits.questions().first().cloned() {
-                if answer == Answer::Delete {
+                if matches!(answer, Answer::Delete | Answer::Publish) {
                     confirmed.extend(members(&question));
                 }
                 prop_assert!(commits.decide(&question.id, answer));
+                if answer == Answer::Discard {
+                    pending = Some(question.clone());
+                }
                 asked += 1;
                 continue;
             }
@@ -1113,13 +1158,26 @@ fn run_ignoring(
             continue;
         };
         for op in &commit.ops {
-            if let Some(op::Op::Delete(delete)) = &op.op {
-                let id = &delete.node_id;
+            let id = match &op.op {
+                Some(op::Op::Delete(delete)) => &delete.node_id,
+                Some(op::Op::CreateFile(create)) => &create.node_id,
+                Some(op::Op::CreateDir(create)) => &create.node_id,
+                _ => continue,
+            };
+            // A discarded entry the user changed, or a discarded folder the user put an entry in,
+            // before the effects moved it to the local trash is the user's new change, which syncs
+            // like any other from then on (section 5.2).
+            let changed = |shown: &flarebox_engine::tree::Shape| {
+                revived.contains(id)
+                    || (device.trees.local().get(id)).is_some_and(|node| !node.shape.same(shown))
+            };
+            if held_once.contains(id) && !confirmed.contains(id) {
                 prop_assert!(
-                    !held_once.contains(id) || confirmed.contains(id),
-                    "{} was held and deleted before the person said so",
+                    discarded.get(id).is_some_and(changed),
+                    "{} was held and sent before the person said so",
                     id
                 );
+                confirmed.insert(id.clone());
             }
         }
         let delete = |op: &&Op| matches!(op.op, Some(op::Op::Delete(_)));
@@ -1373,6 +1431,7 @@ proptest! {
             Cut::None,
             &rulings,
             Answer::Delete,
+            false,
         )?;
         prop_assert_eq!((ran.deletes, ran.removals, ran.trashed), (0, 0, 0));
     }
@@ -1411,7 +1470,7 @@ proptest! {
         let mut actions = vec![act(4, folder, 0, 0, 0)];
         actions.extend(local);
 
-        let ran = run_ignoring(&seed, &actions, &[], fits, true, &[], cut, &[], answer)?;
+        let ran = run_ignoring(&seed, &actions, &[], fits, true, &[], cut, &[], answer, false)?;
 
         prop_assert!(ran.asked >= 1, "the removal was asked about");
         match answer {
@@ -1419,6 +1478,65 @@ proptest! {
             Answer::Delete => prop_assert_eq!(ran.trashed, inside + 1),
             other => unreachable!("the guard does not offer {other}"),
         }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(
+        std::env::var("PROPTEST_CASES").ok().and_then(|cases| cases.parse().ok()).unwrap_or(256),
+    ))]
+
+    /// Section 6.4: on the first link of a folder to a space that holds something, what both hold
+    /// alike is adopted and the rest of the folder is held. No create of a held entry goes out
+    /// before the person publishes it, across the restart the run makes at every step, while the
+    /// user and the other device go on changing things. After `publish` every local write is on the
+    /// server; after `discard` the discarded entries are in the local trash and every other write
+    /// is on the server.
+    #[test]
+    fn a_first_link_sends_nothing_it_holds_until_the_person_publishes_it(
+        seed in prop::collection::vec(action(2), 1..12),
+        local in prop::collection::vec(action(2), 1..8),
+        fits in prop_oneof![Just(MAX_OPS), 1usize..4],
+        during in prop::collection::vec(
+            (any::<bool>(), prop::collection::vec(action(5), 1..4)),
+            0..6,
+        ),
+        answer in prop_oneof![Just(Answer::Publish), Just(Answer::Discard)],
+        cut in prop::sample::select(CUTS.to_vec()),
+    ) {
+        run_ignoring(&seed, &local, &[], fits, false, &during, cut, &[], answer, true)?;
+    }
+}
+
+#[test]
+fn a_first_link_holds_a_file_whose_name_the_space_holds_until_the_person_answers() {
+    for answer in [Answer::Publish, Answer::Discard] {
+        let seed = [act(1, 0, 0, 0, 0)];
+        let local = [act(1, 0, 0, 0, 0), act(0, 0, 0, 2, 0)];
+        let ran = run_ignoring(
+            &seed,
+            &local,
+            &[],
+            MAX_OPS,
+            false,
+            &[],
+            Cut::None,
+            &[],
+            answer,
+            true,
+        )
+        .unwrap();
+        assert_eq!(ran.asked, 1, "{answer}");
+        let live = (ran.space.nodes().into_iter())
+            .filter(|node| node.status == 1 && node.node_id != ran.space.space_id())
+            .count();
+        let expected = if answer == Answer::Publish { 3 } else { 1 };
+        assert_eq!(live, expected, "{answer}");
+        assert_eq!(
+            ran.removals,
+            if answer == Answer::Discard { 2 } else { 0 },
+            "{answer}"
+        );
     }
 }
 

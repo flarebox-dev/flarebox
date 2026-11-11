@@ -10,6 +10,7 @@ mod casefold_data;
 pub mod classify;
 pub mod commit;
 pub mod effects;
+pub mod first_link;
 pub mod guard;
 pub mod ids;
 pub mod ignore;

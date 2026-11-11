@@ -1053,10 +1053,9 @@ impl Folder {
         Ok(())
     }
 
-    /// Replaces R with the bootstrap's tree once the log has caught it up (design §4.4). A folder that was never
-    /// synced waits for its first scan, and stops when the folder and the space hold an entry of the same name key
-    /// under their roots, because matching the two (design §2.8 and §6.4) is not built: syncing them as they are
-    /// would upload or fork everything both hold. Two trees that share no such name sync as they are.
+    /// Replaces R with the bootstrap's tree once the log has caught it up (design §4.4). On the first link of the
+    /// folder, with no cursor in the store, R waits for the first scan, and the engine then matches L against it
+    /// (§6.4): what both hold alike is adopted, and the rest of L is held until the person publishes or discards it.
     fn publish_remote(&mut self) -> Result<(), Stop> {
         let Stream::Replaying(staging) = &self.stream else {
             return Ok(());
@@ -1064,20 +1063,9 @@ impl Folder {
         if !staging.ready() {
             return Ok(());
         }
-        if self.engine.cursor.is_none() {
-            if !self.scanned {
-                return Ok(());
-            }
-            let root = &self.link.space_id;
-            let shared = (self.engine.trees.local().iter())
-                .filter(|(_, node)| node.shape.parent == *root && !node.parked)
-                .find(|(_, node)| staging.holds(root, &node.shape.name));
-            if let Some((_, node)) = shared {
-                return Err(Stop::Unsupported(format!(
-                    "the folder and the space it was linked to both hold {:?}",
-                    node.shape.name
-                )));
-            }
+        let first_link = self.engine.cursor.is_none();
+        if first_link && !self.scanned {
+            return Ok(());
         }
         let head = Some(staging.last_seq());
         let Stream::Replaying(staging) =
@@ -1085,8 +1073,13 @@ impl Folder {
         else {
             unreachable!("checked above");
         };
+        let now_ms = (SystemTime::now().duration_since(UNIX_EPOCH))
+            .map_or(0, |since| since.as_millis() as u64);
         self.remote_nodes = self.step(|engine, tx| {
             engine.replace_remote(tx, staging)?;
+            if first_link {
+                (engine.commits).first_link(&mut engine.trees, &mut engine.ids, now_ms);
+            }
             Ok(tx.remote_node_count()?)
         })?;
         Ok(())

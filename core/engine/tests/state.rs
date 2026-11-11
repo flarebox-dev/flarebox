@@ -76,6 +76,7 @@ fn trees_state() -> TreesState {
         waiting: [("a".into(), Some(dir(ROOT, "x")))].into(),
         watched: [("u".into(), true), ("v".into(), false)].into(),
         trashed_here: [("t".into(), 5)].into(),
+        discarded: ["a".into()].into(),
     }
 }
 
@@ -160,6 +161,7 @@ fn questions() -> Vec<Question> {
         )]
         .into(),
         answer: Some(Answer::Delete),
+        shown: Default::default(),
     }]
 }
 
