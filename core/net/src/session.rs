@@ -1259,4 +1259,4 @@ async fn closed(closing: &mut watch::Receiver<bool>) {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

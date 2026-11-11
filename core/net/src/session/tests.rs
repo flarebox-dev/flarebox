@@ -18,7 +18,7 @@ use koidrive_proto::v1::error::Code;
 
 type Server = WebSocketStream<TcpStream>;
 
-async fn listen() -> (TcpListener, Arc<Auth>) {
+pub(crate) async fn listen() -> (TcpListener, Arc<Auth>) {
     listen_on("127.0.0.1:0", Duration::from_secs(3600), None).await
 }
 
@@ -50,7 +50,7 @@ async fn listen_on(
     (listener, Arc::new(auth))
 }
 
-fn config() -> SessionConfig {
+pub(crate) fn config() -> SessionConfig {
     let mut config = SessionConfig::new("0190a0b0-0000-7000-8000-000000000001", "test", "0", 1);
     config.backoff = Backoff {
         initial: Duration::from_millis(10),
@@ -60,7 +60,7 @@ fn config() -> SessionConfig {
 }
 
 /// Accepts one connection, reads `Hello`, and answers with this `Welcome`.
-async fn accept(listener: &TcpListener, welcome: Welcome) -> Server {
+pub(crate) async fn accept(listener: &TcpListener, welcome: Welcome) -> Server {
     let (tcp, _) = listener.accept().await.unwrap();
     accept_upgrade(tcp, welcome).await
 }
@@ -82,7 +82,7 @@ async fn recv(ws: &mut Server) -> client_message::Msg {
     }
 }
 
-async fn recv_rpc(ws: &mut Server) -> RpcRequest {
+pub(crate) async fn recv_rpc(ws: &mut Server) -> RpcRequest {
     match recv(ws).await {
         client_message::Msg::Rpc(request) => request,
         other => panic!("expected an RpcRequest, got {other:?}"),
@@ -97,7 +97,7 @@ async fn push(ws: &mut Server, msg: server_message::Msg) {
     .unwrap();
 }
 
-async fn reply(ws: &mut Server, req_id: u64, result: rpc_response::Result) {
+pub(crate) async fn reply(ws: &mut Server, req_id: u64, result: rpc_response::Result) {
     push(
         ws,
         server_message::Msg::Rpc(RpcResponse {
@@ -108,7 +108,7 @@ async fn reply(ws: &mut Server, req_id: u64, result: rpc_response::Result) {
     .await;
 }
 
-fn welcome(history_id: &str, device_seq: u64) -> Welcome {
+pub(crate) fn welcome(history_id: &str, device_seq: u64) -> Welcome {
     Welcome {
         proto: 1,
         history_id: history_id.into(),

@@ -93,7 +93,8 @@ pub struct Transfer {
     http: reqwest::Client,
     uploads: reqwest::Client,
     pub backoff: Backoff,
-    /// Attempts per chunk, and rounds of asking the server again for chunks it deferred or whose target expired.
+    /// Attempts per chunk, and rounds of asking the server again for chunks it deferred or whose target expired. Only a
+    /// round in which no chunk was uploaded or found present counts.
     pub attempts: u32,
     /// Bounds a download from sending the request to the last byte of the answer, and an upload from the last slice
     /// of its body to the last byte of the answer.
@@ -134,6 +135,7 @@ impl Transfer {
             let mut wait = Duration::ZERO;
             for batch in todo.chunks(MAX_CHUNKS_PER_CALL) {
                 let result = session.prepare_upload(batch.to_vec()).await?;
+                let prepared = SystemTime::now();
                 let plans: HashMap<_, _> = result
                     .chunks
                     .iter()
@@ -152,6 +154,12 @@ impl Transfer {
                         }
                         Action::Upload => {
                             let target = plan.target.as_ref().ok_or_else(no_target)?;
+                            // A target that looks expiring on arrival means this clock runs ahead of the server's, so it
+                            // is sent as given and the relay judges the ticket.
+                            if expiring(target) && !expiring_at(target, prepared) {
+                                deferred.push(chunk.clone());
+                                continue;
+                            }
                             let bytes = read(chunk).await.map_err(|source| ChunkError::Io {
                                 hash: chunk.hash.clone(),
                                 source,
@@ -177,7 +185,8 @@ impl Transfer {
             if deferred.is_empty() {
                 break;
             }
-            if round >= self.attempts {
+            let progressed = deferred.len() < todo.len();
+            if !progressed && round >= self.attempts {
                 let message =
                     "the server kept deferring the upload or refusing its ticket".to_owned();
                 return Err(ChunkError::Unavailable {
@@ -191,7 +200,9 @@ impl Transfer {
                 wait
             })
             .await;
-            round += 1;
+            if !progressed {
+                round += 1;
+            }
             todo = deferred;
         }
         Ok(receipts)
@@ -547,12 +558,14 @@ fn distinct(chunks: &[ChunkRef]) -> Vec<ChunkRef> {
 }
 
 fn expiring(target: &Target) -> bool {
+    expiring_at(target, SystemTime::now())
+}
+
+fn expiring_at(target: &Target, now: SystemTime) -> bool {
     if target.expires_at_ms <= 0 {
         return false;
     }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+    let now = now.duration_since(UNIX_EPOCH).unwrap_or_default();
     (now + TARGET_MARGIN).as_millis() >= target.expires_at_ms as u128
 }
 
