@@ -190,15 +190,18 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
         ));
     }
     let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let temp = dir.join(format!(".{name}.new"));
+    let temp = dir.join(format!(".{name}.{}.new", std::process::id()));
     match fs::remove_file(&temp) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
     let listener = bind_socket(&temp)?;
-    fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))?;
-    fs::rename(&temp, path)?;
+    fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))
+        .and_then(|()| fs::rename(&temp, path))
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&temp);
+        })?;
     listener.set_nonblocking(true)?;
     UnixListener::from_std(listener)
 }
