@@ -1,6 +1,6 @@
 # Deploying and upgrading a Koidrive server
 
-> **Draft.** Not reviewed for publication; do not link it from the README or the website yet. This guide cannot be followed end to end yet: the steps marked *not yet available* need app and CLI support that does not exist, and steps marked *unverified* have not been run against a real account. Koidrive is not affiliated with Cloudflare, Inc.
+> **Draft.** Not reviewed for publication; do not link it from the README or the website yet. This guide cannot be followed end to end yet: the steps marked *not yet available* need app and CLI support that does not exist, and steps marked *unverified* have not been run against a real account.
 
 This guide is for the owner: the person who deploys the server to their own Cloudflare account and uses it first. The design behind it is in [design/deploy-and-upgrade.md](design/deploy-and-upgrade.md).
 

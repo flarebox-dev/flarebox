@@ -651,12 +651,6 @@ struct GeneralSettings: View {
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
                 .help(Text(verbatim: "Core \(KoidriveFFI.version())"))
-                Divider()
-                Text(independenceNotice)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
             }
             Spacer()
         }

@@ -42,10 +42,6 @@ struct SetupSteps: View {
             case .folder: FolderStep(setup: setup)
             case .done: DoneStep { dismissWindow(id: WindowID.setup) }
             }
-            Divider()
-            Text(independenceNotice)
-                .font(.caption)
-                .foregroundStyle(.secondary)
         }
         .padding(24)
         .disabled(setup.isBusy)

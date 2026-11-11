@@ -229,7 +229,7 @@ async function route(request: Request, env: Env): Promise<Response> {
     const text = (await account(env).isClaimed())
       ? "This Koidrive server already has an owner.\n"
       : "A one-time claim code, valid for one hour, is in this Worker's logs. Find it under this Worker's Observability tab in the dashboard by searching for \"Koidrive claim code\", run `koi server claim`, or read it with `wrangler tail`.\n";
-    return new Response(text + "\nKoidrive is not affiliated with Cloudflare, Inc.\n", { headers: { "Content-Type": "text/plain; charset=utf-8" } });
+    return new Response(text, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
   }
 
   if (method === "POST" && path === "/v1/claim") {

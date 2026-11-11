@@ -131,8 +131,9 @@ async function claimLocally() {
     STARTUP_MS,
   );
   if (before.claimed) fail("a fresh deployment reports that it already has an owner");
-  const page = await request(base + "/setup").then((response) => response.text());
-  if (!page.includes("not affiliated with Cloudflare, Inc.")) fail("/setup lost the notice that Koidrive is not affiliated with Cloudflare, Inc.");
+  const setup = await request(base + "/setup");
+  const page = await setup.text();
+  if (!setup.ok || !page.includes("claim code")) fail("/setup did not issue a claim code (HTTP " + setup.status + "): " + page.slice(0, 200));
   const viewer = await request(base + "/s/AAAAAAAAAAAAAAAAAAAAAA");
   if (!viewer.ok || !(await viewer.text()).includes('src="/viewer/viewer.js"')) fail("/s/{link_id} does not serve the built share viewer (HTTP " + viewer.status + ")");
   const script = await request(base + "/viewer/viewer.js");

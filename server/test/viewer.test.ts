@@ -23,7 +23,6 @@ describe("share links: web viewer (RFC 0005 section 8)", () => {
     const page = await response.text();
     expect(page).toMatch(/<script type="module" (crossorigin )?src="\/viewer\/viewer\.js"><\/script>/);
     expect(page).toMatch(/<link rel="stylesheet" (crossorigin )?href="\/viewer\/viewer\.css">/);
-    expect(page).toContain("not affiliated with Cloudflare, Inc.");
     for (const script of page.match(/<script\b[^>]*>/g) ?? []) expect(script, "every script is a same-origin file").toMatch(/ src="\/[^/]/);
     expect(page).not.toMatch(/<style\b| style=| on[a-z]+=|https?:\/\//i);
 

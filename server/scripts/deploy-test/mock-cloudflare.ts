@@ -116,7 +116,7 @@ export class MockCloudflare {
       if (path === "/setup") {
         this.pushClaimCode(this.url + "/setup");
         response.writeHead(200, { "Content-Type": "text/plain" });
-        response.end("A one-time claim code, valid for one hour, is in this Worker's logs.\n\nKoidrive is not affiliated with Cloudflare, Inc.\n");
+        response.end("A one-time claim code, valid for one hour, is in this Worker's logs.\n");
         return;
       }
       if ((match = /^\/mock\/workers\/([^/]+)$/.exec(path)) && method === "POST") {

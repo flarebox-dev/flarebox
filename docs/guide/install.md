@@ -6,7 +6,7 @@ Install the `koi` command on Linux or macOS:
 curl -fsSL https://raw.githubusercontent.com/koidrive/koidrive/main/install.sh | sh
 ```
 
-This URL will move to koidrive.com. Koidrive is not affiliated with Cloudflare, Inc.
+This URL will move to koidrive.com.
 
 Downloads become available with the first published CLI release. Until then, build from source below.
 

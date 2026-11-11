@@ -365,12 +365,6 @@ async fn loopback_round_trip_returns_the_callback_code() {
         "{}",
         page.1
     );
-    assert!(
-        page.1
-            .contains("Koidrive is not affiliated with Cloudflare, Inc."),
-        "{}",
-        page.1
-    );
     assert_eq!(code_sent(&server, login, code.unwrap()).await, "the-code");
 }
 

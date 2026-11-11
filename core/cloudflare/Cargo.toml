@@ -2,7 +2,7 @@
 
 [package]
 name = "koidrive-cloudflare"
-description = "Cloudflare OAuth login and the Workers and R2 API calls that deploy a Koidrive server. Not affiliated with Cloudflare, Inc."
+description = "Cloudflare OAuth login and the Workers and R2 API calls that deploy a Koidrive server."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

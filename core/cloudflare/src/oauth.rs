@@ -40,8 +40,7 @@ const MAX_REQUEST_HEAD: usize = 64 * 1024;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 const CALLBACK_PAGE: &str = "<!doctype html>\n<meta charset=\"utf-8\">\n<title>Koidrive</title>\n\
-<p>You can close this tab and return to the terminal.</p>\n\
-<p>Koidrive is not affiliated with Cloudflare, Inc.</p>\n";
+<p>You can close this tab and return to the terminal.</p>\n";
 
 /// The HTTP client for the OAuth endpoints and the Cloudflare API: HTTPS only, no redirects, a 15 s connect timeout
 /// and a 60 s limit per request. It fails only when the TLS backend cannot load the platform's certificate verifier.

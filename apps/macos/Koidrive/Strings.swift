@@ -345,5 +345,3 @@ extension Date {
         self.init(timeIntervalSince1970: TimeInterval(milliseconds) / 1000)
     }
 }
-
-let independenceNotice = String(localized: "Koidrive is not affiliated with Cloudflare, Inc.")
