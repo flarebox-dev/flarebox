@@ -38,7 +38,7 @@ import { ChunkPlan_Action, Error_Code, ErrorSchema, type Target } from "../src/g
 import { type Identity, type ServerKey, signAccessToken, verifyAccessToken } from "../src/auth";
 import { fromBase64url, sha256 } from "../src/crypto";
 import { ShareLinkListSchema } from "../src/gen/flarebox/v1/share_pb";
-import { toHex, uuidv7 } from "../src/ids";
+import { toHex, uuidv7, uuidv7Ms } from "../src/ids";
 import { type Principal, policy } from "../src/policy";
 import { Close, HOLD_MS, type SpaceDO } from "../src/space-do";
 import { CallFailure } from "../src/space/commit";
@@ -1070,9 +1070,8 @@ describe("RFC 0007 name limits and space list pages", () => {
   it("lists a space whose create was still storing it when a listing passed newer spaces", async () => {
     const owner = await getOwner();
     const token = owner.access!.token;
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => (release = resolve));
-    let gated: Promise<void> | undefined;
+    const { promise: gate, resolve: release } = Promise.withResolvers<void>();
+    const { promise: storing, resolve: entered } = Promise.withResolvers<string>();
     await runInDurableObject(account(), (instance) => {
       const spaces = (instance as unknown as { env: Env }).env.SPACE;
       const get = spaces.get.bind(spaces);
@@ -1080,26 +1079,45 @@ describe("RFC 0007 name limits and space list pages", () => {
         const stub = get(id);
         return {
           init: (args: Parameters<typeof stub.init>[0]) => {
-            gated = Promise.resolve();
+            entered(args.spaceId);
             return gate.then(() => stub.init(args));
           },
         } as unknown as typeof stub;
       });
     });
     const pending = call("/v1/spaces", { token, body: body(CreateSpaceRequestSchema, { name: "Slow" }) }, SpaceInfoSchema);
-    await vi.waitFor(() => expect(gated).toBeDefined());
-    const newer: string[] = [];
-    for (let i = 0; i < 101; i++) newer.push(await createSpace(owner));
-    const first = await listSpaces(token);
-    expect(first.message!.nextCursor).not.toBe("");
-    release();
-    const created = await pending;
-    expect(created.status).toBe(201);
-    const later = await spacePages(token, first.message!.nextCursor);
-    const listed = [...first.message!.spaces, ...later.flatMap((page) => page.spaces)].map((space) => space.spaceId);
-    expect(listed).toContain(created.message!.spaceId);
-    expect(listed).toEqual(expect.arrayContaining(newer));
-    expect(new Set(listed).size).toBe(listed.length);
+    const newerMs = uuidv7Ms(await storing) + 1;
+    const newer = Array.from({ length: 101 }, () => uuidv7(newerMs));
+    try {
+      await runInDurableObject(account(), (_instance, state) => {
+        for (const id of newer) {
+          state.storage.sql.exec(
+            "INSERT INTO spaces (space_id, name, owner_id, created_at_ms, format_version, list_seq) VALUES (?, ?, ?, ?, 1, (SELECT COALESCE(MAX(list_seq), 0) + 1 FROM spaces))",
+            id,
+            `Newer ${id}`,
+            owner.userId,
+            newerMs,
+          );
+        }
+      });
+      const first = await listSpaces(token);
+      expect(first.message!.nextCursor).not.toBe("");
+      expect(first.message!.spaces.some((space) => newer.includes(space.spaceId))).toBe(true);
+      release();
+      const created = await pending;
+      expect(created.status).toBe(201);
+      const later = await spacePages(token, first.message!.nextCursor);
+      const listed = [...first.message!.spaces, ...later.flatMap((page) => page.spaces)].map((space) => space.spaceId);
+      expect(listed).toContain(created.message!.spaceId);
+      expect(listed).toEqual(expect.arrayContaining(newer));
+      expect(new Set(listed).size).toBe(listed.length);
+    } finally {
+      release();
+      await pending;
+      await runInDurableObject(account(), (_instance, state) => {
+        for (const id of newer) state.storage.sql.exec("DELETE FROM spaces WHERE space_id = ?", id);
+      });
+    }
   });
 
   it("lists the user's spaces in creation order and pages them by cursor, each page within 32 KiB", async () => {

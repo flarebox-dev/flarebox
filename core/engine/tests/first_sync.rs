@@ -10,6 +10,7 @@ use flarebox_engine::classify::Trees;
 use flarebox_engine::effects::Effects;
 use flarebox_engine::ids::IdGen;
 use flarebox_engine::tree::{Content, FileIdentity, Kind, RemoteNode, Shape};
+use rustix::time::{ClockId, clock_gettime};
 
 const ROOT: &str = "root";
 const NOW: u64 = 1_794_268_740_000;
@@ -34,7 +35,7 @@ fn remote(parent: &str, name: String, kind: Kind) -> RemoteNode {
     }
 }
 
-/// Downloads `files` remote files, `per_dir` to a folder, onto an empty disk. Returns the time
+/// Downloads `files` remote files, `per_dir` to a folder, onto an empty disk. Returns the thread CPU time
 /// the loop took, the effects it planned and the nodes the checkpoints were given to write.
 fn first_sync(files: usize, per_dir: usize) -> (Duration, usize, usize) {
     let mut trees = Trees::new(ROOT);
@@ -56,7 +57,7 @@ fn first_sync(files: usize, per_dir: usize) -> (Duration, usize, usize) {
     trees.take_changed();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
     let (mut planned, mut rows) = (0, 0);
-    let started = Instant::now();
+    let started = clock_gettime(ClockId::ThreadCPUTime);
     loop {
         trees.settle();
         rows += trees.take_changed().len();
@@ -73,7 +74,7 @@ fn first_sync(files: usize, per_dir: usize) -> (Duration, usize, usize) {
             .done(&mut trees, &record.effect_id, Some(identity))
             .unwrap();
     }
-    let elapsed = started.elapsed();
+    let elapsed = Duration::try_from(clock_gettime(ClockId::ThreadCPUTime) - started).unwrap();
     assert!(trees.dirty().is_empty(), "{:?}", trees.work());
     assert_eq!(trees.local().len(), files + dirs);
     (elapsed, planned, rows)
@@ -94,13 +95,23 @@ fn a_first_sync_takes_time_in_proportion_to_its_files() {
                 (nodes, nodes),
                 "{files} files, {per_dir} per folder"
             );
-            eprintln!("files={files:5} per_dir={per_dir:4} time={elapsed:?}");
+            eprintln!("files={files:5} per_dir={per_dir:4} cpu={elapsed:?}");
             times.push(elapsed);
         }
         let growth = times[2].as_secs_f64() / times[0].as_secs_f64();
         assert!(
             growth < 8.0,
-            "{per_dir} per folder: 4 times the files took {growth:.1} times as long ({times:?})"
+            "{per_dir} per folder: 4 times the files used {growth:.1} times the thread CPU time ({times:?})"
         );
     }
+}
+
+#[test]
+fn the_first_sync_clock_excludes_time_off_cpu() {
+    let wall = Instant::now();
+    let started = clock_gettime(ClockId::ThreadCPUTime);
+    std::thread::sleep(Duration::from_millis(20));
+    let cpu = Duration::try_from(clock_gettime(ClockId::ThreadCPUTime) - started).unwrap();
+    let elapsed = wall.elapsed();
+    assert!(cpu < elapsed / 2, "thread CPU={cpu:?}, wall={elapsed:?}");
 }

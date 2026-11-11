@@ -600,6 +600,7 @@ dependencies = [
  "flarebox-proto",
  "proptest",
  "prost",
+ "rustix",
  "unicode-normalization",
 ]
 
