@@ -6,9 +6,21 @@
 koi link ~/Koidrive --space Koidrive
 ```
 
-`--space` takes the space's name or its ID. If two spaces have the same name, use the ID. The folder must exist. It may already hold files, and those files are uploaded. Files the space already holds are downloaded into it.
+`--space` takes the space's name or its ID. If two spaces have the same name, use the ID. The folder must exist, and it may already hold files.
 
-The first sync can't yet merge a folder and a space that hold the same name at their top level. If both hold `Notes`, for example, the folder halts with `the folder and the space it was linked to both hold "Notes"`. To combine such a folder with a space, link an empty folder, wait until the space has downloaded, then move your files in.
+If the space holds no live files or folders, the folder's files are uploaded as they are. Otherwise the first sync compares the folder with the space, path by path. Here names must match exactly, including case and Unicode normalization, so `Report.txt` doesn't match `report.txt`:
+
+- A folder that the space also holds at the same path stays, and its contents are compared one by one.
+- A file that the space holds at the same path, with the same content and the same executable bit, stays as it is.
+- Files and folders that only the space holds are downloaded, except where a held entry has the same name.
+- Entries that `.koiignore` or this device's rules leave out are skipped.
+
+Every other file and folder is held. Sync asks one question about the held entries and uploads none of them until you answer. A file you create later inside a held folder joins the question. Files you create anywhere else sync as usual. The question takes one of two answers:
+
+- `publish` uploads the held files. If the space already has a file with the same name, the upload gets a [conflict name](conflicts.md#two-files-with-the-same-name).
+- `discard` moves the held files to the [local trash](#the-local-trash) and downloads the space's files at their paths.
+
+Answer it with `koi questions`, as [Questions](status.md#questions) describes. If the held entries change before sync applies your answer, sync replaces the question with a new one that has a new ID and drops your answer. An entry you edit or move stays held, and one you delete leaves the question. Run `koi questions` again and answer the new question.
 
 A space syncs to at most one folder on each device. Koidrive refuses a folder that:
 
