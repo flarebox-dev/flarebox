@@ -807,7 +807,7 @@ impl Snapshot {
         let (rules, read) = match scan.rules.take() {
             Some(mut rules) => {
                 rules.settle();
-                find_ignored(&mut changes, &old, &mut rules, again.as_fd());
+                find_ignored(&mut changes, &old, &self.entries, &mut rules, again.as_fd());
                 rules.finish(|dir| {
                     self.entries
                         .get(dir)
@@ -1139,13 +1139,29 @@ fn take_left_out(
 /// by its own identity, and so is each entry it held. Such an entry found
 /// there, and not inside a folder that was found, was moved out before its
 /// folder went, and is reported as ignored beside the folder's removal. A
-/// removal the search does not find stands.
+/// removal the search does not find stands. So does a file another file took
+/// the path of, as in a swap through a third name: when the old file sits at
+/// a name the rules leave out, it is reported as ignored and the new one as
+/// created. That search looks only at those names and not below them, since
+/// a save by rename takes a path the same way and leaves no old file to find.
 fn find_ignored(
     changes: &mut Vec<Change>,
     old: &BTreeMap<PathBuf, Entry>,
+    new: &BTreeMap<PathBuf, Entry>,
     rules: &mut Pending<'_>,
     root: BorrowedFd<'_>,
 ) {
+    let replaced: BTreeSet<PathBuf> = (changes.iter())
+        .filter_map(|change| match change {
+            Change::Modified { path }
+                if (old.get(path).zip(new.get(path)))
+                    .is_some_and(|(before, after)| after.id != before.id) =>
+            {
+                Some(path.clone())
+            }
+            _ => None,
+        })
+        .collect();
     let removed: Vec<&PathBuf> = changes
         .iter()
         .filter_map(|change| match change {
@@ -1153,7 +1169,7 @@ fn find_ignored(
             _ => None,
         })
         .collect();
-    if removed.is_empty() {
+    if removed.is_empty() && replaced.is_empty() {
         return;
     }
     let held: Vec<&PathBuf> = (removed.iter().copied())
@@ -1164,10 +1180,14 @@ fn find_ignored(
                 .map(|(path, _)| path)
         })
         .collect();
-    let mut wanted: Wanted = (removed.iter().chain(&held))
-        .map(|path| ((old[*path].id, old[*path].kind), None))
+    let key = |path: &PathBuf| ((old[path].id, old[path].kind), None);
+    let mut wanted: Wanted = (removed.iter().chain(&held).copied()).map(key).collect();
+    rules.find(root, &mut wanted, true);
+    let mut swapped: Wanted = (replaced.iter().map(key))
+        .filter(|(id, _)| !wanted.contains_key(id))
         .collect();
-    rules.find(root, &mut wanted);
+    rules.find(root, &mut swapped, false);
+    wanted.extend(swapped);
     let found = |path: &Path| {
         let entry = &old[path];
         (wanted.get(&(entry.id, entry.kind)).cloned().flatten()).map(|to| Change::Ignored {
@@ -1177,7 +1197,7 @@ fn find_ignored(
             id: entry.id,
         })
     };
-    let moved: Vec<Change> = (held.iter())
+    let mut moved: Vec<Change> = (held.iter())
         .filter(|path| {
             !(path.ancestors().skip(1))
                 .take_while(|above| old.contains_key(*above))
@@ -1186,10 +1206,22 @@ fn find_ignored(
         .filter_map(|path| found(path))
         .collect();
     for change in changes.iter_mut() {
-        if let Change::Removed { path, .. } = &*change
-            && let Some(ignored) = found(path)
-        {
-            *change = ignored;
+        match &*change {
+            Change::Removed { path, .. } => {
+                if let Some(ignored) = found(path) {
+                    *change = ignored;
+                }
+            }
+            Change::Modified { path } if replaced.contains(path) => {
+                if let Some(ignored) = found(path) {
+                    *change = Change::Created {
+                        path: path.clone(),
+                        kind: EntryKind::File,
+                    };
+                    moved.push(ignored);
+                }
+            }
+            _ => {}
         }
     }
     changes.extend(moved);

@@ -541,6 +541,51 @@ fn files_and_folders_swapped_in_one_batch_keep_every_byte() {
     assert_eq!(files(&site.root), swapped);
 }
 
+/// Device a swaps the file `a` with the file `b`, which its rules exclude, through a third name. The file that took
+/// `b` left what this device syncs, so its copy stays on the server.
+#[test]
+fn a_file_swapped_into_a_name_the_rules_exclude_keeps_its_remote_copy() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site.root.join("a"), b"A");
+    a.create(&mut remote, &site.root.join("b"), b"BB");
+    let old_a = a
+        .folder
+        .engine
+        .trees
+        .remote()
+        .iter()
+        .find(|(_, n)| n.shape.name == "a")
+        .unwrap()
+        .0
+        .clone();
+    a.create(&mut remote, &site.root.join(".fbignore"), b"b\n");
+    fs::rename(site.root.join("a"), site.root.join("tmp")).unwrap();
+    fs::rename(site.root.join("b"), site.root.join("a")).unwrap();
+    fs::rename(site.root.join("tmp"), site.root.join("b")).unwrap();
+    let included_ino = fs::metadata(site.root.join("a")).unwrap().ino();
+    a.scan_until(|a| {
+        a.observer
+            .snapshot()
+            .entries
+            .get(Path::new("a"))
+            .is_some_and(|e| e.id.ino == included_ino)
+    });
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    assert_eq!(fs::read(site.root.join("b")).unwrap(), b"A");
+    assert!(
+        a.folder
+            .engine
+            .trees
+            .remote()
+            .get(&old_a)
+            .is_some_and(|n| !n.trashed),
+        "the copy moved into an ignored name was deleted from the server"
+    );
+}
+
 /// Device b holds an untracked symlink at e. The server moves d to e and creates another file at d.
 /// The move fails because e is taken, but d is parked out of the way, so the new file arrives at d
 /// and the symlink stays.

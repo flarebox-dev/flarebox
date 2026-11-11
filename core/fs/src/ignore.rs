@@ -228,11 +228,11 @@ impl<'r> Pending<'r> {
         }
     }
 
-    /// Looks for the `wanted` entries at and below the entries the rules
-    /// leave out, and sets where each one is. The search lists and stats, and
-    /// reads no file. It skips what it cannot open and forgets a recorded
-    /// name that is gone.
-    pub(crate) fn find(&mut self, root: BorrowedFd<'_>, wanted: &mut Wanted) {
+    /// Looks for the `wanted` entries at the entries the rules leave out by
+    /// name, and below them when `below` is set, and sets where each one is.
+    /// The search lists and stats, and reads no file. It skips what it cannot
+    /// open and forgets a recorded name that is gone.
+    pub(crate) fn find(&mut self, root: BorrowedFd<'_>, wanted: &mut Wanted, below: bool) {
         let mut missing = wanted.len();
         self.rules.ignored.retain(|folder, names| {
             if missing == 0 {
@@ -256,6 +256,7 @@ impl<'r> Pending<'r> {
                             &stat,
                             wanted,
                             &mut missing,
+                            below,
                         );
                         true
                     }
@@ -356,7 +357,7 @@ fn read_rules(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<Option<Vec<u8>>> 
 }
 
 /// Checks the entry `name` of `dir`, at `path` under the root, and everything
-/// below it against `wanted`, until none is `missing`.
+/// below it when `below` is set, against `wanted`, until none is `missing`.
 fn look(
     dir: BorrowedFd<'_>,
     name: &OsStr,
@@ -364,6 +365,7 @@ fn look(
     stat: &Stat,
     wanted: &mut Wanted,
     missing: &mut usize,
+    below: bool,
 ) {
     let Some(entry) = stat.entry() else {
         return;
@@ -372,7 +374,7 @@ fn look(
         *found = Some(path.clone());
         *missing -= 1;
     }
-    if entry.kind != EntryKind::Dir || *missing == 0 {
+    if !below || entry.kind != EntryKind::Dir || *missing == 0 {
         return;
     }
     let Ok(sub) = open_dir_at(dir, name) else {
@@ -386,7 +388,15 @@ fn look(
             return;
         }
         if let Ok(stat) = stat_at(sub.as_fd(), &name) {
-            look(sub.as_fd(), &name, path.join(&name), &stat, wanted, missing);
+            look(
+                sub.as_fd(),
+                &name,
+                path.join(&name),
+                &stat,
+                wanted,
+                missing,
+                true,
+            );
         }
     }
 }
