@@ -77,6 +77,7 @@ fn migrations_apply_from_empty() {
             "commit_in_flight",
             "commit_in_flight_delete_members",
             "commit_in_flight_deletes",
+            "commit_slots",
             "commit_state",
             "effect_state",
             "engine_state",
@@ -91,6 +92,7 @@ fn migrations_apply_from_empty() {
             "restore_intents",
             "restore_requests",
             "synced_nodes",
+            "trashed_here",
             "waiting_updates",
             "watched_contents",
         ]
@@ -376,6 +378,7 @@ fn engine_state() -> EngineState {
                 ("gone".into(), None),
             ]),
             watched: BTreeMap::from([("edited".into(), true), ("kept".into(), false)]),
+            trashed_here: BTreeMap::from([("t".into(), 5)]),
         },
         commits: CommitsState {
             accepted: 4,
@@ -405,6 +408,7 @@ fn engine_state() -> EngineState {
                 (id(102), version.clone()),
             ]),
             resolved: resolved.collect(),
+            slots: BTreeMap::from([(3, 7), (4, 9)]),
         },
         effects: EffectsState {
             in_flight: Some(EffectRecord {
@@ -472,7 +476,7 @@ fn engine_state_survives_a_reopen() {
 }
 
 /// The tables of the engine state besides the nodes of R, L and S.
-const ENGINE_TABLES: [&str; 11] = [
+const ENGINE_TABLES: [&str; 13] = [
     "node_sets",
     "node_maps",
     "waiting_updates",
@@ -481,6 +485,8 @@ const ENGINE_TABLES: [&str; 11] = [
     "commit_in_flight_deletes",
     "commit_in_flight_delete_members",
     "watched_contents",
+    "trashed_here",
+    "commit_slots",
     "effect_state",
     "failed_effects",
     "restore_intents",
@@ -761,7 +767,7 @@ fn a_cursor_stored_before_it_could_record_a_server_behind_it_records_none() {
         .unwrap();
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
-        "DROP TABLE watched_contents;
+        "DROP TABLE trashed_here; DROP TABLE commit_slots; DROP TABLE watched_contents;
          ALTER TABLE remote_cursor DROP COLUMN ahead_of_server;",
     )
     .unwrap();
@@ -792,14 +798,43 @@ fn a_store_from_before_contents_were_watched_opens_with_nothing_watched() {
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("DROP TABLE watched_contents;").unwrap();
+    conn.execute_batch(
+        "DROP TABLE trashed_here; DROP TABLE commit_slots; DROP TABLE watched_contents;",
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 5).unwrap();
+    drop(conn);
+
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    before.trees.watched.clear();
+    before.trees.trashed_here.clear();
+    before.commits.slots.clear();
+    assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
+}
+
+/// A database of the schema before the deletes and commit slots of this device are recorded keeps
+/// its engine state, with neither recorded.
+#[test]
+fn a_store_from_before_deletes_were_recorded_opens_with_none_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let mut before = engine_state();
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| tx.set_engine_state(&before))
+        .unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("DROP TABLE trashed_here; DROP TABLE commit_slots;")
+        .unwrap();
     conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
         .unwrap();
     drop(conn);
 
     let mut store = Store::open(&path).unwrap();
     assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
-    before.trees.watched.clear();
+    before.trees.trashed_here.clear();
+    before.commits.slots.clear();
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
 }
 
@@ -812,6 +847,8 @@ fn a_version_3_store_opens_with_empty_restore_tables() {
     let mut before = engine_state();
     before.commits.in_flight.as_mut().unwrap().commit.ops.pop();
     before.trees.watched.clear();
+    before.trees.trashed_here.clear();
+    before.commits.slots.clear();
     before.commits.restores.clear();
     before.commits.resolved.clear();
     Store::open(&path)
@@ -821,7 +858,7 @@ fn a_version_3_store_opens_with_empty_restore_tables() {
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
         "DROP TABLE restore_requests; DROP TABLE restore_intents;
-         DROP TABLE watched_contents;
+         DROP TABLE watched_contents; DROP TABLE trashed_here; DROP TABLE commit_slots;
          ALTER TABLE remote_cursor DROP COLUMN ahead_of_server;",
     )
     .unwrap();

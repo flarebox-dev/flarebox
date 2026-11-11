@@ -18,6 +18,9 @@ use crate::tree::{Content, Kind, Names, NodeId, Shape, same, same_content};
 
 /// The most ops one commit holds (spec v0 section 13).
 pub const MAX_OPS: usize = 1000;
+/// How many of this device's acknowledged commits [`Commits::held_through`] remembers. A server
+/// restored from a backup older than all of them gives 0, so no lost delete is sent again.
+pub const SLOTS_KEPT: usize = 1000;
 
 /// The most bytes of change records a commit is planned to make, as estimated. Its records and
 /// its result must each fit in one 1 MiB `ServerMessage` (spec v0 section 7.2), and the estimate is
@@ -139,6 +142,8 @@ pub struct Commits {
     restores: BTreeMap<RestoreId, RestoreIntent>,
     /// The last [`RESOLVED_KEPT`] restores that ended, oldest first.
     resolved: Vec<Resolved>,
+    /// The seq of each of this device's last [`SLOTS_KEPT`] acknowledged commits, by slot.
+    slots: BTreeMap<u64, u64>,
 }
 
 impl Commits {
@@ -154,6 +159,7 @@ impl Commits {
             aliases: self.aliases.clone(),
             restores: self.restores.clone(),
             resolved: self.resolved.clone(),
+            slots: self.slots.clone(),
         }
     }
 
@@ -209,6 +215,7 @@ impl Commits {
             aliases,
             restores,
             resolved,
+            slots,
         } = state;
         Ok(Self {
             accepted,
@@ -220,7 +227,16 @@ impl Commits {
             aliases,
             restores,
             resolved,
+            slots,
         })
+    }
+
+    /// The seq of the newest commit of this device that the server counts, or 0 when none is
+    /// known. A server that lost commits keeps every seq up to the backup it was restored from, and
+    /// this commit is among them, so a node state of a seq at or below it is from before the loss
+    /// (section 4.4).
+    pub fn held_through(&self) -> u64 {
+        self.slots.last_key_value().map_or(0, |(_, &seq)| seq)
     }
 
     /// The accepted counter *a* of section 2.8: the `device_seq` of the last commit whose result
@@ -575,6 +591,7 @@ impl Commits {
                     if done {
                         for id in flight.deletes.get(&delete.node_id).into_iter().flatten() {
                             synced.set(id, None);
+                            trees.record_trashed(id, result.seq);
                         }
                     }
                     (&delete.node_id, done)
@@ -607,6 +624,10 @@ impl Commits {
         trees.watch_content([]);
         self.retry_waiting(trees, BTreeSet::new(), Vec::new());
         self.accepted = flight.commit.device_seq;
+        self.slots.insert(flight.commit.device_seq, result.seq);
+        while self.slots.len() > SLOTS_KEPT {
+            self.slots.pop_first();
+        }
         self.cap = self.cap.map(|cap| cap * 2).filter(|cap| *cap < MAX_OPS);
         true
     }
@@ -758,6 +779,7 @@ impl Commits {
         if reconnect == Reconnect::AheadOfServer {
             self.accepted = w;
             self.in_flight = None;
+            self.slots.split_off(&(w + 1));
         }
         if welcome.read_only {
             self.halted = Some(Halt::ReadOnly);

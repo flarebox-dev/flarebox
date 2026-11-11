@@ -126,6 +126,14 @@ impl ByName {
     }
 }
 
+/// A node a delete of this device trashed, with the shape R holds in the trash, which is the shape
+/// the delete saw.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Trashed {
+    pub id: NodeId,
+    pub shape: Shape,
+}
+
 /// R, L and S of one space, and the nodes whose entries changed since they were last found in sync.
 /// Every mutation goes through these methods, so a change in any tree marks its node dirty, and
 /// [`Trees::settle`] and the planner look only at what changed.
@@ -147,6 +155,9 @@ pub struct Trees {
     /// The nodes whose content the commit in flight updates, each with whether S's content
     /// changed since the commit was built.
     watched: BTreeMap<NodeId, bool>,
+    /// The nodes a delete of this device trashed, each with the seq of its commit, while R holds
+    /// them trashed by that commit.
+    trashed_here: BTreeMap<NodeId, u64>,
     ignore: Matcher,
     /// Nodes whose local copy the user moved into an ignored folder that is no node. L keeps the
     /// entry each had before the move.
@@ -203,6 +214,7 @@ impl Trees {
             parked_as: BTreeMap::new(),
             waiting: BTreeMap::new(),
             watched: BTreeMap::new(),
+            trashed_here: BTreeMap::new(),
             ignore: Matcher::new(LocalRules::default()),
             outside: BTreeSet::new(),
             rules_known: true,
@@ -279,6 +291,10 @@ impl Trees {
 
     pub fn set_remote(&mut self, id: NodeId, node: RemoteNode) {
         self.mark(&id);
+        if (self.trashed_here.get(&id)).is_some_and(|&seq| !(node.trashed && node.meta_rev == seq))
+        {
+            self.trashed_here.remove(&id);
+        }
         if node.is_live() && node.shape.kind == Kind::File && is_rules_file(&node.shape.name) {
             self.remote_rules_files.insert(id.clone());
         } else {
@@ -289,6 +305,7 @@ impl Trees {
 
     pub fn remove_remote(&mut self, id: &str) {
         self.remote_rules_files.remove(id);
+        self.trashed_here.remove(id);
         if self.r.remove(id).is_some() {
             self.mark(id);
         }
@@ -611,6 +628,28 @@ impl Trees {
         true
     }
 
+    /// Records that a delete of this device, in the commit at `seq`, trashed `id`, if R holds it
+    /// trashed by that commit.
+    pub fn record_trashed(&mut self, id: &str, seq: u64) {
+        if (self.r.get(id)).is_some_and(|remote| remote.trashed && remote.meta_rev == seq) {
+            self.trashed_here.insert(id.to_owned(), seq);
+        }
+    }
+
+    /// The nodes a delete of this device trashed and R still holds trashed by it, for
+    /// [`Trees::forget_lost`] once a bootstrap has replaced R.
+    pub fn trashed_here(&self) -> Vec<Trashed> {
+        (self.trashed_here.keys())
+            .filter_map(|id| {
+                let remote = self.r.get(id)?;
+                Some(Trashed {
+                    id: id.clone(),
+                    shape: remote.shape.clone(),
+                })
+            })
+            .collect()
+    }
+
     /// Forgets what the server may have lost, after a bootstrap from a server that is behind what
     /// this device applied (design §4.4). S forgets every node that R does not hold at all or holds
     /// live with another shape, and every node S holds below one. A node L still holds is then
@@ -619,7 +658,35 @@ impl Trees {
     /// node R holds in the trash keeps S, so it stays a remote delete, also below a node S forgets.
     /// S then forgets each such ancestor only once the delete has taken what it held: the update
     /// waits ([`Trees::waiting`]) and is made as soon as it fits.
-    pub fn forget_lost(&mut self) {
+    ///
+    /// `trashed` lists what deletes of this device had trashed before the bootstrap
+    /// ([`Trees::trashed_here`]), and `held_through` the seq of the newest commit of this device the
+    /// server still counts ([`Commits::held_through`]), at or below which every seq is from before
+    /// the loss. A node of `trashed` that R now holds live, as it was deleted and with no revision
+    /// above `held_through`, lost its delete: nothing changed it after the loss. S takes R's shape
+    /// for it, parents first, so the delete is sent again. Any other node of it is downloaded again,
+    /// since a restore or another change after the loss can take a seq the lost commits had.
+    ///
+    /// [`Commits::held_through`]: crate::commit::Commits::held_through
+    pub fn forget_lost(&mut self, trashed: Vec<Trashed>, held_through: u64) {
+        let mut deletes: Vec<(NodeId, Shape)> = (trashed.into_iter())
+            .filter(|deleted| {
+                self.l.get(&deleted.id).is_none() && self.s.get(&deleted.id).is_none()
+            })
+            .filter_map(|deleted| {
+                let remote = (self.r.get(&deleted.id))
+                    .filter(|remote| !remote.trashed && remote.shape.same(&deleted.shape))
+                    .filter(|remote| remote.content_rev.max(remote.meta_rev) <= held_through)?;
+                Some((deleted.id, remote.shape.clone()))
+            })
+            .collect();
+        while let Some(at) = (0..deletes.len()).find(|&at| {
+            let (id, shape) = &deletes[at];
+            self.fits_synced(id, Some(shape))
+        }) {
+            let (id, shape) = deletes.swap_remove(at);
+            self.set_synced(id, Some(shape));
+        }
         let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for (id, shape) in self.s.iter() {
             children.entry(&shape.parent).or_default().push(id);
@@ -1102,6 +1169,7 @@ impl Trees {
             parked_as: self.parked_as.clone(),
             waiting: self.waiting.clone(),
             watched: self.watched.clone(),
+            trashed_here: self.trashed_here.clone(),
         }
     }
 
@@ -1133,6 +1201,12 @@ impl Trees {
         if let Some(id) = state.parked_as.keys().find(placed) {
             return Err(StateError::NotParked(id.clone()));
         }
+        let trashed = |(id, seq): &(&NodeId, &u64)| {
+            (self.r.get(id)).is_some_and(|remote| remote.trashed && remote.meta_rev == **seq)
+        };
+        if let Some((id, _)) = state.trashed_here.iter().find(|entry| !trashed(entry)) {
+            return Err(StateError::NotTrashedHere(id.clone()));
+        }
         let TreesState {
             dirty,
             unsearched,
@@ -1140,6 +1214,7 @@ impl Trees {
             parked_as,
             waiting,
             watched,
+            trashed_here,
         } = state;
         self.unsettled = dirty.clone();
         self.same.clear();
@@ -1150,6 +1225,7 @@ impl Trees {
         self.parked_as = parked_as;
         self.waiting = waiting;
         self.watched = watched;
+        self.trashed_here = trashed_here;
         self.rules_known = false;
         self.unknown_rules.clear();
         Ok(())

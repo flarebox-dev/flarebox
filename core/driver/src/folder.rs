@@ -34,8 +34,8 @@ use flarebox_net::{
 use flarebox_proto::v1::error::Code;
 use flarebox_proto::v1::resync_required::Reason;
 use flarebox_proto::v1::{
-    ChunkRef, Commit, CommitRecord, CommitResult, Error as ProtoError, TreePage, UploadReceipt,
-    Welcome,
+    ChunkRef, Commit, CommitRecord, CommitResult, Error as ProtoError, TrashPage, TreePage,
+    UploadReceipt, Welcome,
 };
 use flarebox_store::{Cursor, Link, Store, Tx};
 use tokio::sync::{Notify, mpsc, watch};
@@ -163,8 +163,9 @@ enum Next {
 pub(crate) enum Work {
     /// `Session::subscribe`.
     Subscribe { history_id: String, since_seq: u64 },
-    /// Read every page of the tree. Answered with [`Folder::listed`].
-    List,
+    /// Read every page of the tree, then every page of the trash when `trash` is set. Answered with
+    /// [`Folder::listed`].
+    List { trash: bool },
     /// Read on from `Listing` after a wait.
     ListAfter(Duration, Listing),
     /// [`Pending::stage`]. Answered with [`Folder::staged`].
@@ -181,18 +182,25 @@ pub(crate) enum Work {
     RetryAfter(Duration),
 }
 
-/// The pages of the tree read so far, the cursor of the next page and how many times in a row a page failed.
+/// The pages of the tree read so far, the cursor of the next page and how many times in a row a page failed. When
+/// `trash` is set, the trash is read after the tree, with its own pages and cursor.
 #[derive(Debug, Default)]
 pub(crate) struct Listing {
     pages: Vec<TreePage>,
     cursor: String,
+    trash: bool,
+    trash_pages: Vec<TrashPage>,
+    trash_cursor: String,
     failures: u32,
 }
 
 /// How reading the tree ended.
 #[derive(Debug)]
 pub(crate) enum Listed {
-    Done(Vec<TreePage>),
+    Done {
+        pages: Vec<TreePage>,
+        trash: Vec<TrashPage>,
+    },
     /// A page failed for now with `why`. Read on from `listing` after `wait`.
     Later {
         listing: Listing,
@@ -381,23 +389,25 @@ impl Folder {
             && *superseded
         {
             *superseded = false;
-            return Ok(vec![Work::List]);
+            return Ok(vec![Work::List {
+                trash: self.lists_trash(),
+            }]);
         }
         let listed = listed?;
         if !matches!(self.stream, Stream::Listing { .. }) {
             return Ok(Vec::new());
         }
-        let pages = match listed {
-            Listed::Done(pages) => {
+        let (pages, trash) = match listed {
+            Listed::Done { pages, trash } => {
                 self.retrying.remove(&Call::List);
-                pages
+                (pages, trash)
             }
             Listed::Later { listing, wait, why } => {
                 self.retry_after(Call::List, why, wait);
                 return Ok(vec![Work::ListAfter(wait, listing)]);
             }
         };
-        let staging = Staging::new(self.history_id.clone(), pages);
+        let staging = Staging::new(self.history_id.clone(), pages, trash);
         tracing::info!(
             space_id = self.link.space_id,
             seq = staging.last_seq(),
@@ -881,7 +891,9 @@ impl Folder {
                 }),
             ) => {
                 self.stream = Stream::Listing { superseded: false };
-                work.push(Work::List);
+                work.push(Work::List {
+                    trash: self.lists_trash(),
+                });
             }
             (Stream::Connecting, Some(cursor)) => {
                 work.push(Work::Subscribe {
@@ -1071,7 +1083,15 @@ impl Folder {
             return;
         }
         self.stream = Stream::Listing { superseded: false };
-        work.push(Work::List);
+        work.push(Work::List {
+            trash: self.lists_trash(),
+        });
+    }
+
+    /// Whether a bootstrap reads the trash too: when the server lost commits this device applied, so that a node
+    /// another device trashed since is not taken for one the server lost and published again (RFC 0002 §6).
+    fn lists_trash(&self) -> bool {
+        (self.engine.cursor.as_ref()).is_some_and(|cursor| cursor.ahead_of_server)
     }
 
     /// Starts the upload of what `commit` adds, or its send when it adds no content.
@@ -1392,8 +1412,11 @@ impl FolderTask {
                             history_id,
                             since_seq,
                         } => session.subscribe(history_id, since_seq),
-                        Work::List => {
-                            let listing = Listing::default();
+                        Work::List { trash } => {
+                            let listing = Listing {
+                                trash,
+                                ..Listing::default()
+                            };
                             list = Some(Box::pin(list_tree(
                                 session,
                                 &self.link.space_id,
@@ -1592,7 +1615,8 @@ impl FolderTask {
 }
 
 /// Reads the rest of the tree with `ListTree` from `listing`, after `wait` when there is one, page by page (spec
-/// v0 section 7.5). A page refused in a way the server asks to retry ends it with the wait, so the folder can show it.
+/// v0 section 7.5), then the trash with `ListTrash` when the listing asks for it (RFC 0002 §6). A page refused in a
+/// way the server asks to retry ends it with the wait, so the folder can show it.
 async fn list_tree(
     session: &Session,
     space_id: &str,
@@ -1602,44 +1626,63 @@ async fn list_tree(
     if let Some(wait) = wait {
         tokio::time::sleep(wait).await;
     }
-    loop {
+    while listing.pages.is_empty() || !listing.cursor.is_empty() {
         match session.list_tree(listing.cursor.clone(), TREE_PAGE).await {
             Ok(page) => {
                 listing.failures = 0;
                 listing.cursor.clone_from(&page.next_cursor);
                 listing.pages.push(page);
-                if listing.cursor.is_empty() {
-                    return Ok(Listed::Done(listing.pages));
-                }
             }
-            Err(error) => {
-                let wait = match policy::after_call_error(&error) {
-                    Disposition::RetryAfter(wait) => wait,
-                    Disposition::Backoff => Backoff::default().delay(listing.failures),
-                    Disposition::Halt => {
-                        let error = match &error {
-                            CallError::Server(refusal) => policy::describe(refusal),
-                            other => other.to_string(),
-                        };
-                        return Err(Stop::Refused(format!(
-                            "reading the space's tree failed: {error}"
-                        )));
-                    }
-                };
-                tracing::info!(space_id, %error, ?wait, "reading the tree again later");
-                listing.failures += 1;
-                let why = match &error {
-                    CallError::Server(refusal) => policy::describe(refusal),
-                    other => other.to_string(),
-                };
-                return Ok(Listed::Later {
-                    listing,
-                    wait,
-                    why: format!("reading the space's tree failed: {why}"),
-                });
-            }
+            Err(error) => return later(space_id, "tree", listing, &error),
         }
     }
+    while listing.trash && (listing.trash_pages.is_empty() || !listing.trash_cursor.is_empty()) {
+        match session
+            .list_trash(listing.trash_cursor.clone(), TREE_PAGE)
+            .await
+        {
+            Ok(page) => {
+                listing.failures = 0;
+                listing.trash_cursor.clone_from(&page.next_cursor);
+                listing.trash_pages.push(page);
+            }
+            Err(error) => return later(space_id, "trash", listing, &error),
+        }
+    }
+    Ok(Listed::Done {
+        pages: listing.pages,
+        trash: listing.trash_pages,
+    })
+}
+
+/// How a listing ends after a page of the space's `what`, tree or trash, failed with `error`: later with a wait, or
+/// with a stop when the server refuses it for good.
+fn later(
+    space_id: &str,
+    what: &str,
+    mut listing: Listing,
+    error: &CallError,
+) -> Result<Listed, Stop> {
+    let why = match error {
+        CallError::Server(refusal) => policy::describe(refusal),
+        other => other.to_string(),
+    };
+    let wait = match policy::after_call_error(error) {
+        Disposition::RetryAfter(wait) => wait,
+        Disposition::Backoff => Backoff::default().delay(listing.failures),
+        Disposition::Halt => {
+            return Err(Stop::Refused(format!(
+                "reading the space's {what} failed: {why}"
+            )));
+        }
+    };
+    tracing::info!(space_id, %error, ?wait, "reading the {what} again later");
+    listing.failures += 1;
+    Ok(Listed::Later {
+        listing,
+        wait,
+        why: format!("reading the space's {what} failed: {why}"),
+    })
 }
 
 /// The time of day of `at` in UTC, such as `00:00 UTC`.
