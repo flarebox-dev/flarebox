@@ -147,6 +147,12 @@ pub struct Trees {
     r: Tree<RemoteNode>,
     l: Tree<LocalNode>,
     s: Tree<Shape>,
+    /// The files S holds.
+    s_files: u64,
+    /// The nodes L holds that R holds trashed, counted by trash group.
+    held_trash: BTreeMap<String, u64>,
+    /// The nodes R holds trashed, counted by trash group.
+    trashed: BTreeMap<String, u64>,
     dirty: BTreeSet<NodeId>,
     unsearched: BTreeSet<NodeId>,
     reverted: BTreeSet<NodeId>,
@@ -218,6 +224,9 @@ impl Trees {
             r: Tree::new(root.clone()),
             l: Tree::new(root.clone()),
             s: Tree::new(root),
+            s_files: 0,
+            held_trash: BTreeMap::new(),
+            trashed: BTreeMap::new(),
             dirty: BTreeSet::new(),
             unsearched: BTreeSet::new(),
             reverted: BTreeSet::new(),
@@ -254,6 +263,43 @@ impl Trees {
 
     pub fn synced(&self) -> &Tree<Shape> {
         &self.s
+    }
+
+    /// The number of files S holds, kept as S changes.
+    pub fn synced_files(&self) -> u64 {
+        self.s_files
+    }
+
+    /// Whether L still holds a node that R holds trashed in `group`.
+    pub fn holds_trash_group(&self, group: &str) -> bool {
+        self.held_trash.contains_key(group)
+    }
+
+    /// Whether R holds a node trashed in `group`.
+    pub fn trashes_group(&self, group: &str) -> bool {
+        self.trashed.contains_key(group)
+    }
+
+    /// The trash group of a node L holds and R holds trashed.
+    fn held_trash_group(&self, id: &str) -> Option<String> {
+        self.l.get(id)?;
+        let remote = self.r.get(id).filter(|remote| remote.trashed)?;
+        Some(remote.trash_group.clone())
+    }
+
+    /// Counts `id` in `held_trash` by its trash group, `add` or not, before and after a change of
+    /// its R or L.
+    fn count_held_trash(&mut self, id: &str, add: bool) {
+        let group = self.held_trash_group(id);
+        count_group(&mut self.held_trash, group, add);
+    }
+
+    /// Counts `id` in `trashed` by its trash group, `add` or not, before and after a change of
+    /// its R.
+    fn count_trashed(&mut self, id: &str, add: bool) {
+        let group = (self.r.get(id)).filter(|node| node.trashed);
+        let group = group.map(|node| node.trash_group.clone());
+        count_group(&mut self.trashed, group, add);
     }
 
     pub fn dirty(&self) -> &BTreeSet<NodeId> {
@@ -320,12 +366,18 @@ impl Trees {
         } else {
             self.remote_rules_files.remove(&id);
         }
-        self.r.insert(id, node);
+        self.count_held_trash(&id, false);
+        self.count_trashed(&id, false);
+        self.r.insert(id.clone(), node);
+        self.count_held_trash(&id, true);
+        self.count_trashed(&id, true);
     }
 
     pub fn remove_remote(&mut self, id: &str) {
         self.remote_rules_files.remove(id);
         self.trashed_here.remove(id);
+        self.count_held_trash(id, false);
+        self.count_trashed(id, false);
         self.displaced.remove(id);
         self.edited_here.remove(id);
         if self.r.remove(id).is_some() {
@@ -365,13 +417,16 @@ impl Trees {
         self.displaced.remove(&id);
         (self.l_identities.entry(node.identity).or_default()).insert(id.clone());
         self.mark(&id);
-        self.l.insert(id, node);
+        self.count_held_trash(&id, false);
+        self.l.insert(id.clone(), node);
+        self.count_held_trash(&id, true);
     }
 
     pub fn remove_local(&mut self, id: &str) {
         self.parked_as.remove(id);
         self.unknown_rules.remove(id);
         self.outside.remove(id);
+        self.count_held_trash(id, false);
         if let Some(old) = self.l.remove(id) {
             if !old.parked {
                 self.l_names.remove(id, &old.shape);
@@ -1322,6 +1377,8 @@ impl Trees {
             }
             None => self.s.remove(id),
         };
+        let file = |shape: Option<&Shape>| u64::from(shape.is_some_and(|s| s.kind == Kind::File));
+        self.s_files = self.s_files - file(old.as_ref()) + file(self.s.get(id));
         if let Some(changed) = self.watched.get_mut(id) {
             let before = old.as_ref().and_then(|shape| shape.content.as_ref());
             let after = self.s.get(id).and_then(|shape| shape.content.as_ref());
@@ -1342,6 +1399,33 @@ impl Trees {
 
     /// The invariants of section 2.2 for all three trees.
     pub fn check(&self) -> Result<(), (char, TreeError)> {
+        debug_assert_eq!(
+            self.s_files,
+            (self.s.iter())
+                .filter(|(_, shape)| shape.kind == Kind::File)
+                .count() as u64,
+            "the kept count of S's files"
+        );
+        debug_assert_eq!(
+            self.held_trash,
+            (self.l.iter()).fold(BTreeMap::new(), |mut held, (id, _)| {
+                if let Some(group) = self.held_trash_group(id) {
+                    *held.entry(group).or_insert(0) += 1;
+                }
+                held
+            }),
+            "the kept count of the trashed nodes L holds"
+        );
+        debug_assert_eq!(
+            self.trashed,
+            (self.r.iter()).fold(BTreeMap::new(), |mut trashed, (_, node)| {
+                if node.trashed {
+                    *trashed.entry(node.trash_group.clone()).or_insert(0) += 1;
+                }
+                trashed
+            }),
+            "the kept count of the trashed nodes R holds"
+        );
         self.r.check(Names::ByKey).map_err(|e| ('R', e))?;
         self.s.check(Names::ByKey).map_err(|e| ('S', e))?;
         self.l.check(Names::Exact).map_err(|e| ('L', e))
@@ -1441,5 +1525,21 @@ impl Trees {
         self.rules_known = false;
         self.unknown_rules.clear();
         Ok(())
+    }
+}
+
+/// Counts a node of `group` in `counts`, `add` or not. A node of no group counts nowhere.
+fn count_group(counts: &mut BTreeMap<String, u64>, group: Option<String>, add: bool) {
+    let Some(group) = group else {
+        return;
+    };
+    let count = counts.entry(group.clone()).or_insert(0);
+    if add {
+        *count += 1;
+    } else {
+        *count -= 1;
+        if *count == 0 {
+            counts.remove(&group);
+        }
     }
 }

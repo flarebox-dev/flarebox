@@ -398,7 +398,8 @@ pub enum NoticeKind {
     },
     /// Deletions from the server crossed a limit of the mass-delete guard and were applied here
     /// without asking, because the server is authoritative (design §6.1, Remote deletions). The
-    /// files are in the local trash. The counts cover the rolling 10-minute window.
+    /// files are in the local trash. The counts start with the 10-minute window that crossed the
+    /// limit and grow with each later removal until the notice is dismissed.
     RemoteMassDelete {
         deletions: u64,
         affected_files: u64,

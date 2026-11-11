@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use koidrive_driver::{Credential, Paths, Question, QuestionKind};
+use koidrive_driver::{Credential, Limit, Paths, Question, QuestionKind};
 use koidrive_ffi::{Answer, SessionEvent, SessionListener, SyncSession, SyncStatus};
 use koidrive_store::{Link, Store, StoredQuestion};
 
@@ -74,6 +74,7 @@ fn paired_profile(base: &Path, spaces: &[&str], questions: usize) -> PathBuf {
                             deletions: 1_200,
                             affected_files: 1_500,
                             space_files: 2_000,
+                            exceeded: vec![Limit::Deletions, Limit::Share],
                         },
                         items: Vec::new(),
                     };

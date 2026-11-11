@@ -158,13 +158,21 @@ impl Engine {
     }
 
     /// Stores each question the engine asked since the last checkpoint and removes the rows of the ones it no longer
-    /// asks, for `Driver::questions` to show.
+    /// asks, for `Driver::questions` to show. A question whose counts changed under the same id, as a notice's do, is
+    /// shown with the new counts and keeps any answer it was given.
     pub fn ask(&self, tx: &Tx<'_>, space_id: &str) -> Result<(), Error> {
         let asked = &self.stored.commits.questions;
         let asking = self.commits.questions();
         let open = |questions: &[engine::Question], id: &str| questions.iter().any(|q| q.id == id);
         for question in asked.iter().filter(|question| !open(asking, &question.id)) {
             tx.remove_question(&question.id)?;
+        }
+        for question in asking.iter().filter(|question| {
+            (asked.iter()).any(|before| before.id == question.id && before.kind != question.kind)
+        }) {
+            let body =
+                serde_json::to_vec(&self.shown(space_id, question)).expect("a question serializes");
+            tx.reshow_question(&question.id, &body)?;
         }
         for question in asking.iter().filter(|question| !open(asked, &question.id)) {
             tracing::warn!(

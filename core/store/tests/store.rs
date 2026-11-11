@@ -5,9 +5,11 @@ use std::path::Path;
 
 use koidrive_engine::commit::{Commits, Halt, InFlight, Reconnect};
 use koidrive_engine::effects::{Base, Dir, Displaced, Effect, EffectRecord, Location};
-use koidrive_engine::guard::{Counted, GuardState};
+use koidrive_engine::guard::{Counted, GuardState, RemoteDeletion, Trash};
 use koidrive_engine::ids::uuid_v7;
-use koidrive_engine::question::{Answer, Held, Question, QuestionKind, RecoveryGroup, Revisions};
+use koidrive_engine::question::{
+    Answer, Held, Limit, Question, QuestionKind, RecoveryGroup, Revisions,
+};
 use koidrive_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
 use koidrive_engine::state::{CommitsState, EffectsState, TreesState};
 use koidrive_engine::tree::{FileIdentity, Kind, Shape as EngineShape};
@@ -87,8 +89,11 @@ fn migrations_apply_from_empty() {
             "engine_state",
             "failed_effects",
             "guard_confirmed",
+            "guard_confirmed_limits",
             "guard_confirmed_members",
             "guard_ledger",
+            "guard_remote",
+            "guard_remote_dismissed",
             "link",
             "local_nodes",
             "node_maps",
@@ -287,6 +292,25 @@ fn revisions(content_rev: u64, meta_rev: u64) -> Revisions {
     }
 }
 
+fn deletion(top: &str, trash: Trash) -> RemoteDeletion {
+    RemoteDeletion {
+        top: top.into(),
+        trash,
+    }
+}
+
+/// The trash of a delete whose tombstones R holds, the first delete of the commit at \`seq\`.
+fn group(seq: u64) -> Trash {
+    Trash::Group {
+        group: format!("{seq}:0"),
+        seq,
+    }
+}
+
+fn unknown(no_later_than: u64) -> Trash {
+    Trash::Unknown { no_later_than }
+}
+
 fn nodes<const N: usize>(ids: [&str; N]) -> BTreeSet<String> {
     ids.into_iter().map(String::from).collect()
 }
@@ -447,6 +471,7 @@ fn engine_state() -> EngineState {
                         deletions: 1001,
                         affected_files: 1002,
                         space_files: 5000,
+                        exceeded: vec![Limit::Deletions, Limit::Share],
                     },
                     held: BTreeMap::from([(
                         "held".into(),
@@ -486,6 +511,19 @@ fn engine_state() -> EngineState {
                         },
                     )]),
                 },
+                Question {
+                    id: "q3".into(),
+                    asked_at_ms: 9,
+                    kind: QuestionKind::RemoteMassDelete {
+                        deletions: 2,
+                        affected_files: 30,
+                        space_files: 40,
+                        exceeded: vec![Limit::Share],
+                    },
+                    held: BTreeMap::new(),
+                    answer: None,
+                    shown: BTreeMap::new(),
+                },
             ],
             guard: GuardState {
                 ledger: BTreeMap::from([
@@ -499,6 +537,24 @@ fn engine_state() -> EngineState {
                         files: 1,
                     },
                 )]),
+                confirmed_limits: BTreeSet::from([Limit::Share]),
+                remote: BTreeMap::from([
+                    (
+                        deletion("gone", group(4)),
+                        Counted {
+                            at_ms: 7,
+                            files: 29,
+                        },
+                    ),
+                    (
+                        deletion("gone-file", unknown(6)),
+                        Counted { at_ms: 8, files: 1 },
+                    ),
+                ]),
+                dismissed: BTreeSet::from([
+                    deletion("seen", group(3)),
+                    deletion("forgotten", unknown(5)),
+                ]),
             },
         },
         effects: EffectsState {
@@ -567,7 +623,7 @@ fn engine_state_survives_a_reopen() {
 }
 
 /// The tables of the engine state besides the nodes of R, L and S.
-const ENGINE_TABLES: [&str; 21] = [
+const ENGINE_TABLES: [&str; 24] = [
     "node_sets",
     "node_maps",
     "waiting_updates",
@@ -589,6 +645,9 @@ const ENGINE_TABLES: [&str; 21] = [
     "guard_ledger",
     "guard_confirmed",
     "guard_confirmed_members",
+    "guard_remote",
+    "guard_remote_dismissed",
+    "guard_confirmed_limits",
 ];
 
 /// Counts each row inserted, updated or deleted in the engine's tables from now on in the table
@@ -641,6 +700,46 @@ fn engine_state_of(n: usize) -> EngineState {
         state.effects.failed.insert(node, effect);
     }
     state
+}
+
+/// A removal that applies another device's deletion changes the count of one deletion, and only
+/// that row is written, however many deletions the guard holds.
+#[test]
+fn a_counted_remote_removal_writes_its_row_alone() {
+    let mut writes = Vec::new();
+    for n in [100, 1000] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let mut before = engine_state();
+        let guard = &mut before.commits.guard;
+        for i in 0..n {
+            let counted = Counted { at_ms: 1, files: 1 };
+            let top = format!("top-{i}");
+            guard.remote.insert(deletion(&top, group(i)), counted);
+            let old = format!("old-{i}");
+            guard.dismissed.insert(deletion(&old, unknown(i)));
+        }
+        let mut after = before.clone();
+        let counted = after
+            .commits
+            .guard
+            .remote
+            .get_mut(&deletion("top-0", group(0)));
+        counted.unwrap().files += 1;
+        Store::open(&path)
+            .unwrap()
+            .transaction(|tx| tx.set_engine_state(&before))
+            .unwrap();
+        count_engine_writes(&path);
+
+        let mut store = Store::open(&path).unwrap();
+        store
+            .transaction(|tx| tx.update_engine_state(&before, &after))
+            .unwrap();
+        writes.push(engine_writes(&path));
+        assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), after);
+    }
+    assert_eq!(writes, [1, 1]);
 }
 
 #[test]
@@ -708,6 +807,17 @@ fn engine_state_updates_store_every_part() {
     changed.commits.restores.clear();
     changed.effects.in_flight = None;
     changed.trees.waiting.clear();
+    let guard = &mut changed.commits.guard;
+    guard.confirmed_limits.insert(Limit::Deletions);
+    guard.remote.remove(&deletion("gone-file", unknown(6)));
+    guard
+        .remote
+        .values_mut()
+        .for_each(|counted| counted.files += 1);
+    let counted = Counted { at_ms: 9, files: 3 };
+    guard.remote.insert(deletion("new", unknown(9)), counted);
+    guard.dismissed.remove(&deletion("seen", group(3)));
+    guard.dismissed.insert(deletion("later", group(8)));
     let states = [full.clone(), changed, full, EngineState::default()];
     let mut stored = EngineState::default();
     store
@@ -873,6 +983,8 @@ fn a_cursor_stored_before_it_could_record_a_server_behind_it_records_none() {
          DROP TABLE guard_confirmed_members; DROP TABLE guard_confirmed;
          DROP TABLE edited_here; DROP TABLE trashed_here; DROP TABLE commit_slots;
          DROP TABLE watched_contents;
+         DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed;
+         DROP TABLE guard_confirmed_limits;
          ALTER TABLE remote_cursor DROP COLUMN ahead_of_server;",
     )
     .unwrap();
@@ -910,7 +1022,9 @@ fn a_store_from_before_contents_were_watched_opens_with_nothing_watched() {
          DROP TABLE open_questions; DROP TABLE guard_ledger;
          DROP TABLE guard_confirmed_members; DROP TABLE guard_confirmed;
          DROP TABLE edited_here; DROP TABLE trashed_here; DROP TABLE commit_slots;
-         DROP TABLE watched_contents;",
+         DROP TABLE watched_contents;
+         DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed;
+         DROP TABLE guard_confirmed_limits;",
     )
     .unwrap();
     conn.pragma_update(None, "user_version", 5).unwrap();
@@ -937,14 +1051,21 @@ fn a_store_from_before_edits_were_recorded_opens_with_none_recorded() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
     let mut before = engine_state();
+    before.commits.questions.pop();
+    before.commits.guard.remote.clear();
+    before.commits.guard.dismissed.clear();
+    before.commits.guard.confirmed_limits.clear();
     Store::open(&path)
         .unwrap()
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("DROP TABLE edited_here;").unwrap();
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
-        .unwrap();
+    conn.execute_batch(
+        "DROP TABLE edited_here; DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed;
+         DROP TABLE guard_confirmed_limits;",
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 10).unwrap();
     drop(conn);
 
     let mut store = Store::open(&path).unwrap();
@@ -971,7 +1092,9 @@ fn a_store_from_before_deletes_were_recorded_opens_with_none_recorded() {
          DROP TABLE open_question_items;
          DROP TABLE open_questions; DROP TABLE guard_ledger;
          DROP TABLE guard_confirmed_members; DROP TABLE guard_confirmed;
-         DROP TABLE edited_here; DROP TABLE trashed_here; DROP TABLE commit_slots;",
+         DROP TABLE edited_here; DROP TABLE trashed_here; DROP TABLE commit_slots;
+         DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed;
+         DROP TABLE guard_confirmed_limits;",
     )
     .unwrap();
     conn.pragma_update(None, "user_version", 6).unwrap();
@@ -1008,7 +1131,9 @@ fn a_store_from_before_the_guard_opens_with_an_empty_guard() {
          DROP TABLE open_question_items;
          DROP TABLE open_questions; DROP TABLE guard_ledger;
          DROP TABLE guard_confirmed_members; DROP TABLE guard_confirmed;
-         DROP TABLE edited_here;",
+         DROP TABLE edited_here;
+         DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed;
+         DROP TABLE guard_confirmed_limits;",
     )
     .unwrap();
     conn.pragma_update(None, "user_version", 7).unwrap();
@@ -1032,6 +1157,10 @@ fn a_store_from_before_questions_showed_local_shapes_keeps_its_questions() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
     let mut before = engine_state();
+    before.commits.questions.pop();
+    before.commits.guard.remote.clear();
+    before.commits.guard.dismissed.clear();
+    before.commits.guard.confirmed_limits.clear();
     for question in &mut before.commits.questions {
         question.shown.clear();
     }
@@ -1046,7 +1175,9 @@ fn a_store_from_before_questions_showed_local_shapes_keeps_its_questions() {
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
         "DROP TABLE recorded_nodes; DROP TABLE open_question_shapes;
-         DROP TABLE discarded_nodes; DROP TABLE edited_here;",
+         DROP TABLE discarded_nodes; DROP TABLE edited_here;
+         DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed;
+         DROP TABLE guard_confirmed_limits;",
     )
     .unwrap();
     conn.pragma_update(None, "user_version", 8).unwrap();
@@ -1064,13 +1195,21 @@ fn a_store_from_before_nodes_in_ignored_folders_were_stored_opens_with_none_reco
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
     let mut before = engine_state();
+    before.commits.questions.pop();
+    before.commits.guard.remote.clear();
+    before.commits.guard.dismissed.clear();
+    before.commits.guard.confirmed_limits.clear();
     Store::open(&path)
         .unwrap()
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("DROP TABLE recorded_nodes; DROP TABLE edited_here;")
-        .unwrap();
+    conn.execute_batch(
+        "DROP TABLE recorded_nodes; DROP TABLE edited_here;
+         DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed;
+         DROP TABLE guard_confirmed_limits;",
+    )
+    .unwrap();
     conn.pragma_update(None, "user_version", 9).unwrap();
     drop(conn);
 
@@ -1088,6 +1227,33 @@ fn a_store_from_before_nodes_in_ignored_folders_were_stored_opens_with_none_reco
     drop(store);
     let mut store = Store::open(&path).unwrap();
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), after);
+}
+
+/// A database of the schema before the guard counted other devices' deletions keeps its engine
+/// state, with none counted.
+#[test]
+fn a_store_from_before_remote_removals_were_counted_opens_with_none_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let mut before = engine_state();
+    before.commits.questions.pop();
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| tx.set_engine_state(&before))
+        .unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed; DROP TABLE guard_confirmed_limits;")
+        .unwrap();
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+        .unwrap();
+    drop(conn);
+
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    before.commits.guard.remote.clear();
+    before.commits.guard.dismissed.clear();
+    before.commits.guard.confirmed_limits.clear();
+    assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
 }
 
 /// A database of the schema before restores gains the two restore tables, empty, and keeps the
@@ -1123,6 +1289,8 @@ fn a_version_3_store_opens_with_empty_restore_tables() {
          DROP TABLE guard_confirmed_members; DROP TABLE guard_confirmed;
          DROP TABLE watched_contents; DROP TABLE edited_here; DROP TABLE trashed_here;
          DROP TABLE commit_slots;
+         DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed;
+         DROP TABLE guard_confirmed_limits;
          ALTER TABLE remote_cursor DROP COLUMN ahead_of_server;",
     )
     .unwrap();

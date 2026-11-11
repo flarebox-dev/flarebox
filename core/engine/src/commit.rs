@@ -11,7 +11,7 @@ use prost::Message;
 
 use crate::classify::{Class, Trees, classify};
 use crate::first_link;
-use crate::guard::{self, GuardState};
+use crate::guard::{self, GuardState, RemoteRemoval};
 use crate::ids::IdGen;
 use crate::names::{MAX_NAME_BYTES, name_key, nfc};
 use crate::question::{Answer, Question, QuestionKind};
@@ -345,9 +345,11 @@ impl Commits {
         self.hold(trees);
     }
 
-    /// Takes the person's answer to the open question `id`, routed by its kind. The answer stays
-    /// on the question until the next build, which takes it only if the question still holds what
-    /// it listed, and asks a new question otherwise.
+    /// Takes the person's answer to the open question `id`, routed by its kind. [`Answer::Dismiss`]
+    /// closes a notice about other devices' deletions at once (section 6.1), and the guard never
+    /// counts its deletions again. Any other answer stays on the question until the next build,
+    /// which takes it only if the question still holds what it listed, and asks a new question
+    /// otherwise.
     ///
     /// For the mass-delete guard's question (section 6.1), the next build counts what is pending
     /// first. [`Answer::Delete`] then makes the held deletions without counting them again.
@@ -368,13 +370,77 @@ impl Commits {
             question.id == id
                 && question.answer.is_none()
                 && question.kind.answers().contains(&answer)
-                && (matches!(question.kind, QuestionKind::MassDelete { .. })
-                    || first_link::asks(question))
+                && (matches!(
+                    question.kind,
+                    QuestionKind::MassDelete { .. } | QuestionKind::RemoteMassDelete { .. }
+                ) || first_link::asks(question))
         }) else {
             return false;
         };
-        self.questions[index].answer = Some(answer);
+        if let QuestionKind::RemoteMassDelete { .. } = self.questions[index].kind {
+            self.questions.remove(index);
+            self.guard.dismiss_remote();
+        } else {
+            self.questions[index].answer = Some(answer);
+        }
         true
+    }
+
+    /// Counts a removal that applied another device's deletion, as [`Effects::done`] returns it
+    /// (section 6.1). When the removals of the window cross a limit of the guard, a notice opens.
+    /// While it is open, each removal updates its counts and adds the limits crossed, and none
+    /// leaves the window, until the person dismisses it. The rest of a deletion the dismissed
+    /// notice counted, such as the files of a folder still being removed, is not counted.
+    /// `last_seq` is the seq up to which R holds every change. The trees settle first, so the space
+    /// counts the files S holds after the removal.
+    ///
+    /// [`Effects::done`]: crate::effects::Effects::done
+    pub fn count_remote(
+        &mut self,
+        removal: RemoteRemoval,
+        trees: &mut Trees,
+        last_seq: u64,
+        ids: &mut IdGen,
+        now_ms: u64,
+    ) {
+        trees.settle();
+        let open = (self.questions.iter())
+            .position(|question| matches!(question.kind, QuestionKind::RemoteMassDelete { .. }));
+        let noticed = open.is_some();
+        let Some(window) = (self.guard).count_remote(removal, last_seq, noticed, &*trees, now_ms)
+        else {
+            return;
+        };
+        let mut exceeded = window.exceeded();
+        let kind = |exceeded| QuestionKind::RemoteMassDelete {
+            deletions: window.deletions,
+            affected_files: window.affected_files,
+            space_files: window.space_files,
+            exceeded,
+        };
+        match open {
+            Some(index) => {
+                let notice = &mut self.questions[index];
+                if let QuestionKind::RemoteMassDelete {
+                    exceeded: before, ..
+                } = &notice.kind
+                {
+                    exceeded.extend(before);
+                    exceeded.sort();
+                    exceeded.dedup();
+                }
+                notice.kind = kind(exceeded);
+            }
+            None if exceeded.is_empty() => {}
+            None => self.questions.push(Question {
+                id: ids.uuid_v7(now_ms),
+                asked_at_ms: now_ms,
+                kind: kind(exceeded),
+                held: BTreeMap::new(),
+                answer: None,
+                shown: BTreeMap::new(),
+            }),
+        }
     }
 
     /// Asks again about what a first link holds, as L holds it now (section 6.4), and takes the

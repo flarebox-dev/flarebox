@@ -17,10 +17,9 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use koidrive_driver::{
-    Answer, Credential, Driver, DriverError, FolderStatus, Paths, Question, QuestionKind,
-    RecoveryGroup, SET_UP_AGAIN, Status,
+    Answer, Credential, Driver, DriverError, FolderStatus, Limit, MAX_DELETIONS, Paths, Question,
+    QuestionKind, RecoveryGroup, SET_UP_AGAIN, Status,
 };
-use koidrive_engine::guard::{Limit, MAX_DELETIONS, Window};
 use koidrive_net::{ApiError, Auth, Reload};
 use koidrive_proto::v1::{
     CreateSpaceRequest, DeviceInfo, SpaceInfo, SpaceUsage, device_info::Kind,
@@ -1003,28 +1002,38 @@ const ITEMS_SHOWN: usize = 20;
 
 /// How `koi questions` shows one question: what it asks, how to answer it, and its first [`ITEMS_SHOWN`] items.
 fn question_text(question: &Question) -> String {
+    let why = |exceeded: &[Limit]| {
+        let limits: Vec<String> = (exceeded.iter())
+            .map(|limit| match limit {
+                Limit::Deletions => format!("more than {MAX_DELETIONS} deletions in 10 minutes"),
+                Limit::Share => "more than half of the space in 10 minutes".to_owned(),
+            })
+            .collect();
+        match &limits[..] {
+            [] => String::new(),
+            limits => format!(", {}", limits.join(" and ")),
+        }
+    };
     let what = match &question.kind {
         QuestionKind::MassDelete {
             deletions,
             affected_files,
             space_files,
-        } => {
-            let window = Window {
-                deletions: *deletions,
-                affected_files: *affected_files,
-                space_files: *space_files,
-            };
-            let why = match window.limit() {
-                Some(Limit::Deletions) => {
-                    format!(", more than {MAX_DELETIONS} deletions in 10 minutes")
-                }
-                Some(Limit::Share) => ", more than half of the space in 10 minutes".to_owned(),
-                None => String::new(),
-            };
-            format!(
-                "held {deletions} deletions that would remove {affected_files} of {space_files} files{why}"
-            )
-        }
+            exceeded,
+        } => format!(
+            "held {deletions} deletions that would remove {affected_files} of {space_files} files{}",
+            why(exceeded)
+        ),
+        QuestionKind::RemoteMassDelete {
+            deletions,
+            affected_files,
+            space_files,
+            exceeded,
+        } => format!(
+            "applied {deletions} deletions from other devices that removed {affected_files} of \
+             {space_files} files{}",
+            why(exceeded)
+        ),
         QuestionKind::AmbiguousDisappearance => {
             "files disappeared while changes were not tracked".to_owned()
         }
@@ -1047,12 +1056,13 @@ fn question_text(question: &Question) -> String {
         }
         .to_owned(),
     };
-    let [first, second] = question.kind.answers();
+    let answers: Vec<&str> = question.kind.answers().iter().map(|a| a.as_str()).collect();
     let mut text = format!(
-        "{}  space {}  {what}\n  answer with: koi questions answer {} {first}|{second}\n",
+        "{}  space {}  {what}\n  answer with: koi questions answer {} {}\n",
         printable(&question.id),
         printable(&question.space_id),
-        printable(&question.id)
+        printable(&question.id),
+        answers.join("|")
     );
     for item in question.items.iter().take(ITEMS_SHOWN) {
         text += &format!(
@@ -1195,7 +1205,11 @@ mod tests {
         );
     }
 
-    fn held(deletions: u64, affected_files: u64, space_files: u64, items: usize) -> Question {
+    fn held(
+        (deletions, affected_files, space_files): (u64, u64, u64),
+        exceeded: &[Limit],
+        items: usize,
+    ) -> Question {
         Question {
             id: "q1".into(),
             space_id: "s1".into(),
@@ -1204,6 +1218,7 @@ mod tests {
                 deletions,
                 affected_files,
                 space_files,
+                exceeded: exceeded.to_vec(),
             },
             items: (0..items)
                 .map(|i| koidrive_driver::HeldItem {
@@ -1217,7 +1232,7 @@ mod tests {
 
     #[test]
     fn a_held_path_is_shown_with_its_control_characters_escaped() {
-        let mut question = held(1, 15, 20, 1);
+        let mut question = held((1, 15, 20), &[Limit::Share], 1);
         question.items[0].path = "old/a\nforged line\u{1b}[2J".into();
         let text = question_text(&question);
         assert_eq!(text.lines().count(), 3, "{text}");
@@ -1226,7 +1241,7 @@ mod tests {
 
     #[test]
     fn a_mass_delete_question_names_the_limit_it_crossed_and_lists_at_most_20_items() {
-        let text = question_text(&held(1_001, 1_001, 5_000, 25));
+        let text = question_text(&held((1_001, 1_001, 5_000), &[Limit::Deletions], 25));
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines[..3],
@@ -1243,7 +1258,7 @@ mod tests {
             "  and 5 more; koi questions --json lists them all"
         );
 
-        let text = question_text(&held(1, 15, 20, 1));
+        let text = question_text(&held((1, 15, 20), &[Limit::Share], 1));
         assert_eq!(
             text.lines().next(),
             Some(
@@ -1286,8 +1301,38 @@ mod tests {
     }
 
     #[test]
+    fn a_question_names_every_limit_crossed_and_a_notice_takes_dismiss() {
+        let both = [Limit::Deletions, Limit::Share];
+        let text = question_text(&held((1_001, 3_000, 5_000), &both, 1));
+        assert_eq!(
+            text.lines().next(),
+            Some(
+                "q1  space s1  held 1001 deletions that would remove 3000 of 5000 files, more than 1000 deletions in 10 minutes and more than half of the space in 10 minutes"
+            )
+        );
+
+        let notice = Question {
+            kind: QuestionKind::RemoteMassDelete {
+                deletions: 1,
+                affected_files: 15,
+                space_files: 20,
+                exceeded: vec![Limit::Share],
+            },
+            ..held((1, 15, 20), &[Limit::Share], 0)
+        };
+        let text = question_text(&notice);
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            [
+                "q1  space s1  applied 1 deletions from other devices that removed 15 of 20 files, more than half of the space in 10 minutes",
+                "  answer with: koi questions answer q1 dismiss",
+            ]
+        );
+    }
+
+    #[test]
     fn a_first_link_question_reads_as_a_sentence_with_its_answers() {
-        let mut question = held(0, 0, 0, 1);
+        let mut question = held((0, 0, 0), &[], 1);
         question.kind = QuestionKind::Recovery {
             group: RecoveryGroup::CreatedOnThisDevice,
         };

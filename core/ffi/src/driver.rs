@@ -29,9 +29,9 @@ use tokio::sync::watch;
 use crate::core::{Core, Events, pairing_code};
 use crate::types::{
     Account, Answer, Device, FolderState, HeldItem, ItemDetail, LinkedFolder, MassDeleteLimit,
-    NodeKind, PairingCode, Problem, ProblemKind, Question, QuestionKind, RecoveryCause,
-    RecoveryGroup, RecoveryTrigger, ServerInfo, SessionError, SessionEvent, SessionState, Space,
-    SpaceUsage, SyncStatus,
+    NodeKind, Notice, NoticeKind, PairingCode, Problem, ProblemKind, Question, QuestionKind,
+    RecoveryCause, RecoveryGroup, RecoveryTrigger, ServerInfo, SessionError, SessionEvent,
+    SessionState, Space, SpaceUsage, SyncStatus,
 };
 
 pub(crate) struct DriverCore {
@@ -147,6 +147,11 @@ impl DriverCore {
                 problems: next.problems.clone(),
             });
         }
+        if next.notices != sent.notices {
+            events.push(SessionEvent::Notices {
+                notices: next.notices.clone(),
+            });
+        }
         if next.status != sent.status {
             events.push(SessionEvent::Status {
                 status: next.status,
@@ -172,13 +177,16 @@ impl DriverCore {
             Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
             Err(TryLockError::WouldBlock) => None,
         };
-        let questions = match unchanging.map(|_unchanging| driver.questions()) {
-            Some(Ok(questions)) => questions.into_iter().map(question).collect(),
+        let (questions, notices) = match unchanging.map(|_unchanging| driver.questions()) {
+            Some(Ok(asked)) => (
+                asked.iter().cloned().filter_map(question).collect(),
+                asked.into_iter().filter_map(notice).collect(),
+            ),
             Some(Err(error)) => {
                 tracing::warn!(%error, "the questions cannot be read");
-                inner.sent.questions.clone()
+                (inner.sent.questions.clone(), inner.sent.notices.clone())
             }
-            None => inner.sent.questions.clone(),
+            None => (inner.sent.questions.clone(), inner.sent.notices.clone()),
         };
         SessionState {
             status: sync_status(&status, inner.started, inner.paused),
@@ -188,7 +196,7 @@ impl DriverCore {
             recent_changes: Vec::new(),
             questions,
             problems: problems(&status, &mut inner.halted),
-            notices: Vec::new(),
+            notices,
         }
     }
 
@@ -538,8 +546,15 @@ impl Core for DriverCore {
         })
     }
 
-    fn dismiss_notice(&self, _notice_id: &str) -> Result<(), SessionError> {
-        Err(SessionError::NoticeNotFound)
+    fn dismiss_notice(&self, notice_id: &str) -> Result<(), SessionError> {
+        self.change(
+            |driver| match driver.answer(notice_id, driver::Answer::Dismiss) {
+                Err(DriverError::QuestionNotFound(_) | DriverError::AnswerNotAllowed { .. }) => {
+                    Err(SessionError::NoticeNotFound)
+                }
+                done => done.map_err(driver_error),
+            },
+        )
     }
 
     fn close(&self) {
@@ -673,32 +688,56 @@ fn problems(status: &Status, halted: &mut BTreeMap<String, (String, i64)>) -> Ve
     problems
 }
 
-// interim until driver part 2 reports each item's kind and detail, the mass-delete limits crossed
-// and the recovery cause: they are inferred here.
-fn question(question: driver::Question) -> Question {
+fn mass_delete_limit(limit: driver::Limit) -> MassDeleteLimit {
+    match limit {
+        driver::Limit::Deletions => MassDeleteLimit::Deletions {
+            limit: driver::MAX_DELETIONS,
+        },
+        driver::Limit::Share => MassDeleteLimit::ShareOfSpace { percent: 50 },
+    }
+}
+
+/// A notice the driver stores as a question, which the app shows as a notice; `None` for any
+/// other question.
+fn notice(asked: driver::Question) -> Option<Notice> {
+    let driver::QuestionKind::RemoteMassDelete {
+        deletions,
+        affected_files,
+        space_files,
+        exceeded,
+    } = asked.kind
+    else {
+        return None;
+    };
+    Some(Notice {
+        id: asked.id,
+        space_id: asked.space_id,
+        at_ms: asked.asked_at_ms,
+        kind: NoticeKind::RemoteMassDelete {
+            deletions,
+            affected_files,
+            space_files,
+            exceeded: exceeded.into_iter().map(mass_delete_limit).collect(),
+        },
+    })
+}
+
+// interim until driver part 2 reports each item's kind and detail and the recovery cause: they
+// are inferred here. `None` for a notice ([`notice`]).
+fn question(question: driver::Question) -> Option<Question> {
     let kind = match question.kind {
+        driver::QuestionKind::RemoteMassDelete { .. } => return None,
         driver::QuestionKind::MassDelete {
             deletions,
             affected_files,
             space_files,
-        } => {
-            let mut exceeded = Vec::new();
-            if deletions > 1_000 {
-                exceeded.push(MassDeleteLimit::Deletions { limit: 1_000 });
-            }
-            if space_files >= 20 && affected_files * 2 > space_files {
-                exceeded.push(MassDeleteLimit::ShareOfSpace { percent: 50 });
-            }
-            if exceeded.is_empty() {
-                exceeded.push(MassDeleteLimit::Deletions { limit: 1_000 });
-            }
-            QuestionKind::MassDelete {
-                deletions,
-                affected_files,
-                space_files,
-                exceeded,
-            }
-        }
+            exceeded,
+        } => QuestionKind::MassDelete {
+            deletions,
+            affected_files,
+            space_files,
+            exceeded: exceeded.into_iter().map(mass_delete_limit).collect(),
+        },
         driver::QuestionKind::AmbiguousDisappearance => QuestionKind::AmbiguousDisappearance,
         driver::QuestionKind::Recovery { group } => QuestionKind::Recovery {
             cause: RecoveryCause {
@@ -716,7 +755,7 @@ fn question(question: driver::Question) -> Question {
             },
         },
     };
-    Question {
+    Some(Question {
         id: question.id,
         space_id: question.space_id,
         asked_at_ms: question.asked_at_ms,
@@ -737,7 +776,7 @@ fn question(question: driver::Question) -> Question {
                 detail: ItemDetail::Plain,
             })
             .collect(),
-    }
+    })
 }
 
 fn driver_answer(answer: Answer) -> driver::Answer {
@@ -964,6 +1003,7 @@ mod tests {
                 deletions: 1_200,
                 affected_files: 1_500,
                 space_files: 2_000,
+                exceeded: vec![driver::Limit::Deletions, driver::Limit::Share],
             },
             items: vec![
                 driver::HeldItem {
@@ -977,7 +1017,8 @@ mod tests {
                     files: 1,
                 },
             ],
-        });
+        })
+        .unwrap();
         assert_eq!(
             mapped.kind,
             QuestionKind::MassDelete {
@@ -1002,7 +1043,8 @@ mod tests {
                 group: driver::RecoveryGroup::RequestedBeforeReset,
             },
             items: Vec::new(),
-        });
+        })
+        .unwrap();
         assert_eq!(recovery.answers, vec![Answer::Repeat, Answer::Cancel]);
         for answer in [
             Answer::Delete,
@@ -1018,6 +1060,40 @@ mod tests {
                 driver_answer(answer).as_str()
             );
         }
+    }
+
+    #[test]
+    fn a_remote_mass_delete_is_a_notice_and_no_question() {
+        let asked = driver::Question {
+            id: "n1".into(),
+            space_id: "s1".into(),
+            asked_at_ms: 9,
+            kind: driver::QuestionKind::RemoteMassDelete {
+                deletions: 2,
+                affected_files: 30,
+                space_files: 40,
+                exceeded: vec![driver::Limit::Deletions, driver::Limit::Share],
+            },
+            items: Vec::new(),
+        };
+        assert_eq!(question(asked.clone()), None);
+        assert_eq!(
+            notice(asked),
+            Some(Notice {
+                id: "n1".into(),
+                space_id: "s1".into(),
+                at_ms: 9,
+                kind: NoticeKind::RemoteMassDelete {
+                    deletions: 2,
+                    affected_files: 30,
+                    space_files: 40,
+                    exceeded: vec![
+                        MassDeleteLimit::Deletions { limit: 1_000 },
+                        MassDeleteLimit::ShareOfSpace { percent: 50 }
+                    ],
+                },
+            })
+        );
     }
 
     #[test]

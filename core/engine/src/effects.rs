@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::classify::{Class, Trees, classify};
+use crate::guard::RemoteRemoval;
 use crate::ids::IdGen;
 use crate::ignore::is_rules_file;
 
@@ -334,12 +335,16 @@ impl Effects {
     /// that change stays the user's.
     /// An outcome L does not take ([`EffectRecord::applies`]) is refused, and the effect stays
     /// in flight.
+    /// A removal of a node R no longer holds applied another device's deletion, and is returned
+    /// for the mass-delete guard to count ([`Commits::count_remote`]).
+    ///
+    /// [`Commits::count_remote`]: crate::commit::Commits::count_remote
     pub fn done(
         &mut self,
         trees: &mut Trees,
         effect_id: &str,
         identity: Option<FileIdentity>,
-    ) -> Result<(), EffectError> {
+    ) -> Result<Option<RemoteRemoval>, EffectError> {
         if (self.in_flight.as_ref())
             .is_some_and(|record| record.effect_id == effect_id && !record.applies(trees))
         {
@@ -359,6 +364,13 @@ impl Effects {
             None => return Err(EffectError::NotInFlight(effect_id.to_owned())),
         };
         let record = self.take(effect_id)?;
+        let removal =
+            (record.after.is_none() && trees.remote().live(&record.node).is_none()).then(|| {
+                RemoteRemoval {
+                    within: within(trees, &record.node),
+                    files: u64::from(matches!(record.effect, Effect::RemoveFile { .. })),
+                }
+            });
         let parked = record.parks();
         let base = match trees.waiting().get(&record.node) {
             Some(waiting) => waiting.as_ref(),
@@ -401,7 +413,7 @@ impl Effects {
         }
         self.failed.remove(&record.node);
         self.cleared = record.counter;
-        Ok(())
+        Ok(removal)
     }
 
     /// Whether L confirms what recovery reports after a crash: that the effect in flight is done,
@@ -442,6 +454,24 @@ impl Effects {
             .take_if(|record| record.effect_id == effect_id)
             .ok_or_else(|| EffectError::NotInFlight(effect_id.to_owned()))
     }
+}
+
+/// The deletions a removal of `node` can belong to: the node and each folder above it in L that R
+/// no longer holds, innermost first.
+fn within(trees: &Trees, node: &NodeId) -> Vec<NodeId> {
+    let mut within = vec![node.clone()];
+    for _ in 0..trees.local().len() {
+        match trees.local().get(within.last().expect("the node")) {
+            Some(local)
+                if trees.local().get(&local.shape.parent).is_some()
+                    && trees.remote().live(&local.shape.parent).is_none() =>
+            {
+                within.push(local.shape.parent.clone());
+            }
+            _ => break,
+        }
+    }
+    within
 }
 
 /// A node the planner considers: one whose only change is remote, one that is parked, one whose

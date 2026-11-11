@@ -501,7 +501,11 @@ impl Folder {
             Err(Stall::Halt(stop)) => return Err(stop),
         };
         let node = (self.engine.effects.in_flight()).map(|record| record.node.clone());
+        let asked = self.engine.commits.questions().len();
         let settled = self.disk.apply(staged, &mut self.engine, &mut self.store)?;
+        if self.engine.commits.questions().len() != asked {
+            self.questions = self.store.transaction(unanswered)?;
+        }
         let mut work = Vec::new();
         if let Some(node) = node {
             match settled {
@@ -1199,10 +1203,12 @@ impl Folder {
         });
     }
 
-    /// Whether a bootstrap reads the trash too: when the server lost commits this device applied, so that a node
-    /// another device trashed since is not taken for one the server lost and published again (RFC 0002 §6).
+    /// Whether a bootstrap reads the trash too: once the folder has synced, since L may then hold nodes another
+    /// device trashed while this device missed the log. A node trashed since the server lost commits this device
+    /// applied is then not taken for one the server lost and published again (RFC 0002 §6), and the mass-delete
+    /// guard tells by each node's trash group which deletion its removal belongs to (design §6.1).
     fn lists_trash(&self) -> bool {
-        (self.engine.cursor.as_ref()).is_some_and(|cursor| cursor.ahead_of_server)
+        self.engine.cursor.is_some()
     }
 
     /// Starts the upload of what `commit` adds, or its send when it adds no content.

@@ -60,12 +60,35 @@ pub enum QuestionKind {
         deletions: u64,
         affected_files: u64,
         space_files: u64,
+        /// The limits the deletions crossed, also those of the questions this one replaced.
+        #[cfg_attr(feature = "serde", serde(default))]
+        exceeded: Vec<Limit>,
+    },
+    /// Deletions made on other devices that this device applied crossed a limit of the guard
+    /// (design §6.1). It holds nothing, and its counts grow until the person dismisses it.
+    RemoteMassDelete {
+        deletions: u64,
+        affected_files: u64,
+        space_files: u64,
+        exceeded: Vec<Limit>,
     },
     /// Files disappeared while changes were not tracked and may have moved into an ignored folder
     /// (design §5.10).
     AmbiguousDisappearance,
     /// One group of files a recovery holds (design §6.4).
     Recovery { group: RecoveryGroup },
+}
+
+/// A limit of the mass-delete guard (design §6.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum Limit {
+    /// More than [`MAX_DELETIONS`](crate::guard::MAX_DELETIONS) deletions in the window.
+    Deletions,
+    /// More than half of the files of a space of at least
+    /// [`MIN_SPACE_FILES`](crate::guard::MIN_SPACE_FILES) files.
+    Share,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,29 +120,32 @@ pub enum Answer {
     Repeat,
     /// Drop a request.
     Cancel,
+    /// Close a notice.
+    Dismiss,
 }
 
 impl QuestionKind {
-    /// The two answers this kind of question accepts, in the order to offer them.
-    pub fn answers(&self) -> [Answer; 2] {
+    /// The answers this kind of question accepts, in the order to offer them.
+    pub fn answers(&self) -> &'static [Answer] {
         match self {
             QuestionKind::MassDelete { .. } | QuestionKind::AmbiguousDisappearance => {
-                [Answer::Delete, Answer::Restore]
+                &[Answer::Delete, Answer::Restore]
             }
+            QuestionKind::RemoteMassDelete { .. } => &[Answer::Dismiss],
             QuestionKind::Recovery { group } => match group {
-                RecoveryGroup::CreatedAfterRestorePoint => [Answer::Keep, Answer::Discard],
+                RecoveryGroup::CreatedAfterRestorePoint => &[Answer::Keep, Answer::Discard],
                 RecoveryGroup::ChangedOnThisDevice | RecoveryGroup::CreatedOnThisDevice => {
-                    [Answer::Publish, Answer::Discard]
+                    &[Answer::Publish, Answer::Discard]
                 }
-                RecoveryGroup::DeletedOnThisDevice => [Answer::Delete, Answer::Restore],
-                RecoveryGroup::RequestedBeforeReset => [Answer::Repeat, Answer::Cancel],
+                RecoveryGroup::DeletedOnThisDevice => &[Answer::Delete, Answer::Restore],
+                RecoveryGroup::RequestedBeforeReset => &[Answer::Repeat, Answer::Cancel],
             },
         }
     }
 }
 
 impl Answer {
-    pub const ALL: [Answer; 7] = [
+    pub const ALL: [Answer; 8] = [
         Answer::Delete,
         Answer::Restore,
         Answer::Keep,
@@ -127,6 +153,7 @@ impl Answer {
         Answer::Publish,
         Answer::Repeat,
         Answer::Cancel,
+        Answer::Dismiss,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -138,6 +165,7 @@ impl Answer {
             Answer::Publish => "publish",
             Answer::Repeat => "repeat",
             Answer::Cancel => "cancel",
+            Answer::Dismiss => "dismiss",
         }
     }
 }

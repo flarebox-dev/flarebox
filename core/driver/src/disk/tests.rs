@@ -2328,3 +2328,106 @@ fn a_trashed_file_whose_metadata_alone_changed_is_reclaimed_when_due() {
     assert_eq!(reclaimed.removed.len(), 1, "{reclaimed:?}");
     assert!(reclaimed.recovered.is_empty(), "{reclaimed:?}");
 }
+
+/// Another device's deletion removes a file whose edit was observed and then undone before the
+/// removal, with 10 files of the deletion counted before it. The space is the 10 files S holds
+/// after the removal and the 11 the deletion removed, so the notice opens.
+#[test]
+fn a_removal_counts_against_the_files_s_holds_after_it() {
+    use koidrive_engine::guard::{Counted, RemoteDeletion, Trash};
+    let folder = Folder::new();
+    let path = folder.root.join("report.txt");
+    fs::write(&path, SYNCED).unwrap();
+    let mut rows = vec![(NODE.to_owned(), SPACE.to_owned(), "report.txt".to_owned())];
+    let mut r_nodes = Vec::new();
+    for i in 0..10 {
+        let id = format!("loose{i}");
+        let name = format!("stay{i}.txt");
+        fs::write(folder.root.join(&name), SYNCED).unwrap();
+        r_nodes.push(remote(
+            &id,
+            &name,
+            Some(disk_content(&folder.root.join(&name))),
+        ));
+        rows.push((id, SPACE.to_owned(), name));
+    }
+    let held: Vec<_> = rows
+        .iter()
+        .map(|(id, parent, path)| (id.as_str(), parent.as_str(), path.as_str()))
+        .collect();
+    folder.seed(&r_nodes, &held, 0);
+    let (mut store, _) = folder.open();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    store
+        .transaction(|tx| {
+            let mut state = tx.engine_state()?;
+            state.commits.guard.remote.insert(
+                RemoteDeletion {
+                    top: "earlier".into(),
+                    trash: Trash::Group {
+                        group: "0:0".into(),
+                        seq: 0,
+                    },
+                },
+                Counted {
+                    at_ms: now,
+                    files: 10,
+                },
+            );
+            tx.set_engine_state(&state)
+        })
+        .unwrap();
+    drop(store);
+    let mut running = folder.start(no_hook()).unwrap();
+    let pending = running
+        .disk
+        .next(&mut running.engine, &mut running.store)
+        .unwrap()
+        .unwrap();
+    let original_mtime = fs::metadata(&path).unwrap().modified().unwrap();
+    fs::write(&path, b"temporary user edit").unwrap();
+    let edited = disk_content(&path);
+    batch(&mut running, |trees| {
+        let mut local = trees.local().get(NODE).unwrap().clone();
+        local.shape.content = Some(edited);
+        trees.set_local(NODE.into(), local);
+    });
+    fs::write(&path, SYNCED).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(original_mtime))
+        .unwrap();
+    let staged = ready(pending.stage(&Server::default())).unwrap();
+    assert!(pending.record.applies(&running.engine.trees));
+    assert_eq!(
+        running
+            .disk
+            .apply(staged, &mut running.engine, &mut running.store)
+            .unwrap(),
+        Settled::Done
+    );
+    assert!(!path.exists());
+    assert_eq!(running.engine.trees.synced_files(), 10);
+    assert_eq!(
+        running
+            .engine
+            .commits
+            .state()
+            .guard
+            .remote
+            .values()
+            .map(|c| c.files)
+            .sum::<u64>(),
+        11
+    );
+    assert_eq!(
+        running.engine.commits.questions().len(),
+        1,
+        "11 of 21 files cross the share"
+    );
+}

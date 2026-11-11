@@ -85,7 +85,7 @@ koi questions
 koi questions answer <id> <answer>
 ```
 
-`koi questions` lists the questions a folder is waiting on, with the answers each accepts, and `answer` gives one. The number of open questions is at the end of each folder's status line.
+`koi questions` lists the questions a folder is waiting on, with the answers each accepts, and `answer` gives one. The number of open questions, notices included, is at the end of each folder's status line.
 
 Sync asks before it deletes many files at once. It holds this device's deletions when, within 10 minutes, they number more than 1,000, or they would remove more than half of the files of a space that has at least 20. A removed folder counts as one deletion of all the files it held. Sync then holds every deletion it has not sent yet and asks one question. Until you answer, the files stay on the server and on your other devices, and every other change keeps syncing, also after a restart.
 
@@ -93,5 +93,7 @@ Sync asks before it deletes many files at once. It holds this device's deletions
 - `restore` downloads them to this device again.
 
 `koi questions` lists the first 20 held files and folders, and `--json` lists all of them. If the held deletions change before you answer, for example because you put a file back or deleted more, the question is replaced by a new one with a new ID. Sync keeps holding what is left until you answer, even when it no longer crosses a limit. An answer covers only the files its question listed: if you deleted more before sync took your answer, it asks again.
+
+Deletions made on your other devices are applied here without asking, and the removed files go to this folder's [local trash](folders.md#the-local-trash). When they cross the same limits, `koi questions` lists a notice once enough files are removed, which can be before a removed folder is gone. Its counts grow while more deletions arrive, and it waits until you answer `dismiss`, which only closes it. The rest of a deletion it counted, such as the rest of that folder, opens no new notice. To bring the files back, [restore](history.md#restore-a-deleted-file-or-folder) them from the space's trash.
 
 Sync also asks after the first link of a folder to a space that already held live files or folders, when the comparison holds some of the folder's files, as [Link a folder](folders.md#link-a-folder) describes. `koi questions` shows that question as "files on this device that the space does not hold", and it takes `publish` or `discard`.

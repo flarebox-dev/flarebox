@@ -820,9 +820,21 @@ impl World {
             device.link = None;
             return Ok(false);
         }
-        let Engine { trees, effects, .. } = &mut device.engine;
+        let Engine {
+            trees,
+            effects,
+            commits,
+            ids,
+            last_seq,
+        } = &mut device.engine;
         let reported = match applied {
-            Some(Ok(identity)) => effects.done(trees, &record.effect_id, identity),
+            Some(Ok(identity)) => {
+                (effects.done(trees, &record.effect_id, identity)).map(|removal| {
+                    if let Some(removal) = removal {
+                        commits.count_remote(removal, trees, *last_seq, ids, NOW as u64);
+                    }
+                })
+            }
             _ => effects.failed(&record.effect_id).map(|()| {
                 if !applies {
                     effects.unblock(&record.node);
@@ -872,7 +884,13 @@ impl World {
             if !resent_over_revert(&self.exposed, &self.rolled_back, &record, &applied) {
                 lost(&self.held, d, &record, &applied)?;
             }
-            let Engine { trees, effects, .. } = &mut device.engine;
+            let Engine {
+                trees,
+                effects,
+                commits,
+                ids,
+                last_seq,
+            } = &mut device.engine;
             let download = match &record.effect {
                 Effect::WriteFile { content, .. } => Some(content),
                 _ => None,
@@ -909,7 +927,11 @@ impl World {
                             false => "restart finds the effect in flight done",
                         },
                     );
-                    effects.done(trees, &record.effect_id, identity)
+                    (effects.done(trees, &record.effect_id, identity)).map(|removal| {
+                        if let Some(removal) = removal {
+                            commits.count_remote(removal, trees, *last_seq, ids, NOW as u64);
+                        }
+                    })
                 }
                 outcome => {
                     note(
