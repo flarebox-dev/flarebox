@@ -164,6 +164,9 @@ pub struct Trees {
     /// Nodes whose local copy the user moved into an ignored folder that is no node. L keeps the
     /// entry each had before the move.
     outside: BTreeSet<NodeId>,
+    /// The nodes of `outside`, and those L held under them, that left L because another entry took their name
+    /// ([`Trees::displace_local`]), each with the identity L held for it.
+    displaced: BTreeMap<NodeId, FileIdentity>,
     /// False from a restore until the rules of a full scan are in force.
     rules_known: bool,
     /// The folders whose rules the last scan of each could not read, by node: a folder renamed is the same folder,
@@ -222,6 +225,7 @@ impl Trees {
             discarded: BTreeSet::new(),
             ignore: Matcher::new(LocalRules::default()),
             outside: BTreeSet::new(),
+            displaced: BTreeMap::new(),
             rules_known: true,
             unknown_rules: BTreeSet::new(),
             asked: BTreeSet::new(),
@@ -301,6 +305,9 @@ impl Trees {
         {
             self.trashed_here.remove(&id);
         }
+        if node.trashed {
+            self.displaced.remove(&id);
+        }
         if node.is_live() && node.shape.kind == Kind::File && is_rules_file(&node.shape.name) {
             self.remote_rules_files.insert(id.clone());
         } else {
@@ -312,6 +319,7 @@ impl Trees {
     pub fn remove_remote(&mut self, id: &str) {
         self.remote_rules_files.remove(id);
         self.trashed_here.remove(id);
+        self.displaced.remove(id);
         if self.r.remove(id).is_some() {
             self.mark(id);
         }
@@ -346,6 +354,7 @@ impl Trees {
             let children: Vec<NodeId> = self.l_names.children(&id).cloned().collect();
             self.outside.extend(children);
         }
+        self.displaced.remove(&id);
         (self.l_identities.entry(node.identity).or_default()).insert(id.clone());
         self.mark(&id);
         self.l.insert(id, node);
@@ -495,13 +504,57 @@ impl Trees {
     /// so L cannot hold its new position. L keeps the entry as it was, and the node is excluded
     /// until an observation places it again or removes it. When the node is placed again, its
     /// children are recorded in its place: the user may have moved them elsewhere while it was
-    /// excluded, so each stays excluded until an observation places it too. This is not part of
-    /// the stored state: after a restart the entry is missing from its path again, and the scan
-    /// that finds it under the ignored folder reports the move once more.
+    /// excluded, so each stays excluded until an observation places it too. The record is part of
+    /// the stored state. A scan after a restart cannot always make it again: it does not find the
+    /// node in the ignored folder when another file has taken the node's path.
     pub fn ignore_local(&mut self, id: &str) {
         if self.l.get(id).is_some() {
             self.outside.insert(id.to_owned());
         }
+    }
+
+    /// Whether [`Trees::ignore_local`] recorded the node, or a folder L holds it under.
+    pub fn recorded_local(&self, id: &str) -> bool {
+        let mut above = id;
+        for _ in 0..=self.l.len() {
+            if self.outside.contains(above) {
+                return true;
+            }
+            match self.l.get(above) {
+                Some(node) => above = &node.shape.parent,
+                None => break,
+            }
+        }
+        false
+    }
+
+    /// Takes the node out of L because another entry took its name, and keeps the record that its local copy is in
+    /// an ignored folder: L cannot hold two entries at one name, and the copy is still there. The node stays excluded
+    /// ([`Trees::excluded`]) until an observation places it again or R holds it trashed. This record is part of the
+    /// stored state, since no scan can find the node again once L has no entry for it. The caller passes only a node
+    /// [`Trees::recorded_local`] holds for.
+    pub fn displace_local(&mut self, id: &str) {
+        let Some(identity) = self.l.get(id).map(|node| node.identity) else {
+            return;
+        };
+        self.remove_local(id);
+        if self.r.live(id).is_some() {
+            self.displaced.insert(id.to_owned(), identity);
+        }
+    }
+
+    /// The nodes [`Trees::displace_local`] took out of L, each with the identity L held for it.
+    pub fn displaced_local(&self) -> &BTreeMap<NodeId, FileIdentity> {
+        &self.displaced
+    }
+
+    /// The node [`Trees::displace_local`] took out of L with `identity`: the greatest ID when several have it. An
+    /// identity without a birth time finds none: the record can outlive the node's copy, and the file system may
+    /// give its inode to another file, which only the birth time tells apart.
+    pub fn displaced_with_identity(&self, identity: &FileIdentity) -> Option<&NodeId> {
+        (self.displaced.iter().rev())
+            .find(|(_, held)| *held == identity && identity.birth_ns.is_some())
+            .map(|(id, _)| id)
     }
 
     /// Whether S holds the node at a position that neither placed L nor R holds, the nodes
@@ -606,15 +659,8 @@ impl Trees {
     /// it, also when the node is parked. The effects move a parked node that is ignored back to
     /// the position L keeps for it, and it is excluded from then on.
     pub fn ignored(&self, id: &str) -> bool {
-        let mut above = id;
-        for _ in 0..=self.l.len() {
-            if self.outside.contains(above) {
-                return true;
-            }
-            match self.l.get(above) {
-                Some(node) => above = &node.shape.parent,
-                None => break,
-            }
+        if self.recorded_local(id) || self.displaced.contains_key(id) {
+            return true;
         }
         let ignored =
             |path: Option<(Vec<&str>, Kind)>| path.map(|(names, kind)| self.ignores(&names, kind));
@@ -1232,6 +1278,8 @@ impl Trees {
             watched: self.watched.clone(),
             trashed_here: self.trashed_here.clone(),
             discarded: self.discarded.clone(),
+            outside: self.outside.clone(),
+            displaced: self.displaced.clone(),
         }
     }
 
@@ -1269,6 +1317,13 @@ impl Trees {
         if let Some((id, _)) = state.trashed_here.iter().find(|entry| !trashed(entry)) {
             return Err(StateError::NotTrashedHere(id.clone()));
         }
+        if let Some(id) = (state.outside.iter()).find(|id| self.l.get(id).is_none()) {
+            return Err(StateError::NotIgnoredLocal(id.clone()));
+        }
+        let kept = |id: &&NodeId| self.l.get(id).is_none() && self.r.live(id).is_some();
+        if let Some(id) = state.displaced.keys().find(|id| !kept(id)) {
+            return Err(StateError::NotDisplaced(id.clone()));
+        }
         let TreesState {
             dirty,
             unsearched,
@@ -1278,6 +1333,8 @@ impl Trees {
             watched,
             trashed_here,
             discarded,
+            outside,
+            displaced,
         } = state;
         self.unsettled = dirty.clone();
         self.same.clear();
@@ -1290,6 +1347,8 @@ impl Trees {
         self.watched = watched;
         self.trashed_here = trashed_here;
         self.discarded = discarded;
+        self.outside = outside;
+        self.displaced = displaced;
         self.rules_known = false;
         self.unknown_rules.clear();
         Ok(())

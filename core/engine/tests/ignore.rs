@@ -328,6 +328,64 @@ fn a_file_renamed_to_an_ignored_name_stays_on_the_server_as_it_was() {
     assert_eq!(effects(&mut trees), [], "its local copy is left as it is");
 }
 
+/// Another entry takes the name of a folder L keeps for its copy in an ignored folder. The folder and the file in it
+/// leave L and stay excluded, also after a restart. Each takes part in sync again once an entry with its identity is
+/// placed, or once R holds it trashed.
+#[test]
+fn a_node_whose_name_another_entry_took_stays_excluded_until_it_returns_or_is_trashed() {
+    let mut trees = trees(&[
+        synced("d", dir(ROOT, "d")),
+        synced("a", file("d", "a.txt", 1)),
+        synced("b", file("d", "b.txt", 2)),
+    ]);
+    trees.ignore_local("d");
+    let held = trees.local().get("a").unwrap().identity;
+    assert!(["d", "a", "b"].iter().all(|id| trees.recorded_local(id)));
+    for id in ["d", "a", "b"] {
+        trees.displace_local(id);
+        assert!(trees.local().get(id).is_none() && trees.excluded(id));
+    }
+    trees.set_local("new".into(), local(file(ROOT, "d", 3), 9));
+    let sent = ops(&mut trees);
+    assert!(
+        matches!(sent.as_slice(), [op::Op::CreateFile(_)]),
+        "only the new file is sent, and nothing is deleted: {sent:?}"
+    );
+    set_content(&mut trees, "a", 7);
+    assert_eq!(effects(&mut trees), [], "none is downloaded again");
+
+    let mut restored = trees.clone();
+    restored.restore(trees.state()).unwrap();
+    assert_eq!(restored.state(), trees.state());
+    assert!(["d", "a", "b"].iter().all(|id| restored.ignored(id)));
+
+    assert_eq!(trees.displaced_with_identity(&held), Some(&"a".to_owned()));
+    let undated = FileIdentity {
+        birth_ns: None,
+        ..held
+    };
+    assert_eq!(trees.displaced_with_identity(&undated), None);
+    trees.set_local("a".into(), local(file(ROOT, "back.txt", 1), 2));
+    assert!(!trees.excluded("a") && trees.displaced_with_identity(&held).is_none());
+    trash(&mut trees, "b");
+    assert!(!trees.excluded("b"));
+    assert_eq!(
+        trees.displaced_local().keys().collect::<Vec<_>>(),
+        ["d"],
+        "the folder is still out"
+    );
+}
+
+/// A node that R does not hold live has nothing to keep on the server, so it leaves L without a record.
+#[test]
+fn a_displaced_node_r_does_not_hold_live_is_not_recorded() {
+    let mut trees = trees(&[synced("a", file(ROOT, "a.txt", 1))]);
+    trees.ignore_local("a");
+    trash(&mut trees, "a");
+    trees.displace_local("a");
+    assert!(trees.local().get("a").is_none() && trees.displaced_local().is_empty());
+}
+
 #[test]
 fn a_file_moved_into_an_ignored_folder_that_is_no_node_stays_on_the_server_as_it_was() {
     let mut trees = trees(&[

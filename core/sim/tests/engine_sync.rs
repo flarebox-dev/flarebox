@@ -760,9 +760,6 @@ fn reload(
     loaded.restore(trees.state()).map_err(refused)?;
     prop_assert!(!loaded.rules_known());
     rules.read(&mut loaded);
-    for id in trees.ignored_local() {
-        loaded.ignore_local(id);
-    }
     let restored_commits = Commits::from_state(commits.state()).map_err(refused)?;
     restored_commits.hold(&mut loaded);
     let restored_effects = Effects::from_state(effects.state()).map_err(refused)?;

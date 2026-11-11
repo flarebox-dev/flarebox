@@ -18,7 +18,7 @@ use crate::effects::{Effect, EffectRecord};
 use crate::guard::GuardState;
 use crate::question::Question;
 use crate::restore::{Resolved, RestoreId, RestoreIntent};
-use crate::tree::{NodeId, Shape, TreeError};
+use crate::tree::{FileIdentity, NodeId, Shape, TreeError};
 
 /// What [`Trees`](crate::classify::Trees) holds besides the nodes of R, L and S.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -44,6 +44,12 @@ pub struct TreesState {
     /// The nodes S took from a Discard answer to a first-link question (section 6.4), while S, or
     /// the S update waiting for them, still holds them.
     pub discarded: BTreeSet<NodeId>,
+    /// The nodes whose local copy the user moved into an ignored folder that is no node, and the folders L keeps
+    /// for them. L holds each at the position it had before.
+    pub outside: BTreeSet<NodeId>,
+    /// The nodes whose local copy is in an ignored folder and whose name in L another entry took, each with the
+    /// identity L held for it. L holds none of them, and R holds each live.
+    pub displaced: BTreeMap<NodeId, FileIdentity>,
 }
 
 /// What [`Commits`](crate::commit::Commits) holds.
@@ -105,6 +111,10 @@ pub enum StateError {
     /// A node is recorded as trashed by a delete of this device, but R does not hold it trashed by
     /// that commit.
     NotTrashedHere(NodeId),
+    /// A node is recorded as moved into an ignored folder, but L does not hold it.
+    NotIgnoredLocal(NodeId),
+    /// A node is recorded as displaced, but L holds it or R does not hold it live.
+    NotDisplaced(NodeId),
     /// The commit in flight does not take the slot after the accepted counter.
     DeviceSeq { accepted: u64, device_seq: u64 },
     /// The result of the commit in flight does not have one outcome per op.
