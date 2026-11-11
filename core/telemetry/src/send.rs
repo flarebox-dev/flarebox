@@ -18,8 +18,8 @@ use crate::system::Environment;
 
 /// The project's host, a CNAME to PostHog's managed reverse proxy.
 pub const ENDPOINT: &str = "https://tel.koidrive.com";
-/// The PostHog project token (US Cloud). It only lets a client add events to the project, and PostHog documents it
-/// as public. A build with an empty token sends nothing and its queue waits.
+/// The PostHog project token (US Cloud). A client can only add events and evaluate feature flags with it, and PostHog
+/// documents it as public. A build with an empty token sends nothing and its queue waits.
 pub const PROJECT_TOKEN: &str = "phc_zS5sUnZrgWmsxoiodya3UeRdNfBkk5Pvdpsqiii4XqZ8";
 pub const ENDPOINT_VARIABLE: &str = "KOIDRIVE_TELEMETRY_URL";
 pub const TOKEN_VARIABLE: &str = "KOIDRIVE_TELEMETRY_TOKEN";
