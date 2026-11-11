@@ -4237,3 +4237,39 @@ fn a_late_create_acknowledgement_after_a_rollback_drops_the_agreement_the_server
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert_eq!(ops(&commit), [mv("n", ROOT, "c")]);
 }
+
+/// GUN-453. n's move to b is in flight when L and R agree on c at seq 3 and the other device moves
+/// n back to a at seq 4. The server then loses an unrelated change at seq 5, and a bootstrap
+/// replaces R. The agreement at seq 3 is from before the loss, so it stays: S takes c and the disk
+/// follows the other device's move back to a.
+#[test]
+fn a_late_acknowledgement_after_a_rollback_keeps_an_agreement_the_server_kept() {
+    let mut trees = trees(&[(
+        "n",
+        Some(file(ROOT, "b", 1)),
+        Some(file(ROOT, "a", 1)),
+        Some(remote(file(ROOT, "a", 1))),
+    )]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", ROOT, "b")]);
+    trees.set_remote("n".into(), remote_at(file(ROOT, "b", 1), 2));
+    trees.set_remote("n".into(), remote_at(file(ROOT, "c", 1), 3));
+    trees.set_local("n".into(), local(file(ROOT, "c", 1), 1));
+    trees.set_remote("n".into(), remote_at(file(ROOT, "a", 1), 4));
+    trees.set_remote("u".into(), remote_at(file(ROOT, "u", 3), 5));
+    trees.settle();
+    trees.remove_remote("u");
+    trees.forget_lost(Vec::new(), Vec::new(), 4);
+    trees.settle();
+    commits
+        .received(result(2, vec![outcome(op_result::Code::Applied)]))
+        .unwrap();
+    assert!(commits.acknowledge(&mut trees, 4));
+    trees.settle();
+    assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "c", 1)));
+    let effects = effects_for(&mut trees, &mut ids, "n");
+    assert!(matches!(&effects[..], [Effect::Move { .. }]), "{effects:?}");
+    assert_eq!(trees.local().live("n"), Some(&file(ROOT, "a", 1)));
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+}
