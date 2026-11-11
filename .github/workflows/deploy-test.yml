@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
-# Deploys server/ to a real Cloudflare account under a throwaway name, claims it, smoke-tests it over HTTPS and
-# deletes everything again (docs/deploy-test.md). Manual only: it needs the account's scoped API token, and each run
+# Deploys server/ to a real Cloudflare account under a throwaway name, claims it, smoke-tests it over HTTPS, or syncs a
+# macOS and a Linux device through it with the koi command, and deletes everything again (docs/deploy-test.md). Manual only: it needs the account's scoped API token, and each run
 # uses a little of the account's Workers, Durable Objects and R2 usage. A first job without secrets refuses a run that
 # is not on main of koidrive/koidrive, or whose deploy-test environment lacks the protection the docs require; the
 # secrets live only in that environment, which releases them after a required reviewer approves the run.
@@ -12,9 +12,9 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "smoke: deploy this commit and test it. upgrade: deploy from_ref, write data, upgrade to this commit and check the data."
+        description: "smoke: deploy this commit and test it. upgrade: deploy from_ref, write data, upgrade to this commit and check the data. e2e: deploy this commit and sync a macOS and a Linux device through it."
         type: choice
-        options: [smoke, upgrade]
+        options: [smoke, upgrade, e2e]
         default: smoke
       from_ref:
         description: "upgrade only: the commit or tag to upgrade from. Empty means the newest tag before this commit."
@@ -84,10 +84,15 @@ jobs:
     needs: trusted
     runs-on: ubuntu-latest
     environment: deploy-test
-    timeout-minutes: 60
+    timeout-minutes: ${{ inputs.mode == 'e2e' && 90 || 60 }}
+    permissions:
+      contents: read
+      actions: read
     env:
       KOIDRIVE_TEST_NAME: koidrive-test-${{ github.run_id }}-${{ github.run_attempt }}
       WRANGLER_SEND_METRICS: "false"
+      KOI: ${{ github.workspace }}/target/debug/koi
+      E2E_PEER_JOB: e2e (macOS)
     defaults:
       run:
         working-directory: server
@@ -120,6 +125,18 @@ jobs:
           cache: pnpm
           cache-dependency-path: server/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
+      - name: Install the pinned Rust toolchain
+        if: inputs.mode == 'e2e'
+        working-directory: .
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: inputs.mode == 'e2e'
+        with:
+          key: e2e
+      - name: Build koi
+        if: inputs.mode == 'e2e'
+        working-directory: .
+        run: cargo build -p koidrive-cli --locked
 
       - name: Resolve the release to upgrade from
         id: from
@@ -169,6 +186,86 @@ jobs:
         timeout-minutes: 10
         run: pnpm exec vitest run --config scripts/deploy-test/vitest.config.ts --reporter=verbose upgrade-verify
 
+      - name: "e2e: pair the Linux device and seal a pairing code for the macOS device"
+        if: inputs.mode == 'e2e'
+        timeout-minutes: 50
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/deploy-test/e2e.ts linux-setup
+      - name: "e2e: upload the sealed pairing code"
+        if: inputs.mode == 'e2e'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-macos-join-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/koidrive-e2e/mac-join/join.bin
+          retention-days: 1
+          if-no-files-found: error
+      - name: "e2e 1: create"
+        if: inputs.mode == 'e2e'
+        timeout-minutes: 15
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/deploy-test/e2e.ts linux-1
+      - name: "e2e 2: edit"
+        if: inputs.mode == 'e2e'
+        timeout-minutes: 15
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node scripts/deploy-test/e2e.ts linux-2 "e2e 1: create"
+      - name: "e2e 3: rename and move"
+        if: inputs.mode == 'e2e'
+        timeout-minutes: 15
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node scripts/deploy-test/e2e.ts linux-3 "e2e 2: edit"
+      - name: "e2e 4: delete"
+        if: inputs.mode == 'e2e'
+        timeout-minutes: 15
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/deploy-test/e2e.ts linux-4
+      - name: "e2e 5: Linux goes offline and edits shared.txt"
+        if: inputs.mode == 'e2e'
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/deploy-test/e2e.ts linux-5-offline
+      - name: "e2e 5: Linux comes back and syncs the conflict"
+        if: inputs.mode == 'e2e'
+        timeout-minutes: 20
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node scripts/deploy-test/e2e.ts linux-5-online "e2e 5: macOS edits shared.txt"
+      - name: "e2e 6: a third device reads the space"
+        if: inputs.mode == 'e2e'
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/deploy-test/e2e.ts linux-6
+      - name: "e2e 7: record the restore point"
+        if: inputs.mode == 'e2e'
+        timeout-minutes: 20
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node scripts/deploy-test/e2e.ts linux-7-point "e2e 5: macOS holds the conflict's tree"
+      - name: "e2e 7: write after the restore point, rewind and recover"
+        if: inputs.mode == 'e2e'
+        timeout-minutes: 25
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/deploy-test/e2e.ts linux-7
+      - name: "e2e: compare the macOS and Linux trees"
+        if: inputs.mode == 'e2e'
+        timeout-minutes: 20
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node scripts/deploy-test/e2e.ts linux-final "e2e: upload the macOS tree"
+
       - name: Tear down the Worker, its Durable Objects and the R2 bucket
         if: always() && steps.secrets.outcome == 'success'
         timeout-minutes: 10
@@ -176,3 +273,85 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: node scripts/deploy-test/run.ts teardown
+
+  e2e-macos:
+    name: e2e (macOS)
+    needs: trusted
+    if: inputs.mode == 'e2e'
+    runs-on: macos-15
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: read
+    env:
+      KOI: ${{ github.workspace }}/target/debug/koi
+      GH_TOKEN: ${{ github.token }}
+      E2E_PEER_JOB: deploy test (e2e)
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Install the pinned Rust toolchain
+        working-directory: .
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: e2e
+      - name: Build koi
+        working-directory: .
+        run: cargo build -p koidrive-cli --locked
+      - name: "e2e: make the key the pairing code is sealed to"
+        run: node scripts/deploy-test/e2e.ts mac-keygen
+      - name: "e2e: upload the public key"
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-macos-key-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/koidrive-e2e/mac-key/public.pem
+          retention-days: 1
+          if-no-files-found: error
+      - name: "e2e: pair the macOS device"
+        timeout-minutes: 60
+        run: node scripts/deploy-test/e2e.ts mac-setup
+      - name: "e2e 1: create"
+        timeout-minutes: 15
+        run: node scripts/deploy-test/e2e.ts mac-1
+      - name: "e2e 2: edit"
+        timeout-minutes: 15
+        run: |
+          node scripts/deploy-test/e2e.ts mac-2 "e2e 1: create"
+      - name: "e2e 3: rename and move"
+        timeout-minutes: 15
+        run: |
+          node scripts/deploy-test/e2e.ts mac-3 "e2e 2: edit"
+      - name: "e2e 4: delete"
+        timeout-minutes: 15
+        run: |
+          node scripts/deploy-test/e2e.ts mac-4 "e2e 3: rename and move"
+      - name: "e2e 5: macOS edits shared.txt"
+        timeout-minutes: 20
+        run: |
+          node scripts/deploy-test/e2e.ts mac-5 "e2e 5: Linux goes offline and edits shared.txt"
+      - name: "e2e 5: macOS holds the conflict's tree"
+        timeout-minutes: 20
+        run: node scripts/deploy-test/e2e.ts mac-5-check
+      - name: "e2e 7: write after the restore point and recover from the rewind"
+        timeout-minutes: 40
+        run: |
+          node scripts/deploy-test/e2e.ts mac-7 "e2e 7: record the restore point"
+      - name: "e2e: record the macOS tree"
+        timeout-minutes: 20
+        run: |
+          node scripts/deploy-test/e2e.ts mac-final "e2e 7: write after the restore point, rewind and recover"
+      - name: "e2e: upload the macOS tree"
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-macos-listing-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/koidrive-e2e/mac-listing/listing.txt
+          retention-days: 1
+          if-no-files-found: error
