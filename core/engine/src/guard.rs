@@ -174,22 +174,6 @@ impl RemoteDeletion {
         };
         (!ours || trees.local().get(&self.top).is_none()) && !group
     }
-
-    /// Whether a dismissed deletion leaves: L holds no node R holds in its trash group, and either
-    /// not its topmost node or R holds that node trashed in another group, as when a restore
-    /// brought it back and a later delete took it. A topmost node a restore brought back live
-    /// keeps the deletion, because a rollback of that restore trashes the node in its group again.
-    fn cleared(&self, trees: &Trees) -> bool {
-        let (group, taken) = match &self.trash {
-            Trash::Group { group, .. } => (
-                trees.holds_trash_group(group),
-                (trees.remote().get(&self.top))
-                    .is_some_and(|node| node.trashed && node.trash_group != *group),
-            ),
-            Trash::Unknown { .. } => (false, false),
-        };
-        (taken || trees.local().get(&self.top).is_none()) && !group
-    }
 }
 
 /// A removal that applied another device's deletion: the node it removed and each folder above it
@@ -225,7 +209,7 @@ impl GuardState {
         now_ms: u64,
     ) -> Checked {
         self.dismissed
-            .retain(|deletion| !deletion.undone(trees) && !deletion.cleared(trees));
+            .retain(|deletion| !deletion.undone(trees) && !deletion.removed(trees));
         self.remote.retain(|deletion, _| !deletion.undone(trees));
         for counted in self.ledger.values_mut() {
             counted.at_ms = counted.at_ms.min(now_ms);
@@ -358,7 +342,7 @@ impl GuardState {
         let takes = |deletion: &RemoteDeletion| deletion.takes(&removed, &removal.within);
         let dismissed = self.dismissed.iter().any(takes);
         self.dismissed
-            .retain(|deletion| !deletion.undone(trees) && !deletion.cleared(trees));
+            .retain(|deletion| !deletion.undone(trees) && !deletion.removed(trees));
         if dismissed {
             return None;
         }

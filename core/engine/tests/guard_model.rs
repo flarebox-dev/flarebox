@@ -21,8 +21,9 @@
 //! - A notice opens when the window crosses a limit. While it is open no deletion leaves the
 //!   window by age.
 //! - Dismissing the notice dismisses the deletions it counted. A later removal of a node one of
-//!   them trashed is not counted. A removal of a node another deletion trashed is counted, also
-//!   under the same folder.
+//!   them trashed is not counted, until it is fully removed: a rollback that trashes its nodes
+//!   again after that is a deletion to count. A removal of a node another deletion trashed is
+//!   counted, also under the same folder.
 //! - Truncation and restarts change none of this. Every bootstrap after the first lists the
 //!   trash, so R holds the trash group of every node it removes.
 //!
@@ -394,7 +395,11 @@ impl World {
         self.model
             .counted
             .retain(|deletion, _| trashing.contains(deletion));
-        (self.model.dismissed).retain(|deletion| trashing.contains(deletion));
+        let unfinished: BTreeSet<u64> = (self.trees.local().iter())
+            .filter_map(|(id, _)| self.truth(id).map(|(_, deletion)| deletion))
+            .collect();
+        (self.model.dismissed)
+            .retain(|deletion| trashing.contains(deletion) && unfinished.contains(deletion));
         let built = (self
             .commits
             .build(&mut self.trees, &mut self.ids, self.now, "h", 7))
@@ -998,10 +1003,10 @@ fn witness_a_delete_whose_folder_was_deleted_again_after_a_restore_leaves_the_wi
 }
 
 /// GUN-455: a folder removed and noticed, one of its folders restored, the notice dismissed, and
-/// the restore lost. The server trashes the folder again in the dismissed delete's group, so
-/// removing it again is not noticed.
+/// the restore lost. The restore had brought back all that was left of the delete, so the
+/// dismissal ended with it, and removing the folder again after the loss is noticed.
 #[test]
-fn witness_a_restore_lost_after_the_dismissal_stays_dismissed() {
+fn witness_a_restore_lost_after_the_dismissal_is_noticed() {
     let events = [
         Delete("p"),
         StepAll,
@@ -1012,28 +1017,27 @@ fn witness_a_restore_lost_after_the_dismissal_stays_dismissed() {
         Bootstrap,
         StepAll,
     ];
-    assert_eq!(witness(&events), None);
+    assert_eq!(witness(&events), Some((1, 26, 50)));
 }
 
-/// GUN-455 review: a dismissed folder brought back by a restore, deleted again, and purged before
-/// this device removes it. R held the folder trashed in the new delete's group before the purge,
-/// so the dismissed delete ended there. The removals, of nodes R then holds no record of, are
-/// noticed with all 40 files of p/f. The model leaves such removals out, so only the engine
-/// counts them.
+/// GUN-455 review: a dismissed folder brought back by a restore, then deleted again and purged
+/// before this device builds or removes anything. The restore ended the dismissal, so the
+/// removals, of nodes R holds no record of, are noticed with all 40 files of p/f. The model leaves
+/// such removals out, so only the engine counts them.
 #[test]
 fn a_new_delete_of_a_dismissed_folder_purged_before_its_removal_is_noticed() {
     let mut world = World::new(Groups::Commit);
-    for event in [
-        Delete("p"),
-        StepAll,
-        Dismiss,
-        Restore("p/f"),
-        StepAll,
-        Delete("p"),
-        Event::Purge("p"),
-    ] {
+    for event in [Delete("p"), StepAll, Dismiss, Restore("p/f"), StepAll] {
         world.apply(event);
     }
+    let deletion = world.next_deletion;
+    world.next_deletion += 1;
+    world.delete(Deleted {
+        target: "p",
+        kept: BTreeSet::new(),
+        deletion,
+    });
+    world.apply(Event::Purge("p"));
     world.step_past_the_model();
     let notice = (world.notice()).map(|(_, w)| (w.deletions, w.affected_files, w.space_files));
     assert_eq!(notice, Some((1, 40, 50)));
