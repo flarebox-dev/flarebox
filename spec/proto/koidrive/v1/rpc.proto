@@ -126,6 +126,9 @@ message TreePage {
   string next_cursor = 2;
   // head_seq when this page was read.
   uint64 head_seq = 3;
+  // The commit token at head_seq (RFC 0013). Empty at seq 0.
+  string head_commit_id = 4;
+  int64 head_committed_at_ms = 5;
 }
 
 message ListTrash {

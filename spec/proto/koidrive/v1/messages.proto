@@ -65,6 +65,11 @@ message Resume {
   string history_id = 1;
   // The last seq the client applied completely.
   uint64 since_seq = 2;
+  // The commit token at since_seq: the commit_id and committed_at_ms of the commit the client applied there (RFC
+  // 0013). Both empty at seq 0 or when the client does not know it. A server that holds another commit at since_seq
+  // answers ResyncRequired with REASON_AHEAD_OF_SERVER.
+  string since_commit_id = 3;
+  int64 since_committed_at_ms = 4;
 }
 
 message Changes {
@@ -74,6 +79,9 @@ message Changes {
 // Sent once the backlog after a Resume is delivered; live pushes follow.
 message CaughtUp {
   uint64 head_seq = 1;
+  // The commit token at head_seq (RFC 0013). Empty at seq 0.
+  string head_commit_id = 2;
+  int64 head_committed_at_ms = 3;
 }
 
 message RpcRequest {

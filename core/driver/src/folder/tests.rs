@@ -5753,3 +5753,50 @@ fn a_question_asked_again_about_the_same_files_after_an_answer_starts_its_own_li
     assert_ne!(second.id, first.id);
     assert_eq!(second.lineage, second.id);
 }
+
+/// GUN-423: the server loses `two.txt`'s commit, and c commits `three.txt` to the restored server, so its
+/// head is back at b's cursor when b reconnects. b's Resume names the commit it saw at that seq, which the server no
+/// longer has, so b lists the tree again instead of resuming on a fork: it gets `three.txt`, and `two.txt`,
+/// which b still holds, is created again.
+#[test]
+fn a_cursor_the_restored_head_caught_up_with_lists_the_tree_again() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("one.txt"), b"one");
+    let mut restored = backup(&remote, &a);
+    a.create(&mut remote, &site_a.root.join("two.txt"), b"two");
+    let (site_b, mut b) = linked(&mut remote, "b");
+    b.settle();
+    assert_eq!(names(&site_b.root), ["one.txt", "two.txt"]);
+    let (site_c, mut c) = linked(&mut restored, "c");
+    c.create(&mut restored, &site_c.root.join("three.txt"), b"three");
+    let welcome = restored.space.welcome(&b.caller);
+    assert_eq!(
+        welcome.head_seq,
+        b.folder.engine.cursor.as_ref().unwrap().last_seq
+    );
+    b.event(Event::Disconnected {
+        reason: koidrive_net::DisconnectReason::Timeout,
+        retry_in: Duration::from_secs(1),
+    })
+    .unwrap();
+    b.event(Event::Connected(welcome)).unwrap();
+    for _ in 0..3 {
+        b.pull(&restored);
+        b.run(&mut restored);
+        b.settle();
+    }
+    c.pull(&restored);
+    c.run(&mut restored);
+    c.create(&mut restored, &site_c.root.join("four.txt"), b"four");
+    for _ in 0..2 {
+        b.pull(&restored);
+        b.run(&mut restored);
+        b.settle();
+    }
+    assert_eq!(names(&site_b.root), restored.names());
+    assert_eq!(
+        names(&site_b.root),
+        ["four.txt", "one.txt", "three.txt", "two.txt"]
+    );
+}
