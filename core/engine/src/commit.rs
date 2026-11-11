@@ -595,7 +595,9 @@ impl Commits {
     /// Makes the waiting S updates that fit now, together with S := ⊥ for the `needed` nodes the
     /// keep rule could not clear yet and the `agreed` updates of the rebase, which may depend on
     /// each other. Returns the needed nodes still not cleared; agreed updates that do not fit are
-    /// dropped, since the next rebase finds them again.
+    /// dropped, since the next rebase finds them again. A needed node whose own update waited
+    /// keeps waiting, so the update is made once it fits, also after the keep rule no longer
+    /// needs the node.
     fn retry_waiting(
         &mut self,
         trees: &mut Trees,
@@ -607,6 +609,7 @@ impl Commits {
             .into_iter()
             .filter_map(|(id, shape)| Some((id.clone(), outstanding(trees, &id, shape)?)))
             .collect();
+        let waited: BTreeSet<NodeId> = waiting.iter().map(|(id, _)| id.clone()).collect();
         let updates = waiting
             .into_iter()
             .chain(needed.iter().map(|id| (id.clone(), None)))
@@ -615,8 +618,11 @@ impl Commits {
         let mut still = BTreeSet::new();
         for (id, shape) in update_synced(trees, updates) {
             if needed.contains(&id) {
-                still.insert(id);
-            } else if !agreed.iter().any(|(other, _)| *other == id) {
+                still.insert(id.clone());
+            }
+            if (!needed.contains(&id) || waited.contains(&id))
+                && !agreed.iter().any(|(other, _)| *other == id)
+            {
                 trees.wait(id, shape);
             }
         }

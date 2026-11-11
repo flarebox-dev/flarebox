@@ -320,7 +320,9 @@ impl Effects {
 
     /// The driver did the effect. L takes the node's new shape, with `identity` for an entry the
     /// effect created. When L matched S, or the shape S's waiting update holds, the effect gave L
-    /// the shape R had when it was planned, so S takes that shape too, when S stays a valid tree.
+    /// the shape R had when it was planned, so S takes that shape too. When that would not leave S
+    /// a valid tree yet, as when S still holds a child the user moved out of a removed folder, the
+    /// update waits ([`Trees::waiting`]) instead of being lost.
     /// A move changes only the position, so for a move L only has to match that shape's position,
     /// and L and S each keep their content, which can be newer than the content the move was
     /// planned with. An edit the user made while the move was in flight stays the user's.
@@ -378,7 +380,9 @@ impl Effects {
                 }),
                 _ => record.after.clone(),
             };
-            trees.set_synced_if_valid(record.node.clone(), synced);
+            if !trees.set_synced_if_valid(record.node.clone(), synced.clone()) {
+                trees.wait(record.node.clone(), synced);
+            }
         }
         let content = (trees.local().get(&record.node)).map(|node| node.shape.content.clone());
         match record.after {

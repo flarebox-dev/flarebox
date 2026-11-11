@@ -2356,3 +2356,46 @@ fn a_waiting_folder_the_user_deleted_is_brought_back_for_a_remote_move_into_it()
     let h = trees.local().get("h").unwrap();
     assert_eq!((&h.shape, h.parked), (&file("d", "h", 9), false));
 }
+
+/// GUN-350. The user moves f out of folder d while the other device removes both. The removal of
+/// the empty d is in flight when R restores d with f in it. S cannot drop d while it holds f, so
+/// that update waits instead of being lost. The commit sends only the user's move, and once it is
+/// acknowledged S drops d, the effects bring d back, and the trees end in sync.
+#[test]
+fn a_removal_r_undid_whose_s_update_does_not_fit_yet_waits() {
+    let mut trees = trees(&[
+        ("d", Some(dir(ROOT, "d")), Some(dir(ROOT, "d")), None),
+        ("f", Some(file(ROOT, "f", 1)), Some(file("d", "f", 1)), None),
+    ]);
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    let record = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    assert_eq!(record.node, "d");
+    assert!(
+        matches!(record.effect, Effect::RemoveDir { .. }),
+        "{record:?}"
+    );
+    trees.set_remote("d".into(), remote(dir(ROOT, "d")));
+    trees.set_remote("f".into(), remote(file("d", "f", 1)));
+    effects.done(&mut trees, &record.effect_id, None).unwrap();
+    trees.settle();
+
+    assert_eq!(effects_for(&mut trees, &mut ids, "d"), []);
+
+    let mut commits = Commits::default();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("f", ROOT, "f")]);
+    trees.set_remote("f".into(), remote(file(ROOT, "f", 1)));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    assert_eq!(trees.waiting(), &Default::default());
+    let effects = effects_for(&mut trees, &mut ids, "d");
+    assert!(
+        matches!(effects[..], [Effect::CreateDir { .. }]),
+        "{effects:?}"
+    );
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    assert_eq!(trees.class("d"), Class::InSync);
+}
