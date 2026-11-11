@@ -4273,3 +4273,36 @@ fn a_late_acknowledgement_after_a_rollback_keeps_an_agreement_the_server_kept() 
     assert_eq!(trees.local().live("n"), Some(&file(ROOT, "a", 1)));
     assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
 }
+
+/// GUN-453. n's create at b is applied at seq 8, L and R agree on c at seq 10, and the user moves
+/// n back to b. The server then loses commits after seq 11, none of them n's, so the bootstrap's R
+/// still holds n at c from seq 10. That agreement survived, so S takes c and the user's move back
+/// to b is sent rather than undone.
+#[test]
+fn a_late_create_acknowledgement_after_a_rollback_keeps_an_agreement_r_still_holds() {
+    let mut trees = trees(&[("n", Some(file(ROOT, "b", 1)), None, None)]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id == "n"));
+    trees.set_remote("n".into(), remote_at(file(ROOT, "b", 1), 8));
+    trees.set_local("n".into(), local(file(ROOT, "c", 1), 1));
+    trees.set_remote(
+        "n".into(),
+        RemoteNode {
+            content_rev: 10,
+            ..remote_at(file(ROOT, "c", 2), 10)
+        },
+    );
+    trees.set_local("n".into(), local(file(ROOT, "b", 1), 1));
+    trees.settle();
+    trees.forget_lost(Vec::new(), Vec::new(), 0);
+    trees.settle();
+    commits
+        .received(result(8, vec![outcome(op_result::Code::Applied)]))
+        .unwrap();
+    assert!(commits.acknowledge(&mut trees, 11));
+    trees.settle();
+    assert_eq!(effects_for(&mut trees, &mut ids, "n"), []);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", ROOT, "b")]);
+}
