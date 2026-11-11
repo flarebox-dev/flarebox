@@ -175,16 +175,20 @@ impl RemoteDeletion {
         (!ours || trees.local().get(&self.top).is_none()) && !group
     }
 
-    /// Whether L holds nothing of this deletion: no node R holds in its trash group, and not its
-    /// topmost node, whoever's it is now. A dismissed deletion leaves only then, also when a
-    /// restore brought its topmost node back, because a rollback of that restore trashes the node
-    /// in its group again.
+    /// Whether a dismissed deletion leaves: L holds no node R holds in its trash group, and either
+    /// not its topmost node or R holds that node trashed in another group, as when a restore
+    /// brought it back and a later delete took it. A topmost node a restore brought back live
+    /// keeps the deletion, because a rollback of that restore trashes the node in its group again.
     fn cleared(&self, trees: &Trees) -> bool {
-        let group = match &self.trash {
-            Trash::Group { group, .. } => trees.holds_trash_group(group),
-            Trash::Unknown { .. } => false,
+        let (group, taken) = match &self.trash {
+            Trash::Group { group, .. } => (
+                trees.holds_trash_group(group),
+                (trees.remote().get(&self.top))
+                    .is_some_and(|node| node.trashed && node.trash_group != *group),
+            ),
+            Trash::Unknown { .. } => (false, false),
         };
-        trees.local().get(&self.top).is_none() && !group
+        (taken || trees.local().get(&self.top).is_none()) && !group
     }
 }
 

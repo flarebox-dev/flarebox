@@ -547,6 +547,28 @@ impl World {
         }
     }
 
+    /// Removes every node L holds and R does not, counting each removal in the engine alone. The
+    /// model leaves out removals of nodes the server purged first, so this checks nothing.
+    fn step_past_the_model(&mut self) {
+        self.now += 1;
+        let mut effects = Effects::default();
+        while let Some(record) = effects.plan(&self.trees, &mut self.ids, self.now).cloned() {
+            self.ino += 1;
+            let identity = Some(identity(self.ino));
+            let removal = (effects.done(&mut self.trees, &record.effect_id, identity)).unwrap();
+            if let Some(removal) = removal {
+                (self.commits).count_remote(
+                    removal,
+                    &mut self.trees,
+                    self.last_seq,
+                    &mut self.ids,
+                    self.now,
+                );
+            }
+            self.trees.settle();
+        }
+    }
+
     /// The deletions the server holds: those whose nodes it has not restored or lost.
     fn trashing(&self) -> BTreeSet<u64> {
         let (nodes, purged) = self.known();
@@ -991,6 +1013,30 @@ fn witness_a_restore_lost_after_the_dismissal_stays_dismissed() {
         StepAll,
     ];
     assert_eq!(witness(&events), None);
+}
+
+/// GUN-455 review: a dismissed folder brought back by a restore, deleted again, and purged before
+/// this device removes it. R held the folder trashed in the new delete's group before the purge,
+/// so the dismissed delete ended there. The removals, of nodes R then holds no record of, are
+/// noticed with all 40 files of p/f. The model leaves such removals out, so only the engine
+/// counts them.
+#[test]
+fn a_new_delete_of_a_dismissed_folder_purged_before_its_removal_is_noticed() {
+    let mut world = World::new(Groups::Commit);
+    for event in [
+        Delete("p"),
+        StepAll,
+        Dismiss,
+        Restore("p/f"),
+        StepAll,
+        Delete("p"),
+        Event::Purge("p"),
+    ] {
+        world.apply(event);
+    }
+    world.step_past_the_model();
+    let notice = (world.notice()).map(|(_, w)| (w.deletions, w.affected_files, w.space_files));
+    assert_eq!(notice, Some((1, 40, 50)));
 }
 
 /// GUN-384 review: one file restored from a delete the server applied in part, after the notice
