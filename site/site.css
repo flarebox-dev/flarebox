@@ -5,7 +5,7 @@
 /* Hallmark · dropped #top, top · the wordmark links to "/" as coreav-dev/site's does, so the hero no longer carries the id top */
 /* Hallmark · answered F3 · the headline balances its lines: "Your own Dropbox / on Cloudflare" from 375 to 480 and from 961 to 1920, one line from 600 to 900 where the stacked head is full width, three lines at 320 */
 /* Hallmark · finish-review: in-thread designer's critique, then a cross-lab review (BOX-139) · 13 findings · fixed 5: the head sat 28px under the screen's middle, now 8px over it; the ® stood 1 to 2px off the "e", now 3 to 6px; the commands were 13px, under the 14px labels, now 14px on a 24px line; Copy grew with its label and reflowed the panel, now 104px in every state; under 60rem an empty field row added 64px under the head, now gone · kept 8: the "Y" inks 1.5px inside the column edge; the nav centres the wordmark and the link, so their baselines differ by 7px; the block is wider than its commands; Copy's hover is a small step on the surface; two GitHub links on the first screen; the phone page has empty paper above the footer; the footer is below the fold on desktop; Copy sits under the commands under 415px (coreav-dev/site's layout or the reviewers' and the maintainer's choices) · logo round: the cube lockup sits on the wordmark's centre within 0.5px with a 10px gap, crisp at 1x on desktop; kept: on a phone the 23.33px cube leaves its seams soft at 1x, because the lockup's ratios fix that size · gap: none */
-/* Hallmark · Koidrive preview: supplied koi SVGs unchanged, outlined Outfit 500 wordmark, app-icon favicons and OG image; layout unchanged · self-critique: the original 24/20px wordmark and 28/23.33px icon boxes fit both nav widths; the supplied icon retains its internal whitespace · sweep: 0 FAIL, 1 file-URL font WARN, 2 section-count NOTEs; HTTP font captures loaded · cross-lab identity review pending */
+/* Hallmark · Koidrive: supplied koi paths unchanged, chosen Outfit 600 wordmark, app-icon favicons and OG image; install block unchanged · self-critique: the nav's viewBox crop removes the unused padding, so its 28/23.33px visible height balances the 24/20px wordmark without scaling the lockup · sweep: 0 FAIL, 1 file-URL font WARN, 2 section-count NOTEs; HTTP font captures loaded · cross-lab identity review pending */
 /* SPDX-License-Identifier: Apache-2.0 */
 /* The page, built on coreav-dev/site (see DESIGN.md): its edge-aligned nav, its Ledge hero in the bare form and its
    colophon footer, with their values. Shared pieces first, then the page from top to bottom. */
@@ -134,7 +134,7 @@ a:active {
 .brand-icon {
   display: block;
   flex: none;
-  width: calc(var(--mark) * 7 / 6);
+  width: auto;
   height: calc(var(--mark) * 7 / 6);
 }
 
