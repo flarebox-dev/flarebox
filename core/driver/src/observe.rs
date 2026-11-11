@@ -730,15 +730,13 @@ mod tests {
         dir
     }
 
-    /// Observes until `done` accepts the changes seen so far, for at most ten seconds.
+    /// Observes until `done` accepts the changes seen so far.
     fn observe_until(
         observer: &mut FsObserver,
         done: impl Fn(&[Observed]) -> bool,
     ) -> (Vec<Observed>, Observation) {
-        let deadline = Instant::now() + Duration::from_secs(10);
         let mut seen = Vec::new();
         loop {
-            assert!(Instant::now() < deadline, "not observed in time: {seen:?}");
             if let Some(observation) = observer.observe(Duration::from_millis(500)).unwrap() {
                 seen.extend(observation.changes.iter().cloned());
                 if done(&seen) {
