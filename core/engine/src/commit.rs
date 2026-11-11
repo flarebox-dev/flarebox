@@ -996,8 +996,9 @@ impl Commits {
     /// and *w* = *a* + 1 that it was and its response was lost; both resend it unchanged, and
     /// the server answers an accepted one with its stored result. *w* < *a* means the server lost
     /// commits it had accepted, since its counter only grows and the store learns a slot only from
-    /// its result: *a* takes *w*, and the commit in flight is dropped, its restores staying queued,
-    /// so that its changes are planned again once R is listed again. Any other *w*, or a commit
+    /// its result. So does *w* = *a* while the result of the commit in flight is held, since the
+    /// server sent that result. Either way *a* takes *w*, and the commit in flight is dropped, its
+    /// restores staying queued, so that its changes are planned again once R is listed again. Any other *w*, or a commit
     /// built in another history, starts recovery. A read-only device resends nothing. A device
     /// under a policy halt resends nothing whatever the `Welcome` says, but *w* < *a* is a loss
     /// there too: *a* takes *w*, the refused commit is dropped, since its slot is no longer the one
@@ -1021,6 +1022,7 @@ impl Commits {
             None if w == a => Reconnect::Idle,
             Some(flight) if flight.result.is_none() && (w == a || w == a + 1) => Reconnect::Resend,
             Some(_) if w == a + 1 => Reconnect::Idle,
+            Some(_) if w == a => Reconnect::AheadOfServer,
             _ if w < a => Reconnect::AheadOfServer,
             _ => Reconnect::Recovery,
         };

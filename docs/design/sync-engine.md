@@ -210,10 +210,10 @@ The server keeps, per device, the highest `device_seq` it accepted and that comm
 
 | *w* against the store | Meaning | Action |
 |---|---|---|
-| *w* = *a* | the commit in flight, if any, was not accepted | resend it unchanged (table below) |
+| *w* = *a* | the commit in flight, if any, was not accepted | resend it unchanged (table below). **[changed]** If its result has already arrived, the server accepted it and lost it, so this is the *w* < *a* row |
 | *w* = *a* + 1, and the commit in flight has slot *a* + 1 | the commit was accepted and its response was lost | resend it unchanged: the server returns its stored result, which is applied as usual. Only if the server does not know that `commit_id` (`STALE_DEVICE_STATE`) is this a rollback |
 | *w* = *a* + 1 with no commit in flight, or *w* > *a* + 1 | the store is behind the server: it was restored from a backup or copied | nothing is planned from this store; the space enters recovery (§6.4) with the store as evidence |
-| **[changed]** *w* < *a* | the server lost commits of this device that it had accepted: its counter only grows and the store learns a slot only from its result | *a* := *w*; the commit in flight is dropped and its restores stay queued; R is recorded as ahead of the server and bootstrapped as for `AHEAD_OF_SERVER` (§4.4), which sends again what was lost |
+| **[changed]** *w* < *a*, or *w* = *a* with the result of the commit in flight held | the server lost commits of this device that it had accepted: its counter only grows and the store learns a slot only from its result | *a* := *w*; the commit in flight is dropped and its restores stay queued; R is recorded as ahead of the server and bootstrapped as for `AHEAD_OF_SERVER` (§4.4), which sends again what was lost |
 
 A healthy store never shows the third row, because the commit is persisted before it is sent and *a* moves in the same transaction that clears it. **[changed]** The other recovery triggers are checked first: the root marker's counter (below) when the task starts, and the history before the counter. The driver takes a `Welcome` before the result of any commit the session answered after it, so *w* is never older than a commit the store acknowledged. A new connection also drops the results the session held behind a gap on the old one, so no event after a `Welcome` comes from an earlier connection, and a bootstrap after *w* < *a* takes nothing the server lost. A listing still out when such a `Welcome` arrives may have read the server before it, so its pages are dropped and the tree is listed again.
 

@@ -136,13 +136,13 @@ proptest! {
     }
 
     #[test]
-    #[ignore = "a server restore still breaks these: an edit equal to the restored bytes is undone (GUN-438), a device that saw a seq the server lost takes the commit that reuses it for the one it saw (GUN-423), a device that holds the result of a commit the server lost starts recovery when it connects again (GUN-444), and a commit refused as ahead of the server leaves its edit unsent (GUN-442)"]
+    #[ignore = "a server restore still breaks these: an edit equal to the restored bytes is undone (GUN-438), and a device that saw a seq the server lost takes the commit that reuses it for the one it saw (GUN-423)"]
     fn devices_lose_no_write_across_server_restores(devices in 2..=3usize, phases in phases(true)) {
         keep(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
 
     #[test]
-    #[ignore = "a server restore still breaks these: an edit equal to the restored bytes is undone (GUN-438), a device that saw a seq the server lost takes the commit that reuses it for the one it saw (GUN-423), a device that holds the result of a commit the server lost starts recovery when it connects again (GUN-444), and a commit refused as ahead of the server leaves its edit unsent (GUN-442)"]
+    #[ignore = "a server restore still breaks these: an edit equal to the restored bytes is undone (GUN-438), and a device that saw a seq the server lost takes the commit that reuses it for the one it saw (GUN-423)"]
     fn devices_converge_across_server_restores(devices in 2..=3usize, phases in phases(true)) {
         converge(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
@@ -1089,4 +1089,37 @@ fn a_removal_recovered_after_the_user_moved_its_file_keeps_one_file() {
         ],
     ];
     converge(3, &phases).unwrap();
+}
+
+/// GUN-444: device 1's create is applied at seq 3 and its result arrives, but the server is
+/// restored to seq 2 before device 1's stream reaches seq 3. The server lost a commit the device
+/// saw accepted, so the device lists R again instead of starting recovery.
+#[test]
+fn a_device_holding_the_result_of_a_commit_the_server_lost_lists_r_again() {
+    let u = |kind, target, parent, name, text| {
+        Step::User(Action {
+            kind,
+            target,
+            parent,
+            name,
+            text,
+        })
+    };
+    let phases = vec![
+        vec![(0, u(1, 0, 0, 0, 0))],
+        vec![
+            (0, u(2, 0, 0, 0, 0)),
+            (1, u(0, 0, 0, 1, 0)),
+            (0, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (2, Step::Work(0)),
+            (2, Step::Work(0)),
+            (0, BACKUP),
+            (1, Step::Work(3407374106458668457)),
+            (1, Step::Deliver(4808377001051081459)),
+            (0, RESTORE),
+        ],
+    ];
+    converge(2, &phases).unwrap();
 }
