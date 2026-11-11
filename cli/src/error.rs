@@ -5,7 +5,7 @@
 //! server, an error of the driver, a parse error of the arguments.
 
 use koidrive_cloudflare::{ApiError as CloudflareError, OauthError};
-use koidrive_driver::{ConfigError, DriverError, PathsError};
+use koidrive_driver::{ConfigError, DriverError, PathsError, SET_UP_AGAIN};
 use koidrive_net::ApiError;
 use koidrive_proto::v1::error::Code as ServerCode;
 use serde::{Deserialize, Serialize};
@@ -117,7 +117,10 @@ impl From<ApiError> for CliError {
         if error.is_unauthenticated() {
             return CliError::new(
                 Code::AuthRequired,
-                "the server refused this device's credential: another device revoked it, or the credential is wrong. Pair it again to sync.",
+                format!(
+                    "the server refused this device's credential, so another device revoked it or the credential is \
+                     wrong. To use this device again, {SET_UP_AGAIN}."
+                ),
             );
         }
         let busy = matches!(error.status(), Some(429 | 502 | 503 | 504))

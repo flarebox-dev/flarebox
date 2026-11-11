@@ -612,13 +612,19 @@ async fn a_device_revokes_a_lost_one_and_stops_syncing_when_another_revokes_it()
     }
     machine.run(&join);
     assert_ne!(machine.status()["account"]["device_id"], device_id.as_str());
-    machine.run(&["link", folder.to_str().unwrap(), "--space", &space_name]);
+    machine.run(&[
+        "folder",
+        "link",
+        folder.to_str().unwrap(),
+        "--space",
+        &space_name,
+    ]);
     let socket = machine.path("run/koidrive/daemon.sock");
     if socket.exists() {
         fs::remove_file(&socket).unwrap();
     }
     let mut daemon = machine
-        .command(&["daemon"])
+        .command(&["_daemon"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
