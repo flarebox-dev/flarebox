@@ -313,6 +313,16 @@ impl Auth {
             answer => return answer,
         };
         let stored = reload().map_err(ApiError::Credential)?;
+        if (&stored.current.user_id, &stored.current.device_id)
+            != (
+                &state.stored.current.user_id,
+                &state.stored.current.device_id,
+            )
+        {
+            return Err(ApiError::Credential(io::Error::other(
+                "the profile now holds another device's credential",
+            )));
+        }
         let candidates = [
             Some(stored.current.refresh_credential.clone()),
             stored.staged.map(|staged| staged.refresh_credential),

@@ -982,6 +982,68 @@ mod tests {
 
     const ID: &str = "0190a0b0-0000-7000-8000-000000000001";
 
+    #[tokio::test]
+    async fn a_reload_never_presents_another_profiles_credential_to_the_first_server() {
+        use crate::setup::fake::{Fake, Reply};
+        use prost::Message;
+
+        let refused = || Reply {
+            method: "POST",
+            path: "/v1/token".into(),
+            status: 401,
+            content_type: "application/x-protobuf",
+            body: flarebox_proto::v1::Error {
+                code: flarebox_proto::v1::error::Code::Unauthenticated as i32,
+                message: "unknown device or refresh credential".into(),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        };
+        let first_server = Fake::start(vec![refused(), refused(), refused()]).await;
+        let other_server = Fake::start(Vec::new()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let first = Credential {
+            server: first_server.base.to_string(),
+            user_id: "first-user".into(),
+            user_name: None,
+            device_id: ID.into(),
+            device_name: "first".into(),
+            refresh_credential: "first-credential".into(),
+        };
+        first.save_new(&paths.credential()).unwrap();
+        let reader = reading(&paths, &first).unwrap();
+        let owner = Driver::open(paths.clone()).unwrap();
+        owner.sign_out_device(ID).await.unwrap();
+        let replacement = Credential {
+            server: other_server.base.to_string(),
+            user_id: "other-user".into(),
+            user_name: None,
+            device_id: "0190a0b0-0000-7000-8000-000000000002".into(),
+            device_name: "other".into(),
+            refresh_credential: "other-credential".into(),
+        };
+        owner.save_credential(replacement.clone()).await.unwrap();
+
+        assert!(matches!(
+            reader.access_token().await,
+            Err(ApiError::Credential(_))
+        ));
+        let presented: Vec<String> = first_server
+            .seen()
+            .iter()
+            .map(|seen| {
+                flarebox_proto::v1::TokenRequest::decode(seen.body.as_slice())
+                    .unwrap()
+                    .refresh_credential
+            })
+            .collect();
+        assert!(
+            !presented.contains(&replacement.refresh_credential),
+            "{presented:?}"
+        );
+    }
+
     #[test]
     fn a_device_id_is_a_uuid_and_nothing_that_could_name_another_path() {
         assert_eq!(device_id(ID).as_deref(), Ok(ID));
