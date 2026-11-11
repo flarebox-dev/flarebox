@@ -13,13 +13,12 @@ When a property fails, proptest prints the shrunk input and saves a line to a `.
 
 ### Several devices
 
-`core/sim/tests/devices.rs` runs two or three devices against one reference server while effects fail, messages are lost, repeated or reordered, commits are refused, and devices crash between store transactions or in the middle of an effect (`core/sim/src/world`). It has three properties:
+`core/sim/tests/devices.rs` runs two or three devices against one reference server while effects fail, messages are lost, repeated or reordered, commits are refused, and devices crash between store transactions or in the middle of an effect (`core/sim/src/world`). It has two properties:
 
-- `devices_lose_no_write` fails when a write leaves a disk or the server's tree and no user overwrote or deleted it, or when the engine, the store or the server refuses a state. It runs on every pull request and in the battery. A case ends early when a restart gives the entry of one node to another node (GUN-342), because the trees cannot be judged after that. The test passes such a case and reports it with the seed of the run, on stderr and in the job summary on GitHub Actions.
-- `devices_keep_a_store_that_loads` also fails when the engine refuses to load what the store holds after the transaction that records the outcome of an effect.
+- `devices_lose_no_write` fails when a write leaves a disk or the server's tree and no user overwrote or deleted it, or when the engine, the store or the server refuses a state. It runs on every pull request and in the battery.
 - `devices_converge_once_the_faults_stop` also fails when the devices do not reach the server's tree, or when a commit makes a change that the user of its device never made.
 
-The last two fail on `main`, so they are marked `#[ignore]`, together with the fixed schedules of the known failures of the engine and of the reference server. Each `#[ignore]` names its issue. Neither `cargo test` nor the battery runs these tests. Until they pass, nothing checks convergence under every interleaving, and nothing checks that a device can start again when it stops between recording an effect and observing the disk. The gate also does not fail on GUN-342. It only reports the cases that end there.
+The second can fail on `main`, because the reference server puts files into the trash that no user deleted (GUN-333). It is marked `#[ignore]`, together with the two fixed schedules of that failure. Neither `cargo test` nor the battery runs these tests. Until they pass, nothing checks convergence under every interleaving.
 
 To run the ignored tests, and to print the state after every step of one of them:
 

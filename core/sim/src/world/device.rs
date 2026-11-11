@@ -39,7 +39,8 @@ impl Engine {
     }
 
     /// Rebuilds the engine the way the store loads it after a restart, and checks that every part
-    /// comes back equal.
+    /// comes back equal. The store does not hold the ignore rules. These devices have no rules of
+    /// their own, and a restart plans nothing before its full scan, so the rules count as read.
     pub fn reload(&self) -> Result<Engine, Failure> {
         let mut trees = Trees::new(self.trees.remote().root.clone());
         for (id, node) in self.trees.remote().iter() {
@@ -53,6 +54,7 @@ impl Engine {
         }
         let refused = |error| Failure::Broken(format!("the stored state was refused: {error:?}"));
         trees.restore(self.trees.state()).map_err(refused)?;
+        trees.rules_scanned();
         let loaded = Engine {
             trees,
             commits: Commits::from_state(self.commits.state()).map_err(refused)?,
@@ -194,19 +196,6 @@ impl Device {
         self.engine.trees.settle();
         self.store = self.engine.reload()?;
         Ok(())
-    }
-
-    /// The transaction that records the outcome of an effect. The driver observes the disk only
-    /// after it, so L can still hold an entry that the user has moved or deleted since the last
-    /// scan. Returns what is wrong with L when the engine would refuse to load it. The store
-    /// then keeps the state of the transaction before.
-    pub fn persist_outcome(&mut self) -> Result<Option<String>, Failure> {
-        self.engine.trees.settle();
-        if let Err(('L', error)) = self.engine.trees.check() {
-            return Ok(Some(format!("{error:?}")));
-        }
-        self.store = self.engine.reload()?;
-        Ok(None)
     }
 
     /// A full rescan. After it the engine plans the nodes again that the server refused an op

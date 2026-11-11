@@ -9,7 +9,7 @@
 //! The oracle uses the harness's own records and the server's state, never the engine's
 //! bookkeeping. Every user write carries a tag in its content's `mtime_ns`, which the engine
 //! does not compare, so two files with the same bytes are still two writes. A broken property is
-//! a [`Failure`] of one of four kinds.
+//! a [`Failure`] of one of two kinds.
 //!
 //! [`Failure::Broken`]: a write is lost, or a state or a call is refused.
 //!
@@ -24,19 +24,9 @@
 //!   device's user overwrites or deletes it.
 //! - L, S and R are valid trees after every step, the store gives back the state it was given,
 //!   and the engine and the server accept every outcome and message the harness reports.
-//!
-//! [`Failure::Unloadable`]: a device that stops between two store transactions cannot start
-//! again.
-//!
-//! - The engine loads what the store holds after the transaction that records the outcome of an
-//!   effect. The disk is observed only after that transaction, so L can still hold an entry that
-//!   the user has moved or deleted since the last scan.
-//!
-//! [`Failure::Adopted`]: a restart gives the entry of one node to another node.
-//!
-//! - After a crash, recovery reports the effect in flight as done when its target holds the
-//!   effect's final state (section 5.3). The entry it reports is not one that L holds as another
-//!   node. The trees are not judged after such a report, so the run ends there.
+//! - The engine loads what the store holds after every transaction. The transaction that records
+//!   the outcome of an effect comes before the disk is observed again, so L can still hold an
+//!   entry that the user has moved or deleted since the last scan.
 //!
 //! [`Failure::Diverged`]: the faults have stopped, and the devices did not reach one tree.
 //!
@@ -56,7 +46,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use flarebox_engine::commit::{self, Reconnect};
 use flarebox_engine::effects::{Effect, EffectRecord};
-use flarebox_engine::tree::{Content, LocalNode, NodeId, RemoteNode, same, same_content};
+use flarebox_engine::tree::{Content, NodeId, RemoteNode, same, same_content};
 use flarebox_proto::v1::{
     ChunkRef, Commit, Error, NodeKind, NodeStatus, PrepareUpload, Resume, UploadReceipt,
     chunk_plan, error, op, op_result,
@@ -83,13 +73,6 @@ pub enum Failure {
     /// A write was lost, or the engine, the store or the server refused a state or a call that
     /// the design promises.
     Broken(String),
-    /// The store was left with a state that the engine refuses to load, in the transaction that
-    /// records the outcome of an effect. This is GUN-330. Its fix removes this kind, so that the
-    /// refusal is `Broken` again.
-    Unloadable(String),
-    /// A restart reported the effect in flight as done with an entry that L holds as another
-    /// node. The run ends there. This is GUN-342. Its fix removes this kind.
-    Adopted(String),
     /// The devices did not reach the server's tree once the faults stopped, or a commit made a
     /// change that no user made.
     Diverged(String),
@@ -100,8 +83,6 @@ impl Failure {
     fn at(self, place: String) -> Self {
         match self {
             Failure::Broken(why) => Failure::Broken(format!("{place}: {why}")),
-            Failure::Unloadable(why) => Failure::Unloadable(format!("{place}: {why}")),
-            Failure::Adopted(why) => Failure::Adopted(format!("{place}: {why}")),
             Failure::Diverged(why) => Failure::Diverged(format!("{place}: {why}")),
         }
     }
@@ -109,10 +90,7 @@ impl Failure {
 
 impl std::fmt::Display for Failure {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (Failure::Broken(why)
-        | Failure::Unloadable(why)
-        | Failure::Adopted(why)
-        | Failure::Diverged(why)) = self;
+        let (Failure::Broken(why) | Failure::Diverged(why)) = self;
         out.write_str(why)
     }
 }
@@ -248,22 +226,6 @@ fn stored(held: &Held, write: i64) -> bool {
     held.values().any(|writes| writes.contains_key(&write))
 }
 
-/// Records the outcome of an effect in the store, in its own transaction, before the disk is
-/// observed again. Returns the failure to report when the engine refuses to load that state.
-fn outcome_stored(
-    d: usize,
-    device: &mut Device,
-    record: &EffectRecord,
-) -> Result<Option<String>, Failure> {
-    Ok(device.persist_outcome()?.map(|why| {
-        format!(
-            "device {d} recorded the outcome of {:?} before it observed the disk, and the engine \
-             refuses to load L as the store then holds it: {why}",
-            record.effect
-        )
-    }))
-}
-
 /// Fails when an effect sent a file to the local trash that held a write the server never held.
 fn lost(held: &Held, d: usize, record: &EffectRecord, applied: &Applied) -> Result<(), Failure> {
     let trashed = applied.trashed.as_ref();
@@ -341,8 +303,6 @@ pub struct World {
     held: Held,
     /// The first change a commit made that no user asked for.
     unasked: Option<String>,
-    /// The first state the store was left with that the engine refuses to load.
-    unloadable: Option<String>,
     /// The writes that a download left on a disk in a file the engine then took for a new one. A
     /// crash kept the store from hearing of the download, and the user renamed the file before
     /// the restart (section 5.3). The server holds such a write in two files.
@@ -384,7 +344,6 @@ impl World {
             published: BTreeSet::new(),
             held: Held::new(),
             unasked: None,
-            unloadable: None,
             copied: BTreeSet::new(),
         }
     }
@@ -541,6 +500,11 @@ impl World {
 
     /// Plans the next effect, or ends the one in flight. With `Outcome::Fail` or
     /// `Outcome::Crash` a step does both. True when there was an effect to plan or to end.
+    ///
+    /// As in the driver, the disk gets an effect only while L still takes its outcome
+    /// (`EffectRecord::applies`). An effect that L no longer takes fails, and is planned again once
+    /// L has changed. The outcome goes to the store in its own transaction, before the disk is
+    /// observed again.
     fn effect(&mut self, d: usize, outcome: Outcome) -> Result<bool, Failure> {
         let device = &mut self.devices[d];
         let Some(record) = device.engine.effects.in_flight().cloned() else {
@@ -555,10 +519,11 @@ impl World {
             device.persist()?;
             return Ok(planned);
         };
+        let applies = record.applies(&device.engine.trees);
         let applied = match outcome {
-            Outcome::Fail => None,
-            Outcome::Run => Some(device.disk.apply(&record, Cut::Done)),
-            Outcome::Crash(cut) => Some(device.disk.apply(&record, cut)),
+            Outcome::Run if applies => Some(device.disk.apply(&record, Cut::Done)),
+            Outcome::Crash(cut) if applies => Some(device.disk.apply(&record, cut)),
+            _ => None,
         };
         if let Some(applied) = &applied {
             lost(&self.held, d, &record, applied)?;
@@ -573,7 +538,9 @@ impl World {
                     }
                     _ if device.disk.staged => "crash with a download staged",
                     Some(Err(_)) => "crash after the disk refused an effect",
-                    _ if cut == Cut::Quarantined => "crash before an effect reached the disk",
+                    _ if applied.is_none() || cut == Cut::Quarantined => {
+                        "crash before an effect reached the disk"
+                    }
                     _ => "crash after an effect reached the disk",
                 },
             );
@@ -584,7 +551,11 @@ impl World {
         let Engine { trees, effects, .. } = &mut device.engine;
         let reported = match applied {
             Some(Ok(identity)) => effects.done(trees, &record.effect_id, identity),
-            _ => effects.failed(&record.effect_id),
+            _ => effects.failed(&record.effect_id).map(|()| {
+                if !applies {
+                    effects.unblock(&record.node);
+                }
+            }),
         };
         note(
             &mut self.seen,
@@ -600,16 +571,14 @@ impl World {
                 }
                 (Some(Ok(_)), _) => "effect done",
                 (_, Outcome::Fail) => "effect failed before the disk",
+                (None, _) => "effect not applied, L no longer takes it",
                 _ => "effect refused by the disk",
             },
         );
         reported.map_err(|error| {
             Failure::Broken(format!("the effect's outcome was refused: {error:?}"))
         })?;
-        self.unloadable = self
-            .unloadable
-            .take()
-            .or(outcome_stored(d, device, &record)?);
+        device.persist()?;
         device.engine.scan(&device.disk);
         device.persist()?;
         Ok(true)
@@ -617,6 +586,10 @@ impl World {
 
     /// Restarts a crashed device: the engine comes back from the store, the effect in flight is
     /// ended from what the disk shows, and the disk is scanned again (sections 2.8 and 5.3).
+    ///
+    /// As in the driver, an effect that recovery reports as done fails when L refutes it
+    /// (`Effects::confirms`), and so does an effect whose outcome L no longer takes
+    /// (`EffectRecord::applies`).
     fn restart(&mut self, d: usize) -> Result<(), Failure> {
         let device = &mut self.devices[d];
         device.down = false;
@@ -630,21 +603,13 @@ impl World {
                 Effect::WriteFile { content, .. } => Some(content),
                 _ => None,
             };
+            let applies = record.applies(trees);
+            let refuted = matches!(
+                &applied.outcome,
+                Ok(identity) if !effects.confirms(trees, identity.as_ref())
+            );
             let reported = match applied.outcome {
-                Ok(identity) => {
-                    let held = identity.as_ref().and_then(|identity| {
-                        let other = |(id, node): &(&NodeId, &LocalNode)| {
-                            **id != record.node && node.identity.ino == identity.ino
-                        };
-                        trees.local().iter().find(other)
-                    });
-                    if let Some((other, _)) = held {
-                        return Err(Failure::Adopted(format!(
-                            "device {d} restarted, and recovery reported {:?} for node {} as \
-                             done with the entry that L holds as node {other}",
-                            record.effect, record.node
-                        )));
-                    }
+                Ok(identity) if applies && !refuted => {
                     // A file that the user made with the bytes of the download counts as the
                     // download. The server holds that write from then on.
                     let taken = identity
@@ -672,21 +637,26 @@ impl World {
                     );
                     effects.done(trees, &record.effect_id, identity)
                 }
-                Err(refused) => {
+                outcome => {
                     note(
                         &mut self.seen,
-                        match refused {
-                            Refused::Interrupted => "restart finds the effect in flight not done",
-                            _ => "restart finds the effect in flight refused by the disk",
+                        match outcome {
+                            Ok(_) if refuted => "restart finds a done effect that L refutes",
+                            Ok(_) => "restart finds an effect that L no longer takes",
+                            Err(Refused::Interrupted) => {
+                                "restart finds the effect in flight not done"
+                            }
+                            Err(_) => "restart finds the effect in flight refused by the disk",
                         },
                     );
                     if let Some(content) = download.filter(|c| device.disk.holds(c.mtime_ns)) {
                         self.copied.insert(content.mtime_ns);
                     }
-                    // The driver plans an interrupted effect again. An effect that failed for
-                    // another reason waits until the disk is observed.
+                    // The driver plans an interrupted effect again, and one that L no longer
+                    // takes once L has changed. An effect that failed for another reason waits
+                    // until the disk is observed.
                     effects.failed(&record.effect_id).map(|()| {
-                        if refused == Refused::Interrupted {
+                        if !applies || matches!(outcome, Err(Refused::Interrupted)) {
                             effects.unblock(&record.node);
                         }
                     })
@@ -695,10 +665,7 @@ impl World {
             reported.map_err(|error| {
                 Failure::Broken(format!("the effect's outcome was refused: {error:?}"))
             })?;
-            self.unloadable = self
-                .unloadable
-                .take()
-                .or(outcome_stored(d, device, &record)?);
+            device.persist()?;
         }
         if device.engine.commits.in_flight().is_some() {
             note(&mut self.seen, "restart with a commit in flight");
@@ -1034,13 +1001,10 @@ impl World {
     /// reported before a tree the devices did not reach.
     fn quiesce(&mut self) -> Result<(), Failure> {
         let quiet = self.quiet();
-        if let Err(Failure::Broken(_) | Failure::Adopted(_)) = quiet {
+        if let Err(Failure::Broken(_)) = quiet {
             return quiet;
         }
         self.kept()?;
-        if let Some(why) = self.unloadable.take() {
-            return Err(Failure::Unloadable(why));
-        }
         match self.unasked.take() {
             Some(why) => Err(Failure::Diverged(why)),
             None => quiet,
@@ -1319,7 +1283,9 @@ impl World {
             if let Some((id, _)) = engine.trees.local().iter().find(|(_, node)| node.parked) {
                 return fail(format!("node {id} is parked"));
             }
-            let unsettled = engine.trees.clone().settle();
+            let mut trees = engine.trees.clone();
+            trees.settle();
+            let unsettled = trees.work();
             if !unsettled.is_empty() {
                 return fail(format!("nodes are not in sync: {unsettled:?}"));
             }

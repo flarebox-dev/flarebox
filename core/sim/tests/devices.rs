@@ -3,23 +3,16 @@
 //! Two or three devices share one reference server while their users edit, effects fail,
 //! messages are lost, repeated or reordered, commits are refused and devices crash between store
 //! transactions or in the middle of an effect (docs/design/sync-engine.md section 7.3).
-//! `flarebox_sim::world` describes the harness and its four kinds of failure.
+//! `flarebox_sim::world` describes the harness and its two kinds of failure.
 //!
 //! `devices_lose_no_write` fails when a write is lost or when the engine, the store or the server
-//! refuses a state. A case ends early, and is reported, when a restart gives the entry of one node
-//! to another node (GUN-342). `devices_keep_a_store_that_loads` also asks that the engine loads what the
-//! store holds after the transaction that records the outcome of an effect.
-//! `devices_converge_once_the_faults_stop` also asks that every disk reaches the server's tree and
-//! that no commit makes a change the user of its device never made. The engine does not do these
-//! two under every interleaving yet, so both properties are ignored, and so are the fixed
-//! schedules of the known failures. `cargo test -p flarebox-sim --test devices -- --ignored`
-//! runs them.
+//! refuses a state. `devices_converge_once_the_faults_stop` also asks that every disk reaches the
+//! server's tree and that no commit makes a change the user of its device never made. The
+//! reference server puts files into the trash that no user deleted (GUN-333), so this property is
+//! ignored, and so are the two fixed schedules of that failure.
+//! `cargo test -p flarebox-sim --test devices -- --ignored` runs them.
 
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use flarebox_proto::v1::error;
 use flarebox_sim::world::{Action, Cut, Failure, NAMES, Outcome, Reply, Step, TEXTS, World};
@@ -109,62 +102,11 @@ fn converge(devices: usize, phases: &[Vec<(usize, Step)>]) -> Result<World, Fail
     run(devices, phases, |_| true)
 }
 
-/// Stops only when a write is lost or a state is refused, or when the run cannot go on.
+/// Stops only when a write is lost or a state is refused.
 fn keep(devices: usize, phases: &[Vec<(usize, Step)>]) -> Result<World, Failure> {
-    let stops = |failure: &Failure| matches!(failure, Failure::Broken(_) | Failure::Adopted(_));
-    run(devices, phases, stops)
-}
-
-/// The cases of this run that ended at GUN-342.
-static ADOPTED: AtomicUsize = AtomicUsize::new(0);
-
-/// Appends a line to the job summary. The step that runs these tests may not have written to
-/// its summary yet, so the file is made when it does not exist.
-fn summarize(path: &Path, line: &str) -> std::io::Result<()> {
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    file.write_all(line.as_bytes())
-}
-
-/// Passes a case that ended at GUN-342, where the trees cannot be judged any more, and fails a
-/// case with any other failure. Every such case is reported with the seed of the run: on
-/// stderr, which the test harness does not capture, and in the job summary on GitHub Actions.
-/// A summary that cannot be written is reported on stderr too. The fix of GUN-342 removes this
-/// function.
-fn judge(run: Result<World, Failure>) -> Result<(), TestCaseError> {
-    let why = match run {
-        Err(Failure::Adopted(why)) => why,
-        Err(failure) => return Err(TestCaseError::fail(failure.to_string())),
-        Ok(_) => return Ok(()),
-    };
-    let count = ADOPTED.fetch_add(1, Ordering::Relaxed) + 1;
-    let seed = std::env::var("PROPTEST_RNG_SEED").unwrap_or_else(|_| "not set".into());
-    let line = format!(
-        "- devices: case {count} of this run that ended at GUN-342 (PROPTEST_RNG_SEED {seed}): {why}\n"
-    );
-    let _ = std::io::stderr().write_all(line.as_bytes());
-    if let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY")
-        && let Err(error) = summarize(Path::new(&path), &line)
-    {
-        let path = Path::new(&path).display();
-        let _ = writeln!(
-            std::io::stderr(),
-            "- devices: the job summary {path} was not written: {error}"
-        );
-    }
-    Ok(())
-}
-
-#[test]
-fn a_report_is_written_to_a_job_summary_that_does_not_exist_yet() {
-    let folder = std::env::temp_dir().join(format!("flarebox-sim-devices-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&folder);
-    std::fs::create_dir_all(&folder).unwrap();
-    let path = folder.join("summary.md");
-    summarize(&path, "first\n").unwrap();
-    summarize(&path, "second\n").unwrap();
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\nsecond\n");
-    assert!(summarize(&folder.join("missing").join("summary.md"), "third\n").is_err());
-    std::fs::remove_dir_all(&folder).unwrap();
+    run(devices, phases, |failure| {
+        matches!(failure, Failure::Broken(_))
+    })
 }
 
 proptest! {
@@ -174,17 +116,11 @@ proptest! {
 
     #[test]
     fn devices_lose_no_write(devices in 2..=3usize, phases in phases()) {
-        judge(keep(devices, &phases))?;
+        keep(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
 
     #[test]
-    #[ignore = "GUN-330, GUN-339: the engine does not load what the store holds after some effects"]
-    fn devices_keep_a_store_that_loads(devices in 2..=3usize, phases in phases()) {
-        judge(run(devices, &phases, |failure| !matches!(failure, Failure::Diverged(_))))?;
-    }
-
-    #[test]
-    #[ignore = "GUN-326, GUN-327, GUN-328, GUN-330, GUN-332, GUN-333, GUN-334, GUN-339, GUN-342: the engine does not converge under every interleaving"]
+    #[ignore = "GUN-333: the reference server puts files into the trash that no user deleted"]
     fn devices_converge_once_the_faults_stop(devices in 2..=3usize, phases in phases()) {
         converge(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
@@ -199,10 +135,7 @@ fn the_schedules_reach_every_fault() {
     let mut seen: BTreeMap<&str, u64> = BTreeMap::new();
     for _ in 0..256 {
         let (devices, phases) = strategy.new_tree(&mut runner).unwrap().current();
-        let world = match keep(devices, &phases) {
-            Err(Failure::Adopted(_)) => continue,
-            world => world.unwrap(),
-        };
+        let world = keep(devices, &phases).unwrap();
         for (what, count) in world.seen {
             *seen.entry(what).or_default() += count;
         }
@@ -516,8 +449,9 @@ fn a_failed_download_and_a_refused_commit_are_done_again() {
 /// Both devices overwrite one file. Device 1's commit makes a conflict copy and its answer is lost.
 /// After reconnecting, device 1 replays its own commit from the log and downloads the copy before
 /// the stored result arrives.
+///
+/// Found as GUN-326.
 #[test]
-#[ignore = "GUN-326: the engine uploads the conflict copy a second time"]
 fn a_conflict_copy_replayed_before_its_result_is_kept_once() {
     let synced = vec![(0, file("a"))];
     let mut racing = vec![(0, overwrite(0)), (1, overwrite(0))];
@@ -537,8 +471,9 @@ fn a_conflict_copy_replayed_before_its_result_is_kept_once() {
 
 /// Device 1 starts to download a new file. Before the download ends, device 0 renames the file
 /// and device 1 hears of it.
+///
+/// Found as GUN-327.
 #[test]
-#[ignore = "GUN-327: the engine sends the old name back as a Move"]
 fn a_rename_that_arrives_during_the_download_is_not_undone() {
     let mut schedule = vec![(0, file("a"))];
     schedule.extend(commit(0));
@@ -550,8 +485,9 @@ fn a_rename_that_arrives_during_the_download_is_not_undone() {
 
 /// On a disk that tells "A" from "a", device 0 edits the file "A" and creates the folder "a" while
 /// device 1 edits and renames the file. Device 0's edit becomes a conflict copy.
+///
+/// Found as GUN-328.
 #[test]
-#[ignore = "GUN-328: the engine never ends the wait for the colliding name"]
 fn a_conflict_copy_whose_old_name_a_new_folder_took_leaves_waiting() {
     let synced = vec![(0, file("A"))];
     let racing = vec![
@@ -570,8 +506,9 @@ fn a_conflict_copy_whose_old_name_a_new_folder_took_leaves_waiting() {
 
 /// Device 0 creates the file "a" where device 1 has created a folder, so the server renames the
 /// file. The user of device 0 deletes the file before the disk has the server's name for it.
+///
+/// Found as GUN-332.
 #[test]
-#[ignore = "GUN-332: the engine downloads the deleted file again and restores it on the server"]
 fn a_file_deleted_before_the_disk_took_the_servers_name_stays_deleted() {
     let mut schedule = vec![(1, folder("a")), (0, file("a"))];
     schedule.extend(commit(1));
@@ -617,8 +554,9 @@ fn a_file_in_a_folder_moved_into_a_folder_that_another_device_deletes_is_kept() 
 /// Device 2 deletes a folder that holds a file, and device 1 renames the folder, which brings both
 /// back on the server. Device 0 has taken the delete and is removing the file from its disk when
 /// the rename arrives.
+///
+/// Found as GUN-334.
 #[test]
-#[ignore = "GUN-334: the engine sends the removal that its own effect made as a Delete"]
 fn a_file_that_an_effect_removes_after_the_server_restored_it_is_not_deleted() {
     let synced = vec![(0, folder("b")), (0, user(1, 0, 1, "a"))];
     let mut racing = vec![(2, delete(0)), (1, rename(0, 0, "c.txt"))];
@@ -630,9 +568,11 @@ fn a_file_that_an_effect_removes_after_the_server_restored_it_is_not_deleted() {
 }
 
 /// Device 1 plans the download of the file "a". Its user then creates the folder "a", and moves it
-/// away after the engine has seen it there. The download ends before the next scan.
+/// away after the engine has seen it there. The download comes up before the next scan, while L
+/// still holds the folder at that name.
+///
+/// Found as GUN-330.
 #[test]
-#[ignore = "GUN-330: the store holds two nodes with one name and cannot be loaded"]
 fn a_download_onto_a_name_that_a_moved_folder_held_leaves_a_loadable_store() {
     let mut schedule = vec![(0, file("a"))];
     schedule.extend(commit(0));
@@ -648,10 +588,11 @@ fn a_download_onto_a_name_that_a_moved_folder_held_leaves_a_loadable_store() {
 }
 
 /// Another device deletes the folder "a". While its removal is in flight, the user moves a file
-/// into the folder, a rescan sees it there, and the user moves it out again. The removal then
-/// finds the folder empty, and L keeps the file in a folder it no longer holds.
+/// into the folder, a rescan sees it there, and the user moves it out again. The removal comes up
+/// before the next scan, while L still holds the file in the folder.
+///
+/// Found as GUN-330.
 #[test]
-#[ignore = "GUN-330: the store holds a file in a folder it does not hold and cannot be loaded"]
 fn a_removal_of_a_folder_that_a_file_left_unseen_leaves_a_store_that_loads() {
     let mut schedule = vec![(0, folder("a")), (0, file("b"))];
     schedule.extend(commit(0));
@@ -677,10 +618,11 @@ fn a_removal_of_a_folder_that_a_file_left_unseen_leaves_a_store_that_loads() {
 
 /// Another device deletes the folder "a". While its removal is in flight, the user renames the
 /// folder and makes a folder in it, a rescan sees both, and the device stops. The restart finds
-/// nothing at the name "a" and reports the removal as done (section 5.3), and L keeps the new
-/// folder in a folder it no longer holds.
+/// nothing at the name "a", which recovery reports as the removal done (section 5.3), while L
+/// holds the folder under its new name.
+///
+/// Found as GUN-339.
 #[test]
-#[ignore = "GUN-339: a restart ends the removal of a folder the user renamed, and the store cannot be loaded"]
 fn a_restart_during_the_removal_of_a_renamed_folder_leaves_a_store_that_loads() {
     let mut schedule = vec![(0, folder("a"))];
     schedule.extend(commit(0));
@@ -698,10 +640,11 @@ fn a_restart_during_the_removal_of_a_renamed_folder_leaves_a_store_that_loads() 
 }
 
 /// Device 1 plans the download of the file "a" and stops. Its user renames the file "b", which
-/// has the same bytes, to "a". The restart finds those bytes at the name "a" and reports the
-/// download as done with the entry that L holds as "b" (section 5.3).
+/// has the same bytes, to "a". The restart finds those bytes at the name "a", which recovery
+/// reports as the download done (section 5.3), in the entry that L holds as "b".
+///
+/// Found as GUN-342.
 #[test]
-#[ignore = "GUN-342: a restart takes a renamed file for the download, and a file leaves the server"]
 fn a_file_renamed_onto_the_name_of_a_download_in_flight_is_kept() {
     let mut schedule = vec![(0, file("b"))];
     schedule.extend(commit(0));
