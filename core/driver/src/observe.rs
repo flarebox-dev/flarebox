@@ -960,6 +960,60 @@ mod tests {
     }
 
     #[test]
+    fn a_retry_the_caller_stopped_reads_no_further_and_keeps_every_file_due() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let dir = marked();
+        for file in 0..20 {
+            fs::write(dir.path().join(format!("{file:04}.txt")), b"x").unwrap();
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let reads_after_stop = Arc::new(AtomicUsize::new(0));
+        let stopped = {
+            let stop = stop.clone();
+            let reads_after_stop = reads_after_stop.clone();
+            move || {
+                let stopped = stop.load(Ordering::SeqCst);
+                if stopped {
+                    reads_after_stop.fetch_add(1, Ordering::SeqCst);
+                }
+                stopped
+            }
+        };
+        let dev = fs::metadata(dir.path()).unwrap().dev();
+        let started = FsObserver::start(
+            dir.path(),
+            SPACE,
+            dev,
+            Snapshot::default(),
+            Arc::new(Unfiltered),
+            stopped,
+        );
+        let mut observer = started.unwrap();
+        observe_until(&mut observer, |seen| seen.len() >= 20);
+        let now = Instant::now();
+        for file in 0..20 {
+            observer.unread.insert(
+                format!("{file:04}.txt").into(),
+                Retry {
+                    failures: 0,
+                    due: now,
+                },
+            );
+        }
+        stop.store(true, Ordering::SeqCst);
+        let mut out = Vec::new();
+        observer.retry(now, &mut out, &mut Reads::default());
+        assert_eq!(reads_after_stop.load(Ordering::SeqCst), 1);
+        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(observer.unread.len(), 20);
+        assert!(
+            (observer.unread.values()).all(|retry| retry.failures == 0 && retry.due == now),
+            "{:?}",
+            observer.unread
+        );
+    }
+
+    #[test]
     fn an_observation_reads_no_more_bytes_than_the_budget_past_its_first_file() {
         let mut reads = Reads::default();
         assert!(
