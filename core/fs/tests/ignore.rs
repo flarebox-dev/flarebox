@@ -474,7 +474,6 @@ fn a_file_moved_into_an_ignored_folder_before_its_folder_was_removed_is_ignored(
 }
 
 #[test]
-#[ignore = "GUN-368"]
 fn a_file_moved_out_of_a_removed_folder_with_a_link_in_an_ignored_folder_is_renamed() {
     let (dir, mut snapshot, mut rules) = tree_with_an_ignored_folder();
     let root = dir.path();
@@ -492,6 +491,93 @@ fn a_file_moved_out_of_a_removed_folder_with_a_link_in_an_ignored_folder_is_rena
     let ignored = |change: &Change| matches!(change, Change::Ignored { from, .. } if from == Path::new("d/g.txt"));
     assert!(rescan.changes.iter().any(renamed), "{:?}", rescan.changes);
     assert!(!rescan.changes.iter().any(ignored), "{:?}", rescan.changes);
+}
+
+/// `d/g.txt` and `d/h.txt` are links of one file. One goes to an included path and the other into the ignored
+/// folder, so the scan reports one rename and one ignore.
+#[test]
+fn a_file_moved_out_of_a_removed_folder_is_renamed_and_its_link_moved_into_an_ignored_folder_is_ignored()
+ {
+    let (dir, mut snapshot, mut rules) = tree_with_an_ignored_folder();
+    let root = dir.path();
+    fs::hard_link(root.join("d/g.txt"), root.join("d/h.txt")).unwrap();
+    snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    let id = snapshot.entries[Path::new("d/g.txt")].id;
+    fs::rename(root.join("d/g.txt"), root.join("moved.txt")).unwrap();
+    fs::rename(root.join("d/h.txt"), root.join("ig/h.txt")).unwrap();
+    fs::remove_dir(root.join("d")).unwrap();
+
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert_eq!(
+        rescan.changes,
+        [
+            Change::Removed {
+                path: "d".into(),
+                kind: Dir,
+            },
+            Change::Renamed {
+                from: "d/g.txt".into(),
+                to: "moved.txt".into(),
+                kind: File,
+            },
+            Change::Ignored {
+                from: "d/h.txt".into(),
+                to: "ig/h.txt".into(),
+                kind: File,
+                id,
+            },
+        ]
+    );
+}
+
+/// The folder `d/a` is renamed to `dest/a`, and the folder `x` inside it to `y`. The second rename carries
+/// the file, so its link in the ignored folder does not count as a move.
+#[test]
+fn a_file_in_a_folder_renamed_inside_a_renamed_folder_with_a_link_in_an_ignored_folder_is_not_ignored()
+ {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, RULES_FILE, "ig/\n");
+    write(root, "d/a/x/file", "kept");
+    fs::create_dir(root.join("ig")).unwrap();
+    fs::create_dir(root.join("dest")).unwrap();
+    let mut snapshot = Snapshot::default();
+    let mut rules = rules();
+    snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    fs::hard_link(root.join("d/a/x/file"), root.join("ig/alias")).unwrap();
+    fs::rename(root.join("d/a"), root.join("dest/a")).unwrap();
+    fs::rename(root.join("dest/a/x"), root.join("dest/a/y")).unwrap();
+    fs::remove_dir(root.join("d")).unwrap();
+
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert_eq!(
+        rescan.changes,
+        [
+            Change::Removed {
+                path: "d".into(),
+                kind: Dir,
+            },
+            Change::Renamed {
+                from: "d/a".into(),
+                to: "dest/a".into(),
+                kind: Dir,
+            },
+            Change::Renamed {
+                from: "d/a/x".into(),
+                to: "dest/a/y".into(),
+                kind: Dir,
+            },
+        ]
+    );
+    assert!(snapshot.entries.contains_key(Path::new("dest/a/y/file")));
 }
 
 #[test]
@@ -1273,4 +1359,42 @@ fn a_file_swapped_with_an_ignored_file_is_ignored_and_the_other_created() {
             }
         ]
     );
+}
+
+/// Each file moved out of the removed folder is carried by its own rename, so none of them is looked for in the
+/// ignored folder. Comparing every held entry with every rename made this scan take seconds.
+#[test]
+#[ignore = "timing probe; run with --release -- --ignored"]
+fn many_files_moved_out_of_a_removed_folder_are_renamed_in_less_than_a_second() {
+    let files = 20_000;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, RULES_FILE, "ig/\n");
+    write(root, "ig/deep/old.txt", "o");
+    fs::create_dir(root.join("d")).unwrap();
+    fs::create_dir(root.join("e")).unwrap();
+    for i in 0..files {
+        fs::write(root.join(format!("d/{i}")), "x").unwrap();
+    }
+    let mut rules = rules();
+    let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
+    for i in 0..files {
+        fs::rename(root.join(format!("d/{i}")), root.join(format!("e/{i}"))).unwrap();
+    }
+    fs::remove_dir(root.join("d")).unwrap();
+
+    let started = Instant::now();
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    let elapsed = started.elapsed();
+    let renamed = (rescan.changes.iter())
+        .filter(|change| matches!(change, Change::Renamed { .. }))
+        .count();
+    assert_eq!((rescan.changes.len(), renamed), (files + 1, files));
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "{files} files took {elapsed:?}"
+    );
+    eprintln!("{files} files: {elapsed:?}");
 }

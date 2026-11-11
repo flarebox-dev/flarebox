@@ -1138,7 +1138,9 @@ fn take_left_out(
 /// leave out into [`Change::Ignored`] (design §5.10). A folder is looked for
 /// by its own identity, and so is each entry it held. Such an entry found
 /// there, and not inside a folder that was found, was moved out before its
-/// folder went, and is reported as ignored beside the folder's removal. A
+/// folder went, and is reported as ignored beside the folder's removal. An
+/// entry that a rename of it or of a folder above it carries to a path with
+/// the same identity stayed included, so it is not looked for. A
 /// removal the search does not find stands. So does a file another file took
 /// the path of, as in a swap through a third name: when the old file sits at
 /// a name the rules leave out, it is reported as ignored and the new one as
@@ -1172,6 +1174,21 @@ fn find_ignored(
     if removed.is_empty() && replaced.is_empty() {
         return;
     }
+    let renamed: HashMap<&Path, &Path> = (changes.iter())
+        .filter_map(|change| match change {
+            Change::Renamed { from, to, .. } => Some((from.as_path(), to.as_path())),
+            _ => None,
+        })
+        .collect();
+    let carried = |path: &Path| {
+        let entry = &old[path];
+        (path.ancestors())
+            .filter_map(|from| Some((renamed.get(from)?, path.strip_prefix(from).ok()?)))
+            .any(|(to, below)| {
+                (new.get(&to.join(below)))
+                    .is_some_and(|after| after.id == entry.id && after.kind == entry.kind)
+            })
+    };
     let held: BTreeSet<&PathBuf> = (removed.iter().copied())
         .filter(|dir| old[*dir].kind == EntryKind::Dir)
         .flat_map(|dir| {
@@ -1179,7 +1196,7 @@ fn find_ignored(
                 .take_while(move |(path, _)| path.starts_with(dir))
                 .map(|(path, _)| path)
         })
-        .filter(|path| !removed.contains(path))
+        .filter(|path| !removed.contains(path) && !carried(path))
         .collect();
     let key = |path: &PathBuf| ((old[path].id, old[path].kind), None);
     let mut wanted: Wanted = (removed.iter().chain(&held).copied()).map(key).collect();
