@@ -1162,7 +1162,7 @@ fn find_ignored(
             _ => None,
         })
         .collect();
-    let removed: Vec<&PathBuf> = changes
+    let removed: BTreeSet<&PathBuf> = changes
         .iter()
         .filter_map(|change| match change {
             Change::Removed { path, .. } => Some(path),
@@ -1172,13 +1172,14 @@ fn find_ignored(
     if removed.is_empty() && replaced.is_empty() {
         return;
     }
-    let held: Vec<&PathBuf> = (removed.iter().copied())
+    let held: BTreeSet<&PathBuf> = (removed.iter().copied())
         .filter(|dir| old[*dir].kind == EntryKind::Dir)
         .flat_map(|dir| {
             (old.range(dir.clone()..).skip(1))
                 .take_while(move |(path, _)| path.starts_with(dir))
                 .map(|(path, _)| path)
         })
+        .filter(|path| !removed.contains(path))
         .collect();
     let key = |path: &PathBuf| ((old[path].id, old[path].kind), None);
     let mut wanted: Wanted = (removed.iter().chain(&held).copied()).map(key).collect();
