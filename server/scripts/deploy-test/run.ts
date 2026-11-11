@@ -298,7 +298,6 @@ async function claim(): Promise<void> {
     const setup = await fetch(url + "/setup", { signal: AbortSignal.timeout(15_000) });
     const page = await setup.text();
     if (!setup.ok || !page.includes("claim code")) fail("/setup did not issue a claim code (HTTP " + setup.status + "): " + page.slice(0, 200));
-    if (!page.includes("not affiliated with Cloudflare, Inc.")) fail("/setup lost the notice that Koidrive is not affiliated with Cloudflare, Inc.");
     code = await until(() => CLAIM_CODE.exec(log)?.[1], "the claim code in the Worker's log", TAIL_MS);
     console.log("Read the claim code from the Worker's log through wrangler tail");
     const response = await fetch(url + "/v1/claim", {

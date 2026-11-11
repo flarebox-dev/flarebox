@@ -1,6 +1,6 @@
 # Koidrive user guide
 
-Koidrive keeps folders in sync between your computers through a server that you deploy to your own Cloudflare account. File contents are stored as chunks in an R2 bucket in that account. A Durable Object for each space keeps its file tree, its trash and the old versions of its files. Koidrive is an independent project and is not affiliated with Cloudflare, Inc.
+Koidrive keeps folders in sync between your computers through a server that you deploy to your own Cloudflare account. File contents are stored as chunks in an R2 bucket in that account. A Durable Object for each space keeps its file tree, its trash and the old versions of its files.
 
 This guide covers the `koi` command on macOS and Linux, version 0.1.0.
 

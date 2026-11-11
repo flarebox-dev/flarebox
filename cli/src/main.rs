@@ -31,11 +31,7 @@ use tracing_subscriber::EnvFilter;
 use crate::ipc::{Request, Response};
 
 #[derive(Parser)]
-#[command(
-    name = "koi",
-    version,
-    about = "Koidrive sync client. Not affiliated with Cloudflare, Inc."
-)]
+#[command(name = "koi", version, about = "Koidrive sync client.")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,

@@ -1,6 +1,6 @@
 # Testing a deploy on a real account
 
-> Koidrive is not affiliated with Cloudflare, Inc. This guide is for maintainers; it is not part of the owner guide.
+> This guide is for maintainers; it is not part of the owner guide.
 
 The **Deploy test** workflow (`.github/workflows/deploy-test.yml`) deploys `server/` to a real Cloudflare account under a throwaway name, claims it, tests it over HTTPS or syncs a macOS and a Linux device through it, and deletes everything again. It covers what CI's dry run and local `wrangler dev` checks cannot (the real-deploy checklist in [design/deploy-and-upgrade.md](design/deploy-and-upgrade.md)): Durable Objects and R2 on Cloudflare's network, the claim code in the Worker's own log, point-in-time recovery for a rewind, and an upgrade over existing data. It runs only when started by hand from `main`, because it needs the account's API token, and only after you approve it.
 

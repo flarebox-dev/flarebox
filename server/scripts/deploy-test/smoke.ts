@@ -58,7 +58,7 @@ function seqName(seq: bigint): string {
 }
 
 describe("a server deployed to a real account", () => {
-  it("reports its owner, keeps the notice on /setup and refuses a second claim", async () => {
+  it("reports its owner and refuses a second claim", async () => {
     const info = await server.json("GET", "/v1/server", ServerInfoSchema);
     expect(info.claimed).toBe(true);
     expect(info.dataPath).toBe(ServerInfo_DataPath.RELAY);
@@ -66,7 +66,6 @@ describe("a server deployed to a real account", () => {
     const setup = await readBytes(await send(server.base + "/setup"));
     const text = new TextDecoder().decode(setup);
     expect(text).toContain("already has an owner");
-    expect(text).toContain("not affiliated with Cloudflare, Inc.");
     const second = await server.request("POST", "/v1/claim", { body: { code: "AAAA-BBBB-CCCC", userName: "Intruder", deviceName: "x", platform: "linux" } });
     expect(second.status).toBe(403);
     await readBytes(second);

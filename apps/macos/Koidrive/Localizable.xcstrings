@@ -226,7 +226,6 @@
     "Koidrive can't save its sync state" : {},
     "Koidrive can't start" : {},
     "Koidrive couldn't save this change, so it wasn't made: %@" : {},
-    "Koidrive is an independent project and is not affiliated with Cloudflare, Inc." : {},
     "Koidrive is holding these deletions instead of sending them, because they would make %@: %@ removing %@ from a folder of %@. Other changes keep syncing." : {
       "localizations" : {
         "en" : {
