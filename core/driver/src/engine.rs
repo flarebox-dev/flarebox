@@ -398,7 +398,11 @@ impl Engine {
     /// A node that held the name a change puts an entry at is gone from there, so it leaves L with everything under
     /// it. A file that arrives over a file keeps the node of the file it replaces when L's own node for the arriving
     /// file never synced, as when an editor saves by renaming a new file over the old one. The arriving node then
-    /// leaves L. A file whose content could not be read is left out until the observer reports it with its content.
+    /// leaves L. A new folder that arrives where L keeps a recorded folder ([`Trees::ignore_local`]) that R holds
+    /// live is that folder placed again: it keeps the folder's node, and what is recorded under it stays recorded, so
+    /// the server keeps it. A recorded folder R no longer holds live leaves L instead, and the new folder is a new
+    /// node, so it does not bring back a folder another device deleted. A file whose content could not be read is
+    /// left out until the observer reports it with its content.
     /// A rename to a path the rules exclude is a move out of what this device syncs: the node takes that position
     /// when its folder is in L or arrives in the batch, and keeps its entry otherwise ([`Trees::ignore_local`]); an
     /// entry L never held stays out.
@@ -725,10 +729,19 @@ impl Engine {
             let replaced = self.trees.local().get(&holder).map(|node| node.shape.kind);
             let synced =
                 self.trees.synced().get(&id).is_some() || self.trees.remote().get(&id).is_some();
+            let kept = self.trees.ignored_local().contains(&holder)
+                && self.trees.remote().live(&holder).is_some();
             if kind == Kind::File && replaced == Some(Kind::File) && !synced {
                 if self.trees.local().get(&id).is_some() {
                     self.remove(&id, moving, false, touched, gone);
                 }
+                id = holder;
+            } else if kind == Kind::Dir
+                && replaced == Some(Kind::Dir)
+                && kept
+                && !synced
+                && self.trees.local().get(&id).is_none()
+            {
                 id = holder;
             } else {
                 self.remove(&holder, moving, false, touched, gone);
