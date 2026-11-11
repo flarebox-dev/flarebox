@@ -737,6 +737,7 @@ impl SpaceDo {
         let mut state = self.state.clone();
         let ctx = Context {
             seq,
+            commit_id: &commit.commit_id,
             base_seq: commit.base_seq,
             now_ms,
             committer: session,

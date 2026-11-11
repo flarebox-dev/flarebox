@@ -872,6 +872,7 @@ export class SpaceDO extends DurableObject<Env> {
 
       const ctx: ApplyContext = {
         seq: head + 1,
+        commitId: commit.commitId,
         baseSeq: Number(commit.baseSeq),
         nowMs,
         committer: { deviceId: session.deviceId, userId: session.userId, deviceName: session.deviceName },

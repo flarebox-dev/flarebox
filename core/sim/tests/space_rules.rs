@@ -3,7 +3,7 @@
 //! The conflict rules of spec v0 section 6 on the reference Space DO, following the scenarios of the
 //! TypeScript server's tests (server/test/space-do.test.ts in koidrive#6).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use koidrive_engine::ids::IdGen;
 use koidrive_engine::names::conflict_name;
@@ -668,7 +668,16 @@ fn r7_trashes_a_whole_subtree_under_one_trash_group() {
     let dir = s.id();
     s.commit(&mut a, vec![mkdir(&dir, &root, "Old")], vec![]);
     let (file, _) = s.create_file(&mut a, &dir, "x", "x");
-    let result = s.commit(&mut a, vec![delete(&dir)], vec![]);
+    let commit_id = s.id();
+    let result = s
+        .commit_raw(
+            &a,
+            vec![delete(&dir)],
+            a.base_seq,
+            vec![],
+            Some(commit_id.clone()),
+        )
+        .unwrap();
     assert_eq!(codes(&result), [op_result::Code::Applied]);
     let mut ids: Vec<&str> = node_states(&result.changes)
         .map(|n| n.node_id.as_str())
@@ -677,13 +686,77 @@ fn r7_trashes_a_whole_subtree_under_one_trash_group() {
     let mut expected = [dir.as_str(), file.as_str()];
     expected.sort();
     assert_eq!(ids, expected);
-    assert!(
-        node_states(&result.changes).all(|n| n.trash_group == format!("{}:0", result.seq)
-            && n.status == NodeStatus::Trashed as i32)
-    );
+    assert!(node_states(&result.changes).all(
+        |n| n.trash_group == format!("{commit_id}:0") && n.status == NodeStatus::Trashed as i32
+    ));
     let again = s.commit(&mut a, vec![delete(&dir)], vec![]);
     assert_eq!(codes(&again), [op_result::Code::Applied]);
     assert!(again.changes.is_empty());
+}
+
+/// RFC 0012: each Delete of a commit takes the group `<commit_id>:<op index>`.
+#[test]
+fn deletes_in_one_commit_take_trash_groups_of_its_id() {
+    let mut s = Space::new();
+    let root = s.root();
+    let mut a = s.client("A");
+    let (first, second) = (s.id(), s.id());
+    s.commit(
+        &mut a,
+        vec![
+            mkdir(&first, &root, "First"),
+            mkdir(&second, &root, "Second"),
+        ],
+        vec![],
+    );
+    let commit_id = s.id();
+    let result = s
+        .commit_raw(
+            &a,
+            vec![delete(&first), delete(&second)],
+            a.base_seq,
+            vec![],
+            Some(commit_id.clone()),
+        )
+        .unwrap();
+    let groups: BTreeMap<&str, String> = node_states(&result.changes)
+        .map(|n| (n.node_id.as_str(), n.trash_group.clone()))
+        .collect();
+    assert_eq!(
+        groups,
+        BTreeMap::from([
+            (first.as_str(), format!("{commit_id}:0")),
+            (second.as_str(), format!("{commit_id}:1")),
+        ])
+    );
+}
+
+/// RFC 0012, GUN-404: a commit that takes the seq of a commit the server lost does not take the
+/// trash groups of its Deletes.
+#[test]
+fn a_delete_at_a_lost_seq_takes_another_trash_group() {
+    let mut s = Space::new();
+    let root = s.root();
+    let mut a = s.client("A");
+    let dir = s.id();
+    s.commit(&mut a, vec![mkdir(&dir, &root, "Dir")], vec![]);
+    let backup = s.space.clone();
+    let lost = s
+        .commit_raw(&a, vec![delete(&dir)], a.base_seq, vec![], None)
+        .unwrap();
+    s.space.restore(&backup);
+    let again = s
+        .commit_raw(&a, vec![delete(&dir)], a.base_seq, vec![], None)
+        .unwrap();
+    assert_eq!(again.seq, lost.seq);
+    let group = |result: &CommitResult| {
+        node_states(&result.changes)
+            .next()
+            .unwrap()
+            .trash_group
+            .clone()
+    };
+    assert_ne!(group(&again), group(&lost));
 }
 
 #[test]

@@ -33,8 +33,12 @@
 //! several.
 //!
 //! The model below keeps this over the server's truth, where each Delete op has an ID no other op
-//! shares, also after a rollback reuses its seq. The engine sees only R, and the test fails when
-//! the notice it shows differs from the model's after any event.
+//! shares, also after a loss gives its seq to another commit. Only a resend of the lost commit
+//! applies the same Delete again. The server names a trash group after the commit (RFC 0012), so
+//! the engine's group stands for that ID; [`Groups::Seq`] names it after the seq as before, for
+//! the witnesses of a loss. The engine sees only R, and the test fails when the notice it shows
+//! differs from the model's after any event. A loss counts for the model once this device lists R
+//! again, as it does for the engine.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -82,8 +86,13 @@ enum Event {
     /// The log was truncated: R is listed again with the trash, as the driver does once the
     /// folder has synced.
     Bootstrap,
-    /// The server lost its last commit, and this device lists R again.
-    Rollback,
+    /// The server lost its last commit. This device does not know yet: it keeps R and the
+    /// server's head stays below its `last_seq`, so the next [`Event::Bootstrap`] lists R again
+    /// (`AHEAD_OF_SERVER`, design section 4.4).
+    Lose,
+    /// The device whose Delete the server lost sends that commit again, with the same commit ID,
+    /// and the server applies it again.
+    Resend,
     /// The engine restarts from its stored state.
     Restart,
 }
@@ -102,12 +111,42 @@ struct ServerNode {
     meta_rev: u64,
 }
 
+/// A Delete op the server applied: its target, what it kept, and its ID.
+#[derive(Clone, Debug, Hash)]
+struct Deleted {
+    target: &'static str,
+    kept: BTreeSet<String>,
+    deletion: u64,
+}
+
+/// The state before a commit, for a loss, and the Delete it applied, if any.
+#[derive(Clone, Debug)]
+struct Undo {
+    seq: u64,
+    nodes: BTreeMap<String, ServerNode>,
+    delete: Option<Deleted>,
+}
+
+type Nodes = BTreeMap<String, ServerNode>;
+
+/// Purged nodes, with their kind and the deletion that trashed them.
+type Purged = BTreeMap<String, (Kind, u64)>;
+
 #[derive(Clone, Debug, Default)]
 struct Server {
     seq: u64,
-    nodes: BTreeMap<String, ServerNode>,
-    /// The state before each commit, for a rollback.
-    before: Vec<(u64, BTreeMap<String, ServerNode>)>,
+    nodes: Nodes,
+    before: Vec<Undo>,
+}
+
+/// How the server names a trash group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Groups {
+    /// `<commit_id>:<op index>` (RFC 0012). Each Delete is one commit, so the commit ID is the
+    /// Delete's ID, and a resend keeps it.
+    Commit,
+    /// `<seq>:<op index>`, as before RFC 0012: a commit that takes a lost seq takes its groups.
+    Seq,
 }
 
 /// The model: the deletions the window counts, with the time of their last removal and their
@@ -122,9 +161,15 @@ struct Model {
 #[derive(Clone)]
 struct World {
     server: Server,
+    groups: Groups,
     next_deletion: u64,
+    /// The Deletes the server lost, the last one last.
+    lost: Vec<Deleted>,
+    /// While the server is behind this device: the server's nodes and purged nodes as this
+    /// device last saw them.
+    seen: Option<(Nodes, Purged)>,
     /// The purged nodes, with their kind and the deletion that trashed them.
-    purged: BTreeMap<String, (Kind, u64)>,
+    purged: Purged,
     trees: Trees,
     commits: Commits,
     ids: IdGen,
@@ -154,7 +199,7 @@ fn below(id: &str, top: &str) -> bool {
 impl World {
     /// The space `root`: the files `a0` to `a9`, the folder `p` with the files `p/q0` to
     /// `p/q5`, and the folder `p/f` with the files `p/f/g0` to `p/f/g39`, 56 files.
-    fn new() -> Self {
+    fn new(groups: Groups) -> Self {
         let mut nodes = vec![
             ("p".to_owned(), shape(ROOT, "p", Kind::Dir)),
             ("p/f".to_owned(), shape("p", "f", Kind::Dir)),
@@ -172,7 +217,10 @@ impl World {
                 seq: 1,
                 ..Server::default()
             },
+            groups,
             next_deletion: 1,
+            lost: Vec::new(),
+            seen: None,
             purged: BTreeMap::new(),
             trees: Trees::new(ROOT),
             commits: Commits::default(),
@@ -202,7 +250,8 @@ impl World {
 
     fn enabled(&self) -> Vec<Event> {
         let mut events = Vec::new();
-        for target in TARGETS {
+        let commits = self.seen.is_none() || self.server.seq + 1 < self.last_seq;
+        for target in TARGETS.into_iter().filter(|_| commits) {
             match self
                 .server
                 .nodes
@@ -228,7 +277,7 @@ impl World {
                 None => {}
             }
         }
-        for member in MEMBERS {
+        for member in MEMBERS.into_iter().filter(|_| commits) {
             if (self.server.nodes.get(member)).is_some_and(|node| node.trash.is_some()) {
                 events.push(Event::Restore(member));
             }
@@ -236,13 +285,19 @@ impl World {
         if (Effects::default().plan(&self.trees, &mut self.ids.clone(), self.now)).is_some() {
             events.extend([Event::Step, Event::StepAll]);
         }
-        events.extend([Event::Commit, Event::Pause]);
+        if commits {
+            events.push(Event::Commit);
+            if !self.lost.is_empty() {
+                events.push(Event::Resend);
+            }
+        }
+        events.push(Event::Pause);
         if self.notice().is_some() {
             events.push(Event::Dismiss);
         }
         events.push(Event::Bootstrap);
         if !self.server.before.is_empty() {
-            events.push(Event::Rollback);
+            events.push(Event::Lose);
         }
         events.push(Event::Restart);
         events
@@ -250,7 +305,15 @@ impl World {
 
     fn apply(&mut self, event: Event) {
         match event {
-            Event::Delete(target) => self.delete(target, BTreeSet::new()),
+            Event::Delete(target) => {
+                let deletion = self.next_deletion;
+                self.next_deletion += 1;
+                self.delete(Deleted {
+                    target,
+                    kept: BTreeSet::new(),
+                    deletion,
+                });
+            }
             Event::DeleteUnseen(target) => {
                 let nodes = &self.server.nodes;
                 let edited = (nodes.iter()).find(|(id, node)| {
@@ -262,7 +325,13 @@ impl World {
                     id = Some(nodes[&node].shape.parent.clone());
                     kept.insert(node);
                 }
-                self.delete(target, kept);
+                let deletion = self.next_deletion;
+                self.next_deletion += 1;
+                self.delete(Deleted {
+                    target,
+                    kept,
+                    deletion,
+                });
             }
             Event::Restore(target) => {
                 let changed = self.commit(|server| {
@@ -302,13 +371,20 @@ impl World {
                 model.notice = None;
             }
             Event::Bootstrap => self.bootstrap(),
-            Event::Rollback => {
-                let (seq, nodes) = self.server.before.pop().unwrap();
-                self.server.seq = seq;
-                self.server.nodes = nodes;
+            Event::Lose => {
+                if self.seen.is_none() {
+                    self.seen = Some((self.server.nodes.clone(), self.purged.clone()));
+                }
+                let undo = self.server.before.pop().unwrap();
+                self.server.seq = undo.seq;
+                self.server.nodes = undo.nodes;
+                self.lost.extend(undo.delete);
                 let server = &self.server;
                 self.purged.retain(|id, _| !server.nodes.contains_key(id));
-                self.bootstrap();
+            }
+            Event::Resend => {
+                let deleted = self.lost.pop().unwrap();
+                self.delete(deleted);
             }
             Event::Restart => {
                 self.commits = Commits::from_state(self.commits.state()).unwrap();
@@ -341,15 +417,20 @@ impl World {
             .collect()
     }
 
-    /// Another device deletes `target`, and the server keeps `kept`.
-    fn delete(&mut self, target: &str, kept: BTreeSet<String>) {
-        let deletion = self.next_deletion;
-        self.next_deletion += 1;
+    /// Another device's Delete: the server trashes `target` and keeps `kept`.
+    fn delete(&mut self, deleted: Deleted) {
+        let Deleted {
+            target,
+            ref kept,
+            deletion,
+        } = deleted;
+        let groups = self.groups;
         let changed = self.commit(|server| {
-            let trash = Trash {
-                group: format!("{}:0", server.seq),
-                deletion,
+            let group = match groups {
+                Groups::Commit => format!("c{deletion}:0"),
+                Groups::Seq => format!("{}:0", server.seq),
             };
+            let trash = Trash { group, deletion };
             let mut changed = Vec::new();
             for (id, node) in &mut server.nodes {
                 if below(id, target) && node.trash.is_none() && !kept.contains(id) {
@@ -360,18 +441,26 @@ impl World {
             }
             changed
         });
+        self.server.before.last_mut().unwrap().delete = Some(deleted);
         self.pull(changed);
     }
 
     fn commit<T>(&mut self, change: impl FnOnce(&mut Server) -> T) -> T {
         let server = &mut self.server;
-        server.before.push((server.seq, server.nodes.clone()));
+        server.before.push(Undo {
+            seq: server.seq,
+            nodes: server.nodes.clone(),
+            delete: None,
+        });
         server.seq += 1;
         change(server)
     }
 
-    /// R takes the changes of the commits since `last_seq`.
+    /// R takes the changes of the commits since `last_seq`, unless the server is behind it.
     fn pull(&mut self, changed: Vec<String>) {
+        if self.seen.is_some() {
+            return;
+        }
         for id in changed {
             match self.server.nodes.get(&id) {
                 Some(node) => self.trees.set_remote(id, remote(node)),
@@ -395,6 +484,7 @@ impl World {
         }
         self.trees.settle();
         self.last_seq = self.server.seq;
+        self.seen = None;
     }
 
     fn step(&mut self, limit: usize) {
@@ -448,19 +538,30 @@ impl World {
         }
     }
 
+    /// The server's nodes and purged nodes as this device knows them: a loss counts only once
+    /// this device lists R again.
+    fn known(&self) -> (&Nodes, &Purged) {
+        match &self.seen {
+            Some((nodes, purged)) => (nodes, purged),
+            None => (&self.server.nodes, &self.purged),
+        }
+    }
+
     /// The deletions the server holds: those whose nodes it has not restored or lost.
     fn trashing(&self) -> BTreeSet<u64> {
-        (self.server.nodes.values())
+        let (nodes, purged) = self.known();
+        (nodes.values())
             .filter_map(|node| node.trash.as_ref().map(|trash| trash.deletion))
-            .chain(self.purged.values().map(|(_, deletion)| *deletion))
+            .chain(purged.values().map(|(_, deletion)| *deletion))
             .collect()
     }
 
     /// The kind of a node the server trashed, and the deletion that trashed it.
     fn truth(&self, id: &str) -> Option<(Kind, u64)> {
-        match self.server.nodes.get(id) {
+        let (nodes, purged) = self.known();
+        match nodes.get(id) {
             Some(node) => (node.trash.as_ref()).map(|trash| (node.shape.kind, trash.deletion)),
-            None => self.purged.get(id).copied(),
+            None => purged.get(id).copied(),
         }
     }
 
@@ -506,9 +607,10 @@ impl World {
     fn key(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
         self.model.hash(&mut hasher);
-        (self.now, self.last_seq, self.next_deletion).hash(&mut hasher);
+        (self.now, self.last_seq, self.next_deletion, &self.lost).hash(&mut hasher);
         let state = (
             &self.server,
+            &self.seen,
             &self.purged,
             &self.trees,
             self.commits.state(),
@@ -645,9 +747,9 @@ fn the_notice_follows_the_model_over_every_short_sequence_of_events() {
     let depth = (std::env::var("GUARD_MODEL_DEPTH").ok()).map_or(5, |depth| depth.parse().unwrap());
     for depth in 1..=depth {
         let (mut seen, mut failures) = (HashMap::new(), Vec::new());
-        seen.insert(World::new().key(), depth);
+        seen.insert(World::new(Groups::Commit).key(), depth);
         explore(
-            &World::new(),
+            &World::new(Groups::Commit),
             &mut Vec::new(),
             depth,
             &mut seen,
@@ -679,19 +781,25 @@ fn witness(events: &[Event]) -> Option<(u64, u64, u64)> {
 
 /// Runs `events`, each compared with the model, and returns the world they leave.
 fn run(events: &[Event]) -> World {
-    let mut world = World::new();
+    try_run(Groups::Commit, events).unwrap_or_else(|error| panic!("{error}"))
+}
+
+/// Runs `events` with trash groups named by `groups`, and returns the world they leave, or the
+/// first difference from the model.
+fn try_run(groups: Groups, events: &[Event]) -> Result<World, String> {
+    let mut world = World::new(groups);
     for (index, event) in events.iter().enumerate() {
         assert!(world.enabled().contains(event), "{event:?} at {index}");
         world.apply(*event);
-        if let Err(error) = world.check() {
-            panic!("{:?}: {error}", &events[..=index]);
-        }
+        world
+            .check()
+            .map_err(|error| format!("{:?}: {error}", &events[..=index]))?;
     }
-    world
+    Ok(world)
 }
 
 use Event::{
-    Bootstrap, Commit, Delete, DeleteUnseen, Dismiss, Pause, Restore, Rollback, Step, StepAll,
+    Bootstrap, Commit, Delete, DeleteUnseen, Dismiss, Lose, Pause, Resend, Restore, Step, StepAll,
 };
 
 /// Removals until the notice about `p/f` opens, 29 of its 40 files, and the dismissal.
@@ -763,7 +871,8 @@ fn witness_a_dismissal_without_the_record_then_a_rollback() {
         Step,
         Dismiss,
         Commit,
-        Rollback,
+        Lose,
+        Bootstrap,
         StepAll,
     ];
     assert_eq!(witness(&events), None);
@@ -845,6 +954,116 @@ fn witness_one_file_restored_from_a_dismissed_delete() {
         Dismiss,
         Restore("p/f/g1"),
         Delete("p"),
+        StepAll,
+    ];
+    assert_eq!(witness(&events), None);
+}
+
+/// Runs `events`, which reach a Delete that takes the seq of a lost one, and checks the notice
+/// at the end. With trash groups named after the seq, the new Delete takes the lost one's group,
+/// and the engine's notice differs from the model's.
+fn witness_across_a_loss(events: &[Event], notice: Option<(u64, u64, u64)>) {
+    assert_eq!(witness(events), notice);
+    assert!(
+        try_run(Groups::Seq, events).is_err(),
+        "with groups named after the seq, the engine follows the model"
+    );
+}
+
+/// GUN-404: `p` is dismissed part way through its removal, the server loses that Delete and the
+/// commit after it, and another Delete of `p` takes the lost seq. The new Delete is noticed for
+/// the 17 files L still holds.
+#[test]
+fn witness_a_dismissed_folder_deleted_again_at_a_lost_seq() {
+    let events = [
+        Delete("p"),
+        Step,
+        Step,
+        Step,
+        Dismiss,
+        Commit,
+        Lose,
+        Lose,
+        Delete("p"),
+        Bootstrap,
+        StepAll,
+        StepAll,
+    ];
+    witness_across_a_loss(&events, Some((1, 17, 27)));
+}
+
+/// GUN-404: as above with `p/f` dismissed and `p` deleted at the lost seq, so the new Delete is
+/// of another folder.
+#[test]
+fn witness_a_folder_above_a_dismissed_one_deleted_at_a_lost_seq() {
+    let events = [
+        Delete("p/f"),
+        Step,
+        Step,
+        Step,
+        Dismiss,
+        Commit,
+        Lose,
+        Lose,
+        Delete("p"),
+        Bootstrap,
+        StepAll,
+        StepAll,
+    ];
+    witness_across_a_loss(&events, Some((1, 17, 27)));
+}
+
+/// GUN-404: 10 files of `p` are removed, below the limits, and the server loses that Delete. The
+/// lost Delete ends once R is listed again, so the new Delete of `p` counts only its own 36
+/// files. With the lost group, the two are one deletion of 46 files.
+#[test]
+fn witness_a_counted_folder_deleted_again_at_a_lost_seq() {
+    let events = [
+        Delete("p"),
+        Step,
+        Commit,
+        Lose,
+        Lose,
+        Delete("p"),
+        Bootstrap,
+        StepAll,
+        StepAll,
+    ];
+    witness_across_a_loss(&events, Some((1, 36, 46)));
+}
+
+/// GUN-404: as above with 10 files of `p/f` removed and `p` deleted at the lost seq.
+#[test]
+fn witness_a_folder_above_a_counted_one_deleted_at_a_lost_seq() {
+    let events = [
+        Delete("p/f"),
+        Step,
+        Commit,
+        Lose,
+        Lose,
+        Delete("p"),
+        Bootstrap,
+        StepAll,
+        StepAll,
+    ];
+    witness_across_a_loss(&events, Some((1, 36, 46)));
+}
+
+/// GUN-404, RFC 0012: the server loses a dismissed Delete, and its device sends the commit again
+/// with the same commit ID. The Delete keeps its group, so it stays dismissed.
+#[test]
+fn witness_a_dismissed_delete_sent_again_after_a_loss() {
+    let events = [
+        Delete("p"),
+        Step,
+        Step,
+        Step,
+        Dismiss,
+        Commit,
+        Lose,
+        Lose,
+        Resend,
+        Bootstrap,
         StepAll,
     ];
     assert_eq!(witness(&events), None);

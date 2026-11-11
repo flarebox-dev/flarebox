@@ -17,6 +17,8 @@ pub const MAX_DEPTH: usize = 256;
 
 pub(super) struct Context<'a> {
     pub seq: u64,
+    /// The commit's ID, which names the trash groups of its deletes (RFC 0012).
+    pub commit_id: &'a str,
     pub base_seq: u64,
     pub now_ms: i64,
     pub committer: &'a Session,
@@ -628,7 +630,7 @@ impl<'a> Applier<'a> {
         if node.status == NodeStatus::Trashed {
             return result(op_result::Code::Applied, "", "");
         }
-        let kept = self.trash_subtree(&node, &format!("{}:{index}", self.ctx.seq));
+        let kept = self.trash_subtree(&node, &format!("{}:{index}", self.ctx.commit_id));
         result(
             if kept {
                 op_result::Code::Superseded
