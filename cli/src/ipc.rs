@@ -173,7 +173,8 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
             format!("{} {reason}", dir.display()),
         )
     };
-    if metadata.uid() != rustix::process::getuid().as_raw() {
+    let uid = rustix::process::getuid().as_raw();
+    if metadata.uid() != uid {
         return Err(refuse("belongs to another user".to_owned()));
     }
     let mode = metadata.mode() & 0o7777;
@@ -182,6 +183,12 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
             "is open to other users (mode {mode:o}); make it 0700"
         )));
     }
+    #[cfg(target_os = "macos")]
+    if acl_allows_others(dir, uid)? {
+        return Err(refuse(
+            "lets other users in through an ACL; remove it with chmod -N".to_owned(),
+        ));
+    }
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let temp = dir.join(format!(".{name}.new"));
     match fs::remove_file(&temp) {
@@ -189,10 +196,94 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    let listener = UnixListener::bind(&temp)?;
+    let listener = bind_socket(&temp)?;
     fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))?;
     fs::rename(&temp, path)?;
-    Ok(listener)
+    listener.set_nonblocking(true)?;
+    UnixListener::from_std(listener)
+}
+
+/// Creates the socket 0600 before binding it, so it is closed to other users from its first moment even if the
+/// directory was swapped after it was checked. Linux takes the new file's mode from the socket; macOS ignores it.
+#[cfg(target_os = "linux")]
+fn bind_socket(path: &Path) -> io::Result<std::os::unix::net::UnixListener> {
+    use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+    let socket = rustix::net::socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC,
+        None,
+    )?;
+    rustix::fs::fchmod(&socket, rustix::fs::Mode::from_raw_mode(0o600))?;
+    rustix::net::bind(&socket, &SocketAddrUnix::new(path)?)?;
+    rustix::net::listen(&socket, 1024)?;
+    Ok(socket.into())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bind_socket(path: &Path) -> io::Result<std::os::unix::net::UnixListener> {
+    std::os::unix::net::UnixListener::bind(path)
+}
+
+/// Whether the extended ACL of `dir` has an allow entry for anyone but `owner`. Such an entry grants access the mode
+/// bits do not show, and an inheritable one is copied onto the socket. Deny entries only take access away.
+#[cfg(target_os = "macos")]
+fn acl_allows_others(dir: &Path, owner: u32) -> io::Result<bool> {
+    use std::ffi::{CString, c_char, c_int, c_void};
+    use std::os::unix::ffi::OsStrExt;
+
+    const ACL_TYPE_EXTENDED: c_int = 0x100;
+    const ACL_FIRST_ENTRY: c_int = 0;
+    const ACL_NEXT_ENTRY: c_int = -1;
+    const ACL_EXTENDED_ALLOW: c_int = 1;
+    const ID_TYPE_UID: c_int = 0;
+    unsafe extern "C" {
+        fn acl_get_file(path: *const c_char, kind: c_int) -> *mut c_void;
+        fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry: *mut *mut c_void) -> c_int;
+        fn acl_get_tag_type(entry: *mut c_void, tag: *mut c_int) -> c_int;
+        fn acl_get_qualifier(entry: *mut c_void) -> *mut c_void;
+        fn acl_free(object: *mut c_void) -> c_int;
+        fn mbr_uuid_to_id(uuid: *const u8, id: *mut u32, id_type: *mut c_int) -> c_int;
+    }
+
+    let path = CString::new(dir.as_os_str().as_bytes())?;
+    // SAFETY: `path` is a valid C string for the duration of the call.
+    let acl = unsafe { acl_get_file(path.as_ptr(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let error = io::Error::last_os_error();
+        return match error.kind() {
+            io::ErrorKind::NotFound => Ok(false),
+            _ => Err(error),
+        };
+    }
+    let mut allows_others = false;
+    let mut entry = std::ptr::null_mut();
+    let mut which = ACL_FIRST_ENTRY;
+    // SAFETY: `acl` is a live ACL from acl_get_file, `entry` points into it, and each qualifier is freed once.
+    unsafe {
+        while acl_get_entry(acl, which, &mut entry) == 0 {
+            which = ACL_NEXT_ENTRY;
+            let mut tag = 0;
+            if acl_get_tag_type(entry, &mut tag) == 0 && tag != ACL_EXTENDED_ALLOW {
+                continue;
+            }
+            let qualifier = acl_get_qualifier(entry);
+            let (mut id, mut id_type) = (0, -1);
+            let owner_only = !qualifier.is_null()
+                && mbr_uuid_to_id(qualifier.cast(), &mut id, &mut id_type) == 0
+                && id_type == ID_TYPE_UID
+                && id == owner;
+            if !qualifier.is_null() {
+                acl_free(qualifier);
+            }
+            if !owner_only {
+                allows_others = true;
+                break;
+            }
+        }
+        acl_free(acl);
+    }
+    Ok(allows_others)
 }
 
 /// Serves requests until the task is dropped.
@@ -362,23 +453,33 @@ mod tests {
         let socket = dir.path().join("run/daemon.sock");
         let stop = Arc::new(AtomicBool::new(false));
         let watcher = std::thread::spawn({
-            let socket = socket.clone();
+            let run = dir.path().join("run");
             let stop = stop.clone();
             move || {
-                let mut modes = BTreeSet::new();
+                let (mut at_socket, mut anywhere) = (BTreeSet::new(), BTreeSet::new());
                 while !stop.load(Ordering::Relaxed) {
-                    if let Ok(metadata) = fs::symlink_metadata(&socket) {
-                        modes.insert(metadata.permissions().mode() & 0o777);
+                    for entry in fs::read_dir(&run).into_iter().flatten().flatten() {
+                        if let Ok(metadata) = entry.metadata() {
+                            let mode = metadata.permissions().mode() & 0o777;
+                            if entry.file_name() == "daemon.sock" {
+                                at_socket.insert(mode);
+                            }
+                            anywhere.insert(mode);
+                        }
                     }
                 }
-                modes
+                (at_socket, anywhere)
             }
         });
         for _ in 0..200 {
             drop(bind(&socket).unwrap());
         }
         stop.store(true, Ordering::Relaxed);
-        assert_eq!(watcher.join().unwrap(), BTreeSet::from([0o600]));
+        let (at_socket, anywhere) = watcher.join().unwrap();
+        assert_eq!(at_socket, BTreeSet::from([0o600]));
+        if cfg!(target_os = "linux") {
+            assert_eq!(anywhere, BTreeSet::from([0o600]));
+        }
         let names: Vec<_> = fs::read_dir(dir.path().join("run"))
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
@@ -415,6 +516,65 @@ mod tests {
             error.to_string().contains("belongs to another user"),
             "{error}"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn add_acl_entries(dir: &Path, entries: &[&str]) {
+        for entry in entries {
+            let status = std::process::Command::new("/bin/chmod")
+                .arg("+a")
+                .arg(entry)
+                .arg(dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "chmod +a {entry:?}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_directory_whose_acl_lets_everyone_in_gets_no_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        DirBuilder::new().mode(0o700).create(&run).unwrap();
+        add_acl_entries(
+            &run,
+            &[
+                "everyone allow list,search",
+                "everyone allow read,write,append,file_inherit,only_inherit",
+            ],
+        );
+        let error = bind(&run.join("daemon.sock")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("through an ACL"), "{error}");
+        assert_eq!(fs::read_dir(&run).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_directory_whose_acl_only_denies_or_allows_the_owner_gets_the_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        DirBuilder::new().mode(0o700).create(&run).unwrap();
+        let user = std::process::Command::new("/usr/bin/id")
+            .arg("-un")
+            .output()
+            .unwrap()
+            .stdout;
+        let user = String::from_utf8(user).unwrap();
+        add_acl_entries(
+            &run,
+            &[
+                "everyone deny delete",
+                &format!("user:{} allow list,search", user.trim()),
+            ],
+        );
+        let socket = run.join("daemon.sock");
+        let listener = bind(&socket).unwrap();
+        let mode = fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _client = UnixStream::connect(&socket).await.unwrap();
+        listener.accept().await.unwrap();
     }
 
     #[test]
