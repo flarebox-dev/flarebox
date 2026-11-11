@@ -1219,15 +1219,20 @@ fn diff(old: &BTreeMap<PathBuf, Entry>, new: &BTreeMap<PathBuf, Entry>) -> Vec<C
         })
         .map(|(_, before)| before.id)
         .collect();
+    let dirs: HashSet<FileId> = (new.values())
+        .filter(|after| after.kind == EntryKind::Dir)
+        .map(|after| after.id)
+        .collect();
     let same = |path: &Path, before: &Entry, after: &Entry| {
         after.kind == before.kind
             && !(after.kind == EntryKind::Dir
                 && after.id != before.id
                 && moved.contains(&after.id)
-                && !old
-                    .range(path.to_path_buf()..)
-                    .nth(1)
-                    .is_some_and(|(inside, _)| inside.starts_with(path)))
+                && (dirs.contains(&before.id)
+                    || !old
+                        .range(path.to_path_buf()..)
+                        .nth(1)
+                        .is_some_and(|(inside, _)| inside.starts_with(path))))
     };
     let mut removed: BTreeMap<&Path, &Entry> = BTreeMap::new();
     let mut created: Vec<(&Path, &Entry)> = Vec::new();

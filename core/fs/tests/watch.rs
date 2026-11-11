@@ -939,3 +939,32 @@ fn a_folder_on_another_device_number_is_not_replaced() {
         assert_eq!(snapshot, scanned, "inode moved by {ino}");
     }
 }
+
+/// A folder moved onto the path of a folder that moved elsewhere in the same
+/// rescan, as in a rotation through a third name, is a rename, although the
+/// folder that held the path held entries.
+#[test]
+fn a_folder_moved_onto_the_path_of_a_folder_that_moved_away_is_renamed_onto_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("a"), "a").unwrap();
+    fs::create_dir(root.join("b")).unwrap();
+    fs::write(root.join("b/one"), "one").unwrap();
+    fs::create_dir(root.join("c")).unwrap();
+    fs::write(root.join("c/two"), "two").unwrap();
+    let mut snapshot = Snapshot::scan(root).unwrap();
+
+    for (from, to) in [("a", "tmp"), ("c", "a"), ("b", "c"), ("tmp", "b")] {
+        fs::rename(root.join(from), root.join(to)).unwrap();
+    }
+    let changes = snapshot.rescan(root, [PathBuf::new()]).unwrap().changes;
+    assert_eq!(
+        changes,
+        [
+            renamed("a", "b", File),
+            renamed("b", "c", Dir),
+            renamed("c", "a", Dir)
+        ]
+    );
+    assert_eq!(snapshot, Snapshot::scan(root).unwrap());
+}
