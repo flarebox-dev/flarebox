@@ -131,6 +131,7 @@ pub async fn setup(paths: &Paths, device_name: &str, login: &LoginArgs) -> Resul
     println!("  2. Enter a pairing code from another device");
     match prompt("Choose 1 or 2: ").await?.as_str() {
         "1" => {
+            bundled()?;
             with_session(login, async |session| {
                 session.setup(paths, device_name).await
             })
@@ -155,6 +156,7 @@ pub async fn server(paths: &Paths, action: ServerAction) -> Result<(), String> {
     match action {
         ServerAction::Deploy { device, login } => {
             not_set_up(paths)?;
+            bundled()?;
             let name = device.name();
             with_session(&login, async |session| {
                 session.server_deploy(paths, &name).await
@@ -167,6 +169,7 @@ pub async fn server(paths: &Paths, action: ServerAction) -> Result<(), String> {
             login,
         } => {
             not_set_up(paths)?;
+            bundled()?;
             let name = device.name();
             with_session(&login, async |session| {
                 session
@@ -177,6 +180,7 @@ pub async fn server(paths: &Paths, action: ServerAction) -> Result<(), String> {
         }
         ServerAction::Claim { .. } => unreachable!("main sends a claim to the driver"),
         ServerAction::Upgrade { server, yes, login } => {
+            bundled()?;
             with_session(&login, async |session| {
                 let found = session.pick(server.as_deref()).await?;
                 session.upgrade(&found, yes).await
@@ -190,6 +194,12 @@ pub async fn server(paths: &Paths, action: ServerAction) -> Result<(), String> {
             yes,
             login,
         } => {
+            let resuming = StateFile::new(paths)
+                .load()?
+                .is_some_and(|state| state.step == Step::Uninstalling);
+            if bucket.is_none() && !resuming {
+                bundled()?;
+            }
             with_session(&login, async |session| {
                 session
                     .uninstall(
@@ -1059,12 +1069,19 @@ impl Session {
     }
 }
 
+/// Fails when this koi has no embedded server bundle. The commands that find, deploy or upgrade a server call it before
+/// the Cloudflare login, so that nobody authorizes a login that cannot be used.
+fn bundled() -> Result<(), String> {
+    if SERVER_BUNDLE.is_empty() {
+        return Err("this koi was built without a server bundle, so it cannot find, deploy or upgrade a server; build it with KOIDRIVE_SERVER_BUNDLE as docs/guide/install.md describes".into());
+    }
+    Ok(())
+}
+
 /// The embedded server bundle, read through [`Bundle::from_dir`] from a private copy, so the release's bundle passes the
 /// same checks as one on disk.
 fn embedded_bundle() -> Result<Bundle, String> {
-    if SERVER_BUNDLE.is_empty() {
-        return Err("this koi was built without a server bundle; install a release build to deploy or upgrade a server".into());
-    }
+    bundled()?;
     let broken =
         |error: &dyn std::fmt::Display| format!("this koi's server bundle is broken: {error}");
     let dir =
