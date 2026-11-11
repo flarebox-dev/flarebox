@@ -39,6 +39,15 @@ reject() {
     pass "$1"
 }
 
+sed '$d' "$root/install.sh" | HOME="$tmp/truncated" sh -s -- --no-systemd
+[ ! -e "$tmp/truncated" ]
+if head -n 60 "$root/install.sh" | HOME="$tmp/truncated" sh -s -- --no-systemd > "$tmp/truncated.log" 2>&1; then
+    printf 'Expected a truncated function body to fail parsing\n' >&2
+    exit 1
+fi
+[ ! -e "$tmp/truncated" ]
+pass 'truncated download does not install anything'
+
 cat "$root/install.sh" | sh -s -- --no-systemd > "$tmp/install.log" 2>&1
 cat "$tmp/install.log"
 grep -q 'not on PATH' "$tmp/install.log"
@@ -87,7 +96,7 @@ EOF
     [ ! -e "$tmp/no-tty/systemd/user/flarebox.service" ]
     [ "$(wc -l < "$HOME/systemctl.log" | tr -d ' ')" = 1 ]
     pass 'noninteractive default does not install or start the service'
-    printf 'Passed 12 installer tests on %s\n' "$(uname -s)"
+    printf 'Passed 13 installer tests on %s\n' "$(uname -s)"
 else
-    printf 'Passed 10 installer tests on %s\n' "$(uname -s)"
+    printf 'Passed 11 installer tests on %s\n' "$(uname -s)"
 fi

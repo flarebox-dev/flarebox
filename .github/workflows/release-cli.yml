@@ -239,6 +239,7 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --verify-tag --title "$TAG" --notes 'Flarebox CLI for Linux and macOS. See docs/guide/install.md for installation.'
+            gh release create "$TAG" --draft --verify-tag --title "$TAG" --notes 'Flarebox CLI for Linux and macOS. See docs/guide/install.md for installation.'
           fi
           gh release upload "$TAG" dist/* --clobber
+          gh release edit "$TAG" --draft=false
