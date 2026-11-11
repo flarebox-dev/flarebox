@@ -276,7 +276,8 @@ impl Commits {
     }
 
     /// Lifts a policy halt the way a person chose. With [`Lift::Resend`] the commit in flight
-    /// stays, and the next `Welcome` that accounts for its slot sends it again (section 2.8). With
+    /// stays, and the next `Welcome` that accounts for its slot sends it again (section 2.8); a
+    /// server loss under the halt has already dropped it, and its changes are planned again. With
     /// [`Lift::Replan`] it is forgotten, and its restores stay queued for the next commit, as when
     /// a refusal forgets a commit. Nothing else changes.
     pub fn lift(&mut self, lift: Lift) -> Result<(), LiftError> {
@@ -900,13 +901,13 @@ impl Commits {
     /// commits it had accepted, since its counter only grows and the store learns a slot only from
     /// its result: *a* takes *w*, and the commit in flight is dropped, its restores staying queued,
     /// so that its changes are planned again once R is listed again. Any other *w*, or a commit
-    /// built in another history, starts recovery. A read-only device resends nothing, and a
-    /// device under a policy halt resends nothing whatever the `Welcome` says. With *w* < *a* the
-    /// slots above *w* are forgotten in every case, a policy halt included: the server does not hold
-    /// those commits, so [`Commits::held_through`] must not count them for a listing taken under the
-    /// halt. Under that halt *w* < *a* still gives [`Reconnect::AheadOfServer`], so that R is
-    /// listed again, but *a* and the refused commit stay. Whether R itself
-    /// belongs to the `Welcome`'s history is checked where R is kept.
+    /// built in another history, starts recovery. A read-only device resends nothing. A device
+    /// under a policy halt resends nothing whatever the `Welcome` says, but *w* < *a* is a loss
+    /// there too: *a* takes *w*, the refused commit is dropped, since its slot is no longer the one
+    /// after the server's count, and R is listed again, while the halt stays. The slots above *w*
+    /// are forgotten with every loss, so that [`Commits::held_through`] does not count commits the
+    /// server lost, and a later `Welcome` finds *w* = *a*, so a loss is handled once. Whether R
+    /// itself belongs to the `Welcome`'s history is checked where R is kept.
     ///
     /// Recovery keeps the queued restores with the commit in flight: nothing is built under that
     /// halt, so none is sent again or planned again, and each stays as the request it was
@@ -914,17 +915,10 @@ impl Commits {
     /// rejected.
     pub fn connected(&mut self, welcome: &proto::Welcome) -> Reconnect {
         let (a, w) = (self.accepted, welcome.device_seq);
-        if w < a {
-            self.slots.split_off(&(w + 1));
-        }
-        if matches!(self.halted, Some(Halt::Policy { .. })) {
-            return if w < a {
-                Reconnect::AheadOfServer
-            } else {
-                Reconnect::Idle
-            };
-        }
+        let policy = matches!(self.halted, Some(Halt::Policy { .. }));
         let reconnect = match &self.in_flight {
+            _ if policy && w >= a => return Reconnect::Idle,
+            _ if policy => Reconnect::AheadOfServer,
             _ if self.halted == Some(Halt::Recovery) => Reconnect::Recovery,
             Some(flight) if flight.commit.history_id != welcome.history_id => Reconnect::Recovery,
             None if w == a => Reconnect::Idle,
@@ -940,6 +934,10 @@ impl Commits {
         if reconnect == Reconnect::AheadOfServer {
             self.accepted = w;
             self.in_flight = None;
+            self.slots.split_off(&(w + 1));
+        }
+        if policy {
+            return reconnect;
         }
         if welcome.read_only {
             self.halted = Some(Halt::ReadOnly);

@@ -1974,11 +1974,12 @@ fn a_policy_refusal_keeps_the_commit_and_outlasts_any_welcome() {
     }
 }
 
-/// A device under a policy halt keeps its counter and the refused commit whatever the `Welcome`
-/// says. A server that counts fewer of its commits still has R listed again, and the slots of the
-/// commits it lost are forgotten, so the listing does not count those commits as held.
+/// A device under a policy halt keeps the refused commit whatever the `Welcome` says, until a
+/// server counts fewer of its commits. That loss is handled as without the halt, once: the
+/// counter takes the server's, the refused commit and the slots of the lost commits are dropped,
+/// and R is listed again. The halt stays, and the next `Welcome` finds nothing lost.
 #[test]
-fn a_policy_halt_forgets_the_slots_the_server_lost() {
+fn a_policy_halt_takes_a_server_loss_once() {
     let mut trees = trees(&[("a", Some(file(ROOT, "x", 1)), None, None)]);
     let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
     build(&mut commits, &mut trees, &mut ids).unwrap();
@@ -1997,17 +1998,19 @@ fn a_policy_halt_forgets_the_slots_the_server_lost() {
     trees.settle();
     let refused = build(&mut commits, &mut trees, &mut ids).unwrap();
     commits.failed(&refusal(error::Code::Forbidden, 0)).unwrap();
+    let halt = Some(Halt::Policy {
+        code: error::Code::Forbidden as i32,
+    });
     assert_eq!(commits.held_through(), 4);
     assert_eq!(commits.connected(&welcome(1)), Reconnect::Idle);
     assert_eq!(commits.held_through(), 4);
+    assert_eq!(commits.in_flight().unwrap().commit, refused);
     assert_eq!(commits.connected(&welcome(0)), Reconnect::AheadOfServer);
     assert_eq!(commits.held_through(), 0);
-    let halt = Halt::Policy {
-        code: error::Code::Forbidden as i32,
-    };
-    assert_eq!(commits.halted(), Some(halt));
-    assert_eq!(commits.accepted(), 1);
-    assert_eq!(commits.in_flight().unwrap().commit, refused);
+    assert_eq!((commits.accepted(), commits.in_flight()), (0, None));
+    assert_eq!(commits.halted(), halt);
+    assert_eq!(commits.connected(&welcome(0)), Reconnect::Idle);
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
 }
 
 #[test]

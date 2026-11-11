@@ -3656,6 +3656,66 @@ fn an_edit_the_server_lost_under_a_policy_halt_is_kept_when_the_server_passed_th
     assert_eq!(fs::read(copy).unwrap(), b"authored");
 }
 
+/// `a` is under a policy halt when it meets a server that lost its commits, and `b` creates `docs/plan.txt`
+/// there. The first halted run lists the tree. `b` then renames `docs` to `papers` before a second halted run, and
+/// `papers` to `notes` before the halt is lifted. The loss was handled by the first listing, so neither later run
+/// takes `b`'s renames for lost changes and puts an old name back.
+#[test]
+fn renames_after_a_server_loss_was_handled_under_a_policy_halt_are_kept() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site.root.join("one.txt"), b"one");
+    let mut restored = backup(&remote, &a);
+    for pad in ["pad-two.txt", "pad-three.txt"] {
+        a.create(&mut remote, &site.root.join(pad), pad.as_bytes());
+    }
+    fs::write(site.root.join("refused.txt"), b"refused").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    let upload = a.work.pop_front().unwrap();
+    a.perform(upload, &mut remote).unwrap();
+    assert!(matches!(a.work.pop_front(), Some(Work::Send(_))));
+    let step = a.folder.sent(Err(CallError::Server(ServerError(
+        flarebox_proto::v1::Error {
+            code: Code::Forbidden as i32,
+            message: "refused".into(),
+            ..Default::default()
+        },
+    ))));
+    assert!(a.take(step).is_err());
+    let (other, mut b) = linked(&mut restored, "b");
+    fs::create_dir(other.root.join("docs")).unwrap();
+    b.create(&mut restored, &other.root.join("docs/plan.txt"), b"plan");
+    drop(a);
+    for (from, to) in [("docs", "papers"), ("papers", "notes")] {
+        let mut halted = restarted(&site, &mut restored);
+        halted.settle();
+        halted.run(&mut restored);
+        assert!(halted.sent.is_empty());
+        drop(halted);
+        fs::rename(other.root.join(from), other.root.join(to)).unwrap();
+        b.scan_until(|b| !b.work.is_empty());
+        b.run(&mut restored);
+    }
+    lift_halt(&site.db, Lift::Replan).unwrap();
+    let mut a = restarted(&site, &mut restored);
+    a.settle();
+    a.run(&mut restored);
+    a.settle();
+    a.run(&mut restored);
+    let all = [
+        "notes",
+        "one.txt",
+        "pad-three.txt",
+        "pad-two.txt",
+        "refused.txt",
+    ];
+    assert_eq!(names(&site.root), all);
+    assert_eq!(fs::read(site.root.join("notes/plan.txt")).unwrap(), b"plan");
+    assert_eq!(a.state(), FolderState::UpToDate);
+    let (fresh, _c) = linked(&mut restored, "c");
+    assert_eq!(names(&fresh.root), all);
+}
+
 /// The server lost `a`'s commit of `two.txt`, and `b` deleted `one.txt` on the restored server. The listing reads
 /// the trash too, so `a` takes `one.txt` for a remote delete and removes it, instead of creating it again under an
 /// ID the server holds in its trash, which it would refuse with `ID_EXISTS`.
