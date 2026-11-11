@@ -145,7 +145,8 @@ private struct AddFolderSheet: View {
 
 private struct AccountSettings: View {
     @Environment(AppModel.self) private var model
-    @State private var devices: DeviceList?
+    @State private var devices: [Device] = []
+    @State private var revoking: Device?
     @State private var pairing: PairingCode?
     @State private var confirmingSignOut = false
     @State private var confirmingLastDevice = false
@@ -164,13 +165,14 @@ private struct AccountSettings: View {
                         LabeledContent("This Mac", value: account.deviceName)
                     }
                     Section("Devices") {
-                        if devices == .unavailable {
-                            Text("This server can't list the account's devices yet.")
-                                .foregroundStyle(.secondary)
-                        }
-                        ForEach(devices?.available ?? [], id: \.deviceId) { device in
+                        ForEach(devices, id: \.deviceId) { device in
                             LabeledContent {
-                                Text("Added \(Date(milliseconds: device.addedAtMs), format: .dateTime.year().month().day())")
+                                HStack {
+                                    Text("Added \(Date(milliseconds: device.addedAtMs), format: .dateTime.year().month().day())")
+                                    if !device.thisDevice {
+                                        Button("Remove…") { revoking = device }
+                                    }
+                                }
                             } label: {
                                 Label {
                                     Text(device.thisDevice ? String(localized: "\(device.name) (this Mac)") : device.name)
@@ -216,6 +218,20 @@ private struct AccountSettings: View {
                 ContentUnavailableView("Not Signed In", systemImage: "person.crop.circle.badge.questionmark")
             }
         }
+        .confirmationDialog(
+            "Remove \(revoking?.name ?? "")?",
+            isPresented: Binding(get: { revoking != nil }, set: { if !$0 { revoking = nil } }),
+            presenting: revoking
+        ) { device in
+            Button("Remove", role: .destructive) {
+                perform {
+                    try await model.revokeDevice(device)
+                    devices = try await model.devices()
+                }
+            }
+        } message: { _ in
+            Text("The device stops syncing and is removed from the server's devices. The files already on it stay there.")
+        }
         .confirmationDialog("Sign out of Flarebox?", isPresented: $confirmingSignOut) {
             Button("Sign Out", role: .destructive) {
                 perform {
@@ -256,12 +272,6 @@ private struct AccountSettings: View {
                 error = failure
             } catch {}
         }
-    }
-}
-
-extension DeviceList {
-    fileprivate var available: [Device]? {
-        if case .available(let devices) = self { devices } else { nil }
     }
 }
 

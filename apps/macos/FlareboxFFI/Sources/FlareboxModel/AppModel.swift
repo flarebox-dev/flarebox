@@ -209,8 +209,16 @@ public final class AppModel {
         try await run { try $0.signOut(confirmLastDevice: confirmLastDevice) }
     }
 
-    public func devices() async throws -> DeviceList {
+    /// The account's devices that are not revoked.
+    public func devices() async throws -> [Device] {
         try await run { try $0.devices() }
+    }
+
+    /// Revokes another device of the account: it can no longer sync, and the files already on it stay there. This Mac
+    /// leaves with `signOut` instead, so revoking it throws `SessionError.ThisDevice`.
+    public func revokeDevice(_ device: Device) async throws {
+        let id = device.deviceId
+        try await run { try $0.revokeDevice(deviceId: id) }
     }
 
     public func startPairing() async throws -> PairingCode {

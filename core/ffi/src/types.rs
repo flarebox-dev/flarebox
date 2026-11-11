@@ -137,17 +137,6 @@ pub struct Device {
     pub added_at_ms: i64,
 }
 
-/// The account's devices, if the server can list them.
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
-pub enum DeviceList {
-    /// The server has no API that lists an account's devices; no server has one yet (`spec/proto/flarebox/v1/auth.proto`).
-    /// The app shows that the list is unavailable rather than a partial one.
-    Unavailable,
-    Available {
-        devices: Vec<Device>,
-    },
-}
-
 /// A code that signs in another device of the same account (`POST /v1/pair/start`).
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct PairingCode {
@@ -550,6 +539,11 @@ pub enum SessionError {
     /// that this may be their last device and signs out again with confirmation.
     #[error("the server did not confirm that it removed this device: {reason}")]
     NotRevoked { reason: String },
+    /// The device to revoke is this one, which leaves the account with a sign-out instead.
+    #[error("this device cannot revoke itself; sign out instead")]
+    ThisDevice,
+    #[error("the account has no such device")]
+    DeviceNotFound,
     #[error("the space does not exist")]
     SpaceNotFound,
     #[error("the folder does not exist")]

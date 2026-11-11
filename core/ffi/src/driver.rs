@@ -28,7 +28,7 @@ use tokio::sync::watch;
 
 use crate::core::{Core, Events};
 use crate::types::{
-    Account, Answer, DeviceList, FolderState, HeldItem, ItemDetail, LinkedFolder, MassDeleteLimit,
+    Account, Answer, Device, FolderState, HeldItem, ItemDetail, LinkedFolder, MassDeleteLimit,
     NodeKind, PairingCode, Problem, ProblemKind, Question, QuestionKind, RecoveryCause,
     RecoveryGroup, RecoveryTrigger, ServerInfo, SessionError, SessionEvent, SessionState, Space,
     SpaceUsage, SyncStatus,
@@ -391,9 +391,46 @@ impl Core for DriverCore {
         })
     }
 
-    fn devices(&self) -> Result<DeviceList, SessionError> {
-        self.signed_in()?;
-        Ok(DeviceList::Unavailable)
+    fn devices(&self) -> Result<Vec<Device>, SessionError> {
+        let (api, auth) = self.signed_in()?;
+        let mut devices = Vec::new();
+        let mut cursor = String::new();
+        loop {
+            let page = self
+                .runtime
+                .block_on(api.list_devices(&auth, &cursor))
+                .map_err(api_error)?;
+            devices.extend(
+                (page.devices.into_iter())
+                    .filter(|device| device.revoked_at_ms == 0)
+                    .map(|device| Device {
+                        device_id: device.device_id,
+                        name: device.name,
+                        platform: device.platform,
+                        this_device: device.current,
+                        added_at_ms: device.created_at_ms,
+                    }),
+            );
+            if page.next_cursor.is_empty() {
+                return Ok(devices);
+            }
+            cursor = page.next_cursor;
+        }
+    }
+
+    fn revoke_device(&self, device_id: &str) -> Result<(), SessionError> {
+        let (api, auth) = self.signed_in()?;
+        if device_id == auth.credentials().device_id {
+            return Err(SessionError::ThisDevice);
+        }
+        self.runtime
+            .block_on(api.revoke_device(&auth, device_id))
+            .map_err(|error| match &error {
+                ApiError::Server { error: refusal, .. } if refusal.code() == Code::NotFound => {
+                    SessionError::DeviceNotFound
+                }
+                _ => api_error(error),
+            })
     }
 
     fn start_pairing(&self) -> Result<PairingCode, SessionError> {

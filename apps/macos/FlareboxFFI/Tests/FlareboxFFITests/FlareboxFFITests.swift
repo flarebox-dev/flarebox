@@ -103,7 +103,7 @@ private final class Recorder: SessionListener {
     let session = SyncSession.fake(listener: Recorder())
     let fake = try #require(session.fakeCore())
     try fake.loadScenario(scenario: .remoteMassDelete)
-    #expect(try session.devices() == .unavailable)
+    #expect(try session.devices().map(\.thisDevice) == [true, false])
     let notice = try #require(session.state().notices.first)
     guard case .remoteMassDelete(_, let affectedFiles, _, _) = notice.kind else {
         Issue.record("expected a remote mass delete, got \(notice.kind)")

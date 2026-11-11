@@ -323,6 +323,50 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
     assert!(!accepted(&kept));
     drop(other);
 
+    let listed = |device: &Device| {
+        let mut devices: Vec<(String, bool)> = (device.session().devices().unwrap().into_iter())
+            .map(|device| (device.name, device.this_device))
+            .collect();
+        devices.sort();
+        devices
+    };
+    assert_eq!(listed(&mac), [("Ada's Mac".to_owned(), true)]);
+    let old = Device::new();
+    old.session().connect(server.clone()).unwrap();
+    let pairing = mac.session().start_pairing().unwrap();
+    let old_account = old.session().pair(pairing.code, "Old Mac".into()).unwrap();
+    assert_eq!(
+        listed(&mac),
+        [
+            ("Ada's Mac".to_owned(), true),
+            ("Old Mac".to_owned(), false)
+        ]
+    );
+    assert_eq!(
+        listed(&old),
+        [
+            ("Ada's Mac".to_owned(), false),
+            ("Old Mac".to_owned(), true)
+        ]
+    );
+    assert_eq!(
+        mac.session().revoke_device(owner.device_id.clone()),
+        Err(SessionError::ThisDevice)
+    );
+    let old_kept = old.path("credential");
+    keep_credential(&old.profile(), &old_kept);
+    mac.session()
+        .revoke_device(old_account.device_id.clone())
+        .unwrap();
+    assert!(!accepted(&old_kept));
+    assert_eq!(listed(&mac), [("Ada's Mac".to_owned(), true)]);
+    assert_eq!(
+        mac.session()
+            .revoke_device("0190b6a5-0000-7000-8000-000000000000".into()),
+        Err(SessionError::DeviceNotFound)
+    );
+    drop(old);
+
     let held = driver::Question {
         id: "q-mass-delete".into(),
         space_id: space.space_id.clone(),
