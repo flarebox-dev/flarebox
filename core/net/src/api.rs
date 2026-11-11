@@ -885,7 +885,7 @@ mod tests {
             .parse()
             .unwrap();
         let auth = signed_in(base);
-        for id in ["", ".", "..", ".\t.", "..\n", "\r.."] {
+        for id in ["", ".", "..", ".\t.", "..\n", "\r..", "d\n1"] {
             let outcome = auth.api().revoke_device(&auth, id).await;
             assert!(
                 matches!(&outcome, Err(ApiError::PathSegment(segment)) if segment == id),
