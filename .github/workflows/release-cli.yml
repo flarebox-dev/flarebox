@@ -5,7 +5,6 @@ on:
   push:
     tags: ['v[0-9]+.[0-9]+.[0-9]+']
   pull_request:
-    paths: ['install.sh', 'scripts/test-install.sh', '.github/workflows/release-cli.yml', 'cli/**', 'core/**', 'Cargo.*', 'rust-toolchain.toml', 'server/**']
   merge_group:
   workflow_dispatch:
 
@@ -37,6 +36,7 @@ jobs:
           LINUX: '[{"target":"x86_64-unknown-linux-musl","runner":"ubuntu-latest"},{"target":"aarch64-unknown-linux-musl","runner":"ubuntu-latest"}]'
           MACOS: '[{"target":"aarch64-apple-darwin","runner":"macos-15"},{"target":"x86_64-apple-darwin","runner":"macos-15-intel"}]'
         run: |
+          linux=true
           macos=true
           if [ "$EVENT" = pull_request ]; then
             git fetch --no-tags --depth=1 origin "$BASE"
@@ -46,21 +46,24 @@ jobs:
             fi
             echo "Files this pull request changes against $BASE:"
             printf '%s\n' "$changed"
+            pattern='^(cli/|core/|server/|install\.sh$|scripts/test-install\.sh$|\.github/workflows/release-cli\.yml$|Cargo\.[^/]*$|rust-toolchain\.toml$)'
+            if grep -Eq "$pattern" <<<"$changed"; then
+              echo "Linux targets: build, because a changed file matches $pattern"
+            else
+              echo "Linux targets: skipped, because no changed file matches $pattern. The merge queue run of this workflow builds them."
+              linux=false
+            fi
             pattern='^(cli/|install\.sh$|scripts/test-install\.sh$|\.github/workflows/release-cli\.yml$|Cargo\.(toml|lock)$|rust-toolchain\.toml$)'
             if grep -Eq "$pattern" <<<"$changed"; then
               echo "macOS targets: build, because a changed file matches $pattern"
             else
-              echo "macOS targets: skipped, because no changed file matches $pattern. The merge queue run of this workflow builds them, but the merge queue does not wait for that run."
+              echo "macOS targets: skipped, because no changed file matches $pattern. The merge queue run of this workflow builds them."
               macos=false
             fi
           else
             echo "$EVENT run: every target builds."
           fi
-          if [ "$macos" = true ]; then
-            targets="$(jq -cn --argjson linux "$LINUX" --argjson macos "$MACOS" '$linux + $macos')"
-          else
-            targets="$(jq -c . <<<"$LINUX")"
-          fi
+          targets="$(jq -cn --argjson linux "$LINUX" --argjson macos "$MACOS" --argjson build_linux "$linux" --argjson build_macos "$macos" '(if $build_linux then $linux else [] end) + (if $build_macos then $macos else [] end)')"
           echo "Targets: $targets"
           {
             echo "targets=$targets"
@@ -89,6 +92,7 @@ jobs:
   build:
     name: CLI (${{ matrix.target }})
     needs: changes
+    if: needs.changes.outputs.count != '0'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
@@ -268,6 +272,35 @@ jobs:
           name: cli-distribution
           path: dist/*
           if-no-files-found: error
+
+  cli-report:
+    name: cli-report
+    if: always()
+    needs: [changes, build, checksums]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail unless every CLI target the change needs built and was checksummed
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          COUNT: ${{ needs.changes.outputs.count }}
+          BUILD: ${{ needs.build.result }}
+          CHECKSUMS: ${{ needs.checksums.result }}
+        run: |
+          echo "CLI targets: $CHANGES (${COUNT:-unknown} targets), build: $BUILD, checksums: $CHECKSUMS"
+          if [ "$CHANGES" != success ]; then
+            echo "::error::The CLI targets job is $CHANGES, so which targets this change needs is unknown. Open that job's log for the cause."
+            exit 1
+          fi
+          if [ "$COUNT" = 0 ]; then
+            echo "This change touches no file the CLI targets use, so build and checksums are skipped by design."
+            exit 0
+          fi
+          if [ "$BUILD" != success ] || [ "$CHECKSUMS" != success ]; then
+            echo "::error::$COUNT CLI targets had to build, but build is $BUILD and checksums is $CHECKSUMS. Open the failed job's log for the cause."
+            exit 1
+          fi
+          echo "All $COUNT CLI targets built and their checksums verified."
 
   publish:
     name: Publish CLI tarballs
