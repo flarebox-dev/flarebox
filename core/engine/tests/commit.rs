@@ -1801,6 +1801,35 @@ fn welcome(device_seq: u64) -> Welcome {
     }
 }
 
+/// GUN-379. The server counts fewer commits of this device than the store accepted, so it lost some it had
+/// accepted. The store continues from the server's count and drops the commit in flight, also on a read-only
+/// device.
+#[test]
+fn a_server_count_below_the_accepted_one_is_taken_and_drops_the_commit_in_flight() {
+    for read_only in [false, true] {
+        let mut trees = trees(&[("n", Some(file(ROOT, "n", 1)), None, None)]);
+        let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+        build(&mut commits, &mut trees, &mut ids).unwrap();
+        acknowledge(
+            &mut commits,
+            &mut trees,
+            vec![outcome(op_result::Code::Applied)],
+        );
+        assert_eq!(commits.accepted(), 1);
+        trees.set_local("m".into(), local(file(ROOT, "m", 2), 2));
+        trees.settle();
+        let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+        assert_eq!(commit.device_seq, 2);
+        let welcome = Welcome {
+            read_only,
+            ..welcome(0)
+        };
+        assert_eq!(commits.connected(&welcome), Reconnect::AheadOfServer);
+        assert_eq!(commits.accepted(), 0);
+        assert!(commits.in_flight().is_none());
+    }
+}
+
 #[test]
 fn the_device_slot_is_kept_by_a_retry_and_reused_after_a_refusal() {
     let mut trees = trees(&[("a", Some(file(ROOT, "x", 1)), None, None)]);

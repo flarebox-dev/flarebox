@@ -63,6 +63,9 @@ pub enum Reconnect {
     Resend,
     /// Enter recovery.
     Recovery,
+    /// The server lost commits of this device that it had accepted: list the tree again, as for
+    /// `AHEAD_OF_SERVER` (section 4.4), so that what it lost is sent again.
+    AheadOfServer,
 }
 
 /// How a person lifts a policy halt (RFC 0006 section 1, point 5).
@@ -706,7 +709,10 @@ impl Commits {
     /// Compares the `Welcome` with the commit in flight and the accepted counter *a* (section
     /// 2.8). With *w* the server's counter, *w* = *a* means the commit in flight was not accepted
     /// and *w* = *a* + 1 that it was and its response was lost; both resend it unchanged, and
-    /// the server answers an accepted one with its stored result. Any other *w*, or a commit
+    /// the server answers an accepted one with its stored result. *w* < *a* means the server lost
+    /// commits it had accepted, since its counter only grows and the store learns a slot only from
+    /// its result: *a* takes *w*, and the commit in flight is dropped, its restores staying queued,
+    /// so that its changes are planned again once R is listed again. Any other *w*, or a commit
     /// built in another history, starts recovery. A read-only device resends nothing, and a
     /// device under a policy halt resends nothing whatever the `Welcome` says. Whether R itself
     /// belongs to the `Welcome`'s history is checked where R is kept.
@@ -726,16 +732,24 @@ impl Commits {
             None if w == a => Reconnect::Idle,
             Some(flight) if flight.result.is_none() && (w == a || w == a + 1) => Reconnect::Resend,
             Some(_) if w == a + 1 => Reconnect::Idle,
+            _ if w < a => Reconnect::AheadOfServer,
             _ => Reconnect::Recovery,
         };
         if reconnect == Reconnect::Recovery {
             self.halted = Some(Halt::Recovery);
             return reconnect;
         }
+        if reconnect == Reconnect::AheadOfServer {
+            self.accepted = w;
+            self.in_flight = None;
+        }
         if welcome.read_only {
             self.halted = Some(Halt::ReadOnly);
             self.reject_unsent_when_read_only();
-            return Reconnect::Idle;
+            return match reconnect {
+                Reconnect::Resend => Reconnect::Idle,
+                other => other,
+            };
         }
         if self.halted == Some(Halt::ReadOnly) {
             self.halted = None;

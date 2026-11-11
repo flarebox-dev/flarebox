@@ -28,7 +28,8 @@ use flarebox_engine::ignore::LocalRules;
 use flarebox_engine::state::CommitsState;
 use flarebox_fs::{Snapshot, check_root};
 use flarebox_net::{
-    Auth, Backoff, CallError, ChunkError, Event, ServerError, Session, SessionConfig, Transfer,
+    Auth, Backoff, CallError, ChunkError, Event, NotResent, ServerError, Session, SessionConfig,
+    Transfer,
 };
 use flarebox_proto::v1::error::Code;
 use flarebox_proto::v1::resync_required::Reason;
@@ -590,7 +591,9 @@ impl Folder {
     }
 
     /// `Session::commit` returned. A result is acknowledged once R has reached it. A refusal goes to the engine,
-    /// which says whether the same commit is sent again, its changes are planned again, or committing stops.
+    /// which says whether the same commit is sent again, its changes are planned again, or committing stops. A
+    /// commit the session did not send again because the server counts fewer commits than its slot accounts for
+    /// waits for the `Welcome` that reported the count, which drops it ([`Folder::connected`]).
     pub fn sent(&mut self, result: Result<CommitResult, CallError>) -> Result<Vec<Work>, Stop> {
         let mut work = Vec::new();
         let Flight::Sending(commit) = std::mem::replace(&mut self.flight, Flight::Idle) else {
@@ -604,6 +607,12 @@ impl Folder {
             }
             Err(CallError::Server(refusal)) => self.refused(commit, &refusal, &mut work)?,
             Err(CallError::Stopped(_)) => {
+                self.flight = Flight::Unknown;
+                return Ok(work);
+            }
+            Err(CallError::NotResent(NotResent::DeviceSeqMismatch { slot, welcome }))
+                if welcome + 1 < slot =>
+            {
                 self.flight = Flight::Unknown;
                 return Ok(work);
             }
@@ -779,6 +788,11 @@ impl Folder {
     /// synced the space with a store that is gone, as after an unlink and a second link, and the new store continues
     /// from the server's count (design §6.4, step 2). RFC 0002 section 2 sends every count but the store's own to
     /// recovery, and every other store still goes there.
+    ///
+    /// A server whose count is below the store's lost commits of this device that it had accepted, as when its
+    /// storage was restored from a backup (design §2.8). The store then continues from the server's count, drops
+    /// the commit in flight, and lists the tree again as for `AHEAD_OF_SERVER`, so that what the server lost is sent
+    /// again.
     fn connected(&mut self, welcome: &Welcome, work: &mut Vec<Work>) -> Result<(), Stop> {
         self.offline = false;
         self.note = None;
@@ -805,7 +819,7 @@ impl Folder {
                 "this device synced the space with a store that is gone; continuing from the server's count"
             );
         }
-        let reconnect = self.step(|engine, _| {
+        let reconnect = self.step(|engine, tx| {
             if adopt {
                 let state = CommitsState {
                     accepted: welcome.device_seq,
@@ -813,7 +827,11 @@ impl Folder {
                 };
                 engine.commits = Commits::from_state(state).expect("no commit is in flight");
             }
-            Ok(engine.commits.connected(welcome))
+            let reconnect = engine.commits.connected(welcome);
+            if reconnect == Reconnect::AheadOfServer {
+                engine.server_behind(tx)?;
+            }
+            Ok(reconnect)
         })?;
         match reconnect {
             Reconnect::Recovery => {
@@ -821,6 +839,15 @@ impl Folder {
                     "the server's count of this device's commits does not match the folder's sync state"
                         .into(),
                 ));
+            }
+            Reconnect::AheadOfServer => {
+                tracing::info!(
+                    space_id = self.link.space_id,
+                    device_seq = welcome.device_seq,
+                    "the server lost commits of this device; reading the tree again"
+                );
+                self.flight = Flight::Idle;
+                self.list_again(work);
             }
             Reconnect::Resend => {
                 if let (Flight::Unknown, Some(commit)) = (&self.flight, self.in_flight()) {
