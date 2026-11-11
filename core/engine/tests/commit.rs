@@ -1974,9 +1974,9 @@ fn a_policy_refusal_keeps_the_commit_and_outlasts_any_welcome() {
     }
 }
 
-/// A device under a policy halt does not compare the `Welcome` with its counter, but it still
-/// forgets the slots of the commits a server that counts fewer of them lost, so a listing taken
-/// under the halt does not count those commits as held.
+/// A device under a policy halt keeps its counter and the refused commit whatever the `Welcome`
+/// says. A server that counts fewer of its commits still has R listed again, and the slots of the
+/// commits it lost are forgotten, so the listing does not count those commits as held.
 #[test]
 fn a_policy_halt_forgets_the_slots_the_server_lost() {
     let mut trees = trees(&[("a", Some(file(ROOT, "x", 1)), None, None)]);
@@ -2000,7 +2000,7 @@ fn a_policy_halt_forgets_the_slots_the_server_lost() {
     assert_eq!(commits.held_through(), 4);
     assert_eq!(commits.connected(&welcome(1)), Reconnect::Idle);
     assert_eq!(commits.held_through(), 4);
-    assert_eq!(commits.connected(&welcome(0)), Reconnect::Idle);
+    assert_eq!(commits.connected(&welcome(0)), Reconnect::AheadOfServer);
     assert_eq!(commits.held_through(), 0);
     let halt = Halt::Policy {
         code: error::Code::Forbidden as i32,

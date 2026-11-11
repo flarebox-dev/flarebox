@@ -904,7 +904,8 @@ impl Commits {
     /// device under a policy halt resends nothing whatever the `Welcome` says. With *w* < *a* the
     /// slots above *w* are forgotten in every case, a policy halt included: the server does not hold
     /// those commits, so [`Commits::held_through`] must not count them for a listing taken under the
-    /// halt. Whether R itself
+    /// halt. Under that halt *w* < *a* still gives [`Reconnect::AheadOfServer`], so that R is
+    /// listed again, but *a* and the refused commit stay. Whether R itself
     /// belongs to the `Welcome`'s history is checked where R is kept.
     ///
     /// Recovery keeps the queued restores with the commit in flight: nothing is built under that
@@ -917,7 +918,11 @@ impl Commits {
             self.slots.split_off(&(w + 1));
         }
         if matches!(self.halted, Some(Halt::Policy { .. })) {
-            return Reconnect::Idle;
+            return if w < a {
+                Reconnect::AheadOfServer
+            } else {
+                Reconnect::Idle
+            };
         }
         let reconnect = match &self.in_flight {
             _ if self.halted == Some(Halt::Recovery) => Reconnect::Recovery,
