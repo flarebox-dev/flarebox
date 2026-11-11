@@ -2,7 +2,8 @@
 
 //! The engine state besides the nodes of R, L and S (design §2.8) and the rows that hold it. This
 //! module is the one place that knows both the engine's state types and the tables of migration 3.
-//! The restores of the commit side have their rows in [`crate::restore`].
+//! The restores of the commit side have their rows in [`crate::restore`], and the open questions
+//! and the mass-delete guard in [`crate::questions`].
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -135,6 +136,8 @@ impl Tx<'_> {
         while let Some(row) = rows.next()? {
             state.commits.slots.insert(row.get(0)?, row.get(1)?);
         }
+        state.commits.questions = self.open_questions()?;
+        state.commits.guard = self.guard()?;
 
         if let Some((cleared, in_flight)) = self
             .0
@@ -180,6 +183,12 @@ impl Tx<'_> {
             "effect_state",
             "failed_effects",
             "restore_intents",
+            "open_question_members",
+            "open_question_items",
+            "open_questions",
+            "guard_ledger",
+            "guard_confirmed_members",
+            "guard_confirmed",
         ] {
             self.0.execute(&format!("DELETE FROM {table}"), [])?;
         }
@@ -189,7 +198,8 @@ impl Tx<'_> {
     /// Changes the stored engine state from `before`, which must be the state the store holds, to
     /// `after`. Only the rows of what differs are written: a member of a node set or a node map, a
     /// waiting update and a failed effect by node, and each of the commit counters, the commit in
-    /// flight, the restores and the effect counters as a whole.
+    /// flight, the restores, the open questions, the mass-delete guard and the effect counters as a
+    /// whole.
     pub fn update_engine_state(&self, before: &EngineState, after: &EngineState) -> Result<()> {
         let (mut old, mut new) = (before.clone(), after.clone());
         let mut remove = self
@@ -326,6 +336,12 @@ impl Tx<'_> {
         if (&old.restores, &old.resolved) != (&new.restores, &new.resolved) {
             self.0.execute("DELETE FROM restore_intents", [])?;
             self.set_restores(&new.restores, &new.resolved)?;
+        }
+        if old.questions != new.questions {
+            self.set_open_questions(&new.questions)?;
+        }
+        if old.guard != new.guard {
+            self.set_guard(&new.guard)?;
         }
 
         let (old, new) = (&before.effects, &after.effects);

@@ -17,6 +17,7 @@ use flarebox_engine::commit::Commits;
 use flarebox_engine::effects::Effects;
 use flarebox_engine::ids::IdGen;
 use flarebox_engine::names::name_key;
+use flarebox_engine::question as engine;
 use flarebox_engine::tree::{
     Content, FileIdentity, Kind, LocalNode, Names, NodeId, RemoteNode, Shape, Tree, same_content,
 };
@@ -24,10 +25,11 @@ use flarebox_fs::{Entry, EntryKind, FileId, Known, Snapshot};
 use flarebox_proto::v1::{
     ChangeRecord, CommitRecord, NodeKind, NodeState, TrashPage, TreePage, change_record,
 };
-use flarebox_store::{Cursor, EngineState, Error, SyncedNode, Tx};
+use flarebox_store::{Cursor, EngineState, Error, StoredQuestion, SyncedNode, Tx};
 
 use crate::disk::Stop;
 use crate::observe::{Observed, Reset, RulesChange};
+use crate::question::{HeldItem, Question};
 
 pub(crate) struct Engine {
     pub trees: Trees,
@@ -135,6 +137,84 @@ impl Engine {
         tx.update_engine_state(&self.stored, &state)?;
         self.stored = state;
         tx.set_id_generator(&self.ids.state.to_le_bytes())
+    }
+
+    /// Takes the answers the person gave to the engine's questions (`Driver::answer`) and removes the rows of the
+    /// ones it took, in the transaction the caller's checkpoint ends. The engine routes each answer by the question's
+    /// kind. An answer to a question the engine no longer asks changes nothing: what it held changed since, and the
+    /// engine asks about it again.
+    pub fn accept_answers(&mut self, tx: &Tx<'_>) -> Result<(), Error> {
+        for stored in tx.questions()? {
+            let Some(Ok(answer)) = (stored.answer.as_ref()).map(|given| given.answer.parse())
+            else {
+                continue;
+            };
+            if (self.commits).decide(&stored.question_id, answer) {
+                tracing::info!(question_id = stored.question_id, %answer, "took an answer to a question");
+                tx.remove_question(&stored.question_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Stores each question the engine asked since the last checkpoint and removes the rows of the ones it no longer
+    /// asks, for `Driver::questions` to show.
+    pub fn ask(&self, tx: &Tx<'_>, space_id: &str) -> Result<(), Error> {
+        let asked = &self.stored.commits.questions;
+        let asking = self.commits.questions();
+        let open = |questions: &[engine::Question], id: &str| questions.iter().any(|q| q.id == id);
+        for question in asked.iter().filter(|question| !open(asking, &question.id)) {
+            tx.remove_question(&question.id)?;
+        }
+        for question in asking.iter().filter(|question| !open(asked, &question.id)) {
+            tracing::warn!(
+                space_id,
+                question_id = question.id,
+                kind = ?question.kind,
+                items = question.held.len(),
+                "holds changes until it is answered with flarebox questions"
+            );
+            tx.put_question(&StoredQuestion {
+                question_id: question.id.clone(),
+                asked_at_ms: question.asked_at_ms as i64,
+                body: serde_json::to_vec(&self.shown(space_id, question))
+                    .expect("a question serializes"),
+                answer: None,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// The question as the person sees it: each item the engine holds with its path, in path order.
+    fn shown(&self, space_id: &str, asked: &engine::Question) -> Question {
+        let mut items: Vec<HeldItem> = (asked.held.iter())
+            .map(|(id, held)| HeldItem {
+                node_id: id.clone(),
+                path: self.synced_path(id),
+                files: held.files,
+            })
+            .collect();
+        items.sort_by(|a, b| a.path.cmp(&b.path));
+        Question {
+            id: asked.id.clone(),
+            space_id: space_id.to_owned(),
+            asked_at_ms: asked.asked_at_ms as i64,
+            kind: asked.kind.clone(),
+            items,
+        }
+    }
+
+    /// The path of a node S holds, relative to the linked folder.
+    fn synced_path(&self, id: &str) -> String {
+        let synced = self.trees.synced();
+        let mut names = Vec::new();
+        let mut current = id;
+        while let Some(shape) = synced.live(current).filter(|_| names.len() <= synced.len()) {
+            names.push(shape.name.as_str());
+            current = &shape.parent;
+        }
+        names.reverse();
+        names.join("/")
     }
 
     /// Queues the restores asked for since the last take (`Driver::restore`) and empties the store's inbox. The

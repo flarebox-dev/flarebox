@@ -19,6 +19,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use flarebox_driver::{
     Answer, Credential, Driver, DriverError, FolderStatus, Paths, Question, QuestionKind, Status,
 };
+use flarebox_engine::guard::{Limit, MAX_DELETIONS, Window};
 use flarebox_net::{ApiError, Auth, Reload};
 use flarebox_proto::v1::{
     CreateSpaceRequest, DeviceInfo, SpaceInfo, SpaceUsage, device_info::Kind,
@@ -973,28 +974,57 @@ fn print_questions(questions: &[Question]) {
         println!("No questions.");
     }
     for question in questions {
-        let what = match &question.kind {
-            QuestionKind::MassDelete {
-                deletions,
-                affected_files,
-                space_files,
-            } => format!(
-                "{deletions} deletions would remove {affected_files} of {space_files} files"
-            ),
-            QuestionKind::AmbiguousDisappearance => {
-                "files disappeared while changes were not tracked".to_owned()
-            }
-            QuestionKind::Recovery { group } => format!("recovery: {group:?}"),
-        };
-        let [first, second] = question.kind.answers();
-        println!(
-            "{}  space {}  {what}\n  answer with: flarebox questions answer {} {first}|{second}",
-            question.id, question.space_id, question.id
-        );
-        for item in &question.items {
-            println!("  {} ({} files)", item.path, item.files);
-        }
+        print!("{}", question_text(question));
     }
+}
+
+/// The most items `flarebox questions` lists for one question.
+const ITEMS_SHOWN: usize = 20;
+
+/// How `flarebox questions` shows one question: what it asks, how to answer it, and its first [`ITEMS_SHOWN`] items.
+fn question_text(question: &Question) -> String {
+    let what = match &question.kind {
+        QuestionKind::MassDelete {
+            deletions,
+            affected_files,
+            space_files,
+        } => {
+            let window = Window {
+                deletions: *deletions,
+                affected_files: *affected_files,
+                space_files: *space_files,
+            };
+            let why = match window.limit() {
+                Some(Limit::Deletions) => {
+                    format!(", more than {MAX_DELETIONS} deletions in 10 minutes")
+                }
+                Some(Limit::Share) => ", more than half of the space in 10 minutes".to_owned(),
+                None => String::new(),
+            };
+            format!(
+                "held {deletions} deletions that would remove {affected_files} of {space_files} files{why}"
+            )
+        }
+        QuestionKind::AmbiguousDisappearance => {
+            "files disappeared while changes were not tracked".to_owned()
+        }
+        QuestionKind::Recovery { group } => format!("recovery: {group:?}"),
+    };
+    let [first, second] = question.kind.answers();
+    let mut text = format!(
+        "{}  space {}  {what}\n  answer with: flarebox questions answer {} {first}|{second}\n",
+        printable(&question.id),
+        printable(&question.space_id),
+        printable(&question.id)
+    );
+    for item in question.items.iter().take(ITEMS_SHOWN) {
+        text += &format!("  {} ({} files)\n", printable(&item.path), item.files);
+    }
+    let more = question.items.len().saturating_sub(ITEMS_SHOWN);
+    if more > 0 {
+        text += &format!("  and {more} more; flarebox questions --json lists them all\n");
+    }
+    text
 }
 
 #[cfg(test)]
@@ -1122,6 +1152,64 @@ mod tests {
             !presented.contains(&replacement.refresh_credential),
             "{presented:?}"
         );
+    }
+
+    fn held(deletions: u64, affected_files: u64, space_files: u64, items: usize) -> Question {
+        Question {
+            id: "q1".into(),
+            space_id: "s1".into(),
+            asked_at_ms: 1,
+            kind: QuestionKind::MassDelete {
+                deletions,
+                affected_files,
+                space_files,
+            },
+            items: (0..items)
+                .map(|i| flarebox_driver::HeldItem {
+                    node_id: format!("n{i}"),
+                    path: format!("old/{i:02}"),
+                    files: 1,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_held_path_is_shown_with_its_control_characters_escaped() {
+        let mut question = held(1, 15, 20, 1);
+        question.items[0].path = "old/a\nforged line\u{1b}[2J".into();
+        let text = question_text(&question);
+        assert_eq!(text.lines().count(), 3, "{text}");
+        assert!(!text.contains('\u{1b}'), "{text}");
+    }
+
+    #[test]
+    fn a_mass_delete_question_names_the_limit_it_crossed_and_lists_at_most_20_items() {
+        let text = question_text(&held(1_001, 1_001, 5_000, 25));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[..3],
+            [
+                "q1  space s1  held 1001 deletions that would remove 1001 of 5000 files, more than 1000 deletions in 10 minutes",
+                "  answer with: flarebox questions answer q1 delete|restore",
+                "  old/00 (1 files)",
+            ]
+        );
+        assert_eq!(lines.len(), 2 + ITEMS_SHOWN + 1);
+        assert_eq!(lines[21], "  old/19 (1 files)");
+        assert_eq!(
+            lines[22],
+            "  and 5 more; flarebox questions --json lists them all"
+        );
+
+        let text = question_text(&held(1, 15, 20, 1));
+        assert_eq!(
+            text.lines().next(),
+            Some(
+                "q1  space s1  held 1 deletions that would remove 15 of 20 files, more than half of the space in 10 minutes"
+            )
+        );
+        assert_eq!(text.lines().count(), 3);
     }
 
     #[test]

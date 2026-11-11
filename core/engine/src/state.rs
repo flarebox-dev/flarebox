@@ -15,6 +15,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::commit::{Halt, InFlight};
 use crate::effects::{Effect, EffectRecord};
+use crate::guard::GuardState;
+use crate::question::Question;
 use crate::restore::{Resolved, RestoreId, RestoreIntent};
 use crate::tree::{NodeId, Shape, TreeError};
 
@@ -69,6 +71,10 @@ pub struct CommitsState {
     /// The seq of each of this device's last [`SLOTS_KEPT`](crate::commit::SLOTS_KEPT)
     /// acknowledged commits, by slot.
     pub slots: BTreeMap<u64, u64>,
+    /// The open questions, in the order they were asked.
+    pub questions: Vec<Question>,
+    /// The mass-delete guard's window and confirmed deletions.
+    pub guard: GuardState,
 }
 
 /// What [`Effects`](crate::effects::Effects) holds.

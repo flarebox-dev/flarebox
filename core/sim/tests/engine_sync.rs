@@ -17,6 +17,7 @@ use flarebox_engine::effects::{Effect, Effects};
 use flarebox_engine::ids::IdGen;
 use flarebox_engine::ignore::{LocalRules, RuleFile};
 use flarebox_engine::names::name_key;
+use flarebox_engine::question::{Answer, Question};
 use flarebox_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
 use flarebox_engine::state::StateError;
 use flarebox_engine::tree::{FileIdentity, Kind, LocalNode, Names, RemoteNode, same};
@@ -793,6 +794,8 @@ struct Ran {
     removals: usize,
     /// The nodes the server holds trashed at the end.
     trashed: usize,
+    /// The questions of the mass-delete guard the run answered.
+    asked: usize,
     space: SpaceDo,
 }
 
@@ -817,6 +820,11 @@ fn run(
         Cut::None,
     )?;
     Ok(ran.parked_reverted)
+}
+
+/// Every node a question of the mass-delete guard holds.
+fn members(question: &Question) -> impl Iterator<Item = String> + '_ {
+    (question.held.values()).flat_map(|held| held.members.keys().cloned())
 }
 
 /// Whether the effects cannot place `id` because of an excluded node: on the way from the node's
@@ -884,7 +892,17 @@ fn run_cut(
     during: &[(bool, Vec<Action>)],
     cut: Cut,
 ) -> Result<Ran, TestCaseError> {
-    run_ignoring(seed, local, remote, fits, fresh_dir_names, during, cut, &[])
+    run_ignoring(
+        seed,
+        local,
+        remote,
+        fits,
+        fresh_dir_names,
+        during,
+        cut,
+        &[],
+        Answer::Delete,
+    )
 }
 
 /// [`run_cut`] with changes to the ignore rules: the first of `rulings` is made before the offline
@@ -901,6 +919,7 @@ fn run_ignoring(
     during: &[(bool, Vec<Action>)],
     cut: Cut,
     rulings: &[Ruling],
+    answer: Answer,
 ) -> Result<Ran, TestCaseError> {
     let (mut space, mut other) = seeded(seed);
     let root = space.space_id().to_owned();
@@ -979,6 +998,7 @@ fn run_ignoring(
     let mut effects = Effects::default();
     let (mut steps, mut quiet, mut due, mut parked_reverted) = (0, false, false, 0);
     let (mut deletes, mut removals) = (0, 0);
+    let (mut asked, mut held_once, mut confirmed) = (0, BTreeSet::new(), BTreeSet::new());
     let mut during = during.iter();
     while !quiet {
         steps += 1;
@@ -1077,10 +1097,31 @@ fn run_ignoring(
             device.trees.synced().check(Names::ByKey).is_ok(),
             "S is not a valid tree"
         );
+        if let Some(question) = commits.questions().first() {
+            held_once.extend(members(question));
+        }
         let Some(commit) = built else {
+            if let Some(question) = commits.questions().first().cloned() {
+                if answer == Answer::Delete {
+                    confirmed.extend(members(&question));
+                }
+                prop_assert!(commits.decide(&question.id, answer));
+                asked += 1;
+                continue;
+            }
             quiet = device.trees == before && during.len() == 0;
             continue;
         };
+        for op in &commit.ops {
+            if let Some(op::Op::Delete(delete)) = &op.op {
+                let id = &delete.node_id;
+                prop_assert!(
+                    !held_once.contains(id) || confirmed.contains(id),
+                    "{} was held and deleted before the person said so",
+                    id
+                );
+            }
+        }
         let delete = |op: &&Op| matches!(op.op, Some(op::Op::Delete(_)));
         deletes += commit.ops.iter().filter(delete).count();
         if commit.ops.len() > fits {
@@ -1274,6 +1315,7 @@ fn run_ignoring(
         deletes,
         removals,
         trashed: server.iter().filter(|(_, shape)| shape.is_none()).count(),
+        asked,
         space,
     })
 }
@@ -1330,8 +1372,53 @@ proptest! {
             &during,
             Cut::None,
             &rulings,
+            Answer::Delete,
         )?;
         prop_assert_eq!((ran.deletes, ran.removals, ran.trashed), (0, 0, 0));
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(
+        std::env::var("PROPTEST_CASES").ok().and_then(|cases| cases.parse().ok()).unwrap_or(128),
+    ))]
+
+    /// Section 6.1: removing a folder that holds more than half of a space of at least 20 files
+    /// is held, among other local changes that still sync. No `Delete` of a held node goes out
+    /// before the person answers, across the restart the run makes at every step. After
+    /// `restore` the files come back on disk and the server trashes nothing; after `delete` the
+    /// server trashes the folder and every file in it.
+    #[test]
+    fn removing_most_of_a_space_is_held_until_the_person_answers(
+        inside in 11usize..20,
+        loose in 9usize..11,
+        local in prop::collection::vec(action(3), 0..4),
+        fits in prop_oneof![Just(MAX_OPS), 1usize..4],
+        answer in prop_oneof![Just(Answer::Delete), Just(Answer::Restore)],
+        cut in prop::sample::select(CUTS.to_vec()),
+    ) {
+        let mut seed = vec![act(0, 0, 0, 0, 0)];
+        seed.extend((0..inside).map(|i| act(1, 0, 1, i % NAMES.len(), 0)));
+        seed.extend((0..loose).map(|i| act(1, 0, 0, i % NAMES.len(), 0)));
+        let (space, _) = seeded(&seed);
+        let root = space.space_id().to_owned();
+        let mut live: Vec<_> = (space.nodes().into_iter())
+            .filter(|node| node.status == 1 && node.node_id != root)
+            .collect();
+        live.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        prop_assert_eq!(live.len(), inside + loose + 1, "every seeded file has its own name");
+        let folder = live.iter().position(|node| node.kind == 1).unwrap();
+        let mut actions = vec![act(4, folder, 0, 0, 0)];
+        actions.extend(local);
+
+        let ran = run_ignoring(&seed, &actions, &[], fits, true, &[], cut, &[], answer)?;
+
+        prop_assert!(ran.asked >= 1, "the removal was asked about");
+        match answer {
+            Answer::Restore => prop_assert_eq!((ran.deletes, ran.removals, ran.trashed), (0, 0, 0)),
+            Answer::Delete => prop_assert_eq!(ran.trashed, inside + 1),
+            other => unreachable!("the guard does not offer {other}"),
+        }
     }
 }
 
