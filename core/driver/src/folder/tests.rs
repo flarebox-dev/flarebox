@@ -5440,6 +5440,54 @@ fn a_folder_restored_and_deleted_again_while_the_log_was_truncated_is_noticed() 
     assert_eq!(questions.len(), 1, "the later deletion is noticed");
 }
 
+/// GUN-384 review: while device b's notice is open, device a deletes two more files. The notice keeps its id and its
+/// counts grow, so the number of questions stays 1, and the folder still marks the questions changed for the status.
+#[test]
+fn a_notice_whose_counts_grow_marks_the_questions_changed() {
+    use crate::question::QuestionKind;
+
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    let (site_b, mut b) = linked(&mut remote, "b");
+    fs::create_dir(site_a.root.join("d")).unwrap();
+    for i in 0..15 {
+        fs::write(site_a.root.join(format!("d/{i}.txt")), format!("in d {i}")).unwrap();
+    }
+    for i in 0..5 {
+        fs::write(
+            site_a.root.join(format!("{i}.txt")),
+            format!("beside d {i}"),
+        )
+        .unwrap();
+    }
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+    fs::remove_dir_all(site_a.root.join("d")).unwrap();
+    a.scan_until(|a| a.folder.view().questions == 1);
+    answer(&site_a, Answer::Delete);
+    let step = a.folder.requested();
+    a.take(step).unwrap();
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+    assert_eq!(b.folder.view().questions, 1);
+    assert!(b.folder.take_questions_changed());
+
+    for i in 0..2 {
+        fs::remove_file(site_a.root.join(format!("{i}.txt"))).unwrap();
+    }
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+
+    assert_eq!(files(&site_b.root).len(), 3);
+    assert_eq!(b.folder.view().questions, 1);
+    assert!(b.folder.take_questions_changed());
+    match answer(&site_b, Answer::Dismiss).kind {
+        QuestionKind::RemoteMassDelete {
+            deletions,
+            affected_files,
+            ..
+        } => assert_eq!((deletions, affected_files), (3, 17)),
+        kind => panic!("a notice: {kind:?}"),
+    }
+}
+
 /// Device a deletes the folder `d`, which holds 15 of the 20 files, and the person confirms it there. Device b removes
 /// the folder and its store holds a notice about it (design §6.1) until the person dismisses it.
 #[test]

@@ -108,6 +108,9 @@ pub(crate) struct Folder {
     remote_nodes: u64,
     /// The questions in the store that wait for an answer.
     questions: u64,
+    /// Whether a question changed since the status last showed the questions, also when their number did not, as
+    /// when a notice's counts grow.
+    questions_changed: bool,
     /// Commit sends and uploads that failed in a row, for the backoff.
     failures: u32,
     backoff: Backoff,
@@ -291,6 +294,7 @@ impl Folder {
             local_entries: None,
             remote_nodes,
             questions,
+            questions_changed: false,
             failures: 0,
             backoff: Backoff::default(),
             note: None,
@@ -501,10 +505,16 @@ impl Folder {
             Err(Stall::Halt(stop)) => return Err(stop),
         };
         let node = (self.engine.effects.in_flight()).map(|record| record.node.clone());
-        let asked = self.engine.commits.questions().len();
+        let asked = |commits: &Commits| -> Vec<_> {
+            (commits.questions().iter())
+                .map(|question| (question.id.clone(), question.kind.clone()))
+                .collect()
+        };
+        let before = asked(&self.engine.commits);
         let settled = self.disk.apply(staged, &mut self.engine, &mut self.store)?;
-        if self.engine.commits.questions().len() != asked {
+        if asked(&self.engine.commits) != before {
             self.questions = self.store.transaction(unanswered)?;
+            self.questions_changed = true;
         }
         let mut work = Vec::new();
         if let Some(node) = node {
@@ -738,6 +748,11 @@ impl Folder {
             at,
         };
         self.retrying.insert(call, retrying);
+    }
+
+    /// Whether a question changed since the last call, also when the number of questions did not.
+    pub fn take_questions_changed(&mut self) -> bool {
+        std::mem::take(&mut self.questions_changed)
     }
 
     /// The folder's status as the task knows it.
@@ -1532,7 +1547,7 @@ impl FolderTask {
             Err(reason) => return Halt::Person(reason.to_string()),
         };
         let transfer = Transfer::new(self.auth.api());
-        self.publish(&folder);
+        self.publish(&mut folder);
         let stop = {
             let (session, transfer) = (&session, &transfer);
             let mut list: Slot<'_, Result<Listed, Stop>> = None;
@@ -1638,7 +1653,7 @@ impl FolderTask {
                         }
                     }
                 }
-                self.publish(&folder);
+                self.publish(&mut folder);
             }
         };
         session.close().await;
@@ -1784,9 +1799,10 @@ impl FolderTask {
         receiver
     }
 
-    /// Shows what the folder knows in the status, and marks the status changed when it differs.
-    fn publish(&self, folder: &Folder) {
+    /// Shows what the folder knows in the status, and marks the status changed when it differs or a question changed.
+    fn publish(&self, folder: &mut Folder) {
         let view = folder.view();
+        let asked = folder.take_questions_changed();
         let mut status = self.status.lock().unwrap();
         let shown = View {
             state: status.state,
@@ -1798,7 +1814,7 @@ impl FolderTask {
             problem: status.problem.clone(),
             questions: status.questions,
         };
-        if shown == view {
+        if shown == view && !asked {
             return;
         }
         status.state = view.state;
