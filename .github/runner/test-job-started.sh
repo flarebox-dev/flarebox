@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Runs job-started.sh against fake event payloads the way the runner calls it (bash -e, with
-# only the base system on PATH) and checks that it allows only pushes to main and merge queue
-# runs for main.
+# only the base system on PATH) and checks that it allows only pushes to main, merge queue runs
+# for main and pull requests from branches of this repository.
 set -euo pipefail
 
 hook="$(cd "$(dirname "$0")" && pwd)/job-started.sh"
@@ -12,11 +12,14 @@ trap 'chmod -R u+rw "$tmp"; rm -rf "$tmp"' EXIT
 failures=0
 
 queue_ref=refs/heads/gh-readonly-queue/main/pr-73-15cfab4073d9b7abc02f71c8f98f2b5a5502829d
-pr() { printf '{"action":"synchronize","pull_request":{"number":1,"head":{"ref":"x","repo":{"full_name":"%s"}}},"repository":{"full_name":"flarebox-dev/flarebox"}}' "$1"; }
+pr() { printf '{"action":"synchronize","pull_request":{"number":1,"head":{"ref":"x","repo":%s}},"repository":{"full_name":"flarebox-dev/flarebox"}}' "$1"; }
 push() { printf '{"ref":"%s","repository":{"full_name":"flarebox-dev/flarebox"},"pusher":{"name":"x"},"head_commit":null}' "$1"; }
 queue() { printf '{"action":"checks_requested","merge_group":{"head_ref":"%s","base_ref":"%s","base_sha":"abc"},"repository":{"full_name":"flarebox-dev/flarebox"}}' "$1" "$2"; }
-pr flarebox-dev/flarebox > "$tmp/same-repo-pr.json"
-pr someone/flarebox > "$tmp/fork-pr.json"
+pr '{"full_name":"flarebox-dev/flarebox"}' > "$tmp/same-repo-pr.json"
+pr '{"full_name":"someone/flarebox"}' > "$tmp/fork-pr.json"
+pr null > "$tmp/deleted-fork-pr.json"
+pr '{"full_name":"flarebox-dev/flarebox-other"}' > "$tmp/sibling-repo-pr.json"
+printf '{"pull_request":{"head":{"repo":{"full_name":"flarebox-dev/flarebox"}}},"repository":{"full_name":"flarebox-dev/flarebox"}}' > "$tmp/pr-no-number.json"
 push refs/heads/main > "$tmp/push-main.json"
 push refs/heads/feature > "$tmp/push-feature.json"
 push refs/tags/v1.0.0 > "$tmp/push-tag.json"
@@ -49,9 +52,17 @@ check() {
 
 check "push to main runs" 0 "push on refs/heads/main in flarebox-dev/flarebox may run here" push "$tmp/push-main.json" refs/heads/main
 check "merge queue run for main runs" 0 "merge_group on $queue_ref in flarebox-dev/flarebox may run here" merge_group "$tmp/queue-main.json" "$queue_ref"
-check "pull request from the same repository is refused" 1 "its event is pull_request" pull_request "$tmp/same-repo-pr.json" refs/pull/1/merge
-check "pull request from a fork is refused" 1 "its event is pull_request" pull_request "$tmp/fork-pr.json" refs/pull/1/merge
+check "pull request from the same repository runs" 0 "pull_request on refs/pull/1/merge in flarebox-dev/flarebox may run here" pull_request "$tmp/same-repo-pr.json" refs/pull/1/merge
+check "pull request from a fork is refused" 1 "whose head is not in flarebox-dev/flarebox" pull_request "$tmp/fork-pr.json" refs/pull/1/merge
+check "pull request from a deleted fork is refused" 1 "whose head is not in flarebox-dev/flarebox" pull_request "$tmp/deleted-fork-pr.json" refs/pull/1/merge
+check "pull request from a repository with a longer name is refused" 1 "whose head is not in flarebox-dev/flarebox" pull_request "$tmp/sibling-repo-pr.json" refs/pull/1/merge
+check "same-repository pull request on another pull request's ref is refused" 1 "does not name 'refs/pull/2/merge'" pull_request "$tmp/same-repo-pr.json" refs/pull/2/merge
+check "same-repository pull request on its head ref is refused" 1 "does not name 'refs/pull/1/head'" pull_request "$tmp/same-repo-pr.json" refs/pull/1/head
+check "same-repository pull request on main is refused" 1 "does not name 'refs/heads/main'" pull_request "$tmp/same-repo-pr.json" refs/heads/main
+check "pull request payload with no number is refused" 1 "does not name 'refs/pull/1/merge'" pull_request "$tmp/pr-no-number.json" refs/pull/1/merge
+check "pull request from the same repository in another repository's job is refused" 1 "these runners serve only flarebox-dev/flarebox" pull_request "$tmp/same-repo-pr.json" refs/pull/1/merge someone/flarebox
 check "pull_request_target is refused" 1 "its event is pull_request_target" pull_request_target "$tmp/fork-pr.json" refs/heads/main
+check "pull_request_target from the same repository is refused" 1 "its event is pull_request_target" pull_request_target "$tmp/same-repo-pr.json" refs/heads/main
 check "pull_request_review is refused" 1 "its event is pull_request_review" pull_request_review "$tmp/same-repo-pr.json" refs/pull/1/merge
 check "workflow_dispatch on main is refused" 1 "its event is workflow_dispatch" workflow_dispatch "$tmp/workflow-dispatch.json" refs/heads/main
 check "schedule is refused" 1 "its event is schedule" schedule "$tmp/schedule.json" refs/heads/main

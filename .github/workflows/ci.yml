@@ -36,10 +36,12 @@ jobs:
         id: runners
         env:
           EVENT: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
           RUNS_ON: ${{ vars.MACOS_RUNS_ON || '["self-hosted","flarebox-mini"]' }}
         run: |
-          if [ "$EVENT" = pull_request ]; then
-            echo "Pull request: its macOS jobs run on GitHub-hosted runners."
+          if [ "$EVENT" = pull_request ] && [ "$HEAD_REPO" != "$REPO" ]; then
+            echo "Pull request from ${HEAD_REPO:-a deleted repository}: its macOS jobs run on GitHub-hosted runners."
             RUNS_ON='["xcode-27"]'
           fi
           if ! jq -e 'type == "array" and length > 0 and all(.[]; type == "string")' <<<"$RUNS_ON" >/dev/null 2>&1; then
