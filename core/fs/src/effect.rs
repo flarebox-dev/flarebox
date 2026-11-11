@@ -30,6 +30,7 @@ use rustix::io::Errno;
 
 use crate::resolve::{Folder, Location, Space, Unresolved, check_name};
 use crate::root::{Marker, flush, remove_if_present, rename_no_replace, write_marker_at};
+use crate::trash::TRASH_DIR;
 use crate::{Entry, EntryKind, FileId, Stat, list, stat_at, stat_fd};
 
 /// The folder inside the private folder that holds staged downloads.
@@ -537,7 +538,7 @@ impl Space {
             hook(Step::Trashed);
             return Ok(outcome);
         }
-        if !staged && let Some(done) = self.finished(&effect.action, contents)? {
+        if !staged && let Some(done) = self.finished(effect, contents)? {
             return Ok(done);
         }
         self.drop_staged(&effect.id)?;
@@ -545,10 +546,13 @@ impl Space {
     }
 
     /// The outcome of an effect that left nothing in quarantine, when the disk
-    /// holds `action`'s final state.
+    /// holds its final state. A removal is final only once its entry is in the
+    /// local trash. A name found empty with no such entry was emptied by the
+    /// user, who moved or deleted the entry before the effect reached it, so the
+    /// removal fails as it would have failed had it run.
     fn finished(
         &self,
-        action: &Action,
+        effect: &Effect,
         contents: &mut dyn Contents,
     ) -> io::Result<Option<Outcome>> {
         let entry_at = |at: &Location| -> io::Result<Option<Option<Stat>>> {
@@ -562,7 +566,11 @@ impl Space {
                 Err(err) => Err(err.into()),
             }
         };
-        let identity = match action {
+        let trashed = || -> io::Result<bool> {
+            let trash = self.private(&[TRASH_DIR])?;
+            Ok(lookup(trash.fd(), OsStr::new(&effect.id))?.is_some())
+        };
+        let identity = match &effect.action {
             Action::CreateDir { at } => match entry_at(at)? {
                 Some(Some(stat)) if stat.file_type == FileType::Directory => Some(stat.id),
                 _ => return Ok(None),
@@ -579,7 +587,8 @@ impl Space {
                 displaced: Displaced { at, .. },
             }
             | Action::RemoveDir { at, .. } => match entry_at(at)? {
-                Some(None) => None,
+                Some(None) if trashed()? => None,
+                Some(None) => return Ok(Some(failed(Reason::Missing))),
                 _ => return Ok(None),
             },
         };

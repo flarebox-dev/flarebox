@@ -999,3 +999,34 @@ fn a_lost_file_both_devices_create_again_is_kept_once() {
             .all(|device| device.disk.entries().len() == 1)
     );
 }
+
+/// Devices 1 and 0 rename a file that device 2 deletes, and device 1 crashes once it recorded the
+/// removal and before the removal reached the file. Recovery finds the old name empty and nothing
+/// in the local trash, so the removal failed, and device 1 moves the node instead of creating the
+/// file again beside the one device 0 revived (GUN-443).
+#[test]
+fn a_removal_recovered_after_the_user_moved_its_file_keeps_one_file() {
+    let u = |kind, name| {
+        Step::User(Action {
+            kind,
+            target: 0,
+            parent: 0,
+            name,
+            text: 0,
+        })
+    };
+    let phases = vec![
+        vec![(0, u(1, 0))],
+        vec![
+            (2, u(4, 0)),
+            (1, u(3, 1)),
+            (2, Step::Work(0)),
+            (2, Step::Work(0)),
+            (2, Step::Work(0)),
+            (1, DELIVER),
+            (0, u(3, 1)),
+            (1, Step::Effect(Outcome::Crash(Cut::Quarantined))),
+        ],
+    ];
+    converge(3, &phases).unwrap();
+}

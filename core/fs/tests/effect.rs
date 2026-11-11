@@ -724,3 +724,25 @@ fn space_changes_nothing_once_its_root_is_moved_away() {
     assert_settled(&moved);
     assert!(listing(&root).is_empty());
 }
+/// A crash after the record of a removal and before the effect reached the file, while the user
+/// moved the entry away: recovery finds the name empty with nothing in the local trash, so the
+/// effect did not remove the entry, and it fails as it would have had it run.
+#[test]
+fn recovery_of_a_removal_whose_file_the_user_moved_first_fails() {
+    for scenario in ["remove_file", "remove_dir"] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let effect = prepare(common::scenario(scenario), root);
+        let (from, to) = match scenario {
+            "remove_file" => ("docs/report.txt", "docs/moved.txt"),
+            _ => ("docs/empty", "docs/moved"),
+        };
+        fs::rename(root.join(from), root.join(to)).unwrap();
+        let outcome = bind(root)
+            .recover(&marker(), &effect, &mut Bytes, now(), &mut |_| {})
+            .unwrap();
+        assert_eq!(outcome, failed(Reason::Missing), "{scenario}");
+        assert!(root.join(to).exists(), "{scenario}");
+        assert!(trashed(root).is_empty(), "{scenario}");
+    }
+}

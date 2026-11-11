@@ -12,7 +12,7 @@
 //! folder that has entries before it moves the folder, so a folder with entries is never in
 //! quarantine.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use koidrive_engine::effects::{Base, Displaced, Effect, EffectRecord, Location};
 use koidrive_engine::tree::{Content, FileIdentity, same_content};
@@ -93,6 +93,8 @@ pub struct Disk {
     pub(super) staged: bool,
     /// The entry that the effect in flight displaced and has not sent to the local trash yet.
     pub(super) quarantine: Option<Entry>,
+    /// The effects whose displaced entry is in the local trash.
+    trash: BTreeSet<String>,
 }
 
 impl Disk {
@@ -219,6 +221,13 @@ impl Disk {
         if until == Cut::Done {
             self.staged = false;
         }
+        let removal = matches!(
+            record.effect,
+            Effect::RemoveFile { .. } | Effect::RemoveDir { .. }
+        );
+        if until == Cut::Done && outcome.is_ok() && removal {
+            self.trash.insert(record.effect_id.clone());
+        }
         Applied { outcome, trashed }
     }
 
@@ -298,14 +307,16 @@ impl Disk {
     /// Ends the effect in flight after a crash (section 5.3). An entry in quarantine means that
     /// the effect displaced it: the staged download gets its name if it has none yet, and the
     /// entry goes to the local trash. With nothing in quarantine and nothing staged, the effect
-    /// is done when its target is in the effect's final state. Anything else is an effect that
-    /// stopped early or whose target the user has changed since.
+    /// is done when its target is in the effect's final state, which for a removal also takes its
+    /// entry in the local trash. A removal whose name is empty without that entry fails, since the
+    /// user moved or deleted the entry before the effect reached it. Anything else is an effect
+    /// that stopped early or whose target the user has changed since.
     pub fn recover(&mut self, record: &EffectRecord) -> Applied {
         let staged = std::mem::take(&mut self.staged);
         let Some(entry) = self.quarantine.take() else {
-            let outcome = match self.finished(&record.effect) {
-                Some(identity) if !staged => Ok(identity),
-                _ => Err(Refused::Interrupted),
+            let outcome = match staged {
+                false => self.finished(record),
+                true => Err(Refused::Interrupted),
             };
             return Applied {
                 outcome,
@@ -330,24 +341,30 @@ impl Disk {
         }
     }
 
-    /// The identity of the entry an effect made, when the disk is in the effect's final state.
-    fn finished(&self, effect: &Effect) -> Option<Option<FileIdentity>> {
-        match effect {
-            Effect::CreateDir { at } => {
-                let ino = self.at(at).ok()??;
-                (self.entries[&ino].content.is_none()).then(|| Some(identity(ino)))
-            }
+    /// The identity of the entry an effect made, when the disk is in the effect's final state. A
+    /// removal is final only once its entry is in the local trash.
+    fn finished(&self, record: &EffectRecord) -> Result<Option<FileIdentity>, Refused> {
+        let at = |at: &Location| self.at(at).map_err(|_| Refused::Interrupted);
+        let done = match &record.effect {
+            Effect::CreateDir { at: place } => at(place)?
+                .filter(|ino| self.entries[ino].content.is_none())
+                .map(|ino| Some(identity(ino))),
             Effect::WriteFile { at, content, .. } => self.written(at, content).map(Some),
             Effect::Move {
                 identity: moved,
                 to,
                 ..
-            } => (self.at(to).ok()? == Some(moved.ino)).then_some(None),
+            } => (at(to)? == Some(moved.ino)).then_some(None),
             Effect::RemoveFile {
-                displaced: Displaced { at, .. },
+                displaced: Displaced { at: place, .. },
             }
-            | Effect::RemoveDir { at, .. } => self.at(at).ok()?.is_none().then_some(None),
-        }
+            | Effect::RemoveDir { at: place, .. } => match at(place)? {
+                None if self.trash.contains(&record.effect_id) => Some(None),
+                None => return Err(Refused::Moved),
+                Some(_) => None,
+            },
+        };
+        done.ok_or(Refused::Interrupted)
     }
 
     /// The identity of the file at `at`, when it holds `content`.
