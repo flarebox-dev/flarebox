@@ -484,6 +484,30 @@ fn a_file_and_a_folder_swapped_in_one_batch_keep_the_folders_child() {
     assert_eq!(both.iter().filter(|(_, text)| text == "file A").count(), 1);
 }
 
+/// Device b rotates the file `a` and the folders `b` and `c` through a third name before its observer looks: `c`
+/// takes `a`, `b` takes `c` and the file takes `b`. Each folder keeps its own child on both devices.
+#[test]
+fn a_file_and_two_folders_rotated_in_one_batch_keep_each_child_in_its_folder() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("a"), b"A");
+    fs::create_dir(site_a.root.join("b")).unwrap();
+    a.create(&mut remote, &site_a.root.join("b/one"), b"B child");
+    fs::create_dir(site_a.root.join("c")).unwrap();
+    a.create(&mut remote, &site_a.root.join("c/two"), b"C child");
+    let (site, mut b) = linked(&mut remote, "b");
+    b.settle();
+    for (from, to) in [("a", "tmp"), ("c", "a"), ("b", "c"), ("tmp", "b")] {
+        fs::rename(site.root.join(from), site.root.join(to)).unwrap();
+    }
+    sync(&mut remote, (&site_a, &mut a), (&site, &mut b));
+    let both = files(&site_a.root);
+    assert_eq!(both, files(&site.root));
+    assert!(both.contains(&("a/two".to_owned(), "C child".to_owned())));
+    assert!(both.contains(&("c/one".to_owned(), "B child".to_owned())));
+    assert_eq!(both.iter().filter(|(_, bytes)| bytes == "A").count(), 1);
+}
+
 /// Device b swaps two files, and two folders with a file each, through a third name before its observer looks.
 /// Every file keeps its bytes at its new path on both devices.
 #[test]
