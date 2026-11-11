@@ -71,7 +71,7 @@ On the new device, run:
 The code works once, for about 10 minutes.
 ```
 
-In the macOS app, Settings, Account, Add a Device shows the same kind of code.
+In the macOS app, Settings, Account, Add a Device shows a pairing code without the server's address. To use it on a device with the `koi` command, run `koi join <code> --server <address>`.
 
 A code written as `<code>@<host>` carries the server's address. For a code without it, add the address with `--server https://koidrive.alice.workers.dev`. `koi setup <code>` does the same as `koi join`.
 
