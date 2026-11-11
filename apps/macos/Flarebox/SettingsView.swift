@@ -226,7 +226,7 @@ private struct AccountSettings: View {
             Button("Remove", role: .destructive) {
                 perform {
                     try await model.revokeDevice(device)
-                    devices = try await model.devices()
+                    devices.removeAll { $0.deviceId == device.deviceId }
                 }
             }
         } message: { _ in

@@ -104,6 +104,7 @@ fn signed_in() -> Saved {
                 added_at_ms: now_ms() - 7 * DAY_MS,
             },
         ],
+        revoked: Vec::new(),
         spaces: vec![
             Space {
                 space_id: DOCUMENTS.to_owned(),

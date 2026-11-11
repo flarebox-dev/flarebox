@@ -297,7 +297,9 @@ private final class Fetches {
         await #expect(throws: SessionError.ThisDevice) { try await model.revokeDevice(devices[0]) }
         try await model.revokeDevice(devices[1])
         #expect(try await model.devices().map(\.deviceId) == ["device-1"])
-        await #expect(throws: SessionError.DeviceNotFound) { try await model.revokeDevice(devices[1]) }
+        try await model.revokeDevice(devices[1])
+        let unknown = Device(deviceId: "device-9", name: "Mac", platform: "macos", thisDevice: false, addedAtMs: 1)
+        await #expect(throws: SessionError.DeviceNotFound) { try await model.revokeDevice(unknown) }
     }
 
     @Test func theLastDeviceSignsOutOnlyOnceConfirmed() async throws {

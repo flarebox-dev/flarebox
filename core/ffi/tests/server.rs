@@ -353,6 +353,18 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
         mac.session().revoke_device(owner.device_id.clone()),
         Err(SessionError::ThisDevice)
     );
+    assert_eq!(
+        mac.session()
+            .revoke_device(format!("{}?confirm=last-device", owner.device_id)),
+        Err(SessionError::DeviceNotFound)
+    );
+    assert_eq!(
+        listed(&mac),
+        [
+            ("Ada's Mac".to_owned(), true),
+            ("Old Mac".to_owned(), false)
+        ]
+    );
     let old_kept = old.path("credential");
     keep_credential(&old.profile(), &old_kept);
     mac.session()

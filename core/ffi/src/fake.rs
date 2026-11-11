@@ -83,6 +83,7 @@ struct Saved {
     claimed: bool,
     account: Option<Account>,
     devices: Vec<Device>,
+    revoked: Vec<String>,
     spaces: Vec<Space>,
     folders: Vec<LinkedFolder>,
     questions: Vec<Question>,
@@ -685,11 +686,15 @@ impl Core for FakeCore {
             if saved.account()?.device_id == device_id {
                 return Err(SessionError::ThisDevice);
             }
+            if saved.revoked.iter().any(|revoked| revoked == device_id) {
+                return Ok(());
+            }
             let listed = saved.devices.len();
             saved.devices.retain(|device| device.device_id != device_id);
             if saved.devices.len() == listed {
                 return Err(SessionError::DeviceNotFound);
             }
+            saved.revoked.push(device_id.to_owned());
             Ok(())
         })
     }
@@ -1385,8 +1390,9 @@ mod tests {
         );
         h.core.revoke_device("device-2").unwrap();
         assert_eq!(listed(&h), ["device-1"]);
+        h.core.revoke_device("device-2").unwrap();
         assert_eq!(
-            h.core.revoke_device("device-2"),
+            h.core.revoke_device("device-9"),
             Err(SessionError::DeviceNotFound)
         );
     }

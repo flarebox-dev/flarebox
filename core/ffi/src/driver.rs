@@ -420,6 +420,11 @@ impl Core for DriverCore {
 
     fn revoke_device(&self, device_id: &str) -> Result<(), SessionError> {
         let (api, auth) = self.signed_in()?;
+        let issued = device_id.len() == 36
+            && (device_id.bytes()).all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f' | b'-'));
+        if !issued {
+            return Err(SessionError::DeviceNotFound);
+        }
         if device_id == auth.credentials().device_id {
             return Err(SessionError::ThisDevice);
         }
@@ -1191,6 +1196,48 @@ mod tests {
             .unwrap();
         assert_eq!(stored.refresh_credential, "staged");
         assert!(!next.exists());
+    }
+
+    #[test]
+    fn a_device_id_unlike_the_servers_never_reaches_it() {
+        let (server, served) = serve(Vec::new());
+        let dir = tempfile::tempdir().unwrap();
+        let this = "0190b6a5-0000-7000-8000-000000000001";
+        driver::Credential {
+            server,
+            user_id: "u1".into(),
+            user_name: None,
+            device_id: this.into(),
+            device_name: "Mac".into(),
+            refresh_credential: "current".into(),
+        }
+        .save_new(&Paths::under(dir.path()).credential())
+        .unwrap();
+        let session = SyncSession::open(
+            Box::new(Recorder(Arc::default())),
+            dir.path().to_str().unwrap().to_owned(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            session.revoke_device(this.into()),
+            Err(SessionError::ThisDevice)
+        );
+        for id in [
+            format!("{this}?confirm=last-device"),
+            format!("{this}/"),
+            format!("../devices/{this}"),
+            this.to_uppercase(),
+            String::new(),
+        ] {
+            assert_eq!(
+                session.revoke_device(id.clone()),
+                Err(SessionError::DeviceNotFound),
+                "{id}"
+            );
+        }
+        drop(session);
+        assert!(served.join().unwrap().is_empty());
     }
 
     #[test]

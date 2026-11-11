@@ -95,7 +95,9 @@ pub trait Core: Send + Sync {
     /// The account's devices that are not revoked.
     fn devices(&self) -> Result<Vec<Device>, SessionError>;
     /// Revokes another device of the account on the server. It can no longer sync, and the files already on it stay
-    /// there. This device leaves with [`Core::sign_out`], so its own ID returns [`SessionError::ThisDevice`].
+    /// there. This device leaves with [`Core::sign_out`], so its own ID returns [`SessionError::ThisDevice`]. An ID
+    /// unlike those the server issues (36 lowercase hexadecimal digits and hyphens) returns
+    /// [`SessionError::DeviceNotFound`] without a request.
     fn revoke_device(&self, device_id: &str) -> Result<(), SessionError>;
     /// Creates a code that signs in another device.
     fn start_pairing(&self) -> Result<PairingCode, SessionError>;
