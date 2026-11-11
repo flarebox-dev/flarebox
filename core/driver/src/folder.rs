@@ -1262,8 +1262,9 @@ impl Folder {
     /// its staging is out, or waits to be staged again. An effect comes first, and none is planned while a commit is
     /// in flight unless committing has stopped, because the engine's property test never runs an effect between
     /// building a commit and acknowledging it. A commit is built only when no effect is planned, R is caught up and
-    /// the session is connected, and only when a node is dirty or a restore is queued. Building can change the
-    /// trees without giving a commit, so the effects are planned once more after it.
+    /// the session is connected, and only when a node is dirty, a restore is queued or a conflict question is due
+    /// ([`Commits::conflicts_due`]). Building can change the trees without giving a commit, so the effects are
+    /// planned once more after it.
     /// Nothing is planned either while the rules an effect can have changed are awaited ([`Disk::awaits_rules`]);
     /// the batch that brings them drives the folder again.
     fn drive(&mut self, work: &mut Vec<Work>) -> Result<(), Stop> {
@@ -1282,7 +1283,8 @@ impl Folder {
         let trees = &self.engine.trees;
         let nothing_local = trees.dirty().is_empty()
             && trees.waiting().is_empty()
-            && self.engine.commits.restores().is_empty();
+            && self.engine.commits.restores().is_empty()
+            && !self.engine.commits.conflicts_due(trees);
         let may_build = matches!(self.flight, Flight::Idle)
             && self.engine.commits.in_flight().is_none()
             && self.caught_up()

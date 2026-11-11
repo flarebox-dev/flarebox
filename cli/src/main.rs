@@ -1332,6 +1332,7 @@ fn question_summary(question: &Question) -> String {
             }
         }
         .to_owned(),
+        QuestionKind::Conflict { .. } => "two files conflict".to_owned(),
     }
 }
 
@@ -1367,6 +1368,9 @@ fn answer_effect(answer: Answer) -> &'static str {
         Answer::Repeat => "Send the request again",
         Answer::Cancel => "Drop the request",
         Answer::Dismiss => "Close this notice",
+        Answer::KeepOriginal => "Keep the original and move the conflict copy to the trash",
+        Answer::KeepCopy => "Move the original to the trash and give the conflict copy its name",
+        Answer::KeepBoth => "Keep both files",
     }
 }
 
@@ -1829,6 +1833,7 @@ mod tests {
                     node_id: format!("n{i}"),
                     path: format!("old/{i:02}"),
                     files: 1,
+                    device_id: None,
                 })
                 .collect(),
         }

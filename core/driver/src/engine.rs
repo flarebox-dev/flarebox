@@ -18,7 +18,8 @@ use koidrive_engine::effects::Effects;
 use koidrive_engine::ids::IdGen;
 use koidrive_engine::question as engine;
 use koidrive_engine::tree::{
-    Content, FileIdentity, Kind, LocalNode, Names, NodeId, RemoteNode, Shape, Tree, same_content,
+    Content, FileIdentity, Kind, LocalNode, Names, Node, NodeId, RemoteNode, Shape, Tree,
+    same_content,
 };
 use koidrive_fs::{Entry, EntryKind, FileId, Known, Snapshot};
 use koidrive_proto::v1::{
@@ -197,7 +198,7 @@ impl Engine {
             let kept = rows
                 .get(&question.id)
                 .map_or_else(|| question.id.clone(), lineage);
-            let body = serde_json::to_vec(&self.shown(space_id, question, kept))
+            let body = serde_json::to_vec(&self.shown(tx, space_id, question, kept)?)
                 .expect("a question serializes");
             tx.reshow_question(&question.id, &body)?;
             changed = true;
@@ -217,7 +218,7 @@ impl Engine {
             tx.put_question(&StoredQuestion {
                 question_id: question.id.clone(),
                 asked_at_ms: question.asked_at_ms as i64,
-                body: serde_json::to_vec(&self.shown(space_id, question, continued))
+                body: serde_json::to_vec(&self.shown(tx, space_id, question, continued)?)
                     .expect("a question serializes"),
                 answer: None,
             })?;
@@ -227,24 +228,45 @@ impl Engine {
         Ok(())
     }
 
-    /// The question as the person sees it: each item the engine holds with its path, in path order.
-    fn shown(&self, space_id: &str, asked: &engine::Question, lineage: String) -> Question {
-        let mut items: Vec<HeldItem> = (asked.held.iter())
-            .map(|(id, held)| HeldItem {
-                node_id: id.clone(),
-                path: self.path(id),
-                files: held.files,
-            })
-            .collect();
+    /// The question as the person sees it, with its items in path order: each item the engine holds with its path
+    /// ([`Self::path`]), or both files of a conflict with their paths in R and the devices that wrote them.
+    fn shown(
+        &self,
+        tx: &Tx<'_>,
+        space_id: &str,
+        asked: &engine::Question,
+        lineage: String,
+    ) -> Result<Question, Error> {
+        let mut items: Vec<HeldItem> = match &asked.kind {
+            engine::QuestionKind::Conflict { original, copy } => [original, copy]
+                .into_iter()
+                .map(|file| {
+                    Ok(HeldItem {
+                        node_id: file.node_id.clone(),
+                        path: path(self.trees.remote(), &file.node_id),
+                        files: 1,
+                        device_id: tx.remote_writer(&file.node_id)?,
+                    })
+                })
+                .collect::<Result<_, Error>>()?,
+            _ => (asked.held.iter())
+                .map(|(id, held)| HeldItem {
+                    node_id: id.clone(),
+                    path: self.path(id),
+                    files: held.files,
+                    device_id: None,
+                })
+                .collect(),
+        };
         items.sort_by(|a, b| a.path.cmp(&b.path));
-        Question {
+        Ok(Question {
             id: asked.id.clone(),
             space_id: space_id.to_owned(),
             asked_at_ms: asked.asked_at_ms as i64,
             kind: asked.kind.clone(),
             items,
             lineage,
-        }
+        })
     }
 
     /// The path of a node relative to the linked folder: where L holds it, or where S holds it when L does not, as
@@ -1002,6 +1024,18 @@ impl Engine {
 type Gone = BTreeMap<PathBuf, (NodeId, FileIdentity)>;
 
 /// The placed node of L at `path`, or the root for the empty path.
+/// The path of a node `tree` holds live, relative to the linked folder.
+fn path<N: Node>(tree: &Tree<N>, id: &str) -> String {
+    let mut names = Vec::new();
+    let mut current = id;
+    while let Some(shape) = tree.live(current).filter(|_| names.len() <= tree.len()) {
+        names.push(shape.name.as_str());
+        current = &shape.parent;
+    }
+    names.reverse();
+    names.join("/")
+}
+
 fn local_at(trees: &Trees, path: &Path) -> Option<NodeId> {
     let mut current = trees.local().root.clone();
     for component in path.components() {
@@ -1238,6 +1272,13 @@ fn same_kind(before: &engine::QuestionKind, after: &engine::QuestionKind) -> boo
             engine::QuestionKind::Recovery { group: a },
             engine::QuestionKind::Recovery { group: b },
         ) => a == b,
+        (
+            engine::QuestionKind::Conflict { original, copy },
+            engine::QuestionKind::Conflict {
+                original: other,
+                copy: other_copy,
+            },
+        ) => original.node_id == other.node_id && copy.node_id == other_copy.node_id,
         (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
     }
 }

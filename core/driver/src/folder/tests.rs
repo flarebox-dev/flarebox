@@ -5902,3 +5902,274 @@ fn a_cursor_the_restored_head_caught_up_with_lists_the_tree_again() {
         ["four.txt", "one.txt", "three.txt", "two.txt"]
     );
 }
+
+/// The questions in the site's store, as `Driver::questions` shows them.
+fn asked(site: &Site) -> Vec<crate::question::Question> {
+    let mut store = Store::open(&site.db).unwrap();
+    let stored = store.transaction(|tx| tx.questions()).unwrap();
+    (stored.iter())
+        .map(|stored| serde_json::from_slice(&stored.body).unwrap())
+        .collect()
+}
+
+const COPY: &str = "main (conflict from b 2023-11-14).go";
+
+/// Devices `a` and `b` hold `main.go`, and both edit it. `a` commits first, and `b` commits before it hears of
+/// that, so the server keeps `b`'s edit as the conflict copy [`COPY`]. Then both sync.
+fn edited_on_both(remote: &mut Remote) -> ((Site, Device), (Site, Device)) {
+    let (site_a, mut a) = linked(remote, "a");
+    a.create(remote, &site_a.root.join("main.go"), b"v1");
+    let (site_b, mut b) = linked(remote, "b");
+    b.settle();
+    fs::write(site_a.root.join("main.go"), b"from a").unwrap();
+    fs::write(site_b.root.join("main.go"), b"from b").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(remote);
+    b.scan_until(|b| !b.work.is_empty());
+    b.run(remote);
+    sync(remote, (&site_a, &mut a), (&site_b, &mut b));
+    ((site_a, a), (site_b, b))
+}
+
+/// The device whose edit became a conflict copy asks about it, with both files, their revisions and the devices
+/// that wrote them. The other device asks nothing.
+#[test]
+fn an_edit_that_became_a_conflict_copy_is_asked_about_with_both_files() {
+    use crate::question::QuestionKind;
+
+    let mut remote = Remote::new();
+    let ((site_a, _), (site_b, _)) = edited_on_both(&mut remote);
+
+    let both = [(COPY, "from b"), ("main.go", "from a")]
+        .map(|(path, text)| (path.to_owned(), text.to_owned()));
+    assert_eq!(files(&site_a.root), both);
+    assert_eq!(files(&site_b.root), both);
+    assert_eq!(asked(&site_a), []);
+    let [question] = &asked(&site_b)[..] else {
+        panic!("one question: {:?}", asked(&site_b));
+    };
+    let nodes = server_nodes(&remote);
+    let QuestionKind::Conflict { original, copy } = &question.kind else {
+        panic!("a conflict: {question:?}");
+    };
+    assert_eq!(original.node_id, live_id(&nodes, "main.go"));
+    assert_eq!(copy.node_id, live_id(&nodes, COPY));
+    let items: Vec<_> = (question.items.iter())
+        .map(|item| {
+            (
+                item.path.as_str(),
+                item.node_id.as_str(),
+                item.device_id.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        items,
+        [
+            (COPY, copy.node_id.as_str(), Some("b")),
+            ("main.go", original.node_id.as_str(), Some("a")),
+        ]
+    );
+}
+
+/// Keep both closes the question and changes no file.
+#[test]
+fn keeping_both_files_of_a_conflict_changes_nothing() {
+    let mut remote = Remote::new();
+    let ((site_a, mut a), (site_b, mut b)) = edited_on_both(&mut remote);
+    answer(&site_b, Answer::KeepBoth);
+    let step = b.folder.requested();
+    b.take(step).unwrap();
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+
+    assert_eq!(asked(&site_b), []);
+
+    let both = [(COPY, "from b"), ("main.go", "from a")]
+        .map(|(path, text)| (path.to_owned(), text.to_owned()));
+    assert_eq!(files(&site_a.root), both);
+    assert_eq!(files(&site_b.root), both);
+    assert_eq!(remote.names(), [COPY, "main.go"]);
+}
+
+/// Keep the original moves the conflict copy to the server's trash, and every device removes it.
+#[test]
+fn keeping_the_original_of_a_conflict_moves_the_copy_to_the_trash() {
+    let mut remote = Remote::new();
+    let ((site_a, mut a), (site_b, mut b)) = edited_on_both(&mut remote);
+    let before = server_nodes(&remote);
+    answer(&site_b, Answer::KeepOriginal);
+    let step = b.folder.requested();
+    b.take(step).unwrap();
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+
+    let kept = [("main.go".to_owned(), "from a".to_owned())];
+    assert_eq!(files(&site_a.root), kept);
+    assert_eq!(files(&site_b.root), kept);
+    let after = server_nodes(&remote);
+    assert_eq!(live_id(&after, "main.go"), live_id(&before, "main.go"));
+    assert!(
+        after.contains(&(COPY.to_owned(), live_id(&before, COPY), false)),
+        "{after:?}"
+    );
+    assert_eq!(asked(&site_b), []);
+}
+
+/// Keep the copy moves the original to the server's trash and gives the copy the original's name on every device.
+#[test]
+fn keeping_the_copy_of_a_conflict_gives_it_the_name_and_moves_the_original_to_the_trash() {
+    let mut remote = Remote::new();
+    let ((site_a, mut a), (site_b, mut b)) = edited_on_both(&mut remote);
+    let before = server_nodes(&remote);
+    answer(&site_b, Answer::KeepCopy);
+    let step = b.folder.requested();
+    b.take(step).unwrap();
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+
+    let kept = [("main.go".to_owned(), "from b".to_owned())];
+    assert_eq!(files(&site_a.root), kept);
+    assert_eq!(files(&site_b.root), kept);
+    let after = server_nodes(&remote);
+    assert_eq!(live_id(&after, "main.go"), live_id(&before, COPY));
+    let original = live_id(&before, "main.go");
+    assert!(
+        after.contains(&("main.go".to_owned(), original, false)),
+        "{after:?}"
+    );
+    assert_eq!(asked(&site_b), []);
+}
+
+/// Renaming the copy by hand, here on the other device, ends the conflict.
+#[test]
+fn a_conflict_ends_when_someone_renames_a_file_by_hand() {
+    let mut remote = Remote::new();
+    let ((site_a, mut a), (site_b, mut b)) = edited_on_both(&mut remote);
+    fs::rename(site_a.root.join(COPY), site_a.root.join("other.go")).unwrap();
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+
+    assert_eq!(asked(&site_b), []);
+    assert_eq!(remote.names(), ["main.go", "other.go"]);
+}
+
+/// Deleting the copy by hand on the device that asks ends the conflict.
+#[test]
+fn a_conflict_ends_when_the_person_deletes_a_file_by_hand() {
+    let mut remote = Remote::new();
+    let ((site_a, mut a), (site_b, mut b)) = edited_on_both(&mut remote);
+    fs::remove_file(site_b.root.join(COPY)).unwrap();
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+
+    assert_eq!(asked(&site_b), []);
+    assert_eq!(remote.names(), ["main.go"]);
+}
+
+/// An edit of either file asks the question again under a new ID. The answer to the new question applies to the
+/// files as they are now.
+#[test]
+fn a_conflict_whose_file_changes_is_asked_again() {
+    use crate::question::QuestionKind;
+
+    let mut remote = Remote::new();
+    let ((site_a, mut a), (site_b, mut b)) = edited_on_both(&mut remote);
+    let [first] = &asked(&site_b)[..] else {
+        panic!("one question");
+    };
+    fs::write(site_a.root.join("main.go"), b"from a again").unwrap();
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+
+    let [second] = &asked(&site_b)[..] else {
+        panic!("one question: {:?}", asked(&site_b));
+    };
+    assert_ne!(second.id, first.id);
+    let revisions = |question: &crate::question::Question| match &question.kind {
+        QuestionKind::Conflict { original, .. } => original.revisions,
+        kind => panic!("a conflict: {kind:?}"),
+    };
+    assert!(revisions(second).content_rev > revisions(first).content_rev);
+    answer(&site_b, Answer::KeepOriginal);
+    let step = b.folder.requested();
+    b.take(step).unwrap();
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+    assert_eq!(
+        files(&site_b.root),
+        [("main.go".to_owned(), "from a again".to_owned())]
+    );
+}
+
+/// The question outlives the process, and its answer is carried out by the next one.
+#[test]
+fn a_conflict_is_asked_again_after_a_restart_and_answered_then() {
+    let mut remote = Remote::new();
+    let ((site_a, mut a), (site_b, b)) = edited_on_both(&mut remote);
+    let before = asked(&site_b);
+    drop(b);
+    let mut b = site_b.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    assert_eq!(b.folder.view().questions, 1);
+    assert_eq!(asked(&site_b), before);
+    answer(&site_b, Answer::KeepCopy);
+    let step = b.folder.requested();
+    b.take(step).unwrap();
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+    assert_eq!(
+        files(&site_a.root),
+        [("main.go".to_owned(), "from b".to_owned())]
+    );
+}
+
+/// Two devices create a file of one name. The second commit gets a conflict name from the server, and its device
+/// asks about the pair.
+#[test]
+fn a_file_created_under_a_name_another_device_took_is_asked_about() {
+    use crate::question::QuestionKind;
+
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    let (site_b, mut b) = linked(&mut remote, "b");
+    a.create(&mut remote, &site_a.root.join("notes.txt"), b"from a");
+    b.create(&mut remote, &site_b.root.join("notes.txt"), b"from b");
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+
+    let copy = "notes (conflict from b 2023-11-14).txt";
+    assert_eq!(remote.names(), [copy, "notes.txt"]);
+    let nodes = server_nodes(&remote);
+    let [question] = &asked(&site_b)[..] else {
+        panic!("one question: {:?}", asked(&site_b));
+    };
+    let QuestionKind::Conflict {
+        original,
+        copy: renamed,
+    } = &question.kind
+    else {
+        panic!("a conflict: {question:?}");
+    };
+    assert_eq!(original.node_id, live_id(&nodes, "notes.txt"));
+    assert_eq!(renamed.node_id, live_id(&nodes, copy));
+    assert_eq!(asked(&site_a), []);
+}
+
+/// The person edits the copy on `b`, and the observer has not seen it when the answer to delete the copy is
+/// carried out. The edit is kept on both devices.
+#[test]
+fn an_edit_of_the_copy_the_answer_would_delete_is_kept() {
+    let mut remote = Remote::new();
+    let ((site_a, mut a), (site_b, mut b)) = edited_on_both(&mut remote);
+    fs::write(site_b.root.join(COPY), b"edited copy").unwrap();
+    answer(&site_b, Answer::KeepOriginal);
+    let step = b.folder.requested();
+    b.take(step).unwrap();
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+
+    assert!(b.sent.iter().any(|commit| kinds(commit) == ["delete"]));
+    for site in [&site_a, &site_b] {
+        let files = files(&site.root);
+        assert!(
+            files.iter().any(|(_, text)| text == "edited copy"),
+            "{files:?}"
+        );
+        assert!(
+            files.contains(&("main.go".to_owned(), "from a".to_owned())),
+            "{files:?}"
+        );
+    }
+}

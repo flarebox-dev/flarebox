@@ -1485,6 +1485,7 @@ mod tests {
                 node_id: "n1".into(),
                 path: "old".into(),
                 files: 1_001,
+                device_id: None,
             }],
         }
     }

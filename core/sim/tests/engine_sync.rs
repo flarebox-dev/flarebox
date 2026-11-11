@@ -17,7 +17,7 @@ use koidrive_engine::effects::{Effect, Effects};
 use koidrive_engine::ids::IdGen;
 use koidrive_engine::ignore::{LocalRules, RuleFile};
 use koidrive_engine::names::name_key;
-use koidrive_engine::question::{Answer, Question};
+use koidrive_engine::question::{Answer, Question, QuestionKind};
 use koidrive_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
 use koidrive_engine::state::StateError;
 use koidrive_engine::tree::{FileIdentity, Kind, LocalNode, Names, RemoteNode, same};
@@ -1138,11 +1138,14 @@ fn run_ignoring(
                 revived.insert(id);
             }
         }
-        if let Some(question) = commits.questions().first() {
+        let guarded = (commits.questions().iter())
+            .find(|question| !matches!(question.kind, QuestionKind::Conflict { .. }))
+            .cloned();
+        if let Some(question) = &guarded {
             held_once.extend(members(question));
         }
         let Some(commit) = built else {
-            if let Some(question) = commits.questions().first().cloned() {
+            if let Some(question) = guarded {
                 if matches!(answer, Answer::Delete | Answer::Publish) {
                     confirmed.extend(members(&question));
                 }

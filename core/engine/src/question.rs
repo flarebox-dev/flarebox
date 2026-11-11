@@ -46,6 +46,7 @@ pub struct Held {
 
 /// A node's revisions in R. A held node R does not hold has none.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Revisions {
     pub content_rev: u64,
     pub meta_rev: u64,
@@ -77,6 +78,23 @@ pub enum QuestionKind {
     AmbiguousDisappearance,
     /// One group of files a recovery holds (design §6.4).
     Recovery { group: RecoveryGroup },
+    /// The server gave a write of this device a node of its own (design §2.7): an edit became the
+    /// conflict copy `copy` of `original`, or a file this device created or moved took a
+    /// conflict name because `original` held the name. It holds nothing, so both files keep
+    /// syncing. It is asked again when either file's content changes, and it ends when either is
+    /// renamed, moved or deleted, here or on another device.
+    Conflict {
+        original: ConflictFile,
+        copy: ConflictFile,
+    },
+}
+
+/// One file of a conflict, with the revisions R held for it when it was asked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ConflictFile {
+    pub node_id: NodeId,
+    pub revisions: Revisions,
 }
 
 /// A limit of the mass-delete guard (design §6.1).
@@ -122,6 +140,12 @@ pub enum Answer {
     Cancel,
     /// Close a notice.
     Dismiss,
+    /// Keep the original of a conflict and move the copy to the trash.
+    KeepOriginal,
+    /// Move the original of a conflict to the trash and give the copy its name.
+    KeepCopy,
+    /// Keep both files of a conflict and close the question.
+    KeepBoth,
 }
 
 impl QuestionKind {
@@ -140,12 +164,15 @@ impl QuestionKind {
                 RecoveryGroup::DeletedOnThisDevice => &[Answer::Delete, Answer::Restore],
                 RecoveryGroup::RequestedBeforeReset => &[Answer::Repeat, Answer::Cancel],
             },
+            QuestionKind::Conflict { .. } => {
+                &[Answer::KeepOriginal, Answer::KeepCopy, Answer::KeepBoth]
+            }
         }
     }
 }
 
 impl Answer {
-    pub const ALL: [Answer; 8] = [
+    pub const ALL: [Answer; 11] = [
         Answer::Delete,
         Answer::Restore,
         Answer::Keep,
@@ -154,6 +181,9 @@ impl Answer {
         Answer::Repeat,
         Answer::Cancel,
         Answer::Dismiss,
+        Answer::KeepOriginal,
+        Answer::KeepCopy,
+        Answer::KeepBoth,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -166,6 +196,9 @@ impl Answer {
             Answer::Repeat => "repeat",
             Answer::Cancel => "cancel",
             Answer::Dismiss => "dismiss",
+            Answer::KeepOriginal => "keep_original",
+            Answer::KeepCopy => "keep_copy",
+            Answer::KeepBoth => "keep_both",
         }
     }
 }

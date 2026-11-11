@@ -228,6 +228,7 @@ impl Decision {
                 counts(deletions, affected_files, space_files, exceeded),
             ),
             QuestionKind::AmbiguousDisappearance => ("ambiguous_disappearance", None, None),
+            QuestionKind::Conflict { .. } => ("conflict", None, None),
             QuestionKind::Recovery { group } => (
                 "recovery",
                 Some(match group {
@@ -828,11 +829,13 @@ mod tests {
                     node_id: "n1".into(),
                     path: "archive/a".into(),
                     files: 3,
+                    device_id: None,
                 },
                 HeldItem {
                     node_id: "n2".into(),
                     path: "archive/b".into(),
                     files: 1,
+                    device_id: None,
                 },
             ],
         }

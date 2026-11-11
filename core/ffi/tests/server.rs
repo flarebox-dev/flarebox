@@ -398,6 +398,7 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
             node_id: "n1".into(),
             path: "Archive".into(),
             files: 1_200,
+            device_id: None,
         }],
     };
     let noticed = driver::Question {
