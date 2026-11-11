@@ -2638,6 +2638,42 @@ fn a_wait_for_another_failed_effect_leaves_a_folder_removal_that_entries_l_does_
     );
 }
 
+/// The person deletes a folder whose removal is stuck on an entry L does not know. The scan takes the node out of
+/// the blocked ones without planning anything for it, and the store holds it unblocked too, as every step checks.
+#[test]
+fn a_scan_that_unblocks_a_node_without_planning_an_effect_stores_it_unblocked() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site_a.root.join("held")).unwrap();
+    a.create(&mut remote, &site_a.root.join("held/a.txt"), b"synced");
+    let sync = SyncRules {
+        include: Vec::new(),
+        exclude: vec!["*.log".into()],
+    };
+    let site = Site::new(&remote, "b");
+    let mut b = site.start_with(&sync);
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    b.run(&mut remote);
+    b.settle();
+    let held = node_named(&b, "held");
+    fs::write(site.root.join("held/build.log"), b"left out").unwrap();
+    b.settle();
+    fs::remove_dir_all(site_a.root.join("held")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(&mut remote);
+    b.pull(&remote);
+    b.run(&mut remote);
+    b.settle();
+    assert!(b.folder.engine.effects.blocked().contains_key(&held));
+
+    fs::remove_dir_all(site.root.join("held")).unwrap();
+    b.scan_until(|b| !b.folder.engine.effects.blocked().contains_key(&held));
+    assert!(!site.stored().effects.blocked().contains_key(&held));
+    b.settle();
+    assert_eq!(b.state(), FolderState::UpToDate);
+}
+
 /// Whether L, as the site's store holds it, has an entry named `name`.
 fn local_holds(site: &Site, name: &str) -> bool {
     (site.stored().trees.local().iter()).any(|(_, node)| node.shape.name == name)
