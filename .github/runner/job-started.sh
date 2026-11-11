@@ -3,10 +3,11 @@
 #
 # Job-started hook for Flarebox's self-hosted Mac runners (ACTIONS_RUNNER_HOOK_JOB_STARTED).
 # The runner runs it with `bash -e` before every job, and a nonzero exit fails the job before
-# any step runs. It enforces what ci.yml routes to these runners: a push to refs/heads/main, or a
-# merge queue run for main (refs/heads/gh-readonly-queue/main/...), in flarebox-dev/flarebox. It
-# refuses every other event, pull requests from this repository included, whatever runs-on the
-# workflow asked for. It fails closed: a job whose event it cannot read does not run. It uses only
+# any step runs. It enforces what ci.yml routes to these runners: a push to refs/heads/main, a
+# merge queue run for main (refs/heads/gh-readonly-queue/main/...), or a pull request whose head
+# branch is in flarebox-dev/flarebox. It refuses every other event, pull requests from forks
+# included, whatever runs-on the workflow asked for. It fails closed: a job whose event it cannot
+# read does not run. It uses only
 # the macOS base system (/bin/bash and /usr/bin/jq). CONTRIBUTING.md says how to install it.
 set -u
 
@@ -51,8 +52,18 @@ case "$event_name" in
       refuse "its merge_group payload is not a queue run of $ref into refs/heads/main."
     fi
     ;;
+  pull_request)
+    if ! head_repo="$(/usr/bin/jq -er '.pull_request.head.repo.full_name | strings' "$event_path" 2>/dev/null)" ||
+      [ "$head_repo" != "$repository" ]; then
+      refuse "it is a pull request whose head is not in $repository. Pull requests from forks run their macOS jobs on GitHub-hosted runners."
+    fi
+    if ! number="$(/usr/bin/jq -er '.pull_request.number | numbers' "$event_path" 2>/dev/null)" ||
+      [ "$ref" != "refs/pull/$number/merge" ]; then
+      refuse "its pull_request payload does not name '$ref' as the merge ref of its pull request."
+    fi
+    ;;
   *)
-    refuse "its event is $event_name. These runners take only pushes to main and merge queue runs for main; pull requests run their macOS jobs on GitHub-hosted runners."
+    refuse "its event is $event_name. These runners take only pushes to main, merge queue runs for main and pull requests from branches of $repository."
     ;;
 esac
 
