@@ -3964,3 +3964,115 @@ fn the_status_names_a_node_whose_effect_failed_and_why() {
         )
     );
 }
+/// GUN-388, for a node L does not hold yet: a write the server made in a folder fails, and the status names the
+/// write by its whole path, not by its name alone.
+#[test]
+fn the_status_names_a_failed_write_in_a_folder_by_its_whole_path() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    let (site, mut b) = linked(&mut remote, "b");
+    fs::create_dir(site_a.root.join("docs")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(&mut remote);
+    b.pull(&remote);
+    b.run(&mut remote);
+    b.settle();
+    a.create(
+        &mut remote,
+        &site_a.root.join("docs/notes.txt"),
+        b"written on a",
+    );
+    b.pull(&remote);
+    let Some(Work::Stage(pending)) = b.work.pop_front() else {
+        panic!("the effect that writes docs/notes.txt is staged");
+    };
+    fs::write(site.root.join("docs/notes.txt"), b"the user's").unwrap();
+    let staged = ready(pending.stage(&remote.chunks));
+    let step = b.folder.staged(pending, staged);
+    b.take(step).unwrap();
+    assert_eq!(b.folder.engine.effects.blocked().len(), 1);
+    assert_eq!(
+        b.folder.view().problem.as_deref(),
+        Some(
+            "1 item could not be synced: docs/notes.txt (the server's change could not be made here: another entry \
+             holds its name); run flarebox restart once it is fixed"
+        )
+    );
+}
+/// GUN-388. A node whose effect failed and that the server also left out of commits is one item, with both reasons.
+#[test]
+fn the_status_names_a_node_stuck_for_two_reasons_once() {
+    let mut remote = Remote::new();
+    let (_site, mut b, _) = failed_at_a_taken_name(&mut remote);
+    let id = b
+        .folder
+        .engine
+        .effects
+        .blocked()
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    let mut state = b.folder.engine.commits.state();
+    state.problems.insert(id.clone());
+    b.folder.engine.commits = flarebox_engine::commit::Commits::from_state(state).unwrap();
+    (b.folder.refused_nodes).insert(id, "the server rejected it: INVALID_NAME".into());
+    assert_eq!(
+        b.folder.view().problem.as_deref(),
+        Some(
+            "1 item could not be synced: notes.txt (the server's change could not be made here: another entry holds \
+             its name; the server rejected it: INVALID_NAME); run flarebox restart once it is fixed"
+        )
+    );
+}
+
+/// GUN-388. A result that waits for the log keeps the server's reason through the first scan of a start, so the
+/// node it leaves out of commits once the log reaches it is named with that reason.
+#[test]
+fn the_reason_of_a_result_that_waits_for_the_log_outlasts_the_first_scan() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::write(site.root.join("notes.txt"), b"written on a").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    let Some(upload @ Work::Upload(_)) = a.work.pop_front() else {
+        panic!("the new file is uploaded");
+    };
+    a.perform(upload, &mut remote).unwrap();
+    let Some(Work::Send(commit)) = a.work.pop_front() else {
+        panic!("the commit is sent");
+    };
+    a.folder.scanned = false;
+    let seq = a.folder.engine.cursor.as_ref().unwrap().last_seq;
+    let result = CommitResult {
+        seq: seq + 2,
+        results: vec![flarebox_proto::v1::OpResult {
+            code: op_result::Code::Rejected as i32,
+            reject_reason: "INVALID_NAME".into(),
+            ..Default::default()
+        }],
+        changes: Vec::new(),
+    };
+    let step = a.folder.sent(Ok(result.clone()));
+    a.take(step).unwrap();
+    assert!(a.folder.engine.commits.problems().is_empty());
+    let step = a.folder.scanned();
+    a.take(step).unwrap();
+    let record = CommitRecord {
+        seq: seq + 1,
+        ..Default::default()
+    };
+    a.event(Event::Changes(vec![record])).unwrap();
+    let committed = Committed {
+        commit_id: commit.commit_id,
+        result,
+    };
+    a.event(Event::Committed(committed)).unwrap();
+    assert_eq!(a.folder.engine.commits.problems().len(), 1);
+    assert_eq!(
+        a.folder.view().problem.as_deref(),
+        Some(
+            "1 item could not be synced: notes.txt (the server rejected it: INVALID_NAME); run flarebox restart once \
+             it is fixed"
+        )
+    );
+}

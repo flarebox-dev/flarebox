@@ -26,6 +26,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use flarebox_engine::commit::{Commits, Failure, Halt as CommitHalt, Reconnect};
 use flarebox_engine::ignore::LocalRules;
 use flarebox_engine::state::CommitsState;
+use flarebox_engine::tree::{RemoteNode, Tree};
 use flarebox_fs::{Snapshot, check_root};
 use flarebox_net::{
     Auth, Backoff, CallError, ChunkError, Event, NotResent, ServerError, Session, SessionConfig,
@@ -443,15 +444,16 @@ impl Folder {
     /// here on. Nothing else clears them.
     pub fn scanned(&mut self) -> Result<Vec<Work>, Stop> {
         self.scanned = true;
-        if !self.engine.commits.problems().is_empty() {
+        let cleared = self.engine.commits.problems().clone();
+        if !cleared.is_empty() {
             self.step(|engine, _| {
-                for node in engine.commits.problems().clone() {
-                    engine.commits.clear_problem(&node);
+                for node in &cleared {
+                    engine.commits.clear_problem(node);
                 }
                 Ok(())
             })?;
         }
-        self.refused_nodes.clear();
+        self.refused_nodes.retain(|id, _| !cleared.contains(id));
         self.publish_remote()?;
         let mut work = Vec::new();
         self.drive(&mut work)?;
@@ -713,24 +715,24 @@ impl Folder {
             Stream::Following { .. } if self.settled() => FolderState::UpToDate,
             Stream::Following { .. } => FolderState::CatchingUp,
         };
-        let named = |id: &String| match self.engine.path_of(id) {
-            Some(path) => path.display().to_string(),
-            None => (self.engine.trees.remote().get(id))
-                .map_or_else(|| format!("node {id}"), |node| node.shape.name.clone()),
+        let named = |id: &String| {
+            (self.item_path(id))
+                .map_or_else(|| format!("node {id}"), |path| path.display().to_string())
         };
-        let blocked = (self.engine.effects.blocked().keys()).map(|id| {
+        let mut reasons: BTreeMap<&String, Vec<String>> = BTreeMap::new();
+        for id in self.engine.effects.blocked().keys() {
             let why = (self.effect_failures.get(id)).map_or("it failed earlier", |(_, why)| why);
-            format!(
-                "{} (the server's change could not be made here: {why})",
-                named(id)
-            )
-        });
-        let refused = (self.engine.commits.problems().iter()).map(|id| {
+            let why = format!("the server's change could not be made here: {why}");
+            reasons.entry(id).or_default().push(why);
+        }
+        for id in self.engine.commits.problems() {
             let why =
                 (self.refused_nodes.get(id)).map_or("the server did not take it", String::as_str);
-            format!("{} ({why})", named(id))
-        });
-        let mut stuck: Vec<String> = blocked.chain(refused).collect();
+            reasons.entry(id).or_default().push(why.to_owned());
+        }
+        let mut stuck: Vec<String> = (reasons.into_iter())
+            .map(|(id, whys)| format!("{} ({})", named(id), whys.join("; ")))
+            .collect();
         stuck.sort();
         let retrying = (self.retrying.values())
             .find(|retrying| {
@@ -779,6 +781,12 @@ impl Folder {
             local_entries: self.local_entries,
             problem,
         }
+    }
+
+    /// The path of a node relative to the root: where L holds it, or else where R does, as for a file whose download
+    /// failed or that this device deleted.
+    fn item_path(&self, id: &str) -> Option<PathBuf> {
+        (self.engine.path_of(id)).or_else(|| remote_path(self.engine.trees.remote(), id))
     }
 
     /// True when nothing is left to move: R holds the server's head, the folder was scanned, no effect and no
@@ -986,14 +994,15 @@ impl Folder {
     fn result(&mut self, commit_id: &str, result: CommitResult) -> Result<(), Stop> {
         let ours = (self.engine.commits.in_flight())
             .is_some_and(|flight| flight.commit.commit_id == commit_id && flight.result.is_none());
-        if let Some(flight) = self.engine.commits.in_flight().filter(|_| ours) {
+        let flight = self.engine.commits.in_flight().filter(|_| ours);
+        if let Some(refused) = flight.map(|flight| not_applied(&flight.commit, &result)) {
             let problems = self.engine.commits.problems();
             self.refused_nodes.retain(|id, _| problems.contains(id));
-            for (node, why) in not_applied(&flight.commit, &result) {
+            for (node, why) in refused {
                 tracing::info!(
                     space_id = self.link.space_id,
                     node,
-                    path = ?self.engine.path_of(&node),
+                    path = ?self.item_path(&node),
                     why,
                     "the server did not apply a change"
                 );
@@ -1298,6 +1307,21 @@ fn lift_hint(code: i32) -> &'static str {
         "; once the cause is fixed, run flarebox lift <folder> --resend to send them again, or --replan to plan them \
          again"
     }
+}
+
+/// The path of a node R holds, relative to the root, for a node L does not hold, such as one whose download failed.
+fn remote_path(remote: &Tree<RemoteNode>, id: &str) -> Option<PathBuf> {
+    let mut names = Vec::new();
+    let mut current = id;
+    while current != remote.root {
+        let node = remote.get(current)?;
+        names.push(node.shape.name.as_str());
+        current = &node.shape.parent;
+        if names.len() > remote.len() {
+            return None;
+        }
+    }
+    Some(names.into_iter().rev().collect())
 }
 
 /// The node of each op of `commit` that `result` says the server did not apply, with why. A `Restore` op is left out:
