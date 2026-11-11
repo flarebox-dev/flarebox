@@ -3718,3 +3718,78 @@ fn a_late_create_acknowledgement_keeps_the_content_s_took_after_the_commit() {
         "{sent:?}"
     );
 }
+
+/// GUN-453. n's `op` is in flight when the user moves n to c, and the other device moves n to c
+/// and edits it to content 2 at seq 3, so L and R agree on the position but not on the content.
+/// With `later`, the replay also holds the other device's later move to x at seq 4. After the
+/// acknowledgement the effects and the commits take turns: the disk ends with R's content at R's
+/// position, and the user's move to c, which the server already holds, is never sent again.
+fn a_late_acknowledgement_converges_on_a_remote_edit_made_at_the_position_l_took(
+    created: bool,
+    later: bool,
+) {
+    let mut trees = match created {
+        true => trees(&[("n", Some(file(ROOT, "b", 1)), None, None)]),
+        false => trees(&[(
+            "n",
+            Some(file(ROOT, "b", 1)),
+            Some(file(ROOT, "a", 1)),
+            Some(remote(file(ROOT, "a", 1))),
+        )]),
+    };
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(
+        matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if created && c.node_id == "n")
+            || (!created && ops(&commit) == [mv("n", ROOT, "b")]),
+        "{:?}",
+        ops(&commit)
+    );
+    trees.set_remote("n".into(), remote_at(file(ROOT, "b", 1), 2));
+    trees.set_local("n".into(), local(file(ROOT, "c", 1), 1));
+    let edited = |name: &str, rev: u64| RemoteNode {
+        content_rev: 3,
+        ..remote_at(file(ROOT, name, 2), rev)
+    };
+    trees.set_remote("n".into(), edited("c", 3));
+    let (at, last) = match later {
+        true => ("x", 4),
+        false => ("c", 3),
+    };
+    if later {
+        trees.set_remote("n".into(), edited("x", 4));
+    }
+    trees.settle();
+    commits
+        .received(result(2, vec![outcome(op_result::Code::Applied)]))
+        .unwrap();
+    assert!(commits.acknowledge(&mut trees, last));
+    trees.settle();
+    for _ in 0..3 {
+        effects_for(&mut trees, &mut ids, "n");
+        let commit = build(&mut commits, &mut trees, &mut ids);
+        assert_eq!(commit.as_ref().map(ops), None);
+    }
+    assert_eq!(trees.local().live("n"), Some(&file(ROOT, at, 2)));
+    assert_eq!(trees.synced().live("n"), Some(&file(ROOT, at, 2)));
+}
+
+#[test]
+fn a_late_create_acknowledgement_converges_on_a_remote_edit_made_at_the_position_l_took() {
+    a_late_acknowledgement_converges_on_a_remote_edit_made_at_the_position_l_took(true, false);
+}
+
+#[test]
+fn a_late_create_acknowledgement_keeps_a_later_remote_move_after_a_remote_edit() {
+    a_late_acknowledgement_converges_on_a_remote_edit_made_at_the_position_l_took(true, true);
+}
+
+#[test]
+fn a_late_move_acknowledgement_converges_on_a_remote_edit_made_at_the_position_l_took() {
+    a_late_acknowledgement_converges_on_a_remote_edit_made_at_the_position_l_took(false, false);
+}
+
+#[test]
+fn a_late_move_acknowledgement_keeps_a_later_remote_move_after_a_remote_edit() {
+    a_late_acknowledgement_converges_on_a_remote_edit_made_at_the_position_l_took(false, true);
+}
