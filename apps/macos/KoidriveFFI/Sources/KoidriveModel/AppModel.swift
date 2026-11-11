@@ -168,6 +168,11 @@ public final class AppModel {
         }
     }
 
+    /// False when every unanswered question is in this Mac's only linked folder, so the list needs no space headings.
+    public var questionSectionsShowSpace: Bool {
+        state.folders.count != 1 || questionSections.contains { $0.folder == nil }
+    }
+
     /// Problems grouped by the space they concern; problems of the whole session come first.
     public var problemSections: [ProblemSection] {
         let bySpace = Dictionary(grouping: state.problems) { $0.spaceId ?? "" }

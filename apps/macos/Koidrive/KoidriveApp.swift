@@ -60,7 +60,7 @@ struct KoidriveApp: App {
         }
         .windowResizability(.contentSize)
 
-        Window("Questions", id: WindowID.questions) {
+        Window("Needs You", id: WindowID.questions) {
             QuestionsView()
                 .environment(model)
         }

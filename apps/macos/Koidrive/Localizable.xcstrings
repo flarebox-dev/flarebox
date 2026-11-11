@@ -65,6 +65,28 @@
         }
       }
     },
+    "%lld need you" : {
+      "localizations" : {
+        "en" : {
+          "variations" : {
+            "plural" : {
+              "one" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld needs you"
+                }
+              },
+              "other" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld need you"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "%lld problems" : {
       "localizations" : {
         "en" : {
@@ -80,28 +102,6 @@
                 "stringUnit" : {
                   "state" : "translated",
                   "value" : "%lld problems"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "%lld questions need an answer" : {
-      "localizations" : {
-        "en" : {
-          "variations" : {
-            "plural" : {
-              "one" : {
-                "stringUnit" : {
-                  "state" : "translated",
-                  "value" : "%lld question needs an answer"
-                }
-              },
-              "other" : {
-                "stringUnit" : {
-                  "state" : "translated",
-                  "value" : "%lld questions need an answer"
                 }
               }
             }
@@ -266,14 +266,17 @@
       }
     },
     "Name of this Mac" : {},
+    "Needs You" : {},
+    "Needs You…" : {},
+    "Needs you" : {},
     "New Space…" : {},
     "No Linked Folders" : {},
     "No Problems" : {},
-    "No Questions" : {},
     "No other device is signed in to this server. After this Mac signs out, you can't sign back in from the Koidrive app. Getting back in needs the owner recovery steps from the deployment guide, run outside the app with administrator access to the server's deployment." : {},
     "None" : {},
     "Not Signed In" : {},
     "Nothing needed your decision." : {},
+    "Nothing needs you" : {},
     "Nothing syncs until Koidrive can save again: %@. Check that your disk has free space." : {},
     "Old versions" : {},
     "On a device that is already signed in, open Settings, choose Account, and click Add a Device to get a pairing code." : {},
@@ -285,8 +288,6 @@
     "Pause Sync" : {},
     "Problems" : {},
     "Put Back on Server" : {},
-    "Questions" : {},
-    "Questions…" : {},
     "Quit Koidrive" : {},
     "Recent changes" : {},
     "Recovering" : {},

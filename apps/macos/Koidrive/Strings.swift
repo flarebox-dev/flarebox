@@ -199,7 +199,7 @@ extension Notice {
         case .recovery(let cause, let heldFiles):
             let held = heldFiles == 0
                 ? String(localized: "Nothing needs your answer.")
-                : String(localized: "Answer the questions to finish.")
+                : String(localized: "Answer in Needs You to finish.")
             return cause.text + " " + String(localized: "Koidrive applied the server's changes and moved removed files to the local trash.") + " " + held
         case .remoteMassDelete(_, let affectedFiles, let spaceFiles, _):
             return String(localized: "\(affectedFiles.formatted()) of \(fileCount(spaceFiles)) removed. Copies are in the folder's local trash.")

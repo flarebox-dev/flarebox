@@ -426,7 +426,7 @@ private struct PairingCodeLabel: View {
 
 // MARK: Storage
 
-private struct StorageSettings: View {
+struct StorageSettings: View {
     @Environment(AppModel.self) private var model
     @State private var storage = StorageModel()
 
@@ -434,18 +434,12 @@ private struct StorageSettings: View {
         Group {
             if let account = model.state.account {
                 Form {
-                    ForEach(storage.spaces ?? []) { entry in
-                        Section(entry.space.name) {
-                            switch entry.usage {
-                            case .success(let usage):
-                                StorageRow(title: "Live files", count: "^[\(usage.liveFiles) file](inflect: true)", bytes: usage.liveBytes)
-                                StorageRow(title: "Trash", count: "^[\(usage.trashedFiles) file](inflect: true)", bytes: usage.trashBytes)
-                                StorageRow(title: "Old versions", count: "^[\(usage.oldVersions) version](inflect: true)", bytes: usage.oldVersionBytes)
-                                StorageRow(title: "Unreferenced", count: nil, bytes: usage.unreferencedBytes)
-                                StorageRow(title: "Total", count: nil, bytes: usage.totalBytes).bold()
-                            case .failure(let refusal):
-                                Label(refusal.message, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red)
-                            }
+                    let spaces = storage.spaces ?? []
+                    if spaces.count == 1 {
+                        Section { usage(of: spaces[0]) }
+                    } else {
+                        ForEach(spaces) { entry in
+                            Section(entry.space.name) { usage(of: entry) }
                         }
                     }
                     Section {
@@ -473,6 +467,22 @@ private struct StorageSettings: View {
             } else {
                 ContentUnavailableView("Not signed in", systemImage: "person.crop.circle.badge.questionmark")
             }
+        }
+    }
+
+    /// A space's usage rows, or why the server refused them. With a single space its section has
+    /// no header.
+    @ViewBuilder
+    private func usage(of entry: SpaceStorage) -> some View {
+        switch entry.usage {
+        case .success(let usage):
+            StorageRow(title: "Live files", count: "^[\(usage.liveFiles) file](inflect: true)", bytes: usage.liveBytes)
+            StorageRow(title: "Trash", count: "^[\(usage.trashedFiles) file](inflect: true)", bytes: usage.trashBytes)
+            StorageRow(title: "Old versions", count: "^[\(usage.oldVersions) version](inflect: true)", bytes: usage.oldVersionBytes)
+            StorageRow(title: "Unreferenced", count: nil, bytes: usage.unreferencedBytes)
+            StorageRow(title: "Total", count: nil, bytes: usage.totalBytes).bold()
+        case .failure(let refusal):
+            Label(refusal.message, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red)
         }
     }
 }
@@ -686,7 +696,11 @@ struct GeneralSettings: View {
     ProblemsSettings().environment(AppModel.preview(.problems)).frame(width: 600, height: 440)
 }
 
-#Preview("Storage") {
+#Preview("Storage: one space") {
+    StorageSettings().environment(AppModel.previewWithOneSpace()).frame(width: 600, height: 440)
+}
+
+#Preview("Storage: two spaces") {
     StorageSettings().environment(AppModel.preview(.upToDate)).frame(width: 600, height: 440)
 }
 
