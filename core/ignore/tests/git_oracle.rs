@@ -141,7 +141,13 @@ fn git(case: &Case, ignorecase: bool, spell: fn(&str) -> String) -> Vec<Verdict>
 }
 
 fn run_git(dir: &Path, args: &[&str], stdin: Option<&[u8]>) -> Vec<u8> {
-    let mut child = Command::new("git")
+    let mut git = Command::new("git");
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            git.env_remove(key);
+        }
+    }
+    let mut child = git
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_NOSYSTEM", "1")
