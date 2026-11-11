@@ -16,7 +16,7 @@ use crate::ids::IdGen;
 use crate::names::{MAX_NAME_BYTES, name_key, nfc};
 use crate::question::{Answer, Question, QuestionKind};
 use crate::restore::{Outcome, RESOLVED_KEPT, Rejection, Resolved, RestoreId, RestoreIntent};
-use crate::state::{CommitsState, StateError};
+use crate::state::{Agreed, CommitsState, StateError};
 use crate::tree::{Content, Kind, Names, NodeId, Shape, same, same_content};
 
 /// The most ops one commit holds (spec v0 section 13).
@@ -686,12 +686,16 @@ impl Commits {
     /// built is newer than what was sent: the server applies a content update only when no other
     /// device changed the content after the commit's `base_seq`, and a created file has no content
     /// before its create, so that change came after the commit. When S's content changed since then ([`Trees::took_content`]), even back to what it
-    /// was, S keeps what it holds. A position S holds is newer than the one a create or move sent only when L and R
-    /// agreed on it, after the commit was built, at a revision of R after the result's seq: the
-    /// server applies a move whatever another device did after `base_seq`, so the move replaced a
-    /// position from an earlier record, and a position only R came back to is a remote change. When S holds a
-    /// newer position ([`Trees::took_position_after`]), S keeps that position, and a rename by the server
-    /// does not revert the node. A conflict copy is re-keyed in L, and so is
+    /// was, S keeps what it holds. A position is newer than the one a create or move sent only when L
+    /// and R agreed on it, after the commit was built, at a revision of R after the result's seq,
+    /// whether or not S took it: the server applies a move whatever another device did after
+    /// `base_seq`, so the move replaced a position from an earlier record, and a position only R
+    /// came back to is a remote change. When L and R agreed on a newer position
+    /// ([`Trees::position_after`]), S takes that position, and a rename by the server does not
+    /// revert the node. S first takes what every op sent, as without an agreement, and then each
+    /// agreed position S can hold, with the rest of the shape the ops gave the node. A node whose
+    /// agreed position S cannot hold, because another node holds its name or its parent is gone,
+    /// keeps what was sent, and is reverted when the server renamed it. A conflict copy is re-keyed in L, and so is
     /// a directory merged into one L does not hold yet. When L already holds the conflict copy,
     /// because a log replay brought it before the result and the effects downloaded it, the local
     /// file keeps its ID and takes what was sent as its S, so the server's content replaces it. When L already holds the directory it was
@@ -722,6 +726,8 @@ impl Commits {
         let result = flight.result.expect("taken with a result");
         let mut synced = Synced::default();
         let mut merged: BTreeMap<NodeId, NodeId> = BTreeMap::new();
+        let mut agreed: BTreeMap<NodeId, Agreed> = BTreeMap::new();
+        let mut unreverted: BTreeSet<NodeId> = BTreeSet::new();
         let aliases = self.aliases.clone();
         for (op, outcome) in flight.commit.ops.iter().zip(&result.results) {
             use op_result::Code;
@@ -758,7 +764,7 @@ impl Commits {
                         synced.set(into, Some(shape));
                         merged.insert(create.node_id.clone(), into.clone());
                     } else if applied {
-                        let shape = created(trees, &synced, &create.node_id, result.seq, shape);
+                        agreed.extend(agree(trees, &create.node_id, result.seq));
                         synced.set(&create.node_id, Some(shape));
                     }
                     let exists = taken && trees.remote().live(&create.node_id).is_some();
@@ -775,7 +781,8 @@ impl Commits {
                             kind: Kind::File,
                             content: create.content.clone(),
                         };
-                        let shape = created(trees, &synced, &create.node_id, result.seq, shape);
+                        let shape = created(trees, &synced, &create.node_id, shape);
+                        agreed.extend(agree(trees, &create.node_id, result.seq));
                         synced.set(&create.node_id, Some(shape));
                     }
                     let exists = taken && trees.remote().live(&create.node_id).is_some();
@@ -815,13 +822,13 @@ impl Commits {
                     if let Some(shape) = synced.get(trees, id)
                         && applied
                         && target != *id
-                        && !trees.took_position_after(id, result.seq)
                     {
                         let shape = Shape {
                             parent: target,
                             name: name(&moved.new_name),
                             ..shape
                         };
+                        agreed.extend(agree(trees, id, result.seq));
                         synced.set(id, Some(shape));
                     }
                     if cycle {
@@ -850,15 +857,42 @@ impl Commits {
                     local.shape.parent != *parent || nfc(&local.shape.name) != nfc(name)
                 })
             });
-            let kept = sent.is_some() && trees.took_position_after(node, result.seq);
+            let kept = agreed.contains_key(node);
             if (renamed && !left && !kept) || (done && follows) {
                 trees.revert(node.clone());
+            } else if renamed && !left {
+                unreverted.insert(node.clone());
             }
             if !done {
                 self.problems.insert(node.clone());
             }
         }
-        for (id, shape) in synced.apply(trees) {
+        let mut rest = synced.apply(trees);
+        let mut positions = Synced::default();
+        for (id, at) in &agreed {
+            let held = match rest.iter().find(|(other, _)| other == id) {
+                Some((_, shape)) => shape.clone(),
+                None => trees.synced().get(id).cloned(),
+            };
+            if let Some(shape) = held {
+                let shape = Shape {
+                    parent: at.parent.clone(),
+                    name: at.name.clone(),
+                    ..shape
+                };
+                positions.set(id, Some(shape));
+            }
+        }
+        let tried: BTreeSet<NodeId> = positions.ids().collect();
+        let refused: BTreeSet<NodeId> = (positions.apply(trees).into_iter())
+            .map(|(id, _)| id)
+            .collect();
+        let taken: BTreeSet<&NodeId> = tried.difference(&refused).collect();
+        rest.retain(|(id, _)| !taken.contains(id));
+        for id in unreverted.iter().filter(|id| !taken.contains(id)) {
+            trees.revert(id.clone());
+        }
+        for (id, shape) in rest {
             trees.wait(id, shape, Origin::Commit(flight.commit.device_seq));
         }
         let restored = carried(&self.restores, &flight.commit.ops);
@@ -1104,6 +1138,10 @@ impl Synced {
     }
 
     /// Makes the updates that leave S valid and returns the rest (see [`update_synced`]).
+    fn ids(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.updates.iter().map(|(id, _)| id.clone())
+    }
+
     fn apply(self, trees: &mut Trees) -> Vec<(NodeId, Option<Shape>)> {
         update_synced(trees, self.updates)
     }
@@ -1327,27 +1365,21 @@ fn keep(trees: &mut Trees, id: &str, needed: &mut BTreeSet<NodeId>) {
     }
 }
 
-/// The shape a create sent, with the position S holds when S took it after the create's result
-/// ([`Trees::took_position_after`]) and the content S holds when it changed since the create was
-/// built ([`Trees::took_content`]).
-fn created(trees: &Trees, synced: &Synced, id: &str, seq: u64, sent: Shape) -> Shape {
-    let Some(held) = synced.get(trees, id) else {
-        return sent;
-    };
-    let (parent, name) = match trees.took_position_after(id, seq) {
-        true => (held.parent, held.name),
-        false => (sent.parent, sent.name),
-    };
-    let content = match trees.took_content(id) {
-        true => held.content,
-        false => sent.content,
-    };
-    Shape {
-        parent,
-        name,
-        content,
-        ..sent
+/// The shape a create sent, with the content S holds when it changed since the create was built
+/// ([`Trees::took_content`]).
+fn created(trees: &Trees, synced: &Synced, id: &str, sent: Shape) -> Shape {
+    match synced.get(trees, id) {
+        Some(held) if trees.took_content(id) => Shape {
+            content: held.content,
+            ..sent
+        },
+        _ => sent,
     }
+}
+
+/// The position of `id` that L and R agreed on after `seq` ([`Trees::position_after`]), if any.
+fn agree(trees: &Trees, id: &str, seq: u64) -> Option<(NodeId, Agreed)> {
+    (trees.position_after(id, seq)).map(|at| (id.to_owned(), at.clone()))
 }
 
 /// What S holds for `id`, or its waiting update while one waits.

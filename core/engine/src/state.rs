@@ -21,6 +21,14 @@ use crate::question::Question;
 use crate::restore::{Resolved, RestoreId, RestoreIntent};
 use crate::tree::{FileIdentity, NodeId, TreeError};
 
+/// A position L and R agreed on, with the revision of R's record that held it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Agreed {
+    pub rev: u64,
+    pub parent: NodeId,
+    pub name: String,
+}
+
 /// What [`Trees`](crate::classify::Trees) holds besides the nodes of R, L and S.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TreesState {
@@ -36,12 +44,12 @@ pub struct TreesState {
     /// S updates of acknowledged ops that wait until S stays a valid tree with them, by node.
     /// `None` removes the node from S.
     pub waiting: BTreeMap<NodeId, Waiting>,
-    /// The nodes whose content the commit in flight updates, each with whether S's content
-    /// changed since the commit was built.
+    /// The nodes whose content the commit in flight creates or updates, each with whether S's
+    /// content changed since the commit was built.
     pub watched: BTreeMap<NodeId, bool>,
-    /// The nodes the commit in flight moves, each with the latest revision at which L and R agreed
-    /// on the position S holds, since the commit was built.
-    pub watched_positions: BTreeMap<NodeId, Option<u64>>,
+    /// The nodes the commit in flight creates or moves, each with the latest position L and R
+    /// agreed on since the commit was built.
+    pub watched_positions: BTreeMap<NodeId, Option<Agreed>>,
     /// The nodes a delete of this device trashed, each with the seq of its commit, while R holds
     /// them trashed by that commit.
     pub trashed_here: BTreeMap<NodeId, u64>,

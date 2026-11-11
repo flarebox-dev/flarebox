@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use koidrive_engine::classify::{Origin, Waiting};
 use koidrive_engine::commit::{Halt, InFlight};
 use koidrive_engine::effects::{Base, Dir, Displaced, Effect, EffectRecord, Location};
-use koidrive_engine::state::{CommitsState, EffectsState, TreesState};
+use koidrive_engine::state::{Agreed, CommitsState, EffectsState, TreesState};
 use koidrive_engine::tree::{FileIdentity, Kind, NodeId, Shape};
 use koidrive_proto::v1::{Commit, CommitResult, Content, NodeKind};
 use prost::{Message, Oneof};
@@ -109,13 +109,14 @@ impl Tx<'_> {
         }
         let mut stmt = self
             .0
-            .prepare_cached("SELECT node_id, rev FROM watched_positions")?;
+            .prepare_cached("SELECT node_id, rev, parent_id, name FROM watched_positions")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
-            state
-                .trees
-                .watched_positions
-                .insert(row.get(0)?, row.get(1)?);
+            let parent = row.get::<_, Option<String>>(2)?.unwrap_or_default();
+            let agreed = (row.get::<_, Option<u64>>(1)?)
+                .zip(row.get::<_, Option<String>>(3)?)
+                .map(|(rev, name)| Agreed { rev, parent, name });
+            state.trees.watched_positions.insert(row.get(0)?, agreed);
         }
         let mut stmt = self
             .0
@@ -339,7 +340,8 @@ impl Tx<'_> {
             .0
             .prepare_cached("DELETE FROM watched_positions WHERE node_id = ?1")?;
         let mut put = self.0.prepare_cached(
-            "INSERT OR REPLACE INTO watched_positions (node_id, rev) VALUES (?1, ?2)",
+            "INSERT OR REPLACE INTO watched_positions (node_id, rev, parent_id, name)
+             VALUES (?1, ?2, ?3, ?4)",
         )?;
         let (removed, changed) = differences(
             &before.trees.watched_positions,
@@ -348,8 +350,13 @@ impl Tx<'_> {
         for node in removed {
             remove.execute([node])?;
         }
-        for (node, rev) in changed {
-            put.execute(params![node, rev])?;
+        for (node, agreed) in changed {
+            put.execute(params![
+                node,
+                agreed.as_ref().map(|agreed| agreed.rev),
+                agreed.as_ref().and_then(|agreed| non_empty(&agreed.parent)),
+                agreed.as_ref().map(|agreed| &agreed.name),
+            ])?;
         }
         let mut remove = self
             .0

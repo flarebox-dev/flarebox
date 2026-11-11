@@ -12,7 +12,7 @@ use koidrive_engine::question::{
     Answer, Held, Limit, Question, QuestionKind, RecoveryGroup, Revisions,
 };
 use koidrive_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
-use koidrive_engine::state::{CommitsState, EffectsState, TreesState};
+use koidrive_engine::state::{Agreed, CommitsState, EffectsState, TreesState};
 use koidrive_engine::tree::{FileIdentity, Kind, Shape as EngineShape};
 use koidrive_fs::FileId;
 use koidrive_proto::v1::{
@@ -433,7 +433,17 @@ fn engine_state() -> EngineState {
                 ("gone".into(), from_commit(4, None)),
             ]),
             watched: BTreeMap::from([("edited".into(), true), ("kept".into(), false)]),
-            watched_positions: BTreeMap::from([("moved".into(), Some(9)), ("placed".into(), None)]),
+            watched_positions: BTreeMap::from([
+                (
+                    "moved".into(),
+                    Some(Agreed {
+                        rev: 9,
+                        parent: "root".into(),
+                        name: "moved.txt".into(),
+                    }),
+                ),
+                ("placed".into(), None),
+            ]),
             trashed_here: BTreeMap::from([("t".into(), 5)]),
             discarded: nodes(["d"]),
             outside: nodes(["kept"]),
@@ -1371,17 +1381,68 @@ fn a_store_from_before_waiting_updates_kept_their_origin_takes_the_accepted_slot
     assert_eq!(before.commits.accepted, 4);
     Store::open(&path)
         .unwrap()
-        .transaction(|tx| tx.set_engine_state(&before))
+        .transaction(|tx| {
+            tx.put_synced_node(&SyncedNode {
+                node_id: "moved".into(),
+                shape: file_shape("root", "moved.txt"),
+            })?;
+            tx.set_engine_state(&before)
+        })
         .unwrap();
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
-        .unwrap();
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
-        .unwrap();
+    conn.execute_batch(
+        "ALTER TABLE waiting_updates DROP COLUMN slot;
+         ALTER TABLE watched_positions DROP COLUMN parent_id;
+         ALTER TABLE watched_positions DROP COLUMN name;",
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 13).unwrap();
     drop(conn);
 
     let mut store = Store::open(&path).unwrap();
     assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
+}
+
+/// A database of schema 14, which kept only the revision of a watched position, takes the position
+/// from S, which held it whenever a revision was recorded. A revision whose node S does not hold
+/// is dropped, and the commit in flight takes what it sent for that node.
+#[test]
+fn a_store_from_before_watched_positions_were_kept_takes_them_from_s() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let mut before = engine_state();
+    before.trees.watched_positions.insert(
+        "lost".into(),
+        Some(Agreed {
+            rev: 4,
+            parent: "root".into(),
+            name: "lost.txt".into(),
+        }),
+    );
+    let mut store = Store::open(&path).unwrap();
+    store
+        .transaction(|tx| {
+            tx.put_synced_node(&SyncedNode {
+                node_id: "moved".into(),
+                shape: file_shape("root", "moved.txt"),
+            })?;
+            tx.set_engine_state(&before)
+        })
+        .unwrap();
+    drop(store);
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "ALTER TABLE watched_positions DROP COLUMN parent_id;
+         ALTER TABLE watched_positions DROP COLUMN name;",
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 14).unwrap();
+    drop(conn);
+
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    before.trees.watched_positions.insert("lost".into(), None);
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
 }
 
