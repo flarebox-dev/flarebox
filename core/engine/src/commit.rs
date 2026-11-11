@@ -642,10 +642,13 @@ impl Commits {
             return None;
         }
         trees.watch_content(ops.iter().filter_map(|op| match &op.op {
+            Some(op::Op::CreateFile(create)) => Some(create.node_id.clone()),
             Some(op::Op::UpdateContent(update)) => Some(update.node_id.clone()),
             _ => None,
         }));
         trees.watch_positions(ops.iter().filter_map(|op| match &op.op {
+            Some(op::Op::CreateDir(create)) => Some(create.node_id.clone()),
+            Some(op::Op::CreateFile(create)) => Some(create.node_id.clone()),
             Some(op::Op::Move(moved)) => Some(moved.node_id.clone()),
             _ => None,
         }));
@@ -681,13 +684,13 @@ impl Commits {
     /// remote change; a create or move the server renamed takes the server's name instead, and the
     /// node is reverted so that the disk takes it too. Content S took from R after the commit was
     /// built is newer than what was sent: the server applies a content update only when no other
-    /// device changed the content after the commit's `base_seq`, so that change came after the
-    /// commit. When S's content changed since then ([`Trees::took_content`]), even back to what it
-    /// was, S keeps what it holds. A position S holds is newer than what was sent only when L and R
+    /// device changed the content after the commit's `base_seq`, and a created file has no content
+    /// before its create, so that change came after the commit. When S's content changed since then ([`Trees::took_content`]), even back to what it
+    /// was, S keeps what it holds. A position S holds is newer than the one a create or move sent only when L and R
     /// agreed on it, after the commit was built, at a revision of R after the result's seq: the
     /// server applies a move whatever another device did after `base_seq`, so the move replaced a
     /// position from an earlier record, and a position only R came back to is a remote change. When S holds a
-    /// newer position ([`Trees::took_position_after`]), S keeps it, and a rename by the server
+    /// newer position ([`Trees::took_position_after`]), S keeps that position, and a rename by the server
     /// does not revert the node. A conflict copy is re-keyed in L, and so is
     /// a directory merged into one L does not hold yet. When L already holds the conflict copy,
     /// because a log replay brought it before the result and the effects downloaded it, the local
@@ -755,6 +758,7 @@ impl Commits {
                         synced.set(into, Some(shape));
                         merged.insert(create.node_id.clone(), into.clone());
                     } else if applied {
+                        let shape = created(trees, &synced, &create.node_id, result.seq, shape);
                         synced.set(&create.node_id, Some(shape));
                     }
                     let exists = taken && trees.remote().live(&create.node_id).is_some();
@@ -771,6 +775,7 @@ impl Commits {
                             kind: Kind::File,
                             content: create.content.clone(),
                         };
+                        let shape = created(trees, &synced, &create.node_id, result.seq, shape);
                         synced.set(&create.node_id, Some(shape));
                     }
                     let exists = taken && trees.remote().live(&create.node_id).is_some();
@@ -845,8 +850,7 @@ impl Commits {
                     local.shape.parent != *parent || nfc(&local.shape.name) != nfc(name)
                 })
             });
-            let kept = matches!(&op.op, Some(op::Op::Move(_)))
-                && trees.took_position_after(node, result.seq);
+            let kept = sent.is_some() && trees.took_position_after(node, result.seq);
             if (renamed && !left && !kept) || (done && follows) {
                 trees.revert(node.clone());
             }
@@ -1318,6 +1322,29 @@ fn keep(trees: &mut Trees, id: &str, needed: &mut BTreeSet<NodeId>) {
             return;
         }
         current = parent;
+    }
+}
+
+/// The shape a create sent, with the position S holds when S took it after the create's result
+/// ([`Trees::took_position_after`]) and the content S holds when it changed since the create was
+/// built ([`Trees::took_content`]).
+fn created(trees: &Trees, synced: &Synced, id: &str, seq: u64, sent: Shape) -> Shape {
+    let Some(held) = synced.get(trees, id) else {
+        return sent;
+    };
+    let (parent, name) = match trees.took_position_after(id, seq) {
+        true => (held.parent, held.name),
+        false => (sent.parent, sent.name),
+    };
+    let content = match trees.took_content(id) {
+        true => held.content,
+        false => sent.content,
+    };
+    Shape {
+        parent,
+        name,
+        content,
+        ..sent
     }
 }
 
