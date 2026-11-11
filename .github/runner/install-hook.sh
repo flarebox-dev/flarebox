@@ -1,7 +1,7 @@
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# Installs job-started.sh as the job-started hook of Flarebox's self-hosted Mac runners. Run it
+# Installs job-started.sh as the job-started hook of Koidrive's self-hosted Mac runners. Run it
 # with sudo from a checkout on the Mac that hosts the runners, then restart each runner while it
 # is idle. It copies the hook to a root-owned path, and in each runner directory it writes .env
 # (with ACTIONS_RUNNER_HOOK_JOB_STARTED) and .path (system directories first, so the runner finds
@@ -15,14 +15,14 @@
 #
 # Usage: sudo .github/runner/install-hook.sh [RUNNER_DIR...]
 # The default runner directories are /Users/ghrunner/runner-1 to /Users/ghrunner/runner-4.
-# FLAREBOX_INSTALL_ROOT, FLAREBOX_INSTALL_OWNER and FLAREBOX_INSTALL_GROUP let
+# KOIDRIVE_INSTALL_ROOT, KOIDRIVE_INSTALL_OWNER and KOIDRIVE_INSTALL_GROUP let
 # test-install-hook.sh run it without root against fake runner directories. Run as root, it
 # refuses them.
 set -euo pipefail
 
-root="${FLAREBOX_INSTALL_ROOT:-}"
-owner="${FLAREBOX_INSTALL_OWNER:-root}"
-group="${FLAREBOX_INSTALL_GROUP:-wheel}"
+root="${KOIDRIVE_INSTALL_ROOT:-}"
+owner="${KOIDRIVE_INSTALL_OWNER:-root}"
+group="${KOIDRIVE_INSTALL_GROUP:-wheel}"
 runner_user=ghrunner
 hook_dir="$root/usr/local/libexec/flarebox"
 hook="$hook_dir/job-started.sh"
@@ -36,8 +36,8 @@ die() {
 }
 
 if [ "$(id -u)" -eq 0 ]; then
-  if [ -n "${FLAREBOX_INSTALL_ROOT+set}${FLAREBOX_INSTALL_OWNER+set}${FLAREBOX_INSTALL_GROUP+set}" ]; then
-    die "FLAREBOX_INSTALL_ROOT, FLAREBOX_INSTALL_OWNER and FLAREBOX_INSTALL_GROUP are for tests without root; unset them to install as root. Nothing was changed."
+  if [ -n "${KOIDRIVE_INSTALL_ROOT+set}${KOIDRIVE_INSTALL_OWNER+set}${KOIDRIVE_INSTALL_GROUP+set}" ]; then
+    die "KOIDRIVE_INSTALL_ROOT, KOIDRIVE_INSTALL_OWNER and KOIDRIVE_INSTALL_GROUP are for tests without root; unset them to install as root. Nothing was changed."
   fi
 elif [ "$owner" != "$(id -un)" ]; then
   die "run this with sudo."
@@ -112,21 +112,21 @@ done
 
 apply_runner() {
   local dir="$1" s="$2" file
-  install -o "$owner" -g "$group" -m 644 "$s/new.env" "$dir/.env.flarebox-new" || return 1
-  install -o "$owner" -g "$group" -m 644 "$s/new.path" "$dir/.path.flarebox-new" || return 1
+  install -o "$owner" -g "$group" -m 644 "$s/new.env" "$dir/.env.koidrive-new" || return 1
+  install -o "$owner" -g "$group" -m 644 "$s/new.path" "$dir/.path.koidrive-new" || return 1
   for file in .env .path; do
     if [ -e "$dir/$file" ]; then
       chflags nouchg "$dir/$file" || return 1
     fi
   done
-  mv -f "$dir/.env.flarebox-new" "$dir/.env" || return 1
-  mv -f "$dir/.path.flarebox-new" "$dir/.path" || return 1
+  mv -f "$dir/.env.koidrive-new" "$dir/.env" || return 1
+  mv -f "$dir/.path.koidrive-new" "$dir/.path" || return 1
   chflags uchg "$dir/.env" "$dir/.path" || return 1
 }
 
 restore_runner() {
   local dir="$1" s="$2" file status=0
-  rm -f "$dir/.env.flarebox-new" "$dir/.path.flarebox-new" || status=1
+  rm -f "$dir/.env.koidrive-new" "$dir/.path.koidrive-new" || status=1
   for file in .env .path; do
     if [ -e "$dir/$file" ]; then
       chflags 0 "$dir/$file" || status=1

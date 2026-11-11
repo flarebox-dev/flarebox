@@ -8,14 +8,14 @@ import {
   CreateSpaceRequestSchema,
   DeviceCredentialsSchema,
   SpaceInfoSchema,
-} from "../src/gen/flarebox/v1/auth_pb";
-import { UploadReceiptSchema } from "../src/gen/flarebox/v1/commit_pb";
-import { ClientMessageSchema, RpcRequestSchema, type RpcResponse, RpcResponseSchema, ServerMessageSchema } from "../src/gen/flarebox/v1/messages_pb";
-import { ChunkPlan_Action } from "../src/gen/flarebox/v1/rpc_pb";
+} from "../src/gen/koidrive/v1/auth_pb";
+import { UploadReceiptSchema } from "../src/gen/koidrive/v1/commit_pb";
+import { ClientMessageSchema, RpcRequestSchema, type RpcResponse, RpcResponseSchema, ServerMessageSchema } from "../src/gen/koidrive/v1/messages_pb";
+import { ChunkPlan_Action } from "../src/gen/koidrive/v1/rpc_pb";
 import { uuidv7 } from "../src/ids";
 import { content, op } from "./helpers";
 
-const BASE = "https://flarebox.test";
+const BASE = "https://koidrive.test";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -44,7 +44,7 @@ describe("server logs", () => {
   it("carry no ticket, receipt, token or credential through an upload, a failed upload and a download", async () => {
     const claimLog = vi.spyOn(console, "log");
     await exports.default.fetch(BASE + "/setup");
-    const code = claimLog.mock.calls.map((args) => String(args[0])).find((text) => text.startsWith("Flarebox claim code"))!.split(": ")[1]!;
+    const code = claimLog.mock.calls.map((args) => String(args[0])).find((text) => text.startsWith("Koidrive claim code"))!.split(": ")[1]!;
     claimLog.mockRestore();
     const owner = await post("/v1/claim", toBinary(ClaimRequestSchema, create(ClaimRequestSchema, { code, deviceName: "Laptop", platform: "linux" })), DeviceCredentialsSchema);
     const token = owner.access!.token;

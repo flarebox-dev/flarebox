@@ -23,8 +23,8 @@ The second can fail on `main`, because the reference server puts files into the 
 To run the ignored tests, and to print the state after every step of one of them:
 
 ```sh
-cargo test -p flarebox-sim --test devices -- --ignored
-FLAREBOX_SIM_TRACE=1 cargo test -p flarebox-sim --test devices <test name> -- --ignored --nocapture
+cargo test -p koidrive-sim --test devices -- --ignored
+KOIDRIVE_SIM_TRACE=1 cargo test -p koidrive-sim --test devices <test name> -- --ignored --nocapture
 ```
 
 A pull request that fixes one of the issues removes the `#[ignore]` of its schedules.
@@ -58,14 +58,14 @@ The workflow always runs on the branch or tag it tests, using that ref's own cop
 The shard's job summary prints one command per failing test target, for example:
 
 ```sh
-git checkout <commit> && PROPTEST_CASES=8192 PROPTEST_RNG_SEED=<seed> cargo test --locked -p flarebox-sim --test engine_sync
+git checkout <commit> && PROPTEST_CASES=8192 PROPTEST_RNG_SEED=<seed> cargo test --locked -p koidrive-sim --test engine_sync
 ```
 
 Running it reproduces the failure locally. The shard's `failure-shard-k` artifact holds the seed, the commands, the test logs and any new `.proptest-regressions` files. Copying a regression file into the checkout replays the shrunk case directly, without the full case count.
 
 ## The mutation set
 
-`scripts/engine-mutations.sh` lists mutations of the engine's commit and effects code that the tests must catch, each a perl substitution on one file. `scripts/mutations.sh` applies them one at a time, runs the unit tests (`cargo test -p flarebox-engine --test commit`), the interleaving property (`cargo test -p flarebox-sim --test engine_sync`, up to three runs of 4096 cases), both, or the tests of several devices (`cargo test -p flarebox-sim --test devices`, up to three runs of 4096 cases), and restores the file. It first checks that the tests pass without mutations. A mutation fails the run when:
+`scripts/engine-mutations.sh` lists mutations of the engine's commit and effects code that the tests must catch, each a perl substitution on one file. `scripts/mutations.sh` applies them one at a time, runs the unit tests (`cargo test -p koidrive-engine --test commit`), the interleaving property (`cargo test -p koidrive-sim --test engine_sync`, up to three runs of 4096 cases), both, or the tests of several devices (`cargo test -p koidrive-sim --test devices`, up to three runs of 4096 cases), and restores the file. It first checks that the tests pass without mutations. A mutation fails the run when:
 
 - no test catches it (`SURVIVED`),
 - its pattern no longer matches the source (`STALE`), or

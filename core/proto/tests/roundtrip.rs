@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use flarebox_proto::v1::{Commit, Move, Op, op};
+use koidrive_proto::v1::{Commit, Move, Op, op};
 use prost::Message;
 
 #[test]

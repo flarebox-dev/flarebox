@@ -2,8 +2,8 @@
 
 import { create, type DescMessage, type MessageShape } from "@bufbuild/protobuf";
 import type { Identity } from "../auth";
-import { Error_Code, ErrorSchema } from "../gen/flarebox/v1/rpc_pb";
-import { CreateShareLinkRequestSchema, ShareInfoSchema, ShareLinkListSchema, ShareLinkSchema, ShareListingSchema, ShareUnlockRequestSchema } from "../gen/flarebox/v1/share_pb";
+import { Error_Code, ErrorSchema } from "../gen/koidrive/v1/rpc_pb";
+import { CreateShareLinkRequestSchema, ShareInfoSchema, ShareLinkListSchema, ShareLinkSchema, ShareListingSchema, ShareUnlockRequestSchema } from "../gen/koidrive/v1/share_pb";
 import { BadRequest, errorReply, readMessage, reply } from "../http";
 import { isUuidV7, toHex } from "../ids";
 import { clientKey } from "./limiter";

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Cloudflare API v4 calls that deploy, find, upgrade and remove a Flarebox server (docs/design/cli-setup.md
+//! The Cloudflare API v4 calls that deploy, find, upgrade and remove a Koidrive server (docs/design/cli-setup.md
 //! sections 4 to 6). Each call answers Cloudflare's envelope `{success, errors, result}`.
 
 use std::collections::{BTreeMap, HashMap};
@@ -66,7 +66,7 @@ pub enum ApiError {
         status: u16,
         errors: Vec<CloudflareMessage>,
     },
-    #[error("could not {call}: {detail}; a newer flarebox release may read Cloudflare's answer")]
+    #[error("could not {call}: {detail}; a newer koi release may read Cloudflare's answer")]
     Unreadable {
         call: &'static str,
         detail: &'static str,
@@ -530,7 +530,7 @@ impl Cloudflare {
             );
         let url = self.url(&["accounts", account, "workers", "scripts", script])?;
         let request = self.request(Method::PUT, url).multipart(form);
-        Ok(self.send("upload the Flarebox server", request).await?.0)
+        Ok(self.send("upload the Koidrive server", request).await?.0)
     }
 
     /// The names of the script's secrets.
@@ -593,7 +593,7 @@ impl Cloudflare {
             .map(drop)
     }
 
-    /// The account's workers.dev subdomain, such as `alice` in `flarebox.alice.workers.dev`.
+    /// The account's workers.dev subdomain, such as `alice` in `koidrive.alice.workers.dev`.
     pub async fn workers_subdomain(&self, account: &str) -> Result<String, ApiError> {
         #[derive(Deserialize)]
         struct Subdomain {
@@ -614,7 +614,7 @@ impl Cloudflare {
         let mut url = self.url(&["accounts", account, "workers", "scripts", script])?;
         url.query_pairs_mut().append_pair("force", "true");
         self.delete(
-            "delete the Flarebox server",
+            "delete the Koidrive server",
             self.request(Method::DELETE, url),
         )
         .await

@@ -2,7 +2,7 @@
 
 //! Properties of the spec v0 section 6.1 name rules.
 
-use flarebox_engine::names::{MAX_NAME_BYTES, casefold, conflict_name, name_key, normalize_name};
+use koidrive_engine::names::{MAX_NAME_BYTES, casefold, conflict_name, name_key, normalize_name};
 use proptest::prelude::*;
 use unicode_normalization::UnicodeNormalization;
 

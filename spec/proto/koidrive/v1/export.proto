@@ -1,0 +1,30 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package koidrive.v1;
+
+import "koidrive/v1/model.proto";
+
+// The first record of every R2 export file (spec v0 section 11, RFC 0004).
+message ExportHeader {
+  // "koidrive.log" for a log segment, "koidrive.snapshot" for a snapshot page.
+  string format = 1;
+  uint32 format_version = 2;
+  string space_id = 3;
+  string history_id = 4;
+}
+
+// One node in a snapshot page. Every chunk list is complete, with no 16,384-chunk cap.
+message NodeSnapshot {
+  NodeState node = 1;
+  // Retained versions other than node.current.
+  repeated RetainedVersion previous = 2;
+  // When the node was trashed; 0 when it is not trashed.
+  int64 trashed_at_ms = 3;
+}
+
+message RetainedVersion {
+  VersionInfo version = 1;
+  int64 superseded_at_ms = 2;
+}

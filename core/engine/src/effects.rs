@@ -26,7 +26,7 @@ pub struct Dir {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Base {
     Root,
-    /// The parked directory `.flarebox/parked/<node>`, which must have `identity`.
+    /// The parked directory `.koidrive/parked/<node>`, which must have `identity`.
     Parked {
         node: NodeId,
         identity: FileIdentity,
@@ -36,7 +36,7 @@ pub enum Base {
 /// An entry's place on disk.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Location {
-    /// `.flarebox/parked/<node_id>` itself.
+    /// `.koidrive/parked/<node_id>` itself.
     Parked(NodeId),
     /// `name` inside the last of `dirs`, which start at `base`.
     At {
@@ -100,11 +100,11 @@ pub struct EffectRecord {
 
 impl EffectRecord {
     pub fn staging(&self) -> String {
-        format!(".flarebox/staging/{}", self.effect_id)
+        format!(".koidrive/staging/{}", self.effect_id)
     }
 
     pub fn quarantine(&self) -> String {
-        format!(".flarebox/quarantine/{}", self.effect_id)
+        format!(".koidrive/quarantine/{}", self.effect_id)
     }
 
     /// Whether L takes the outcome of this effect as L is now, by the checks [`Effects::plan`] makes
@@ -223,7 +223,7 @@ impl Effects {
     /// node whose own place an excluded node holds. A parked node that the rules now leave out is
     /// only moved back to the position L keeps for it, and nothing is planned while the rules are
     /// unknown ([`Trees::rules_known`]), or for a node below a folder whose rules are unknown
-    /// ([`Trees::held`]). A `.fbignore` file that R
+    /// ([`Trees::held`]). A `.koiignore` file that R
     /// holds and the disk does not yet is written before any other effect below its folder
     /// (section 5.10). The driver reads the rules of a rules file it wrote and passes them to
     /// [`Trees::set_rules`] before it asks for the next effect, so the rules are in force before

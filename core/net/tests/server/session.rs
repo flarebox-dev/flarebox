@@ -7,10 +7,10 @@ use std::time::Duration;
 
 use crate::support::proxy::{Fault, Proxy};
 use crate::support::*;
-use flarebox_net::{
+use koidrive_net::{
     Api, ApiError, Auth, CallError, Credentials, Event, Events, NotResent, StopReason,
 };
-use flarebox_proto::v1::{
+use koidrive_proto::v1::{
     ClaimRequest, CommitResult, CreateDir, Move, Op, ResyncRequired, Welcome, error::Code, op,
     op_result, resync_required::Reason, server_info::DataPath,
 };
@@ -44,7 +44,7 @@ fn queued_welcome(events: &mut Events) -> Welcome {
     panic!("the Welcome was not queued before the answer");
 }
 
-async fn tree_names(session: &flarebox_net::Session) -> Vec<String> {
+async fn tree_names(session: &koidrive_net::Session) -> Vec<String> {
     let mut names = Vec::new();
     let mut cursor = String::new();
     loop {
@@ -69,7 +69,7 @@ async fn auth_claims_pairs_refreshes_and_refuses_bad_credentials() {
     let info = api().server_info().await.unwrap();
     assert!(info.claimed);
     assert_eq!(info.data_path(), DataPath::Relay);
-    assert!(info.proto_min <= flarebox_net::PROTO_MAX && flarebox_net::PROTO_MIN <= info.proto_max);
+    assert!(info.proto_min <= koidrive_net::PROTO_MAX && koidrive_net::PROTO_MIN <= info.proto_max);
 
     let again = ClaimRequest {
         code: "AAAA-AAAA-AAAA".into(),
@@ -114,7 +114,7 @@ async fn auth_claims_pairs_refreshes_and_refuses_bad_credentials() {
         Event::Stopped(StopReason::CredentialsRefused)
     );
 
-    let stale = flarebox_proto::v1::AccessToken {
+    let stale = koidrive_proto::v1::AccessToken {
         token: "v1.unknown.e30.AAAA".into(),
         expires_at_ms: i64::MAX,
         ..Default::default()
@@ -129,7 +129,7 @@ async fn auth_claims_pairs_refreshes_and_refuses_bad_credentials() {
     .await;
     assert_eq!(
         refused,
-        flarebox_net::DisconnectReason::Refused { status: 401 }
+        koidrive_net::DisconnectReason::Refused { status: 401 }
     );
     connected(&mut events).await;
     session.list_tree("", 1).await.unwrap();

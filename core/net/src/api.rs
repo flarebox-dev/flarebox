@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use flarebox_proto::v1::{
+use koidrive_proto::v1::{
     AccessToken, ClaimRequest, CreateSpaceRequest, DeviceCredentials, DeviceList,
     PairCompleteRequest, PairStartResponse, RewindRequest, RewindResult, RpcRequest, RpcResponse,
     ServerInfo, SpaceInfo, SpaceList, SpaceUsage, TokenRequest, rpc_request,
@@ -36,7 +36,7 @@ const MAX_SPACE_LISTING: usize = 128 << 20;
 /// text from clients.
 const MAX_ERROR: usize = 1 << 20;
 
-/// The HTTP endpoints of one Flarebox deployment (spec v0 section 15.1). Bodies are binary protobuf.
+/// The HTTP endpoints of one Koidrive deployment (spec v0 section 15.1). Bodies are binary protobuf.
 ///
 /// Credentials and tokens travel only over HTTPS, and the WebSocket only over WSS. Plain HTTP is allowed only for
 /// a loopback address, and only through [`Api::local_development`]. Redirects are never followed, so a request
@@ -76,7 +76,7 @@ impl Api {
             base.set_path(&path);
         }
         let http = reqwest::Client::builder()
-            .user_agent(concat!("flarebox-net/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("koidrive-net/", env!("CARGO_PKG_VERSION")))
             .https_only(!local_development)
             .redirect(redirect::Policy::none())
             .connect_timeout(CONNECT_TIMEOUT)
@@ -515,7 +515,7 @@ mod tests {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0u8; 4096];
             assert!(socket.read(&mut request).await.unwrap() > 0);
-            let body = flarebox_proto::v1::Error {
+            let body = koidrive_proto::v1::Error {
                 code: 999,
                 message: "refused".into(),
                 ..Default::default()
@@ -702,7 +702,7 @@ mod tests {
         );
 
         let devices = DeviceList {
-            devices: vec![flarebox_proto::v1::DeviceInfo {
+            devices: vec![koidrive_proto::v1::DeviceInfo {
                 name: "n".repeat(MAX_DEVICE_PAGE),
                 ..Default::default()
             }],

@@ -2,8 +2,8 @@
 
 //! One-request HTTP servers that answer chunk transfers in scripted ways.
 
-use flarebox_proto::v1::Error as ProtoError;
-use flarebox_proto::v1::error::Code;
+use koidrive_proto::v1::Error as ProtoError;
+use koidrive_proto::v1::error::Code;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Instant;

@@ -11,8 +11,8 @@ import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import file from "../../spec/testdata/scenarios/space-conformance-v1.json";
 import { signChunkGrant, sha256 } from "../src/crypto";
-import { type Op, OpResult_Code, OpSchema, type OpResult, type UploadReceipt, UploadReceiptSchema } from "../src/gen/flarebox/v1/commit_pb";
-import { RpcRequestSchema, type RpcResponse, RpcResponseSchema } from "../src/gen/flarebox/v1/messages_pb";
+import { type Op, OpResult_Code, OpSchema, type OpResult, type UploadReceipt, UploadReceiptSchema } from "../src/gen/koidrive/v1/commit_pb";
+import { RpcRequestSchema, type RpcResponse, RpcResponseSchema } from "../src/gen/koidrive/v1/messages_pb";
 import {
   type ChunkRef,
   ChunkRefSchema,
@@ -22,8 +22,8 @@ import {
   type NodeState,
   NodeStatus,
   type VersionInfo,
-} from "../src/gen/flarebox/v1/model_pb";
-import { ChunkPlan_Action, Error_Code, type Error as RpcError } from "../src/gen/flarebox/v1/rpc_pb";
+} from "../src/gen/koidrive/v1/model_pb";
+import { ChunkPlan_Action, Error_Code, type Error as RpcError } from "../src/gen/koidrive/v1/rpc_pb";
 import { toHex, uuidv7 } from "../src/ids";
 import { GRANT_MS, type Role, type Session, type SpaceDO } from "../src/space-do";
 import { chunkKey, encodeChunkList, getMeta, getNode, nodeState } from "../src/space/store";
@@ -33,7 +33,7 @@ type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 type Obj = { [key: string]: Json };
 
 const doc = file as unknown as Obj;
-const ORIGIN = "https://flarebox.test";
+const ORIGIN = "https://koidrive.test";
 const CHUNKER = "fastcdc2020-1m-4m-16m";
 
 class Failure extends Error {}
@@ -761,8 +761,8 @@ keys(doc, "the file", ["format", "version", "spec", "unicode", "now_ms", "mtime_
 const scenarios = req(optList(doc, "scenarios"), "scenarios");
 
 describe("space conformance (spec/testdata/scenarios/space-conformance-v1.json)", () => {
-  it("reads format flarebox.space-conformance version 1", () => {
-    expect([doc.format, doc.version]).toEqual(["flarebox.space-conformance", 1]);
+  it("reads format koidrive.space-conformance version 1", () => {
+    expect([doc.format, doc.version]).toEqual(["koidrive.space-conformance", 1]);
   });
 
   for (const scenario of scenarios) {

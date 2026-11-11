@@ -1,8 +1,8 @@
 This package is licensed under the GNU Affero General Public License v3.0
 or later (SPDX: AGPL-3.0-or-later); see LICENSE.
 
-Exception: the files in src/gen/ are generated from the Flarebox protocol
-schema (spec/ in https://github.com/flarebox-dev/flarebox) and are licensed
+Exception: the files in src/gen/ are generated from the Koidrive protocol
+schema (spec/ in https://github.com/koidrive/koidrive) and are licensed
 under the Apache License 2.0 (SPDX: Apache-2.0), as their headers state.
 Apache-2.0 code may be combined with an AGPL-3.0-or-later work. The full
 text of the Apache License 2.0 follows.

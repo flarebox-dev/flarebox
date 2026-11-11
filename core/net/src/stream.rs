@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use flarebox_proto::v1::{CommitRecord, Resume, ResyncRequired};
+use koidrive_proto::v1::{CommitRecord, Resume, ResyncRequired};
 
 use crate::event::{Committed, Event};
 
@@ -155,7 +155,7 @@ impl Stream {
 
 #[cfg(test)]
 mod tests {
-    use flarebox_proto::v1::CommitResult;
+    use koidrive_proto::v1::CommitResult;
 
     use super::*;
 

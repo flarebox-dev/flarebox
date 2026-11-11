@@ -4,9 +4,9 @@ import { fromBinary } from "@bufbuild/protobuf";
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { OpResult_Code } from "../src/gen/flarebox/v1/commit_pb";
-import { CommitRecordSchema, NodeStatus } from "../src/gen/flarebox/v1/model_pb";
-import { ChunkPlan_Action, Error_Code } from "../src/gen/flarebox/v1/rpc_pb";
+import { OpResult_Code } from "../src/gen/koidrive/v1/commit_pb";
+import { CommitRecordSchema, NodeStatus } from "../src/gen/koidrive/v1/model_pb";
+import { ChunkPlan_Action, Error_Code } from "../src/gen/koidrive/v1/rpc_pb";
 import { toHex, uuidv7 } from "../src/ids";
 import type { SpaceDO } from "../src/space-do";
 import { conflictName, nameKey } from "../src/space/names";
@@ -115,7 +115,7 @@ describe("Space DO commits", () => {
 });
 
 describe("RFC 0001 name and move rules", () => {
-  it("rejects .flarebox in any case directly under the root and allows it deeper", async () => {
+  it("rejects .koidrive in any case directly under the root and allows it deeper", async () => {
     const { a, root } = await setup();
     const dir = uuidv7();
     const nested = uuidv7();
@@ -123,10 +123,10 @@ describe("RFC 0001 name and move rules", () => {
     const parts = await content("x");
     const result = await a.commit(
       [
-        op.mkdir(uuidv7(), root, ".flarebox"),
-        op.create(uuidv7(), root, ".FlareBox", parts.content),
+        op.mkdir(uuidv7(), root, ".koidrive"),
+        op.create(uuidv7(), root, ".KoiDrive", parts.content),
         op.mkdir(dir, root, "dir"),
-        op.mkdir(nested, dir, ".flarebox"),
+        op.mkdir(nested, dir, ".koidrive"),
         op.mkdir(trashed, root, "old"),
       ],
       { receipts: await a.uploadParts(parts) },
@@ -139,21 +139,21 @@ describe("RFC 0001 name and move rules", () => {
       [OpResult_Code.APPLIED, ""],
     ]);
     await a.commit([op.delete(trashed)]);
-    const moved = await a.commit([op.move(nested, root, ".flarebox"), op.move(dir, root, ".FLAREBOX"), op.restore(trashed, { name: ".flarebox" })]);
+    const moved = await a.commit([op.move(nested, root, ".koidrive"), op.move(dir, root, ".KOIDRIVE"), op.restore(trashed, { name: ".koidrive" })]);
     expect(moved.results.map((r) => [r.code, r.rejectReason])).toEqual([
       [OpResult_Code.REJECTED, "INVALID_NAME"],
       [OpResult_Code.REJECTED, "INVALID_NAME"],
       [OpResult_Code.REJECTED, "INVALID_NAME"],
     ]);
     const tree = await a.tree();
-    expect(tree.get(nested)).toMatchObject({ parentId: dir, name: ".flarebox" });
+    expect(tree.get(nested)).toMatchObject({ parentId: dir, name: ".koidrive" });
     expect(tree.get(dir)).toMatchObject({ parentId: root, name: "dir" });
     expect(tree.has(trashed)).toBe(false);
   });
 
-  it("rejects a full-casefold alias of .flarebox at the root", async () => {
+  it("rejects a Kelvin-sign alias of .koidrive at the root", async () => {
     const { a, root } = await setup();
-    const result = await a.commit([op.mkdir(uuidv7(), root, ".\uFB02arebox")]);
+    const result = await a.commit([op.mkdir(uuidv7(), root, ".\u212Aoidrive")]);
     expect(result.results[0]).toMatchObject({ code: OpResult_Code.REJECTED, rejectReason: "INVALID_NAME" });
   });
 
@@ -168,7 +168,7 @@ describe("RFC 0001 name and move rules", () => {
     const versionId = firstVersion.case === "node" ? firstVersion.value.current!.versionId : "";
     await a.commit([op.delete(dir), op.delete(updated.nodeId), op.delete(restored.nodeId)]);
     await runInDurableObject(space.stub, (_instance, state) => {
-      for (const [id, name] of [[dir, ".FlareBox"], [updated.nodeId, ".flarebox"], [restored.nodeId, ".\uFB02AREBOX"]]) {
+      for (const [id, name] of [[dir, ".KoiDrive"], [updated.nodeId, ".koidrive"], [restored.nodeId, ".\u212AOIDRIVE"]]) {
         state.storage.sql.exec("UPDATE nodes SET name = ?, name_key = ? WHERE node_id = ?", name, nameKey(name!), id);
       }
     });
@@ -180,10 +180,10 @@ describe("RFC 0001 name and move rules", () => {
     );
     expect(result.results.map((r) => r.code)).toEqual([OpResult_Code.APPLIED, OpResult_Code.APPLIED_RENAMED, OpResult_Code.APPLIED_RENAMED]);
     const tree = await a.tree();
-    expect(tree.get(dir)!.name).toMatch(/^\.FlareBox \(conflict from Laptop A \d{4}-\d{2}-\d{2}\)$/);
-    expect(tree.get(updated.nodeId)!.name).toMatch(/^\.flarebox \(conflict from Laptop A \d{4}-\d{2}-\d{2} 2\)$/);
-    expect(tree.get(restored.nodeId)!.name).toMatch(/^\.\uFB02AREBOX \(conflict from Laptop A \d{4}-\d{2}-\d{2} 3\)$/);
-    expect([...tree.values()].filter((n) => n.parentId === root && nameKey(n.name) === ".flarebox")).toEqual([]);
+    expect(tree.get(dir)!.name).toMatch(/^\.KoiDrive \(conflict from Laptop A \d{4}-\d{2}-\d{2}\)$/);
+    expect(tree.get(updated.nodeId)!.name).toMatch(/^\.koidrive \(conflict from Laptop A \d{4}-\d{2}-\d{2} 2\)$/);
+    expect(tree.get(restored.nodeId)!.name).toMatch(/^\.KOIDRIVE \(conflict from Laptop A \d{4}-\d{2}-\d{2} 3\)$/);
+    expect([...tree.values()].filter((n) => n.parentId === root && nameKey(n.name) === ".koidrive")).toEqual([]);
   });
 
   it("applies a no-op Move without a change record, so a concurrent delete still trashes the node", async () => {

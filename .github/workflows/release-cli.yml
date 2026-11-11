@@ -67,7 +67,7 @@ jobs:
         run: |
           pnpm --dir server install --frozen-lockfile
           node server/scripts/pack-bundle.mjs "$RUNNER_TEMP/server-bundle"
-          echo "FLAREBOX_SERVER_BUNDLE=$RUNNER_TEMP/server-bundle" >> "$GITHUB_ENV"
+          echo "KOIDRIVE_SERVER_BUNDLE=$RUNNER_TEMP/server-bundle" >> "$GITHUB_ENV"
       - name: Install the pinned Rust toolchain and target
         env:
           TARGET: ${{ matrix.target }}
@@ -95,14 +95,14 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           if [[ "$TARGET" == *linux-musl ]]; then
-            nice -n 10 cargo zigbuild --release --locked -p flarebox-cli --target "$TARGET"
-            file "target/$TARGET/release/flarebox"
-            if readelf -l "target/$TARGET/release/flarebox" | grep -q INTERP || readelf -d "target/$TARGET/release/flarebox" | grep -q NEEDED; then
+            nice -n 10 cargo zigbuild --release --locked -p koidrive-cli --target "$TARGET"
+            file "target/$TARGET/release/koi"
+            if readelf -l "target/$TARGET/release/koi" | grep -q INTERP || readelf -d "target/$TARGET/release/koi" | grep -q NEEDED; then
               echo '::error::The Linux release binary needs a dynamic interpreter or library; expected a static musl binary.'
               exit 1
             fi
           else
-            nice -n 10 cargo build --release --locked -p flarebox-cli --target "$TARGET"
+            nice -n 10 cargo build --release --locked -p koidrive-cli --target "$TARGET"
           fi
           embedded=$(find "target/$TARGET/release/build" -path '*/out/server_bundle.rs' -exec grep -l include_bytes {} +)
           test -n "$embedded" || { echo '::error::The CLI has no embedded server bundle'; exit 1; }
@@ -110,15 +110,15 @@ jobs:
         if: matrix.target != 'aarch64-unknown-linux-musl'
         env:
           TARGET: ${{ matrix.target }}
-        run: sh scripts/test-install.sh "target/$TARGET/release/flarebox" "$TARGET"
+        run: sh scripts/test-install.sh "target/$TARGET/release/koi" "$TARGET"
       - name: Package the CLI and user unit
         env:
           TARGET: ${{ matrix.target }}
         run: |
           mkdir -p dist package
-          cp "target/$TARGET/release/flarebox" package/flarebox
-          cp cli/systemd/flarebox.service package/flarebox.service
-          tar -czf "dist/flarebox-$TARGET.tar.gz" -C package flarebox flarebox.service
+          cp "target/$TARGET/release/koi" package/koi
+          cp cli/systemd/koidrive.service package/koidrive.service
+          tar -czf "dist/koidrive-$TARGET.tar.gz" -C package koi koidrive.service
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cli-${{ matrix.target }}
@@ -168,9 +168,9 @@ jobs:
           for archive in dist/*.tar.gz; do
             mkdir package
             tar -xzf "$archive" -C package
-            codesign --force --keychain "$keychain" --sign "$identity" --options runtime --timestamp package/flarebox
-            codesign --verify --strict --verbose=2 package/flarebox
-            tar -czf "$archive" -C package flarebox flarebox.service
+            codesign --force --keychain "$keychain" --sign "$identity" --options runtime --timestamp package/koi
+            codesign --verify --strict --verbose=2 package/koi
+            tar -czf "$archive" -C package koi koidrive.service
             rm -rf package
           done
       - name: Remove signing material
@@ -211,7 +211,7 @@ jobs:
         run: |
           cd dist
           test "$(find . -name '*.tar.gz' | wc -l)" -eq 4
-          sha256sum flarebox-*.tar.gz > SHA256SUMS
+          sha256sum koidrive-*.tar.gz > SHA256SUMS
           sha256sum -c SHA256SUMS
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -239,7 +239,7 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --draft --verify-tag --title "$TAG" --notes 'Flarebox CLI for Linux and macOS. See docs/guide/install.md for installation.'
+            gh release create "$TAG" --draft --verify-tag --title "$TAG" --notes 'Koidrive CLI for Linux and macOS. See docs/guide/install.md for installation.'
           fi
           gh release upload "$TAG" dist/* --clobber
           gh release edit "$TAG" --draft=false

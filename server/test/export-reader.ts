@@ -7,7 +7,7 @@ import { create, fromBinary } from "@bufbuild/protobuf";
 import { BinaryReader } from "@bufbuild/protobuf/wire";
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { ExportHeaderSchema, NodeSnapshotSchema } from "../src/gen/flarebox/v1/export_pb";
+import { ExportHeaderSchema, NodeSnapshotSchema } from "../src/gen/koidrive/v1/export_pb";
 import {
   type CommitRecord,
   CommitRecordSchema,
@@ -18,7 +18,7 @@ import {
   NodeStatus,
   type VersionInfo,
   VersionInfoSchema,
-} from "../src/gen/flarebox/v1/model_pb";
+} from "../src/gen/koidrive/v1/model_pb";
 import { sha256 } from "../src/crypto";
 import { toHex } from "../src/ids";
 import { nodeState, type NodeRow, rows, type VersionRow, versionInfo } from "../src/space/store";
@@ -116,7 +116,7 @@ export async function restoreFromR2(spaceId: string): Promise<Restored> {
   for (const key of await keys(meta)) {
     if (!key.endsWith("/space.json")) continue;
     const descriptor = (await json<Record<string, unknown>>(key))!;
-    if (descriptor.format !== "flarebox.space" || descriptor.format_version !== 1) throw new Error(`unexpected descriptor ${key}`);
+    if (descriptor.format !== "koidrive.space" || descriptor.format_version !== 1) throw new Error(`unexpected descriptor ${key}`);
     descriptors.push(descriptor);
   }
   const descriptor = descriptors.sort((a, b) => Number(b.rewind_number) - Number(a.rewind_number))[0];
@@ -133,7 +133,7 @@ export async function restoreFromR2(spaceId: string): Promise<Restored> {
     const manifest = manifests.sort((a, b) => b.start_seq - a.start_seq)[0];
     const nodes = new Map<string, RestoredNode>();
     if (manifest) {
-      if (manifest.format !== "flarebox.snapshot" || manifest.format_version !== 1 || manifest.history_id !== historyId) throw new Error("unexpected manifest");
+      if (manifest.format !== "koidrive.snapshot" || manifest.format_version !== 1 || manifest.history_id !== historyId) throw new Error("unexpected manifest");
       let missing = false;
       for (const page of manifest.pages) {
         const object = await env.BUCKET.get(`${prefix}snap/${String(manifest.start_seq).padStart(20, "0")}/pages/${page.name}`);
@@ -143,7 +143,7 @@ export async function restoreFromR2(spaceId: string): Promise<Restored> {
         }
         const bytes = new Uint8Array(await object.arrayBuffer());
         if (bytes.length !== page.bytes || toHex(await sha256(bytes)) !== page.sha256) throw new Error(`page ${page.name} does not match the manifest`);
-        const records = await frames(bytes, "flarebox.snapshot", spaceId, historyId);
+        const records = await frames(bytes, "koidrive.snapshot", spaceId, historyId);
         if (records.length !== page.records) throw new Error(`page ${page.name} holds ${records.length} records`);
         for (const record of records) {
           const snapshot = fromBinary(NodeSnapshotSchema, record);
@@ -177,7 +177,7 @@ export async function restoreFromR2(spaceId: string): Promise<Restored> {
       if (i === 0 ? segment.first > next : segment.first !== next) throw new Error(`the log does not chain at ${segment.key}`);
       const object = (await env.BUCKET.get(segment.key))!;
       let seq = segment.first;
-      for (const frame of await frames(new Uint8Array(await object.arrayBuffer()), "flarebox.log", spaceId, historyId)) {
+      for (const frame of await frames(new Uint8Array(await object.arrayBuffer()), "koidrive.log", spaceId, historyId)) {
         const record = fromBinary(CommitRecordSchema, frame);
         if (Number(record.seq) !== seq++) throw new Error(`${segment.key} skips a seq`);
         if (record.seq > BigInt(startSeq)) replay(nodes, record);

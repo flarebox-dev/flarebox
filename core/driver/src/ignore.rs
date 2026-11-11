@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The ignore rules of a linked folder as the driver holds them (design §5.10). The matcher is the engine's
-//! ([`flarebox_engine::ignore`]): the built-in exclusions, this device's `[sync]` list and the `.fbignore` files of
+//! ([`koidrive_engine::ignore`]): the built-in exclusions, this device's `[sync]` list and the `.koiignore` files of
 //! the folder. [`matcher`] builds the part that is the same for every folder of the profile, and `scan_rules` gives
-//! `core/fs` the form its scans and watchers apply, which also reads the `.fbignore` files. The engine's trees take the
+//! `core/fs` the form its scans and watchers apply, which also reads the `.koiignore` files. The engine's trees take the
 //! same list through [`local_rules`] and the same files with each observation, so a scan leaves out exactly the paths
 //! the engine excludes.
 
@@ -11,20 +11,20 @@ use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::sync::Arc;
 
-use flarebox_engine::ignore::{LocalRules, Matcher as Rules, RuleFile};
-use flarebox_engine::names::name_key;
-use flarebox_fs::{EntryKind, Ignore, Ignored};
-use flarebox_ignore::{Kind, LocalRulesError, Reason, Status};
+use koidrive_engine::ignore::{LocalRules, Matcher as Rules, RuleFile};
+use koidrive_engine::names::name_key;
+use koidrive_fs::{EntryKind, Ignore, Ignored};
+use koidrive_ignore::{Kind, LocalRulesError, Reason, Status};
 
 use crate::config::SyncRules;
 
-/// Decides whether a path of a linked folder is excluded on this device, before any `.fbignore` file is read.
+/// Decides whether a path of a linked folder is excluded on this device, before any `.koiignore` file is read.
 pub trait Matcher: Send + Sync {
     /// `path` is relative to the folder's root; `dir` says whether it names a folder.
     fn is_excluded(&self, path: &Path, dir: bool) -> bool;
 }
 
-/// Excludes nothing of its own. The built-in exclusions and the `.fbignore` files still apply to a scan.
+/// Excludes nothing of its own. The built-in exclusions and the `.koiignore` files still apply to a scan.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Unfiltered;
 
@@ -75,7 +75,7 @@ pub fn matcher(sync: &SyncRules) -> Result<Arc<dyn Matcher>, LocalRulesError> {
     Ok(Arc::new(Device(Rules::new(local_rules(sync)?))))
 }
 
-/// What `core/fs` asks while it scans: the device's matcher, and the `.fbignore` files the scan has read so far.
+/// What `core/fs` asks while it scans: the device's matcher, and the `.koiignore` files the scan has read so far.
 struct Scanned {
     device: Arc<dyn Matcher>,
     files: Rules,
@@ -102,10 +102,10 @@ impl Ignore for Scanned {
     }
 }
 
-/// The rules a new watcher of a folder scans with: `device`, the built-in exclusions, and the `.fbignore` files, of
+/// The rules a new watcher of a folder scans with: `device`, the built-in exclusions, and the `.koiignore` files, of
 /// which it has read none yet. Its first scan reads and reports every one.
-pub(crate) fn scan_rules(device: &Arc<dyn Matcher>) -> flarebox_fs::Rules {
-    flarebox_fs::Rules::new(Box::new(Scanned {
+pub(crate) fn scan_rules(device: &Arc<dyn Matcher>) -> koidrive_fs::Rules {
+    koidrive_fs::Rules::new(Box::new(Scanned {
         device: device.clone(),
         files: Rules::new(LocalRules::default()),
     }))
@@ -134,8 +134,8 @@ mod tests {
         ] {
             assert!(matcher.is_excluded(Path::new(name), false), "{name:?}");
         }
-        assert!(matcher.is_excluded(Path::new(".flarebox"), true));
-        assert!(!matcher.is_excluded(Path::new("docs/.flarebox"), true));
+        assert!(matcher.is_excluded(Path::new(".koidrive"), true));
+        assert!(!matcher.is_excluded(Path::new("docs/.koidrive"), true));
         assert!(!matcher.is_excluded(Path::new("docs/notes.txt"), false));
     }
 
@@ -156,7 +156,7 @@ mod tests {
         assert!(!matcher.is_excluded(Path::new("Notes/todo.txt"), false));
         assert!(matcher.is_excluded(Path::new("Notes/other.txt"), false));
         assert!(matcher.is_excluded(Path::new("Photos"), true));
-        assert!(!matcher.is_excluded(Path::new("Notes/.fbignore"), false));
+        assert!(!matcher.is_excluded(Path::new("Notes/.koiignore"), false));
     }
 
     #[test]

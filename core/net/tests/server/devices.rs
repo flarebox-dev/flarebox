@@ -2,8 +2,8 @@
 
 //! The device routes against the real Worker (RFC 0006 section 7, RFC 0009).
 
-use flarebox_net::Auth;
-use flarebox_proto::v1::{DeviceInfo, TokenRequest};
+use koidrive_net::Auth;
+use koidrive_proto::v1::{DeviceInfo, TokenRequest};
 
 use crate::support::*;
 

@@ -14,9 +14,9 @@ import {
   OpResultSchema,
   type Restore,
   type UpdateContent,
-} from "../gen/flarebox/v1/commit_pb";
-import { type ChangeRecord, ChangeRecordSchema, type ChunkRef, type Content } from "../gen/flarebox/v1/model_pb";
-import { Error_Code } from "../gen/flarebox/v1/rpc_pb";
+} from "../gen/koidrive/v1/commit_pb";
+import { type ChangeRecord, ChangeRecordSchema, type ChunkRef, type Content } from "../gen/koidrive/v1/model_pb";
+import { Error_Code } from "../gen/koidrive/v1/rpc_pb";
 import { uuidv7 } from "../ids";
 import type { OpEffect } from "../policy";
 import { conflictName, isReservedAtRoot, nameKey, normalizeName } from "./names";

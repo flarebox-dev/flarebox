@@ -11,9 +11,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use flarebox_driver::{Credential, Paths, Question, QuestionKind};
-use flarebox_ffi::{Answer, SessionEvent, SessionListener, SyncSession, SyncStatus};
-use flarebox_store::{Link, Store, StoredQuestion};
+use koidrive_driver::{Credential, Paths, Question, QuestionKind};
+use koidrive_ffi::{Answer, SessionEvent, SessionListener, SyncSession, SyncStatus};
+use koidrive_store::{Link, Store, StoredQuestion};
 
 /// Nothing listens on the discard port.
 const SERVER: &str = "http://127.0.0.1:9/";
@@ -43,9 +43,9 @@ fn paired_profile(base: &Path, spaces: &[&str], questions: usize) -> PathBuf {
     .unwrap();
     for space in spaces {
         let root = base.join(space);
-        fs::create_dir_all(root.join(".flarebox")).unwrap();
+        fs::create_dir_all(root.join(".koidrive")).unwrap();
         fs::write(
-            root.join(".flarebox/space.json"),
+            root.join(".koidrive/space.json"),
             format!("{{\"space_id\":\"{space}\",\"effects\":0}}"),
         )
         .unwrap();
@@ -84,7 +84,7 @@ fn paired_profile(base: &Path, spaces: &[&str], questions: usize) -> PathBuf {
                         answer: None,
                     })?;
                 }
-                Ok::<_, flarebox_store::Error>(())
+                Ok::<_, koidrive_store::Error>(())
             })
             .unwrap();
     }
@@ -169,11 +169,11 @@ fn a_sign_out_that_cannot_unlink_a_folder_leaves_sync_stopped() {
     let base = dir.path().canonicalize().unwrap();
     let session = open(&paired_profile(&base, &["a1", "b2"], 0));
     session.start();
-    let owner = base.join("b2/.flarebox/device.json");
+    let owner = base.join("b2/.koidrive/device.json");
     assert!(appears(&owner), "the folder's task did not start");
     fs::remove_file(&owner).unwrap();
 
-    let private = base.join("a1/.flarebox");
+    let private = base.join("a1/.koidrive");
     fs::set_permissions(&private, fs::Permissions::from_mode(0o000)).unwrap();
     let refused = session.sign_out(true);
     fs::set_permissions(&private, fs::Permissions::from_mode(0o755)).unwrap();

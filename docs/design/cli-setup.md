@@ -1,43 +1,43 @@
 # CLI-first setup design
 
-Status: draft for review. Scope: making `brew install flarebox` followed by `flarebox setup` the default way to install Flarebox on macOS and Linux, with the deploy button as a second path. It covers the Cloudflare login, the server deploy and claim, adding devices, upgrades, and how the CLI and the macOS app are distributed. Out of scope: implementing the commands, README and website text, and buying or verifying a domain. The server side builds on [deploy-and-upgrade.md](deploy-and-upgrade.md).
+Status: draft for review. Scope: making `brew install koidrive` followed by `koi setup` the default way to install Koidrive on macOS and Linux, with the deploy button as a second path. It covers the Cloudflare login, the server deploy and claim, adding devices, upgrades, and how the CLI and the macOS app are distributed. Out of scope: implementing the commands, README and website text, and buying or verifying a domain. The server side builds on [deploy-and-upgrade.md](deploy-and-upgrade.md).
 
-Every step below ran against the test account "Flarebox deploy test" on 2026-11-10 with a private OAuth client and a throwaway prototype: branch [`spike/cli-setup-oauth`](https://github.com/flarebox-dev/flarebox/tree/spike/cli-setup-oauth/spike/cli-setup) at commit a5d0a2370ec8377d4a0ef053b255d9663dabf3e9. "Measured" means a call in that run returned the value quoted. Anything else carries a source or is labelled *unverified*. Flarebox is not affiliated with Cloudflare, Inc.
+Every step below ran against the test account "Koidrive deploy test" on 2026-11-10 with a private OAuth client and a throwaway prototype: branch [`spike/cli-setup-oauth`](https://github.com/koidrive/koidrive/tree/spike/cli-setup-oauth/spike/cli-setup) at commit a5d0a2370ec8377d4a0ef053b255d9663dabf3e9. "Measured" means a call in that run returned the value quoted. Anything else carries a source or is labelled *unverified*. Koidrive is not affiliated with Cloudflare, Inc.
 
 ## Summary
 
 - One OAuth login (Authorization Code with PKCE, public client, no secret) is enough to deploy the server, claim it and upgrade it later. The CLI needs no Node, no Wrangler and no API token. The measured setup took 13 seconds from the first API call to a claimed server with the secret deleted again.
-- The client needs four scopes: `account-settings.read`, `workers-scripts.admin`, `workers-r2.write` and `offline_access`. Workers Editor (`workers-scripts.edit`) is not enough, because script upload and asset upload return 403 under it. Flarebox uses Workers Admin (section 11, decision 1).
+- The client needs four scopes: `account-settings.read`, `workers-scripts.admin`, `workers-r2.write` and `offline_access`. Workers Editor (`workers-scripts.edit`) is not enough, because script upload and asset upload return 403 under it. Koidrive uses Workers Admin (section 11, decision 1).
 - The loopback redirect works on `http://127.0.0.1` with any port. The device-code grant is not available to third-party clients, so a headless Linux machine joins with a pairing code from a device that has a browser by default, or pastes the redirect URL with `--no-browser`.
-- The claim moves from the Worker log to a one-time Worker secret. The server needs one small change, so that a correct `FLAREBOX_RECOVERY_KEY` also claims a server that has no owner yet. Adding a device to an existing owner through the same secret already works on main.
-- `flarebox setup` finds an existing server by a script tag (`flarebox-server`) and confirms it with `GET /v1/server`. With no server it deploys and claims one. With one it adds this device. A run that stopped halfway resumes from a small state file that holds no secrets (section 4.6).
+- The claim moves from the Worker log to a one-time Worker secret. The server needs one small change, so that a correct `KOIDRIVE_RECOVERY_KEY` also claims a server that has no owner yet. Adding a device to an existing owner through the same secret already works on main.
+- `koi setup` finds an existing server by a script tag (`koidrive-server`) and confirms it with `GET /v1/server`. With no server it deploys and claims one. With one it adds this device. A run that stopped halfway resumes from a small state file that holds no secrets (section 4.6).
 - Upgrades upload a newer bundle under the same names. Bindings, secrets and data survive, and storage migrations run when each Durable Object adopts the new code, which Cloudflare now defers for up to 300 seconds by default.
-- Before Flarebox can ship this to everyone, the OAuth client must become public. That needs a verified domain on the client URL (flarebox.dev, bought before launch), a logo and a name, and promotion is permanent.
+- Before Koidrive can ship this to everyone, the OAuth client must become public. That needs a verified domain on the client URL (koidrive.com, bought before launch), a logo and a name, and promotion is permanent.
 - Section 11 records the project owner's decisions and lists the points still waiting for one.
 
 ## 1. Commands
 
 ```
-flarebox setup                  # asks: log in with Cloudflare, or enter a code from another device
-flarebox setup <pairing code>   # joins the server named in the code
-flarebox join <pairing code>    # the same, for scripts
-flarebox server deploy          # Cloudflare login, then deploy and claim; fails if a server exists
-flarebox server add-device      # Cloudflare login, then add this device to the existing server
-flarebox server upgrade         # Cloudflare login, then upload this CLI's server bundle
-flarebox server uninstall       # Cloudflare login, then delete the Worker, empty and delete the bucket
+koi setup                  # asks: log in with Cloudflare, or enter a code from another device
+koi setup <pairing code>   # joins the server named in the code
+koi join <pairing code>    # the same, for scripts
+koi server deploy          # Cloudflare login, then deploy and claim; fails if a server exists
+koi server add-device      # Cloudflare login, then add this device to the existing server
+koi server upgrade         # Cloudflare login, then upload this CLI's server bundle
+koi server uninstall       # Cloudflare login, then delete the Worker, empty and delete the bucket
 ```
 
-`flarebox setup` with no argument offers two choices. "Log in with Cloudflare" runs the OAuth flow (section 2), then looks for a Flarebox server in the chosen account (section 6):
+`koi setup` with no argument offers two choices. "Log in with Cloudflare" runs the OAuth flow (section 2), then looks for a Koidrive server in the chosen account (section 6):
 
 ```mermaid
 flowchart TD
-    A[flarebox setup] --> B{Choice}
+    A[koi setup] --> B{Choice}
     B -->|Code from another device| J[POST /v1/pair/complete on the server named in the code]
     B -->|Log in with Cloudflare| C[OAuth consent, pick the account]
     C --> D{R2 enabled?}
     D -->|No| E[Open the R2 dashboard page, poll until enabled]
     E --> D
-    D -->|Yes| F{Flarebox servers in the account}
+    D -->|Yes| F{Koidrive servers in the account}
     F -->|None| G[Create bucket, upload bundle with a one-time secret, enable workers.dev]
     F -->|Interrupted deploy| L[Finish the missing steps, section 4.6] --> H
     G --> H[Claim with the secret, save credentials, delete the secret]
@@ -45,9 +45,9 @@ flowchart TD
     F -->|Several| K[Ask which one] --> I
 ```
 
-The pairing code carries the server address, so a new device needs nothing else. Today `POST /v1/pair/start` returns an 8-character code such as `K7QM-2XPD` that is valid for 600 seconds (measured on the deployed server). The CLI shows it as `<code>@<host>`, for example `K7QM-2XPD@flarebox.alice.workers.dev` (decision 3). A QR code in the macOS app comes later. The CLI splits on the last `@` and prepends `https://`. The code alone still works with `--server`. The existing `flarebox pair --server --code --name` becomes `flarebox join`, and `pair` is removed in the same change.
+The pairing code carries the server address, so a new device needs nothing else. Today `POST /v1/pair/start` returns an 8-character code such as `K7QM-2XPD` that is valid for 600 seconds (measured on the deployed server). The CLI shows it as `<code>@<host>`, for example `K7QM-2XPD@koidrive.alice.workers.dev` (decision 3). A QR code in the macOS app comes later. The CLI splits on the last `@` and prepends `https://`. The code alone still works with `--server`. The existing `koi pair --server --code --name` becomes `koi join`, and `pair` is removed in the same change.
 
-The explicit subcommands never ask questions, so scripts can use them. Where `flarebox setup` would ask, they stop instead and print the command or flag that goes on: `server add-device` on a server that needs an upgrade first (section 4.5) prints `flarebox server upgrade`, and `server uninstall` runs only with `--yes` when no terminal is attached (section 5). Each one that needs Cloudflare runs the login itself (section 5).
+The explicit subcommands never ask questions, so scripts can use them. Where `koi setup` would ask, they stop instead and print the command or flag that goes on: `server add-device` on a server that needs an upgrade first (section 4.5) prints `koi server upgrade`, and `server uninstall` runs only with `--yes` when no terminal is attached (section 5). Each one that needs Cloudflare runs the login itself (section 5).
 
 ## 2. Cloudflare login
 
@@ -85,7 +85,7 @@ Rules this gives the implementation:
 **Headless Linux.** The device grant is not available, so a machine without a browser has three options:
 
 1. Join with a pairing code from a device that has a browser. A server needs one Cloudflare login, not one per device. This is the default (decision 4).
-2. `flarebox setup --no-browser` (decision 4) prints the authorize URL. The user opens it on any machine, and the final redirect to `127.0.0.1` fails to load there. The user copies that page's address and pastes it into the CLI, which checks the state and exchanges the code. *Unverified* end to end; it relies only on the code and state in the URL, which the prototype received.
+2. `koi setup --no-browser` (decision 4) prints the authorize URL. The user opens it on any machine, and the final redirect to `127.0.0.1` fails to load there. The user copies that page's address and pastes it into the CLI, which checks the state and exchanges the code. *Unverified* end to end; it relies only on the code and state in the URL, which the prototype received.
 3. SSH port forwarding (`ssh -L <port>:127.0.0.1:<port> host`) with `--port <port>`, so the laptop's browser reaches the CLI's listener.
 
 A hosted HTTPS page that shows the code to copy would also work, but it needs a domain and a server, and it is not needed while option 2 exists.
@@ -101,9 +101,9 @@ A hosted HTTPS page that shows the code to copy would also work, but it needs a 
 
 Not needed: User Details Read (`GET /user` returns 403 without it; only useful to show the user's email), Workers Observability Write (the upload's `observability` block applied without it), and Workers Routes (the workers.dev route goes through `POST .../scripts/<name>/subdomain`).
 
-Workers Editor (`workers-scripts.edit`) was the first choice and failed: `POST .../assets-upload-session` and `PUT .../workers/scripts/<name>` returned 403 "No access to the specified resource." even for a five-line Worker with no bindings. The API reference lists only Workers Scripts Write for the asset session ([Assets upload](#ref-assets-api)). `GET /client/v4/oauth/scopes` lists `workers-scripts.write` as "Workers Scripts Write", but the dashboard's scope picker does not offer it, and the authorize endpoint refuses it with `invalid_scope` for a client created in the dashboard. Workers Admin is broader than Scripts Write, and Flarebox accepts it (decision 1). A client with `workers-scripts.write` is not pursued.
+Workers Editor (`workers-scripts.edit`) was the first choice and failed: `POST .../assets-upload-session` and `PUT .../workers/scripts/<name>` returned 403 "No access to the specified resource." even for a five-line Worker with no bindings. The API reference lists only Workers Scripts Write for the asset session ([Assets upload](#ref-assets-api)). `GET /client/v4/oauth/scopes` lists `workers-scripts.write` as "Workers Scripts Write", but the dashboard's scope picker does not offer it, and the authorize endpoint refuses it with `invalid_scope` for a client created in the dashboard. Workers Admin is broader than Scripts Write, and Koidrive accepts it (decision 1). A client with `workers-scripts.write` is not pursued.
 
-**What the grant can reach.** Cloudflare does not limit the grant to Flarebox's resources. On the account picked at consent, whoever holds the grant can upload, replace and delete any Worker, set and delete any Worker's secrets, and list and delete objects in every R2 bucket and delete the buckets. On a Flarebox server, setting `FLAREBOX_RECOVERY_KEY` adds a device for the owner, which gives that device the owner's files. The tag and the `/v1/server` check of section 6 keep the CLI itself on Flarebox's resources, but the token does not. The grant lives for one command (section 7), which keeps this window short. Section 11 lists this for the owner.
+**What the grant can reach.** Cloudflare does not limit the grant to Koidrive's resources. On the account picked at consent, whoever holds the grant can upload, replace and delete any Worker, set and delete any Worker's secrets, and list and delete objects in every R2 bucket and delete the buckets. On a Koidrive server, setting `KOIDRIVE_RECOVERY_KEY` adds a device for the owner, which gives that device the owner's files. The tag and the `/v1/server` check of section 6 keep the CLI itself on Koidrive's resources, but the token does not. The grant lives for one command (section 7), which keeps this window short. Section 11 lists this for the owner.
 
 ## 4. Deploy and claim
 
@@ -117,7 +117,7 @@ The release job builds the server once with `wrangler deploy --dry-run --outdir`
 
 - `worker/worker.js`: the bundled Worker module, 418 KiB (97 KiB gzipped) on main.
 - `assets/`: `server/web/dist`, the share-link viewer.
-- `manifest.json`: the server version, main module, compatibility date, Durable Object classes, R2 binding name and default bucket name, the migration list, the assets binding and the observability settings, read from `server/wrangler.jsonc`. The prototype's [`make-manifest.mjs`](https://github.com/flarebox-dev/flarebox/blob/spike/cli-setup-oauth/spike/cli-setup/make-manifest.mjs) shows the shape.
+- `manifest.json`: the server version, main module, compatibility date, Durable Object classes, R2 binding name and default bucket name, the migration list, the assets binding and the observability settings, read from `server/wrangler.jsonc`. The prototype's [`make-manifest.mjs`](https://github.com/koidrive/koidrive/blob/spike/cli-setup-oauth/spike/cli-setup/make-manifest.mjs) shows the shape.
 
 The CLI embeds the bundle for its own version (decision 5): CLI 0.3.0 deploys and upgrades to server 0.3.0. That keeps the deploy offline once the CLI is installed, and the bundle is covered by the same checksum as the CLI. A CI check compares the manifest with `wrangler.jsonc`, so the button path and the CLI path cannot drift.
 
@@ -138,10 +138,10 @@ All calls go to `https://api.cloudflare.com/client/v4/accounts/<id>` with `Autho
     { "type": "durable_object_namespace", "name": "ACCOUNT", "class_name": "AccountDO" },
     { "type": "durable_object_namespace", "name": "SPACE", "class_name": "SpaceDO" },
     { "type": "r2_bucket", "name": "BUCKET", "bucket_name": "<bucket>" },
-    { "type": "secret_text", "name": "FLAREBOX_RECOVERY_KEY", "text": "<one-time secret>" },
+    { "type": "secret_text", "name": "KOIDRIVE_RECOVERY_KEY", "text": "<one-time secret>" },
     { "type": "assets", "name": "ASSETS" }
   ],
-  "tags": ["flarebox-server"],
+  "tags": ["koidrive-server"],
   "keep_bindings": ["secret_text", "secret_key"],
   "migrations": { "new_tag": "v1", "steps": [{ "new_sqlite_classes": ["AccountDO", "SpaceDO"] }] },
   "observability": { "enabled": true, "redact_query_string": true },
@@ -164,21 +164,21 @@ The CLI generates 32 random bytes and sends them base64url-encoded (43 character
 
 1. `POST <url>/v1/claim` with `{"code": <secret>, "userName": ..., "deviceName": ..., "platform": ...}`, the JSON form of `ClaimRequest`. The first attempt returned 200 with the owner's `userId` and the device's `deviceId` (measured).
 2. Store the device credentials and wait until the store reports them written: the Keychain call returns, or the file is renamed into place and synced. The prototype saved the credentials before it deleted the secret, in this order.
-3. `DELETE /workers/scripts/<name>/secrets/FLAREBOX_RECOVERY_KEY`, then `GET .../secrets` to confirm that `FLAREBOX_RECOVERY_KEY` is no longer in the list. Other secrets the owner set stay. A 404 counts as deleted. A replay of the same secret afterwards returned 403 "this deployment already has an owner".
+3. `DELETE /workers/scripts/<name>/secrets/KOIDRIVE_RECOVERY_KEY`, then `GET .../secrets` to confirm that `KOIDRIVE_RECOVERY_KEY` is no longer in the list. Other secrets the owner set stay. A 404 counts as deleted. A replay of the same secret afterwards returned 403 "this deployment already has an owner".
 
 The CLI retries the claim only while the server cannot see the key yet. Two refusals mean that: "no valid claim code; open /setup to issue one" on an unclaimed server whose Account DO still runs code without the key claim, and "this deployment already has an owner" while a new secret propagates. The refusal "this recovery key was already used; set a new one" means the key is spent, and section 4.6 handles it. The CLI never retries a spent key.
 
 **Server change.** Main is not enough. On an unclaimed deployment, `redeemClaim` checks only claim codes from `/setup`, so the recovery key is ignored. On a Worker running main with the secret in its upload, 20 claims over 63 seconds were all refused with "no valid claim code; open /setup to issue one" (measured). The prototype's patch (12 lines in `server/src/account/claim.ts`) lets a correct, unused key claim an unclaimed deployment. It records the key as used, deletes any claim code, and creates the owner and the device in the same transaction. With it, the claim succeeded. The trust argument of deploy-and-upgrade.md section 2 carries over unchanged, because whoever can set the Worker's secrets can already replace its code. Spec section 15.2 needs one sentence for it. The `/setup` claim code stays for button deploys.
 
-The change also needs the Durable Object to run the new code. On the Worker that went from main to the patched build, claims kept failing for 60 seconds after the upload while `/v1/server` already showed the new version. A claim about 100 seconds after the upload, following half a minute without requests, succeeded. Since 2026-10-30, an active Durable Object keeps its current code for up to 300 seconds after a deploy unless the upload sets `code_update_strategy` ([Code updates](#ref-do-updates)). Our retries every 3 seconds kept the Account DO active, so it kept the old claim logic. The secret itself was in place: `/v1/claim` runs in the Worker, which reads `env.FLAREBOX_RECOVERY_KEY` and passes it to the Durable Object. A fresh deploy is not affected, because the Account DO starts on the new code.
+The change also needs the Durable Object to run the new code. On the Worker that went from main to the patched build, claims kept failing for 60 seconds after the upload while `/v1/server` already showed the new version. A claim about 100 seconds after the upload, following half a minute without requests, succeeded. Since 2026-10-30, an active Durable Object keeps its current code for up to 300 seconds after a deploy unless the upload sets `code_update_strategy` ([Code updates](#ref-do-updates)). Our retries every 3 seconds kept the Account DO active, so it kept the old claim logic. The secret itself was in place: `/v1/claim` runs in the Worker, which reads `env.KOIDRIVE_RECOVERY_KEY` and passes it to the Durable Object. A fresh deploy is not affected, because the Account DO starts on the new code.
 
 ### 4.5 Existing server: add this device
 
-When `flarebox setup` finds a claimed server, it first lists the script's secrets. If `FLAREBOX_RECOVERY_KEY` is already set and the state file does not record that this CLI set it, the owner set it for recovery ([deploy-and-upgrade.md §2](deploy-and-upgrade.md)), and the CLI stops rather than replace it. It says so and asks the owner to use that key or delete it first. Otherwise it sets a one-time secret with `PUT /workers/scripts/<name>/secrets` (`{"name": "FLAREBOX_RECOVERY_KEY", "text": ..., "type": "secret_text"}`), claims, and deletes the secret. On a claimed server this is today's recovery path, so main can already add the device. The CLI claims only on a server that handles setup attempts (section 4.6), and the readiness check below makes sure of that. In the measured run, after a second login, the first claim 0.2 seconds after setting the secret was refused, and the next one 3.4 seconds after returned a device with the same `userId` as the first device. That device listed the space the first device had created. The CLI retries the claim for up to 60 seconds, then saves the credentials and deletes the secret in the order of section 4.4.
+When `koi setup` finds a claimed server, it first lists the script's secrets. If `KOIDRIVE_RECOVERY_KEY` is already set and the state file does not record that this CLI set it, the owner set it for recovery ([deploy-and-upgrade.md §2](deploy-and-upgrade.md)), and the CLI stops rather than replace it. It says so and asks the owner to use that key or delete it first. Otherwise it sets a one-time secret with `PUT /workers/scripts/<name>/secrets` (`{"name": "KOIDRIVE_RECOVERY_KEY", "text": ..., "type": "secret_text"}`), claims, and deletes the secret. On a claimed server this is today's recovery path, so main can already add the device. The CLI claims only on a server that handles setup attempts (section 4.6), and the readiness check below makes sure of that. In the measured run, after a second login, the first claim 0.2 seconds after setting the secret was refused, and the next one 3.4 seconds after returned a device with the same `userId` as the first device. That device listed the space the first device had created. The CLI retries the claim for up to 60 seconds, then saves the credentials and deletes the secret in the order of section 4.4.
 
 `GET /v1/server` returns `claimed`, so the CLI tells an unclaimed server from a claimed one before it sets the secret. An unclaimed server found in the account, such as a button deploy nobody claimed, takes the fresh-claim path of section 4.4. If its `server_version` predates the key-claim change, the CLI first upgrades it to the embedded bundle (section 5), after asking. The Account DO then keeps the old claim logic for up to 300 seconds, so this case retries for up to 330 seconds instead of 60.
 
-**Readiness for setup attempts.** Before every claim, on a new server or an existing one, the CLI reads `ServerInfo.setup_attempts`. The Account DO reports this field itself, not the Worker, so it says what the code that runs the claim supports, including during the 300-second adoption window after an upgrade. When it is false, the CLI upgrades the server to its embedded bundle first, after asking, and polls `GET /v1/server` every 5 seconds until the field is true, for up to 330 seconds. A server the CLI just deployed starts on the new code and passes at once. If the user declines the upgrade, setup stops without claiming. The CLI explains that this server cannot yet make a retried claim end with one device, prints the command that upgrades it later (`flarebox server upgrade`), and exits with a non-zero status. So every claim the CLI makes is attempt-aware, and the one-device rule of section 4.6 holds without exceptions.
+**Readiness for setup attempts.** Before every claim, on a new server or an existing one, the CLI reads `ServerInfo.setup_attempts`. The Account DO reports this field itself, not the Worker, so it says what the code that runs the claim supports, including during the 300-second adoption window after an upgrade. When it is false, the CLI upgrades the server to its embedded bundle first, after asking, and polls `GET /v1/server` every 5 seconds until the field is true, for up to 330 seconds. A server the CLI just deployed starts on the new code and passes at once. If the user declines the upgrade, setup stops without claiming. The CLI explains that this server cannot yet make a retried claim end with one device, prints the command that upgrades it later (`koi server upgrade`), and exits with a non-zero status. So every claim the CLI makes is attempt-aware, and the one-device rule of section 4.6 holds without exceptions.
 
 Recovery adds a device; it does not revoke the others ([deploy-and-upgrade.md §2](deploy-and-upgrade.md)). This branch makes that path the normal way to add a device. The server already lists and revokes devices: `GET /v1/devices` and `DELETE /v1/devices/{device_id}` in `server/src/worker.ts`, backed by `AccountDO.revokeDevice`. The CLI and app commands that use them ship in the same release as this setup path (decision 8).
 
@@ -196,7 +196,7 @@ A run can also stop after it saved a claim's credentials and before it wrote tha
 
 | Stopped after | What exists in the account | What a rerun does |
 |---|---|---|
-| Bucket create | An empty bucket, no script | Creates the bucket the state file names. That name is `flarebox-` and 16 random hex digits, written to the state file before the first create, so no other application holds it. A 409 for it means an earlier try of this deploy created the bucket and its answer was lost, and the run goes on with that bucket. |
+| Bucket create | An empty bucket, no script | Creates the bucket the state file names. That name is `koidrive-` and 16 random hex digits, written to the state file before the first create, so no other application holds it. A 409 for it means an earlier try of this deploy created the bucket and its answer was lost, and the run goes on with that bucket. |
 | Asset upload | The bucket, uploaded asset files that no script uses yet | Starts a new upload session. Files already uploaded are skipped. When Cloudflare already holds every file, the session lists none to upload and carries the completion JWT (section 4.3; documented, not measured). |
 | Script upload | A tagged script bound to the bucket, with a one-time secret, no workers.dev route | Section 6 finds it from the tag and the bucket binding. The secret's value died with the process, so the CLI sets a new one, enables workers.dev and claims as in section 4.4. |
 | workers.dev enabled | An unclaimed server that answers `GET /v1/server` | Sets a new secret and claims as in section 4.4. |
@@ -204,15 +204,15 @@ A run can also stop after it saved a claim's credentials and before it wrote tha
 | Credentials saved, secret not deleted | A claimed server whose secret is a spent key | Deletes the secret. A spent key cannot claim again, because the server records used keys. |
 | Uninstall | See section 5 | Continues the uninstall from the step after the last finished one. |
 
-The CLI never takes over a resource it cannot tie to Flarebox. A script counts as a Flarebox server when it has the tag and binds a bucket, or when it answers `GET /v1/server`. A bucket counts as Flarebox's when the state file names it or a Flarebox script binds it. A deploy names its bucket `flarebox-` and 16 random hex digits (64 bits), so it never creates or adopts a bucket another application made. The Worker gets the default name `flarebox` when it is free, and otherwise the next free name, `flarebox-2` and so on. The state file records both names. Before it uploads the script, a run checks the recorded Worker name again. A Worker under it that has the tag and binds the recorded bucket is this deploy's own upload, and the run uploads over it. Any other Worker under it means another application took the name since, so the run moves to the next free Worker name. An unbound bucket that the state file does not name is reported and left alone.
+The CLI never takes over a resource it cannot tie to Koidrive. A script counts as a Koidrive server when it has the tag and binds a bucket, or when it answers `GET /v1/server`. A bucket counts as Koidrive's when the state file names it or a Koidrive script binds it. A deploy names its bucket `koidrive-` and 16 random hex digits (64 bits), so it never creates or adopts a bucket another application made. The Worker gets the default name `koidrive` when it is free, and otherwise the next free name, `koidrive-2` and so on. The state file records both names. Before it uploads the script, a run checks the recorded Worker name again. A Worker under it that has the tag and binds the recorded bucket is this deploy's own upload, and the run uploads over it. Any other Worker under it means another application took the name since, so the run moves to the next free Worker name. An unbound bucket that the state file does not name is reported and left alone.
 
 ## 5. Upgrade and uninstall
 
-`flarebox server upgrade`:
+`koi server upgrade`:
 
 1. Log in, find the server (section 6), and read `GET .../scripts/<name>/settings` for the bucket name and the current bindings.
 2. Read `GET <url>/v1/server`. If the server reports a newer `server_version` than the embedded bundle, stop: the newer server may have run storage migrations that the older code cannot read, even under the same Durable Object migration tag. The CLI tells the user to install a newer CLI.
-3. If the script has no `flarebox-server` tag, it came from the deploy button, which also created a repository whose pushes Workers Builds deploys ([deploy-and-upgrade.md](deploy-and-upgrade.md)). A later push to that repository would replace the CLI's upload with that repository's code. The CLI's scopes do not cover Workers Builds, so it cannot see or change that connection; *unverified* whether any granted scope could. It warns the user to update that repository too or disconnect its builds, and asks before it goes on (`--yes` in scripts).
+3. If the script has no `koidrive-server` tag, it came from the deploy button, which also created a repository whose pushes Workers Builds deploys ([deploy-and-upgrade.md](deploy-and-upgrade.md)). A later push to that repository would replace the CLI's upload with that repository's code. The CLI's scopes do not cover Workers Builds, so it cannot see or change that connection; *unverified* whether any granted scope could. It warns the user to update that repository too or disconnect its builds, and asks before it goes on (`--yes` in scripts).
 4. Upload the assets and the bundle under the same script name with the same bucket, `keep_bindings: ["secret_text", "secret_key"]`, and the migration diff from section 4.3.
 5. Poll `/v1/server` until it reports the new version.
 
@@ -220,7 +220,7 @@ The measured upgrade from 0.0.1 to 0.0.2 kept the space created before it, and t
 
 Because of the deferred code update, an upgrade is complete for each Durable Object only after it adopts the new code, within 300 seconds by default. The CLI sets `code_update_strategy` explicitly (`{"mode": "deferred", "max_delay": 300}`), so the behaviour does not depend on Cloudflare's default, and it tells the user that open sync sessions move to the new release within 5 minutes. The API accepted `{"mode": "immediate"}` in a measured upload; it resets active objects at once and drops their WebSockets, so it is not the default.
 
-`flarebox server uninstall` must empty the bucket before it deletes it. `DELETE /r2/buckets/<bucket>` on a bucket the server had written to returned 409 with "10008 ... is not empty". Creating a space writes `spaces/<space id>/meta/<id>/space.json`. `GET /r2/buckets/<bucket>/objects` and `DELETE .../objects/<key>` worked under `workers-r2.write`. `DELETE /workers/scripts/<name>?force=true` also removed the Worker's two Durable Object namespaces, and the namespace list was empty afterwards.
+`koi server uninstall` must empty the bucket before it deletes it. `DELETE /r2/buckets/<bucket>` on a bucket the server had written to returned 409 with "10008 ... is not empty". Creating a space writes `spaces/<space id>/meta/<id>/space.json`. `GET /r2/buckets/<bucket>/objects` and `DELETE .../objects/<key>` worked under `workers-r2.write`. `DELETE /workers/scripts/<name>?force=true` also removed the Worker's two Durable Object namespaces, and the namespace list was empty afterwards.
 
 The Worker is the only place that names the bucket, so the CLI records the bucket before it deletes the Worker:
 
@@ -233,19 +233,19 @@ The Worker is the only place that names the bucket, so the CLI records the bucke
 
 R2 allows buckets with the same name in different jurisdictions, and a bucket outside the default one needs the `cf-r2-jurisdiction` header on every API call ([Data location](#ref-r2-location)). The CLI sends the recorded jurisdiction on every R2 call of the uninstall. That the script settings return the binding's `jurisdiction`, as a Wrangler binding sets it, was not measured; *unverified*.
 
-Every delete treats 404 as done, so a rerun repeats a finished step without error. A rerun with the state file starts at step 3, so it passes the check of step 4 again before it deletes anything in the bucket. If step 4 or 5 finds that the bucket no longer exists, the bucket was deleted before the run stopped, so the CLI deletes the state file and reports the uninstall as complete. The exact R2 error for a missing bucket was not measured; *unverified*. Any other error, such as a 403 or a network failure, keeps the state file for the next rerun. On another machine, or after the state file is lost, the Worker is gone and nothing in the account links the bucket to it. `flarebox server uninstall --bucket <name>` then empties and deletes the named bucket after the same confirmation and the check of step 4, recording its `creation_date` first. `--jurisdiction <name>` names a jurisdiction other than the default one. The CLI does not guess the name or the jurisdiction.
+Every delete treats 404 as done, so a rerun repeats a finished step without error. A rerun with the state file starts at step 3, so it passes the check of step 4 again before it deletes anything in the bucket. If step 4 or 5 finds that the bucket no longer exists, the bucket was deleted before the run stopped, so the CLI deletes the state file and reports the uninstall as complete. The exact R2 error for a missing bucket was not measured; *unverified*. Any other error, such as a 403 or a network failure, keeps the state file for the next rerun. On another machine, or after the state file is lost, the Worker is gone and nothing in the account links the bucket to it. `koi server uninstall --bucket <name>` then empties and deletes the named bucket after the same confirmation and the check of step 4, recording its `creation_date` first. `--jurisdiction <name>` names a jurisdiction other than the default one. The CLI does not guess the name or the jurisdiction.
 
-## 6. Finding a Flarebox server in an account
+## 6. Finding a Koidrive server in an account
 
-An account may hold other Workers. The upload sets `tags: ["flarebox-server"]`, and `GET /workers/scripts` returns each script's `tags` (measured: `{"id": "flarebox-proto", "tags": ["flarebox-server"], "migration_tag": "v1", "has_assets": true}`). The CLI keeps the scripts with that tag, then calls `GET <workers.dev URL>/v1/server` on each and keeps those that answer with a valid `ServerInfo`. A tag alone is not proof, since anyone with the account can tag a script. A tagged script that binds a bucket but has no workers.dev route is a deploy that stopped halfway (section 4.6). `flarebox setup` finishes it: it turns on the route, waits for the server to answer and adds this device as section 4.5 describes. `flarebox server add-device` stops and names `flarebox setup`. A Worker deployed with the button has no tag, and the owner may have renamed it. So the CLI also reads the settings of each untagged script and keeps those that bind Durable Object namespaces of the classes `AccountDO` and `SpaceDO`, then checks them with `/v1/server` the same way. It adds the tag on the next upgrade. With several matches the CLI lists their names and URLs and asks. `--server <name>` picks one in scripts.
+An account may hold other Workers. The upload sets `tags: ["koidrive-server"]`, and `GET /workers/scripts` returns each script's `tags` (measured: `{"id": "koidrive-proto", "tags": ["koidrive-server"], "migration_tag": "v1", "has_assets": true}`). The CLI keeps the scripts with that tag, then calls `GET <workers.dev URL>/v1/server` on each and keeps those that answer with a valid `ServerInfo`. A tag alone is not proof, since anyone with the account can tag a script. A tagged script that binds a bucket but has no workers.dev route is a deploy that stopped halfway (section 4.6). `koi setup` finishes it: it turns on the route, waits for the server to answer and adds this device as section 4.5 describes. `koi server add-device` stops and names `koi setup`. A Worker deployed with the button has no tag, and the owner may have renamed it. So the CLI also reads the settings of each untagged script and keeps those that bind Durable Object namespaces of the classes `AccountDO` and `SpaceDO`, then checks them with `/v1/server` the same way. It adds the tag on the next upgrade. With several matches the CLI lists their names and URLs and asks. `--server <name>` picks one in scripts.
 
 ## 7. Credentials on the device
 
-- The Cloudflare grant is needed for deploy, add-device, upgrade and uninstall, which are rare. Each of these commands logs in, keeps the tokens in memory only, and revokes the grant when it ends (decision 2). No Workers Admin credential stays on disk, and `flarebox server upgrade` logs in again.
+- The Cloudflare grant is needed for deploy, add-device, upgrade and uninstall, which are rare. Each of these commands logs in, keeps the tokens in memory only, and revokes the grant when it ends (decision 2). No Workers Admin credential stays on disk, and `koi server upgrade` logs in again.
 - The CLI revokes on success, on failure, and on Ctrl-C or `SIGTERM`. It sends `POST /oauth2/revoke` with the refresh token, then with the access token. If revocation fails, it retries three times, then prints that the grant is still active, that the access token expires within an hour, and that the user can revoke it under Manage OAuth authorizations in the dashboard ([Authorizing an application](#ref-authorizing)).
 - A process that is killed, or a machine that loses power, leaves the grant active on Cloudflare's side. Nothing on the device holds its tokens any more, but the grant stays until the refresh token expires or the user revokes it in the dashboard. Deleting local tokens does not revoke a grant.
 - The refresh token's lifetime was not measured and Cloudflare does not document it; *unverified*. A third-party report measured the same one-hour access token ([Mailda](#ref-mailda)).
-- Flarebox device credentials (`DeviceCredentials`) stay where the CLI and the app keep them today. The Cloudflare grant never reaches the Flarebox server.
+- Koidrive device credentials (`DeviceCredentials`) stay where the CLI and the app keep them today. The Cloudflare grant never reaches the Koidrive server.
 
 ## 8. Changes by directory
 
@@ -260,48 +260,48 @@ An account may hold other Workers. The upload sets `tags: ["flarebox-server"]`, 
 
 **`cli/` and `core/`**
 
-- A new crate, `core/cloudflare`, with the OAuth client (PKCE, loopback listener, paste-URL fallback, tokens kept in memory and revoked on exit), the state file of section 4.6, a small API client over `reqwest` (already a dependency of `core/net`), the bundle upload and the server discovery. It holds no Flarebox protocol logic, so the macOS app can call it through `core/ffi`.
+- A new crate, `core/cloudflare`, with the OAuth client (PKCE, loopback listener, paste-URL fallback, tokens kept in memory and revoked on exit), the state file of section 4.6, a small API client over `reqwest` (already a dependency of `core/net`), the bundle upload and the server discovery. It holds no Koidrive protocol logic, so the macOS app can call it through `core/ffi`.
 - `cli/`: the commands of section 1, the embedded bundle, and `pair` renamed to `join` with the address-carrying code. The claim and pairing calls reuse `core/net`.
 
 **`apps/macos/`**
 
-The setup screen (`SetupModel`) gains "Log in with Cloudflare" next to "Enter a code from another device". Both call the same Rust code as the CLI through the FFI. The app opens the default browser and receives the callback on the loopback listener in Rust. A custom URL scheme callback (`flarebox://`), which `ASWebAuthenticationSession` would want, is refused by Cloudflare's client form according to a third-party report ([ubitools](#ref-ubitools)); *unverified*. The existing claim-code entry stays for servers deployed with the button.
+The setup screen (`SetupModel`) gains "Log in with Cloudflare" next to "Enter a code from another device". Both call the same Rust code as the CLI through the FFI. The app opens the default browser and receives the callback on the loopback listener in Rust. A custom URL scheme callback (`koidrive://`), which `ASWebAuthenticationSession` would want, is refused by Cloudflare's client form according to a third-party report ([ubitools](#ref-ubitools)); *unverified*. The existing claim-code entry stays for servers deployed with the button.
 
 ## 9. Distribution
 
-**Homebrew.** Flarebox starts in its own tap (decision 7). The repository `flarebox-dev/homebrew-tap` (tap name `flarebox-dev/tap`) carries a `flarebox` formula that builds the CLI from the tagged source archive, with bottles for macOS arm64 and Linux x86_64 and arm64 built by the tap's GitHub Actions ([Taps](#ref-tap)). Users run `brew install flarebox-dev/tap/flarebox`. The short `brew install flarebox` needs the formula in homebrew/core, which requires a stable tagged release, a build from source on Homebrew's macOS and Linux CI, and a DFSG-compatible licence ([Acceptable formulae](#ref-core)); Apache-2.0 and AGPL-3.0-or-later both qualify. The name was free on 2026-11-10: `brew info flarebox` found no formula and no cask. Flarebox submits the formula to homebrew/core once its usage meets Homebrew's notability bar (decision 7). Those thresholds were not checked; *unverified*.
+**Homebrew.** Koidrive starts in its own tap (decision 7). The repository `koidrive/homebrew-tap` (tap name `koidrive/tap`) carries a `koidrive` formula that builds the CLI from the tagged source archive, with bottles for macOS arm64 and Linux x86_64 and arm64 built by the tap's GitHub Actions ([Taps](#ref-tap)). Users run `brew install koidrive/tap/koidrive`. The short `brew install koidrive` needs the formula in homebrew/core, which requires a stable tagged release, a build from source on Homebrew's macOS and Linux CI, and a DFSG-compatible licence ([Acceptable formulae](#ref-core)); Apache-2.0 and AGPL-3.0-or-later both qualify. The name was free on 2026-11-11: `brew info koidrive` found no formula and no cask. Koidrive submits the formula to homebrew/core once its usage meets Homebrew's notability bar (decision 7). Those thresholds were not checked; *unverified*.
 
-**macOS app.** The DMG from `release-macos.yml` goes into the tap as the cask `flarebox-app` (decision 7): `brew install --cask flarebox-dev/tap/flarebox-app`. homebrew/core does not accept formulae whose main output is a `.app` ([Acceptable formulae](#ref-core)).
+**macOS app.** The DMG from `release-macos.yml` goes into the tap as the cask `koidrive-app` (decision 7): `brew install --cask koidrive/tap/koidrive-app`. homebrew/core does not accept formulae whose main output is a `.app` ([Acceptable formulae](#ref-core)).
 
-**Linux without Homebrew.** Each release also attaches static `x86_64` and `aarch64` musl binaries with SHA-256 checksums. `.deb`, `.rpm` and a systemd user unit for `flarebox daemon` can follow. Release work is out of scope here.
+**Linux without Homebrew.** Each release also attaches static `x86_64` and `aarch64` musl binaries with SHA-256 checksums. `.deb`, `.rpm` and a systemd user unit for `koi daemon` can follow. Release work is out of scope here.
 
 ## 10. What a public client needs before launch
 
-The prototype used a private client, which only members of the test account can authorize ([Create an OAuth client](#ref-client)). Before anyone else can use `flarebox setup`, the client must become public, which needs:
+The prototype used a private client, which only members of the test account can authorize ([Create an OAuth client](#ref-client)). Before anyone else can use `koi setup`, the client must become public, which needs:
 
 - A client name, a logo, a client URL and at least one scope.
 - Domain verification of the client URL: a DNS `TXT` record `cloudflare_oauth_client_publisher=<value>`, which Cloudflare polls for up to two days. After verification the domain cannot change ([Create an OAuth client](#ref-client)).
 - Promotion to public, which cannot be undone. The API accepts only `public` for `visibility` and does not support demotion ([Update OAuth client](#ref-client-update)).
 
-Until then the consent page shows the amber "has not verified ownership of any domain" warning, as it did for every login in this run. The public client uses the client URL domain flarebox.dev, which the project owner buys before launch and keeps on the project owner's main account (decision 9). Until then the private client on the test account stays, for development only. Account administrators can turn off public OAuth app access for their account ([Authorizing an application](#ref-authorizing)); for them the CLI needs a fallback that accepts an API token with the same permissions (`--api-token`, read from an environment variable).
+Until then the consent page shows the amber "has not verified ownership of any domain" warning, as it did for every login in this run. The public client uses the client URL domain koidrive.com, which the project owner buys before launch and keeps on the project owner's main account (decision 9). Until then the private client on the test account stays, for development only. Account administrators can turn off public OAuth app access for their account ([Authorizing an application](#ref-authorizing)); for them the CLI needs a fallback that accepts an API token with the same permissions (`--api-token`, read from an environment variable).
 
 ## 11. Decisions
 
 The project owner decided the open points on 2026-11-10:
 
-1. Scopes. Flarebox uses Workers Admin (`workers-scripts.admin`). It does not try a client created through the API with `workers-scripts.write`.
-2. Cloudflare grant. Every command that needs Cloudflare logs in and revokes the grant when it ends. `flarebox server upgrade` logs in again (section 7).
+1. Scopes. Koidrive uses Workers Admin (`workers-scripts.admin`). It does not try a client created through the API with `workers-scripts.write`.
+2. Cloudflare grant. Every command that needs Cloudflare logs in and revokes the grant when it ends. `koi server upgrade` logs in again (section 7).
 3. Pairing code. The format is `<code>@<host>` (section 1). A QR code in the macOS app comes later.
 4. Headless Linux. Joining with a code from another device is the default. The paste-URL login sits behind `--no-browser` (section 2).
 5. Server bundle. The CLI embeds the bundle for its own version (section 4.2).
-6. Secret name. The one-time claim secret keeps the name `FLAREBOX_RECOVERY_KEY` (section 4.4).
-7. Homebrew. The formula `flarebox` is for the CLI and the cask `flarebox-app` for the macOS app, both in the tap `flarebox-dev/tap`. Flarebox submits to homebrew/core once usage meets its notability bar (section 9).
+6. Secret name. The one-time claim secret keeps the name `KOIDRIVE_RECOVERY_KEY` (section 4.4).
+7. Homebrew. The formula `koidrive` is for the CLI and the cask `koidrive-app` for the macOS app, both in the tap `koidrive/tap`. Koidrive submits to homebrew/core once usage meets its notability bar (section 9).
 8. Lost devices. The CLI and app commands that revoke a lost device ship in the same release as this setup path. The server side already exists (section 4.5).
-9. Public client. Its client URL uses flarebox.dev, which the project owner buys before launch on the project owner's main account. Until then the private test client stays (section 10).
+9. Public client. Its client URL uses koidrive.com, which the project owner buys before launch on the project owner's main account. Until then the private test client stays (section 10).
 
 Still open for the owner. The design assumes the first answer to each of these:
 
-- Reach of the grant. Decision 1 came before section 3 described what a Workers Admin and R2 Write grant can do outside Flarebox. Keep Workers Admin with a grant that lives for one command, or look for a narrower scope set first.
+- Reach of the grant. Decision 1 came before section 3 described what a Workers Admin and R2 Write grant can do outside Koidrive. Keep Workers Admin with a grant that lives for one command, or look for a narrower scope set first.
 - Durable Object code updates. The CLI and `wrangler.jsonc` set `{"mode": "deferred", "max_delay": 300}`, so open sync sessions move to a new release within 5 minutes and are not dropped at once (section 5). Keep this, or use `immediate` and accept dropped sessions.
 - `/setup` on CLI deploys. Keep it, accepting that log readers can claim first as section 4.4 describes, or turn it off for servers the CLI deploys. Turning it off needs a server change.
 

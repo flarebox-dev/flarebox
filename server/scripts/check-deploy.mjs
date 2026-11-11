@@ -23,7 +23,7 @@ const REQUEST_MS = 5_000;
 const WHOLE_CHECK_MS = 9 * 60_000;
 
 const server = join(dirname(fileURLToPath(import.meta.url)), "..");
-const root = mkdtempSync(join(tmpdir(), "flarebox-deploy-"));
+const root = mkdtempSync(join(tmpdir(), "koidrive-deploy-"));
 const env = { ...process.env, WRANGLER_SEND_METRICS: "false", CI: "true" };
 let dev;
 let devOutput = "";
@@ -64,7 +64,7 @@ function copyTrackedFiles() {
 
 async function checkConfig() {
   for (const file of [".dev.vars.example", ".env.example"]) {
-    if (existsSync(join(root, file))) fail(file + " exists, so the deploy button would ask owners for secrets; Flarebox needs none");
+    if (existsSync(join(root, file))) fail(file + " exists, so the deploy button would ask owners for secrets; Koidrive needs none");
   }
   const require = createRequire(join(root, "package.json"));
   const pkg = require("./package.json");
@@ -132,14 +132,14 @@ async function claimLocally() {
   );
   if (before.claimed) fail("a fresh deployment reports that it already has an owner");
   const page = await request(base + "/setup").then((response) => response.text());
-  if (!page.includes("not affiliated with Cloudflare, Inc.")) fail("/setup lost the notice that Flarebox is not affiliated with Cloudflare, Inc.");
+  if (!page.includes("not affiliated with Cloudflare, Inc.")) fail("/setup lost the notice that Koidrive is not affiliated with Cloudflare, Inc.");
   const viewer = await request(base + "/s/AAAAAAAAAAAAAAAAAAAAAA");
   if (!viewer.ok || !(await viewer.text()).includes('src="/viewer/viewer.js"')) fail("/s/{link_id} does not serve the built share viewer (HTTP " + viewer.status + ")");
   const script = await request(base + "/viewer/viewer.js");
   if (!script.ok || !script.headers.get("content-security-policy")?.includes("default-src 'none'")) {
     fail("/viewer/viewer.js is not served from the built assets with the viewer's headers (HTTP " + script.status + ")");
   }
-  const code = await waitFor(async () => /Flarebox claim code[^:]*: ([A-Z0-9-]+)/.exec(devOutput)?.[1], "the claim code in the Worker log", 10_000);
+  const code = await waitFor(async () => /Koidrive claim code[^:]*: ([A-Z0-9-]+)/.exec(devOutput)?.[1], "the claim code in the Worker log", 10_000);
   const response = await request(base + "/v1/claim", {
     method: "POST",
     headers: json,

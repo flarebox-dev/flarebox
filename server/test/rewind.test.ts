@@ -15,7 +15,7 @@ import {
   RewindRequestSchema,
   RewindResultSchema,
   SpaceInfoSchema,
-} from "../src/gen/flarebox/v1/auth_pb";
+} from "../src/gen/koidrive/v1/auth_pb";
 import {
   ClientMessageSchema,
   ResyncRequired_Reason,
@@ -23,8 +23,8 @@ import {
   RpcResponseSchema,
   type ServerMessage,
   ServerMessageSchema,
-} from "../src/gen/flarebox/v1/messages_pb";
-import { ChunkPlan_Action, Error_Code, ErrorSchema } from "../src/gen/flarebox/v1/rpc_pb";
+} from "../src/gen/koidrive/v1/messages_pb";
+import { ChunkPlan_Action, Error_Code, ErrorSchema } from "../src/gen/koidrive/v1/rpc_pb";
 import { toHex, uuidv7 } from "../src/ids";
 import { Close, CONNECT_HEADER, type SpaceDO } from "../src/space-do";
 import { ChunkState } from "../src/space/schema";
@@ -35,7 +35,7 @@ import { simulatedPitr } from "./pitr";
 
 simulatedPitr.install();
 
-const BASE = "https://flarebox.test";
+const BASE = "https://koidrive.test";
 const MINUTE = 60_000;
 const DAY = 24 * 3_600_000;
 
@@ -81,7 +81,7 @@ async function getOwner(): Promise<DeviceCredentials> {
   if (owner) return owner;
   const log = vi.spyOn(console, "log");
   await exports.default.fetch(BASE + "/setup");
-  const line = log.mock.calls.map((args) => String(args[0])).find((text) => text.startsWith("Flarebox claim code"));
+  const line = log.mock.calls.map((args) => String(args[0])).find((text) => text.startsWith("Koidrive claim code"));
   const claimed = await call(
     "/v1/claim",
     { body: body(ClaimRequestSchema, { code: line!.split(": ")[1]!, userName: "Owner", deviceName: "Laptop A", platform: "macos" }) },

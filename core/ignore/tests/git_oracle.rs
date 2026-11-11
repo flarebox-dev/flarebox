@@ -3,13 +3,13 @@
 //! Differential tests against `git check-ignore`: random trees with random rules files must get
 //! the same verdict from this crate and from git, down to the file and line that excludes each
 //! path. Each tree is written to disk as a git work tree with `.gitignore` files, and the same
-//! bytes are given to the matcher as `.fbignore` files.
+//! bytes are given to the matcher as `.koiignore` files.
 //!
 //! The generators leave out the intentional differences listed in the crate documentation: the
 //! rules files themselves are not compared, names and patterns are ASCII, and under case folding
 //! patterns hold no uppercase bracket members or escaped uppercase letters. Two more runs use
 //! non-ASCII letters and combining marks: random cases, and the boundary matrix from the review of
-//! flarebox#50. This crate gets them spelled NFD or NFC; git gets the NFC text with each non-ASCII
+//! koidrive#50. This crate gets them spelled NFD or NFC; git gets the NFC text with each non-ASCII
 //! code point replaced by a one-byte stand-in, so git decides every case code point by code point.
 
 use std::collections::BTreeMap;
@@ -17,7 +17,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use flarebox_ignore::{Kind, LocalRules, Matcher, NameKey, Reason, RuleFile, Status};
+use koidrive_ignore::{Kind, LocalRules, Matcher, NameKey, Reason, RuleFile, Status};
 use proptest::prelude::*;
 use proptest::sample::Index;
 use unicode_normalization::UnicodeNormalization;
@@ -34,7 +34,7 @@ struct Folded;
 
 impl NameKey for Folded {
     fn key(name: &str) -> String {
-        flarebox_engine::names::name_key(name)
+        koidrive_engine::names::name_key(name)
     }
 }
 

@@ -2,7 +2,7 @@
 
 // Deploys server/ to a real Cloudflare account under a throwaway name, claims it, and tears it down again
 // (docs/deploy-test.md). The smoke and upgrade checks themselves are Vitest suites in this directory. Usage, from
-// server/, with CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID and FLAREBOX_TEST_NAME set:
+// server/, with CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID and KOIDRIVE_TEST_NAME set:
 //   node scripts/deploy-test/run.ts upgrade-from [<ref>]   resolve and check the upgrade's starting commit
 //   node scripts/deploy-test/run.ts deploy <ref>           deploy server/ at <ref>, creating the bucket on first use
 //   node scripts/deploy-test/run.ts claim                  claim the deployment with the code from its own log
@@ -40,8 +40,8 @@ const TAIL_MS = 60_000;
 const PROPAGATION_MS = 15_000;
 /** The first commit whose server/ deploys on its own (#38); an upgrade cannot start earlier. */
 const FIRST_DEPLOYABLE = "8c9bf4a";
-const CLAIM_LOG_LINE = "Flarebox claim code";
-const CLAIM_CODE = /Flarebox claim code[^:]*: ([A-Z0-9-]+)/;
+const CLAIM_LOG_LINE = "Koidrive claim code";
+const CLAIM_CODE = /Koidrive claim code[^:]*: ([A-Z0-9-]+)/;
 
 const repo = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 
@@ -199,7 +199,7 @@ async function deploy(account: Account, ref: string): Promise<void> {
     fail("the Worker " + state.name + " is no longer the one this run created; refusing to deploy over it");
   }
 
-  const dir = mkdtempSync(join(tmpdir(), "flarebox-deploy-test-"));
+  const dir = mkdtempSync(join(tmpdir(), "koidrive-deploy-test-"));
   execFileSync("sh", ["-c", 'git archive --format=tar "$1:server" | tar -x -C "$2"', "sh", sha, dir], { cwd: repo, stdio: "inherit" });
   rename(dir, state.name);
   console.log("Copied server/ at " + sha + " to " + dir + " as Worker and R2 bucket " + state.name);
@@ -227,7 +227,7 @@ async function deploy(account: Account, ref: string): Promise<void> {
     await sleep(PROPAGATION_MS);
   }
   const info = await serving(url);
-  console.log(url + " serves Flarebox " + info.serverVersion + (info.claimed ? ", claimed" : ", not claimed yet"));
+  console.log(url + " serves Koidrive " + info.serverVersion + (info.claimed ? ", claimed" : ", not claimed yet"));
 }
 
 /** Waits until check returns a value, or fails naming what it waited for. */
@@ -278,7 +278,7 @@ async function claim(): Promise<void> {
   const state = readState();
   const deployment = state.deployments.at(-1) ?? fail("nothing is deployed yet");
   const url = state.url!;
-  const logDir = mkdtempSync(join(tmpdir(), "flarebox-wrangler-logs-"));
+  const logDir = mkdtempSync(join(tmpdir(), "koidrive-wrangler-logs-"));
   const tail = spawn(join(deployment.dir, "node_modules", ".bin", "wrangler"), ["tail", state.name, "--format", "pretty"], {
     cwd: deployment.dir,
     env: { ...process.env, WRANGLER_SEND_METRICS: "false", WRANGLER_WRITE_LOGS: "false", WRANGLER_LOG_PATH: logDir },
@@ -298,7 +298,7 @@ async function claim(): Promise<void> {
     const setup = await fetch(url + "/setup", { signal: AbortSignal.timeout(15_000) });
     const page = await setup.text();
     if (!setup.ok || !page.includes("claim code")) fail("/setup did not issue a claim code (HTTP " + setup.status + "): " + page.slice(0, 200));
-    if (!page.includes("not affiliated with Cloudflare, Inc.")) fail("/setup lost the notice that Flarebox is not affiliated with Cloudflare, Inc.");
+    if (!page.includes("not affiliated with Cloudflare, Inc.")) fail("/setup lost the notice that Koidrive is not affiliated with Cloudflare, Inc.");
     code = await until(() => CLAIM_CODE.exec(log)?.[1], "the claim code in the Worker's log", TAIL_MS);
     console.log("Read the claim code from the Worker's log through wrangler tail");
     const response = await fetch(url + "/v1/claim", {

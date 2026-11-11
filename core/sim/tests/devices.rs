@@ -3,7 +3,7 @@
 //! Two or three devices share one reference server while their users edit, effects fail,
 //! messages are lost, repeated or reordered, commits are refused and devices crash between store
 //! transactions or in the middle of an effect (docs/design/sync-engine.md section 7.3).
-//! `flarebox_sim::world` describes the harness and its two kinds of failure.
+//! `koidrive_sim::world` describes the harness and its two kinds of failure.
 //!
 //! `devices_lose_no_write` fails when a write is lost or when the engine, the store or the server
 //! refuses a state. `devices_converge_once_the_faults_stop` also asks that every disk reaches the
@@ -11,9 +11,9 @@
 
 use std::collections::BTreeMap;
 
-use flarebox_proto::v1::error;
-use flarebox_sim::world::disk::Place;
-use flarebox_sim::world::{Action, Cut, Failure, NAMES, Outcome, Reply, Step, TEXTS, World};
+use koidrive_proto::v1::error;
+use koidrive_sim::world::disk::Place;
+use koidrive_sim::world::{Action, Cut, Failure, NAMES, Outcome, Reply, Step, TEXTS, World};
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
@@ -71,10 +71,10 @@ fn phases() -> impl Strategy<Value = Vec<Vec<(usize, Step)>>> {
     prop::collection::vec(prop::collection::vec((0..3usize, step()), 0..48), 1..=3)
 }
 
-/// Devices that print every step with the state it leaves when `FLAREBOX_SIM_TRACE` is set.
+/// Devices that print every step with the state it leaves when `KOIDRIVE_SIM_TRACE` is set.
 fn world(devices: usize) -> World {
     let mut world = World::new(devices);
-    world.trace = std::env::var_os("FLAREBOX_SIM_TRACE").is_some();
+    world.trace = std::env::var_os("KOIDRIVE_SIM_TRACE").is_some();
     world
 }
 

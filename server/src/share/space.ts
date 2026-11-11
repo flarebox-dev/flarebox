@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { create } from "@bufbuild/protobuf";
-import { Error_Code } from "../gen/flarebox/v1/rpc_pb";
-import { NodeKind } from "../gen/flarebox/v1/model_pb";
-import { type ShareEntry, ShareEntrySchema, type ShareInfo, ShareInfoSchema, type ShareListing, ShareListingSchema } from "../gen/flarebox/v1/share_pb";
+import { Error_Code } from "../gen/koidrive/v1/rpc_pb";
+import { NodeKind } from "../gen/koidrive/v1/model_pb";
+import { type ShareEntry, ShareEntrySchema, type ShareInfo, ShareInfoSchema, type ShareListing, ShareListingSchema } from "../gen/koidrive/v1/share_pb";
 import { base64url, fromBase64url } from "../crypto";
 import { isUuidV7, toHex } from "../ids";
 import type { ResolvedLink, ShareOutcome } from "./links";

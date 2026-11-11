@@ -37,7 +37,7 @@ pub struct InvalidLine {
     pub error: LineError,
 }
 
-/// The parsed rules of one `.fbignore` file.
+/// The parsed rules of one `.koiignore` file.
 pub struct RuleFile<K> {
     rules: Vec<Rule>,
     invalid: Vec<InvalidLine>,

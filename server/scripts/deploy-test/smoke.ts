@@ -7,11 +7,11 @@
 
 import { create, toJson } from "@bufbuild/protobuf";
 import { afterAll, describe, expect, it } from "vitest";
-import { RewindRequestSchema, RewindResultSchema, ServerInfo_DataPath, ServerInfoSchema, SpaceInfoSchema, SpaceListSchema } from "../../src/gen/flarebox/v1/auth_pb";
-import { OpResult_Code } from "../../src/gen/flarebox/v1/commit_pb";
-import { NodeKind, NodeStatus } from "../../src/gen/flarebox/v1/model_pb";
-import { ChunkPlan_Action, Error_Code } from "../../src/gen/flarebox/v1/rpc_pb";
-import { ShareInfoSchema, ShareLinkSchema, ShareListingSchema } from "../../src/gen/flarebox/v1/share_pb";
+import { RewindRequestSchema, RewindResultSchema, ServerInfo_DataPath, ServerInfoSchema, SpaceInfoSchema, SpaceListSchema } from "../../src/gen/koidrive/v1/auth_pb";
+import { OpResult_Code } from "../../src/gen/koidrive/v1/commit_pb";
+import { NodeKind, NodeStatus } from "../../src/gen/koidrive/v1/model_pb";
+import { ChunkPlan_Action, Error_Code } from "../../src/gen/koidrive/v1/rpc_pb";
+import { ShareInfoSchema, ShareLinkSchema, ShareListingSchema } from "../../src/gen/koidrive/v1/share_pb";
 import { Device, type FileData, fileData, HttpError, op, randomBytes, Server, sleep, SpaceClient, send, sha256, stats, toHex, uuidv7, readBytes } from "./client";
 import { type Account, getObject, listObjects, requireAccount } from "./cloudflare.ts";
 import { addStats, readState } from "./state.ts";
@@ -215,7 +215,7 @@ describe("a server deployed to a real account", () => {
     });
     expect(keys.find((key) => key.startsWith("log/"))).toMatch(new RegExp("^log/" + seqName(1n) + "-\\d{20}\\.fblog$"));
     const descriptor = JSON.parse(new TextDecoder().decode(await getObject(account, state.name, prefix + "space.json")));
-    expect(descriptor).toMatchObject({ format: "flarebox.space", format_version: 1, space_id: run.spaceId, history_id: run.firstHistory, hash_alg: "sha256", rewind_number: 0 });
+    expect(descriptor).toMatchObject({ format: "koidrive.space", format_version: 1, space_id: run.spaceId, history_id: run.firstHistory, hash_alg: "sha256", rewind_number: 0 });
     console.log("R2 holds " + chunks.length + " chunk objects and the export " + keys.join(", "));
   });
 
@@ -260,7 +260,7 @@ describe("a server deployed to a real account", () => {
       return listed.includes("space.json") && listed.includes(manifestKey) ? listed : undefined;
     });
     const manifest = JSON.parse(new TextDecoder().decode(await getObject(account, state.name, prefix + manifestKey)));
-    expect(manifest).toMatchObject({ format: "flarebox.snapshot", format_version: 1, space_id: run.spaceId, history_id: result.historyId, start_seq: Number(result.restoreSeq) });
+    expect(manifest).toMatchObject({ format: "koidrive.snapshot", format_version: 1, space_id: run.spaceId, history_id: result.historyId, start_seq: Number(result.restoreSeq) });
     expect(manifest.pages.length).toBeGreaterThan(0);
     const descriptor = JSON.parse(new TextDecoder().decode(await getObject(account, state.name, prefix + "space.json")));
     expect(descriptor).toMatchObject({ history_id: result.historyId, rewind_number: 1 });

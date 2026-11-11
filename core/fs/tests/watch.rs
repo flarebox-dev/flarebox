@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use flarebox_fs::{
+use koidrive_fs::{
     Change, Entry, EntryKind, Error, FileId, Known, NativeWatcher, Poll, Rescan, RescanWatcher,
     Snapshot, Space, Watcher,
 };
@@ -613,7 +613,7 @@ fn folder_readable_again_is_watched_again() {
 fn private_folder_is_never_reported() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let private = root.join(flarebox_fs::PRIVATE_DIR);
+    let private = root.join(koidrive_fs::PRIVATE_DIR);
     fs::create_dir_all(private.join("staging")).unwrap();
     fs::write(private.join("space.json"), "{}").unwrap();
     fs::write(root.join("a.txt"), "a").unwrap();
@@ -627,9 +627,9 @@ fn private_folder_is_never_reported() {
     fs::remove_file(private.join("space.json")).unwrap();
     for scope in [
         "",
-        ".flarebox",
-        ".flarebox/staging/x",
-        ".flarebox/space.json",
+        ".koidrive",
+        ".koidrive/staging/x",
+        ".koidrive/space.json",
     ] {
         assert_eq!(
             snapshot.rescan(root, [PathBuf::from(scope)]).unwrap(),

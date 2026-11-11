@@ -7,14 +7,14 @@
 
 #![no_main]
 
-use flarebox_ignore::{Kind, LocalRules, Matcher, NameKey, RuleFile, Status};
+use koidrive_ignore::{Kind, LocalRules, Matcher, NameKey, RuleFile, Status};
 use libfuzzer_sys::fuzz_target;
 
 struct Folded;
 
 impl NameKey for Folded {
     fn key(name: &str) -> String {
-        flarebox_engine::names::name_key(name)
+        koidrive_engine::names::name_key(name)
     }
 }
 
@@ -42,7 +42,7 @@ fn check<K: NameKey>(data: &[u8]) {
             let _ = matcher.status(&path, kind);
         }
     }
-    assert_eq!(matcher.status(&[".fbignore"], Kind::File), Status::Included);
+    assert_eq!(matcher.status(&[".koiignore"], Kind::File), Status::Included);
 }
 
 fuzz_target!(|data: &[u8]| {

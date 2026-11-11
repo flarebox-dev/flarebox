@@ -20,7 +20,7 @@ use std::fmt;
 use std::io::{self, Chain, Cursor, Read};
 
 use fastcdc::v2020::{Normalization, StreamCDC};
-use flarebox_proto::v1::{ChunkRef, Content};
+use koidrive_proto::v1::{ChunkRef, Content};
 use sha2::{Digest, Sha256};
 
 const MIB: u32 = 1 << 20;

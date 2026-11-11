@@ -2,7 +2,7 @@
 
 //! The rules of design §5.10 and §5.1, one at a time, and the device-local list.
 
-use flarebox_ignore::{
+use koidrive_ignore::{
     Change, InvalidLine, Kind, LineError, LocalRules, LocalRulesError, Matcher, NameKey, Reason,
     RuleFile, Status,
 };
@@ -11,7 +11,7 @@ struct Folded;
 
 impl NameKey for Folded {
     fn key(name: &str) -> String {
-        flarebox_engine::names::name_key(name)
+        koidrive_engine::names::name_key(name)
     }
 }
 
@@ -101,25 +101,25 @@ fn the_last_matching_pattern_in_a_file_wins() {
 fn a_rules_file_in_an_included_directory_is_never_excluded() {
     for rules in [
         "*\n",
-        ".fbignore\n",
-        "/.fbignore\n",
+        ".koiignore\n",
+        "/.koiignore\n",
         "**\n",
         ".*\n",
         "*/\n!sub/\n",
     ] {
         let m = matcher(&[("", rules), ("sub", "*\n")]);
-        assert_eq!(status(&m, ".fbignore"), Status::Included, "{rules:?}");
+        assert_eq!(status(&m, ".koiignore"), Status::Included, "{rules:?}");
         assert_eq!(
-            status(&m, ".FBIGNORE"),
+            status(&m, ".KOIIGNORE"),
             Status::Included,
             "compared by key: {rules:?}"
         );
     }
-    let m = matcher(&[("", "*\n!sub/\n"), ("sub", ".fbignore\n")]);
-    assert_eq!(status(&m, "sub/.fbignore"), Status::Included);
+    let m = matcher(&[("", "*\n!sub/\n"), ("sub", ".koiignore\n")]);
+    assert_eq!(status(&m, "sub/.koiignore"), Status::Included);
     assert_eq!(status(&m, "sub/other"), rule(0, 1));
     assert_eq!(
-        status(&m, ".fbignore/"),
+        status(&m, ".koiignore/"),
         rule(0, 1),
         "only a file is a rules file"
     );
@@ -135,7 +135,7 @@ fn rules_inside_an_excluded_subtree_are_not_read() {
     assert_eq!(status(&m, "build/keep"), rule(0, 1));
     assert_eq!(status(&m, "build/out/x"), rule(0, 1));
     assert_eq!(
-        status(&m, "build/.fbignore"),
+        status(&m, "build/.koiignore"),
         rule(0, 1),
         "a rules file there is excluded with its directory"
     );
@@ -153,7 +153,7 @@ fn a_path_under_an_excluded_directory_cannot_be_included() {
 
 #[test]
 fn built_in_exclusions_cannot_be_negated() {
-    let rules = "!.DS_Store\n!.flarebox\n!.flarebox/\n!Thumbs.db\n!desktop.ini\n!Icon\r\r\n!*\n";
+    let rules = "!.DS_Store\n!.koidrive\n!.koidrive/\n!Thumbs.db\n!desktop.ini\n!Icon\r\r\n!*\n";
     let m = matcher(&[("", rules)]);
     for path in [
         ".DS_Store",
@@ -164,10 +164,10 @@ fn built_in_exclusions_cannot_be_negated() {
         "desktop.ini",
         "Icon\r",
         "sub/Icon\r",
-        ".flarebox/",
-        ".FLAREBOX/",
-        ".flarebox/staging/x",
-        ".flarebox",
+        ".koidrive/",
+        ".KOIDRIVE/",
+        ".koidrive/staging/x",
+        ".koidrive",
     ] {
         assert_eq!(
             status(&m, path),
@@ -176,7 +176,7 @@ fn built_in_exclusions_cannot_be_negated() {
         );
     }
     assert_eq!(
-        status(&m, "sub/.flarebox/"),
+        status(&m, "sub/.koidrive/"),
         Status::Included,
         "only the root's"
     );
@@ -212,7 +212,7 @@ fn names_match_by_key_after_nfc() {
 }
 
 /// The same pattern spelled NFC or NFD, with Kelvin and Ångström signs or their canonical letters,
-/// selects the same names (review of flarebox#50).
+/// selects the same names (review of koidrive#50).
 #[test]
 fn equivalent_pattern_spellings_select_the_same_names() {
     let names = [
@@ -263,7 +263,7 @@ fn equivalent_pattern_spellings_select_the_same_names() {
 }
 
 /// Every token reads one code point of the NFC key, so wildcards next to a combining mark match
-/// as in git (review of flarebox#50).
+/// as in git (review of koidrive#50).
 #[test]
 fn wildcards_match_code_points_next_to_combining_marks() {
     let m = matcher(&[("", "q*\n")]);
@@ -402,13 +402,13 @@ fn the_include_list_narrows_sync_to_its_paths() {
         rule(0, 1),
         "root rules still apply"
     );
-    assert_eq!(status(&m, ".fbignore"), Status::Included);
+    assert_eq!(status(&m, ".koiignore"), Status::Included);
     assert_eq!(
         status(&m, "Work/"),
         Status::Included,
         "on the way to an include"
     );
-    assert_eq!(status(&m, "Work/.fbignore"), Status::Included);
+    assert_eq!(status(&m, "Work/.koiignore"), Status::Included);
     assert_eq!(status(&m, "Work/Notes.txt"), Status::Included);
     for path in ["Other/", "readme.md", "Work/other", "Projects", "Work"] {
         assert_eq!(
@@ -420,7 +420,7 @@ fn the_include_list_narrows_sync_to_its_paths() {
 }
 
 #[test]
-fn the_local_list_and_fbignore_files_only_add_exclusions() {
+fn the_local_list_and_koiignore_files_only_add_exclusions() {
     let local = LocalRules::new(&[] as &[&str], &["*.mp4", "!keep.log"]).unwrap();
     let m = matcher_with(local, &[("", "!a.mp4\n*.log\n")]);
     assert_eq!(status(&m, "a.mp4"), Status::Excluded(Reason::Local));
@@ -465,7 +465,7 @@ fn a_new_rule_excludes_without_deleting_and_removing_it_includes_again() {
         "sub/",
         "sub/b.log",
         "sub/c.txt",
-        "sub/.fbignore",
+        "sub/.koiignore",
         "other/d.log",
     ]);
     let mut m = matcher(&[]);
@@ -567,7 +567,7 @@ fn a_scope_walk_refuses_excluded_directories() {
 }
 
 /// The closure over `**/` is a loop, so a long pattern cannot overflow the stack (review of
-/// flarebox#50).
+/// koidrive#50).
 #[test]
 fn a_long_globstar_chain_matches_without_recursion() {
     let m = matcher(&[("", &format!("{}a\n", "**/".repeat(50_000)))]);

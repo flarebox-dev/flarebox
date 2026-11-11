@@ -14,13 +14,13 @@ import {
   DeviceCredentialsSchema,
   ServerInfoSchema,
   TokenRequestSchema,
-} from "../src/gen/flarebox/v1/auth_pb";
-import { Error_Code, ErrorSchema } from "../src/gen/flarebox/v1/rpc_pb";
+} from "../src/gen/koidrive/v1/auth_pb";
+import { Error_Code, ErrorSchema } from "../src/gen/koidrive/v1/rpc_pb";
 
-const BASE = "https://flarebox.test";
+const BASE = "https://koidrive.test";
 const OWNER_ADDRESS = "198.51.100.7";
 const STRANGER_ADDRESS = "203.0.113.9";
-/** The key vitest.config.ts gives the Worker as FLAREBOX_RECOVERY_KEY. */
+/** The key vitest.config.ts gives the Worker as KOIDRIVE_RECOVERY_KEY. */
 const RECOVERY_KEY = "test-recovery-key-for-local-workerd-only";
 const WRONG_CODE = "AAAA-BBBB-CCCC";
 
@@ -70,7 +70,7 @@ function failuresOf(client: string): Promise<number> {
 async function setup(): Promise<{ text: string; code: string | undefined }> {
   const log = vi.spyOn(console, "log");
   const text = await exports.default.fetch(BASE + "/setup").then((response) => response.text());
-  const line = log.mock.calls.map((args) => String(args[0])).find((entry) => entry.startsWith("Flarebox claim code"));
+  const line = log.mock.calls.map((args) => String(args[0])).find((entry) => entry.startsWith("Koidrive claim code"));
   log.mockRestore();
   return { text, code: line?.split(": ")[1] };
 }

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! `flarebox setup` and `flarebox server ...`: log in with Cloudflare, then deploy a server to the user's account, add
+//! `koi setup` and `koi server ...`: log in with Cloudflare, then deploy a server to the user's account, add
 //! this device to the server there, upgrade it or remove it (docs/design/cli-setup.md). The Cloudflare grant lives in
 //! memory for one command and is revoked when the command ends, also on failure, Ctrl-C and SIGTERM (section 7).
 
@@ -17,13 +17,13 @@ use std::path::Path;
 use std::process::{Command as Process, Stdio};
 use std::time::{Duration, Instant};
 
-use flarebox_cloudflare::{
+use koidrive_cloudflare::{
     Account, Bundle, CLIENT_ID, Cloudflare, Endpoints, Grant, Jurisdiction, Login, Loopback,
     Script, Secret, UploadPlan,
 };
-use flarebox_driver::Paths;
-use flarebox_net::{Api, ApiError};
-use flarebox_proto::v1::ServerInfo;
+use koidrive_driver::Paths;
+use koidrive_net::{Api, ApiError};
+use koidrive_proto::v1::ServerInfo;
 use tokio::signal::unix::{SignalKind, signal};
 use url::Url;
 
@@ -33,9 +33,9 @@ use claim::Claim;
 use state::{SetupState, StateFile, Step};
 
 const API_BASE: &str = "https://api.cloudflare.com/client/v4/";
-/// Marks the Worker scripts `flarebox setup` uploads (section 6).
-const TAG: &str = "flarebox-server";
-/// The Durable Object classes that identify an untagged Flarebox Worker, such as a renamed button deploy.
+/// Marks the Worker scripts `koi setup` uploads (section 6).
+const TAG: &str = "koidrive-server";
+/// The Durable Object classes that identify an untagged Koidrive Worker, such as a renamed button deploy.
 const SERVER_CLASSES: [&str; 2] = ["AccountDO", "SpaceDO"];
 /// Cloudflare's error code for an account without an R2 subscription (section 4.1).
 const R2_DISABLED: u64 = 10042;
@@ -77,10 +77,10 @@ pub enum ServerAction {
         #[command(flatten)]
         login: LoginArgs,
     },
-    /// Claim a server deployed without flarebox setup, with the one-time claim code that its /setup page writes to the
+    /// Claim a server deployed without koi setup, with the one-time claim code that its /setup page writes to the
     /// Worker's log. This device becomes the owner's first device.
     Claim {
-        /// The server's address, such as https://flarebox.alice.workers.dev.
+        /// The server's address, such as https://koidrive.alice.workers.dev.
         server: String,
         /// The claim code from the Worker's log.
         code: String,
@@ -118,13 +118,13 @@ pub enum ServerAction {
     },
 }
 
-/// `flarebox setup` without a code: asks whether to join with a code or log in with Cloudflare.
+/// `koi setup` without a code: asks whether to join with a code or log in with Cloudflare.
 pub async fn setup(paths: &Paths, device_name: &str, login: &LoginArgs) -> Result<(), String> {
     if !std::io::stdin().is_terminal() {
-        return Err("flarebox setup asks questions; in a script use flarebox join, flarebox server deploy or flarebox server add-device".into());
+        return Err("koi setup asks questions; in a script use koi join, koi server deploy or koi server add-device".into());
     }
     not_set_up(paths)?;
-    println!("How do you want to set up Flarebox on this machine?");
+    println!("How do you want to set up Koidrive on this machine?");
     println!(
         "  1. Log in with Cloudflare: deploy a server to your account, or add this device to the server there"
     );
@@ -150,7 +150,7 @@ pub async fn setup(paths: &Paths, device_name: &str, login: &LoginArgs) -> Resul
     }
 }
 
-/// `flarebox server <action>`. These never ask unless a terminal is attached and the step needs a yes.
+/// `koi server <action>`. These never ask unless a terminal is attached and the step needs a yes.
 pub async fn server(paths: &Paths, action: ServerAction) -> Result<(), String> {
     match action {
         ServerAction::Deploy { device, login } => {
@@ -236,17 +236,17 @@ fn not_set_up(paths: &Paths) -> Result<(), String> {
 fn unfinished(state: &SetupState, account: &str, file: &Path) -> String {
     let run = if state.account != account {
         format!(
-            "a setup of {} in another Cloudflare account ({}) has not finished; run flarebox setup and log in to that account to finish it",
+            "a setup of {} in another Cloudflare account ({}) has not finished; run koi setup and log in to that account to finish it",
             state.script, state.account
         )
     } else if state.step == Step::Uninstalling {
         format!(
-            "the uninstall of {} has not finished; run flarebox server uninstall to finish it",
+            "the uninstall of {} has not finished; run koi server uninstall to finish it",
             state.script
         )
     } else {
         format!(
-            "the deploy of {} has not finished; run flarebox setup to finish it",
+            "the deploy of {} has not finished; run koi setup to finish it",
             state.script
         )
     };
@@ -289,7 +289,7 @@ async fn with_session(
     };
     let outcome = guarded(Session::login(args), stopped, work).await;
     if let (Err(message), Some(code)) = (&outcome, status) {
-        eprintln!("flarebox: {message}");
+        eprintln!("koi: {message}");
         std::process::exit(code);
     }
     outcome
@@ -378,7 +378,7 @@ fn open_browser(url: &Url) {
         .spawn();
 }
 
-/// A Flarebox server found in the account.
+/// A Koidrive server found in the account.
 struct Found {
     script: Script,
     bucket: Option<Bound>,
@@ -430,7 +430,7 @@ impl Cloud for Session {
 impl Session {
     /// Logs in with Cloudflare and returns once the code is exchanged for a grant, before any other call.
     async fn login(args: &LoginArgs) -> Result<Session, String> {
-        let http = flarebox_cloudflare::http_client().map_err(|error| error.to_string())?;
+        let http = koidrive_cloudflare::http_client().map_err(|error| error.to_string())?;
         let loopback = if args.no_browser {
             None
         } else {
@@ -514,7 +514,7 @@ impl Session {
                 Ok(()) => return,
                 Err(error) if attempt == 3 => {
                     eprintln!(
-                        "flarebox: could not revoke the Cloudflare login ({error}). It stays active; its access token expires within an hour. Revoke it now under Manage OAuth authorizations in the Cloudflare dashboard."
+                        "koi: could not revoke the Cloudflare login ({error}). It stays active; its access token expires within an hour. Revoke it now under Manage OAuth authorizations in the Cloudflare dashboard."
                     );
                 }
                 Err(_) => tokio::time::sleep(Duration::from_secs(2)).await,
@@ -570,7 +570,7 @@ impl Session {
                         ))
                         .expect("the R2 page is a URL");
                         println!(
-                            "R2 is not enabled on this account. Flarebox keeps your files in R2."
+                            "R2 is not enabled on this account. Koidrive keeps your files in R2."
                         );
                         println!(
                             "Enable it on this page. Its checkout includes free monthly usage and bills use beyond it:\n{page}"
@@ -589,8 +589,8 @@ impl Session {
         }
     }
 
-    /// The Flarebox servers in the account (section 6): scripts with the tag, and untagged scripts that bind the
-    /// Flarebox Durable Object classes, each checked with `GET /v1/server`. A tagged script that binds a bucket but does
+    /// The Koidrive servers in the account (section 6): scripts with the tag, and untagged scripts that bind the
+    /// Koidrive Durable Object classes, each checked with `GET /v1/server`. A tagged script that binds a bucket but does
     /// not answer is a deploy that stopped halfway, and is kept without `info`.
     async fn find_servers(&mut self) -> Result<Vec<Found>, String> {
         let binding = embedded_bundle()?.manifest.r2_binding;
@@ -643,12 +643,12 @@ impl Session {
         }
         match found.len() {
             0 => Err(match name {
-                Some(name) => format!("the account has no Flarebox server named {name}"),
-                None => "the account has no Flarebox server; run flarebox server deploy".into(),
+                Some(name) => format!("the account has no Koidrive server named {name}"),
+                None => "the account has no Koidrive server; run koi server deploy".into(),
             }),
             1 => Ok(found.remove(0)),
             _ => Err(format!(
-                "the account has several Flarebox servers; name one with --server: {}",
+                "the account has several Koidrive servers; name one with --server: {}",
                 found
                     .iter()
                     .map(|server| server.script.id.as_str())
@@ -674,7 +674,7 @@ impl Session {
         state.account == self.account() && state.step != Step::Uninstalling
     }
 
-    /// `flarebox server deploy` after the login: finish an interrupted deploy, or deploy a new server into an account
+    /// `koi server deploy` after the login: finish an interrupted deploy, or deploy a new server into an account
     /// that has none.
     async fn server_deploy(&mut self, paths: &Paths, device_name: &str) -> Result<(), String> {
         if let Some(state) = self.resumable(paths)? {
@@ -683,14 +683,14 @@ impl Session {
         let found = self.find_servers().await?;
         if let Some(server) = found.first() {
             return Err(format!(
-                "the account already has a Flarebox server, {} at {}; run flarebox server add-device",
+                "the account already has a Koidrive server, {} at {}; run koi server add-device",
                 server.script.id, server.url
             ));
         }
         self.deploy(paths, device_name).await
     }
 
-    /// `flarebox server add-device` after the login: add this device to the named server, or to the only one.
+    /// `koi server add-device` after the login: add this device to the named server, or to the only one.
     async fn server_add_device(
         &mut self,
         paths: &Paths,
@@ -710,7 +710,7 @@ impl Session {
         self.add_device(paths, found, device_name, false).await
     }
 
-    /// `flarebox setup` after the login: finish an interrupted deploy, deploy a new server, or add this device.
+    /// `koi setup` after the login: finish an interrupted deploy, deploy a new server, or add this device.
     async fn setup(&mut self, paths: &Paths, device_name: &str) -> Result<(), String> {
         if let Some(state) = self.resumable(paths)? {
             println!(
@@ -725,7 +725,7 @@ impl Session {
             0 => return self.deploy(paths, device_name).await,
             1 => found.remove(0),
             _ => {
-                println!("The account has several Flarebox servers:");
+                println!("The account has several Koidrive servers:");
                 for (index, server) in found.iter().enumerate() {
                     println!("  {}. {} at {}", index + 1, server.script.id, server.url);
                 }
@@ -786,7 +786,7 @@ impl Session {
             )
             .await?;
             println!(
-                "Uploading Flarebox {} as the Worker {}...",
+                "Uploading Koidrive {} as the Worker {}...",
                 bundle.manifest.version, state.script
             );
             let secret = Secret::random(32);
@@ -859,7 +859,7 @@ impl Session {
             }
             None => {
                 return Err(format!(
-                    "{} stopped halfway through its deploy; run flarebox setup to finish it",
+                    "{} stopped halfway through its deploy; run koi setup to finish it",
                     server.script.id
                 ));
             }
@@ -867,14 +867,14 @@ impl Session {
         let mut window = Duration::from_secs(60);
         if !info.setup_attempts {
             let reason = format!(
-                "{} runs Flarebox {}, which cannot make a retried claim end with one device. It needs an upgrade to {} first.",
+                "{} runs Koidrive {}, which cannot make a retried claim end with one device. It needs an upgrade to {} first.",
                 server.script.id,
                 info.server_version,
                 embedded_bundle()?.manifest.version
             );
             if !interactive {
                 return Err(format!(
-                    "{reason} Run flarebox server upgrade, then this command again."
+                    "{reason} Run koi server upgrade, then this command again."
                 ));
             }
             if confirm(&format!("{reason} Upgrade it now?"), false, "--yes")
@@ -882,7 +882,7 @@ impl Session {
                 .is_err()
             {
                 return Err(format!(
-                    "{reason} Run flarebox server upgrade, then flarebox setup again."
+                    "{reason} Run koi server upgrade, then koi setup again."
                 ));
             }
             self.upgrade(&server, false).await?;
@@ -931,13 +931,13 @@ impl Session {
         let bundle = embedded_bundle()?;
         let Some(info) = &server.info else {
             return Err(format!(
-                "{} does not answer; run flarebox setup to finish its deploy",
+                "{} does not answer; run koi setup to finish its deploy",
                 server.script.id
             ));
         };
         if newer(&info.server_version, &bundle.manifest.version) {
             return Err(format!(
-                "{} runs Flarebox {}, newer than this CLI's {}; install a newer flarebox",
+                "{} runs Koidrive {}, newer than this CLI's {}; install a newer koi",
                 server.script.id, info.server_version, bundle.manifest.version
             ));
         }
@@ -956,7 +956,7 @@ impl Session {
             .clone()
             .ok_or_else(|| format!("{} binds no R2 bucket", server.script.id))?;
         println!(
-            "Uploading Flarebox {} over {} {}...",
+            "Uploading Koidrive {} over {} {}...",
             bundle.manifest.version, server.script.id, info.server_version
         );
         self.upload(
@@ -969,7 +969,7 @@ impl Session {
         .await?;
         wait_until_serving(&server.url, Some(&bundle.manifest.version)).await?;
         println!(
-            "{} now runs Flarebox {}. Open sync sessions move to it within 5 minutes.",
+            "{} now runs Koidrive {}. Open sync sessions move to it within 5 minutes.",
             server.script.id, bundle.manifest.version
         );
         Ok(())
@@ -1063,10 +1063,10 @@ impl Session {
 /// same checks as one on disk.
 fn embedded_bundle() -> Result<Bundle, String> {
     if SERVER_BUNDLE.is_empty() {
-        return Err("this flarebox was built without a server bundle; install a release build to deploy or upgrade a server".into());
+        return Err("this koi was built without a server bundle; install a release build to deploy or upgrade a server".into());
     }
     let broken =
-        |error: &dyn std::fmt::Display| format!("this flarebox's server bundle is broken: {error}");
+        |error: &dyn std::fmt::Display| format!("this koi's server bundle is broken: {error}");
     let dir =
         tempfile::tempdir().map_err(|error| format!("cannot unpack the server bundle: {error}"))?;
     for (path, bytes) in SERVER_BUNDLE {
@@ -1176,7 +1176,7 @@ fn newer(a: &str, b: &str) -> bool {
     }
 }
 
-/// The Flarebox API of the server at `url`. Tests serve it over http on a loopback address.
+/// The Koidrive API of the server at `url`. Tests serve it over http on a loopback address.
 fn server_api(url: &Url) -> Result<Api, ApiError> {
     if cfg!(test) {
         Api::local_development(url.clone())
@@ -1233,7 +1233,7 @@ async fn wait_for_setup_attempts(url: &Url) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use flarebox_proto::v1::DeviceCredentials;
+    use koidrive_proto::v1::DeviceCredentials;
     use serde_json::json;
 
     use super::fake::{self, ACCOUNT, Fake, Reply, cf, proto, revoked, tokens};
@@ -1242,14 +1242,14 @@ mod tests {
     fn deployed(fake: &Fake) -> Found {
         Found {
             script: Script {
-                id: "flarebox".into(),
+                id: "koidrive".into(),
                 created_on: None,
                 tags: vec![TAG.into()],
                 migration_tag: None,
                 has_assets: true,
             },
             bucket: Some(Bound {
-                name: "flarebox".into(),
+                name: "koidrive".into(),
                 jurisdiction: Jurisdiction::Default,
             }),
             url: fake.base.clone(),
@@ -1330,38 +1330,38 @@ mod tests {
         let binds = |bucket: &str| json!({ "bindings": [{ "type": "r2_bucket", "name": "BUCKET", "bucket_name": bucket }] });
         let cases = [
             (
-                json!([{ "id": "flarebox", "tags": [] }]),
+                json!([{ "id": "koidrive", "tags": [] }]),
                 None,
-                "flarebox-2",
+                "koidrive-2",
             ),
             (
-                json!([{ "id": "flarebox", "tags": [TAG] }, { "id": "flarebox-2", "tags": [] }]),
+                json!([{ "id": "koidrive", "tags": [TAG] }, { "id": "koidrive-2", "tags": [] }]),
                 Some(binds("photos")),
-                "flarebox-3",
+                "koidrive-3",
             ),
             (
-                json!([{ "id": "flarebox", "tags": [TAG] }]),
-                Some(binds("flarebox")),
-                "flarebox",
+                json!([{ "id": "koidrive", "tags": [TAG] }]),
+                Some(binds("koidrive")),
+                "koidrive",
             ),
-            (json!([{ "id": "photos", "tags": [] }]), None, "flarebox"),
+            (json!([{ "id": "photos", "tags": [] }]), None, "koidrive"),
         ];
         for (scripts, settings, expected) in cases {
             let mut replies = vec![tokens(), cf("GET", "/workers/scripts", scripts)];
             replies.extend(
-                settings.map(|settings| cf("GET", "/workers/scripts/flarebox/settings", settings)),
+                settings.map(|settings| cf("GET", "/workers/scripts/koidrive/settings", settings)),
             );
             let fake = Fake::start(replies).await;
             let mut session = fake::session(&fake).await;
             let mut state = SetupState {
                 account: ACCOUNT.into(),
-                script: "flarebox".into(),
-                bucket: "flarebox".into(),
+                script: "koidrive".into(),
+                bucket: "koidrive".into(),
                 step: Step::BucketCreated,
                 ..SetupState::default()
             };
 
-            keep_script_name(&mut session, &mut state, "BUCKET", "flarebox")
+            keep_script_name(&mut session, &mut state, "BUCKET", "koidrive")
                 .await
                 .unwrap();
 
@@ -1371,15 +1371,15 @@ mod tests {
 
     #[test]
     fn a_deploy_names_its_bucket_with_a_random_suffix() {
-        let first = new_bucket_name("flarebox");
-        let suffix = first.strip_prefix("flarebox-").unwrap();
+        let first = new_bucket_name("koidrive");
+        let suffix = first.strip_prefix("koidrive-").unwrap();
         assert_eq!(suffix.len(), 16);
         assert!(
             suffix
                 .bytes()
                 .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
         );
-        assert_ne!(first, new_bucket_name("flarebox"));
+        assert_ne!(first, new_bucket_name("koidrive"));
     }
 
     /// The bucket names of the creates `fake` received.
@@ -1410,10 +1410,10 @@ mod tests {
     async fn a_lost_create_answer_is_adopted_under_the_saved_name_on_the_next_run() {
         let dir = tempfile::tempdir().unwrap();
         let file = StateFile::new(&Paths::under(dir.path()));
-        let name = new_bucket_name("flarebox");
+        let name = new_bucket_name("koidrive");
         let planned = SetupState {
             account: ACCOUNT.into(),
-            script: "flarebox".into(),
+            script: "koidrive".into(),
             bucket: name.clone(),
             ..SetupState::default()
         };
@@ -1446,8 +1446,8 @@ mod tests {
         let file = StateFile::new(&Paths::under(dir.path()));
         let mut state = SetupState {
             account: ACCOUNT.into(),
-            script: "flarebox".into(),
-            bucket: new_bucket_name("flarebox"),
+            script: "koidrive".into(),
+            bucket: new_bucket_name("koidrive"),
             ..SetupState::default()
         };
 
@@ -1456,12 +1456,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(created(&fake), [state.bucket.as_str()]);
-        assert_ne!(state.bucket, "flarebox");
+        assert_ne!(state.bucket, "koidrive");
         assert!(
             !fake
                 .seen()
                 .iter()
-                .any(|seen| seen.path.contains("/r2/buckets/flarebox") || seen.method == "DELETE")
+                .any(|seen| seen.path.contains("/r2/buckets/koidrive") || seen.method == "DELETE")
         );
     }
 
@@ -1478,17 +1478,17 @@ mod tests {
             refresh_credential: "device".into(),
             ..DeviceCredentials::default()
         };
-        let secrets = "/workers/scripts/flarebox/secrets";
+        let secrets = "/workers/scripts/koidrive/secrets";
         let fake = Fake::start(vec![
             tokens(),
-            cf("POST", "/workers/scripts/flarebox/subdomain", json!(null)),
+            cf("POST", "/workers/scripts/koidrive/subdomain", json!(null)),
             proto("GET", "/v1/server", info),
             cf("GET", secrets, json!([])),
             cf("PUT", secrets, json!(null)),
             proto("POST", "/v1/claim", issued),
             cf(
                 "DELETE",
-                &format!("{secrets}/FLAREBOX_RECOVERY_KEY"),
+                &format!("{secrets}/KOIDRIVE_RECOVERY_KEY"),
                 json!(null),
             ),
             cf("GET", secrets, json!([])),
@@ -1504,7 +1504,7 @@ mod tests {
             .unwrap();
 
         assert!(fake.seen().iter().any(|seen| seen.method == "POST"
-            && seen.path.ends_with("/workers/scripts/flarebox/subdomain")));
+            && seen.path.ends_with("/workers/scripts/koidrive/subdomain")));
         assert!(paths.credential().exists());
         assert_eq!(StateFile::new(&paths).load().unwrap(), None);
     }
@@ -1513,8 +1513,8 @@ mod tests {
     async fn uninstall_stops_at_another_unfinished_run_before_calling_the_account() {
         let deploy = SetupState {
             account: ACCOUNT.into(),
-            script: "flarebox".into(),
-            bucket: new_bucket_name("flarebox"),
+            script: "koidrive".into(),
+            bucket: new_bucket_name("koidrive"),
             step: Step::BucketCreated,
             ..SetupState::default()
         };
@@ -1526,7 +1526,7 @@ mod tests {
             account: "another-account".into(),
             ..uninstall.clone()
         };
-        let bucket = new_bucket_name("flarebox");
+        let bucket = new_bucket_name("koidrive");
         for (other, named) in [
             (deploy, None),
             (elsewhere, None),
@@ -1555,15 +1555,15 @@ mod tests {
         let others = [
             SetupState {
                 account: "another-account".into(),
-                script: "flarebox".into(),
-                bucket: new_bucket_name("flarebox"),
+                script: "koidrive".into(),
+                bucket: new_bucket_name("koidrive"),
                 step: Step::BucketCreated,
                 ..SetupState::default()
             },
             SetupState {
                 account: ACCOUNT.into(),
-                script: "flarebox".into(),
-                bucket: new_bucket_name("flarebox"),
+                script: "koidrive".into(),
+                bucket: new_bucket_name("koidrive"),
                 step: Step::Uninstalling,
                 ..SetupState::default()
             },
@@ -1599,8 +1599,8 @@ mod tests {
         let paths = Paths::under(dir.path());
         let unfinished = SetupState {
             account: ACCOUNT.into(),
-            script: "flarebox-2".into(),
-            bucket: new_bucket_name("flarebox"),
+            script: "koidrive-2".into(),
+            bucket: new_bucket_name("koidrive"),
             step: Step::BucketCreated,
             ..SetupState::default()
         };
@@ -1612,7 +1612,7 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            error.contains("the deploy of flarebox-2 has not finished"),
+            error.contains("the deploy of koidrive-2 has not finished"),
             "{error}"
         );
         assert_eq!(StateFile::new(&paths).load().unwrap(), Some(unfinished));
@@ -1634,20 +1634,20 @@ mod tests {
         let paths = Paths::under(dir.path());
         let unfinished = SetupState {
             account: ACCOUNT.into(),
-            script: "flarebox-2".into(),
-            bucket: new_bucket_name("flarebox"),
+            script: "koidrive-2".into(),
+            bucket: new_bucket_name("koidrive"),
             step: Step::BucketCreated,
             ..SetupState::default()
         };
         StateFile::new(&paths).save(&unfinished).unwrap();
 
         let error = session
-            .server_add_device(&paths, Some("flarebox"), "laptop")
+            .server_add_device(&paths, Some("koidrive"), "laptop")
             .await
             .unwrap_err();
 
         assert!(
-            error.contains("the deploy of flarebox-2 has not finished"),
+            error.contains("the deploy of koidrive-2 has not finished"),
             "{error}"
         );
         assert_eq!(StateFile::new(&paths).load().unwrap(), Some(unfinished));
@@ -1656,14 +1656,14 @@ mod tests {
 
     #[test]
     fn free_names_count_up_from_the_default() {
-        let taken = vec!["flarebox".to_owned(), "flarebox-2".to_owned()];
-        assert_eq!(free_name("flarebox", &[]), "flarebox");
-        assert_eq!(free_name("flarebox", &taken), "flarebox-3");
+        let taken = vec!["koidrive".to_owned(), "koidrive-2".to_owned()];
+        assert_eq!(free_name("koidrive", &[]), "koidrive");
+        assert_eq!(free_name("koidrive", &taken), "koidrive-3");
     }
 
     #[test]
     fn the_embedded_bundle_reads_back_when_the_build_has_one() {
-        match option_env!("FLAREBOX_SERVER_BUNDLE") {
+        match option_env!("KOIDRIVE_SERVER_BUNDLE") {
             None => assert!(
                 embedded_bundle()
                     .unwrap_err()

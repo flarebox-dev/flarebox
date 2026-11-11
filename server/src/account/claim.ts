@@ -4,7 +4,7 @@
 // wrong codes that pairing shares. Each claim function runs inside one transactionSync of the Account DO, so a claim
 // either creates the owner and the device or changes nothing but a failure count.
 
-import { Error_Code } from "../gen/flarebox/v1/rpc_pb";
+import { Error_Code } from "../gen/koidrive/v1/rpc_pb";
 
 /** Wrong codes one client address may send in one window before further wrong codes are refused. */
 export const CLAIM_FAILURES_PER_WINDOW = 10;

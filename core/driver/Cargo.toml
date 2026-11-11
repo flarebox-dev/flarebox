@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-name = "flarebox-driver"
+name = "koidrive-driver"
 description = "Runs sync for the folders a device links: credentials, configuration, server sessions and disk observation."
 version.workspace = true
 edition.workspace = true
@@ -11,13 +11,13 @@ publish.workspace = true
 
 [dependencies]
 bytes = "1.12.1"
-flarebox-chunk = { path = "../chunk" }
-flarebox-engine = { path = "../engine", features = ["serde"] }
-flarebox-fs = { path = "../fs" }
-flarebox-ignore = { path = "../ignore" }
-flarebox-net = { path = "../net" }
-flarebox-proto = { path = "../proto" }
-flarebox-store = { path = "../store" }
+koidrive-chunk = { path = "../chunk" }
+koidrive-engine = { path = "../engine", features = ["serde"] }
+koidrive-fs = { path = "../fs" }
+koidrive-ignore = { path = "../ignore" }
+koidrive-net = { path = "../net" }
+koidrive-proto = { path = "../proto" }
+koidrive-store = { path = "../store" }
 prost.workspace = true
 rustix = { version = "1.1.6", features = ["fs", "process"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -29,7 +29,7 @@ tracing = "0.1.41"
 url = "2.5.8"
 
 [dev-dependencies]
-flarebox-sim = { path = "../sim" }
+koidrive-sim = { path = "../sim" }
 reqwest = { version = "0.13.5", default-features = false }
 tempfile = "3.27.0"
 tokio = { version = "1.48", features = ["full", "test-util"] }

@@ -5,8 +5,8 @@ import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import type { AccountDO } from "../src/account-do";
-import { type DeviceCredentials, ServerInfoSchema, TokenRequestSchema } from "../src/gen/flarebox/v1/auth_pb";
-import { Error_Code } from "../src/gen/flarebox/v1/rpc_pb";
+import { type DeviceCredentials, ServerInfoSchema, TokenRequestSchema } from "../src/gen/koidrive/v1/auth_pb";
+import { Error_Code } from "../src/gen/koidrive/v1/rpc_pb";
 
 const ADDRESS = "198.51.100.7";
 const LOST_RESPONSES = 3;
@@ -25,7 +25,7 @@ async function claim(setupAttempt: string, deviceName = "Laptop"): Promise<Devic
 
 async function refreshes(device: DeviceCredentials): Promise<boolean> {
   const body = toBinary(TokenRequestSchema, create(TokenRequestSchema, { deviceId: device.deviceId, refreshCredential: device.refreshCredential }));
-  const response = await exports.default.fetch("https://flarebox.test/v1/token", { method: "POST", headers: { "Content-Type": "application/x-protobuf" }, body });
+  const response = await exports.default.fetch("https://koidrive.test/v1/token", { method: "POST", headers: { "Content-Type": "application/x-protobuf" }, body });
   await response.arrayBuffer();
   return response.ok;
 }
@@ -69,7 +69,7 @@ describe("recovery-key claims of one setup attempt", () => {
   });
 
   it("reports in ServerInfo that the Account DO handles setup attempts", async () => {
-    const response = await exports.default.fetch("https://flarebox.test/v1/server");
+    const response = await exports.default.fetch("https://koidrive.test/v1/server");
     expect(fromBinary(ServerInfoSchema, new Uint8Array(await response.arrayBuffer())).setupAttempts).toBe(true);
   });
 

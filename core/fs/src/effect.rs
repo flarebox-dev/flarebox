@@ -5,7 +5,7 @@
 //!
 //! Every name change in the sync root is one rename that never replaces an
 //! entry, or one `mkdir`; nothing in the root is unlinked or overwritten.
-//! An entry an effect displaces goes to `.flarebox/quarantine/<effect id>`
+//! An entry an effect displaces goes to `.koidrive/quarantine/<effect id>`
 //! first, is compared with what the caller expected, and then goes to the
 //! local trash, or back to its name, or, when the name was taken in the
 //! meantime, to a recovered name beside it. After every rename the source
@@ -24,7 +24,7 @@ use std::os::fd::{AsFd, BorrowedFd};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use flarebox_ignore::PLATFORM_FILES;
+use koidrive_ignore::PLATFORM_FILES;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 
@@ -53,7 +53,7 @@ pub enum Action {
     CreateDir {
         at: Location,
     },
-    /// Puts the staged file `.flarebox/staging/<effect id>` at `at`. With
+    /// Puts the staged file `.koidrive/staging/<effect id>` at `at`. With
     /// `replaces`, that entry goes to quarantine first; it sits elsewhere when
     /// the node also moves.
     WriteFile {

@@ -4,13 +4,13 @@ import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { createExecutionContext, runInDurableObject, waitOnExecutionContext } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { CommitSchema } from "../src/gen/flarebox/v1/commit_pb";
+import { CommitSchema } from "../src/gen/koidrive/v1/commit_pb";
 import worker, { AccountDO, SpaceDO } from "../src/worker";
 
 describe("server scaffold", () => {
   it("answers 404 for unknown routes", async () => {
     const ctx = createExecutionContext();
-    const response = await worker.fetch(new Request("https://flarebox.test/"), env, ctx);
+    const response = await worker.fetch(new Request("https://koidrive.test/"), env, ctx);
     await waitOnExecutionContext(ctx);
     expect(response.status).toBe(404);
   });

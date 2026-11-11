@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
-use flarebox_proto::v1::{AccessToken, DeviceCredentials, TokenRequest};
+use koidrive_proto::v1::{AccessToken, DeviceCredentials, TokenRequest};
 use tokio::sync::Mutex;
 
 use crate::api::Api;

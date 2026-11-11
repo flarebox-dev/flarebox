@@ -4,9 +4,9 @@
 // device, writes a space with files and creates a share link, and records what it wrote for upgrade-verify.ts.
 
 import { afterAll, expect, it } from "vitest";
-import { SpaceInfoSchema } from "../../src/gen/flarebox/v1/auth_pb";
-import { OpResult_Code } from "../../src/gen/flarebox/v1/commit_pb";
-import { ShareLinkSchema } from "../../src/gen/flarebox/v1/share_pb";
+import { SpaceInfoSchema } from "../../src/gen/koidrive/v1/auth_pb";
+import { OpResult_Code } from "../../src/gen/koidrive/v1/commit_pb";
+import { ShareLinkSchema } from "../../src/gen/koidrive/v1/share_pb";
 import { Device, fileData, op, randomBytes, Server, SpaceClient, stats, uuidv7 } from "./client";
 import { addStats, readState, writeState } from "./state.ts";
 

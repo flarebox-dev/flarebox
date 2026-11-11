@@ -20,7 +20,7 @@ ln -s /Applications "$staging/Applications"
 rm -f "$dmg"
 # hdiutil create sometimes fails with "Resource busy" on CI machines; retry before giving up.
 for attempt in 1 2 3 4 5; do
-  if hdiutil create -volname Flarebox -srcfolder "$staging" -fs HFS+ -format UDZO -ov "$dmg"; then
+  if hdiutil create -volname Koidrive -srcfolder "$staging" -fs HFS+ -format UDZO -ov "$dmg"; then
     break
   fi
   if [ "$attempt" -eq 5 ]; then

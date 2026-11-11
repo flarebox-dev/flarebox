@@ -9,12 +9,12 @@
 
 use std::path::Path;
 
-use flarebox_engine::classify::Trees;
-use flarebox_engine::commit::{Commits, Halt, Reconnect};
-use flarebox_engine::ids::{IdGen, uuid_v7};
-use flarebox_engine::restore::{Outcome, Resolved, RestoreId, RestoreIntent};
-use flarebox_proto::v1::{CommitResult, OpResult, Welcome, op, op_result};
-use flarebox_store::{EngineState, Error, Store};
+use koidrive_engine::classify::Trees;
+use koidrive_engine::commit::{Commits, Halt, Reconnect};
+use koidrive_engine::ids::{IdGen, uuid_v7};
+use koidrive_engine::restore::{Outcome, Resolved, RestoreId, RestoreIntent};
+use koidrive_proto::v1::{CommitResult, OpResult, Welcome, op, op_result};
+use koidrive_store::{EngineState, Error, Store};
 use rusqlite::Connection;
 
 const NOW: u64 = 1_794_268_740_000;

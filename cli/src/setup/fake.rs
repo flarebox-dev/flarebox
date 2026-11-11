@@ -15,7 +15,7 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use url::Url;
 
-use flarebox_cloudflare::{Account, CLIENT_ID, Endpoints, Login};
+use koidrive_cloudflare::{Account, CLIENT_ID, Endpoints, Login};
 
 use super::Session;
 
@@ -88,7 +88,7 @@ pub fn cf(method: &'static str, path: &str, result: serde_json::Value) -> Reply 
     }
 }
 
-/// A Flarebox server's protobuf answer to `method` on `path`.
+/// A Koidrive server's protobuf answer to `method` on `path`.
 pub fn proto(method: &'static str, path: &str, message: impl prost::Message) -> Reply {
     Reply {
         method,
@@ -110,7 +110,7 @@ pub fn tokens() -> Reply {
             "access_token": "access",
             "refresh_token": "refresh",
             "expires_in": 3600,
-            "scope": flarebox_cloudflare::SCOPES.join(" "),
+            "scope": koidrive_cloudflare::SCOPES.join(" "),
         })
         .to_string()
         .into_bytes(),

@@ -47,10 +47,10 @@ impl Paths {
                 .or_else(|| home.as_ref().map(|home| home.join(default)))
                 .ok_or(PathsError::NoHome)
         };
-        let config_dir = base("XDG_CONFIG_HOME", ".config")?.join("flarebox");
-        let state_dir = base("XDG_STATE_HOME", ".local/state")?.join("flarebox");
+        let config_dir = base("XDG_CONFIG_HOME", ".config")?.join("koidrive");
+        let state_dir = base("XDG_STATE_HOME", ".local/state")?.join("koidrive");
         let runtime_dir = absolute("XDG_RUNTIME_DIR")
-            .map(|dir| dir.join("flarebox"))
+            .map(|dir| dir.join("koidrive"))
             .unwrap_or_else(|| state_dir.clone());
         Ok(Paths {
             config_file: config_dir.join("config.toml"),
@@ -120,19 +120,19 @@ mod tests {
         let paths = Paths::from_vars(vars(&[("HOME", "/home/ada")])).unwrap();
         assert_eq!(
             paths.config_file,
-            Path::new("/home/ada/.config/flarebox/config.toml")
+            Path::new("/home/ada/.config/koidrive/config.toml")
         );
         assert_eq!(
             paths.state_dir,
-            Path::new("/home/ada/.local/state/flarebox")
+            Path::new("/home/ada/.local/state/koidrive")
         );
         assert_eq!(
             paths.socket(),
-            Path::new("/home/ada/.local/state/flarebox/daemon.sock")
+            Path::new("/home/ada/.local/state/koidrive/daemon.sock")
         );
         assert_eq!(
             paths.credential(),
-            Path::new("/home/ada/.local/state/flarebox/credential.json")
+            Path::new("/home/ada/.local/state/koidrive/credential.json")
         );
     }
 
@@ -145,14 +145,14 @@ mod tests {
             ("XDG_RUNTIME_DIR", "/run/user/1000"),
         ]))
         .unwrap();
-        assert_eq!(paths.config_file, Path::new("/cfg/flarebox/config.toml"));
+        assert_eq!(paths.config_file, Path::new("/cfg/koidrive/config.toml"));
         assert_eq!(
             paths.state_dir,
-            Path::new("/home/ada/.local/state/flarebox")
+            Path::new("/home/ada/.local/state/koidrive")
         );
         assert_eq!(
             paths.socket(),
-            Path::new("/run/user/1000/flarebox/daemon.sock")
+            Path::new("/run/user/1000/koidrive/daemon.sock")
         );
     }
 

@@ -3,13 +3,13 @@
 ## Read the status
 
 ```sh
-flarebox status
+koi status
 ```
 
 ```
-Device: laptop (019a...) on https://flarebox.alice.workers.dev
+Device: laptop (019a...) on https://koidrive.alice.workers.dev
 Daemon: running
-/home/alice/Flarebox  space Flarebox (019a...)  UpToDate  seq 1204 of 1204, 3120 remote nodes, 3118 local entries, 0 questions
+/home/alice/Koidrive  space Koidrive (019a...)  UpToDate  seq 1204 of 1204, 3120 remote nodes, 3118 local entries, 0 questions
 ```
 
 Each linked folder has one line. Its state is one of these:
@@ -53,7 +53,7 @@ Some problems clear by themselves. A folder that was moved away, or whose root c
 Other problems need you. Fix what the problem names, then:
 
 ```sh
-flarebox restart ~/Flarebox
+koi restart ~/Koidrive
 ```
 
 This stops the folder and syncs it again from the start. While the daemon isn't running, the folder syncs at the next start.
@@ -67,29 +67,29 @@ When the server refuses a folder's changes for a reason that retrying won't fix,
 For a cause you fixed on the server, such as access restored to this device, send the refused changes again as they were:
 
 ```sh
-flarebox lift ~/Flarebox --resend
+koi lift ~/Koidrive --resend
 ```
 
 For a cause fixed on this device, plan the changes again into a new commit:
 
 ```sh
-flarebox lift ~/Flarebox --replan
+koi lift ~/Koidrive --replan
 ```
 
-If the fix is a newer `flarebox`, install it and restart the daemon before you run `lift`, because `lift` runs in the daemon when one is running. A restart alone doesn't send the refused changes again. When the problem says the space's owner must confirm the changes, `lift` can't help, because Flarebox can't ask for that confirmation yet.
+If the fix is a newer `koi`, install it and restart the daemon before you run `lift`, because `lift` runs in the daemon when one is running. A restart alone doesn't send the refused changes again. When the problem says the space's owner must confirm the changes, `lift` can't help, because Koidrive can't ask for that confirmation yet.
 
 ## Questions
 
 ```sh
-flarebox questions
-flarebox questions answer <id> <answer>
+koi questions
+koi questions answer <id> <answer>
 ```
 
-`flarebox questions` lists the questions a folder is waiting on, with the answers each accepts, and `answer` gives one. The number of open questions is at the end of each folder's status line.
+`koi questions` lists the questions a folder is waiting on, with the answers each accepts, and `answer` gives one. The number of open questions is at the end of each folder's status line.
 
 Sync asks before it deletes many files at once. It holds this device's deletions when, within 10 minutes, they number more than 1,000, or they would remove more than half of the files of a space that has at least 20. A removed folder counts as one deletion of all the files it held. Sync then holds every deletion it has not sent yet and asks one question. Until you answer, the files stay on the server and on your other devices, and every other change keeps syncing, also after a restart.
 
 - `delete` deletes the held files on the server and on every device.
 - `restore` downloads them to this device again.
 
-`flarebox questions` lists the first 20 held files and folders, and `--json` lists all of them. If the held deletions change before you answer, for example because you put a file back or deleted more, the question is replaced by a new one with a new ID. Sync keeps holding what is left until you answer, even when it no longer crosses a limit. An answer covers only the files its question listed: if you deleted more before sync took your answer, it asks again.
+`koi questions` lists the first 20 held files and folders, and `--json` lists all of them. If the held deletions change before you answer, for example because you put a file back or deleted more, the question is replaced by a new one with a new ID. Sync keeps holding what is left until you answer, even when it no longer crosses a limit. An answer covers only the files its question listed: if you deleted more before sync took your answer, it asks again.

@@ -4,15 +4,15 @@
 //! hand-built trees and results: the `Restore` op a commit carries for each, what its result does
 //! to the trees, and how a restore ends or waits when the commit is refused, lost or halted.
 
-use flarebox_engine::classify::{Class, Trees};
-use flarebox_engine::commit::{Commits, Failure, Halt, MAX_OPS, Reconnect};
-use flarebox_engine::effects::{Effect, Effects};
-use flarebox_engine::ids::{IdGen, uuid_v7};
-use flarebox_engine::restore::{
+use koidrive_engine::classify::{Class, Trees};
+use koidrive_engine::commit::{Commits, Failure, Halt, MAX_OPS, Reconnect};
+use koidrive_engine::effects::{Effect, Effects};
+use koidrive_engine::ids::{IdGen, uuid_v7};
+use koidrive_engine::restore::{
     Malformed, Outcome, RESOLVED_KEPT, Rejection, Resolved, RestoreIntent,
 };
-use flarebox_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape};
-use flarebox_proto::v1::{self as proto, CommitResult, OpResult, Welcome, error, op, op_result};
+use koidrive_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape};
+use koidrive_proto::v1::{self as proto, CommitResult, OpResult, Welcome, error, op, op_result};
 
 const NOW: u64 = 1_794_268_740_000;
 const HISTORY: &str = "history";

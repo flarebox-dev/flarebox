@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use flarebox_ignore::{Change, Kind, LocalRules, Matcher, NameKey, Reason, RuleFile, Status};
+use koidrive_ignore::{Change, Kind, LocalRules, Matcher, NameKey, Reason, RuleFile, Status};
 use proptest::prelude::*;
 use proptest::sample::Index;
 
@@ -21,7 +21,7 @@ struct Folded;
 
 impl NameKey for Folded {
     fn key(name: &str) -> String {
-        flarebox_engine::names::name_key(name)
+        koidrive_engine::names::name_key(name)
     }
 }
 
@@ -30,9 +30,9 @@ type Tree = BTreeMap<Vec<String>, Kind>;
 fn name() -> impl Strategy<Value = String> {
     prop_oneof![
         8 => "[aAb][aAb.]?",
-        1 => Just(".fbignore".to_owned()),
+        1 => Just(".koiignore".to_owned()),
         1 => Just(".DS_Store".to_owned()),
-        1 => Just(".flarebox".to_owned()),
+        1 => Just(".koidrive".to_owned()),
     ]
 }
 
@@ -80,8 +80,8 @@ fn line() -> impl Strategy<Value = String> {
             "a/**",
             "?",
             "[ab]",
-            "!.fbignore",
-            ".fbignore",
+            "!.koiignore",
+            ".koiignore",
             "!.DS_Store",
             "*/",
             "!*/",
@@ -269,9 +269,9 @@ proptest! {
                 || status[&parent.to_vec()] == Status::Included;
             if !parent_included {
                 prop_assert_eq!(status[path], status[&parent.to_vec()]);
-            } else if name == ".ds_store" || (path.len() == 1 && name == ".flarebox") {
+            } else if name == ".ds_store" || (path.len() == 1 && name == ".koidrive") {
                 prop_assert_eq!(status[path], Status::Excluded(Reason::BuiltIn));
-            } else if *kind == Kind::File && name == ".fbignore" {
+            } else if *kind == Kind::File && name == ".koiignore" {
                 prop_assert_eq!(status[path], Status::Included);
             }
         }
@@ -296,10 +296,10 @@ proptest! {
         matcher.set_rules(&[] as &[&str], Some(file), []);
         let kind = if is_dir { Kind::Dir } else { Kind::File };
         let _ = matcher.status(&path, kind);
-        prop_assert_eq!(matcher.status(&[".fbignore"], Kind::File), Status::Included);
+        prop_assert_eq!(matcher.status(&[".koiignore"], Kind::File), Status::Included);
     }
     /// NFC and NFD spellings of a pattern, and of the names it is matched against, give the same
-    /// verdicts (review of flarebox#50).
+    /// verdicts (review of koidrive#50).
     #[test]
     fn equivalent_spellings_give_the_same_verdicts(
         lines in prop::collection::vec(prop::collection::vec((any::<Index>(), any::<Index>()), 1..6), 1..4),

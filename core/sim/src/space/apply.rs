@@ -5,8 +5,8 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use flarebox_engine::names::{conflict_name, is_reserved_at_root, name_key, normalize_name};
-use flarebox_proto::v1::{
+use koidrive_engine::names::{conflict_name, is_reserved_at_root, name_key, normalize_name};
+use koidrive_proto::v1::{
     ChangeRecord, ChunkRef, Content, CreateDir, CreateFile, Delete, Error, Move, NodeKind,
     NodeStatus, Op, OpResult, Restore, change_record, error, op, op_result,
 };

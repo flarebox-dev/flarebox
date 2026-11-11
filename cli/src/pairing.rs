@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pairing codes that carry their server: `<code>@<host>`, such as `K7QM-2XPD@flarebox.alice.workers.dev`
+//! Pairing codes that carry their server: `<code>@<host>`, such as `K7QM-2XPD@koidrive.alice.workers.dev`
 //! (docs/design/cli-setup.md section 1).
 
 use url::Url;
@@ -39,7 +39,7 @@ pub fn parse(text: &str, server: Option<&str>) -> Result<Invitation, String> {
     })
 }
 
-/// The arguments of `flarebox join` for `code` from `server`: `<code>@<host>`, which [`parse`] reads back, for an https
+/// The arguments of `koi join` for `code` from `server`: `<code>@<host>`, which [`parse`] reads back, for an https
 /// address with no path, and the code with `--server` for any other.
 pub fn join_args(code: &str, server: &Url) -> String {
     match (
@@ -89,10 +89,10 @@ mod tests {
     #[test]
     fn a_code_carries_its_server() {
         assert_eq!(
-            parse(" K7QM-2XPD@flarebox.alice.workers.dev ", None),
+            parse(" K7QM-2XPD@koidrive.alice.workers.dev ", None),
             Ok(Invitation {
                 code: "K7QM-2XPD".into(),
-                server: "https://flarebox.alice.workers.dev".into(),
+                server: "https://koidrive.alice.workers.dev".into(),
             })
         );
     }
@@ -118,10 +118,10 @@ mod tests {
     #[test]
     fn join_args_read_back_as_the_same_code_and_server() {
         for server in [
-            "https://flarebox.alice.workers.dev",
+            "https://koidrive.alice.workers.dev",
             "https://files.example.com:8443",
             "http://127.0.0.1:8787",
-            "https://files.example.com/flarebox/",
+            "https://files.example.com/koidrive/",
         ] {
             let url = Url::parse(server).unwrap();
             let args = join_args("K7QM-2XPD", &url);
@@ -136,9 +136,9 @@ mod tests {
         assert_eq!(
             join_args(
                 "K7QM-2XPD",
-                &Url::parse("https://flarebox.alice.workers.dev").unwrap()
+                &Url::parse("https://koidrive.alice.workers.dev").unwrap()
             ),
-            "K7QM-2XPD@flarebox.alice.workers.dev"
+            "K7QM-2XPD@koidrive.alice.workers.dev"
         );
     }
 
@@ -172,8 +172,8 @@ mod tests {
     #[test]
     fn a_bare_server_host_gets_https() {
         assert_eq!(
-            server_url(" flarebox.alice.workers.dev "),
-            "https://flarebox.alice.workers.dev"
+            server_url(" koidrive.alice.workers.dev "),
+            "https://koidrive.alice.workers.dev"
         );
         assert_eq!(server_url("http://127.0.0.1:8787"), "http://127.0.0.1:8787");
     }

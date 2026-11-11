@@ -7,13 +7,13 @@
 //! [`Tx::set_engine_state`] writes it. A request moves from one to the other in one transaction,
 //! so it is never in both and never in neither.
 //!
-//! [`CommitsState`]: flarebox_engine::state::CommitsState
+//! [`CommitsState`]: koidrive_engine::state::CommitsState
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flarebox_engine::restore::{Outcome, Rejection, Resolved, RestoreId, RestoreIntent};
-use flarebox_engine::tree::NodeId;
-use flarebox_proto::v1::Restore;
+use koidrive_engine::restore::{Outcome, Rejection, Resolved, RestoreId, RestoreIntent};
+use koidrive_engine::tree::NodeId;
+use koidrive_proto::v1::Restore;
 use rusqlite::params;
 
 use crate::{Error, Result, Tx};

@@ -18,11 +18,11 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use flarebox_driver::{
+use koidrive_driver::{
     self as driver, Driver, DriverError, FolderState as DriverFolderState, Paths, Status, api_for,
 };
-use flarebox_net::{Api, ApiError, Auth, PROTO_MAX, PROTO_MIN};
-use flarebox_proto::v1::{CreateSpaceRequest, error::Code};
+use koidrive_net::{Api, ApiError, Auth, PROTO_MAX, PROTO_MIN};
+use koidrive_proto::v1::{CreateSpaceRequest, error::Code};
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::watch;
 
@@ -68,7 +68,7 @@ impl DriverCore {
     pub(crate) fn open(dir: &Path, events: Events) -> Result<Arc<Self>, SessionError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
-            .thread_name("flarebox-sync")
+            .thread_name("koidrive-sync")
             .enable_all()
             .build()
             .map_err(|error| SessionError::Failed {
@@ -245,7 +245,7 @@ fn follow(
     runtime: Handle,
 ) -> Option<JoinHandle<()>> {
     let spawned = thread::Builder::new()
-        .name("flarebox-state".into())
+        .name("koidrive-state".into())
         .spawn(move || {
             while runtime.block_on(changes.changed()).is_ok() {
                 let Some(core) = core.upgrade() else { return };
@@ -837,8 +837,8 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
 
-    use flarebox_net::ServerError;
-    use flarebox_proto::v1::Error as ProtoError;
+    use koidrive_net::ServerError;
+    use koidrive_proto::v1::Error as ProtoError;
 
     use super::*;
     use crate::SyncSession;
@@ -1119,7 +1119,7 @@ mod tests {
     fn calls_the_driver_does_not_make_present_its_credential_and_staged_slot() {
         use prost::Message;
 
-        let token = flarebox_proto::v1::AccessToken {
+        let token = koidrive_proto::v1::AccessToken {
             token: "token".into(),
             expires_at_ms: i64::MAX,
             server_time_ms: 5_000,
@@ -1135,7 +1135,7 @@ mod tests {
             (200, token.encode_to_vec()),
             (
                 200,
-                flarebox_proto::v1::SpaceList::default().encode_to_vec(),
+                koidrive_proto::v1::SpaceList::default().encode_to_vec(),
             ),
         ]);
         let dir = tempfile::tempdir().unwrap();
@@ -1175,7 +1175,7 @@ mod tests {
         let presented: Vec<(String, String)> = requests[..2]
             .iter()
             .map(|(_, body)| {
-                let request = flarebox_proto::v1::TokenRequest::decode(body.as_slice()).unwrap();
+                let request = koidrive_proto::v1::TokenRequest::decode(body.as_slice()).unwrap();
                 (request.refresh_credential, request.next_refresh_credential)
             })
             .collect();
@@ -1280,17 +1280,17 @@ mod tests {
                 }
                 let spaces = !bytes.starts_with(b"POST /v1/token ");
                 let body = if spaces {
-                    flarebox_proto::v1::SpaceList::default().encode_to_vec()
+                    koidrive_proto::v1::SpaceList::default().encode_to_vec()
                 } else {
                     let request =
-                        flarebox_proto::v1::TokenRequest::decode(&bytes[end..end + length])
+                        koidrive_proto::v1::TokenRequest::decode(&bytes[end..end + length])
                             .unwrap();
                     if index == 0 {
                         assert!(request.rotation && request.next_refresh_credential.is_empty());
                         arrived.send(()).unwrap();
                         held.recv_timeout(Duration::from_secs(30)).unwrap();
                     }
-                    flarebox_proto::v1::AccessToken {
+                    koidrive_proto::v1::AccessToken {
                         token: "access".into(),
                         expires_at_ms: i64::MAX,
                         server_time_ms: 5_000,

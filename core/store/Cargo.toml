@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-name = "flarebox-store"
+name = "koidrive-store"
 description = "Local SQLite state for a synced space."
 version.workspace = true
 edition.workspace = true
@@ -10,9 +10,9 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-flarebox-engine = { path = "../engine", features = ["serde"] }
-flarebox-fs = { path = "../fs" }
-flarebox-proto = { path = "../proto" }
+koidrive-engine = { path = "../engine", features = ["serde"] }
+koidrive-fs = { path = "../fs" }
+koidrive-proto = { path = "../proto" }
 prost.workspace = true
 serde_json = "1.0.154"
 rusqlite = { version = "0.41.1", features = ["bundled", "fallible_uint"] }

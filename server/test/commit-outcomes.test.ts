@@ -3,8 +3,8 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { OpResult_Code } from "../src/gen/flarebox/v1/commit_pb";
-import { Error_Code } from "../src/gen/flarebox/v1/rpc_pb";
+import { OpResult_Code } from "../src/gen/koidrive/v1/commit_pb";
+import { Error_Code } from "../src/gen/koidrive/v1/rpc_pb";
 import { toHex, uuidv7 } from "../src/ids";
 import { MAX_HEAD_CHECKS, type SpaceDO } from "../src/space-do";
 import { client, content, newSpace, op, type TestClient } from "./helpers";

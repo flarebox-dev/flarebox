@@ -2,14 +2,14 @@
 
 //! The mass-delete guard (design section 6.1) as the commit planner applies it.
 
-use flarebox_engine::classify::{Class, Trees};
-use flarebox_engine::commit::Commits;
-use flarebox_engine::guard::{Limit, WINDOW_MS, Window};
-use flarebox_engine::ids::IdGen;
-use flarebox_engine::question::{Answer, Held, Question, QuestionKind, RecoveryGroup};
-use flarebox_engine::state::CommitsState;
-use flarebox_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape};
-use flarebox_proto::v1::{CommitResult, OpResult, op, op_result};
+use koidrive_engine::classify::{Class, Trees};
+use koidrive_engine::commit::Commits;
+use koidrive_engine::guard::{Limit, WINDOW_MS, Window};
+use koidrive_engine::ids::IdGen;
+use koidrive_engine::question::{Answer, Held, Question, QuestionKind, RecoveryGroup};
+use koidrive_engine::state::CommitsState;
+use koidrive_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape};
+use koidrive_proto::v1::{CommitResult, OpResult, op, op_result};
 
 const ROOT: &str = "root";
 const NOW: u64 = 1_794_268_740_000;
@@ -497,7 +497,7 @@ fn a_held_file_changed_on_the_server_leaves_the_question_and_is_downloaded() {
 fn nothing_is_counted_while_committing_has_stopped() {
     let mut trees = space(10, 15);
     let mut commits = Commits::from_state(CommitsState {
-        halted: Some(flarebox_engine::commit::Halt::Recovery),
+        halted: Some(koidrive_engine::commit::Halt::Recovery),
         ..Default::default()
     })
     .unwrap();

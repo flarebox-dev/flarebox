@@ -69,7 +69,7 @@ run() {
   local status=0
   STUB="$work/$name" PATH="$work/bin:$PATH" NOTARY_KEY_PATH="$key_path" NOTARY_KEY_ID="$key_id" NOTARY_ISSUER_ID="$issuer_id" \
     NOTARY_POLL_SECONDS=0 NOTARY_BACKOFF_SECONDS="${BACKOFF:-0}" NOTARY_DEADLINE_SECONDS="${DEADLINE:-60}" \
-    "$scripts/notarize.sh" Flarebox.zip "$@" >"$work/$name.out" 2>&1 || status=$?
+    "$scripts/notarize.sh" Koidrive.zip "$@" >"$work/$name.out" 2>&1 || status=$?
   if [ "$status" -ne "$expected" ]; then
     fail "$name" "exited with $status, expected $expected"
   fi
@@ -108,7 +108,7 @@ expect_output an_earlier_submission_is_awaited_without_submitting_again "Notariz
 
 run an_invalid_submission_prints_apples_log 1 "Invalid"
 expect_output an_invalid_submission_prints_apples_log "The binary is not signed."
-expect_output an_invalid_submission_prints_apples_log "Apple reported submission $id for Flarebox.zip as Invalid"
+expect_output an_invalid_submission_prints_apples_log "Apple reported submission $id for Koidrive.zip as Invalid"
 expect_calls an_invalid_submission_prints_apples_log "submit info log "
 
 run a_rejected_submission_fails 1 "Rejected"

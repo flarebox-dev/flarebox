@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 import type { AccountDO } from "../src/account-do";
 import { MIGRATIONS as ACCOUNT_MIGRATIONS } from "../src/account/schema";
 import { sha256 } from "../src/crypto";
-import { OpResult_Code } from "../src/gen/flarebox/v1/commit_pb";
+import { OpResult_Code } from "../src/gen/koidrive/v1/commit_pb";
 import { toHex, uuidv7 } from "../src/ids";
 import type { Migration } from "../src/migrations";
 import type { SpaceDO } from "../src/space-do";

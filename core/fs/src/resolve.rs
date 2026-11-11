@@ -32,14 +32,14 @@ pub struct Dir {
 pub enum Base {
     /// The sync root.
     Root,
-    /// The parked folder `.flarebox/parked/<name>`, which must have `id`.
+    /// The parked folder `.koidrive/parked/<name>`, which must have `id`.
     Parked { name: OsString, id: FileId },
 }
 
 /// An entry's place on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Location {
-    /// `.flarebox/parked/<name>` itself.
+    /// `.koidrive/parked/<name>` itself.
     Parked(OsString),
     /// `name` inside the last of `dirs`, which start at `base`.
     At {
@@ -212,7 +212,7 @@ impl Space {
         Ok(folder)
     }
 
-    /// Opens `.flarebox/<parts>`, creating the folders that are missing, and
+    /// Opens `.koidrive/<parts>`, creating the folders that are missing, and
     /// records the identity of each folder on the way, so that
     /// [`Space::recheck`] also notices one of them moved. Each part must be a
     /// single file name.

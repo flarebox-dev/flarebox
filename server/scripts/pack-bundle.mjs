@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Packs the server the way `flarebox setup` uploads it (docs/design/cli-setup.md section 4.2): the Worker module from
+// Packs the server the way `koi setup` uploads it (docs/design/cli-setup.md section 4.2): the Worker module from
 // a dry-run deploy, the static assets, and manifest.json with what an API upload needs from wrangler.jsonc. The CLI
 // embeds the result, so its deploy needs neither Node nor Wrangler. Needs no account or credentials.
 // Usage: node scripts/pack-bundle.mjs <output directory>
@@ -76,7 +76,7 @@ if (fromAssets === "" || (fromAssets.split(sep)[0] !== ".." && !isAbsolute(fromA
   fail(output + " is inside " + config.assets.directory + ", which the packer copies into it; name a directory outside it");
 }
 
-const built = mkdtempSync(join(tmpdir(), "flarebox-bundle-"));
+const built = mkdtempSync(join(tmpdir(), "koidrive-bundle-"));
 try {
   console.log("$ wrangler deploy --dry-run --outdir " + built);
   execFileSync("pnpm", ["exec", "wrangler", "deploy", "--dry-run", "--outdir", built], {

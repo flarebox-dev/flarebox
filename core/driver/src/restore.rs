@@ -8,9 +8,9 @@
 
 use std::hash::{BuildHasher, Hasher, RandomState};
 
-use flarebox_engine::ids::uuid_v7;
-use flarebox_engine::restore::{Malformed, Outcome, Rejection, RestoreIntent};
-use flarebox_store::Tx;
+use koidrive_engine::ids::uuid_v7;
+use koidrive_engine::restore::{Malformed, Outcome, Rejection, RestoreIntent};
+use koidrive_store::Tx;
 use serde::{Deserialize, Serialize};
 
 /// What to restore. The IDs come from the server's `ListTrash` and `ListVersions`.
@@ -164,7 +164,7 @@ pub(crate) fn new_id(now_ms: u64) -> String {
 /// Every restore the store knows: first those that ended, in the order they ended, then those that wait, in
 /// request order. A restore the engine has taken and one it has not are both pending, and either says so when
 /// its node is a problem.
-pub(crate) fn list(tx: &Tx<'_>) -> Result<Vec<RestoreStatus>, flarebox_store::Error> {
+pub(crate) fn list(tx: &Tx<'_>) -> Result<Vec<RestoreStatus>, koidrive_store::Error> {
     let (queued, resolved) = tx.restores()?;
     let problems = tx.problem_nodes()?;
     let ended = resolved.iter().map(|ended| RestoreStatus {

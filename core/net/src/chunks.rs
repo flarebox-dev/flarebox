@@ -9,7 +9,7 @@ use std::io;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use flarebox_proto::v1::{ChunkRef, Target, UploadReceipt, chunk_plan::Action};
+use koidrive_proto::v1::{ChunkRef, Target, UploadReceipt, chunk_plan::Action};
 use prost::Message;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::{Method, StatusCode};
@@ -268,7 +268,7 @@ impl Transfer {
                     if tries >= self.attempts {
                         return Err(error);
                     }
-                    tracing::debug!(%error, "flarebox chunk transfer will be retried");
+                    tracing::debug!(%error, "koidrive chunk transfer will be retried");
                     let asked = match &error {
                         ChunkError::Refused {
                             error: Some(server),

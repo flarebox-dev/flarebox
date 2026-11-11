@@ -5,7 +5,7 @@
 //! with this crate. A failure here means the boundary algorithm changed and
 //! the `fastcdc2020-1m-4m-16m` identifier no longer describes it.
 
-use flarebox_chunk::{ChunkerConfig, chunks};
+use koidrive_chunk::{ChunkerConfig, chunks};
 
 enum Input {
     Noise(usize, u64),

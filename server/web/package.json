@@ -1,8 +1,8 @@
 {
-  "name": "flarebox-web",
+  "name": "koidrive-web",
   "version": "0.0.0",
   "private": true,
-  "description": "Flarebox web pages served by the Worker: today the share-link viewer.",
+  "description": "Koidrive web pages served by the Worker: today the share-link viewer.",
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "scripts": {

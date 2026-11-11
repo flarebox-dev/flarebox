@@ -11,12 +11,12 @@ import {
   DeviceCredentialsSchema,
   ServerInfoSchema,
   SpaceInfoSchema,
-} from "../src/gen/flarebox/v1/auth_pb";
-import { ClientMessageSchema, type ServerMessage, ServerMessageSchema } from "../src/gen/flarebox/v1/messages_pb";
+} from "../src/gen/koidrive/v1/auth_pb";
+import { ClientMessageSchema, type ServerMessage, ServerMessageSchema } from "../src/gen/koidrive/v1/messages_pb";
 import { Close } from "../src/space-do";
 import { PROTO_MAX, PROTO_MIN, SERVER_VERSION } from "../src/version";
 
-const BASE = "https://flarebox.test";
+const BASE = "https://koidrive.test";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -37,7 +37,7 @@ function deployment() {
   setup ??= (async () => {
     const log = vi.spyOn(console, "log");
     await exports.default.fetch(BASE + "/setup");
-    const code = log.mock.calls.map((args) => String(args[0])).find((text) => text.startsWith("Flarebox claim code"))!.split(": ")[1]!;
+    const code = log.mock.calls.map((args) => String(args[0])).find((text) => text.startsWith("Koidrive claim code"))!.split(": ")[1]!;
     const claim = toBinary(ClaimRequestSchema, create(ClaimRequestSchema, { code, userName: "Owner", deviceName: "Laptop", platform: "macos" }));
     const owner = await post("/v1/claim", claim, DeviceCredentialsSchema);
     const request = toBinary(CreateSpaceRequestSchema, create(CreateSpaceRequestSchema, { name: "Home" }));

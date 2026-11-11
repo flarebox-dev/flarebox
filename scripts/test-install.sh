@@ -9,15 +9,15 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 trap 'exit 1' HUP INT TERM
 export HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config"
-export FLAREBOX_RELEASE_BASE_URL="file://$tmp/releases"
-export FLAREBOX_VERSION=v0.0.0
-unset FLAREBOX_INSTALL_DIR
+export KOIDRIVE_RELEASE_BASE_URL="file://$tmp/releases"
+export KOIDRIVE_VERSION=v0.0.0
+unset KOIDRIVE_INSTALL_DIR
 mkdir -p "$HOME" "$tmp/package" "$tmp/releases/download/v0.0.0" "$tmp/releases/latest" "$tmp/bin"
-cp "$binary" "$tmp/package/flarebox"
-cp "$root/cli/systemd/flarebox.service" "$tmp/package/flarebox.service"
-archive=flarebox-$target.tar.gz
+cp "$binary" "$tmp/package/koi"
+cp "$root/cli/systemd/koidrive.service" "$tmp/package/koidrive.service"
+archive=koidrive-$target.tar.gz
 release=$tmp/releases/download/v0.0.0
-tar -czf "$release/$archive" -C "$tmp/package" flarebox flarebox.service
+tar -czf "$release/$archive" -C "$tmp/package" koi koidrive.service
 if command -v sha256sum >/dev/null 2>&1; then
     (cd "$release" && sha256sum "$archive") > "$release/SHA256SUMS"
 else
@@ -35,7 +35,7 @@ reject() {
     fi
     cat "$tmp/rejected.log"
     grep -F "$2" "$tmp/rejected.log"
-    cmp "$binary" "$HOME/.local/bin/flarebox"
+    cmp "$binary" "$HOME/.local/bin/koi"
     pass "$1"
 }
 
@@ -51,21 +51,21 @@ pass 'truncated download does not install anything'
 cat "$root/install.sh" | sh -s -- --no-systemd > "$tmp/install.log" 2>&1
 cat "$tmp/install.log"
 grep -q 'not on PATH' "$tmp/install.log"
-cmp "$binary" "$HOME/.local/bin/flarebox"
-"$HOME/.local/bin/flarebox" --version
+cmp "$binary" "$HOME/.local/bin/koi"
+"$HOME/.local/bin/koi" --version
 pass 'piped install, checksum, executable, and PATH warning'
 sh "$root/install.sh" --no-systemd
-cmp "$binary" "$HOME/.local/bin/flarebox"
+cmp "$binary" "$HOME/.local/bin/koi"
 pass 'repeat installation'
-printf 'old binary\n' > "$HOME/.local/bin/flarebox"
+printf 'old binary\n' > "$HOME/.local/bin/koi"
 sh "$root/install.sh" --no-systemd
-cmp "$binary" "$HOME/.local/bin/flarebox"
+cmp "$binary" "$HOME/.local/bin/koi"
 pass 'upgrade replaces the old binary'
-unset FLAREBOX_VERSION
-FLAREBOX_INSTALL_DIR="$HOME/custom bin" sh "$root/install.sh" --no-systemd
-cmp "$binary" "$HOME/custom bin/flarebox"
+unset KOIDRIVE_VERSION
+KOIDRIVE_INSTALL_DIR="$HOME/custom bin" sh "$root/install.sh" --no-systemd
+cmp "$binary" "$HOME/custom bin/koi"
 pass 'latest release and custom install directory'
-export FLAREBOX_VERSION=0.0.0
+export KOIDRIVE_VERSION=0.0.0
 printf '%064d  %s\n' 0 "$archive" > "$release/SHA256SUMS"
 reject 'checksum mismatch preserves the installed binary' 'Checksum mismatch'
 printf '%064d  other.tar.gz\n' 0 > "$release/SHA256SUMS"
@@ -76,10 +76,10 @@ cp "$tmp/good-sums" "$release/SHA256SUMS"
 mv "$release/$archive" "$tmp/saved.tar.gz"
 reject 'missing tarball' 'curl:'
 mv "$tmp/saved.tar.gz" "$release/$archive"
-FLAREBOX_VERSION=../../bad reject 'invalid version' 'FLAREBOX_VERSION must be'
-export FLAREBOX_VERSION=0.0.0
-FLAREBOX_INSTALL_DIR=relative reject 'relative install directory' 'FLAREBOX_INSTALL_DIR must be'
-unset FLAREBOX_INSTALL_DIR
+KOIDRIVE_VERSION=../../bad reject 'invalid version' 'KOIDRIVE_VERSION must be'
+export KOIDRIVE_VERSION=0.0.0
+KOIDRIVE_INSTALL_DIR=relative reject 'relative install directory' 'KOIDRIVE_INSTALL_DIR must be'
+unset KOIDRIVE_INSTALL_DIR
 
 if [ "$(uname -s)" = Linux ]; then
     cat > "$tmp/bin/systemctl" <<'EOF'
@@ -87,13 +87,13 @@ if [ "$(uname -s)" = Linux ]; then
 printf '%s\n' "$*" >> "$HOME/systemctl.log"
 EOF
     chmod +x "$tmp/bin/systemctl"
-    PATH="$tmp/bin:$PATH" FLAREBOX_INSTALL_DIR="$HOME/custom bin" sh "$root/install.sh" --systemd
-    grep -F "ExecStart=\"$HOME/custom bin/flarebox\" daemon" "$XDG_CONFIG_HOME/systemd/user/flarebox.service"
+    PATH="$tmp/bin:$PATH" KOIDRIVE_INSTALL_DIR="$HOME/custom bin" sh "$root/install.sh" --systemd
+    grep -F "ExecStart=\"$HOME/custom bin/koi\" daemon" "$XDG_CONFIG_HOME/systemd/user/koidrive.service"
     grep -x -- '--user daemon-reload' "$HOME/systemctl.log"
     [ "$(wc -l < "$HOME/systemctl.log" | tr -d ' ')" = 1 ]
     pass 'systemd unit follows the custom directory without starting the daemon'
     PATH="$tmp/bin:$PATH" XDG_CONFIG_HOME="$tmp/no-tty" sh "$root/install.sh" < /dev/null
-    [ ! -e "$tmp/no-tty/systemd/user/flarebox.service" ]
+    [ ! -e "$tmp/no-tty/systemd/user/koidrive.service" ]
     [ "$(wc -l < "$HOME/systemctl.log" | tr -d ' ')" = 1 ]
     pass 'noninteractive default does not install or start the service'
     printf 'Passed 13 installer tests on %s\n' "$(uname -s)"
@@ -109,21 +109,21 @@ EOF
     cat > "$tmp/bin/sysctl" <<'EOF'
 #!/bin/sh
 [ "$*" = '-n hw.optional.arm64' ] || exit 1
-printf '%s\n' "$FLAREBOX_TEST_ARM64"
+printf '%s\n' "$KOIDRIVE_TEST_ARM64"
 EOF
     chmod +x "$tmp/bin/uname" "$tmp/bin/sysctl"
     hash=$(awk 'NR == 1 {print $1}' "$tmp/good-sums")
     for candidate in aarch64 x86_64; do
-        selected=flarebox-$candidate-apple-darwin.tar.gz
+        selected=koidrive-$candidate-apple-darwin.tar.gz
         if [ "$selected" != "$archive" ]; then
             cp "$release/$archive" "$release/$selected"
         fi
         printf '%s  %s\n' "$hash" "$selected" > "$release/SHA256SUMS"
         if [ "$candidate" = aarch64 ]; then arm64=1; else arm64=0; fi
-        PATH="$tmp/bin:$PATH" FLAREBOX_TEST_ARM64=$arm64 sh "$root/install.sh" --no-systemd > "$tmp/arch.log" 2>&1
+        PATH="$tmp/bin:$PATH" KOIDRIVE_TEST_ARM64=$arm64 sh "$root/install.sh" --no-systemd > "$tmp/arch.log" 2>&1
         cat "$tmp/arch.log"
         grep -F "Downloading $selected" "$tmp/arch.log"
-        cmp "$binary" "$HOME/.local/bin/flarebox"
+        cmp "$binary" "$HOME/.local/bin/koi"
         pass "macOS x86_64 shell selects $candidate with hw.optional.arm64=$arm64"
     done
     printf 'Passed 13 installer tests on %s\n' "$(uname -s)"

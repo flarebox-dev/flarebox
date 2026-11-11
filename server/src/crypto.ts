@@ -38,7 +38,7 @@ export async function hmacVerify(secret: Uint8Array, message: string, mac: Uint8
 
 /** The per-space secret for chunk tickets and upload receipts, derived from a server key. */
 export function deriveSpaceKey(serverKey: Uint8Array, spaceId: string): Promise<Uint8Array> {
-  return hmac(serverKey, `flarebox/space-key/v1|${spaceId}`);
+  return hmac(serverKey, `koidrive/space-key/v1|${spaceId}`);
 }
 
 export type ChunkGrant = "put" | "get" | "receipt";

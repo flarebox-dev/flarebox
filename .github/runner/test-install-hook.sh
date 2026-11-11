@@ -29,7 +29,7 @@ new_root() {
 runner() { echo "$root/Users/ghrunner/runner-$1"; }
 install_as_me() {
   code=0
-  out="$(FLAREBOX_INSTALL_ROOT="$root" FLAREBOX_INSTALL_OWNER="$me" FLAREBOX_INSTALL_GROUP="$grp" "$installer" 2>&1)" || code=$?
+  out="$(KOIDRIVE_INSTALL_ROOT="$root" KOIDRIVE_INSTALL_OWNER="$me" KOIDRIVE_INSTALL_GROUP="$grp" "$installer" 2>&1)" || code=$?
 }
 snapshot() {
   local dir="$1" file
@@ -58,7 +58,7 @@ installed() {
   [ "$(cat "$dir/.env")" = "$(printf 'LANG=en_US.UTF-8\nJAVA_HOME=/opt/java-%s\nACTIONS_RUNNER_HOOK_JOB_STARTED=%s' "${dir##*-}" "$root/usr/local/libexec/flarebox/job-started.sh")" ] &&
     [ "$(cat "$dir/.path")" = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/Users/ghrunner/.cargo/bin" ] &&
     [ "$(stat -f '%Sf' "$dir/.env")" = uchg ] && [ "$(stat -f '%Sf' "$dir/.path")" = uchg ] &&
-    [ ! -e "$dir/.env.flarebox-new" ] && [ ! -e "$dir/.path.flarebox-new" ]
+    [ ! -e "$dir/.env.koidrive-new" ] && [ ! -e "$dir/.path.koidrive-new" ]
 }
 all_installed() {
   [ "$code" -eq 0 ] && cmp -s "$(dirname "$installer")/job-started.sh" "$root/usr/local/libexec/flarebox/job-started.sh" &&
@@ -103,7 +103,7 @@ mkdir "$tmp/fake-grep"
 printf '#!/bin/sh\nexit 2\n' > "$tmp/fake-grep/grep"
 chmod +x "$tmp/fake-grep/grep"
 code=0
-out="$(PATH="$tmp/fake-grep:$PATH" FLAREBOX_INSTALL_ROOT="$root" FLAREBOX_INSTALL_OWNER="$me" FLAREBOX_INSTALL_GROUP="$grp" "$installer" 2>&1)" || code=$?
+out="$(PATH="$tmp/fake-grep:$PATH" KOIDRIVE_INSTALL_ROOT="$root" KOIDRIVE_INSTALL_OWNER="$me" KOIDRIVE_INSTALL_GROUP="$grp" "$installer" 2>&1)" || code=$?
 expect "a grep read error stops the install instead of dropping settings" failed_with "cannot filter $(runner 1)/.env; nothing was changed."
 expect "a grep read error leaves the runners unchanged" unchanged "$(runner 1)" "$before1"
 expect "a grep read error installs no hook" no_hook
@@ -124,7 +124,7 @@ mkdir "$tmp/signal-mv"
 cat > "$tmp/signal-mv/mv" <<'EOF'
 #!/bin/bash
 case "${!#}" in
-  */runner-2/.path) kill -"$FLAREBOX_TEST_SIGNAL" "$PPID" ;;
+  */runner-2/.path) kill -"$KOIDRIVE_TEST_SIGNAL" "$PPID" ;;
 esac
 exec /bin/mv "$@"
 EOF
@@ -136,7 +136,7 @@ for signal in TERM:143 INT:130 HUP:129; do
   before2="$(snapshot "$(runner 2)")"
   before3="$(snapshot "$(runner 3)")"
   code=0
-  out="$(FLAREBOX_TEST_SIGNAL="$sig" PATH="$tmp/signal-mv:$PATH" FLAREBOX_INSTALL_ROOT="$root" FLAREBOX_INSTALL_OWNER="$me" FLAREBOX_INSTALL_GROUP="$grp" "$installer" 2>&1)" || code=$?
+  out="$(KOIDRIVE_TEST_SIGNAL="$sig" PATH="$tmp/signal-mv:$PATH" KOIDRIVE_INSTALL_ROOT="$root" KOIDRIVE_INSTALL_OWNER="$me" KOIDRIVE_INSTALL_GROUP="$grp" "$installer" 2>&1)" || code=$?
   expect "SIG$sig after runner-2's .env is swapped exits with $sig_status" interrupted "$sig_status" "$sig"
   expect "SIG$sig restores runner-2 with its files, owners, modes and flags" unchanged "$(runner 2)" "$before2"
   expect "SIG$sig leaves runner-1 fully installed and runner-3 unchanged" installed_and_unchanged "$(runner 1)" "$(runner 3)" "$before3"
@@ -155,13 +155,13 @@ chmod +x "$tmp/fake-root/id"
 new_root
 before1="$(snapshot "$(runner 1)")"
 code=0
-out="$(PATH="$tmp/fake-root:$PATH" FLAREBOX_INSTALL_ROOT="$root" FLAREBOX_INSTALL_OWNER="$me" FLAREBOX_INSTALL_GROUP="$grp" "$installer" 2>&1)" || code=$?
+out="$(PATH="$tmp/fake-root:$PATH" KOIDRIVE_INSTALL_ROOT="$root" KOIDRIVE_INSTALL_OWNER="$me" KOIDRIVE_INSTALL_GROUP="$grp" "$installer" 2>&1)" || code=$?
 expect "as root it refuses the test overrides" failed_with "are for tests without root; unset them to install as root. Nothing was changed."
 expect "as root with the test overrides it changes nothing" nothing_changed "$(runner 1)" "$before1"
 code=0
-out="$(PATH="$tmp/fake-root:$PATH" FLAREBOX_INSTALL_ROOT="$root" "$installer" 2>&1)" || code=$?
-expect "as root it refuses FLAREBOX_INSTALL_ROOT on its own" failed_with "are for tests without root"
-expect "as root with FLAREBOX_INSTALL_ROOT alone it changes nothing" nothing_changed "$(runner 1)" "$before1"
+out="$(PATH="$tmp/fake-root:$PATH" KOIDRIVE_INSTALL_ROOT="$root" "$installer" 2>&1)" || code=$?
+expect "as root it refuses KOIDRIVE_INSTALL_ROOT on its own" failed_with "are for tests without root"
+expect "as root with KOIDRIVE_INSTALL_ROOT alone it changes nothing" nothing_changed "$(runner 1)" "$before1"
 
 new_root
 rm "$(runner 4)/.runner"
@@ -172,7 +172,7 @@ expect "a directory without .runner leaves it unchanged" unchanged "$(runner 4)"
 
 new_root
 code=0
-out="$(FLAREBOX_INSTALL_ROOT="$root" "$installer" 2>&1)" || code=$?
+out="$(KOIDRIVE_INSTALL_ROOT="$root" "$installer" 2>&1)" || code=$?
 expect "without sudo it refuses to run" failed_with "run this with sudo."
 expect "without sudo it installs no hook" no_hook
 

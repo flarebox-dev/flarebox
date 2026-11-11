@@ -1,4 +1,4 @@
-# Flarebox for macOS
+# Koidrive for macOS
 
 A menu bar app that links the Rust core through [UniFFI](https://mozilla.github.io/uniffi-rs/). It has a menu bar menu (status, progress, recent changes, notices, pause and resume, open folder), a first-run setup window (server, sign-in, folder), a questions window, and settings (linked folders, account, storage used by each space, problems, open at login). The session runs the sync driver of `core/driver` in-process through `core/ffi`: it signs this Mac in, links folders, follows each space's log and observes the disk. The driver does not run the sync engine yet, so no file is uploaded or downloaded, and progress, recent changes and notices stay empty until it does. There is no File Provider extension.
 
@@ -18,34 +18,34 @@ Run these from `apps/macos`:
 scripts/build-ffi.sh
 
 # 2. Test the bindings and the app's models.
-swift test --package-path FlareboxFFI
+swift test --package-path KoidriveFFI
 
-# 3. Generate Flarebox.xcodeproj from project.yml.
+# 3. Generate Koidrive.xcodeproj from project.yml.
 scripts/generate-project.sh
 
 # 4. Build the app without signing it.
-xcodebuild -project Flarebox.xcodeproj -scheme Flarebox -configuration Release \
+xcodebuild -project Koidrive.xcodeproj -scheme Koidrive -configuration Release \
   -derivedDataPath build/DerivedData -destination "platform=macOS,arch=$(uname -m)" \
   CODE_SIGNING_ALLOWED=NO build
-open build/DerivedData/Build/Products/Release/Flarebox.app
+open build/DerivedData/Build/Products/Release/Koidrive.app
 ```
 
-The app keeps its sync profile in `~/Library/Application Support/Flarebox`: the device credential (`state/credential.json`), one store per linked space (`state/spaces/`) and the pause. One process at a time can open the profile. Time Machine leaves out the credential, so a Mac restored from a backup sets Flarebox up again as a new device, and the files in its folders stay.
+The app keeps its sync profile in `~/Library/Application Support/Koidrive`: the device credential (`state/credential.json`), one store per linked space (`state/spaces/`) and the pause. One process at a time can open the profile. Time Machine leaves out the credential, so a Mac restored from a backup sets Koidrive up again as a new device, and the files in its folders stay.
 
 To try it against a local server, start the Worker in `server/` with `pnpm exec wrangler dev` (after `pnpm install`), enter `http://127.0.0.1:8787` in the setup window, open `http://127.0.0.1:8787/setup` in a browser, and claim the server with the code that `wrangler dev` prints. Plain `http` is accepted only on a loopback address.
 
 To show a state the driver cannot reach yet, start a Debug build on the fake core in `core/ffi` with a scripted scenario. Release builds ignore the `FakeScenario` setting. The fake keeps its state in memory only:
 
 ```sh
-xcodebuild -project Flarebox.xcodeproj -scheme Flarebox -configuration Debug \
+xcodebuild -project Koidrive.xcodeproj -scheme Koidrive -configuration Debug \
   -derivedDataPath build/DerivedData -destination "platform=macOS,arch=$(uname -m)" \
   CODE_SIGNING_ALLOWED=NO build
-open build/DerivedData/Build/Products/Debug/Flarebox.app --args -FakeScenario manyQuestions
+open build/DerivedData/Build/Products/Debug/Koidrive.app --args -FakeScenario manyQuestions
 ```
 
 The scenarios are `firstRun`, `upToDate`, `syncing`, `paused`, `offline`, `massDelete`, `ambiguousDisappearance`, `recovery`, `recoveredWithoutQuestions`, `remoteMassDelete`, `manyQuestions` and `problems`.
 
-You can also open `Flarebox.xcodeproj` in Xcode after step 3 and run the Flarebox scheme; the views have SwiftUI previews for these scenarios. Local builds are signed ad hoc, so no Apple developer account is needed.
+You can also open `Koidrive.xcodeproj` in Xcode after step 3 and run the Koidrive scheme; the views have SwiftUI previews for these scenarios. Local builds are signed ad hoc, so no Apple developer account is needed.
 
 `core/ffi/scripts/integration-test.sh`, run from anywhere in the repository, tests the session against the Worker under `wrangler dev`: claiming, pairing, linking, status events, the pause, questions and problems.
 
@@ -55,13 +55,13 @@ Run `scripts/build-ffi.sh` again after every change to `core/ffi`. It rebuilds t
 
 | Path | Contents |
 |---|---|
-| `Flarebox/` | The SwiftUI menu bar app and its windows. User-facing text is in `Localizable.xcstrings`, with English as the base language. |
-| `project.yml` | The XcodeGen spec for `Flarebox.xcodeproj`. The generated project is not checked in, so edit `project.yml` and run `scripts/generate-project.sh` again after changing it or adding or removing source files. |
-| `FlareboxFFI/` | A Swift package: the `FlareboxFFI` library wraps the Rust core (the generated bindings and the static library as an XCFramework), and `FlareboxModel` holds the app's view models. Both have tests. |
-| `scripts/generate-project.sh` | Generates `Flarebox.xcodeproj` with the pinned XcodeGen. |
-| `scripts/build-ffi.sh` | Builds the Rust library and fills in `FlareboxFFI/Frameworks` and `FlareboxFFI/Sources`. These generated files are not checked in. |
+| `Koidrive/` | The SwiftUI menu bar app and its windows. User-facing text is in `Localizable.xcstrings`, with English as the base language. |
+| `project.yml` | The XcodeGen spec for `Koidrive.xcodeproj`. The generated project is not checked in, so edit `project.yml` and run `scripts/generate-project.sh` again after changing it or adding or removing source files. |
+| `KoidriveFFI/` | A Swift package: the `KoidriveFFI` library wraps the Rust core (the generated bindings and the static library as an XCFramework), and `KoidriveModel` holds the app's view models. Both have tests. |
+| `scripts/generate-project.sh` | Generates `Koidrive.xcodeproj` with the pinned XcodeGen. |
+| `scripts/build-ffi.sh` | Builds the Rust library and fills in `KoidriveFFI/Frameworks` and `KoidriveFFI/Sources`. These generated files are not checked in. |
 | `scripts/build-release.sh`, `sign-app.sh`, `make-dmg.sh`, `notarize.sh`, `verify-release.sh` | Build, sign, package, notarize and verify a release disk image. The macOS release workflow runs them; see [docs/release-macos.md](../../docs/release-macos.md). |
-| `Flarebox.entitlements` | The entitlements release builds are signed with, deliberately empty. |
+| `Koidrive.entitlements` | The entitlements release builds are signed with, deliberately empty. |
 
 The Rust library is built for the architecture of the machine you build on, not as a universal binary.
 

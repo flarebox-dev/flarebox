@@ -11,22 +11,22 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flarebox_engine::classify::Trees;
-use flarebox_engine::commit::{Commits, Failure, Halt, MAX_OPS, Reconnect};
-use flarebox_engine::effects::{Effect, Effects};
-use flarebox_engine::ids::IdGen;
-use flarebox_engine::ignore::{LocalRules, RuleFile};
-use flarebox_engine::names::name_key;
-use flarebox_engine::question::{Answer, Question};
-use flarebox_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
-use flarebox_engine::state::StateError;
-use flarebox_engine::tree::{FileIdentity, Kind, LocalNode, Names, RemoteNode, same};
-use flarebox_proto::v1::{
+use koidrive_engine::classify::Trees;
+use koidrive_engine::commit::{Commits, Failure, Halt, MAX_OPS, Reconnect};
+use koidrive_engine::effects::{Effect, Effects};
+use koidrive_engine::ids::IdGen;
+use koidrive_engine::ignore::{LocalRules, RuleFile};
+use koidrive_engine::names::name_key;
+use koidrive_engine::question::{Answer, Question};
+use koidrive_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
+use koidrive_engine::state::StateError;
+use koidrive_engine::tree::{FileIdentity, Kind, LocalNode, Names, RemoteNode, same};
+use koidrive_proto::v1::{
     ChangeRecord, ChunkRef, Commit, Content, CreateDir, CreateFile, Delete, Error, ListVersions,
     Move, NodeState, Op, OpResult, PrepareUpload, Restore, Resume, UpdateContent, UploadReceipt,
     VersionInfo, change_record, chunk_plan, error, op, op_result,
 };
-use flarebox_sim::space::{Role, Session, SpaceDo};
+use koidrive_sim::space::{Role, Session, SpaceDo};
 use proptest::prelude::*;
 use sha2::{Digest, Sha256};
 
@@ -459,7 +459,7 @@ fn apply(trees: &mut Trees, changes: &[ChangeRecord]) {
 /// A change to what this device ignores, made while it runs (section 5.10).
 #[derive(Clone, Debug)]
 enum Ruling {
-    /// The lines of the `.fbignore` file at the root.
+    /// The lines of the `.koiignore` file at the root.
     File(Vec<&'static str>),
     /// The device-local exclude list.
     Exclude(Vec<&'static str>),
@@ -607,7 +607,7 @@ impl Device {
                 if lands_unseen(kind) {
                     return;
                 }
-                let shape = flarebox_engine::tree::Shape {
+                let shape = koidrive_engine::tree::Shape {
                     parent,
                     name: name.into(),
                     kind,
@@ -1003,7 +1003,7 @@ fn run_ignoring(
     let (mut steps, mut quiet, mut due, mut parked_reverted) = (0, false, false, 0);
     let (mut deletes, mut removals) = (0, 0);
     let (mut asked, mut held_once, mut confirmed) = (0, BTreeSet::new(), BTreeSet::new());
-    let mut discarded: BTreeMap<String, flarebox_engine::tree::Shape> = BTreeMap::new();
+    let mut discarded: BTreeMap<String, koidrive_engine::tree::Shape> = BTreeMap::new();
     let mut revived: BTreeSet<String> = BTreeSet::new();
     let mut pending: Option<Question> = None;
     let mut during = during.iter();
@@ -1164,7 +1164,7 @@ fn run_ignoring(
             // A discarded entry the user changed, or a discarded folder the user put an entry in,
             // before the effects moved it to the local trash is the user's new change, which syncs
             // like any other from then on (section 5.2).
-            let changed = |shown: &flarebox_engine::tree::Shape| {
+            let changed = |shown: &koidrive_engine::tree::Shape| {
                 revived.contains(id)
                     || (device.trees.local().get(id)).is_some_and(|node| !node.shape.same(shown))
             };
@@ -1302,7 +1302,7 @@ fn run_ignoring(
         (device.trees.local().iter()).all(|(id, node)| !node.parked || stays_parked(id)),
         "a node the rules do not leave out is still parked"
     );
-    let server: Vec<(String, Option<flarebox_engine::tree::Shape>)> = space
+    let server: Vec<(String, Option<koidrive_engine::tree::Shape>)> = space
         .nodes()
         .iter()
         .filter(|n| n.node_id != root)

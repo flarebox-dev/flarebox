@@ -12,19 +12,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::hash::BuildHasher;
 use std::path::{Component, Path, PathBuf};
 
-use flarebox_engine::classify::Trees;
-use flarebox_engine::commit::Commits;
-use flarebox_engine::effects::Effects;
-use flarebox_engine::ids::IdGen;
-use flarebox_engine::question as engine;
-use flarebox_engine::tree::{
+use koidrive_engine::classify::Trees;
+use koidrive_engine::commit::Commits;
+use koidrive_engine::effects::Effects;
+use koidrive_engine::ids::IdGen;
+use koidrive_engine::question as engine;
+use koidrive_engine::tree::{
     Content, FileIdentity, Kind, LocalNode, Names, NodeId, RemoteNode, Shape, Tree, same_content,
 };
-use flarebox_fs::{Entry, EntryKind, FileId, Known, Snapshot};
-use flarebox_proto::v1::{
+use koidrive_fs::{Entry, EntryKind, FileId, Known, Snapshot};
+use koidrive_proto::v1::{
     ChangeRecord, CommitRecord, NodeKind, NodeState, TrashPage, TreePage, change_record,
 };
-use flarebox_store::{Cursor, EngineState, Error, StoredQuestion, SyncedNode, Tx};
+use koidrive_store::{Cursor, EngineState, Error, StoredQuestion, SyncedNode, Tx};
 
 use crate::disk::Stop;
 use crate::observe::{Observed, Reset, RulesChange};
@@ -172,7 +172,7 @@ impl Engine {
                 question_id = question.id,
                 kind = ?question.kind,
                 items = question.held.len(),
-                "holds changes until it is answered with flarebox questions"
+                "holds changes until it is answered with koi questions"
             );
             tx.put_question(&StoredQuestion {
                 question_id: question.id.clone(),
@@ -268,7 +268,7 @@ impl Engine {
     ) -> Result<(), Stop> {
         if changes.iter().any(|change| change.change.is_none()) {
             return Err(Stop::Protocol(format!(
-                "commit {seq} holds a kind of change this build does not know; update Flarebox"
+                "commit {seq} holds a kind of change this build does not know; update Koidrive"
             )));
         }
         let Some(cursor) = &mut self.cursor else {
@@ -972,7 +972,7 @@ fn invalid(what: String) -> Error {
     Error::InvalidEngineState(what)
 }
 
-fn shape(shape: flarebox_store::Shape) -> Result<Shape, Error> {
+fn shape(shape: koidrive_store::Shape) -> Result<Shape, Error> {
     let kind = match NodeKind::try_from(shape.kind) {
         Ok(NodeKind::Dir) => Kind::Dir,
         Ok(NodeKind::File) => Kind::File,
@@ -986,8 +986,8 @@ fn shape(shape: flarebox_store::Shape) -> Result<Shape, Error> {
     })
 }
 
-fn stored(id: &NodeId, node: &LocalNode) -> flarebox_store::LocalNode {
-    flarebox_store::LocalNode {
+fn stored(id: &NodeId, node: &LocalNode) -> koidrive_store::LocalNode {
+    koidrive_store::LocalNode {
         node_id: id.clone(),
         shape: stored_shape(&node.shape),
         identity: file_id(node.identity),
@@ -995,12 +995,12 @@ fn stored(id: &NodeId, node: &LocalNode) -> flarebox_store::LocalNode {
     }
 }
 
-fn stored_shape(shape: &Shape) -> flarebox_store::Shape {
+fn stored_shape(shape: &Shape) -> koidrive_store::Shape {
     let kind = match shape.kind {
         Kind::Dir => NodeKind::Dir,
         Kind::File => NodeKind::File,
     };
-    flarebox_store::Shape {
+    koidrive_store::Shape {
         parent_id: shape.parent.clone(),
         name: shape.name.clone(),
         kind: kind as i32,
@@ -1091,7 +1091,7 @@ impl Staging {
     pub fn replay_commit(&mut self, seq: u64, changes: &[ChangeRecord]) -> Result<(), Stop> {
         if changes.iter().any(|change| change.change.is_none()) {
             return Err(Stop::Protocol(format!(
-                "commit {seq} holds a kind of change this build does not know; update Flarebox"
+                "commit {seq} holds a kind of change this build does not know; update Koidrive"
             )));
         }
         for change in changes {
@@ -1141,10 +1141,10 @@ pub(crate) fn file_id(identity: FileIdentity) -> FileId {
 
 #[cfg(test)]
 mod tests {
-    use flarebox_engine::effects::{Base, Effect, EffectRecord, Location};
-    use flarebox_engine::state::EffectsState;
-    use flarebox_proto::v1::{NodePurged, NodeStatus, SpaceUpdated};
-    use flarebox_store::Store;
+    use koidrive_engine::effects::{Base, Effect, EffectRecord, Location};
+    use koidrive_engine::state::EffectsState;
+    use koidrive_proto::v1::{NodePurged, NodeStatus, SpaceUpdated};
+    use koidrive_store::Store;
 
     use super::*;
 
@@ -1891,7 +1891,7 @@ mod tests {
         let (_dir, mut engine) = mapper();
         let log = || RulesChange {
             dir: "proj".into(),
-            rules: Some(flarebox_engine::ignore::RuleFile::parse(b"*.log\n")),
+            rules: Some(koidrive_engine::ignore::RuleFile::parse(b"*.log\n")),
         };
         engine.rules(vec![log()], true);
         let proj = Observed::Created {
@@ -1951,7 +1951,7 @@ mod tests {
         let changes = snapshot.rescan(&root, [PathBuf::new()]).unwrap().changes;
         assert_eq!(
             changes,
-            [flarebox_fs::Change::Created {
+            [koidrive_fs::Change::Created {
                 path: "d/x".into(),
                 kind: EntryKind::File,
             }]
@@ -2007,15 +2007,15 @@ mod tests {
         let changes = snapshot.rescan(&root, [PathBuf::new()]).unwrap().changes;
         let observed: Vec<_> = (changes.into_iter())
             .map(|change| match change {
-                flarebox_fs::Change::Removed { path, kind } => Observed::Removed { path, kind },
-                flarebox_fs::Change::Renamed { from, to, kind } => Observed::Renamed {
+                koidrive_fs::Change::Removed { path, kind } => Observed::Removed { path, kind },
+                koidrive_fs::Change::Renamed { from, to, kind } => Observed::Renamed {
                     id: snapshot.entries[&to].id,
                     from,
                     to,
                     kind,
                     linked: false,
                 },
-                flarebox_fs::Change::Created { path, kind } => Observed::Created {
+                koidrive_fs::Change::Created { path, kind } => Observed::Created {
                     id: snapshot.entries[&path].id,
                     content: (kind == EntryKind::File).then(|| bytes(3)),
                     path,

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-name = "flarebox-proto"
-description = "Protocol types generated from the Flarebox spec."
+name = "koidrive-proto"
+description = "Protocol types generated from the Koidrive spec."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

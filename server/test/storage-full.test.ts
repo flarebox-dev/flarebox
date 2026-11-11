@@ -4,14 +4,14 @@ import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { expect, it, vi } from "vitest";
-import { ClaimRequestSchema, CreateSpaceRequestSchema, DeviceCredentialsSchema, SpaceInfoSchema } from "../src/gen/flarebox/v1/auth_pb";
-import { RpcRequestSchema } from "../src/gen/flarebox/v1/messages_pb";
-import { Error_Code, ErrorSchema } from "../src/gen/flarebox/v1/rpc_pb";
+import { ClaimRequestSchema, CreateSpaceRequestSchema, DeviceCredentialsSchema, SpaceInfoSchema } from "../src/gen/koidrive/v1/auth_pb";
+import { RpcRequestSchema } from "../src/gen/koidrive/v1/messages_pb";
+import { Error_Code, ErrorSchema } from "../src/gen/koidrive/v1/rpc_pb";
 import { uuidv7 } from "../src/ids";
 import { getMeta } from "../src/space/store";
 import { op } from "./helpers";
 
-const BASE = "https://flarebox.test";
+const BASE = "https://koidrive.test";
 const DAY_MS = 86_400_000;
 
 async function post(path: string, body: Uint8Array, token?: string): Promise<Response> {
@@ -23,7 +23,7 @@ async function post(path: string, body: Uint8Array, token?: string): Promise<Res
 it("answers a commit that fills the space's storage with 429 QUOTA_EXCEEDED and the RFC 0001 section 9 wait", async () => {
   const log = vi.spyOn(console, "log");
   await exports.default.fetch(BASE + "/setup");
-  const code = log.mock.calls.map((args) => String(args[0])).find((text) => text.startsWith("Flarebox claim code"))!.split(": ")[1]!;
+  const code = log.mock.calls.map((args) => String(args[0])).find((text) => text.startsWith("Koidrive claim code"))!.split(": ")[1]!;
   log.mockRestore();
   const claim = toBinary(ClaimRequestSchema, create(ClaimRequestSchema, { code, userName: "Owner", deviceName: "Laptop", platform: "macos" }));
   const token = fromBinary(DeviceCredentialsSchema, new Uint8Array(await (await post("/v1/claim", claim)).arrayBuffer())).access!.token;

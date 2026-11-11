@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The local trash `.flarebox/trash/` (design §5.2): every entry an effect
+//! The local trash `.koidrive/trash/` (design §5.2): every entry an effect
 //! displaced, kept for [`TRASH_RETENTION`] or until the caller's size cap
 //! evicts it, whichever comes first.
 //!
 //! The trash keeps its own index of each entry's size when it entered, with
-//! the content the caller says a file holds, in `.flarebox/trash.json`. The
+//! the content the caller says a file holds, in `.koidrive/trash.json`. The
 //! index is written before the entry moves in, so a crash never leaves an
 //! entry the index does not know. A process that held a descriptor open across
 //! the effect can still write to a trashed file, so before reclaiming a file

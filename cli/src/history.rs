@@ -1,21 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! `flarebox trash` and `flarebox versions`: what the space of a linked folder keeps after a delete or an edit. Both
+//! `koi trash` and `koi versions`: what the space of a linked folder keeps after a delete or an edit. Both
 //! read the server through its HTTP RPC route with this profile's credential. They change no file here or on the
-//! server, and without a daemon they read the profile without writing to it. `flarebox restore` reads the same
+//! server, and without a daemon they read the profile without writing to it. `koi restore` reads the same
 //! listings to find what to restore and records the request in the folder's store, for the folder's engine to send
-//! (design §6.3). `flarebox restores` lists those requests and how each went.
+//! (design §6.3). `koi restores` lists those requests and how each went.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
-use flarebox_driver::{
+use koidrive_driver::{
     Driver, DriverError, FolderState, FolderStatus, Paths, RestoreRejection, RestoreRequest,
     RestoreState, RestoreStatus, RestoreWait,
 };
-use flarebox_engine::names::name_key;
-use flarebox_net::Auth;
-use flarebox_proto::v1::{
+use koidrive_engine::names::name_key;
+use koidrive_net::Auth;
+use koidrive_proto::v1::{
     ListTrash, ListTree, ListVersions, NodeKind, NodeState, VersionInfo, rpc_request::Call,
     rpc_response,
 };
@@ -27,7 +27,7 @@ use crate::{ago, now_ms, print_json, printable, refusal, signed_in, size};
 const PAGE: u32 = 1000;
 const UNEXPECTED: &str = "the server answered with another kind of result";
 
-/// `flarebox trash [folder]`: the deletions in the trash of the folder's space, or of the part under `folder` when it is a
+/// `koi trash [folder]`: the deletions in the trash of the folder's space, or of the part under `folder` when it is a
 /// folder inside a linked one.
 pub async fn trash(paths: &Paths, folder: &Path, json: bool) -> Result<(), String> {
     let (linked, below) = locate(paths, folder).await?;
@@ -44,7 +44,7 @@ pub async fn trash(paths: &Paths, folder: &Path, json: bool) -> Result<(), Strin
     Ok(())
 }
 
-/// `flarebox versions <file>`: the versions the server keeps of a live file, newest first.
+/// `koi versions <file>`: the versions the server keeps of a live file, newest first.
 pub async fn versions(paths: &Paths, file: &Path, json: bool) -> Result<(), String> {
     let (linked, below) = locate(paths, file).await?;
     if below.is_empty() {
@@ -58,7 +58,7 @@ pub async fn versions(paths: &Paths, file: &Path, json: bool) -> Result<(), Stri
     let live = tree(&auth, space).await?;
     let node = find(&live, space, &below).ok_or_else(|| {
         format!(
-            "the server has no file at {} in {}; flarebox trash lists deleted ones",
+            "the server has no file at {} in {}; koi trash lists deleted ones",
             printable(&below.join("/")),
             linked.path
         )
@@ -80,7 +80,7 @@ pub async fn versions(paths: &Paths, file: &Path, json: bool) -> Result<(), Stri
     Ok(())
 }
 
-/// `flarebox restore <path>`: asks the folder's engine to bring the deletion at `path` back from the trash, or, with
+/// `koi restore <path>`: asks the folder's engine to bring the deletion at `path` back from the trash, or, with
 /// `version`, to make that version of the live file at `path` current again. `node` picks one of several deletions
 /// that had the path. The request is checked against the server's listings first, so a typo fails here and not after
 /// the next commit.
@@ -105,7 +105,7 @@ pub async fn restore(
         Some(version_id) => {
             let file = find(&live, space, &below).ok_or_else(|| {
                 format!(
-                    "the server has no file at {shown} in {}; flarebox trash lists deleted ones",
+                    "the server has no file at {shown} in {}; koi trash lists deleted ones",
                     linked.path
                 )
             })?;
@@ -125,7 +125,7 @@ pub async fn restore(
             let kept = versions_of(&auth, space, &file.node_id).await?;
             if !kept.iter().any(|kept| kept.version_id == version_id) {
                 return Err(format!(
-                    "{shown} has no version {version_id}; flarebox versions lists them"
+                    "{shown} has no version {version_id}; koi versions lists them"
                 ));
             }
             RestoreRequest::Version {
@@ -155,17 +155,17 @@ pub async fn restore(
     };
     println!("Asked to restore {shown} (restore {id}).");
     if linked.state == FolderState::Stopped {
-        println!("Run flarebox daemon to send it. flarebox restores shows how it went.");
+        println!("Run koi daemon to send it. koi restores shows how it went.");
     } else {
         println!(
-            "The folder sends it with its next commit. flarebox restores {} shows how it went.",
+            "The folder sends it with its next commit. koi restores {} shows how it went.",
             linked.path
         );
     }
     Ok(())
 }
 
-/// `flarebox restores [folder]`: the restores asked for in the folder's space, those that ended first.
+/// `koi restores [folder]`: the restores asked for in the folder's space, those that ended first.
 pub async fn restores(paths: &Paths, folder: &Path, json: bool) -> Result<(), String> {
     let (linked, _) = locate(paths, folder).await?;
     let request = Request::Restores {
@@ -198,10 +198,10 @@ impl NotPicked<'_> {
     fn message(&self, shown: &str, linked: &FolderStatus) -> String {
         match self {
             Self::None { live: true } => {
-                format!("{shown} is not deleted; flarebox versions lists the versions of a file")
+                format!("{shown} is not deleted; koi versions lists the versions of a file")
             }
             Self::None { live: false } => format!(
-                "nothing deleted at {shown} is in the trash of {}; flarebox trash lists what is",
+                "nothing deleted at {shown} is in the trash of {}; koi trash lists what is",
                 linked.path
             ),
             Self::Several(found) => {
@@ -220,7 +220,7 @@ impl NotPicked<'_> {
                 message
             }
             Self::NotThere(node) => {
-                format!("no deletion at {shown} is node {node}; flarebox trash --json lists them")
+                format!("no deletion at {shown} is node {node}; koi trash --json lists them")
             }
         }
     }
@@ -303,7 +303,7 @@ async fn locate(paths: &Paths, path: &Path) -> Result<(FolderStatus, Vec<String>
         }
     }
     Err(format!(
-        "{} is not in a linked folder; flarebox status lists them",
+        "{} is not in a linked folder; koi status lists them",
         typed.display()
     ))
 }
@@ -602,14 +602,14 @@ fn restores_report(restores: &[RestoreStatus], linked: &FolderStatus) -> String 
             "A pending restore goes out with a commit of the folder once the earlier changes of its node have synced.\n",
         );
         if linked.state == FolderState::Stopped {
-            report.push_str("The folder is not syncing: run flarebox daemon.\n");
+            report.push_str("The folder is not syncing: run koi daemon.\n");
         }
         if let Some(problem) = &linked.problem {
             report.push_str(&format!("The folder has a problem: {problem}\n"));
         }
         if linked.questions > 0 {
             report.push_str(&format!(
-                "{} for the folder: flarebox questions lists them.\n",
+                "{} for the folder: koi questions lists them.\n",
                 crate::count(linked.questions, "open question")
             ));
         }
@@ -693,8 +693,8 @@ fn versions_report(path: &str, node: &NodeState, kept: &[VersionInfo], now_ms: i
 
 #[cfg(test)]
 mod tests {
-    use flarebox_driver::Credential;
-    use flarebox_proto::v1::{
+    use koidrive_driver::Credential;
+    use koidrive_proto::v1::{
         AccessToken, Content, Error, NodeStatus, RpcRequest, RpcResponse, TrashPage, TreePage,
         VersionList,
     };
@@ -916,20 +916,20 @@ mod tests {
     #[test]
     fn a_path_is_normalized_without_reading_the_disk() {
         assert_eq!(
-            lexical(Path::new("/home/ada/./Flarebox/docs/../link.txt")),
-            Path::new("/home/ada/Flarebox/link.txt")
+            lexical(Path::new("/home/ada/./Koidrive/docs/../link.txt")),
+            Path::new("/home/ada/Koidrive/link.txt")
         );
     }
 
     #[test]
     fn a_path_below_a_linked_folder_gives_its_names() {
-        let root = Path::new("/home/ada/Flarebox");
+        let root = Path::new("/home/ada/Koidrive");
         assert_eq!(
-            below(root, Path::new("/home/ada/Flarebox/docs/a.txt")),
+            below(root, Path::new("/home/ada/Koidrive/docs/a.txt")),
             Some(names("docs/a.txt"))
         );
         assert_eq!(below(root, root), Some(Vec::new()));
-        assert_eq!(below(root, Path::new("/home/ada/Flarebox2/a.txt")), None);
+        assert_eq!(below(root, Path::new("/home/ada/Koidrive2/a.txt")), None);
         assert!(starts_with(&names("Docs/a.txt"), &names("docs")));
         assert!(!starts_with(&names("docs"), &names("docs/a.txt")));
     }
@@ -963,7 +963,7 @@ mod tests {
             ]
         );
         let linked = FolderStatus {
-            path: "/home/ada/Flarebox".into(),
+            path: "/home/ada/Koidrive".into(),
             ..serde_json::from_value(serde_json::json!({
                 "space_id": SPACE, "space_name": "Home", "path": "", "state": "up_to_date",
                 "history_id": null, "last_seq": null, "head_seq": null, "remote_nodes": 0,
@@ -977,7 +977,7 @@ mod tests {
         );
         assert_eq!(
             trash_report(&[], &linked),
-            "Nothing from /home/ada/Flarebox is in the trash.\n"
+            "Nothing from /home/ada/Koidrive is in the trash.\n"
         );
     }
 
@@ -1040,7 +1040,7 @@ mod tests {
 
     fn linked() -> FolderStatus {
         FolderStatus {
-            path: "/home/ada/Flarebox".into(),
+            path: "/home/ada/Koidrive".into(),
             ..serde_json::from_value(serde_json::json!({
                 "space_id": SPACE, "space_name": "Home", "path": "", "state": "up_to_date",
                 "history_id": null, "last_seq": null, "head_seq": null, "remote_nodes": 0,
@@ -1088,9 +1088,9 @@ mod tests {
                 "r2  version note-0 of node note\n",
                 "  pending: waits for the folder to sync\n",
                 "A pending restore goes out with a commit of the folder once the earlier changes of its node have synced.\n",
-                "The folder is not syncing: run flarebox daemon.\n",
+                "The folder is not syncing: run koi daemon.\n",
                 "The folder has a problem: the root is missing\n",
-                "1 open question for the folder: flarebox questions lists them.\n",
+                "1 open question for the folder: koi questions lists them.\n",
             )
         );
         let two = FolderStatus {
@@ -1099,7 +1099,7 @@ mod tests {
         };
         assert!(
             restores_report(&restores, &two)
-                .ends_with("2 open questions for the folder: flarebox questions lists them.\n")
+                .ends_with("2 open questions for the folder: koi questions lists them.\n")
         );
         assert_eq!(
             restores_report(&restores[..1], &folder),
@@ -1107,7 +1107,7 @@ mod tests {
         );
         assert_eq!(
             restores_report(&[], &folder),
-            "No restore was asked for in /home/ada/Flarebox.\n"
+            "No restore was asked for in /home/ada/Koidrive.\n"
         );
     }
 

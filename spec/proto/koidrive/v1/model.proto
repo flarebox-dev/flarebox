@@ -1,0 +1,92 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package koidrive.v1;
+
+// A content-addressed piece of a file.
+message ChunkRef {
+  // SHA-256 of the chunk bytes, 32 bytes.
+  bytes hash = 1;
+  uint32 size = 2;
+  // 0 = raw. Reserved for compression and encryption.
+  uint32 encoding = 3;
+}
+
+message Content {
+  uint64 size = 1;
+  int64 mtime_ns = 2;
+  bool executable = 3;
+  // Empty when the version has more than 16,384 chunks; chunk_count is still set.
+  repeated ChunkRef chunks = 4;
+  uint32 chunk_count = 5;
+  // SHA-256 over the concatenation of (32-byte hash || u32 LE size) for every chunk.
+  bytes manifest_digest = 6;
+  // Chunk boundary algorithm, for example "fastcdc2020-1m-4m-16m".
+  string chunker = 7;
+}
+
+enum NodeKind {
+  NODE_KIND_UNSPECIFIED = 0;
+  NODE_KIND_DIR = 1;
+  NODE_KIND_FILE = 2;
+  NODE_KIND_SYMLINK = 3;
+}
+
+enum NodeStatus {
+  NODE_STATUS_UNSPECIFIED = 0;
+  NODE_STATUS_LIVE = 1;
+  NODE_STATUS_TRASHED = 2;
+}
+
+message VersionInfo {
+  string version_id = 1;
+  uint64 seq = 2;
+  Content content = 3;
+  string device_id = 4;
+  string user_id = 5;
+  int64 created_at_ms = 6;
+}
+
+// The full resulting state of a node after a commit.
+message NodeState {
+  string node_id = 1;
+  string parent_id = 2;
+  string name = 3;
+  NodeKind kind = 4;
+  NodeStatus status = 5;
+  uint64 content_rev = 6;
+  uint64 meta_rev = 7;
+  string trash_group = 8;
+  VersionInfo current = 9;
+}
+
+message ChangeRecord {
+  oneof change {
+    NodeState node = 1;
+    NodePurged purged = 2;
+    SpaceUpdated space = 3;
+    MemberUpdated member = 4;
+  }
+}
+
+message NodePurged {
+  string node_id = 1;
+}
+
+// Fields to be defined in a later spec revision.
+message SpaceUpdated {}
+
+// Fields to be defined in a later spec revision.
+message MemberUpdated {}
+
+message CommitRecord {
+  uint64 seq = 1;
+  string commit_id = 2;
+  string device_id = 3;
+  string user_id = 4;
+  int64 committed_at_ms = 5;
+  repeated ChangeRecord changes = 6;
+  // Reserved for labelling the commits of one automated run (RFC 0006 section 4). Servers leave it empty.
+  string run_id = 7;
+}

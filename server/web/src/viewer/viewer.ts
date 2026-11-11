@@ -233,7 +233,7 @@ async function start(): Promise<void> {
   if (status === 401 && body?.passwordRequired) return passwordForm();
   if (status !== 200 || !body) return fail(status, body);
   info = body;
-  document.title = (info.name ?? "") + " · Flarebox";
+  document.title = (info.name ?? "") + " · Koidrive";
   if (info.kind === "NODE_KIND_DIR") return showFolder(info);
   showFile(info);
 }

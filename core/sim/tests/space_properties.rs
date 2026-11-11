@@ -4,13 +4,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flarebox_engine::ids::IdGen;
-use flarebox_engine::names::{MAX_NAME_BYTES, name_key, normalize_name};
-use flarebox_proto::v1::{
+use koidrive_engine::ids::IdGen;
+use koidrive_engine::names::{MAX_NAME_BYTES, name_key, normalize_name};
+use koidrive_proto::v1::{
     ChunkRef, Commit, Content, CreateDir, CreateFile, Delete, Move, NodeKind, NodeState,
     NodeStatus, Op, PrepareUpload, Restore, UpdateContent, chunk_plan, op,
 };
-use flarebox_sim::space::{MAX_DEPTH, Role, Session, SpaceDo, node_states};
+use koidrive_sim::space::{MAX_DEPTH, Role, Session, SpaceDo, node_states};
 use proptest::prelude::*;
 use sha2::{Digest, Sha256};
 

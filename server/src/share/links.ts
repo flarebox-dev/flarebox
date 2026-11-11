@@ -2,8 +2,8 @@
 
 import { create } from "@bufbuild/protobuf";
 import { base64url, fromBase64url, hmac, hmacVerify } from "../crypto";
-import { Error_Code } from "../gen/flarebox/v1/rpc_pb";
-import { type ShareLink, type ShareLinkList, ShareLinkListSchema, ShareLinkSchema } from "../gen/flarebox/v1/share_pb";
+import { Error_Code } from "../gen/koidrive/v1/rpc_pb";
+import { type ShareLink, type ShareLinkList, ShareLinkListSchema, ShareLinkSchema } from "../gen/koidrive/v1/share_pb";
 import { isUuidV7 } from "../ids";
 import { ClientLimiter } from "./limiter";
 
@@ -273,7 +273,7 @@ export class ShareLinks {
   }
 
   private async sessionKey(): Promise<Uint8Array> {
-    return hmac(await this.deps.serverSecret(), "flarebox/share-session/v1");
+    return hmac(await this.deps.serverSecret(), "koidrive/share-session/v1");
   }
 
   private sessionMessage(link: ShareLinkRow, expiresAtMs: number): string {

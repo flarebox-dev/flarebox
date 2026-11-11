@@ -3,10 +3,10 @@
 //! Which profile may sync a linked folder. Both facts belong to the physical folder, whatever path, symbolic link or
 //! mount reaches it:
 //!
-//! - `.flarebox/device.json` names the device that linked the folder. Another device's profile refuses to link or
+//! - `.koidrive/device.json` names the device that linked the folder. Another device's profile refuses to link or
 //!   sync it until it is unlinked there.
 //! - The process that syncs the folder holds an `flock` on the folder itself for as long as its task and observer
-//!   run, so two processes never sync one folder at once. Deleting or replacing `.flarebox/` cannot split the lock,
+//!   run, so two processes never sync one folder at once. Deleting or replacing `.koidrive/` cannot split the lock,
 //!   and the task checks that its path still names the locked folder. The last holder unlocks the folder
 //!   ([`Flock`]), so the folder is free as soon as the task and the observer have ended.
 
@@ -18,7 +18,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::SystemTime;
 
-use flarebox_fs::PRIVATE_DIR;
+use koidrive_fs::PRIVATE_DIR;
 use rustix::fs::{FlockOperation, Mode, OFlags};
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};

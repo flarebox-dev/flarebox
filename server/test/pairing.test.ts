@@ -6,10 +6,10 @@ import { env, exports } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import type { AccountDO } from "../src/account-do";
 import { CLAIM_FAILURE_WINDOW_MS, PAIRING_FAILURES_PER_WINDOW } from "../src/account/claim";
-import { ClaimRequestSchema, type DeviceCredentials, DeviceCredentialsSchema, PairCompleteRequestSchema, PairStartResponseSchema } from "../src/gen/flarebox/v1/auth_pb";
-import { ErrorSchema } from "../src/gen/flarebox/v1/rpc_pb";
+import { ClaimRequestSchema, type DeviceCredentials, DeviceCredentialsSchema, PairCompleteRequestSchema, PairStartResponseSchema } from "../src/gen/koidrive/v1/auth_pb";
+import { ErrorSchema } from "../src/gen/koidrive/v1/rpc_pb";
 
-const BASE = "https://flarebox.test";
+const BASE = "https://koidrive.test";
 const OWNER_ADDRESS = "198.51.100.7";
 const STRANGER_ADDRESS = "203.0.113.9";
 
@@ -37,7 +37,7 @@ async function getOwner(): Promise<DeviceCredentials> {
   if (owner) return owner;
   const log = vi.spyOn(console, "log");
   await exports.default.fetch(BASE + "/setup");
-  const line = log.mock.calls.map((args) => String(args[0])).find((text) => text.startsWith("Flarebox claim code"));
+  const line = log.mock.calls.map((args) => String(args[0])).find((text) => text.startsWith("Koidrive claim code"));
   log.mockRestore();
   const body = toBinary(ClaimRequestSchema, create(ClaimRequestSchema, { code: line!.split(": ")[1]!, userName: "Owner", deviceName: "Laptop", platform: "macos" }));
   owner = (await call("/v1/claim", { body, address: OWNER_ADDRESS }, DeviceCredentialsSchema)).message!;

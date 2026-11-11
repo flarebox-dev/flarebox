@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `flarebox` command: sets up a server or joins one, links folders, shows status and questions, lists a folder's
+//! The `koi` command: sets up a server or joins one, links folders, shows status and questions, lists a folder's
 //! trash and a file's versions, manages the account's devices, shows what each space stores, and runs the sync daemon.
 //! Commands run in the daemon through its socket when it is running, and on their own otherwise. The device, usage,
 //! trash and versions commands talk to the server directly with the credential.
@@ -16,12 +16,12 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use flarebox_driver::{
+use koidrive_driver::{
     Answer, Credential, Driver, DriverError, FolderStatus, Paths, Question, QuestionKind, Status,
 };
-use flarebox_engine::guard::{Limit, MAX_DELETIONS, Window};
-use flarebox_net::{ApiError, Auth, Reload};
-use flarebox_proto::v1::{
+use koidrive_engine::guard::{Limit, MAX_DELETIONS, Window};
+use koidrive_net::{ApiError, Auth, Reload};
+use koidrive_proto::v1::{
     CreateSpaceRequest, DeviceInfo, SpaceInfo, SpaceUsage, device_info::Kind,
 };
 use tokio::signal::unix::{SignalKind, signal};
@@ -31,9 +31,9 @@ use crate::ipc::{Request, Response};
 
 #[derive(Parser)]
 #[command(
-    name = "flarebox",
+    name = "koi",
     version,
-    about = "Flarebox sync client. Not affiliated with Cloudflare, Inc."
+    about = "Koidrive sync client. Not affiliated with Cloudflare, Inc."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -42,10 +42,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Set up Flarebox on this machine: join with a code from another device, or log in with Cloudflare to deploy a
+    /// Set up Koidrive on this machine: join with a code from another device, or log in with Cloudflare to deploy a
     /// server to your account or add this device to the server there.
     Setup {
-        /// A pairing code from another device, such as K7QM-2XPD@flarebox.alice.workers.dev.
+        /// A pairing code from another device, such as K7QM-2XPD@koidrive.alice.workers.dev.
         code: Option<String>,
         #[command(flatten)]
         device: DeviceArgs,
@@ -54,7 +54,7 @@ enum Command {
     },
     /// Join a server with a pairing code from a device that is already paired.
     Join {
-        /// The pairing code, such as K7QM-2XPD@flarebox.alice.workers.dev.
+        /// The pairing code, such as K7QM-2XPD@koidrive.alice.workers.dev.
         code: String,
         /// The server's address, for a code without @host or to replace its host.
         #[arg(long)]
@@ -62,7 +62,7 @@ enum Command {
         #[command(flatten)]
         device: DeviceArgs,
     },
-    /// Deploy, add this device to, upgrade or remove the Flarebox server in your Cloudflare account.
+    /// Deploy, add this device to, upgrade or remove the Koidrive server in your Cloudflare account.
     Server {
         #[command(subcommand)]
         action: setup::ServerAction,
@@ -130,10 +130,10 @@ enum Command {
     Restore {
         /// The deleted file or folder at the path it had, or the file whose version to restore.
         path: PathBuf,
-        /// Restore this version of the file, as flarebox versions lists it.
+        /// Restore this version of the file, as koi versions lists it.
         #[arg(long)]
         version: Option<String>,
-        /// The deleted node to restore, as flarebox trash --json lists it, when several deletions had this path.
+        /// The deleted node to restore, as koi trash --json lists it, when several deletions had this path.
         #[arg(long, conflicts_with = "version")]
         node: Option<String>,
     },
@@ -169,7 +169,7 @@ enum QuestionAction {
 
 #[derive(Subcommand)]
 enum SpaceAction {
-    /// Create a space. Link a folder to it with flarebox link.
+    /// Create a space. Link a folder to it with koi link.
     Create {
         /// The space's name, at most 255 bytes.
         #[arg(value_parser = short_name)]
@@ -193,7 +193,7 @@ enum DeviceAction {
     },
     /// Revoke another device, such as a lost one. It stops syncing at once, and the files on it stay there.
     Revoke {
-        /// The device's ID, as flarebox device list shows it.
+        /// The device's ID, as koi device list shows it.
         #[arg(value_parser = device_id)]
         id: String,
     },
@@ -227,7 +227,7 @@ enum LogFormat {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let Some(command) = cli.command else {
-        println!("flarebox {}", env!("CARGO_PKG_VERSION"));
+        println!("koi {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     };
     let log_format = match &command {
@@ -279,17 +279,17 @@ fn main() -> ExitCode {
 }
 
 fn fail(message: String) -> ExitCode {
-    eprintln!("flarebox: {message}");
+    eprintln!("koi: {message}");
     ExitCode::FAILURE
 }
 
 /// Logs go to stderr: structured key-value text by default, one JSON object per line with `--log-format json`. The
-/// level comes from `FLAREBOX_LOG` (`info` for the daemon, `warn` for other commands). No log line carries a
+/// level comes from `KOIDRIVE_LOG` (`info` for the daemon, `warn` for other commands). No log line carries a
 /// credential, an access token or a pairing code.
 fn init_logging(daemon: Option<LogFormat>) {
     let default = if daemon.is_some() { "info" } else { "warn" };
     let filter =
-        EnvFilter::try_from_env("FLAREBOX_LOG").unwrap_or_else(|_| EnvFilter::new(default));
+        EnvFilter::try_from_env("KOIDRIVE_LOG").unwrap_or_else(|_| EnvFilter::new(default));
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_ansi(std::io::stderr().is_terminal())
@@ -303,7 +303,7 @@ fn init_logging(daemon: Option<LogFormat>) {
 async fn daemon(paths: Paths) -> Result<(), String> {
     let driver = Driver::open(paths).map_err(|error| match error {
         DriverError::Busy(_) => {
-            "another Flarebox daemon or command is using this profile".to_owned()
+            "another Koidrive daemon or command is using this profile".to_owned()
         }
         other => other.to_string(),
     })?;
@@ -430,24 +430,24 @@ async fn client(paths: Paths, command: Command) -> Result<(), String> {
                 "Linked {} to space {} ({}).",
                 folder.path, folder.space_name, folder.space_id
             );
-            if folder.state == flarebox_driver::FolderState::Stopped {
-                println!("Run flarebox daemon to sync it.");
+            if folder.state == koidrive_driver::FolderState::Stopped {
+                println!("Run koi daemon to sync it.");
             }
             Ok(())
         }
         Response::Unlinked { space_id, path } => {
             println!(
-                "Unlinked {} from space {space_id}. Its files and its .flarebox folder stay.",
+                "Unlinked {} from space {space_id}. Its files and its .koidrive folder stay.",
                 path.display()
             );
             Ok(())
         }
         Response::Restarted { folder } => match folder.state {
-            flarebox_driver::FolderState::Stopped => {
-                println!("Run flarebox daemon to sync {}.", folder.path);
+            koidrive_driver::FolderState::Stopped => {
+                println!("Run koi daemon to sync {}.", folder.path);
                 Ok(())
             }
-            flarebox_driver::FolderState::Halted => Err(format!(
+            koidrive_driver::FolderState::Halted => Err(format!(
                 "{} cannot sync: {}",
                 folder.path,
                 folder.problem.unwrap_or_default()
@@ -553,7 +553,7 @@ async fn device(paths: Paths, action: DeviceAction) -> Result<(), String> {
             let started = auth.api().pair_start(&auth).await.map_err(refusal)?;
             let minutes = ((started.expires_at_ms - now_ms()) / 60_000).max(1);
             println!(
-                "On the new device, run:\n  flarebox join {}\nThe code works once, for about {minutes} minutes.",
+                "On the new device, run:\n  koi join {}\nThe code works once, for about {minutes} minutes.",
                 pairing::join_args(&started.code, auth.api().base())
             );
             Ok(())
@@ -576,7 +576,7 @@ async fn device(paths: Paths, action: DeviceAction) -> Result<(), String> {
     }
 }
 
-/// Runs a space command. Creating refuses a name another space has, since flarebox link names a space by its name.
+/// Runs a space command. Creating refuses a name another space has, since koi link names a space by its name.
 async fn space(paths: Paths, action: SpaceAction) -> Result<(), String> {
     let auth = signed_in(&paths)?;
     let spaces = auth.api().list_spaces(&auth).await.map_err(refusal)?.spaces;
@@ -610,7 +610,7 @@ async fn space(paths: Paths, action: SpaceAction) -> Result<(), String> {
                 .await
                 .map_err(refusal)?;
             println!(
-                "Created the space {} ({}).\nLink a folder to it with flarebox link <folder> --space {}.",
+                "Created the space {} ({}).\nLink a folder to it with koi link <folder> --space {}.",
                 printable(&created.name),
                 created.space_id,
                 created.space_id
@@ -631,7 +631,7 @@ fn space_json(space: &SpaceInfo) -> serde_json::Value {
 /// One line per space: its ID and its name.
 fn space_table(spaces: &[SpaceInfo]) -> String {
     if spaces.is_empty() {
-        return "No spaces. Create one with flarebox space create <name>.\n".to_owned();
+        return "No spaces. Create one with koi space create <name>.\n".to_owned();
     }
     let mut table = format!("{:<36}  NAME\n", "ID");
     for space in spaces {
@@ -670,7 +670,7 @@ async fn usage(paths: Paths, json: bool) -> Result<(), String> {
     }
 }
 
-/// What `flarebox usage` prints on stdout: the spaces that answered, as text or as a JSON array. It prints nothing when
+/// What `koi usage` prints on stdout: the spaces that answered, as text or as a JSON array. It prints nothing when
 /// every space refused, so that stdout never shows an empty account that is not empty; the error names them instead.
 fn usage_output(usages: &[(SpaceInfo, SpaceUsage)], refused: usize, json: bool) -> String {
     if usages.is_empty() && refused > 0 {
@@ -790,7 +790,7 @@ fn device_id(text: &str) -> Result<String, String> {
     if shaped {
         Ok(id)
     } else {
-        Err("not a device ID; flarebox device list shows them".to_owned())
+        Err("not a device ID; koi device list shows them".to_owned())
     }
 }
 
@@ -927,7 +927,7 @@ fn print_status(status: &Status) {
             "Device: {} ({}) on {}",
             account.device_name, account.device_id, account.server
         ),
-        None => println!("Device: not set up; run flarebox setup"),
+        None => println!("Device: not set up; run koi setup"),
     }
     println!(
         "Daemon: {}",
@@ -938,7 +938,7 @@ fn print_status(status: &Status) {
         }
     );
     if status.folders.is_empty() {
-        println!("No linked folders; run flarebox link.");
+        println!("No linked folders; run koi link.");
     }
     for folder in &status.folders {
         print_folder(folder);
@@ -978,10 +978,10 @@ fn print_questions(questions: &[Question]) {
     }
 }
 
-/// The most items `flarebox questions` lists for one question.
+/// The most items `koi questions` lists for one question.
 const ITEMS_SHOWN: usize = 20;
 
-/// How `flarebox questions` shows one question: what it asks, how to answer it, and its first [`ITEMS_SHOWN`] items.
+/// How `koi questions` shows one question: what it asks, how to answer it, and its first [`ITEMS_SHOWN`] items.
 fn question_text(question: &Question) -> String {
     let what = match &question.kind {
         QuestionKind::MassDelete {
@@ -1012,7 +1012,7 @@ fn question_text(question: &Question) -> String {
     };
     let [first, second] = question.kind.answers();
     let mut text = format!(
-        "{}  space {}  {what}\n  answer with: flarebox questions answer {} {first}|{second}\n",
+        "{}  space {}  {what}\n  answer with: koi questions answer {} {first}|{second}\n",
         printable(&question.id),
         printable(&question.space_id),
         printable(&question.id)
@@ -1022,7 +1022,7 @@ fn question_text(question: &Question) -> String {
     }
     let more = question.items.len().saturating_sub(ITEMS_SHOWN);
     if more > 0 {
-        text += &format!("  and {more} more; flarebox questions --json lists them all\n");
+        text += &format!("  and {more} more; koi questions --json lists them all\n");
     }
     text
 }
@@ -1043,8 +1043,8 @@ mod tests {
             path: "/v1/token".into(),
             status: 401,
             content_type: "application/x-protobuf",
-            body: flarebox_proto::v1::Error {
-                code: flarebox_proto::v1::error::Code::Unauthenticated as i32,
+            body: koidrive_proto::v1::Error {
+                code: koidrive_proto::v1::error::Code::Unauthenticated as i32,
                 message: "unknown device or refresh credential".into(),
                 ..Default::default()
             }
@@ -1081,7 +1081,7 @@ mod tests {
             .seen()
             .iter()
             .map(|seen| {
-                flarebox_proto::v1::TokenRequest::decode(seen.body.as_slice())
+                koidrive_proto::v1::TokenRequest::decode(seen.body.as_slice())
                     .unwrap()
                     .refresh_credential
             })
@@ -1102,8 +1102,8 @@ mod tests {
             path: "/v1/token".into(),
             status: 401,
             content_type: "application/x-protobuf",
-            body: flarebox_proto::v1::Error {
-                code: flarebox_proto::v1::error::Code::Unauthenticated as i32,
+            body: koidrive_proto::v1::Error {
+                code: koidrive_proto::v1::error::Code::Unauthenticated as i32,
                 message: "unknown device or refresh credential".into(),
                 ..Default::default()
             }
@@ -1143,7 +1143,7 @@ mod tests {
             .seen()
             .iter()
             .map(|seen| {
-                flarebox_proto::v1::TokenRequest::decode(seen.body.as_slice())
+                koidrive_proto::v1::TokenRequest::decode(seen.body.as_slice())
                     .unwrap()
                     .refresh_credential
             })
@@ -1165,7 +1165,7 @@ mod tests {
                 space_files,
             },
             items: (0..items)
-                .map(|i| flarebox_driver::HeldItem {
+                .map(|i| koidrive_driver::HeldItem {
                     node_id: format!("n{i}"),
                     path: format!("old/{i:02}"),
                     files: 1,
@@ -1191,7 +1191,7 @@ mod tests {
             lines[..3],
             [
                 "q1  space s1  held 1001 deletions that would remove 1001 of 5000 files, more than 1000 deletions in 10 minutes",
-                "  answer with: flarebox questions answer q1 delete|restore",
+                "  answer with: koi questions answer q1 delete|restore",
                 "  old/00 (1 files)",
             ]
         );
@@ -1199,7 +1199,7 @@ mod tests {
         assert_eq!(lines[21], "  old/19 (1 files)");
         assert_eq!(
             lines[22],
-            "  and 5 more; flarebox questions --json lists them all"
+            "  and 5 more; koi questions --json lists them all"
         );
 
         let text = question_text(&held(1, 15, 20, 1));
@@ -1217,16 +1217,16 @@ mod tests {
         let longest = "가".repeat(85);
         let too_long = format!("{longest}a");
         for args in [
-            vec!["flarebox", "space", "create", &too_long],
+            vec!["koi", "space", "create", &too_long],
             vec![
-                "flarebox",
+                "koi",
                 "join",
                 "K7QM-2XPD@files.example.com",
                 "--name",
                 &too_long,
             ],
             vec![
-                "flarebox",
+                "koi",
                 "server",
                 "claim",
                 "files.example.com",
@@ -1245,7 +1245,7 @@ mod tests {
                 "{error}"
             );
         }
-        assert!(Cli::try_parse_from(["flarebox", "space", "create", &longest]).is_ok());
+        assert!(Cli::try_parse_from(["koi", "space", "create", &longest]).is_ok());
     }
 
     #[test]
@@ -1361,7 +1361,7 @@ mod tests {
         );
         assert_eq!(
             space_table(&[]),
-            "No spaces. Create one with flarebox space create <name>.\n"
+            "No spaces. Create one with koi space create <name>.\n"
         );
     }
 

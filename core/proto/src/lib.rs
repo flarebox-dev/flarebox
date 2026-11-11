@@ -5,5 +5,5 @@
 
 #[allow(clippy::all)]
 pub mod v1 {
-    include!("gen/flarebox/v1/flarebox.v1.rs");
+    include!("gen/koidrive/v1/koidrive.v1.rs");
 }

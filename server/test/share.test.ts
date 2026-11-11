@@ -13,9 +13,9 @@ import {
   RewindRequestSchema,
   RewindResultSchema,
   SpaceInfoSchema,
-} from "../src/gen/flarebox/v1/auth_pb";
-import { Error_Code } from "../src/gen/flarebox/v1/rpc_pb";
-import { CreateShareLinkRequestSchema, type ShareLink, ShareLinkListSchema, ShareLinkSchema } from "../src/gen/flarebox/v1/share_pb";
+} from "../src/gen/koidrive/v1/auth_pb";
+import { Error_Code } from "../src/gen/koidrive/v1/rpc_pb";
+import { CreateShareLinkRequestSchema, type ShareLink, ShareLinkListSchema, ShareLinkSchema } from "../src/gen/koidrive/v1/share_pb";
 import { fromBase64url, base64url } from "../src/crypto";
 import { toHex, uuidv7 } from "../src/ids";
 import { clientKey, MISSES_PER_HOUR, REQUESTS_PER_MINUTE } from "../src/share/limiter";
@@ -27,7 +27,7 @@ import { simulatedPitr } from "./pitr";
 
 simulatedPitr.install();
 
-const BASE = "https://flarebox.test";
+const BASE = "https://koidrive.test";
 const MINUTE = 60_000;
 const decoder = new TextDecoder();
 
@@ -74,7 +74,7 @@ async function getOwner(): Promise<DeviceCredentials> {
   if (owner) return owner;
   const log = vi.spyOn(console, "log");
   await exports.default.fetch(BASE + "/setup");
-  const line = log.mock.calls.map((args) => String(args[0])).find((text) => text.startsWith("Flarebox claim code"));
+  const line = log.mock.calls.map((args) => String(args[0])).find((text) => text.startsWith("Koidrive claim code"));
   const claimed = await owned(
     "/v1/claim",
     { body: body(ClaimRequestSchema, { code: line!.split(": ")[1]!, userName: "Owner", deviceName: "Laptop A", platform: "macos" }) },

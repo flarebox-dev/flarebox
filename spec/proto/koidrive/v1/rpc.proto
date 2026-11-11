@@ -1,0 +1,139 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package koidrive.v1;
+
+import "koidrive/v1/model.proto";
+
+// A call-level failure. Op-level outcomes are in OpResult instead.
+message Error {
+  enum Code {
+    CODE_UNSPECIFIED = 0;
+    CODE_UNAUTHENTICATED = 1;
+    CODE_FORBIDDEN = 2;
+    CODE_INVALID_ARGUMENT = 3;
+    CODE_MISSING_CHUNKS = 4;
+    CODE_LIMIT_EXCEEDED = 5;
+    CODE_QUOTA_EXCEEDED = 6;
+    CODE_READ_ONLY = 7;
+    CODE_RETRY_LATER = 8;
+    CODE_UNSUPPORTED_VERSION = 9;
+    CODE_INTERNAL = 10;
+    // The commit's history_id is not the space's current history.
+    CODE_HISTORY_MISMATCH = 11;
+    // An unknown commit whose device_seq is at or below the device's highest accepted one.
+    CODE_STALE_DEVICE_STATE = 12;
+    // A commit with require_head whose base_seq is below head_seq.
+    CODE_HEAD_MOVED = 13;
+    // The commit's base_seq is above head_seq in the same history: the server is behind what the client saw.
+    CODE_AHEAD_OF_SERVER = 14;
+    // The share link, or the node or link the request names, does not exist or is not reachable (RFC 0005).
+    CODE_NOT_FOUND = 15;
+    // A commit that would trash more than the server's delete policy allows, until the owner confirms (RFC 0006
+    // section 10); no 0.1.0 server sends it for a commit. Also the refusal of a user's last active device that
+    // revokes itself without confirming it (RFC 0009 section 5).
+    CODE_CONFIRMATION_REQUIRED = 16;
+  }
+  Code code = 1;
+  string message = 2;
+  // Set with CODE_MISSING_CHUNKS: the chunk hashes that are not ready, at most 1,000 (RFC 0002 section 11).
+  repeated bytes missing_chunks = 3;
+  uint64 retry_after_ms = 4;
+}
+
+// Where and how to send or fetch one chunk.
+message Target {
+  string url = 1;
+  string method = 2;
+  map<string, string> headers = 3;
+  int64 expires_at_ms = 4;
+}
+
+// Asks which chunks need uploading before a commit. At most 1,000 chunks.
+message PrepareUpload {
+  repeated ChunkRef chunks = 1;
+}
+
+message ChunkPlan {
+  enum Action {
+    ACTION_UNSPECIFIED = 0;
+    // Already stored; its hold is extended.
+    ACTION_PRESENT = 1;
+    // Upload to target before committing.
+    ACTION_UPLOAD = 2;
+    // Being deleted; ask again after retry_after_ms.
+    ACTION_RETRY_LATER = 3;
+  }
+  bytes hash = 1;
+  Action action = 2;
+  Target target = 3;
+  uint64 retry_after_ms = 4;
+}
+
+message PrepareUploadResult {
+  repeated ChunkPlan chunks = 1;
+}
+
+message GetDownloadTargets {
+  repeated bytes hashes = 1;
+}
+
+message ChunkTarget {
+  bytes hash = 1;
+  Target target = 2;
+}
+
+message DownloadTargets {
+  repeated ChunkTarget targets = 1;
+}
+
+// Reads one page of a version's chunk list, for versions whose Content has no inline chunks.
+message GetVersionChunks {
+  string version_id = 1;
+  uint32 page = 2;
+}
+
+message VersionChunks {
+  repeated ChunkRef chunks = 1;
+  uint32 page = 2;
+  uint32 page_count = 3;
+}
+
+// Lists the retained versions of a file, newest first.
+message ListVersions {
+  string node_id = 1;
+  string cursor = 2;
+  uint32 limit = 3;
+}
+
+message VersionList {
+  repeated VersionInfo versions = 1;
+  // Empty on the last page.
+  string next_cursor = 2;
+}
+
+// Reads the live tree one page at a time (spec v0 section 7.5).
+message ListTree {
+  // Empty for the first page.
+  string cursor = 1;
+  uint32 limit = 2;
+}
+
+message TreePage {
+  repeated NodeState nodes = 1;
+  // Empty on the last page.
+  string next_cursor = 2;
+  // head_seq when this page was read.
+  uint64 head_seq = 3;
+}
+
+message ListTrash {
+  string cursor = 1;
+  uint32 limit = 2;
+}
+
+message TrashPage {
+  repeated NodeState nodes = 1;
+  string next_cursor = 2;
+}

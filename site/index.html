@@ -4,8 +4,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Flarebox, your own Dropbox on Cloudflare</title>
-<meta name="description" content="Flarebox is an open-source file sync service whose server, metadata and file chunks live in a Cloudflare account you own.">
+<title>Koidrive, your own Dropbox on Cloudflare</title>
+<meta name="description" content="Koidrive is an open-source file sync service whose server, metadata and file chunks live in a Cloudflare account you own.">
 <link rel="stylesheet" href="site.css">
 </head>
 <body>
@@ -14,8 +14,8 @@
 <header class="site-nav">
   <div class="container">
     <nav class="site-nav__bar cut" aria-label="Main">
-      <a class="wordmark" href="#top" aria-label="Flarebox, back to the top">Flarebox</a>
-      <a class="key key--primary key--small" href="https://github.com/flarebox-dev/flarebox">See GitHub</a>
+      <a class="wordmark" href="#top" aria-label="Koidrive, back to the top">Koidrive</a>
+      <a class="key key--primary key--small" href="https://github.com/koidrive/koidrive">See GitHub</a>
     </nav>
   </div>
 </header>
@@ -28,16 +28,16 @@
         <p class="lead">The open-source server, its database and your files stay in your account.</p>
       </div>
 
-      <figure class="term cut" aria-label="Installing Flarebox and running setup in a terminal">
+      <figure class="term cut" aria-label="Installing Koidrive and running setup in a terminal">
         <ul class="term__cmds">
-          <li class="cmd"><code><span class="term__prompt" aria-hidden="true">$ </span><span data-cmd>brew install flarebox-dev/tap/flarebox</span></code><button class="copy" type="button" aria-live="polite">Copy</button></li>
-          <li class="cmd"><code><span class="term__prompt" aria-hidden="true">$ </span><span data-cmd>flarebox setup</span></code><button class="copy" type="button" aria-live="polite">Copy</button></li>
+          <li class="cmd"><code><span class="term__prompt" aria-hidden="true">$ </span><span data-cmd>brew install koidrive/tap/koidrive</span></code><button class="copy" type="button" aria-live="polite">Copy</button></li>
+          <li class="cmd"><code><span class="term__prompt" aria-hidden="true">$ </span><span data-cmd>koi setup</span></code><button class="copy" type="button" aria-live="polite">Copy</button></li>
         </ul>
         <ol class="term__log" data-run>
           <li style="--i: 0"><svg class="ok" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>Logged in with Cloudflare</span></li>
-          <li style="--i: 1"><svg class="ok" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>Created the R2 bucket <b>flarebox</b></span></li>
+          <li style="--i: 1"><svg class="ok" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>Created the R2 bucket <b>koidrive</b></span></li>
           <li style="--i: 2"><svg class="ok" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>Uploaded the Worker with <b>AccountDO</b> and <b>SpaceDO</b></span></li>
-          <li style="--i: 3"><svg class="ok" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>Serving at <b class="url">https://flarebox.example.workers.dev</b></span></li>
+          <li style="--i: 3"><svg class="ok" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>Serving at <b class="url">https://koidrive.example.workers.dev</b></span></li>
           <li style="--i: 4"><svg class="ok" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>Claimed the server with a one-time secret</span></li>
           <li style="--i: 5"><svg class="ok" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>Saved the device credentials and deleted the secret</span></li>
           <li style="--i: 6"><svg class="ok" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>Revoked the Cloudflare login</span></li>
@@ -49,7 +49,7 @@
 
 <footer class="site-foot">
   <div class="container">
-    <p>Cloudflare, Workers, Durable Objects and R2 are trademarks of Cloudflare, Inc. Flarebox is not affiliated with or endorsed by Cloudflare, Inc.</p>
+    <p>Cloudflare, Workers, Durable Objects and R2 are trademarks of Cloudflare, Inc. Koidrive is not affiliated with or endorsed by Cloudflare, Inc.</p>
   </div>
 </footer>
 

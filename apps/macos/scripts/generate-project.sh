@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# Generates Flarebox.xcodeproj from project.yml with a pinned XcodeGen.
+# Generates Koidrive.xcodeproj from project.yml with a pinned XcodeGen.
 # The first run downloads XcodeGen into build/tools and verifies its SHA-256.
 # Run it again after changing project.yml or adding or removing source files.
 set -euo pipefail

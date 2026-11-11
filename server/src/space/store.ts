@@ -12,7 +12,7 @@ import {
   NodeStatus,
   type VersionInfo,
   VersionInfoSchema,
-} from "../gen/flarebox/v1/model_pb";
+} from "../gen/koidrive/v1/model_pb";
 
 /** Chunks per row of version_chunk_pages, and per GetVersionChunks page. */
 export const PAGE_CHUNKS = 4096;

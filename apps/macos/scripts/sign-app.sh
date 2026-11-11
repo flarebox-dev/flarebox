@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# Signs an app bundle with the hardened runtime and Flarebox.entitlements.
+# Signs an app bundle with the hardened runtime and Koidrive.entitlements.
 # Usage: sign-app.sh <app> <identity>
 #   identity  the SHA-1 hash or name of a Developer ID Application identity, or - for an
 #             ad hoc signature (unsigned builds)
@@ -17,7 +17,7 @@ app="$1"
 identity="$2"
 macos_dir="$(cd "$(dirname "$0")/.." && pwd)"
 
-args=(--force --options runtime --entitlements "$macos_dir/Flarebox.entitlements" --sign "$identity")
+args=(--force --options runtime --entitlements "$macos_dir/Koidrive.entitlements" --sign "$identity")
 if [ "$identity" = "-" ]; then
   args+=(--timestamp=none)
 else

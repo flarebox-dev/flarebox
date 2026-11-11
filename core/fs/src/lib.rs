@@ -49,7 +49,7 @@
 //!   the old entry removed and the new one created at the same path.
 //!
 //! Scans and watchers given [`Rules`] also leave out what the rules name
-//! (design §5.10): the built-in platform files, and every entry a `.fbignore`
+//! (design §5.10): the built-in platform files, and every entry a `.koiignore`
 //! file or the device's own list excludes, with everything below it. A scan
 //! reads the [`RULES_FILE`] of each folder it lists and hands the bytes to
 //! the caller's matcher ([`Ignore`]) before it judges the folder's entries.

@@ -8,8 +8,8 @@ use std::io;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use flarebox_net::{ChunkError, Session, Transfer};
-use flarebox_proto::v1::{ChunkRef, UploadReceipt};
+use koidrive_net::{ChunkError, Session, Transfer};
+use koidrive_proto::v1::{ChunkRef, UploadReceipt};
 
 /// Reads each chunk on a blocking thread from a source the callback holds.
 async fn upload(

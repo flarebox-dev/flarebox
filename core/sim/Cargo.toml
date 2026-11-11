@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-name = "flarebox-sim"
+name = "koidrive-sim"
 description = "Deterministic simulation harness and reference server."
 version.workspace = true
 edition.workspace = true
@@ -10,8 +10,8 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-flarebox-engine = { path = "../engine" }
-flarebox-proto = { path = "../proto" }
+koidrive-engine = { path = "../engine" }
+koidrive-proto = { path = "../proto" }
 prost.workspace = true
 sha2 = "0.11.1"
 

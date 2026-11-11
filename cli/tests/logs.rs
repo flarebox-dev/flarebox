@@ -7,17 +7,17 @@ use std::process::{Command, Stdio};
 #[test]
 fn logs_to_a_pipe_are_plain_text() {
     let home = tempfile::tempdir().unwrap();
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_flarebox"))
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_koi"))
         .arg("daemon")
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", home.path().join("config"))
         .env("XDG_STATE_HOME", home.path().join("state"))
         .env("XDG_RUNTIME_DIR", home.path().join("run"))
         .env_remove("NO_COLOR")
-        .env_remove("FLAREBOX_LOG")
+        .env_remove("KOIDRIVE_LOG")
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run flarebox");
+        .expect("run koi");
     let mut log = String::new();
     BufReader::new(daemon.stderr.take().unwrap())
         .read_line(&mut log)

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-name = "flarebox-net"
-description = "HTTP and WebSocket client for a Flarebox server."
+name = "koidrive-net"
+description = "HTTP and WebSocket client for a Koidrive server."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,7 +13,7 @@ publish.workspace = true
 base64 = "0.23.1"
 bytes = "1.12.1"
 fastrand = "2"
-flarebox-proto = { path = "../proto" }
+koidrive-proto = { path = "../proto" }
 futures-util = { version = "0.3.31", default-features = false, features = ["sink", "std"] }
 http-body-util = "0.1.5"
 hyper = { version = "1.12.0", features = ["client", "http1"] }

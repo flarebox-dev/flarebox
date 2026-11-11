@@ -42,20 +42,20 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use flarebox_chunk::ChunkerConfig;
-use flarebox_engine::effects::{
+use koidrive_chunk::ChunkerConfig;
+use koidrive_engine::effects::{
     Base as EngineBase, Displaced as EngineDisplaced, Effect as EngineEffect, EffectRecord,
     Location as EngineLocation,
 };
-use flarebox_engine::ignore::is_rules_file;
-use flarebox_engine::tree::{Content, Kind};
-use flarebox_fs::{
+use koidrive_engine::ignore::is_rules_file;
+use koidrive_engine::tree::{Content, Kind};
+use koidrive_fs::{
     Action, Base, Contents, Dir, Displaced, Effect, Entry, EntryKind, FileId, Location, Marker,
     Outcome, Reason, Reclaimed, RootProblem, Space, Step,
 };
-use flarebox_net::{CallError, ChunkError, Session, StopReason, Transfer};
-use flarebox_proto::v1::{ChunkRef, Commit, op};
-use flarebox_store::{Link, Store, Tx};
+use koidrive_net::{CallError, ChunkError, Session, StopReason, Transfer};
+use koidrive_proto::v1::{ChunkRef, Commit, op};
+use koidrive_store::{Link, Store, Tx};
 use prost::Message;
 
 use crate::engine::{Engine, file_id, file_identity};
@@ -92,7 +92,7 @@ pub(crate) enum Stop {
     #[error("effect {effect_id} cannot be carried out: {what}")]
     Record { effect_id: String, what: String },
     #[error("the folder's sync state: {0}")]
-    Store(#[from] flarebox_store::Error),
+    Store(#[from] koidrive_store::Error),
     #[error("the folder: {0}")]
     Io(#[from] io::Error),
     #[error("{0}")]
@@ -175,7 +175,7 @@ impl Sections {
         &self,
         observer: &mut FsObserver,
         idle: Duration,
-    ) -> Result<Option<Batch>, flarebox_fs::Error> {
+    ) -> Result<Option<Batch>, koidrive_fs::Error> {
         let (resets, requests) = self.take_resets();
         let wait = if resets.is_empty() {
             idle
@@ -308,7 +308,7 @@ impl Disk {
     /// 3. The no-replace probe.
     /// 4. The effect in flight is recovered without staging anything again, and acknowledged. An interrupted one is
     ///    planned again; one that met another state on disk stays blocked, and so does one that recovery found done
-    ///    where L shows another entry ([`flarebox_engine::effects::Effects::confirms`]). The marker must then equal
+    ///    where L shows another entry ([`koidrive_engine::effects::Effects::confirms`]). The marker must then equal
     ///    *e*.
     /// 5. Staged files without an effect are deleted.
     ///
@@ -754,7 +754,7 @@ impl Pending {
         let mut received = 0;
         let fetched = fetch
             .download(&manifest.distinct, &mut |chunk, bytes| {
-                if !flarebox_net::matches(chunk, bytes) {
+                if !koidrive_net::matches(chunk, bytes) {
                     corrupt = true;
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -825,7 +825,7 @@ impl Pending {
                 ..
             } => Some(policy::after_refusal(refusal)),
             ChunkError::Call(call)
-                if call.code() == Some(flarebox_proto::v1::error::Code::NotFound) =>
+                if call.code() == Some(koidrive_proto::v1::error::Code::NotFound) =>
             {
                 None
             }
@@ -929,7 +929,7 @@ fn acknowledge(
 }
 
 /// `outcome` as recovery reports it for the effect in flight, unless L refutes a done
-/// ([`flarebox_engine::effects::Effects::confirms`]). Then the effect fails as it would have on the entry recovery
+/// ([`koidrive_engine::effects::Effects::confirms`]). Then the effect fails as it would have on the entry recovery
 /// found: a removal finds its entry missing, and a write or a new folder finds its name taken.
 fn confirmed(outcome: Outcome, engine: &Engine) -> Outcome {
     let Outcome::Done { identity } = &outcome else {
@@ -1158,7 +1158,7 @@ impl Manifest {
                 chunks.len()
             ));
         }
-        if flarebox_chunk::manifest_digest(&chunks).as_slice() != content.manifest_digest {
+        if koidrive_chunk::manifest_digest(&chunks).as_slice() != content.manifest_digest {
             return Err("its chunk list does not match its manifest digest".into());
         }
         let mut sizes: BTreeMap<&[u8], u32> = BTreeMap::new();
@@ -1234,7 +1234,7 @@ fn holds(file: &File, expected: Option<&Content>, executable: bool) -> io::Resul
     {
         return Ok(false);
     }
-    let chunks = flarebox_chunk::chunks(Positioned { file, at: 0 }, config)
+    let chunks = koidrive_chunk::chunks(Positioned { file, at: 0 }, config)
         .map(|chunk| chunk.map(|chunk| chunk.chunk_ref()))
         .collect::<io::Result<Vec<ChunkRef>>>()?;
     let after = file.metadata()?;
@@ -1248,7 +1248,7 @@ fn holds(file: &File, expected: Option<&Content>, executable: bool) -> io::Resul
         )
     };
     Ok(same(&before) == same(&after)
-        && flarebox_chunk::manifest_digest(&chunks).as_slice() == expected.manifest_digest)
+        && koidrive_chunk::manifest_digest(&chunks).as_slice() == expected.manifest_digest)
 }
 
 /// Reads a file from `at` with positional reads, whatever its descriptor's offset.

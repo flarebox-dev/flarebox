@@ -20,7 +20,7 @@ use crate::{FileId, list, open_dir_at, open_root, stat_at, stat_fd};
 /// The engine's private folder at the root of a space, for the marker,
 /// staging, quarantine, parked entries and the local trash. Scans and watchers
 /// never report anything in it.
-pub const PRIVATE_DIR: &str = ".flarebox";
+pub const PRIVATE_DIR: &str = ".koidrive";
 
 const MARKER: &str = "space.json";
 const MARKER_TEMP: &str = "space.json.tmp";
@@ -30,7 +30,7 @@ const PROBE: [&str; 3] = [
     "no-replace-probe-c",
 ];
 
-/// The root marker `.flarebox/space.json`: the space the folder holds, and the
+/// The root marker `.koidrive/space.json`: the space the folder holds, and the
 /// effect counter *m* of design §2.8.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Marker {

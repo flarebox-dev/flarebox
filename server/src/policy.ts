@@ -3,7 +3,7 @@
 // The points where the server decides what a principal may do (RFC 0006 sections 3 and 10). In 0.1.0 every principal
 // that authenticates is a full-scope device, so each point allows everything.
 
-import type { Op } from "./gen/flarebox/v1/commit_pb";
+import type { Op } from "./gen/koidrive/v1/commit_pb";
 
 /** A credential the server authenticated: a row of the Account DO's devices table (RFC 0006 section 2). */
 export interface Principal {

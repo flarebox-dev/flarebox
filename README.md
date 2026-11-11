@@ -1,13 +1,13 @@
-# Flarebox
+# Koidrive
 
 > [!WARNING]
-> **Not released yet.** Flarebox syncs files between devices, but 0.1.0 has no packaged release, and the protocol and storage format may still change before it. Keep another copy of anything you sync.
+> **Not released yet.** Koidrive syncs files between devices, but 0.1.0 has no packaged release, and the protocol and storage format may still change before it. Keep another copy of anything you sync.
 
-Flarebox is an open-source file sync service, in the spirit of Dropbox, that you deploy to your own Cloudflare account. File contents are stored as content-addressed chunks in your own R2 bucket, a Durable Object per space orders every change, and native clients for Linux and macOS share a sync engine written in Rust.
+Koidrive is an open-source file sync service, in the spirit of Dropbox, that you deploy to your own Cloudflare account. File contents are stored as content-addressed chunks in your own R2 bucket, a Durable Object per space orders every change, and native clients for Linux and macOS share a sync engine written in Rust.
 
-## Using Flarebox
+## Using Koidrive
 
-The [user guide](docs/guide/README.md) covers installing the `flarebox` command, deploying a server to your Cloudflare account, linking folders, conflicts, the trash and old versions, and removing everything again.
+The [user guide](docs/guide/README.md) covers installing the `koi` command, deploying a server to your Cloudflare account, linking folders, conflicts, the trash and old versions, and removing everything again.
 
 ## Repository layout
 
@@ -29,4 +29,4 @@ Issues are open to everyone, and until 1.0 only the project owner and invited ma
 
 ## Trademarks
 
-Cloudflare, Cloudflare Workers, Durable Objects and R2 are trademarks of Cloudflare, Inc. Flarebox is an independent project and is not affiliated with or endorsed by Cloudflare, Inc.
+Cloudflare, Cloudflare Workers, Durable Objects and R2 are trademarks of Cloudflare, Inc. Koidrive is an independent project and is not affiliated with or endorsed by Cloudflare, Inc.

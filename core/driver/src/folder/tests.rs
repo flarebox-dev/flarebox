@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! [`Folder`] with a test in place of the shell: a real folder, store and observer, `flarebox-sim`'s space as the
+//! [`Folder`] with a test in place of the shell: a real folder, store and observer, `koidrive-sim`'s space as the
 //! server, and chunks held in memory. A test runs the work a step returns and feeds the result back, so it chooses
 //! the order results arrive in. After every step the store is loaded again and compared with the engine in memory.
 
@@ -8,15 +8,15 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 
-use flarebox_engine::commit::Lift;
-use flarebox_engine::restore::{Outcome, RestoreIntent};
-use flarebox_engine::tree::{Kind, LocalNode, Tree};
-use flarebox_fs::{EntryKind, Marker, RootProblem, write_marker};
-use flarebox_net::Committed;
-use flarebox_proto::v1::{
+use koidrive_engine::commit::Lift;
+use koidrive_engine::restore::{Outcome, RestoreIntent};
+use koidrive_engine::tree::{Kind, LocalNode, Tree};
+use koidrive_fs::{EntryKind, Marker, RootProblem, write_marker};
+use koidrive_net::Committed;
+use koidrive_proto::v1::{
     ListTrash, ListTree, ListVersions, Op, PrepareUpload, Resume, ResyncRequired, chunk_plan, op,
 };
-use flarebox_sim::space::{Role, Session as Caller, SpaceDo};
+use koidrive_sim::space::{Role, Session as Caller, SpaceDo};
 
 use super::*;
 use crate::config::SyncRules;
@@ -89,7 +89,7 @@ impl Remote {
         let mut receipts = Vec::new();
         for chunk in chunks.iter().filter(|chunk| wanted(chunk)) {
             let bytes = upload.read(chunk).unwrap();
-            assert!(flarebox_net::matches(chunk, &bytes));
+            assert!(koidrive_net::matches(chunk, &bytes));
             self.chunks
                 .chunks
                 .insert(chunk.hash.clone(), bytes.to_vec());
@@ -113,7 +113,7 @@ impl Remote {
     /// The names of the live nodes besides the root, in order.
     fn names(&self) -> Vec<String> {
         let root = self.space.space_id();
-        let live = flarebox_proto::v1::NodeStatus::Live as i32;
+        let live = koidrive_proto::v1::NodeStatus::Live as i32;
         let mut names: Vec<String> = (self.space.nodes().into_iter())
             .filter(|node| node.node_id != root && node.status == live)
             .map(|node| node.name)
@@ -576,7 +576,7 @@ fn a_file_swapped_into_a_name_the_rules_exclude_keeps_its_remote_copy() {
         .unwrap()
         .0
         .clone();
-    a.create(&mut remote, &site.root.join(".fbignore"), b"b\n");
+    a.create(&mut remote, &site.root.join(".koiignore"), b"b\n");
     fs::rename(site.root.join("a"), site.root.join("tmp")).unwrap();
     fs::rename(site.root.join("b"), site.root.join("a")).unwrap();
     fs::rename(site.root.join("tmp"), site.root.join("b")).unwrap();
@@ -631,25 +631,25 @@ fn a_move_onto_a_name_a_symlink_holds_still_lets_the_new_file_take_the_old_name(
     assert_eq!(fs::read(site.root.join("d")).unwrap(), b"new remote file");
 }
 
-/// The names in a folder besides `.flarebox`, in order.
+/// The names in a folder besides `.koidrive`, in order.
 fn names(root: &Path) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(root)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-        .filter(|name| name != flarebox_fs::PRIVATE_DIR)
+        .filter(|name| name != koidrive_fs::PRIVATE_DIR)
         .collect();
     names.sort();
     names
 }
 
-/// Every file under a folder besides `.flarebox`, by its path from the folder, with its text, in order.
+/// Every file under a folder besides `.koidrive`, by its path from the folder, with its text, in order.
 fn files(root: &Path) -> Vec<(String, String)> {
     let mut files = Vec::new();
     let mut dirs = vec![root.to_owned()];
     while let Some(dir) = dirs.pop() {
         for entry in fs::read_dir(&dir).unwrap() {
             let path = entry.unwrap().path();
-            if path == root.join(flarebox_fs::PRIVATE_DIR) {
+            if path == root.join(koidrive_fs::PRIVATE_DIR) {
                 continue;
             }
             if path.is_dir() {
@@ -664,14 +664,14 @@ fn files(root: &Path) -> Vec<(String, String)> {
     files
 }
 
-/// Every entry under a folder besides `.flarebox`, by its path from the folder, with the text of a file, in order.
+/// Every entry under a folder besides `.koidrive`, by its path from the folder, with the text of a file, in order.
 fn entries(root: &Path) -> Vec<(String, Option<String>)> {
     let mut entries = Vec::new();
     let mut dirs = vec![root.to_owned()];
     while let Some(dir) = dirs.pop() {
         for entry in fs::read_dir(&dir).unwrap() {
             let path = entry.unwrap().path();
-            if path == root.join(flarebox_fs::PRIVATE_DIR) {
+            if path == root.join(koidrive_fs::PRIVATE_DIR) {
                 continue;
             }
             let name = path
@@ -767,9 +767,9 @@ fn an_effect_whose_name_l_gave_to_another_node_writes_nothing_and_is_planned_aga
     assert_eq!(names(&site.root), ["f"], "nothing is written at the name");
     let effects = &b.folder.engine.effects;
     assert!(effects.in_flight().is_none() && effects.blocked().is_empty());
-    let marker = flarebox_fs::read_marker(&site.root).unwrap().unwrap();
+    let marker = koidrive_fs::read_marker(&site.root).unwrap().unwrap();
     assert_eq!(marker.effects, effects.cleared());
-    let staging = site.root.join(flarebox_fs::PRIVATE_DIR).join("staging");
+    let staging = site.root.join(koidrive_fs::PRIVATE_DIR).join("staging");
     assert_eq!(fs::read_dir(staging).unwrap().count(), 0);
 
     sync(&mut remote, (&site_a, &mut a), (&site, &mut b));
@@ -1011,8 +1011,8 @@ fn a_download_the_server_puts_off_for_an_hour_shows_in_the_status_until_it_goes_
     let mut b = site.start();
     b.connect(&remote);
     b.scan_until(|b| b.folder.scanned);
-    *remote.chunks.refusal.lock().unwrap() = Some(ServerError(flarebox_proto::v1::Error {
-        code: flarebox_proto::v1::error::Code::QuotaExceeded as i32,
+    *remote.chunks.refusal.lock().unwrap() = Some(ServerError(koidrive_proto::v1::Error {
+        code: koidrive_proto::v1::error::Code::QuotaExceeded as i32,
         message: "the daily limit is used up".into(),
         retry_after_ms: 3_600_000,
         ..Default::default()
@@ -1194,8 +1194,8 @@ fn a_tree_listing_put_off_for_an_hour_shows_in_the_status_and_one_put_off_for_a_
 }
 
 /// A refusal of the server that puts a call off for an hour.
-fn put_off(code: flarebox_proto::v1::error::Code) -> ServerError {
-    ServerError(flarebox_proto::v1::Error {
+fn put_off(code: koidrive_proto::v1::error::Code) -> ServerError {
+    ServerError(koidrive_proto::v1::Error {
         code: code as i32,
         message: "not now".into(),
         retry_after_ms: 3_600_000,
@@ -1205,7 +1205,7 @@ fn put_off(code: flarebox_proto::v1::error::Code) -> ServerError {
 
 #[test]
 fn an_upload_put_off_for_an_hour_leaves_the_status_once_its_file_is_deleted() {
-    use flarebox_proto::v1::error::Code;
+    use koidrive_proto::v1::error::Code;
     let mut remote = Remote::new();
     let (site, mut a) = linked(&mut remote, "a");
     let path = site.root.join("notes.txt");
@@ -1239,7 +1239,7 @@ fn an_upload_put_off_for_an_hour_leaves_the_status_once_its_file_is_deleted() {
 
 #[test]
 fn a_commit_put_off_for_an_hour_leaves_the_status_once_the_server_refuses_it() {
-    use flarebox_proto::v1::error::Code;
+    use koidrive_proto::v1::error::Code;
     let mut remote = Remote::new();
     let (site, mut a) = linked(&mut remote, "a");
     fs::write(site.root.join("notes.txt"), b"written on a").unwrap();
@@ -1381,7 +1381,7 @@ fn a_node_the_server_refused_is_committed_again_after_the_scan_of_the_next_start
         panic!("the commit is sent");
     };
     assert_eq!(kinds(&commit), ["create file"]);
-    let refusal = flarebox_proto::v1::Error {
+    let refusal = koidrive_proto::v1::Error {
         code: Code::LimitExceeded as i32,
         ..Default::default()
     };
@@ -1559,7 +1559,7 @@ fn a_file_that_changes_while_it_is_uploaded_is_committed_with_its_new_bytes() {
     )
     .unwrap();
     let chunk = upload.chunks[0].clone();
-    assert!(!flarebox_net::matches(
+    assert!(!koidrive_net::matches(
         &chunk,
         &upload.read(&chunk).unwrap()
     ));
@@ -1995,7 +1995,7 @@ fn node_named(device: &Device, name: &str) -> String {
 fn ended(site: &Site) -> Vec<(String, Outcome)> {
     let mut store = Store::open(&site.db).unwrap();
     let (inbox, (queued, resolved)) = store
-        .transaction(|tx| Ok::<_, flarebox_store::Error>((tx.restore_requests()?, tx.restores()?)))
+        .transaction(|tx| Ok::<_, koidrive_store::Error>((tx.restore_requests()?, tx.restores()?)))
         .unwrap();
     assert!(inbox.is_empty() && queued.is_empty());
     (resolved.into_iter())
@@ -2182,14 +2182,14 @@ fn a_downloaded_rules_file_is_in_force_before_anything_else_is_planned() {
     let mut remote = Remote::new();
     let (site_a, mut a) = linked(&mut remote, "a");
     a.create(&mut remote, &site_a.root.join("cache.tmp"), b"cache");
-    a.create(&mut remote, &site_a.root.join(".fbignore"), b"*.tmp\n");
+    a.create(&mut remote, &site_a.root.join(".koiignore"), b"*.tmp\n");
 
     let site = Site::new(&remote, "b");
     let mut b = site.start();
     b.connect(&remote);
     b.scan_until(|b| b.folder.scanned);
     assert_eq!(b.run(&mut remote), ["list", "subscribe", "stage"]);
-    assert_eq!(names(&site.root), [".fbignore"]);
+    assert_eq!(names(&site.root), [".koiignore"]);
     assert!(b.folder.disk.awaits_rules());
     assert_eq!(b.state(), FolderState::CatchingUp);
 
@@ -2200,8 +2200,8 @@ fn a_downloaded_rules_file_is_in_force_before_anything_else_is_planned() {
     );
     b.settle();
     assert!(b.work.is_empty() && b.sent.is_empty());
-    assert_eq!(names(&site.root), [".fbignore"]);
-    assert_eq!(remote.names(), [".fbignore", "cache.tmp"]);
+    assert_eq!(names(&site.root), [".koiignore"]);
+    assert_eq!(remote.names(), [".koiignore", "cache.tmp"]);
     assert_eq!(b.state(), FolderState::UpToDate);
 }
 
@@ -2215,13 +2215,13 @@ fn a_rules_file_a_restart_cannot_read_holds_everything_below_its_folder() {
     a.create(&mut remote, &site_a.root.join("build.log"), b"v1");
     let (site, mut b) = linked(&mut remote, "b");
     let (site_c, mut c) = linked(&mut remote, "c");
-    a.create(&mut remote, &site_a.root.join(".fbignore"), b"*.log\n");
+    a.create(&mut remote, &site_a.root.join(".koiignore"), b"*.log\n");
     b.pull(&remote);
     assert_eq!(b.run(&mut remote), ["stage"]);
     b.scan_until(|b| !b.folder.disk.awaits_rules());
     assert!(b.run(&mut remote).is_empty());
     drop(b);
-    fs::write(site.root.join(".fbignore"), "*.log\n".repeat(200_000)).unwrap();
+    fs::write(site.root.join(".koiignore"), "*.log\n".repeat(200_000)).unwrap();
     a.create(&mut remote, &site_a.root.join("notes.txt"), b"notes");
     c.create(&mut remote, &site_c.root.join("build.log"), b"v2 from c");
 
@@ -2230,14 +2230,14 @@ fn a_rules_file_a_restart_cannot_read_holds_everything_below_its_folder() {
     b.scan_until(|b| b.folder.scanned);
     assert_eq!(b.run(&mut remote), ["subscribe"]);
     assert_eq!(fs::read(site.root.join("build.log")).unwrap(), b"v1");
-    assert_eq!(names(&site.root), [".fbignore", "build.log"]);
+    assert_eq!(names(&site.root), [".koiignore", "build.log"]);
 
-    fs::write(site.root.join(".fbignore"), "*.log\n").unwrap();
+    fs::write(site.root.join(".koiignore"), "*.log\n").unwrap();
     b.scan_until(|b| !b.work.is_empty());
     assert_eq!(b.run(&mut remote), ["stage"]);
     b.settle();
     assert!(b.run(&mut remote).is_empty());
-    assert_eq!(names(&site.root), [".fbignore", "build.log", "notes.txt"]);
+    assert_eq!(names(&site.root), [".koiignore", "build.log", "notes.txt"]);
     assert_eq!(fs::read(site.root.join("build.log")).unwrap(), b"v1");
     assert!(b.work.is_empty() && b.sent.is_empty());
 }
@@ -2251,18 +2251,22 @@ fn the_rules_hold_of_a_folder_ends_also_after_it_was_renamed_only_in_case() {
     let (site_a, mut a) = linked(&mut remote, "a");
     fs::create_dir(site_a.root.join("proj")).unwrap();
     a.create(&mut remote, &site_a.root.join("proj/file.txt"), b"v1");
-    a.create(&mut remote, &site_a.root.join("proj/.fbignore"), b"*.log\n");
+    a.create(
+        &mut remote,
+        &site_a.root.join("proj/.koiignore"),
+        b"*.log\n",
+    );
     let (site, mut b) = linked(&mut remote, "b");
     b.scan_until(|b| !b.folder.disk.awaits_rules());
     b.run(&mut remote);
     drop(b);
-    fs::write(site.root.join("proj/.fbignore"), "*.log\n".repeat(200_000)).unwrap();
+    fs::write(site.root.join("proj/.koiignore"), "*.log\n".repeat(200_000)).unwrap();
     let mut b = site.start();
     b.connect(&remote);
     b.scan_until(|b| b.folder.scanned);
     b.run(&mut remote);
     fs::rename(site.root.join("proj"), site.root.join("PROJ")).unwrap();
-    fs::write(site.root.join("PROJ/.fbignore"), b"*.log\n").unwrap();
+    fs::write(site.root.join("PROJ/.koiignore"), b"*.log\n").unwrap();
     b.scan_until(|b| !b.work.is_empty());
     b.run(&mut remote);
     b.settle();
@@ -2293,18 +2297,22 @@ fn review_removing_unknown_rules_while_renaming_the_folder_does_not_hold_remote_
     let (site_a, mut a) = linked(&mut remote, "a");
     fs::create_dir(site_a.root.join("proj")).unwrap();
     a.create(&mut remote, &site_a.root.join("proj/file.txt"), b"v1");
-    a.create(&mut remote, &site_a.root.join("proj/.fbignore"), b"*.log\n");
+    a.create(
+        &mut remote,
+        &site_a.root.join("proj/.koiignore"),
+        b"*.log\n",
+    );
     let (site, mut b) = linked(&mut remote, "b");
     b.scan_until(|b| !b.folder.disk.awaits_rules());
     b.run(&mut remote);
     drop(b);
-    fs::write(site.root.join("proj/.fbignore"), "*.log\n".repeat(200_000)).unwrap();
+    fs::write(site.root.join("proj/.koiignore"), "*.log\n".repeat(200_000)).unwrap();
     let mut b = site.start();
     b.connect(&remote);
     b.scan_until(|b| b.folder.scanned);
     b.run(&mut remote);
     fs::rename(site.root.join("proj"), site.root.join("PROJ")).unwrap();
-    fs::remove_file(site.root.join("PROJ/.fbignore")).unwrap();
+    fs::remove_file(site.root.join("PROJ/.koiignore")).unwrap();
     b.scan_until(|b| !b.work.is_empty());
     b.run(&mut remote);
     b.settle();
@@ -2338,17 +2346,21 @@ fn deleting_a_rules_file_a_restart_cannot_read_ends_the_hold_of_its_folder() {
     let (site_a, mut a) = linked(&mut remote, "a");
     fs::create_dir(site_a.root.join("proj")).unwrap();
     a.create(&mut remote, &site_a.root.join("proj/file.txt"), b"v1");
-    a.create(&mut remote, &site_a.root.join("proj/.fbignore"), b"*.log\n");
+    a.create(
+        &mut remote,
+        &site_a.root.join("proj/.koiignore"),
+        b"*.log\n",
+    );
     let (site, mut b) = linked(&mut remote, "b");
     b.scan_until(|b| !b.folder.disk.awaits_rules());
     b.run(&mut remote);
     drop(b);
-    fs::write(site.root.join("proj/.fbignore"), "*.log\n".repeat(200_000)).unwrap();
+    fs::write(site.root.join("proj/.koiignore"), "*.log\n".repeat(200_000)).unwrap();
     let mut b = site.start();
     b.connect(&remote);
     b.scan_until(|b| b.folder.scanned);
     b.run(&mut remote);
-    fs::remove_file(site.root.join("proj/.fbignore")).unwrap();
+    fs::remove_file(site.root.join("proj/.koiignore")).unwrap();
     b.scan_until(|b| !b.work.is_empty());
     b.run(&mut remote);
     b.settle();
@@ -2390,7 +2402,7 @@ fn removals_below_a_folder_move_that_is_dropped_are_dropped_with_it() {
     b.run(&mut remote);
     assert!(site.root.join("b").is_dir());
     fs::rename(site.root.join("a"), site.root.join("b/a")).unwrap();
-    fs::write(site.root.join("b/a/.fbignore"), "*.log\n".repeat(200_000)).unwrap();
+    fs::write(site.root.join("b/a/.koiignore"), "*.log\n".repeat(200_000)).unwrap();
     let stale = Batch {
         stamp,
         answered: None,
@@ -2436,7 +2448,7 @@ fn a_deleted_folder_that_keeps_an_excluded_file_on_the_server_leaves_the_folder_
     fs::create_dir(site.root.join("d")).unwrap();
     a.create(&mut remote, &site.root.join("d/a.log"), b"log");
     a.create(&mut remote, &site.root.join("d/b.txt"), b"text");
-    a.create(&mut remote, &site.root.join(".fbignore"), b"*.log\n");
+    a.create(&mut remote, &site.root.join(".koiignore"), b"*.log\n");
     fs::remove_dir_all(site.root.join("d")).unwrap();
     a.scan_until(|a| !a.work.is_empty());
     assert_eq!(a.run(&mut remote), ["send"]);
@@ -2449,7 +2461,7 @@ fn a_deleted_folder_that_keeps_an_excluded_file_on_the_server_leaves_the_folder_
         .map(|(_, node)| node.shape.name.as_str())
         .collect();
     live.sort();
-    assert_eq!(live, [".fbignore", "a.log", "d"]);
+    assert_eq!(live, [".koiignore", "a.log", "d"]);
     assert_eq!(a.state(), FolderState::UpToDate);
 }
 
@@ -2682,7 +2694,7 @@ fn a_batch_that_fails_the_root_check_stops_the_folder_before_l_loses_a_file() {
     let (site, mut a) = linked(&mut remote, "a");
     a.create(&mut remote, &site.root.join("notes.txt"), b"written on a");
 
-    fs::remove_file(site.root.join(flarebox_fs::PRIVATE_DIR).join("space.json")).unwrap();
+    fs::remove_file(site.root.join(koidrive_fs::PRIVATE_DIR).join("space.json")).unwrap();
     fs::remove_file(site.root.join("notes.txt")).unwrap();
     let stop = loop {
         if let Err(stop) = a.try_scan(Duration::from_millis(100)) {
@@ -2767,21 +2779,21 @@ fn a_rules_file_named_in_another_case_is_downloaded_and_in_force_first() {
     let mut remote = Remote::new();
     let (site_a, mut a) = linked(&mut remote, "a");
     a.create(&mut remote, &site_a.root.join("cache.tmp"), b"cache");
-    a.create(&mut remote, &site_a.root.join(".FBIGNORE"), b"*.tmp\n");
+    a.create(&mut remote, &site_a.root.join(".KOIIGNORE"), b"*.tmp\n");
 
     let site = Site::new(&remote, "b");
     let mut b = site.start();
     b.connect(&remote);
     b.scan_until(|b| b.folder.scanned);
     assert_eq!(b.run(&mut remote), ["list", "subscribe", "stage"]);
-    assert_eq!(names(&site.root), [".FBIGNORE"]);
+    assert_eq!(names(&site.root), [".KOIIGNORE"]);
     assert!(b.folder.disk.awaits_rules());
 
     b.scan_until(|b| !b.folder.disk.awaits_rules());
     assert!(b.run(&mut remote).is_empty());
     b.settle();
     assert!(b.work.is_empty() && b.sent.is_empty());
-    assert_eq!(names(&site.root), [".FBIGNORE"]);
+    assert_eq!(names(&site.root), [".KOIIGNORE"]);
     assert_eq!(b.state(), FolderState::UpToDate);
 }
 
@@ -2835,7 +2847,11 @@ fn a_remote_edit_of_an_excluded_file_is_not_applied_while_its_folder_moves() {
     b.settle();
     c.settle();
 
-    a.create(&mut remote, &site_a.root.join("proj/.fbignore"), b"*.log\n");
+    a.create(
+        &mut remote,
+        &site_a.root.join("proj/.koiignore"),
+        b"*.log\n",
+    );
     b.pull(&remote);
     assert_eq!(b.run(&mut remote), ["stage"]);
     b.scan_until(|b| !b.folder.disk.awaits_rules());
@@ -2868,7 +2884,7 @@ fn a_batch_scanned_before_a_rules_file_was_written_does_not_end_the_wait_for_its
     let mut remote = Remote::new();
     let (site_a, mut a) = linked(&mut remote, "a");
     a.create(&mut remote, &site_a.root.join("cache.tmp"), b"cache");
-    a.create(&mut remote, &site_a.root.join(".fbignore"), b"*.tmp\n");
+    a.create(&mut remote, &site_a.root.join(".koiignore"), b"*.tmp\n");
 
     let site = Site::new(&remote, "b");
     let mut b = site.start();
@@ -2895,7 +2911,7 @@ fn a_batch_scanned_before_a_rules_file_was_written_does_not_end_the_wait_for_its
 
     b.scan_until(|b| !b.folder.disk.awaits_rules());
     assert_eq!(b.run(&mut remote), ["upload", "send"]);
-    assert_eq!(names(&site.root), [".fbignore", "mine.txt"]);
+    assert_eq!(names(&site.root), [".koiignore", "mine.txt"]);
 }
 
 /// The observer's thread takes its resets, and the effect that moves the folder ends before the thread reads its
@@ -2910,7 +2926,11 @@ fn a_batch_that_was_not_asked_to_scan_a_moved_folder_does_not_end_the_wait_for_i
     let (site_c, mut c) = linked(&mut remote, "c");
     b.settle();
     c.settle();
-    a.create(&mut remote, &site_a.root.join("proj/.fbignore"), b"*.log\n");
+    a.create(
+        &mut remote,
+        &site_a.root.join("proj/.koiignore"),
+        b"*.log\n",
+    );
     b.pull(&remote);
     assert_eq!(b.run(&mut remote), ["stage"]);
     b.scan_until(|b| !b.folder.disk.awaits_rules());
@@ -3012,7 +3032,7 @@ fn a_reconnect_while_a_commit_is_sent_starts_no_second_send() {
         }
 
         a.event(Event::Disconnected {
-            reason: flarebox_net::DisconnectReason::Timeout,
+            reason: koidrive_net::DisconnectReason::Timeout,
             retry_in: Duration::from_secs(1),
         })
         .unwrap();
@@ -3104,7 +3124,7 @@ fn refused_first_commit(remote: &mut Remote, code: Code) -> (Site, Commit, Strin
     let Some(Work::Send(commit)) = a.work.pop_front() else {
         panic!("the commit is sent");
     };
-    let refusal = ServerError(flarebox_proto::v1::Error {
+    let refusal = ServerError(koidrive_proto::v1::Error {
         code: code as i32,
         message: "refused".into(),
         ..Default::default()
@@ -3127,11 +3147,11 @@ fn restarted(site: &Site, remote: &mut Remote) -> Device {
 fn a_refused_commit_lifted_to_resend_goes_out_unchanged() {
     let mut remote = Remote::new();
     let (site, refused, halt) = refused_first_commit(&mut remote, Code::Forbidden);
-    assert!(halt.contains("flarebox lift"), "{halt}");
+    assert!(halt.contains("koi lift"), "{halt}");
     let a = restarted(&site, &mut remote);
     assert!(a.sent.is_empty(), "a restart lifts nothing");
     let problem = a.folder.view().problem.unwrap();
-    assert!(problem.contains("flarebox lift"), "{problem}");
+    assert!(problem.contains("koi lift"), "{problem}");
     drop(a);
 
     lift_halt(&site.db, Lift::Resend).unwrap();
@@ -3194,7 +3214,7 @@ fn a_file_edited_while_a_move_the_server_undid_was_in_flight_keeps_its_name() {
     b.pull(&remote);
     assert!(matches!(
         b.folder.engine.effects.in_flight().unwrap().effect,
-        flarebox_engine::effects::Effect::Move { .. }
+        koidrive_engine::effects::Effect::Move { .. }
     ));
     fs::rename(site_a.root.join("remote.txt"), site_a.root.join("old.txt")).unwrap();
     a.scan_until(|a| !a.work.is_empty());
@@ -3255,7 +3275,7 @@ fn backup(remote: &Remote, device: &Device) -> Remote {
 
 /// The names in the folder's local trash.
 fn trashed(root: &Path) -> Vec<String> {
-    let trash = root.join(flarebox_fs::PRIVATE_DIR).join("trash");
+    let trash = root.join(koidrive_fs::PRIVATE_DIR).join("trash");
     fs::read_dir(trash).map_or(Vec::new(), |entries| {
         entries
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
@@ -3747,7 +3767,7 @@ fn a_restore_after_the_server_lost_a_delete_under_a_policy_halt_is_kept() {
     a.perform(upload, &mut remote).unwrap();
     assert!(matches!(a.work.pop_front(), Some(Work::Send(_))));
     let step = a.folder.sent(Err(CallError::Server(ServerError(
-        flarebox_proto::v1::Error {
+        koidrive_proto::v1::Error {
             code: Code::Forbidden as i32,
             message: "refused".into(),
             ..Default::default()
@@ -3864,7 +3884,7 @@ fn an_edit_the_server_lost_under_a_policy_halt_is_not_sent_again_over_a_later_ed
     a.perform(upload, &mut remote).unwrap();
     assert!(matches!(a.work.pop_front(), Some(Work::Send(_))));
     let step = a.folder.sent(Err(CallError::Server(ServerError(
-        flarebox_proto::v1::Error {
+        koidrive_proto::v1::Error {
             code: Code::Forbidden as i32,
             message: "refused".into(),
             ..Default::default()
@@ -3917,7 +3937,7 @@ fn an_edit_the_server_lost_under_a_policy_halt_is_kept_when_the_server_passed_th
     a.perform(upload, &mut remote).unwrap();
     assert!(matches!(a.work.pop_front(), Some(Work::Send(_))));
     let step = a.folder.sent(Err(CallError::Server(ServerError(
-        flarebox_proto::v1::Error {
+        koidrive_proto::v1::Error {
             code: Code::Forbidden as i32,
             message: "refused".into(),
             ..Default::default()
@@ -3970,7 +3990,7 @@ fn renames_after_a_server_loss_was_handled_under_a_policy_halt_are_kept() {
     a.perform(upload, &mut remote).unwrap();
     assert!(matches!(a.work.pop_front(), Some(Work::Send(_))));
     let step = a.folder.sent(Err(CallError::Server(ServerError(
-        flarebox_proto::v1::Error {
+        koidrive_proto::v1::Error {
             code: Code::Forbidden as i32,
             message: "refused".into(),
             ..Default::default()
@@ -4202,7 +4222,7 @@ fn a_file_moved_into_an_ignored_folder_stays_on_the_server_when_its_folder_is_re
         let (site, mut a) = linked(&mut remote, "a");
         fs::create_dir(site.root.join("source")).unwrap();
         a.create(&mut remote, &site.root.join("source/file"), b"kept");
-        a.create(&mut remote, &site.root.join(".fbignore"), b"ignored/\n");
+        a.create(&mut remote, &site.root.join(".koiignore"), b"ignored/\n");
         let id = a.observer.snapshot().entries[Path::new("source/file")].id;
         fs::create_dir(site.root.join("ignored")).unwrap();
         fs::rename(
@@ -4247,7 +4267,7 @@ fn a_file_moved_into_an_ignored_folder_stays_on_the_server_when_its_folder_is_re
         assert_eq!(fs::read(site.root.join("ignored/file")).unwrap(), b"kept");
         assert_eq!(
             remote.names(),
-            [".fbignore", "file", "source"],
+            [".koiignore", "file", "source"],
             "{removed_first}"
         );
         assert_eq!(a.folder.engine.trees.check(), Ok(()));
@@ -4263,7 +4283,7 @@ fn a_file_moved_into_an_ignored_folder_stays_on_the_server_when_its_folder_is_re
     let (site, mut a) = linked(&mut remote, "a");
     fs::create_dir(site.root.join("source")).unwrap();
     a.create(&mut remote, &site.root.join("source/file"), b"kept");
-    a.create(&mut remote, &site.root.join(".fbignore"), b"ignored/\n");
+    a.create(&mut remote, &site.root.join(".koiignore"), b"ignored/\n");
     fs::create_dir(site.root.join("ignored")).unwrap();
     fs::rename(
         site.root.join("source/file"),
@@ -4277,7 +4297,7 @@ fn a_file_moved_into_an_ignored_folder_stays_on_the_server_when_its_folder_is_re
     a.run(&mut remote);
     a.settle();
     a.run(&mut remote);
-    assert_eq!(remote.names(), [".fbignore", "file", "source"]);
+    assert_eq!(remote.names(), [".koiignore", "file", "source"]);
     assert_eq!(a.folder.engine.trees.check(), Ok(()));
     drop(a);
 
@@ -4288,7 +4308,7 @@ fn a_file_moved_into_an_ignored_folder_stays_on_the_server_when_its_folder_is_re
     a.settle();
     a.run(&mut remote);
     assert_eq!(fs::read(site.root.join("ignored/file")).unwrap(), b"kept");
-    assert_eq!(remote.names(), [".fbignore", "file", "source"]);
+    assert_eq!(remote.names(), [".koiignore", "file", "source"]);
     assert_eq!(a.folder.engine.trees.check(), Ok(()));
 }
 
@@ -4302,7 +4322,7 @@ fn a_folder_created_again_at_a_removed_folder_kept_for_an_ignored_file_keeps_the
     let (site, mut a) = linked(&mut remote, "a");
     fs::create_dir(site.root.join("source")).unwrap();
     a.create(&mut remote, &site.root.join("source/file"), b"kept");
-    a.create(&mut remote, &site.root.join(".fbignore"), b"ignored/\n");
+    a.create(&mut remote, &site.root.join(".koiignore"), b"ignored/\n");
     fs::create_dir(site.root.join("ignored")).unwrap();
     fs::rename(
         site.root.join("source/file"),
@@ -4316,7 +4336,7 @@ fn a_folder_created_again_at_a_removed_folder_kept_for_an_ignored_file_keeps_the
     a.create(&mut remote, &site.root.join("source/new"), b"new");
     a.settle();
     a.run(&mut remote);
-    assert_eq!(remote.names(), [".fbignore", "file", "new", "source"]);
+    assert_eq!(remote.names(), [".koiignore", "file", "new", "source"]);
     assert_eq!(a.folder.engine.trees.check(), Ok(()));
     drop(a);
 
@@ -4328,7 +4348,7 @@ fn a_folder_created_again_at_a_removed_folder_kept_for_an_ignored_file_keeps_the
     a.run(&mut remote);
     assert_eq!(fs::read(site.root.join("ignored/file")).unwrap(), b"kept");
     assert_eq!(fs::read(site.root.join("source/new")).unwrap(), b"new");
-    assert_eq!(remote.names(), [".fbignore", "file", "new", "source"]);
+    assert_eq!(remote.names(), [".koiignore", "file", "new", "source"]);
     assert_eq!(a.folder.engine.trees.check(), Ok(()));
 }
 
@@ -4342,7 +4362,7 @@ fn a_folder_created_again_at_a_kept_folder_another_device_deleted_is_a_new_folde
         let (site, mut a) = linked(&mut remote, "a");
         fs::create_dir(site.root.join("source")).unwrap();
         a.create(&mut remote, &site.root.join("source/file"), b"kept");
-        a.create(&mut remote, &site.root.join(".fbignore"), b"ignored/\n");
+        a.create(&mut remote, &site.root.join(".koiignore"), b"ignored/\n");
         let before = server_nodes(&remote);
         let (source, file) = (live_id(&before, "source"), live_id(&before, "file"));
         fs::create_dir(site.root.join("ignored")).unwrap();
@@ -4384,7 +4404,7 @@ fn a_folder_created_again_at_a_kept_folder_another_device_deleted_is_a_new_folde
         let after = server_nodes(&remote);
         let revived = |id: &String| after.iter().any(|(_, node, live)| node == id && *live);
         assert!(!revived(&source) && !revived(&file), "{restart}: {after:?}");
-        assert_eq!(remote.names(), [".fbignore", "new", "source"], "{restart}");
+        assert_eq!(remote.names(), [".koiignore", "new", "source"], "{restart}");
         assert_eq!(fs::read(site.root.join("ignored/file")).unwrap(), b"kept");
         assert_eq!(a.folder.engine.trees.check(), Ok(()));
     }
@@ -4430,7 +4450,7 @@ fn a_name_l_keeps_is_taken(folder: bool, taker: Taker) {
         fs::create_dir(site.root.join("other")).unwrap();
         a.create(&mut remote, &site.root.join("other/inner"), b"inner");
         a.create(&mut remote, &site.root.join("note"), b"note");
-        a.create(&mut remote, &site.root.join(".fbignore"), b"ignored/\n");
+        a.create(&mut remote, &site.root.join(".koiignore"), b"ignored/\n");
         let before = server_nodes(&remote);
         fs::create_dir(site.root.join("ignored")).unwrap();
         fs::rename(
@@ -4537,7 +4557,7 @@ fn a_file_created_in_a_folder_created_again_does_not_replace_the_file_moved_into
         let (site, mut a) = linked(&mut remote, "a");
         fs::create_dir(site.root.join("source")).unwrap();
         a.create(&mut remote, &site.root.join("source/file"), b"kept");
-        a.create(&mut remote, &site.root.join(".fbignore"), b"ignored/\n");
+        a.create(&mut remote, &site.root.join(".koiignore"), b"ignored/\n");
         let file = live_id(&server_nodes(&remote), "file");
         fs::create_dir(site.root.join("ignored")).unwrap();
         fs::rename(
@@ -4581,7 +4601,7 @@ fn a_file_moved_back_out_of_an_ignored_folder_after_its_name_was_taken_is_moved_
         let (site, mut a) = linked(&mut remote, "a");
         fs::create_dir(site.root.join("source")).unwrap();
         a.create(&mut remote, &site.root.join("source/file"), b"kept");
-        a.create(&mut remote, &site.root.join(".fbignore"), b"ignored/\n");
+        a.create(&mut remote, &site.root.join(".koiignore"), b"ignored/\n");
         let file = live_id(&server_nodes(&remote), "file");
         fs::create_dir(site.root.join("ignored")).unwrap();
         fs::rename(
@@ -4644,7 +4664,7 @@ fn a_file_moved_out_of_a_removed_folder_with_a_link_in_an_ignored_folder_is_move
     let (site, mut a) = linked(&mut remote, "a");
     fs::create_dir(site.root.join("source")).unwrap();
     a.create(&mut remote, &site.root.join("source/file"), b"kept");
-    a.create(&mut remote, &site.root.join(".fbignore"), b"ignored/\n");
+    a.create(&mut remote, &site.root.join(".koiignore"), b"ignored/\n");
     fs::create_dir(site.root.join("ignored")).unwrap();
     fs::hard_link(
         site.root.join("source/file"),
@@ -4657,7 +4677,7 @@ fn a_file_moved_out_of_a_removed_folder_with_a_link_in_an_ignored_folder_is_move
     a.run(&mut remote);
     a.settle();
     a.run(&mut remote);
-    assert_eq!(remote.names(), [".fbignore", "moved"]);
+    assert_eq!(remote.names(), [".koiignore", "moved"]);
     assert_eq!(fs::read(site.root.join("moved")).unwrap(), b"kept");
     assert_eq!(fs::read(site.root.join("ignored/alias")).unwrap(), b"kept");
     assert_eq!(a.folder.engine.trees.check(), Ok(()));
@@ -4672,11 +4692,11 @@ fn a_file_moved_into_an_ignored_folder_out_of_a_removed_folder_with_an_included_
     let (site, mut a) = linked(&mut remote, "a");
     fs::create_dir(site.root.join("source")).unwrap();
     a.create(&mut remote, &site.root.join("source/file"), b"kept");
-    a.create(&mut remote, &site.root.join(".fbignore"), b"ignored/\n");
+    a.create(&mut remote, &site.root.join(".koiignore"), b"ignored/\n");
     fs::hard_link(site.root.join("source/file"), site.root.join("also")).unwrap();
     a.scan_until(|a| !a.work.is_empty());
     a.run(&mut remote);
-    assert_eq!(remote.names(), [".fbignore", "also", "file", "source"]);
+    assert_eq!(remote.names(), [".koiignore", "also", "file", "source"]);
     fs::create_dir(site.root.join("ignored")).unwrap();
     fs::rename(
         site.root.join("source/file"),
@@ -4688,7 +4708,7 @@ fn a_file_moved_into_an_ignored_folder_out_of_a_removed_folder_with_an_included_
     a.run(&mut remote);
     a.settle();
     a.run(&mut remote);
-    assert_eq!(remote.names(), [".fbignore", "also", "file", "source"]);
+    assert_eq!(remote.names(), [".koiignore", "also", "file", "source"]);
     assert_eq!(fs::read(site.root.join("ignored/file")).unwrap(), b"kept");
     assert_eq!(fs::read(site.root.join("also")).unwrap(), b"kept");
     assert_eq!(a.folder.engine.trees.check(), Ok(()));
@@ -4703,7 +4723,7 @@ fn a_file_moved_into_an_ignored_folder_before_a_folder_above_it_was_moved_is_kep
     fs::create_dir_all(site.root.join("d/a/b")).unwrap();
     fs::create_dir(site.root.join("dest")).unwrap();
     a.create(&mut remote, &site.root.join("d/a/b/file"), b"kept");
-    a.create(&mut remote, &site.root.join(".fbignore"), b"ig/\n");
+    a.create(&mut remote, &site.root.join(".koiignore"), b"ig/\n");
     fs::create_dir(site.root.join("ig")).unwrap();
     fs::rename(site.root.join("d/a/b/file"), site.root.join("ig/file")).unwrap();
     fs::remove_dir(site.root.join("d/a/b")).unwrap();
@@ -4732,7 +4752,7 @@ fn a_file_moved_out_of_its_folder_while_the_folder_was_ignored_stays_on_the_serv
     let (site, mut a) = linked(&mut remote, "a");
     fs::create_dir_all(site.root.join("d/a")).unwrap();
     a.create(&mut remote, &site.root.join("d/a/file"), b"kept");
-    a.create(&mut remote, &site.root.join(".fbignore"), b"ig/\nother/\n");
+    a.create(&mut remote, &site.root.join(".koiignore"), b"ig/\nother/\n");
     fs::create_dir(site.root.join("ig")).unwrap();
     fs::create_dir(site.root.join("other")).unwrap();
     fs::rename(site.root.join("d/a"), site.root.join("ig/a")).unwrap();
@@ -4744,13 +4764,13 @@ fn a_file_moved_out_of_its_folder_while_the_folder_was_ignored_stays_on_the_serv
     a.run(&mut remote);
     a.settle();
     a.run(&mut remote);
-    assert_eq!(remote.names(), [".fbignore", "d", "file", "returned"]);
+    assert_eq!(remote.names(), [".koiignore", "d", "file", "returned"]);
     fs::remove_dir(site.root.join("returned")).unwrap();
     a.scan_until(|a| !(a.observer.snapshot().entries).contains_key(Path::new("returned")));
     a.run(&mut remote);
     a.settle();
     a.run(&mut remote);
-    assert_eq!(remote.names(), [".fbignore", "d", "file", "returned"]);
+    assert_eq!(remote.names(), [".koiignore", "d", "file", "returned"]);
     assert_eq!(fs::read(site.root.join("other/file")).unwrap(), b"kept");
     assert_eq!(a.folder.engine.trees.check(), Ok(()));
 }
@@ -4764,7 +4784,7 @@ fn a_file_moved_out_of_its_folder_while_the_folder_was_ignored_stays_on_the_serv
     let (site, mut a) = linked(&mut remote, "a");
     fs::create_dir_all(site.root.join("d/a")).unwrap();
     a.create(&mut remote, &site.root.join("d/a/file"), b"kept");
-    a.create(&mut remote, &site.root.join(".fbignore"), b"ig/\nother/\n");
+    a.create(&mut remote, &site.root.join(".koiignore"), b"ig/\nother/\n");
     fs::create_dir(site.root.join("ig")).unwrap();
     fs::create_dir(site.root.join("other")).unwrap();
     fs::rename(site.root.join("d/a"), site.root.join("ig/a")).unwrap();
@@ -4784,13 +4804,13 @@ fn a_file_moved_out_of_its_folder_while_the_folder_was_ignored_stays_on_the_serv
     a.run(&mut remote);
     a.settle();
     a.run(&mut remote);
-    assert_eq!(remote.names(), [".fbignore", "d", "file", "returned"]);
+    assert_eq!(remote.names(), [".koiignore", "d", "file", "returned"]);
     fs::remove_dir(site.root.join("returned")).unwrap();
     a.scan_until(|a| !(a.observer.snapshot().entries).contains_key(Path::new("returned")));
     a.run(&mut remote);
     a.settle();
     a.run(&mut remote);
-    assert_eq!(remote.names(), [".fbignore", "d", "file", "returned"]);
+    assert_eq!(remote.names(), [".koiignore", "d", "file", "returned"]);
     assert_eq!(fs::read(site.root.join("other/file")).unwrap(), b"kept");
     assert_eq!(a.folder.engine.trees.check(), Ok(()));
 }
@@ -4800,7 +4820,7 @@ type Nodes = Vec<(String, String, bool)>;
 
 /// Every node on the server by name, with its ID and whether it is live, in order.
 fn server_nodes(remote: &Remote) -> Nodes {
-    let live = flarebox_proto::v1::NodeStatus::Live as i32;
+    let live = koidrive_proto::v1::NodeStatus::Live as i32;
     let mut nodes: Nodes = (remote.space.nodes().into_iter())
         .filter(|node| !node.parent_id.is_empty())
         .map(|node| (node.name, node.node_id, node.status == live))
@@ -4903,7 +4923,7 @@ fn a_file_saved_by_swapping_in_a_new_file_keeps_its_node() {
     a.create(&mut remote, &site.root.join("doc"), b"first");
     let before = server_nodes(&remote);
     a.event(Event::Disconnected {
-        reason: flarebox_net::DisconnectReason::Timeout,
+        reason: koidrive_net::DisconnectReason::Timeout,
         retry_in: Duration::from_secs(1),
     })
     .unwrap();
@@ -4942,7 +4962,7 @@ fn the_status_names_a_node_the_server_rejected_an_op_for_and_why() {
     let last_seq = a.folder.engine.cursor.as_ref().unwrap().last_seq;
     let result = CommitResult {
         seq: last_seq + 1,
-        results: vec![flarebox_proto::v1::OpResult {
+        results: vec![koidrive_proto::v1::OpResult {
             code: op_result::Code::Rejected as i32,
             reject_reason: "INVALID_NAME".into(),
             ..Default::default()
@@ -4955,7 +4975,7 @@ fn the_status_names_a_node_the_server_rejected_an_op_for_and_why() {
     assert_eq!(
         a.folder.view().problem.as_deref(),
         Some(
-            "1 item could not be synced: notes.txt (the server rejected it: INVALID_NAME); run flarebox restart once it is fixed"
+            "1 item could not be synced: notes.txt (the server rejected it: INVALID_NAME); run koi restart once it is fixed"
         )
     );
 }
@@ -4974,7 +4994,7 @@ fn the_status_names_a_node_of_a_refused_commit_and_the_refusal() {
     let Some(Work::Send(_)) = a.work.pop_front() else {
         panic!("the commit is sent");
     };
-    let refusal = flarebox_proto::v1::Error {
+    let refusal = koidrive_proto::v1::Error {
         code: Code::LimitExceeded as i32,
         message: "the commit is too large".into(),
         ..Default::default()
@@ -4985,7 +5005,7 @@ fn the_status_names_a_node_of_a_refused_commit_and_the_refusal() {
     assert_eq!(
         a.folder.view().problem.as_deref(),
         Some(
-            "1 item could not be synced: notes.txt (the server refused it: CODE_LIMIT_EXCEEDED: the commit is too large); run flarebox restart once it is fixed"
+            "1 item could not be synced: notes.txt (the server refused it: CODE_LIMIT_EXCEEDED: the commit is too large); run koi restart once it is fixed"
         )
     );
 }
@@ -4998,7 +5018,7 @@ fn the_status_names_a_node_whose_effect_failed_and_why() {
     assert_eq!(
         b.folder.view().problem.as_deref(),
         Some(
-            "1 item could not be synced: notes.txt (the server's change could not be made here: another entry holds its name); run flarebox restart once it is fixed"
+            "1 item could not be synced: notes.txt (the server's change could not be made here: another entry holds its name); run koi restart once it is fixed"
         )
     );
 }
@@ -5033,7 +5053,7 @@ fn the_status_names_a_failed_write_in_a_folder_by_its_whole_path() {
         b.folder.view().problem.as_deref(),
         Some(
             "1 item could not be synced: docs/notes.txt (the server's change could not be made here: another entry \
-             holds its name); run flarebox restart once it is fixed"
+             holds its name); run koi restart once it is fixed"
         )
     );
 }
@@ -5053,13 +5073,13 @@ fn the_status_names_a_node_stuck_for_two_reasons_once() {
         .clone();
     let mut state = b.folder.engine.commits.state();
     state.problems.insert(id.clone());
-    b.folder.engine.commits = flarebox_engine::commit::Commits::from_state(state).unwrap();
+    b.folder.engine.commits = koidrive_engine::commit::Commits::from_state(state).unwrap();
     (b.folder.refused_nodes).insert(id, "the server rejected it: INVALID_NAME".into());
     assert_eq!(
         b.folder.view().problem.as_deref(),
         Some(
             "1 item could not be synced: notes.txt (the server's change could not be made here: another entry holds \
-             its name; the server rejected it: INVALID_NAME); run flarebox restart once it is fixed"
+             its name; the server rejected it: INVALID_NAME); run koi restart once it is fixed"
         )
     );
 }
@@ -5083,7 +5103,7 @@ fn the_reason_of_a_result_that_waits_for_the_log_outlasts_the_first_scan() {
     let seq = a.folder.engine.cursor.as_ref().unwrap().last_seq;
     let result = CommitResult {
         seq: seq + 2,
-        results: vec![flarebox_proto::v1::OpResult {
+        results: vec![koidrive_proto::v1::OpResult {
             code: op_result::Code::Rejected as i32,
             reject_reason: "INVALID_NAME".into(),
             ..Default::default()
@@ -5109,7 +5129,7 @@ fn the_reason_of_a_result_that_waits_for_the_log_outlasts_the_first_scan() {
     assert_eq!(
         a.folder.view().problem.as_deref(),
         Some(
-            "1 item could not be synced: notes.txt (the server rejected it: INVALID_NAME); run flarebox restart once \
+            "1 item could not be synced: notes.txt (the server rejected it: INVALID_NAME); run koi restart once \
              it is fixed"
         )
     );
@@ -5157,12 +5177,12 @@ fn answer(site: &Site, answer: Answer) -> crate::question::Question {
             let [stored] = &questions[..] else {
                 panic!("one question: {questions:?}");
             };
-            let given = flarebox_store::GivenAnswer {
+            let given = koidrive_store::GivenAnswer {
                 answer: answer.as_str().into(),
                 answered_at_ms: NOW,
             };
             assert!(tx.answer_question(&stored.question_id, &given)?);
-            Ok::<_, flarebox_store::Error>(serde_json::from_slice(&stored.body).unwrap())
+            Ok::<_, koidrive_store::Error>(serde_json::from_slice(&stored.body).unwrap())
         })
         .unwrap()
 }

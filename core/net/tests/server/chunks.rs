@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use flarebox_net::{Api, Auth, Backoff, ChunkError, Event, Session, Transfer, matches};
-use flarebox_proto::v1::{
+use koidrive_net::{Api, Auth, Backoff, ChunkError, Event, Session, Transfer, matches};
+use koidrive_proto::v1::{
     ChunkRef, CommitResult, Content, CreateFile, Op, UploadReceipt, change_record, error::Code, op,
     op_result,
 };
@@ -143,7 +143,7 @@ async fn upload_commit_and_download_round_trip() {
     let mut sent = commit(&history, 0, 1, vec![file]);
     let missing = writer.commit(sent.clone()).await.unwrap_err();
     assert_eq!(missing.code(), Some(Code::MissingChunks));
-    let flarebox_net::CallError::Server(error) = missing else {
+    let koidrive_net::CallError::Server(error) = missing else {
         unreachable!()
     };
     assert_eq!(
@@ -335,16 +335,16 @@ async fn commits_are_bound_by_the_1_mib_server_message() {
         _ => None,
     })
     .await;
-    let size = flarebox_proto::v1::ServerMessage {
-        msg: Some(flarebox_proto::v1::server_message::Msg::Changes(
-            flarebox_proto::v1::Changes {
+    let size = koidrive_proto::v1::ServerMessage {
+        msg: Some(koidrive_proto::v1::server_message::Msg::Changes(
+            koidrive_proto::v1::Changes {
                 commits: records.clone(),
             },
         )),
     };
     let size = prost::Message::encoded_len(&size);
     assert!(
-        size > 900 * 1024 && size <= flarebox_net::MAX_SERVER_MESSAGE,
+        size > 900 * 1024 && size <= koidrive_net::MAX_SERVER_MESSAGE,
         "a replay of {size} bytes, just under 1 MiB"
     );
     assert_eq!(records[0].seq, 1);

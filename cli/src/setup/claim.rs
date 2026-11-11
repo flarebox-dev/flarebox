@@ -1,23 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Claiming a server with a one-time `FLAREBOX_RECOVERY_KEY` (docs/design/cli-setup.md sections 4.4 to 4.6): set the
+//! Claiming a server with a one-time `KOIDRIVE_RECOVERY_KEY` (docs/design/cli-setup.md sections 4.4 to 4.6): set the
 //! secret, claim with the setup attempt id, save the credential, then delete the secret. Each step is recorded in the
 //! state file first, so a rerun after a crash or a lost response converges on one device.
 
 use std::time::{Duration, Instant};
 
-use flarebox_cloudflare::Secret;
-use flarebox_driver::{Credential, Paths};
-use flarebox_net::ApiError;
-use flarebox_proto::v1::ClaimRequest;
-use flarebox_proto::v1::error::Code;
+use koidrive_cloudflare::Secret;
+use koidrive_driver::{Credential, Paths};
+use koidrive_net::ApiError;
+use koidrive_proto::v1::ClaimRequest;
+use koidrive_proto::v1::error::Code;
 
 use super::state::{SetupState, StateFile};
 use super::{Cloud, Found, Session, report_paired, server_api};
 use crate::ipc::{self, Request, Response};
 use url::Url;
 
-pub const KEY_NAME: &str = "FLAREBOX_RECOVERY_KEY";
+pub const KEY_NAME: &str = "KOIDRIVE_RECOVERY_KEY";
 /// A new key at most this often per run; more spent keys mean something else is wrong.
 const MAX_KEYS: usize = 5;
 
@@ -268,7 +268,7 @@ fn user_name() -> String {
 
 #[cfg(test)]
 mod tests {
-    use flarebox_proto::v1::{AccessToken, Error};
+    use koidrive_proto::v1::{AccessToken, Error};
     use prost::Message;
 
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -315,7 +315,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_credential_save_keeps_the_setup_attempt() {
-        let issued = flarebox_proto::v1::DeviceCredentials {
+        let issued = koidrive_proto::v1::DeviceCredentials {
             user_id: "user".into(),
             device_id: "0194f8a2-0000-7000-8000-000000000002".into(),
             refresh_credential: "device".into(),
@@ -342,8 +342,8 @@ mod tests {
             writer.write_all(line.as_bytes()).await.unwrap();
         });
         let server = Found {
-            script: flarebox_cloudflare::Script {
-                id: "flarebox".into(),
+            script: koidrive_cloudflare::Script {
+                id: "koidrive".into(),
                 created_on: None,
                 tags: Vec::new(),
                 migration_tag: None,
@@ -355,7 +355,7 @@ mod tests {
         };
         let state = SetupState {
             account: ACCOUNT.into(),
-            script: "flarebox".into(),
+            script: "koidrive".into(),
             step: Step::Serving,
             secret_set: true,
             setup_attempt: Some("attempt".into()),

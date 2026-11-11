@@ -1,4 +1,4 @@
-# Design: Flarebox
+# Design: Koidrive
 
 The design rules for this site. Every page follows them. Change a rule here before a page breaks it.
 
@@ -7,7 +7,7 @@ The design rules for this site. Every page follows them. Change a rule here befo
 - Shape: one screen. A Stage hero, a floating bar nav with the wordmark and one key, and a footer with the trademark notice. Add a section only when the project needs it.
 - Theme: Cobalt
 - Axes: light/grotesk-sans/cool, posture: restrained
-- Signature: the two install commands, each with a copy key, and `flarebox setup` running under them in a terminal panel. Each progress line is a step in the CLI setup design (docs/design/cli-setup.md). The workers.dev host is an example.
+- Signature: the two install commands, each with a copy key, and `koi setup` running under them in a terminal panel. Each progress line is a step in the CLI setup design (docs/design/cli-setup.md). The workers.dev host is an example.
 
 ## Tokens
 `tokens.css` is the source of truth. The roles:
@@ -45,7 +45,7 @@ The spacing scale, the type scale, the easings and the durations are the scaffol
 
 ## Copy
 - Every word passes the project's unslop skill. The page reads as it will on launch day, with no status caveats and no roadmap lines. The shipped files carry no drafting notes.
-- Keep the notice that Flarebox is not affiliated with or endorsed by Cloudflare, Inc. Never put "Cloudflare" in the product name.
+- Keep the notice that Koidrive is not affiliated with or endorsed by Cloudflare, Inc. Never put "Cloudflare" in the product name.
 
 ## Files
 - `index.html`: the page, with one inline script for the Copy buttons and the setup log.

@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use flarebox_proto::v1::{CommitRecord, CommitResult, Notice, ResyncRequired, Welcome};
+use koidrive_proto::v1::{CommitRecord, CommitResult, Notice, ResyncRequired, Welcome};
 
 use crate::error::StopReason;
 

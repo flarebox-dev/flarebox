@@ -18,9 +18,9 @@ import {
   SpaceListSchema,
   SpaceUsageSchema,
   TokenRequestSchema,
-} from "./gen/flarebox/v1/auth_pb";
-import { UploadReceiptSchema } from "./gen/flarebox/v1/commit_pb";
-import { Error_Code, ErrorSchema } from "./gen/flarebox/v1/rpc_pb";
+} from "./gen/koidrive/v1/auth_pb";
+import { UploadReceiptSchema } from "./gen/koidrive/v1/commit_pb";
+import { Error_Code, ErrorSchema } from "./gen/koidrive/v1/rpc_pb";
 import { BadRequest, errorReply, readMessage, reply } from "./http";
 import { type ChunkObject, deriveSpaceKey, signChunkGrant, verifyChunkGrant } from "./crypto";
 import { fromHex, isUuidV7 } from "./ids";
@@ -225,17 +225,17 @@ async function route(request: Request, env: Env): Promise<Response> {
 
   if (method === "GET" && path === "/setup") {
     const code = await account(env).issueClaimCode();
-    if (code) console.log("Flarebox claim code (valid for 1 hour): " + code);
+    if (code) console.log("Koidrive claim code (valid for 1 hour): " + code);
     const text = (await account(env).isClaimed())
-      ? "This Flarebox server already has an owner.\n"
-      : "A one-time claim code, valid for one hour, is in this Worker's logs. Find it under this Worker's Observability tab in the dashboard by searching for \"Flarebox claim code\", run `flarebox server claim`, or read it with `wrangler tail`.\n";
-    return new Response(text + "\nFlarebox is not affiliated with Cloudflare, Inc.\n", { headers: { "Content-Type": "text/plain; charset=utf-8" } });
+      ? "This Koidrive server already has an owner.\n"
+      : "A one-time claim code, valid for one hour, is in this Worker's logs. Find it under this Worker's Observability tab in the dashboard by searching for \"Koidrive claim code\", run `koi server claim`, or read it with `wrangler tail`.\n";
+    return new Response(text + "\nKoidrive is not affiliated with Cloudflare, Inc.\n", { headers: { "Content-Type": "text/plain; charset=utf-8" } });
   }
 
   if (method === "POST" && path === "/v1/claim") {
     const body = await readMessage(request, ClaimRequestSchema);
     checkNames({ user_name: body.userName, device_name: body.deviceName, platform: body.platform });
-    const recoveryKey = (env as Env & { FLAREBOX_RECOVERY_KEY?: string }).FLAREBOX_RECOVERY_KEY;
+    const recoveryKey = (env as Env & { KOIDRIVE_RECOVERY_KEY?: string }).KOIDRIVE_RECOVERY_KEY;
     const outcome = await account(env).claim(body, request.headers.get("CF-Connecting-IP") ?? "", recoveryKey);
     if (!outcome.ok) return errorReply(request, outcome.code, outcome.message);
     return reply(request, DeviceCredentialsSchema, create(DeviceCredentialsSchema, outcome.value));

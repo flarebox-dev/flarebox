@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 /** Test Workers and buckets carry this prefix, and teardown refuses any other name. */
-export const NAME_PREFIX = "flarebox-test-";
+export const NAME_PREFIX = "koidrive-test-";
 
 export interface Deployment {
   ref: string;
@@ -66,14 +66,14 @@ export interface State {
 }
 
 export function statePath(): string {
-  return process.env.FLAREBOX_DEPLOY_TEST_STATE || join(process.env.RUNNER_TEMP || tmpdir(), "flarebox-deploy-test.json");
+  return process.env.KOIDRIVE_DEPLOY_TEST_STATE || join(process.env.RUNNER_TEMP || tmpdir(), "koidrive-deploy-test.json");
 }
 
-/** The Worker and bucket name of this run: FLAREBOX_TEST_NAME, which must carry the test prefix. */
+/** The Worker and bucket name of this run: KOIDRIVE_TEST_NAME, which must carry the test prefix. */
 export function testName(): string {
-  const name = process.env.FLAREBOX_TEST_NAME ?? "";
+  const name = process.env.KOIDRIVE_TEST_NAME ?? "";
   if (!name.startsWith(NAME_PREFIX) || !/^[a-z0-9-]{3,63}$/.test(name)) {
-    throw new Error("FLAREBOX_TEST_NAME must be a lowercase name of at most 63 characters starting with " + JSON.stringify(NAME_PREFIX));
+    throw new Error("KOIDRIVE_TEST_NAME must be a lowercase name of at most 63 characters starting with " + JSON.stringify(NAME_PREFIX));
   }
   return name;
 }

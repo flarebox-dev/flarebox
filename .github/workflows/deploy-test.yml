@@ -3,7 +3,7 @@
 # Deploys server/ to a real Cloudflare account under a throwaway name, claims it, smoke-tests it over HTTPS and
 # deletes everything again (docs/deploy-test.md). Manual only: it needs the account's scoped API token, and each run
 # uses a little of the account's Workers, Durable Objects and R2 usage. A first job without secrets refuses a run that
-# is not on main of flarebox-dev/flarebox, or whose deploy-test environment lacks the protection the docs require; the
+# is not on main of koidrive/koidrive, or whose deploy-test environment lacks the protection the docs require; the
 # secrets live only in that environment, which releases them after a required reviewer approves the run.
 
 name: Deploy test
@@ -41,13 +41,13 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - name: Refuse unless the run is for a commit on main of flarebox-dev/flarebox
+      - name: Refuse unless the run is for a commit on main of koidrive/koidrive
         env:
           REPOSITORY: ${{ github.repository }}
           REF: ${{ github.ref }}
         run: |
-          if [ "$REPOSITORY" != flarebox-dev/flarebox ]; then
-            echo "::error::The deploy test runs only in flarebox-dev/flarebox, not in $REPOSITORY."
+          if [ "$REPOSITORY" != koidrive/koidrive ]; then
+            echo "::error::The deploy test runs only in koidrive/koidrive, not in $REPOSITORY."
             exit 1
           fi
           if [ "$REF" != refs/heads/main ]; then
@@ -86,7 +86,7 @@ jobs:
     environment: deploy-test
     timeout-minutes: 60
     env:
-      FLAREBOX_TEST_NAME: flarebox-test-${{ github.run_id }}-${{ github.run_attempt }}
+      KOIDRIVE_TEST_NAME: koidrive-test-${{ github.run_id }}-${{ github.run_attempt }}
       WRANGLER_SEND_METRICS: "false"
     defaults:
       run:
@@ -106,7 +106,7 @@ jobs:
             echo "::error::The deploy test needs the environment secrets$missing in the deploy-test environment. docs/deploy-test.md lists what each holds and the token's permissions. Nothing was deployed."
             exit 1
           fi
-          echo "Both secrets are set. This run deploys and then deletes the Worker and R2 bucket $FLAREBOX_TEST_NAME."
+          echo "Both secrets are set. This run deploys and then deletes the Worker and R2 bucket $KOIDRIVE_TEST_NAME."
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0

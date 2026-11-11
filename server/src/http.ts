@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { create, type DescMessage, fromBinary, fromJson, type MessageShape, toBinary, toJson } from "@bufbuild/protobuf";
-import { Error_Code, ErrorSchema } from "./gen/flarebox/v1/rpc_pb";
+import { Error_Code, ErrorSchema } from "./gen/koidrive/v1/rpc_pb";
 
 // Bodies are binary protobuf, or proto3 JSON for debugging (spec v0 section 15.1).
 

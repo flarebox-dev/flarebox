@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Two devices syncing one space through the real Worker in `server/`, run by
-//! `core/driver/scripts/integration-test.sh`, which starts `wrangler dev` and sets `FLAREBOX_TEST_SERVER` (its URL)
-//! and `FLAREBOX_TEST_SERVER_LOG` (its output, where the Worker prints the claim code). Each device is a [`Driver`]
+//! `core/driver/scripts/integration-test.sh`, which starts `wrangler dev` and sets `KOIDRIVE_TEST_SERVER` (its URL)
+//! and `KOIDRIVE_TEST_SERVER_LOG` (its output, where the Worker prints the claim code). Each device is a [`Driver`]
 //! with a profile and a folder of its own, and both run in the test's process.
 
 use std::collections::BTreeMap;
@@ -14,10 +14,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use flarebox_chunk::ChunkerConfig;
-use flarebox_driver::{Driver, FolderState, FolderStatus, Paths};
-use flarebox_net::{Api, Auth, Credentials, Event, Session, SessionConfig};
-use flarebox_proto::v1::{ClaimRequest, CreateSpaceRequest, SpaceInfo};
+use koidrive_chunk::ChunkerConfig;
+use koidrive_driver::{Driver, FolderState, FolderStatus, Paths};
+use koidrive_net::{Api, Auth, Credentials, Event, Session, SessionConfig};
+use koidrive_proto::v1::{ClaimRequest, CreateSpaceRequest, SpaceInfo};
 use tokio::sync::OnceCell;
 use url::Url;
 
@@ -25,10 +25,10 @@ use url::Url;
 const WAIT: Duration = Duration::from_secs(30);
 
 fn server_url() -> Url {
-    let url = std::env::var("FLAREBOX_TEST_SERVER").expect(
-        "FLAREBOX_TEST_SERVER is not set; run core/driver/scripts/integration-test.sh, which starts the Worker",
+    let url = std::env::var("KOIDRIVE_TEST_SERVER").expect(
+        "KOIDRIVE_TEST_SERVER is not set; run core/driver/scripts/integration-test.sh, which starts the Worker",
     );
-    url.parse().expect("FLAREBOX_TEST_SERVER is a URL")
+    url.parse().expect("KOIDRIVE_TEST_SERVER is a URL")
 }
 
 fn api() -> Api {
@@ -47,7 +47,7 @@ async fn owner() -> Arc<Auth> {
 /// Claims the deployment with the code the Worker prints to its log.
 async fn claim() -> Credentials {
     let log =
-        std::env::var("FLAREBOX_TEST_SERVER_LOG").expect("FLAREBOX_TEST_SERVER_LOG is not set");
+        std::env::var("KOIDRIVE_TEST_SERVER_LOG").expect("KOIDRIVE_TEST_SERVER_LOG is not set");
     let setup = reqwest::get(server_url().join("setup").unwrap())
         .await
         .unwrap();
@@ -95,7 +95,7 @@ fn claim_code(line: &str) -> Option<String> {
 /// Shows the driver's log lines with a failed test.
 fn log() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "flarebox_driver=debug,flarebox_net=info".into());
+        .unwrap_or_else(|_| "koidrive_driver=debug,koidrive_net=info".into());
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_test_writer()
@@ -189,14 +189,14 @@ impl fmt::Debug for Entry {
 
 type Tree = BTreeMap<PathBuf, Entry>;
 
-/// Everything under `root` except `.flarebox`, by relative path, with each file's bytes. An error means the folder
+/// Everything under `root` except `.koidrive`, by relative path, with each file's bytes. An error means the folder
 /// changed while it was read.
 fn tree(root: &Path) -> io::Result<Tree> {
     fn walk(root: &Path, dir: &Path, tree: &mut Tree) -> io::Result<()> {
         for entry in fs::read_dir(dir)? {
             let path = entry?.path();
             let relative = path.strip_prefix(root).unwrap().to_path_buf();
-            if relative == Path::new(".flarebox") {
+            if relative == Path::new(".koidrive") {
                 continue;
             }
             let metadata = fs::symlink_metadata(&path)?;
@@ -315,7 +315,7 @@ async fn a_file_created_on_one_device_appears_on_the_other() {
 async fn a_file_of_several_chunks_arrives_with_the_same_bytes() {
     log();
     let bytes = generated(8 << 20);
-    let chunks = flarebox_chunk::chunks(bytes.as_slice(), ChunkerConfig::V0).count();
+    let chunks = koidrive_chunk::chunks(bytes.as_slice(), ChunkerConfig::V0).count();
     assert!(chunks > 1, "the file is one chunk");
     let owner = owner().await;
     let space = new_space(&owner, "several chunks").await;
@@ -435,7 +435,7 @@ async fn a_folder_moved_over_an_empty_folder_keeps_its_files() {
     let mut b = Device::linked(&owner, &space, "b").await;
     converged(&a, &b).await;
     fs::create_dir_all(a.folder().join("drafts/inner")).unwrap();
-    fs::write(a.folder().join("drafts/.fbignore"), b"*.tmp\n").unwrap();
+    fs::write(a.folder().join("drafts/.koiignore"), b"*.tmp\n").unwrap();
     fs::write(a.folder().join("drafts/one.txt"), b"one\n").unwrap();
     fs::write(a.folder().join("drafts/inner/two.txt"), b"two\n").unwrap();
     fs::create_dir(a.folder().join("final")).unwrap();
@@ -448,7 +448,7 @@ async fn a_folder_moved_over_an_empty_folder_keeps_its_files() {
         synced,
         Tree::from([
             ("final".into(), Entry::Folder),
-            ("final/.fbignore".into(), file(b"*.tmp\n")),
+            ("final/.koiignore".into(), file(b"*.tmp\n")),
             ("final/inner".into(), Entry::Folder),
             ("final/inner/two.txt".into(), file(b"two\n")),
             ("final/one.txt".into(), file(b"one\n")),
@@ -469,7 +469,7 @@ async fn a_folder_moved_over_an_empty_folder_with_unreadable_rules_keeps_its_fil
     let mut b = Device::linked(&owner, &space, "b").await;
     converged(&a, &b).await;
     fs::create_dir_all(a.folder().join("drafts/inner")).unwrap();
-    fs::write(a.folder().join("drafts/.fbignore"), b"*.tmp\n").unwrap();
+    fs::write(a.folder().join("drafts/.koiignore"), b"*.tmp\n").unwrap();
     fs::write(a.folder().join("drafts/one.txt"), b"one\n").unwrap();
     fs::write(a.folder().join("drafts/inner/two.txt"), b"two\n").unwrap();
     fs::create_dir(a.folder().join("final")).unwrap();
@@ -477,13 +477,13 @@ async fn a_folder_moved_over_an_empty_folder_with_unreadable_rules_keeps_its_fil
     assert_eq!(synced.len(), 6, "{synced:#?}");
     let moved = Tree::from([
         ("final".into(), Entry::Folder),
-        ("final/.fbignore".into(), file(b"*.tmp\n")),
+        ("final/.koiignore".into(), file(b"*.tmp\n")),
         ("final/inner".into(), Entry::Folder),
         ("final/inner/two.txt".into(), file(b"two\n")),
         ("final/one.txt".into(), file(b"one\n")),
     ]);
 
-    let rules = a.folder().join("drafts/.fbignore");
+    let rules = a.folder().join("drafts/.koiignore");
     fs::set_permissions(&rules, fs::Permissions::from_mode(0o000)).unwrap();
     if fs::read(&rules).is_ok() {
         eprintln!("skipped: the rules file is still readable, as for root");
@@ -503,7 +503,7 @@ async fn a_folder_moved_over_an_empty_folder_with_unreadable_rules_keeps_its_fil
     }
     assert_eq!(trashed(&owner, &space).await, ["final"]);
 
-    let rules = a.folder().join("final/.fbignore");
+    let rules = a.folder().join("final/.koiignore");
     fs::set_permissions(&rules, fs::Permissions::from_mode(0o644)).unwrap();
     let (synced, _) = converged(&a, &b).await;
     assert_eq!(synced, moved);
@@ -630,18 +630,18 @@ async fn two_edits_of_one_file_keep_both_contents() {
 /// trashed at `when` records it.
 fn put_in_trash(device: &Device, name: &str, entry: &str, when: std::time::SystemTime) {
     let root = device.folder();
-    let space = flarebox_fs::Space::bind(fs::File::open(&root).unwrap().into(), &root).unwrap();
-    let location = flarebox_fs::Location::At {
-        base: flarebox_fs::Base::Root,
+    let space = koidrive_fs::Space::bind(fs::File::open(&root).unwrap().into(), &root).unwrap();
+    let location = koidrive_fs::Location::At {
+        base: koidrive_fs::Base::Root,
         dirs: Vec::new(),
         name: name.into(),
     };
     let (folder, name) = space.parent(&location).unwrap();
     let config = ChunkerConfig::V0;
-    let refs = flarebox_chunk::chunks(fs::read(root.join(name)).unwrap().as_slice(), config)
+    let refs = koidrive_chunk::chunks(fs::read(root.join(name)).unwrap().as_slice(), config)
         .map(|chunk| chunk.unwrap().chunk_ref())
         .collect();
-    let content = flarebox_chunk::content(refs, 0, false, &config);
+    let content = koidrive_chunk::content(refs, 0, false, &config);
     let content = prost::Message::encode_to_vec(&content);
     space
         .trash(&folder, name, entry, name, Some(&content), when)
@@ -650,7 +650,7 @@ fn put_in_trash(device: &Device, name: &str, entry: &str, when: std::time::Syste
 
 /// Waits until the local trash of `device` no longer holds `entry`.
 async fn reclaimed(device: &Device, entry: &str) {
-    let path = device.folder().join(".flarebox/trash").join(entry);
+    let path = device.folder().join(".koidrive/trash").join(entry);
     let started = Instant::now();
     while path.exists() {
         assert!(
@@ -670,7 +670,7 @@ async fn a_started_folder_reclaims_its_local_trash_by_age_and_by_the_configured_
     let mut a = Device::linked(&owner, &space, "a").await;
     a.stop().await;
     fs::write(a.folder().join("old.txt"), b"old\n").unwrap();
-    let week_ago = std::time::SystemTime::now() - flarebox_fs::TRASH_RETENTION;
+    let week_ago = std::time::SystemTime::now() - koidrive_fs::TRASH_RETENTION;
     put_in_trash(&a, "old.txt", "e1", week_ago);
     a.start();
     reclaimed(&a, "e1").await;
@@ -689,6 +689,6 @@ async fn a_started_folder_reclaims_its_local_trash_by_age_and_by_the_configured_
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
         .collect();
-    assert_eq!(names, [".flarebox"], "nothing came back to the root");
+    assert_eq!(names, [".koidrive"], "nothing came back to the root");
     a.stop().await;
 }
