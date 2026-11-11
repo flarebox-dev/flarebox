@@ -4525,7 +4525,7 @@ fn a_late_acknowledgement_takes_an_agreed_position_only_where_s_can_hold_it() {
                 commits.received(result(2, applied)).unwrap();
                 assert!(commits.acknowledge(&mut trees, 8), "{case}");
                 let held = |trees: &Trees, id: &str| match trees.waiting().get(id) {
-                    Some(shape) => shape.clone(),
+                    Some(waiting) => waiting.shape.clone(),
                     None => trees.synced().get(id).cloned(),
                 };
                 let position = |shape: Option<Shape>| shape.map(|s| (s.parent, s.name));
@@ -4624,7 +4624,7 @@ fn a_late_acknowledgement_after_a_rollback_keeps_an_agreement_the_server_kept() 
     trees.set_remote("u".into(), remote_at(file(ROOT, "u", 3), 5));
     trees.settle();
     trees.remove_remote("u");
-    trees.forget_lost(Vec::new(), Vec::new(), 4);
+    trees.forget_lost(Vec::new(), Vec::new(), 4, commits.accepted());
     trees.settle();
     commits
         .received(result(2, vec![outcome(op_result::Code::Applied)]))
@@ -4659,7 +4659,7 @@ fn a_late_create_acknowledgement_after_a_rollback_keeps_an_agreement_r_still_hol
     );
     trees.set_local("n".into(), local(file(ROOT, "b", 1), 1));
     trees.settle();
-    trees.forget_lost(Vec::new(), Vec::new(), 0);
+    trees.forget_lost(Vec::new(), Vec::new(), 0, commits.accepted());
     trees.settle();
     commits
         .received(result(8, vec![outcome(op_result::Code::Applied)]))
