@@ -3649,7 +3649,7 @@ fn a_late_create_acknowledgement_that_keeps_a_position_takes_the_sent_content() 
     let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert!(
-        matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id == "n"),
+        matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id == "n" && c.content == Some(content(3))),
         "{:?}",
         ops(&commit)
     );
@@ -3672,7 +3672,7 @@ fn a_late_create_acknowledgement_that_keeps_a_position_takes_the_sent_content() 
     assert_eq!(trees.local().live("n"), Some(&file(ROOT, "b", 2)));
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert!(
-        matches!(&ops(&commit)[..], [op::Op::UpdateContent(u)] if u.node_id == "n"),
+        matches!(&ops(&commit)[..], [op::Op::UpdateContent(u)] if u.node_id == "n" && u.content == Some(content(2))),
         "{:?}",
         ops(&commit)
     );
