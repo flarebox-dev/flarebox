@@ -22,7 +22,7 @@ use flarebox_engine::tree::{
 };
 use flarebox_fs::{Entry, EntryKind, FileId, Known, Snapshot};
 use flarebox_proto::v1::{
-    ChangeRecord, CommitRecord, NodeKind, NodeState, TreePage, change_record,
+    ChangeRecord, CommitRecord, NodeKind, NodeState, TrashPage, TreePage, change_record,
 };
 use flarebox_store::{Cursor, EngineState, Error, SyncedNode, Tx};
 
@@ -230,10 +230,12 @@ impl Engine {
     /// Replaces R, in the store and in the trees, with a bootstrap's tree that the log has caught up, and sets the
     /// cursor. S and L stay, so the planner then moves what differs (design §4.4). When the server reported that it
     /// is behind the cursor ([`Engine::server_behind`]), it lost commits this device applied, and S forgets the
-    /// nodes it lost ([`Trees::forget_lost`]), so that they are uploaded again. A tree that is not valid stops the
-    /// task before anything is replaced.
+    /// nodes it lost ([`Trees::forget_lost`]), so that they are uploaded again, and takes back the deletes of this
+    /// device it lost, so that they are sent again. A tree that is not valid stops the task before anything is
+    /// replaced.
     pub fn replace_remote(&mut self, tx: &Tx<'_>, staging: Staging) -> Result<(), Stop> {
         let behind = (self.cursor.as_ref()).is_some_and(|cursor| cursor.ahead_of_server);
+        let trashed = self.trees.trashed_here();
         let root = self.trees.remote().root.clone();
         let mut tree = Tree::new(root.clone());
         for state in staging.nodes.values().filter(|state| state.node_id != root) {
@@ -259,7 +261,7 @@ impl Engine {
             }
         }
         if behind {
-            self.trees.forget_lost();
+            self.trees.forget_lost(trashed);
         }
         tx.clear_remote_nodes()?;
         for state in staging.nodes.values() {
@@ -904,9 +906,12 @@ pub(crate) struct Staging {
 }
 
 impl Staging {
-    /// The listing of a bootstrap. The log is replayed from the first page's `head_seq` (spec v0 section 7.5).
-    pub fn new(history_id: String, pages: Vec<TreePage>) -> Self {
-        Staging {
+    /// The listing of a bootstrap. The log is replayed from the first page's `head_seq` (spec v0 section 7.5). The
+    /// pages of the trash, read after the tree when the server lost commits, carry no `head_seq`: a trashed node
+    /// replaces a listed one only when it is newer, as in the replay, which covers what changed while they were read
+    /// (RFC 0002 §6).
+    pub fn new(history_id: String, pages: Vec<TreePage>, trash: Vec<TrashPage>) -> Self {
+        let mut staging = Staging {
             history_id,
             last_seq: pages.first().map_or(0, |page| page.head_seq),
             highest_page_seq: pages.iter().map(|page| page.head_seq).max().unwrap_or(0),
@@ -916,6 +921,20 @@ impl Staging {
                 .flat_map(|page| page.nodes)
                 .map(|node| (node.node_id.clone(), node))
                 .collect(),
+        };
+        for state in trash.into_iter().flat_map(|page| page.nodes) {
+            staging.take(state);
+        }
+        staging
+    }
+
+    /// Holds `state` unless the node it holds is as new.
+    fn take(&mut self, state: NodeState) {
+        let newer = self.nodes.get(&state.node_id).is_none_or(|held| {
+            state.content_rev > held.content_rev || state.meta_rev > held.meta_rev
+        });
+        if newer {
+            self.nodes.insert(state.node_id.clone(), state);
         }
     }
 
@@ -951,14 +970,7 @@ impl Staging {
         }
         for change in changes {
             match &change.change {
-                Some(change_record::Change::Node(state)) => {
-                    let newer = self.nodes.get(&state.node_id).is_none_or(|held| {
-                        state.content_rev > held.content_rev || state.meta_rev > held.meta_rev
-                    });
-                    if newer {
-                        self.nodes.insert(state.node_id.clone(), state.clone());
-                    }
-                }
+                Some(change_record::Change::Node(state)) => self.take(state.clone()),
                 Some(change_record::Change::Purged(purged)) => {
                     self.nodes.remove(&purged.node_id);
                 }
@@ -1068,7 +1080,7 @@ mod tests {
             head_seq: seq,
             ..Default::default()
         };
-        Staging::new("h".into(), vec![page])
+        Staging::new("h".into(), vec![page], Vec::new())
     }
 
     /// The names R holds, in the store and in the trees, which must agree.

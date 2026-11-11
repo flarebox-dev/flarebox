@@ -15,7 +15,7 @@ use flarebox_engine::tree::{Kind, LocalNode, Tree};
 use flarebox_fs::{EntryKind, Marker, RootProblem, write_marker};
 use flarebox_net::Committed;
 use flarebox_proto::v1::{
-    ListTree, ListVersions, Op, PrepareUpload, Resume, ResyncRequired, chunk_plan, op,
+    ListTrash, ListTree, ListVersions, Op, PrepareUpload, Resume, ResyncRequired, chunk_plan, op,
 };
 use flarebox_sim::space::{Role, Session as Caller, SpaceDo};
 
@@ -52,6 +52,20 @@ impl Remote {
                 .last()
                 .map_or(String::new(), |page| page.next_cursor.clone());
             pages.push(self.space.list_tree(&ListTree { cursor, limit }));
+            if pages.last().unwrap().next_cursor.is_empty() {
+                return pages;
+            }
+        }
+    }
+
+    /// Every page of the trash, with `limit` nodes a page.
+    fn trash_pages(&self, limit: u32) -> Vec<TrashPage> {
+        let mut pages: Vec<TrashPage> = Vec::new();
+        loop {
+            let cursor = pages
+                .last()
+                .map_or(String::new(), |page| page.next_cursor.clone());
+            pages.push(self.space.list_trash(&ListTrash { cursor, limit }));
             if pages.last().unwrap().next_cursor.is_empty() {
                 return pages;
             }
@@ -328,9 +342,14 @@ impl Device {
                 history_id,
                 since_seq,
             } => return self.resume(remote, history_id, since_seq),
-            Work::List | Work::ListAfter(..) => self
-                .folder
-                .listed(Ok(Listed::Done(remote.pages(TREE_PAGE)))),
+            Work::List { trash } | Work::ListAfter(_, Listing { trash, .. }) => {
+                let trash = match trash {
+                    true => remote.trash_pages(TREE_PAGE),
+                    false => Vec::new(),
+                };
+                let pages = remote.pages(TREE_PAGE);
+                self.folder.listed(Ok(Listed::Done { pages, trash }))
+            }
             Work::Stage(pending) | Work::StageAfter(_, pending) => {
                 let staged = ready(pending.stage(&remote.chunks));
                 self.folder.staged(pending, staged)
@@ -356,7 +375,7 @@ impl Device {
         while let Some(work) = self.work.pop_front() {
             ran.push(match &work {
                 Work::Subscribe { .. } => "subscribe",
-                Work::List => "list",
+                Work::List { .. } => "list",
                 Work::ListAfter(..) => "list again",
                 Work::Stage(_) => "stage",
                 Work::StageAfter(..) => "stage again",
@@ -1097,7 +1116,7 @@ fn a_tree_listing_put_off_for_an_hour_shows_in_the_status_and_one_put_off_for_a_
     let mut b = site.start();
     b.connect(&remote);
     b.scan_until(|b| b.folder.scanned);
-    assert!(matches!(b.work.pop_front(), Some(Work::List)));
+    assert!(matches!(b.work.pop_front(), Some(Work::List { .. })));
 
     let later = |wait, why: &str| Listed::Later {
         listing: Listing::default(),
@@ -1232,8 +1251,11 @@ fn a_bootstrap_whose_pages_were_read_at_two_heads_replaces_r_after_the_replay() 
     let mut b = site.start();
     b.connect(&remote);
     b.scan_until(|b| b.folder.scanned);
-    assert!(matches!(b.work.pop_front(), Some(Work::List)));
-    let step = b.folder.listed(Ok(Listed::Done(pages)));
+    assert!(matches!(b.work.pop_front(), Some(Work::List { .. })));
+    let step = b.folder.listed(Ok(Listed::Done {
+        pages,
+        trash: vec![],
+    }));
     b.take(step).unwrap();
     assert!(matches!(
         b.work.front(),
@@ -2535,9 +2557,12 @@ fn a_restart_during_a_bootstrap_reads_the_tree_again() {
         let mut b = site.start();
         b.connect(&remote);
         b.scan_until(|b| b.folder.scanned);
-        assert!(matches!(b.work.pop_front(), Some(Work::List)));
+        assert!(matches!(b.work.pop_front(), Some(Work::List { .. })));
         if listed {
-            let step = b.folder.listed(Ok(Listed::Done(remote.pages(TREE_PAGE))));
+            let step = b.folder.listed(Ok(Listed::Done {
+                pages: remote.pages(TREE_PAGE),
+                trash: vec![],
+            }));
             b.take(step).unwrap();
             assert!(matches!(b.work.front(), Some(Work::Subscribe { .. })));
         }
@@ -2978,7 +3003,7 @@ fn a_delete_replayed_below_a_folder_the_server_lost_still_deletes_the_file() {
     remote = restored;
     b.pull(&remote);
     let list = b.work.pop_front().unwrap();
-    assert!(matches!(list, Work::List));
+    assert!(matches!(list, Work::List { .. }));
     b.perform(list, &mut remote).unwrap();
     assert!(matches!(b.folder.stream, Stream::Replaying(_)));
     let (site_c, mut c) = linked(&mut remote, "c");
@@ -3152,6 +3177,76 @@ fn a_server_that_lost_a_commit_of_this_device_gets_it_back_after_others_committe
     assert_eq!(a.state(), FolderState::UpToDate);
 }
 
+/// The server's storage is restored from a backup taken before `a` deleted `one.txt` (GUN-359). `a` lists the tree
+/// again, which holds `one.txt` live as it was deleted, and sends the delete again instead of downloading the file.
+#[test]
+fn a_delete_the_server_lost_is_sent_again() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site.root.join("one.txt"), b"one");
+    a.create(&mut remote, &site.root.join("two.txt"), b"two");
+    let mut restored = backup(&remote, &a);
+    fs::remove_file(site.root.join("one.txt")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    assert_eq!(a.run(&mut remote), ["send"]);
+    assert_eq!(remote.names(), ["two.txt"]);
+    a.event(Event::Connected(restored.space.welcome(&a.caller)))
+        .unwrap();
+    a.run(&mut restored);
+    a.settle();
+    a.run(&mut restored);
+    assert_eq!(restored.names(), ["two.txt"]);
+    assert_eq!(names(&site.root), ["two.txt"]);
+    assert_eq!(a.state(), FolderState::UpToDate);
+}
+
+/// As above, but `b` writes new content into `one.txt` on the restored server before `a` reconnects, at the seq
+/// `a`'s lost delete had. `a` does not send the delete again: it downloads `b`'s content.
+#[test]
+fn a_delete_the_server_lost_is_not_sent_again_over_another_devices_edit() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site.root.join("one.txt"), b"one");
+    let mut restored = backup(&remote, &a);
+    fs::remove_file(site.root.join("one.txt")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    assert_eq!(a.run(&mut remote), ["send"]);
+    let (other, mut b) = linked(&mut restored, "b");
+    b.create(&mut restored, &other.root.join("one.txt"), b"edited");
+    a.event(Event::Connected(restored.space.welcome(&a.caller)))
+        .unwrap();
+    a.run(&mut restored);
+    a.settle();
+    a.run(&mut restored);
+    assert_eq!(restored.names(), ["one.txt"]);
+    assert_eq!(fs::read(site.root.join("one.txt")).unwrap(), b"edited");
+    assert_eq!(a.state(), FolderState::UpToDate);
+}
+
+/// The server lost `a`'s commit of `two.txt`, and `b` deleted `one.txt` on the restored server. The listing reads
+/// the trash too, so `a` takes `one.txt` for a remote delete and removes it, instead of creating it again under an
+/// ID the server holds in its trash, which it would refuse with `ID_EXISTS`.
+#[test]
+fn a_file_another_device_deleted_after_the_server_lost_commits_is_removed_here() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site.root.join("one.txt"), b"one");
+    let mut restored = backup(&remote, &a);
+    a.create(&mut remote, &site.root.join("two.txt"), b"two");
+    let (other, mut b) = linked(&mut restored, "b");
+    fs::remove_file(other.root.join("one.txt")).unwrap();
+    b.scan_until(|b| !b.work.is_empty());
+    assert_eq!(b.run(&mut restored), ["send"]);
+    a.event(Event::Connected(restored.space.welcome(&a.caller)))
+        .unwrap();
+    a.run(&mut restored);
+    a.settle();
+    a.run(&mut restored);
+    assert_eq!(restored.names(), ["two.txt"]);
+    assert_eq!(names(&site.root), ["two.txt"]);
+    assert_eq!(a.state(), FolderState::UpToDate);
+}
+
 /// `a` lists the tree after its log was truncated, and reconnects to a server that lost its commit and took two of
 /// `b`'s at the same seqs before the listing returns. The pages read from the old server are dropped and the tree is
 /// listed again, so R holds the restored server's files, not the old snapshot with its seq 1.
@@ -3165,7 +3260,7 @@ fn a_listing_out_when_the_server_lost_this_devices_commits_is_read_again() {
         ..ResyncRequired::default()
     }))
     .unwrap();
-    let Some(Work::List) = a.work.pop_front() else {
+    let Some(Work::List { .. }) = a.work.pop_front() else {
         panic!("list");
     };
     let old = remote.pages(TREE_PAGE);
@@ -3175,7 +3270,10 @@ fn a_listing_out_when_the_server_lost_this_devices_commits_is_read_again() {
     b.create(&mut restored, &other.root.join("new-two.txt"), b"new two");
     a.event(Event::Connected(restored.space.welcome(&a.caller)))
         .unwrap();
-    let step = a.folder.listed(Ok(Listed::Done(old)));
+    let step = a.folder.listed(Ok(Listed::Done {
+        pages: old,
+        trash: vec![],
+    }));
     a.take(step).unwrap();
     a.run(&mut restored);
     a.settle();
@@ -3207,7 +3305,7 @@ fn a_welcome_queued_before_a_finished_send_is_taken_first() {
     let step = sent_in_order(&mut a.folder, [Event::Connected(queued)], Ok(result));
     a.take(step).unwrap();
     assert_eq!(a.folder.engine.commits.accepted(), 2);
-    assert!(!a.work.iter().any(|work| matches!(work, Work::List)));
+    assert!(!a.work.iter().any(|work| matches!(work, Work::List { .. })));
     a.pull(&remote);
     a.run(&mut remote);
     a.settle();

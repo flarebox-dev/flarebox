@@ -55,6 +55,13 @@ fn trees() -> Trees {
         );
         trees.set_synced(id.into(), Some(shape));
     }
+    let deleted = RemoteNode {
+        trashed: true,
+        meta_rev: 5,
+        trash_group: "5:0".into(),
+        ..remote(dir(ROOT, "t"))
+    };
+    trees.set_remote("t".into(), deleted);
     trees
 }
 
@@ -66,6 +73,7 @@ fn trees_state() -> TreesState {
         parked_as: [("b".into(), "c".into())].into(),
         waiting: [("a".into(), Some(dir(ROOT, "x")))].into(),
         watched: [("u".into(), true), ("v".into(), false)].into(),
+        trashed_here: [("t".into(), 5)].into(),
     }
 }
 
@@ -215,6 +223,22 @@ fn trees_restore_a_valid_state_and_refuse_each_broken_one() {
                 state.parked_as.insert("a".into(), "z".into());
             }),
             StateError::NotParked("a".into()),
+        ),
+        (
+            "a node trashed here that R holds live",
+            trees(),
+            broken(trees_state(), |state| {
+                state.trashed_here.insert("a".into(), 5);
+            }),
+            StateError::NotTrashedHere("a".into()),
+        ),
+        (
+            "a node trashed here that R holds trashed by another commit",
+            trees(),
+            broken(trees_state(), |state| {
+                state.trashed_here.insert("t".into(), 4);
+            }),
+            StateError::NotTrashedHere("t".into()),
         ),
     ];
     for (name, mut trees, state, error) in cases {

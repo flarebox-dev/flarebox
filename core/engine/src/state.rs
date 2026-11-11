@@ -36,6 +36,9 @@ pub struct TreesState {
     /// The nodes whose content the commit in flight updates, each with whether S's content
     /// changed since the commit was built.
     pub watched: BTreeMap<NodeId, bool>,
+    /// The nodes a delete of this device trashed, each with the seq of its commit, while R holds
+    /// them trashed by that commit.
+    pub trashed_here: BTreeMap<NodeId, u64>,
 }
 
 /// What [`Commits`](crate::commit::Commits) holds.
@@ -87,6 +90,9 @@ pub enum StateError {
     UnsearchedNotDirty(NodeId),
     /// A node has a parked name but L does not hold it as parked.
     NotParked(NodeId),
+    /// A node is recorded as trashed by a delete of this device, but R does not hold it trashed by
+    /// that commit.
+    NotTrashedHere(NodeId),
     /// The commit in flight does not take the slot after the accepted counter.
     DeviceSeq { accepted: u64, device_seq: u64 },
     /// The result of the commit in flight does not have one outcome per op.

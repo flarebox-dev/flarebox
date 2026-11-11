@@ -235,6 +235,12 @@ const MIGRATIONS: &[&str] = &[
         changed INTEGER NOT NULL CHECK (changed IN (0, 1))
     ) STRICT, WITHOUT ROWID;
 ",
+    "
+    CREATE TABLE trashed_here (
+        node_id TEXT PRIMARY KEY,
+        seq INTEGER NOT NULL
+    ) STRICT, WITHOUT ROWID;
+",
 ];
 
 /// The schema version this build writes.

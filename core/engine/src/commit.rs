@@ -575,6 +575,7 @@ impl Commits {
                     if done {
                         for id in flight.deletes.get(&delete.node_id).into_iter().flatten() {
                             synced.set(id, None);
+                            trees.record_trashed(id, result.seq);
                         }
                     }
                     (&delete.node_id, done)
