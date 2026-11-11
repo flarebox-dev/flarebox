@@ -3793,3 +3793,84 @@ fn a_late_move_acknowledgement_converges_on_a_remote_edit_made_at_the_position_l
 fn a_late_move_acknowledgement_keeps_a_later_remote_move_after_a_remote_edit() {
     a_late_acknowledgement_converges_on_a_remote_edit_made_at_the_position_l_took(false, true);
 }
+
+/// GUN-453. n's move to b is in flight when the other device moves n to c and edits it at seq 3,
+/// and the user then moves n to c too, before the other device moves n on to x at seq 4. L took
+/// the position R already held, so that is where they agreed. After the acknowledgement the disk
+/// follows n to x with R's content, and the user's move to c is never sent again.
+#[test]
+fn a_late_move_acknowledgement_keeps_a_later_remote_move_after_l_took_the_position_r_held() {
+    let mut trees = trees(&[(
+        "n",
+        Some(file(ROOT, "b", 1)),
+        Some(file(ROOT, "a", 1)),
+        Some(remote(file(ROOT, "a", 1))),
+    )]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", ROOT, "b")]);
+    let edited = |name: &str, rev: u64| RemoteNode {
+        content_rev: 3,
+        ..remote_at(file(ROOT, name, 2), rev)
+    };
+    trees.set_remote("n".into(), remote_at(file(ROOT, "b", 1), 2));
+    trees.set_remote("n".into(), edited("c", 3));
+    trees.set_local("n".into(), local(file(ROOT, "c", 1), 1));
+    trees.set_remote("n".into(), edited("x", 4));
+    trees.settle();
+    commits
+        .received(result(2, vec![outcome(op_result::Code::Applied)]))
+        .unwrap();
+    assert!(commits.acknowledge(&mut trees, 4));
+    trees.settle();
+    for _ in 0..3 {
+        effects_for(&mut trees, &mut ids, "n");
+        let commit = build(&mut commits, &mut trees, &mut ids);
+        assert_eq!(commit.as_ref().map(ops), None);
+    }
+    assert_eq!(trees.local().live("n"), Some(&file(ROOT, "x", 2)));
+}
+
+/// GUN-453. n's move to b is in flight when the user and the other device both move n to c, and
+/// the other device then moves n on to x and m to c, which the user does too. The user moves n back
+/// to a. S cannot take c for n, since m holds it, so S takes the b that was sent, and the user's
+/// move back to a is sent rather than the disk following n to x.
+#[test]
+fn a_late_move_acknowledgement_takes_the_sent_position_when_another_node_took_the_agreed_one() {
+    let mut trees = trees(&[
+        (
+            "n",
+            Some(file(ROOT, "b", 1)),
+            Some(file(ROOT, "a", 1)),
+            Some(remote(file(ROOT, "a", 1))),
+        ),
+        (
+            "m",
+            Some(file(ROOT, "z", 2)),
+            Some(file(ROOT, "z", 2)),
+            Some(remote(file(ROOT, "z", 2))),
+        ),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", ROOT, "b")]);
+    trees.set_remote("n".into(), remote_at(file(ROOT, "b", 1), 2));
+    trees.set_local("n".into(), local(file(ROOT, "c", 1), 1));
+    trees.set_remote("n".into(), remote_at(file(ROOT, "c", 1), 3));
+    trees.set_remote("n".into(), remote_at(file(ROOT, "x", 1), 4));
+    trees.set_local("n".into(), local(file(ROOT, "a", 1), 1));
+    trees.set_local("m".into(), local(file(ROOT, "c", 2), 2));
+    trees.set_remote("m".into(), remote_at(file(ROOT, "c", 2), 5));
+    trees.settle();
+    assert_eq!(trees.synced().live("m"), Some(&file(ROOT, "c", 2)));
+    commits
+        .received(result(2, vec![outcome(op_result::Code::Applied)]))
+        .unwrap();
+    assert!(commits.acknowledge(&mut trees, 5));
+    trees.settle();
+    assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "b", 1)));
+    assert_eq!(effects_for(&mut trees, &mut ids, "n"), []);
+    assert_eq!(trees.local().live("n"), Some(&file(ROOT, "a", 1)));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", ROOT, "a")]);
+}
