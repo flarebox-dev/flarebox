@@ -124,6 +124,9 @@ pub(crate) enum Settled {
     /// The node stays blocked until the effect planned for it changes, except after an interrupted effect or one L
     /// no longer takes, which can be planned again unchanged.
     Failed(String),
+    /// Failed, and planning the effect again cannot help until the person changes the disk: the folder it removes
+    /// holds entries L does not know. The node stays blocked with no wait to end it.
+    Stuck(String),
 }
 
 /// What the effect sections share with the observer's thread.
@@ -894,16 +897,22 @@ fn acknowledge(
                 if retry && *reason == Reason::Interrupted {
                     engine.effects.unblock(&record.node);
                 }
-                Settled::Failed(
-                    match reason {
-                        Reason::Moved => "a folder on its path is missing or was replaced",
-                        Reason::Missing => "the entry is not there",
-                        Reason::Changed => "the entry changed on this device",
-                        Reason::Taken => "another entry holds its name",
-                        Reason::Interrupted => "it was interrupted",
+                let failed = |why: &str| Settled::Failed(why.into());
+                match reason {
+                    Reason::Moved => failed("a folder on its path is missing or was replaced"),
+                    Reason::Missing => failed("the entry is not there"),
+                    Reason::Changed => failed("the entry changed on this device"),
+                    Reason::Taken => failed("another entry holds its name"),
+                    Reason::Interrupted => failed("it was interrupted"),
+                    Reason::Holds(names) => {
+                        let names: Vec<_> =
+                            names.iter().map(|name| name.to_string_lossy()).collect();
+                        Settled::Stuck(format!(
+                            "the folder holds entries this device does not sync: {}",
+                            names.join(", ")
+                        ))
                     }
-                    .into(),
-                )
+                }
             }
         };
         engine.checkpoint(tx)?;

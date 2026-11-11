@@ -136,7 +136,7 @@ pub enum Outcome {
 }
 
 /// Why an effect failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reason {
     /// A folder on the way is missing, is not a folder, or is another one.
     Moved,
@@ -148,6 +148,9 @@ pub enum Reason {
     Taken,
     /// Recovery found the effect stopped before it displaced anything.
     Interrupted,
+    /// The folder a removal acts on holds entries other than platform files,
+    /// named here in order. The folder went back as it was.
+    Holds(Vec<OsString>),
 }
 
 fn failed(reason: Reason) -> Outcome {
@@ -361,15 +364,12 @@ impl Space {
         flush(quarantine.fd())?;
         hook(Step::Quarantined);
 
-        let matches = matches(quarantine.fd(), id, &displaced.entry, contents)?;
+        let differs = differs(quarantine.fd(), id, &displaced.entry, contents)?;
         hook(Step::Compared);
-        if !matches {
+        if let Some(reason) = differs {
             let recovered = self.put_back(&quarantine, id, &displaced.at, now)?;
             hook(Step::Returned);
-            return Ok(Outcome::Failed {
-                reason: Reason::Changed,
-                recovered,
-            });
+            return Ok(Outcome::Failed { reason, recovered });
         }
         let outcome = match target {
             Some((staging, (target, new_name))) => {
@@ -499,16 +499,13 @@ impl Space {
         if let Some((displaced, place)) = displacing
             && lookup(quarantine.fd(), id)?.is_some()
         {
-            let matches = matches(quarantine.fd(), id, &displaced.entry, contents)?;
+            let differs = differs(quarantine.fd(), id, &displaced.entry, contents)?;
             hook(Step::Compared);
-            if !matches {
+            if let Some(reason) = differs {
                 let recovered = self.put_back(&quarantine, id, &displaced.at, now)?;
                 hook(Step::Returned);
                 self.drop_staged(&effect.id)?;
-                return Ok(Outcome::Failed {
-                    reason: Reason::Changed,
-                    recovered,
-                });
+                return Ok(Outcome::Failed { reason, recovered });
             }
             let outcome = match place {
                 Some(at) if staged => match self.parent(at) {
@@ -619,35 +616,40 @@ impl Space {
     }
 }
 
-/// Whether the quarantined entry `id` is `expected`: the same identity, kind,
-/// size, modification time and executable bit, and, for a file, the content
-/// the effect displaces, or, for a folder, nothing inside but platform files.
-fn matches(
+/// Why the quarantined entry `id` is not `expected`, or `None` when it is: the
+/// same identity, kind, size, modification time and executable bit, and, for a
+/// file, the content the effect displaces, or, for a folder, nothing inside but
+/// platform files.
+fn differs(
     quarantine: BorrowedFd<'_>,
     id: &OsStr,
     expected: &Entry,
     contents: &mut dyn Contents,
-) -> io::Result<bool> {
+) -> io::Result<Option<Reason>> {
     if lookup(quarantine, id)?.and_then(|stat| stat.entry()) != Some(*expected) {
-        return Ok(false);
+        return Ok(Some(Reason::Changed));
     }
     match expected.kind {
-        EntryKind::File => contents.displaced(&open_file(quarantine, id)?),
+        EntryKind::File => {
+            let same = contents.displaced(&open_file(quarantine, id)?)?;
+            Ok((!same).then_some(Reason::Changed))
+        }
         EntryKind::Dir => {
             let dir = rustix::fs::openat(quarantine, id, crate::DIR_FLAGS, Mode::empty())?;
+            let mut held = Vec::new();
             for name in list(dir.as_fd())? {
                 let platform = PLATFORM_FILES.iter().any(|file| name == OsStr::new(file));
                 if !platform || stat_at(dir.as_fd(), &name)?.file_type != FileType::RegularFile {
-                    return Ok(false);
+                    held.push(name);
                 }
             }
-            Ok(true)
+            Ok((!held.is_empty()).then_some(Reason::Holds(held)))
         }
     }
 }
 
 /// Deletes the platform files in the quarantined folder `id`, so that the
-/// folder enters the trash empty. [`matches`] has found nothing else in it.
+/// folder enters the trash empty. [`differs`] has found nothing else in it.
 fn clear_platform_files(quarantine: BorrowedFd<'_>, id: &OsStr) -> io::Result<()> {
     let dir = rustix::fs::openat(quarantine, id, crate::DIR_FLAGS, Mode::empty())?;
     if list(dir.as_fd())?.is_empty() {
