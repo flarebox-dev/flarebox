@@ -170,6 +170,33 @@ private final class Fetches {
         #expect(model.state.status == .stopped)
     }
 
+    @Test func theUsageReportSwitchTurnsReportsOnAndOff() throws {
+        let model = AppModel.fake(scenario: .upToDate)
+        model.start()
+        #expect(model.telemetry == TelemetrySetting(enabled: true, decided: true, locked: false))
+        try model.setTelemetry(enabled: false)
+        #expect(model.telemetry == TelemetrySetting(enabled: false, decided: true, locked: false))
+        try model.setTelemetry(enabled: true)
+        #expect(model.telemetry == TelemetrySetting(enabled: true, decided: true, locked: false))
+
+        try #require(model.session.fakeCore()).failSaves(fail: true)
+        #expect(throws: SessionError.NotSaved(reason: "saving is scripted to fail")) {
+            try model.setTelemetry(enabled: false)
+        }
+        #expect(model.telemetry.enabled)
+    }
+
+    @Test func aLockedUsageReportSettingIsReportedLockedAndKeepsItsState() throws {
+        let model = AppModel.fake(scenario: .upToDate)
+        try #require(model.session.fakeCore()).setTelemetrySetting(
+            setting: TelemetrySetting(enabled: false, decided: false, locked: true))
+        model.start()
+        #expect(model.telemetry.locked)
+
+        try model.setTelemetry(enabled: true)
+        #expect(model.telemetry == TelemetrySetting(enabled: false, decided: true, locked: true))
+    }
+
     @Test func unansweredQuestionsAreUnseenAtLaunch() throws {
         var model = AppModel.fake(scenario: .recovery)
         model.markQuestionsSeen()
@@ -477,6 +504,66 @@ private final class Fetches {
         #expect(app.state.folders.count == linked.count + 1)
         #expect(app.state.folders.filter { $0.spaceName == "Projects" }.count == 1)
         #expect(setup.spaces.filter { $0.name == "Projects" }.count == 1)
+    }
+
+    @Test func anUndecidedSetupAsksAndConnectStoresUsageReportsOn() async throws {
+        let app = AppModel.fake(scenario: .firstRun)
+        try #require(app.session.fakeCore()).failNext(error: .ServerUnreachable(reason: "timed out"))
+        let setup = SetupModel(app: app, mode: .firstRun, deviceName: "Mac")
+        #expect(setup.asksForUsageReports)
+        #expect(setup.sendsUsageReports)
+
+        setup.serverURL = "https://box.example.com"
+        await setup.connect()
+        #expect(setup.step == .server)
+        #expect(!app.telemetry.decided)
+
+        await setup.connect()
+        #expect(setup.step == .signIn)
+        #expect(app.telemetry == TelemetrySetting(enabled: true, decided: true, locked: false))
+        #expect(!setup.asksForUsageReports)
+    }
+
+    @Test func usageReportsTurnedOffInSetupAreStoredOffOnConnect() async throws {
+        let app = AppModel.fake(scenario: .firstRun)
+        let setup = SetupModel(app: app, mode: .firstRun, deviceName: "Mac")
+        setup.sendsUsageReports = false
+        setup.sendsUsageReports = true
+        setup.sendsUsageReports = false
+        #expect(!app.telemetry.decided)
+
+        setup.serverURL = "https://box.example.com"
+        await setup.connect()
+        #expect(setup.step == .signIn)
+        #expect(app.telemetry == TelemetrySetting(enabled: false, decided: true, locked: false))
+    }
+
+    @Test func aDecidedSetupDoesNotAskOrChangeUsageReports() async throws {
+        let app = AppModel.fake(scenario: .firstRun)
+        try #require(app.session.fakeCore()).setTelemetrySetting(
+            setting: TelemetrySetting(enabled: false, decided: true, locked: false))
+        app.start()
+        let setup = SetupModel(app: app, mode: .firstRun, deviceName: "Mac")
+        #expect(!setup.asksForUsageReports)
+
+        setup.serverURL = "https://box.example.com"
+        await setup.connect()
+        #expect(setup.step == .signIn)
+        #expect(app.telemetry == TelemetrySetting(enabled: false, decided: true, locked: false))
+    }
+
+    @Test func aLockedSetupDoesNotAskAndLeavesUsageReportsUndecided() async throws {
+        let app = AppModel.fake(scenario: .firstRun)
+        let locked = TelemetrySetting(enabled: false, decided: false, locked: true)
+        try #require(app.session.fakeCore()).setTelemetrySetting(setting: locked)
+        app.start()
+        let setup = SetupModel(app: app, mode: .firstRun, deviceName: "Mac")
+        #expect(!setup.asksForUsageReports)
+
+        setup.serverURL = "https://box.example.com"
+        await setup.connect()
+        #expect(setup.step == .signIn)
+        #expect(app.telemetry == locked)
     }
 
     @Test func incompleteStepsMakeNoCall() async throws {

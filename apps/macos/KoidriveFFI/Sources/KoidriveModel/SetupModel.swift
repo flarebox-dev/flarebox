@@ -26,6 +26,8 @@ public final class SetupModel {
 
     public private(set) var step: Step
     public var serverURL = ""
+    /// The usage-report choice asked on the server step, stored when Connect succeeds.
+    public var sendsUsageReports = true
     public private(set) var server: ServerInfo?
     /// The one-time claim code for an unclaimed server, or a pairing code for a claimed one.
     public var code = ""
@@ -54,6 +56,10 @@ public final class SetupModel {
         }
     }
 
+    /// Whether the server step asks about usage reports: only until someone has chosen, here or with the CLI, and
+    /// never while an environment variable such as `DO_NOT_TRACK` decides, as the CLI does.
+    public var asksForUsageReports: Bool { !app.telemetry.decided && !app.telemetry.locked }
+
     /// Whether signing in claims the server rather than pairing with it.
     public var claimsServer: Bool { server?.claimed == false }
 
@@ -72,6 +78,9 @@ public final class SetupModel {
         guard canConnect else { return }
         await attempt {
             server = try await app.connect(url: serverURL)
+            if asksForUsageReports {
+                try? app.setTelemetry(enabled: sendsUsageReports)
+            }
             step = .signIn
         }
     }
