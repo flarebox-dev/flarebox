@@ -142,7 +142,7 @@ proptest! {
     }
 
     #[test]
-    #[ignore = "a server restore still breaks these: an edit equal to the restored bytes is undone (GUN-438), a device that saw a seq the server lost takes the commit that reuses it for the one it saw (GUN-423), a device that holds the result of a commit the server lost starts recovery when it connects again (GUN-444), a reverted file the server lost is created again under a new ID beside the original (GUN-448), and a commit refused as ahead of the server leaves its edit unsent (GUN-442)"]
+    #[ignore = "a server restore still breaks these: an edit equal to the restored bytes is undone (GUN-438), a device that saw a seq the server lost takes the commit that reuses it for the one it saw (GUN-423), a device that holds the result of a commit the server lost starts recovery when it connects again (GUN-444), and a commit refused as ahead of the server leaves its edit unsent (GUN-442)"]
     fn devices_converge_across_server_restores(devices in 2..=3usize, phases in phases(true)) {
         converge(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
@@ -971,6 +971,24 @@ fn a_name_a_restore_lost_is_refused_after_the_recovery() {
     let ino = world.devices[0].disk.child(&Place::Root, "c.txt").unwrap();
     world.devices[0].disk.rename(ino, Place::Root, "b").unwrap();
     assert!(world.phase(5, &[]).is_err());
+}
+
+/// A file whose create the server renamed is reverted until the effects move it to the server's
+/// name, and the server loses the create before they do. Device 1 already took the file, so both
+/// devices create it again. Device 0 keeps the node's ID instead of giving the file a new one, so
+/// the server ends with the file once.
+#[test]
+fn a_lost_file_the_server_renamed_is_created_again_once() {
+    let mut lost = vec![(0, BACKUP), (0, file("C.TXT"))];
+    lost.extend(commit(0));
+    lost.extend([
+        (1, DELIVER),
+        (1, DELIVER),
+        (1, EFFECT),
+        (1, EFFECT),
+        (0, RESTORE),
+    ]);
+    converge(2, &[vec![(0, file("c.txt"))], lost]).unwrap();
 }
 
 /// Both devices create a file the server lost again under its ID, and device 0's create comes

@@ -789,7 +789,9 @@ impl Trees {
     /// Forgets what the server may have lost, after a bootstrap from a server that is behind what
     /// this device applied (design §4.4). S forgets every node that R does not hold at all or holds
     /// live with another shape, and every node S holds below one. A node L still holds is then
-    /// created again instead of being taken for a remote delete, and one whose content differs from
+    /// created again instead of being taken for a remote delete, under its own ID and at the
+    /// position L holds: a node R does not hold at all is no longer reverted, since the server's
+    /// rename or merge that reverted it was lost too. One whose content differs from
     /// R's is kept beside R's as a conflict copy instead of being replaced by R's older content. A
     /// node R holds in the trash keeps S, so it stays a remote delete, also below a node S forgets,
     /// unless it is a file whose edit the server lost (see `edited` below).
@@ -905,6 +907,9 @@ impl Trees {
             .map(|id| (id.to_owned(), waits.contains(id)))
             .collect();
         for (id, waits) in lost {
+            if self.r.get(&id).is_none() {
+                self.reverted.remove(&id);
+            }
             if waits {
                 self.wait(id, None);
             } else {

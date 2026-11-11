@@ -1224,6 +1224,32 @@ fn a_parked_file_rekeyed_for_its_edit_is_moved_out_from_where_it_was_parked() {
     assert_eq!(b, &file(ROOT, "x (new conflict)", 3));
 }
 
+/// The server renamed the create of x to y, and the file is reverted until the effects move it
+/// there. Then the server loses the create. Once S forgets the file, it is no longer reverted, so
+/// it is created again under its own ID at x, instead of as a new node beside the one another
+/// device creates again (section 4.4).
+#[test]
+fn a_reverted_file_the_server_lost_is_created_again_under_its_id() {
+    let renamed = file(ROOT, "y", 1);
+    let mut trees = trees(&[(
+        "h",
+        Some(file(ROOT, "x", 1)),
+        Some(renamed.clone()),
+        Some(remote(renamed)),
+    )]);
+    trees.revert("h".into());
+    trees.remove_remote("h");
+    trees.forget_lost(Vec::new(), Vec::new(), 0);
+    trees.settle();
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(
+        matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id == "h" && c.name == "x"),
+        "{:?}",
+        ops(&commit)
+    );
+}
+
 #[test]
 fn a_file_whose_s_update_waits_is_removed_or_uploaded_anew_after_a_remote_delete() {
     for (edit, parked) in [(None, false), (None, true), (Some(2), false)] {
