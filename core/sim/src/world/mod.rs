@@ -270,8 +270,9 @@ fn lost(held: &Held, d: usize, record: &EffectRecord, applied: &Applied) -> Resu
     }
 }
 
-/// Whether an effect that trashes a write the server never held downloads a lost write that its
-/// author sent again over a user's change back to the bytes a restore rolled the file back to. The
+/// Whether an effect that trashes a write the server never held downloads a lost write of the same
+/// file that its author sent again over a user's change back to the bytes a restore rolled the
+/// file back to. The
 /// engine takes such a change for the content R holds, so the resend replaces it, and the bytes
 /// stay only in the file's versions (design section 4.4).
 fn resent_over_revert(
@@ -284,7 +285,8 @@ fn resent_over_revert(
     else {
         return false;
     };
-    exposed.contains_key(&content.mtime_ns)
+    (exposed.get(&content.mtime_ns))
+        .is_some_and(|exposure| exposure.nodes.contains_key(&record.node))
         && (rolled_back.get(&record.node)).is_some_and(|digest| *digest == trashed.manifest_digest)
 }
 
@@ -1754,6 +1756,61 @@ impl World {
                  overwrote or deleted it"
             ))),
             None => Ok(()),
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use koidrive_engine::effects::{Base, Displaced, Location};
+    use koidrive_engine::tree::{Kind, Shape};
+
+    use super::*;
+
+    /// A write a restore took from another file does not excuse an overwrite of a's change back
+    /// to its rolled-back bytes.
+    #[test]
+    fn a_resend_over_a_revert_comes_from_the_rolled_back_file() {
+        let (old, unseen, incoming) = (content(0, 0, 1), content(0, 0, 99), content(1, 1, 2));
+        let at = Location::At {
+            base: Base::Root,
+            dirs: Vec::new(),
+            name: "a".into(),
+        };
+        let mut disk = Disk::default();
+        let ino = disk.create(Place::Root, "a", Some(unseen.clone())).unwrap();
+        let record = EffectRecord {
+            effect_id: "download".into(),
+            node: "a".into(),
+            counter: 1,
+            effect: Effect::WriteFile {
+                at: at.clone(),
+                content: incoming.clone(),
+                replaces: Some(Displaced {
+                    at,
+                    identity: disk::identity(ino),
+                    content: unseen,
+                }),
+            },
+            after: Some(Shape {
+                parent: "root".into(),
+                name: "a".into(),
+                kind: Kind::File,
+                content: Some(incoming),
+            }),
+        };
+        let applied = disk.apply(&record, Cut::Done);
+        assert!(lost(&Held::new(), 0, &record, &applied).is_err());
+        let rolled_back = BTreeMap::from([("a".into(), old.manifest_digest)]);
+        for file in ["a", "b"] {
+            let exposed = BTreeMap::from([(
+                2,
+                Exposure {
+                    nodes: BTreeMap::from([(file.into(), (1, true))]),
+                    loose: 0,
+                },
+            )]);
+            let accepted = resent_over_revert(&exposed, &rolled_back, &record, &applied);
+            assert_eq!(accepted, file == "a", "write 2 exposed at {file}");
         }
     }
 }
