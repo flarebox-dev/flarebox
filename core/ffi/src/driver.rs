@@ -19,8 +19,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use flarebox_driver::{
-    self as driver, Credential, Driver, DriverError, FolderState as DriverFolderState, Paths,
-    Status, api_for,
+    self as driver, Driver, DriverError, FolderState as DriverFolderState, Paths, Status, api_for,
 };
 use flarebox_net::{Api, ApiError, Auth, PROTO_MAX, PROTO_MIN};
 use flarebox_proto::v1::{CreateSpaceRequest, error::Code};
@@ -217,16 +216,13 @@ impl DriverCore {
         changed
     }
 
-    /// The stored credential's API and authentication, for the calls the driver does not make.
-    fn signed_in(&self) -> Result<(Api, Auth), SessionError> {
-        let credential = Credential::load(&self.paths.credential())
-            .map_err(|error| SessionError::Failed {
-                reason: error.to_string(),
-            })?
-            .ok_or(SessionError::NotSignedIn)?;
-        let api = credential.api().map_err(api_error)?;
-        let auth = Auth::new(api.clone(), credential.net());
-        Ok((api, auth))
+    /// The driver's API and authentication, for the calls the driver does not make.
+    fn signed_in(&self) -> Result<(Api, Arc<Auth>), SessionError> {
+        let auth = self
+            .driver(&self.lock())?
+            .signed_in()
+            .map_err(driver_error)?;
+        Ok((auth.api().clone(), auth))
     }
 
     fn start_driver(&self, driver: &Driver) {
@@ -1025,6 +1021,256 @@ mod tests {
         fn on_event(&self, event: SessionEvent) {
             self.0.lock().unwrap().push(event);
         }
+    }
+
+    /// Each request a stub server answered: its first line and its body.
+    type Requests = Vec<(String, Vec<u8>)>;
+
+    /// Answers each connection with the next reply and records each request.
+    fn serve(replies: Vec<(u16, Vec<u8>)>) -> (String, std::thread::JoinHandle<Requests>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = format!("http://{}/", listener.local_addr().unwrap());
+        let served = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, body) in replies {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut buffer = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let (head, length) = loop {
+                    let n = socket.read(&mut chunk).unwrap();
+                    buffer.extend_from_slice(&chunk[..n]);
+                    if let Some(end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buffer[..end]).into_owned();
+                        let length: usize = head
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|value| value.trim().parse().unwrap())
+                            })
+                            .unwrap_or(0);
+                        buffer.drain(..end + 4);
+                        break (head, length);
+                    }
+                };
+                while buffer.len() < length {
+                    let n = socket.read(&mut chunk).unwrap();
+                    buffer.extend_from_slice(&chunk[..n]);
+                }
+                requests.push((head.lines().next().unwrap().to_owned(), buffer));
+                let reply = format!(
+                    "HTTP/1.1 {status} Reply\r\ncontent-type: application/x-protobuf\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket
+                    .write_all(&[reply.as_bytes(), &body].concat())
+                    .unwrap();
+            }
+            requests
+        });
+        (server, served)
+    }
+
+    #[test]
+    fn calls_the_driver_does_not_make_present_its_credential_and_staged_slot() {
+        use prost::Message;
+
+        let token = flarebox_proto::v1::AccessToken {
+            token: "token".into(),
+            expires_at_ms: i64::MAX,
+            server_time_ms: 5_000,
+            ..Default::default()
+        };
+        let refused = ProtoError {
+            code: Code::Unauthenticated as i32,
+            message: "unknown device or refresh credential".into(),
+            ..Default::default()
+        };
+        let (server, served) = serve(vec![
+            (401, refused.encode_to_vec()),
+            (200, token.encode_to_vec()),
+            (
+                200,
+                flarebox_proto::v1::SpaceList::default().encode_to_vec(),
+            ),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        driver::Credential {
+            server,
+            user_id: "u1".into(),
+            user_name: None,
+            device_id: "d1".into(),
+            device_name: "Mac".into(),
+            refresh_credential: "current".into(),
+        }
+        .save_new(&paths.credential())
+        .unwrap();
+        let next = paths.credential().with_file_name("credential.next");
+        std::os::unix::fs::OpenOptionsExt::mode(
+            fs::OpenOptions::new().write(true).create_new(true),
+            0o600,
+        )
+        .open(&next)
+        .and_then(|mut file| {
+            io::Write::write_all(
+                &mut file,
+                br#"{"refresh_credential":"staged","rotate_before_ms":10000}"#,
+            )
+        })
+        .unwrap();
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let session = SyncSession::open(
+            Box::new(Recorder(seen)),
+            dir.path().to_str().unwrap().to_owned(),
+        )
+        .unwrap();
+
+        assert_eq!(session.spaces(), Ok(Vec::new()));
+        let requests = served.join().unwrap();
+        let presented: Vec<(String, String)> = requests[..2]
+            .iter()
+            .map(|(_, body)| {
+                let request = flarebox_proto::v1::TokenRequest::decode(body.as_slice()).unwrap();
+                (request.refresh_credential, request.next_refresh_credential)
+            })
+            .collect();
+        assert_eq!(
+            presented,
+            [
+                ("current".to_owned(), "staged".to_owned()),
+                ("staged".to_owned(), String::new()),
+            ]
+        );
+        assert!(
+            requests[2].0.starts_with("GET /v1/spaces"),
+            "{}",
+            requests[2].0
+        );
+        let stored = driver::Credential::load(&paths.credential())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.refresh_credential, "staged");
+        assert!(!next.exists());
+    }
+
+    #[test]
+    fn a_refresh_that_ends_after_a_sign_out_writes_no_credential() {
+        use prost::Message;
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = format!("http://{}/", listener.local_addr().unwrap());
+        let (arrived, waiting) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let served = std::thread::spawn(move || {
+            for index in 0.. {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(30)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let (end, length) = loop {
+                    let n = socket.read(&mut chunk).unwrap();
+                    assert_ne!(n, 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                        let length = String::from_utf8_lossy(&bytes[..end])
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|value| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        break (end + 4, length);
+                    }
+                };
+                while bytes.len() < end + length {
+                    let n = socket.read(&mut chunk).unwrap();
+                    assert_ne!(n, 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                }
+                let spaces = !bytes.starts_with(b"POST /v1/token ");
+                let body = if spaces {
+                    flarebox_proto::v1::SpaceList::default().encode_to_vec()
+                } else {
+                    let request =
+                        flarebox_proto::v1::TokenRequest::decode(&bytes[end..end + length])
+                            .unwrap();
+                    if index == 0 {
+                        assert!(request.rotation && request.next_refresh_credential.is_empty());
+                        arrived.send(()).unwrap();
+                        held.recv_timeout(Duration::from_secs(30)).unwrap();
+                    }
+                    flarebox_proto::v1::AccessToken {
+                        token: "access".into(),
+                        expires_at_ms: i64::MAX,
+                        server_time_ms: 5_000,
+                        rotated: !request.next_refresh_credential.is_empty(),
+                    }
+                    .encode_to_vec()
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/x-protobuf\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket
+                    .write_all(&[head.as_bytes(), &body].concat())
+                    .unwrap();
+                if spaces {
+                    break;
+                }
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        driver::Credential {
+            server,
+            user_id: "u1".into(),
+            user_name: None,
+            device_id: "d1".into(),
+            device_name: "Mac".into(),
+            refresh_credential: "current".into(),
+        }
+        .save_new(&paths.credential())
+        .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(paths.credential())
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(2 * 24 * 3600))
+            .unwrap();
+        let session = SyncSession::open(
+            Box::new(Recorder(Arc::new(StdMutex::new(Vec::new())))),
+            dir.path().to_str().unwrap().to_owned(),
+        )
+        .unwrap();
+        let reader = {
+            let session = session.clone();
+            std::thread::spawn(move || session.spaces())
+        };
+        waiting.recv_timeout(Duration::from_secs(30)).unwrap();
+
+        assert_eq!(session.sign_out(true), Ok(()));
+        assert!(!paths.credential().exists());
+        release.send(()).unwrap();
+        assert_eq!(reader.join().unwrap(), Ok(Vec::new()));
+        served.join().unwrap();
+        assert!(
+            !paths.credential().exists(),
+            "the late refresh wrote credential.json"
+        );
+        assert!(
+            !paths
+                .credential()
+                .with_file_name("credential.next")
+                .exists(),
+            "the late refresh wrote credential.next"
+        );
     }
 
     #[test]

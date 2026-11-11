@@ -10,15 +10,16 @@ mod ipc;
 mod pairing;
 mod setup;
 
-use std::io::IsTerminal;
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use flarebox_driver::{
     Answer, Credential, Driver, DriverError, FolderStatus, Paths, Question, QuestionKind, Status,
 };
-use flarebox_net::{ApiError, Auth};
+use flarebox_net::{ApiError, Auth, Reload};
 use flarebox_proto::v1::{
     CreateSpaceRequest, DeviceInfo, SpaceInfo, SpaceUsage, device_info::Kind,
 };
@@ -492,9 +493,33 @@ fn signed_in(paths: &Paths) -> Result<Auth, String> {
     let credential = Credential::load(&paths.credential())
         .map_err(|error| error.to_string())?
         .ok_or_else(|| DriverError::NotPaired.to_string())?;
-    Ok(Auth::new(
+    reading(paths, &credential)
+}
+
+/// An [`Auth`] for a command that only reads the profile's credential. The process that holds the profile may rotate
+/// the credential meanwhile, so when the server refuses it, it reads both credential files again, once, and presents
+/// what they hold (RFC 0011 section 2). A reload that finds a credential for another server fails, so that no
+/// credential reaches a server it was not issued by.
+fn reading(paths: &Paths, credential: &Credential) -> Result<Auth, String> {
+    let path = paths.credential();
+    let server = credential.server.clone();
+    let reload: Reload = Arc::new(move || {
+        let stored = Credential::load_stored(&path)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, DriverError::NotPaired.to_string())
+            })?;
+        if stored.credential.server != server {
+            return Err(io::Error::other(
+                "the profile now holds a credential for another server",
+            ));
+        }
+        Ok(stored.net())
+    });
+    Ok(Auth::reloading(
         credential.api().map_err(|error| error.to_string())?,
         credential.net(),
+        reload,
     ))
 }
 
@@ -977,6 +1002,127 @@ mod tests {
     use super::*;
 
     const ID: &str = "0190a0b0-0000-7000-8000-000000000001";
+
+    #[tokio::test]
+    async fn a_reload_refuses_a_credential_for_another_server() {
+        use crate::setup::fake::{Fake, Reply};
+        use prost::Message;
+
+        let refused = || Reply {
+            method: "POST",
+            path: "/v1/token".into(),
+            status: 401,
+            content_type: "application/x-protobuf",
+            body: flarebox_proto::v1::Error {
+                code: flarebox_proto::v1::error::Code::Unauthenticated as i32,
+                message: "unknown device or refresh credential".into(),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        };
+        let first_server = Fake::start(vec![refused(), refused(), refused()]).await;
+        let other_server = Fake::start(Vec::new()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let first = Credential {
+            server: first_server.base.to_string(),
+            user_id: "same-user".into(),
+            user_name: None,
+            device_id: ID.into(),
+            device_name: "same-device".into(),
+            refresh_credential: "first-credential".into(),
+        };
+        first.save_new(&paths.credential()).unwrap();
+        let reader = reading(&paths, &first).unwrap();
+        let owner = Driver::open(paths.clone()).unwrap();
+        owner.sign_out_device(ID).await.unwrap();
+        let replacement = Credential {
+            server: other_server.base.to_string(),
+            refresh_credential: "other-server-credential".into(),
+            ..first
+        };
+        owner.save_credential(replacement.clone()).await.unwrap();
+
+        assert!(matches!(
+            reader.access_token().await,
+            Err(ApiError::Credential(_))
+        ));
+        let presented: Vec<String> = first_server
+            .seen()
+            .iter()
+            .map(|seen| {
+                flarebox_proto::v1::TokenRequest::decode(seen.body.as_slice())
+                    .unwrap()
+                    .refresh_credential
+            })
+            .collect();
+        assert!(
+            !presented.contains(&replacement.refresh_credential),
+            "{presented:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reload_never_presents_another_profiles_credential_to_the_first_server() {
+        use crate::setup::fake::{Fake, Reply};
+        use prost::Message;
+
+        let refused = || Reply {
+            method: "POST",
+            path: "/v1/token".into(),
+            status: 401,
+            content_type: "application/x-protobuf",
+            body: flarebox_proto::v1::Error {
+                code: flarebox_proto::v1::error::Code::Unauthenticated as i32,
+                message: "unknown device or refresh credential".into(),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        };
+        let first_server = Fake::start(vec![refused(), refused(), refused()]).await;
+        let other_server = Fake::start(Vec::new()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let first = Credential {
+            server: first_server.base.to_string(),
+            user_id: "first-user".into(),
+            user_name: None,
+            device_id: ID.into(),
+            device_name: "first".into(),
+            refresh_credential: "first-credential".into(),
+        };
+        first.save_new(&paths.credential()).unwrap();
+        let reader = reading(&paths, &first).unwrap();
+        let owner = Driver::open(paths.clone()).unwrap();
+        owner.sign_out_device(ID).await.unwrap();
+        let replacement = Credential {
+            server: other_server.base.to_string(),
+            user_id: "other-user".into(),
+            user_name: None,
+            device_id: "0190a0b0-0000-7000-8000-000000000002".into(),
+            device_name: "other".into(),
+            refresh_credential: "other-credential".into(),
+        };
+        owner.save_credential(replacement.clone()).await.unwrap();
+
+        assert!(matches!(
+            reader.access_token().await,
+            Err(ApiError::Credential(_))
+        ));
+        let presented: Vec<String> = first_server
+            .seen()
+            .iter()
+            .map(|seen| {
+                flarebox_proto::v1::TokenRequest::decode(seen.body.as_slice())
+                    .unwrap()
+                    .refresh_credential
+            })
+            .collect();
+        assert!(
+            !presented.contains(&replacement.refresh_credential),
+            "{presented:?}"
+        );
+    }
 
     #[test]
     fn a_name_longer_than_255_bytes_is_refused_before_anything_is_sent() {

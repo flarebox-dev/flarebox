@@ -5,7 +5,7 @@ use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use flarebox_net::{Api, ApiError, CredentialStore, Credentials, Staged, Stored};
@@ -352,18 +352,40 @@ fn identity_at(path: &Path) -> Result<Option<Identity>, CredentialError> {
 /// The two credential files of a profile, written by the one process that holds the profile lock (RFC 0011 section 2).
 /// Each write goes to a new file excluded from backups, is synced and renamed into place, and the directory is synced.
 /// Promoting writes `credential.json` first and removes `credential.next` second, so a crash in between leaves both
-/// files with the same credential, which the next refresh settles.
+/// files with the same credential, which the next refresh settles. A write goes ahead only while `credential.json` still
+/// holds this device's credential, checked under `writes`, which a sign-out holds while it removes the files. So a
+/// refresh that ends after a sign-out, or after the profile paired as another device, writes nothing.
 pub struct CredentialFiles {
     path: PathBuf,
     credential: Mutex<Credential>,
+    writes: Arc<Mutex<()>>,
 }
 
 impl CredentialFiles {
-    pub fn new(path: &Path, credential: Credential) -> Self {
+    pub fn new(path: &Path, credential: Credential, writes: Arc<Mutex<()>>) -> Self {
         CredentialFiles {
             path: path.to_path_buf(),
             credential: Mutex::new(credential),
+            writes,
         }
+    }
+
+    /// Fails unless `credential.json` holds this device's credential.
+    fn still_signed_in(&self, credential: &Credential) -> io::Result<()> {
+        let stored = Credential::load(&self.path).map_err(io::Error::other)?;
+        if stored.is_some_and(|stored| {
+            (&stored.server, &stored.user_id, &stored.device_id)
+                == (
+                    &credential.server,
+                    &credential.user_id,
+                    &credential.device_id,
+                )
+        }) {
+            return Ok(());
+        }
+        Err(io::Error::other(
+            "the profile no longer holds this device's credential",
+        ))
     }
 
     fn write(path: &Path, bytes: Vec<u8>) -> io::Result<()> {
@@ -384,6 +406,8 @@ impl CredentialFiles {
 
 impl CredentialStore for CredentialFiles {
     fn stage(&self, staged: &Staged) -> io::Result<()> {
+        let _writes = self.writes.lock().unwrap();
+        self.still_signed_in(&self.credential.lock().unwrap())?;
         let next = NextFile {
             refresh_credential: staged.refresh_credential.clone(),
             rotate_before_ms: staged.rotate_before_ms,
@@ -392,7 +416,9 @@ impl CredentialStore for CredentialFiles {
     }
 
     fn promote(&self, staged: &Staged) -> io::Result<()> {
+        let _writes = self.writes.lock().unwrap();
         let mut credential = self.credential.lock().unwrap();
+        self.still_signed_in(&credential)?;
         let promoted = Credential {
             refresh_credential: staged.refresh_credential.clone(),
             ..credential.clone()
@@ -403,6 +429,8 @@ impl CredentialStore for CredentialFiles {
     }
 
     fn clear_staged(&self) -> io::Result<()> {
+        let _writes = self.writes.lock().unwrap();
+        self.still_signed_in(&self.credential.lock().unwrap())?;
         self.remove_next()
     }
 }
@@ -607,7 +635,7 @@ pub(crate) mod tests {
     }
 
     fn files(path: &Path) -> CredentialFiles {
-        CredentialFiles::new(path, credential())
+        CredentialFiles::new(path, credential(), Arc::default())
     }
 
     fn staged(refresh_credential: &str) -> Staged {

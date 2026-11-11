@@ -190,6 +190,8 @@ struct Inner {
     /// refresh credential reaches all of them (RFC 0011 section 2). None while signed out, or when the credential's
     /// server URL cannot be used.
     auth: Mutex<Option<Arc<Auth>>>,
+    /// Held by every write to the credential files and by the sign-out while it removes them (`CredentialFiles`).
+    credential_writes: Arc<Mutex<()>>,
     folders: Mutex<BTreeMap<String, Folder>>,
     running: AtomicBool,
     changed: Arc<watch::Sender<()>>,
@@ -313,9 +315,10 @@ impl Driver {
                 Credential::keep_out_of_backups(&next_path(&paths.credential()))?;
             }
         }
+        let credential_writes = Arc::default();
         let auth = stored
             .as_ref()
-            .and_then(|stored| rotating_auth(&paths, stored).ok());
+            .and_then(|stored| rotating_auth(&paths, stored, &credential_writes).ok());
         let credential = stored.map(|stored| stored.credential);
         let folders = load_folders(&paths)?;
         Ok(Driver {
@@ -328,6 +331,7 @@ impl Driver {
                 lifecycle: tokio::sync::Mutex::new(()),
                 credential: Mutex::new(credential),
                 auth: Mutex::new(auth),
+                credential_writes,
                 folders: Mutex::new(folders),
                 running: AtomicBool::new(false),
                 changed: Arc::new(watch::Sender::new(())),
@@ -505,6 +509,7 @@ impl Driver {
             self.unlink_folder(&root).await?;
         }
         let path = self.inner.paths.credential();
+        let _writes = self.inner.credential_writes.lock().unwrap();
         for path in [next_path(&path), path] {
             match fs::remove_file(&path) {
                 Ok(()) => {}
@@ -602,7 +607,8 @@ impl Driver {
             staged: None,
             changed_at: SystemTime::now(),
         };
-        *self.inner.auth.lock().unwrap() = rotating_auth(&self.inner.paths, &stored).ok();
+        *self.inner.auth.lock().unwrap() =
+            rotating_auth(&self.inner.paths, &stored, &self.inner.credential_writes).ok();
         *slot = Some(credential);
         drop(slot);
         self.changed();
@@ -1062,9 +1068,16 @@ impl Driver {
                 staged: None,
                 changed_at: SystemTime::now(),
             });
-        let auth = rotating_auth(&self.inner.paths, &stored)?;
+        let auth = rotating_auth(&self.inner.paths, &stored, &self.inner.credential_writes)?;
         *slot = Some(auth.clone());
         Ok(auth)
+    }
+
+    /// The profile's one [`Auth`], for calls to the server that the driver does not make itself. They present the
+    /// credential that the last rotation left current, like every caller in this process.
+    pub fn signed_in(&self) -> Result<Arc<Auth>, DriverError> {
+        let credential = self.credential()?;
+        Ok(self.auth(&credential)?)
     }
 
     fn credential(&self) -> Result<Credential, DriverError> {
@@ -1304,8 +1317,16 @@ fn now_ms() -> i64 {
 /// is [`DriverError::NotRevoked`]. With it, every failure, a 409 included, is logged and the device stays active on the
 /// server until another device revokes it.
 /// An [`Auth`] that owns the profile's credential files and rotates the refresh credential they hold.
-fn rotating_auth(paths: &Paths, stored: &StoredCredential) -> Result<Arc<Auth>, ApiError> {
-    let files = CredentialFiles::new(&paths.credential(), stored.credential.clone());
+fn rotating_auth(
+    paths: &Paths,
+    stored: &StoredCredential,
+    writes: &Arc<Mutex<()>>,
+) -> Result<Arc<Auth>, ApiError> {
+    let files = CredentialFiles::new(
+        &paths.credential(),
+        stored.credential.clone(),
+        writes.clone(),
+    );
     Ok(Arc::new(Auth::rotating(
         stored.credential.api()?,
         stored.net(),
@@ -3178,7 +3199,7 @@ mod tests {
                 rotate_before_ms: 1_000,
             };
             flarebox_net::CredentialStore::stage(
-                &CredentialFiles::new(&paths.credential(), promoted.clone()),
+                &CredentialFiles::new(&paths.credential(), promoted.clone(), Arc::default()),
                 &staged,
             )
             .unwrap();
@@ -3214,7 +3235,7 @@ mod tests {
         };
         current.save_new(&paths.credential()).unwrap();
         flarebox_net::CredentialStore::stage(
-            &CredentialFiles::new(&paths.credential(), current.clone()),
+            &CredentialFiles::new(&paths.credential(), current.clone(), Arc::default()),
             &flarebox_net::Staged {
                 refresh_credential: "staged".into(),
                 rotate_before_ms: 1_000,
@@ -3240,8 +3261,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::under(dir.path());
         paired(&paths, "d1");
+        let stored = Credential::load(&paths.credential()).unwrap().unwrap();
         flarebox_net::CredentialStore::stage(
-            &CredentialFiles::new(&paths.credential(), credential("d1")),
+            &CredentialFiles::new(&paths.credential(), stored, Arc::default()),
             &flarebox_net::Staged {
                 refresh_credential: "next".into(),
                 rotate_before_ms: 1,
