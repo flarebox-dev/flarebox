@@ -2399,3 +2399,61 @@ fn a_removal_r_undid_whose_s_update_does_not_fit_yet_waits() {
     assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
     assert_eq!(trees.class("d"), Class::InSync);
 }
+
+/// S still holds parked h at x when d's move to X is acknowledged, so d's update waits, and S
+/// still holds m in d. The user deletes d and parks m, and the other device moves h into d. The
+/// keep rule needs d but cannot clear it from S yet. d's acknowledged move keeps waiting, so the
+/// effects bring d back at X for h.
+#[test]
+fn a_needed_folder_whose_move_waits_is_brought_back() {
+    let mut trees = trees(&[
+        (
+            "d",
+            Some(dir(ROOT, "X")),
+            Some(dir(ROOT, "old")),
+            Some(remote(dir(ROOT, "old"))),
+        ),
+        (
+            "h",
+            Some(file(ROOT, "x", 9)),
+            Some(file(ROOT, "x", 9)),
+            Some(remote(file(ROOT, "y", 9))),
+        ),
+        synced("m", file("d", "c", 1)),
+    ]);
+    trees.set_local(
+        "h".into(),
+        LocalNode {
+            parked: true,
+            ..local(file(ROOT, "x", 9), 2)
+        },
+    );
+    trees.settle();
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("d", ROOT, "X")]);
+    trees.set_remote("d".into(), remote(dir(ROOT, "X")));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    assert_eq!(trees.waiting().get("d"), Some(&Some(dir(ROOT, "X"))));
+    trees.set_local(
+        "m".into(),
+        LocalNode {
+            parked: true,
+            ..local(file("d", "c", 1), 3)
+        },
+    );
+    trees.remove_local("d");
+    trees.set_remote("h".into(), remote(file("d", "h", 9)));
+    trees.settle();
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    let effects = effects_for(&mut trees, &mut ids, "d");
+    assert!(
+        matches!(effects[..], [Effect::CreateDir { .. }]),
+        "{effects:?}"
+    );
+    assert_eq!(trees.local().live("d"), Some(&dir(ROOT, "X")));
+}
