@@ -19,7 +19,7 @@ The macOS app is a separate device with its own profile. To remove it, quit the 
 
 ## Remove everything
 
-This deletes the server: the Worker, its Durable Objects and the R2 bucket with every file stored on the server, including the trash and old versions. It can't be undone. The copies in your linked folders stay on each device.
+This deletes the server: the Worker, its Durable Objects and the R2 bucket with every file stored on the server, including the trash and old versions. It can't be undone. The copies in your linked folders stay on each device. To keep a copy of the bucket first, see [Back up the server](backup.md).
 
 ```sh
 koi server uninstall
