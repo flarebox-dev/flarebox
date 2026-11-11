@@ -905,6 +905,31 @@ fn a_copy_of_a_lost_write_after_the_recovery_is_refused() {
     assert!(world.phase(3, &[]).is_err());
 }
 
+/// A copy of a lost write that the engine makes while the devices still recover from the
+/// restore, past the files the restore lets the write end in, is a divergence.
+#[test]
+fn a_copy_of_a_lost_write_during_the_recovery_is_refused() {
+    let mut world = converge(2, &[Vec::new(), vec![(0, BACKUP), (0, file("a"))]]).unwrap();
+    world.run(2, &[(0, RESTORE)]).unwrap();
+    let bytes = (world.devices[0]
+        .disk
+        .entries()
+        .values()
+        .next()
+        .unwrap()
+        .content)
+        .clone();
+    world.devices[0]
+        .disk
+        .create(Place::Root, "b", bytes)
+        .unwrap();
+    let failure = world.phase(2, &[]).unwrap_err();
+    assert!(
+        failure.to_string().contains("is in more than one file"),
+        "{failure}"
+    );
+}
+
 /// Once the devices are quiet after a restore that lost a rename, the old name is refused like
 /// any other name the user did not give.
 #[test]

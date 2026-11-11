@@ -42,8 +42,9 @@
 //!   of its device never overwrote or deleted.
 //! - No node keeps a pending name that no user gave.
 //! - No write is in two files of the server, except one a restore took from the server while a
-//!   disk held it, which may end in each file a device held it in (section 4.4), and then in the
-//!   files the server holds it in once the devices are quiet again.
+//!   disk held it (section 4.4). Until the devices are quiet again, it may be in one file for each
+//!   node that held it, or for each device that held it in a node the restore rolled back to
+//!   other content, and then in the files the server holds it in.
 //! - Every write was in the server's live tree at some time, unless the user who made it
 //!   overwrote or deleted it first.
 
@@ -274,7 +275,7 @@ fn lost(held: &Held, d: usize, record: &EffectRecord, applied: &Applied) -> Resu
 /// engine takes such a change for the content R holds, so the resend replaces it, and the bytes
 /// stay only in the file's versions (design section 4.4).
 fn resent_over_revert(
-    exposed: &BTreeMap<i64, usize>,
+    exposed: &BTreeMap<i64, Exposure>,
     rolled_back: &BTreeMap<NodeId, Vec<u8>>,
     record: &EffectRecord,
     applied: &Applied,
@@ -336,6 +337,22 @@ fn listing(space: &SpaceDo) -> Message {
     }
 }
 
+/// The files a write a restore took from the server may end in, until the devices are quiet
+/// again (design sections 2.4 and 4.4).
+#[derive(Default)]
+struct Exposure {
+    /// For each node that held the write, on the server or on a device, the number of devices
+    /// that held it there, and whether the restore rolled the node back to other content. Such a
+    /// node is created again once, since the server refuses a second create of it with
+    /// ID_EXISTS. Once the node holds other content, from the restore or from a later commit,
+    /// it can end in one file for each of those devices: the author sends the write again over
+    /// the other content, and each other device keeps its copy beside R's. Once the devices are
+    /// quiet again, these are the nodes the server holds the write in, one file each.
+    nodes: BTreeMap<NodeId, (usize, bool)>,
+    /// The disk entries that held the write under no node of L at the restore.
+    loose: usize,
+}
+
 /// A copy of the server's storage, with what the server had held up to that time.
 struct Backup {
     space: SpaceDo,
@@ -377,12 +394,8 @@ pub struct World {
     /// them, and no engine can send them again.
     retired: BTreeSet<i64>,
     /// The writes that a restore took from the server while a disk still held them, each with
-    /// the number of files the server may hold it in. A device that held such a write, on its
-    /// disk, in L or in R, cannot tell whether its author will send it again, so it keeps its
-    /// copies, and the server can end with the write in one file for each file of each device
-    /// that held it at the restore (design section 4.4). Once the devices are quiet again, the
-    /// number is that of the files the server holds.
-    exposed: BTreeMap<i64, usize>,
+    /// the files the server may hold it in.
+    exposed: BTreeMap<i64, Exposure>,
     /// For each device, the names that L and the server held for the nodes whose shape a restore
     /// took from the server, until the devices are quiet again. S forgets a node the restored
     /// server holds with another shape, so the device sends the position it holds again, also one
@@ -442,6 +455,23 @@ impl World {
     /// quiet and the end state is checked, so the next phase starts from trees that every device
     /// holds. A failure names the phase and the step that broke a property.
     pub fn phase(&mut self, phase: usize, schedule: &[(usize, Step)]) -> Result<(), Failure> {
+        self.run(phase, schedule)?;
+        let quiet = self.quiesce();
+        if self.trace {
+            eprintln!(
+                "after phase {phase}: {quiet:?}
+{}",
+                self.dump()
+            );
+        }
+        quiet.map_err(|failure| failure.at(format!("after phase {phase}")))?;
+        self.recovered();
+        Ok(())
+    }
+
+    /// Runs the steps of a phase without letting the devices become quiet, so that a test can
+    /// change a disk while the devices still recover from a restore.
+    pub fn run(&mut self, phase: usize, schedule: &[(usize, Step)]) -> Result<(), Failure> {
         for (index, (device, step)) in schedule.iter().enumerate() {
             let device = device % self.devices.len();
             let done = self.step(device, step);
@@ -455,34 +485,32 @@ impl World {
             let at = format!("phase {phase}, step {index} ({step:?} on device {device})");
             done.map_err(|failure| failure.at(at))?;
         }
-        let quiet = self.quiesce();
-        if self.trace {
-            eprintln!(
-                "after phase {phase}: {quiet:?}
-{}",
-                self.dump()
-            );
-        }
-        quiet.map_err(|failure| failure.at(format!("after phase {phase}")))?;
-        self.recovered()
+        Ok(())
     }
 
     /// Ends what a restore allowed once the devices are quiet again: no later commit sends a name
     /// the restore took from the server, and a write the restore took stays in the files the
     /// server holds it in now.
-    fn recovered(&mut self) -> Result<(), Failure> {
+    fn recovered(&mut self) {
         for names in &mut self.restored_names {
             names.clear();
         }
         self.rolled_back.clear();
-        let mut files: BTreeMap<i64, usize> = BTreeMap::new();
-        for content in self.server_tree()?.into_values().flatten() {
-            *files.entry(content.mtime_ns).or_default() += 1;
+        let mut files: BTreeMap<i64, BTreeMap<NodeId, (usize, bool)>> = BTreeMap::new();
+        for node in self.space.nodes() {
+            if node.status != NodeStatus::Live as i32 {
+                continue;
+            }
+            if let Some(content) = node.current.and_then(|current| current.content) {
+                (files.entry(content.mtime_ns).or_default()).insert(node.node_id, (1, false));
+            }
         }
-        for (write, allowed) in &mut self.exposed {
-            *allowed = files.get(write).copied().unwrap_or(1);
+        for (write, exposure) in &mut self.exposed {
+            *exposure = Exposure {
+                nodes: files.remove(write).unwrap_or_default(),
+                loose: 0,
+            };
         }
-        Ok(())
     }
 
     fn step(&mut self, d: usize, step: &Step) -> Result<(), Failure> {
@@ -674,10 +702,13 @@ impl World {
             }
             let holds =
                 |content: &Option<Content>| content.as_ref().is_some_and(|c| c.mtime_ns == *write);
-            let mut files = 0;
+            let mut holders: BTreeMap<&NodeId, usize> = (held_before.iter())
+                .filter(|(_, held)| held == write)
+                .map(|(id, _)| (id, 0))
+                .collect();
+            let mut unknown = 0;
             for device in &self.devices {
                 let mut nodes: BTreeSet<&NodeId> = BTreeSet::new();
-                let mut unknown = 0;
                 let trees = &device.engine.trees;
                 let local = trees
                     .local()
@@ -699,10 +730,20 @@ impl World {
                         None => unknown += 1,
                     }
                 }
-                files += nodes.len() + unknown;
+                for id in nodes {
+                    *holders.entry(id).or_default() += 1;
+                }
             }
-            let exposed = self.exposed.entry(*write).or_default();
-            *exposed = files.max(*exposed);
+            let kept = |id: &NodeId| {
+                held_after.contains(&(id.clone(), *write)) && after[id].2 == NodeStatus::Live as i32
+            };
+            let exposure = self.exposed.entry(*write).or_default();
+            exposure.loose = unknown.max(exposure.loose);
+            for (id, devices) in holders {
+                let (held, rolled_back) = exposure.nodes.entry(id.clone()).or_default();
+                *held = devices.max(*held);
+                *rolled_back |= after.contains_key(id) && !kept(id);
+            }
         }
     }
 
@@ -1673,9 +1714,28 @@ impl World {
                 files.entry(content.mtime_ns).or_default().push(path);
             }
         }
+        let allowed = |write: i64| {
+            let Some(exposure) = self.exposed.get(&write) else {
+                return 1;
+            };
+            let replaced = |id: &NodeId| {
+                (nodes.iter()).any(|(other, node)| {
+                    other == id
+                        && !node.trashed
+                        && (node.shape.content.as_ref()).is_some_and(|c| c.mtime_ns != write)
+                })
+            };
+            let files = (exposure.nodes.iter()).map(|(id, (devices, rolled_back))| {
+                if *rolled_back || replaced(id) {
+                    (*devices).max(1)
+                } else {
+                    1
+                }
+            });
+            (exposure.loose + files.sum::<usize>()).max(1)
+        };
         let twice = |(write, paths): &(&i64, &Vec<_>)| {
-            paths.len() > self.exposed.get(*write).copied().unwrap_or(1)
-                && !self.copied.contains(*write)
+            paths.len() > allowed(**write) && !self.copied.contains(*write)
         };
         if let Some((write, paths)) = files.iter().find(twice) {
             return Err(Failure::Diverged(format!(
