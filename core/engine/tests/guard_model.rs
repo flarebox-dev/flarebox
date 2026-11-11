@@ -553,11 +553,21 @@ impl Model {
     }
 }
 
-/// Revives a trashed node with its trashed folders and its trash group, as a restore does.
+/// Revives a trashed node with the nodes below it in its trash group, and each trashed folder
+/// above it on its own, as a restore does on the server (`reviveTarget` in
+/// server/src/space/commit.ts).
 fn revive(server: &mut Server, id: &str, changed: &mut Vec<String>) {
-    let parent = server.nodes[id].shape.parent.clone();
-    if (server.nodes.get(&parent)).is_some_and(|node| node.trash.is_some()) {
-        revive(server, &parent, changed);
+    let mut above = Vec::new();
+    let mut parent = server.nodes[id].shape.parent.clone();
+    while (server.nodes.get(&parent)).is_some_and(|node| node.trash.is_some()) {
+        above.push(parent.clone());
+        parent = server.nodes[&parent].shape.parent.clone();
+    }
+    for folder in above.into_iter().rev() {
+        let node = server.nodes.get_mut(&folder).unwrap();
+        node.trash = None;
+        node.meta_rev = server.seq;
+        changed.push(folder);
     }
     let Some(trash) = server.nodes[id].trash.clone() else {
         return;
@@ -662,6 +672,13 @@ fn the_notice_follows_the_model_over_every_short_sequence_of_events() {
 /// Runs `events`, each compared with the model, and returns the engine's notice at the end:
 /// deletions, files and space.
 fn witness(events: &[Event]) -> Option<(u64, u64, u64)> {
+    run(events)
+        .notice()
+        .map(|(_, window)| (window.deletions, window.affected_files, window.space_files))
+}
+
+/// Runs `events`, each compared with the model, and returns the world they leave.
+fn run(events: &[Event]) -> World {
     let mut world = World::new();
     for (index, event) in events.iter().enumerate() {
         assert!(world.enabled().contains(event), "{event:?} at {index}");
@@ -671,8 +688,6 @@ fn witness(events: &[Event]) -> Option<(u64, u64, u64)> {
         }
     }
     world
-        .notice()
-        .map(|(_, window)| (window.deletions, window.affected_files, window.space_files))
 }
 
 use Event::{
@@ -782,6 +797,21 @@ fn witness_a_new_deletion_after_a_second_truncation() {
 fn witness_the_rest_of_a_delete_the_server_applied_in_part() {
     let events = [DeleteUnseen("p"), Step, Step, Step, Dismiss, StepAll];
     assert_eq!(witness(&events), None);
+}
+
+/// GUN-384 review: one file restored from a folder whose notice was dismissed part way through its
+/// removal. The server brings back the folder on its own and the file, so the other 39 files stay
+/// deleted and dismissed.
+#[test]
+fn witness_one_file_restored_from_a_dismissed_folder() {
+    let world = run(&[&DISMISSED_MID_FOLDER[..], &[Restore("p/f/g1"), StepAll]].concat());
+    assert_eq!(world.notice().map(|(_, window)| window.deletions), None);
+    let trashed = (world.server.nodes.iter())
+        .filter(|(id, node)| below(id, "p/f") && node.trash.is_some())
+        .map(|(id, _)| id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(trashed.len(), 39, "{trashed:?}");
+    assert!(!trashed.contains(&"p/f") && !trashed.contains(&"p/f/g1"));
 }
 
 /// GUN-384 review: one file restored from a delete the server applied in part, after the notice
