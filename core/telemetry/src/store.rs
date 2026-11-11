@@ -82,11 +82,11 @@ struct Out {
 }
 
 impl Out {
-    fn new(id: InstallId, batch: Batch) -> Self {
+    fn new(id: InstallId, batch: Batch) -> io::Result<Self> {
         let uuids = (0..batch.days.len() + batch.events.len())
-            .map(|_| EventUuid::generate())
-            .collect();
-        Out { id, batch, uuids }
+            .map(|_| EventUuid::generate().map_err(io::Error::other))
+            .collect::<io::Result<_>>()?;
+        Ok(Out { id, batch, uuids })
     }
 
     /// Without what is older than [`KEEP_DAYS`]. None when nothing is left, or when its uuids don't match its batch.
@@ -130,7 +130,7 @@ impl Queue {
                 .merge(report);
         }
         for event in events {
-            let same = (self.events.iter())
+            let same = (self.events.iter().chain(self.out_events()))
                 .filter(|held| held.kind() == event.kind() && held.day() == event.day())
                 .count();
             if same < Event::PER_KIND_PER_DAY {
@@ -139,14 +139,19 @@ impl Queue {
         }
     }
 
+    /// The events of the batch that is out, which count toward the caps until it is sent.
+    fn out_events(&self) -> impl Iterator<Item = &Event> {
+        self.out.iter().flat_map(|out| &out.batch.events)
+    }
+
     /// Drops what is older than [`KEEP_DAYS`] and the oldest events over [`MAX_EVENTS`].
     fn trim(&mut self, today: u32) {
         let oldest = today.saturating_sub(KEEP_DAYS);
         self.days
             .retain(|day, report| *day >= oldest && !report.is_empty());
         self.events.retain(|event| event.day() >= oldest);
-        let over = self.events.len().saturating_sub(MAX_EVENTS);
-        self.events.drain(..over);
+        let over = (self.events.len() + self.out_events().count()).saturating_sub(MAX_EVENTS);
+        self.events.drain(..over.min(self.events.len()));
     }
 }
 
@@ -277,25 +282,29 @@ impl Store {
             return Ok(None);
         };
         let mut queue = self.queue()?;
-        let had_out = queue.out.is_some();
+        let held = (queue.days.len(), queue.events.len(), queue.out.is_some());
         queue.trim(today);
+        let trimmed = held != (queue.days.len(), queue.events.len(), queue.out.is_some());
         let left = (queue.out.take())
             .filter(|out| out.id == id)
             .and_then(|out| out.trimmed(today));
-        let out = left.unwrap_or_else(|| {
-            let later = queue.days.split_off(&today);
-            let batch = Batch {
-                days: std::mem::replace(&mut queue.days, later)
-                    .into_values()
-                    .collect(),
-                events: std::mem::take(&mut queue.events),
-            };
-            Out::new(id.clone(), batch)
-        });
+        let out = match left {
+            Some(out) => out,
+            None => {
+                let later = queue.days.split_off(&today);
+                let batch = Batch {
+                    days: std::mem::replace(&mut queue.days, later)
+                        .into_values()
+                        .collect(),
+                    events: std::mem::take(&mut queue.events),
+                };
+                Out::new(id.clone(), batch)?
+            }
+        };
         if !out.batch.is_empty() {
             queue.out = Some(out.clone());
         }
-        if had_out || queue.out.is_some() {
+        if trimmed || held.2 || queue.out.is_some() {
             write(&self.dir.join("queue.json"), &queue)?;
         }
         Ok(Some(Sending {
@@ -545,6 +554,34 @@ mod tests {
                 .is_empty()
         );
         assert!(store.peek().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_take_with_nothing_due_still_drops_what_expired() {
+        let (_dir, store) = store();
+        store.set(true).unwrap();
+        store.absorb_at(pending(99, 1), 100, true).unwrap();
+        let late = 99 + KEEP_DAYS + 1;
+        drop(store.take(late).unwrap());
+        assert!(store.queue().unwrap().days.is_empty());
+        assert!(store.queue().unwrap().events.is_empty());
+    }
+
+    #[test]
+    fn events_out_count_toward_the_cap() {
+        let (_dir, store) = store();
+        store.set(true).unwrap();
+        let panics = |n| Pending {
+            days: BTreeMap::new(),
+            events: vec![panic_on(99); n],
+        };
+        store
+            .absorb_at(panics(Event::PER_KIND_PER_DAY), 100, true)
+            .unwrap();
+        let sending = store.take(100).unwrap().unwrap();
+        store.give_back(sending).unwrap();
+        store.absorb_at(panics(5), 100, true).unwrap();
+        assert!(store.queue().unwrap().events.is_empty());
     }
 
     #[test]

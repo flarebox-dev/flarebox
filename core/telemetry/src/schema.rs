@@ -424,20 +424,20 @@ impl fmt::Display for InstallId {
 pub struct EventUuid(String);
 
 impl EventUuid {
-    pub fn generate() -> Self {
+    pub fn generate() -> Result<Self, getrandom::Error> {
         let mut bytes = [0u8; 16];
-        getrandom::fill(&mut bytes).expect("the operating system provides random bytes");
+        getrandom::fill(&mut bytes)?;
         bytes[6] = (bytes[6] & 0x0f) | 0x40;
         bytes[8] = (bytes[8] & 0x3f) | 0x80;
         let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-        EventUuid(format!(
+        Ok(EventUuid(format!(
             "{}-{}-{}-{}-{}",
             &hex[..8],
             &hex[8..12],
             &hex[12..16],
             &hex[16..20],
             &hex[20..]
-        ))
+        )))
     }
 
     pub fn as_str(&self) -> &str {
@@ -624,7 +624,10 @@ mod tests {
 
     #[test]
     fn event_uuids_are_random_version_4_uuids() {
-        let (a, b) = (EventUuid::generate(), EventUuid::generate());
+        let (a, b) = (
+            EventUuid::generate().unwrap(),
+            EventUuid::generate().unwrap(),
+        );
         assert_ne!(a, b);
         assert_eq!(&a.as_str()[14..15], "4");
         assert!(EventUuid::try_from(a.as_str().to_owned()).is_ok());
