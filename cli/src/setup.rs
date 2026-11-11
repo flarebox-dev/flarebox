@@ -92,6 +92,7 @@ pub enum ServerAction {
     },
     /// Log in with Cloudflare and upload this CLI's server version.
     Upgrade {
+        /// The server's Worker name, when the account holds several.
         #[arg(long)]
         server: Option<String>,
         /// Go on without asking, for example past the Workers Builds warning.
@@ -102,6 +103,7 @@ pub enum ServerAction {
     },
     /// Log in with Cloudflare, delete the server's Worker, then empty and delete its bucket.
     Uninstall {
+        /// The server's Worker name, when the account holds several.
         #[arg(long)]
         server: Option<String>,
         /// Empty and delete this bucket when its Worker is already gone.
@@ -1232,7 +1234,7 @@ async fn wait_until_serving(url: &Url, version: Option<&str>) -> Result<ServerIn
 
 /// Polls until the Account DO reports `setup_attempts`, which can take up to 300 seconds after an upgrade.
 async fn wait_for_setup_attempts(url: &Url) -> Result<(), String> {
-    println!("Waiting for the server's storage to move to the new version (up to 5 minutes)...");
+    println!("Waiting for the server's storage to move to the new version (up to 330 seconds)...");
     let started = Instant::now();
     loop {
         if server_info(url)
