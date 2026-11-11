@@ -75,6 +75,7 @@ fn trees_state() -> TreesState {
         parked_as: [("b".into(), "c".into())].into(),
         waiting: [("a".into(), Some(dir(ROOT, "x")))].into(),
         watched: [("u".into(), true), ("v".into(), false)].into(),
+        watched_positions: [("m".into(), Some(3)), ("p".into(), None)].into(),
         trashed_here: [("t".into(), 5)].into(),
         discarded: ["a".into()].into(),
         outside: ["a".into()].into(),

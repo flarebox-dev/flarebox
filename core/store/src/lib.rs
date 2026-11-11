@@ -350,6 +350,12 @@ const MIGRATIONS: &[&str] = &[
         limit_crossed TEXT PRIMARY KEY
     ) STRICT, WITHOUT ROWID;
 ",
+    "
+    CREATE TABLE watched_positions (
+        node_id TEXT PRIMARY KEY,
+        rev INTEGER
+    ) STRICT, WITHOUT ROWID;
+",
 ];
 
 /// The schema version this build writes.

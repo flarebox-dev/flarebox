@@ -161,6 +161,9 @@ pub struct Trees {
     /// The nodes whose content the commit in flight updates, each with whether S's content
     /// changed since the commit was built.
     watched: BTreeMap<NodeId, bool>,
+    /// The nodes the commit in flight moves, each with the latest revision at which L and R agreed
+    /// on the position S holds, since the commit was built.
+    watched_positions: BTreeMap<NodeId, Option<u64>>,
     /// The nodes a delete of this device trashed, each with the seq of its commit, while R holds
     /// them trashed by that commit.
     trashed_here: BTreeMap<NodeId, u64>,
@@ -233,6 +236,7 @@ impl Trees {
             parked_as: BTreeMap::new(),
             waiting: BTreeMap::new(),
             watched: BTreeMap::new(),
+            watched_positions: BTreeMap::new(),
             trashed_here: BTreeMap::new(),
             discarded: BTreeSet::new(),
             edited_here: BTreeMap::new(),
@@ -774,6 +778,22 @@ impl Trees {
         self.watched.get(id) == Some(&true)
     }
 
+    /// Watches S's position of `ids`, the nodes the commit just built moves, and stops watching any
+    /// other node.
+    pub fn watch_positions(&mut self, ids: impl IntoIterator<Item = NodeId>) {
+        self.watched_positions = ids.into_iter().map(|id| (id, None)).collect();
+    }
+
+    /// Whether S holds a position of `id` that L and R agreed on at a revision of R after `seq`,
+    /// since [`Trees::watch_positions`] started watching it.
+    pub fn took_position_after(&self, id: &str, seq: u64) -> bool {
+        self.watched_positions
+            .get(id)
+            .copied()
+            .flatten()
+            .is_some_and(|rev| rev > seq)
+    }
+
     pub(crate) fn take_waiting(&mut self) -> BTreeMap<NodeId, Option<Shape>> {
         std::mem::take(&mut self.waiting)
     }
@@ -1041,6 +1061,7 @@ impl Trees {
                 }
                 None => {}
             }
+            self.note_position(&id, false);
             if self.orphaned_in_s(&id) {
                 self.orphaned.insert(id.clone());
             } else {
@@ -1376,6 +1397,24 @@ impl Trees {
         below.split_off(1)
     }
 
+    /// Records, for a node whose position is watched, the revision of R's position while L and S
+    /// hold it too, and forgets the revision once S's position `moved` to one they do not agree on.
+    fn note_position(&mut self, id: &str, moved: bool) {
+        let held = (self.r.get(id))
+            .filter(|remote| {
+                !remote.trashed
+                    && (self.s.get(id)).is_some_and(|shape| shape.same_position(&remote.shape))
+                    && (self.l.get(id))
+                        .is_some_and(|local| local.shape.same_position(&remote.shape))
+            })
+            .map(|remote| remote.meta_rev);
+        if let Some(taken) = self.watched_positions.get_mut(id)
+            && (moved || held.is_some())
+        {
+            *taken = held;
+        }
+    }
+
     fn set_synced_unmarked(&mut self, id: &str, shape: Option<Shape>) {
         self.waiting.remove(id);
         self.changed.insert(id.to_owned());
@@ -1395,6 +1434,13 @@ impl Trees {
                 (Some(before), Some(after)) => !same_content(before, after),
                 (before, after) => before.is_some() != after.is_some(),
             };
+        }
+        if self.watched_positions.contains_key(id) {
+            let moved = match (old.as_ref(), self.s.get(id)) {
+                (Some(before), Some(after)) => !before.same_position(after),
+                (before, after) => before.is_some() != after.is_some(),
+            };
+            self.note_position(id, moved);
         }
         if let Some(old) = old {
             let kept = self.s.get(id).is_some_and(|new| {
@@ -1449,6 +1495,7 @@ impl Trees {
             parked_as: self.parked_as.clone(),
             waiting: self.waiting.clone(),
             watched: self.watched.clone(),
+            watched_positions: self.watched_positions.clone(),
             trashed_here: self.trashed_here.clone(),
             discarded: self.discarded.clone(),
             outside: self.outside.clone(),
@@ -1511,6 +1558,7 @@ impl Trees {
             parked_as,
             waiting,
             watched,
+            watched_positions,
             trashed_here,
             discarded,
             outside,
@@ -1526,6 +1574,7 @@ impl Trees {
         self.parked_as = parked_as;
         self.waiting = waiting;
         self.watched = watched;
+        self.watched_positions = watched_positions;
         self.trashed_here = trashed_here;
         self.discarded = discarded;
         self.outside = outside;

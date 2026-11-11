@@ -645,6 +645,10 @@ impl Commits {
             Some(op::Op::UpdateContent(update)) => Some(update.node_id.clone()),
             _ => None,
         }));
+        trees.watch_positions(ops.iter().filter_map(|op| match &op.op {
+            Some(op::Op::Move(moved)) => Some(moved.node_id.clone()),
+            _ => None,
+        }));
         self.in_flight = Some(InFlight {
             commit: proto::Commit {
                 commit_id: ids.uuid_v7(now_ms),
@@ -679,7 +683,12 @@ impl Commits {
     /// built is newer than what was sent: the server applies a content update only when no other
     /// device changed the content after the commit's `base_seq`, so that change came after the
     /// commit. When S's content changed since then ([`Trees::took_content`]), even back to what it
-    /// was, S keeps what it holds. A conflict copy is re-keyed in L, and so is
+    /// was, S keeps what it holds. A position S holds is newer than what was sent only when L and R
+    /// agreed on it, after the commit was built, at a revision of R after the result's seq: the
+    /// server applies a move whatever another device did after `base_seq`, so the move replaced a
+    /// position from an earlier record, and a position only R came back to is a remote change. When S holds a
+    /// newer position ([`Trees::took_position_after`]), S keeps it, and a rename by the server
+    /// does not revert the node. A conflict copy is re-keyed in L, and so is
     /// a directory merged into one L does not hold yet. When L already holds the conflict copy,
     /// because a log replay brought it before the result and the effects downloaded it, the local
     /// file keeps its ID and takes what was sent as its S, so the server's content replaces it. When L already holds the directory it was
@@ -801,6 +810,7 @@ impl Commits {
                     if let Some(shape) = synced.get(trees, id)
                         && applied
                         && target != *id
+                        && !trees.took_position_after(id, result.seq)
                     {
                         let shape = Shape {
                             parent: target,
@@ -835,7 +845,9 @@ impl Commits {
                     local.shape.parent != *parent || nfc(&local.shape.name) != nfc(name)
                 })
             });
-            if (renamed && !left) || (done && follows) {
+            let kept = matches!(&op.op, Some(op::Op::Move(_)))
+                && trees.took_position_after(node, result.seq);
+            if (renamed && !left && !kept) || (done && follows) {
                 trees.revert(node.clone());
             }
             if !done {
@@ -850,6 +862,7 @@ impl Commits {
             self.resolve(id, Outcome::from_result(&result.results[index]));
         }
         trees.watch_content([]);
+        trees.watch_positions([]);
         self.retry_waiting(trees, BTreeSet::new(), Vec::new());
         self.accepted = flight.commit.device_seq;
         self.slots.insert(flight.commit.device_seq, result.seq);
