@@ -668,3 +668,32 @@ fn two_files_swapped_through_a_third_name_reach_the_other_device() {
     let world = converge(2, &[synced, swap]).unwrap();
     assert_eq!(world.devices[1].disk.entries().len(), 2);
 }
+
+/// Device 2 sends its rename of a file to b, and while the commit is in flight it receives device
+/// 0's rename to b and then device 1's rename to c.txt. The server applies device 2's commit after
+/// device 1's, so the file ends as b. The driver plans no effect while a commit is in flight, so
+/// device 2 never moves its file to c.txt and then commits that name as its own. The minimal input
+/// proptest found for `devices_converge_once_the_faults_stop` (GUN-383).
+#[test]
+fn a_device_with_a_commit_in_flight_does_not_commit_a_remote_name_back() {
+    let phases = [
+        vec![(0, file("a")), (0, rename(0, 0, "ß"))],
+        vec![
+            (2, rename(0, 0, "b")),
+            (0, rename(0, 0, "b")),
+            (0, Step::Work(0)),
+            (2, Step::Work(0)),
+            (2, Step::Work(0)),
+            (0, Step::Work(913562)),
+            (1, COMMIT),
+            (1, Step::Work(6613876784364572377)),
+            (
+                1,
+                rename(7269053276869567780, 12266595847907186486, "c.txt"),
+            ),
+            (1, Step::Work(2973521201126422277)),
+            (1, Step::Work(10427516227233112141)),
+        ],
+    ];
+    converge(3, &phases).unwrap();
+}
