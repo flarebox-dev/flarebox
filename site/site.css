@@ -6,6 +6,7 @@
 /* Hallmark · answered F3 · the headline balances its lines: "Your own Dropbox / on Cloudflare" from 375 to 480 and from 961 to 1920, one line from 600 to 900 where the stacked head is full width, three lines at 320 */
 /* Hallmark · finish-review: in-thread designer's critique, then a cross-lab review (BOX-139) · 13 findings · fixed 5: the head sat 28px under the screen's middle, now 8px over it; the ® stood 1 to 2px off the "e", now 3 to 6px; the commands were 13px, under the 14px labels, now 14px on a 24px line; Copy grew with its label and reflowed the panel, now 104px in every state; under 60rem an empty field row added 64px under the head, now gone · kept 8: the "Y" inks 1.5px inside the column edge; the nav centres the wordmark and the link, so their baselines differ by 7px; the block is wider than its commands; Copy's hover is a small step on the surface; two GitHub links on the first screen; the phone page has empty paper above the footer; the footer is below the fold on desktop; Copy sits under the commands under 415px (coreav-dev/site's layout or the reviewers' and the maintainer's choices) · logo round: the cube lockup sits on the wordmark's centre within 0.5px with a 10px gap, crisp at 1x on desktop; kept: on a phone the 23.33px cube leaves its seams soft at 1x, because the lockup's ratios fix that size · gap: none */
 /* Hallmark · Koidrive: supplied koi paths unchanged, chosen Outfit 600 wordmark, app-icon favicons and OG image; install block unchanged · self-critique: the nav's viewBox crop removes the unused padding, so its 28/23.33px visible height balances the 24/20px wordmark without scaling the lockup · sweep: 0 FAIL, 1 file-URL font WARN, 2 section-count NOTEs; HTTP font captures loaded · cross-lab identity review pending */
+/* Hallmark · install block removed (maintainer, 2026-11-11): no release or Homebrew tap exists yet and the command will be renamed, so the commands, Copy and its script are gone; the act column holds one release line on the install block's surface */
 /* SPDX-License-Identifier: Apache-2.0 */
 /* The page, built on coreav-dev/site (see DESIGN.md): its edge-aligned nav, its Ledge hero in the bare form and its
    colophon footer, with their values. Shared pieces first, then the page from top to bottom. */
@@ -92,8 +93,7 @@ pre {
   background: var(--color-accent-deep);
 }
 
-.btn[aria-disabled="true"],
-.copy:disabled {
+.btn[aria-disabled="true"] {
   opacity: 0.55;
   cursor: not-allowed;
   transform: none;
@@ -199,7 +199,7 @@ a:active {
   border-top: none;
 }
 
-/* The claim (the headline and See GitHub) and the install block, centred on each other. */
+/* The claim (the headline and See GitHub) and the release line, centred on each other. */
 .head {
   grid-area: head;
   display: grid;
@@ -239,69 +239,13 @@ a:active {
   margin-top: var(--space-xl);
 }
 
-/* What the shell runs: the surface fill, no border, the 16px surface radius, the commands and Copy side by side.
-   Copy drops under the commands when the longest argument and Copy can't share a line. */
-.term {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-md);
+/* The release line, where the install commands go once there is a release: the surface fill, no border,
+   the 16px surface radius and one line of body text in the ink. */
+.soon {
   padding: var(--space-md);
   background: var(--color-surface);
   border-radius: var(--radius-card);
   color: var(--color-ink);
-  font: 400 var(--text-sm) / 24px var(--font-outlier);
-}
-
-.cmds {
-  display: grid;
-  flex: 1 1 0;
-  gap: var(--space-2xs);
-}
-
-/* A wrapped command hangs its continuation under the command, past the prompt. */
-.line {
-  padding-left: 2ch;
-  text-indent: -2ch;
-  overflow-wrap: anywhere;
-}
-
-/* A command wraps between its arguments, never inside one. */
-.arg {
-  white-space: nowrap;
-}
-
-.prompt {
-  color: var(--color-muted);
-  user-select: none;
-}
-
-/* Copy is the outlined pill at the label size, in the pill outline colour. It is as wide as its longest label,
-   "Copy failed", in every state, so the panel never reflows when the label changes. */
-.copy {
-  flex: none;
-  width: 104px;
-  min-height: 44px;
-  padding: 0 var(--space-md);
-  border: none;
-  border-radius: var(--radius-pill);
-  background: transparent;
-  box-shadow: inset 0 0 0 1.5px var(--color-muted-2);
-  color: var(--color-ink);
-  font: 500 var(--text-sm) / 1 var(--font-display);
-  white-space: nowrap;
-  cursor: pointer;
-  transition: background-color var(--dur-micro) var(--ease-out);
-}
-
-.copy:hover {
-  background: var(--color-rule);
-}
-
-.copy:focus-visible {
-  outline: 2px solid var(--color-focus);
-  outline-offset: 3px;
 }
 
 .foot {

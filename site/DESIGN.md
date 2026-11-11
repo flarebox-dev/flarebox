@@ -29,8 +29,8 @@ The spacing scale, the type scale, the easings and the durations live in `tokens
 
 ## Meanings
 - One orange in two strengths. The full one is for the one filled control, focus and a link's hover. The deep one is the filled control's hover. The soft one is unused today.
-- `--color-surface` is the install block's fill, a grey step above the paper that reads as a panel. On it the commands (ink) are 15.6:1, the prompt (muted) 6.4:1 and the Copy pill's outline (muted-2) 3.1:1.
-- `--color-rule` is the section line (over the footer) and the Copy pill's hover. `--color-rule-2` is the fainter row line and a nav link's hover. Pill outlines take `--color-muted-2`.
+- `--color-surface` is the release line's fill, a grey step above the paper that reads as a panel. On it the ink is 15.6:1.
+- `--color-rule` is the section line (over the footer). `--color-rule-2` is the fainter row line and a nav link's hover. Pill outlines take `--color-muted-2`.
 - Body text is ink-2; heads, labels and commands are ink; the notice and the prompt are muted.
 
 ## Type
@@ -45,22 +45,22 @@ The spacing scale, the type scale, the easings and the durations live in `tokens
 - `favicon.svg` is the supplied app-icon SVG; `favicon.ico` holds 16 and 32px renders of it. `apple-touch-icon.png` and the manifest's 192 and 512px icons also render that SVG, without redrawing the fish.
 - `og.png` is a 1200 by 630 image with the transparent icon and outlined wordmark on the dark paper. The page names it in the Open Graph and Twitter card metadata. Its URL is relative in this undeployed preview; use an absolute deployment URL when a hostname is chosen.
 - `logo/draw.py /path/to/outfit-latin-600-normal.woff2` draws the wordmark from an external Outfit 600 Latin WOFF2 file from @fontsource/outfit 5.3.0 and generates the cropped nav SVG. The source font stays outside the repository. The script needs fonttools and brotli. `logo/icons.mjs` renders the supplied app icons and OG image using sharp. Install these tools outside the repository.
-- The installation commands and GitHub links still name flarebox-dev/flarebox. This preview changes the landing-page identity, not the repository or CLI name.
+- The GitHub links still name flarebox-dev/flarebox. This page changes the landing-page identity, not the repository name.
 - Don't reuse CoreAV's wordmark setting, its AV monogram or its icons.
 
 ## Controls
 - Primary: the orange pill, `--color-accent-ink` text, `--color-accent-deep` on hover, 48px, Outfit 500. Once per page: "See GitHub", 40px under the headline (24px under 60rem).
-- Secondary: a pill with a 1.5px inset outline. Copy is the secondary pill at 44px and the label size, outlined in `--color-muted-2`, and 104px wide in every state (Copy, Copied, Copy failed), so the panel never reflows when the label changes.
-- Disabled: a disabled Copy button or an `aria-disabled` pill drops to 55% opacity with a not-allowed cursor and does not move.
+- Secondary: a pill with a 1.5px inset outline. Nothing on the page uses it today.
+- Disabled: an `aria-disabled` pill drops to 55% opacity with a not-allowed cursor and does not move.
 - Nav links: Outfit 500 at the label size in a 40px pill that steps to rule-2 on hover.
-- The install block holds the two commands, one per line, and one Copy button beside them, with 16px of padding all round. When the longest argument and Copy can't share a line (screens narrower than about 415px), Copy sits under the commands in every state. A command wraps only between its arguments, as the first one does at 1024px. It copies the text of each `[data-cmd]` span joined by a newline, so the clipboard holds exactly `brew install flarebox-dev/tap/flarebox` and `flarebox setup` on two lines. Its accessible name is "Copy both commands". If the copy fails, the button reads "Copy failed" and both commands are selected for a keyboard copy (the prompts are not selectable). A command wraps between its arguments; an `.arg` span keeps an argument whole. To change a command, edit its span in index.html.
+- No install commands ship until there is a release. In their place the act column holds one line, "The first release is coming soon.", in the ink on the surface fill with 16px of padding all round.
 - Focus: a 2px ring in `--color-focus`, 3px out on pills and 2px on links.
 
 ## Motion
 - Character: quick and dry. Colours step over `--dur-micro` (120ms) and a pressed pill moves 1px. Nothing is revealed on scroll or load. Under reduced motion every transition ends at once.
 
 ## Copy
-- Every word passes the project's unslop skill. The page reads as it will on launch day, with no status caveats and no roadmap lines.
+- Every word passes the project's unslop skill. The page carries one status line, the release line, and no roadmap lines.
 - The ® sits 0.2 of its own size (0.064em of the headline) after "Cloudflare", with its top on the cap line.
 - The trademark notice follows Cloudflare's trademark guidelines (https://www.cloudflare.com/trademark/): the first "Cloudflare" in visible text carries ®, set small at the cap line (`.reg`), and the footer names the marks the page uses and their owners: Cloudflare, Inc. for Cloudflare and Dropbox, Inc. for Dropbox. It ends "Koidrive is not affiliated with or endorsed by either company." Keep it, and name a mark there only when the page uses it.
 - Never put "Cloudflare" in the product name.
@@ -72,18 +72,17 @@ The spacing scale, the type scale, the easings and the durations live in `tokens
 | Headline | A forced break (`<br>`) before the orange word's line | No forced break; balanced lines break it as "Your own Dropbox / on Cloudflare" | Our copy |
 | Headline | No mark | ® after "Cloudflare" | Trademark rules |
 | Under the headline | The lead sentence | See GitHub | Gunwoo's cuts (no lead) and his See GitHub move |
-| Install block | One command in a `<pre>`, then a note, then the GitHub pill | Two commands and one Copy button in one row, nothing under it | Our copy (two commands, no note) and Gunwoo's cuts (one Copy button) |
+| Install block | One command in a `<pre>`, then a note, then the GitHub pill | One release line on the surface fill, no commands | The maintainer's call: no release or Homebrew tap exists yet |
 | Columns of the head | Feet on one line (`align-items: end`) | Centred on each other (`align-items: center`) | Gunwoo's request |
 | Hero bottom padding, 60rem and wider | 40px | 40px plus the nav's 72px | Design review: centres the head on the screen, not under the nav |
-| Command type | 13px on a 1.7 line | 14px on a 24px line | Design review: the commands were smaller than the labels around them |
-| Install block fill | `--color-paper-2` | `--color-surface` | Gunwoo's request: the block was close to invisible on the paper |
+| Release line fill | `--color-paper-2` | `--color-surface` | Gunwoo's request: the block was close to invisible on the paper |
 | Gap above the primary pill | 16px (`.cta`), under the install note | 40px under the headline, 24px under 60rem (`.claim .cta`) | Gunwoo's request: 16px was too tight under the headline |
 | Primary pill | "GitHub", in the right column under the note | "See GitHub", in the left column under the headline | Our copy (the label) and Gunwoo's See GitHub move (the place) |
 | Nav | The CoreAV wordmark; Docs, Blog and GitHub | The Koidrive lockup (the supplied koi icon and the wordmark); GitHub, hidden under 40rem | Brand rules (the wordmark) and our copy (no docs or blog); hiding the link on a phone is Gunwoo's request |
 | Footer | The licence and the Blog and GitHub links | The trademark notice | Trademark rules (the notice) and our copy (no blog) |
 
 ## Files
-- `index.html`: the page, with one inline script for the Copy button.
+- `index.html`: the page. It has no script.
 - `site.css` imports `tokens.css` (which imports `fonts.css`) and `base.css`, then styles the page. The nav, hero and footer rules are coreav-dev/site's scoped Astro styles, made global under their class names.
 - `fonts/`: the three WOFF2 files and their licences. `logo/`: the logo and the scripts that draw it.
 - `favicon.*`, `apple-touch-icon.png`, `icon-*.png` and `site.webmanifest`: the icons.

@@ -49,10 +49,7 @@
           </div>
         </div>
         <div class="act">
-          <div class="term">
-            <code class="cmds" data-cmds><span class="line"><span class="prompt" aria-hidden="true">$ </span><span data-cmd>brew install <span class="arg">flarebox-dev/tap/flarebox</span></span></span><span class="line"><span class="prompt" aria-hidden="true">$ </span><span data-cmd>flarebox setup</span></span></code>
-            <button class="copy" type="button" aria-live="polite">Copy</button>
-          </div>
+          <p class="soon">The first release is coming soon.</p>
         </div>
       </div>
     </div>
@@ -65,25 +62,5 @@
   </div>
 </footer>
 
-<script>
-const copy = document.querySelector('.copy');
-const cmds = document.querySelector('[data-cmds]');
-const text = [...cmds.querySelectorAll('[data-cmd]')].map((c) => c.textContent).join('\n');
-const idle = 'Copy both commands';
-const show = (label, name) => {
-  copy.textContent = label;
-  copy.setAttribute('aria-label', name);
-  setTimeout(() => { copy.textContent = 'Copy'; copy.setAttribute('aria-label', idle); }, 2400);
-};
-const fail = () => {
-  getSelection().selectAllChildren(cmds);
-  show('Copy failed', 'Could not copy. Both commands are selected, so copy them with your keyboard.');
-};
-copy.setAttribute('aria-label', idle);
-copy.addEventListener('click', () => {
-  if (!navigator.clipboard) return fail();
-  navigator.clipboard.writeText(text).then(() => show('Copied', 'Copied both commands'), fail);
-});
-</script>
 </body>
 </html>

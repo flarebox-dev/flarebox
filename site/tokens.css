@@ -1,7 +1,7 @@
 /* Design tokens, as coreav-dev/site has them in src/styles/tokens.css: Hallmark's Ultraviolet theme (type, pills,
    hairlines, scale) on the colours of Hallmark's Rim theme, 'rim: night', with the orange in two derived strengths
    (deep, soft). Dark only. --color-rule is the section line, --color-rule-2 the fainter row line, and pills take
-   --color-muted-2. One token is Flarebox's own: --color-surface, the command block's fill (see DESIGN.md). */
+   --color-muted-2. One token is Flarebox's own: --color-surface, the release line's fill (see DESIGN.md). */
 
 @import url("./fonts.css");
 
