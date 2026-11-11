@@ -3,11 +3,13 @@
 # The engine mutation set, run by scripts/mutations.sh. Each mutation applies
 # one perl substitution (perl -0pi -e) to one file. The last field names the
 # tests that must catch it: unit runs the commit tests, prop runs the
-# interleaving property up to three times, both runs the unit tests first.
+# interleaving property up to three times, both runs the unit tests first, and
+# devices runs the tests of several devices up to three times.
 # shellcheck shell=bash disable=SC2034
 
 unit=(cargo test -q --locked -p flarebox-engine --test commit)
 property=(cargo test -q --locked -p flarebox-sim --test engine_sync)
+devices=(cargo test -q --locked -p flarebox-sim --test devices)
 
 C=core/engine/src/commit.rs
 E=core/engine/src/effects.rs
@@ -48,3 +50,4 @@ mutation refused-reconnect $C 's/        if self\.halted == Some\(Halt::Refused\
 mutation unknown-resend $C 's/            _ => Failure::Halted\(Halt::Refused\),/            Err(_) => Failure::Resend,\n            _ => Failure::Halted(Halt::Refused),/' unit
 mutation parked-name $L 's/self\.parked_as\.get\(id\)\.map_or\(id, String::as_str\)/{ let _ = \&self.parked_as; id }/' unit
 mutation rekey-park-as $C 's/        trees\.park_as\(to\.to_owned\(\), parked_name\);\n//' unit
+mutation digest-dedupe $E 's/    let changed = remote_only\(trees, id\)\n/    let changed = trees.local().get(id).is_some_and(|node| {\n        let digest = |node: \&LocalNode| node.shape.content.as_ref().map(|content| content.manifest_digest.clone());\n        let twin = |(other, twin): (\&NodeId, \&LocalNode)| other.as_str() < id \&\& digest(twin) == digest(node);\n        digest(node).is_some() \&\& trees.synced().live(id).is_none() \&\& trees.remote().live(id).is_none() \&\& trees.local().iter().any(twin)\n    }) || remote_only(trees, id)\n/' devices

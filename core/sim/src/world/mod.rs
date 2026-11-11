@@ -1,0 +1,1366 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Whole devices against the reference server in one thread (docs/design/sync-engine.md section
+//! 7.3). Each device has a disk, an engine, the copy of the engine state its store holds, and a
+//! connection. A schedule names one step at a time: a user action on a disk, a rescan, an
+//! effect, a commit, the delivery of any one message, or a fault. After the schedule the faults
+//! stop and the devices run until nothing is left to do.
+//!
+//! The oracle uses the harness's own records and the server's state, never the engine's
+//! bookkeeping. Every user write carries a tag in its content's `mtime_ns`, which the engine
+//! does not compare, so two files with the same bytes are still two writes. A broken property is
+//! a [`Failure`] of one of two kinds.
+//!
+//! [`Failure::Broken`]: a write is lost, or a state or a call is refused.
+//!
+//! - An effect takes a file off a disk only when the server holds its write, in its tree or in
+//!   its trash.
+//! - A commit takes a write out of the server's live tree only when the user of some device
+//!   overwrote or deleted a file that held it, or when the commit deletes a folder above the
+//!   file, which sends the write to the server's trash. The engine tells contents apart by their
+//!   bytes, so a user who overwrites or deletes a file does the same to a later write of the same
+//!   bytes to that file.
+//! - A write the server does not hold stays on the disk of the device it was made on until that
+//!   device's user overwrites or deletes it.
+//! - L, S and R are valid trees after every step, the store gives back the state it was given,
+//!   and the engine and the server accept every outcome and message the harness reports.
+//! - The engine loads what the store holds after every transaction. The transaction that records
+//!   the outcome of an effect comes before the disk is observed again, so L can still hold an
+//!   entry that the user has moved or deleted since the last scan.
+//!
+//! [`Failure::Diverged`]: the faults have stopped, and the devices did not reach one tree.
+//!
+//! - Every disk equals the server's live tree, and every engine reports L = S = R with nothing
+//!   in flight, blocked, parked or halted.
+//! - No commit moved a node to a name that the user of its device never gave to anything, and
+//!   no commit took a write out of the server's live tree that the user of its device never
+//!   overwrote or deleted.
+//! - No write is in two files of the server.
+//! - Every write was in the server's live tree at some time, unless the user who made it
+//!   overwrote or deleted it first.
+
+pub mod device;
+pub mod disk;
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use flarebox_engine::commit::{self, Reconnect};
+use flarebox_engine::effects::{Effect, EffectRecord};
+use flarebox_engine::tree::{Content, NodeId, RemoteNode, same, same_content};
+use flarebox_proto::v1::{
+    ChunkRef, Commit, Error, NodeKind, NodeStatus, PrepareUpload, Resume, UploadReceipt,
+    chunk_plan, error, op, op_result,
+};
+use sha2::{Digest, Sha256};
+
+use self::device::{Device, Engine, Link, Message};
+pub use self::disk::Cut;
+use self::disk::{Applied, Disk, Place, Refused};
+use crate::space::{Role, Session, SpaceDo};
+
+const NOW: i64 = 1_794_268_740_000;
+/// Names that collide by case and by case folding, so the server renames and merges often.
+pub const NAMES: &[&str] = &["a", "A", "b", "c.txt", "C.TXT", "ß", "ss"];
+/// The contents a device writes. The pool is small, so separate files with the same bytes are
+/// common on one device.
+pub const TEXTS: u8 = 4;
+/// The rounds the devices get to become quiet once the faults stop.
+const ROUNDS: usize = 200;
+
+/// A broken property, with what broke it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Failure {
+    /// A write was lost, or the engine, the store or the server refused a state or a call that
+    /// the design promises.
+    Broken(String),
+    /// The devices did not reach the server's tree once the faults stopped, or a commit made a
+    /// change that no user made.
+    Diverged(String),
+}
+
+impl Failure {
+    /// The same failure, with where it happened in front.
+    fn at(self, place: String) -> Self {
+        match self {
+            Failure::Broken(why) => Failure::Broken(format!("{place}: {why}")),
+            Failure::Diverged(why) => Failure::Diverged(format!("{place}: {why}")),
+        }
+    }
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (Failure::Broken(why) | Failure::Diverged(why)) = self;
+        out.write_str(why)
+    }
+}
+
+/// One change a user makes on a device's disk. The numbers pick among what the disk holds when
+/// the action runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Action {
+    /// 0 creates a folder, 1 creates a file, 2 overwrites a file, 3 moves or renames an entry
+    /// and 4 deletes one with everything in it.
+    pub kind: u8,
+    pub target: usize,
+    pub parent: usize,
+    pub name: usize,
+    pub text: u8,
+}
+
+/// How the effect in flight ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// The disk does it, or refuses it because the disk is not what the effect expects.
+    Run,
+    /// It fails before it touches the disk, as a failed download does.
+    Fail,
+    /// The disk does it as far as the cut, and the device crashes before the store hears of it.
+    Crash(Cut),
+}
+
+/// What happens to the commit a device sends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reply {
+    /// The server answers it.
+    Served,
+    /// The server refuses it with this code before it applies anything. The server answers a
+    /// commit that it already holds, and it gives `HEAD_MOVED` only to a commit that requires the
+    /// head it was built on. For those the commit is served.
+    Refused(error::Code),
+    /// The chunk uploads are lost, so the server answers `MISSING_CHUNKS` for new chunks.
+    NoChunks,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    User(Action),
+    /// A full rescan of the disk.
+    Scan,
+    /// Plans the next effect when none is in flight, and ends the one in flight otherwise.
+    Effect(Outcome),
+    /// Builds the next commit when none is in flight, and sends the one in flight otherwise.
+    Commit(Reply),
+    Connect,
+    /// Delivers one message on its way to the device, not necessarily the oldest.
+    Deliver(usize),
+    /// Makes the server send one message a second time.
+    Duplicate(usize),
+    /// Breaks the connection. Every message on its way is lost.
+    Drop,
+    /// Stops the device between two store transactions. The next step that is not a user action
+    /// restarts it from the store.
+    Crash,
+    /// Does the first of these that has something to do, starting at the one the number picks:
+    /// deliver a message, plan or end an effect, build or send a commit, rescan.
+    Work(usize),
+}
+
+/// The content of a write: three bytes that name the device and the text, so writes of different
+/// devices never have the same bytes, and the write's tag.
+fn content(device: u8, text: u8, write: i64) -> Content {
+    let bytes = [device, text, text];
+    let chunks = vec![ChunkRef {
+        hash: Sha256::digest(bytes).to_vec(),
+        size: 3,
+        encoding: 0,
+    }];
+    let list: Vec<u8> = (chunks.iter())
+        .flat_map(|c| c.hash.iter().copied().chain(c.size.to_le_bytes()))
+        .collect();
+    Content {
+        size: 3,
+        mtime_ns: write,
+        chunk_count: 1,
+        manifest_digest: Sha256::digest(list).to_vec(),
+        chunks,
+        ..Default::default()
+    }
+}
+
+fn contents(commit: &Commit) -> impl Iterator<Item = &Content> {
+    commit.ops.iter().filter_map(|op| match &op.op {
+        Some(op::Op::CreateFile(create)) => create.content.as_ref(),
+        Some(op::Op::UpdateContent(update)) => update.content.as_ref(),
+        _ => None,
+    })
+}
+
+/// Uploads the chunks of every content the disk still holds. Bytes the user has replaced since
+/// the commit was built cannot be read any more.
+fn upload(
+    space: &mut SpaceDo,
+    session: &Session,
+    disk: &Disk,
+    commit: &Commit,
+) -> Vec<UploadReceipt> {
+    let chunks: Vec<ChunkRef> = contents(commit)
+        .filter(|content| disk.holds(content.mtime_ns))
+        .flat_map(|content| content.chunks.clone())
+        .collect();
+    if chunks.is_empty() {
+        return Vec::new();
+    }
+    let plan = space
+        .prepare_upload(session, NOW, &PrepareUpload { chunks })
+        .expect("chunks of three bytes");
+    (plan.chunks.iter())
+        .filter(|chunk| chunk.action == chunk_plan::Action::Upload as i32)
+        .map(|chunk| space.put_chunk(&chunk.hash, 3, NOW))
+        .collect()
+}
+
+/// The writes the server's live tree holds, each with the node that holds it.
+fn live_writes(space: &SpaceDo) -> BTreeMap<i64, NodeId> {
+    (space.nodes().into_iter())
+        .filter(|node| node.status == NodeStatus::Live as i32)
+        .filter_map(|node| Some((node.current?.content?.mtime_ns, node.node_id)))
+        .collect()
+}
+
+/// For each node of the server, the writes it has held, each with the digest of its bytes.
+type Held = BTreeMap<NodeId, BTreeMap<i64, Vec<u8>>>;
+
+/// True when some node of the server, live or trashed, has held the write.
+fn stored(held: &Held, write: i64) -> bool {
+    held.values().any(|writes| writes.contains_key(&write))
+}
+
+/// Fails when an effect sent a file to the local trash that held a write the server never held.
+fn lost(held: &Held, d: usize, record: &EffectRecord, applied: &Applied) -> Result<(), Failure> {
+    let trashed = applied.trashed.as_ref();
+    match trashed.filter(|content| !stored(held, content.mtime_ns)) {
+        Some(lost) => Err(Failure::Broken(format!(
+            "{:?} removed write {} from the disk of device {d}, and the server never held that write",
+            record.effect, lost.mtime_ns
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Applies the result of the commit in flight to R when it is the next commit, and acknowledges
+/// the commit once R holds its records (section 2.7).
+fn acknowledge(engine: &mut Engine) -> Result<(), Failure> {
+    let flight = engine.commits.in_flight();
+    let next = flight.and_then(|flight| flight.result.as_ref());
+    if let Some(result) = next
+        .filter(|result| result.seq == engine.last_seq + 1)
+        .cloned()
+    {
+        engine.apply(&result.changes)?;
+        engine.last_seq = result.seq;
+    }
+    engine
+        .commits
+        .acknowledge(&mut engine.trees, engine.last_seq);
+    Ok(())
+}
+
+/// True when the write is in a trashed file below one of these folders.
+fn trashed_under(space: &SpaceDo, write: i64, folders: &BTreeSet<&str>) -> bool {
+    let nodes = space.nodes();
+    let Some(file) = nodes.iter().find(|node| {
+        let content = (node.current.as_ref()).and_then(|version| version.content.as_ref());
+        node.status != NodeStatus::Live as i32 && content.is_some_and(|c| c.mtime_ns == write)
+    }) else {
+        return false;
+    };
+    let mut parent = file.parent_id.as_str();
+    for _ in 0..nodes.len() {
+        if folders.contains(parent) {
+            return true;
+        }
+        let Some(above) = nodes.iter().find(|node| node.node_id == parent) else {
+            return false;
+        };
+        parent = &above.parent_id;
+    }
+    false
+}
+
+fn note(seen: &mut BTreeMap<&'static str, u64>, what: &'static str) {
+    *seen.entry(what).or_default() += 1;
+}
+
+pub struct World {
+    space: SpaceDo,
+    pub devices: Vec<Device>,
+    /// How often each kind of event happened, so a test can tell that the schedules reach it.
+    pub seen: BTreeMap<&'static str, u64>,
+    /// Prints every step and every turn after the faults stop, with the state each leaves.
+    pub trace: bool,
+    /// The tag of the last write.
+    writes: i64,
+    /// The device whose user made each write.
+    writers: BTreeMap<i64, usize>,
+    /// For each device, the writes its user overwrote or deleted on its disk.
+    removed: Vec<BTreeSet<i64>>,
+    /// For each device, the names its user gave to entries on its disk.
+    named: Vec<BTreeSet<&'static str>>,
+    /// The writes the server's live tree has held at some time.
+    published: BTreeSet<i64>,
+    /// What every node of the server, live or trashed, has held at some time.
+    held: Held,
+    /// The first change a commit made that no user asked for.
+    unasked: Option<String>,
+    /// The writes that a download left on a disk in a file the engine then took for a new one. A
+    /// crash kept the store from hearing of the download, and the user renamed the file before
+    /// the restart (section 5.3). The server holds such a write in two files.
+    copied: BTreeSet<i64>,
+}
+
+impl World {
+    /// Devices with empty disks, connected to an empty space.
+    pub fn new(devices: usize) -> Self {
+        let space = SpaceDo::new(5, NOW);
+        let devices = (0..devices)
+            .map(|d| {
+                let engine = Engine::new(space.space_id(), 100 + d as u64);
+                Device {
+                    session: Session {
+                        device_id: format!("device-{d}"),
+                        user_id: "user".into(),
+                        device_name: format!("device-{d}"),
+                        role: Role::Owner,
+                        max_format: 1,
+                    },
+                    disk: Disk::default(),
+                    store: engine.clone(),
+                    engine,
+                    down: false,
+                    link: Some(Link::default()),
+                }
+            })
+            .collect::<Vec<_>>();
+        Self {
+            space,
+            removed: vec![BTreeSet::new(); devices.len()],
+            named: vec![BTreeSet::new(); devices.len()],
+            devices,
+            seen: BTreeMap::new(),
+            trace: false,
+            writes: 0,
+            writers: BTreeMap::new(),
+            published: BTreeSet::new(),
+            held: Held::new(),
+            unasked: None,
+            copied: BTreeSet::new(),
+        }
+    }
+
+    /// Runs one phase: a schedule of steps, after which the faults stop, the devices become
+    /// quiet and the end state is checked, so the next phase starts from trees that every device
+    /// holds. A failure names the phase and the step that broke a property.
+    pub fn phase(&mut self, phase: usize, schedule: &[(usize, Step)]) -> Result<(), Failure> {
+        for (index, (device, step)) in schedule.iter().enumerate() {
+            let device = device % self.devices.len();
+            let done = self.step(device, step);
+            if self.trace {
+                eprintln!(
+                    "phase {phase}, step {index}: {step:?} on device {device}: {done:?}
+{}",
+                    self.dump()
+                );
+            }
+            let at = format!("phase {phase}, step {index} ({step:?} on device {device})");
+            done.map_err(|failure| failure.at(at))?;
+        }
+        let quiet = self.quiesce();
+        if self.trace {
+            eprintln!(
+                "after phase {phase}: {quiet:?}
+{}",
+                self.dump()
+            );
+        }
+        quiet.map_err(|failure| failure.at(format!("after phase {phase}")))
+    }
+
+    fn step(&mut self, d: usize, step: &Step) -> Result<(), Failure> {
+        match step {
+            Step::User(action) => self.act(d, action),
+            _ if self.devices[d].down => self.restart(d)?,
+            Step::Scan => {
+                self.scan(d)?;
+            }
+            Step::Effect(outcome) => {
+                if self.effect(d, *outcome)? && *outcome != Outcome::Run {
+                    self.effect(d, *outcome)?;
+                }
+            }
+            Step::Commit(reply) => {
+                if self.commit(d, *reply)? && *reply != Reply::Served {
+                    self.commit(d, *reply)?;
+                }
+            }
+            Step::Connect => self.connect(d)?,
+            Step::Deliver(index) => {
+                self.deliver(d, *index)?;
+            }
+            Step::Work(pick) => {
+                for turn in 0..4 {
+                    let worked = match (pick + turn) % 4 {
+                        0 => self.deliver(d, pick / 4)?,
+                        1 => self.effect(d, Outcome::Run)?,
+                        2 => self.commit(d, Reply::Served)?,
+                        _ => self.scan(d)?,
+                    };
+                    if worked {
+                        break;
+                    }
+                }
+            }
+            Step::Duplicate(index) => {
+                if let Some(link) = self.devices[d]
+                    .link
+                    .as_mut()
+                    .filter(|l| !l.inbox.is_empty())
+                {
+                    let message = link.inbox[index % link.inbox.len()].clone();
+                    link.inbox.push(message);
+                }
+            }
+            Step::Drop => self.devices[d].link = None,
+            Step::Crash => {
+                self.devices[d].down = true;
+                self.devices[d].link = None;
+            }
+        }
+        let trees = &self.devices[d].engine.trees;
+        (trees.check()).map_err(|(tree, error)| {
+            Failure::Broken(format!("{tree} is not a valid tree: {error:?}"))
+        })
+    }
+
+    fn act(&mut self, d: usize, action: &Action) {
+        let disk = &mut self.devices[d].disk;
+        let visible = disk.visible();
+        let dirs: Vec<Place> = std::iter::once(Place::Root)
+            .chain(
+                (visible.iter())
+                    .filter(|ino| disk.entries()[ino].content.is_none())
+                    .map(|ino| Place::In(*ino)),
+            )
+            .collect();
+        let place = dirs[action.parent % dirs.len()].clone();
+        let name = NAMES[action.name % NAMES.len()];
+        let target = (!visible.is_empty()).then(|| visible[action.target % visible.len()]);
+        let write = self.writes + 1;
+        match (action.kind % 5, target) {
+            (0, _) => {
+                if disk.create(place, name, None).is_some() {
+                    self.named[d].insert(name);
+                }
+            }
+            (1, _) => {
+                let content = content(d as u8, action.text % TEXTS, write);
+                if disk.create(place, name, Some(content)).is_some() {
+                    self.named[d].insert(name);
+                    self.writes = write;
+                    self.writers.insert(write, d);
+                }
+            }
+            (2, Some(ino)) => {
+                let entry = &disk.entries()[&ino];
+                let fresh = (0..TEXTS)
+                    .map(|i| content(d as u8, (action.text % TEXTS + i) % TEXTS, write))
+                    .find(|content| !entry.held.contains(&content.manifest_digest));
+                if let (Some(_), Some(fresh)) = (&entry.content, fresh)
+                    && let Some(old) = disk.overwrite(ino, fresh)
+                {
+                    self.removed[d].insert(old.mtime_ns);
+                    self.writes = write;
+                    self.writers.insert(write, d);
+                }
+            }
+            (3, Some(ino)) => {
+                if disk.rename(ino, place, name).is_ok() {
+                    self.named[d].insert(name);
+                }
+            }
+            (4, Some(ino)) => {
+                let deleted = disk.delete(ino);
+                self.removed[d].extend(deleted.iter().map(|content| content.mtime_ns));
+            }
+            _ => {}
+        }
+    }
+
+    /// A full rescan. True when L changed.
+    fn scan(&mut self, d: usize) -> Result<bool, Failure> {
+        let device = &mut self.devices[d];
+        if device.rescan() > 0 {
+            note(
+                &mut self.seen,
+                "rescan lets a problem node be planned again",
+            );
+        }
+        let changed = device.engine != device.store;
+        device.persist()?;
+        Ok(changed)
+    }
+
+    /// Plans the next effect, or ends the one in flight. With `Outcome::Fail` or
+    /// `Outcome::Crash` a step does both. True when there was an effect to plan or to end.
+    ///
+    /// As in the driver, the disk gets an effect only while L still takes its outcome
+    /// (`EffectRecord::applies`). An effect that L no longer takes fails, and is planned again once
+    /// L has changed. The outcome goes to the store in its own transaction, before the disk is
+    /// observed again.
+    fn effect(&mut self, d: usize, outcome: Outcome) -> Result<bool, Failure> {
+        let device = &mut self.devices[d];
+        let Some(record) = device.engine.effects.in_flight().cloned() else {
+            let Engine {
+                trees,
+                effects,
+                ids,
+                ..
+            } = &mut device.engine;
+            trees.settle();
+            let planned = effects.plan(trees, ids, NOW as u64).is_some();
+            device.persist()?;
+            return Ok(planned);
+        };
+        let applies = record.applies(&device.engine.trees);
+        let applied = match outcome {
+            Outcome::Run if applies => Some(device.disk.apply(&record, Cut::Done)),
+            Outcome::Crash(cut) if applies => Some(device.disk.apply(&record, cut)),
+            _ => None,
+        };
+        if let Some(applied) = &applied {
+            lost(&self.held, d, &record, applied)?;
+        }
+        let applied = applied.map(|applied| applied.outcome);
+        if let Outcome::Crash(cut) = outcome {
+            note(
+                &mut self.seen,
+                match applied {
+                    _ if device.disk.quarantine.is_some() => {
+                        "crash with a displaced entry in quarantine"
+                    }
+                    _ if device.disk.staged => "crash with a download staged",
+                    Some(Err(_)) => "crash after the disk refused an effect",
+                    _ if applied.is_none() || cut == Cut::Quarantined => {
+                        "crash before an effect reached the disk"
+                    }
+                    _ => "crash after an effect reached the disk",
+                },
+            );
+            device.down = true;
+            device.link = None;
+            return Ok(false);
+        }
+        let Engine { trees, effects, .. } = &mut device.engine;
+        let reported = match applied {
+            Some(Ok(identity)) => effects.done(trees, &record.effect_id, identity),
+            _ => effects.failed(&record.effect_id).map(|()| {
+                if !applies {
+                    effects.unblock(&record.node);
+                }
+            }),
+        };
+        note(
+            &mut self.seen,
+            match (applied, outcome) {
+                (Some(Ok(_)), _) if record.after.is_none() => "effect removed an entry",
+                (Some(Ok(_)), _)
+                    if trees
+                        .local()
+                        .get(&record.node)
+                        .is_some_and(|node| node.parked) =>
+                {
+                    "effect parked a node"
+                }
+                (Some(Ok(_)), _) => "effect done",
+                (_, Outcome::Fail) => "effect failed before the disk",
+                (None, _) => "effect not applied, L no longer takes it",
+                _ => "effect refused by the disk",
+            },
+        );
+        reported.map_err(|error| {
+            Failure::Broken(format!("the effect's outcome was refused: {error:?}"))
+        })?;
+        device.persist()?;
+        device.engine.scan(&device.disk);
+        device.persist()?;
+        Ok(true)
+    }
+
+    /// Restarts a crashed device: the engine comes back from the store, the effect in flight is
+    /// ended from what the disk shows, and the disk is scanned again (sections 2.8 and 5.3).
+    ///
+    /// As in the driver, an effect that recovery reports as done fails when L refutes it
+    /// (`Effects::confirms`), and so does an effect whose outcome L no longer takes
+    /// (`EffectRecord::applies`).
+    fn restart(&mut self, d: usize) -> Result<(), Failure> {
+        let device = &mut self.devices[d];
+        device.down = false;
+        device.engine = device.store.reload()?;
+        if let Some(record) = device.engine.effects.in_flight().cloned() {
+            let quarantined = device.disk.quarantine.is_some();
+            let applied = device.disk.recover(&record);
+            lost(&self.held, d, &record, &applied)?;
+            let Engine { trees, effects, .. } = &mut device.engine;
+            let download = match &record.effect {
+                Effect::WriteFile { content, .. } => Some(content),
+                _ => None,
+            };
+            let applies = record.applies(trees);
+            let refuted = matches!(
+                &applied.outcome,
+                Ok(identity) if !effects.confirms(trees, identity.as_ref())
+            );
+            let reported = match applied.outcome {
+                Ok(identity) if applies && !refuted => {
+                    // A file that the user made with the bytes of the download counts as the
+                    // download. The server holds that write from then on.
+                    let taken = identity
+                        .as_ref()
+                        .zip(download)
+                        .and_then(|(identity, content)| {
+                            let found = device.disk.entries()[&identity.ino].content.as_ref()?;
+                            (found.mtime_ns != content.mtime_ns).then_some(found)
+                        });
+                    if let Some(found) = taken {
+                        note(
+                            &mut self.seen,
+                            "restart takes a file of the user for the download",
+                        );
+                        let writes = self.held.entry(record.node.clone()).or_default();
+                        writes.insert(found.mtime_ns, found.manifest_digest.clone());
+                        self.published.insert(found.mtime_ns);
+                    }
+                    note(
+                        &mut self.seen,
+                        match quarantined {
+                            true => "restart ends an effect that left an entry in quarantine",
+                            false => "restart finds the effect in flight done",
+                        },
+                    );
+                    effects.done(trees, &record.effect_id, identity)
+                }
+                outcome => {
+                    note(
+                        &mut self.seen,
+                        match outcome {
+                            Ok(_) if refuted => "restart finds a done effect that L refutes",
+                            Ok(_) => "restart finds an effect that L no longer takes",
+                            Err(Refused::Interrupted) => {
+                                "restart finds the effect in flight not done"
+                            }
+                            Err(_) => "restart finds the effect in flight refused by the disk",
+                        },
+                    );
+                    if let Some(content) = download.filter(|c| device.disk.holds(c.mtime_ns)) {
+                        self.copied.insert(content.mtime_ns);
+                    }
+                    // The driver plans an interrupted effect again, and one that L no longer
+                    // takes once L has changed. An effect that failed for another reason waits
+                    // until the disk is observed.
+                    effects.failed(&record.effect_id).map(|()| {
+                        if !applies || matches!(outcome, Err(Refused::Interrupted)) {
+                            effects.unblock(&record.node);
+                        }
+                    })
+                }
+            };
+            reported.map_err(|error| {
+                Failure::Broken(format!("the effect's outcome was refused: {error:?}"))
+            })?;
+            device.persist()?;
+        }
+        if device.engine.commits.in_flight().is_some() {
+            note(&mut self.seen, "restart with a commit in flight");
+        }
+        if device.rescan() > 0 {
+            note(
+                &mut self.seen,
+                "rescan lets a problem node be planned again",
+            );
+        }
+        device.persist()
+    }
+
+    fn resume(&self, d: usize) -> Result<Message, Failure> {
+        let resume = Resume {
+            history_id: self.space.history_id().to_owned(),
+            since_seq: self.devices[d].engine.last_seq,
+        };
+        let backlog = self.space.resume(&resume);
+        backlog
+            .map(Message::Records)
+            .map_err(|error| Failure::Broken(format!("the server refused a resume: {error:?}")))
+    }
+
+    fn connect(&mut self, d: usize) -> Result<(), Failure> {
+        if self.devices[d].link.is_some() {
+            return Ok(());
+        }
+        let welcome = self.space.welcome(&self.devices[d].session);
+        match self.devices[d].engine.commits.connected(&welcome) {
+            Reconnect::Recovery => {
+                return Err(Failure::Broken(
+                    "recovery started with no rewind and no rolled-back store".into(),
+                ));
+            }
+            Reconnect::Resend if welcome.device_seq > self.devices[d].engine.commits.accepted() => {
+                note(
+                    &mut self.seen,
+                    "reconnect resends a commit the server applied",
+                );
+            }
+            Reconnect::Resend => note(
+                &mut self.seen,
+                "reconnect resends a commit the server never got",
+            ),
+            Reconnect::Idle => {}
+        }
+        let backlog = self.resume(d)?;
+        self.devices[d].link = Some(Link {
+            inbox: vec![backlog],
+            head: welcome.head_seq,
+            ..Default::default()
+        });
+        self.devices[d].persist()
+    }
+
+    /// Receives one message as section 4.4 asks: commits apply in seq order, a commit R already
+    /// holds is skipped, and a gap asks for the backlog again and drops the rest of the batch.
+    fn deliver(&mut self, d: usize, index: usize) -> Result<bool, Failure> {
+        let Some(link) = self.devices[d]
+            .link
+            .as_mut()
+            .filter(|l| !l.inbox.is_empty())
+        else {
+            return Ok(false);
+        };
+        let message = link.inbox.remove(index % link.inbox.len());
+        match message {
+            Message::Records(records) => {
+                for record in records {
+                    let engine = &mut self.devices[d].engine;
+                    if record.seq > engine.last_seq + 1 {
+                        note(&mut self.seen, "records arrive past a gap");
+                        let backlog = self.resume(d)?;
+                        let link = self.devices[d].link.as_mut().expect("checked above");
+                        link.inbox.push(backlog);
+                        break;
+                    }
+                    if record.seq == engine.last_seq + 1 {
+                        engine.apply(&record.changes)?;
+                        engine.last_seq = record.seq;
+                        let flight = engine.commits.in_flight();
+                        if flight.is_some_and(|f| f.commit.commit_id == record.commit_id) {
+                            note(&mut self.seen, "own commit replayed before its result");
+                        }
+                        let engine = &mut self.devices[d].engine;
+                        acknowledge(engine)?;
+                    } else {
+                        note(&mut self.seen, "records arrive twice");
+                    }
+                }
+            }
+            Message::Answer { request, result } => {
+                if link.awaiting != Some(request) {
+                    note(&mut self.seen, "answer arrives twice");
+                    return Ok(true);
+                }
+                link.awaiting = None;
+                let device = &mut self.devices[d];
+                let refused = |error| Failure::Broken(format!("the answer was refused: {error:?}"));
+                let problems = device.engine.commits.problems().len();
+                match result {
+                    Ok(result) => {
+                        note(
+                            &mut self.seen,
+                            match result.seq {
+                                seq if seq <= device.engine.last_seq => {
+                                    "result arrives after its records"
+                                }
+                                seq if seq == device.engine.last_seq + 1 => {
+                                    "result arrives in order"
+                                }
+                                _ => "result arrives before earlier commits",
+                            },
+                        );
+                        device.engine.commits.received(result).map_err(refused)?
+                    }
+                    Err(error) => match device.engine.commits.failed(&error).map_err(refused)? {
+                        commit::Failure::Resend => {
+                            let flight = device.engine.commits.in_flight().expect("kept to resend");
+                            let gone =
+                                contents(&flight.commit).any(|c| !device.disk.holds(c.mtime_ns));
+                            if error.code == error::Code::MissingChunks as i32 && gone {
+                                note(&mut self.seen, "commit abandoned, its bytes are gone");
+                                device.engine.commits.abandon();
+                                device.engine.scan(&device.disk);
+                            } else {
+                                note(&mut self.seen, "commit refused, sent again");
+                            }
+                        }
+                        commit::Failure::Abandoned => {
+                            note(&mut self.seen, "commit refused, planned again")
+                        }
+                        commit::Failure::Split => note(
+                            &mut self.seen,
+                            match device.engine.commits.problems().len() > problems {
+                                true => {
+                                    "commit of one op refused for its size, its node is a problem"
+                                }
+                                false => "commit refused for its size, planned again in parts",
+                            },
+                        ),
+                        failure => {
+                            return Err(Failure::Broken(format!(
+                                "{error:?} on a commit led to {failure:?}"
+                            )));
+                        }
+                    },
+                }
+            }
+        }
+        acknowledge(&mut self.devices[d].engine)?;
+        self.devices[d].persist()?;
+        Ok(true)
+    }
+
+    /// Builds the next commit, or sends the one in flight, once the device is connected and
+    /// caught up. With a reply other than `Reply::Served` a step does both. True when the
+    /// trees changed or a commit was built or sent.
+    fn commit(&mut self, d: usize, reply: Reply) -> Result<bool, Failure> {
+        let device = &mut self.devices[d];
+        let Some(link) = device.link.as_mut() else {
+            return Ok(false);
+        };
+        let engine = &mut device.engine;
+        if engine.last_seq < link.head {
+            return Ok(false);
+        }
+        let Some(flight) = engine.commits.in_flight() else {
+            let history = self.space.history_id().to_owned();
+            engine.trees.settle();
+            let Engine {
+                trees,
+                commits,
+                ids,
+                last_seq,
+                ..
+            } = engine;
+            commits.build(trees, ids, NOW as u64, &history, *last_seq);
+            if commits.in_flight().is_none() && !commits.problems().is_empty() {
+                note(&mut self.seen, "no commit built while a node is a problem");
+            }
+            let changed = device.engine != device.store;
+            device.persist()?;
+            return Ok(changed);
+        };
+        if flight.result.is_some() || link.awaiting.is_some() || engine.commits.halted().is_some() {
+            return Ok(false);
+        }
+        let commit = flight.commit.clone();
+        link.requests += 1;
+        let request = link.requests;
+        link.awaiting = Some(request);
+        let applied = self.space.device_seq(&device.session.device_id) >= commit.device_seq;
+        let stale = commit.require_head && commit.base_seq < self.space.head_seq();
+        let refusal = match reply {
+            // The codes say that nothing was applied, so the server never gives one for a commit
+            // it holds, and it gives `HEAD_MOVED` only to a commit that requires its base.
+            Reply::Refused(code) if applied || code == error::Code::HeadMoved && !stale => {
+                note(
+                    &mut self.seen,
+                    "refusal the server cannot give, commit served",
+                );
+                None
+            }
+            Reply::Refused(code) => Some(Error {
+                code: code as i32,
+                retry_after_ms: 1,
+                ..Default::default()
+            }),
+            Reply::Served | Reply::NoChunks => None,
+        };
+        let result = match refusal {
+            Some(error) => Err(error),
+            None => {
+                let receipts = match reply {
+                    Reply::NoChunks => Vec::new(),
+                    _ => upload(&mut self.space, &device.session, &device.disk, &commit),
+                };
+                let before = live_writes(&self.space);
+                let session = device.session.clone();
+                let sent = Commit { receipts, ..commit };
+                let made_up = sent.ops.iter().find_map(|op| match &op.op {
+                    Some(op::Op::Move(moved))
+                        if !self.named[d].contains(moved.new_name.as_str()) =>
+                    {
+                        Some(moved)
+                    }
+                    _ => None,
+                });
+                if let Some(moved) = made_up.filter(|_| !applied) {
+                    self.unasked.get_or_insert_with(|| {
+                        format!(
+                            "a commit of device {d} moves node {} to the name {:?}, which the \
+                             user of device {d} never gave to anything",
+                            moved.node_id, moved.new_name
+                        )
+                    });
+                }
+                match self.space.commit(&session, NOW, &sent) {
+                    Ok(committed) => {
+                        if let Some(record) = committed.record {
+                            let after = live_writes(&self.space);
+                            let folders: BTreeSet<&str> = (sent.ops.iter())
+                                .filter_map(|op| match &op.op {
+                                    Some(op::Op::Delete(delete)) => Some(delete.node_id.as_str()),
+                                    _ => None,
+                                })
+                                .collect();
+                            let gone = before.iter().filter(|(w, _)| !after.contains_key(w));
+                            for (lost, node) in gone {
+                                // The engine tells contents apart by their bytes. A user who
+                                // overwrites or deletes a file therefore does the same to a later
+                                // write of the same bytes to that file.
+                                let held = self.held.get(node);
+                                let digest = held.and_then(|held| held.get(lost));
+                                let asked = |removed: &BTreeSet<i64>| {
+                                    (removed.iter()).any(|write| {
+                                        write == lost
+                                            || digest.is_some()
+                                                && held.and_then(|held| held.get(write)) == digest
+                                    })
+                                };
+                                if asked(&self.removed[d]) {
+                                    continue;
+                                }
+                                let why = if self.removed.iter().any(asked) {
+                                    format!(
+                                        "a commit of device {d} took write {lost} out of the \
+                                         server's tree. The user of another device overwrote or \
+                                         deleted it, and the user of device {d} never did: {:?}",
+                                        sent.ops
+                                    )
+                                } else if trashed_under(&self.space, *lost, &folders) {
+                                    // The server sends what a deleted folder holds to its trash.
+                                    // That write is not lost, but no user deleted it.
+                                    format!(
+                                        "a commit of device {d} deleted a folder, and write {lost} \
+                                         went to the trash with it, which the user of device {d} \
+                                         never had in that folder"
+                                    )
+                                } else {
+                                    return Err(Failure::Broken(format!(
+                                        "a commit of device {d} took write {lost} out of the \
+                                         server's tree, and no user overwrote or deleted it: {:?}",
+                                        sent.ops
+                                    )));
+                                };
+                                self.unasked.get_or_insert(why);
+                            }
+                            self.published.extend(after.into_keys());
+                            for node in self.space.nodes() {
+                                if let Some(content) = node.current.and_then(|v| v.content) {
+                                    let writes = self.held.entry(node.node_id).or_default();
+                                    writes.insert(content.mtime_ns, content.manifest_digest);
+                                }
+                            }
+                            note(&mut self.seen, "commit applied");
+                            for outcome in &committed.result.results {
+                                use op_result::Code;
+                                note(
+                                    &mut self.seen,
+                                    match Code::try_from(outcome.code) {
+                                        Ok(Code::ConflictCopy) => "op made a conflict copy",
+                                        Ok(Code::MergedInto) => "op merged a folder",
+                                        Ok(Code::AppliedRenamed) => "op renamed by the server",
+                                        Ok(Code::Superseded) => "op superseded",
+                                        Ok(Code::Rejected) => "op rejected",
+                                        _ => "op applied",
+                                    },
+                                );
+                            }
+                            for (other, device) in self.devices.iter_mut().enumerate() {
+                                if let Some(link) = device.link.as_mut().filter(|_| other != d) {
+                                    link.inbox.push(Message::Records(vec![record.clone()]));
+                                }
+                            }
+                        } else {
+                            note(&mut self.seen, "commit answered from the stored result");
+                        }
+                        Ok(committed.result)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        };
+        let link = self.devices[d].link.as_mut().expect("checked above");
+        link.inbox.push(Message::Answer { request, result });
+        Ok(true)
+    }
+
+    /// Stops the faults, lets the devices become quiet and checks the end state. A lost write is
+    /// reported before a tree the devices did not reach.
+    fn quiesce(&mut self) -> Result<(), Failure> {
+        let quiet = self.quiet();
+        if let Err(Failure::Broken(_)) = quiet {
+            return quiet;
+        }
+        self.kept()?;
+        match self.unasked.take() {
+            Some(why) => Err(Failure::Diverged(why)),
+            None => quiet,
+        }
+    }
+
+    /// Every device restarts if it is down, reconnects, tries its failed effects again and
+    /// rescans. Then the devices take turns until a whole round changes nothing.
+    fn quiet(&mut self) -> Result<(), Failure> {
+        for d in 0..self.devices.len() {
+            if self.devices[d].down {
+                self.restart(d)?;
+            }
+            if self.devices[d].engine.effects.in_flight().is_some() {
+                self.effect(d, Outcome::Run)?;
+            }
+            self.devices[d].link = None;
+            self.connect(d)?;
+            let device = &mut self.devices[d];
+            let blocked: Vec<NodeId> = device.engine.effects.blocked().keys().cloned().collect();
+            for node in blocked {
+                device.engine.effects.unblock(&node);
+            }
+            self.scan(d)?;
+        }
+        for _ in 0..ROUNDS {
+            let before: Vec<Engine> = self.devices.iter().map(|d| d.engine.clone()).collect();
+            for d in 0..self.devices.len() {
+                let at = |failure: Failure| {
+                    failure.at(format!("after the faults stopped, on device {d}"))
+                };
+                while self.deliver(d, 0).map_err(at)? {}
+                self.effect(d, Outcome::Run).map_err(at)?;
+                self.effect(d, Outcome::Run).map_err(at)?;
+                self.commit(d, Reply::Served).map_err(at)?;
+                self.commit(d, Reply::Served).map_err(at)?;
+                let trees = &self.devices[d].engine.trees;
+                (trees.check())
+                    .map_err(|(tree, error)| {
+                        Failure::Broken(format!("{tree} is not a valid tree: {error:?}"))
+                    })
+                    .map_err(at)?;
+                if self.trace {
+                    eprintln!(
+                        "quiet round, device {d}:
+{}",
+                        self.dump()
+                    );
+                }
+            }
+            let idle = |device: &Device| device.link.as_ref().is_some_and(|l| l.inbox.is_empty());
+            if self.devices.iter().all(idle)
+                && self.devices.iter().map(|d| &d.engine).eq(before.iter())
+            {
+                return self.converged();
+            }
+        }
+        Err(Failure::Diverged(format!(
+            "the devices were not quiet {ROUNDS} rounds after the faults stopped"
+        )))
+    }
+
+    /// The server's nodes and every device's disk and trees, one line each, for reading a failing
+    /// schedule step by step. A file shows the tag of the write it holds.
+    fn dump(&self) -> String {
+        use std::fmt::Write;
+        let short = |id: &str| id[id.len().saturating_sub(4)..].to_owned();
+        let file = |content: &Option<Content>| match content {
+            Some(content) => format!("w{}", content.mtime_ns),
+            None => "dir".to_owned(),
+        };
+        let mut out = format!(
+            "server at seq {}
+",
+            self.space.head_seq()
+        );
+        for node in self
+            .space
+            .nodes()
+            .iter()
+            .filter(|node| node.node_id != self.space.space_id())
+        {
+            let content = node
+                .current
+                .as_ref()
+                .and_then(|version| version.content.clone());
+            let trashed = if node.status == NodeStatus::Live as i32 {
+                ""
+            } else {
+                " trashed"
+            };
+            let (id, parent) = (short(&node.node_id), short(&node.parent_id));
+            writeln!(
+                out,
+                "  {id} in {parent} {:?} {}{trashed}",
+                node.name,
+                file(&content)
+            )
+            .unwrap();
+        }
+        for (d, device) in self.devices.iter().enumerate() {
+            let engine = &device.engine;
+            let link = match &device.link {
+                _ if device.down => "down".to_owned(),
+                None => "offline".to_owned(),
+                Some(link) => format!("online, {} messages on their way", link.inbox.len()),
+            };
+            writeln!(out, "device {d}: {link}, last_seq {}", engine.last_seq).unwrap();
+            for (ino, entry) in device.disk.entries() {
+                let place = match &entry.place {
+                    Place::Root => "root".to_owned(),
+                    Place::In(parent) => format!("ino {parent}"),
+                    Place::Parked(node) => format!("parked {}", short(node)),
+                };
+                writeln!(
+                    out,
+                    "  disk ino {ino} in {place} {:?} {}",
+                    entry.name,
+                    file(&entry.content)
+                )
+                .unwrap();
+            }
+            let trees = &engine.trees;
+            let mut ids: BTreeSet<&NodeId> = trees.local().iter().map(|(id, _)| id).collect();
+            ids.extend(trees.synced().iter().map(|(id, _)| id));
+            ids.extend(trees.remote().iter().map(|(id, _)| id));
+            for id in ids {
+                let shape = |shape: Option<&flarebox_engine::tree::Shape>| match shape {
+                    Some(shape) => format!(
+                        "{} {:?} {}",
+                        short(&shape.parent),
+                        shape.name,
+                        file(&shape.content)
+                    ),
+                    None => "-".to_owned(),
+                };
+                let local = trees.local().get(id);
+                let mut flags = String::new();
+                for (flag, set) in [
+                    (" ino", local.is_some()),
+                    (" parked", local.is_some_and(|node| node.parked)),
+                    (
+                        " trashed",
+                        trees.remote().get(id).is_some_and(|node| node.trashed),
+                    ),
+                    (" dirty", trees.dirty().contains(id)),
+                    (" reverted", trees.reverted().contains(id)),
+                    (" waiting", trees.waiting().contains_key(id)),
+                    (" blocked", engine.effects.blocked().contains_key(id)),
+                    (" problem", engine.commits.problems().contains(id)),
+                ] {
+                    if set {
+                        flags.push_str(flag);
+                    }
+                    if flag == " ino"
+                        && let Some(node) = local
+                    {
+                        write!(flags, " {}", node.identity.ino).unwrap();
+                    }
+                }
+                let (l, s) = (
+                    shape(local.map(|node| &node.shape)),
+                    shape(trees.synced().live(id)),
+                );
+                let r = shape(trees.remote().get(id).map(|node| &node.shape));
+                writeln!(out, "  node {} L[{l}] S[{s}] R[{r}]{flags}", short(id)).unwrap();
+            }
+            if let Some(record) = engine.effects.in_flight() {
+                writeln!(
+                    out,
+                    "  effect in flight for {}: {:?}",
+                    short(&record.node),
+                    record.effect
+                )
+                .unwrap();
+            }
+            if let Some(flight) = engine.commits.in_flight() {
+                let result = flight.result.as_ref().map(|result| result.seq);
+                writeln!(
+                    out,
+                    "  commit in flight at base {}, result {result:?}:",
+                    flight.commit.base_seq
+                )
+                .unwrap();
+                for op in &flight.commit.ops {
+                    writeln!(out, "    {:?}", op.op).unwrap();
+                }
+            }
+        }
+        out
+    }
+
+    /// Every write is on the disk of the device whose user made it, unless the server has held it
+    /// or that user overwrote or deleted it.
+    fn kept(&self) -> Result<(), Failure> {
+        let lost = (self.writers.iter()).find(|(write, writer)| {
+            !stored(&self.held, **write)
+                && !self.removed[**writer].contains(write)
+                && !self.devices[**writer].disk.holds(**write)
+        });
+        match lost {
+            Some((write, writer)) => Err(Failure::Broken(format!(
+                "write {write} left the disk of device {writer}: the server never held it, and \
+                 its user never overwrote or deleted it"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// The server's live tree by path.
+    fn server_tree(&self) -> Result<BTreeMap<Vec<String>, Option<Content>>, Failure> {
+        let nodes = self.space.nodes();
+        let live = |id: &str| {
+            (nodes.iter()).find(|node| node.node_id == id && node.status == NodeStatus::Live as i32)
+        };
+        let mut tree = BTreeMap::new();
+        for node in nodes
+            .iter()
+            .filter(|node| node.node_id != self.space.space_id())
+        {
+            if node.status != NodeStatus::Live as i32 {
+                continue;
+            }
+            let mut path = vec![node.name.clone()];
+            let mut parent = node.parent_id.as_str();
+            while parent != self.space.space_id() {
+                let above = live(parent).filter(|_| path.len() <= nodes.len());
+                let above = above.ok_or_else(|| {
+                    Failure::Broken(format!(
+                        "the server's node {} is not under the root",
+                        node.node_id
+                    ))
+                })?;
+                path.push(above.name.clone());
+                parent = &above.parent_id;
+            }
+            path.reverse();
+            let content = node
+                .current
+                .as_ref()
+                .and_then(|version| version.content.clone());
+            tree.insert(path, content.filter(|_| node.kind == NodeKind::File as i32));
+        }
+        Ok(tree)
+    }
+
+    /// The end state of sections 3.3 and 3.4.
+    fn converged(&self) -> Result<(), Failure> {
+        let server = self.server_tree()?;
+        let nodes: Vec<(NodeId, RemoteNode)> = (self.space.nodes().iter())
+            .filter(|state| state.node_id != self.space.space_id())
+            .map(|state| RemoteNode::from_state(state).expect("a file or a folder"))
+            .collect();
+        for (d, device) in self.devices.iter().enumerate() {
+            let engine = &device.engine;
+            let fail =
+                |why: String| Err(Failure::Diverged(format!("device {d} is quiet, but {why}")));
+            if let Some(flight) = engine.commits.in_flight() {
+                return fail(format!("a commit is in flight: {flight:?}"));
+            }
+            if let Some(record) = engine.effects.in_flight() {
+                return fail(format!("an effect is in flight: {record:?}"));
+            }
+            if !engine.effects.blocked().is_empty() {
+                return fail(format!(
+                    "effects are blocked: {:?}",
+                    engine.effects.blocked()
+                ));
+            }
+            if !engine.commits.problems().is_empty() || engine.commits.halted().is_some() {
+                let (problems, halted) = (engine.commits.problems(), engine.commits.halted());
+                return fail(format!(
+                    "committing has problems {problems:?} or has stopped: {halted:?}"
+                ));
+            }
+            if let Some((id, _)) = engine.trees.local().iter().find(|(_, node)| node.parked) {
+                return fail(format!("node {id} is parked"));
+            }
+            let mut trees = engine.trees.clone();
+            trees.settle();
+            let unsettled = trees.work();
+            if !unsettled.is_empty() {
+                return fail(format!("nodes are not in sync: {unsettled:?}"));
+            }
+            let disk: BTreeMap<Vec<String>, Option<Content>> = (device.disk.entries().iter())
+                .filter_map(|(ino, entry)| Some((device.disk.path(*ino)?, entry.content.clone())))
+                .collect();
+            if device.disk.entries().len() != disk.len() {
+                return fail("its parked directory is not empty".into());
+            }
+            let paths: BTreeSet<&Vec<String>> = disk.keys().chain(server.keys()).collect();
+            let equal = |here: Option<&Option<Content>>, there: Option<&Option<Content>>| match (
+                here, there,
+            ) {
+                (Some(Some(here)), Some(Some(there))) => same_content(here, there),
+                (here, there) => here == there,
+            };
+            if let Some(path) = paths
+                .into_iter()
+                .find(|path| !equal(disk.get(*path), server.get(*path)))
+            {
+                let (here, there) = (disk.get(path), server.get(path));
+                return fail(format!(
+                    "its disk has {here:?} at {path:?} and the server has {there:?}"
+                ));
+            }
+            let trees = &engine.trees;
+            let mut ids: BTreeSet<&NodeId> = nodes.iter().map(|(id, _)| id).collect();
+            ids.extend(trees.local().iter().map(|(id, _)| id));
+            ids.extend(trees.synced().iter().map(|(id, _)| id));
+            ids.extend(trees.remote().iter().map(|(id, _)| id));
+            for id in ids {
+                let on_server = (nodes.iter())
+                    .find(|(other, node)| other == id && !node.trashed)
+                    .map(|(_, node)| &node.shape);
+                let local = trees.local().get(id).map(|node| &node.shape);
+                for (tree, shape) in [
+                    ('L', local),
+                    ('S', trees.synced().live(id)),
+                    ('R', trees.remote().live(id)),
+                ] {
+                    if !same(shape, on_server) {
+                        return fail(format!(
+                            "{tree} has {shape:?} for node {id} and the server has {on_server:?}"
+                        ));
+                    }
+                }
+            }
+        }
+        let mut files: BTreeMap<i64, Vec<&Vec<String>>> = BTreeMap::new();
+        for (path, content) in &server {
+            if let Some(content) = content {
+                files.entry(content.mtime_ns).or_default().push(path);
+            }
+        }
+        let twice =
+            |(write, paths): &(&i64, &Vec<_>)| paths.len() > 1 && !self.copied.contains(*write);
+        if let Some((write, paths)) = files.iter().find(twice) {
+            return Err(Failure::Diverged(format!(
+                "write {write} is in more than one file on the server, and no user copied it: {paths:?}"
+            )));
+        }
+        let live = live_writes(&self.space);
+        let lost = (self.writers.iter()).find(|(write, writer)| {
+            !live.contains_key(write)
+                && !self.published.contains(write)
+                && !self.removed[**writer].contains(write)
+        });
+        match lost {
+            Some((write, writer)) => Err(Failure::Diverged(format!(
+                "write {write} of device {writer} was never in the server's tree, and its user never \
+                 overwrote or deleted it"
+            ))),
+            None => Ok(()),
+        }
+    }
+}

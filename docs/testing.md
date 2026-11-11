@@ -11,6 +11,24 @@ The property tests use [proptest](https://docs.rs/proptest/1.12.0/proptest/). Th
 
 When a property fails, proptest prints the shrunk input and saves a line to a `.proptest-regressions` file next to the test file, for example `core/sim/tests/engine_sync.proptest-regressions`. Later runs replay the saved cases first. Commit the file when the failure is fixed so the case keeps being checked.
 
+### Several devices
+
+`core/sim/tests/devices.rs` runs two or three devices against one reference server while effects fail, messages are lost, repeated or reordered, commits are refused, and devices crash between store transactions or in the middle of an effect (`core/sim/src/world`). It has two properties:
+
+- `devices_lose_no_write` fails when a write leaves a disk or the server's tree and no user overwrote or deleted it, or when the engine, the store or the server refuses a state. It runs on every pull request and in the battery.
+- `devices_converge_once_the_faults_stop` also fails when the devices do not reach the server's tree, or when a commit makes a change that the user of its device never made.
+
+The second can fail on `main`, because the reference server puts files into the trash that no user deleted (GUN-333). It is marked `#[ignore]`, together with the two fixed schedules of that failure. Neither `cargo test` nor the battery runs these tests. Until they pass, nothing checks convergence under every interleaving.
+
+To run the ignored tests, and to print the state after every step of one of them:
+
+```sh
+cargo test -p flarebox-sim --test devices -- --ignored
+FLAREBOX_SIM_TRACE=1 cargo test -p flarebox-sim --test devices <test name> -- --ignored --nocapture
+```
+
+A pull request that fixes one of the issues removes the `#[ignore]` of its schedules.
+
 ## The property battery
 
 The battery runs the property tests at high case counts on GitHub Actions instead of a local machine (`.github/workflows/property-battery.yml`). One job builds the test binaries of every package that depends on proptest and keeps each binary that compiles a file with a `proptest!` block, including files it pulls in with `mod` or `include!` and library unit tests. The build fails if a file with a `proptest!` block is in no test binary, or if the filter selects no test. Then many shards run those binaries with the same case count and a different seed each, and a shard fails if a binary runs a different number of tests than it lists for the filter. Shard `k` uses `PROPTEST_RNG_SEED` = run ID × 1000 + `k`, so every run covers new cases and every failure can be reproduced. A summary job lists each shard's seed, result and log, and the number of cases run.
@@ -47,7 +65,7 @@ Running it reproduces the failure locally. The shard's `failure-shard-k` artifac
 
 ## The mutation set
 
-`scripts/engine-mutations.sh` lists mutations of the engine's commit and effects code that the tests must catch, each a perl substitution on one file. `scripts/mutations.sh` applies them one at a time, runs the unit tests (`cargo test -p flarebox-engine --test commit`), the interleaving property (`cargo test -p flarebox-sim --test engine_sync`, up to three runs of 4096 cases), or both, and restores the file. It first checks that the tests pass without mutations. A mutation fails the run when:
+`scripts/engine-mutations.sh` lists mutations of the engine's commit and effects code that the tests must catch, each a perl substitution on one file. `scripts/mutations.sh` applies them one at a time, runs the unit tests (`cargo test -p flarebox-engine --test commit`), the interleaving property (`cargo test -p flarebox-sim --test engine_sync`, up to three runs of 4096 cases), both, or the tests of several devices (`cargo test -p flarebox-sim --test devices`, up to three runs of 4096 cases), and restores the file. It first checks that the tests pass without mutations. A mutation fails the run when:
 
 - no test catches it (`SURVIVED`),
 - its pattern no longer matches the source (`STALE`), or
