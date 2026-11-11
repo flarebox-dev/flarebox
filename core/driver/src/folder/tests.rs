@@ -3223,6 +3223,54 @@ fn a_delete_the_server_lost_is_not_sent_again_over_another_devices_edit() {
     assert_eq!(a.state(), FolderState::UpToDate);
 }
 
+/// The server's storage is restored from a backup taken after `a` created `one.txt`, before three more commits of
+/// `a` and its delete of `one.txt` at seq 5. On the restored server `b` deletes `one.txt` at seq 2 and a person
+/// restores it at seq 3. The restore brings back the shape `a` deleted, at a seq below the lost delete's, so only the
+/// seq of `a`'s last commit the server still holds shows it came after the loss. `a` keeps the restore.
+#[test]
+fn a_restore_after_the_server_lost_a_delete_is_kept() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site.root.join("one.txt"), b"one");
+    let mut restored = backup(&remote, &a);
+    for pad in ["pad-two.txt", "pad-three.txt", "pad-four.txt"] {
+        a.create(&mut remote, &site.root.join(pad), pad.as_bytes());
+    }
+    fs::remove_file(site.root.join("one.txt")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    assert_eq!(a.run(&mut remote), ["send"]);
+    assert_eq!(remote.space.head_seq(), 5);
+    let (other, mut b) = linked(&mut restored, "b");
+    let node = (b.folder.engine.trees.local().iter())
+        .find(|(_, node)| node.shape.name == "one.txt")
+        .unwrap()
+        .0
+        .clone();
+    fs::remove_file(other.root.join("one.txt")).unwrap();
+    b.scan_until(|b| !b.work.is_empty());
+    assert_eq!(b.run(&mut restored), ["send"]);
+    let intent = RestoreIntent::from_trash(node.clone(), None, None).unwrap();
+    let request = ask(&other, &intent);
+    let step = b.folder.requested();
+    b.take(step).unwrap();
+    b.run(&mut restored);
+    assert_eq!(ended(&other), [(request, Outcome::Restored)]);
+    assert_eq!(
+        b.folder.engine.trees.remote().get(&node).unwrap().meta_rev,
+        3
+    );
+    a.event(Event::Connected(restored.space.welcome(&a.caller)))
+        .unwrap();
+    a.run(&mut restored);
+    a.settle();
+    a.run(&mut restored);
+    let all = ["one.txt", "pad-four.txt", "pad-three.txt", "pad-two.txt"];
+    assert_eq!(restored.names(), all);
+    assert_eq!(names(&site.root), all);
+    assert_eq!(fs::read(site.root.join("one.txt")).unwrap(), b"one");
+    assert_eq!(a.state(), FolderState::UpToDate);
+}
+
 /// The server lost `a`'s commit of `two.txt`, and `b` deleted `one.txt` on the restored server. The listing reads
 /// the trash too, so `a` takes `one.txt` for a remote delete and removes it, instead of creating it again under an
 /// ID the server holds in its trash, which it would refuse with `ID_EXISTS`.

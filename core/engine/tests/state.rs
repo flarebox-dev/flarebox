@@ -129,6 +129,7 @@ fn commits_state() -> CommitsState {
             intent: restore(3),
             outcome: Outcome::Rejected(Rejection::NotFound),
         }],
+        slots: [(2, 5), (3, 8)].into(),
     }
 }
 

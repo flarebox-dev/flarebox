@@ -128,6 +128,13 @@ impl Tx<'_> {
         }
         state.commits.in_flight = self.in_flight()?;
         (state.commits.restores, state.commits.resolved) = self.restores()?;
+        let mut stmt = self
+            .0
+            .prepare_cached("SELECT device_seq, seq FROM commit_slots")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            state.commits.slots.insert(row.get(0)?, row.get(1)?);
+        }
 
         if let Some((cleared, in_flight)) = self
             .0
@@ -164,6 +171,7 @@ impl Tx<'_> {
             "node_maps",
             "waiting_updates",
             "commit_state",
+            "commit_slots",
             "commit_in_flight",
             "commit_in_flight_deletes",
             "commit_in_flight_delete_members",
@@ -301,6 +309,19 @@ impl Tx<'_> {
                     }
                 }
             }
+        }
+        let mut remove = self
+            .0
+            .prepare_cached("DELETE FROM commit_slots WHERE device_seq = ?1")?;
+        let mut put = self.0.prepare_cached(
+            "INSERT OR REPLACE INTO commit_slots (device_seq, seq) VALUES (?1, ?2)",
+        )?;
+        let (removed, changed) = differences(&old.slots, &new.slots);
+        for slot in removed {
+            remove.execute([slot])?;
+        }
+        for (slot, seq) in changed {
+            put.execute(params![slot, seq])?;
         }
         if (&old.restores, &old.resolved) != (&new.restores, &new.resolved) {
             self.0.execute("DELETE FROM restore_intents", [])?;

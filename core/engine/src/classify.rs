@@ -126,12 +126,11 @@ impl ByName {
     }
 }
 
-/// A node a delete of this device trashed: the seq of the delete's commit, and the shape R holds
-/// in the trash, which is the shape the delete saw.
+/// A node a delete of this device trashed, with the shape R holds in the trash, which is the shape
+/// the delete saw.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Trashed {
     pub id: NodeId,
-    pub seq: u64,
     pub shape: Shape,
 }
 
@@ -640,12 +639,11 @@ impl Trees {
     /// The nodes a delete of this device trashed and R still holds trashed by it, for
     /// [`Trees::forget_lost`] once a bootstrap has replaced R.
     pub fn trashed_here(&self) -> Vec<Trashed> {
-        (self.trashed_here.iter())
-            .filter_map(|(id, &seq)| {
+        (self.trashed_here.keys())
+            .filter_map(|id| {
                 let remote = self.r.get(id)?;
                 Some(Trashed {
                     id: id.clone(),
-                    seq,
                     shape: remote.shape.clone(),
                 })
             })
@@ -662,10 +660,15 @@ impl Trees {
     /// waits ([`Trees::waiting`]) and is made as soon as it fits.
     ///
     /// `trashed` lists what deletes of this device had trashed before the bootstrap
-    /// ([`Trees::trashed_here`]). A node of it that R now holds live, as it was deleted and with no
-    /// revision from the delete's commit or later, lost its delete. S takes R's shape for it, parents
-    /// first, so the delete is sent again. Any other node of it is downloaded again.
-    pub fn forget_lost(&mut self, trashed: Vec<Trashed>) {
+    /// ([`Trees::trashed_here`]), and `held_through` the seq of the newest commit of this device the
+    /// server still counts ([`Commits::held_through`]), at or below which every seq is from before
+    /// the loss. A node of `trashed` that R now holds live, as it was deleted and with no revision
+    /// above `held_through`, lost its delete: nothing changed it after the loss. S takes R's shape
+    /// for it, parents first, so the delete is sent again. Any other node of it is downloaded again,
+    /// since a restore or another change after the loss can take a seq the lost commits had.
+    ///
+    /// [`Commits::held_through`]: crate::commit::Commits::held_through
+    pub fn forget_lost(&mut self, trashed: Vec<Trashed>, held_through: u64) {
         let mut deletes: Vec<(NodeId, Shape)> = (trashed.into_iter())
             .filter(|deleted| {
                 self.l.get(&deleted.id).is_none() && self.s.get(&deleted.id).is_none()
@@ -673,7 +676,7 @@ impl Trees {
             .filter_map(|deleted| {
                 let remote = (self.r.get(&deleted.id))
                     .filter(|remote| !remote.trashed && remote.shape.same(&deleted.shape))
-                    .filter(|remote| remote.content_rev.max(remote.meta_rev) < deleted.seq)?;
+                    .filter(|remote| remote.content_rev.max(remote.meta_rev) <= held_through)?;
                 Some((deleted.id, remote.shape.clone()))
             })
             .collect();

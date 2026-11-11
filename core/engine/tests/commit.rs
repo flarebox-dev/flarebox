@@ -616,7 +616,7 @@ fn a_parked_folder_the_server_lost_is_created_again_after_a_delete_empties_it() 
             ..local(dir(ROOT, "albums"), 1)
         },
     );
-    trees.forget_lost(Vec::new());
+    trees.forget_lost(Vec::new(), 0);
     trees.settle();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
     let removed = effects.plan(&trees, &mut ids, NOW).cloned().unwrap();
@@ -637,15 +637,31 @@ fn a_parked_folder_the_server_lost_is_created_again_after_a_delete_empties_it() 
     assert!(matches!(&ops(&commit)[..], [op::Op::CreateDir(c)] if c.node_id == "albums"));
 }
 
-/// Trees with `rows`, which the user deletes here. The commit that deletes them is applied at seq
-/// 5, which trashes each row, and acknowledged. Returns the commit's ops.
-fn deleted_at_5(rows: &[Row]) -> (Commits, Trees, IdGen, Vec<op::Op>) {
+/// Trees with @@rows@@, synced at seq 1. A commit of this device at slot 1 creates @@pad@@ and is
+/// applied at seq 2. The user then deletes @@rows@@ here, and the commit at slot 2 that deletes them
+/// is applied at seq 5, which trashes each row. A server restored from a backup taken at seq 2
+/// counts only slot 1, so every seq up to 2 is from before the loss. Returns the delete's ops.
+fn deleted_at_5_then_lost(rows: &[Row]) -> (Commits, Trees, IdGen, Vec<op::Op>) {
     let mut trees = trees(rows);
+    trees.set_local("pad".into(), local(file(ROOT, "pad", 9), 99));
+    trees.settle();
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    let pad = RemoteNode {
+        content_rev: 2,
+        meta_rev: 2,
+        ..remote(file(ROOT, "pad", 9))
+    };
+    trees.set_remote("pad".into(), pad);
+    commits
+        .received(result(2, vec![outcome(op_result::Code::Applied)]))
+        .unwrap();
+    assert!(commits.acknowledge(&mut trees, 2));
+    trees.settle();
     for (id, ..) in rows.iter().rev() {
         trees.remove_local(id);
     }
     trees.settle();
-    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
     let sent = ops(&build(&mut commits, &mut trees, &mut ids).unwrap());
     for (id, _, shape, _) in rows {
         let trashed = RemoteNode {
@@ -660,20 +676,28 @@ fn deleted_at_5(rows: &[Row]) -> (Commits, Trees, IdGen, Vec<op::Op>) {
     assert!(commits.acknowledge(&mut trees, 5));
     trees.settle();
     assert_eq!(trees.work(), vec![]);
+    assert_eq!(commits.held_through(), 5);
+    let welcome = Welcome {
+        history_id: HISTORY.into(),
+        device_seq: 1,
+        ..Default::default()
+    };
+    assert_eq!(commits.connected(&welcome), Reconnect::AheadOfServer);
+    assert_eq!(commits.held_through(), 2);
     (commits, trees, ids, sent)
 }
 
 /// The server lost the commit that deleted folder d with file a in it, and a bootstrap lists both
-/// live as they were deleted. The delete is sent again, not taken for a remote create.
+/// live as they were deleted, at seq 1. The delete is sent again, not taken for a remote create.
 #[test]
 fn a_delete_the_server_lost_is_sent_again() {
     let rows = [synced("d", dir(ROOT, "d")), synced("a", file("d", "a", 1))];
-    let (mut commits, mut trees, mut ids, sent) = deleted_at_5(&rows);
+    let (mut commits, mut trees, mut ids, sent) = deleted_at_5_then_lost(&rows);
     assert_eq!(sent, [delete("d")]);
     let trashed = trees.trashed_here();
     trees.set_remote("d".into(), remote(dir(ROOT, "d")));
     trees.set_remote("a".into(), remote(file("d", "a", 1)));
-    trees.forget_lost(trashed);
+    trees.forget_lost(trashed, commits.held_through());
     trees.settle();
     assert_eq!(
         (trees.class("d"), trees.class("a")),
@@ -683,10 +707,10 @@ fn a_delete_the_server_lost_is_sent_again() {
     assert_eq!(ops(&commit), [delete("d")]);
 }
 
-/// Of three files this device deleted at seq 5, a bootstrap from a server that lost commits lists
-/// `same` as it was deleted, `edited` with content another device wrote after the loss at a reused
-/// seq below 5, and `restored` as a restore after the delete left it. Only `same` is deleted
-/// again; the other two are downloaded.
+/// Of three files this device deleted at seq 5, a bootstrap from a server restored from seq 2 lists
+/// @@same@@ as it was deleted, @@edited@@ with other content, and @@restored@@ as it was deleted but
+/// restored after the loss at seq 3, a seq below the lost delete's that the lost commits had. Only
+/// @@same@@ is deleted again; the other two are downloaded.
 #[test]
 fn a_delete_the_server_lost_is_sent_again_only_for_what_it_saw() {
     let rows = [
@@ -694,22 +718,22 @@ fn a_delete_the_server_lost_is_sent_again_only_for_what_it_saw() {
         synced("edited", file(ROOT, "edited", 1)),
         synced("restored", file(ROOT, "restored", 1)),
     ];
-    let (mut commits, mut trees, mut ids, _) = deleted_at_5(&rows);
+    let (mut commits, mut trees, mut ids, _) = deleted_at_5_then_lost(&rows);
     let trashed = trees.trashed_here();
     assert_eq!(trashed.len(), 3);
     trees.set_remote("same".into(), remote(file(ROOT, "same", 1)));
     let edited = RemoteNode {
-        content_rev: 3,
-        meta_rev: 3,
+        content_rev: 2,
+        meta_rev: 2,
         ..remote(file(ROOT, "edited", 2))
     };
     trees.set_remote("edited".into(), edited);
     let restored = RemoteNode {
-        meta_rev: 6,
+        meta_rev: 3,
         ..remote(file(ROOT, "restored", 1))
     };
     trees.set_remote("restored".into(), restored);
-    trees.forget_lost(trashed);
+    trees.forget_lost(trashed, commits.held_through());
     trees.settle();
     let classes = ["same", "edited", "restored"].map(|id| (id, trees.class(id)));
     assert_eq!(

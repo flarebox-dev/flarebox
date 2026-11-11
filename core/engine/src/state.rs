@@ -66,6 +66,9 @@ pub struct CommitsState {
     /// The restores that ended, oldest first, at most
     /// [`RESOLVED_KEPT`](crate::restore::RESOLVED_KEPT).
     pub resolved: Vec<Resolved>,
+    /// The seq of each of this device's last [`SLOTS_KEPT`](crate::commit::SLOTS_KEPT)
+    /// acknowledged commits, by slot.
+    pub slots: BTreeMap<u64, u64>,
 }
 
 /// What [`Effects`](crate::effects::Effects) holds.
