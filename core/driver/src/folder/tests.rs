@@ -3794,6 +3794,206 @@ fn a_folder_created_again_at_a_kept_folder_another_device_deleted_is_a_new_folde
         assert_eq!(a.folder.engine.trees.check(), Ok(()));
     }
 }
+
+/// The size of the content the server holds for the node.
+fn server_size(remote: &Remote, id: &str) -> u64 {
+    let nodes = remote.space.nodes();
+    let node = nodes.iter().find(|node| node.node_id == id).unwrap();
+    let version = node.current.as_ref().unwrap();
+    version.content.as_ref().unwrap().size
+}
+
+/// What takes the name of a node L keeps for an ignored file.
+#[derive(Clone, Copy, Debug)]
+enum Taker {
+    NewFile,
+    NewFolder,
+    MovedFolder,
+    MovedFile,
+}
+
+/// When the device restarts: never, while the taker arrives, or after the taker is synced.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Restart {
+    Never,
+    During,
+    After,
+}
+
+/// The user moves `source/file` into the ignored folder, so L keeps the file's entry, and with `folder` also
+/// removes `source`, so L keeps `source` for the file. Then `taker` takes the name L keeps: `source` with `folder`,
+/// `source/file` without. The file's only local copy is in the ignored folder, so the server keeps the file with its
+/// content and the folder it is in, whenever the device restarts. The server still holds the name, so the taker is
+/// synced under a conflict name, on the server and on the disk.
+fn a_name_l_keeps_is_taken(folder: bool, taker: Taker) {
+    for restart in [Restart::Never, Restart::During, Restart::After] {
+        let case = format!("{taker:?} {restart:?}");
+        let mut remote = Remote::new();
+        let (site, mut a) = linked(&mut remote, "a");
+        fs::create_dir(site.root.join("source")).unwrap();
+        a.create(&mut remote, &site.root.join("source/file"), b"kept");
+        fs::create_dir(site.root.join("other")).unwrap();
+        a.create(&mut remote, &site.root.join("other/inner"), b"inner");
+        a.create(&mut remote, &site.root.join("note"), b"note");
+        a.create(&mut remote, &site.root.join(".fbignore"), b"ignored/\n");
+        let before = server_nodes(&remote);
+        fs::create_dir(site.root.join("ignored")).unwrap();
+        fs::rename(
+            site.root.join("source/file"),
+            site.root.join("ignored/file"),
+        )
+        .unwrap();
+        if folder {
+            fs::remove_dir(site.root.join("source")).unwrap();
+        }
+        let recorded = if folder { 2 } else { 1 };
+        a.scan_until(|a| a.folder.engine.trees.ignored_local().len() == recorded);
+        a.run(&mut remote);
+        let start = |remote: &mut Remote| {
+            let mut a = site.start();
+            a.connect(remote);
+            a.scan_until(|a| a.folder.scanned);
+            a.run(remote);
+            a
+        };
+        let target = site
+            .root
+            .join(if folder { "source" } else { "source/file" });
+        let take = || match taker {
+            Taker::NewFile => fs::write(&target, b"taker").unwrap(),
+            Taker::NewFolder => {
+                fs::create_dir(&target).unwrap();
+                fs::write(target.join("new"), b"taker").unwrap();
+            }
+            Taker::MovedFolder => fs::rename(site.root.join("other"), &target).unwrap(),
+            Taker::MovedFile => fs::rename(site.root.join("note"), &target).unwrap(),
+        };
+        if restart == Restart::During {
+            drop(a);
+            take();
+            a = start(&mut remote);
+        } else {
+            take();
+        }
+        for _ in 0..3 {
+            a.settle();
+            a.run(&mut remote);
+        }
+        if restart == Restart::After {
+            drop(a);
+            a = start(&mut remote);
+            for _ in 0..2 {
+                a.settle();
+                a.run(&mut remote);
+            }
+        }
+        let after = server_nodes(&remote);
+        let live = |name: &str| {
+            let id = live_id(&before, name);
+            after.iter().any(|(_, node, live)| *node == id && *live)
+        };
+        assert!(live("file") && live("source"), "{case}: {after:?}");
+        assert!(live("inner") && live("note"), "{case}: {after:?}");
+        assert_eq!(server_size(&remote, &live_id(&before, "file")), 4, "{case}");
+        let taken = if folder { "source" } else { "file" };
+        let conflict = format!("{taken} (conflict from a 2023-11-14)");
+        live_id(&after, &conflict);
+        assert!(target.with_file_name(&conflict).exists(), "{case}");
+        assert!(!target.exists(), "{case}");
+        assert_eq!(
+            fs::read(site.root.join("ignored/file")).unwrap(),
+            b"kept",
+            "{case}"
+        );
+        assert_eq!(a.folder.engine.trees.check(), Ok(()), "{case}");
+    }
+}
+
+#[test]
+fn a_file_created_at_a_removed_folder_kept_for_an_ignored_file_keeps_the_file_on_the_server() {
+    a_name_l_keeps_is_taken(true, Taker::NewFile);
+}
+
+#[test]
+fn a_folder_moved_onto_a_removed_folder_kept_for_an_ignored_file_keeps_the_file_on_the_server() {
+    a_name_l_keeps_is_taken(true, Taker::MovedFolder);
+}
+
+#[test]
+fn a_synced_file_moved_onto_a_removed_folder_kept_for_an_ignored_file_keeps_the_file_on_the_server()
+{
+    a_name_l_keeps_is_taken(true, Taker::MovedFile);
+}
+
+#[test]
+fn a_file_created_at_the_name_of_a_file_moved_into_an_ignored_folder_keeps_the_file_on_the_server()
+{
+    a_name_l_keeps_is_taken(false, Taker::NewFile);
+}
+
+/// The user moves `source/file` into the ignored folder, removes `source`, creates `source` again and writes a new
+/// `source/file`. The new file is not the one in the ignored folder, so the server keeps that file's content under
+/// its node and takes the new file as another node.
+#[test]
+fn a_file_created_in_a_folder_created_again_does_not_replace_the_file_moved_into_an_ignored_folder()
+{
+    for restart in [false, true] {
+        let mut remote = Remote::new();
+        let (site, mut a) = linked(&mut remote, "a");
+        fs::create_dir(site.root.join("source")).unwrap();
+        a.create(&mut remote, &site.root.join("source/file"), b"kept");
+        a.create(&mut remote, &site.root.join(".fbignore"), b"ignored/\n");
+        let file = live_id(&server_nodes(&remote), "file");
+        fs::create_dir(site.root.join("ignored")).unwrap();
+        fs::rename(
+            site.root.join("source/file"),
+            site.root.join("ignored/file"),
+        )
+        .unwrap();
+        fs::remove_dir(site.root.join("source")).unwrap();
+        a.scan_until(|a| a.folder.engine.trees.ignored_local().len() == 2);
+        a.run(&mut remote);
+        if restart {
+            drop(a);
+            a = site.start();
+            a.connect(&remote);
+            a.scan_until(|a| a.folder.scanned);
+            a.run(&mut remote);
+        }
+        fs::create_dir(site.root.join("source")).unwrap();
+        fs::write(site.root.join("source/file"), b"taker").unwrap();
+        for _ in 0..3 {
+            a.settle();
+            a.run(&mut remote);
+        }
+        let after = server_nodes(&remote);
+        assert_eq!(live_id(&after, "file"), file, "{restart}: {after:?}");
+        assert_eq!(server_size(&remote, &file), 4, "{restart}");
+        let taker = live_id(&after, "file (conflict from a 2023-11-14)");
+        assert_eq!(server_size(&remote, &taker), 5, "{restart}");
+        assert_eq!(fs::read(site.root.join("ignored/file")).unwrap(), b"kept");
+        assert_eq!(a.folder.engine.trees.check(), Ok(()));
+    }
+}
+
+#[test]
+fn a_folder_created_at_the_name_of_a_file_moved_into_an_ignored_folder_keeps_the_file_on_the_server()
+ {
+    a_name_l_keeps_is_taken(false, Taker::NewFolder);
+}
+
+#[test]
+fn a_folder_moved_onto_the_name_of_a_file_moved_into_an_ignored_folder_keeps_the_file_on_the_server()
+ {
+    a_name_l_keeps_is_taken(false, Taker::MovedFolder);
+}
+
+#[test]
+fn a_synced_file_moved_onto_the_name_of_a_file_moved_into_an_ignored_folder_keeps_the_file_on_the_server()
+ {
+    a_name_l_keeps_is_taken(false, Taker::MovedFile);
+}
+
 /// The user hard-links `source/file` into the ignored folder, moves the file itself to `moved`, and removes
 /// `source`. The file is still synced at `moved`, so the server follows the move; the link stays out.
 #[test]
