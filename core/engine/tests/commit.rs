@@ -2212,6 +2212,24 @@ fn a_server_count_below_the_accepted_one_is_taken_and_drops_the_commit_in_flight
     }
 }
 
+/// GUN-444: a commit's result arrives, but before it is acknowledged the server loses it, and
+/// its `Welcome` counts *w* = *a*. That is a loss, so the commit in flight is dropped and R is
+/// listed again, instead of recovery starting.
+#[test]
+fn a_held_result_of_a_commit_the_server_lost_is_a_loss() {
+    let mut trees = trees(&[("n", Some(file(ROOT, "n", 1)), None, None)]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    let applied = vec![outcome(op_result::Code::Applied)];
+    commits.received(result(3, applied)).unwrap();
+    assert_eq!(commits.connected(&welcome(0)), Reconnect::AheadOfServer);
+    assert_eq!(commits.halted(), None);
+    assert!(commits.in_flight().is_none());
+    assert_eq!(commits.accepted(), 0);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id == "n"));
+}
+
 #[test]
 fn the_device_slot_is_kept_by_a_retry_and_reused_after_a_refusal() {
     let mut trees = trees(&[("a", Some(file(ROOT, "x", 1)), None, None)]);
