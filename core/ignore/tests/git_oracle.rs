@@ -291,7 +291,8 @@ fn name() -> impl Strategy<Value = String> {
     "[abAB.*?\\[\\]\\\\!# -]{1,3}".prop_filter("not . or ..", |n| n != "." && n != "..")
 }
 
-/// Bracket expressions. Under folding, members are lowercase: git leaves them unfolded.
+/// Bracket expressions. Under folding, members are lowercase: git leaves them unfolded. Nor does a class leave its
+/// bracket or an escape open under folding, because the next piece would then put an uppercase letter in it.
 fn class(fold: bool) -> BoxedStrategy<String> {
     let mut classes = vec![
         "[ab]",
@@ -319,12 +320,10 @@ fn class(fold: bool) -> BoxedStrategy<String> {
         "[b-a]",
         "[.-]",
         "[[]",
-        "[ab",
         "[[:nope:]]",
-        "[\\",
     ];
     if !fold {
-        classes.extend(["[A]", "[aB]", "[!B]", "[\\A]", "[[:upper:]A]"]);
+        classes.extend(["[A]", "[aB]", "[!B]", "[\\A]", "[[:upper:]A]", "[ab", "[\\"]);
     }
     proptest::sample::select(classes)
         .prop_map(str::to_owned)
@@ -380,6 +379,59 @@ fn line(fold: bool) -> impl Strategy<Value = String> {
         1 => Just("# comment".to_owned()),
     ]
     .prop_filter("version-dependent in git", |line| !version_dependent(line))
+}
+
+/// Whether git with `core.ignorecase` folds every uppercase letter of `line` as this crate does. Git leaves an escaped
+/// letter and a single member of a bracket expression as written, and folds a range end. This reads brackets as git's
+/// `wildmatch` does. It also refuses an escaped letter at a range end, and an uppercase member of a bracket that never
+/// closes, although such a bracket matches nothing in either.
+fn git_folds_every_letter(line: &str) -> bool {
+    let line: Vec<char> = line.chars().collect();
+    let upper = |at: usize| line.get(at).is_some_and(char::is_ascii_uppercase);
+    let mut i = 0;
+    while i < line.len() {
+        match line[i] {
+            '\\' if upper(i + 1) => return false,
+            '\\' => i += 2,
+            '[' => {
+                i += 1;
+                if matches!(line.get(i), Some('!' | '^')) {
+                    i += 1;
+                }
+                let mut first = true;
+                loop {
+                    match line.get(i) {
+                        None => return true,
+                        Some(']') if !first => break,
+                        Some('\\') if upper(i + 1) => return false,
+                        Some('\\') => i += 2,
+                        Some('[') if line.get(i + 1) == Some(&':') => {
+                            let end = (i + 2..line.len()).find(|&j| line[j] == ']');
+                            match end {
+                                Some(end) if line[end - 1] == ':' && end > i + 2 => i = end + 1,
+                                _ => i += 1,
+                            }
+                        }
+                        Some(_)
+                            if line.get(i + 1) == Some(&'-')
+                                && !matches!(line.get(i + 2), None | Some(']')) =>
+                        {
+                            if line[i + 2] == '\\' && upper(i + 3) {
+                                return false;
+                            }
+                            i += if line[i + 2] == '\\' { 4 } else { 3 };
+                        }
+                        Some(_) if upper(i) => return false,
+                        Some(_) => i += 1,
+                    }
+                    first = false;
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    true
 }
 
 /// Names and patterns with non-ASCII letters and combining marks, spelled NFD for this crate and
@@ -507,6 +559,37 @@ proptest! {
     fn nfd_spellings_agree_with_git_on_nfc_code_points(case in case_with(unicode_name().boxed(), unicode_line().boxed())) {
         compare::<Exact>(&case, false, nfd, code_points)?;
     }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(10_000))]
+
+    /// The ignorecase run leaves out the letters git does not fold (see the crate documentation), also where pieces
+    /// meet: `[\` followed by `B` is an escaped member.
+    #[test]
+    fn ignorecase_lines_hold_no_letter_git_leaves_unfolded(line in line(true)) {
+        prop_assert!(git_folds_every_letter(&line), "{:?}", line);
+    }
+}
+
+/// Under folding this crate folds escaped letters and bracket members, which git leaves as written, so the ignorecase
+/// run leaves such lines out. A line of that kind gets git's verdicts on its lowercase spelling instead. From a random
+/// run that missed it: `[\B[Z-a]` excludes `B` here and not in git, as `[\b[Z-a]` does in both.
+#[test]
+fn a_folded_escaped_member_agrees_with_git_on_its_lowercase_spelling() {
+    let case = |text: &str| Case {
+        entries: ["B", "a", "["]
+            .into_iter()
+            .map(|name| (vec![name.to_owned()], Kind::File))
+            .collect(),
+        files: BTreeMap::from([(Vec::new(), format!("{text}\n"))]),
+    };
+    let (line, lowercase) = (case("[\\B[Z-a]"), case("[\\b[Z-a]"));
+    assert_eq!(ours::<Exact>(&line, same), git(&line, false, same));
+    let folded = ours::<Folded>(&line, same);
+    assert_eq!(folded, [Some((0, 1)); 3]);
+    assert_eq!(folded, git(&lowercase, true, same));
+    assert_ne!(folded, git(&line, true, same), "git leaves \\B unfolded");
 }
 
 /// Hand-picked lines, one rules file each, on one fixed tree. Readable failures for the cases the
