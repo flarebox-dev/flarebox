@@ -15,7 +15,7 @@ If the space holds no live files or folders, the folder's files are uploaded as 
 - Files and folders that only the space holds are downloaded, except where a held entry has the same name.
 - Entries that `.koiignore` or this device's rules leave out are skipped.
 
-Every other file and folder is held. Sync asks one question about the held entries and uploads none of them until you answer. Files you create after the comparison sync as usual.
+Every other file and folder is held. Sync asks one question about the held entries and uploads none of them until you answer. Files you create after the comparison sync as usual. The question takes one of two answers:
 
 - `publish` uploads the held files. If the space already has a file with the same name, the upload gets a [conflict name](conflicts.md#two-files-with-the-same-name).
 - `discard` moves the held files to the [local trash](#the-local-trash) and downloads the space's files at their paths.
