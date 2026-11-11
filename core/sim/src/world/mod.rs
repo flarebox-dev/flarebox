@@ -903,6 +903,8 @@ impl World {
 
     /// Receives one message as section 4.4 asks: commits apply in seq order, a commit R already
     /// holds is skipped, and a gap asks for the backlog again and drops the rest of the batch.
+    /// Records that arrive while R waits for a listing are dropped, and the listing asks for the
+    /// backlog after its head, as the driver subscribes again from the listing's seq.
     fn deliver(&mut self, d: usize, index: usize) -> Result<bool, Failure> {
         let behind = self.devices[d].engine.behind;
         let Some(link) = self.devices[d]
@@ -958,6 +960,9 @@ impl World {
                 trees.forget_lost(trashed, edited, commits.held_through());
                 *last_seq = head;
                 *behind = false;
+                let backlog = self.resume(d)?;
+                let link = self.devices[d].link.as_mut().expect("checked above");
+                link.inbox.push(backlog);
             }
             Message::Records(records) => {
                 for record in records {
