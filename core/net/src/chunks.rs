@@ -298,9 +298,10 @@ impl Transfer {
     }
 
     /// One upload. It ends when the connection takes no slice of the body for `stall_timeout`, or when the answer is
-    /// not complete `attempt_timeout` after the last slice, so an uplink too slow to send a chunk within any fixed
-    /// time still gets it through while it keeps moving. The relay answers with an `UploadReceipt`; a presigned URL
-    /// answers without a body to keep.
+    /// not complete `attempt_timeout` after the last slice. The connection takes slices into its send buffers, so
+    /// the answer wait also covers sending what those buffers still hold. On an uplink too slow to empty them within
+    /// `attempt_timeout`, an upload that keeps moving still ends. The relay answers with an `UploadReceipt`; a
+    /// presigned URL answers without a body to keep.
     async fn put(
         &self,
         target: &Target,
