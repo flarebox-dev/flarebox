@@ -341,6 +341,48 @@ fn a_merged_folder_replayed_before_its_result_is_kept_once() {
     assert_eq!(world.devices[1].disk.entries().len(), 3);
 }
 
+/// GUN-378. Device 0 renames a to b, and the answer to its commit is lost. Device 1 then renames
+/// the file to c.txt, and so does the user of device 0, who reads both commits in the backlog
+/// before the stored result arrives and then renames the file back to b. Device 1 commits a
+/// rename to ss after device 0 acknowledged its commit. Device 0's rename back to b is then
+/// committed after ss, so it wins on every device instead of being undone.
+#[test]
+fn a_rename_made_while_a_replayed_commit_waits_for_its_result_is_kept() {
+    let mut synced = vec![(0, file("a"))];
+    synced.extend(commit(0));
+    let mut racing = vec![
+        (0, rename(0, 0, "b")),
+        (0, SCAN),
+        (0, COMMIT),
+        (0, COMMIT),
+        (0, Step::Drop),
+        (1, rename(0, 0, "c.txt")),
+    ];
+    racing.extend(commit(1));
+    racing.extend([
+        (1, DELIVER),
+        (0, rename(0, 0, "c.txt")),
+        (0, Step::Connect),
+        (0, DELIVER),
+        (0, SCAN),
+        (0, rename(0, 0, "b")),
+        (0, SCAN),
+        (0, COMMIT),
+        (0, DELIVER),
+        (1, rename(0, 0, "ss")),
+    ]);
+    racing.extend(commit(1));
+    let world = converge(2, &[synced, racing]).unwrap();
+    assert_eq!(world.seen["own commit replayed before its result"], 1);
+    assert_eq!(world.seen["result arrives after its records"], 1);
+    for device in &world.devices {
+        let names: Vec<&str> = (device.disk.entries().values())
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["b"]);
+    }
+}
+
 /// A download reaches the disk and the device crashes before the store hears of it.
 #[test]
 fn a_download_cut_by_a_crash_is_not_done_twice() {
