@@ -814,6 +814,24 @@ fn witness_one_file_restored_from_a_dismissed_folder() {
     assert!(!trashed.contains(&"p/f") && !trashed.contains(&"p/f/g1"));
 }
 
+/// GUN-384 review: a delete the server applied in part, then a delete of the folders it kept,
+/// then one file of the first restored. The server brings back p and p/f on their own, so L holds
+/// the second delete's topmost node again while its file stays trashed. This device has removed
+/// all of the second delete, so it leaves the window after the pause, and the notice counts only
+/// the rest of the first.
+#[test]
+fn witness_a_delete_whose_folder_a_restore_brought_back_leaves_the_window() {
+    let events = [
+        DeleteUnseen("p"),
+        Delete("p"),
+        Step,
+        Restore("p/f/g1"),
+        Pause,
+        StepAll,
+    ];
+    assert_eq!(witness(&events), Some((1, 29, 56)));
+}
+
 /// GUN-384 review: one file restored from a delete the server applied in part, after the notice
 /// was dismissed part way through its removal. The rest of the delete stays dismissed, and the
 /// folder deleted above it counts only its own 8 files.
