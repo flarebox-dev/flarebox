@@ -17,7 +17,8 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use koidrive_driver::{
-    Answer, Credential, Driver, DriverError, FolderStatus, Paths, Question, QuestionKind, Status,
+    Answer, Credential, Driver, DriverError, FolderStatus, Paths, Question, QuestionKind,
+    SET_UP_AGAIN, Status,
 };
 use koidrive_engine::guard::{Limit, MAX_DELETIONS, Window};
 use koidrive_net::{ApiError, Auth, Reload};
@@ -796,7 +797,10 @@ fn device_id(text: &str) -> Result<String, String> {
 
 fn refusal(error: ApiError) -> String {
     if error.is_unauthenticated() {
-        return "the server refused this device's credential: another device revoked it, or the credential is wrong. Pair it again to sync.".to_owned();
+        return format!(
+            "the server refused this device's credential, so another device revoked it or the credential is wrong. To \
+             use this device again, {SET_UP_AGAIN}."
+        );
     }
     error.to_string()
 }

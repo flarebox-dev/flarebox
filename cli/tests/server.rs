@@ -568,9 +568,55 @@ async fn a_device_revokes_a_lost_one_and_stops_syncing_when_another_revokes_it()
         fs::read(folder.join("kept.txt")).unwrap(),
         b"stays on the device"
     );
+    assert!(problem.contains("docs/guide/uninstall.md"), "{problem}");
     let refused = machine.fails(&["device", "list"]);
-    assert!(refused.contains("Pair it again"), "{refused}");
+    assert!(refused.contains("docs/guide/uninstall.md"), "{refused}");
     assert!(stop(daemon).success());
+    assert_eq!(
+        fs::read(folder.join("kept.txt")).unwrap(),
+        b"stays on the device"
+    );
+
+    let pairing = owner.api().pair_start(&owner).await.unwrap();
+    let join = ["join", &pairing.code, "--server", &server, "--name", "desk"];
+    let held = machine.fails(&join);
+    assert!(held.contains("already paired"), "{held}");
+    for state in [
+        machine.path("state/koidrive"),
+        machine.path("config/koidrive"),
+        folder.join(".koidrive"),
+    ] {
+        if state.exists() {
+            fs::remove_dir_all(state).unwrap();
+        }
+    }
+    machine.run(&join);
+    assert_ne!(machine.status()["account"]["device_id"], device_id.as_str());
+    machine.run(&["link", folder.to_str().unwrap(), "--space", &space_name]);
+    let daemon = machine
+        .command(&["daemon"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    while !machine.output(&["status", "--json"]).status.success() {
+        assert!(started.elapsed() < WAIT, "the daemon did not answer");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    machine
+        .status_until("the sync after setting up again", |status| {
+            status["running"] == true && status["folders"][0]["state"] == "up_to_date"
+        })
+        .await;
+    assert!(stop(daemon).success());
+    let mut names: Vec<_> = fs::read_dir(&folder)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name != ".koidrive")
+        .collect();
+    names.sort();
+    assert_eq!(names, ["kept.txt"]);
     assert_eq!(
         fs::read(folder.join("kept.txt")).unwrap(),
         b"stays on the device"

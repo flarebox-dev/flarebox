@@ -30,7 +30,7 @@ use koidrive_engine::tree::{RemoteNode, Tree};
 use koidrive_fs::{Snapshot, check_root};
 use koidrive_net::{
     Auth, Backoff, CallError, ChunkError, Event, NotResent, ServerError, Session, SessionConfig,
-    Transfer,
+    StopReason, Transfer,
 };
 use koidrive_proto::v1::error::Code;
 use koidrive_proto::v1::resync_required::Reason;
@@ -42,6 +42,7 @@ use koidrive_store::{Cursor, Link, Store, Tx};
 use tokio::sync::{Notify, mpsc, watch};
 
 use crate::claim::{self, Flock, Identity, Owner};
+use crate::credential::SET_UP_AGAIN;
 use crate::disk::{Batch, Disk, Pending, Sections, Settled, Staged, Stall, Stop, Upload};
 use crate::driver::check_placement;
 use crate::engine::{Applied, Engine, Staging};
@@ -1339,6 +1340,9 @@ impl From<Stop> for Halt {
     fn from(stop: Stop) -> Self {
         match stop {
             Stop::Withdrawn(_) | Stop::Root(_) | Stop::OtherRoot => Halt::Root(stop.to_string()),
+            Stop::Session(StopReason::CredentialsRefused | StopReason::DeviceRevoked) => {
+                Halt::Person(format!("{stop}; {SET_UP_AGAIN}"))
+            }
             stop => Halt::Person(stop.to_string()),
         }
     }

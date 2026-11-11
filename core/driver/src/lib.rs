@@ -33,7 +33,7 @@ mod restore;
 mod status;
 
 pub use config::{Config, ConfigError, LocalTrash, SyncRules};
-pub use credential::{Credential, CredentialError, api_for};
+pub use credential::{Credential, CredentialError, SET_UP_AGAIN, api_for};
 pub use driver::{Driver, DriverError};
 pub use folder::MAX_FORMAT;
 pub use observe::{FsObserver, Observation, Observed, Observer, RulesChange};
