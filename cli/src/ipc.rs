@@ -7,7 +7,7 @@
 
 use std::fs::{self, DirBuilder};
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use flarebox_driver::{
@@ -159,17 +159,39 @@ pub async fn handle(driver: &Driver, request: Request) -> Response {
 }
 
 /// Binds the daemon's socket. The caller holds the profile lock, so a socket file left behind is stale.
+///
+/// The directory must belong to this user and be closed to everyone else, so no other user can reach the socket even
+/// before its mode is set. The socket is bound under a temporary name and renamed once it is 0600, so it never
+/// appears at `path` with another mode. Setting the umask instead would change it for every thread of the process.
 pub fn bind(path: &Path) -> io::Result<UnixListener> {
-    if let Some(dir) = path.parent() {
-        DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    let dir = path.parent().unwrap_or(Path::new("."));
+    DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    let metadata = fs::metadata(dir)?;
+    let refuse = |reason: String| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} {reason}", dir.display()),
+        )
+    };
+    if metadata.uid() != rustix::process::getuid().as_raw() {
+        return Err(refuse("belongs to another user".to_owned()));
     }
-    match fs::remove_file(path) {
+    let mode = metadata.mode() & 0o7777;
+    if mode & 0o077 != 0 {
+        return Err(refuse(format!(
+            "is open to other users (mode {mode:o}); make it 0700"
+        )));
+    }
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let temp = dir.join(format!(".{name}.new"));
+    match fs::remove_file(&temp) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    let listener = UnixListener::bind(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    let listener = UnixListener::bind(&temp)?;
+    fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))?;
+    fs::rename(&temp, path)?;
     Ok(listener)
 }
 
