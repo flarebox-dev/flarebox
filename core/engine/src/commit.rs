@@ -623,8 +623,9 @@ impl Commits {
     ///
     /// A create the server refuses with ID_EXISTS while R holds the node live is no problem. Only
     /// another device can have created a node under this device's ID first, as when both send a
-    /// file the server lost again (section 4.4). S stays without the node, so the next commit
-    /// compares L with what R holds instead of creating the node a second time.
+    /// file the server lost again (section 4.4). S stays without the node, so the next plan
+    /// compares L with what R holds instead of sending the create again: equal content leaves
+    /// nothing to send, and other content is kept beside R's as a new node (section 2.4).
     ///
     /// A `Restore` op changes neither S nor L. What it sent is an instruction, and only the server
     /// knows the nodes and the content it brought back, so all of it is a remote change that R

@@ -136,13 +136,13 @@ proptest! {
     }
 
     #[test]
-    #[ignore = "a server restore still breaks these: an edit equal to the restored bytes is undone (GUN-438), a device that saw a seq the server lost takes the commit that reuses it for the one it saw (GUN-423), and a commit refused as ahead of the server leaves its edit unsent (GUN-442)"]
+    #[ignore = "a server restore still breaks these: an edit equal to the restored bytes is undone (GUN-438), a device that saw a seq the server lost takes the commit that reuses it for the one it saw (GUN-423), a device that holds the result of a commit the server lost starts recovery when it connects again (GUN-444), and a commit refused as ahead of the server leaves its edit unsent (GUN-442)"]
     fn devices_lose_no_write_across_server_restores(devices in 2..=3usize, phases in phases(true)) {
         keep(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
 
     #[test]
-    #[ignore = "a server restore still breaks these: an edit equal to the restored bytes is undone (GUN-438), a device that saw a seq the server lost takes the commit that reuses it for the one it saw (GUN-423), and a commit refused as ahead of the server leaves its edit unsent (GUN-442)"]
+    #[ignore = "a server restore still breaks these: an edit equal to the restored bytes is undone (GUN-438), a device that saw a seq the server lost takes the commit that reuses it for the one it saw (GUN-423), a device that holds the result of a commit the server lost starts recovery when it connects again (GUN-444), and a commit refused as ahead of the server leaves its edit unsent (GUN-442)"]
     fn devices_converge_across_server_restores(devices in 2..=3usize, phases in phases(true)) {
         converge(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }

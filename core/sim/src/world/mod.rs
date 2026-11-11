@@ -42,8 +42,8 @@
 //!   of its device never overwrote or deleted.
 //! - No node keeps a pending name that no user gave.
 //! - No write is in two files of the server, except one a restore took from the server while a
-//!   disk held it, which each device that held it keeps (section 4.4), in the files the server
-//!   holds it in once the devices are quiet again.
+//!   disk held it, which may end in each file a device held it in (section 4.4), and then in the
+//!   files the server holds it in once the devices are quiet again.
 //! - Every write was in the server's live tree at some time, unless the user who made it
 //!   overwrote or deleted it first.
 
@@ -378,9 +378,10 @@ pub struct World {
     retired: BTreeSet<i64>,
     /// The writes that a restore took from the server while a disk still held them, each with
     /// the number of files the server may hold it in. A device that held such a write, on its
-    /// disk or in R, cannot tell whether its author will send it again, so it keeps its copy, and
-    /// the server can end with the write in one file for each of those devices (design section
-    /// 4.4). Once the devices are quiet again, the number is that of the files the server holds.
+    /// disk, in L or in R, cannot tell whether its author will send it again, so it keeps its
+    /// copies, and the server can end with the write in one file for each file of each device
+    /// that held it at the restore (design section 4.4). Once the devices are quiet again, the
+    /// number is that of the files the server holds.
     exposed: BTreeMap<i64, usize>,
     /// For each device, the names that L and the server held for the nodes whose shape a restore
     /// took from the server, until the devices are quiet again. S forgets a node the restored
@@ -389,7 +390,7 @@ pub struct World {
     /// L holds.
     restored_names: Vec<BTreeMap<NodeId, BTreeSet<String>>>,
     /// The files whose content a restore rolled back, each with the digest of the content the
-    /// restored server holds.
+    /// restored server holds, until the devices are quiet again.
     rolled_back: BTreeMap<NodeId, Vec<u8>>,
 }
 
@@ -473,6 +474,7 @@ impl World {
         for names in &mut self.restored_names {
             names.clear();
         }
+        self.rolled_back.clear();
         let mut files: BTreeMap<i64, usize> = BTreeMap::new();
         for content in self.server_tree()?.into_values().flatten() {
             *files.entry(content.mtime_ns).or_default() += 1;
@@ -600,8 +602,9 @@ impl World {
         }
     }
 
-    /// Restores the server from the last copy. A write the server held only after the copy is
-    /// lost with the restore: it is retired when no disk holds it, and exposed otherwise.
+    /// Restores the server from the last copy. A write is lost with the restore when the server
+    /// held it only after the copy, or when a file of the server held it before the restore and
+    /// no longer holds it after: it is retired when no disk holds it, and exposed otherwise.
     fn restore(&mut self) {
         let Some(backup) = &self.backup else {
             return;
@@ -622,9 +625,16 @@ impl World {
                 })
                 .collect()
         };
+        let writes = |space: &SpaceDo| -> BTreeSet<(NodeId, i64)> {
+            (space.nodes().into_iter())
+                .filter_map(|node| Some((node.node_id, node.current?.content?.mtime_ns)))
+                .collect()
+        };
         let before = shapes(&self.space);
+        let held_before = writes(&self.space);
         self.space.restore(&backup.space);
         let after = shapes(&self.space);
+        let held_after = writes(&self.space);
         for (id, (.., digest)) in &after {
             if let Some(digest) = digest
                 && before
@@ -654,22 +664,45 @@ impl World {
             }
         }
         for write in self.writers.keys() {
-            if !stored(&self.held, *write) || stored(&backup.held, *write) {
+            let taken = (held_before.difference(&held_after)).any(|(_, held)| held == write);
+            if !taken && (!stored(&self.held, *write) || stored(&backup.held, *write)) {
                 continue;
             }
             if !self.devices.iter().any(|device| device.disk.holds(*write)) {
                 self.retired.insert(*write);
                 continue;
             }
-            let learned = |device: &Device| {
-                device.disk.holds(*write)
-                    || (device.engine.trees.remote().iter()).any(|(_, node)| {
-                        (node.shape.content.as_ref()).is_some_and(|c| c.mtime_ns == *write)
-                    })
-            };
-            let holders = self.devices.iter().filter(|device| learned(device)).count();
+            let holds =
+                |content: &Option<Content>| content.as_ref().is_some_and(|c| c.mtime_ns == *write);
+            let mut files = 0;
+            for device in &self.devices {
+                let mut nodes: BTreeSet<&NodeId> = BTreeSet::new();
+                let mut unknown = 0;
+                let trees = &device.engine.trees;
+                let local = trees
+                    .local()
+                    .iter()
+                    .filter(|(_, node)| holds(&node.shape.content));
+                let remote = trees
+                    .remote()
+                    .iter()
+                    .filter(|(_, node)| holds(&node.shape.content));
+                nodes.extend(local.map(|(id, _)| id).chain(remote.map(|(id, _)| id)));
+                for (ino, entry) in device.disk.entries() {
+                    if !holds(&entry.content) {
+                        continue;
+                    }
+                    match (trees.local().iter()).find(|(_, node)| node.identity.ino == *ino) {
+                        Some((id, _)) => {
+                            nodes.insert(id);
+                        }
+                        None => unknown += 1,
+                    }
+                }
+                files += nodes.len() + unknown;
+            }
             let exposed = self.exposed.entry(*write).or_default();
-            *exposed = holders.max(*exposed);
+            *exposed = files.max(*exposed);
         }
     }
 
