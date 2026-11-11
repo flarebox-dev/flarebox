@@ -39,6 +39,11 @@ const RESCAN_INTERVAL: Duration = Duration::from_secs(30);
 const RETRY_FIRST: Duration = Duration::from_millis(250);
 /// The longest wait between two reads of such a file.
 const RETRY_MAX: Duration = Duration::from_secs(30);
+/// The most files whose content one observation reads. A created or modified file past it is reported without
+/// content and read by a later observation, so a large tree reaches the engine in batches of bounded reading.
+pub(crate) const READ_FILES: usize = 1_000;
+/// The most bytes one observation reads, past its first file.
+const READ_BYTES: u64 = 256 << 20;
 
 /// One batch of observations.
 #[derive(Debug)]
@@ -145,7 +150,7 @@ pub struct FsObserver {
     settling: bool,
     /// Whether a reset still waits for the batch of a scan made after it.
     reset: bool,
-    /// Files whose content could not be read, with when to read them again.
+    /// Files whose content could not be read, or that an observation left to a later one, with when to read them.
     unread: BTreeMap<PathBuf, Retry>,
     /// Whether the caller has stopped waiting for observations.
     stopped: Arc<dyn Fn() -> bool + Send + Sync>,
@@ -155,6 +160,36 @@ pub struct FsObserver {
 struct Retry {
     failures: u32,
     due: Instant,
+}
+
+/// The reads of one observation.
+#[derive(Default)]
+struct Reads {
+    files: usize,
+    bytes: u64,
+    /// Files that changed while they were read, or could not be read.
+    busy: Vec<PathBuf>,
+    /// Files left to a later observation because this one read all it may.
+    deferred: Vec<PathBuf>,
+    /// Folders the changes of this observation removed or renamed into place. A file created under one may be a node
+    /// that the batch takes out of L with the folder, which the engine keeps only for a created file with content, so
+    /// such a file is read whatever the budget left.
+    replaced: Vec<PathBuf>,
+}
+
+impl Reads {
+    /// Counts a file of `size` bytes as read if [`READ_FILES`] and [`READ_BYTES`] leave room for it, or if it `must` be
+    /// read. The first file always has room, so a file larger than the budget is read on its own.
+    fn take(&mut self, size: u64, must: bool) -> bool {
+        let room = must
+            || self.files == 0
+            || (self.files < READ_FILES && self.bytes.saturating_add(size) <= READ_BYTES);
+        if room {
+            self.files += 1;
+            self.bytes = self.bytes.saturating_add(size);
+        }
+        room
+    }
 }
 
 impl Retry {
@@ -241,13 +276,14 @@ impl FsObserver {
 
     /// Adds what `change` means for the engine to `out`. The scans leave out excluded paths, so every path here is
     /// one this device syncs, except the target of a move into an excluded path.
-    fn observed(&self, change: Change, out: &mut Vec<Observed>, busy: &mut Vec<PathBuf>) {
+    fn observed(&self, change: Change, out: &mut Vec<Observed>, reads: &mut Reads) {
         let entry = |path: &Path| self.watcher.snapshot().entries.get(path).copied();
         match change {
             Change::Created { path, kind } => {
                 let Some(entry) = entry(&path) else { return };
+                let must = reads.replaced.iter().any(|dir| path.starts_with(dir));
                 let content = (kind == EntryKind::File)
-                    .then(|| self.content(&path, &entry, busy))
+                    .then(|| self.content(&path, &entry, reads, must))
                     .flatten();
                 out.push(Observed::Created {
                     linked: self.linked(&path, kind),
@@ -262,7 +298,7 @@ impl FsObserver {
                 if entry.kind != EntryKind::File {
                     return;
                 }
-                let content = self.content(&path, &entry, busy);
+                let content = self.content(&path, &entry, reads, false);
                 out.push(Observed::Modified {
                     content,
                     id: entry.id,
@@ -332,20 +368,24 @@ impl FsObserver {
         }
     }
 
-    /// Reads again the unread files that are due, and reports each one that can now be read.
-    fn retry(&mut self, now: Instant, out: &mut Vec<Observed>) {
-        let due: Vec<PathBuf> = self
-            .unread
-            .iter()
+    /// Reads again the unread files that are due, the longest due first and as many as `reads` has room for, and
+    /// reports each one that can now be read. An observation retries before it reads its own changes, so a file the
+    /// budget left out gets the first turn of a later observation, also when it is larger than the budget.
+    fn retry(&mut self, now: Instant, out: &mut Vec<Observed>, reads: &mut Reads) {
+        let mut due: Vec<(Instant, PathBuf)> = (self.unread.iter())
             .filter(|(_, retry)| retry.due <= now)
-            .map(|(path, _)| path.clone())
+            .map(|(path, retry)| (retry.due, path.clone()))
             .collect();
-        for path in due {
+        due.sort();
+        for (_, path) in due {
             let entry = self.watcher.snapshot().entries.get(&path).copied();
             let Some(entry) = entry.filter(|entry| entry.kind == EntryKind::File) else {
                 self.unread.remove(&path);
                 continue;
             };
+            if !reads.take(entry.size, false) {
+                continue;
+            }
             match read_content(&self.root, &path, &entry, &*self.stopped) {
                 Ok(Some(content)) => {
                     self.unread.remove(&path);
@@ -370,17 +410,28 @@ impl FsObserver {
             && std::fs::symlink_metadata(self.root.join(path)).is_ok_and(|meta| meta.nlink() > 1)
     }
 
-    /// Chunks the file at `path` if it is still the entry the scan saw and does not change while it is read.
-    fn content(&self, path: &Path, entry: &Entry, busy: &mut Vec<PathBuf>) -> Option<Content> {
+    /// Chunks the file at `path` if `reads` has room for it or it `must` be read, it is still the entry the scan saw and
+    /// it does not change while it is read.
+    fn content(
+        &self,
+        path: &Path,
+        entry: &Entry,
+        reads: &mut Reads,
+        must: bool,
+    ) -> Option<Content> {
+        if !reads.take(entry.size, must) {
+            reads.deferred.push(path.to_path_buf());
+            return None;
+        }
         match read_content(&self.root, path, entry, &*self.stopped) {
             Ok(Some(content)) => Some(content),
             Ok(None) => {
-                busy.push(path.to_path_buf());
+                reads.busy.push(path.to_path_buf());
                 None
             }
             Err(error) => {
                 tracing::debug!(path = %path.display(), %error, "a file could not be chunked");
-                busy.push(path.to_path_buf());
+                reads.busy.push(path.to_path_buf());
                 None
             }
         }
@@ -414,21 +465,50 @@ impl Observer for FsObserver {
         }
         let now = Instant::now();
         let mut changes = Vec::new();
-        let mut busy = Vec::new();
+        let mut reads = Reads {
+            replaced: (poll.changes.iter())
+                .filter_map(|change| match change {
+                    Change::Removed {
+                        path,
+                        kind: EntryKind::Dir,
+                    }
+                    | Change::Renamed {
+                        to: path,
+                        kind: EntryKind::Dir,
+                        ..
+                    } => Some(path.clone()),
+                    _ => None,
+                })
+                .collect(),
+            ..Reads::default()
+        };
         let observed = !poll.changes.is_empty();
+        for change in &poll.changes {
+            self.supersede(change);
+        }
+        let mut retried = Vec::new();
+        self.retry(now, &mut retried, &mut reads);
         for change in poll.changes {
             if (self.stopped)() {
                 return Ok(None);
             }
-            self.supersede(&change);
-            self.observed(change, &mut changes, &mut busy);
+            self.observed(change, &mut changes, &mut reads);
         }
-        self.retry(now, &mut changes);
+        changes.extend(retried);
         if (self.stopped)() {
             return Ok(None);
         }
-        for path in &busy {
+        for path in &reads.busy {
             self.unread.insert(path.clone(), Retry::after(0, now));
+        }
+        for path in reads.deferred {
+            self.unread.insert(
+                path,
+                Retry {
+                    failures: 0,
+                    due: now,
+                },
+            );
         }
         let rules: Vec<RulesChange> = (poll.rules.into_iter())
             .map(|(dir, bytes)| RulesChange {
@@ -471,7 +551,7 @@ impl Observer for FsObserver {
             unreadable,
             read: poll.read,
             scanned: self.scanned,
-            busy,
+            busy: reads.busy,
             rules,
             all_rules: first,
         }))
@@ -504,7 +584,7 @@ fn read_content(
         return Ok(None);
     }
     let config = ChunkerConfig::V0;
-    let chunks = flarebox_chunk::chunks(&file, config)
+    let chunks = flarebox_chunk::chunks(io::Read::take(&file, entry.size), config)
         .map(|chunk| match stopped() {
             true => Err(io::ErrorKind::Interrupted.into()),
             false => chunk.map(|chunk| chunk.chunk_ref()),
@@ -766,6 +846,134 @@ mod tests {
         assert_eq!(
             read_content(dir.path(), Path::new("a.txt"), &entry, &|| false).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn a_scan_of_more_files_than_one_observation_reads_reports_the_rest_later() {
+        let dir = marked();
+        for i in 0..=READ_FILES {
+            fs::write(dir.path().join(format!("{i:04}.txt")), i.to_string()).unwrap();
+        }
+        let mut observer = observer(dir.path());
+        let (first, _) = observe_until(&mut observer, |seen| !seen.is_empty());
+        let unread: Vec<&Path> = (first.iter())
+            .filter_map(|change| match change {
+                Observed::Created {
+                    path,
+                    content: None,
+                    ..
+                } => Some(path.as_path()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(first.len(), READ_FILES + 1, "every file is reported");
+        assert_eq!(
+            unread,
+            [Path::new("1000.txt")],
+            "one file is past the budget"
+        );
+
+        let (later, _) = observe_until(&mut observer, |seen| !seen.is_empty());
+        assert!(
+            matches!(
+                later.as_slice(),
+                [Observed::Modified { path, content: Some(content), .. }]
+                    if path == Path::new("1000.txt") && content.size == 4
+            ),
+            "{later:?}"
+        );
+        assert!(observer.unread.is_empty());
+    }
+
+    #[test]
+    fn a_file_larger_than_the_budget_is_read_before_the_changes_of_a_later_observation() {
+        let dir = marked();
+        fs::write(dir.path().join("a.txt"), b"a").unwrap();
+        File::create(dir.path().join("z.bin"))
+            .unwrap()
+            .set_len(READ_BYTES + 1)
+            .unwrap();
+        let mut observer = observer(dir.path());
+        let (first, _) = observe_until(&mut observer, |seen| !seen.is_empty());
+        assert!(
+            first.iter().any(|change| matches!(
+                change,
+                Observed::Created { path, content: None, .. } if path == Path::new("z.bin")
+            )),
+            "{first:?}"
+        );
+        observer.watcher = Box::new(
+            RescanWatcher::new(dir.path(), observer.snapshot().clone(), Duration::ZERO).unwrap(),
+        );
+        fs::write(dir.path().join("a.txt"), b"aa").unwrap();
+        let next = observer.observe(Duration::ZERO).unwrap().unwrap().changes;
+        assert!(
+            next.iter().any(|change| matches!(
+                change,
+                Observed::Modified { path, content: Some(_), .. } if path == Path::new("z.bin")
+            )),
+            "{next:?}"
+        );
+        assert!(
+            next.iter().any(|change| matches!(
+                change,
+                Observed::Modified { path, content: None, .. } if path == Path::new("a.txt")
+            )),
+            "{next:?}"
+        );
+    }
+
+    #[test]
+    fn the_unread_file_due_longest_is_read_first() {
+        let dir = marked();
+        fs::write(dir.path().join("a.txt"), b"a").unwrap();
+        fs::write(dir.path().join("b.txt"), b"b").unwrap();
+        let mut observer = observer(dir.path());
+        observe_until(&mut observer, |seen| seen.len() >= 2);
+        let now = Instant::now();
+        observer.unread.insert(
+            "a.txt".into(),
+            Retry {
+                failures: 0,
+                due: now,
+            },
+        );
+        observer.unread.insert(
+            "b.txt".into(),
+            Retry {
+                failures: 3,
+                due: now - Duration::from_secs(1),
+            },
+        );
+        let mut reads = Reads {
+            files: READ_FILES - 1,
+            ..Reads::default()
+        };
+        let mut out = Vec::new();
+        observer.retry(now, &mut out, &mut reads);
+        assert!(
+            matches!(out.as_slice(), [Observed::Modified { path, .. }] if path == Path::new("b.txt")),
+            "{out:?}"
+        );
+        assert!(observer.unread.contains_key(Path::new("a.txt")));
+    }
+
+    #[test]
+    fn an_observation_reads_no_more_bytes_than_the_budget_past_its_first_file() {
+        let mut reads = Reads::default();
+        assert!(
+            reads.take(READ_BYTES * 2, false),
+            "a file larger than the budget is read on its own"
+        );
+        assert!(!reads.take(0, false));
+        let mut reads = Reads::default();
+        assert!(reads.take(READ_BYTES / 2, false));
+        assert!(reads.take(READ_BYTES / 2, false));
+        assert!(!reads.take(1, false));
+        assert!(
+            reads.take(1, true),
+            "a file that must be read is read past the budget"
         );
     }
 
