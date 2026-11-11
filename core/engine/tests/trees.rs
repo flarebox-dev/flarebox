@@ -635,7 +635,7 @@ fn forgetting_what_the_server_lost_keeps_the_rest_of_s() {
         },
     );
     trees.set_remote("same".into(), remote(file(ROOT, "same", 1)));
-    trees.forget_lost(Vec::new(), Vec::new(), 0);
+    trees.forget_lost(Vec::new(), Vec::new(), 0, 0);
     assert_eq!(trees.check(), Ok(()));
     let classes = shapes.map(|(id, _)| (id, trees.class(id)));
     assert_eq!(
@@ -672,11 +672,14 @@ fn a_remote_delete_below_a_folder_the_server_lost_stays_a_remote_delete() {
             ..remote(file(ROOT, "one", 1))
         },
     );
-    trees.forget_lost(Vec::new(), Vec::new(), 0);
+    trees.forget_lost(Vec::new(), Vec::new(), 0, 0);
     assert_eq!(trees.check(), Ok(()));
     assert_eq!(trees.class("one"), Class::Remote);
     assert_eq!(trees.class("two"), Class::Local);
-    assert_eq!(trees.waiting().get("albums"), Some(&None));
+    assert_eq!(
+        trees.waiting().get("albums").map(|waiting| &waiting.shape),
+        Some(&None)
+    );
 }
 
 fn spaces() -> impl Strategy<Value = Vec<(bool, Change, Change)>> {

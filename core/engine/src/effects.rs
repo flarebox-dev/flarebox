@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::classify::{Class, Trees, classify};
+use crate::classify::{Class, Origin, Trees, classify};
 use crate::guard::RemoteRemoval;
 use crate::ids::IdGen;
 use crate::ignore::is_rules_file;
@@ -373,7 +373,7 @@ impl Effects {
             });
         let parked = record.parks();
         let base = match trees.waiting().get(&record.node) {
-            Some(waiting) => waiting.as_ref(),
+            Some(waiting) => waiting.shape.as_ref(),
             None => trees.synced().live(&record.node),
         };
         let local = trees.local().live(&record.node);
@@ -393,7 +393,7 @@ impl Effects {
                 _ => record.after.clone(),
             };
             if !trees.set_synced_if_valid(record.node.clone(), synced.clone()) {
-                trees.wait(record.node.clone(), synced);
+                trees.wait(record.node.clone(), synced, Origin::Other);
             }
         }
         let content = (trees.local().get(&record.node)).map(|node| node.shape.content.clone());
@@ -483,7 +483,7 @@ fn within(trees: &Trees, node: &NodeId) -> Vec<NodeId> {
 /// ([`Trees::forget_lost`]) is never one: once the update is made, L holds a node S does not,
 /// which is created again. An excluded node is never one.
 fn candidate(trees: &Trees, id: &str) -> bool {
-    let forgets = trees.waiting().get(id).is_some_and(Option::is_none);
+    let forgets = (trees.waiting().get(id)).is_some_and(|waiting| waiting.shape.is_none());
     let changed = remote_only(trees, id)
         || trees.local().get(id).is_some_and(|node| node.parked)
         || (trees.reverted().contains(id)
@@ -530,7 +530,7 @@ fn holds_below(trees: &Trees, id: &str) -> bool {
 fn remote_only(trees: &Trees, id: &str) -> bool {
     let (local, remote) = (trees.local().live(id), trees.remote().live(id));
     match trees.waiting().get(id) {
-        Some(waiting) => classify(local, waiting.as_ref(), remote) == Class::Remote,
+        Some(waiting) => classify(local, waiting.shape.as_ref(), remote) == Class::Remote,
         None => trees.class(id) == Class::Remote,
     }
 }

@@ -3,7 +3,7 @@
 //! Building commits from local changes and acknowledging their results (docs/design/sync-engine.md
 //! sections 2.4, 2.6, 2.7, 2.8 and 4.2, and RFC 0002), on hand-built trees and results.
 
-use koidrive_engine::classify::{Class, Trees};
+use koidrive_engine::classify::{Class, Origin, Trees};
 use koidrive_engine::commit::{Commits, Failure, Halt, Lift, LiftError, MAX_OPS, Reconnect};
 use koidrive_engine::effects::{Effect, EffectError, Effects, Location};
 use koidrive_engine::ids::IdGen;
@@ -675,7 +675,7 @@ fn a_parked_folder_the_server_lost_is_created_again_after_a_delete_empties_it() 
             ..local(dir(ROOT, "albums"), 1)
         },
     );
-    trees.forget_lost(Vec::new(), Vec::new(), 0);
+    trees.forget_lost(Vec::new(), Vec::new(), 0, 0);
     trees.settle();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
     let removed = effects.plan(&trees, &mut ids, NOW).cloned().unwrap();
@@ -756,7 +756,12 @@ fn a_delete_the_server_lost_is_sent_again() {
     let trashed = trees.trashed_here();
     trees.set_remote("d".into(), remote(dir(ROOT, "d")));
     trees.set_remote("a".into(), remote(file("d", "a", 1)));
-    trees.forget_lost(trashed, Vec::new(), commits.held_through());
+    trees.forget_lost(
+        trashed,
+        Vec::new(),
+        commits.held_through(),
+        commits.accepted(),
+    );
     trees.settle();
     assert_eq!(
         (trees.class("d"), trees.class("a")),
@@ -792,7 +797,12 @@ fn a_delete_the_server_lost_is_sent_again_only_for_what_it_saw() {
         ..remote(file(ROOT, "restored", 1))
     };
     trees.set_remote("restored".into(), restored);
-    trees.forget_lost(trashed, Vec::new(), commits.held_through());
+    trees.forget_lost(
+        trashed,
+        Vec::new(),
+        commits.held_through(),
+        commits.accepted(),
+    );
     trees.settle();
     let classes = ["same", "edited", "restored"].map(|id| (id, trees.class(id)));
     assert_eq!(
@@ -858,7 +868,12 @@ fn an_edit_the_server_lost_is_sent_again() {
     let edited = trees.edited_here();
     assert_eq!(edited, ["a"]);
     trees.set_remote("a".into(), remote(file(ROOT, "a", 1)));
-    trees.forget_lost(Vec::new(), edited, commits.held_through());
+    trees.forget_lost(
+        Vec::new(),
+        edited,
+        commits.held_through(),
+        commits.accepted(),
+    );
     trees.settle();
     assert_eq!(trees.class("a"), Class::Local);
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
@@ -876,7 +891,12 @@ fn an_edit_the_server_lost_is_not_sent_again_over_a_later_edit() {
         ..remote(file(ROOT, "a", 3))
     };
     trees.set_remote("a".into(), later);
-    trees.forget_lost(Vec::new(), edited, commits.held_through());
+    trees.forget_lost(
+        Vec::new(),
+        edited,
+        commits.held_through(),
+        commits.accepted(),
+    );
     trees.settle();
     assert_eq!(trees.class("a"), Class::Concurrent);
 }
@@ -892,7 +912,12 @@ fn an_edit_the_server_lost_is_sent_again_over_a_later_delete() {
         ..trashed(file(ROOT, "a", 1))
     };
     trees.set_remote("a".into(), deleted);
-    trees.forget_lost(Vec::new(), edited, commits.held_through());
+    trees.forget_lost(
+        Vec::new(),
+        edited,
+        commits.held_through(),
+        commits.accepted(),
+    );
     trees.settle();
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert_eq!(ops(&commit), [update("a", 2)]);
@@ -1247,7 +1272,7 @@ fn a_reverted_file_the_server_lost_is_created_again_under_its_id() {
     )]);
     trees.revert("h".into());
     trees.remove_remote("h");
-    trees.forget_lost(Vec::new(), Vec::new(), 0);
+    trees.forget_lost(Vec::new(), Vec::new(), 0, 0);
     trees.settle();
     let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
@@ -1279,7 +1304,7 @@ fn a_reverted_file_whose_s_update_waits_is_created_again_under_its_id_once_the_s
     assert!(trees.waiting().contains_key("n"), "S still has h at y");
     assert!(trees.reverted().contains("n"));
     trees.remove_remote("n");
-    trees.forget_lost(Vec::new(), Vec::new(), 0);
+    trees.forget_lost(Vec::new(), Vec::new(), 0, 0);
     trees.settle();
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert!(
@@ -2332,7 +2357,10 @@ fn a_move_and_edit_whose_s_update_waits() -> (Trees, Commits, IdGen) {
         &mut trees,
         vec![outcome(op_result::Code::Applied); 2],
     );
-    assert_eq!(trees.waiting().get("n"), Some(&Some(file(ROOT, "x", 1))));
+    assert_eq!(
+        trees.waiting().get("n").map(|waiting| &waiting.shape),
+        Some(&Some(file(ROOT, "x", 1)))
+    );
     (trees, commits, ids)
 }
 
@@ -2425,12 +2453,15 @@ fn a_move_and_edit_whose_s_update_waits_lost_at_5() -> (Trees, Commits, IdGen) {
     commits.received(result(5, applied)).unwrap();
     assert!(commits.acknowledge(&mut trees, 5));
     trees.settle();
-    assert_eq!(trees.waiting().get("n"), Some(&Some(file(ROOT, "x", 1))));
+    assert_eq!(
+        trees.waiting().get("n").map(|waiting| &waiting.shape),
+        Some(&Some(file(ROOT, "x", 1)))
+    );
     assert_eq!(commits.connected(&welcome(1)), Reconnect::AheadOfServer);
     assert_eq!(commits.held_through(), 2);
     let (trashed, edited) = (trees.trashed_here(), trees.edited_here());
     trees.set_remote("n".into(), remote(file(ROOT, "old", 0)));
-    trees.forget_lost(trashed, edited, commits.held_through());
+    trees.forget_lost(trashed, edited, commits.held_through(), commits.accepted());
     trees.settle();
     (trees, commits, ids)
 }
@@ -2449,20 +2480,22 @@ fn a_move_and_edit_the_server_lost_while_its_s_update_waits_is_sent_again() {
 }
 
 /// As in `a_move_and_edit_whose_s_update_waits`, but the server loses every commit of this device,
-/// and a bootstrap lists n at root/old with content 0 of seq 1, a seq the lost commit had. Another
-/// device may have put n back after the loss, so the edit is not sent over it, and R's content is
-/// not written over the edit either: n is a concurrent change.
+/// and a bootstrap lists n at root/old with content 0 of seq 1, a seq the lost commit had. The
+/// update came from the lost commit, so it is dropped. R holds n as S does, so R's content is not
+/// written over the edit: the move and the edit are sent again.
 #[test]
 fn a_move_and_edit_whose_s_update_waits_is_not_overwritten_by_a_change_after_the_loss() {
-    let (mut trees, mut commits, _) = a_move_and_edit_whose_s_update_waits();
+    let (mut trees, mut commits, mut ids) = a_move_and_edit_whose_s_update_waits();
     assert_eq!(commits.connected(&welcome(0)), Reconnect::AheadOfServer);
     let (trashed, edited) = (trees.trashed_here(), trees.edited_here());
     trees.set_remote("n".into(), remote(file(ROOT, "old", 0)));
-    trees.forget_lost(trashed, edited, commits.held_through());
+    trees.forget_lost(trashed, edited, commits.held_through(), commits.accepted());
     trees.settle();
     trees.set_local("h".into(), local(file(ROOT, "y", 9), 1));
     trees.settle();
-    assert_eq!(trees.class("n"), Class::Concurrent);
+    assert_eq!(trees.class("n"), Class::Local);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", ROOT, "x"), update("n", 1)]);
 }
 
 /// A parked file h holds root/x in S while R has it at y, and the user creates n at x. The server
@@ -2500,13 +2533,259 @@ fn a_create_the_server_lost_while_its_s_update_waits_is_sent_again() {
     assert_eq!(commits.connected(&welcome(0)), Reconnect::AheadOfServer);
     let (trashed, edited) = (trees.trashed_here(), trees.edited_here());
     trees.remove_remote("n");
-    trees.forget_lost(trashed, edited, commits.held_through());
+    trees.forget_lost(trashed, edited, commits.held_through(), commits.accepted());
     trees.settle();
     trees.set_local("h".into(), local(file(ROOT, "y", 9), 1));
     trees.settle();
     assert_eq!(trees.class("n"), Class::Local);
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert!(matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id == "n"));
+}
+
+/// Commits a new file `id`, and acknowledges it at `seq` with R holding the file.
+fn commit_file(trees: &mut Trees, commits: &mut Commits, ids: &mut IdGen, id: &str, seq: u64) {
+    trees.set_local(id.into(), local(file(ROOT, id, 7), 100 + seq));
+    trees.settle();
+    let commit = build(commits, trees, ids).unwrap();
+    assert!(
+        matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id == id),
+        "{:?}",
+        ops(&commit)
+    );
+    let created = RemoteNode {
+        content_rev: seq,
+        meta_rev: seq,
+        ..remote(file(ROOT, id, 7))
+    };
+    trees.set_remote(id.into(), created);
+    let applied = vec![outcome(op_result::Code::Applied)];
+    commits.received(result(seq, applied)).unwrap();
+    assert!(commits.acknowledge(trees, seq));
+    trees.settle();
+}
+
+/// Whether `ops` upload content `digest`, to any node.
+fn uploads(ops: &[op::Op], digest: u8) -> bool {
+    ops.iter().any(|op| match op {
+        op::Op::CreateFile(create) => create.content == Some(content(digest)),
+        op::Op::UpdateContent(update) => update.content == Some(content(digest)),
+        _ => false,
+    })
+}
+
+/// GUN-418: the move and edit of n at slot 1 wait behind h. Another device moves n back at seq 2,
+/// this device's commit at slot 2 and seq 3 is kept, and the one at slot 3 is lost. The bootstrap
+/// lists n as S holds it. The update came from a kept commit, so it stays, and once h leaves x, n
+/// takes the other device's change: nothing is sent for n.
+#[test]
+fn a_kept_move_that_another_device_reverses_before_a_loss_is_not_sent_again() {
+    let (mut trees, mut commits, mut ids) = a_move_and_edit_whose_s_update_waits();
+    let reversed = RemoteNode {
+        content_rev: 2,
+        meta_rev: 2,
+        ..remote(file(ROOT, "old", 0))
+    };
+    trees.set_remote("n".into(), reversed);
+    trees.settle();
+    commit_file(&mut trees, &mut commits, &mut ids, "p", 3);
+    commit_file(&mut trees, &mut commits, &mut ids, "q", 4);
+    assert_eq!(commits.connected(&welcome(2)), Reconnect::AheadOfServer);
+    assert_eq!(commits.held_through(), 3);
+    let (gone, edited) = (trees.trashed_here(), trees.edited_here());
+    trees.remove_remote("q");
+    trees.forget_lost(gone, edited, commits.held_through(), commits.accepted());
+    trees.settle();
+    assert!(trees.waiting().contains_key("n"));
+    trees.set_local("h".into(), local(file(ROOT, "y", 9), 1));
+    trees.settle();
+    let sent =
+        build(&mut commits, &mut trees, &mut ids).map_or_else(Vec::new, |commit| ops(&commit));
+    assert!(
+        !sent.contains(&mv("n", ROOT, "x")) && !uploads(&sent, 1),
+        "{sent:?}"
+    );
+    assert_eq!(trees.class("n"), Class::Remote);
+}
+
+/// GUN-418: the create of n at slot 1 waits behind h, and the commit at slot 2 is lost. Another
+/// device then deletes n and the trash is purged, so the bootstrap lists no n. The create was
+/// kept, so its update stays, and once h leaves x, n is a remote delete instead of being created
+/// again.
+#[test]
+fn a_kept_create_that_another_device_deletes_after_a_loss_stays_deleted() {
+    let mut trees = trees(&[(
+        "h",
+        Some(file(ROOT, "x", 9)),
+        Some(file(ROOT, "x", 9)),
+        Some(remote(file(ROOT, "y", 9))),
+    )]);
+    trees.set_local(
+        "h".into(),
+        LocalNode {
+            parked: true,
+            ..local(file(ROOT, "x", 9), 1)
+        },
+    );
+    trees.set_local("n".into(), local(file(ROOT, "x", 1), 2));
+    trees.settle();
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    trees.set_remote("n".into(), remote(file(ROOT, "x", 1)));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    assert!(trees.waiting().contains_key("n"));
+    commit_file(&mut trees, &mut commits, &mut ids, "p", 2);
+    assert_eq!(commits.connected(&welcome(1)), Reconnect::AheadOfServer);
+    let (gone, edited) = (trees.trashed_here(), trees.edited_here());
+    trees.remove_remote("n");
+    trees.remove_remote("p");
+    trees.forget_lost(gone, edited, commits.held_through(), commits.accepted());
+    trees.settle();
+    assert!(trees.waiting().contains_key("n"));
+    trees.set_local("h".into(), local(file(ROOT, "y", 9), 1));
+    trees.settle();
+    let sent =
+        build(&mut commits, &mut trees, &mut ids).map_or_else(Vec::new, |commit| ops(&commit));
+    assert!(
+        !sent
+            .iter()
+            .any(|op| matches!(op, op::Op::CreateFile(c) if c.node_id == "n")),
+        "{sent:?}"
+    );
+    assert_eq!(trees.class("n"), Class::Remote);
+}
+
+/// GUN-418: a waiting update taken by a rebase and waited again keeps the slot of its commit.
+#[test]
+fn a_waiting_update_keeps_its_slot_through_a_rebase() {
+    let (mut trees, mut commits, mut ids) = a_move_and_edit_whose_s_update_waits();
+    assert_eq!(trees.waiting()["n"].origin, Origin::Commit(1));
+    trees.set_local("p".into(), local(file(ROOT, "p", 7), 50));
+    trees.settle();
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(trees.waiting()["n"].origin, Origin::Commit(1));
+}
+
+/// As in `a_move_and_edit_whose_s_update_waits`, but the server loses the commit, and the
+/// bootstrap lists n in the trash. The update stays for the trash, marked as from a lost commit.
+fn a_move_and_edit_lost_while_r_holds_it_in_the_trash() -> (Trees, Commits, IdGen) {
+    let (mut trees, mut commits, ids) = a_move_and_edit_whose_s_update_waits();
+    assert_eq!(commits.connected(&welcome(0)), Reconnect::AheadOfServer);
+    let (gone, edited) = (trees.trashed_here(), trees.edited_here());
+    trees.set_remote("n".into(), trashed(file(ROOT, "old", 0)));
+    trees.forget_lost(gone, edited, commits.held_through(), commits.accepted());
+    trees.settle();
+    assert_eq!(trees.waiting()["n"].origin, Origin::LostCommit);
+    (trees, commits, ids)
+}
+
+/// GUN-418: another device restores n with other content, and h leaves x, so the lost update
+/// would fit. It is dropped instead of made, so L's edit, which only L holds, is uploaded rather
+/// than replaced by R's content.
+#[test]
+fn a_lost_update_kept_by_the_trash_is_not_applied_when_the_node_is_restored() {
+    let (mut trees, mut commits, mut ids) = a_move_and_edit_lost_while_r_holds_it_in_the_trash();
+    let restored = RemoteNode {
+        content_rev: 2,
+        meta_rev: 2,
+        ..remote(file(ROOT, "old", 7))
+    };
+    trees.set_remote("n".into(), restored);
+    trees.set_local("h".into(), local(file(ROOT, "y", 9), 1));
+    trees.settle();
+    let sent =
+        build(&mut commits, &mut trees, &mut ids).map_or_else(Vec::new, |commit| ops(&commit));
+    assert!(!trees.waiting().contains_key("n"));
+    assert!(uploads(&sent, 1), "{sent:?}");
+}
+
+/// GUN-418: as above, but before the restore a second loss leaves the server at slot 1, the slot
+/// the lost commit had, as it does once new commits take that slot again. The update is not read
+/// as kept, so it is dropped, and L's edit is uploaded once h leaves x. Any change of L's to n
+/// would be sent over the trashed node first (R8), so the second loss runs before the next build.
+#[test]
+fn a_lost_update_kept_by_the_trash_is_not_read_as_kept_after_a_second_loss() {
+    let (mut trees, mut commits, mut ids) = a_move_and_edit_lost_while_r_holds_it_in_the_trash();
+    let (gone, edited) = (trees.trashed_here(), trees.edited_here());
+    let restored = RemoteNode {
+        content_rev: 2,
+        meta_rev: 2,
+        ..remote(file(ROOT, "old", 7))
+    };
+    trees.set_remote("n".into(), restored);
+    trees.forget_lost(gone, edited, 1, 1);
+    trees.settle();
+    assert!(!trees.waiting().contains_key("n"));
+    trees.set_local("h".into(), local(file(ROOT, "y", 9), 1));
+    trees.settle();
+    let sent =
+        build(&mut commits, &mut trees, &mut ids).map_or_else(Vec::new, |commit| ops(&commit));
+    assert!(uploads(&sent, 1), "{sent:?}");
+}
+
+/// GUN-418: this device moves file m out of folder d to root/x and deletes d. A parked file h
+/// holds root/x in S while R has it at y, so m's update waits, S still holds m under d, and the
+/// removal of d waits too. The server loses the commit and lists d and m as S holds them. Both
+/// updates are dropped, so once h leaves x, the move and the delete are sent again instead of R's
+/// d reading as a remote create.
+#[test]
+fn a_removal_the_server_lost_while_it_waits_is_sent_again() {
+    let mut trees = trees(&[
+        (
+            "h",
+            Some(file(ROOT, "x", 9)),
+            Some(file(ROOT, "x", 9)),
+            Some(remote(file(ROOT, "y", 9))),
+        ),
+        (
+            "d",
+            None,
+            Some(dir(ROOT, "d")),
+            Some(remote(dir(ROOT, "d"))),
+        ),
+        (
+            "m",
+            Some(file(ROOT, "x", 1)),
+            Some(file("d", "m", 1)),
+            Some(remote(file("d", "m", 1))),
+        ),
+    ]);
+    trees.set_local(
+        "h".into(),
+        LocalNode {
+            parked: true,
+            ..local(file(ROOT, "x", 9), 1)
+        },
+    );
+    trees.settle();
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    let applied = vec![outcome(op_result::Code::Applied); ops(&commit).len()];
+    trees.remove_remote("d");
+    trees.set_remote("m".into(), remote(file(ROOT, "x", 1)));
+    acknowledge(&mut commits, &mut trees, applied);
+    assert_eq!(
+        trees.waiting().get("d").map(|waiting| &waiting.shape),
+        Some(&None)
+    );
+    assert_eq!(commits.connected(&welcome(0)), Reconnect::AheadOfServer);
+    let (gone, edited) = (trees.trashed_here(), trees.edited_here());
+    trees.set_remote("d".into(), remote(dir(ROOT, "d")));
+    trees.set_remote("m".into(), remote(file("d", "m", 1)));
+    trees.forget_lost(gone, edited, commits.held_through(), commits.accepted());
+    trees.settle();
+    assert!(trees.waiting().is_empty());
+    trees.set_local("h".into(), local(file(ROOT, "y", 9), 1));
+    trees.settle();
+    let sent =
+        build(&mut commits, &mut trees, &mut ids).map_or_else(Vec::new, |commit| ops(&commit));
+    assert!(
+        sent.contains(&mv("m", ROOT, "x")) && sent.contains(&delete("d")),
+        "{sent:?}"
+    );
 }
 
 /// Folder h at root/x is trashed remotely, and the user moves and edits its file n to root/X. The
@@ -2536,7 +2815,10 @@ fn a_file_moved_out_of_a_trashed_folder_whose_update_waits() -> (Trees, Commits,
         &mut trees,
         vec![outcome(op_result::Code::Applied); 2],
     );
-    assert_eq!(trees.waiting().get("n"), Some(&Some(file(ROOT, "X", 1))));
+    assert_eq!(
+        trees.waiting().get("n").map(|waiting| &waiting.shape),
+        Some(&Some(file(ROOT, "X", 1)))
+    );
     (trees, commits, ids)
 }
 
@@ -3059,7 +3341,10 @@ fn a_needed_folder_whose_move_waits_is_brought_back() {
         &mut trees,
         vec![outcome(op_result::Code::Applied)],
     );
-    assert_eq!(trees.waiting().get("d"), Some(&Some(dir(ROOT, "X"))));
+    assert_eq!(
+        trees.waiting().get("d").map(|waiting| &waiting.shape),
+        Some(&Some(dir(ROOT, "X")))
+    );
     trees.set_local(
         "m".into(),
         LocalNode {
@@ -3099,7 +3384,10 @@ fn a_removal_that_waits_after_both_sides_dropped_the_node_is_kept_until_it_fits(
     assert!(matches!(record.effect, Effect::RemoveDir { .. }));
     effects.done(&mut trees, &record.effect_id, None).unwrap();
     trees.settle();
-    assert_eq!(trees.waiting().get("d"), Some(&None));
+    assert_eq!(
+        trees.waiting().get("d").map(|waiting| &waiting.shape),
+        Some(&None)
+    );
     assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
     trees.set_remote("d".into(), remote(dir(ROOT, "d")));
     trees.set_remote("f".into(), remote(file("d", "f", 1)));
