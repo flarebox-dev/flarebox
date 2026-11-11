@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 
 use flarebox_proto::v1::error;
+use flarebox_sim::world::disk::Place;
 use flarebox_sim::world::{Action, Cut, Failure, NAMES, Outcome, Reply, Step, TEXTS, World};
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
@@ -695,4 +696,34 @@ fn a_device_with_a_commit_in_flight_does_not_commit_a_remote_name_back() {
         ],
     ];
     converge(3, &phases).unwrap();
+}
+
+/// Device 2 makes folder A next to the synced folder a, commits it, and moves A into a while
+/// device 0 deletes a. A's acknowledged S update waits, since a still holds the name key in S on
+/// device 2, and a cannot leave the disk while it holds A. Device 2 sends the move against the
+/// waiting update, so the server brings a back with A in it. The minimal input proptest found for
+/// `devices_converge_once_the_faults_stop` (GUN-399).
+#[test]
+fn a_folder_moved_into_a_deleted_folder_while_its_create_waits_is_sent() {
+    let phases = [
+        vec![(0, folder("a"))],
+        vec![
+            (2, folder("A")),
+            (2, Step::Work(0)),
+            (2, COMMIT),
+            (2, rename(1, 1, "a")),
+            (0, delete(0)),
+        ],
+    ];
+    let world = converge(3, &phases).unwrap();
+    let entries = world.devices[0].disk.entries();
+    assert_eq!(entries.len(), 2);
+    let moved = (entries.values())
+        .find(|entry| matches!(entry.place, Place::In(_)))
+        .expect("A is inside a");
+    let Place::In(folder) = moved.place else {
+        unreachable!()
+    };
+    assert_eq!(moved.name, "a");
+    assert_eq!(entries[&folder].place, Place::Root);
 }

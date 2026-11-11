@@ -2141,6 +2141,103 @@ fn a_move_and_edit_whose_s_update_waits() -> (Trees, Commits, IdGen) {
     (trees, commits, ids)
 }
 
+/// The user moves and edits n again while its update waits. Compared with the waiting shape, only
+/// L changed, so both ops are sent for n itself, which is not forked into a new file.
+#[test]
+fn a_node_whose_update_waits_is_moved_and_edited_again_under_its_id() {
+    let (mut trees, mut commits, mut ids) = a_move_and_edit_whose_s_update_waits();
+    trees.set_local("n".into(), local(file(ROOT, "z", 2), 2));
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", ROOT, "z"), update("n", 2)]);
+    assert!(trees.local().get("n").is_some());
+}
+
+/// The user takes n back to its S shape while the update to x waits. That is a change of L
+/// against the waiting shape, not a remote change, so it is sent.
+#[test]
+fn a_node_whose_update_waits_taken_back_to_its_s_shape_is_sent() {
+    let (mut trees, mut commits, mut ids) = a_move_and_edit_whose_s_update_waits();
+    trees.set_local("n".into(), local(file(ROOT, "old", 0), 2));
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", ROOT, "old"), update("n", 0)]);
+}
+
+/// The other device edits n while its update waits, and the user moves it. The edit does not hold
+/// back the move (R4).
+#[test]
+fn a_remote_edit_of_a_node_whose_update_waits_does_not_hold_back_its_local_move() {
+    let (mut trees, mut commits, mut ids) = a_move_and_edit_whose_s_update_waits();
+    trees.set_local("n".into(), local(file(ROOT, "z", 1), 2));
+    trees.set_remote("n".into(), remote(file(ROOT, "x", 3)));
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", ROOT, "z")]);
+}
+
+/// Folder h at root/x is trashed remotely, and the user moves and edits its file n to root/X. The
+/// server applies both ops, but S cannot take n at X while h holds the name key x, so the update
+/// waits.
+fn a_file_moved_out_of_a_trashed_folder_whose_update_waits() -> (Trees, Commits, IdGen) {
+    let mut trees = trees(&[
+        (
+            "h",
+            Some(dir(ROOT, "x")),
+            Some(dir(ROOT, "x")),
+            Some(trashed(dir(ROOT, "x"))),
+        ),
+        (
+            "n",
+            Some(file(ROOT, "X", 1)),
+            Some(file("h", "old", 0)),
+            Some(trashed(file("h", "old", 0))),
+        ),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", ROOT, "X"), update("n", 1)]);
+    trees.set_remote("n".into(), remote(file(ROOT, "X", 1)));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied); 2],
+    );
+    assert_eq!(trees.waiting().get("n"), Some(&Some(file(ROOT, "X", 1))));
+    (trees, commits, ids)
+}
+
+/// The user moves n back into h. Its content agrees with the waiting shape, not with S, so S does
+/// not take that content as both sides' and drop the waiting update, and the move is sent instead
+/// of the effects undoing it.
+#[test]
+fn a_file_moved_back_into_a_trashed_folder_while_its_update_waits_stays_there() {
+    let (mut trees, mut commits, mut ids) =
+        a_file_moved_out_of_a_trashed_folder_whose_update_waits();
+    trees.set_local("n".into(), local(file("h", "old", 1), 2));
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", "h", "old")]);
+    effects_for(&mut trees, &mut ids, "n");
+    assert_eq!(trees.check(), Ok(()));
+    assert_eq!(trees.local().live("n"), Some(&file("h", "old", 1)));
+}
+
+/// As above, with an edit of n on the other device and a move of n into h on this one. The move is
+/// sent, so neither n's update nor h's removal waits for the other for good.
+#[test]
+fn a_file_moved_into_a_trashed_folder_while_its_update_waits_and_it_is_edited_remotely_is_sent() {
+    let (mut trees, mut commits, mut ids) =
+        a_file_moved_out_of_a_trashed_folder_whose_update_waits();
+    trees.set_local("n".into(), local(file("h", "z", 1), 2));
+    trees.set_remote("n".into(), remote(file(ROOT, "X", 3)));
+    trees.settle();
+    assert_eq!(effects_for(&mut trees, &mut ids, "n"), []);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", "h", "z")]);
+    assert_eq!(trees.check(), Ok(()));
+}
+
 /// Plans and does every effect, failing none, and returns those planned for `node`. An entry an
 /// effect creates or writes gets inode 100.
 fn effects_for(trees: &mut Trees, ids: &mut IdGen, node: &str) -> Vec<Effect> {

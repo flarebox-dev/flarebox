@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use flarebox_proto::v1::{self as proto, error, op, op_result};
 use prost::Message;
 
-use crate::classify::{Class, Trees};
+use crate::classify::{Class, Trees, classify};
 use crate::first_link;
 use crate::guard::{self, GuardState};
 use crate::ids::IdGen;
@@ -482,8 +482,9 @@ impl Commits {
     /// edit of a file is sent before the restore of an earlier version and so becomes a version
     /// itself. While such an op is left for a later commit, the restore waits with it. It also
     /// waits while its node is not settled: a node left out of planning (a problem node, a node
-    /// whose S update waits, a parked one), and a node L and R agree on while S lags
-    /// ([`Class::Same`]). A folder is not deleted in the commit that restores a node into it.
+    /// whose S update waits and that L did not move away from the waiting position, a parked one),
+    /// and a node L and R agree on while S lags ([`Class::Same`]). A folder is not deleted in the
+    /// commit that restores a node into it.
     ///
     /// An excluded node ([`Trees::excluded`]) gets no op and is not forked, and nothing is built
     /// while the rules are unknown ([`Trees::rules_known`]). A folder L deleted that still holds
@@ -512,10 +513,11 @@ impl Commits {
         self.ask_again(trees, ids, now_ms);
         trees.reclaim();
         let parked = trees.local().iter().filter(|(_, node)| node.parked);
+        let waiting = (trees.waiting().keys()).filter(|id| !moved_locally(trees, id));
         let mut skip: BTreeSet<NodeId> = self
             .problems
             .iter()
-            .chain(trees.waiting().keys())
+            .chain(waiting)
             .chain(parked.map(|(id, _)| id))
             .cloned()
             .collect();
@@ -779,7 +781,8 @@ impl Commits {
     /// Makes the waiting S updates that fit now, together with S := ⊥ for the `needed` nodes the
     /// keep rule could not clear yet and the `agreed` updates of the rebase, which may depend on
     /// each other. Returns the needed nodes still not cleared; agreed updates that do not fit are
-    /// dropped, since the next rebase finds them again. A needed node whose own update waited
+    /// dropped, since the next rebase finds them again, except that one for a node whose update
+    /// waited waits in its place, since the rebase took it from the waiting shape. A needed node whose own update waited
     /// keeps that update waiting, so it is made once it fits, also after the keep rule no longer
     /// needs the node.
     fn retry_waiting(
@@ -806,7 +809,7 @@ impl Commits {
                     trees.wait(id.clone(), waited.clone());
                 }
                 still.insert(id);
-            } else if !agreed.iter().any(|(other, _)| *other == id) {
+            } else if waited.contains_key(&id) || !agreed.iter().any(|(other, _)| *other == id) {
                 trees.wait(id, shape);
             }
         }
@@ -984,11 +987,11 @@ impl Synced {
         self.updates.push((id.to_owned(), shape));
     }
 
-    /// S for `id` with the updates so far.
+    /// S for `id` with the updates so far. A waiting update stands in for S.
     fn get(&self, trees: &Trees, id: &str) -> Option<Shape> {
         match self.updates.iter().rev().find(|(other, _)| other == id) {
             Some((_, shape)) => shape.clone(),
-            None => trees.synced().live(id).cloned(),
+            None => acknowledged(trees, id).cloned(),
         }
     }
 
@@ -1097,7 +1100,7 @@ fn rebase(
         }
     }
     for id in dirty.iter().filter(|id| !skip.contains(*id)) {
-        if trees.class(id) != Class::Concurrent
+        if acknowledged_class(trees, id) != Class::Concurrent
             || !edited_on_both_sides(trees, id)
             || trees.excluded(id)
         {
@@ -1116,7 +1119,7 @@ fn rebase(
         if skip.contains(id) {
             continue;
         }
-        match trees.class(id) {
+        match acknowledged_class(trees, id) {
             Class::Concurrent => {
                 agreed.extend(take_agreed(trees, id).map(|s| (id.clone(), Some(s))))
             }
@@ -1132,7 +1135,7 @@ fn rebase(
 fn take_agreed(trees: &Trees, id: &str) -> Option<Shape> {
     let (Some(local), Some(synced), Some(remote)) = (
         trees.local().get(id).map(|node| &node.shape),
-        trees.synced().live(id),
+        acknowledged(trees, id),
         trees.remote().live(id),
     ) else {
         return None;
@@ -1159,7 +1162,7 @@ fn edited_on_both_sides(trees: &Trees, id: &str) -> bool {
     ) else {
         return false;
     };
-    let s = content(trees.synced().live(id));
+    let s = content(acknowledged(trees, id));
     let changed = |c: &Content| s.as_ref().is_none_or(|s| !same_content(c, s));
     changed(&l) && changed(&r) && !same_content(&l, &r)
 }
@@ -1177,10 +1180,7 @@ fn keep(trees: &mut Trees, id: &str, needed: &mut BTreeSet<NodeId>) {
         .local()
         .get(id)
         .is_some_and(|node| node.parked || trees.reverted().contains(id));
-    let acknowledged = match trees.waiting().get(id) {
-        Some(waiting) => waiting.as_ref(),
-        None => trees.synced().live(id),
-    };
+    let acknowledged = acknowledged(trees, id);
     if trees.remote().live(id).is_none()
         || (!reverted && same(trees.remote().live(id), acknowledged))
     {
@@ -1217,6 +1217,33 @@ fn keep(trees: &mut Trees, id: &str, needed: &mut BTreeSet<NodeId>) {
         }
         current = parent;
     }
+}
+
+/// What S holds for `id`, or its waiting update while one waits.
+fn acknowledged<'a>(trees: &'a Trees, id: &str) -> Option<&'a Shape> {
+    match trees.waiting().get(id) {
+        Some(waiting) => waiting.as_ref(),
+        None => trees.synced().live(id),
+    }
+}
+
+/// The node's class with its waiting update, while one waits, standing in for S.
+fn acknowledged_class(trees: &Trees, id: &str) -> Class {
+    let (local, remote) = (trees.local().live(id), trees.remote().live(id));
+    classify(local, acknowledged(trees, id), remote)
+}
+
+/// Whether L moved a node whose S update waits away from the waiting position, where R still
+/// holds it. Such a node is planned and rebased against the waiting shape, since the update may
+/// never fit while L holds the node elsewhere, as when a folder R trashed takes its name key in S
+/// and L cannot remove that folder while the node is inside it.
+fn moved_locally(trees: &Trees, id: &str) -> bool {
+    let (Some(local), Some(Some(waiting))) = (trees.local().live(id), trees.waiting().get(id))
+    else {
+        return false;
+    };
+    let held = |shape: &Shape| shape.same_position(waiting);
+    !held(local) && trees.remote().live(id).is_some_and(held)
 }
 
 /// What is left of a waiting S update. Its position is stale once R no longer has the node there
@@ -1379,10 +1406,11 @@ fn plan(
     let mut deleted = BTreeSet::new();
     let mut reverts = Vec::new();
     for id in trees.dirty().iter().filter(|id| !problems.contains(*id)) {
-        if !matches!(trees.class(id), Class::Local | Class::Concurrent) {
+        let class = acknowledged_class(trees, id);
+        if !matches!(class, Class::Local | Class::Concurrent) {
             continue;
         }
-        let synced = trees.synced().live(id);
+        let synced = acknowledged(trees, id);
         let Some(local) = trees.local().get(id).map(|node| &node.shape) else {
             if deletes(trees, id, needed) {
                 deleted.insert(id.clone());
