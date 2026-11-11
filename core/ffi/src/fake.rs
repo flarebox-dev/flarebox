@@ -883,6 +883,11 @@ impl Core for FakeCore {
     fn set_telemetry(&self, enabled: bool) -> Result<(), SessionError> {
         let mut state = self.lock();
         state.take_failure()?;
+        if state.fail_saves {
+            return Err(SessionError::NotSaved {
+                reason: "saving is scripted to fail".to_owned(),
+            });
+        }
         let telemetry = &mut state.telemetry;
         telemetry.decided = true;
         if !telemetry.locked {
@@ -1025,6 +1030,14 @@ mod tests {
             decided: false,
             locked: true,
         };
+        h.core.fail_saves(true);
+        assert!(matches!(
+            h.core.set_telemetry(false),
+            Err(SessionError::NotSaved { .. })
+        ));
+        assert!(h.core.telemetry().enabled);
+        h.core.fail_saves(false);
+
         h.core.set_telemetry_setting(locked);
         h.core.set_telemetry(true).unwrap();
         assert_eq!(
