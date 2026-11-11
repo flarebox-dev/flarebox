@@ -11,6 +11,42 @@ use crate::types::{
     SessionState, Space, SpaceUsage,
 };
 
+/// The code part of a pairing code as typed or pasted. `koi device add` prints the code as
+/// `<code>@<host>`, with `:<port>` after the host when the server's port isn't the default, and
+/// in single quotes when the host is an IPv6 address, so the text is split on its last `@` as
+/// `koi join` does. That form names an https server, so a host and port other than those of
+/// `server_url`, the server this device connected to, are refused, and so is any host when that
+/// server isn't https; host names compare without case.
+pub(crate) fn pairing_code<'a>(text: &'a str, server_url: &str) -> Result<&'a str, SessionError> {
+    let text = text.trim();
+    let text = text
+        .strip_prefix('\'')
+        .and_then(|text| text.strip_suffix('\''))
+        .unwrap_or(text);
+    let Some((code, host)) = text.rsplit_once('@') else {
+        return Ok(text);
+    };
+    let server = url::Url::parse(server_url)
+        .ok()
+        .and_then(|url| {
+            let host = url.host_str()?;
+            Some(match (url.scheme(), url.port()) {
+                ("https", Some(port)) => format!("{host}:{port}"),
+                ("https", None) => host.to_owned(),
+                _ => url.origin().ascii_serialization(),
+            })
+        })
+        .unwrap_or_else(|| server_url.to_owned());
+    let host = host.trim();
+    if !host.eq_ignore_ascii_case(&server) {
+        return Err(SessionError::CodeForOtherServer {
+            host: host.to_owned(),
+            server,
+        });
+    }
+    Ok(code.trim())
+}
+
 /// Receives every [`SessionEvent`] of a session, in order.
 ///
 /// The core calls the listener on the thread that changed the state, while holding its lock,
@@ -123,4 +159,65 @@ pub trait Core: Send + Sync {
     /// device's sync state, so that the state can be opened again at once. The session calls it
     /// when it is dropped; no other call follows.
     fn close(&self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pasted_code_drops_the_host_of_its_server() {
+        let server = "https://koidrive.alice.workers.dev/";
+        assert_eq!(pairing_code(" K7QM-2XPD ", server), Ok("K7QM-2XPD"));
+        assert_eq!(
+            pairing_code("K7QM-2XPD@koidrive.alice.workers.dev", server),
+            Ok("K7QM-2XPD")
+        );
+        assert_eq!(
+            pairing_code("K7QM-2XPD@KoiDrive.Alice.Workers.Dev ", server),
+            Ok("K7QM-2XPD")
+        );
+        assert_eq!(
+            pairing_code(
+                "K7QM-2XPD@files.example.com:8443",
+                "https://files.example.com:8443"
+            ),
+            Ok("K7QM-2XPD")
+        );
+        assert_eq!(
+            pairing_code("'K7QM-2XPD@[2001:db8::1]'", "https://[2001:db8::1]/"),
+            Ok("K7QM-2XPD")
+        );
+    }
+
+    #[test]
+    fn a_code_for_another_server_is_refused() {
+        assert_eq!(
+            pairing_code(
+                "K7QM-2XPD@files.example.com",
+                "https://koidrive.alice.workers.dev"
+            ),
+            Err(SessionError::CodeForOtherServer {
+                host: "files.example.com".to_owned(),
+                server: "koidrive.alice.workers.dev".to_owned(),
+            })
+        );
+        assert_eq!(
+            pairing_code(
+                "K7QM-2XPD@files.example.com",
+                "https://files.example.com:8443"
+            ),
+            Err(SessionError::CodeForOtherServer {
+                host: "files.example.com".to_owned(),
+                server: "files.example.com:8443".to_owned(),
+            })
+        );
+        assert_eq!(
+            pairing_code("K7QM-2XPD@localhost:8787", "http://localhost:8787"),
+            Err(SessionError::CodeForOtherServer {
+                host: "localhost:8787".to_owned(),
+                server: "http://localhost:8787".to_owned(),
+            })
+        );
+    }
 }

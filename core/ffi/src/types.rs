@@ -526,6 +526,10 @@ pub enum SessionError {
     InvalidCode,
     #[error("too many wrong codes; try again in a few minutes")]
     TooManyAttempts,
+    /// The pairing code was pasted as `<code>@<host>`, as `koi device add` prints it, and the host
+    /// is not the server this device connected to.
+    #[error("the pairing code is for {host}, not {server}")]
+    CodeForOtherServer { host: String, server: String },
     #[error("a name is required")]
     EmptyName,
     #[error("this device is not signed in")]
