@@ -826,6 +826,7 @@ impl World {
             commits,
             ids,
             last_seq,
+            ..
         } = &mut device.engine;
         let reported = match applied {
             Some(Ok(identity)) => {
@@ -890,6 +891,7 @@ impl World {
                 commits,
                 ids,
                 last_seq,
+                ..
             } = &mut device.engine;
             let download = match &record.effect {
                 Effect::WriteFile { content, .. } => Some(content),
