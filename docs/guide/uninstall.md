@@ -12,10 +12,10 @@ Your files stay where they are.
 
 2. Stop the daemon. On Linux with the systemd unit, run `systemctl --user disable --now flarebox`.
 3. Revoke the device from another device with `flarebox device revoke <id>`.
-4. Delete Flarebox's files on this machine: `~/.local/state/flarebox` and `~/.config/flarebox`, or the `flarebox` folders under `$XDG_STATE_HOME` and `$XDG_CONFIG_HOME` when those are set, and the `.flarebox/` folder in each folder it linked. `.flarebox/trash/` holds files that sync replaced in the last 7 days, so look through it first.
+4. Delete Flarebox's files on this machine: `~/.local/state/flarebox` and `~/.config/flarebox`, or the `flarebox` folders under `$XDG_STATE_HOME` and `$XDG_CONFIG_HOME` when those are set to absolute paths, and the `.flarebox/` folder in each folder it linked. `.flarebox/trash/` holds files that sync replaced in the last 7 days, so look through it first.
 5. Remove the command with `cargo uninstall flarebox-cli`. If you copied it to `~/.local/bin` for the systemd unit, delete that copy and `~/.config/systemd/user/flarebox.service` too.
 
-The macOS app is a separate device with its own profile. To remove it, quit the app, revoke its device from another device, and delete the app, `~/Library/Application Support/Flarebox`, and the `.flarebox/` folder in each folder the app linked. Until that folder is gone, another device can't link the folder.
+The macOS app is a separate device with its own profile. To remove it, quit the app, revoke its device from another device, and delete the app, `~/Library/Application Support/Flarebox`, and the `.flarebox/` folder in each folder the app linked. Look through each folder's `.flarebox/trash/` before you delete it. Until that folder is gone, another device can't link the folder.
 
 ## Remove everything
 

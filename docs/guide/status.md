@@ -60,6 +60,24 @@ This stops the folder and syncs it again from the start. While the daemon isn't 
 
 Problems that end with "this build cannot recover the folder yet" mean the folder's sync state and the server disagree in a way that this version can't resolve, for example after the space was rewound on the server. A restart doesn't fix them. To sync the space again, unlink the folder and link a new, empty folder to the space. Then copy over any files you changed in the old folder.
 
+## Send refused changes again
+
+When the server refuses a folder's changes for a reason that retrying won't fix, such as a device without access to the space, the folder halts. The problem line names the cause and ends with what to run once it is fixed. After the daemon restarts, it gives only the server's numeric error code, for example `code 2` when the device lacks access to the space or `code 3` when the server found the changes invalid. Run one of these two commands, not both.
+
+For a cause you fixed on the server, such as access restored to this device, send the refused changes again as they were:
+
+```sh
+flarebox lift ~/Flarebox --resend
+```
+
+For a cause fixed on this device, plan the changes again into a new commit:
+
+```sh
+flarebox lift ~/Flarebox --replan
+```
+
+If the fix is a newer `flarebox`, install it and restart the daemon before you run `lift`, because `lift` runs in the daemon when one is running. A restart alone doesn't send the refused changes again. When the problem says the space's owner must confirm the changes, `lift` can't help, because Flarebox can't ask for that confirmation yet.
+
 ## Questions
 
 ```sh
