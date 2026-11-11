@@ -620,6 +620,108 @@ async fn usage_lists_what_each_space_stores() {
     );
 }
 
+/// A credential's two slots on a profile that the server already rotated: the old credential is still current and the new
+/// one is staged, as the process that holds the profile leaves them until it hears the answer (RFC 0011 section 2).
+async fn rotated_on_the_server(machine: &Machine) -> String {
+    let current =
+        flarebox_driver::Credential::load(&machine.path("state/flarebox/credential.json"))
+            .unwrap()
+            .unwrap();
+    let staged: String = std::iter::repeat_with(fastrand::alphanumeric)
+        .take(43)
+        .collect();
+    let mut request = TokenRequest {
+        device_id: current.device_id,
+        refresh_credential: current.refresh_credential,
+        rotation: true,
+        ..Default::default()
+    };
+    let deadline = api().token(&request).await.unwrap().server_time_ms + 60_000;
+    request.next_refresh_credential = staged.clone();
+    request.rotate_before_ms = deadline;
+    assert!(api().token(&request).await.unwrap().rotated);
+    let next = serde_json::json!({ "refresh_credential": staged, "rotate_before_ms": deadline });
+    let mut file = std::os::unix::fs::OpenOptionsExt::mode(
+        fs::OpenOptions::new().write(true).create_new(true),
+        0o600,
+    )
+    .open(machine.path("state/flarebox/credential.next"))
+    .unwrap();
+    std::io::Write::write_all(&mut file, next.to_string().as_bytes()).unwrap();
+    staged
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Worker; run cli/scripts/integration-test.sh"]
+async fn a_command_reads_the_credential_again_when_a_rotation_left_it_staged() {
+    let owner = Arc::new(Auth::new(api(), owner().await));
+    let pairing = owner.api().pair_start(&owner).await.unwrap();
+    let server = server_url().to_string();
+    let machine = Machine::new();
+    machine.run(&["join", &pairing.code, "--server", &server, "--name", "desk"]);
+    rotated_on_the_server(&machine).await;
+    let before = machine.profile();
+
+    let listed: Value = serde_json::from_str(&machine.run(&["usage", "--json"])).unwrap();
+    assert!(listed.is_array(), "{listed:#}");
+    assert!(machine.run(&["device", "list"]).contains("desk"));
+    assert_eq!(
+        machine.profile(),
+        before,
+        "a command that only reads the credential changes none of the profile's files"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Worker; run cli/scripts/integration-test.sh"]
+async fn of_two_copies_of_one_credential_only_the_one_that_rotates_it_keeps_working() {
+    let owner = Arc::new(Auth::new(api(), owner().await));
+    let pairing = owner.api().pair_start(&owner).await.unwrap();
+    let server = server_url().to_string();
+    let first = Machine::new();
+    first.run(&["join", &pairing.code, "--server", &server, "--name", "desk"]);
+    let credential = first.path("state/flarebox/credential.json");
+    let copy = Machine::new();
+    fs::create_dir_all(copy.path("state/flarebox")).unwrap();
+    fs::copy(&credential, copy.path("state/flarebox/credential.json")).unwrap();
+    copy.run(&["usage", "--json"]);
+    let original = flarebox_driver::Credential::load(&credential)
+        .unwrap()
+        .unwrap()
+        .refresh_credential;
+    File::options()
+        .write(true)
+        .open(&credential)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(2 * 24 * 3600))
+        .unwrap();
+    let name = format!("rotation {}", uuidv7());
+    owner
+        .api()
+        .create_space(&owner, &CreateSpaceRequest { name: name.clone() })
+        .await
+        .unwrap();
+    let folder = first.path("Rotation");
+    fs::create_dir_all(&folder).unwrap();
+
+    first.run(&["link", folder.to_str().unwrap(), "--space", &name]);
+    let rotated = flarebox_driver::Credential::load(&credential)
+        .unwrap()
+        .unwrap()
+        .refresh_credential;
+    assert_ne!(
+        rotated, original,
+        "linking the folder rotated the credential"
+    );
+    assert!(!first.path("state/flarebox/credential.next").exists());
+    first.run(&["usage", "--json"]);
+    let refused = copy.fails(&["usage"]);
+    assert!(
+        refused.contains("refused this device's credential"),
+        "{refused}"
+    );
+}
+
 /// A one-chunk file of these bytes.
 fn file_content(bytes: &[u8]) -> Content {
     let chunk = ChunkRef {

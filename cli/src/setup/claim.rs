@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use flarebox_cloudflare::Secret;
 use flarebox_driver::{Credential, Paths};
-use flarebox_net::{ApiError, Auth};
+use flarebox_net::ApiError;
 use flarebox_proto::v1::ClaimRequest;
 use flarebox_proto::v1::error::Code;
 
@@ -234,7 +234,7 @@ pub async fn saved_device(paths: &Paths, server: &Url) -> Result<bool, String> {
             paths.credential().display()
         ));
     }
-    match Auth::new(api, credential.net()).access_token().await {
+    match crate::reading(paths, &credential)?.access_token().await {
         Ok(_) => Ok(true),
         Err(error) if error.is_unauthenticated() => {
             let request = Request::SignOut {

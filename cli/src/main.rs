@@ -10,15 +10,16 @@ mod ipc;
 mod pairing;
 mod setup;
 
-use std::io::IsTerminal;
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use flarebox_driver::{
     Answer, Credential, Driver, DriverError, FolderStatus, Paths, Question, QuestionKind, Status,
 };
-use flarebox_net::{ApiError, Auth};
+use flarebox_net::{ApiError, Auth, Reload};
 use flarebox_proto::v1::{
     CreateSpaceRequest, DeviceInfo, SpaceInfo, SpaceUsage, device_info::Kind,
 };
@@ -491,9 +492,26 @@ fn signed_in(paths: &Paths) -> Result<Auth, String> {
     let credential = Credential::load(&paths.credential())
         .map_err(|error| error.to_string())?
         .ok_or_else(|| DriverError::NotPaired.to_string())?;
-    Ok(Auth::new(
+    reading(paths, &credential)
+}
+
+/// An [`Auth`] for a command that only reads the profile's credential. The process that holds the profile may rotate
+/// the credential meanwhile, so when the server refuses it, it reads both credential files again, once, and presents
+/// what they hold (RFC 0011 section 2).
+fn reading(paths: &Paths, credential: &Credential) -> Result<Auth, String> {
+    let path = paths.credential();
+    let reload: Reload = Arc::new(move || {
+        Credential::load_stored(&path)
+            .map_err(io::Error::other)?
+            .map(|stored| stored.net())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, DriverError::NotPaired.to_string())
+            })
+    });
+    Ok(Auth::reloading(
         credential.api().map_err(|error| error.to_string())?,
         credential.net(),
+        reload,
     ))
 }
 

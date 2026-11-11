@@ -1067,6 +1067,13 @@ impl Driver {
         Ok(auth)
     }
 
+    /// The profile's one [`Auth`], for calls to the server that the driver does not make itself. They present the
+    /// credential that the last rotation left current, like every caller in this process.
+    pub fn signed_in(&self) -> Result<Arc<Auth>, DriverError> {
+        let credential = self.credential()?;
+        Ok(self.auth(&credential)?)
+    }
+
     fn credential(&self) -> Result<Credential, DriverError> {
         self.inner
             .credential
