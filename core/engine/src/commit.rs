@@ -690,8 +690,8 @@ impl Commits {
     /// and R agreed on it, after the commit was built, at a revision of R after the result's seq,
     /// whether or not S took it: the server applies a move whatever another device did after
     /// `base_seq`, so the move replaced a position from an earlier record, and a position only R
-    /// came back to is a remote change. When L and R agreed on a newer position
-    /// ([`Trees::position_after`]), S takes that position, and a rename by the server does not
+    /// came back to is a remote change. When L and R agreed on a newer position that S can still
+    /// hold ([`Trees::position_after`]), S takes that position, and a rename by the server does not
     /// revert the node. A conflict copy is re-keyed in L, and so is
     /// a directory merged into one L does not hold yet. When L already holds the conflict copy,
     /// because a log replay brought it before the result and the effects downloaded it, the local

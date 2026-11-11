@@ -787,9 +787,18 @@ impl Trees {
     }
 
     /// The latest position of `id` that L and R agreed on since [`Trees::watch_positions`] started
-    /// watching it, when R's record that held it came after `seq`.
+    /// watching it, when R's record that held it came after `seq` and S can take it: no other node
+    /// of S holds its name, and its parent is a folder of S.
     pub fn position_after(&self, id: &str, seq: u64) -> Option<&Agreed> {
-        (self.watched_positions.get(id)?.as_ref()).filter(|agreed| agreed.rev > seq)
+        let agreed =
+            (self.watched_positions.get(id)?.as_ref()).filter(|agreed| agreed.rev > seq)?;
+        let held = (self.s.get(id)).or(self.r.get(id).map(|remote| &remote.shape))?;
+        let shape = Shape {
+            parent: agreed.parent.clone(),
+            name: agreed.name.clone(),
+            ..held.clone()
+        };
+        self.fits_synced(id, Some(&shape)).then_some(agreed)
     }
 
     pub(crate) fn take_waiting(&mut self) -> BTreeMap<NodeId, Option<Shape>> {
