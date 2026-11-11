@@ -1,0 +1,244 @@
+# SPDX-License-Identifier: Apache-2.0
+name: CLI distribution
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  pull_request:
+    paths: ['install.sh', 'scripts/test-install.sh', '.github/workflows/release-cli.yml', 'cli/**', 'core/**', 'Cargo.*', 'rust-toolchain.toml', 'server/**']
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-cli-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-ref:
+    name: CLI release tag on main
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Refuse a release tag outside main
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo '::error::Expected a vMAJOR.MINOR.PATCH tag'; exit 1; }
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor HEAD origin/main || { echo '::error::Release tags must point to a commit on main'; exit 1; }
+
+  build:
+    name: CLI (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          package_json_file: server/package.json
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: server/pnpm-lock.yaml
+      - name: Pack the server bundle
+        run: |
+          pnpm --dir server install --frozen-lockfile
+          node server/scripts/pack-bundle.mjs "$RUNNER_TEMP/server-bundle"
+          echo "FLAREBOX_SERVER_BUNDLE=$RUNNER_TEMP/server-bundle" >> "$GITHUB_ENV"
+      - name: Install the pinned Rust toolchain and target
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add "$TARGET"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: cli-${{ matrix.target }}
+      - name: Install Linux cross-build tools and ShellCheck
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          python3 -m venv "$RUNNER_TEMP/zigbuild"
+          "$RUNNER_TEMP/zigbuild/bin/pip" install cargo-zigbuild==0.24.1 ziglang==0.15.2
+          echo "$RUNNER_TEMP/zigbuild/bin" >> "$GITHUB_PATH"
+      - name: Install ShellCheck on macOS
+        if: runner.os == 'macOS'
+        run: brew install shellcheck
+      - name: Lint the installer
+        run: shellcheck -s sh install.sh scripts/test-install.sh
+      - name: Build the CLI with its server bundle
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          if [[ "$TARGET" == *linux-musl ]]; then
+            nice -n 10 cargo zigbuild --release --locked -p flarebox-cli --target "$TARGET"
+            file "target/$TARGET/release/flarebox"
+            if readelf -l "target/$TARGET/release/flarebox" | grep -q INTERP || readelf -d "target/$TARGET/release/flarebox" | grep -q NEEDED; then
+              echo '::error::The Linux release binary needs a dynamic interpreter or library; expected a static musl binary.'
+              exit 1
+            fi
+          else
+            nice -n 10 cargo build --release --locked -p flarebox-cli --target "$TARGET"
+          fi
+          embedded=$(find "target/$TARGET/release/build" -path '*/out/server_bundle.rs' -exec grep -l include_bytes {} +)
+          test -n "$embedded" || { echo '::error::The CLI has no embedded server bundle'; exit 1; }
+      - name: Test the installer against a local tarball
+        if: matrix.target != 'aarch64-unknown-linux-musl'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: sh scripts/test-install.sh "target/$TARGET/release/flarebox" "$TARGET"
+      - name: Package the CLI and user unit
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p dist package
+          cp "target/$TARGET/release/flarebox" package/flarebox
+          cp cli/systemd/flarebox.service package/flarebox.service
+          tar -czf "dist/flarebox-$TARGET.tar.gz" -C package flarebox flarebox.service
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cli-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  sign-macos:
+    name: Sign the macOS CLI
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [build, release-ref]
+    runs-on: macos-15
+    timeout-minutes: 15
+    environment: macos-release
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: cli-*-apple-darwin
+          merge-multiple: true
+          path: dist
+      - name: Sign with the existing Developer ID identity
+        env:
+          P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          if [ -z "$P12_BASE64" ] && [ -z "$P12_PASSWORD" ]; then
+            echo '::warning::No Developer ID secrets configured. macOS CLI tarballs are unsigned and not notarized.'
+            exit 0
+          fi
+          if [ -z "$P12_BASE64" ] || [ -z "$P12_PASSWORD" ]; then
+            echo '::error::Set both MACOS_DEVELOPER_ID_P12_BASE64 and MACOS_DEVELOPER_ID_P12_PASSWORD, or neither.'
+            exit 1
+          fi
+          umask 077
+          keychain="$RUNNER_TEMP/cli-signing.keychain-db"
+          password=$(openssl rand -hex 32)
+          echo "::add-mask::$password"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 1800 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          printf '%s' "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cli-signing.p12"
+          security import "$RUNNER_TEMP/cli-signing.p12" -k "$keychain" -f pkcs12 -P "$P12_PASSWORD" -T /usr/bin/codesign >/dev/null
+          rm -f "$RUNNER_TEMP/cli-signing.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" >/dev/null
+          identities=$(security find-identity -v -p codesigning "$keychain" | grep '"Developer ID Application: ')
+          test "$(printf '%s\n' "$identities" | wc -l | tr -d ' ')" = 1 || { echo '::error::Expected exactly one Developer ID Application identity'; exit 1; }
+          identity=$(awk '{print $2}' <<< "$identities")
+          for archive in dist/*.tar.gz; do
+            mkdir package
+            tar -xzf "$archive" -C package
+            codesign --force --keychain "$keychain" --sign "$identity" --options runtime --timestamp package/flarebox
+            codesign --verify --strict --verbose=2 package/flarebox
+            tar -czf "$archive" -C package flarebox flarebox.service
+            rm -rf package
+          done
+      - name: Remove signing material
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/cli-signing.keychain-db" || true
+          rm -f "$RUNNER_TEMP/cli-signing.p12"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cli-macos-release
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  checksums:
+    name: CLI checksums
+    needs: [build, sign-macos]
+    if: always() && needs.build.result == 'success' && (needs.sign-macos.result == 'success' || (github.event_name != 'push' && needs.sign-macos.result == 'skipped'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: cli-*-linux-musl
+          merge-multiple: true
+          path: dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.sign-macos.result == 'success'
+        with:
+          name: cli-macos-release
+          path: dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.sign-macos.result == 'skipped'
+        with:
+          pattern: cli-*-apple-darwin
+          merge-multiple: true
+          path: dist
+      - name: Write and verify SHA256SUMS
+        run: |
+          cd dist
+          test "$(find . -name '*.tar.gz' | wc -l)" -eq 4
+          sha256sum flarebox-*.tar.gz > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cli-distribution
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish CLI tarballs
+    needs: checksums
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cli-distribution
+          path: dist
+      - name: Attach tarballs and checksums to the tagged release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --title "$TAG" --notes 'Flarebox CLI for Linux and macOS. See docs/guide/install.md for installation.'
+          fi
+          gh release upload "$TAG" dist/* --clobber
