@@ -120,6 +120,7 @@ impl Transfer {
             let mut wait = Duration::ZERO;
             for batch in todo.chunks(MAX_CHUNKS_PER_CALL) {
                 let result = session.prepare_upload(batch.to_vec()).await?;
+                let prepared = SystemTime::now();
                 let plans: HashMap<_, _> = result
                     .chunks
                     .iter()
@@ -138,6 +139,12 @@ impl Transfer {
                         }
                         Action::Upload => {
                             let target = plan.target.as_ref().ok_or_else(no_target)?;
+                            // A target that looks expiring on arrival means this clock runs ahead of the server's, so it
+                            // is sent as given and the relay judges the ticket.
+                            if expiring(target) && !expiring_at(target, prepared) {
+                                deferred.push(chunk.clone());
+                                continue;
+                            }
                             let bytes = read(chunk).await.map_err(|source| ChunkError::Io {
                                 hash: chunk.hash.clone(),
                                 source,
@@ -438,12 +445,14 @@ fn distinct(chunks: &[ChunkRef]) -> Vec<ChunkRef> {
 }
 
 fn expiring(target: &Target) -> bool {
+    expiring_at(target, SystemTime::now())
+}
+
+fn expiring_at(target: &Target, now: SystemTime) -> bool {
     if target.expires_at_ms <= 0 {
         return false;
     }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+    let now = now.duration_since(UNIX_EPOCH).unwrap_or_default();
     (now + TARGET_MARGIN).as_millis() >= target.expires_at_ms as u128
 }
 

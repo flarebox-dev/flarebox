@@ -2,13 +2,19 @@
 
 //! One-request HTTP servers that answer chunk transfers in scripted ways.
 
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+
 use koidrive_proto::v1::Error as ProtoError;
 use koidrive_proto::v1::error::Code;
+use koidrive_proto::v1::{ChunkPlan, PrepareUploadResult, rpc_request, rpc_response};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Instant;
 
 use super::*;
+use crate::session::Events;
+use crate::session::tests::{accept, config, listen, recv_rpc, reply, welcome};
 
 fn chunk(bytes: &[u8]) -> ChunkRef {
     ChunkRef {
@@ -42,7 +48,7 @@ async fn serve(
         let mut bodies = Vec::new();
         for (status, content_type, body) in responses {
             let (mut socket, _) = listener.accept().await.unwrap();
-            bodies.push(read_request(&mut socket).await);
+            bodies.push(read_request(&mut socket).await.1);
             let head = format!(
                 "HTTP/1.1 {status} X\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                 body.len()
@@ -63,8 +69,8 @@ async fn serve(
     )
 }
 
-/// Reads one request and returns its body.
-async fn read_request(socket: &mut TcpStream) -> Vec<u8> {
+/// Reads one request and returns its head and body.
+async fn read_request(socket: &mut TcpStream) -> (String, Vec<u8>) {
     let mut request = Vec::new();
     let mut buffer = [0u8; 4096];
     let (head_end, length) = loop {
@@ -83,7 +89,10 @@ async fn read_request(socket: &mut TcpStream) -> Vec<u8> {
         let n = socket.read(&mut buffer).await.unwrap();
         request.extend_from_slice(&buffer[..n]);
     }
-    request[head_end..].to_vec()
+    (
+        String::from_utf8_lossy(&request[..head_end]).into_owned(),
+        request[head_end..].to_vec(),
+    )
 }
 
 /// Answers one request with a body that never ends: `part` again and again, `every` apart, until the client leaves.
@@ -459,6 +468,165 @@ async fn a_target_inside_the_expiry_margin_is_still_tried() {
         Attempt::Done(None)
     ));
     server.await.unwrap();
+}
+
+/// An `UPLOAD` plan for `chunk` through the relay at `relay`, with a ticket that expires `lifetime` from now.
+fn upload_plan(relay: SocketAddr, chunk: &ChunkRef, ticket: &str, lifetime: Duration) -> ChunkPlan {
+    let expires = SystemTime::now() + lifetime;
+    ChunkPlan {
+        hash: chunk.hash.clone(),
+        action: Action::Upload as i32,
+        target: Some(Target {
+            url: format!("http://{relay}/v1/spaces/s/chunks/x?ticket={ticket}"),
+            expires_at_ms: expires.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64,
+            ..Default::default()
+        }),
+        retry_after_ms: 0,
+    }
+}
+
+/// A relay that refuses the ticket `stale` with 403, as the Worker refuses an expired ticket, and answers any other
+/// ticket with a receipt. Returns its address and the tickets it saw, in order.
+async fn relay() -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let tickets = Arc::new(Mutex::new(Vec::new()));
+    let seen = tickets.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let (head, body) = read_request(&mut socket).await;
+            let (_, query) = head.split_once("ticket=").unwrap();
+            let ticket = query.split(' ').next().unwrap().to_owned();
+            let (status, answer) = if ticket == "stale" {
+                (403, Vec::new())
+            } else {
+                let receipt = UploadReceipt {
+                    hash: Sha256::digest(&body).to_vec(),
+                    size: body.len() as u32,
+                    token: ticket.clone(),
+                };
+                (200, receipt.encode_to_vec())
+            };
+            seen.lock().unwrap().push(ticket);
+            let head = format!(
+                "HTTP/1.1 {status} X\r\ncontent-type: application/x-protobuf\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                answer.len()
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(&answer).await.unwrap();
+        }
+    });
+    (address, tickets)
+}
+
+/// A session whose server answers its n-th `PrepareUpload` with `plans(n)`, and the chunks each call asked for.
+async fn scripted_session(
+    mut plans: impl FnMut(usize) -> Vec<ChunkPlan> + Send + 'static,
+) -> (Session, Events, Arc<Mutex<Vec<Vec<ChunkRef>>>>) {
+    let (listener, auth) = listen().await;
+    let (session, events) = Session::start(auth, config()).unwrap();
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let calls = asked.clone();
+    tokio::spawn(async move {
+        let mut ws = accept(&listener, welcome("h", 0)).await;
+        loop {
+            let request = recv_rpc(&mut ws).await;
+            let Some(rpc_request::Call::PrepareUpload(prepare)) = request.call else {
+                panic!("expected PrepareUpload, got {:?}", request.call);
+            };
+            let round = {
+                let mut calls = calls.lock().unwrap();
+                calls.push(prepare.chunks);
+                calls.len() - 1
+            };
+            let result = rpc_response::Result::PrepareUpload(PrepareUploadResult {
+                chunks: plans(round),
+            });
+            reply(&mut ws, request.req_id, result).await;
+        }
+    });
+    (session, events, asked)
+}
+
+#[tokio::test]
+async fn an_upload_target_that_expires_during_its_batch_is_prepared_again_before_the_chunk_is_read()
+{
+    let a = chunk(b"chunk a");
+    let b = chunk(b"chunk b");
+    let (relay, tickets) = relay().await;
+    let (session, _events, asked) = scripted_session({
+        let (a, b) = (a.clone(), b.clone());
+        move |round| match round {
+            0 => vec![
+                upload_plan(relay, &b, "b", Duration::from_secs(3600)),
+                upload_plan(relay, &a, "stale", Duration::from_millis(61_000)),
+            ],
+            _ => vec![upload_plan(relay, &a, "fresh", Duration::from_secs(3600))],
+        }
+    })
+    .await;
+
+    let mut reads = Vec::new();
+    let receipts = transfer()
+        .upload(&session, &[b.clone(), a.clone()], |chunk| {
+            reads.push(chunk.hash.clone());
+            let (bytes, delay): (&'static [u8], _) = if chunk.hash == b.hash {
+                (b"chunk b", Duration::from_millis(1500))
+            } else {
+                (b"chunk a", Duration::ZERO)
+            };
+            async move {
+                tokio::time::sleep(delay).await;
+                Ok(Bytes::from_static(bytes))
+            }
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(*tickets.lock().unwrap(), ["b", "fresh"]);
+    assert_eq!(reads, [b.hash.clone(), a.hash.clone()]);
+    assert_eq!(
+        *asked.lock().unwrap(),
+        [vec![b.clone(), a.clone()], vec![a.clone()]]
+    );
+    let receipts: Vec<_> = receipts
+        .into_iter()
+        .map(|receipt| (receipt.hash, receipt.token))
+        .collect();
+    assert_eq!(
+        receipts,
+        [(b.hash, "b".to_owned()), (a.hash, "fresh".to_owned())]
+    );
+}
+
+#[tokio::test]
+async fn an_upload_target_already_inside_the_expiry_margin_when_prepared_is_sent_as_given() {
+    let a = chunk(b"chunk a");
+    let (relay, tickets) = relay().await;
+    let (session, _events, asked) = scripted_session({
+        let a = a.clone();
+        move |_| vec![upload_plan(relay, &a, "skewed", Duration::from_secs(30))]
+    })
+    .await;
+
+    let mut reads = 0;
+    let receipts = transfer()
+        .upload(&session, std::slice::from_ref(&a), |_| {
+            reads += 1;
+            async { Ok(Bytes::from_static(b"chunk a")) }
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(*asked.lock().unwrap(), [vec![a.clone()]]);
+    assert_eq!(*tickets.lock().unwrap(), ["skewed"]);
+    assert_eq!(reads, 1);
+    let receipts: Vec<_> = receipts
+        .into_iter()
+        .map(|receipt| (receipt.hash, receipt.token))
+        .collect();
+    assert_eq!(receipts, [(a.hash, "skewed".to_owned())]);
 }
 
 #[tokio::test]
