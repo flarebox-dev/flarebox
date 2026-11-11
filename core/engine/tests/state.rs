@@ -11,7 +11,7 @@ use koidrive_engine::guard::{Counted, GuardState, RemoteDeletion, Trash};
 use koidrive_engine::ids::uuid_v7;
 use koidrive_engine::question::{Answer, Held, Limit, Question, QuestionKind, Revisions};
 use koidrive_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
-use koidrive_engine::state::{CommitsState, EffectsState, StateError, TreesState};
+use koidrive_engine::state::{Agreed, CommitsState, EffectsState, StateError, TreesState};
 use koidrive_engine::tree::{FileIdentity, Kind, LocalNode, RemoteNode, Shape, TreeError};
 use koidrive_proto::v1::{Commit, CommitResult, Delete, Move, Op, OpResult, op};
 
@@ -75,7 +75,18 @@ fn trees_state() -> TreesState {
         parked_as: [("b".into(), "c".into())].into(),
         waiting: [("a".into(), Some(dir(ROOT, "x")))].into(),
         watched: [("u".into(), true), ("v".into(), false)].into(),
-        watched_positions: [("m".into(), Some(3)), ("p".into(), None)].into(),
+        watched_positions: [
+            (
+                "m".into(),
+                Some(Agreed {
+                    rev: 3,
+                    parent: ROOT.into(),
+                    name: "m".into(),
+                }),
+            ),
+            ("p".into(), None),
+        ]
+        .into(),
         trashed_here: [("t".into(), 5)].into(),
         discarded: ["a".into()].into(),
         outside: ["a".into()].into(),

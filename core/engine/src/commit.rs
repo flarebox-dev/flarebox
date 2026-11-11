@@ -686,12 +686,13 @@ impl Commits {
     /// built is newer than what was sent: the server applies a content update only when no other
     /// device changed the content after the commit's `base_seq`, and a created file has no content
     /// before its create, so that change came after the commit. When S's content changed since then ([`Trees::took_content`]), even back to what it
-    /// was, S keeps what it holds. A position S holds is newer than the one a create or move sent only when L and R
-    /// agreed on it, after the commit was built, at a revision of R after the result's seq: the
-    /// server applies a move whatever another device did after `base_seq`, so the move replaced a
-    /// position from an earlier record, and a position only R came back to is a remote change. When S holds a
-    /// newer position ([`Trees::took_position_after`]), S keeps that position, and a rename by the server
-    /// does not revert the node. A conflict copy is re-keyed in L, and so is
+    /// was, S keeps what it holds. A position is newer than the one a create or move sent only when L
+    /// and R agreed on it, after the commit was built, at a revision of R after the result's seq,
+    /// whether or not S took it: the server applies a move whatever another device did after
+    /// `base_seq`, so the move replaced a position from an earlier record, and a position only R
+    /// came back to is a remote change. When L and R agreed on a newer position
+    /// ([`Trees::position_after`]), S takes that position, and a rename by the server does not
+    /// revert the node. A conflict copy is re-keyed in L, and so is
     /// a directory merged into one L does not hold yet. When L already holds the conflict copy,
     /// because a log replay brought it before the result and the effects downloaded it, the local
     /// file keeps its ID and takes what was sent as its S, so the server's content replaces it. When L already holds the directory it was
@@ -815,11 +816,14 @@ impl Commits {
                     if let Some(shape) = synced.get(trees, id)
                         && applied
                         && target != *id
-                        && !trees.took_position_after(id, result.seq)
                     {
+                        let (parent, name) = match trees.position_after(id, result.seq) {
+                            Some(agreed) => (agreed.parent.clone(), agreed.name.clone()),
+                            None => (target, name(&moved.new_name)),
+                        };
                         let shape = Shape {
-                            parent: target,
-                            name: name(&moved.new_name),
+                            parent,
+                            name,
                             ..shape
                         };
                         synced.set(id, Some(shape));
@@ -850,7 +854,7 @@ impl Commits {
                     local.shape.parent != *parent || nfc(&local.shape.name) != nfc(name)
                 })
             });
-            let kept = sent.is_some() && trees.took_position_after(node, result.seq);
+            let kept = sent.is_some() && trees.position_after(node, result.seq).is_some();
             if (renamed && !left && !kept) || (done && follows) {
                 trees.revert(node.clone());
             }
@@ -1325,20 +1329,17 @@ fn keep(trees: &mut Trees, id: &str, needed: &mut BTreeSet<NodeId>) {
     }
 }
 
-/// The shape a create sent, with the position S holds when S took it after the create's result
-/// ([`Trees::took_position_after`]) and the content S holds when it changed since the create was
+/// The shape a create sent, with the position L and R agreed on after the create's result
+/// ([`Trees::position_after`]) and the content S holds when it changed since the create was
 /// built ([`Trees::took_content`]).
 fn created(trees: &Trees, synced: &Synced, id: &str, seq: u64, sent: Shape) -> Shape {
-    let Some(held) = synced.get(trees, id) else {
-        return sent;
+    let (parent, name) = match trees.position_after(id, seq) {
+        Some(agreed) => (agreed.parent.clone(), agreed.name.clone()),
+        None => (sent.parent, sent.name),
     };
-    let (parent, name) = match trees.took_position_after(id, seq) {
-        true => (held.parent, held.name),
-        false => (sent.parent, sent.name),
-    };
-    let content = match trees.took_content(id) {
-        true => held.content,
-        false => sent.content,
+    let content = match synced.get(trees, id) {
+        Some(held) if trees.took_content(id) => held.content,
+        _ => sent.content,
     };
     Shape {
         parent,
