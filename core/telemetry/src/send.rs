@@ -101,11 +101,12 @@ pub async fn send(
     if mode == Mode::Off {
         return Ok(Sent::Nothing);
     }
-    let batch = store.take(today)?;
+    let Some((id, batch)) = store.take(today)? else {
+        return Ok(Sent::Nothing);
+    };
     if batch.is_empty() {
         return Ok(Sent::Nothing);
     }
-    let id = store.install_id()?;
     let token = uploader.map_or("", Uploader::token);
     let body = self::batch(token, &id, environment, &batch);
     if mode == Mode::Debug {
@@ -116,7 +117,7 @@ pub async fn send(
         return Ok(Sent::Printed);
     }
     let Some(uploader) = uploader else {
-        store.give_back(batch, today)?;
+        store.give_back(&id, batch, today)?;
         return Ok(Sent::Later);
     };
     let sent = match uploader
@@ -139,7 +140,7 @@ pub async fn send(
         }
     };
     if sent == Sent::Later {
-        store.give_back(batch, today)?;
+        store.give_back(&id, batch, today)?;
     }
     Ok(sent)
 }

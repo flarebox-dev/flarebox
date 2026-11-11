@@ -134,11 +134,28 @@ impl Store {
     }
 
     pub(crate) fn absorb_at(&self, pending: Pending, today: u32, wait: bool) -> io::Result<()> {
+        self.absorb_for(pending, today, wait, None)
+    }
+
+    /// Adds `pending` while the profile has an install id, and only when it is `expected` if that is given. Without an
+    /// id telemetry was turned off, and what was recorded before must not be kept.
+    fn absorb_for(
+        &self,
+        pending: Pending,
+        today: u32,
+        wait: bool,
+        expected: Option<&InstallId>,
+    ) -> io::Result<()> {
         if pending.days.values().all(DailyReport::is_empty) && pending.events.is_empty() {
             return Ok(());
         }
         let _lock = self.lock(wait)?;
-        let mut queue: Queue = read(&self.dir.join("queue.json"))?;
+        match (self.settings()?.install_id, expected) {
+            (None, _) => return Ok(()),
+            (Some(id), Some(expected)) if &id != expected => return Ok(()),
+            _ => {}
+        }
+        let mut queue = self.queue();
         for (day, report) in pending.days {
             queue
                 .days
@@ -167,11 +184,14 @@ impl Store {
         write(&self.dir.join("queue.json"), &queue)
     }
 
-    /// Takes the reports of days before `today` and every event out of the queue. The caller gives them back with
-    /// [`Store::give_back`] if sending fails.
-    pub fn take(&self, today: u32) -> io::Result<Batch> {
+    /// Takes the reports of days before `today` and every event out of the queue, with the install id they belong
+    /// to. None while the profile has no id. The caller gives them back with [`Store::give_back`] if sending fails.
+    pub fn take(&self, today: u32) -> io::Result<Option<(InstallId, Batch)>> {
         let _lock = self.lock(true)?;
-        let mut queue: Queue = read(&self.dir.join("queue.json"))?;
+        let Some(id) = self.settings()?.install_id else {
+            return Ok(None);
+        };
+        let mut queue = self.queue();
         let later = queue.days.split_off(&today);
         let batch = Batch {
             days: std::mem::replace(&mut queue.days, later)
@@ -182,11 +202,13 @@ impl Store {
         if !batch.is_empty() {
             write(&self.dir.join("queue.json"), &queue)?;
         }
-        Ok(batch)
+        Ok(Some((id, batch)))
     }
 
-    /// Puts a batch that was not sent back into the queue, as of `today`.
-    pub fn give_back(&self, batch: Batch, today: u32) -> io::Result<()> {
+    /// Puts a batch that was not sent back into the queue, as of `today`. It is dropped when the profile's install
+    /// id is no longer `id`: telemetry was turned off or reset while the batch was out, so it must not be sent
+    /// again, under the old id or a new one.
+    pub fn give_back(&self, id: &InstallId, batch: Batch, today: u32) -> io::Result<()> {
         let pending = Pending {
             days: batch
                 .days
@@ -195,15 +217,24 @@ impl Store {
                 .collect(),
             events: batch.events,
         };
-        self.absorb_at(pending, today, true)
+        self.absorb_for(pending, today, true, Some(id))
     }
 
     /// Everything in the queue, today included, without taking it.
     pub fn peek(&self) -> io::Result<Batch> {
-        let queue: Queue = read(&self.dir.join("queue.json"))?;
+        let queue = self.queue();
         Ok(Batch {
             days: queue.days.into_values().collect(),
             events: queue.events,
+        })
+    }
+
+    /// The queue. One that cannot be read, such as one a newer build wrote or one a crash left empty, is dropped, so
+    /// it cannot stop every later write.
+    fn queue(&self) -> Queue {
+        read(&self.dir.join("queue.json")).unwrap_or_else(|error| {
+            tracing::debug!(%error, "dropping a telemetry queue that cannot be read");
+            Queue::default()
         })
     }
 
@@ -316,6 +347,7 @@ mod tests {
     #[test]
     fn sums_from_several_processes_add_up() {
         let (_dir, store) = store();
+        store.set(true).unwrap();
         store.absorb_at(pending(100, 1), 100, true).unwrap();
         store.absorb_at(pending(100, 2), 100, true).unwrap();
         let queued = store.peek().unwrap();
@@ -327,9 +359,10 @@ mod tests {
     #[test]
     fn take_leaves_today_and_give_back_restores_the_rest() {
         let (_dir, store) = store();
+        store.set(true).unwrap();
         store.absorb_at(pending(99, 1), 100, true).unwrap();
         store.absorb_at(pending(100, 5), 100, true).unwrap();
-        let batch = store.take(100).unwrap();
+        let (id, batch) = store.take(100).unwrap().unwrap();
         assert_eq!(
             batch
                 .days
@@ -349,13 +382,51 @@ mod tests {
         );
         assert!(left.events.is_empty());
 
-        store.give_back(batch, 100).unwrap();
+        store.give_back(&id, batch, 100).unwrap();
         assert_eq!(store.peek().unwrap().days.len(), 2);
+    }
+
+    #[test]
+    fn a_batch_out_while_telemetry_is_reset_or_turned_off_is_not_given_back() {
+        let (_dir, store) = store();
+        store.set(true).unwrap();
+        store.absorb_at(pending(99, 1), 100, true).unwrap();
+        let (id, batch) = store.take(100).unwrap().unwrap();
+        store.reset().unwrap();
+        store.give_back(&id, batch.clone(), 100).unwrap();
+        assert!(store.peek().unwrap().is_empty());
+
+        store.set(false).unwrap();
+        store.give_back(&id, batch, 100).unwrap();
+        assert!(store.peek().unwrap().is_empty());
+        assert_eq!(store.take(100).unwrap(), None);
+        assert_eq!(store.settings().unwrap().install_id, None);
+    }
+
+    #[test]
+    fn nothing_is_kept_without_an_install_id() {
+        let (_dir, store) = store();
+        store.absorb_at(pending(100, 1), 100, true).unwrap();
+        assert!(store.peek().unwrap().is_empty());
+        store.set(true).unwrap();
+        store.set(false).unwrap();
+        store.absorb_at(pending(100, 1), 100, true).unwrap();
+        assert!(store.peek().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_queue_is_dropped_instead_of_stopping_later_writes() {
+        let (_dir, store) = store();
+        store.set(true).unwrap();
+        fs::write(store.dir.join("queue.json"), b"").unwrap();
+        store.absorb_at(pending(100, 1), 100, true).unwrap();
+        assert_eq!(store.peek().unwrap().days.len(), 1);
     }
 
     #[test]
     fn old_days_and_events_are_dropped() {
         let (_dir, store) = store();
+        store.set(true).unwrap();
         store.absorb_at(pending(80, 1), 80, true).unwrap();
         store.absorb_at(pending(100, 1), 100, true).unwrap();
         let queued = store.peek().unwrap();
@@ -373,6 +444,7 @@ mod tests {
     #[test]
     fn the_queue_holds_at_most_20_events_of_a_kind_a_day() {
         let (_dir, store) = store();
+        store.set(true).unwrap();
         for _ in 0..30 {
             store
                 .absorb_at(
