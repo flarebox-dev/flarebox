@@ -181,10 +181,14 @@ impl Store {
     }
 
     /// Stores the person's choice. Turning it on keeps the install id or draws one. Turning it off deletes the id and
-    /// everything waiting to be sent.
+    /// everything waiting to be sent. A `settings.json` that cannot be parsed is replaced, so a broken file never
+    /// stops someone from choosing, least of all from turning reports off.
     pub fn set(&self, on: bool) -> io::Result<Settings> {
         let _lock = self.lock(true)?;
-        let mut settings = self.settings()?;
+        let mut settings = match self.settings() {
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => Settings::default(),
+            settings => settings?,
+        };
         settings.enabled = Some(on);
         if on {
             settings.install_id.get_or_insert_with(InstallId::generate);
@@ -472,6 +476,18 @@ mod tests {
         );
         assert!(store.peek().unwrap().is_empty());
         assert_ne!(store.set(true).unwrap().install_id, Some(id));
+    }
+
+    #[test]
+    fn a_broken_settings_file_does_not_stop_a_choice() {
+        let (_dir, store) = store();
+        store.set(true).unwrap();
+        store.absorb_at(pending(100, 1), 100, true).unwrap();
+        fs::write(store.dir.join("settings.json"), b"{").unwrap();
+        assert!(store.settings().is_err());
+        assert_eq!(store.set(false).unwrap().enabled, Some(false));
+        assert!(store.peek().unwrap().is_empty());
+        assert_eq!(store.settings().unwrap().install_id, None);
     }
 
     #[test]
