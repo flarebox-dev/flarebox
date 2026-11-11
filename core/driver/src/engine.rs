@@ -1300,7 +1300,7 @@ fn same_kind(before: &engine::QuestionKind, after: &engine::QuestionKind) -> boo
 #[cfg(test)]
 mod tests {
     use koidrive_engine::effects::{Base, Effect, EffectRecord, Location};
-    use koidrive_engine::state::EffectsState;
+    use koidrive_engine::state::{CommitsState, EffectsState};
     use koidrive_proto::v1::{NodePurged, NodeStatus, SpaceUpdated};
     use koidrive_store::Store;
 
@@ -1544,6 +1544,58 @@ mod tests {
                 assert!(matches!(stop, Stop::Protocol(_)), "{stop}");
                 assert_eq!(names(tx, &engine), ["a"]);
                 assert_eq!(tx.cursor()?, Some(cursor(3)));
+                Ok::<_, Stop>(())
+            })
+            .unwrap();
+    }
+
+    /// The engine dropped the answer to a conflict without sending an op, as it does for keep the copy when R's record
+    /// of the copy leaves out its chunk list. It still asks the question under the same id and kind, and
+    /// `accept_answers` removed its row when it took the answer. Asking puts the row back unanswered and marks the
+    /// questions changed.
+    #[test]
+    fn a_conflict_answer_dropped_before_it_was_sent_is_shown_again_under_the_same_id() {
+        use engine::{Answer, ConflictFile, QuestionKind, Revisions};
+
+        let file = |id: &str| ConflictFile {
+            node_id: id.into(),
+            revisions: Revisions {
+                content_rev: 1,
+                meta_rev: 1,
+            },
+        };
+        let asking = engine::Question {
+            id: "conflict".into(),
+            asked_at_ms: 1,
+            kind: QuestionKind::Conflict {
+                original: file("original"),
+                copy: file("copy"),
+                sent_in: None,
+            },
+            held: BTreeMap::new(),
+            answer: None,
+            shown: BTreeMap::new(),
+        };
+        let answered = engine::Question {
+            answer: Some(Answer::KeepCopy),
+            ..asking.clone()
+        };
+        let (_dir, mut store) = store();
+        store
+            .transaction(|tx| {
+                let mut engine = Engine::load(tx, ROOT)?;
+                engine.stored.commits.questions = vec![answered];
+                engine.commits = Commits::from_state(CommitsState {
+                    questions: vec![asking],
+                    ..Default::default()
+                })
+                .unwrap();
+                engine.ask(tx, ROOT)?;
+                let rows: Vec<_> = (tx.questions()?.into_iter())
+                    .map(|row| (row.question_id, row.answer))
+                    .collect();
+                assert_eq!(rows, [("conflict".to_owned(), None)]);
+                assert!(engine.asked, "the questions changed");
                 Ok::<_, Stop>(())
             })
             .unwrap();

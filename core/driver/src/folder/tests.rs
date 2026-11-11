@@ -6077,6 +6077,46 @@ fn a_conflict_whose_file_changes_before_the_answer_reaches_the_server_is_asked_a
     assert_ne!(second.id, first.id);
 }
 
+/// The server rejects the op that carries out keep the original, and neither file changed. The engine drops the
+/// answer, so the folder shows the conflict again under the same ID with no answer and marks the questions changed.
+#[test]
+fn a_conflict_answer_the_server_rejects_is_asked_again_under_the_same_id() {
+    let mut remote = Remote::new();
+    let (_, (site_b, mut b)) = edited_on_both(&mut remote);
+    let [first] = &shown(&site_b)[..] else {
+        panic!("one question");
+    };
+    answer(&site_b, Answer::KeepOriginal);
+    let step = b.folder.requested();
+    b.take(step).unwrap();
+    assert_eq!(b.folder.view().questions, 0);
+    let Some(Work::Send(commit)) = b.work.pop_front() else {
+        panic!("the answer is sent");
+    };
+    assert_eq!(kinds(&commit), ["delete"]);
+    b.folder.take_questions_changed();
+    let last_seq = b.folder.engine.cursor.as_ref().unwrap().last_seq;
+    let result = CommitResult {
+        seq: last_seq + 1,
+        results: vec![koidrive_proto::v1::OpResult {
+            code: op_result::Code::Rejected as i32,
+            reject_reason: "INVALID_ARGUMENT".into(),
+            ..Default::default()
+        }],
+        changes: Vec::new(),
+        ..Default::default()
+    };
+    let step = b.folder.sent(Ok(result));
+    b.take(step).unwrap();
+
+    assert!(b.folder.take_questions_changed());
+    assert_eq!(b.folder.view().questions, 1);
+    let [again] = &shown(&site_b)[..] else {
+        panic!("one question: {:?}", shown(&site_b));
+    };
+    assert_eq!(again.id, first.id);
+}
+
 /// Device `a` edits the original, and its observer has not seen the edit when `b`'s answer to keep the copy
 /// reaches it. The edit is kept in a file the person sees, on both devices, and both come to rest.
 #[test]
