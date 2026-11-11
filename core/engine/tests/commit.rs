@@ -4200,3 +4200,40 @@ fn a_late_acknowledgement_keeps_the_sent_content_when_s_cannot_hold_the_agreed_p
     };
     assert!(ops(&commit).iter().any(uploaded), "{:?}", ops(&commit));
 }
+
+/// GUN-453. n's create at b is in flight and the server applied it, when L and R agree on c with
+/// different contents at seq 10. The server then loses everything after seq 7, a bootstrap
+/// replaces R without n, and the create is sent again and applied at seq 9. The agreement at seq
+/// 10 was lost with the records that held it, so S takes the b that was sent, and the user's move
+/// to c is sent rather than the disk moving n back to b.
+#[test]
+fn a_late_create_acknowledgement_after_a_rollback_drops_the_agreement_the_server_lost() {
+    let mut trees = trees(&[("n", Some(file(ROOT, "b", 1)), None, None)]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id == "n"));
+    trees.set_remote("n".into(), remote_at(file(ROOT, "b", 1), 8));
+    trees.set_local("n".into(), local(file(ROOT, "c", 1), 1));
+    trees.set_remote(
+        "n".into(),
+        RemoteNode {
+            content_rev: 10,
+            ..remote_at(file(ROOT, "c", 2), 10)
+        },
+    );
+    trees.settle();
+    trees.remove_remote("n");
+    trees.forget_lost(Vec::new(), Vec::new(), 7);
+    trees.settle();
+    trees.set_remote("n".into(), remote_at(file(ROOT, "b", 1), 9));
+    commits
+        .received(result(9, vec![outcome(op_result::Code::Applied)]))
+        .unwrap();
+    assert!(commits.acknowledge(&mut trees, 9));
+    trees.settle();
+    assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "b", 1)));
+    assert_eq!(effects_for(&mut trees, &mut ids, "n"), []);
+    assert_eq!(trees.local().live("n"), Some(&file(ROOT, "c", 1)));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", ROOT, "c")]);
+}
