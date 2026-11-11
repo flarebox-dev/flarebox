@@ -333,8 +333,9 @@ impl Store {
         let _lock = self.lock(true)?;
         let id = self.settings()?.install_id;
         let mut queue = self.queue()?;
-        let ours = (queue.out.as_ref())
-            .is_some_and(|out| out.id == sending.id && out.uuids == sending.uuids);
+        let ours = (queue.out.as_ref()).is_some_and(|out| {
+            out.id == sending.id && out.uuids.iter().all(|uuid| sending.uuids.contains(uuid))
+        });
         if !ours || (!sent && id.as_ref() == Some(&sending.id)) {
             return Ok(());
         }
@@ -596,6 +597,22 @@ mod tests {
         store.give_back(sending).unwrap();
         store.absorb_at(panics(5), 100, true).unwrap();
         assert!(store.queue().unwrap().events.is_empty());
+    }
+
+    #[test]
+    fn a_batch_partly_expired_while_out_still_settles() {
+        let (_dir, store) = store();
+        store.set(true).unwrap();
+        store.absorb_at(pending(98, 1), 100, true).unwrap();
+        store.absorb_at(pending(99, 1), 100, true).unwrap();
+        let sending = store.take(100).unwrap().unwrap();
+        assert_eq!(sending.batch.days.len(), 2);
+        store
+            .absorb_at(pending(100, 1), 98 + KEEP_DAYS + 1, true)
+            .unwrap();
+        assert_eq!(store.queue().unwrap().out.unwrap().batch.days.len(), 1);
+        store.sent(sending).unwrap();
+        assert!(store.queue().unwrap().out.is_none());
     }
 
     #[test]
