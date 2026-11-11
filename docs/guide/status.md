@@ -62,14 +62,21 @@ Problems that end with "this build cannot recover the folder yet" mean the folde
 
 ## Send refused changes again
 
-When the server refuses a folder's changes for a reason that retrying won't fix, such as a device without access to the space, the folder halts. The problem line names the cause and ends with what to run once it is fixed:
+When the server refuses a folder's changes for a reason that retrying won't fix, such as a device without access to the space, the folder halts. The problem line names the cause and ends with what to run once it is fixed. Run one of these two commands, not both.
+
+For a cause you fixed on the server, such as access restored to this device, send the refused changes again as they were:
 
 ```sh
 flarebox lift ~/Flarebox --resend
+```
+
+For a cause fixed on this device, plan the changes again into a new commit:
+
+```sh
 flarebox lift ~/Flarebox --replan
 ```
 
-Pass one of the two. `--resend` sends the refused changes again as they were, for a cause you fixed on the server, such as access restored to this device. `--replan` plans the changes again into a new commit, for a cause fixed on this device, such as a newer `flarebox`. A restart alone doesn't send them again. When the problem says the space's owner must confirm the changes, `lift` can't help, because Flarebox can't ask for that confirmation yet.
+If the fix is a newer `flarebox`, install it and restart the daemon before you run `lift`, because `lift` runs in the daemon when one is running. A restart alone doesn't send the refused changes again. When the problem says the space's owner must confirm the changes, `lift` can't help, because Flarebox can't ask for that confirmation yet.
 
 ## Questions
 

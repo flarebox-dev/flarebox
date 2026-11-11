@@ -31,7 +31,7 @@ Folders sync only while the daemon runs:
 flarebox daemon
 ```
 
-It runs in the foreground until you press Ctrl-C or send it SIGTERM. Commands that change this device's folders, such as `link`, `restart` and `lift`, talk to the daemon through a socket when it runs, and open the profile themselves when it doesn't. So `flarebox link` works without the daemon, and the folder starts syncing when the daemon starts. The `device`, `space`, `usage`, `trash` and `versions` commands talk to the server directly.
+It runs in the foreground until you press Ctrl-C or send it SIGTERM. Commands that change this device's folders, such as `link`, `restart` and `lift`, talk to the daemon through a socket when it runs, and open the profile themselves when it doesn't. So `flarebox link` works without the daemon, and the folder starts syncing when the daemon starts. The `device`, `space` and `usage` commands talk to the server directly. `trash` and `versions` read from the server too, but first ask the daemon, when it runs, which space the folder syncs.
 
 The daemon logs at the `info` level. Set `FLAREBOX_LOG` to change it, for example `FLAREBOX_LOG=debug`. `--log-format json` writes one JSON object per line.
 

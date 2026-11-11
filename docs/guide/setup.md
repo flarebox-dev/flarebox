@@ -52,7 +52,7 @@ Until the public client exists, deploy the server and claim it without `flarebox
    flarebox server claim flarebox.alice.workers.dev ABCD-EFGH-JKLM --user Alice
    ```
 
-   Give the server's address, the claim code and your name. The device takes this machine's host name; give it another with `--name`. A server that already has an owner refuses the claim, and nothing changes on this machine.
+   Give the server's address, the claim code and your name. The device takes this machine's host name; give it another with `--name`. A server that already has an owner refuses the claim code.
 4. Add your other machines with a pairing code, as the next section describes.
 
 ## Add another device
