@@ -653,3 +653,17 @@ fn a_file_renamed_onto_the_name_of_a_download_in_flight_is_kept() {
     let world = converge(2, &[schedule]).unwrap();
     assert_eq!(world.devices[0].disk.entries().len(), 2);
 }
+
+/// Device 0 swaps two files through a third name. Its commit moves one of them through a pending
+/// name, which the user never gave, and both devices end with the two files at the swapped names.
+#[test]
+fn two_files_swapped_through_a_third_name_reach_the_other_device() {
+    let synced = vec![(0, file("a")), (0, file("b"))];
+    let swap = vec![
+        (0, rename(0, 0, "c.txt")),
+        (0, rename(1, 0, "a")),
+        (0, rename(0, 0, "b")),
+    ];
+    let world = converge(2, &[synced, swap]).unwrap();
+    assert_eq!(world.devices[1].disk.entries().len(), 2);
+}

@@ -32,8 +32,8 @@
 //!
 //! - Every disk equals the server's live tree, and every engine reports L = S = R with nothing
 //!   in flight, blocked, parked or halted.
-//! - No commit moved a node to a name that the user of its device never gave to anything, and
-//!   no commit took a write out of the server's live tree that the user of its device never
+//! - No commit moved a node to a name that the user of its device never gave to anything, other
+//!   than the pending name a swap goes through (design section 2.6), and no commit took a write out of the server's live tree that the user of its device never
 //!   overwrote or deleted.
 //! - No write is in two files of the server.
 //! - Every write was in the server's live tree at some time, unless the user who made it
@@ -227,6 +227,19 @@ fn stored(held: &Held, write: i64) -> bool {
 }
 
 /// Fails when an effect sent a file to the local trash that held a write the server never held.
+/// Whether a user gave `name` to something, or `name` is the pending name of such a name, which
+/// a swap goes through on the server (design section 2.6).
+fn given(named: &BTreeSet<&str>, name: &str) -> bool {
+    let pending = (name.strip_suffix(')'))
+        .and_then(|rest| rest.rsplit_once(" (pending"))
+        .filter(|(_, n)| {
+            n.is_empty()
+                || n.strip_prefix(' ')
+                    .is_some_and(|n| n.parse::<u32>().is_ok())
+        });
+    named.contains(name) || pending.is_some_and(|(stem, _)| named.contains(stem))
+}
+
 fn lost(held: &Held, d: usize, record: &EffectRecord, applied: &Applied) -> Result<(), Failure> {
     let trashed = applied.trashed.as_ref();
     match trashed.filter(|content| !stored(held, content.mtime_ns)) {
@@ -896,9 +909,7 @@ impl World {
                 let session = device.session.clone();
                 let sent = Commit { receipts, ..commit };
                 let made_up = sent.ops.iter().find_map(|op| match &op.op {
-                    Some(op::Op::Move(moved))
-                        if !self.named[d].contains(moved.new_name.as_str()) =>
-                    {
+                    Some(op::Op::Move(moved)) if !given(&self.named[d], &moved.new_name) => {
                         Some(moved)
                     }
                     _ => None,

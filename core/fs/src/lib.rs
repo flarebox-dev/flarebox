@@ -1223,8 +1223,15 @@ fn diff(old: &BTreeMap<PathBuf, Entry>, new: &BTreeMap<PathBuf, Entry>) -> Vec<C
         .filter(|after| after.kind == EntryKind::Dir)
         .map(|after| after.id)
         .collect();
+    let ids = |tree: &BTreeMap<PathBuf, Entry>| -> HashSet<(FileId, EntryKind)> {
+        tree.values().map(|entry| (entry.id, entry.kind)).collect()
+    };
+    let (ids_before, ids_after) = (ids(old), ids(new));
     let same = |path: &Path, before: &Entry, after: &Entry| {
         after.kind == before.kind
+            && !(after.id != before.id
+                && ids_before.contains(&(after.id, after.kind))
+                && ids_after.contains(&(before.id, before.kind)))
             && !(after.kind == EntryKind::Dir
                 && after.id != before.id
                 && moved.contains(&after.id)

@@ -3565,3 +3565,133 @@ fn a_file_moved_out_of_its_folder_while_the_folder_was_ignored_stays_on_the_serv
     assert_eq!(fs::read(site.root.join("other/file")).unwrap(), b"kept");
     assert_eq!(a.folder.engine.trees.check(), Ok(()));
 }
+
+/// The server's nodes by name, with their IDs and whether each is live.
+type Nodes = Vec<(String, String, bool)>;
+
+/// Every node on the server by name, with its ID and whether it is live, in order.
+fn server_nodes(remote: &Remote) -> Nodes {
+    let live = flarebox_proto::v1::NodeStatus::Live as i32;
+    let mut nodes: Nodes = (remote.space.nodes().into_iter())
+        .filter(|node| !node.parent_id.is_empty())
+        .map(|node| (node.name, node.node_id, node.status == live))
+        .collect();
+    nodes.sort();
+    nodes
+}
+
+/// The ID of the live node named `name` in `nodes`.
+fn live_id(nodes: &[(String, String, bool)], name: &str) -> String {
+    let found = nodes.iter().find(|(named, _, live)| named == name && *live);
+    found
+        .unwrap_or_else(|| panic!("no live {name} in {nodes:?}"))
+        .1
+        .clone()
+}
+
+/// Device `a` makes `files`, then device `b` makes each rename of `renames` in turn before its observer looks, and
+/// both sync. Returns both sites and the server's nodes before and after the renames.
+fn renamed_on_b(files: &[(&str, &[u8])], renames: &[(&str, &str)]) -> (Site, Site, Nodes, Nodes) {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    for (path, bytes) in files {
+        let path = site_a.root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        a.create(&mut remote, &path, bytes);
+    }
+    let (site, mut b) = linked(&mut remote, "b");
+    b.settle();
+    let before = server_nodes(&remote);
+    for (from, to) in renames {
+        fs::rename(site.root.join(from), site.root.join(to)).unwrap();
+    }
+    sync(&mut remote, (&site_a, &mut a), (&site, &mut b));
+    (site_a, site, before, server_nodes(&remote))
+}
+
+/// Device `b` swaps two files through a third name. Each file keeps its node, and so its version history, and both
+/// names arrive as they are, with no conflict name.
+#[test]
+fn two_files_swapped_through_a_third_name_keep_their_nodes() {
+    let (site_a, site, before, after) = renamed_on_b(
+        &[("one", b"first file"), ("two", b"second file")],
+        &[("one", "tmp"), ("two", "one"), ("tmp", "two")],
+    );
+    let swapped = [("one", "second file"), ("two", "first file")]
+        .map(|(path, text)| (path.to_owned(), text.to_owned()));
+    assert_eq!(files(&site_a.root), swapped);
+    assert_eq!(files(&site.root), swapped);
+    assert_eq!(after.len(), 2, "{after:?}");
+    assert_eq!(live_id(&after, "one"), live_id(&before, "two"));
+    assert_eq!(live_id(&after, "two"), live_id(&before, "one"));
+}
+
+/// As above for three files rotated through a third name.
+#[test]
+fn three_files_rotated_through_a_third_name_keep_their_nodes() {
+    let (_, site, before, after) = renamed_on_b(
+        &[("a", b"from a"), ("b", b"from b"), ("c", b"from c")],
+        &[("a", "tmp"), ("c", "a"), ("b", "c"), ("tmp", "b")],
+    );
+    let rotated = [("a", "from c"), ("b", "from a"), ("c", "from b")]
+        .map(|(path, text)| (path.to_owned(), text.to_owned()));
+    assert_eq!(files(&site.root), rotated);
+    assert_eq!(after.len(), 3, "{after:?}");
+    assert_eq!(live_id(&after, "a"), live_id(&before, "c"));
+    assert_eq!(live_id(&after, "b"), live_id(&before, "a"));
+    assert_eq!(live_id(&after, "c"), live_id(&before, "b"));
+}
+
+/// Device `b` swaps two folders that each hold a file named `note`. The folders and their files keep their nodes,
+/// so nothing goes to the server's trash, and no name carries a conflict suffix.
+#[test]
+fn two_folders_swapped_through_a_third_name_keep_their_nodes() {
+    let (site_a, site, before, after) = renamed_on_b(
+        &[("x/note", b"in x"), ("y/note", b"in y")],
+        &[("x", "tmp"), ("y", "x"), ("tmp", "y")],
+    );
+    let swapped = [("x/note", "in y"), ("y/note", "in x")]
+        .map(|(path, text)| (path.to_owned(), text.to_owned()));
+    assert_eq!(files(&site_a.root), swapped);
+    assert_eq!(files(&site.root), swapped);
+    assert!(after.iter().all(|(_, _, live)| *live), "{after:?}");
+    let names: Vec<&str> = after.iter().map(|(name, _, _)| name.as_str()).collect();
+    assert_eq!(names, ["note", "note", "x", "y"]);
+    assert_eq!(live_id(&after, "x"), live_id(&before, "y"));
+    assert_eq!(live_id(&after, "y"), live_id(&before, "x"));
+    let ids = |nodes: &[(String, String, bool)]| -> std::collections::BTreeSet<String> {
+        nodes.iter().map(|(_, id, _)| id.clone()).collect()
+    };
+    assert_eq!(ids(&after), ids(&before));
+}
+
+/// An editor saves `doc` by writing a new file next to it, swapping the two, and removing the old one, and the
+/// observer sees the new file before the swap. `doc` keeps its node, so its version history stays with it.
+#[test]
+fn a_file_saved_by_swapping_in_a_new_file_keeps_its_node() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site.root.join("doc"), b"first");
+    let before = server_nodes(&remote);
+    a.event(Event::Disconnected {
+        reason: flarebox_net::DisconnectReason::Timeout,
+        retry_in: Duration::from_secs(1),
+    })
+    .unwrap();
+    fs::write(site.root.join(".doc.tmp"), b"second").unwrap();
+    a.scan_until(|a| a.folder.engine.trees.dirty().len() == 1);
+    assert!(a.work.is_empty());
+    for (from, to) in [(".doc.tmp", "x"), ("doc", ".doc.tmp"), ("x", "doc")] {
+        fs::rename(site.root.join(from), site.root.join(to)).unwrap();
+    }
+    a.settle();
+    fs::remove_file(site.root.join(".doc.tmp")).unwrap();
+    a.settle();
+    a.connect(&remote);
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    assert_eq!(files(&site.root), [("doc".to_owned(), "second".to_owned())]);
+    let after = server_nodes(&remote);
+    assert_eq!(live_id(&after, "doc"), live_id(&before, "doc"), "{after:?}");
+}

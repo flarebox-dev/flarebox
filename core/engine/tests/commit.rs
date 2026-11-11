@@ -195,9 +195,9 @@ fn local_changes_become_ops_with_parents_first() {
     );
 }
 
-#[test]
-fn a_name_swap_is_sent_for_the_server_to_resolve() {
-    let mut trees = trees(&[
+/// Two files that swapped names.
+fn swapped() -> Vec<Row> {
+    vec![
         (
             "x",
             Some(file(ROOT, "b", 1)),
@@ -210,10 +210,61 @@ fn a_name_swap_is_sent_for_the_server_to_resolve() {
             Some(file(ROOT, "b", 2)),
             Some(remote(file(ROOT, "b", 2))),
         ),
+    ]
+}
+
+/// Neither move of a swap is valid before the other, so one node moves to a pending name first and to its own name
+/// last, in one commit, and each node keeps its node and its exact name.
+#[test]
+fn a_name_swap_goes_through_a_pending_name() {
+    let mut trees = trees(&swapped());
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(
+        ops(&commit),
+        [
+            mv("x", ROOT, "b (pending)"),
+            mv("y", ROOT, "a"),
+            mv("x", ROOT, "b")
+        ]
+    );
+}
+
+/// A swap that the rest of the commit leaves no room for waits for the next commit, so its pending name never
+/// reaches the server.
+#[test]
+fn a_name_swap_that_does_not_fit_the_commit_waits_for_the_next_one() {
+    let mut rows = swapped();
+    rows.push(("n", Some(file(ROOT, "new", 3)), None, None));
+    let mut trees = trees(&rows);
+    let state = flarebox_engine::state::CommitsState {
+        cap: Some(2),
+        ..Commits::default().state()
+    };
+    let (mut commits, mut ids) = (Commits::from_state(state).unwrap(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(
+        matches!(ops(&commit).as_slice(), [op::Op::CreateFile(create)] if create.name == "new"),
+        "{:?}",
+        ops(&commit)
+    );
+}
+
+/// A move onto a name that a node keeps is no cycle, and is sent for the server to resolve (R1).
+#[test]
+fn a_move_onto_a_name_another_node_keeps_is_sent_for_the_server_to_resolve() {
+    let mut trees = trees(&[
+        (
+            "x",
+            Some(file(ROOT, "b", 1)),
+            Some(file(ROOT, "a", 1)),
+            Some(remote(file(ROOT, "a", 1))),
+        ),
+        synced("y", file(ROOT, "b", 2)),
     ]);
     let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
-    assert_eq!(ops(&commit), [mv("x", ROOT, "b"), mv("y", ROOT, "a")]);
+    assert_eq!(ops(&commit), [mv("x", ROOT, "b")]);
 }
 
 #[test]

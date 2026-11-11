@@ -338,9 +338,12 @@ impl Commits {
     /// under the original name; a node changed remotely keeps the nodes L deleted on its way to the
     /// root, which are downloaded again instead of deleted. Then every local change becomes ops,
     /// ordered on a scratch copy of R (section 2.6): an op is emitted once it is valid there. When
-    /// none is, a create or move that only waits for a name is sent anyway, for the server to
-    /// rename, except that a folder created where a moving folder still is takes a pending name
-    /// first, and a folder it may be merged into is not deleted in the same commit. A delete waits
+    /// none is, moves that each wait for a name another one frees, as in a swap, go through a
+    /// pending name: one node of the cycle moves to a free name first and to its own name last, in
+    /// the same commit when the commit holds the whole cycle. Otherwise a create or move that only
+    /// waits for a name is sent anyway, for the server to rename, except that a folder created
+    /// where a moving folder still is takes a pending name first, and a folder it may be merged
+    /// into is not deleted in the same commit. A delete waits
     /// until nothing that survives is left under it, a create or move until its parent exists, and
     /// a move that would close a cycle against R is reverted: the node is marked in
     /// [`Trees::reverted`], and the effects move it back to its R position on disk, bringing back
@@ -1383,13 +1386,16 @@ fn plan(
         ops.push(proto::Op { op: Some(op) });
     };
     let (mut emitted, mut bytes) = (0, 0);
-    let mut room = |want: &Want| {
+    let fits = |emitted: usize, bytes: usize, ops: usize, cost: usize| {
+        emitted + ops <= cap && (emitted == 0 || bytes + cost <= MAX_COMMIT_BYTES)
+    };
+    let room = |emitted: &mut usize, bytes: &mut usize, want: &Want| {
         let cost = cost(trees, want);
-        if emitted == cap || (emitted > 0 && bytes + cost > MAX_COMMIT_BYTES) {
+        if !fits(*emitted, *bytes, 1, cost) {
             return false;
         }
-        emitted += 1;
-        bytes += cost;
+        *emitted += 1;
+        *bytes += cost;
         true
     };
     let capped = loop {
@@ -1399,7 +1405,7 @@ fn plan(
                 .as_ref()
                 .is_some_and(|want| scratch.fit(want, &moving) == Fit::Valid)
             {
-                if !room(slot.as_ref().expect("checked")) {
+                if !room(&mut emitted, &mut bytes, slot.as_ref().expect("checked")) {
                     full = true;
                     break;
                 }
@@ -1413,6 +1419,32 @@ fn plan(
         if progress {
             continue;
         }
+        if let Some(cycle) = name_cycle(&wants, &scratch, &moving) {
+            let Some(Want::Move { id, parent, name }) = &wants[cycle[0]] else {
+                unreachable!("a name cycle holds moves");
+            };
+            let aside = Want::Move {
+                id: id.clone(),
+                parent: parent.clone(),
+                name: scratch.free_name(parent, name),
+            };
+            let all: usize = (cycle.iter())
+                .filter_map(|at| wants[*at].as_ref())
+                .map(|want| cost(trees, want))
+                .sum();
+            let whole = fits(emitted, bytes, cycle.len() + 1, all + cost(trees, &aside));
+            if (emitted > 0 && !whole) || !room(&mut emitted, &mut bytes, &aside) {
+                break true;
+            }
+            let id = id.clone();
+            let unsent = scratch.unsent.get(&id).copied();
+            emit(aside, &mut scratch, &mut moving);
+            moving.insert(id.clone());
+            if let Some(unsent) = unsent {
+                scratch.unsent.insert(id, unsent);
+            }
+            continue;
+        }
         let forced = wants.iter_mut().find(|slot| {
             slot.as_ref()
                 .is_some_and(|want| scratch.fit(want, &moving) == Fit::NameTaken)
@@ -1420,7 +1452,7 @@ fn plan(
         let Some(slot) = forced else {
             break false;
         };
-        if !room(slot.as_ref().expect("checked")) {
+        if !room(&mut emitted, &mut bytes, slot.as_ref().expect("checked")) {
             break true;
         }
         if let Some(Want::Create { shape, .. }) = slot.as_mut()
@@ -1445,6 +1477,50 @@ fn plan(
         }
     }
     (ops, deletes, reverts)
+}
+
+/// A cycle of moves that each wait only for a name held by the node of the next one, as in a swap
+/// or a rotation through a third name, by their indices in `wants`.
+fn name_cycle(
+    wants: &[Option<Want>],
+    scratch: &Scratch,
+    moving: &BTreeSet<NodeId>,
+) -> Option<Vec<usize>> {
+    let blocked: BTreeMap<&str, usize> = (wants.iter().enumerate())
+        .filter_map(|(at, slot)| match slot {
+            Some(want @ Want::Move { id, .. }) if scratch.fit(want, moving) == Fit::NameTaken => {
+                Some((id.as_str(), at))
+            }
+            _ => None,
+        })
+        .collect();
+    for &start in blocked.keys() {
+        let mut cycle = Vec::new();
+        let mut node = start;
+        while let Some(&at) = blocked.get(node) {
+            if cycle.contains(&at) {
+                break;
+            }
+            cycle.push(at);
+            let Some(Want::Move { id, parent, name }) = &wants[at] else {
+                unreachable!("indexed from the moves");
+            };
+            let holders: Vec<&NodeId> = (scratch.children.get(parent))
+                .and_then(|keys| keys.get(&name_key(name)))
+                .into_iter()
+                .flatten()
+                .filter(|holder| *holder != id)
+                .collect();
+            let [holder] = holders.as_slice() else {
+                break;
+            };
+            if holder.as_str() == start {
+                return Some(cycle);
+            }
+            node = holder;
+        }
+    }
+    None
 }
 
 struct Entry {
