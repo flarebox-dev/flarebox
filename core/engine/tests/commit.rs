@@ -3925,3 +3925,87 @@ fn a_late_move_acknowledgement_takes_the_sent_position_when_the_commit_gives_the
     let sent = ops(&commit);
     assert!(sent.contains(&mv("n", ROOT, "a")), "{sent:?}");
 }
+
+/// GUN-453. As above, with the user moving n back to b, the position the commit sent, and the
+/// server creating it as "b 2". S cannot hold c for n, so n takes the server's name and is
+/// reverted, so the disk takes that name too.
+#[test]
+fn a_late_move_acknowledgement_renamed_by_the_server_is_reverted_when_another_node_took_the_agreed_position()
+ {
+    let mut trees = trees(&[
+        (
+            "n",
+            Some(file(ROOT, "b", 1)),
+            Some(file(ROOT, "a", 1)),
+            Some(remote(file(ROOT, "a", 1))),
+        ),
+        (
+            "m",
+            Some(file(ROOT, "z", 2)),
+            Some(file(ROOT, "z", 2)),
+            Some(remote(file(ROOT, "z", 2))),
+        ),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", ROOT, "b")]);
+    trees.set_remote("n".into(), remote_at(file(ROOT, "b 2", 1), 2));
+    trees.set_local("n".into(), local(file(ROOT, "c", 1), 1));
+    trees.set_remote("n".into(), remote_at(file(ROOT, "c", 1), 3));
+    trees.set_remote("n".into(), remote_at(file(ROOT, "x", 1), 4));
+    trees.set_local("n".into(), local(file(ROOT, "b", 1), 1));
+    trees.set_local("m".into(), local(file(ROOT, "c", 2), 2));
+    trees.set_remote("m".into(), remote_at(file(ROOT, "c", 2), 5));
+    trees.settle();
+    let renamed = OpResult {
+        name: "b 2".into(),
+        ..outcome(op_result::Code::AppliedRenamed)
+    };
+    commits.received(result(2, vec![renamed])).unwrap();
+    assert!(commits.acknowledge(&mut trees, 5));
+    trees.settle();
+    assert_eq!(trees.synced().live("n"), Some(&file(ROOT, "b 2", 1)));
+    assert!(trees.reverted().contains("n"));
+}
+
+/// GUN-453. n's create at b is in flight when L and R agree on c with different contents, so S
+/// never takes n. The other device then deletes n and the server purges it, all before the result
+/// arrives. S takes c, the position L and R agreed on, so the disk follows the purge and the create
+/// is not sent again.
+#[test]
+fn a_late_create_acknowledgement_follows_a_purge_after_l_and_r_agreed_on_a_position() {
+    let mut trees = trees(&[("n", Some(file(ROOT, "b", 1)), None, None)]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id == "n"));
+    trees.set_remote("n".into(), remote_at(file(ROOT, "b", 1), 8));
+    trees.set_local("n".into(), local(file(ROOT, "c", 1), 1));
+    let edited = RemoteNode {
+        content_rev: 9,
+        ..remote_at(file(ROOT, "c", 2), 9)
+    };
+    trees.set_remote("n".into(), edited.clone());
+    trees.set_remote(
+        "n".into(),
+        RemoteNode {
+            meta_rev: 10,
+            trashed: true,
+            trash_group: "10:0".into(),
+            ..edited
+        },
+    );
+    trees.remove_remote("n");
+    trees.settle();
+    assert_eq!(trees.synced().get("n"), None);
+    commits
+        .received(result(8, vec![outcome(op_result::Code::Applied)]))
+        .unwrap();
+    assert!(commits.acknowledge(&mut trees, 11));
+    trees.settle();
+    for _ in 0..3 {
+        effects_for(&mut trees, &mut ids, "n");
+        let commit = build(&mut commits, &mut trees, &mut ids);
+        assert_eq!(commit.as_ref().map(ops), None);
+    }
+    assert!(trees.local().get("n").is_none());
+}
