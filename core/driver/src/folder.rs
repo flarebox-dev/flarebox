@@ -123,8 +123,10 @@ pub(crate) struct Folder {
 enum Stream {
     /// No `Welcome` yet.
     Connecting,
-    /// The tree is being listed for a bootstrap. R is untouched.
-    Listing,
+    /// The tree is being listed for a bootstrap. R is untouched. `superseded` is set when something calls for a new
+    /// listing while this one is out, such as a `Welcome` from a server that lost commits: the pages may have been
+    /// read from the server before it, so they are dropped and the tree is listed again.
+    Listing { superseded: bool },
     /// The listing follows the log until it may replace R.
     Replaying(Staging),
     /// R follows the log. `head` is the server's head as of the last `CaughtUp` of this connection.
@@ -317,7 +319,7 @@ impl Folder {
                 match &mut self.stream {
                     Stream::Replaying(staging) => staging.caught_up(head_seq),
                     Stream::Following { head } => *head = Some(head_seq),
-                    Stream::Connecting | Stream::Listing => {}
+                    Stream::Connecting | Stream::Listing { .. } => {}
                 }
                 self.publish_remote()?;
             }
@@ -375,8 +377,14 @@ impl Folder {
     /// The pages of a bootstrap, read in order. The log is replayed onto them from the first page's `head_seq`
     /// before they replace R.
     pub fn listed(&mut self, listed: Result<Listed, Stop>) -> Result<Vec<Work>, Stop> {
+        if let Stream::Listing { superseded } = &mut self.stream
+            && *superseded
+        {
+            *superseded = false;
+            return Ok(vec![Work::List]);
+        }
         let listed = listed?;
-        if !matches!(self.stream, Stream::Listing) {
+        if !matches!(self.stream, Stream::Listing { .. }) {
             return Ok(Vec::new());
         }
         let pages = match listed {
@@ -682,7 +690,7 @@ impl Folder {
         let state = match &self.stream {
             _ if self.offline => FolderState::Offline,
             Stream::Connecting => FolderState::Connecting,
-            Stream::Listing | Stream::Replaying(_) => FolderState::Bootstrapping,
+            Stream::Listing { .. } | Stream::Replaying(_) => FolderState::Bootstrapping,
             Stream::Following { .. } if self.settled() => FolderState::UpToDate,
             Stream::Following { .. } => FolderState::CatchingUp,
         };
@@ -872,7 +880,7 @@ impl Folder {
                     ..
                 }),
             ) => {
-                self.stream = Stream::Listing;
+                self.stream = Stream::Listing { superseded: false };
                 work.push(Work::List);
             }
             (Stream::Connecting, Some(cursor)) => {
@@ -883,7 +891,7 @@ impl Folder {
                 self.stream = Stream::Following { head: None };
             }
             (Stream::Following { head }, _) => *head = None,
-            (Stream::Listing | Stream::Replaying(_), _) => {}
+            (Stream::Listing { .. } | Stream::Replaying(_), _) => {}
         }
         Ok(())
     }
@@ -891,7 +899,7 @@ impl Folder {
     /// Commits of the log. A gap subscribes again from the last commit applied.
     fn changes(&mut self, records: &[CommitRecord], work: &mut Vec<Work>) -> Result<(), Stop> {
         let (applied, history_id, since_seq) = match &mut self.stream {
-            Stream::Connecting | Stream::Listing => return Ok(()),
+            Stream::Connecting | Stream::Listing { .. } => return Ok(()),
             Stream::Replaying(staging) => (
                 staging.replay(records)?,
                 staging.history_id().to_owned(),
@@ -1058,10 +1066,12 @@ impl Folder {
     /// Bootstraps again (design §4.4): the tree is listed and replayed into a staging tree that replaces R, while L
     /// and S stay.
     fn list_again(&mut self, work: &mut Vec<Work>) {
-        if !matches!(self.stream, Stream::Listing) {
-            self.stream = Stream::Listing;
-            work.push(Work::List);
+        if let Stream::Listing { superseded } = &mut self.stream {
+            *superseded = true;
+            return;
         }
+        self.stream = Stream::Listing { superseded: false };
+        work.push(Work::List);
     }
 
     /// Starts the upload of what `commit` adds, or its send when it adds no content.

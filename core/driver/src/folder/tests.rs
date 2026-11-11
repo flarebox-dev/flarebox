@@ -14,7 +14,9 @@ use flarebox_engine::restore::{Outcome, RestoreIntent};
 use flarebox_engine::tree::{Kind, LocalNode, Tree};
 use flarebox_fs::{EntryKind, Marker, RootProblem, write_marker};
 use flarebox_net::Committed;
-use flarebox_proto::v1::{ListTree, ListVersions, Op, PrepareUpload, Resume, chunk_plan, op};
+use flarebox_proto::v1::{
+    ListTree, ListVersions, Op, PrepareUpload, Resume, ResyncRequired, chunk_plan, op,
+};
 use flarebox_sim::space::{Role, Session as Caller, SpaceDo};
 
 use super::*;
@@ -2963,7 +2965,7 @@ fn a_commit_the_server_is_behind_for_sends_what_it_lost_when_the_head_catches_up
     let (site, mut b) = behind_the_device(&mut remote);
     fs::write(site.root.join("two.txt"), b"two").unwrap();
     b.scan_until(|b| !b.work.is_empty());
-    while !matches!(b.folder.stream, Stream::Listing) {
+    while !matches!(b.folder.stream, Stream::Listing { .. }) {
         let work = b.work.pop_front().expect("the commit is refused");
         b.perform(work, &mut remote).unwrap();
     }
@@ -3066,6 +3068,40 @@ fn a_server_that_lost_a_commit_of_this_device_gets_it_back_after_others_committe
     assert_eq!(restored.names(), all);
     assert_eq!(names(&site.root), all);
     assert_eq!(trashed(&site.root), Vec::<String>::new());
+    assert_eq!(a.state(), FolderState::UpToDate);
+}
+
+/// `a` lists the tree after its log was truncated, and reconnects to a server that lost its commit and took two of
+/// `b`'s at the same seqs before the listing returns. The pages read from the old server are dropped and the tree is
+/// listed again, so R holds the restored server's files, not the old snapshot with its seq 1.
+#[test]
+fn a_listing_out_when_the_server_lost_this_devices_commits_is_read_again() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site.root.join("one.txt"), b"one");
+    a.event(Event::ResyncRequired(ResyncRequired {
+        reason: Reason::LogTruncated as i32,
+        ..ResyncRequired::default()
+    }))
+    .unwrap();
+    let Some(Work::List) = a.work.pop_front() else {
+        panic!("list");
+    };
+    let old = remote.pages(TREE_PAGE);
+    let mut restored = Remote::new();
+    let (other, mut b) = linked(&mut restored, "b");
+    b.create(&mut restored, &other.root.join("new-one.txt"), b"new one");
+    b.create(&mut restored, &other.root.join("new-two.txt"), b"new two");
+    a.event(Event::Connected(restored.space.welcome(&a.caller)))
+        .unwrap();
+    let step = a.folder.listed(Ok(Listed::Done(old)));
+    a.take(step).unwrap();
+    a.run(&mut restored);
+    a.settle();
+    a.run(&mut restored);
+    let all = ["new-one.txt", "new-two.txt", "one.txt"];
+    assert_eq!(restored.names(), all);
+    assert_eq!(names(&site.root), all);
     assert_eq!(a.state(), FolderState::UpToDate);
 }
 
