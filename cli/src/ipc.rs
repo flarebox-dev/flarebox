@@ -163,6 +163,8 @@ pub async fn handle(driver: &Driver, request: Request) -> Response {
 /// The directory must belong to this user and be closed to everyone else, so no other user can reach the socket even
 /// before its mode is set. The socket is bound under a temporary name and renamed once it is 0600, so it never
 /// appears at `path` with another mode. Setting the umask instead would change it for every thread of the process.
+/// The temporary name is `.tmp` and the process id, at most 11 bytes like `daemon.sock`, so it fits the socket address
+/// limit wherever the socket path does.
 pub fn bind(path: &Path) -> io::Result<UnixListener> {
     let dir = path.parent().unwrap_or(Path::new("."));
     DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
@@ -189,8 +191,7 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
             "lets other users in through an ACL; remove it with chmod -N".to_owned(),
         ));
     }
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let temp = dir.join(format!(".{name}.{}.new", std::process::id()));
+    let temp = dir.join(format!(".tmp{}", std::process::id()));
     match fs::remove_file(&temp) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
