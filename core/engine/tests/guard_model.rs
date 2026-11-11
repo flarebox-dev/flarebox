@@ -941,6 +941,58 @@ fn witness_a_delete_whose_folder_a_restore_brought_back_leaves_the_window() {
     assert_eq!(witness(&events), Some((1, 29, 56)));
 }
 
+/// GUN-455: a folder deleted, one of its folders restored, which brings the folder back, and the
+/// folder deleted again. This device removed all of the first delete before the pause, so the
+/// first delete leaves the window, and the notice counts only the second delete's 26 files.
+#[test]
+fn witness_a_folder_a_restore_brought_back_and_deleted_again_counts_only_the_new_delete() {
+    let events = [
+        Delete("p"),
+        Step,
+        Restore("p/f"),
+        StepAll,
+        Delete("p"),
+        Pause,
+        StepAll,
+    ];
+    assert_eq!(witness(&events), Some((1, 26, 50)));
+}
+
+/// GUN-455: as the witness above for a delete the server applied in part. Once the restore brought
+/// p back and p was deleted again, the second delete's one removal is all of it, so it leaves the
+/// window, and the notice counts only the restored file's delete.
+#[test]
+fn witness_a_delete_whose_folder_was_deleted_again_after_a_restore_leaves_the_window() {
+    let events = [
+        DeleteUnseen("p"),
+        Delete("p"),
+        Step,
+        Restore("p/f/g1"),
+        Delete("p"),
+        Pause,
+        StepAll,
+    ];
+    assert_eq!(witness(&events), Some((1, 28, 55)));
+}
+
+/// GUN-455: a folder removed and noticed, one of its folders restored, the notice dismissed, and
+/// the restore lost. The server trashes the folder again in the dismissed delete's group, so
+/// removing it again is not noticed.
+#[test]
+fn witness_a_restore_lost_after_the_dismissal_stays_dismissed() {
+    let events = [
+        Delete("p"),
+        StepAll,
+        Restore("p/f"),
+        StepAll,
+        Dismiss,
+        Lose,
+        Bootstrap,
+        StepAll,
+    ];
+    assert_eq!(witness(&events), None);
+}
+
 /// GUN-384 review: one file restored from a delete the server applied in part, after the notice
 /// was dismissed part way through its removal. The rest of the delete stays dismissed, and the
 /// folder deleted above it counts only its own 8 files.
