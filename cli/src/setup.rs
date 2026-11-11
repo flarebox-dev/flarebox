@@ -12,7 +12,7 @@ pub(crate) mod fake;
 mod state;
 mod uninstall;
 
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::process::{Command as Process, Stdio};
 use std::time::{Duration, Instant};
@@ -129,7 +129,7 @@ pub async fn setup(paths: &Paths, device_name: &str, login: &LoginArgs) -> Resul
         "  1. Log in with Cloudflare: deploy a server to your account, or add this device to the server there"
     );
     println!("  2. Enter a pairing code from another device");
-    match prompt("Choose 1 or 2: ")?.as_str() {
+    match prompt("Choose 1 or 2: ").await?.as_str() {
         "1" => {
             with_session(login, async |session| {
                 session.setup(paths, device_name).await
@@ -137,7 +137,7 @@ pub async fn setup(paths: &Paths, device_name: &str, login: &LoginArgs) -> Resul
             .await
         }
         "2" => {
-            let code = prompt("Pairing code: ")?;
+            let code = prompt("Pairing code: ").await?;
             let invitation = crate::pairing::parse(&code, None)?;
             let request = Request::Pair {
                 server: invitation.server,
@@ -270,20 +270,29 @@ fn report_paired(paths: &Paths, response: Response) -> Result<(), String> {
     }
 }
 
-/// Logs in, runs `work`, and revokes the grant however `work` ends: success, failure, Ctrl-C or SIGTERM.
+/// Logs in, runs `work`, and revokes the grant however `work` ends: success, failure, Ctrl-C or SIGTERM. After a
+/// signal it exits at once with 130 for Ctrl-C or 143 for SIGTERM, as a shell does for a command the signal ended.
 async fn with_session(
     args: &LoginArgs,
     work: impl AsyncFnOnce(&mut Session) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut terminate = signal(SignalKind::terminate()).map_err(|error| error.to_string())?;
     let mut interrupt = signal(SignalKind::interrupt()).map_err(|error| error.to_string())?;
+    let mut status = None;
     let stopped = async || {
-        tokio::select! {
-            _ = terminate.recv() => "stopped by SIGTERM",
-            _ = interrupt.recv() => "stopped",
-        }
+        let (how, code) = tokio::select! {
+            _ = terminate.recv() => ("stopped by SIGTERM", 143),
+            _ = interrupt.recv() => ("stopped", 130),
+        };
+        status = Some(code);
+        how
     };
-    guarded(Session::login(args), stopped, work).await
+    let outcome = guarded(Session::login(args), stopped, work).await;
+    if let (Err(message), Some(code)) = (&outcome, status) {
+        eprintln!("flarebox: {message}");
+        std::process::exit(code);
+    }
+    outcome
 }
 
 /// Runs `work` on the session `login` returns, then revokes its grant. The grant exists once `login` returns, so
@@ -308,21 +317,38 @@ async fn guarded(
     outcome
 }
 
-fn prompt(question: &str) -> Result<String, String> {
+/// Asks `question` on stdout and reads one line of the answer from stdin.
+async fn prompt(question: &str) -> Result<String, String> {
     print!("{question}");
     std::io::stdout()
         .flush()
         .map_err(|error| error.to_string())?;
-    let mut line = String::new();
-    std::io::stdin()
-        .lock()
-        .read_line(&mut line)
+    read_answer(|| {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).map(|_| line)
+    })
+    .await
+}
+
+/// Runs the blocking `read` on a thread of its own, so the caller can stop waiting for it: `with_session` ends the
+/// command at Ctrl-C while a prompt waits. The thread is not one of the runtime's blocking threads, which the runtime
+/// waits for when it is dropped, so a read nobody answers stays blocked until the process exits.
+async fn read_answer(
+    read: impl FnOnce() -> std::io::Result<String> + Send + 'static,
+) -> Result<String, String> {
+    let (sender, answer) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(read());
+    });
+    let line = answer
+        .await
+        .map_err(|_| "the answer could not be read".to_owned())?
         .map_err(|error| error.to_string())?;
     Ok(line.trim().to_owned())
 }
 
 /// Asks a yes-or-no question on a terminal. Without a terminal it refuses, naming `flag`.
-fn confirm(question: &str, yes: bool, flag: &str) -> Result<(), String> {
+async fn confirm(question: &str, yes: bool, flag: &str) -> Result<(), String> {
     if yes {
         return Ok(());
     }
@@ -331,7 +357,7 @@ fn confirm(question: &str, yes: bool, flag: &str) -> Result<(), String> {
             "{question} Run again with {flag} to go on without a terminal."
         ));
     }
-    match prompt(&format!("{question} [y/N] "))?.as_str() {
+    match prompt(&format!("{question} [y/N] ")).await?.as_str() {
         "y" | "Y" | "yes" => Ok(()),
         _ => Err("stopped; nothing more was changed".into()),
     }
@@ -438,7 +464,7 @@ impl Session {
                 println!(
                     "The browser then fails to load a page on 127.0.0.1. Copy that page's address."
                 );
-                let pasted = prompt("Address: ")?;
+                let pasted = prompt("Address: ").await?;
                 let url = Url::parse(&pasted)
                     .map_err(|error| format!("that is not an address: {error}"))?;
                 login.code_from(&url).map_err(|error| error.to_string())?
@@ -703,7 +729,7 @@ impl Session {
                 for (index, server) in found.iter().enumerate() {
                     println!("  {}. {} at {}", index + 1, server.script.id, server.url);
                 }
-                let choice = prompt("Which one? ")?;
+                let choice = prompt("Which one? ").await?;
                 let index = choice
                     .parse::<usize>()
                     .ok()
@@ -851,7 +877,10 @@ impl Session {
                     "{reason} Run flarebox server upgrade, then this command again."
                 ));
             }
-            if confirm(&format!("{reason} Upgrade it now?"), false, "--yes").is_err() {
+            if confirm(&format!("{reason} Upgrade it now?"), false, "--yes")
+                .await
+                .is_err()
+            {
                 return Err(format!(
                     "{reason} Run flarebox server upgrade, then flarebox setup again."
                 ));
@@ -920,7 +949,7 @@ impl Session {
                 ),
                 yes,
                 "--yes",
-            )?;
+            ).await?;
         }
         let bucket = server
             .bucket
@@ -1024,7 +1053,7 @@ impl Session {
             ),
             yes,
             "--yes",
-        )?;
+        ).await?;
         file.save(&state)?;
         uninstall::finish(self, &file, state).await
     }
@@ -1226,6 +1255,43 @@ mod tests {
             url: fake.base.clone(),
             info: None,
         }
+    }
+
+    #[test]
+    fn a_stop_ends_a_prompt_nobody_answers_and_the_runtime_does_not_wait_for_it() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = runtime.block_on(guarded(
+            async {
+                read_answer(|| {
+                    loop {
+                        std::thread::park();
+                    }
+                })
+                .await?;
+                unreachable!("nobody answers the prompt")
+            },
+            async || "stopped",
+            async |_: &mut Session| Ok(()),
+        ));
+        assert_eq!(outcome.unwrap_err(), "stopped before the login finished");
+        let (dropped, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(runtime);
+            dropped.send(()).unwrap();
+        });
+        done.recv_timeout(Duration::from_secs(5))
+            .expect("the runtime stops without waiting for the blocked read");
+    }
+
+    #[tokio::test]
+    async fn an_answer_is_read_without_its_line_end() {
+        let answer = read_answer(|| Ok(" y\n".to_owned())).await;
+        assert_eq!(answer.as_deref(), Ok("y"));
+        let failed = read_answer(|| Err(std::io::Error::other("closed"))).await;
+        assert_eq!(failed.unwrap_err(), "closed");
     }
 
     #[tokio::test]
