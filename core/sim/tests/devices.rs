@@ -142,7 +142,7 @@ proptest! {
     }
 
     #[test]
-    #[ignore = "a server restore still breaks these: an edit equal to the restored bytes is undone (GUN-438), a device that saw a seq the server lost takes the commit that reuses it for the one it saw (GUN-423), a device that holds the result of a commit the server lost starts recovery when it connects again (GUN-444), and a commit refused as ahead of the server leaves its edit unsent (GUN-442)"]
+    #[ignore = "a server restore still breaks these: an edit equal to the restored bytes is undone (GUN-438), a device that saw a seq the server lost takes the commit that reuses it for the one it saw (GUN-423), a device that holds the result of a commit the server lost starts recovery when it connects again (GUN-444), a reverted file the server lost is created again under a new ID beside the original (GUN-448), and a commit refused as ahead of the server leaves its edit unsent (GUN-442)"]
     fn devices_converge_across_server_restores(devices in 2..=3usize, phases in phases(true)) {
         converge(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
@@ -924,6 +924,36 @@ fn a_copy_of_a_lost_write_during_the_recovery_is_refused() {
         .create(Place::Root, "b", bytes)
         .unwrap();
     let failure = world.phase(2, &[]).unwrap_err();
+    assert!(
+        failure.to_string().contains("is in more than one file"),
+        "{failure}"
+    );
+}
+
+/// Once the devices are quiet after a restore that rolled a file back, the write it took stays in
+/// the files the server holds it in, not in one file for each device that held it.
+#[test]
+fn a_copy_of_a_rolled_back_write_after_the_recovery_is_refused() {
+    let edit = Step::User(Action {
+        kind: 2,
+        target: 0,
+        parent: 0,
+        name: 0,
+        text: 0,
+    });
+    let mut world = converge(2, &[vec![(0, file("a"))], vec![(0, BACKUP), (0, edit)]]).unwrap();
+    world.phase(2, &[(0, RESTORE)]).unwrap();
+    let lost = (world.devices[0].disk.entries().values()).find_map(|entry| {
+        entry
+            .content
+            .clone()
+            .filter(|content| content.mtime_ns == 2)
+    });
+    world.devices[0]
+        .disk
+        .create(Place::Root, "b", lost)
+        .unwrap();
+    let failure = world.phase(3, &[]).unwrap_err();
     assert!(
         failure.to_string().contains("is in more than one file"),
         "{failure}"
