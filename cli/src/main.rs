@@ -1212,6 +1212,38 @@ mod tests {
         assert_eq!(text.lines().count(), 3);
     }
 
+    #[tokio::test]
+    async fn a_build_without_the_server_bundle_stops_before_the_cloudflare_login() {
+        if option_env!("KOIDRIVE_SERVER_BUNDLE").is_some() {
+            return;
+        }
+        for args in [
+            vec!["koi", "server", "deploy", "--no-browser"],
+            vec!["koi", "server", "add-device", "--no-browser"],
+            vec!["koi", "server", "upgrade", "--no-browser"],
+            vec!["koi", "server", "uninstall", "--no-browser"],
+        ] {
+            let Some(Command::Server { action }) = Cli::try_parse_from(&args).unwrap().command
+            else {
+                unreachable!("{args:?} is a server command");
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::under(dir.path());
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                setup::server(&paths, action),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{args:?} waited for a login"));
+            assert!(
+                outcome
+                    .unwrap_err()
+                    .contains("built without a server bundle"),
+                "{args:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_name_longer_than_255_bytes_is_refused_before_anything_is_sent() {
         let longest = "가".repeat(85);
