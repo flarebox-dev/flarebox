@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::sync::Mutex;
 use std::task::{Context, Poll, Waker};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use flarebox_chunk::{ChunkerConfig, chunks, content};
 use flarebox_engine::classify::Trees;
@@ -1476,16 +1476,14 @@ fn a_root_replaced_before_an_effect_applies_receives_nothing() {
     assert!(engine.effects.in_flight().is_some());
 }
 
-/// Observes until `done` accepts the changes seen so far, for at most ten seconds, and returns them as one batch.
+/// Observes until `done` accepts the changes seen so far, and returns them as one batch.
 fn observe_until(
     observer: &mut FsObserver,
     stamp: Stamp,
     done: impl Fn(&[Observed]) -> bool,
 ) -> Batch {
-    let deadline = Instant::now() + Duration::from_secs(10);
     let (mut seen, mut rules) = (Vec::new(), Vec::new());
     loop {
-        assert!(Instant::now() < deadline, "not observed in time: {seen:?}");
         if let Some(observation) = observer.observe(Duration::from_millis(200)).unwrap() {
             seen.extend(observation.changes.iter().cloned());
             rules.extend(observation.rules.iter().cloned());

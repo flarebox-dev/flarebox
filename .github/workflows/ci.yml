@@ -107,6 +107,7 @@ jobs:
       matrix:
         os: ${{ fromJSON(needs.changes.outputs.rust_macos == 'true' && '["ubuntu-latest","macos"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os == 'macos' && fromJSON(needs.changes.outputs.macos_runs_on) || matrix.os }}
+    timeout-minutes: 60
     env:
       DEVELOPER_DIR: ${{ matrix.os == 'macos' && needs.changes.outputs.macos_developer_dir || '' }}
     steps:
