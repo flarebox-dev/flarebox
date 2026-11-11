@@ -10,8 +10,10 @@ use flarebox_proto::v1::{self as proto, error, op, op_result};
 use prost::Message;
 
 use crate::classify::{Class, Trees};
+use crate::guard::{self, GuardState};
 use crate::ids::IdGen;
 use crate::names::{MAX_NAME_BYTES, name_key, nfc};
+use crate::question::{Answer, Question, QuestionKind};
 use crate::restore::{Outcome, RESOLVED_KEPT, Rejection, Resolved, RestoreId, RestoreIntent};
 use crate::state::{CommitsState, StateError};
 use crate::tree::{Content, Kind, Names, NodeId, Shape, same, same_content};
@@ -144,6 +146,9 @@ pub struct Commits {
     resolved: Vec<Resolved>,
     /// The seq of each of this device's last [`SLOTS_KEPT`] acknowledged commits, by slot.
     slots: BTreeMap<u64, u64>,
+    /// The open questions, in the order they were asked.
+    questions: Vec<Question>,
+    guard: GuardState,
 }
 
 impl Commits {
@@ -160,6 +165,8 @@ impl Commits {
             restores: self.restores.clone(),
             resolved: self.resolved.clone(),
             slots: self.slots.clone(),
+            questions: self.questions.clone(),
+            guard: self.guard.clone(),
         }
     }
 
@@ -216,6 +223,8 @@ impl Commits {
             restores,
             resolved,
             slots,
+            questions,
+            guard,
         } = state;
         Ok(Self {
             accepted,
@@ -228,6 +237,8 @@ impl Commits {
             restores,
             resolved,
             slots,
+            questions,
+            guard,
         })
     }
 
@@ -311,6 +322,35 @@ impl Commits {
         &self.resolved
     }
 
+    /// The open questions, in the order they were asked. No commit carries an op for a node one of
+    /// them holds ([`Question::holds`]) until it is answered.
+    pub fn questions(&self) -> &[Question] {
+        &self.questions
+    }
+
+    /// Takes the person's answer to the open question `id`, routed by its kind. Only the
+    /// mass-delete guard asks questions so far (section 6.1). The answer stays on the question
+    /// until the next build has counted what is pending. [`Answer::Delete`] then makes the held
+    /// deletions without counting them again if they are still exactly the ones the question
+    /// listed, and asks a new question otherwise. [`Answer::Restore`] clears S for every node of
+    /// the question that is still deleted, so the effects download them again, and holds any other
+    /// pending deletion under a new question. An S update that would leave S invalid, such as for
+    /// a folder whose child was moved out and is not acknowledged yet, waits ([`Trees::waiting`]).
+    /// False, and nothing changes, when no open question has the ID, its kind does not take the
+    /// answer, or it already took one.
+    pub fn decide(&mut self, id: &str, answer: Answer) -> bool {
+        let Some(index) = (self.questions.iter()).position(|question| {
+            question.id == id
+                && question.answer.is_none()
+                && question.kind.answers().contains(&answer)
+                && matches!(question.kind, QuestionKind::MassDelete { .. })
+        }) else {
+            return false;
+        };
+        self.questions[index].answer = Some(answer);
+        true
+    }
+
     fn resolve(&mut self, id: RestoreId, outcome: Outcome) {
         let intent = self.restores.remove(&id).expect("a queued restore");
         self.resolved.push(Resolved {
@@ -382,6 +422,10 @@ impl Commits {
     /// an excluded node in R is not deleted, since that would trash the excluded node on the
     /// server: each topmost deleted node below it with no excluded node in its subtree gets its
     /// own delete, and the folder stays (section 5.10).
+    ///
+    /// A node an open question holds gets no op. Every other deletion that could be planned now goes
+    /// through the mass-delete guard first (section 6.1), and the commit carries the changes it
+    /// does not hold.
     pub fn build(
         &mut self,
         trees: &mut Trees,
@@ -412,6 +456,32 @@ impl Commits {
             .collect();
         skip.extend(excluded);
         let needed = self.retry_waiting(trees, needed, agreed);
+        let guarded =
+            |question: &Question| matches!(question.kind, QuestionKind::MassDelete { .. });
+        let index = self.questions.iter().position(guarded);
+        let mut asked = index.map(|index| self.questions.remove(index));
+        let open = asked.as_ref().map(|question| question.id.clone());
+        skip.extend(self.questions.iter().flat_map(Question::holds).cloned());
+        let deleted = (trees.dirty().iter())
+            .filter(|id| !skip.contains(*id) && deletes(trees, id, &needed))
+            .cloned()
+            .collect();
+        let pending = guard::deletions(trees, &deleted);
+        let checked = (self.guard).check(&mut asked, pending, trees, ids, now_ms);
+        skip.extend(checked.held);
+        let restored: Vec<NodeId> = (checked.restored.into_values())
+            .flat_map(|held| held.members.into_keys())
+            .collect();
+        skip.extend(restored.iter().cloned());
+        let updates = restored.into_iter().map(|id| (id, None)).collect();
+        for (id, shape) in update_synced(trees, updates) {
+            trees.wait(id, shape);
+        }
+        if let Some(question) = asked {
+            let kept = index.filter(|_| open.as_ref() == Some(&question.id));
+            self.questions
+                .insert(kept.unwrap_or(self.questions.len()), question);
+        }
         self.split.retain(|id| trees.synced().live(id).is_some());
         self.aliases
             .retain(|id, _| trees.local().get(id).is_some() && trees.reverted().contains(id));
@@ -857,6 +927,14 @@ impl Synced {
     }
 }
 
+/// Whether planning deletes the node: L deleted it, S holds it, and the keep rule does not need it.
+fn deletes(trees: &Trees, id: &str, needed: &BTreeSet<NodeId>) -> bool {
+    trees.local().get(id).is_none()
+        && trees.synced().live(id).is_some()
+        && trees.class(id) == Class::Local
+        && !needed.contains(id)
+}
+
 /// Makes the S updates, the last for each node, that leave S a valid tree: all of them together
 /// when they fit together, otherwise each that fits on its own and then the rest together again,
 /// while any is made. Returns the rest.
@@ -1230,7 +1308,7 @@ fn plan(
         }
         let synced = trees.synced().live(id);
         let Some(local) = trees.local().get(id).map(|node| &node.shape) else {
-            if synced.is_some() && trees.class(id) == Class::Local && !needed.contains(id) {
+            if deletes(trees, id, needed) {
                 deleted.insert(id.clone());
             }
             continue;

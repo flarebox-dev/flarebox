@@ -12,7 +12,7 @@ publish.workspace = true
 [dependencies]
 bytes = "1.12.1"
 flarebox-chunk = { path = "../chunk" }
-flarebox-engine = { path = "../engine" }
+flarebox-engine = { path = "../engine", features = ["serde"] }
 flarebox-fs = { path = "../fs" }
 flarebox-ignore = { path = "../ignore" }
 flarebox-net = { path = "../net" }

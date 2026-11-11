@@ -9,10 +9,14 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+serde = ["dep:serde"]
+
 [dependencies]
 flarebox-ignore = { path = "../ignore" }
 flarebox-proto = { path = "../proto" }
 prost.workspace = true
+serde = { version = "1.0.229", features = ["derive"], optional = true }
 unicode-normalization = "0.1"
 
 [dev-dependencies]

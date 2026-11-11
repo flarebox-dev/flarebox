@@ -7,7 +7,9 @@
 use flarebox_engine::classify::Trees;
 use flarebox_engine::commit::{Commits, Halt, InFlight, MAX_OPS};
 use flarebox_engine::effects::{Effect, EffectRecord, Effects, Location};
+use flarebox_engine::guard::{Counted, GuardState};
 use flarebox_engine::ids::uuid_v7;
+use flarebox_engine::question::{Answer, Held, Question, QuestionKind, Revisions};
 use flarebox_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
 use flarebox_engine::state::{CommitsState, EffectsState, StateError, TreesState};
 use flarebox_engine::tree::{FileIdentity, Kind, LocalNode, RemoteNode, Shape, TreeError};
@@ -130,6 +132,46 @@ fn commits_state() -> CommitsState {
             outcome: Outcome::Rejected(Rejection::NotFound),
         }],
         slots: [(2, 5), (3, 8)].into(),
+        questions: questions(),
+        guard: guard_state(),
+    }
+}
+
+/// An open question holding a node R holds and one it does not.
+fn questions() -> Vec<Question> {
+    let revisions = Revisions {
+        content_rev: 2,
+        meta_rev: 3,
+    };
+    vec![Question {
+        id: "q".into(),
+        asked_at_ms: 7,
+        kind: QuestionKind::MassDelete {
+            deletions: 1,
+            affected_files: 1,
+            space_files: 1,
+        },
+        held: [(
+            "h".into(),
+            Held {
+                members: [("h".into(), Some(revisions)), ("i".into(), None)].into(),
+                files: 1,
+            },
+        )]
+        .into(),
+        answer: Some(Answer::Delete),
+    }]
+}
+
+/// A guard with a deletion in the window and a confirmed deletion.
+fn guard_state() -> GuardState {
+    let held = Held {
+        members: [("c".into(), None)].into(),
+        files: 1,
+    };
+    GuardState {
+        ledger: [("h".into(), Counted { at_ms: 7, files: 1 })].into(),
+        confirmed: [("c".into(), held)].into(),
     }
 }
 
