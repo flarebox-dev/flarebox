@@ -920,6 +920,12 @@ impl Trees {
     /// replace an edit only L holds with content another device restores, and later commits take
     /// its slot again. No update keeps a slot above `accepted` after a loss.
     ///
+    /// A position L and R agreed on while the commit in flight was out ([`Trees::position_after`])
+    /// is kept only where the server still holds the record that showed it: one of a seq at or
+    /// below `held_through`, or one R now holds the node at, live and at that revision. Any other
+    /// record may be lost, and a later record can take its seq, so a revision comparison cannot
+    /// tell it survived (GUN-457). The agreement is then taken again from L and the new R.
+    ///
     /// [`Commits::held_through`]: crate::commit::Commits::held_through
     pub fn forget_lost(
         &mut self,
@@ -1008,6 +1014,24 @@ impl Trees {
             } else {
                 self.set_synced(id, None);
             }
+        }
+        let unproven: Vec<NodeId> = (self.watched_positions.iter())
+            .filter(|(id, agreed)| {
+                agreed.as_ref().is_some_and(|agreed| {
+                    agreed.rev > held_through
+                        && !(self.r.get(id)).is_some_and(|remote| {
+                            !remote.trashed
+                                && remote.meta_rev == agreed.rev
+                                && remote.shape.parent == agreed.parent
+                                && remote.shape.name == agreed.name
+                        })
+                })
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in unproven {
+            self.watched_positions.insert(id.clone(), None);
+            self.note_position(&id);
         }
         debug_assert_eq!(self.s.check(Names::ByKey), Ok(()));
     }
