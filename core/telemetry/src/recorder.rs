@@ -74,7 +74,14 @@ impl Recorder {
                     .merge(report);
             }
             let mut events = taken.events;
-            events.append(&mut pending.events);
+            for event in std::mem::take(&mut pending.events) {
+                let same = (events.iter())
+                    .filter(|held| held.kind() == event.kind() && held.day() == event.day())
+                    .count();
+                if same < Event::PER_KIND_PER_DAY {
+                    events.push(event);
+                }
+            }
             pending.events = events;
         });
     }
@@ -176,5 +183,21 @@ mod tests {
         recorder.count_on(3, Counter::Command(Command::Status), 4);
         recorder.restore(taken);
         assert_eq!(recorder.take().days[&3].counters["command"]["status"], 5);
+    }
+
+    #[test]
+    fn restoring_keeps_the_event_cap() {
+        let recorder = Recorder::on();
+        for _ in 0..Event::PER_KIND_PER_DAY {
+            recorder.event(panic_on(5));
+        }
+        for _ in 0..3 {
+            let taken = recorder.take();
+            for _ in 0..Event::PER_KIND_PER_DAY {
+                recorder.event(panic_on(5));
+            }
+            recorder.restore(taken);
+        }
+        assert_eq!(recorder.take().events.len(), Event::PER_KIND_PER_DAY);
     }
 }

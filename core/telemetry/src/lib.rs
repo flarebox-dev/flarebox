@@ -17,7 +17,7 @@ mod system;
 pub use consent::{Mode, Source, Status, VARIABLE, resolve, should_ask};
 pub use panic::install_panic_hook;
 pub use recorder::{Pending, Recorder};
-pub use schema::{DailyReport, Event, InstallId};
+pub use schema::{DailyReport, Event, EventUuid, InstallId};
 pub use send::{
     ENDPOINT, ENDPOINT_VARIABLE, PROJECT_TOKEN, Sent, TOKEN_VARIABLE, UploadError, Uploader, batch,
     send,

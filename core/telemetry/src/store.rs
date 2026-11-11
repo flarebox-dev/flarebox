@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{FlockOperation, flock};
@@ -16,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::consent::{self, Status};
 use crate::recorder::Pending;
-use crate::schema::{DailyReport, Event, InstallId};
+use crate::schema::{DailyReport, Event, EventUuid, InstallId};
 
 /// Days a report or an event waits to be sent before it is dropped.
 pub const KEEP_DAYS: u32 = 14;
@@ -48,13 +49,15 @@ impl Batch {
     }
 }
 
-/// A batch [`Store::take`] handed out. It stays in the queue until [`Store::sent`] or [`Store::give_back`] settles
-/// it, and holds `send.lock` meanwhile, so one send runs at a time. Dropped without either, as when its send is
-/// cancelled or its process ends, it goes back to the queue at the next take.
+/// A batch [`Store::take`] handed out. It stays in the queue until [`Store::sent`] removes it, and holds `send.lock`
+/// meanwhile, so one send runs at a time. Given back, or dropped as when its send is cancelled or its process ends,
+/// the next take hands out the same batch with the same uuids, so PostHog keeps one copy if an earlier try arrived.
 #[derive(Debug)]
 pub struct Sending {
     pub id: InstallId,
     pub batch: Batch,
+    /// One per day of `batch`, then one per event.
+    pub uuids: Vec<EventUuid>,
     _lock: File,
 }
 
@@ -70,11 +73,48 @@ struct Queue {
     out: Option<Out>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Out {
     id: InstallId,
     batch: Batch,
+    uuids: Vec<EventUuid>,
+}
+
+impl Out {
+    fn new(id: InstallId, batch: Batch) -> Self {
+        let uuids = (0..batch.days.len() + batch.events.len())
+            .map(|_| EventUuid::generate())
+            .collect();
+        Out { id, batch, uuids }
+    }
+
+    /// Without what is older than [`KEEP_DAYS`]. None when nothing is left, or when its uuids don't match its batch.
+    fn trimmed(self, today: u32) -> Option<Self> {
+        if self.uuids.len() != self.batch.days.len() + self.batch.events.len() {
+            return None;
+        }
+        let oldest = today.saturating_sub(KEEP_DAYS);
+        let mut uuids = self.uuids.into_iter();
+        let mut out = Out {
+            id: self.id,
+            batch: Batch::default(),
+            uuids: Vec::new(),
+        };
+        for (report, uuid) in self.batch.days.into_iter().zip(uuids.by_ref()) {
+            if report.day >= oldest {
+                out.batch.days.push(report);
+                out.uuids.push(uuid);
+            }
+        }
+        for (event, uuid) in self.batch.events.into_iter().zip(uuids) {
+            if event.day() >= oldest {
+                out.batch.events.push(event);
+                out.uuids.push(uuid);
+            }
+        }
+        (!out.batch.is_empty()).then_some(out)
+    }
 }
 
 impl Queue {
@@ -149,9 +189,11 @@ impl Store {
         Ok(settings)
     }
 
-    /// Draws a new install id and deletes everything waiting to be sent. Without an id there is nothing to reset.
+    /// Deletes everything waiting to be sent and then draws a new install id, so a crash between the two never leaves
+    /// old reports under the new id. Without an id there is nothing to reset.
     pub fn reset(&self) -> io::Result<Option<InstallId>> {
         let _lock = self.lock(true)?;
+        remove(&self.dir.join("queue.json"))?;
         let mut settings = self.settings()?;
         if settings.install_id.is_none() {
             return Ok(None);
@@ -159,7 +201,6 @@ impl Store {
         let id = InstallId::generate();
         settings.install_id = Some(id.clone());
         write(&self.dir.join("settings.json"), &settings)?;
-        remove(&self.dir.join("queue.json"))?;
         Ok(Some(id))
     }
 
@@ -215,15 +256,16 @@ impl Store {
             (Some(id), Some(expected)) if &id != expected => return Ok(()),
             _ => {}
         }
-        let mut queue = self.queue();
+        let mut queue = self.queue()?;
         queue.put(pending.days.into_values(), pending.events);
         queue.trim(today);
         write(&self.dir.join("queue.json"), &queue)
     }
 
-    /// Marks the reports of days before `today` and every event as out, and hands them over with the install id they
-    /// belong to. A batch an earlier send left out joins them. None while the profile has no id, or while another
-    /// send has a batch out. The caller settles it with [`Store::sent`] or [`Store::give_back`].
+    /// Hands out the batch an earlier send left out, unchanged but for what expired. Without one, it marks the reports
+    /// of days before `today` and every event as out and hands them over, each with a new uuid. None while the profile
+    /// has no id, or while another send has a batch out. The caller settles it with [`Store::sent`] or
+    /// [`Store::give_back`].
     pub fn take(&self, today: u32) -> io::Result<Option<Sending>> {
         let sending = match self.send_lock() {
             Ok(file) => file,
@@ -234,65 +276,66 @@ impl Store {
         let Some(id) = self.settings()?.install_id else {
             return Ok(None);
         };
-        let mut queue = self.queue();
-        if let Some(out) = queue.out.take()
-            && out.id == id
-        {
-            queue.put(out.batch.days, out.batch.events);
+        let mut queue = self.queue()?;
+        let had_out = queue.out.is_some();
+        queue.trim(today);
+        let left = (queue.out.take())
+            .filter(|out| out.id == id)
+            .and_then(|out| out.trimmed(today));
+        let out = left.unwrap_or_else(|| {
+            let later = queue.days.split_off(&today);
+            let batch = Batch {
+                days: std::mem::replace(&mut queue.days, later)
+                    .into_values()
+                    .collect(),
+                events: std::mem::take(&mut queue.events),
+            };
+            Out::new(id.clone(), batch)
+        });
+        if !out.batch.is_empty() {
+            queue.out = Some(out.clone());
         }
-        let later = queue.days.split_off(&today);
-        let batch = Batch {
-            days: std::mem::replace(&mut queue.days, later)
-                .into_values()
-                .collect(),
-            events: std::mem::take(&mut queue.events),
-        };
-        if !batch.is_empty() {
-            queue.out = Some(Out {
-                id: id.clone(),
-                batch: batch.clone(),
-            });
+        if had_out || queue.out.is_some() {
             write(&self.dir.join("queue.json"), &queue)?;
         }
         Ok(Some(Sending {
             id,
-            batch,
+            batch: out.batch,
+            uuids: out.uuids,
             _lock: sending,
         }))
     }
 
     /// Removes a batch the endpoint accepted, or refused for good.
     pub fn sent(&self, sending: Sending) -> io::Result<()> {
-        self.settle(sending, None)
+        self.settle(sending, true)
     }
 
-    /// Puts a batch that was not sent back into the queue, as of `today`. It is dropped when the profile's install
-    /// id is no longer the batch's: telemetry was turned off or reset while the batch was out, so it must not be sent
-    /// again, under the old id or a new one.
-    pub fn give_back(&self, sending: Sending, today: u32) -> io::Result<()> {
-        self.settle(sending, Some(today))
+    /// Leaves a batch that was not sent in the queue, for the next take to send again as it is. It is dropped when
+    /// the profile's install id is no longer the batch's: telemetry was turned off or reset while the batch was out,
+    /// so it must not be sent again, under the old id or a new one.
+    pub fn give_back(&self, sending: Sending) -> io::Result<()> {
+        self.settle(sending, false)
     }
 
-    fn settle(&self, sending: Sending, back: Option<u32>) -> io::Result<()> {
+    /// Touches the queue's batch only when it is the one `sending` took, so a [`Sending`] of another profile
+    /// changes nothing.
+    fn settle(&self, sending: Sending, sent: bool) -> io::Result<()> {
         let _lock = self.lock(true)?;
         let id = self.settings()?.install_id;
-        let mut queue = self.queue();
-        let Some(out) = queue.out.take() else {
+        let mut queue = self.queue()?;
+        let ours = (queue.out.as_ref())
+            .is_some_and(|out| out.id == sending.id && out.uuids == sending.uuids);
+        if !ours || (!sent && id.as_ref() == Some(&sending.id)) {
             return Ok(());
-        };
-        if let Some(today) = back
-            && id.as_ref() == Some(&sending.id)
-            && out.id == sending.id
-        {
-            queue.put(out.batch.days, out.batch.events);
-            queue.trim(today);
         }
+        queue.out = None;
         write(&self.dir.join("queue.json"), &queue)
     }
 
     /// Everything in the queue, today and a batch that is out included, without taking it.
     pub fn peek(&self) -> io::Result<Batch> {
-        let mut queue = self.queue();
+        let mut queue = self.queue()?;
         if let Some(out) = queue.out.take() {
             queue.put(out.batch.days, out.batch.events);
         }
@@ -302,13 +345,16 @@ impl Store {
         })
     }
 
-    /// The queue. One that cannot be read, such as one a newer build wrote or one a crash left empty, is dropped, so
-    /// it cannot stop every later write.
-    fn queue(&self) -> Queue {
-        read(&self.dir.join("queue.json")).unwrap_or_else(|error| {
-            tracing::debug!(%error, "dropping a telemetry queue that cannot be read");
-            Queue::default()
-        })
+    /// The queue. One that cannot be parsed, such as one a newer build wrote or one a crash left empty, is dropped,
+    /// so it cannot stop every later write. Any other read error is returned, so the file is not overwritten.
+    fn queue(&self) -> io::Result<Queue> {
+        match read(&self.dir.join("queue.json")) {
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                tracing::debug!(%error, "dropping a telemetry queue that cannot be parsed");
+                Ok(Queue::default())
+            }
+            read => read,
+        }
     }
 
     fn lock(&self, wait: bool) -> io::Result<File> {
@@ -320,8 +366,12 @@ impl Store {
         self.flock("send.lock", false)
     }
 
+    /// Creates the directory, and any missing parent, readable by the owner alone.
     fn flock(&self, name: &str, wait: bool) -> io::Result<File> {
-        fs::create_dir_all(&self.dir)?;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&self.dir)?;
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -456,16 +506,59 @@ mod tests {
             [99]
         );
         assert_eq!(sending.batch.events.len(), 2);
-        let left = store.queue();
+        let left = store.queue().unwrap();
         assert_eq!(days(&left), [100]);
         assert!(left.events.is_empty());
         assert_eq!(left.out.unwrap().batch, sending.batch);
         assert_eq!(store.peek().unwrap().days.len(), 2);
 
-        store.give_back(sending, 100).unwrap();
-        let queue = store.queue();
-        assert_eq!(days(&queue), [99, 100]);
-        assert!(queue.out.is_none());
+        let (batch, uuids) = (sending.batch.clone(), sending.uuids.clone());
+        assert_eq!(uuids.len(), 3);
+        store.give_back(sending).unwrap();
+        store.absorb_at(pending(99, 4), 100, true).unwrap();
+        let again = store.take(101).unwrap().unwrap();
+        assert_eq!((again.batch, again.uuids), (batch, uuids));
+    }
+
+    #[test]
+    fn take_drops_what_expired() {
+        let (_dir, store) = store();
+        store.set(true).unwrap();
+        store.absorb_at(pending(99, 1), 100, true).unwrap();
+        assert!(
+            store
+                .take(99 + KEEP_DAYS + 1)
+                .unwrap()
+                .unwrap()
+                .batch
+                .is_empty()
+        );
+        store.absorb_at(pending(99, 1), 100, true).unwrap();
+        let sending = store.take(100).unwrap().unwrap();
+        store.give_back(sending).unwrap();
+        assert!(
+            store
+                .take(99 + KEEP_DAYS + 1)
+                .unwrap()
+                .unwrap()
+                .batch
+                .is_empty()
+        );
+        assert!(store.peek().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_sending_of_another_profile_settles_nothing() {
+        let (_dir, store) = store();
+        let (_other_dir, other) = self::store();
+        for store in [&store, &other] {
+            store.set(true).unwrap();
+            store.absorb_at(pending(99, 1), 100, true).unwrap();
+        }
+        let theirs = other.take(100).unwrap().unwrap();
+        let _ours = store.take(100).unwrap().unwrap();
+        store.sent(theirs).unwrap();
+        assert!(store.queue().unwrap().out.is_some());
     }
 
     #[test]
@@ -485,14 +578,16 @@ mod tests {
         store.absorb_at(pending(99, 1), 100, true).unwrap();
         let sending = store.take(100).unwrap().unwrap();
         assert!(store.take(100).unwrap().is_none());
-        let batch = sending.batch.clone();
+        let (batch, uuids) = (sending.batch.clone(), sending.uuids.clone());
         drop(sending);
 
         store.absorb_at(pending(99, 2), 100, true).unwrap();
         let again = store.take(100).unwrap().unwrap();
-        assert_eq!(again.batch.days.len(), 1);
-        assert_eq!(again.batch.days[0].counters["command"]["status"], 3);
-        assert_eq!(again.batch.events.len(), batch.events.len() + 1);
+        assert_eq!((&again.batch, &again.uuids), (&batch, &uuids));
+        store.sent(again).unwrap();
+        let next = store.take(100).unwrap().unwrap();
+        assert_eq!(next.batch.days[0].counters["command"]["status"], 2);
+        assert_ne!(next.uuids, uuids);
     }
 
     #[test]
@@ -502,13 +597,13 @@ mod tests {
         store.absorb_at(pending(99, 1), 100, true).unwrap();
         let sending = store.take(100).unwrap().unwrap();
         store.reset().unwrap();
-        store.give_back(sending, 100).unwrap();
+        store.give_back(sending).unwrap();
         assert!(store.peek().unwrap().is_empty());
 
         store.absorb_at(pending(99, 1), 100, true).unwrap();
         let sending = store.take(100).unwrap().unwrap();
         store.set(false).unwrap();
-        store.give_back(sending, 100).unwrap();
+        store.give_back(sending).unwrap();
         assert!(store.peek().unwrap().is_empty());
         assert!(store.take(100).unwrap().is_none());
         assert_eq!(store.settings().unwrap().install_id, None);
@@ -543,6 +638,24 @@ mod tests {
         fs::write(store.dir.join("queue.json"), b"").unwrap();
         store.absorb_at(pending(100, 1), 100, true).unwrap();
         assert_eq!(store.peek().unwrap().days.len(), 1);
+    }
+
+    #[test]
+    fn a_queue_that_cannot_be_read_is_left_alone() {
+        let (_dir, store) = store();
+        store.set(true).unwrap();
+        fs::create_dir(store.dir.join("queue.json")).unwrap();
+        assert!(store.absorb_at(pending(100, 1), 100, true).is_err());
+        assert!(store.dir.join("queue.json").is_dir());
+    }
+
+    #[test]
+    fn the_directory_is_the_owner_s_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, store) = store();
+        store.set(true).unwrap();
+        let mode = fs::metadata(&store.dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 
     #[test]

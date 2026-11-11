@@ -12,7 +12,7 @@ use serde_json::{Map, Value, json};
 use url::Url;
 
 use crate::consent::Mode;
-use crate::schema::{DailyReport, InstallId, SCHEMA};
+use crate::schema::{DailyReport, EventUuid, InstallId, SCHEMA};
 use crate::store::{Batch, Store};
 use crate::system::Environment;
 
@@ -42,7 +42,7 @@ pub enum Sent {
     Accepted,
     /// Printed to stderr, in [`Mode::Debug`].
     Printed,
-    /// It went back to the queue, to be sent later: no token, a network error, a 429 or a 5xx.
+    /// It went back to the queue, to be sent later: no token, a network error, a 408, a 429 or a 5xx.
     Later,
     /// The endpoint refused it with this status. It is dropped, since sending it again would be refused again.
     Refused(u16),
@@ -56,7 +56,8 @@ pub struct Uploader {
 
 impl Uploader {
     /// The endpoint and token from `KOIDRIVE_TELEMETRY_URL` and `KOIDRIVE_TELEMETRY_TOKEN`, or the built-in ones. None
-    /// without a token. Plain HTTP is accepted only for a loopback address, for tests.
+    /// without a token. Requests go to `batch/` under the endpoint's path. Plain HTTP is accepted only for a loopback
+    /// address, for tests.
     pub fn from_env(var: impl Fn(&str) -> Option<OsString>) -> Result<Option<Self>, UploadError> {
         let text = |name: &str| {
             var(name)
@@ -69,7 +70,12 @@ impl Uploader {
         }
         let endpoint = text(ENDPOINT_VARIABLE).unwrap_or_else(|| ENDPOINT.to_owned());
         let url = Url::parse(&endpoint)
-            .and_then(|base| base.join("batch/"))
+            .and_then(|mut base| {
+                if !base.path().ends_with('/') {
+                    base.set_path(&format!("{}/", base.path()));
+                }
+                base.join("batch/")
+            })
             .map_err(|_| UploadError::Endpoint(endpoint.clone()))?;
         let loopback = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
         if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
@@ -108,7 +114,13 @@ pub async fn send(
         return Ok(Sent::Nothing);
     }
     let token = uploader.map_or("", Uploader::token);
-    let body = self::batch(token, &sending.id, environment, &sending.batch);
+    let body = self::batch(
+        token,
+        &sending.id,
+        environment,
+        &sending.batch,
+        &sending.uuids,
+    );
     if mode == Mode::Debug {
         eprintln!(
             "[telemetry] {}",
@@ -118,7 +130,7 @@ pub async fn send(
         return Ok(Sent::Printed);
     }
     let Some(uploader) = uploader else {
-        store.give_back(sending, today)?;
+        store.give_back(sending)?;
         return Ok(Sent::Later);
     };
     let sent = match uploader
@@ -130,7 +142,8 @@ pub async fn send(
     {
         Ok(response) if response.status().is_success() => Sent::Accepted,
         Ok(response)
-            if response.status().as_u16() == 429 || response.status().is_server_error() =>
+            if matches!(response.status().as_u16(), 408 | 429)
+                || response.status().is_server_error() =>
         {
             Sent::Later
         }
@@ -141,7 +154,7 @@ pub async fn send(
         }
     };
     if sent == Sent::Later {
-        store.give_back(sending, today)?;
+        store.give_back(sending)?;
     } else {
         store.sent(sending)?;
     }
@@ -150,7 +163,15 @@ pub async fn send(
 
 /// The body of a PostHog batch request: one `daily_report` event per day and one event per [`Event`], each with
 /// the install id as its `distinct_id`, the environment as properties and the start of its UTC day as its time.
-pub fn batch(token: &str, id: &InstallId, environment: &Environment, batch: &Batch) -> Value {
+/// `uuids` holds one per day and then one per event, as [`Sending`](crate::Sending) does; without them, as in a
+/// preview, the events have no uuid.
+pub fn batch(
+    token: &str,
+    id: &InstallId,
+    environment: &Environment,
+    batch: &Batch,
+    uuids: &[EventUuid],
+) -> Value {
     let mut events = Vec::new();
     for report in &batch.days {
         let mut properties = common(id, environment);
@@ -168,6 +189,11 @@ pub fn batch(token: &str, id: &InstallId, environment: &Environment, batch: &Bat
         events.push(
             json!({ "event": name, "properties": properties, "timestamp": midnight(event.day()) }),
         );
+    }
+    if uuids.len() == events.len() {
+        for (event, uuid) in events.iter_mut().zip(uuids) {
+            event["uuid"] = json!(uuid.as_str());
+        }
     }
     json!({ "api_key": token, "historical_migration": false, "batch": events })
 }
@@ -275,7 +301,7 @@ mod tests {
         let store = Store::new(dir.path());
         queued(&store, 20_404);
         let id = store.install_id().unwrap();
-        let body = batch("phc_test", &id, &environment(), &store.peek().unwrap());
+        let body = batch("phc_test", &id, &environment(), &store.peek().unwrap(), &[]);
         assert_eq!(body["api_key"], "phc_test");
         let events = body["batch"].as_array().unwrap();
         assert_eq!(
@@ -305,7 +331,15 @@ mod tests {
         let store = Store::new(dir.path());
         queued(&store, 20_404);
         let id = store.install_id().unwrap();
-        let body = batch("phc_test", &id, &environment(), &store.peek().unwrap());
+        let sending = store.take(20_405).unwrap().unwrap();
+        let body = batch(
+            "phc_test",
+            &id,
+            &environment(),
+            &sending.batch,
+            &sending.uuids,
+        );
+        assert_eq!(body["batch"][0]["uuid"], sending.uuids[0].as_str());
         let mut strings = Vec::new();
         collect(&body, &mut strings);
         let closed = |s: &str| {
@@ -315,6 +349,7 @@ mod tests {
         };
         for string in strings {
             let allowed = string == id.as_str()
+                || sending.uuids.iter().any(|uuid| uuid.as_str() == string)
                 || string == "phc_test"
                 || string == "2025-11-12T00:00:00Z"
                 || string == "0.1.0"
@@ -357,6 +392,36 @@ mod tests {
             assert!(!request.contains(secret), "{secret} in {request}");
         }
         assert!(request.contains("c.command.setup"));
+    }
+
+    /// A batch that was not accepted goes again with the same uuids, so PostHog keeps one copy if both arrived.
+    #[tokio::test]
+    async fn a_retry_sends_the_same_uuids() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        queued(&store, 20_404);
+        let mut uuids = Vec::new();
+        for status in [503, 200] {
+            let (address, bodies) = server(status).await;
+            send(
+                &store,
+                Some(&uploader(&address)),
+                &environment(),
+                Mode::On,
+                20_405,
+            )
+            .await
+            .unwrap();
+            let body = bodies.lock().unwrap()[0].clone();
+            uuids.push(
+                (body["batch"].as_array().unwrap().iter())
+                    .map(|event| event["uuid"].as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(uuids[0].len(), 3);
+        assert_eq!(uuids[0], uuids[1]);
+        assert!(store.peek().unwrap().is_empty());
     }
 
     /// A send cancelled before any answer, as by a timeout around it, leaves its batch to the next send.
@@ -491,6 +556,7 @@ mod tests {
     async fn a_server_error_keeps_the_batch_and_a_refusal_drops_it() {
         for (status, expected, kept) in [
             (503, Sent::Later, true),
+            (408, Sent::Later, true),
             (429, Sent::Later, true),
             (400, Sent::Refused(400), false),
         ] {
@@ -569,6 +635,10 @@ mod tests {
             "https://tel.koidrive.com/batch/"
         );
         assert!(with("http://127.0.0.1:9").unwrap().is_some());
+        assert_eq!(
+            with("https://example.com/posthog").unwrap().unwrap(),
+            "https://example.com/posthog/batch/"
+        );
         assert!(with("http://tel.koidrive.com").is_err());
     }
 }

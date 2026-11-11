@@ -417,6 +417,55 @@ impl fmt::Display for InstallId {
     }
 }
 
+/// An event's uuid, drawn once when its batch is first taken and sent again with every retry, so PostHog keeps one copy
+/// of a batch it got twice. Random, in the UUID version 4 layout.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct EventUuid(String);
+
+impl EventUuid {
+    pub fn generate() -> Self {
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes).expect("the operating system provides random bytes");
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        EventUuid(format!(
+            "{}-{}-{}-{}-{}",
+            &hex[..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..]
+        ))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for EventUuid {
+    type Error = Invalid;
+
+    fn try_from(value: String) -> Result<Self, Invalid> {
+        let valid = value.len() == 36
+            && value.bytes().enumerate().all(|(i, byte)| match i {
+                8 | 13 | 18 | 23 => byte == b'-',
+                _ => matches!(byte, b'0'..=b'9' | b'a'..=b'f'),
+            });
+        valid
+            .then_some(EventUuid(value))
+            .ok_or(Invalid("event uuid"))
+    }
+}
+
+impl From<EventUuid> for String {
+    fn from(uuid: EventUuid) -> String {
+        uuid.0
+    }
+}
+
 /// A version number such as `0.1.0` or `0.1.0-dev+abc123`: a digit first, then at most 63 characters from
 /// `0-9A-Za-z.+-`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -571,6 +620,15 @@ mod tests {
         ] {
             assert!(InstallId::try_from(bad.to_owned()).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn event_uuids_are_random_version_4_uuids() {
+        let (a, b) = (EventUuid::generate(), EventUuid::generate());
+        assert_ne!(a, b);
+        assert_eq!(&a.as_str()[14..15], "4");
+        assert!(EventUuid::try_from(a.as_str().to_owned()).is_ok());
+        assert!(EventUuid::try_from("/home/alice/notes.txt/0123456789abcdef".to_owned()).is_err());
     }
 
     #[test]
