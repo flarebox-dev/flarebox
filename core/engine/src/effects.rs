@@ -392,8 +392,10 @@ impl Effects {
                 }),
                 _ => record.after.clone(),
             };
+            let origin =
+                (trees.waiting().get(&record.node)).map_or(Origin::Other, |waiting| waiting.origin);
             if !trees.set_synced_if_valid(record.node.clone(), synced.clone()) {
-                trees.wait(record.node.clone(), synced, Origin::Other);
+                trees.wait(record.node.clone(), synced, origin);
             }
         }
         let content = (trees.local().get(&record.node)).map(|node| node.shape.content.clone());

@@ -93,7 +93,6 @@ impl Tx<'_> {
             };
             let origin = match row.get::<_, Option<u64>>(5)? {
                 None => Origin::Other,
-                Some(0) => Origin::LostCommit,
                 Some(slot) => Origin::Commit(slot),
             };
             state
@@ -309,7 +308,6 @@ impl Tx<'_> {
         for (node, Waiting { shape, origin }) in changed {
             let slot = match origin {
                 Origin::Commit(slot) => Some(*slot),
-                Origin::LostCommit => Some(0),
                 Origin::Other => None,
             };
             put.execute(params![

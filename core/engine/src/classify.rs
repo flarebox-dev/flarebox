@@ -33,9 +33,6 @@ pub struct Waiting {
 pub enum Origin {
     /// The acknowledged results of this device's commit with this `device_seq`.
     Commit(u64),
-    /// A commit a server loss already dropped. The update stays only because R holds the node in
-    /// the trash, and it is never made.
-    LostCommit,
     /// No commit: a Discard, a restore the mass-delete guard made, an effect, an update both sides
     /// agree on, or loss recovery.
     Other,
@@ -826,12 +823,6 @@ impl Trees {
         self.waiting.insert(id, Waiting { shape, origin });
     }
 
-    /// Drops a waiting update taken with [`Trees::take_waiting`] without making it: S keeps what it
-    /// holds, so L's change is compared with S.
-    pub(crate) fn drop_waiting(&mut self, id: &str) {
-        self.mark(id);
-    }
-
     /// Sets S, or clears it with `None` (S := ⊥).
     pub fn set_synced(&mut self, id: NodeId, shape: Option<Shape>) {
         self.set_synced_unmarked(&id, shape);
@@ -921,15 +912,15 @@ impl Trees {
     /// the local trash would be missing from the server.
     ///
     /// `accepted` is the count of this device's commits the server still holds (*w*, section
-    /// 2.8). An S update that waits ([`Trees::waiting`]) from a commit above it, or from one an
-    /// earlier loss dropped ([`Origin::LostCommit`]), came from a commit the server lost. The
-    /// update is dropped, a removal as well as a shape, so S keeps what it held: L's change is
+    /// 2.8). An S update that waits ([`Trees::waiting`]) from a commit above it came from a commit
+    /// the server lost. The update is dropped, a removal as well as a shape, so S keeps what it held: L's change is
     /// compared with S and sent again when R holds the node as S does, and kept beside R's when R
     /// holds it otherwise. A node R does not hold at all is then no longer reverted, as one S
     /// forgets. An update from a kept commit, or from no commit, stays, so a change another device
-    /// made since reads as a remote change once the update fits. An update for a node R holds in
-    /// the trash stays whatever its origin, and one from a lost commit becomes
-    /// [`Origin::LostCommit`], since later commits take its slot again.
+    /// made since reads as a remote change once the update fits. That holds for a node R holds in
+    /// the trash too: a lost update kept there would stand for S in the effects, which would then
+    /// replace an edit only L holds with content another device restores, and later commits take
+    /// its slot again. No update keeps a slot above `accepted` after a loss.
     ///
     /// [`Commits::held_through`]: crate::commit::Commits::held_through
     pub fn forget_lost(
@@ -967,21 +958,12 @@ impl Trees {
             };
             self.set_synced_if_valid(id, Some(remote));
         }
-        let lost_commit = |origin: Origin| match origin {
-            Origin::Commit(slot) => slot > accepted,
-            Origin::LostCommit => true,
-            Origin::Other => false,
-        };
-        let mut dropped = Vec::new();
-        for (id, waiting) in &mut self.waiting {
-            if !lost_commit(waiting.origin) {
-                continue;
-            }
-            match self.r.get(id) {
-                Some(remote) if remote.trashed => waiting.origin = Origin::LostCommit,
-                _ => dropped.push(id.clone()),
-            }
-        }
+        let dropped: Vec<NodeId> = (self.waiting.iter())
+            .filter(
+                |(_, waiting)| matches!(waiting.origin, Origin::Commit(slot) if slot > accepted),
+            )
+            .map(|(id, _)| id.clone())
+            .collect();
         for id in dropped {
             if self.r.get(&id).is_none() {
                 self.reverted.remove(&id);

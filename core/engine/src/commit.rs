@@ -884,32 +884,18 @@ impl Commits {
     /// waited waits in its place, since the rebase took it from the waiting shape. A needed node whose own update waited
     /// keeps that update waiting, so it is made once it fits, also after the keep rule no longer
     /// needs the node. Each update that waits again keeps its origin.
-    ///
-    /// An update of a commit the server lost ([`Origin::LostCommit`]) is never made: once it fits,
-    /// it is dropped and S keeps what it held, so L's change is compared with S. Otherwise a node
-    /// another device restored from the trash with other content would take the lost shape, L
-    /// would equal S, and R's content would replace L's edit, which only L held.
     fn retry_waiting(
         &mut self,
         trees: &mut Trees,
         needed: BTreeSet<NodeId>,
         agreed: Vec<(NodeId, Option<Shape>)>,
     ) -> BTreeSet<NodeId> {
-        let mut waited: BTreeMap<NodeId, Waiting> = BTreeMap::new();
-        for (id, waiting) in trees.take_waiting() {
-            let Some(shape) = outstanding(trees, &id, waiting.shape) else {
-                continue;
-            };
-            match waiting.origin {
-                Origin::LostCommit if trees.fits_synced(&id, shape.as_ref()) => {
-                    trees.drop_waiting(&id);
-                }
-                Origin::LostCommit => trees.wait(id, shape, Origin::LostCommit),
-                origin => {
-                    waited.insert(id, Waiting { shape, origin });
-                }
-            }
-        }
+        let mut waited: BTreeMap<NodeId, Waiting> = (trees.take_waiting().into_iter())
+            .filter_map(|(id, Waiting { shape, origin })| {
+                let shape = outstanding(trees, &id, shape)?;
+                Some((id, Waiting { shape, origin }))
+            })
+            .collect();
         let updates = (waited.iter())
             .map(|(id, waiting)| (id.clone(), waiting.shape.clone()))
             .chain(needed.iter().map(|id| (id.clone(), None)))

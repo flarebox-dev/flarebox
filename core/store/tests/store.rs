@@ -1322,8 +1322,7 @@ fn a_store_from_before_positions_were_watched_opens_with_none_watched() {
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
 }
 
-/// Each waiting S update keeps where it came from: a commit's slot, a commit a loss dropped, or
-/// no commit.
+/// Each waiting S update keeps where it came from: a commit's slot, or no commit.
 #[test]
 fn waiting_updates_keep_their_origin() {
     let dir = tempfile::tempdir().unwrap();
@@ -1334,13 +1333,7 @@ fn waiting_updates_keep_their_origin() {
             "kept".into(),
             from_commit(3, Some(engine_shape("root", "k.txt"))),
         ),
-        (
-            "lost".into(),
-            Waiting {
-                shape: None,
-                origin: Origin::LostCommit,
-            },
-        ),
+        ("removed".into(), from_commit(1, None)),
         (
             "other".into(),
             Waiting {
