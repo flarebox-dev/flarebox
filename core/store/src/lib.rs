@@ -321,6 +321,12 @@ const MIGRATIONS: &[&str] = &[
         CHECK (dev IS NOT NULL OR birth_ns IS NULL)
     ) STRICT, WITHOUT ROWID;
 ",
+    "
+    CREATE TABLE edited_here (
+        node_id TEXT PRIMARY KEY,
+        seq INTEGER NOT NULL
+    ) STRICT, WITHOUT ROWID;
+",
 ];
 
 /// The schema version this build writes.

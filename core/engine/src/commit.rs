@@ -710,6 +710,9 @@ impl Commits {
                         synced.set(id, None);
                         rekey(trees, id, &outcome.node_id);
                     }
+                    if applied {
+                        trees.record_edited(id, result.seq);
+                    }
                     (id, applied || code == Code::ConflictCopy)
                 }
                 Some(op::Op::Move(moved)) => {

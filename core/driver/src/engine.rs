@@ -316,12 +316,13 @@ impl Engine {
     /// Replaces R, in the store and in the trees, with a bootstrap's tree that the log has caught up, and sets the
     /// cursor. S and L stay, so the planner then moves what differs (design §4.4). When the server reported that it
     /// is behind the cursor ([`Engine::server_behind`]), it lost commits this device applied, and S forgets the
-    /// nodes it lost ([`Trees::forget_lost`]), so that they are uploaded again, and takes back the deletes of this
-    /// device it lost, so that they are sent again. A tree that is not valid stops the task before anything is
+    /// nodes it lost ([`Trees::forget_lost`]), so that they are uploaded again, and takes back the deletes and edits
+    /// of this device it lost, so that they are sent again. A tree that is not valid stops the task before anything is
     /// replaced.
     pub fn replace_remote(&mut self, tx: &Tx<'_>, staging: Staging) -> Result<(), Stop> {
         let behind = (self.cursor.as_ref()).is_some_and(|cursor| cursor.ahead_of_server);
         let trashed = self.trees.trashed_here();
+        let edited = self.trees.edited_here();
         let root = self.trees.remote().root.clone();
         let mut tree = Tree::new(root.clone());
         for state in staging.nodes.values().filter(|state| state.node_id != root) {
@@ -347,7 +348,7 @@ impl Engine {
             }
         }
         if behind {
-            self.trees.forget_lost(trashed, self.commits.held_through());
+            (self.trees).forget_lost(trashed, edited, self.commits.held_through());
         }
         tx.clear_remote_nodes()?;
         for state in staging.nodes.values() {

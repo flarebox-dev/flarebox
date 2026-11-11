@@ -3113,6 +3113,48 @@ fn an_edit_the_server_lost_is_kept_as_a_conflict_copy() {
     assert_eq!(b.state(), FolderState::UpToDate);
 }
 
+/// As above, and then `a`, which made the edit, lists the tree again too. It sends its edit again as an edit, so
+/// `one.txt` holds `v2` again on the server and on both devices. `b`'s copy is the one conflict copy left: `b` did
+/// not make the edit, so it cannot tell that `a` will send it again.
+#[test]
+fn an_edit_the_server_lost_leaves_one_copy_on_the_device_that_did_not_make_it() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("one.txt"), b"v1");
+    let restored = backup(&remote, &a);
+    let (site, mut b) = linked(&mut remote, "b");
+    b.settle();
+    a.create(&mut remote, &site_a.root.join("one.txt"), b"v2");
+    b.pull(&remote);
+    b.run(&mut remote);
+    b.settle();
+    remote = restored;
+    b.pull(&remote);
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    a.event(Event::Connected(remote.space.welcome(&a.caller)))
+        .unwrap();
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    b.pull(&remote);
+    b.run(&mut remote);
+    b.settle();
+    let copy = "one (conflict from b 2023-11-14).txt";
+    let both = [
+        (copy.to_owned(), "v2".to_owned()),
+        ("one.txt".to_owned(), "v2".to_owned()),
+    ];
+    assert_eq!(remote.names(), [copy, "one.txt"]);
+    assert_eq!(files(&site.root), both);
+    assert_eq!(files(&site_a.root), both);
+    assert_eq!(
+        (a.state(), b.state()),
+        (FolderState::UpToDate, FolderState::UpToDate)
+    );
+}
+
 /// The server lost the commits that created `albums` and moved `one.txt` into it. While `b` replays the log
 /// after its listing, the log brings device `c`'s delete of `one.txt`. `b` deletes the file instead of
 /// uploading it again, and creates `albums` again.
@@ -3414,6 +3456,29 @@ fn a_restore_after_the_server_lost_a_delete_is_kept() {
     assert_eq!(names(&site.root), all);
     assert_eq!(fs::read(site.root.join("one.txt")).unwrap(), b"one");
     assert_eq!(a.state(), FolderState::UpToDate);
+}
+
+/// The server's storage is restored from a backup taken before `a` wrote new content into `one.txt` (GUN-387).
+/// `a` lists the tree again, which holds `one.txt` with its older content, and sends its edit again instead of
+/// keeping it beside `one.txt` as a conflict copy.
+#[test]
+fn an_edit_the_server_lost_is_sent_again() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site.root.join("one.txt"), b"one");
+    let mut restored = backup(&remote, &a);
+    a.create(&mut remote, &site.root.join("one.txt"), b"edited");
+    a.event(Event::Connected(restored.space.welcome(&a.caller)))
+        .unwrap();
+    a.run(&mut restored);
+    a.settle();
+    a.run(&mut restored);
+    assert_eq!(restored.names(), ["one.txt"]);
+    assert_eq!(names(&site.root), ["one.txt"]);
+    assert_eq!(fs::read(site.root.join("one.txt")).unwrap(), b"edited");
+    assert_eq!(a.state(), FolderState::UpToDate);
+    let (other, _b) = linked(&mut restored, "b");
+    assert_eq!(fs::read(other.root.join("one.txt")).unwrap(), b"edited");
 }
 
 /// The server lost `a`'s commit of `two.txt`, and `b` deleted `one.txt` on the restored server. The listing reads
