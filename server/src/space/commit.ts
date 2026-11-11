@@ -55,6 +55,8 @@ export interface Committer {
 
 export interface ApplyContext {
   seq: number;
+  /** The commit's ID, which names the trash groups of its deletes (RFC 0012). */
+  commitId: string;
   baseSeq: number;
   nowMs: number;
   committer: Committer;
@@ -521,7 +523,7 @@ export class CommitApplier {
     if (!node) return rejected("NOT_FOUND");
     if (!node.parent_id) return rejected("ROOT");
     if (node.status === NodeStatusValue.TRASHED) return result(OpResult_Code.APPLIED);
-    const kept = this.trashSubtree(node, `${this.ctx.seq}:${index}`);
+    const kept = this.trashSubtree(node, `${this.ctx.commitId}:${index}`);
     return result(kept ? OpResult_Code.SUPERSEDED : OpResult_Code.APPLIED);
   }
 

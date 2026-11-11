@@ -386,12 +386,23 @@ describe("conflict rules", () => {
     const dir = uuidv7();
     await a.commit([op.mkdir(dir, root, "Old")]);
     const { nodeId: file } = await createFile(a, dir, "x", "x");
-    const result = await a.commit([op.delete(dir)]);
+    const commitId = uuidv7();
+    const result = await a.commit([op.delete(dir)], { commitId });
     expect(result.results[0]!.code).toBe(OpResult_Code.APPLIED);
     const states = result.changes.map((c) => (c.change.case === "node" ? c.change.value : undefined)!);
     expect(states.map((s) => s.nodeId).sort()).toEqual([dir, file].sort());
-    expect(new Set(states.map((s) => s.trashGroup))).toEqual(new Set([`${result.seq}:0`]));
+    expect(new Set(states.map((s) => s.trashGroup))).toEqual(new Set([`${commitId}:0`]));
     expect(states.every((s) => s.status === NodeStatus.TRASHED)).toBe(true);
+  });
+
+  it("RFC 0012: each delete of a commit takes the trash group <commit_id>:<op index>", async () => {
+    const { a, root } = await setup();
+    const [first, second] = [uuidv7(), uuidv7()];
+    await a.commit([op.mkdir(first, root, "First"), op.mkdir(second, root, "Second")]);
+    const commitId = uuidv7();
+    const result = await a.commit([op.delete(first), op.delete(second)], { commitId });
+    const groups = new Map(result.changes.flatMap((c) => (c.change.case === "node" ? [[c.change.value.nodeId, c.change.value.trashGroup] as const] : [])));
+    expect(groups).toEqual(new Map([[first, `${commitId}:0`], [second, `${commitId}:1`]]));
   });
 
   it("R8: an unseen edit revives a deleted file, and creating inside a trashed folder revives the folder", async () => {

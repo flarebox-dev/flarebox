@@ -366,6 +366,8 @@ pub struct NodeState {
     pub content_rev: u64,
     #[prost(uint64, tag="7")]
     pub meta_rev: u64,
+    /// The trash group of a trashed node, `<commit_id>:<op index>` of the Delete that trashed it
+    /// (RFC 0012). Clients compare groups only for equality.
     #[prost(string, tag="8")]
     pub trash_group: ::prost::alloc::string::String,
     #[prost(message, optional, tag="9")]

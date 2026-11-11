@@ -184,6 +184,9 @@ export type NodeState = Message<"koidrive.v1.NodeState"> & {
   metaRev: bigint;
 
   /**
+   * The trash group of a trashed node, `<commit_id>:<op index>` of the Delete that trashed it
+   * (RFC 0012). Clients compare groups only for equality.
+   *
    * @generated from field: string trash_group = 8;
    */
   trashGroup: string;
