@@ -180,7 +180,7 @@ The result's change records update R like any other record, and like any other r
 | CreateDir, CreateFile n | APPLIED | S(n) := sent shape | unchanged |
 | CreateDir, CreateFile n | APPLIED_RENAMED **[changed]** | S(n) := sent shape with the server's name | n is reverted (§2.6): the disk takes the server's name |
 | CreateDir A | MERGED_INTO B | S(B) := sent shape | re-key A as B (children follow). **[changed]** If B is already in L elsewhere, A keeps its ID and S(A) stays ⊥; A and the nodes created in it are reverted, so on disk they move into B and A is removed once empty. Later creates and moves into A are sent into B and reverted the same way, and so is a node in A that B already holds |
-| UpdateContent n | APPLIED | S(n).content := sent content | unchanged |
+| UpdateContent n | APPLIED | S(n).content := sent content, unless S(n)'s content changed since the commit was built, even back to what it was then: S(n) then keeps what it holds, since the server applies the op only when no other device changed n's content after `base_seq`, so that change came after the commit. The store keeps, for each node the commit updates, whether S's content changed since it was built **[changed]** | unchanged |
 | UpdateContent n | CONFLICT_COPY Y | S(Y) := sent shape and content; S(n) := ⊥ | re-key the local file as Y; n is downloaded again |
 | Move n | APPLIED | S(n) position := sent position | unchanged |
 | Move n | APPLIED_RENAMED **[changed]** | S(n) position := sent parent with the server's name | n is reverted: the disk takes the server's name |

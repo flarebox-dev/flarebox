@@ -229,6 +229,12 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE remote_cursor ADD COLUMN ahead_of_server INTEGER NOT NULL DEFAULT 0
         CHECK (ahead_of_server IN (0, 1));
 ",
+    "
+    CREATE TABLE watched_contents (
+        node_id TEXT PRIMARY KEY,
+        changed INTEGER NOT NULL CHECK (changed IN (0, 1))
+    ) STRICT, WITHOUT ROWID;
+",
 ];
 
 /// The schema version this build writes.

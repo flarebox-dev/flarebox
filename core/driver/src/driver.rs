@@ -1775,7 +1775,7 @@ mod tests {
         let stopping = Instant::now();
         driver.stop().await;
         let took = stopping.elapsed();
-        assert!(took < Duration::from_secs(30), "stopping took {took:?}");
+        assert!(took < Duration::from_secs(5), "stopping took {took:?}");
     }
 
     #[tokio::test]

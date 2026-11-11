@@ -412,6 +412,10 @@ impl Commits {
         if ops.is_empty() {
             return None;
         }
+        trees.watch_content(ops.iter().filter_map(|op| match &op.op {
+            Some(op::Op::UpdateContent(update)) => Some(update.node_id.clone()),
+            _ => None,
+        }));
         self.in_flight = Some(InFlight {
             commit: proto::Commit {
                 commit_id: ids.uuid_v7(now_ms),
@@ -442,7 +446,11 @@ impl Commits {
     /// seq is `last_seq + 1` to R first, and a result further ahead waits for the commits before
     /// it. S takes what was sent, not what the server returned, so any difference shows up as a
     /// remote change; a create or move the server renamed takes the server's name instead, and the
-    /// node is reverted so that the disk takes it too. A conflict copy is re-keyed in L, and so is
+    /// node is reverted so that the disk takes it too. Content S took from R after the commit was
+    /// built is newer than what was sent: the server applies a content update only when no other
+    /// device changed the content after the commit's `base_seq`, so that change came after the
+    /// commit. When S's content changed since then ([`Trees::took_content`]), even back to what it
+    /// was, S keeps what it holds. A conflict copy is re-keyed in L, and so is
     /// a directory merged into one L does not hold yet. When L already holds the conflict copy,
     /// because a log replay brought it before the result and the effects downloaded it, the local
     /// file keeps its ID and takes what was sent as its S, so the server's content replaces it. When L already holds the directory it was
@@ -524,9 +532,16 @@ impl Commits {
                         content: update.content.clone(),
                         ..shape
                     });
+                    let current = trees.synced().live(id).and_then(|s| s.content.as_ref());
                     let downloaded =
                         code == Code::ConflictCopy && trees.local().get(&outcome.node_id).is_some();
-                    if (applied && edited.is_some()) || downloaded {
+                    if applied && trees.took_content(id) {
+                        let kept = synced.get(trees, id).map(|shape| Shape {
+                            content: current.cloned(),
+                            ..shape
+                        });
+                        synced.set(id, kept);
+                    } else if (applied && edited.is_some()) || downloaded {
                         synced.set(id, edited);
                     } else if code == Code::ConflictCopy {
                         synced.set(&outcome.node_id, edited);
@@ -589,6 +604,7 @@ impl Commits {
         for (index, id) in restored.expect("a Restore op in flight is queued") {
             self.resolve(id, Outcome::from_result(&result.results[index]));
         }
+        trees.watch_content([]);
         self.retry_waiting(trees, BTreeSet::new(), Vec::new());
         self.accepted = flight.commit.device_seq;
         self.cap = self.cap.map(|cap| cap * 2).filter(|cap| *cap < MAX_OPS);

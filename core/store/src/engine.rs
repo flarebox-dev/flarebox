@@ -91,6 +91,13 @@ impl Tx<'_> {
             };
             state.trees.waiting.insert(row.get(0)?, shape);
         }
+        let mut stmt = self
+            .0
+            .prepare_cached("SELECT node_id, changed FROM watched_contents")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            state.trees.watched.insert(row.get(0)?, row.get(1)?);
+        }
 
         if let Some((accepted, halt, code, cap)) = self
             .0
@@ -153,6 +160,7 @@ impl Tx<'_> {
             "commit_in_flight",
             "commit_in_flight_deletes",
             "commit_in_flight_delete_members",
+            "watched_contents",
             "effect_state",
             "failed_effects",
             "restore_intents",
@@ -219,6 +227,19 @@ impl Tx<'_> {
                     .and_then(|shape| shape.content.as_ref())
                     .map(Content::encode_to_vec),
             ])?;
+        }
+        let mut remove = self
+            .0
+            .prepare_cached("DELETE FROM watched_contents WHERE node_id = ?1")?;
+        let mut put = self.0.prepare_cached(
+            "INSERT OR REPLACE INTO watched_contents (node_id, changed) VALUES (?1, ?2)",
+        )?;
+        let (removed, changed) = differences(&before.trees.watched, &after.trees.watched);
+        for node in removed {
+            remove.execute([node])?;
+        }
+        for (node, took) in changed {
+            put.execute(params![node, took])?;
         }
 
         let (old, new) = (&before.commits, &after.commits);

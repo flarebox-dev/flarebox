@@ -74,11 +74,12 @@ first_failure() { grep -m1 -oE 'Test failed: .{0,90}|panicked at [^ ]+' "$log" |
 
 property_runs() {
   local i=$1 attempt
+  shift
   for attempt in 0 1 2; do
     if [ -n "${MUTATION_SEED:-}" ]; then
       export PROPTEST_RNG_SEED=$((MUTATION_SEED + 3 * i + attempt))
     fi
-    if ! PROPTEST_CASES=$cases "${property[@]}" > "$log" 2>&1; then
+    if ! PROPTEST_CASES=$cases "$@" > "$log" 2>&1; then
       caught="property tests (run $((attempt + 1))${PROPTEST_RNG_SEED:+, seed $PROPTEST_RNG_SEED})"
       return
     fi
@@ -86,17 +87,18 @@ property_runs() {
   done
 }
 
-echo "Baseline: building and running the unit and property tests without mutations"
+echo "Baseline: building and running the unit, property and device tests without mutations"
 caught=""
 if ! "${unit[@]}" > "$log" 2>&1; then caught="unit tests"; fi
 if [ -n "${MUTATION_SEED:-}" ]; then export PROPTEST_RNG_SEED=$MUTATION_SEED; fi
 if [ -z "$caught" ] && ! PROPTEST_CASES=$cases "${property[@]}" > "$log" 2>&1; then caught="property tests"; fi
+if [ -z "$caught" ] && ! PROPTEST_CASES=$cases "${devices[@]}" > "$log" 2>&1; then caught="device tests"; fi
 if [ -n "$caught" ]; then
   tail -n 40 "$log"
   echo "Baseline: the $caught fail without any mutation ($(first_failure)). Fix that before running mutations."
   exit 1
 fi
-echo "Baseline: unit and property tests pass"
+echo "Baseline: unit, property and device tests pass"
 
 status=0
 for i in "${!names[@]}"; do
@@ -113,7 +115,7 @@ for i in "${!names[@]}"; do
     status=1
     continue
   fi
-  if ! { "${unit[@]}" --no-run && "${property[@]}" --no-run; } > "$log" 2>&1; then
+  if ! { "${unit[@]}" --no-run && "${property[@]}" --no-run && "${devices[@]}" --no-run; } > "$log" 2>&1; then
     echo "$name: BROKEN (the mutated $file does not compile: $(grep -m1 -E '^error' "$log" || echo "see the cargo output"))"
     restore
     status=1
@@ -124,7 +126,10 @@ for i in "${!names[@]}"; do
     if ! "${unit[@]}" > "$log" 2>&1; then caught="unit tests"; fi
   fi
   if [ -z "$caught" ] && { [ "$kind" = prop ] || [ "$kind" = both ]; }; then
-    property_runs "$i"
+    property_runs "$i" "${property[@]}"
+  fi
+  if [ "$kind" = devices ]; then
+    property_runs "$i" "${devices[@]}"
   fi
   restore
   if [ -n "$caught" ]; then

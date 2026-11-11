@@ -65,6 +65,7 @@ fn trees_state() -> TreesState {
         reverted: ["a".into()].into(),
         parked_as: [("b".into(), "c".into())].into(),
         waiting: [("a".into(), Some(dir(ROOT, "x")))].into(),
+        watched: [("u".into(), true), ("v".into(), false)].into(),
     }
 }
 
