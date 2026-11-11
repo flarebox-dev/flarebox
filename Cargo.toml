@@ -15,6 +15,7 @@ members = [
     "core/proto",
     "core/sim",
     "core/store",
+    "core/telemetry",
 ]
 
 [workspace.package]

@@ -1218,6 +1218,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "koidrive-telemetry"
+version = "0.0.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "reqwest",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "kqueue"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
