@@ -42,6 +42,7 @@ jobs:
       checks: read
     env:
       SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      PROJECT: koidrive
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -70,9 +71,9 @@ jobs:
                 echo "::error::The Cloudflare Pages build of $SHA ended with '$conclusion': $(jq -r '.[0].details_url' <<<"$runs")"
                 exit 1
               fi
-              url="$(jq -r '.[0].output.summary' <<<"$runs" | grep -oE "href='https://[0-9a-f]{8}\.[a-z0-9-]+\.pages\.dev'" | head -n 1 | sed "s/^href='//; s/'$//")"
+              url="$(jq -r '.[0].output.summary' <<<"$runs" | grep -oE "href='https://[0-9a-f]{8}\.$PROJECT\.pages\.dev'" | head -n 1 | sed "s/^href='//; s/'$//")"
               if [ -z "$url" ]; then
-                echo "::error::The Cloudflare Pages check run for $SHA names no deployment URL:"
+                echo "::error::The Cloudflare Pages check run for $SHA names no deployment URL on $PROJECT.pages.dev:"
                 jq -r '.[0].output.summary' <<<"$runs"
                 exit 1
               fi
