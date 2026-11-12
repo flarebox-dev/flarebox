@@ -2672,20 +2672,80 @@ mod tests {
                 let batch = scan(&mut snapshot, folder.path());
                 engine.observe(&batch, 0);
                 prop_assert_eq!(engine.trees.check(), Ok(()), "after {:?}", batch);
-                let disk: BTreeMap<PathBuf, Option<FileIdentity>> = (snapshot.entries.iter())
-                    .map(|(path, entry)| {
-                        let file = entry.kind == EntryKind::File;
-                        (path.clone(), file.then(|| file_identity(entry.id)))
-                    })
-                    .collect();
-                let held: BTreeMap<PathBuf, Option<FileIdentity>> = (engine.trees.local().iter())
-                    .filter_map(|(id, node)| {
-                        let file = node.shape.kind == Kind::File;
-                        Some((engine.path_of(id)?, file.then_some(node.identity)))
-                    })
-                    .collect();
-                prop_assert_eq!(held, disk, "after {:?}", batch);
+                prop_assert_eq!(in_l(&engine), on_disk(&snapshot), "after {:?}", batch);
             }
         }
+    }
+
+    /// Each entry on disk by its path, with a file's identity.
+    fn on_disk(snapshot: &Snapshot) -> BTreeMap<PathBuf, Option<FileIdentity>> {
+        (snapshot.entries.iter())
+            .map(|(path, entry)| {
+                let file = entry.kind == EntryKind::File;
+                (path.clone(), file.then(|| file_identity(entry.id)))
+            })
+            .collect()
+    }
+
+    /// Each placed node of L by its path, with a file's identity.
+    fn in_l(engine: &Engine) -> BTreeMap<PathBuf, Option<FileIdentity>> {
+        (engine.trees.local().iter())
+            .filter_map(|(id, node)| {
+                let file = node.shape.kind == Kind::File;
+                Some((engine.path_of(id)?, file.then_some(node.identity)))
+            })
+            .collect()
+    }
+
+    /// Makes each round of `mkdir`, `write` and `mv` edits on a real temporary folder and observes the scan after
+    /// it, checking that L stays a tree that holds the disk, as [`batches_leave_l_a_tree_that_holds_the_disk`] does.
+    fn replay(rounds: &[&[&str]]) {
+        let (_dir, mut engine) = mapper();
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        let mut snapshot = Snapshot::default();
+        for edits in rounds {
+            for edit in *edits {
+                match edit.split(' ').collect::<Vec<_>>()[..] {
+                    ["mkdir", path] => fs::create_dir(root.join(path)).unwrap(),
+                    ["write", path] => fs::write(root.join(path), path).unwrap(),
+                    ["mv", from, to] => fs::rename(root.join(from), root.join(to)).unwrap(),
+                    _ => panic!("{edit}"),
+                }
+            }
+            let batch = scan(&mut snapshot, root);
+            engine.observe(&batch, 0);
+            assert_eq!(engine.trees.check(), Ok(()), "after {batch:?}");
+            assert_eq!(in_l(&engine), on_disk(&snapshot), "after {batch:?}");
+        }
+    }
+
+    /// The saved property case `cc 4707a502`: the folder `ß/ß` moves out to `a`, and `ß` moves below it into
+    /// `a/b`. The scan reports `ß`'s move first, so it waits for the move that brings `a`, the folder above `a/b`.
+    #[test]
+    fn a_folder_moved_below_its_former_child_keeps_l_on_the_disk() {
+        replay(&[
+            &["mkdir ß", "mkdir ß/ß", "mkdir ß/ß/b"],
+            &["mv ß/ß a", "mv ß a/b/ß"],
+        ]);
+    }
+
+    /// An entry moves back from a folder moved away into a new folder made at the old path. The scan keeps the folder
+    /// at that path and reports the moved one as created with the identity L's node for the path has, so the created
+    /// folder is a new node and the entry stays where it is.
+    #[test]
+    fn an_entry_moved_back_into_a_new_folder_at_its_path_stays_in_l() {
+        replay(&[
+            &["mkdir d", "write d/x"],
+            &["mv d d.old", "mkdir d", "mv d.old/x d/x"],
+        ]);
+        replay(&[
+            &["mkdir a", "write a/f", "write a/g"],
+            &["mv a b", "mkdir a", "mv b/f a/f"],
+        ]);
+        replay(&[
+            &["mkdir d", "mkdir d/s"],
+            &["mv d d.old", "mkdir d", "mv d.old/s d/s", "write d/s/n"],
+        ]);
     }
 }
