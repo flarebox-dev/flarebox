@@ -450,28 +450,8 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
         });
     }
 
-    /**
-     * The error is caught inside the callback, because an exception there would reset this object and drop every
-     * connection.
-     */
     protected async checkDevice(deviceId: string): Promise<SessionCheck | undefined> {
-      const known = this.knownCheck(deviceId);
-      if (known) return known;
-      const account = this.account();
-      const spaceId = String(getMeta(this.sql, "space_id"));
-      const check = await this.state.blockConcurrencyWhile(async () => {
-        const askedAtMs = this.clock();
-        try {
-          const answer = await account.checkSession(deviceId, spaceId);
-          this.storeLease(deviceId, answer, askedAtMs);
-          return answer;
-        } catch (error) {
-          console.error("account device check failed", error);
-          return undefined;
-        }
-      });
-      if (check?.revoked) this.recordRevoked(deviceId);
-      return check;
+      return this.knownCheck(deviceId) ?? (await this.coldChecks([deviceId]))?.get(deviceId);
     }
 
     private async checkDevices(deviceIds: string[]): Promise<Map<string, SessionCheck> | undefined> {
@@ -482,12 +462,29 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
         return !known;
       });
       if (unknown.length === 0) return checks;
+      const answered = await this.coldChecks(unknown);
+      if (!answered) return undefined;
+      for (const [deviceId, check] of answered) checks.set(deviceId, check);
+      return checks;
+    }
+
+    /**
+     * The error is caught inside the callback, because an exception there would reset this object and drop every
+     * connection.
+     */
+    private async coldChecks(deviceIds: string[]): Promise<Map<string, SessionCheck> | undefined> {
       const account = this.account();
       const spaceId = String(getMeta(this.sql, "space_id"));
-      const answered = await this.state.blockConcurrencyWhile(async () => {
+      const answers = await this.state.blockConcurrencyWhile(async () => {
         const askedAtMs = this.clock();
+        const asked = new Set(deviceIds);
+        for (const ws of this.state.getWebSockets()) {
+          const deviceId = (ws.deserializeAttachment() as Attachment).identity.deviceId;
+          const lease = this.leases.get(deviceId);
+          if ((!lease || lease.untilMs - askedAtMs < lease.check.leaseMs / 2) && !this.revoked(deviceId)) asked.add(deviceId);
+        }
         try {
-          const answers = await account.checkSessions(unknown, spaceId);
+          const answers = await account.checkSessions([...asked], spaceId);
           for (const [deviceId, check] of Object.entries(answers)) this.storeLease(deviceId, check, askedAtMs);
           return answers;
         } catch (error) {
@@ -495,10 +492,11 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
           return undefined;
         }
       });
-      if (!answered) return undefined;
-      for (const [deviceId, check] of Object.entries(answered)) {
+      if (!answers) return undefined;
+      const checks = new Map<string, SessionCheck>();
+      for (const [deviceId, check] of Object.entries(answers)) {
         if (check.revoked) this.recordRevoked(deviceId);
-        checks.set(deviceId, check);
+        if (deviceIds.includes(deviceId)) checks.set(deviceId, check);
       }
       return checks;
     }

@@ -176,8 +176,11 @@ class Socket {
       if (this.closed) throw new Error("socket closed while waiting for " + what);
       if (Date.now() > deadline) throw new Error("timed out waiting for " + what);
       await new Promise<void>((resolve) => {
-        this.wake = resolve;
-        setTimeout(resolve, 50);
+        const timer = setTimeout(resolve, 50);
+        this.wake = () => {
+          clearTimeout(timer);
+          resolve();
+        };
       });
     }
   }
@@ -805,6 +808,8 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
     const spaceId = await createSpace(owner);
     const socket = await Socket.connect(spaceId, pad);
     const { historyId } = await socket.start();
+    const listed = await call(`/v1/spaces/${spaceId}/rpc`, { token: owner.access!.token, body: body(RpcRequestSchema, { reqId: 1n, call: { case: "listTree", value: {} } }) }, RpcResponseSchema);
+    expect(listed.message!.result.case).toBe("tree");
     vi.spyOn(console, "error").mockImplementation(() => {});
     const prototype = await runInDurableObject(account(), (instance: import("../src/account-do").AccountDO) => Object.getPrototypeOf(instance) as import("../src/account-do").AccountDO);
     const original = prototype.checkSessions;
@@ -812,7 +817,9 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
       throw new Error("injected Account DO failure");
     };
     try {
-      await passLeases(spaceId);
+      await runInDurableObject(env.SPACE.get(env.SPACE.idFromName(spaceId)), (instance: SpaceDO) => {
+        (instance as unknown as { leases: Map<string, unknown> }).leases.delete(pad.deviceId);
+      });
       await commitAsOwner(owner, spaceId, historyId);
       expect(await socket.next()).toMatchObject({ case: "goodbye", value: { code: Close.TRY_AGAIN_LATER } });
     } finally {
@@ -1006,15 +1013,15 @@ describe("RFC 0014 session leases", () => {
     });
   }
 
-  async function holdAccount(method: "checkSession" | "checkSessions") {
+  async function holdAccount(method: "checkSession" | "checkSessions", held_calls = Infinity) {
     const prototype = await runInDurableObject(account(), (instance: AccountDO) => Object.getPrototypeOf(instance) as AccountDO);
     const original = prototype[method] as (this: AccountDO, ...args: unknown[]) => Promise<unknown>;
     const asked: unknown[] = [];
     const { promise: held, resolve: release } = Promise.withResolvers<void>();
     (prototype as unknown as Record<string, unknown>)[method] = async function (this: AccountDO, ...args: unknown[]) {
-      asked.push(args[0]);
+      const call = asked.push(args[0]);
       const answer = await original.apply(this, args);
-      await held;
+      if (call <= held_calls) await held;
       return answer;
     };
     return {
@@ -1044,6 +1051,83 @@ describe("RFC 0014 session leases", () => {
     await socket.start();
     return { owner, device, spaceId, socket };
   }
+
+
+
+  async function slowAccount(delayMs: number) {
+    const prototype = await runInDurableObject(account(), (instance: AccountDO) => Object.getPrototypeOf(instance) as AccountDO);
+    const originals = { checkSession: prototype.checkSession, checkSessions: prototype.checkSessions };
+    const calls = { checkSession: 0, checkSessions: 0 };
+    const delay = () => new Promise((resolve) => setTimeout(resolve, delayMs));
+    prototype.checkSession = async function (this: AccountDO, deviceId: string, spaceId?: string) {
+      calls.checkSession++;
+      await delay();
+      return originals.checkSession.call(this, deviceId, spaceId);
+    };
+    prototype.checkSessions = async function (this: AccountDO, deviceIds: string[], spaceId: string) {
+      calls.checkSessions++;
+      await delay();
+      return Object.fromEntries(await Promise.all(deviceIds.map(async (deviceId) => [deviceId, await originals.checkSession.call(this, deviceId, spaceId)])));
+    };
+    return {
+      calls,
+      restore: () => Object.assign(prototype, originals),
+    };
+  }
+
+  async function steadyLoad(devices: number, leaseMs: number, delayMs: number, forMs: number) {
+    const owner = await getOwner();
+    const spaceId = await createSpace(owner);
+    const creds: DeviceCredentials[] = [];
+    for (let i = 0; i < devices; i++) creds.push(await pairDevice(owner, "Steady " + i));
+    return withLease(leaseMs, async () => {
+      const slow = await slowAccount(delayMs);
+      try {
+        const sockets = await Promise.all(creds.map((cred) => Socket.connect(spaceId, cred)));
+        await Promise.all(sockets.map((socket) => socket.start()));
+        const before = { ...slow.calls };
+        const until = Date.now() + forMs;
+        let replies = 0;
+        await Promise.all(
+          sockets.map(async (socket) => {
+            while (Date.now() < until) if ((await listTree(socket)).case === "rpc") replies++;
+          }),
+        );
+        for (const socket of sockets) socket.ws.close();
+        return { replies, checks: slow.calls.checkSession - before.checkSession + slow.calls.checkSessions - before.checkSessions };
+      } finally {
+        slow.restore();
+      }
+    });
+  }
+
+  it("answers 24 devices from leases when checking them one at a time would outlast a lease", { timeout: 60_000 }, async () => {
+    const { replies, checks } = await steadyLoad(24, 1000, 50, 3000);
+    expect(replies).toBeGreaterThan(1000);
+    expect(checks * 100).toBeLessThan(replies);
+  });
+
+  it("renews in one blocking check every connected device whose lease has run out", async () => {
+    const owner = await getOwner();
+    const spaceId = await createSpace(owner);
+    const devices = [await pairDevice(owner, "Lapsed A"), await pairDevice(owner, "Lapsed B"), await pairDevice(owner, "Lapsed C")];
+    const sockets = await Promise.all(devices.map((device) => Socket.connect(spaceId, device)));
+    for (const socket of sockets) await socket.start();
+    await passLeases(spaceId);
+    const check = await holdAccount("checkSessions");
+    try {
+      const reply = listTree(sockets[0]!);
+      await vi.waitFor(() => expect(check.asked).toHaveLength(1));
+      expect([...(check.asked[0] as string[])].sort()).toEqual(devices.map((device) => device.deviceId).sort());
+      check.release();
+      expect(await reply).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+      expect(await listTree(sockets[1]!)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+      expect(await listTree(sockets[2]!)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+      expect(check.asked).toHaveLength(1);
+    } finally {
+      check.restore();
+    }
+  });
 
   it("renews a lease past half its life in the background, so a commit does not wait for the Account DO", async () => {
     const { device, spaceId, socket } = await connected("Renewing writer");
@@ -1193,7 +1277,7 @@ describe("RFC 0014 session leases", () => {
   it("sends a new renewal once a renewal that never answers has been out for a lease", async () => {
     const { spaceId, socket } = await connected("Hung renewal");
     await ageLeases(spaceId, SESSION_LEASE_MS * 0.6);
-    const renewal = await holdAccount("checkSessions");
+    const renewal = await holdAccount("checkSessions", 1);
     try {
       expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
       await vi.waitFor(() => expect(renewal.asked).toHaveLength(1));
@@ -1201,7 +1285,8 @@ describe("RFC 0014 session leases", () => {
       expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
       await ageLeases(spaceId, SESSION_LEASE_MS * 0.6);
       expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
-      await vi.waitFor(() => expect(renewal.asked).toHaveLength(2));
+      expect(renewal.asked).toHaveLength(2);
+      await vi.waitFor(() => expect(renewal.asked).toHaveLength(3));
     } finally {
       renewal.restore();
     }
@@ -1246,7 +1331,7 @@ describe("RFC 0014 session leases", () => {
   it("keeps the answer to the check sent last when a renewal from before a cold check arrives after it", async () => {
     const { device, spaceId, socket } = await connected("Renewal overtaken");
     await ageLeases(spaceId, SESSION_LEASE_MS * 0.6);
-    const renewal = await holdAccount("checkSessions");
+    const renewal = await holdAccount("checkSessions", 1);
     const identity = { userId: device.userId, deviceId: device.deviceId, deviceName: "Renewal overtaken", expiresAtMs: Date.now() + 900_000, kind: "device", scope: null };
     const ask = async () =>
       fromBinary(RpcResponseSchema, await env.SPACE.get(env.SPACE.idFromName(spaceId)).httpRpc({ identity, origin: BASE }, body(RpcRequestSchema, { reqId: 1n, call: { case: "listTree", value: {} } }))).result;
