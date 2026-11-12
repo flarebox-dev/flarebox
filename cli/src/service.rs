@@ -60,7 +60,7 @@ impl Service {
         };
         let default = paths.state_dir == home.join(".local/state/koidrive")
             && paths.config_file == home.join(".config/koidrive/config.toml");
-        let suffix = (!default).then(|| paths.profile_key());
+        let suffix = (!default).then(|| paths.state_key());
         Ok(Service {
             suffix,
             binary: text(binary)?,

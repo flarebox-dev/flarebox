@@ -79,16 +79,13 @@ impl Paths {
     pub fn socket(&self) -> PathBuf {
         match self.runtime_dir == self.state_dir {
             true => self.runtime_dir.join("daemon.sock"),
-            false => {
-                let socket = format!("daemon-{}.sock", self.profile_key());
-                self.runtime_dir.join(socket)
-            }
+            false => (self.runtime_dir).join(format!("daemon-{}.sock", self.state_key())),
         }
     }
 
     /// A short hash of the state directory. It names the profile's socket in a shared runtime directory and its
-    /// background service, so that profiles never share either.
-    pub fn profile_key(&self) -> String {
+    /// background service.
+    pub fn state_key(&self) -> String {
         let hash = (self.state_dir.as_os_str().as_encoded_bytes().iter())
             .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
                 (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
@@ -174,8 +171,7 @@ mod tests {
         );
         assert_eq!(
             paths.socket(),
-            Path::new("/run/user/1000/koidrive")
-                .join(format!("daemon-{}.sock", paths.profile_key()))
+            Path::new("/run/user/1000/koidrive").join(format!("daemon-{}.sock", paths.state_key()))
         );
     }
 

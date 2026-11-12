@@ -355,7 +355,8 @@ async fn unreadable(folders: Vec<FolderStatus>) -> Vec<Blocked> {
     blocked
 }
 
-/// Binds the daemon's socket. The caller holds the profile lock, so a socket file left behind is stale.
+/// Binds the daemon's socket, unless a process still answers on it. The caller holds the profile lock, so a socket
+/// file that doesn't answer is stale.
 ///
 /// The directory must belong to this user and be closed to everyone else, so no other user can reach the socket even
 /// before its mode is set. The socket is bound under a temporary name and renamed once it is 0600, so it never
@@ -388,6 +389,12 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
     if acl::allows_others(dir, uid)? {
         return Err(refuse(
             "lets other users in through an ACL; remove it with chmod -N".to_owned(),
+        ));
+    }
+    if std::os::unix::net::UnixStream::connect(path).is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("another process answers on {}", path.display()),
         ));
     }
     let temp = dir.join(format!(".tmp{}", std::process::id()));
@@ -820,6 +827,18 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(error.to_string().contains("open to other users"), "{error}");
         assert_eq!(fs::read_dir(&run).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_socket_another_process_answers_on_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("run/daemon.sock");
+        let live = bind(&socket).unwrap();
+        let error = bind(&socket).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        tokio::net::UnixStream::connect(&socket).await.unwrap();
+        drop(live);
+        bind(&socket).unwrap();
     }
 
     #[tokio::test]
