@@ -12,6 +12,7 @@ mod ipc;
 mod notify;
 mod pairing;
 mod report;
+mod service;
 mod setup;
 mod telemetry;
 
@@ -119,6 +120,12 @@ enum Command {
         #[command(subcommand)]
         action: FolderAction,
     },
+    /// Start the background service that syncs the linked folders.
+    #[command(arg_required_else_help = true)]
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
     /// Invite, list, or revoke devices.
     #[command(arg_required_else_help = true)]
     Device {
@@ -214,6 +221,12 @@ enum FolderAction {
         #[arg(long)]
         replan: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Install and start the service, after fixing what kept it from running, such as koi switched off in Login Items.
+    Start,
 }
 
 #[derive(Subcommand)]
@@ -394,12 +407,52 @@ fn telemetry_of(
         Command::Folder { .. } => (Name::Folder, None, None),
         Command::Device { .. } => (Name::Device, None, None),
         Command::History { .. } => (Name::History, None, None),
+        Command::Service { .. } => (Name::Service, None, None),
         Command::Telemetry { .. } => (Name::Telemetry, None, None),
         Command::Daemon { .. } => (Name::Daemon, None, None),
     }
 }
 
+/// Runs the command. After one that may change the folders this profile links or its pairing, or `service start`, it
+/// brings the background service in line with the profile and reports it as `service`.
 async fn run(paths: Paths, command: Command, json: bool) -> Result<Done, CliError> {
+    let asked = matches!(command, Command::Service { .. });
+    let reconciles = asked
+        || matches!(
+            command,
+            Command::Folder {
+                action: FolderAction::Link { .. } | FolderAction::Unlink { .. }
+            } | Command::Setup { .. }
+                | Command::Join { .. }
+                | Command::Server {
+                    action: setup::ServerAction::Claim { .. }
+                        | setup::ServerAction::Deploy { .. }
+                        | setup::ServerAction::AddDevice { .. }
+                }
+        );
+    let mut done = execute(paths.clone(), command, json).await?;
+    if reconciles {
+        let report = service::reconcile(&paths, asked).await;
+        let text = match report.text() {
+            text if text.is_empty() && asked => report.status_line(),
+            text => text,
+        };
+        if asked && report.failed() {
+            return Err(CliError::new(Code::Failed, text.trim_end()));
+        }
+        done.text.push_str(&text);
+        if done.data.is_null() {
+            done.data = Value::Object(serde_json::Map::new());
+        }
+        if let Value::Object(data) = &mut done.data {
+            let report = serde_json::to_value(&report).expect("the CLI's own types serialize");
+            data.insert("service".to_owned(), report);
+        }
+    }
+    Ok(done)
+}
+
+async fn execute(paths: Paths, command: Command, json: bool) -> Result<Done, CliError> {
     match command {
         Command::Daemon { .. } => daemon(paths, json).await,
         Command::Status { check } => status(&paths, check).await,
@@ -445,6 +498,9 @@ async fn run(paths: Paths, command: Command, json: bool) -> Result<Done, CliErro
         Command::Server { action } => setup::server(&paths, action, json).await,
         Command::Space { action } => space(paths, action).await,
         Command::Folder { action } => folder(&paths, action).await,
+        Command::Service {
+            action: ServiceAction::Start,
+        } => Ok(Done::ok(serde_json::Map::new(), "")),
         Command::Device { action } => device(paths, action).await,
         Command::History { action } => history::run(&paths, action).await,
         Command::Telemetry { action } => telemetry::command(&paths, action),
@@ -767,13 +823,16 @@ async fn status(paths: &Paths, check: bool) -> Result<Done, CliError> {
     } else {
         0
     };
+    let service = service::inspect(paths, status.running).await;
+    let text = status_text(&status, &questions, &service.status_line());
     let data = StatusData {
         account: status.account.as_ref().map(AccountData::of),
         running: status.running,
         folders: status.folders.iter().map(FolderData::of).collect(),
         conditions,
+        service,
     };
-    let mut done = Done::ok(data, status_text(&status, &questions));
+    let mut done = Done::ok(data, text);
     done.decisions = questions.iter().map(Decision::of).collect();
     done.exit = exit;
     if status.account.is_none() {
@@ -835,15 +894,12 @@ async fn folder(paths: &Paths, action: FolderAction) -> Result<Done, CliError> {
     };
     match ipc::run(paths, request).await? {
         Response::Linked { folder } => {
-            let mut text = format!(
+            let text = format!(
                 "Linked {} to space {} ({}).\n",
                 printable(&folder.path),
                 printable(&folder.space_name),
                 printable(&folder.space_id)
             );
-            if folder.state == FolderState::Stopped {
-                text.push_str("Run koi _daemon to sync it.\n");
-            }
             Ok(Done::ok(FolderData::of(&folder), text))
         }
         Response::Unlinked { space_id, path } => {
@@ -874,7 +930,6 @@ fn restarted(folder: FolderStatus) -> Result<Done, CliError> {
                 format!("{path} cannot sync: {problem}"),
             ));
         }
-        FolderState::Stopped => format!("Run koi _daemon to sync {path}.\n"),
         _ => format!("Syncing {path} again.\n"),
     };
     Ok(Done::ok(FolderData::of(&folder), text))
@@ -1287,7 +1342,7 @@ fn absolute(folder: &Path) -> Result<PathBuf, CliError> {
     })
 }
 
-fn status_text(status: &Status, questions: &[Question]) -> String {
+fn status_text(status: &Status, questions: &[Question], service: &str) -> String {
     let mut text = match &status.account {
         Some(account) => format!(
             "Device: {} ({}) on {}\n",
@@ -1305,6 +1360,7 @@ fn status_text(status: &Status, questions: &[Question]) -> String {
             "not running"
         }
     ));
+    text.push_str(service);
     if status.folders.is_empty() {
         text.push_str("No linked folders; run koi folder link.\n");
     }
@@ -1660,7 +1716,7 @@ mod tests {
             running: true,
             folders: vec![folder],
         };
-        let text = status_text(&status, &[]);
+        let text = status_text(&status, &[], "");
         for raw in ['\u{1b}', '\u{7}', '\u{9b}', '\u{202e}', '\r'] {
             assert!(
                 !text.contains(raw),

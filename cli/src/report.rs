@@ -364,6 +364,7 @@ pub struct StatusData {
     pub folders: Vec<FolderData>,
     /// Every condition `status --check` weighs, whether or not `--check` was given.
     pub conditions: Vec<Condition>,
+    pub service: crate::service::Report,
 }
 
 /// Something `status --check` reports. Connecting and catching up are not conditions: they pass on their own.

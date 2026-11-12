@@ -118,16 +118,41 @@ fn uuidv7() -> String {
     )
 }
 
-/// A machine's home for the device under test, with its XDG directories.
+/// A machine's home for the device under test, with its XDG directories. Its config.toml turns the background service
+/// off, so that the tests run the daemon themselves and never touch the service manager of the machine running them.
 struct Machine {
     home: tempfile::TempDir,
+    /// The background service is on, and the device uses the machine's own runtime directory, where its service
+    /// manager listens.
+    service: bool,
 }
 
 impl Machine {
     fn new() -> Self {
+        let machine = Machine {
+            home: tempfile::tempdir().unwrap(),
+            service: false,
+        };
+        machine.configure("");
+        machine
+    }
+
+    #[cfg(target_os = "linux")]
+    fn with_service() -> Self {
         Machine {
             home: tempfile::tempdir().unwrap(),
+            service: true,
         }
+    }
+
+    /// Writes config.toml: `rules`, and the switch that keeps the background service off.
+    fn configure(&self, rules: &str) {
+        fs::create_dir_all(self.path("config/koidrive")).unwrap();
+        fs::write(
+            self.path("config/koidrive/config.toml"),
+            format!("[service]\nbackground = false\n\n{rules}"),
+        )
+        .unwrap();
     }
 
     fn path(&self, rel: &str) -> PathBuf {
@@ -142,8 +167,10 @@ impl Machine {
             .env("HOME", self.home.path())
             .env("XDG_CONFIG_HOME", self.path("config"))
             .env("XDG_STATE_HOME", self.path("state"))
-            .env("XDG_RUNTIME_DIR", self.path("run"))
             .env_remove("KOIDRIVE_LOG");
+        if !self.service {
+            command.env("XDG_RUNTIME_DIR", self.path("run"));
+        }
         command
     }
 
@@ -288,12 +315,7 @@ async fn a_headless_device_pairs_links_and_follows_the_change_stream() {
     let again = machine.fails(&["join", "AAAA-BBBB", "--server", &server, "--name", "again"]);
     assert!(again.contains("already paired"), "{again}");
 
-    fs::create_dir_all(machine.path("config/koidrive")).unwrap();
-    fs::write(
-        machine.path("config/koidrive/config.toml"),
-        "[sync]\ninclude = [\"Projects/\"]\nexclude = [\"*.tmp\"]\n",
-    )
-    .unwrap();
+    machine.configure("[sync]\ninclude = [\"Projects/\"]\nexclude = [\"*.tmp\"]\n");
     let folder = machine.path("Sync");
     fs::create_dir_all(folder.join("Projects")).unwrap();
     fs::write(folder.join("Projects/notes.txt"), b"agent notes").unwrap();
@@ -610,6 +632,7 @@ async fn a_device_revokes_a_lost_one_and_stops_syncing_when_another_revokes_it()
             fs::remove_dir_all(state).unwrap();
         }
     }
+    machine.configure("");
     machine.run(&join);
     assert_ne!(machine.status()["account"]["device_id"], device_id.as_str());
     machine.run(&[
@@ -1474,4 +1497,87 @@ async fn a_name_longer_than_255_bytes_is_refused_before_it_reaches_the_server() 
             && format!("{}\n", space["space_id"].as_str().unwrap()) == created),
         "{created:?} {spaces:#}"
     );
+}
+
+/// Needs a systemd user instance, which the CI job starts by turning lingering on, and `KOIDRIVE_TEST_SYSTEMD=1`.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Worker and a systemd user instance; run cli/scripts/integration-test.sh"]
+async fn a_linked_folder_syncs_in_the_systemd_user_service_until_the_last_unlink() {
+    if std::env::var_os("KOIDRIVE_TEST_SYSTEMD").is_none() {
+        eprintln!("skipped: set KOIDRIVE_TEST_SYSTEMD=1 where systemctl --user works");
+        return;
+    }
+    let systemctl = |args: &[&str]| {
+        Command::new("systemctl")
+            .arg("--user")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let owner = Auth::new(api(), owner().await);
+    let space_name = format!("background {}", uuidv7());
+    owner
+        .api()
+        .create_space(
+            &owner,
+            &CreateSpaceRequest {
+                name: space_name.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let pairing = owner.api().pair_start(&owner).await.unwrap();
+    let machine = Machine::with_service();
+    let server = server_url().to_string();
+    machine.run(&[
+        "join",
+        &pairing.code,
+        "--server",
+        &server,
+        "--name",
+        "server-vm",
+    ]);
+    let folder = machine.path("Sync");
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(folder.join("notes.txt"), b"synced by the service").unwrap();
+    let folder = folder.to_str().unwrap();
+
+    let linked = machine.data(&["folder", "link", folder, "--space", &space_name]);
+    let service = &linked["service"];
+    assert_eq!(service["manager"], "systemd", "{linked:#}");
+    assert_eq!(service["state"], "running", "{linked:#}");
+    assert_eq!(service["lingers"], true, "{linked:#}");
+    let unit = service["name"].as_str().unwrap().to_owned();
+    assert!(unit.starts_with("koidrive-"), "{unit}");
+    assert!(systemctl(&["is-active", "--quiet", &unit]).status.success());
+    assert!(
+        systemctl(&["is-enabled", "--quiet", &unit])
+            .status
+            .success()
+    );
+    let main_pid = || systemctl(&["show", "--property=MainPID", "--value", &unit]).stdout;
+    let pid = main_pid();
+    let status = machine
+        .status_until("the service syncing the folder", |status| {
+            status["running"] == true && status["folders"][0]["state"] == "up_to_date"
+        })
+        .await;
+    assert_eq!(status["service"]["state"], "running", "{status:#}");
+
+    let restarted = machine.data(&["folder", "restart", folder]);
+    assert!(restarted.get("service").is_none(), "{restarted:#}");
+    let started = machine.data(&["service", "start"]);
+    assert_eq!(started["service"]["state"], "running", "{started:#}");
+    assert_eq!(main_pid(), pid, "a second reconcile restarted the service");
+
+    let unlinked = machine.data(&["folder", "unlink", folder]);
+    assert_eq!(
+        unlinked["service"]["state"], "not_installed",
+        "{unlinked:#}"
+    );
+    assert!(!systemctl(&["is-active", "--quiet", &unit]).status.success());
+    assert!(!systemctl(&["cat", &unit]).status.success());
+    assert!(!machine.path("state/koidrive/systemd").join(&unit).exists());
+    assert_eq!(machine.status()["service"]["state"], "not_installed");
 }
