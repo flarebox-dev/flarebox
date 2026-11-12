@@ -3280,8 +3280,7 @@ fn a_lost_move_is_sent_again_after_another_device_trashed_and_restored_the_node(
     assert_eq!(sent, [mv("n", ROOT, "y")]);
 }
 
-#[test]
-fn a_lost_move_is_sent_again_over_a_move_the_server_kept_from_before_it() {
+fn n_moved_to_z_at_7_after_a_commit_at_5() -> (Trees, Commits, IdGen) {
     let (mut trees, mut commits, mut ids) = n_at_x();
     trees.set_local("pad".into(), local(file(ROOT, "pad", 7), 99));
     trees.settle();
@@ -3294,8 +3293,24 @@ fn a_lost_move_is_sent_again_over_a_move_the_server_kept_from_before_it() {
     trees.set_remote("n".into(), remote_at(file(ROOT, "z", 1), 7));
     trees.set_local("n".into(), local(file(ROOT, "z", 1), 1));
     trees.settle();
+    (trees, commits, ids)
+}
+
+#[test]
+fn a_lost_move_is_sent_again_over_a_move_the_server_kept_from_before_it() {
+    let (mut trees, mut commits, mut ids) = n_moved_to_z_at_7_after_a_commit_at_5();
     move_n_to_y_at(9, &mut trees, &mut commits, &mut ids);
     let n = remote_at(file(ROOT, "z", 1), 7);
+    let sent = lose_with_n_at(n, 1, &mut trees, &mut commits, &mut ids);
+    assert_eq!(commits.held_through(), 5);
+    assert_eq!(sent, [mv("n", ROOT, "y")]);
+}
+
+#[test]
+fn a_lost_move_is_sent_again_when_the_move_it_followed_was_lost_too() {
+    let (mut trees, mut commits, mut ids) = n_moved_to_z_at_7_after_a_commit_at_5();
+    move_n_to_y_at(9, &mut trees, &mut commits, &mut ids);
+    let n = remote(file(ROOT, "x", 1));
     let sent = lose_with_n_at(n, 1, &mut trees, &mut commits, &mut ids);
     assert_eq!(commits.held_through(), 5);
     assert_eq!(sent, [mv("n", ROOT, "y")]);
