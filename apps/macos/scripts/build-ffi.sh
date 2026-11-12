@@ -15,12 +15,13 @@ work_dir="$macos_dir/build/ffi"
 export MACOSX_DEPLOYMENT_TARGET=14.0
 
 cd "$repo_root"
-cargo build --locked --release -p koidrive-ffi
-lib="$repo_root/target/release/libkoidrive_ffi.a"
+target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
+cargo build --locked --release -p koidrive-ffi --target-dir "$target_dir"
+lib="$target_dir/release/libkoidrive_ffi.a"
 
 rm -rf "$work_dir"
 bindgen=(cargo run --locked --quiet -p koidrive-ffi --features bindgen --bin uniffi-bindgen-swift
-  --target-dir "$repo_root/target/uniffi-bindgen" --)
+  --target-dir "$target_dir/uniffi-bindgen" --)
 "${bindgen[@]}" "$lib" "$work_dir/swift" --swift-sources
 "${bindgen[@]}" "$lib" "$work_dir/include" --headers
 "${bindgen[@]}" "$lib" "$work_dir/include" --modulemap --module-name koidrive_ffiFFI --modulemap-filename module.modulemap
