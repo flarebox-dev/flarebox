@@ -321,12 +321,12 @@ impl Redactor {
                 }
             }
             if c == '"'
-                && let Some(end) = rest[1..].find('"')
+                && let Some(end) = closing_quote(rest)
             {
                 out.push('"');
-                out.push_str(&self.name("name", &rest[1..=end]));
+                out.push_str(&self.name("name", &rest[1..end]));
                 out.push('"');
-                rest = &rest[end + 2..];
+                rest = &rest[end + 1..];
                 continue;
             }
             if delimiter(c) {
@@ -348,6 +348,21 @@ impl Redactor {
         }
         out
     }
+}
+
+/// Where the quoted string that starts `text` ends, skipping the quotes a backslash escapes, as `{:?}` writes them.
+fn closing_quote(text: &str) -> Option<usize> {
+    let mut chars = text.char_indices().skip(1);
+    while let Some((index, c)) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '"' => return Some(index),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Splits a log line into its time, level, target and the rest.
@@ -593,8 +608,12 @@ thread 'tokio-runtime-worker' panicked at /Users/ada/Secret Plans/ledger.rs:1:1:
         ];
         const GLUE: [&str; 10] = [" ", ": ", ", ", " (", ")", "'", "\"", ".", "-", ""];
         const EXTENSIONS: [&str; 4] = ["", ".pdf", ".mp4", ".tar.gz"];
-        let shapes = [
+        let relative_shapes = [
             "2026-11-12T06:29:23.000001Z  WARN koidrive_driver::folder: sync of a folder halted space_id=s1 reason=the folder: {}: Permission denied (os error 13)",
+            "2026-11-12T06:29:23.000001Z  WARN koidrive_driver::folder: sync of a folder halted space_id=s1 reason=the folder: {} is missing",
+            "2026-11-12T06:29:23.000001Z  WARN koidrive_driver::folder: sync of a folder halted space_id=s1 reason=the folder: {} is not a folder",
+        ];
+        let absolute_shapes = [
             "2026-11-12T06:29:23.000001Z  WARN koidrive_driver::folder: the folder cannot be observed space_id=s1 error=cannot read {}: No such file or directory (os error 2)",
             "2026-11-12T06:29:23.000001Z  INFO koidrive_driver::driver: linked a folder space_id=s1 path={}",
             "2026-11-12T06:29:23.000001Z  WARN koidrive_driver::folder: the folder fails its root check space_id=s1 problem={} is not a folder",
@@ -611,19 +630,55 @@ thread 'tokio-runtime-worker' panicked at /Users/ada/Secret Plans/ledger.rs:1:1:
                 path.push_str(WORDS[rng.usize(..WORDS.len())]);
             }
             path.push_str(EXTENSIONS[rng.usize(..EXTENSIONS.len())]);
-            let shape = shapes[rng.usize(..shapes.len())];
+            let relative = rng.bool();
+            if relative {
+                path = format!("{:?}", Path::new(&path[1..]));
+            }
+            let shape = match relative || rng.bool() {
+                true => relative_shapes[rng.usize(..relative_shapes.len())],
+                false => absolute_shapes[rng.usize(..absolute_shapes.len())],
+            };
             let mut redactor = Redactor::default();
             let out = redactor.log_line(&shape.replace("{}", &path));
             for word in WORDS {
                 assert!(!out.contains(word), "{word} in {out}\nfrom {path}");
             }
-            let problem = redactor
-                .json(&json!({ "problem": format!("cannot read {path}: Permission denied (os error 13)") }));
+            let problem = match relative {
+                true => format!("the folder: {path} is not a folder"),
+                false => format!("cannot read {path}: Permission denied (os error 13)"),
+            };
+            let problem = redactor.json(&json!({ "problem": problem }));
             assert!(
                 WORDS.iter().all(|word| !problem.to_string().contains(word)),
                 "{problem}"
             );
         }
+    }
+
+    /// The driver quotes a path relative to the folder, as in `the folder: "Secret Plans/budget.xlsx" is missing`.
+    #[test]
+    fn a_quoted_path_relative_to_the_folder_is_redacted_whole() {
+        let mut redactor = Redactor::default();
+        let quoted = |path: &str| format!("{:?}", Path::new(path));
+        assert_eq!(
+            redactor.text(&format!(
+                "the folder: {} is missing",
+                quoted("Secret Plans/budget 2026.xlsx")
+            )),
+            "the folder: \"<name-1>\" is missing"
+        );
+        assert_eq!(
+            redactor.text(&format!(
+                "the folder: {}: Permission denied (os error 13)",
+                quoted("Jiyeon Passport/scan")
+            )),
+            "the folder: \"<name-2>\": Permission denied (os error 13)"
+        );
+        let out = redactor.text(&format!(
+            "the folder: {} is not a folder",
+            quoted("Kim \"Private\" Ledger")
+        ));
+        assert_eq!(out, "the folder: \"<name-3>\" is not a folder");
     }
 
     #[test]

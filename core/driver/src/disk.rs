@@ -72,7 +72,7 @@ const STAGE_AGAIN: Duration = Duration::from_secs(30);
 /// Why the task stops. The effect in flight, if any, stays in the store for the next start to recover.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Stop {
-    #[error("{} no longer names the folder this task locked (it was moved, replaced or removed)", .0.display())]
+    #[error("{:?} no longer names the folder this task locked (it was moved, replaced or removed)", .0)]
     Withdrawn(PathBuf),
     #[error("the folder fails its root check: {0}")]
     Root(RootProblem),
