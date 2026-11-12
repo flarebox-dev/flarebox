@@ -3,6 +3,8 @@
 //! Building commits from local changes and acknowledging their results (docs/design/sync-engine.md
 //! sections 2.4, 2.6, 2.7, 2.8 and 4.2, and RFC 0002), on hand-built trees and results.
 
+use std::collections::BTreeMap;
+
 use koidrive_engine::classify::{Class, Origin, Trees, Waiting};
 use koidrive_engine::commit::{
     Commits, Failure, Halt, Lift, LiftError, MAX_COMMIT_BYTES, MAX_OPS, Reconnect,
@@ -12,7 +14,7 @@ use koidrive_engine::ids::IdGen;
 use koidrive_engine::ignore::RuleFile;
 use koidrive_engine::names::{MAX_NAME_BYTES, nfc, normalize_name};
 use koidrive_engine::question::Answer;
-use koidrive_engine::state::TreesState;
+use koidrive_engine::state::{CommitsState, Pending, TreesState};
 use koidrive_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape};
 use koidrive_proto::v1::{self as proto, CommitResult, OpResult, Welcome, error, op, op_result};
 use prost::Message;
@@ -6069,4 +6071,100 @@ fn a_parked_edit_goes_back_to_its_name_when_another_folder_gets_that_name() {
         trees.settle();
     }
     assert!(moved_back);
+}
+
+fn owing_its_name(rows: &[Row]) -> (Commits, Trees, IdGen) {
+    let trees = trees(rows);
+    let pending = BTreeMap::from([(
+        "a".to_owned(),
+        Pending {
+            sent: "a (pending)".into(),
+            name: "a".into(),
+        },
+    )]);
+    let commits = Commits::from_state(CommitsState {
+        pending,
+        ..Commits::default().state()
+    })
+    .unwrap();
+    (commits, trees, IdGen::new(1))
+}
+
+#[test]
+fn a_rename_the_person_makes_while_the_owed_name_is_sent_is_kept() {
+    let (mut commits, mut trees, mut ids) =
+        owing_its_name(&[synced("a", dir(ROOT, "a (pending)"))]);
+    let sent = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&sent), [mv("a", ROOT, "a")]);
+    trees.set_local("a".into(), local(dir(ROOT, "c"), 1));
+    trees.set_remote("a".into(), remote(dir(ROOT, "a")));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    let next = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&next), [mv("a", ROOT, "c")]);
+}
+
+#[test]
+fn a_move_the_person_makes_while_the_owed_name_is_sent_is_kept() {
+    let (mut commits, mut trees, mut ids) = owing_its_name(&[
+        synced("d", dir(ROOT, "d")),
+        synced("a", dir(ROOT, "a (pending)")),
+    ]);
+    let sent = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&sent), [mv("a", ROOT, "a")]);
+    trees.set_local("a".into(), local(dir("d", "a (pending)"), 2));
+    trees.set_remote("a".into(), remote(dir(ROOT, "a")));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    let next = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&next), [mv("a", "d", "a (pending)")]);
+}
+
+#[test]
+fn a_rename_back_to_the_pending_name_while_another_rename_is_sent_is_kept() {
+    let (mut commits, mut trees, mut ids) =
+        owing_its_name(&[synced("a", dir(ROOT, "a (pending)"))]);
+    trees.set_local("a".into(), local(dir(ROOT, "x"), 1));
+    trees.settle();
+    let sent = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&sent), [mv("a", ROOT, "x")]);
+    trees.set_local("a".into(), local(dir(ROOT, "a (pending)"), 1));
+    trees.set_remote("a".into(), remote(dir(ROOT, "x")));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    let next = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&next), [mv("a", ROOT, "a (pending)")]);
+}
+
+#[test]
+fn an_excluded_node_at_a_pending_name_gets_no_rename() {
+    let (mut commits, mut trees, mut ids) =
+        owing_its_name(&[synced("a", dir(ROOT, "a (pending)"))]);
+    trees.set_rules::<&str>(&[], Some(RuleFile::parse(b"a (pending)/\n")));
+    trees.settle();
+    assert!(trees.excluded("a"));
+    assert!(!commits.due(&trees));
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+}
+
+#[test]
+fn a_held_node_at_a_pending_name_gets_no_rename() {
+    let (mut commits, mut trees, mut ids) = owing_its_name(&[
+        synced("d", dir(ROOT, "d")),
+        synced("a", dir("d", "a (pending)")),
+    ]);
+    trees.set_rules_unknown("d");
+    trees.settle();
+    assert!(trees.held("a"));
+    assert!(!commits.due(&trees));
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
 }

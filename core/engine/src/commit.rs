@@ -817,11 +817,8 @@ impl Commits {
         ops
     }
 
-    /// Whether a build has something to do for a conflict question: a file of it was renamed,
-    /// moved, deleted or changed since it was asked, or its answer can be carried out
-    /// ([`Commits::conflicts`]). The caller builds then even when nothing else changed.
     /// Whether a build has something to do: a node is dirty or its S update waits, a restore is
-    /// queued, a conflict question is due ([`Commits::conflicts_due`]), or a node L, S and R all
+    /// queued, a conflict question is due ([`Commits::conflicts_due`]), or a node L and R both
     /// hold at the pending name a commit gave it is owed its own name.
     pub fn due(&self, trees: &Trees) -> bool {
         !trees.dirty().is_empty()
@@ -831,6 +828,9 @@ impl Commits {
             || renames_owed(trees, &self.pending).next().is_some()
     }
 
+    /// Whether a build has something to do for a conflict question: a file of it was renamed,
+    /// moved, deleted or changed since it was asked, or its answer can be carried out
+    /// ([`Commits::conflicts`]). The caller builds then even when nothing else changed.
     pub fn conflicts_due(&self, trees: &Trees) -> bool {
         self.questions.iter().any(|question| match &question.kind {
             QuestionKind::Conflict { original, copy, .. } => {
@@ -1862,15 +1862,14 @@ fn renames_owed<'a>(
     trees: &'a Trees,
     pending: &'a BTreeMap<NodeId, Pending>,
 ) -> impl Iterator<Item = (&'a NodeId, &'a Shape, &'a Pending)> + 'a {
-    pending.iter().filter_map(|(id, pending)| {
-        let local = trees.local().get(id).filter(|node| !node.parked)?;
-        let synced = trees.acknowledged(id)?;
-        let remote = trees.remote().live(id)?;
-        (nfc(&remote.name) == nfc(&pending.sent)
-            && local.shape.same_position(remote)
-            && synced.same_position(remote))
-        .then_some((id, remote, pending))
-    })
+    (pending.iter())
+        .filter(|(id, _)| !trees.excluded(id) && !trees.held(id))
+        .filter_map(|(id, pending)| {
+            let local = trees.local().get(id).filter(|node| !node.parked)?;
+            let remote = trees.remote().live(id)?;
+            (nfc(&remote.name) == nfc(&pending.sent) && local.shape.same_position(remote))
+                .then_some((id, remote, pending))
+        })
 }
 
 fn changed_locally(trees: &Trees, id: &str) -> bool {
