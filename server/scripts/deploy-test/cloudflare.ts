@@ -248,16 +248,21 @@ export async function namespacesOf(account: Account, script: string): Promise<Na
   }
 }
 
-export async function workerEvents(account: Account, name: string, fromMs: number): Promise<string[]> {
+export const WORKER_KEYS = ["$metadata.service", "$workers.scriptName"] as const;
+export type WorkerKey = (typeof WORKER_KEYS)[number];
+
+export async function workerEvents(account: Account, key: WorkerKey, name: string, fromMs: number): Promise<string[]> {
   const query = {
     queryId: "deploy-test-" + name,
     view: "events",
+    dry: true,
     limit: 2000,
-    parameters: { filters: [{ key: "$workers.scriptName", operation: "eq", type: "string", value: name }] },
+    parameters: { filters: [{ key, operation: "eq", type: "string", value: name }] },
     timeframe: { from: fromMs, to: Date.now() },
   };
-  const response = await call<{ events?: { events?: { $workers?: { scriptName?: string } }[] } }>(account, "POST", `/accounts/${account.id}/workers/observability/telemetry/query`, query);
-  return (response.result?.events?.events ?? []).filter((event) => event.$workers?.scriptName === name).map((event) => JSON.stringify(event));
+  const response = await call<{ events?: { events?: Record<string, Record<string, unknown> | undefined>[] } }>(account, "POST", `/accounts/${account.id}/workers/observability/telemetry/query`, query);
+  const [group, field] = key.split(".") as [string, string];
+  return (response.result?.events?.events ?? []).filter((event) => event[group]?.[field] === name).map((event) => JSON.stringify(event));
 }
 
 export interface Deployment {

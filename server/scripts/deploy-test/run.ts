@@ -24,7 +24,9 @@ import {
   namespacesOf,
   requireAccount,
   serves,
+  WORKER_KEYS,
   workerEvents,
+  type WorkerKey,
   workerTag,
 } from "./cloudflare.ts";
 import { readState, type State, testName, writeState } from "./state.ts";
@@ -245,8 +247,15 @@ async function deploy(account: Account, ref: string): Promise<void> {
   console.log(url + " serves Koidrive " + info.serverVersion + (info.claimed ? ", claimed" : ", not claimed yet"));
 }
 
-async function claimCode(account: Account, name: string, fromMs: number): Promise<string | undefined> {
-  for (const event of await workerEvents(account, name, fromMs)) {
+async function provenKey(account: Account, name: string, fromMs: number, marker: string): Promise<WorkerKey | undefined> {
+  for (const key of WORKER_KEYS) {
+    if ((await workerEvents(account, key, name, fromMs)).some((event) => event.includes(marker))) return key;
+  }
+  return undefined;
+}
+
+async function claimCode(account: Account, key: WorkerKey, name: string, fromMs: number): Promise<string | undefined> {
+  for (const event of await workerEvents(account, key, name, fromMs)) {
     const code = CLAIM_CODE.exec(event)?.[1];
     if (code) return code;
   }
@@ -258,18 +267,28 @@ async function claim(account: Account): Promise<void> {
   const first = state.deployments[0] ?? fail("nothing is deployed yet");
   const url = state.url!;
   const fromMs = first.atMs - CLOCK_SKEW_MS;
+  const marker = "/deploy-test-probe-" + randomBytes(8).toString("hex");
+  await fetch(url + marker, { signal: AbortSignal.timeout(15_000) }).then((response) => response.body?.cancel(), () => undefined);
+  const probeDeadline = Date.now() + CLAIM_LOG_MS;
+  let key: WorkerKey | undefined;
   try {
-    await workerEvents(account, state.name, fromMs);
+    while (!(key = await provenKey(account, state.name, fromMs, marker))) {
+      if (Date.now() > probeDeadline) {
+        fail("no query of this Worker's logs showed its request to " + marker + " within " + CLAIM_LOG_MS / 1000 + " s, so /setup was not opened and no claim code was spent");
+      }
+      await sleep(CLAIM_LOG_EVERY_MS);
+    }
   } catch (error) {
     if (!(error instanceof ApiError)) throw error;
     fail("cannot query this Worker's logs, so /setup was not opened and no claim code was spent: " + error.message);
   }
+  console.log("Workers Logs shows this Worker's request to " + marker + " when filtered on " + key);
   const setup = await fetch(url + "/setup", { signal: AbortSignal.timeout(15_000) });
   const page = await setup.text();
   if (!setup.ok || !page.includes("claim code")) fail("/setup did not issue a claim code (HTTP " + setup.status + "): " + page.slice(0, 200));
   const deadline = Date.now() + CLAIM_LOG_MS;
   let code: string | undefined;
-  while (!(code = await claimCode(account, state.name, fromMs))) {
+  while (!(code = await claimCode(account, key, state.name, fromMs))) {
     if (Date.now() > deadline) fail("the claim code did not appear in this Worker's logs within " + CLAIM_LOG_MS / 1000 + " s");
     await sleep(CLAIM_LOG_EVERY_MS);
   }

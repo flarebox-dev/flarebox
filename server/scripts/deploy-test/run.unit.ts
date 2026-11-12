@@ -533,18 +533,30 @@ describe("claim", () => {
     expect(output).toContain("Claimed " + mock.url);
     expect(status).toBe(0);
     expect(readState().owner?.userId).toBe("user-1");
+    expect(output).toContain("filtered on $metadata.service");
+    expect(mock.queryDryFlags.length).toBeGreaterThan(0);
+    expect(mock.queryDryFlags.every((dry) => dry === true)).toBe(true);
     expect(output).not.toContain(mock.claimCode);
     expect(filesContaining(work, mock.claimCode)).toEqual([]);
   });
 
+  it("filters on $workers.scriptName when a query filtered on $metadata.service does not show the probe request", async () => {
+    mock.filterKeys = ["$workers.scriptName"];
+    claimState();
+    const { status, output } = await runTs("claim");
+    expect(output).toContain("filtered on $workers.scriptName");
+    expect(output).toContain("Claimed " + mock.url);
+    expect(status).toBe(0);
+  });
+
   it("keeps querying the logs until the code arrives, and opens /setup once", async () => {
-    mock.logsLagQueries = 3;
+    mock.codeLagQueries = 3;
     claimState();
     const { status, output } = await runTs("claim");
     expect(output).toContain("Claimed " + mock.url);
     expect(status).toBe(0);
     expect(mock.setupRequests).toBe(1);
-    expect(mock.logQueries).toBe(4);
+    expect(mock.logQueries).toBe(5);
   });
 
   it("ignores a claim code another Worker logged", async () => {

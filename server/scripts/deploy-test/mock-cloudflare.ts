@@ -26,9 +26,11 @@ export class MockCloudflare {
   bucketJobLeftovers: string[] = [];
   readonly bucketJobBodies: unknown[] = [];
   readonly claimCode = "ZQ7K-M2XR-9WPD";
-  readonly logs: { script: string; message: string; timestamp: number }[] = [];
+  readonly logs: { script: string; timestamp: number; message?: string; path?: string; visibleFrom?: number }[] = [];
+  readonly queryDryFlags: unknown[] = [];
   workerName = "";
-  logsLagQueries = 0;
+  filterKeys = ["$metadata.service", "$workers.scriptName"];
+  codeLagQueries = 0;
   observabilityStatus = 200;
   logQueries = 0;
   setupRequests = 0;
@@ -84,7 +86,9 @@ export class MockCloudflare {
       }
       if (path === "/setup") {
         this.setupRequests++;
-        if (this.setupRequests === 1) this.logs.push({ script: this.workerName, message: "Koidrive claim code (valid for 1 hour): " + this.claimCode, timestamp: Date.now() });
+        if (this.setupRequests === 1) {
+          this.logs.push({ script: this.workerName, message: "Koidrive claim code (valid for 1 hour): " + this.claimCode, path, timestamp: Date.now(), visibleFrom: this.logQueries + this.codeLagQueries });
+        }
         response.writeHead(200, { "Content-Type": "text/plain" });
         response.end("A one-time claim code, valid for one hour, is in this Worker's logs.\n");
         return;
@@ -95,6 +99,10 @@ export class MockCloudflare {
         if (!worker) return send(200, this.addWorker(match[1]!, undefined, tag));
         worker.versions.unshift({ id: crypto.randomUUID(), tag });
         return send(200, worker);
+      }
+      if (path.startsWith("/deploy-test-probe-")) {
+        this.logs.push({ script: this.workerName, path, timestamp: Date.now() });
+        return send(404, { code: "NOT_FOUND", message: "not found" });
       }
       if (path === "/v1/claim") {
         const claimed = JSON.parse(body) as { code?: string };
@@ -129,12 +137,18 @@ export class MockCloudflare {
       }
       if (api === "/workers/observability/telemetry/query" && method === "POST") {
         if (this.observabilityStatus !== 200) return send(this.observabilityStatus, { success: false, errors: [{ code: 10000, message: "Authentication error" }], messages: [], result: null });
-        const { timeframe, parameters } = JSON.parse(body) as { timeframe: { from: number; to: number }; parameters: { filters: { key: string; operation: string; value: string }[] } };
-        const script = parameters.filters.find((filter) => filter.key === "$workers.scriptName" && filter.operation === "eq")?.value;
-        const visible = this.logQueries++ >= this.logsLagQueries;
-        const events = (visible ? this.logs : [])
-          .filter((log) => log.timestamp >= timeframe.from && log.timestamp <= timeframe.to && (script === undefined || log.script === script))
-          .map((log) => ({ timestamp: log.timestamp, $metadata: { service: log.script, level: "log", message: log.message }, $workers: { scriptName: log.script }, source: { message: log.message } }));
+        const { timeframe, parameters, dry } = JSON.parse(body) as { timeframe: { from: number; to: number }; parameters: { filters: { key: string; operation: string; value: string }[] }; dry?: unknown };
+        this.queryDryFlags.push(dry);
+        const filter = parameters.filters.find((candidate) => this.filterKeys.includes(candidate.key) && candidate.operation === "eq");
+        const index = this.logQueries++;
+        const events = this.logs
+          .filter((log) => filter !== undefined && log.script === filter.value && (log.visibleFrom ?? 0) <= index && log.timestamp >= timeframe.from && log.timestamp <= timeframe.to)
+          .map((log) => ({
+            timestamp: log.timestamp,
+            $metadata: { service: log.script, level: "log", ...(log.message ? { message: log.message } : {}) },
+            $workers: { scriptName: log.script, event: { request: { url: this.url + (log.path ?? "/"), method: "GET" } } },
+            ...(log.message ? { source: { message: log.message } } : {}),
+          }));
         return ok({ events: { events } });
       }
       if (api === "/workers/durable_objects/namespaces" && method === "GET") {
