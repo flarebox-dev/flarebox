@@ -19,7 +19,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use koidrive_driver::{
-    self as driver, Driver, DriverError, FolderState as DriverFolderState, Paths, Status, api_for,
+    self as driver, Driver, DriverError, FolderState as DriverFolderState, Linked, Paths, Status,
+    api_for,
 };
 use koidrive_net::{Api, ApiError, Auth, PROTO_MAX, PROTO_MIN};
 use koidrive_proto::v1::{CreateSpaceRequest, error::Code};
@@ -514,7 +515,7 @@ impl Core for DriverCore {
 
     fn link_folder(&self, space_id: &str, path: &str) -> Result<LinkedFolder, SessionError> {
         self.change(|driver| {
-            let linked = self
+            let (Linked::New(linked) | Linked::Already(linked)) = self
                 .runtime
                 .block_on(driver.link(Path::new(path), space_id))
                 .map_err(driver_error)?;

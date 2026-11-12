@@ -29,9 +29,10 @@ pub enum Code {
     Halted,
     /// The server or the network is offline, unavailable or limits the rate for now.
     Unavailable,
-    /// The decision answered no longer exists.
+    /// The decision answered no longer exists, or a request ID was used before with other arguments or for a pairing
+    /// code that has expired.
     StaleDecision,
-    /// A signal stopped the command.
+    /// A signal stopped the command, or an earlier run with the same request ID stopped before it recorded its outcome.
     Interrupted,
 }
 

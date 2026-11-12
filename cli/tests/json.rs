@@ -138,6 +138,65 @@ fn errors_are_envelopes_with_their_code_and_exit_status() {
 }
 
 #[test]
+fn unlinking_a_folder_that_is_not_linked_is_unchanged() {
+    let profile = Profile::new();
+    let (code, envelope) = profile.json(&["folder", "unlink", "Docs", "--json"]);
+    assert_eq!(code, 0, "{envelope:#}");
+    assert_eq!(envelope["outcome"], "unchanged");
+    assert_eq!(envelope["error"], Value::Null);
+    let path = (std::fs::canonicalize(profile.home.path()).unwrap())
+        .join("Docs")
+        .display()
+        .to_string();
+    let mut data = envelope["data"].clone();
+    let service = data.as_object_mut().unwrap().remove("service");
+    assert_eq!(data, serde_json::json!({ "path": path }));
+    assert_eq!(service.unwrap()["state"], "not_installed", "{envelope:#}");
+    let output = profile.output(&["folder", "unlink", "Docs"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{path} is not linked, so there is nothing to unlink.\n")
+    );
+}
+
+#[test]
+fn a_change_with_a_request_id_that_failed_records_nothing() {
+    let profile = Profile::new();
+    let requests = profile.home.path().join("state/koidrive/requests");
+    for args in [
+        &["folder", "restart", "Docs", "--request-id", "r1", "--json"][..],
+        &["folder", "restart", "Docs", "--request-id", "r1", "--json"],
+        &[
+            "folder",
+            "retry",
+            "Docs",
+            "--resend",
+            "--request-id",
+            "r2",
+            "--json",
+        ],
+    ] {
+        let (code, envelope) = profile.json(args);
+        assert_eq!(code, 2, "{args:?}: {envelope:#}");
+        assert!(
+            (envelope["error"]["message"].as_str().unwrap()).contains("is not a linked folder"),
+            "{envelope:#}"
+        );
+        let left: Vec<_> = std::fs::read_dir(&requests)
+            .map(|entries| entries.map(|entry| entry.unwrap().file_name()).collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "{left:?}");
+    }
+    let (code, envelope) =
+        profile.json(&["folder", "restart", "Docs", "--request-id", "a/b", "--json"]);
+    assert_eq!(
+        (code, &envelope["error"]["code"]),
+        (2, &Value::from("usage"))
+    );
+}
+
+#[test]
 fn help_and_the_version_are_envelopes_under_json() {
     let profile = Profile::new();
     let (code, envelope) = profile.json(&["--json"]);
@@ -314,11 +373,11 @@ fn a_path_echoed_in_an_error_reaches_stderr_escaped() {
     assert_eq!(stderr.lines().count(), 1, "{stderr:?}");
 
     let output = profile.output(&["folder", "unlink", "x\u{1b}[31m\nFORGED"]);
-    assert_eq!(output.status.code(), Some(2), "{output:?}");
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert_eq!(stderr.lines().count(), 1, "{stderr:?}");
-    assert!(!stderr.contains('\u{1b}'), "{stderr:?}");
-    assert!(stderr.contains("x\\u{1b}[31m\\nFORGED"), "{stderr:?}");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 1, "{stdout:?}");
+    assert!(!stdout.contains('\u{1b}'), "{stdout:?}");
+    assert!(stdout.contains("x\\u{1b}[31m\\nFORGED"), "{stdout:?}");
 
     for args in [
         &["status", "--bad\nFORGED\u{1b}[2J"][..],

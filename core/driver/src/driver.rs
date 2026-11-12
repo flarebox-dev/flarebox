@@ -167,6 +167,15 @@ pub(crate) fn lift_halt(path: &Path, lift: Lift) -> Result<(), DriverError> {
     })
 }
 
+/// What [`Driver::link`] did, with the folder's status.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Linked {
+    /// The folder is linked now.
+    New(FolderStatus),
+    /// The folder was already linked to the space, and nothing changed.
+    Already(FolderStatus),
+}
+
 /// Runs sync for the folders one profile links. The Linux daemon and the macOS app use it alike: the daemon serves
 /// it over a local socket, the app calls it in-process through `core/ffi`.
 ///
@@ -626,8 +635,9 @@ impl Driver {
     }
 
     /// Links `folder` to the space with id or name `space`: checks the folder, writes its root marker, and creates
-    /// its store. The folder starts syncing at once if the driver is running.
-    pub async fn link(&self, folder: &Path, space: &str) -> Result<FolderStatus, DriverError> {
+    /// its store. The folder starts syncing at once if the driver is running. A folder already linked to that space
+    /// stays as it is, and one linked to another space is refused.
+    pub async fn link(&self, folder: &Path, space: &str) -> Result<Linked, DriverError> {
         let _lifecycle = self.inner.lifecycle.lock().await;
         let credential = self.credential()?;
         let root = fs::canonicalize(folder).map_err(|error| match error.kind() {
@@ -636,6 +646,25 @@ impl Driver {
         })?;
         if !root.is_dir() {
             return Err(DriverError::NotAFolder(root));
+        }
+        let here = (self.inner.folders.lock().unwrap().values())
+            .find(|linked| linked.link.root == root)
+            .map(|linked| {
+                (
+                    linked.link.space_id.clone(),
+                    linked.status.lock().unwrap().clone(),
+                )
+            });
+        if let Some((space_id, status)) = here {
+            let same = space == space_id || {
+                let auth = self.auth(&credential)?;
+                resolve_space(auth.api().list_spaces(&auth).await?.spaces, space)?.space_id
+                    == space_id
+            };
+            return match same {
+                true => Ok(Linked::Already(status)),
+                false => Err(DriverError::FolderOverlaps(root)),
+            };
         }
         self.check_placement(&root, &self.inner.folders.lock().unwrap())?;
         if !probe_no_replace(&root).map_err(io_error(&root))? {
@@ -716,7 +745,7 @@ impl Driver {
         drop(folders);
         self.changed();
         let status = status.lock().unwrap().clone();
-        Ok(status)
+        Ok(Linked::New(status))
     }
 
     /// Stops syncing the folder at `folder` and forgets its sync state. The files stay, and so does the folder's
@@ -3447,6 +3476,60 @@ mod tests {
         assert_eq!(fs::read(root.join("keep.txt")).unwrap(), b"mine");
         drop(driver);
         assert!(Driver::open(paths).unwrap().status().folders.is_empty());
+    }
+
+    #[tokio::test]
+    async fn linking_a_folder_to_the_space_it_syncs_changes_nothing_and_to_another_is_refused() {
+        let (_dir, paths, root) = profile(&[]);
+        let token = prost::Message::encode_to_vec(&koidrive_proto::v1::AccessToken {
+            token: "token".into(),
+            expires_at_ms: i64::MAX,
+            ..Default::default()
+        });
+        let spaces = prost::Message::encode_to_vec(&koidrive_proto::v1::SpaceList {
+            spaces: vec![
+                SpaceInfo {
+                    space_id: SPACE.into(),
+                    name: "Projects".into(),
+                    ..Default::default()
+                },
+                SpaceInfo {
+                    space_id: "0190f0a0-0000-7000-8000-000000000002".into(),
+                    name: "Notes".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        let (server, served) =
+            serve_recorded(vec![(200, token), (200, spaces.clone()), (200, spaces)]).await;
+        Credential {
+            server,
+            ..credential("d1")
+        }
+        .save_new(&paths.credential())
+        .unwrap();
+        let driver = Driver::open(paths).unwrap();
+        let before = driver.status().folders;
+
+        assert_eq!(
+            driver.link(&root, SPACE).await.unwrap(),
+            Linked::Already(before[0].clone())
+        );
+        assert_eq!(
+            driver.link(&root, "Projects").await.unwrap(),
+            Linked::Already(before[0].clone())
+        );
+        assert!(matches!(
+            driver.link(&root, "Notes").await,
+            Err(DriverError::FolderOverlaps(path)) if path == root
+        ));
+        assert_eq!(driver.status().folders, before);
+        assert_eq!(read_marker(&root).unwrap(), None);
+        let paths: Vec<String> = (served.await.unwrap().into_iter())
+            .map(|(path, _)| path)
+            .collect();
+        assert_eq!(paths, ["/v1/token", "/v1/spaces", "/v1/spaces"]);
     }
 
     #[tokio::test]

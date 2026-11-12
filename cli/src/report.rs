@@ -25,6 +25,8 @@ pub enum Outcome {
     Ok,
     /// The work is recorded and happens later; it has not finished.
     Accepted,
+    /// The state the command asks for already held, or the command repeated an accepted answer, so nothing changed.
+    Unchanged,
     Error,
 }
 
@@ -84,6 +86,14 @@ impl Done {
         Done {
             outcome: Outcome::Accepted,
             ..Done::ok(data, text)
+        }
+    }
+
+    /// The same result, with the outcome `unchanged`.
+    pub fn unchanged(self) -> Self {
+        Done {
+            outcome: Outcome::Unchanged,
+            ..self
         }
     }
 
@@ -501,7 +511,9 @@ impl Lifecycle {
 
 #[derive(Debug, PartialEq, Serialize)]
 pub struct UnlinkedData {
-    pub space_id: String,
+    /// The space the folder was linked to. Absent when it was not linked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<String>,
     pub path: String,
 }
 
@@ -786,6 +798,23 @@ pub struct VersionInfoData {
 mod tests {
     use super::*;
     use koidrive_driver::HeldItem;
+
+    #[test]
+    fn an_unchanged_result_keeps_its_data_and_its_value() {
+        let done = Done::value(
+            RevokedData {
+                device_id: "d1".into(),
+            },
+            "d1",
+            "Device d1 is already revoked.\n",
+        )
+        .unchanged();
+        assert_eq!((done.exit, done.text.as_str()), (0, "d1\n"));
+        let envelope = serde_json::to_value(Envelope::of("device revoke", done)).unwrap();
+        assert_eq!(envelope["outcome"], "unchanged");
+        assert_eq!(envelope["data"], serde_json::json!({ "device_id": "d1" }));
+        assert_eq!(envelope["error"], Value::Null);
+    }
 
     fn folder(path: &str, state: FolderState) -> FolderStatus {
         FolderStatus {

@@ -14,6 +14,7 @@ mod logfile;
 mod notify;
 mod pairing;
 mod report;
+mod request;
 mod service;
 mod setup;
 mod telemetry;
@@ -32,6 +33,7 @@ use koidrive_driver::{
 };
 use koidrive_net::{Auth, Reload};
 use koidrive_proto::v1::{CreateSpaceRequest, DeviceInfo, SpaceInfo, SpaceUsage};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::EnvFilter;
@@ -46,6 +48,7 @@ use crate::report::{
     HelpData, InvitationData, Lifecycle, RefusedSpace, RevokedData, SpaceData, SpacesData,
     StatusData, UnlinkedData, UsageData, UsagesData, VersionInfoData,
 };
+use crate::request::{Begun, Key, RequestId};
 
 #[derive(Parser)]
 #[command(
@@ -214,6 +217,8 @@ enum FolderAction {
     Restart {
         /// The linked folder.
         folder: PathBuf,
+        #[command(flatten)]
+        request: RequestArg,
     },
     /// Sync a folder again whose changes the server refused, after fixing the cause the status names.
     #[command(group = clap::ArgGroup::new("how").required(true).args(["resend", "replan"]))]
@@ -226,7 +231,18 @@ enum FolderAction {
         /// Plan the refused changes again into a new commit, for a cause fixed on this device.
         #[arg(long)]
         replan: bool,
+        #[command(flatten)]
+        request: RequestArg,
     },
+}
+
+/// `--request-id`, for a change an agent may run again after a timeout.
+#[derive(clap::Args)]
+pub struct RequestArg {
+    /// An ID you pick for this change, of letters, digits, - and _. Running the command again with the same ID and
+    /// arguments returns the first outcome and changes nothing again.
+    #[arg(long, value_name = "ID", value_parser = RequestId::parse)]
+    pub request_id: Option<RequestId>,
 }
 
 #[derive(Subcommand)]
@@ -238,7 +254,10 @@ enum ServiceAction {
 #[derive(Subcommand)]
 enum DeviceAction {
     /// Show a pairing code that adds another device to this server. It works once, for 10 minutes.
-    Invite,
+    Invite {
+        #[command(flatten)]
+        request: RequestArg,
+    },
     /// List the devices paired with the server, revoked ones included.
     List,
     /// Revoke another device, such as a lost one. It stops syncing at once, and the files on it stay there.
@@ -898,6 +917,14 @@ async fn resolve(
             },
             "Resolved.\n",
         )),
+        Response::AlreadyAnswered => Ok(Done::ok(
+            AnsweredData {
+                decision_id: id,
+                answer: word.clone(),
+            },
+            format!("Already resolved with {}.\n", printable(&word)),
+        )
+        .unchanged()),
         other => Err(unexpected(other)),
     }
 }
@@ -912,13 +939,30 @@ async fn folder(paths: &Paths, action: FolderAction) -> Result<Done, CliError> {
         FolderAction::Unlink { folder } => Request::Unlink {
             folder: absolute(&folder)?,
         },
-        FolderAction::Restart { folder } => Request::Restart {
-            folder: absolute(&folder)?,
-        },
-        FolderAction::Retry { folder, replan, .. } => Request::Lift {
-            folder: absolute(&folder)?,
+        FolderAction::Restart { folder, request } => {
+            let folder = absolute(&folder)?;
+            let key = Key::new(
+                "folder restart",
+                serde_json::json!({ "folder": folder.display().to_string() }),
+            );
+            Request::Restart { folder }.once(request.request_id, key)
+        }
+        FolderAction::Retry {
+            folder,
             replan,
-        },
+            request,
+            ..
+        } => {
+            let folder = absolute(&folder)?;
+            let key = Key::new(
+                "folder retry",
+                serde_json::json!({
+                    "folder": folder.display().to_string(),
+                    "how": if replan { "replan" } else { "resend" },
+                }),
+            );
+            Request::Lift { folder, replan }.once(request.request_id, key)
+        }
     };
     match ipc::run(paths, request).await? {
         Response::Linked { folder } => {
@@ -930,6 +974,15 @@ async fn folder(paths: &Paths, action: FolderAction) -> Result<Done, CliError> {
             );
             Ok(Done::ok(FolderData::of(&folder), text))
         }
+        Response::AlreadyLinked { folder } => {
+            let text = format!(
+                "{} is already linked to space {} ({}).\n",
+                printable(&folder.path),
+                printable(&folder.space_name),
+                printable(&folder.space_id)
+            );
+            Ok(Done::ok(FolderData::of(&folder), text).unchanged())
+        }
         Response::Unlinked { space_id, path } => {
             let text = format!(
                 "Unlinked {} from space {}. Its files and its .koidrive folder stay.\n",
@@ -937,10 +990,22 @@ async fn folder(paths: &Paths, action: FolderAction) -> Result<Done, CliError> {
                 printable(&space_id)
             );
             let data = UnlinkedData {
-                space_id,
+                space_id: Some(space_id),
                 path: path.display().to_string(),
             };
             Ok(Done::ok(data, text))
+        }
+        Response::NotLinked { path } => {
+            let path = path.display().to_string();
+            let text = format!(
+                "{} is not linked, so there is nothing to unlink.\n",
+                printable(&path)
+            );
+            let data = UnlinkedData {
+                space_id: None,
+                path,
+            };
+            Ok(Done::ok(data, text).unchanged())
         }
         Response::Restarted { folder } => restarted(folder),
         other => Err(unexpected(other)),
@@ -1004,41 +1069,49 @@ async fn device(paths: Paths, action: DeviceAction) -> Result<Done, CliError> {
     let auth = signed_in(&paths)?;
     match action {
         DeviceAction::List => {
-            let mut devices = Vec::new();
-            let mut cursor = String::new();
-            loop {
-                let page = auth.api().list_devices(&auth, &cursor).await?;
-                devices.extend(page.devices);
-                if page.next_cursor.is_empty() {
-                    break;
-                }
-                cursor = page.next_cursor;
-            }
+            let devices = devices(&auth).await?;
             let data = DevicesData {
                 devices: devices.iter().map(DeviceData::of).collect(),
             };
             Ok(Done::ok(data, device_table(&devices, now_ms())))
         }
-        DeviceAction::Invite => {
+        DeviceAction::Invite { request } => {
+            let claim = match request.request_id {
+                None => None,
+                Some(id) => {
+                    match request::begin(&paths, &id, &Key::new("device invite", Value::Null))? {
+                        Begun::Done(recorded) => {
+                            let invitation = serde_json::from_value(recorded).map_err(|error| {
+                                format!("the record of the request {id} cannot be read: {error}")
+                            })?;
+                            return replayed(&id, &invitation, now_ms());
+                        }
+                        Begun::Claimed(claim) => Some(claim),
+                    }
+                }
+            };
             let started = auth.api().pair_start(&auth).await?;
-            let minutes = ((started.expires_at_ms - now_ms() + 59_999) / 60_000).max(1);
-            let code = pairing::join_args(&started.code, auth.api().base());
-            let note = format!(
-                "On the new device, run:\n  koi join {code}\nThe code works once, for about {minutes} minutes.\n"
-            );
-            let mut join_argv = vec!["koi".to_owned(), "join".to_owned()];
-            join_argv.extend(pairing::join_argv(&started.code, auth.api().base()));
-            let data = InvitationData {
-                join_argv,
+            let invitation = Invitation {
+                code: started.code,
+                server: auth.api().base().to_string(),
                 expires_at_ms: started.expires_at_ms,
             };
-            Ok(Done::value(data, &code, note))
+            if let Some(claim) = claim {
+                claim.finish(&invitation)?;
+            }
+            invited(&invitation, now_ms())
         }
         DeviceAction::Revoke { id } => {
             if id == auth.credentials().device_id {
                 return Err(CliError::usage(
                     "this device cannot revoke itself; revoke it from another device",
                 ));
+            }
+            let revoked = (devices(&auth).await?.iter())
+                .any(|device| device.device_id == id && device.revoked_at_ms != 0);
+            if revoked {
+                let text = format!("Device {id} is already revoked.\n");
+                return Ok(Done::ok(RevokedData { device_id: id }, text).unchanged());
             }
             auth.api().revoke_device(&auth, &id).await?;
             let text = format!(
@@ -1049,8 +1122,61 @@ async fn device(paths: Paths, action: DeviceAction) -> Result<Done, CliError> {
     }
 }
 
-/// Runs a space command. Creating refuses a name another space has, since koi folder link names a space by its
-/// name.
+/// Every device of the account, page by page.
+async fn devices(auth: &Auth) -> Result<Vec<DeviceInfo>, CliError> {
+    let mut devices = Vec::new();
+    let mut cursor = String::new();
+    loop {
+        let page = auth.api().list_devices(auth, &cursor).await?;
+        devices.extend(page.devices);
+        if page.next_cursor.is_empty() {
+            return Ok(devices);
+        }
+        cursor = page.next_cursor;
+    }
+}
+
+/// A pairing code `koi device invite` showed, as its request record keeps it.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct Invitation {
+    code: String,
+    server: String,
+    expires_at_ms: i64,
+}
+
+/// What `koi device invite` shows for `invitation`: the code on stdout, how to use it on stderr.
+fn invited(invitation: &Invitation, now_ms: i64) -> Result<Done, CliError> {
+    let server = url::Url::parse(&invitation.server).map_err(|error| error.to_string())?;
+    let minutes = ((invitation.expires_at_ms - now_ms + 59_999) / 60_000).max(1);
+    let code = pairing::join_args(&invitation.code, &server);
+    let note = format!(
+        "On the new device, run:\n  koi join {code}\nThe code works once, for about {minutes} minutes.\n"
+    );
+    let mut join_argv = vec!["koi".to_owned(), "join".to_owned()];
+    join_argv.extend(pairing::join_argv(&invitation.code, &server));
+    let data = InvitationData {
+        join_argv,
+        expires_at_ms: invitation.expires_at_ms,
+    };
+    Ok(Done::value(data, &code, note))
+}
+
+/// The invitation the request `id` showed before, or a stale request once it expired.
+fn replayed(id: &RequestId, invitation: &Invitation, now_ms: i64) -> Result<Done, CliError> {
+    if invitation.expires_at_ms <= now_ms {
+        return Err(CliError::new(
+            Code::StaleDecision,
+            format!(
+                "stale request: the pairing code of the request {id} expired; run koi device invite with a new \
+                 request ID"
+            ),
+        ));
+    }
+    invited(invitation, now_ms)
+}
+
+/// Runs a space command. Creating a name another space has returns that space, since koi folder link names a space by
+/// its name and the server keeps names unique.
 async fn space(paths: Paths, action: SpaceAction) -> Result<Done, CliError> {
     let auth = signed_in(&paths)?;
     let spaces = auth.api().list_spaces(&auth).await?.spaces;
@@ -1067,11 +1193,13 @@ async fn space(paths: Paths, action: SpaceAction) -> Result<Done, CliError> {
             if name.is_empty() {
                 return Err(CliError::usage("a space needs a name"));
             }
-            if let Some(taken) = spaces.iter().find(|space| space.name == name) {
-                return Err(CliError::usage(format!(
-                    "the space {} already has that name; link a folder to it, or pick another name",
-                    printable(&taken.space_id)
-                )));
+            if let Some(existing) = spaces.iter().find(|space| space.name == name) {
+                let id = printable(&existing.space_id);
+                let note = format!(
+                    "The space {} ({id}) already exists.\nLink a folder to it with koi folder link <folder> --space {id}.\n",
+                    printable(&existing.name),
+                );
+                return Ok(Done::value(SpaceData::of(existing), &id, note).unchanged());
             }
             let created = auth
                 .api()
@@ -1715,6 +1843,49 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Option<Command>, clap::Error> {
         Cli::try_parse_from(args).map(|cli| cli.command)
+    }
+
+    #[test]
+    fn a_replayed_invitation_shows_the_first_code_until_it_expires() {
+        let invitation = Invitation {
+            code: "K7QM-2XPD".into(),
+            server: "https://files.example.com/".into(),
+            expires_at_ms: 600_000,
+        };
+        let id = RequestId::parse("r1").unwrap();
+        let first = invited(&invitation, 0).unwrap();
+        assert_eq!(first.text, "K7QM-2XPD@files.example.com\n");
+        let again = replayed(&id, &invitation, 599_999).unwrap();
+        assert_eq!(
+            (again.outcome, &again.data, &again.text),
+            (first.outcome, &first.data, &first.text)
+        );
+        let expired = replayed(&id, &invitation, 600_000).unwrap_err();
+        assert_eq!(expired.code, Code::StaleDecision);
+        assert_eq!(
+            expired.message,
+            "stale request: the pairing code of the request r1 expired; run koi device invite with a new request ID"
+        );
+        assert!(expired.next.is_empty());
+    }
+
+    #[test]
+    fn request_ids_are_checked_where_they_are_parsed() {
+        assert!(parse(&["koi", "folder", "restart", "/a", "--request-id", "r-1_a"]).is_ok());
+        assert!(parse(&["koi", "device", "invite", "--request-id", "r1"]).is_ok());
+        assert!(parse(&["koi", "history", "restore", "a.txt", "--request-id", "r1"]).is_ok());
+        let error = parse(&[
+            "koi",
+            "folder",
+            "retry",
+            "/a",
+            "--resend",
+            "--request-id",
+            "../r1",
+        ])
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), ErrorKind::ValueValidation);
     }
 
     #[test]

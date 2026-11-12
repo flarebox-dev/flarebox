@@ -26,6 +26,7 @@ use crate::report::{
     Done, Outcome, RequestData, RequestsData, RestoreAskedData, TrashData, TrashEntry, VersionData,
     VersionsData,
 };
+use crate::request::{self, Key, RequestId};
 use crate::{ago, now_ms, printable, signed_in, size, unexpected};
 
 /// The most entries asked for in one page; the server sends at most this many.
@@ -54,6 +55,8 @@ pub enum HistoryAction {
         /// path.
         #[arg(long, conflicts_with = "version")]
         node: Option<String>,
+        #[command(flatten)]
+        request: crate::RequestArg,
     },
     /// List the restores asked for in a linked folder and how each one went.
     Requests {
@@ -71,7 +74,8 @@ pub async fn run(paths: &Paths, action: HistoryAction) -> Result<Done, CliError>
             path,
             version,
             node,
-        } => restore(paths, &path, version, node).await,
+            request,
+        } => restore(paths, &path, version, node, request.request_id).await,
         HistoryAction::Requests { folder } => requests(paths, &folder).await,
     }
 }
@@ -144,13 +148,32 @@ async fn versions(paths: &Paths, file: &Path) -> Result<Done, CliError> {
 /// `koi history restore <path>`: asks the folder's engine to bring the deletion at `path` back from the trash, or, with
 /// `version`, to make that version of the live file at `path` current again. `node` picks one of several deletions
 /// that had the path. The request is checked against the server's listings first, so a typo fails here and not after
-/// the next commit.
+/// the next commit. With `request_id`, a restore already asked for under that ID is reported again without reading the
+/// server, since the deletion it brought back may have left the trash.
 async fn restore(
     paths: &Paths,
     path: &Path,
     version: Option<String>,
     node: Option<String>,
+    request_id: Option<RequestId>,
 ) -> Result<Done, CliError> {
+    let key = Key::new(
+        "history restore",
+        serde_json::json!({
+            "path": lexical(&crate::absolute(path)?).display().to_string(),
+            "version": version,
+            "node": node,
+        }),
+    );
+    if let Some(id) = &request_id
+        && let Some(recorded) = request::recorded(paths, id, &key)?
+    {
+        let (linked, below) = locate(paths, path).await?;
+        return match serde_json::from_value(recorded) {
+            Ok(Response::Restore { id }) => Ok(asked(&linked, &below, id)),
+            _ => Err(format!("the record of the request {id} is not a restore").into()),
+        };
+    }
     let (linked, below) = locate(paths, path).await?;
     if below.is_empty() {
         return Err(CliError::usage(format!(
@@ -211,10 +234,15 @@ async fn restore(
         space_id: linked.space_id.clone(),
         restore: request,
     };
-    let id = match ipc::run(paths, request).await? {
-        Response::Restore { id } => id,
-        other => return Err(unexpected(other)),
-    };
+    match ipc::run(paths, request.once(request_id, key)).await? {
+        Response::Restore { id } => Ok(asked(&linked, &below, id)),
+        other => Err(unexpected(other)),
+    }
+}
+
+/// What `koi history restore` reports for the restore `id` of `below` in `linked`.
+fn asked(linked: &FolderStatus, below: &[String], id: String) -> Done {
+    let shown = printable(&below.join("/"));
     let mut note = format!("Asked to restore {shown} (restore {}).\n", printable(&id));
     if linked.state == FolderState::Stopped {
         note.push_str("The folder sends it once the daemon runs; koi status shows why it doesn't. koi history requests shows how it went.\n");
@@ -234,7 +262,7 @@ async fn restore(
         outcome: Outcome::Accepted,
         ..Done::value(data, &value, note)
     };
-    Ok(done.then(&["koi", "history", "requests", &linked.path]))
+    done.then(&["koi", "history", "requests", &linked.path])
 }
 
 /// `koi history requests [folder]`: the restores asked for in the folder's space, those that ended first.

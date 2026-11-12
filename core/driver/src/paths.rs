@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 ///
 /// - The configuration file is edited by the person and may be shared between machines. It holds no secrets and no
 ///   sync state, and it is never synced.
-/// - The state directory belongs to this machine and is never copied: the credential, the profile lock and one
-///   store per linked space. A copied credential or store breaks the rule that one credential writes one store
-///   (H6 of reports/BOX-71, RFC 0002 section 6).
+/// - The state directory belongs to this machine and is never copied: the credential, the profile lock, one store
+///   per linked space, and the records of changes the CLI made once (see [`Paths::requests`]). A copied credential
+///   or store breaks the rule that one credential writes one store (H6 of reports/BOX-71, RFC 0002 section 6).
 /// - The runtime directory holds the daemon's socket.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Paths {
@@ -82,6 +82,17 @@ impl Paths {
 
     pub fn spaces(&self) -> PathBuf {
         self.state_dir.join("spaces")
+    }
+
+    /// The records of the changes asked for with a request ID, one file per ID, so that running a change again
+    /// returns its first outcome.
+    pub fn requests(&self) -> PathBuf {
+        self.state_dir.join("requests")
+    }
+
+    /// The answers given to decisions, one file per decision, kept after sync takes an answer and forgets the decision.
+    pub fn answers(&self) -> PathBuf {
+        self.state_dir.join("answers")
     }
 
     /// The store of one space. Space ids come from the server, so only ids made of hex digits and dashes name a
