@@ -308,6 +308,29 @@ describe("reading what the API lists late", () => {
     );
   }
 
+  it("stops at 60 s when a listing's headers arrive but its body stalls", async () => {
+    const stalled = vi.fn(
+      async (_url: string, init?: RequestInit) =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              init?.signal?.addEventListener("abort", () => controller.error(init.signal!.reason));
+            },
+          }),
+        ),
+    );
+    const read = async <T>(helper: () => Promise<T>) => {
+      const startMs = Date.now();
+      const value = await helper();
+      return { value, tookMs: Date.now() - startMs };
+    };
+    const tag = await withFetch(stalled, () => read(() => workerTag(account, NAME, "this-runs-tag")), LISTING_MS);
+    expect(tag).toEqual({ value: "unlisted", tookMs: LISTING_MS });
+    const newest = await withFetch(stalled, () => read(() => newestDeployment(account, NAME, "v2")), LISTING_MS);
+    expect(newest).toEqual({ value: undefined, tookMs: LISTING_MS });
+    expect(stalled).toHaveBeenCalledTimes(2);
+  });
+
   it("stops reading slow deployments at 60 s and keeps the last listing it got", async () => {
     const split = { created_on: "2026-11-12T10:00:00Z", versions: [{ version_id: "v1", percentage: 50 }, { version_id: "v2", percentage: 50 }] };
     const started: number[] = [];

@@ -123,9 +123,18 @@ interface Envelope<T> {
   result_info?: { cursor?: string; is_truncated?: boolean; page?: number; total_pages?: number };
 }
 
+async function json<T>(response: Response, deadline?: Deadline): Promise<T> {
+  try {
+    return (await response.json()) as T;
+  } catch (error) {
+    if (deadline && Date.now() >= deadline.atMs) throw new DeadlineError(deadline.what);
+    throw error;
+  }
+}
+
 async function call<T>(account: Account, method: string, path: string, body?: unknown, deadline?: Deadline): Promise<Envelope<T>> {
   const response = await send(account, method, path, { body, deadline });
-  return (await response!.json()) as Envelope<T>;
+  return json<Envelope<T>>(response!, deadline);
 }
 
 export async function createBucket(account: Account, name: string): Promise<void> {
@@ -155,7 +164,7 @@ export async function workerTag(account: Account, name: string, tag: string): Pr
     for (let page = 1; ; page++) {
       const response = await send(account, "GET", `/accounts/${account.id}/workers/scripts/${name}/versions?per_page=100&page=${page}`, { allowMissing: true, deadline });
       if (!response) return page === 1 ? undefined : "untagged";
-      const items = ((await response.json()) as Envelope<{ items?: { id: string }[] }>).result?.items ?? [];
+      const items = (await json<Envelope<{ items?: { id: string }[] }>>(response, deadline)).result?.items ?? [];
       if (page === 1 && items.length === 0) return undefined;
       for (const item of items) {
         const version = await call<{ annotations?: Record<string, string> }>(account, "GET", `/accounts/${account.id}/workers/scripts/${name}/versions/${item.id}`, undefined, deadline);
@@ -200,7 +209,7 @@ export async function emptyBucket(account: Account, bucket: string): Promise<voi
   const path = `/accounts/${account.id}/r2/buckets/${bucket}/jobs`;
   const deadline = { atMs: Date.now() + 6 * 60_000, what: "bucket-emptying job exceeded its six-minute deadline" };
   const created = await send(account, "POST", path, { body: { jobType: "prefixDelete", prefix: "" }, deadline, retry: false });
-  let job = bucketJob(await created!.json());
+  let job = bucketJob(await json(created!, deadline));
   const id = job.id;
   while (job.status !== "COMPLETED") {
     if (job.status === "FAILED" || job.status === "CANCELLED") throw new ApiError("bucket-emptying job " + job.status, 200);
@@ -208,7 +217,7 @@ export async function emptyBucket(account: Account, bucket: string): Promise<voi
     if (remaining <= 0) throw new DeadlineError(deadline.what);
     await sleep(Math.min(5000, remaining));
     const response = await send(account, "GET", path + "/" + encodeURIComponent(id), { deadline });
-    job = bucketJob(await response!.json());
+    job = bucketJob(await json(response!, deadline));
   }
 }
 
