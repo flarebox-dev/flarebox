@@ -14,16 +14,55 @@ export KOIDRIVE_VERSION=v0.0.0
 unset KOIDRIVE_INSTALL_DIR
 mkdir -p "$HOME" "$tmp/package" "$tmp/releases/download/v0.0.0" "$tmp/releases/latest" "$tmp/bin" "$tmp/services"
 export PATH="$tmp/services:$PATH"
-for manager in systemctl launchctl; do
-    cat > "$tmp/services/$manager" <<'EOF'
+cat > "$tmp/services/systemctl" <<'EOF'
+#!/bin/sh
+set -f
+printf '%s\n' "$*" >> "$HOME/services.log"
+[ "$1 $2" = '--user list-units' ] || exit 0
+if [ -e "$HOME/unreachable" ]; then
+    printf 'Failed to connect to bus: No medium found\n' >&2
+    exit 1
+fi
+shift 2
+state= patterns=
+for arg; do
+    case $arg in
+        --state=*) state=${arg#--state=} ;;
+        -*) ;;
+        *) patterns="$patterns $arg" ;;
+    esac
+done
+{
+    printf '%s\n' 'other.service active' 'koidrive-backup.service active' 'koidrive-0badf00d.service failed'
+    [ ! -e "$HOME/running" ] || sed 's/$/ active/' "$HOME/running"
+} | while read -r unit active; do
+    [ -z "$state" ] || [ "$active" = "$state" ] || continue
+    for pattern in $patterns; do
+        case $unit in
+            $pattern) printf '%s loaded %s running Koidrive\n' "$unit" "$active"; break ;;
+        esac
+    done
+done
+EOF
+cat > "$tmp/services/launchctl" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >> "$HOME/services.log"
-case "$*" in
-    '--user is-active --quiet koidrive.service' | "print gui/$(id -u)/dev.koidrive.koi") [ -e "$HOME/running" ] ;;
-esac
+[ "$*" = "print gui/$(id -u)" ] || exit 0
+[ ! -e "$HOME/unreachable" ] || exit 113
+printf 'gui/%s = {\n\ttype = login\n\tservices = {\n' "$(id -u)"
+printf '\t\t%8s %6s \t%s\n' 101 - com.example.other 102 - dev.koidrive.koiz 104 - dev.koidrive.koi.backup 0 0 dev.koidrive.koi.0badf00d
+[ ! -e "$HOME/running" ] || sed 's/^/\t\t     103      - \t/' "$HOME/running"
+printf '\t}\n\n\tunmanaged processes = {\n\t\t     105      - \tdev.koidrive.koi.1a2b3c4e\n\t}\n}\n'
 EOF
-    chmod +x "$tmp/services/$manager"
-done
+cat > "$tmp/services/ps" <<'EOF'
+#!/bin/sh
+if [ "$1 $2 $3" = '-ww -o cgroup=' ] && [ -e "$HOME/cgroup" ]; then
+    cat "$HOME/cgroup"
+    exit 0
+fi
+exec /bin/ps "$@"
+EOF
+chmod +x "$tmp/services/systemctl" "$tmp/services/launchctl" "$tmp/services/ps"
 cp "$binary" "$tmp/package/koi"
 archive=koidrive-$target.tar.gz
 release=$tmp/releases/download/v0.0.0
@@ -131,27 +170,60 @@ KOIDRIVE_INSTALL_DIR=relative reject 'relative install directory' 'KOIDRIVE_INST
 unset KOIDRIVE_INSTALL_DIR
 
 if [ "$(uname -s)" = Linux ]; then
-    restart='--user restart koidrive.service'
+    services='koidrive.service
+koidrive-1a2b3c4d.service'
+    restarts='--user restart koidrive.service
+--user restart koidrive-1a2b3c4d.service'
 else
-    restart="kickstart -k gui/$(id -u)/dev.koidrive.koi"
+    services='dev.koidrive.koi
+dev.koidrive.koi.1a2b3c4d'
+    restarts="kickstart -k gui/$(id -u)/dev.koidrive.koi
+kickstart -k gui/$(id -u)/dev.koidrive.koi.1a2b3c4d"
 fi
 rm -f "$HOME/services.log"
 sh "$root/install.sh"
-if grep -q -x -- "$restart" "$HOME/services.log"; then
-    cat "$HOME/services.log"
-    printf 'Expected an upgrade to leave a service that is not running alone\n' >&2
+if grep -E -e '--user restart|kickstart' "$HOME/services.log"; then
+    printf 'Expected an upgrade to leave services that are not running alone\n' >&2
     exit 1
 fi
-pass 'an upgrade leaves a service that is not running alone'
-touch "$HOME/running"
+pass 'an upgrade leaves services that are not running alone'
+printf '%s\n' "$services" > "$HOME/running"
+rm -f "$HOME/services.log"
 sh "$root/install.sh" > "$tmp/restart.log"
-grep -x -- "$restart" "$HOME/services.log"
-grep -F 'Restarted the background service' "$tmp/restart.log"
+grep -E -e '--user restart|kickstart' "$HOME/services.log" > "$tmp/restarted"
+if [ "$(cat "$tmp/restarted")" != "$restarts" ] || [ "$(grep -c -F 'Restarted the background service' "$tmp/restart.log")" != 2 ]; then
+    cat "$HOME/services.log" "$tmp/restart.log"
+    printf 'Expected an upgrade to restart exactly the running services of every profile\n' >&2
+    exit 1
+fi
 rm "$HOME/running"
-pass 'an upgrade restarts the running background service'
+pass 'an upgrade restarts the running background service of every profile'
 
 if [ "$(uname -s)" = Linux ]; then
-    printf 'Passed 18 installer tests on %s\n' "$(uname -s)"
+    perl -e '$0 = "/opt/custom bin/koi _daemon"; sleep 300' &
+    daemon=$!
+    touch "$HOME/unreachable"
+    COLUMNS=20 sh "$root/install.sh" 2> "$tmp/nobus.log"
+    if ! grep -F "the koi daemon with process ID $daemon still runs the old koi" "$tmp/nobus.log"; then
+        cat "$tmp/nobus.log"
+        printf 'Expected an upgrade without a systemd user manager to name the daemon that still runs the old koi\n' >&2
+        exit 1
+    fi
+    pass 'an upgrade without a systemd user manager names the daemon that still runs the old koi'
+    printf '0::/user.slice/user-%s.slice/user@%s.service/app.slice/koidrive-1a2b3c4d.service\n' "$(id -u)" "$(id -u)" > "$HOME/cgroup"
+    sh "$root/install.sh" 2> "$tmp/nobus.log"
+    rm "$HOME/unreachable" "$HOME/cgroup"
+    kill "$daemon"
+    if ! grep -F "Log in as $(id -un) and run: systemctl --user restart koidrive-1a2b3c4d.service" "$tmp/nobus.log"; then
+        cat "$tmp/nobus.log"
+        printf 'Expected an upgrade without a systemd user manager to give the command that restarts the unit\n' >&2
+        exit 1
+    fi
+    pass 'an upgrade without a systemd user manager gives the command that restarts the unit'
+fi
+
+if [ "$(uname -s)" = Linux ]; then
+    printf 'Passed 20 installer tests on %s\n' "$(uname -s)"
 else
     cat > "$tmp/bin/uname" <<'EOF'
 #!/bin/sh

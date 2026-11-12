@@ -98,20 +98,32 @@ main() {
         fi
     fi
 
-    if [ "$os" = unknown-linux-musl ]; then
-        if command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet koidrive.service 2>/dev/null; then
-            if systemctl --user restart koidrive.service; then
-                printf 'Restarted the background service koidrive.service\n'
-            else
-                printf 'Warning: koi is installed, but the background service koidrive.service did not restart. Run: systemctl --user restart koidrive.service\n' >&2
-            fi
-        fi
-    elif launchctl print "gui/$(id -u)/dev.koidrive.koi" >/dev/null 2>&1; then
-        if launchctl kickstart -k "gui/$(id -u)/dev.koidrive.koi"; then
-            printf 'Restarted the background service dev.koidrive.koi\n'
+    restart() {
+        service=$1
+        shift
+        if "$@"; then
+            printf 'Restarted the background service %s\n' "$service"
         else
-            printf 'Warning: koi is installed, but the background service dev.koidrive.koi did not restart. Run: launchctl kickstart -k gui/%s/dev.koidrive.koi\n' "$(id -u)" >&2
+            printf 'Warning: koi is installed, but the background service %s did not restart. Run: %s\n' "$service" "$*" >&2
         fi
+    }
+    if [ "$os" = apple-darwin ] && agents=$(launchctl print "gui/$(id -u)" 2>/dev/null); then
+        for label in $(printf '%s\n' "$agents" | awk '$1 == "services" && $2 == "=" {inside = 1; next} inside && $1 == "}" {inside = 0} inside && $1 != "0" && ($3 == "dev.koidrive.koi" || $3 ~ /^dev\.koidrive\.koi\.[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]$/) {print $3}'); do
+            restart "$label" launchctl kickstart -k "gui/$(id -u)/$label"
+        done
+    elif [ "$os" = unknown-linux-musl ] && units=$(systemctl --user list-units --type=service --state=active --plain --no-legend 'koidrive.service' 'koidrive-*.service' 2>/dev/null); then
+        for unit in $(printf '%s\n' "$units" | awk '$1 == "koidrive.service" || $1 ~ /^koidrive-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]\.service$/ {print $1}'); do
+            restart "$unit" systemctl --user restart "$unit"
+        done
+    else
+        for pid in $(ps -ww -u "$(id -u)" -o pid= -o args= 2>/dev/null | awk '{pid = $1; sub(/^ *[0-9]+ +/, "")} $0 == "koi _daemon" || $0 ~ /\/koi _daemon$/ {print pid}'); do
+            unit=$(ps -ww -o cgroup= -p "$pid" 2>/dev/null | tr ';' '\n' | sed -n 's|.*/\(koidrive[-0-9a-f]*\.service\)$|\1|p' | head -n 1)
+            if [ -n "$unit" ]; then
+                printf 'Warning: koi is installed, but the background service %s still runs the old koi, because this shell cannot reach the systemd user manager. Log in as %s and run: systemctl --user restart %s\n' "$unit" "$(id -un)" "$unit" >&2
+            else
+                printf 'Warning: koi is installed, but the koi daemon with process ID %s still runs the old koi. Restart it with the service manager that started it.\n' "$pid" >&2
+            fi
+        done
     fi
 }
 
