@@ -1277,9 +1277,9 @@ describe("RFC 0014 session leases", () => {
         await vi.waitFor(() => expect(renewal.asked).toHaveLength(1));
         const sentAtMs = Date.now();
         expect((await send("/v1/devices/" + device.deviceId, { method: "DELETE", token: owner.access!.token })).status).toBe(204);
+        await ageLeases(spaceId, Date.now() - sentAtMs);
         renewal.release();
         await renewalSettled(spaceId);
-        await ageLeases(spaceId, Date.now() - sentAtMs);
         expect(socket.closed).toBeUndefined();
         expect(await listTree(socket)).toMatchObject({ case: "goodbye", value: { code: Close.DEVICE_REVOKED } });
       } finally {
