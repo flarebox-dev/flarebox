@@ -12,7 +12,7 @@ use koidrive_driver::{Credential, Paths};
 use serde_json::{Value, json};
 
 use crate::error::CliError;
-use crate::report::Done;
+use crate::report::{Decision, Done};
 use crate::service;
 
 const ISSUES: &str = "https://github.com/koidrive/koidrive/issues";
@@ -61,7 +61,10 @@ pub async fn run(paths: &Paths) -> Result<Done, CliError> {
             if let Value::Object(fields) = &mut status
                 && !done.decisions.is_empty()
             {
-                fields.insert("decisions".to_owned(), json!(done.decisions));
+                fields.insert(
+                    "decisions".to_owned(),
+                    decisions(&mut redactor, &done.decisions),
+                );
             }
             status
         }
@@ -107,6 +110,37 @@ pub async fn run(paths: &Paths) -> Result<Done, CliError> {
         note: format!("To report a problem, attach this file to an issue at {ISSUES}\n"),
         ..Done::ok(json!({ "path": path }), format!("{}\n", path.display()))
     })
+}
+
+fn decisions(redactor: &mut Redactor, decisions: &[Decision]) -> Value {
+    let mut out = Vec::new();
+    for decision in decisions {
+        let mut items = Vec::new();
+        for item in &decision.items {
+            items.push(json!({
+                "node_id": item.node_id,
+                "path": redactor.name("path", &item.path),
+                "files": item.files,
+            }));
+        }
+        let answers: Vec<&String> = decision
+            .answers
+            .iter()
+            .map(|answer| &answer.token)
+            .collect();
+        out.push(json!({
+            "id": decision.id,
+            "space_id": decision.space_id,
+            "kind": decision.kind,
+            "group": decision.group,
+            "asked_at_ms": decision.asked_at_ms,
+            "requires_choice": decision.requires_choice,
+            "counts": decision.counts,
+            "items": items,
+            "answers": answers,
+        }));
+    }
+    Value::Array(out)
 }
 
 fn know_profile(redactor: &mut Redactor, paths: &Paths) {
@@ -251,7 +285,11 @@ impl Redactor {
     }
 
     fn know(&mut self, kind: &'static str, value: &str) {
-        if !value.trim().is_empty() {
+        let placeholder = self
+            .placeholders
+            .values()
+            .any(|placeholder| placeholder == value);
+        if !value.trim().is_empty() && !placeholder {
             self.name(kind, value);
         }
     }
@@ -764,6 +802,68 @@ thread 'tokio-runtime-worker' panicked at /Users/ada/Secret Plans/ledger.rs:1:1:
             redactor.log_line(&line("Jiyeon contract v2=final path=draft")),
             "2026-11-12T06:29:23.000001Z WARN koidrive_driver::folder: sync of a folder halted space_id=s1 reason=the folder: \"<name-2>\" is missing"
         );
+    }
+
+    #[test]
+    fn no_escaped_form_of_a_decisions_names_reaches_the_file() {
+        use crate::report::{AnswerChoice, Item};
+        let names = [
+            "O'Brien Family/taxes 2026.xlsx",
+            "Kim \"Private\" Ledger.docx",
+            "back\\slash Notes",
+            "line\nbreak Scan.pdf",
+            "김건우 연봉 계약서.docx",
+        ];
+        let words = [
+            "Brien",
+            "taxes",
+            "Kim",
+            "Private",
+            "Ledger",
+            "slash",
+            "Notes",
+            "break",
+            "Scan",
+            "김건우",
+            "연봉",
+            "계약서",
+        ];
+        let decision = Decision {
+            id: "q1".to_owned(),
+            space_id: "s1".to_owned(),
+            kind: "conflict",
+            group: None,
+            asked_at_ms: 1,
+            requires_choice: true,
+            counts: None,
+            items: (names.iter().enumerate())
+                .map(|(index, name)| Item {
+                    node_id: format!("n{index}"),
+                    path: (*name).to_owned(),
+                    files: 1,
+                })
+                .collect(),
+            answers: (names.iter().enumerate())
+                .map(|(index, name)| AnswerChoice {
+                    token: format!("keep-node:n{index}"),
+                    consequence: format!(
+                        "Keep {} or {name:?} or {} and move {} to the trash",
+                        crate::pairing::shell_word(name),
+                        json!(name),
+                        crate::printable(name),
+                    ),
+                    argv: vec!["koi".to_owned(), "resolve".to_owned(), "q1".to_owned()],
+                })
+                .collect(),
+        };
+        let mut redactor = Redactor::default();
+        let status = json!({ "running": true, "decisions": decisions(&mut redactor, &[decision]) });
+        let text = bundle(&mut redactor, "macOS", &status, &Ok(String::new()));
+        for word in words {
+            assert!(!text.contains(word), "{word} in {text}");
+        }
+        assert!(text.contains("\"keep-node:n0\""), "{text}");
+        assert!(text.contains("\"path\": \"<path-1>\""), "{text}");
     }
 
     #[test]
