@@ -926,9 +926,12 @@ impl Commits {
     /// came back to is a remote change. When L and R agreed on a newer position
     /// ([`Trees::position_after`]), S takes that position, and a rename by the server does not
     /// revert the node. S first takes what every op sent, as without an agreement, and then each
-    /// agreed position S can hold, with the rest of the shape the ops gave the node. A node whose
-    /// agreed position S cannot hold, because another node holds its name or its parent is gone,
-    /// keeps what was sent, and is reverted when the server renamed it. A conflict copy is re-keyed in L, and so is
+    /// agreed position S can hold, with the rest of the shape the ops gave the node; agreed positions
+    /// that only fit together are made together ([`update_synced`]). A node whose agreed position S
+    /// cannot hold, because another node holds its name or its parent is gone, keeps what was sent,
+    /// and the agreed position waits as its S update while L or R still holds it there, so the node
+    /// is not planned until S can hold it. A node whose agreement does not wait is reverted when the
+    /// server renamed it. A conflict copy is re-keyed in L, and so is
     /// a directory merged into one L does not hold yet. When L already holds the conflict copy,
     /// because a log replay brought it before the result and the effects downloaded it, the local
     /// file keeps its ID and takes what was sent as its S, so the server's content replaces it. When L already holds the directory it was
@@ -1142,16 +1145,24 @@ impl Commits {
                 positions.set(id, Some(shape));
             }
         }
-        let tried: BTreeSet<NodeId> = positions.ids().collect();
-        let refused: BTreeSet<NodeId> = (positions.apply(trees).into_iter())
-            .map(|(id, _)| id)
-            .collect();
-        let taken: BTreeSet<&NodeId> = tried.difference(&refused).collect();
+        let mut taken: BTreeSet<NodeId> = positions.ids().collect();
+        let (waits, dropped): (Vec<_>, Vec<_>) =
+            (positions.apply(trees).into_iter()).partition(|(id, shape)| {
+                let local = trees.local().get(id).map(|node| &node.shape);
+                (local.into_iter().chain(trees.remote().live(id))).any(|held| {
+                    shape
+                        .as_ref()
+                        .is_some_and(|agreed| held.same_position(agreed))
+                })
+            });
+        for (id, _) in dropped {
+            taken.remove(&id);
+        }
         rest.retain(|(id, _)| !taken.contains(id));
-        for id in unreverted.iter().filter(|id| !taken.contains(id)) {
+        for id in unreverted.iter().filter(|id| !taken.contains(*id)) {
             trees.revert(id.clone());
         }
-        for (id, shape) in rest {
+        for (id, shape) in rest.into_iter().chain(waits) {
             trees.wait(id, shape, Origin::Commit(flight.commit.device_seq));
         }
         let mut closed = BTreeSet::new();
@@ -1459,8 +1470,9 @@ fn deletes(trees: &Trees, id: &str, needed: &BTreeSet<NodeId>) -> bool {
 }
 
 /// Makes the S updates, the last for each node, that leave S a valid tree: all of them together
-/// when they fit together, otherwise each that fits on its own and then the rest together again,
-/// while any is made. Returns the rest.
+/// when they fit together, otherwise those left once each update that a node outside the batch
+/// blocks is taken out ([`blocked`]), otherwise each that fits on its own and then the rest together
+/// again, while any is made. Returns the rest.
 fn update_synced(
     trees: &mut Trees,
     updates: Vec<(NodeId, Option<Shape>)>,
@@ -1471,18 +1483,17 @@ fn update_synced(
         left.push((id, shape));
     }
     while !left.is_empty() {
-        let before: Vec<(NodeId, Option<Shape>)> = left
-            .iter()
-            .map(|(id, _)| (id.clone(), trees.synced().live(id).cloned()))
-            .collect();
-        for (id, shape) in &left {
-            trees.set_synced(id.clone(), shape.clone());
-        }
-        if trees.synced().check(Names::ByKey).is_ok() {
+        if set_synced_together(trees, &left) {
             return Vec::new();
         }
-        for (id, shape) in before {
-            trees.set_synced(id, shape);
+        let mut fitting = left.clone();
+        let mut out = Vec::new();
+        while let Some(at) = (0..fitting.len()).find(|&at| blocked(trees, &fitting, at)) {
+            out.push(fitting.remove(at));
+        }
+        if !out.is_empty() && !fitting.is_empty() && set_synced_together(trees, &fitting) {
+            left = out;
+            continue;
         }
         let count = left.len();
         left.retain(|(id, shape)| !trees.set_synced_if_valid(id.clone(), shape.clone()));
@@ -1491,6 +1502,48 @@ fn update_synced(
         }
     }
     left
+}
+
+/// Sets S for every node of `updates` when S stays a valid tree with all of them. Returns whether it
+/// did.
+fn set_synced_together(trees: &mut Trees, updates: &[(NodeId, Option<Shape>)]) -> bool {
+    let before: Vec<(NodeId, Option<Shape>)> = (updates.iter())
+        .map(|(id, _)| (id.clone(), trees.synced().live(id).cloned()))
+        .collect();
+    for (id, shape) in updates {
+        trees.set_synced(id.clone(), shape.clone());
+    }
+    if trees.synced().check(Names::ByKey).is_ok() {
+        return true;
+    }
+    for (id, shape) in before {
+        trees.set_synced(id, shape);
+    }
+    false
+}
+
+/// Whether a node outside `batch` keeps the update at `at` from fitting, whatever else the batch
+/// makes: S gives the name it takes to a node the batch does not update, or neither S nor the batch
+/// holds its folder, or S holds a node the batch does not update under the node it removes.
+fn blocked(trees: &Trees, batch: &[(NodeId, Option<Shape>)], at: usize) -> bool {
+    let updated = |id: &str| batch.iter().any(|(other, _)| other == id);
+    let (id, shape) = &batch[at];
+    let Some(shape) = shape else {
+        return trees.synced_children(id).any(|child| !updated(child));
+    };
+    let placed = batch.iter().any(|(other, next)| {
+        *other == shape.parent && next.as_ref().is_some_and(|next| next.kind == Kind::Dir)
+    });
+    let held = !updated(&shape.parent)
+        && (trees.synced().live(&shape.parent)).is_some_and(|parent| parent.kind == Kind::Dir);
+    let root = shape.parent == trees.synced().root;
+    let key = name_key(&shape.name);
+    let taken = trees.synced_children(&shape.parent).any(|child| {
+        child != id
+            && !updated(child)
+            && (trees.synced().live(child)).is_some_and(|other| name_key(&other.name) == key)
+    });
+    !(root || placed || held) || taken
 }
 
 /// What changed about the files of a conflict since it was asked.
