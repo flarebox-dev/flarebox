@@ -8,12 +8,13 @@ use std::process::Command;
 const SERVER: &str = "https://koi-ada-7f3k.workers.dev";
 const TOKEN: &str = "kdr_9f8e7d6c5b4a39281706f5e4d3c2b1a0";
 
+/// `koi` with the default profile of `home`, so that its launch agent is `dev.koidrive.koi`.
 fn koi(home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_koi"));
     command
         .env("HOME", home)
-        .env("XDG_CONFIG_HOME", home.join("config"))
-        .env("XDG_STATE_HOME", home.join("state"))
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_STATE_HOME")
         .env("XDG_RUNTIME_DIR", home.join("run"))
         .env_remove("KOIDRIVE_LOG");
     command
@@ -22,7 +23,7 @@ fn koi(home: &Path) -> Command {
 /// A home whose profile is paired with a server by a planted credential.
 fn paired_home() -> tempfile::TempDir {
     let home = tempfile::tempdir().unwrap();
-    let state = home.path().join("state/koidrive");
+    let state = home.path().join(".local/state/koidrive");
     fs::create_dir_all(&state).unwrap();
     let credential = state.join("credential.json");
     let text = serde_json::json!({
@@ -38,16 +39,9 @@ fn paired_home() -> tempfile::TempDir {
     home
 }
 
-/// The launch agent's log of the profile in `home`, at the path the service's name gives.
+/// The launch agent's log of the default profile in `home`.
 fn agent_log(home: &Path) -> PathBuf {
-    let output = koi(home).args(["status", "--json"]).output().unwrap();
-    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let label = status["data"]["service"]["name"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    home.join("Library/Logs/Koidrive")
-        .join(format!("{label}.log"))
+    home.join("Library/Logs/Koidrive/dev.koidrive.koi.log")
 }
 
 /// The file holds the status and the daemon's log, and none of the paths, names, server address or token planted in

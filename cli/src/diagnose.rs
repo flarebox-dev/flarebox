@@ -35,16 +35,15 @@ const NAMED: [(&str, &str); 6] = [
     ("user_name", "user"),
 ];
 
-/// The log fields whose values stay, redacted like any text: causes, ids, signals and waits. Any other field, such
-/// as a path or a name, is replaced whole.
-const KEPT: [&str; 9] = [
+/// The log fields whose values stay, redacted like any text: causes, ids and waits. `signal` stays as it is, since the
+/// daemon writes only a signal's name there. Any other field, such as a path or a name, is replaced whole.
+const KEPT: [&str; 8] = [
     "error",
     "problem",
     "reason",
     "space_id",
     "question_id",
     "restore_id",
-    "signal",
     "retry_in",
     "wait",
 ];
@@ -289,9 +288,10 @@ impl Redactor {
         for (index, start) in starts.iter().enumerate() {
             let end = starts.get(index + 1).map_or(rest.len(), |next| next - 1);
             let (key, value) = rest[*start..end].split_once('=').unwrap_or_default();
-            let value = match KEPT.contains(&key) {
-                true => self.text(value),
-                false => "<redacted>".to_owned(),
+            let value = match key {
+                "signal" => value.to_owned(),
+                _ if KEPT.contains(&key) => self.text(value),
+                _ => "<redacted>".to_owned(),
             };
             out.push_str(&format!(" {key}={value}"));
         }
@@ -335,7 +335,7 @@ impl Redactor {
                 continue;
             }
             let word = &rest[..rest.find(delimiter).unwrap_or(rest.len())];
-            let len = match word.starts_with('/') || word.starts_with("~/") {
+            let len = match word.contains('/') && !word.contains("://") {
                 true => path_len(rest),
                 false => word.trim_end_matches(['.', ':', '!', '?']).len(),
             };
@@ -379,28 +379,16 @@ fn delimiter(c: char) -> bool {
     c.is_whitespace() || "\"'<>()[]{},;=".contains(c)
 }
 
-/// How far a path that starts `text` goes: a path may hold spaces, so it ends only where the text goes on after it,
-/// at `: `, a quote, the end of the line, or a phrase that follows a path in an error.
+/// How far a path that starts `text` goes. File names hold spaces, commas, quotes and parentheses, so a path runs to
+/// the first `: ` after which the line has no other `/`, as in `<path>: Permission denied`, or to the end of the line.
+/// When in doubt it takes too much.
 fn path_len(text: &str) -> usize {
-    const ENDS: [&str; 12] = [
-        ": ",
-        "\"",
-        "'",
-        "\n",
-        ", ",
-        "; ",
-        " (",
-        " does not ",
-        " is not ",
-        " belongs to ",
-        " cannot ",
-        " overlaps ",
-    ];
-    let end = (ENDS.iter())
-        .filter_map(|stop| text.find(stop))
-        .min()
-        .unwrap_or(text.len());
-    text[..end].trim_end_matches(['.', ':']).len()
+    let line = &text[..text.find('\n').unwrap_or(text.len())];
+    let end = (line.match_indices(": "))
+        .map(|(index, _)| index)
+        .find(|&index| !line[index..].contains('/'))
+        .unwrap_or(line.len());
+    line[..end].trim_end_matches(['.', ':']).len()
 }
 
 /// What a word is, when it names something: a URL, an address, a path, a file or host name, or a token.
@@ -408,7 +396,7 @@ fn kind_of(word: &str) -> Option<&'static str> {
     if word.contains("://") {
         return Some("url");
     }
-    if word.contains('@') {
+    if word.contains('@') || ip_address(word) {
         return Some("address");
     }
     if word.contains('/') {
@@ -419,8 +407,10 @@ fn kind_of(word: &str) -> Option<&'static str> {
     }
     if let Some((head, tail)) = word.rsplit_once('.')
         && !head.is_empty()
+        && head.chars().any(char::is_alphabetic)
         && (1..=12).contains(&tail.len())
-        && tail.chars().all(|c| c.is_ascii_alphabetic())
+        && tail.starts_with(|c: char| c.is_ascii_alphabetic())
+        && tail.chars().all(|c| c.is_ascii_alphanumeric())
     {
         return Some("name");
     }
@@ -430,6 +420,14 @@ fn kind_of(word: &str) -> Option<&'static str> {
         && word.chars().any(|c| c.is_ascii_digit())
         && word.chars().any(|c| c.is_ascii_alphabetic()))
     .then_some("token")
+}
+
+/// Whether a word is an IP address, with or without a port.
+fn ip_address(word: &str) -> bool {
+    let host = (word.rsplit_once(':'))
+        .filter(|(_, port)| port.parse::<u16>().is_ok())
+        .map_or(word, |(host, _)| host);
+    host.parse::<std::net::IpAddr>().is_ok() || word.parse::<std::net::IpAddr>().is_ok()
 }
 
 #[cfg(test)]
@@ -530,6 +528,71 @@ thread 'tokio-runtime-worker' panicked at /Users/ada/Secret Plans/ledger.rs:1:1:
         let mut redactor = Redactor::default();
         redactor.know("user", "ada");
         assert_eq!(redactor.text("ada and adam"), "<user-1> and adam");
+    }
+
+    /// The daemon logs a file it cannot read as `reason=the folder: <path>: <error>`, and file names hold spaces,
+    /// commas, quotes and parentheses.
+    #[test]
+    fn a_path_is_redacted_to_the_error_after_it_whatever_its_name_holds() {
+        let mut redactor = Redactor::default();
+        redactor.know("home", "/Users/ada");
+        let line = |reason: &str| {
+            format!(
+                "2026-11-12T06:29:23.000001Z  WARN koidrive_driver::folder: sync of a folder halted space_id=s1 reason=the folder: {reason}"
+            )
+        };
+        for (reason, error, leaks) in [
+            (
+                "/Volumes/외장 SSD/가족 사진/여권 사본 (김건우 900101).jpg: Permission denied",
+                ": Permission denied",
+                ["김건우", "900101", "jpg"],
+            ),
+            (
+                "/Users/ada/Library/Mobile Documents/com~apple~CloudDocs/병원/Kim, Gunwoo - HIV 검사 결과.pdf: Operation not permitted",
+                ": Operation not permitted",
+                ["Gunwoo", "HIV", "검사"],
+            ),
+            (
+                "/Users/ada/Documents/O'Brien Family/taxes: Permission denied",
+                ": Permission denied",
+                ["Brien", "Family", "taxes"],
+            ),
+        ] {
+            let out = redactor.log_line(&line(reason));
+            assert!(out.contains("reason=the folder: <"), "{out}");
+            assert!(out.ends_with(error), "{out}");
+            for leak in leaks {
+                assert!(!out.contains(leak), "{leak} in {out}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_signal_keeps_its_name() {
+        let mut redactor = Redactor::default();
+        let line = "2026-11-12T06:29:23.000001Z  INFO koidrive_cli: stopping the daemon signal=\"SIGTERM\"";
+        assert_eq!(redactor.log_line(line), line.replace("  INFO", " INFO"));
+    }
+
+    #[test]
+    fn a_path_with_a_colon_in_a_name_runs_to_the_last_colon_before_the_error() {
+        let mut redactor = Redactor::default();
+        let out = redactor.text("cannot read /x/Meeting: Jiyeon/notes: Permission denied");
+        assert_eq!(out, "cannot read <path-1>: Permission denied");
+    }
+
+    #[test]
+    fn a_bare_file_name_and_an_ip_address_are_redacted() {
+        let mut redactor = Redactor::default();
+        let out =
+            redactor.text("cannot upload 여권스캔.mp4 to 192.168.0.12:8787 or [fe80::1]:8787");
+        for leak in ["여권스캔", "mp4", "192.168", "fe80"] {
+            assert!(!out.contains(leak), "{leak} in {out}");
+        }
+        assert_eq!(
+            redactor.text("retry in 1.5s, version 0.1.0"),
+            "retry in 1.5s, version 0.1.0"
+        );
     }
 
     #[test]
