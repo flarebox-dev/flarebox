@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+#
+# Publishes the GitHub release for a CLI tag with the files in a directory, then checks the result.
+# The release becomes Latest only when no published release that can be Latest (not a draft and not a
+# prerelease) has a higher version, so a rerun or an older tag leaves Latest where it is.
+# Usage: publish-release.sh <tag> <directory>
+# Environment:
+#   GH_REPO                     owner/name of the repository
+#   PRERELEASE                  true for an -alpha.N or -rc.N tag, false for vX.Y.Z
+#   PRERELEASE_TAGS_PUBLISH_AS  latest: an -alpha.N or -rc.N tag is published as a normal release;
+#                               prerelease: it is published as a GitHub prerelease
+set -euo pipefail
+
+tag=${1:?usage: publish-release.sh <tag> <directory>}
+files=${2:?usage: publish-release.sh <tag> <directory>}
+: "${GH_REPO:?is not set}" "${PRERELEASE:?is not set}" "${PRERELEASE_TAGS_PUBLISH_AS:?is not set}"
+
+# version_key prints a key for vX.Y.Z[-alpha.N|-rc.N] that sorts as text in version order, with
+# alpha before rc before the release itself. It fails for any other tag.
+version_key() {
+    [[ $1 =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(-(alpha|rc)\.([0-9]+))?$ ]] || return 1
+    local stage=2
+    case ${BASH_REMATCH[5]} in alpha) stage=0 ;; rc) stage=1 ;; esac
+    printf '%010d.%010d.%010d.%d.%010d\n' "$((10#${BASH_REMATCH[1]}))" "$((10#${BASH_REMATCH[2]}))" \
+        "$((10#${BASH_REMATCH[3]}))" "$stage" "$((10#${BASH_REMATCH[6]:-0}))"
+}
+
+own=$(version_key "$tag") || { echo "::error::$tag is not a vX.Y.Z, vX.Y.Z-alpha.N or vX.Y.Z-rc.N tag."; exit 1; }
+before=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name 2>/dev/null) || before=none
+
+if [ "$PRERELEASE" = true ] && [ "$PRERELEASE_TAGS_PUBLISH_AS" = prerelease ]; then
+    prerelease=true
+    latest=false
+else
+    prerelease=false
+    latest=true
+    while IFS= read -r other; do
+        key=$(version_key "$other") || continue
+        if [[ $key > $own ]]; then
+            echo "$other is a published release with a higher version, so $tag does not become Latest."
+            latest=false
+        fi
+    done < <(gh api --paginate "repos/$GH_REPO/releases" --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name')
+fi
+
+if ! gh release view "$tag" >/dev/null 2>&1; then
+    gh release create "$tag" --draft --verify-tag --title "$tag" --notes 'Koidrive CLI for Linux and macOS. See docs/guide/install.md for installation.'
+fi
+gh release upload "$tag" "$files"/* --clobber
+gh release edit "$tag" --draft=false --prerelease="$prerelease" --latest="$latest"
+
+state=$(gh release view "$tag" --json isDraft,isPrerelease --jq '"draft=\(.isDraft) prerelease=\(.isPrerelease)"')
+if [ "$state" != "draft=false prerelease=$prerelease" ]; then
+    echo "::error::$tag is $state, expected draft=false prerelease=$prerelease."
+    exit 1
+fi
+after=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name 2>/dev/null) || after=none
+if [ "$latest" = true ]; then expected=$tag; else expected=$before; fi
+if [ "$after" != "$expected" ]; then
+    echo "::error::The Latest release is $after after publishing $tag, expected $expected."
+    exit 1
+fi
+echo "Published $tag ($state). The Latest release, which install.sh downloads by default, is $after."

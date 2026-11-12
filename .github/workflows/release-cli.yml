@@ -47,14 +47,14 @@ jobs:
             changed="$(tr '\0' '\n' < "$RUNNER_TEMP/changed")"
             echo "Files this pull request changes against $BASE:"
             printf '%s\n' "$changed"
-            pattern='^(cli/|core/|server/|\.cargo/|install\.sh$|scripts/test-install\.sh$|\.github/workflows/release-cli\.yml$|Cargo\.[^/]*$|rust-toolchain\.toml$)'
+            pattern='^(cli/|core/|server/|\.cargo/|install\.sh$|scripts/test-install\.sh$|scripts/(test-)?publish-release\.sh$|\.github/workflows/release-cli\.yml$|Cargo\.[^/]*$|rust-toolchain\.toml$)'
             if grep -Eq "$pattern" <<<"$changed"; then
               echo "Linux targets: build, because a changed file matches $pattern"
             else
               echo "Linux targets: skipped, because no changed file matches $pattern. The merge queue run of this workflow builds them."
               linux=false
             fi
-            pattern='^(cli/|\.cargo/|install\.sh$|scripts/test-install\.sh$|\.github/workflows/release-cli\.yml$|Cargo\.(toml|lock)$|rust-toolchain\.toml$)'
+            pattern='^(cli/|\.cargo/|install\.sh$|scripts/test-install\.sh$|scripts/(test-)?publish-release\.sh$|\.github/workflows/release-cli\.yml$|Cargo\.(toml|lock)$|rust-toolchain\.toml$)'
             if grep -Eq "$pattern" <<<"$changed"; then
               echo "macOS targets: build, because a changed file matches $pattern"
             else
@@ -145,8 +145,13 @@ jobs:
       - name: Install ShellCheck on macOS
         if: runner.os == 'macOS'
         run: brew install shellcheck
-      - name: Lint the installer
-        run: shellcheck -s sh install.sh scripts/test-install.sh
+      - name: Lint the installer and the release scripts
+        run: |
+          shellcheck -s sh install.sh scripts/test-install.sh
+          shellcheck scripts/publish-release.sh scripts/test-publish-release.sh
+      - name: Test publishing a release against a stub gh
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: bash scripts/test-publish-release.sh
       - name: Build the CLI with its server bundle
         env:
           TARGET: ${{ matrix.target }}
@@ -371,6 +376,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: cli-distribution
@@ -381,27 +389,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
           PRERELEASE: ${{ needs.release-ref.outputs.prerelease }}
-          # latest: an -alpha.N or -rc.N tag becomes a normal release marked Latest, which install.sh downloads by default.
+          # latest: an -alpha.N or -rc.N tag becomes a normal release, and Latest (which install.sh downloads by default) unless a published release has a higher version.
           # prerelease: it becomes a GitHub prerelease, which install.sh skips unless KOIDRIVE_VERSION names it.
           PRERELEASE_TAGS_PUBLISH_AS: latest
-        run: |
-          if [ "$PRERELEASE" = true ] && [ "$PRERELEASE_TAGS_PUBLISH_AS" = prerelease ]; then
-            marks=(--prerelease --latest=false)
-            prerelease=true
-          else
-            marks=(--prerelease=false --latest)
-            prerelease=false
-          fi
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --draft --verify-tag --title "$TAG" --notes 'Koidrive CLI for Linux and macOS. See docs/guide/install.md for installation.'
-          fi
-          gh release upload "$TAG" dist/* --clobber
-          gh release edit "$TAG" --draft=false "${marks[@]}"
-          state=$(gh release view "$TAG" --json isDraft,isPrerelease --jq '"draft=\(.isDraft) prerelease=\(.isPrerelease)"')
-          [ "$state" = "draft=false prerelease=$prerelease" ] || { echo "::error::$TAG is $state, expected draft=false prerelease=$prerelease."; exit 1; }
-          latest=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name) || latest=none
-          if [ "$prerelease" = false ] && [ "$latest" != "$TAG" ]; then
-            echo "::error::The latest release is $latest, not $TAG, so install.sh would not download $TAG by default."
-            exit 1
-          fi
-          echo "Published $TAG ($state). The latest release, which install.sh downloads by default, is $latest."
+        run: scripts/publish-release.sh "$TAG" dist
