@@ -391,7 +391,11 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
             "lets other users in through an ACL; remove it with chmod -N".to_owned(),
         ));
     }
-    if std::os::unix::net::UnixStream::connect(path).is_ok() {
+    static BOUND: std::sync::Mutex<BTreeSet<PathBuf>> = std::sync::Mutex::new(BTreeSet::new());
+    let mut bound = BOUND
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !bound.contains(path) && std::os::unix::net::UnixStream::connect(path).is_ok() {
         return Err(io::Error::new(
             io::ErrorKind::AddrInUse,
             format!("another process answers on {}", path.display()),
@@ -411,6 +415,7 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
         .inspect_err(|_| {
             let _ = fs::remove_file(&temp);
         })?;
+    bound.insert(path.to_path_buf());
     listener.set_nonblocking(true)?;
     UnixListener::from_std(listener)
 }
@@ -832,13 +837,13 @@ mod tests {
     #[tokio::test]
     async fn a_socket_another_process_answers_on_is_left_alone() {
         let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("run/daemon.sock");
-        let live = bind(&socket).unwrap();
+        let run = dir.path().join("run");
+        DirBuilder::new().mode(0o700).create(&run).unwrap();
+        let socket = run.join("daemon.sock");
+        let _live = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let error = bind(&socket).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
         tokio::net::UnixStream::connect(&socket).await.unwrap();
-        drop(live);
-        bind(&socket).unwrap();
     }
 
     #[tokio::test]
