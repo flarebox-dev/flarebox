@@ -931,9 +931,10 @@ impl Commits {
     /// move into the merged directory and the emptied one is removed. The accepted counter takes
     /// the commit's slot. Returns false while there is nothing to acknowledge.
     ///
-    /// A create the server refuses with ID_EXISTS while R holds the node live is no problem. Only
-    /// another device can have created a node under this device's ID first, as when both send a
-    /// file the server lost again (section 4.4). S stays without the node, so the next plan
+    /// A create the server refuses with ID_EXISTS while R holds the node, live or in the trash, is
+    /// no problem. Only another device can have created a node under this device's ID first, as
+    /// when both send a file the server lost again (section 4.4), and it may have deleted the node
+    /// since. S stays without the node, so the next plan
     /// compares L with what R holds instead of sending the create again: equal content leaves
     /// nothing to send, and other content is kept beside R's as a new node (section 2.4).
     ///
@@ -1003,7 +1004,7 @@ impl Commits {
                         agreed.extend(agree(trees, &create.node_id, result.seq));
                         synced.set(&create.node_id, Some(shape));
                     }
-                    let exists = taken && trees.remote().live(&create.node_id).is_some();
+                    let exists = taken && trees.remote().get(&create.node_id).is_some();
                     (
                         &create.node_id,
                         applied || exists || code == Code::MergedInto,
@@ -1022,7 +1023,7 @@ impl Commits {
                         synced.set(&create.node_id, Some(shape));
                         trees.sent_edit(&create.node_id, create.content.as_ref());
                     }
-                    let exists = taken && trees.remote().live(&create.node_id).is_some();
+                    let exists = taken && trees.remote().get(&create.node_id).is_some();
                     (&create.node_id, applied || exists)
                 }
                 Some(op::Op::UpdateContent(update)) => {
