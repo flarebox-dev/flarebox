@@ -168,7 +168,7 @@ impl Engine {
     /// engine stopped asking, of the same kind and still unanswered, continues that one's lineage: the guard asks
     /// again under a new id when the held set changes, and this is the one place that sees both in one step. A
     /// question whose answer the engine dropped, as it does for a conflict whose answer the server refused, is shown
-    /// again without it.
+    /// again without it. A conflict is shown again when the paths of its files change, as when a folder above them is renamed.
     pub fn ask(&mut self, tx: &Tx<'_>, space_id: &str) -> Result<(), Error> {
         let asked = &self.stored.commits.questions;
         let asking = self.commits.questions();
@@ -209,6 +209,22 @@ impl Engine {
             question.answer.is_none()
                 && (asked.iter()).any(|before| before.id == question.id && before.answer.is_some())
         };
+        for question in asking.iter().filter(|question| {
+            matches!(question.kind, engine::QuestionKind::Conflict { .. })
+                && (asked.iter())
+                    .any(|before| before.id == question.id && before.kind == question.kind)
+                && !dropped(question)
+        }) {
+            let Some(row) = rows.get(&question.id) else {
+                continue;
+            };
+            let body = serde_json::to_vec(&self.shown(tx, space_id, question, lineage(row))?)
+                .expect("a question serializes");
+            if body != row.body {
+                tx.reshow_question(&question.id, &body)?;
+                changed = true;
+            }
+        }
         for question in asking
             .iter()
             .filter(|question| !open(asked, &question.id) || dropped(question))

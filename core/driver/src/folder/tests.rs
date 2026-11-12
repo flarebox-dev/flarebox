@@ -6117,6 +6117,50 @@ fn a_conflict_answer_the_server_rejects_is_asked_again_under_the_same_id() {
     assert_eq!(again.id, first.id);
 }
 
+/// A conflict in a folder that another device renames shows both files at their new paths, under the same id.
+#[test]
+fn a_conflict_shows_its_files_at_their_new_paths_after_their_folder_is_renamed() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site_a.root.join("docs")).unwrap();
+    a.create(&mut remote, &site_a.root.join("docs/main.go"), b"v1");
+    let (site_b, mut b) = linked(&mut remote, "b");
+    b.settle();
+    fs::write(site_a.root.join("docs/main.go"), b"from a").unwrap();
+    fs::write(site_b.root.join("docs/main.go"), b"from b").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(&mut remote);
+    b.scan_until(|b| !b.work.is_empty());
+    b.run(&mut remote);
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+    let [first] = &shown(&site_b)[..] else {
+        panic!("one question: {:?}", shown(&site_b));
+    };
+    let paths = |question: &crate::question::Question| {
+        let mut paths: Vec<String> = (question.items.iter())
+            .map(|item| item.path.clone())
+            .collect();
+        paths.sort();
+        paths
+    };
+    assert_eq!(
+        paths(first),
+        [format!("docs/{COPY}"), "docs/main.go".to_owned()]
+    );
+
+    fs::rename(site_a.root.join("docs"), site_a.root.join("papers")).unwrap();
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+
+    let [again] = &shown(&site_b)[..] else {
+        panic!("one question: {:?}", shown(&site_b));
+    };
+    assert_eq!(again.id, first.id);
+    assert_eq!(
+        paths(again),
+        [format!("papers/{COPY}"), "papers/main.go".to_owned()]
+    );
+}
+
 /// Device `a` edits the original, and its observer has not seen the edit when `b`'s answer to keep the copy
 /// reaches it. The edit is kept in a file the person sees, on both devices, and both come to rest.
 #[test]

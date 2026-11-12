@@ -150,7 +150,8 @@ pub enum Answer {
     Dismiss,
     /// Keep the original of a conflict and move the copy to the trash.
     KeepOriginal,
-    /// Move the original of a conflict to the trash and give the copy its name.
+    /// Give the original of a conflict the copy's content, keeping its old content in its version
+    /// history, and move the copy to the trash.
     KeepCopy,
     /// Keep both files of a conflict and close the question.
     KeepBoth,
