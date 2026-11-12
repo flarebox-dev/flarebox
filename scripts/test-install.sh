@@ -51,7 +51,15 @@ printf '%s\n' "$*" >> "$HOME/services.log"
 printf 'PID\tStatus\tLabel\n101\t0\tcom.example.other\n102\t0\tdev.koidrive.koiz\n104\t0\tdev.koidrive.koi.backup\n-\t0\tdev.koidrive.koi.0badf00d\n'
 [ ! -e "$HOME/running" ] || sed 's/^/103\t0\t/' "$HOME/running"
 EOF
-chmod +x "$tmp/services/systemctl" "$tmp/services/launchctl"
+cat > "$tmp/services/ps" <<'EOF'
+#!/bin/sh
+if [ "$1 $2" = '-o cgroup=' ] && [ -e "$HOME/cgroup" ]; then
+    cat "$HOME/cgroup"
+    exit 0
+fi
+exec /bin/ps "$@"
+EOF
+chmod +x "$tmp/services/systemctl" "$tmp/services/launchctl" "$tmp/services/ps"
 cp "$binary" "$tmp/package/koi"
 archive=koidrive-$target.tar.gz
 release=$tmp/releases/download/v0.0.0
@@ -189,22 +197,30 @@ rm "$HOME/running"
 pass 'an upgrade restarts the running background service of every profile'
 
 if [ "$(uname -s)" = Linux ]; then
-    perl -e '$0 = "/opt/old/koi _daemon"; sleep 300' &
+    perl -e '$0 = "/opt/custom bin/koi _daemon"; sleep 300' &
     daemon=$!
     touch "$HOME/nobus"
     sh "$root/install.sh" 2> "$tmp/nobus.log"
-    rm "$HOME/nobus"
-    kill "$daemon"
     if ! grep -F "the koi daemon with process ID $daemon still runs the old koi" "$tmp/nobus.log"; then
         cat "$tmp/nobus.log"
         printf 'Expected an upgrade without a systemd user manager to name the daemon that still runs the old koi\n' >&2
         exit 1
     fi
     pass 'an upgrade without a systemd user manager names the daemon that still runs the old koi'
+    printf '0::/user.slice/user-%s.slice/user@%s.service/app.slice/koidrive-1a2b3c4d.service\n' "$(id -u)" "$(id -u)" > "$HOME/cgroup"
+    sh "$root/install.sh" 2> "$tmp/nobus.log"
+    rm "$HOME/nobus" "$HOME/cgroup"
+    kill "$daemon"
+    if ! grep -F "Log in as $(id -un) and run: systemctl --user restart koidrive-1a2b3c4d.service" "$tmp/nobus.log"; then
+        cat "$tmp/nobus.log"
+        printf 'Expected an upgrade without a systemd user manager to give the command that restarts the unit\n' >&2
+        exit 1
+    fi
+    pass 'an upgrade without a systemd user manager gives the command that restarts the unit'
 fi
 
 if [ "$(uname -s)" = Linux ]; then
-    printf 'Passed 19 installer tests on %s\n' "$(uname -s)"
+    printf 'Passed 20 installer tests on %s\n' "$(uname -s)"
 else
     cat > "$tmp/bin/uname" <<'EOF'
 #!/bin/sh

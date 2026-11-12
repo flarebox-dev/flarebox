@@ -119,8 +119,8 @@ main() {
             restart "$unit" systemctl --user restart "$unit"
         done
     else
-        for pid in $(ps -u "$(id -u)" -o pid= -o args= 2>/dev/null | awk '$2 ~ /(^|\/)koi$/ && $3 == "_daemon" {print $1}'); do
-            unit=$(sed -n 's|.*/\(koidrive[-0-9a-f]*\.service\)$||p' "/proc/$pid/cgroup" 2>/dev/null | head -n 1)
+        for pid in $(ps -u "$(id -u)" -o pid= -o args= 2>/dev/null | awk '{pid = $1; sub(/^ *[0-9]+ +/, "")} $0 == "koi _daemon" || $0 ~ /\/koi _daemon$/ {print pid}'); do
+            unit=$(ps -o cgroup= -p "$pid" 2>/dev/null | tr ';' '\n' | sed -n 's|.*/\(koidrive[-0-9a-f]*\.service\)$|\1|p' | head -n 1)
             if [ -n "$unit" ]; then
                 printf 'Warning: koi is installed, but the background service %s still runs the old koi, because this shell cannot reach the systemd user manager. Log in as %s and run: systemctl --user restart %s
 ' "$unit" "$(id -un)" "$unit" >&2
