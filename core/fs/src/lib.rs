@@ -1277,11 +1277,20 @@ fn diff(old: &BTreeMap<PathBuf, Entry>, new: &BTreeMap<PathBuf, Entry>) -> Vec<C
         tree.values().map(|entry| (entry.id, entry.kind)).collect()
     };
     let (ids_before, ids_after) = (ids(old), ids(new));
-    let same = |path: &Path, before: &Entry, after: &Entry| {
+    let kept = |path: &Path, before: &Entry, after: &Entry| {
         after.kind == before.kind
             && !(after.id != before.id
                 && ids_before.contains(&(after.id, after.kind))
                 && ids_after.contains(&(before.id, before.kind)))
+            && !(after.kind == EntryKind::Dir
+                && after.id != before.id
+                && dirs.contains(&before.id)
+                && !(old.range(path.to_path_buf()..).skip(1))
+                    .take_while(|(inside, _)| inside.starts_with(path))
+                    .any(|(inside, entry)| {
+                        (new.get(inside))
+                            .is_some_and(|after| (after.id, after.kind) == (entry.id, entry.kind))
+                    }))
             && !(after.kind == EntryKind::Dir
                 && after.id != before.id
                 && moved.contains(&after.id)
@@ -1290,6 +1299,18 @@ fn diff(old: &BTreeMap<PathBuf, Entry>, new: &BTreeMap<PathBuf, Entry>) -> Vec<C
                         .range(path.to_path_buf()..)
                         .nth(1)
                         .is_some_and(|(inside, _)| inside.starts_with(path))))
+    };
+    let replaced: HashSet<&Path> = (old.iter())
+        .filter(|(path, before)| {
+            before.kind == EntryKind::Dir
+                && (new.get(*path)).is_some_and(|after| !kept(path, before, after))
+        })
+        .map(|(path, _)| path.as_path())
+        .collect();
+    let same = |path: &Path, before: &Entry, after: &Entry| {
+        kept(path, before, after)
+            && (after.id == before.id
+                || !(path.ancestors().skip(1)).any(|above| replaced.contains(above)))
     };
     let mut removed: BTreeMap<&Path, &Entry> = BTreeMap::new();
     let mut created: Vec<(&Path, &Entry)> = Vec::new();

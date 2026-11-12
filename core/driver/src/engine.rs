@@ -605,12 +605,13 @@ impl Engine {
     /// follow paths toward the root, so such a change is always left. A node whose rename is still to come is set aside
     /// while another entry takes its name, with what is under it, until its own rename places it. A renamed or
     /// modified entry is the node L holds at its path with its identity, else the node with its identity, else the
-    /// node at its path. A
-    /// created entry with the identity of a node L holds is that node, wherever L had it. So is a created entry with
-    /// the path and identity a node had before an earlier change of the batch took it out of L, unless the batch
-    /// placed that node again. That keeps a child's node when its folder is replaced around it. Any other created
-    /// entry is a new node. An entry that another path also links is a hard link, a file of its own (design §5.6),
-    /// so its identity never takes a node from another path.
+    /// node at its path. A created entry with the identity of a node L holds is that node, wherever L had it, except a
+    /// folder L holds on disk, not recorded, at a path no change of the batch leaves: the scan kept the folder there
+    /// with a new identity, as when an entry moved back into a new folder made at its path, so the created folder is a
+    /// new one. So is a created entry with the path and identity a node had before an earlier change of the batch took
+    /// it out of L, unless the batch placed that node again. That keeps a child's node when its folder is replaced
+    /// around it. Any other created entry is a new node. An entry that another path also links is a hard link, a file
+    /// of its own (design §5.6), so its identity never takes a node from another path.
     ///
     /// A node that held the name a change puts an entry at is gone from there, so it leaves L with everything under
     /// it. A file that arrives over a file keeps the node of the file it replaces when L's own node for the arriving
@@ -636,6 +637,30 @@ impl Engine {
                 } => resolve(&self.trees, from, &file_identity(*id), *linked),
                 Observed::Created { .. } | Observed::Modified { .. } => None,
             })
+            .collect();
+        let left: Vec<&Path> = (changes.iter())
+            .filter_map(|change| match change {
+                Observed::Removed { path, .. } | Observed::Renamed { from: path, .. } => {
+                    Some(path.as_path())
+                }
+                Observed::Created { .. } | Observed::Modified { .. } => None,
+            })
+            .collect();
+        let staying: BTreeSet<NodeId> = (changes.iter())
+            .filter_map(|change| match change {
+                Observed::Created {
+                    kind: EntryKind::Dir,
+                    id,
+                    ..
+                } => self.trees.local_with_identity(&file_identity(*id)),
+                _ => None,
+            })
+            .filter(|node| {
+                !self.trees.recorded_local(node)
+                    && (self.path_of(node))
+                        .is_some_and(|at| !left.iter().any(|path| at.starts_with(path)))
+            })
+            .cloned()
             .collect();
         let moving: BTreeSet<NodeId> = (changes.iter().zip(&before))
             .filter(|(change, _)| matches!(change, Observed::Renamed { .. }))
@@ -785,6 +810,7 @@ impl Engine {
                     }
                     let identity = file_identity(*id);
                     let node = (self.trees.local_with_identity(&identity))
+                        .filter(|node| !staying.contains(*node))
                         .or_else(|| self.trees.displaced_with_identity(&identity))
                         .filter(|_| !linked)
                         .cloned()
@@ -1325,7 +1351,11 @@ mod tests {
     use koidrive_engine::effects::{Base, Effect, EffectRecord, Location};
     use koidrive_engine::state::{CommitsState, EffectsState};
     use koidrive_proto::v1::{NodePurged, NodeStatus, SpaceUpdated};
+    use std::fs;
+
+    use koidrive_fs::Change;
     use koidrive_store::Store;
+    use proptest::prelude::*;
 
     use super::*;
 
@@ -2546,5 +2576,258 @@ mod tests {
         );
         assert_eq!(holding(&engine, "three"), Some(one));
         assert_eq!(holding(&engine, "four"), Some(two));
+    }
+
+    /// Names that the edits of [`batches`] pick from, few enough that entries often take each other's names.
+    const EDITED: [&str; 3] = ["a", "b", "ß"];
+
+    /// One thing a person does to the folder between two scans. Indexes pick from the entries and folders on disk.
+    #[derive(Clone, Debug)]
+    enum Edit {
+        File {
+            folder: usize,
+            name: usize,
+        },
+        Folder {
+            folder: usize,
+            name: usize,
+        },
+        Move {
+            entry: usize,
+            folder: usize,
+            name: usize,
+        },
+        Remove {
+            entry: usize,
+        },
+    }
+
+    fn edit() -> impl Strategy<Value = Edit> {
+        let name = 0..EDITED.len();
+        prop_oneof![
+            2 => (any::<usize>(), name.clone()).prop_map(|(folder, name)| Edit::File { folder, name }),
+            2 => (any::<usize>(), name.clone()).prop_map(|(folder, name)| Edit::Folder { folder, name }),
+            3 => (any::<usize>(), any::<usize>(), name)
+                .prop_map(|(entry, folder, name)| Edit::Move { entry, folder, name }),
+            1 => any::<usize>().prop_map(|entry| Edit::Remove { entry }),
+        ]
+    }
+
+    /// Makes `edit` on the disk under `root`. An edit the file system refuses, such as a move into the moved
+    /// folder itself, changes nothing, as it would for a person.
+    fn make(root: &Path, edit: &Edit) {
+        let mut entries = Vec::new();
+        let mut folders = vec![root.to_owned()];
+        let mut next = 0;
+        while let Some(folder) = folders.get(next).cloned() {
+            let mut listed: Vec<PathBuf> = (fs::read_dir(&folder).unwrap())
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            listed.sort();
+            folders.extend(listed.iter().filter(|path| path.is_dir()).cloned());
+            entries.extend(listed);
+            next += 1;
+        }
+        let at = |folder: usize, name: usize| folders[folder % folders.len()].join(EDITED[name]);
+        match *edit {
+            Edit::File { folder, name } => fs::write(at(folder, name), EDITED[name]).ok(),
+            Edit::Folder { folder, name } => fs::create_dir(at(folder, name)).ok(),
+            Edit::Move { .. } | Edit::Remove { .. } if entries.is_empty() => None,
+            Edit::Move {
+                entry,
+                folder,
+                name,
+            } => fs::rename(&entries[entry % entries.len()], at(folder, name)).ok(),
+            Edit::Remove { entry } => match &entries[entry % entries.len()] {
+                path if path.is_dir() => fs::remove_dir_all(path).ok(),
+                path => fs::remove_file(path).ok(),
+            },
+        };
+    }
+
+    /// The batch an observer reports for what changed under `root` since `snapshot`, with a file's size standing for
+    /// its content.
+    fn scan(snapshot: &mut Snapshot, root: &Path) -> Vec<Observed> {
+        let changes = snapshot.rescan(root, [PathBuf::new()]).unwrap().changes;
+        let entry = |path: &Path| snapshot.entries[path];
+        (changes.into_iter())
+            .filter_map(|change| match change {
+                Change::Created { path, kind } => Some(Observed::Created {
+                    content: (kind == EntryKind::File).then(|| bytes(entry(&path).size)),
+                    id: entry(&path).id,
+                    linked: false,
+                    path,
+                    kind,
+                }),
+                Change::Modified { path } => {
+                    (entry(&path).kind == EntryKind::File).then(|| Observed::Modified {
+                        content: Some(bytes(entry(&path).size)),
+                        id: entry(&path).id,
+                        linked: false,
+                        path,
+                    })
+                }
+                Change::Renamed { from, to, kind } => Some(Observed::Renamed {
+                    id: entry(&to).id,
+                    linked: false,
+                    from,
+                    to,
+                    kind,
+                }),
+                Change::Removed { path, kind } => Some(Observed::Removed { path, kind }),
+                Change::Ignored { .. } => unreachable!("a scan without rules ignores nothing"),
+            })
+            .collect()
+    }
+
+    proptest! {
+        /// Whatever a person does to the folder between scans, each batch leaves L a tree that holds every entry on
+        /// disk at its path, with its kind and a file's identity, and nothing else. A scan takes a folder at the
+        /// same path for the same folder whatever its identity, so a folder's identity is not compared.
+        #[test]
+        fn batches_leave_l_a_tree_that_holds_the_disk(
+            rounds in prop::collection::vec(prop::collection::vec(edit(), 1..8), 1..5),
+        ) {
+            let (_dir, mut engine) = mapper();
+            let folder = tempfile::tempdir().unwrap();
+            let mut snapshot = Snapshot::default();
+            for edits in rounds {
+                for edit in &edits {
+                    make(folder.path(), edit);
+                }
+                let batch = scan(&mut snapshot, folder.path());
+                engine.observe(&batch, 0);
+                prop_assert_eq!(engine.trees.check(), Ok(()), "after {:?}", batch);
+                prop_assert_eq!(in_l(&engine), on_disk(&snapshot), "after {:?}", batch);
+            }
+        }
+    }
+
+    /// Each entry on disk by its path, with a file's identity.
+    fn on_disk(snapshot: &Snapshot) -> BTreeMap<PathBuf, Option<FileIdentity>> {
+        (snapshot.entries.iter())
+            .map(|(path, entry)| {
+                let file = entry.kind == EntryKind::File;
+                (path.clone(), file.then(|| file_identity(entry.id)))
+            })
+            .collect()
+    }
+
+    /// Each placed node of L by its path, with a file's identity.
+    fn in_l(engine: &Engine) -> BTreeMap<PathBuf, Option<FileIdentity>> {
+        (engine.trees.local().iter())
+            .filter_map(|(id, node)| {
+                let file = node.shape.kind == Kind::File;
+                Some((engine.path_of(id)?, file.then_some(node.identity)))
+            })
+            .collect()
+    }
+
+    /// Makes each round of `mkdir`, `write` and `mv` edits on a real temporary folder and observes the scan after
+    /// it, checking that L stays a tree that holds the disk, as [`batches_leave_l_a_tree_that_holds_the_disk`] does.
+    fn replay(rounds: &[&[&str]]) {
+        let (_dir, mut engine) = mapper();
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        let mut snapshot = Snapshot::default();
+        for edits in rounds {
+            run(root, edits);
+            let batch = scan(&mut snapshot, root);
+            engine.observe(&batch, 0);
+            assert_eq!(engine.trees.check(), Ok(()), "after {batch:?}");
+            assert_eq!(in_l(&engine), on_disk(&snapshot), "after {batch:?}");
+        }
+    }
+
+    /// Makes `mkdir`, `write`, `mv` and `rmdir` edits on the disk under `root`.
+    fn run(root: &Path, edits: &[&str]) {
+        for edit in edits {
+            match edit.split(' ').collect::<Vec<_>>()[..] {
+                ["mkdir", path] => fs::create_dir(root.join(path)).unwrap(),
+                ["write", path] => fs::write(root.join(path), path).unwrap(),
+                ["mv", from, to] => fs::rename(root.join(from), root.join(to)).unwrap(),
+                ["rmdir", path] => fs::remove_dir(root.join(path)).unwrap(),
+                _ => panic!("{edit}"),
+            }
+        }
+    }
+
+    /// The saved property case `cc 4707a502`: the folder `ß/ß` moves out to `a`, and `ß` moves below it into
+    /// `a/b`. The scan reports `ß`'s move first, so it waits for the move that brings `a`, the folder above `a/b`.
+    #[test]
+    fn a_folder_moved_below_its_former_child_keeps_l_on_the_disk() {
+        replay(&[
+            &["mkdir ß", "mkdir ß/ß", "mkdir ß/ß/b"],
+            &["mv ß/ß a", "mv ß a/b/ß"],
+        ]);
+    }
+
+    /// An entry moves back from a folder moved away into a new folder made at the old path. The scan keeps the folder
+    /// at that path and reports the moved one as created with the identity L's node for the path has, so the created
+    /// folder is a new node and the entry stays where it is.
+    #[test]
+    fn an_entry_moved_back_into_a_new_folder_at_its_path_stays_in_l() {
+        replay(&[
+            &["mkdir d", "write d/x"],
+            &["mv d d.old", "mkdir d", "mv d.old/x d/x"],
+        ]);
+        replay(&[
+            &["mkdir a", "write a/f", "write a/g"],
+            &["mv a b", "mkdir a", "mv b/f a/f"],
+        ]);
+        replay(&[
+            &["mkdir d", "mkdir d/s"],
+            &["mv d d.old", "mkdir d", "mv d.old/s d/s", "write d/s/n"],
+        ]);
+    }
+
+    /// A folder moved away and made again at its path, with a new folder made below it where the moved one held a folder
+    /// of that name, which is then removed: the new folder below is a new node, and the old one leaves L.
+    #[test]
+    fn a_new_folder_below_a_folder_made_again_at_its_path_is_in_l() {
+        replay(&[
+            &["mkdir a", "mkdir a/s"],
+            &["mv a b", "mkdir a", "mkdir a/s", "rmdir b/s"],
+        ]);
+    }
+
+    /// After an entry moved back into a new folder at its path, the client stops and the user edits the entry. The
+    /// restart's snapshot comes from L, which still gives the folder its old identity, and the edited entry is still
+    /// the one that was there, so the scan reports the edit alone and the entry keeps its node.
+    #[test]
+    fn an_entry_moved_back_and_edited_while_stopped_keeps_its_node() {
+        let (_dir, mut engine) = mapper();
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        let mut snapshot = Snapshot::default();
+        for edits in [
+            &["mkdir d", "write d/x"][..],
+            &["mv d d.old", "mkdir d", "mv d.old/x d/x"],
+        ] {
+            run(root, edits);
+            let batch = scan(&mut snapshot, root);
+            engine.observe(&batch, 0);
+        }
+        let x = local_at(&engine.trees, Path::new("d/x"));
+        let seen = snapshot;
+        let mut snapshot = engine.snapshot();
+        for (path, entry) in snapshot.entries.iter_mut() {
+            if let Some(before) = seen
+                .entries
+                .get(path)
+                .filter(|before| before.id == entry.id)
+            {
+                entry.mtime_ns = before.mtime_ns;
+            }
+        }
+        fs::write(root.join("d/x"), "edited").unwrap();
+        let batch = scan(&mut snapshot, root);
+        assert!(
+            matches!(batch[..], [Observed::Modified { .. }]),
+            "{batch:?}"
+        );
+        engine.observe(&batch, 0);
+        assert_eq!(local_at(&engine.trees, Path::new("d/x")), x);
+        assert_eq!(in_l(&engine), on_disk(&snapshot));
     }
 }
