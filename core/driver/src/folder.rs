@@ -125,7 +125,6 @@ pub(crate) struct Folder {
     stuck_effects: BTreeSet<String>,
     /// Why the server did not take a change of each node, for the nodes it may have left out of commits.
     refused_nodes: BTreeMap<String, String>,
-    /// The ids of the open questions, counted as asked when they first showed up.
     asked: BTreeSet<String>,
     /// When the [`Work::RetryAfter`] that is out ends.
     retry_at: Option<Instant>,
@@ -768,8 +767,7 @@ impl Folder {
         self.retrying.insert(call, retrying);
     }
 
-    /// Whether a question changed since the last call, also when the number of questions did not. Counts each
-    /// question asked since then.
+    /// Whether a question changed since the last call, also when the number of questions did not.
     pub fn take_questions_changed(&mut self) -> bool {
         if !std::mem::take(&mut self.engine.asked) {
             return false;
@@ -1930,7 +1928,6 @@ impl FolderTask {
         self.changed.send_replace(());
     }
 
-    /// Shows the folder as halted for `problem`, and counts the halt when the folder was not halted already.
     fn halt(&self, why: Halted, problem: String) {
         self.update(|status| {
             if status.state != FolderState::Halted {

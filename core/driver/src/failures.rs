@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! What failed in this process since it started, by kind, from zero. The counts only grow. Usage reports read them
-//! and send each day's counts. A kind is one of the closed set of [`Failure`]: nothing here holds a message, a path
-//! or a name.
-
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -25,7 +21,6 @@ pub fn failures() -> BTreeMap<Failure, u64> {
         .unwrap_or_default()
 }
 
-/// How many times `failure` happened in this process. Tests run side by side, so a test reads how much it grew.
 #[cfg(test)]
 pub(crate) fn count(failure: Failure) -> u64 {
     failures().get(&failure).copied().unwrap_or(0)
@@ -59,15 +54,12 @@ pub(crate) fn refusal(error: &ServerError) -> Refusal {
     }
 }
 
-/// Counts a refusal of the server, when `error` is one.
 pub(crate) fn call_failed(error: &CallError) {
     if let CallError::Server(refusal) = error {
         failed(Failure::Refused(self::refusal(refusal)));
     }
 }
 
-/// Counts a transfer that failed, as an upload or a download by `as_failure`, and the refusal in it. A transfer the
-/// session's stop ended did not fail.
 pub(crate) fn transfer_failed(error: &ChunkError, as_failure: fn(Transfer) -> Failure) {
     let why = match error {
         ChunkError::Call(CallError::Stopped(_)) => return,

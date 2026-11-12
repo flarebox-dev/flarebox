@@ -312,7 +312,6 @@ impl Failure {
     }
 }
 
-/// An enum of labels, with every variant in `ALL` and its label from `name`.
 macro_rules! labels {
     ($(#[$meta:meta])* pub enum $name:ident { $($(#[$doc:meta])* $variant:ident => $label:literal,)* }) => {
         $(#[$meta])*

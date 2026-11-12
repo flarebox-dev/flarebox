@@ -296,7 +296,6 @@ fn record_sync(recorder: &Recorder, last: &mut Volume, now: Volume, status: &Sta
     recorder.level(Level::Nodes, nodes);
 }
 
-/// Adds the failures counted between `last` and `now`.
 fn record_failures(
     recorder: &Recorder,
     last: &mut BTreeMap<Failure, u64>,
@@ -311,7 +310,6 @@ fn record_failures(
     *last = now;
 }
 
-/// Counts a failure of this run outside the driver, such as a daemon that cannot start.
 pub fn failed(failure: Failure) {
     if let Some(run) = RUN.get() {
         run.recorder.count(Counter::Failure(failure), 1);
