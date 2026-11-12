@@ -728,7 +728,7 @@ fn a_parked_edit_whose_name_the_remote_tree_gives_another_node_stays_parked() {
     };
     trees.set_remote("d".into(), trashed(dir(ROOT, "x")));
     trees.set_remote("k".into(), trashed(file("d", "k", 1)));
-    let edit = |trees: &mut Trees, disk: &mut Disk, id: &str, ino: u64| {
+    let edit = |trees: &mut Trees, disk: &mut Disk, id: &str, ino: u128| {
         let mut node = trees.local().get(id).unwrap().clone();
         node.shape.content = Some(content(9));
         disk.entries.get_mut(&ino).unwrap().content = Some(content(9));
