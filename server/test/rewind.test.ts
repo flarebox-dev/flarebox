@@ -654,8 +654,8 @@ describe("space rewind (RFC 0003)", () => {
     const leased = await socket(spaceId, token);
     const age = (byMs: number) =>
       runInDurableObject(space(spaceId), (instance: SpaceDO) => {
-        const offsetMs = instance.clock() - Date.now() + byMs;
-        instance.clock = () => Date.now() + offsetMs;
+        const atMs = instance.clock() + byMs;
+        instance.clock = () => atMs;
       });
     const listTree = async (reqId: bigint) => {
       leased.send({ case: "rpc", value: { reqId, call: { case: "listTree", value: {} } } });

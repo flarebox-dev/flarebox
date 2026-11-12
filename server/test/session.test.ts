@@ -1001,8 +1001,8 @@ describe("RFC 0014 session leases", () => {
 
   function ageLeases(spaceId: string, byMs: number) {
     return runInDurableObject(env.SPACE.get(env.SPACE.idFromName(spaceId)), (instance: SpaceDO) => {
-      const offsetMs = instance.clock() - Date.now() + byMs;
-      instance.clock = () => Date.now() + offsetMs;
+      const atMs = instance.clock() + byMs;
+      instance.clock = () => atMs;
     });
   }
 
@@ -1031,6 +1031,7 @@ describe("RFC 0014 session leases", () => {
     const owner = await getOwner();
     const device = await pairDevice(owner, name);
     const spaceId = await createSpace(owner);
+    await ageLeases(spaceId, 0);
     const socket = await Socket.connect(spaceId, device);
     await socket.start();
     return { owner, device, spaceId, socket };
@@ -1266,9 +1267,11 @@ describe("RFC 0014 session leases", () => {
       try {
         expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
         await vi.waitFor(() => expect(renewal.asked).toHaveLength(1));
+        const sentAtMs = Date.now();
         expect((await send("/v1/devices/" + device.deviceId, { method: "DELETE", token: owner.access!.token })).status).toBe(204);
         renewal.release();
         await new Promise((resolve) => setTimeout(resolve, 50));
+        await ageLeases(spaceId, Date.now() - sentAtMs);
         expect(socket.closed).toBeUndefined();
         expect(await listTree(socket)).toMatchObject({ case: "goodbye", value: { code: Close.DEVICE_REVOKED } });
       } finally {
