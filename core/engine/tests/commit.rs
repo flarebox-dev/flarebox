@@ -5371,6 +5371,49 @@ fn a_parked_edit_whose_name_a_new_folder_holds_is_sent() {
 }
 
 #[test]
+fn a_blocker_at_its_r_position_is_not_parked() {
+    let mut trees = trees(&[
+        (
+            "h",
+            Some(file(ROOT, "ss", 1)),
+            Some(file(ROOT, "ss", 1)),
+            Some(trashed(file(ROOT, "ss", 1))),
+        ),
+        (
+            "n",
+            Some(file(ROOT, "ß", 1)),
+            Some(file(ROOT, "ß", 1)),
+            Some(remote(file(ROOT, "ß", 3))),
+        ),
+    ]);
+    trees.set_local(
+        "h".into(),
+        LocalNode {
+            parked: true,
+            ..local(file(ROOT, "ss", 2), 1)
+        },
+    );
+    trees.settle();
+    let (mut effects, mut commits, mut ids) =
+        (Effects::default(), Commits::default(), IdGen::new(1));
+    let (node, effect_id) = effects
+        .plan(&trees, &mut ids, NOW)
+        .map(|record| (record.node.clone(), record.effect_id.clone()))
+        .unwrap();
+    assert_eq!(node, "n");
+    effects.failed(&effect_id).unwrap();
+    let next = effects
+        .plan(&trees, &mut ids, NOW)
+        .map(|record| (record.node.clone(), record.effect.clone()));
+    assert!(
+        !matches!(&next, Some((node, Effect::Move { to: Location::Parked(_), .. })) if node == "n"),
+        "{next:?}"
+    );
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(uploads(&ops(&commit), 2), "{:?}", ops(&commit));
+}
+
+#[test]
 fn a_parked_edit_forked_for_a_concurrent_edit_keeps_its_parked_entry() {
     let mut trees = trees(&[(
         "h",
