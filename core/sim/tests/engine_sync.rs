@@ -3431,3 +3431,72 @@ fn a_removed_folder_the_server_revives_is_created_again_while_its_removal_waits(
     let during = [(true, vec![act(0, 0, 14856899963116643210, 0, 0)])];
     run(&seed, &local, &remote, 1000, true, &during).unwrap();
 }
+#[test]
+fn a_parked_file_forked_from_a_node_the_server_deleted_is_created_after_its_commit_is_split() {
+    let seed = [act(1, 0, 0, 3, 0)];
+    let local = [act(1, 0, 0, 3, 1)];
+    let during = vec![
+        (false, vec![act(2, 0, 0, 0, 0)]),
+        (
+            false,
+            vec![
+                act(0, 0, 0, 0, 0),
+                act(3, 7779810202192050055, 202987497655873243, 5, 0),
+            ],
+        ),
+        (
+            true,
+            vec![
+                act(0, 0, 5081664043081684955, 5, 0),
+                act(2, 6321014178578916138, 0, 0, 0),
+            ],
+        ),
+        (false, vec![act(4, 4791664463415640549, 0, 0, 0)]),
+    ];
+    run_ignoring(
+        &seed,
+        &local,
+        &[],
+        1,
+        false,
+        &during,
+        Cut::None,
+        &[],
+        Answer::Publish,
+        true,
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_folder_the_user_deleted_comes_back_for_a_waiting_file_the_server_moves_into_it() {
+    let seed = [act(0, 0, 0, 2, 0), act(0, 0, 6274166174826663049, 0, 0)];
+    let local = [act(0, 0, 4991715864022573885, 0, 0)];
+    let remote = [
+        act(1, 0, 8366538510828719079, 0, 0),
+        act(2, 0, 0, 0, 0),
+        act(0, 0, 544864474965852954, 0, 0),
+    ];
+    let during = vec![
+        (
+            true,
+            vec![act(6, 0, 0, 0, 0), act(0, 0, 7211273767686463164, 0, 0)],
+        ),
+        (
+            false,
+            vec![
+                act(4, 16841059892813868500, 0, 0, 0),
+                act(1, 0, 343720692834072452, 2, 0),
+            ],
+        ),
+        (true, vec![act(4, 16794273080645545114, 0, 0, 0)]),
+        (
+            false,
+            vec![
+                act(0, 0, 10316403760466809166, 0, 0),
+                act(3, 16377241187031633676, 6363070014188718880, 0, 0),
+            ],
+        ),
+    ];
+    run(&seed, &local, &remote, 1, true, &during).unwrap();
+}

@@ -53,8 +53,9 @@ pub mod disk;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use koidrive_engine::classify::Trees;
 use koidrive_engine::commit::{self, Base, Reconnect};
-use koidrive_engine::effects::{Effect, EffectRecord};
+use koidrive_engine::effects::{Effect, EffectRecord, location_of};
 use koidrive_engine::tree::{Content, NodeId, RemoteNode, same, same_content};
 use koidrive_proto::v1::{
     ChunkRef, Commit, Error, NodeKind, NodeStatus, PrepareUpload, Resume, UploadReceipt,
@@ -193,24 +194,31 @@ fn content(device: u8, text: u8, write: i64) -> Content {
     }
 }
 
-fn contents(commit: &Commit) -> impl Iterator<Item = &Content> {
+fn sources(commit: &Commit) -> impl Iterator<Item = (&NodeId, &Content)> {
     commit.ops.iter().filter_map(|op| match &op.op {
-        Some(op::Op::CreateFile(create)) => create.content.as_ref(),
-        Some(op::Op::UpdateContent(update)) => update.content.as_ref(),
+        Some(op::Op::CreateFile(create)) => Some((&create.node_id, create.content.as_ref()?)),
+        Some(op::Op::UpdateContent(update)) => Some((&update.node_id, update.content.as_ref()?)),
         _ => None,
     })
 }
 
-/// Uploads the chunks of every content the disk still holds. Bytes the user has replaced since
-/// the commit was built cannot be read any more.
+fn readable(disk: &Disk, trees: &Trees, node: &str, content: &Content) -> bool {
+    let (Some(at), Some(local)) = (location_of(trees, node), trees.local().get(node)) else {
+        return false;
+    };
+    disk.reads(&at, local.identity.ino, content.mtime_ns)
+}
+
 fn upload(
     space: &mut SpaceDo,
     session: &Session,
     disk: &Disk,
+    trees: &Trees,
     commit: &Commit,
 ) -> Vec<UploadReceipt> {
-    let chunks: Vec<ChunkRef> = contents(commit)
-        .filter(|content| disk.holds(content.mtime_ns))
+    let chunks: Vec<ChunkRef> = sources(commit)
+        .filter(|(node, content)| readable(disk, trees, node, content))
+        .map(|(_, content)| content)
         .flat_map(|content| content.chunks.clone())
         .collect();
     if chunks.is_empty() {
@@ -1168,8 +1176,9 @@ impl World {
                     Err(error) => match device.engine.commits.failed(&error).map_err(refused)? {
                         commit::Failure::Resend => {
                             let flight = device.engine.commits.in_flight().expect("kept to resend");
-                            let gone =
-                                contents(&flight.commit).any(|c| !device.disk.holds(c.mtime_ns));
+                            let gone = sources(&flight.commit).any(|(node, content)| {
+                                !readable(&device.disk, &device.engine.trees, node, content)
+                            });
                             if error.code == error::Code::MissingChunks as i32 && gone {
                                 note(&mut self.seen, "commit abandoned, its bytes are gone");
                                 device.engine.commits.abandon();
@@ -1271,7 +1280,13 @@ impl World {
             None => {
                 let receipts = match reply {
                     Reply::NoChunks => Vec::new(),
-                    _ => upload(&mut self.space, &device.session, &device.disk, &commit),
+                    _ => upload(
+                        &mut self.space,
+                        &device.session,
+                        &device.disk,
+                        &device.engine.trees,
+                        &commit,
+                    ),
                 };
                 let before = live_writes(&self.space);
                 let session = device.session.clone();

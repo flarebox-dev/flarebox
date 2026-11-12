@@ -45,7 +45,7 @@ use bytes::Bytes;
 use koidrive_chunk::ChunkerConfig;
 use koidrive_engine::effects::{
     Base as EngineBase, Displaced as EngineDisplaced, Effect as EngineEffect, EffectRecord,
-    Location as EngineLocation,
+    Location as EngineLocation, location_of,
 };
 use koidrive_engine::ignore::is_rules_file;
 use koidrive_engine::tree::{Content, Kind};
@@ -57,10 +57,11 @@ use koidrive_net::{CallError, ChunkError, Session, StopReason, Transfer};
 use koidrive_proto::v1::{ChunkRef, Commit, op};
 use koidrive_store::{Link, Store, Tx};
 use prost::Message;
+use rustix::fs::{Mode, OFlags};
 
 use crate::engine::{Engine, file_id, file_identity};
 use crate::failures::{self, Failure};
-use crate::observe::{FsObserver, Observation, Observed, Observer, Reset, open_under};
+use crate::observe::{FsObserver, Observation, Observed, Observer, Reset};
 use crate::policy::{self, Disposition};
 use crate::status::WaitKind;
 
@@ -663,11 +664,13 @@ impl Disk {
             };
             let Some(content) = content else { continue };
             let path = engine.path_of(node);
+            let at = location_of(&engine.trees, node).and_then(|at| location(&at).ok());
             let identity = (engine.trees.local().get(node)).map(|held| file_id(held.identity));
             let mut offset = 0;
             for chunk in &content.chunks {
                 upload.sources.entry(chunk.hash.clone()).or_insert(Source {
                     path: path.clone(),
+                    at: at.clone(),
                     identity,
                     offset,
                 });
@@ -710,6 +713,7 @@ pub(crate) struct Upload {
 struct Source {
     /// `None` when L no longer holds the node under the root.
     path: Option<PathBuf>,
+    at: Option<Location>,
     identity: Option<FileId>,
     offset: u64,
 }
@@ -725,7 +729,10 @@ impl Upload {
             )
         };
         let source = self.sources.get(&chunk.hash).ok_or_else(gone)?;
-        let file = open_under(self.space.root(), source.path.as_deref().ok_or_else(gone)?)?;
+        let at = source.at.as_ref().ok_or_else(gone)?;
+        let (folder, name) = self.space.parent(at).map_err(|_| gone())?;
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        let file = File::from(rustix::fs::openat(folder.fd(), name, flags, Mode::empty())?);
         let meta = file.metadata()?;
         let same = |id: FileId| meta.is_file() && meta.dev() == id.dev && meta.ino() == id.ino;
         if !source.identity.is_some_and(same) {

@@ -1049,15 +1049,26 @@ impl Trees {
         classify(self.l.live(id), self.s.live(id), self.r.live(id))
     }
 
+    pub(crate) fn acknowledged(&self, id: &str) -> Option<&Shape> {
+        match self.waiting.get(id) {
+            Some(waiting) => waiting.shape.as_ref(),
+            None => self.s.live(id),
+        }
+    }
+
+    pub(crate) fn acknowledged_class(&self, id: &str) -> Class {
+        classify(self.l.live(id), self.acknowledged(id), self.r.live(id))
+    }
+
     /// Whether L holds content that S does not, or, while the node's S update waits, content the
     /// waiting shape does not: an edit not uploaded yet.
     pub fn edited(&self, id: &str) -> bool {
         let content = self.l.get(id).and_then(|node| node.shape.content.as_ref());
-        let synced = match self.waiting.get(id) {
-            Some(waiting) => waiting.shape.as_ref(),
-            None => self.s.live(id),
-        };
-        match (content, synced.and_then(|shape| shape.content.as_ref())) {
+        match (
+            content,
+            self.acknowledged(id)
+                .and_then(|shape| shape.content.as_ref()),
+        ) {
             (Some(local), Some(synced)) => !same_content(local, synced),
             (local, _) => local.is_some(),
         }

@@ -619,7 +619,7 @@ fn open_beneath(root: &Path, path: &Path) -> io::Result<File> {
 
 /// Opens the file at the relative `path` under the open folder `root` for reading, one folder at a time, following
 /// no symbolic link.
-pub(crate) fn open_under(root: impl AsFd, path: &Path) -> io::Result<File> {
+fn open_under(root: impl AsFd, path: &Path) -> io::Result<File> {
     let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
     let mut dir: OwnedFd = rustix::fs::openat(&root, ".", dir_flags, Mode::empty())?;
     let mut parts = path.components().peekable();

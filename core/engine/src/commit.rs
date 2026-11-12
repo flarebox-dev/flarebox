@@ -9,7 +9,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use koidrive_proto::v1::{self as proto, error, op, op_result};
 use prost::Message;
 
-use crate::classify::{Class, Origin, Trees, Waiting, classify};
+use crate::classify::{Class, Origin, Trees, Waiting};
+use crate::effects;
 use crate::first_link;
 use crate::guard::{self, GuardState, RemoteRemoval};
 use crate::ids::{IdGen, unix_ms};
@@ -572,15 +573,19 @@ impl Commits {
     /// the same commit when the commit holds the whole cycle. Otherwise a create or move that only
     /// waits for a name is sent anyway, for the server to rename, except that a folder created
     /// where a moving file or folder still is takes a pending name first, and a folder it may be
-    /// merged into is not deleted in the same commit. A delete waits
-    /// until nothing that survives is left under it, a create or move until its parent exists, and
-    /// a move that would close a cycle against R is reverted: the node is marked in
-    /// [`Trees::reverted`], and the effects move it back to its R position on disk, bringing back
-    /// the folders L deleted on its way. A parked or reverted node waits until the effects have
-    /// moved it, and so does a node with a problem or a waiting S update. A commit stops at
-    /// [`MAX_OPS`], at [`MAX_COMMIT_BYTES`] of estimated change records, or at half the size of
-    /// the last commit that did not fit. The rebase changes the trees even when no commit results,
-    /// so the caller plans effects again after building.
+    /// merged into is not deleted in the same commit. A delete waits until nothing that survives is
+    /// left under it, a create or move until its parent exists, and a move that would close a cycle
+    /// against R is reverted: the node is marked in [`Trees::reverted`], and the effects move it
+    /// back to its R position on disk, bringing back the folders L deleted on its way. A parked or
+    /// reverted node waits until the effects have moved it, and so does a node with a problem or a
+    /// waiting S update. A parked node that neither R nor S holds, such as a file forked from a
+    /// parked node R no longer has, is moved back to the position L keeps for it first; while the
+    /// effects cannot move it there, because another entry of L holds that name or L no longer
+    /// holds its folder, it is created from that position while still parked, and the effects then
+    /// move it to the position R gives it. A commit stops at [`MAX_OPS`], at [`MAX_COMMIT_BYTES`]
+    /// of estimated change records, or at half the size of the last commit that did not fit. The
+    /// rebase changes the trees even when no commit results, so the caller plans effects again
+    /// after building.
     ///
     /// The queued restores come first, in request order, so local changes of other nodes do not
     /// hold them back. A restore follows every op this commit has for its own node: an unsent
@@ -618,16 +623,16 @@ impl Commits {
         }
         self.ask_again(trees, ids, now_ms);
         trees.reclaim();
-        let parked = trees.local().iter().filter(|(_, node)| node.parked);
         let waiting = (trees.waiting().keys()).filter(|id| !changed_locally(trees, id));
         let mut skip: BTreeSet<NodeId> = self
             .problems
             .iter()
             .chain(waiting)
-            .chain(parked.map(|(id, _)| id))
+            .chain(parked_until_moved(trees))
             .cloned()
             .collect();
         let (needed, agreed) = rebase(trees, ids, now_ms, &skip);
+        skip.extend(parked_until_moved(trees).cloned());
         let excluded: Vec<NodeId> = (trees.dirty().iter())
             .filter(|id| trees.excluded(id) || trees.held(id))
             .cloned()
@@ -727,17 +732,6 @@ impl Commits {
         self.in_flight.as_ref().map(|flight| &flight.commit)
     }
 
-    /// Goes through the conflict questions (section 2.7) and returns the ops of the answers that
-    /// can be carried out now, at most `cap` of them. A conflict ends once R no longer holds either
-    /// file live with the meta revision it was asked with, or L moved or deleted a file S holds:
-    /// someone renamed, moved or deleted one by hand. It is asked again, under a new ID and
-    /// without its answer, once R holds another content revision of either file. An answer waits
-    /// until both files are in sync and planned (`skip` lists the nodes that are not), and a
-    /// build carries out one op per conflict and none for a node another answer already took.
-    /// [`Answer::KeepOriginal`] deletes the copy. [`Answer::KeepCopy`] first gives the original
-    /// the copy's content, so the original's own content stays in its version history, and once
-    /// that has reached L it deletes the copy. S is left as it is, so the result reaches the disk
-    /// as a remote change would, and only a file L still holds as S does is changed or removed.
     fn conflicts(
         &mut self,
         trees: &Trees,
@@ -1447,7 +1441,7 @@ impl Synced {
     fn get(&self, trees: &Trees, id: &str) -> Option<Shape> {
         match self.updates.iter().rev().find(|(other, _)| other == id) {
             Some((_, shape)) => shape.clone(),
-            None => acknowledged(trees, id).cloned(),
+            None => trees.acknowledged(id).cloned(),
         }
     }
 
@@ -1560,18 +1554,15 @@ enum Drift {
     None,
     /// R holds another content revision of a file.
     Content,
-    /// A file was renamed, moved or deleted: R no longer holds it live with the meta revision it
-    /// was asked with, or L moved or deleted it while S holds it. A reverted file L still holds
-    /// where it was is not moved: the effects move it to the name the server gave it.
     Ended,
 }
 
 fn drift(trees: &Trees, original: &ConflictFile, copy: &ConflictFile) -> Drift {
     let files = [original, copy];
     let moved_here = |id: &str| {
-        (trees.synced().live(id)).is_some_and(|synced| {
+        (trees.acknowledged(id)).is_some_and(|held| {
             (trees.local().get(id)).is_none_or(|local| {
-                !trees.reverted().contains(id) && !local.shape.same_position(synced)
+                !trees.reverted().contains(id) && !local.shape.same_position(held)
             })
         })
     };
@@ -1670,7 +1661,7 @@ fn rebase(
         }
     }
     for id in dirty.iter().filter(|id| !skip.contains(*id)) {
-        if acknowledged_class(trees, id) != Class::Concurrent
+        if trees.acknowledged_class(id) != Class::Concurrent
             || !edited_on_both_sides(trees, id)
             || trees.excluded(id)
         {
@@ -1689,7 +1680,7 @@ fn rebase(
         if skip.contains(id) {
             continue;
         }
-        match acknowledged_class(trees, id) {
+        match trees.acknowledged_class(id) {
             Class::Concurrent => {
                 agreed.extend(take_agreed(trees, id).map(|s| (id.clone(), Some(s))))
             }
@@ -1705,7 +1696,7 @@ fn rebase(
 fn take_agreed(trees: &Trees, id: &str) -> Option<Shape> {
     let (Some(local), Some(synced), Some(remote)) = (
         trees.local().get(id).map(|node| &node.shape),
-        acknowledged(trees, id),
+        trees.acknowledged(id),
         trees.remote().live(id),
     ) else {
         return None;
@@ -1732,9 +1723,18 @@ fn edited_on_both_sides(trees: &Trees, id: &str) -> bool {
     ) else {
         return false;
     };
-    let s = content(acknowledged(trees, id));
+    let s = content(trees.acknowledged(id));
     let changed = |c: &Content| s.as_ref().is_none_or(|s| !same_content(c, s));
     changed(&l) && changed(&r) && !same_content(&l, &r)
+}
+
+fn parked_until_moved(trees: &Trees) -> impl Iterator<Item = &NodeId> {
+    let known = |id: &str| trees.remote().get(id).is_some() || trees.synced().get(id).is_some();
+    (trees.local().iter())
+        .filter(move |(id, node)| {
+            node.parked && (known(id) || effects::unparks_to(trees, id, &node.shape))
+        })
+        .map(|(id, _)| id)
 }
 
 /// The keep rule (R7): a node that changed remotely, or that L still has but must move to its R
@@ -1750,9 +1750,8 @@ fn keep(trees: &mut Trees, id: &str, needed: &mut BTreeSet<NodeId>) {
         .local()
         .get(id)
         .is_some_and(|node| node.parked || trees.reverted().contains(id));
-    let acknowledged = acknowledged(trees, id);
     if trees.remote().live(id).is_none()
-        || (!reverted && same(trees.remote().live(id), acknowledged))
+        || (!reverted && same(trees.remote().live(id), trees.acknowledged(id)))
     {
         return;
     }
@@ -1774,9 +1773,8 @@ fn keep(trees: &mut Trees, id: &str, needed: &mut BTreeSet<NodeId>) {
             None => {}
             Some(local) => {
                 let moved = trees
-                    .synced()
-                    .live(&current)
-                    .is_none_or(|synced| !local.shape.same_position(synced));
+                    .acknowledged(&current)
+                    .is_none_or(|held| !local.shape.same_position(held));
                 if moved && !trees.reverted().contains(&current) {
                     return;
                 }
@@ -1804,20 +1802,6 @@ fn created(trees: &Trees, synced: &Synced, id: &str, sent: Shape) -> Shape {
 /// The position of `id` that L and R agreed on after `seq` ([`Trees::position_after`]), if any.
 fn agree(trees: &Trees, id: &str, seq: u64) -> Option<(NodeId, Agreed)> {
     (trees.position_after(id, seq)).map(|at| (id.to_owned(), at.clone()))
-}
-
-/// What S holds for `id`, or its waiting update while one waits.
-fn acknowledged<'a>(trees: &'a Trees, id: &str) -> Option<&'a Shape> {
-    match trees.waiting().get(id) {
-        Some(waiting) => waiting.shape.as_ref(),
-        None => trees.synced().live(id),
-    }
-}
-
-/// The node's class with its waiting update, while one waits, standing in for S.
-fn acknowledged_class(trees: &Trees, id: &str) -> Class {
-    let (local, remote) = (trees.local().live(id), trees.remote().live(id));
-    classify(local, acknowledged(trees, id), remote)
 }
 
 /// Whether L changed a node whose S update waits: L edited it, or moved it away from the waiting
@@ -2008,11 +1992,11 @@ fn plan(
     let mut deleted = BTreeSet::new();
     let mut reverts = Vec::new();
     for id in trees.dirty().iter().filter(|id| !problems.contains(*id)) {
-        let class = acknowledged_class(trees, id);
+        let class = trees.acknowledged_class(id);
         if !matches!(class, Class::Local | Class::Concurrent) {
             continue;
         }
-        let synced = acknowledged(trees, id);
+        let synced = trees.acknowledged(id);
         let Some(local) = trees.local().get(id).map(|node| &node.shape) else {
             if deletes(trees, id, needed) {
                 deleted.insert(id.clone());

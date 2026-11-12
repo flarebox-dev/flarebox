@@ -626,6 +626,169 @@ fn a_conflict_about_a_renamed_create_stays_open_while_the_local_file_waits_for_i
     assert_eq!(commits.questions(), asked);
 }
 
+#[test]
+fn a_conflict_survives_an_effect_whose_s_update_waits() {
+    let mut trees = trees(&[
+        (
+            "n",
+            Some(file(ROOT, "x", 1)),
+            Some(file(ROOT, "old", 1)),
+            Some(remote(file(ROOT, "old", 1))),
+        ),
+        (
+            "p",
+            Some(dir(ROOT, "x (conflict)")),
+            Some(dir(ROOT, "x (conflict)")),
+            Some(remote(dir(ROOT, "q"))),
+        ),
+    ]);
+    trees.set_local(
+        "p".into(),
+        LocalNode {
+            parked: true,
+            ..local(dir(ROOT, "x (conflict)"), 2)
+        },
+    );
+    trees.settle();
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let sent = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&sent), [mv("n", ROOT, "x")]);
+    trees.set_remote("o".into(), remote(file(ROOT, "x", 2)));
+    trees.set_remote("n".into(), remote(file(ROOT, "x (conflict)", 1)));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![OpResult {
+            name: "x (conflict)".into(),
+            ..outcome(op_result::Code::AppliedRenamed)
+        }],
+    );
+    let asked = commits.questions().to_vec();
+    assert_eq!(asked.len(), 1);
+    assert!(trees.waiting().contains_key("n"));
+    assert_eq!(trees.check(), Ok(()));
+    let mut effects = Effects::default();
+    let record = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    assert_eq!(record.node, "n");
+    effects.done(&mut trees, &record.effect_id, None).unwrap();
+    trees.settle();
+    for _ in 0..4 {
+        let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() else {
+            break;
+        };
+        if record.node == "p" {
+            effects.failed(&record.effect_id).unwrap();
+        } else {
+            effects
+                .done(
+                    &mut trees,
+                    &record.effect_id,
+                    Some(local(file(ROOT, "x", 2), 10).identity),
+                )
+                .unwrap();
+        }
+        trees.settle();
+    }
+    assert!(effects.plan(&trees, &mut ids, NOW).is_none());
+    assert!(trees.waiting().contains_key("n"));
+    assert_eq!(trees.local().live("n"), trees.remote().live("n"));
+    assert_eq!(trees.check(), Ok(()));
+    build(&mut commits, &mut trees, &mut ids);
+    assert_eq!(commits.questions(), asked);
+}
+
+#[test]
+fn a_parked_fork_recovers_after_its_empty_local_parent_is_deleted() {
+    let mut trees = trees(&[
+        synced("d", dir(ROOT, "d")),
+        (
+            "a",
+            Some(file("d", "x", 2)),
+            Some(file("d", "x (conflict)", 1)),
+            Some(remote(file("d", "y", 1))),
+        ),
+        (
+            "c",
+            Some(file("d", "y", 4)),
+            Some(file("d", "y (conflict)", 4)),
+            Some(remote(file("d", "x", 4))),
+        ),
+    ]);
+    trees.revert("a".into());
+    trees.revert("c".into());
+    let (mut commits, mut ids, mut effects) =
+        (Commits::default(), IdGen::new(1), Effects::default());
+    let parking = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    assert!(matches!(&parking.effect, Effect::Move { to: Location::Parked(id), .. } if id == "a"));
+    effects.done(&mut trees, &parking.effect_id, None).unwrap();
+    trees.set_remote("a".into(), trashed(file("d", "y", 1)));
+    trees.set_remote("c".into(), trashed(file("d", "x", 4)));
+    trees.remove_local("c");
+    trees.remove_local("d");
+    trees.settle();
+    assert_eq!(trees.check(), Ok(()));
+    assert!(effects.plan(&trees, &mut ids, NOW).is_none());
+    for ino in 10..26 {
+        trees.settle();
+        assert_eq!(trees.check(), Ok(()));
+        if let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() {
+            effects
+                .done(
+                    &mut trees,
+                    &record.effect_id,
+                    Some(local(dir(ROOT, "d"), ino).identity),
+                )
+                .unwrap();
+            continue;
+        }
+        let Some(sent) = build(&mut commits, &mut trees, &mut ids) else {
+            continue;
+        };
+        for op in ops(&sent) {
+            match op {
+                op::Op::CreateFile(create) => {
+                    trees.set_remote(
+                        create.node_id,
+                        remote(Shape {
+                            parent: create.parent_id,
+                            name: create.name,
+                            kind: Kind::File,
+                            content: create.content,
+                        }),
+                    );
+                }
+                op::Op::Delete(deleted) => {
+                    assert_eq!(deleted.node_id, "d");
+                    trees.set_remote("d".into(), trashed(dir(ROOT, "d")));
+                }
+                other => panic!("unexpected recovery op: {other:?}"),
+            }
+        }
+        acknowledge(
+            &mut commits,
+            &mut trees,
+            vec![outcome(op_result::Code::Applied); sent.ops.len()],
+        );
+    }
+    trees.settle();
+    assert_eq!(trees.check(), Ok(()));
+    assert!(
+        trees.local().iter().all(|(_, node)| !node.parked),
+        "parked edited fork has no effect and no commit: {:?}",
+        trees.work()
+    );
+    assert!(trees.work().is_empty());
+    let (id, fork) = (trees.remote().iter())
+        .find(|(_, node)| !node.trashed && node.shape.content == Some(content(2)))
+        .expect("the edited fork is on the server");
+    assert!(trees.remote().live(&fork.shape.parent).is_some());
+    assert_eq!(fork.shape.name, "x");
+    assert_eq!(
+        trees.local().get(id).map(|node| &node.shape),
+        Some(&fork.shape)
+    );
+}
+
 /// Another device renames and rewrites n, and the disk takes both, so L and R agree. S cannot take
 /// the new name yet, because the folder p it holds there is parked on its way to q. S still takes
 /// the content both sides hold, so the other device's next edit is not taken for a concurrent one
@@ -709,6 +872,44 @@ fn a_folder_renamed_back_after_its_move_was_renamed_by_the_server_keeps_the_user
 /// The server lost folder albums, which is parked here, and another device deleted one in it.
 /// Once one is removed, albums is not removed too: the commit layer forgets its S first, then the
 /// effects move it out of the parked directory, and it is created again.
+#[test]
+fn a_parked_file_forked_in_a_build_is_created_only_after_the_effects_move_it_back() {
+    let mut trees = trees(&[(
+        "a",
+        Some(file(ROOT, "x", 2)),
+        Some(file(ROOT, "x", 1)),
+        Some(trashed(file(ROOT, "x", 1))),
+    )]);
+    trees.set_local(
+        "a".into(),
+        LocalNode {
+            parked: true,
+            ..local(file(ROOT, "x", 2), 2)
+        },
+    );
+    trees.revert("a".into());
+    trees.settle();
+    let (mut commits, mut ids, mut effects) =
+        (Commits::default(), IdGen::new(1), Effects::default());
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    trees.settle();
+    let unparked = effects.plan(&trees, &mut ids, NOW).cloned().unwrap();
+    assert!(matches!(
+        &unparked.effect,
+        Effect::Move {
+            from: Location::Parked(_),
+            ..
+        }
+    ));
+    effects.done(&mut trees, &unparked.effect_id, None).unwrap();
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(matches!(
+        &ops(&commit)[..],
+        [op::Op::CreateFile(create)] if create.node_id == unparked.node && create.name == "x"
+    ));
+}
+
 #[test]
 fn a_parked_folder_the_server_lost_is_created_again_after_a_delete_empties_it() {
     let mut trees = trees(&[
