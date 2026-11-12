@@ -578,14 +578,15 @@ impl Commits {
     /// against R is reverted: the node is marked in [`Trees::reverted`], and the effects move it
     /// back to its R position on disk, bringing back the folders L deleted on its way. A parked or
     /// reverted node waits until the effects have moved it, and so does a node with a problem or a
-    /// waiting S update. A parked node that neither R nor S holds, such as a file forked from a
-    /// parked node R no longer has, is moved back to the position L keeps for it first; while the
-    /// effects cannot move it there, because another entry of L holds that name or L no longer
-    /// holds its folder, it is created from that position while still parked, and the effects then
-    /// move it to the position R gives it. A commit stops at [`MAX_OPS`], at [`MAX_COMMIT_BYTES`]
-    /// of estimated change records, or at half the size of the last commit that did not fit. The
-    /// rebase changes the trees even when no commit results, so the caller plans effects again
-    /// after building.
+    /// waiting S update, except a parked node whose name is held by a node the effects do not park:
+    /// it is sent for the server to rename. A parked node that neither R nor S holds, such as a
+    /// file forked from a parked node R no longer has, is moved back to the position L keeps for it
+    /// first; while the effects cannot move it there, because another entry of L holds that name or
+    /// L no longer holds its folder, it is created from that position while still parked, and the
+    /// effects then move it to the position R gives it. A commit stops at [`MAX_OPS`], at
+    /// [`MAX_COMMIT_BYTES`] of estimated change records, or at half the size of the last commit
+    /// that did not fit. The rebase changes the trees even when no commit results, so the caller
+    /// plans effects again after building.
     ///
     /// The queued restores come first, in request order, so local changes of other nodes do not
     /// hold them back. A restore follows every op this commit has for its own node: an unsent
@@ -1667,9 +1668,7 @@ fn rebase(
         {
             continue;
         }
-        let local = trees.local().get(id).cloned().expect("a local edit");
-        trees.remove_local(id);
-        trees.set_local(ids.uuid_v7(now_ms), local);
+        rekey(trees, id, &ids.uuid_v7(now_ms));
     }
     let mut needed = BTreeSet::new();
     let mut agreed = Vec::new();
@@ -1732,7 +1731,9 @@ fn parked_until_moved(trees: &Trees) -> impl Iterator<Item = &NodeId> {
     let known = |id: &str| trees.remote().get(id).is_some() || trees.synced().get(id).is_some();
     (trees.local().iter())
         .filter(move |(id, node)| {
-            node.parked && (known(id) || effects::unparks_to(trees, id, &node.shape))
+            node.parked
+                && !effects::kept_out(trees, id)
+                && (known(id) || effects::unparks_to(trees, id, &node.shape))
         })
         .map(|(id, _)| id)
 }

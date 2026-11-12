@@ -204,17 +204,18 @@ impl Effects {
         self.failed.remove(node).is_some()
     }
 
-    /// Emits the next effect, unless one is in flight. A dirty node whose only change is remote,
-    /// or that is parked, gets the effect that makes L equal to R when it applies to L as it is:
-    /// its parent is a directory there, no other entry there holds its name key, and a move does
-    /// not go into the node's own subtree. A directory is removed only once it is empty. When no
-    /// such effect applies, a node that blocks one is parked, if it is a candidate itself or its S
-    /// update waits ([`Trees::waiting`]), since the commit layer does not plan it either: the
-    /// entry holding a name, or a directory that would move into its own subtree. A node whose park
-    /// failed gets no effect until L changes: the parked directory always has room, so the park
-    /// failed on the entry itself, and the node's own effect would fail on it too, taking turns
-    /// with the park for as long as L stays as it is. A rename that changes only case or
-    /// normalization goes through the parked directory too.
+    /// Emits the next effect, unless one is in flight. A dirty node whose only change is remote, or
+    /// that is parked, gets the effect that makes L equal to R when it applies to L as it is: its
+    /// parent is a directory there, no other entry there holds its name key, and a move does not go
+    /// into the node's own subtree. A directory is removed only once it is empty. When no such
+    /// effect applies, a node that blocks one is parked, if it is a candidate itself or its S
+    /// update waits ([`Trees::waiting`]), since the commit layer does not plan it either: the entry
+    /// holding a name, or a directory that would move into its own subtree. A blocker that already
+    /// sits where R has it is not parked, since its own effect would move it straight back and take
+    /// the name again. A node whose park failed gets no effect until L changes: the parked
+    /// directory always has room, so the park failed on the entry itself, and the node's own effect
+    /// would fail on it too, taking turns with the park for as long as L stays as it is. A rename
+    /// that changes only case or normalization goes through the parked directory too.
     ///
     /// A parked node with a local change, such as an edit observed in the parked directory, is
     /// only moved out: to its R position, or to the position L keeps for it when R has none. Its
@@ -295,13 +296,7 @@ impl Effects {
         }
         let (node, effect, after) = chosen.or_else(|| {
             blockers.into_iter().find_map(|id| {
-                let waiting = trees.waiting().contains_key(&id);
-                if !(candidate(trees, &id) || waiting)
-                    || trees.excluded(&id)
-                    || trees.held(&id)
-                    || trees.local().get(&id).is_none_or(|node| node.parked)
-                    || view.stuck(&id, trees.local().len()).is_some()
-                {
+                if !view.parkable(&id) {
                     return None;
                 }
                 let (effect, after) = view.park(&id)?;
@@ -471,6 +466,15 @@ fn within(trees: &Trees, node: &NodeId) -> Vec<NodeId> {
         }
     }
     within
+}
+
+pub(crate) fn kept_out(trees: &Trees, id: &str) -> bool {
+    let view = View::new(trees);
+    trees.local().get(id).is_some_and(|node| node.parked)
+        && candidate(trees, id)
+        && !trees.held(id)
+        && !trees.ignored(id)
+        && matches!(view.step(id), Step::Blocked(Some(holder)) if !view.parkable(&holder))
 }
 
 /// A node the planner considers: one whose only change is remote, one that is parked, one whose
@@ -895,6 +899,19 @@ impl<'a> View<'a> {
             }
         }
         false
+    }
+
+    fn parkable(&self, id: &str) -> bool {
+        let trees = self.trees;
+        (candidate(trees, id) || trees.waiting().contains_key(id))
+            && !trees.excluded(id)
+            && !trees.held(id)
+            && trees.local().get(id).is_some_and(|node| {
+                !node.parked
+                    && !(trees.remote().live(id))
+                        .is_some_and(|remote| node.shape.same_position(remote))
+            })
+            && self.stuck(id, trees.local().len()).is_none()
     }
 
     fn park(&self, id: &str) -> Option<(Effect, Option<Shape>)> {
