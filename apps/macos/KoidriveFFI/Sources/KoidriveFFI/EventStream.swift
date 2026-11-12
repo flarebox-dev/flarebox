@@ -28,6 +28,8 @@ extension SyncSession {
     }
 }
 
+/// Rust calls `onEvent` while holding the core's lock, so the relay only yields and never
+/// calls back into the session.
 private final class EventRelay: SessionListener {
     let continuation: AsyncStream<SessionEvent>.Continuation
 
