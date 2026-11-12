@@ -11,11 +11,11 @@ import Observation
 public final class AppModel {
     public private(set) var state: SessionState
     /// Questions not shown to the person yet. Every unanswered question counts as unseen when the
-    /// app launches, so the questions window opens again after a relaunch.
+    /// app launches.
     public private(set) var unseenQuestionIDs: Set<String>
     /// Whether this profile sends anonymous usage reports, read again after every session call.
     public private(set) var telemetry: TelemetrySetting
-    /// Whether an environment variable such as `DO_NOT_TRACK` keeps usage reports off, so Settings says why its switch is disabled.
+    /// Whether an environment variable such as `DO_NOT_TRACK` keeps usage reports off.
     public var usageReportsTurnedOffByVariable: Bool { telemetry.locked && !telemetry.enabled }
     public let session: SyncSession
     @ObservationIgnored private var consumer: Task<Void, Never>?
@@ -69,7 +69,6 @@ public final class AppModel {
         consumer?.cancel()
     }
 
-    /// Applies one event. Each event replaces one part of the state.
     public func apply(_ event: SessionEvent) {
         switch event {
         case .status(let status): state.status = status
@@ -103,8 +102,6 @@ public final class AppModel {
         telemetry = session.telemetry()
     }
 
-    /// Runs a session call off the main actor, then takes the session's latest state, so the
-    /// call's changes are visible when it returns.
     private func run<T: Sendable>(_ call: @escaping @Sendable (SyncSession) throws -> T) async throws -> T {
         let session = session
         let result = await Task.detached { Result { try call(session) } }.value
@@ -112,13 +109,10 @@ public final class AppModel {
         return try result.get()
     }
 
-    // MARK: Derived state
-
     /// True until this device is signed in and has a linked folder.
     public var needsSetup: Bool { state.account == nil || state.folders.isEmpty }
     public var isPaused: Bool { state.status == .paused }
     public var hasUnseenQuestions: Bool { !unseenQuestionIDs.isEmpty }
-    /// Questions and problems together.
     public var attentionCount: Int { state.questions.count + state.problems.count }
 
     /// What the menu bar popover leads with, in priority order: setup, then a folder that stopped,
@@ -191,8 +185,6 @@ public final class AppModel {
         }
     }
 
-    // MARK: Actions
-
     public func start() {
         session.start()
         refresh()
@@ -246,7 +238,7 @@ public final class AppModel {
 
     /// Signs this Mac out and revokes it on the server. Unless `confirmLastDevice` is set, it changes nothing and throws
     /// `SessionError.LastDevice` when no other device of the account is active, or `SessionError.NotRevoked` when the
-    /// server can't be reached, so the person can be told that they may lose their last device.
+    /// server can't be reached.
     public func signOut(confirmLastDevice: Bool = false) async throws {
         try await run { try $0.signOut(confirmLastDevice: confirmLastDevice) }
     }
@@ -337,7 +329,7 @@ public struct QuestionSection: Identifiable, Equatable, Sendable {
     public let spaceID: String
     /// The space's linked folder, if it is still linked.
     public let folder: LinkedFolder?
-    /// The cause of the space's recovery, shown once above its groups.
+    /// The cause of the space's recovery.
     public let recoveryCause: RecoveryCause?
     public let questions: [Question]
 }

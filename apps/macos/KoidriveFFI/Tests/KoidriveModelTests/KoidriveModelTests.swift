@@ -16,7 +16,6 @@ private func item(_ path: String) -> HeldItem {
     HeldItem(nodeId: path, path: path, kind: .file, files: 1, detail: .plain)
 }
 
-/// Storage fetches that finish only when the test resumes them.
 @MainActor
 private final class Fetches {
     var pending: [CheckedContinuation<[SpaceStorage], any Error>] = []

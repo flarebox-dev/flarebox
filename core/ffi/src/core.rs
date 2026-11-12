@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The interface between the app's session and whatever syncs: the sync driver, or
-//! [`FakeCore`](crate::FakeCore) for previews and tests. The app only talks to
-//! [`SyncSession`](crate::SyncSession), which forwards to a [`Core`], so either runs the same app code.
-
 use std::sync::{Arc, Weak};
 
 use crate::types::{
@@ -11,12 +7,6 @@ use crate::types::{
     SessionState, Space, SpaceUsage, TelemetrySetting,
 };
 
-/// The code part of a pairing code as typed or pasted. `koi device add` prints the code as
-/// `<code>@<host>`, with `:<port>` after the host when the server's port isn't the default, and
-/// in single quotes when the host is an IPv6 address, so the text is split on its last `@` as
-/// `koi join` does. That form names an https server, so a host and port other than those of
-/// `server_url`, the server this device connected to, are refused, and so is any host when that
-/// server isn't https; host names compare without case.
 pub(crate) fn pairing_code<'a>(text: &'a str, server_url: &str) -> Result<&'a str, SessionError> {
     let text = text.trim();
     let text = text
@@ -60,8 +50,6 @@ pub trait SessionListener: Send + Sync {
     fn on_event(&self, event: SessionEvent);
 }
 
-/// Where a core sends its events. It holds the session's listener weakly, so events sent after
-/// the session is gone are dropped.
 #[derive(Clone)]
 pub struct Events(Weak<Box<dyn SessionListener>>);
 
@@ -70,7 +58,6 @@ impl Events {
         Self(Arc::downgrade(listener))
     }
 
-    /// Sends an event to the listener, if the session still exists.
     pub fn send(&self, event: SessionEvent) {
         if let Some(listener) = self.0.upgrade() {
             listener.on_event(event);

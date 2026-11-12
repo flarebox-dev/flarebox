@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The session against a loopback server that answers when the test lets it, so that a call can be
-//! made while another one waits on the network. The app makes `state`, `start`, `stop`, `pause`
-//! and `resume` on its main thread, so none of them may wait for a network call to end.
-
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -17,12 +13,10 @@ use koidrive_ffi::{
 };
 use koidrive_store::{Link, Store};
 
-/// Longer than any main-thread call may take, and shorter than the server waits for the test.
 const PROMPT: Duration = Duration::from_secs(1);
 
 const WAIT: Duration = Duration::from_secs(10);
 
-/// `GET /v1/server-info` for a server that speaks protocol 1 only.
 const SERVER_INFO: &[u8] =
     b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n\x10\x01\x18\x01";
 
@@ -34,8 +28,6 @@ impl SessionListener for Ignore {
     fn on_event(&self, _: SessionEvent) {}
 }
 
-/// A server that answers each request with the next of `answers` and holds the last request until
-/// the test sends on the returned channel. The first receiver hears when the last request arrives.
 fn server(
     answers: &'static [&'static [u8]],
 ) -> (String, mpsc::Receiver<()>, mpsc::Sender<()>, JoinHandle<()>) {
@@ -58,7 +50,6 @@ fn server(
     (url, held, release, worker)
 }
 
-/// A paired profile in `base` with one folder linked to space `a1` at `root`.
 fn paired_profile(base: &Path, server: &str, root: PathBuf) -> PathBuf {
     let profile = base.join("profile");
     let paths = Paths::under(&profile);

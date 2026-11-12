@@ -5,10 +5,6 @@ import KoidriveFFI
 import KoidriveModel
 import SwiftUI
 
-/// The menu bar icon: the koi mark as a template image, with a badge for the state. It stays
-/// alive while the app runs, so it also opens the setup window on a first run and the questions
-/// window whenever there are questions the person has not seen, including the unanswered ones
-/// after a relaunch.
 struct MenuBarLabel: View {
     let model: AppModel
     @Environment(\.openWindow) private var openWindow
@@ -30,7 +26,6 @@ struct MenuBarLabel: View {
 }
 
 extension IconBadge {
-    /// The template image in the asset catalog, from the GUN-420 handoff.
     var imageName: String {
         switch self {
         case .none: "MenuBar/up-to-date"
@@ -44,7 +39,6 @@ extension IconBadge {
 }
 
 extension AppModel {
-    /// The popover title, which the menu bar icon also reads out.
     var headlineTitle: String {
         switch headline {
         case .setup: SyncStatus.needsSetup.title
@@ -54,7 +48,6 @@ extension AppModel {
         }
     }
 
-    /// The line under the popover title, if any.
     var headlineSubtitle: String? {
         switch headline {
         case .setup:
@@ -264,7 +257,6 @@ struct MenuContent: View {
         }
     }
 
-    /// "148 of 240 MB": the done bytes in the total's unit.
     private func byteProgress(done: UInt64, total: UInt64) -> String {
         let formatter = ByteCountFormatter()
         formatter.countStyle = .file
@@ -279,15 +271,14 @@ struct MenuContent: View {
 }
 
 extension AppModel {
-    /// A path inside a space as the person knows it, starting with the folder's name.
     func displayPath(_ path: String, spaceID: String) -> String {
         guard let folder = folder(spaceID: spaceID) else { return path }
         return folder.spaceName + "/" + path
     }
 }
 
-/// A thin koi-orange bar on a grey track. The system's linear progress view takes the
-/// system accent colour on macOS, not the tint.
+/// The system's linear progress view takes the system accent colour on macOS,
+/// not the tint.
 private struct ProgressBar: View {
     let fraction: Double
 

@@ -1,10 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The app's session against the real Worker in `server/`, run by `core/ffi/scripts/integration-test.sh`,
-//! which starts `wrangler dev` and sets `KOIDRIVE_TEST_SERVER` (its URL) and `KOIDRIVE_TEST_SERVER_LOG`
-//! (its output, where the Worker prints the claim code). Each device is a [`SyncSession`] on a profile
-//! of its own, driven only through the calls the app makes.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -28,7 +23,6 @@ fn server_url() -> String {
     )
 }
 
-/// Issues a claim code through `GET /setup` and reads it from the Worker's log.
 fn claim_code() -> String {
     let log =
         std::env::var("KOIDRIVE_TEST_SERVER_LOG").expect("KOIDRIVE_TEST_SERVER_LOG is not set");
@@ -52,7 +46,6 @@ fn claim_code() -> String {
     }
 }
 
-/// The claim code on a Worker log line that mentions one, such as `ABCD-EFGH-JKLM`.
 fn code_on(line: &str) -> Option<String> {
     if !line.to_ascii_lowercase().contains("claim code") {
         return None;
@@ -84,8 +77,6 @@ impl SessionListener for Recorder {
     }
 }
 
-/// The state the app builds: the state it read when it opened the session, updated by every event
-/// since.
 #[derive(Debug)]
 struct Mirror {
     status: SyncStatus,
@@ -121,7 +112,6 @@ impl Mirror {
     }
 }
 
-/// One device: a profile directory and the session open on it, with every event it sent.
 struct Device {
     home: tempfile::TempDir,
     session: Option<Arc<SyncSession>>,
@@ -153,7 +143,6 @@ impl Device {
         self.session.as_ref().unwrap()
     }
 
-    /// Closes the session, as quitting the app does, and opens the profile again.
     fn reopen(&mut self) {
         self.session = None;
         self.seen = Arc::default();
@@ -167,8 +156,6 @@ impl Device {
         self.session = Some(session);
     }
 
-    /// Waits until the state read at opening, updated by the events sent since, is one that `done`
-    /// accepts. It never reads the state again, so it fails if a change is not sent as an event.
     fn until(&self, what: &str, done: impl Fn(&Mirror) -> bool) -> Mirror {
         let started = Instant::now();
         let mut events = self.seen.events.lock().unwrap();
@@ -187,12 +174,10 @@ impl Device {
     }
 }
 
-/// Copies the credential of the profile at `profile` to `copy`, to ask the server about it after a sign-out.
 fn keep_credential(profile: &Path, copy: &Path) {
     fs::copy(driver::Paths::under(profile).credential(), copy).unwrap();
 }
 
-/// Whether the server still accepts the credential kept at `copy`.
 fn accepted(copy: &Path) -> bool {
     let credential = driver::Credential::load(copy).unwrap().unwrap();
     let auth = Auth::new(credential.api().unwrap(), credential.net());

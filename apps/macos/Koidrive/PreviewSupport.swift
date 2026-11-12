@@ -4,7 +4,6 @@ import KoidriveFFI
 import KoidriveModel
 
 extension AppModel {
-    /// A started model on a fake scenario, for previews.
     @MainActor
     static func preview(_ scenario: FakeScenario) -> AppModel {
         let model = AppModel.fake(scenario: scenario)
@@ -12,7 +11,6 @@ extension AppModel {
         return model
     }
 
-    /// A started model on a fake scenario with the usage-report setting given, such as a locked one.
     @MainActor
     static func preview(_ scenario: FakeScenario, telemetry: TelemetrySetting) -> AppModel {
         let model = AppModel.fake(scenario: scenario)
@@ -21,8 +19,6 @@ extension AppModel {
         return model
     }
 
-    /// A started model signed in to an account with a single space, Documents, for the views that
-    /// drop the space header when there is only one space.
     @MainActor
     static func previewWithOneSpace() -> AppModel {
         let model = AppModel.preview(.firstRun)

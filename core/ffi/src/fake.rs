@@ -1,11 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! A [`Core`] that syncs nothing and plays back a scripted state in memory, for the app's previews
-//! and tests and for showing on demand a state the driver cannot reach yet. It enforces the same
-//! rules the driver does: codes have the server's lengths, folders must exist and must not
-//! overlap, a question only takes one of its own answers, and a change that cannot be saved (when
-//! [`FakeCore::fail_saves`] scripts it) is not made.
-
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -76,7 +70,6 @@ pub struct GivenAnswer {
     pub answer: Answer,
 }
 
-/// The part of the fake's state the engine would keep in its store.
 #[derive(Clone, Debug, Default)]
 struct Saved {
     server: Option<ServerInfo>,
@@ -101,14 +94,10 @@ struct State {
     recent: Vec<RecentChange>,
     answers: Vec<GivenAnswer>,
     fail_next: Option<SessionError>,
-    /// The spaces whose usage the server refuses, and how.
     usage_refusals: Vec<(String, SessionError)>,
     fail_saves: bool,
-    /// [`ProblemKind::StateNotWritable`] after a failed save, until a save succeeds. It is
-    /// not saved itself.
     not_writable: Option<Problem>,
     status: SyncStatus,
-    /// Kept in memory only: a first run is undecided and off, every other scenario decided and on.
     telemetry: TelemetrySetting,
 }
 
@@ -154,7 +143,6 @@ impl State {
         problems
     }
 
-    /// Records the outcome of a save. Returns whether the problem list changed.
     fn set_save_failure(&mut self, reason: Option<String>) -> bool {
         let next = reason.map(|reason| Problem {
             id: NOT_WRITABLE_ID.to_owned(),
@@ -176,7 +164,6 @@ impl State {
     }
 }
 
-/// The parts of [`SessionState`] a change touched, which the fake sends as events.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Part {
     Progress,
@@ -206,8 +193,6 @@ pub struct FakeCore {
 }
 
 impl FakeCore {
-    /// Creates a stopped fake in a first run. Saves succeed unless [`FakeCore::fail_saves`] says
-    /// otherwise.
     pub fn new(events: Events) -> Self {
         Self {
             state: Mutex::new(State {
@@ -232,18 +217,12 @@ impl FakeCore {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Saves `next`, then makes it the state and sends `parts`. If saving fails, the state
-    /// stays as it was, so memory always matches what was saved; [`ProblemKind::StateNotWritable`]
-    /// is listed until a save succeeds, and the call returns [`SessionError::NotSaved`].
     fn commit(&self, state: &mut State, next: Saved, parts: &[Part]) -> Result<(), SessionError> {
         let cleared = self.store(state, next)?;
         self.publish(state, parts, cleared);
         Ok(())
     }
 
-    /// Saves `next` and makes it the state without sending it; returns whether a listed
-    /// [`ProblemKind::StateNotWritable`] was cleared. If saving fails, the state stays as it
-    /// was and only the problem list is sent.
     fn store(&self, state: &mut State, next: Saved) -> Result<bool, SessionError> {
         if state.fail_saves {
             let reason = "saving is scripted to fail".to_owned();
@@ -255,7 +234,6 @@ impl FakeCore {
         Ok(state.set_save_failure(None))
     }
 
-    /// Builds the next saved state with `change` from a copy, then [commits](Self::commit) it.
     fn update<T>(
         &self,
         state: &mut State,
@@ -268,8 +246,6 @@ impl FakeCore {
         Ok(value)
     }
 
-    /// Sends the touched parts, and the problems if they changed, then the status if it changed.
-    /// Runs under the lock, which keeps events in order.
     fn publish(&self, state: &mut State, parts: &[Part], problems: bool) {
         let extra = (problems && !parts.contains(&Part::Problems)).then_some(Part::Problems);
         for part in parts.iter().copied().chain(extra) {
@@ -337,9 +313,6 @@ fn required(name: &str) -> Result<String, SessionError> {
     }
 }
 
-/// Scripting. A method that changes what the engine would keep in its store stands for an
-/// engine output, so it saves first like every other change: if saving fails, it changes
-/// nothing and returns [`SessionError::NotSaved`].
 #[uniffi::export]
 impl FakeCore {
     /// Replaces the whole state with a scenario and sends every part. A running session keeps
@@ -754,8 +727,6 @@ impl Core for FakeCore {
         })
     }
 
-    /// Made-up numbers that grow with the space's place in the list, so that previews show
-    /// spaces of different sizes.
     fn space_usage(&self, space_id: &str) -> Result<SpaceUsage, SessionError> {
         let mut state = self.lock();
         state.take_failure()?;

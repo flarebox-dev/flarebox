@@ -5,9 +5,6 @@ import KoidriveFFI
 import KoidriveModel
 import SwiftUI
 
-/// Every unanswered question, grouped by folder, with every path each one affects and its two
-/// answers. The engine keeps questions until they are answered, so this window lists them again
-/// after a relaunch.
 struct QuestionsView: View {
     @Environment(AppModel.self) private var model
     @State private var selection: String?
@@ -53,8 +50,6 @@ struct QuestionsView: View {
         }
     }
 
-    /// A space's questions, under its recovery cause if it has one. Without space headings the rows
-    /// stand at the top level of the list.
     @ViewBuilder
     private func rows(of section: QuestionSection) -> some View {
         if let cause = section.recoveryCause {
@@ -74,8 +69,6 @@ struct QuestionsView: View {
     }
 }
 
-/// A section title for a space: its folder's name, or "Unlinked space" with the space ID when no
-/// folder on this Mac is linked to it.
 struct SpaceHeading: View {
     let spaceID: String?
     let folder: LinkedFolder?
@@ -235,12 +228,10 @@ private struct QuestionDetail: View {
         .background(.bar)
     }
 
-    /// The answer drawn as the filled button: the one that keeps files, or the first when neither removes anything.
     private var primaryAnswer: Answer? {
         question.answers.first { !$0.isDestructive }
     }
 
-    /// The other answer first and the filled one last, at the trailing edge.
     private var orderedAnswers: [Answer] {
         question.answers.filter { $0 != primaryAnswer } + [primaryAnswer].compactMap { $0 }
     }
@@ -286,8 +277,6 @@ extension Answer: @retroactive Identifiable {
     public var id: Self { self }
 }
 
-/// Asks again before a destructive answer, like an alert: a red button for the answer and
-/// Cancel as the default, which Esc and Return choose.
 struct ConfirmSheet: View {
     let title: String
     let message: String
@@ -327,7 +316,6 @@ struct ConfirmSheet: View {
     }
 }
 
-/// The red filled button of a destructive confirmation.
 struct DestructiveFillButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
