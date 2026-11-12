@@ -1309,11 +1309,27 @@ fn run_ignoring(
     prop_assert!(commits.problems().is_empty(), "{:?}", commits.problems());
     prop_assert!(effects.blocked().is_empty(), "{:?}", effects.blocked());
     let reported = koidrive_engine::effects::stuck(&device.trees, &effects);
+    let local = device.trees.local();
+    let unreachable = |id: &str, shape: &koidrive_engine::tree::Shape| {
+        let folder = shape.parent == local.root
+            || (local.get(&shape.parent)).is_some_and(|node| node.shape.kind == Kind::Dir);
+        !folder
+            || (local.iter()).any(|(other, node)| {
+                other != id
+                    && !node.parked
+                    && node.shape.parent == shape.parent
+                    && name_key(&node.shape.name) == name_key(&shape.name)
+            })
+    };
+    let nowhere = |id: &str| {
+        (local.get(id)).is_some_and(|node| unreachable(id, &node.shape))
+            && (device.trees.remote().live(id)).is_none_or(|shape| unreachable(id, shape))
+    };
     let stays_parked = |id: &str| {
         waiting.contains(id)
-            || !device.trees.reverted().contains(id)
-                && device.trees.ignored(id)
+            || device.trees.ignored(id)
                 && reported.contains_key(id)
+                && (!device.trees.reverted().contains(id) || nowhere(id))
     };
     prop_assert!(
         (device.trees.local().iter()).all(|(id, node)| !node.parked || stays_parked(id)),
