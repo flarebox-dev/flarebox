@@ -294,6 +294,19 @@ impl<'r> Pending<'r> {
     /// Replaces the left-out names of every folder the scan listed.
     pub(crate) fn settle(&mut self) {
         for (folder, names) in std::mem::take(&mut self.listed) {
+            if let Some(walk) = &mut self.rules.search.walk {
+                let before = self.rules.ignored.get(&folder);
+                let added: Vec<OsString> = (names.iter().rev())
+                    .filter(|name| !before.is_some_and(|before| before.contains(*name)))
+                    .cloned()
+                    .collect();
+                if !added.is_empty() {
+                    walk.push(Listing {
+                        dir: folder.clone(),
+                        names: added,
+                    });
+                }
+            }
             if names.is_empty() {
                 self.rules.ignored.remove(&folder);
             } else {
@@ -473,15 +486,24 @@ impl<'r> Pending<'r> {
         self.rules.search.held.keys()
     }
 
-    pub(crate) fn cover(&mut self, scopes: &[PathBuf]) -> Seeded {
+    pub(crate) fn cover(&mut self, scopes: &[PathBuf], unread: &[PathBuf]) -> Seeded {
         let search = &mut self.rules.search;
         let seeded = Seeded {
             scanned: search.scanned.clone(),
             reseeded: search.reseeded.clone(),
         };
+        let under =
+            |path: &Path, paths: &[PathBuf]| paths.iter().any(|above| path.starts_with(above));
+        let still: Vec<PathBuf> = (unread.iter())
+            .filter(|path| seeded.unscanned(path))
+            .chain(seeded.reseeded.iter().filter(|path| under(path, unread)))
+            .cloned()
+            .collect();
         search.scanned.extend(scopes.iter().cloned());
         search.scanned = crate::outermost(std::mem::take(&mut search.scanned));
-        (search.reseeded).retain(|path| !scopes.iter().any(|scope| path.starts_with(scope)));
+        search.reseeded.retain(|path| !under(path, scopes));
+        search.reseeded.extend(still);
+        search.reseeded = crate::outermost(std::mem::take(&mut search.reseeded));
         seeded
     }
 

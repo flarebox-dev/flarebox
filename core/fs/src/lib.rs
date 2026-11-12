@@ -588,7 +588,8 @@ impl Snapshot {
     /// search run to its end, so the removal is reported first. The first
     /// rescan of a path with new `rules` also runs the search to its end for
     /// each entry there whose path now holds another identity, so a removal
-    /// another watcher held is not read as a replacement. A held entry whose
+    /// another watcher held is not read as a replacement; a path below a
+    /// folder the rescan cannot read is not counted as scanned. A held entry whose
     /// removal the scan cannot confirm, as below a folder it cannot read,
     /// stays held.
     ///
@@ -837,6 +838,10 @@ impl Snapshot {
         let mut changes = diff(&old, &scan.new);
         if let Some(rules) = &mut scan.rules {
             rules.settle();
+            let unread: Vec<PathBuf> = (unreadable.iter().chain(&unsettled).chain(&stays))
+                .cloned()
+                .collect();
+            let earlier = rules.cover(&scan.replaced, &unread);
             let held = rules.take_held(&scan.replaced, &stays);
             find_ignored(
                 &mut changes,
@@ -846,6 +851,7 @@ impl Snapshot {
                     rest: &self.entries,
                 },
                 held,
+                &earlier,
                 rules,
                 &scan.replaced,
                 again.as_fd(),
@@ -1206,6 +1212,7 @@ fn find_ignored(
     changes: &mut Vec<Change>,
     trees: Trees<'_>,
     held: BTreeMap<PathBuf, Entry>,
+    earlier: &Seeded,
     rules: &mut Pending<'_>,
     scopes: &[PathBuf],
     root: BorrowedFd<'_>,
@@ -1234,7 +1241,14 @@ fn find_ignored(
         *changes = diff(&merged, new);
         &merged
     };
-    hold_back(changes, Trees { old, new, rest }, rules, scopes, root);
+    hold_back(
+        changes,
+        Trees { old, new, rest },
+        earlier,
+        rules,
+        scopes,
+        root,
+    );
     for change in changes.iter_mut() {
         match change {
             Change::Removed { path, .. }
@@ -1257,12 +1271,12 @@ fn unaside(path: &Path) -> PathBuf {
 fn hold_back(
     changes: &mut Vec<Change>,
     trees: Trees<'_>,
+    earlier: &Seeded,
     rules: &mut Pending<'_>,
     scopes: &[PathBuf],
     root: BorrowedFd<'_>,
 ) {
     let Trees { old, new, rest } = trees;
-    let earlier = rules.cover(scopes);
     let replaced: BTreeSet<PathBuf> = (changes.iter())
         .filter_map(|change| match change {
             Change::Modified { path }
@@ -2191,7 +2205,7 @@ pub use effect::{
     Action, Contents, Displaced, Effect, Outcome, QUARANTINE_DIR, Reason, STAGING_DIR, Step,
 };
 pub use ignore::{Ignore, Ignored, RULES_FILE, Rules};
-use ignore::{Key, Pending, RulesRead, Wanted};
+use ignore::{Key, Pending, RulesRead, Seeded, Wanted};
 pub use recovered::{recovered_name, utc_date};
 pub use resolve::{Base, Dir, Folder, Location, PARKED_DIR, Space, Unresolved};
 pub use root::{
