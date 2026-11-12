@@ -2386,6 +2386,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_file_renamed_to_its_own_path_out_of_a_replaced_folder_keeps_its_node() {
+        let (_dir, mut engine) = mapper();
+        let folder = |path: &str, id: u64| Observed::Created {
+            path: path.into(),
+            kind: EntryKind::Dir,
+            id: ino(id),
+            linked: false,
+            content: None,
+        };
+        engine.observe(&[folder("d", 1), created("d/x", ino(2), false, 1)], 0);
+        let (before, _, _) = holding(&engine, "d/x").unwrap();
+        engine.observe(
+            &[
+                Observed::Removed {
+                    path: "d".into(),
+                    kind: EntryKind::Dir,
+                },
+                renamed("d/x", "d/x", ino(2), false),
+                folder("d", 3),
+            ],
+            0,
+        );
+        let (after, _, _) = holding(&engine, "d/x").unwrap();
+        assert_eq!(after, before);
+        assert_ne!(holding(&engine, "d"), None);
+    }
+
     /// The scan reports a folder removed and entries renamed out of it in one batch, as it can for `rm -r b && mv a
     /// b` (GUN-353). The entries keep their nodes, with what L holds below them, and only the folder leaves L.
     #[test]

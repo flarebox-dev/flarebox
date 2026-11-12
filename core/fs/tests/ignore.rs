@@ -823,6 +823,169 @@ fn a_reset_over_a_held_path_then_a_new_file_there_keeps_the_move() {
 }
 
 #[test]
+fn a_folder_replaced_while_held_keeps_the_file_returned_to_it() {
+    let dir = large_ignored_tree();
+    let root = dir.path();
+    write(root, "d/x", "x");
+    let mut rules = rules().with_search_budget(100);
+    let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
+    fs::rename(root.join("d"), root.join("ig/zz/deep/d")).unwrap();
+    let first = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert_eq!(first.unsettled, [PathBuf::from("d")]);
+    fs::create_dir(root.join("d")).unwrap();
+    fs::rename(root.join("ig/zz/deep/d/x"), root.join("d/x")).unwrap();
+    fs::remove_dir(root.join("ig/zz/deep/d")).unwrap();
+
+    let mut changes = Vec::new();
+    for _ in 0..10 {
+        let rescan = snapshot.rescan_with_rules(root, whole(), &mut rules);
+        changes.extend(rescan.unwrap().changes);
+    }
+    assert_eq!(
+        changes,
+        [
+            removed("d", Dir),
+            Change::Renamed {
+                from: "d/x".into(),
+                to: "d/x".into(),
+                kind: File,
+            },
+            created("d", Dir),
+        ]
+    );
+}
+
+#[test]
+fn a_file_replaced_by_a_folder_renamed_onto_it_keeps_the_folder() {
+    let dir = large_ignored_tree();
+    let root = dir.path();
+    write(root, "a", "a");
+    write(root, "b/c", "c");
+    let mut rules = rules().with_search_budget(100);
+    let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
+    fs::remove_file(root.join("a")).unwrap();
+    fs::rename(root.join("b"), root.join("a")).unwrap();
+
+    let mut changes = Vec::new();
+    for _ in 0..10 {
+        let rescan = snapshot.rescan_with_rules(root, whole(), &mut rules);
+        changes.extend(rescan.unwrap().changes);
+    }
+    assert_eq!(
+        changes,
+        [
+            removed("a", File),
+            Change::Renamed {
+                from: "b".into(),
+                to: "a".into(),
+                kind: Dir,
+            },
+        ]
+    );
+}
+
+#[test]
+fn a_walk_under_way_looks_in_a_folder_the_rules_leave_out_since_it_began() {
+    let dir = large_ignored_tree();
+    let root = dir.path();
+    write(root, "f.txt", "f");
+    write(root, "ig2/keep.txt", "k");
+    let mut rules = rules().with_search_budget(100);
+    let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
+    let id = snapshot.entries[Path::new("f.txt")].id;
+    fs::rename(root.join("f.txt"), root.join("ig/zz/deep/f.txt")).unwrap();
+    let first = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert_eq!(first.unsettled, [PathBuf::from("f.txt")]);
+    write(root, RULES_FILE, "ig/\nig2/\n");
+    fs::rename(root.join("ig/zz/deep/f.txt"), root.join("ig2/f.txt")).unwrap();
+
+    let mut changes = Vec::new();
+    for _ in 0..10 {
+        let rescan = snapshot.rescan_with_rules(root, whole(), &mut rules);
+        changes.extend(rescan.unwrap().changes);
+    }
+    assert!(
+        changes.contains(&Change::Ignored {
+            from: "f.txt".into(),
+            to: "ig2/f.txt".into(),
+            kind: File,
+            id,
+        }),
+        "{changes:?}"
+    );
+}
+
+#[test]
+fn a_held_path_in_a_folder_the_scan_cannot_read_stays_unscanned() {
+    use std::os::unix::fs::PermissionsExt;
+    for reset in [true, false] {
+        let dir = large_ignored_tree();
+        let root = dir.path();
+        write(root, "d/f.txt", "old");
+        let mut held = rules().with_search_budget(100);
+        let start = Snapshot::scan_with_rules(root, &mut held).unwrap();
+        let id = start.entries[Path::new("d/f.txt")].id;
+        let known: BTreeMap<PathBuf, Known> = (start.entries.iter())
+            .filter(|(path, _)| path.starts_with("d"))
+            .map(|(path, entry)| {
+                let known = Known {
+                    kind: entry.kind,
+                    id: entry.id,
+                };
+                (path.clone(), known)
+            })
+            .collect();
+        let mut a = RescanWatcher::with_rules(root, start, Duration::ZERO, held).unwrap();
+        fs::rename(root.join("d/f.txt"), root.join("ig/zz/deep/f.txt")).unwrap();
+        let poll = a.poll(Duration::ZERO).unwrap();
+        assert_eq!(poll.pending, [PathBuf::from("d/f.txt")]);
+        let mut watcher = match reset {
+            true => {
+                a.reset(Path::new("d"), known);
+                a
+            }
+            false => {
+                let fresh = rules().with_search_budget(100);
+                RescanWatcher::with_rules(root, a.snapshot().clone(), Duration::ZERO, fresh)
+                    .unwrap()
+            }
+        };
+        write(root, "d/f.txt", "new");
+        fs::set_permissions(root.join("d"), fs::Permissions::from_mode(0o000)).unwrap();
+        let mut changes = Vec::new();
+        for _ in 0..3 {
+            changes.extend(watcher.poll(Duration::ZERO).unwrap().changes);
+        }
+        fs::set_permissions(root.join("d"), fs::Permissions::from_mode(0o755)).unwrap();
+        for _ in 0..10 {
+            let poll = watcher.poll(Duration::ZERO).unwrap();
+            changes.extend(poll.changes);
+            if poll.pending.is_empty() && changes.len() >= 2 {
+                break;
+            }
+        }
+        changes.sort_by_key(|change| matches!(change, Change::Ignored { .. }));
+        assert_eq!(
+            changes,
+            [
+                created("d/f.txt", File),
+                Change::Ignored {
+                    from: "d/f.txt".into(),
+                    to: "ig/zz/deep/f.txt".into(),
+                    kind: File,
+                    id,
+                },
+            ],
+            "reset {reset}"
+        );
+    }
+}
+
+#[test]
 fn a_folder_removed_while_the_search_for_its_file_runs_is_removed() {
     let dir = large_ignored_tree();
     let root = dir.path();
