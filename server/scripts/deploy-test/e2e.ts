@@ -295,10 +295,10 @@ async function startDaemon(on: Device): Promise<void> {
   const daemon = spawn(env("KOI"), ["_daemon"], { env: { ...on.env, KOIDRIVE_LOG: "info,koidrive_driver=debug,koidrive_engine=debug" }, detached: true, stdio: ["ignore", log, log] });
   daemon.unref();
   writeFileSync(join(on.dir, "daemon.pid"), String(daemon.pid));
-  const socket = join(on.env.XDG_RUNTIME_DIR!, "koidrive", "daemon.sock");
+  const runtime = join(on.env.XDG_RUNTIME_DIR!, "koidrive");
   await until(on.name + "'s daemon to answer", 30_000, () => {
     if (daemon.exitCode !== null) fail(on.name + "'s daemon exited with " + daemon.exitCode + ": " + readFileSync(join(on.dir, "daemon.log"), "utf8").slice(-2000));
-    if (!existsSync(socket)) return undefined;
+    if (!existsSync(runtime) || !readdirSync(runtime).some((name) => /^daemon-[0-9a-f]{8}\.sock$/.test(name))) return undefined;
     try {
       return (JSON.parse(koi(on, ["status", "--json"], null)) as { data: { running: boolean } }).data.running ? true : undefined;
     } catch {

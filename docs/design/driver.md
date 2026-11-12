@@ -31,7 +31,7 @@ A profile is one device credential and the stores it writes. The CLI uses the XD
 | `…/credential.next` (mode 0600) | Only while a rotation's outcome is unknown: the refresh credential the device proposed and its deadline (RFC 0011 §2, docs/design/credential-rotation.md). Excluded from Time Machine like `credential.json` |
 | `…/lock` | The profile lock (`flock`), held by the one process that writes the profile |
 | `…/spaces/<space_id>/store.sqlite` | One `core/store` per linked space: R, S, L, the cursor, the link and the questions |
-| `$XDG_RUNTIME_DIR/koidrive/daemon.sock` (mode 0600) | The daemon's socket; in the state directory when `XDG_RUNTIME_DIR` is unset |
+| `$XDG_RUNTIME_DIR/koidrive/daemon-<hash>.sock` (mode 0600) | The daemon's socket, named with a hash of the state directory; `daemon.sock` in the state directory when `XDG_RUNTIME_DIR` is unset |
 | `<folder>/.koidrive/` | Inside each linked folder: the root marker `space.json`, the owner record `device.json` and, from part 2, staging, quarantine, parked entries and the local trash |
 
 **One credential, one writer (H6 of reports/BOX-71).** Same-device changes never count as unseen on the server, and `device_seq` is strict, so two writers sharing a credential would overwrite each other silently or refuse each other's commits. The driver keeps the rule in five places:

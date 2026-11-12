@@ -110,3 +110,37 @@ fn the_daemon_under_json_prints_its_lifecycle_as_json_lines() {
         assert!(log.get("level").is_some(), "{line}");
     }
 }
+
+#[test]
+fn profiles_that_share_a_runtime_directory_run_daemons_side_by_side() {
+    let home = tempfile::tempdir().unwrap();
+    let start = |profile: &str| {
+        let mut daemon = Command::new(env!("CARGO_BIN_EXE_koi"))
+            .args(["_daemon", "--json"])
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join(profile).join("config"))
+            .env("XDG_STATE_HOME", home.path().join(profile).join("state"))
+            .env("XDG_RUNTIME_DIR", home.path().join("run"))
+            .env_remove("KOIDRIVE_LOG")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("run koi");
+        let mut stdout = BufReader::new(daemon.stdout.take().unwrap());
+        let mut started = String::new();
+        stdout.read_line(&mut started).unwrap();
+        let started: serde_json::Value = serde_json::from_str(&started).unwrap();
+        let socket = started["socket"].as_str().unwrap().to_owned();
+        (daemon, stdout, socket)
+    };
+    let (mut work, _work_out, work_socket) = start("work");
+    let (mut personal, _personal_out, personal_socket) = start("personal");
+    assert_ne!(work_socket, personal_socket);
+    for socket in [&work_socket, &personal_socket] {
+        assert!(std::path::Path::new(socket).exists(), "{socket}");
+    }
+    for daemon in [&mut work, &mut personal] {
+        daemon.kill().unwrap();
+        daemon.wait().unwrap();
+    }
+}

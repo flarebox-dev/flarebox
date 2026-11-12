@@ -77,7 +77,20 @@ impl Paths {
     }
 
     pub fn socket(&self) -> PathBuf {
-        self.runtime_dir.join("daemon.sock")
+        match self.runtime_dir == self.state_dir {
+            true => self.runtime_dir.join("daemon.sock"),
+            false => (self.runtime_dir).join(format!("daemon-{}.sock", self.state_key())),
+        }
+    }
+
+    /// A short hash of the state directory. It names the profile's socket in a shared runtime directory and its
+    /// background service.
+    pub fn state_key(&self) -> String {
+        let hash = (self.state_dir.as_os_str().as_encoded_bytes().iter())
+            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+            });
+        format!("{:08x}", hash >> 32)
     }
 
     pub fn spaces(&self) -> PathBuf {
@@ -158,7 +171,26 @@ mod tests {
         );
         assert_eq!(
             paths.socket(),
-            Path::new("/run/user/1000/koidrive/daemon.sock")
+            Path::new("/run/user/1000/koidrive").join(format!("daemon-{}.sock", paths.state_key()))
+        );
+    }
+
+    #[test]
+    fn profiles_that_share_a_runtime_directory_get_sockets_of_their_own() {
+        let profile = |state: &'static str| {
+            Paths::from_vars(vars(&[
+                ("HOME", "/home/ada"),
+                ("XDG_STATE_HOME", state),
+                ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ]))
+            .unwrap()
+        };
+        let (work, personal) = (profile("/srv/work"), profile("/srv/personal"));
+        assert_ne!(work.socket(), personal.socket());
+        assert_eq!(work.socket(), profile("/srv/work").socket());
+        assert_eq!(
+            work.socket().parent(),
+            Some(Path::new("/run/user/1000/koidrive"))
         );
     }
 
