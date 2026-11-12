@@ -7312,7 +7312,10 @@ fn a_folder_that_returns_from_a_path_the_rules_exclude_keeps_its_node() {
         (&["docs/sub/y.txt"], "docs/sub", "sub"),
         (&["docs/sub/deep/y.txt", "b/z.txt"], "docs/sub", "b/sub"),
     ];
-    for (made, from, to) in cases {
+    for ((made, from, to), lifted) in cases
+        .into_iter()
+        .flat_map(|case| [(case, false), (case, true)])
+    {
         let mut remote = Remote::new();
         let (site, mut b) = linked(&mut remote, "b");
         for file in made {
@@ -7329,6 +7332,9 @@ fn a_folder_that_returns_from_a_path_the_rules_exclude_keeps_its_node() {
         }
         let before = remote.tree();
         assert!(before.contains_key(from), "{from} is synced: {before:?}");
+        if lifted {
+            fs::write(site.root.join(".koiignore"), b"").unwrap();
+        }
         fs::rename(site.root.join(from), site.root.join(to)).unwrap();
         for _ in 0..3 {
             b.scan(Duration::from_millis(300));
@@ -7343,6 +7349,44 @@ fn a_folder_that_returns_from_a_path_the_rules_exclude_keeps_its_node() {
         let expected: BTreeMap<String, String> = (before.iter())
             .map(|(path, id)| (moved(path), id.clone()))
             .collect();
-        assert_eq!(remote.tree(), expected, "{from} -> {to}");
+        assert_eq!(
+            remote.tree(),
+            expected,
+            "{from} -> {to}, rule lifted: {lifted}"
+        );
     }
+}
+
+#[test]
+fn a_held_folder_renamed_while_another_devices_rule_lets_it_in_stays_held() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("notes.txt"), b"written on a");
+    let site = Site::new(&remote, "b");
+    fs::create_dir(site.root.join("held")).unwrap();
+    fs::write(site.root.join("held/a.txt"), b"inside").unwrap();
+    let mut b = site.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    a.create(&mut remote, &site_a.root.join(".koiignore"), b"held/\n");
+    b.pull(&remote);
+    b.run(&mut remote);
+    b.scan_until(|b| !b.folder.disk.awaits_rules());
+    b.run(&mut remote);
+    a.create(&mut remote, &site_a.root.join(".koiignore"), b"other.txt\n");
+    fs::rename(site.root.join("held"), site.root.join("open")).unwrap();
+    b.pull(&remote);
+    b.run(&mut remote);
+    b.scan_until(|b| !b.folder.disk.awaits_rules());
+    for _ in 0..3 {
+        b.scan(Duration::from_millis(300));
+        b.run(&mut remote);
+        b.settle();
+        b.run(&mut remote);
+    }
+    assert_eq!(remote.names(), [".koiignore", "notes.txt"]);
+    assert_eq!(b.folder.view().questions, 1);
 }
