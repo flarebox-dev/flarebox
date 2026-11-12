@@ -748,6 +748,9 @@ impl<'a> View<'a> {
                 _ => Step::Skip,
             };
         }
+        if self.trees.edited(id) && self.trees.ignored_in_remote(id) {
+            return Step::Skip;
+        }
         if !local.parked
             && local.shape.parent == remote.parent
             && name_key(&local.shape.name) == name_key(&remote.name)
