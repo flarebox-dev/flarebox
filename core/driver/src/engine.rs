@@ -2203,11 +2203,57 @@ mod tests {
         Some((id, node.identity, size))
     }
 
-    #[test]
-    fn a_file_removed_from_a_folder_renamed_while_the_search_runs_leaves_l() {
+    fn observe_rescan(
+        engine: &mut Engine,
+        snapshot: &mut Snapshot,
+        root: &Path,
+        rules: &mut koidrive_fs::Rules,
+    ) -> Vec<PathBuf> {
+        let rescan = snapshot
+            .rescan_with_rules(root, [PathBuf::new()], rules)
+            .unwrap();
+        let entry = |path: &Path| snapshot.entries[path];
+        let batch: Vec<Observed> = (rescan.changes.into_iter())
+            .map(|change| match change {
+                Change::Created { path, kind } => Observed::Created {
+                    content: (kind == EntryKind::File).then(|| bytes(entry(&path).size)),
+                    id: entry(&path).id,
+                    linked: false,
+                    path,
+                    kind,
+                },
+                Change::Modified { path } => Observed::Modified {
+                    content: Some(bytes(entry(&path).size)),
+                    id: entry(&path).id,
+                    linked: false,
+                    path,
+                },
+                Change::Renamed { from, to, kind } => Observed::Renamed {
+                    id: entry(&to).id,
+                    linked: false,
+                    from,
+                    to,
+                    kind,
+                },
+                Change::Ignored { from, to, kind, id } => Observed::Renamed {
+                    from,
+                    to,
+                    kind,
+                    id,
+                    linked: false,
+                },
+                Change::Removed { path, kind } => Observed::Removed { path, kind },
+            })
+            .collect();
+        engine.observe(&batch, 0);
+        rescan.unsettled
+    }
+
+    fn tree_with_a_large_ignored_folder() -> (tempfile::TempDir, PathBuf) {
         let outer = tempfile::tempdir().unwrap();
         let root = outer.path().join("space");
-        fs::create_dir_all(root.join("d")).unwrap();
+        fs::create_dir_all(root.join("d/sub")).unwrap();
+        fs::create_dir_all(root.join("ig/zz/deep")).unwrap();
         fs::write(root.join(koidrive_fs::RULES_FILE), "ig/\n").unwrap();
         for n in 0..30 {
             fs::create_dir_all(root.join(format!("ig/{n:02}"))).unwrap();
@@ -2216,57 +2262,28 @@ mod tests {
             }
         }
         fs::write(root.join("d/x.txt"), "x").unwrap();
-        fs::write(root.join("d/y.txt"), "y").unwrap();
+        fs::write(root.join("d/y.txt"), "yy").unwrap();
+        fs::write(root.join("d/sub/z.txt"), "zzz").unwrap();
+        (outer, root)
+    }
+
+    fn search_rules(budget: usize) -> koidrive_fs::Rules {
         let device: std::sync::Arc<dyn crate::ignore::Matcher> =
             std::sync::Arc::new(crate::ignore::Unfiltered);
-        let mut rules = crate::ignore::scan_rules(&device).with_search_budget(100);
+        crate::ignore::scan_rules(&device).with_search_budget(budget)
+    }
+
+    #[test]
+    fn a_file_removed_from_a_folder_renamed_while_the_search_runs_leaves_l() {
+        let (_outer, root) = tree_with_a_large_ignored_folder();
+        let mut rules = search_rules(100);
         let mut snapshot = Snapshot::default();
         let (_dir, mut engine) = mapper();
-        let mut step = |snapshot: &mut Snapshot, engine: &mut Engine| {
-            let rescan = snapshot
-                .rescan_with_rules(&root, [PathBuf::new()], &mut rules)
-                .unwrap();
-            let entry = |path: &Path| snapshot.entries[path];
-            let batch: Vec<Observed> = (rescan.changes.into_iter())
-                .map(|change| match change {
-                    Change::Created { path, kind } => Observed::Created {
-                        content: (kind == EntryKind::File).then(|| bytes(entry(&path).size)),
-                        id: entry(&path).id,
-                        linked: false,
-                        path,
-                        kind,
-                    },
-                    Change::Modified { path } => Observed::Modified {
-                        content: Some(bytes(entry(&path).size)),
-                        id: entry(&path).id,
-                        linked: false,
-                        path,
-                    },
-                    Change::Renamed { from, to, kind } => Observed::Renamed {
-                        id: entry(&to).id,
-                        linked: false,
-                        from,
-                        to,
-                        kind,
-                    },
-                    Change::Ignored { from, to, kind, id } => Observed::Renamed {
-                        from,
-                        to,
-                        kind,
-                        id,
-                        linked: false,
-                    },
-                    Change::Removed { path, kind } => Observed::Removed { path, kind },
-                })
-                .collect();
-            engine.observe(&batch, 0);
-            rescan.unsettled
-        };
-        step(&mut snapshot, &mut engine);
+        observe_rescan(&mut engine, &mut snapshot, &root, &mut rules);
         fs::remove_file(root.join("d/x.txt")).unwrap();
         fs::rename(root.join("d"), root.join("e")).unwrap();
         let mut rescans = 0;
-        while !step(&mut snapshot, &mut engine).is_empty() {
+        while !observe_rescan(&mut engine, &mut snapshot, &root, &mut rules).is_empty() {
             rescans += 1;
             assert!(rescans < 30, "the search never ended");
         }
@@ -2274,6 +2291,145 @@ mod tests {
         assert!(rescans > 0);
         assert!(holding(&engine, "e/x.txt").is_none());
         assert!(holding(&engine, "e/y.txt").is_some());
+    }
+
+    #[test]
+    fn a_bounded_search_leaves_l_as_an_unbounded_one_does() {
+        type Setup = fn(&Path);
+        let none: Option<Setup> = None;
+        let scenarios: [(&str, Setup, Option<Setup>); 10] = [
+            (
+                "rm x, mv d e",
+                |root| {
+                    fs::remove_file(root.join("d/x.txt")).unwrap();
+                    fs::rename(root.join("d"), root.join("e")).unwrap();
+                },
+                none,
+            ),
+            (
+                "x into ig, mv d e",
+                |root| {
+                    fs::rename(root.join("d/x.txt"), root.join("ig/zz/deep/x.txt")).unwrap();
+                    fs::rename(root.join("d"), root.join("e")).unwrap();
+                },
+                none,
+            ),
+            (
+                "rm x, mv d e, mv e/y e/x",
+                |root| {
+                    fs::remove_file(root.join("d/x.txt")).unwrap();
+                    fs::rename(root.join("d"), root.join("e")).unwrap();
+                    fs::rename(root.join("e/y.txt"), root.join("e/x.txt")).unwrap();
+                },
+                none,
+            ),
+            (
+                "x into ig, mv d e, mv e/y e/x",
+                |root| {
+                    fs::rename(root.join("d/x.txt"), root.join("ig/zz/deep/x.txt")).unwrap();
+                    fs::rename(root.join("d"), root.join("e")).unwrap();
+                    fs::rename(root.join("e/y.txt"), root.join("e/x.txt")).unwrap();
+                },
+                none,
+            ),
+            (
+                "mv d/y f, d into ig",
+                |root| {
+                    fs::create_dir_all(root.join("f")).unwrap();
+                    fs::rename(root.join("d/y.txt"), root.join("f/y.txt")).unwrap();
+                    fs::rename(root.join("d"), root.join("ig/zz/deep/d")).unwrap();
+                },
+                none,
+            ),
+            (
+                "rm z, mv d/sub d/sub2, mv d e",
+                |root| {
+                    fs::remove_file(root.join("d/sub/z.txt")).unwrap();
+                    fs::rename(root.join("d/sub"), root.join("d/sub2")).unwrap();
+                    fs::rename(root.join("d"), root.join("e")).unwrap();
+                },
+                none,
+            ),
+            (
+                "x into ig, new d/x",
+                |root| {
+                    fs::rename(root.join("d/x.txt"), root.join("ig/zz/deep/x.txt")).unwrap();
+                    fs::write(root.join("d/x.txt"), "new").unwrap();
+                },
+                none,
+            ),
+            (
+                "x into ig, then new d/x",
+                |root| fs::rename(root.join("d/x.txt"), root.join("ig/zz/deep/x.txt")).unwrap(),
+                Some(|root| fs::write(root.join("d/x.txt"), "new").unwrap()),
+            ),
+            (
+                "x into ig, then mv d e, new e/x",
+                |root| fs::rename(root.join("d/x.txt"), root.join("ig/zz/deep/x.txt")).unwrap(),
+                Some(|root| {
+                    fs::rename(root.join("d"), root.join("e")).unwrap();
+                    fs::write(root.join("e/x.txt"), "new").unwrap();
+                }),
+            ),
+            (
+                "x into ig, mv d/sub/z d/x, d/sub into ig",
+                |root| {
+                    fs::rename(root.join("d/x.txt"), root.join("ig/zz/deep/x.txt")).unwrap();
+                    fs::rename(root.join("d/sub/z.txt"), root.join("d/x.txt")).unwrap();
+                    fs::rename(root.join("d/sub"), root.join("ig/zz/deep/sub")).unwrap();
+                },
+                none,
+            ),
+        ];
+        for (name, setup, then) in scenarios {
+            let outcomes: Vec<Vec<String>> = [usize::MAX, 100]
+                .into_iter()
+                .map(|budget| {
+                    let (_outer, root) = tree_with_a_large_ignored_folder();
+                    let mut rules = search_rules(budget);
+                    let mut snapshot = Snapshot::default();
+                    let (_dir, mut engine) = mapper();
+                    observe_rescan(&mut engine, &mut snapshot, &root, &mut rules);
+                    let names: BTreeMap<u64, PathBuf> = (snapshot.entries.iter())
+                        .map(|(path, entry)| (entry.id.ino, path.clone()))
+                        .collect();
+                    let local: Vec<_> = (engine.trees.local().iter())
+                        .map(|(id, node)| (id.clone(), node.shape.clone()))
+                        .collect();
+                    for (id, shape) in local {
+                        engine.trees.set_synced(id, Some(shape));
+                    }
+                    setup(&root);
+                    if let Some(then) = then {
+                        observe_rescan(&mut engine, &mut snapshot, &root, &mut rules);
+                        then(&root);
+                    }
+                    for _ in 0..40 {
+                        if observe_rescan(&mut engine, &mut snapshot, &root, &mut rules).is_empty()
+                        {
+                            break;
+                        }
+                    }
+                    let mut nodes: Vec<String> = (engine.trees.local().iter())
+                        .map(|(id, node)| {
+                            format!(
+                                "{:?} {:?} {} {}",
+                                engine.path_of(id),
+                                names.get(&node.identity.ino),
+                                node.shape
+                                    .content
+                                    .as_ref()
+                                    .map_or(0, |content| content.size),
+                                engine.trees.excluded(id)
+                            )
+                        })
+                        .collect();
+                    nodes.sort();
+                    nodes
+                })
+                .collect();
+            assert_eq!(outcomes[0], outcomes[1], "{name}");
+        }
     }
 
     /// The scan reports a folder removed and entries renamed out of it in one batch, as it can for `rm -r b && mv a

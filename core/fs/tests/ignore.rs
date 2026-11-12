@@ -3,9 +3,10 @@
 //! Scans and watchers that apply the rules of design §5.10, with the matcher
 //! of `koidrive-ignore` over the engine's name key.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -464,7 +465,7 @@ fn a_search_through_a_large_ignored_folder_goes_on_across_rescans() {
                 break rescan.changes;
             }
             assert_eq!(rescan.unsettled, [PathBuf::from(gone)], "{gone}");
-            assert!(snapshot.entries.contains_key(Path::new(gone)), "{gone}");
+            assert!(!snapshot.entries.contains_key(Path::new(gone)), "{gone}");
             paths = rescan.unsettled;
         };
         assert!(rescans > 2, "{gone}: {rescans} rescans");
@@ -511,7 +512,7 @@ fn a_file_removed_from_a_folder_renamed_while_the_search_runs_waits_at_its_new_p
             .map(str::to_owned)
             .collect()
     };
-    assert_eq!(outside(&snapshot), ["e", "e/x.txt", "e/y.txt"]);
+    assert_eq!(outside(&snapshot), ["e", "e/y.txt"]);
 
     let mut paths = rescan.unsettled;
     let changes = loop {
@@ -639,6 +640,149 @@ fn a_file_moved_out_of_a_folder_moved_into_an_ignored_folder_is_renamed() {
     );
 }
 
+#[test]
+fn a_new_entry_at_the_path_of_a_deferred_move_into_an_ignored_folder_keeps_the_move() {
+    for (deferred, renamed) in [(true, false), (true, true), (false, true)] {
+        let dir = large_ignored_tree();
+        let root = dir.path();
+        write(root, "d/f.txt", "old");
+        let mut rules = rules().with_search_budget(100);
+        let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
+        let id = snapshot.entries[Path::new("d/f.txt")].id;
+        fs::rename(root.join("d/f.txt"), root.join("ig/zz/deep/f.txt")).unwrap();
+        if deferred {
+            let rescan = snapshot
+                .rescan_with_rules(root, whole(), &mut rules)
+                .unwrap();
+            assert_eq!(rescan.unsettled, [PathBuf::from("d/f.txt")]);
+        }
+        let at = if renamed {
+            fs::rename(root.join("d"), root.join("e")).unwrap();
+            "e/f.txt"
+        } else {
+            "d/f.txt"
+        };
+        write(root, at, "new");
+
+        let rescan = snapshot
+            .rescan_with_rules(root, whole(), &mut rules)
+            .unwrap();
+        let mut expected = vec![Change::Ignored {
+            from: "d/f.txt".into(),
+            to: "ig/zz/deep/f.txt".into(),
+            kind: File,
+            id,
+        }];
+        if renamed {
+            expected.push(Change::Renamed {
+                from: "d".into(),
+                to: "e".into(),
+                kind: Dir,
+            });
+        }
+        expected.push(created(at, File));
+        assert_eq!(rescan.changes, expected, "{deferred} {renamed}");
+        assert_eq!(rescan.unsettled, [] as [PathBuf; 0]);
+    }
+}
+
+#[test]
+fn a_rename_onto_the_new_path_of_a_removal_keeps_the_renamed_file() {
+    for into_ignored in [false, true] {
+        let dir = large_ignored_tree();
+        let root = dir.path();
+        write(root, "d/x.txt", "x");
+        write(root, "d/y.txt", "yy");
+        let mut rules = rules().with_search_budget(100);
+        let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
+        let id = snapshot.entries[Path::new("d/x.txt")].id;
+        if into_ignored {
+            fs::rename(root.join("d/x.txt"), root.join("ig/zz/deep/x.txt")).unwrap();
+        } else {
+            fs::remove_file(root.join("d/x.txt")).unwrap();
+        }
+        fs::rename(root.join("d"), root.join("e")).unwrap();
+        fs::rename(root.join("e/y.txt"), root.join("e/x.txt")).unwrap();
+
+        let rescan = snapshot
+            .rescan_with_rules(root, whole(), &mut rules)
+            .unwrap();
+        let gone = match into_ignored {
+            true => Change::Ignored {
+                from: "d/x.txt".into(),
+                to: "ig/zz/deep/x.txt".into(),
+                kind: File,
+                id,
+            },
+            false => removed("d/x.txt", File),
+        };
+        assert_eq!(
+            rescan.changes,
+            [
+                gone,
+                Change::Renamed {
+                    from: "d".into(),
+                    to: "e".into(),
+                    kind: Dir,
+                },
+                Change::Renamed {
+                    from: "d/y.txt".into(),
+                    to: "e/x.txt".into(),
+                    kind: File,
+                },
+            ],
+            "{into_ignored}"
+        );
+        assert_eq!(rescan.unsettled, [] as [PathBuf; 0]);
+    }
+}
+
+#[test]
+fn a_file_moved_over_another_out_of_a_deferred_folder_leaves_with_the_folder() {
+    let dir = large_ignored_tree();
+    let root = dir.path();
+    write(root, "b/c/2.txt", "2");
+    write(root, "top.txt", "top");
+    let mut rules = rules().with_search_budget(100);
+    let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
+    let id = snapshot.entries[Path::new("b/c")].id;
+    fs::rename(root.join("top.txt"), root.join("ig/zz/deep/top.txt")).unwrap();
+    fs::rename(root.join("b/c/2.txt"), root.join("top.txt")).unwrap();
+    fs::rename(root.join("b/c"), root.join("ig/zz/deep/c")).unwrap();
+
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert_eq!(
+        rescan.changes,
+        [Change::Modified {
+            path: "top.txt".into()
+        }]
+    );
+    assert_eq!(rescan.unsettled, [PathBuf::from("b/c")]);
+    assert_eq!(known(&snapshot), [RULES_FILE, "b", "top.txt"]);
+
+    let mut paths = rescan.unsettled;
+    let changes = loop {
+        let rescan = snapshot.rescan_with_rules(root, paths, &mut rules).unwrap();
+        if !rescan.changes.is_empty() {
+            assert_eq!(rescan.unsettled, [] as [PathBuf; 0]);
+            break rescan.changes;
+        }
+        paths = rescan.unsettled;
+    };
+    assert_eq!(
+        changes,
+        [Change::Ignored {
+            from: "b/c".into(),
+            to: "ig/zz/deep/c".into(),
+            kind: Dir,
+            id,
+        }]
+    );
+}
+
+#[derive(Default)]
 struct Random(u64);
 
 impl Random {
@@ -666,64 +810,124 @@ fn listed(root: &Path, under: &Path, into: &mut Vec<(PathBuf, bool)>) {
     }
 }
 
-fn change_tree(root: &Path, random: &mut Random, fresh: &mut usize) {
+fn on_disk(root: &Path) -> BTreeSet<(u64, u64)> {
     let mut all = Vec::new();
     listed(root, Path::new(""), &mut all);
-    let included: Vec<(PathBuf, bool)> = (all.iter())
-        .filter(|(path, _)| !path.starts_with("ig") && path != Path::new(RULES_FILE))
-        .cloned()
-        .collect();
-    let folders = |within: &str| -> Vec<PathBuf> {
-        (all.iter())
-            .filter(|(path, dir)| *dir && (path.starts_with("ig") == (within == "ig")))
-            .map(|(path, _)| path.clone())
-            .chain((within != "ig").then(PathBuf::new))
-            .collect()
-    };
-    *fresh += 1;
-    let name = format!("n{fresh}");
-    let moved = |from: &Path, into: &Path| {
-        if !into.starts_with(from) {
-            fs::rename(root.join(from), root.join(into).join(&name)).ok();
-        }
-    };
-    match random.below(6) {
-        0 => {
-            if let Some((path, false)) = random.pick(&included) {
-                fs::remove_file(root.join(path)).unwrap();
-            }
-        }
-        1 => {
-            if let Some((path, true)) = random.pick(&included) {
-                fs::remove_dir_all(root.join(path)).unwrap();
-            }
-        }
-        2 => {
-            if let (Some((from, _)), Some(into)) =
-                (random.pick(&included), random.pick(&folders("")))
-            {
-                moved(&from, &into);
-            }
-        }
-        3 => {
-            if let (Some((from, _)), Some(into)) =
-                (random.pick(&included), random.pick(&folders("ig")))
-            {
-                moved(&from, &into);
-            }
-        }
-        4 => {
-            if let Some(into) = random.pick(&folders("")) {
-                write(root, &into.join(&name).to_string_lossy(), "n");
-            }
-        }
-        _ => {
-            let ignored: Vec<PathBuf> = (all.iter())
-                .filter(|(path, _)| path.starts_with("ig") && path.components().count() > 2)
+    (all.iter())
+        .map(|(path, _)| {
+            let meta = fs::symlink_metadata(root.join(path)).unwrap();
+            (meta.dev(), meta.ino())
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct Changer {
+    random: Random,
+    fresh: usize,
+    vacated: Vec<PathBuf>,
+    out: BTreeSet<(u64, u64)>,
+    bounced: BTreeSet<(u64, u64)>,
+}
+
+impl Changer {
+    fn change(&mut self, root: &Path) {
+        let mut all = Vec::new();
+        listed(root, Path::new(""), &mut all);
+        let included: Vec<(PathBuf, bool)> = (all.iter())
+            .filter(|(path, _)| !path.starts_with("ig") && path != Path::new(RULES_FILE))
+            .cloned()
+            .collect();
+        let folders = |ignored: bool| -> Vec<PathBuf> {
+            (all.iter())
+                .filter(|(path, dir)| *dir && path.starts_with("ig") == ignored)
                 .map(|(path, _)| path.clone())
-                .collect();
-            if let (Some(from), Some(into)) = (random.pick(&ignored), random.pick(&folders(""))) {
-                moved(&from, &into);
+                .chain((!ignored).then(PathBuf::new))
+                .collect()
+        };
+        self.fresh += 1;
+        let name = format!("n{}", self.fresh);
+        let moved = |from: &Path, to: &Path| {
+            if !to.starts_with(from) && !root.join(to).exists() {
+                fs::rename(root.join(from), root.join(to)).ok();
+            }
+        };
+        let ids = |path: &Path| -> Vec<(u64, u64)> {
+            let mut all = vec![(path.to_path_buf(), root.join(path).is_dir())];
+            if all[0].1 {
+                listed(root, path, &mut all);
+            }
+            (all.iter())
+                .filter_map(|(path, _)| fs::symlink_metadata(root.join(path)).ok())
+                .map(|meta| (meta.dev(), meta.ino()))
+                .collect()
+        };
+        let free = (self.vacated.iter())
+            .filter(|path| {
+                !root.join(path).exists()
+                    && (path.parent()).is_some_and(|parent| root.join(parent).is_dir())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        match self.random.below(8) {
+            0 => {
+                if let Some((path, false)) = self.random.pick(&included) {
+                    fs::remove_file(root.join(path)).unwrap();
+                }
+            }
+            1 => {
+                if let Some((path, true)) = self.random.pick(&included) {
+                    fs::remove_dir_all(root.join(path)).unwrap();
+                }
+            }
+            2 => {
+                if let (Some((from, _)), Some(into)) = (
+                    self.random.pick(&included),
+                    self.random.pick(&folders(false)),
+                ) {
+                    moved(&from, &into.join(&name));
+                }
+            }
+            3 => {
+                if let (Some((from, _)), Some(into)) = (
+                    self.random.pick(&included),
+                    self.random.pick(&folders(true)),
+                ) {
+                    let inside = ids(&from);
+                    moved(&from, &into.join(&name));
+                    self.vacated.push(from);
+                    (self.bounced).extend(inside.into_iter().filter(|id| self.out.contains(id)));
+                }
+            }
+            4 => {
+                if let Some(into) = self.random.pick(&folders(false)) {
+                    write(root, &into.join(&name).to_string_lossy(), "n");
+                }
+            }
+            5 => {
+                if let Some(path) = self.random.pick(&free) {
+                    write(root, &path.to_string_lossy(), "new");
+                }
+            }
+            6 => {
+                if let (Some(to), Some((from, false))) =
+                    (self.random.pick(&free), self.random.pick(&included))
+                {
+                    moved(&from, &to);
+                }
+            }
+            _ => {
+                let ignored: Vec<PathBuf> = (all.iter())
+                    .filter(|(path, _)| path.starts_with("ig") && path.components().count() > 2)
+                    .map(|(path, _)| path.clone())
+                    .collect();
+                if let (Some(from), Some(into)) = (
+                    self.random.pick(&ignored),
+                    self.random.pick(&folders(false)),
+                ) {
+                    self.out.extend(ids(&from));
+                    moved(&from, &into.join(&name));
+                }
             }
         }
     }
@@ -735,54 +939,120 @@ fn identities(snapshot: &Snapshot) -> BTreeMap<PathBuf, FileId> {
         .collect()
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Node {
+    id: FileId,
+    born: (usize, PathBuf),
+}
+
+type Gone = ((usize, PathBuf), Option<PathBuf>);
+
 #[derive(Default)]
 struct Synced {
-    nodes: BTreeMap<PathBuf, FileId>,
-    gone: Vec<(FileId, bool)>,
+    run: String,
+    step: usize,
+    nodes: BTreeMap<PathBuf, Node>,
+    gone: Vec<Gone>,
+    racy: BTreeSet<(u64, u64)>,
 }
 
 impl Synced {
-    fn apply(&mut self, changes: &[Change], snapshot: &Snapshot) {
-        let sources: Vec<(&PathBuf, Option<&PathBuf>, bool)> = (changes.iter())
+    fn apply(&mut self, changes: &[Change], snapshot: &Snapshot, root: &Path, held: &[PathBuf]) {
+        let run = &self.run;
+        let sources: Vec<(&PathBuf, Option<&PathBuf>, Option<&PathBuf>)> = (changes.iter())
             .filter_map(|change| match change {
-                Change::Removed { path, .. } => Some((path, None, false)),
-                Change::Renamed { from, to, .. } => Some((from, Some(to), false)),
-                Change::Ignored { from, .. } => Some((from, None, true)),
+                Change::Removed { path, .. } => Some((path, None, None)),
+                Change::Renamed { from, to, .. } => Some((from, Some(to), None)),
+                Change::Ignored { from, to, .. } => Some((from, None, Some(to))),
                 _ => None,
             })
             .collect();
         for (from, ..) in &sources {
             assert!(
                 self.nodes.contains_key(*from),
-                "{from:?} matches nothing: {changes:?}"
+                "{from:?} matches nothing in {run}: {changes:?}"
             );
         }
-        for (path, id) in std::mem::take(&mut self.nodes) {
+        let disk = on_disk(root);
+        let there = |id: &FileId| disk.contains(&(id.dev, id.ino));
+        for change in changes {
+            if let Change::Ignored { to, id, .. } = change {
+                let meta = fs::symlink_metadata(root.join(to)).unwrap();
+                assert_eq!(
+                    (meta.dev(), meta.ino()),
+                    (id.dev, id.ino),
+                    "{run}: {change:?}"
+                );
+            }
+        }
+        let mut lost = Vec::new();
+        for (path, node) in std::mem::take(&mut self.nodes) {
             let deepest = (sources.iter())
                 .filter(|(from, ..)| path.starts_with(from))
                 .max_by_key(|(from, ..)| from.components().count());
             match deepest {
                 None => {
-                    self.nodes.insert(path, id);
+                    self.nodes.insert(path, node);
                 }
                 Some((from, Some(to), _)) => {
                     self.nodes
-                        .insert(to.join(path.strip_prefix(from).unwrap()), id);
+                        .insert(to.join(path.strip_prefix(from).unwrap()), node);
                 }
-                Some((_, None, ignored)) => self.gone.push((id, *ignored)),
+                Some((_, None, ignored)) => {
+                    if ignored.is_none()
+                        && there(&node.id)
+                        && !self.racy.contains(&(node.id.dev, node.id.ino))
+                    {
+                        lost.push((path, node.id));
+                    }
+                    self.gone.push((node.born, ignored.cloned()));
+                }
             }
         }
         for change in changes {
-            if let Change::Created { path, .. } | Change::Modified { path } = change {
-                self.nodes.insert(path.clone(), snapshot.entries[path].id);
+            match change {
+                Change::Created { path, .. } => {
+                    let node = Node {
+                        id: snapshot.entries[path].id,
+                        born: (self.step, path.clone()),
+                    };
+                    let before = self.nodes.insert(path.clone(), node);
+                    assert!(
+                        before.is_none(),
+                        "{path:?} created over {before:?} in {run}"
+                    );
+                }
+                Change::Modified { path } => {
+                    let node = self.nodes.get_mut(path);
+                    let node = node.unwrap_or_else(|| panic!("{path:?} modified unknown in {run}"));
+                    node.id = snapshot.entries[path].id;
+                }
+                _ => {}
             }
         }
-        assert_eq!(self.nodes, identities(snapshot), "{changes:?}");
-        let mut ids: Vec<FileId> = snapshot.entries.values().map(|entry| entry.id).collect();
-        let all = ids.len();
-        ids.sort_by_key(|id| format!("{id:?}"));
-        ids.dedup();
-        assert_eq!(ids.len(), all, "an identity at two paths: {changes:?}");
+        for (path, id) in lost {
+            let at = (snapshot.entries.iter()).find(|(_, entry)| entry.id == id);
+            assert!(
+                at.is_some_and(|(at, _)| self.nodes.get(at).is_some_and(|node| node.id == id)),
+                "{path:?} removed but on disk at {at:?} in {run}: {changes:?}"
+            );
+        }
+        let outside = |path: &Path| !held.iter().any(|root| path.starts_with(root));
+        let synced: BTreeMap<PathBuf, FileId> = (self.nodes.iter())
+            .filter(|(path, _)| outside(path))
+            .map(|(path, node)| (path.clone(), node.id))
+            .collect();
+        let scanned: BTreeMap<PathBuf, FileId> = (identities(snapshot).into_iter())
+            .filter(|(path, _)| outside(path))
+            .collect();
+        assert_eq!(synced, scanned, "{run}: {changes:?} held {held:?}");
+        let ids: Vec<FileId> = snapshot.entries.values().map(|entry| entry.id).collect();
+        let unique: BTreeSet<(u64, u64)> = ids.iter().map(|id| (id.dev, id.ino)).collect();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "an identity at two paths in {run}: {changes:?}"
+        );
     }
 }
 
@@ -793,11 +1063,18 @@ struct Run {
 }
 
 impl Run {
-    fn new(root: &Path, budget: usize) -> Self {
+    fn new(root: &Path, budget: usize, run: String) -> Self {
         let mut rules = rules().with_search_budget(budget);
         let snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
+        let nodes = (snapshot.entries.iter())
+            .map(|(path, entry)| {
+                let born = (0, path.clone());
+                (path.clone(), Node { id: entry.id, born })
+            })
+            .collect();
         let synced = Synced {
-            nodes: identities(&snapshot),
+            run,
+            nodes,
             ..Synced::default()
         };
         Self {
@@ -807,21 +1084,24 @@ impl Run {
         }
     }
 
-    fn rescan(&mut self, root: &Path) -> bool {
+    fn rescan(&mut self, root: &Path, paths: Vec<PathBuf>) -> Vec<PathBuf> {
         let rescan = (self.snapshot)
-            .rescan_with_rules(root, whole(), &mut self.rules)
+            .rescan_with_rules(root, paths, &mut self.rules)
             .unwrap();
-        self.synced.apply(&rescan.changes, &self.snapshot);
-        rescan.unsettled.is_empty()
+        (self.synced).apply(&rescan.changes, &self.snapshot, root, &rescan.unsettled);
+        rescan.unsettled
     }
 
     fn settle(&mut self, root: &Path) {
-        for _ in 0..200 {
-            if self.rescan(root) {
+        let mut unsettled = self.rescan(root, whole().to_vec());
+        for turn in 0..300 {
+            if unsettled.is_empty() {
                 return;
             }
+            let scope = unsettled[turn % unsettled.len()].clone();
+            unsettled = self.rescan(root, vec![scope]);
         }
-        panic!("the search never ended");
+        panic!("the search never ended in {}", self.synced.run);
     }
 }
 
@@ -849,36 +1129,46 @@ fn small_tree() -> tempfile::TempDir {
 
 #[test]
 fn a_bounded_search_ends_where_an_unbounded_one_does() {
-    for seed in 1..=60u64 {
+    for seed in 1..=200u64 {
         let dir = small_tree();
         let root = dir.path();
-        let mut random = Random(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
-        let mut fresh = 0;
-        let mut bounded = Run::new(root, 3);
-        let mut unbounded = Run::new(root, usize::MAX);
-        for _ in 0..8 {
-            for _ in 0..=random.below(3) {
-                change_tree(root, &mut random, &mut fresh);
+        let mut changer = Changer {
+            random: Random(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15)),
+            ..Changer::default()
+        };
+        let mut bounded = Run::new(root, 3, format!("bounded {seed}"));
+        let mut unbounded = Run::new(root, usize::MAX, format!("unbounded {seed}"));
+        let gone = |run: &mut Run| {
+            let mut gone = std::mem::take(&mut run.synced.gone);
+            gone.sort();
+            gone
+        };
+        for step in 1..=10 {
+            changer.out.clear();
+            for _ in 0..=changer.random.below(3) {
+                changer.change(root);
             }
-            assert!(unbounded.rescan(root), "seed {seed}");
+            unbounded.synced.step = step;
+            bounded.synced.step = step;
+            let unsettled = unbounded.rescan(root, whole().to_vec());
+            assert_eq!(unsettled, [] as [PathBuf; 0], "seed {seed}");
             if seed % 2 == 0 {
                 bounded.settle(root);
-                let gone = |run: &mut Run| {
-                    let mut gone = std::mem::take(&mut run.synced.gone);
-                    gone.sort_by_key(|gone| format!("{gone:?}"));
-                    gone
-                };
+                assert_eq!(bounded.synced.nodes, unbounded.synced.nodes, "seed {seed}");
                 assert_eq!(gone(&mut bounded), gone(&mut unbounded), "seed {seed}");
             } else {
-                bounded.rescan(root);
+                bounded.synced.racy = changer.bounced.clone();
+                bounded.rescan(root, whole().to_vec());
             }
         }
         bounded.settle(root);
-        assert_eq!(
-            identities(&bounded.snapshot),
-            identities(&unbounded.snapshot),
-            "seed {seed}"
-        );
+        let ids = |run: &Run| -> BTreeMap<PathBuf, FileId> {
+            (run.synced.nodes.iter())
+                .map(|(path, node)| (path.clone(), node.id))
+                .collect()
+        };
+        assert_eq!(ids(&bounded), ids(&unbounded), "seed {seed}");
+        assert_eq!(ids(&bounded), identities(&bounded.snapshot), "seed {seed}");
     }
 }
 
