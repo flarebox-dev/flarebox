@@ -1226,9 +1226,10 @@ impl Commits {
                 let held = &local.shape.parent;
                 aliases.contains_key(held) || merged.contains_key(held)
             });
-            let left = sent.is_some_and(|(parent, name)| {
+            let left = sent.is_some_and(|(sent_parent, name)| {
                 (trees.local().get(node)).is_some_and(|local| {
-                    local.shape.parent != *parent || nfc(&local.shape.name) != nfc(name)
+                    local.shape.parent != *merged.get(sent_parent).unwrap_or(sent_parent)
+                        || nfc(&local.shape.name) != nfc(name)
                 })
             });
             let kept = agreed.contains_key(node);

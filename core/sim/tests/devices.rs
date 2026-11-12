@@ -1435,6 +1435,36 @@ fn a_rename_after_a_restore_is_not_undone_by_the_lost_rename_it_replaced() {
     }
 }
 
+#[test]
+fn a_file_renamed_by_the_server_in_a_folder_it_merged_is_not_moved_back() {
+    converge(
+        2,
+        &[
+            vec![
+                (0, Step::Work(0)),
+                (0, folder("a")),
+                (0, rename(0, 0, "ss")),
+                (0, user(1, 0, 1, "b")),
+                (0, file("a")),
+                (0, BACKUP),
+            ],
+            vec![
+                (0, overwrite(1)),
+                (0, Step::Work(0)),
+                (0, COMMIT),
+                (0, user(1, 0, 1, "a")),
+                (0, folder("A")),
+                (0, RESTORE),
+                (0, user(0, 0, 2, "a")),
+                (0, Step::Work(0)),
+                (0, delete(4)),
+                (0, folder("ß")),
+            ],
+        ],
+    )
+    .unwrap();
+}
+
 fn created_again_by_both_and_deleted_by_one(made: Step, edit: bool) -> World {
     let mut lost = vec![
         (0, RESTORE),
