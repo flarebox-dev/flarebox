@@ -732,18 +732,6 @@ impl Commits {
         self.in_flight.as_ref().map(|flight| &flight.commit)
     }
 
-    /// Goes through the conflict questions (section 2.7) and returns the ops of the answers that
-    /// can be carried out now, at most `cap` of them. A conflict ends once R no longer holds either
-    /// file live with the meta revision it was asked with, or L moved or deleted a file S, or its
-    /// waiting update, holds: someone renamed, moved or deleted one by hand. It is asked again,
-    /// under a new ID and without its answer, once R holds another content revision of either file.
-    /// An answer waits until both files are in sync and planned (`skip` lists the nodes that are
-    /// not), and a build carries out one op per conflict and none for a node another answer already
-    /// took. [`Answer::KeepOriginal`] deletes the copy. [`Answer::KeepCopy`] first gives the
-    /// original the copy's content, so the original's own content stays in its version history, and
-    /// once that has reached L it deletes the copy. S is left as it is, so the result reaches the
-    /// disk as a remote change would, and only a file L still holds as S does is changed or
-    /// removed.
     fn conflicts(
         &mut self,
         trees: &Trees,
@@ -1566,10 +1554,6 @@ enum Drift {
     None,
     /// R holds another content revision of a file.
     Content,
-    /// A file was renamed, moved or deleted: R no longer holds it live with the meta revision it
-    /// was asked with, or L moved or deleted it while S, or its waiting update, holds it. A
-    /// reverted file L still holds where it was is not moved: the effects move it to the name the
-    /// server gave it.
     Ended,
 }
 
