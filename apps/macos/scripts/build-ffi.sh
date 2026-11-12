@@ -16,7 +16,7 @@ export MACOSX_DEPLOYMENT_TARGET=14.0
 
 cd "$repo_root"
 cargo build --locked --release -p koidrive-ffi
-target_dir="$(cargo metadata --locked --no-deps --format-version 1 | jq -r .target_directory)"
+target_dir="$(cargo metadata --locked --no-deps --format-version 1 | sed -E 's/.*"target_directory":"([^"]*)".*/\1/')"
 lib="$target_dir/release/libkoidrive_ffi.a"
 
 rm -rf "$work_dir"
