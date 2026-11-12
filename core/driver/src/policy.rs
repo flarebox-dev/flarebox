@@ -9,6 +9,8 @@ use std::time::Duration;
 use koidrive_net::{CallError, ServerError};
 use koidrive_proto::v1::error::Code;
 
+use crate::status::WaitKind;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Disposition {
     /// Send the same call again after this wait, which the server asked for.
@@ -30,6 +32,14 @@ pub fn after_refusal(error: &ServerError) -> Disposition {
             .map_or(Disposition::Halt, Disposition::RetryAfter),
         Ok(Code::Internal) => Disposition::Backoff,
         Ok(_) | Err(_) => Disposition::Halt,
+    }
+}
+
+/// What a wait after `refusal` is: a quota for `QUOTA_EXCEEDED`, a retry for any other cause.
+pub fn wait_kind(refusal: Option<&ServerError>) -> WaitKind {
+    match refusal.map(|refusal| Code::try_from(refusal.0.code)) {
+        Some(Ok(Code::QuotaExceeded)) => WaitKind::Quota,
+        _ => WaitKind::Retry,
     }
 }
 
@@ -75,6 +85,19 @@ mod tests {
             );
         }
         assert_eq!(describe(&refusal(99, 0)), "unknown refusal code 99: m");
+    }
+
+    #[test]
+    fn a_quota_refusal_is_a_quota_wait_and_any_other_cause_a_retry() {
+        assert_eq!(
+            wait_kind(Some(&refusal(Code::QuotaExceeded as i32, 1_500))),
+            WaitKind::Quota
+        );
+        assert_eq!(
+            wait_kind(Some(&refusal(Code::RetryLater as i32, 1_500))),
+            WaitKind::Retry
+        );
+        assert_eq!(wait_kind(None), WaitKind::Retry);
     }
 
     #[test]

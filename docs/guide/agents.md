@@ -1,0 +1,103 @@
+# Agents and scripts
+
+Every `koi` command can run without a person at the terminal. Add `--json` and read one JSON object from stdout, then branch on the exit status. Start with `koi status --json`.
+
+## Ask for JSON
+
+`--json` works on every command and in any position, as in `koidrive --json status` or `koi folder link ~/Work --space Work --json`. It selects schema 1, the only schema so far. `--json=1` names it explicitly, and any other version is a usage error. A later schema will need its number; plain `--json` keeps meaning schema 1.
+
+With `--json`, every command except `koi _daemon` prints exactly one JSON object on stdout, also when it fails, when it shows help and when it shows the version. The daemon prints one object per line, as [Watch the daemon](#watch-the-daemon) describes. Logs and progress go to stderr. A command with `--json` never asks a question, never reads stdin, never opens a browser and prints no pending-decision line.
+
+Without `--json`, a command whose result is one value prints only that value on stdout, and what it means on stderr, so that shell capture works: `koi space create` prints the new space's ID, `koi history restore` the restore's ID, and `koi device invite` the pairing code, as in `id=$(koi space create Notes)`.
+
+## The envelope
+
+```json
+{
+  "schema_version": 1,
+  "command": "history restore",
+  "outcome": "accepted",
+  "data": { "request_id": "019b...", "folder": "/home/alice/Koidrive", "path": "notes/old.txt" },
+  "error": null,
+  "decisions": [],
+  "next_commands": [{ "argv": ["koi", "history", "requests", "/home/alice/Koidrive"] }]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `schema_version` | Always 1 |
+| `command` | The subcommand, such as `folder link`. Empty for `koi` alone |
+| `outcome` | `ok`, `accepted` or `error` |
+| `data` | The command's result. Its shape depends on the command. `null` when there is none |
+| `error` | `null` on success. Otherwise `code`, `message` and `retryable` |
+| `decisions` | The sync decisions waiting on this device, described below |
+| `next_commands` | Commands to run next, each as an `argv` array. Present only when there is a real next step |
+
+`accepted` means the command recorded work that happens later. Answering a decision and asking for a restore return it. Check `koi status` or `koi history requests` to see the work finish.
+
+A failed command can still carry `data`. For example, `koi space usage` returns the spaces that answered when the server refuses another one.
+
+## Decisions
+
+`koi status` and `koi resolve` list every pending decision in `decisions`. Every other command lists the decisions the running daemon holds. Each decision has every item it holds and the full command for each answer:
+
+```json
+{
+  "id": "019b...",
+  "space_id": "019a...",
+  "kind": "mass_delete",
+  "asked_at_ms": 1762900000000,
+  "requires_choice": true,
+  "counts": { "deletions": 24, "affected_files": 1240, "space_files": 2000, "exceeded": ["deletions"] },
+  "items": [{ "node_id": "019c...", "path": "archive", "files": 1240 }],
+  "answers": [
+    { "token": "delete", "consequence": "Delete these files on the server and other devices", "argv": ["koi", "resolve", "019b...", "delete"] },
+    { "token": "restore", "consequence": "Download these files to this device again", "argv": ["koi", "resolve", "019b...", "restore"] }
+  ]
+}
+```
+
+`kind` is `mass_delete`, `remote_mass_delete`, `ambiguous_disappearance` or `recovery`. A `recovery` decision also has a `group`. A `remote_mass_delete` notice has `requires_choice: false`. It only takes `dismiss` and holds nothing back. Don't pick an answer that deletes files on your own. Ask the person.
+
+## Exit status
+
+| Status | Meaning | What to do |
+|---|---|---|
+| 0 | The command succeeded, or recorded work for later | Read `outcome`. `accepted` isn't done yet |
+| 1 | Another failure | Read `error` and `next_commands` |
+| 2 | Invalid arguments, or input the command needs is missing | Correct the call. Running it again unchanged fails again |
+| 3 | `status --check` found a decision that needs a choice | Read the answers in `decisions` |
+| 4 | A credential is missing or refused, or a person must log in | Run the command in `next_commands`, or ask a person to |
+| 5 | A folder is halted or stopped | Fix the cause the folder's `problem` names |
+| 6 | The server is offline, unavailable or limits the rate | Try again later. `retryable` is true |
+| 7 | The decision answered no longer exists | Read the current decisions with `koi resolve --json` |
+| 130 | Ctrl-C stopped the command | Read the state before you run a change again |
+
+The `error.code` values match these: `failed`, `usage`, `decision_required`, `auth_required`, `halted`, `unavailable`, `stale_decision` and `interrupted`.
+
+## Check health with status --check
+
+`koi status` exits 0 whenever it can read the status. `koi status --check` exits with the status of the most urgent condition:
+
+1. 4 when this device isn't set up.
+2. 5 when a folder is halted, or stopped because the daemon isn't running.
+3. 3 when a decision needs a choice. A notice that only takes `dismiss` doesn't count.
+4. 6 when a folder is offline, or puts a call off until later. The folder's `wait` says why: `quota` when the server refused for a used-up limit or full storage, `retry` when the call kept failing for another reason. `until_ms` is when it's sent again.
+
+Connecting and catching up aren't failures, so they exit 0. `data.conditions` lists every condition found, with or without `--check`.
+
+## Watch the daemon
+
+`koi _daemon --json` prints one JSON object per line on stdout, each with `schema_version` and `event`: `started` with the version, the socket and the number of folders, `folder_state` with the folder, its space and its new state whenever a folder's state changes, `stopping` with the signal, and `stopped`. Its logs on stderr are JSON lines too. If it can't start, it prints one error envelope on a single line.
+
+## Questions need a terminal
+
+No command asks a question unless both stdin and stderr are terminals. Without them, commands that would ask stop instead and say which flag answers the question.
+
+- `koi setup` runs the guided setup only on a terminal, without `--json` and without the `CI` environment variable. Otherwise it lists the setup commands and exits 0. With `--json` they are in `data.choices` and `next_commands`.
+- `--interactive` asks for the guided setup explicitly. It fails with exit status 2 when no terminal is attached, and can't be used with `--json`.
+- `koi server deploy`, `add-device`, `upgrade` and `delete` log in with Cloudflare in a browser, so they run only with `--interactive` and a terminal on stdin and stderr. Otherwise, with or without `--json`, they stop with `auth_required` (exit 4) and name the same command with `--interactive` for a person to run.
+- `--no-browser` reads the login address from the terminal, so it needs `--interactive` too.
+
+`koi join` and `koi server claim` never need a person, so an agent can set up a device with a pairing code or a claim code.

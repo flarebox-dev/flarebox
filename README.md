@@ -92,7 +92,7 @@ Koidrive is free. Cloudflare runs it, at its own prices:
 | **Requests** | R2 includes 1 million writes and 10 million reads a month, then charges $4.50 per million writes and $0.36 per million reads |
 | **Downloads** | No egress fee. Each download counts as read requests |
 
-Files in the trash and old versions count as storage for the 30 days Koidrive keeps them. `koi usage` shows how much each space stores.
+Files in the trash and old versions count as storage for the 30 days Koidrive keeps them. `koi space usage` shows how much each space stores.
 
 ## Get started
 
@@ -119,11 +119,11 @@ You need a Cloudflare account with R2 turned on, and a Mac or a Linux machine.
    ```sh
    mkdir -p ~/Koidrive
    koi space create Koidrive
-   koi link ~/Koidrive --space Koidrive
-   koi daemon
+   koi folder link ~/Koidrive --space Koidrive
+   koi _daemon
    ```
 
-4. **Add your other machines.** On a machine that is signed in, run `koi device add`. It prints a command with a pairing code. Run that command on the new machine, then link a folder there too.
+4. **Add your other machines.** On a machine that is signed in, run `koi device invite`. It prints a command with a pairing code. Run that command on the new machine, then link a folder there too.
 
 The [user guide](docs/guide/README.md) covers conflicts, the trash, devices, limits and how to remove everything.
 

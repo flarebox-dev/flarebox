@@ -16,7 +16,7 @@ You need one server, in a Cloudflare account you own, and at least one device si
 koi setup
 ```
 
-`koi setup` asks how to set up this machine:
+On a terminal, `koi setup` asks how to set up this machine:
 
 1. Log in with Cloudflare. Your browser opens Cloudflare's login page. Pick the account and select Authorize. Then Koidrive looks for its servers in that account:
    - With no server, it deploys one. It creates an R2 bucket, uploads the server as a Worker, turns on its `workers.dev` address, and claims the server with this device.
@@ -30,15 +30,18 @@ The device takes this machine's host name. Give it another with `--name`.
 
 If a setup stops halfway, for example because the network dropped, run `koi setup` again. It finishes from where it stopped.
 
-**On a machine without a browser**, add `--no-browser`. Koidrive prints the login page's address. Open it on any device, log in, and select Authorize. The browser then fails to load a page on `127.0.0.1`. Copy that page's address and paste it into the terminal. To forward the login over SSH instead, pick the callback port with `--port`.
+Without a terminal on stdin and stderr, with `--json`, or with the `CI` environment variable set, `koi setup` asks nothing. It lists the commands below and exits. `koi setup --interactive` asks for the guided setup explicitly, and fails when no terminal is attached.
+
+**On a machine without a browser**, add `--interactive --no-browser`. Koidrive prints the login page's address. Open it on any device, log in, and select Authorize. The browser then fails to load a page on `127.0.0.1`. Copy that page's address and paste it into the terminal. To forward the login over SSH instead, pick the callback port with `--port`.
 
 **In a script**, use the commands that never ask questions:
 
 | Command | What it does |
 |---|---|
-| `koi server deploy` | Logs in, deploys a new server and claims it. Stops if the account already has one |
-| `koi server add-device [--server <worker>]` | Logs in and adds this device to the server in the account. `--server` names the Worker when there are several |
+| `koi server claim <server-url> <code> --user <name>` | Claims a server deployed with the deploy button |
 | `koi join <code>` | Joins with a pairing code |
+
+`koi server deploy` and `koi server add-device [--worker <name>]` log in with Cloudflare in a browser, so a person runs them on a terminal with `--interactive`. Without it, with or without `--json`, they open no browser: they stop with `auth_required` and name the same command with `--interactive`. `deploy` deploys a new server and claims it, and stops if the account already has one. `add-device` adds this device to the server in the account without a pairing code, and `--worker` names the Worker when there are several. See [Agents and scripts](agents.md).
 
 ## Without the Cloudflare login
 
@@ -60,20 +63,23 @@ Until the public client exists, deploy the server and claim it without `koi setu
 On a device that is already signed in, run:
 
 ```sh
-koi device add
+koi device invite
 ```
 
-It prints a pairing code, which works once and for 10 minutes, as the command to run on the new machine:
+It prints a pairing code, which works once and for 10 minutes, and the command to run on the new machine:
 
 ```
+K7QM-2XPD@koidrive.alice.workers.dev
 On the new device, run:
   koi join K7QM-2XPD@koidrive.alice.workers.dev
 The code works once, for about 10 minutes.
 ```
 
+Only the code goes to stdout, so `code=$(koi device invite)` captures it. The rest goes to stderr.
+
 In the macOS app, Settings, Account, Add a Device shows a pairing code without the server's address. To use it on a device with the `koi` command, run `koi join <code> --server <address>`.
 
-A code written as `<code>@<host>` carries the server's address. For a code without it, add the address with `--server https://koidrive.alice.workers.dev`. `koi setup <code>` does the same as `koi join`.
+A code written as `<code>@<host>` carries the server's address. For a code without it, add the address with `--server https://koidrive.alice.workers.dev`.
 
 With the Cloudflare login, `koi server add-device` adds a device without a code.
 
@@ -83,7 +89,7 @@ With the Cloudflare login, `koi server add-device` adds a device without a code.
 koi space create Photos
 ```
 
-This prints the new space's ID. Each of your spaces needs its own name, because `koi link --space` finds a space by its name: the server refuses a name you already use. Names are compared exactly after leading and trailing whitespace is removed, so `Photos` and `photos` are two names. `koi space list` lists your spaces with their IDs, and `--json` prints the same. Then [link a folder](folders.md#link-a-folder) to a space.
+This prints the new space's ID. Each of your spaces needs its own name, because `koi folder link --space` finds a space by its name: the server refuses a name you already use. Names are compared exactly after leading and trailing whitespace is removed, so `Photos` and `photos` are two names. `koi space list` lists your spaces with their IDs, and `--json` returns them as data. Then [link a folder](folders.md#link-a-folder) to a space.
 
 ## Upgrade the server
 
@@ -93,6 +99,6 @@ koi server upgrade
 
 This logs in with Cloudflare and uploads the server version built into your `koi`. Without the Cloudflare login, upgrade as [Deploying and upgrading a Koidrive server](../deploy.md#upgrade) describes. Your files, devices and settings stay. Open sync sessions move to the new version within 5 minutes. The command stops if the server runs a newer version than your `koi`.
 
-A server deployed with the deploy button deploys again whenever its repository changes, and that would replace the upgrade. The command warns you and asks first. Update that repository too, or answer no.
+A server deployed with the deploy button deploys again whenever its repository changes, and that would replace the upgrade. The command warns you and asks first. Update that repository too, or answer no. `--yes` goes on without asking.
 
 Never go back to an older server version. Once a newer version has moved the server's stored data forward, an older one refuses to start.

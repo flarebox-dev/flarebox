@@ -511,8 +511,8 @@ export class AccountDO extends DurableObject<Env> {
   }
 
   /**
-   * Creates a space, refusing a name the owner already uses. Names compare exactly after trimming, as `koi link
-   * --space` resolves them. While the Space DO is set up, the name is held in memory, so a concurrent create of it is
+   * Creates a space, refusing a name the owner already uses. Names compare exactly after trimming, as `koi folder
+   * link --space` resolves them. While the Space DO is set up, the name is held in memory, so a concurrent create of it is
    * refused and an aborted create leaves nothing behind; the row is stored once the Space DO holds the space.
    */
   async createSpace(args: { userId: string; name: string }): Promise<Outcome<SpaceInfo>> {

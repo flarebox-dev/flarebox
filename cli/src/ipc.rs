@@ -19,6 +19,9 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::error::{CliError, Code};
+use crate::report::Next;
+
 /// The longest request or response line the socket accepts.
 const MAX_LINE: u64 = 16 << 20;
 
@@ -81,17 +84,51 @@ pub enum Request {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "response", rename_all = "snake_case")]
 pub enum Response {
-    Status { status: Status },
-    Paired { account: Account },
-    Linked { folder: FolderStatus },
-    Unlinked { space_id: String, path: PathBuf },
-    Restarted { folder: FolderStatus },
-    Questions { questions: Vec<Question> },
+    Status {
+        status: Status,
+    },
+    Paired {
+        account: Account,
+    },
+    Linked {
+        folder: FolderStatus,
+    },
+    Unlinked {
+        space_id: String,
+        path: PathBuf,
+    },
+    Restarted {
+        folder: FolderStatus,
+    },
+    Questions {
+        questions: Vec<Question>,
+    },
     Answered,
-    Restore { id: String },
-    Restores { restores: Vec<RestoreStatus> },
+    Restore {
+        id: String,
+    },
+    Restores {
+        restores: Vec<RestoreStatus>,
+    },
     SignedOut,
-    Error { message: String },
+    /// A failed request. An older daemon sends only `message`, which reads as [`Code::Failed`].
+    Error {
+        message: String,
+        #[serde(default)]
+        code: Code,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        next: Vec<Next>,
+    },
+}
+
+impl Response {
+    fn failed(error: CliError) -> Self {
+        Response::Error {
+            message: error.message,
+            code: error.code,
+            next: error.next,
+        }
+    }
 }
 
 /// Runs one request.
@@ -153,9 +190,7 @@ pub async fn handle(driver: &Driver, request: Request) -> Response {
             .restores(&space_id)
             .map(|restores| Response::Restores { restores }),
     };
-    outcome.unwrap_or_else(|error| Response::Error {
-        message: error.to_string(),
-    })
+    outcome.unwrap_or_else(|error| Response::failed(error.into()))
 }
 
 /// Binds the daemon's socket. The caller holds the profile lock, so a socket file left behind is stale.
@@ -364,9 +399,9 @@ async fn answer(stream: UnixStream, driver: &Driver) -> io::Result<()> {
     let line = read_line(reader).await?;
     let response = match serde_json::from_str::<Request>(&line) {
         Ok(request) => handle(driver, request).await,
-        Err(error) => Response::Error {
-            message: format!("the request is not valid: {error}"),
-        },
+        Err(error) => Response::failed(CliError::usage(format!(
+            "the request is not valid: {error}"
+        ))),
     };
     write_line(&mut writer, &response).await
 }
@@ -417,16 +452,41 @@ pub fn busy(paths: &Paths) -> String {
     )
 }
 
-/// Runs a request in the daemon when one runs, and in a driver of its own otherwise.
-pub async fn run(paths: &Paths, request: Request) -> Result<Response, String> {
-    if let Some(response) = ask(paths, &request).await? {
-        return Ok(response);
+/// Runs `request` in the daemon, or in a driver of its own when no daemon runs. A failed request is an error. Without
+/// a daemon and without a state directory, the status and the questions are read as a profile that is not set up,
+/// without opening a driver, so reading them creates nothing.
+pub async fn run(paths: &Paths, request: Request) -> Result<Response, CliError> {
+    let response = match ask(paths, &request).await? {
+        Some(response) => response,
+        None if matches!(request, Request::Status) && !paths.state_dir.exists() => {
+            Response::Status {
+                status: Status::default(),
+            }
+        }
+        None if matches!(request, Request::Questions) && !paths.state_dir.exists() => {
+            Response::Questions {
+                questions: Vec::new(),
+            }
+        }
+        None => {
+            let driver = Driver::open(paths.clone()).map_err(|error| match error {
+                DriverError::Busy(_) => CliError::from(busy(paths)),
+                other => CliError::from(other),
+            })?;
+            handle(&driver, request).await
+        }
+    };
+    match response {
+        Response::Error {
+            message,
+            code,
+            next,
+        } => Err(CliError {
+            next,
+            ..CliError::new(code, message)
+        }),
+        response => Ok(response),
     }
-    let driver = Driver::open(paths.clone()).map_err(|error| match error {
-        DriverError::Busy(_) => busy(paths),
-        other => other.to_string(),
-    })?;
-    Ok(handle(&driver, request).await)
 }
 
 async fn read_line(reader: impl tokio::io::AsyncRead + Unpin) -> io::Result<String> {
@@ -472,7 +532,7 @@ mod tests {
                 status: driver.status()
             }
         );
-        let response = run(
+        let error = run(
             &paths,
             Request::Answer {
                 question_id: "q1".into(),
@@ -480,14 +540,28 @@ mod tests {
             },
         )
         .await
-        .unwrap();
+        .unwrap_err();
+        assert_eq!(
+            error.message,
+            "no unanswered question has the id \"q1\"; koi resolve lists the decisions waiting now"
+        );
+        assert_eq!(error.code, Code::StaleDecision);
+        assert_eq!(error.next, [Next::of(&["koi", "resolve", "--json"])]);
+        server.abort();
+    }
+
+    #[test]
+    fn an_error_from_an_older_daemon_reads_as_unclassified() {
+        let response: Response =
+            serde_json::from_str(r#"{"response":"error","message":"it failed"}"#).unwrap();
         assert_eq!(
             response,
             Response::Error {
-                message: "no unanswered question has the id \"q1\"".into()
+                message: "it failed".into(),
+                code: Code::Failed,
+                next: Vec::new(),
             }
         );
-        server.abort();
     }
 
     #[tokio::test]
@@ -499,7 +573,7 @@ mod tests {
 
         let _held = Driver::open(paths.clone()).unwrap();
         let error = run(&paths, Request::Status).await.unwrap_err();
-        assert!(error.contains("does not answer"), "{error}");
+        assert!(error.message.contains("does not answer"), "{error:?}");
     }
 
     #[tokio::test]

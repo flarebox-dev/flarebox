@@ -46,6 +46,27 @@ pub struct FolderStatus {
     pub questions: u64,
     /// Why the folder is halted, or what the last transient failure was.
     pub problem: Option<String>,
+    /// The call the folder puts off, as soon as it waits: why and until when. `problem` shows a wait only once it is
+    /// long or keeps failing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait: Option<Wait>,
+}
+
+/// A call a folder sends again later, after the server put it off or it kept failing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Wait {
+    pub kind: WaitKind,
+    /// When the call is sent again, in Unix milliseconds.
+    pub until_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitKind {
+    /// The server refused with `QUOTA_EXCEEDED`: a daily limit is used up, or the space's storage is full.
+    Quota,
+    /// The call failed for another reason, such as the network or `RETRY_LATER`, and is tried again.
+    Retry,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

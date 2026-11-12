@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! `koi trash` and `koi versions`: what the space of a linked folder keeps after a delete or an edit. Both
-//! read the server through its HTTP RPC route with this profile's credential. They change no file here or on the
-//! server, and without a daemon they read the profile without writing to it. `koi restore` reads the same
-//! listings to find what to restore and records the request in the folder's store, for the folder's engine to send
-//! (design §6.3). `koi restores` lists those requests and how each went.
+//! `koi history trash` and `koi history versions`: what the space of a linked folder keeps after a delete or
+//! an edit. Both read the server through its HTTP RPC route with this profile's credential. They change no file here or
+//! on the server, and without a daemon they read the profile without writing to it. `koi history restore` reads
+//! the same listings to find what to restore and records the request in the folder's store, for the folder's engine to
+//! send (design §6.3). `koi history requests` lists those requests and how each went.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
@@ -20,16 +20,65 @@ use koidrive_proto::v1::{
     rpc_response,
 };
 
+use crate::error::CliError;
 use crate::ipc::{self, Request, Response};
-use crate::{ago, now_ms, print_json, printable, refusal, signed_in, size};
+use crate::report::{
+    Done, Outcome, RequestData, RequestsData, RestoreAskedData, TrashData, TrashEntry, VersionData,
+    VersionsData,
+};
+use crate::{ago, now_ms, printable, signed_in, size, unexpected};
 
 /// The most entries asked for in one page; the server sends at most this many.
 const PAGE: u32 = 1000;
 const UNEXPECTED: &str = "the server answered with another kind of result";
 
-/// `koi trash [folder]`: the deletions in the trash of the folder's space, or of the part under `folder` when it is a
-/// folder inside a linked one.
-pub async fn trash(paths: &Paths, folder: &Path, json: bool) -> Result<(), String> {
+#[derive(clap::Subcommand)]
+pub enum HistoryAction {
+    /// List what was deleted in a linked folder and is still in its space's trash.
+    Trash {
+        /// A linked folder, or a folder inside one.
+        #[arg(default_value = ".")]
+        folder: PathBuf,
+    },
+    /// List the versions the server keeps of a file in a linked folder, newest first.
+    Versions { file: PathBuf },
+    /// Bring a deleted file or folder back from its space's trash to where it was, or make an earlier version of a
+    /// file current again. The daemon sends the request with the folder's next commit.
+    Restore {
+        /// The deleted file or folder at the path it had, or the file whose version to restore.
+        path: PathBuf,
+        /// Restore this version of the file, as koi history versions lists it.
+        #[arg(long)]
+        version: Option<String>,
+        /// The deleted node to restore, as koi history trash --json lists it, when several deletions had this
+        /// path.
+        #[arg(long, conflicts_with = "version")]
+        node: Option<String>,
+    },
+    /// List the restores asked for in a linked folder and how each one went.
+    Requests {
+        /// A linked folder, or a folder inside one.
+        #[arg(default_value = ".")]
+        folder: PathBuf,
+    },
+}
+
+pub async fn run(paths: &Paths, action: HistoryAction) -> Result<Done, CliError> {
+    match action {
+        HistoryAction::Trash { folder } => trash(paths, &folder).await,
+        HistoryAction::Versions { file } => versions(paths, &file).await,
+        HistoryAction::Restore {
+            path,
+            version,
+            node,
+        } => restore(paths, &path, version, node).await,
+        HistoryAction::Requests { folder } => requests(paths, &folder).await,
+    }
+}
+
+/// `koi history trash [folder]`: the deletions in the trash of the folder's space, or of the part under `folder`
+/// when it is a folder inside a linked one.
+async fn trash(paths: &Paths, folder: &Path) -> Result<Done, CliError> {
     let (linked, below) = locate(paths, folder).await?;
     let auth = signed_in(paths)?;
     let space = linked.space_id.as_str();
@@ -37,65 +86,77 @@ pub async fn trash(paths: &Paths, folder: &Path, json: bool) -> Result<(), Strin
     let trashed = trash_nodes(&auth, space).await?;
     let mut found = deletions(&live, &trashed, space);
     found.retain(|deleted| starts_with(&deleted.names, &below));
-    if json {
-        return print_json(&found.iter().map(Deleted::json).collect::<Vec<_>>());
-    }
-    print!("{}", trash_report(&found, &linked));
-    Ok(())
+    let data = TrashData {
+        folder: linked.path.clone(),
+        entries: found.iter().map(Deleted::entry).collect(),
+    };
+    Ok(Done::ok(data, trash_report(&found, &linked)))
 }
 
-/// `koi versions <file>`: the versions the server keeps of a live file, newest first.
-pub async fn versions(paths: &Paths, file: &Path, json: bool) -> Result<(), String> {
+/// `koi history versions <file>`: the versions the server keeps of a live file, newest first.
+async fn versions(paths: &Paths, file: &Path) -> Result<Done, CliError> {
     let (linked, below) = locate(paths, file).await?;
     if below.is_empty() {
-        return Err(format!(
+        return Err(CliError::usage(format!(
             "{} is the linked folder itself; name a file in it",
             linked.path
-        ));
+        )));
     }
     let auth = signed_in(paths)?;
     let space = linked.space_id.as_str();
     let live = tree(&auth, space).await?;
     let node = find(&live, space, &below).ok_or_else(|| {
-        format!(
-            "the server has no file at {} in {}; koi trash lists deleted ones",
+        CliError::usage(format!(
+            "the server has no file at {} in {}; koi history trash lists deleted ones",
             printable(&below.join("/")),
             linked.path
-        )
+        ))
     })?;
     if node.kind() == NodeKind::Dir {
-        return Err(format!(
+        return Err(CliError::usage(format!(
             "{} is a folder; name a file in it",
             printable(&below.join("/"))
-        ));
+        )));
     }
     let kept = versions_of(&auth, space, &node.node_id).await?;
-    if json {
-        return print_json(&kept.iter().map(version_json).collect::<Vec<_>>());
-    }
-    print!(
-        "{}",
-        versions_report(&below.join("/"), node, &kept, now_ms())
-    );
-    Ok(())
+    let current = node
+        .current
+        .as_ref()
+        .map(|version| version.version_id.as_str());
+    let data = VersionsData {
+        path: below.join("/"),
+        node_id: node.node_id.clone(),
+        versions: (kept.iter())
+            .map(|version| VersionData {
+                version_id: version.version_id.clone(),
+                seq: version.seq,
+                size: content_size(Some(version)),
+                device_id: version.device_id.clone(),
+                created_at_ms: version.created_at_ms,
+                current: Some(version.version_id.as_str()) == current,
+            })
+            .collect(),
+    };
+    let text = versions_report(&below.join("/"), node, &kept, now_ms());
+    Ok(Done::ok(data, text))
 }
 
-/// `koi restore <path>`: asks the folder's engine to bring the deletion at `path` back from the trash, or, with
+/// `koi history restore <path>`: asks the folder's engine to bring the deletion at `path` back from the trash, or, with
 /// `version`, to make that version of the live file at `path` current again. `node` picks one of several deletions
 /// that had the path. The request is checked against the server's listings first, so a typo fails here and not after
 /// the next commit.
-pub async fn restore(
+async fn restore(
     paths: &Paths,
     path: &Path,
     version: Option<String>,
     node: Option<String>,
-) -> Result<(), String> {
+) -> Result<Done, CliError> {
     let (linked, below) = locate(paths, path).await?;
     if below.is_empty() {
-        return Err(format!(
+        return Err(CliError::usage(format!(
             "{} is the linked folder itself; name a file or folder in it",
             linked.path
-        ));
+        )));
     }
     let auth = signed_in(paths)?;
     let space = linked.space_id.as_str();
@@ -104,13 +165,15 @@ pub async fn restore(
     let request = match version {
         Some(version_id) => {
             let file = find(&live, space, &below).ok_or_else(|| {
-                format!(
-                    "the server has no file at {shown} in {}; koi trash lists deleted ones",
+                CliError::usage(format!(
+                    "the server has no file at {shown} in {}; koi history trash lists deleted ones",
                     linked.path
-                )
+                ))
             })?;
             if file.kind() == NodeKind::Dir {
-                return Err(format!("{shown} is a folder; only a file has versions"));
+                return Err(CliError::usage(format!(
+                    "{shown} is a folder; only a file has versions"
+                )));
             }
             if file
                 .current
@@ -118,15 +181,15 @@ pub async fn restore(
                 .map(|current| current.version_id.as_str())
                 == Some(version_id.as_str())
             {
-                return Err(format!(
+                return Err(CliError::usage(format!(
                     "{version_id} is already the current version of {shown}"
-                ));
+                )));
             }
             let kept = versions_of(&auth, space, &file.node_id).await?;
             if !kept.iter().any(|kept| kept.version_id == version_id) {
-                return Err(format!(
-                    "{shown} has no version {version_id}; koi versions lists them"
-                ));
+                return Err(CliError::usage(format!(
+                    "{shown} has no version {version_id}; koi history versions lists them"
+                )));
             }
             RestoreRequest::Version {
                 node_id: file.node_id.clone(),
@@ -136,7 +199,7 @@ pub async fn restore(
         None => {
             let trashed = trash_nodes(&auth, space).await?;
             let deleted = trashed_at(&live, &trashed, space, &below, node.as_deref())
-                .map_err(|why| why.message(&shown, &linked))?;
+                .map_err(|why| CliError::usage(why.message(&shown, &linked)))?;
             RestoreRequest::FromTrash {
                 node_id: deleted.node_id.clone(),
                 parent_id: None,
@@ -150,37 +213,45 @@ pub async fn restore(
     };
     let id = match ipc::run(paths, request).await? {
         Response::Restore { id } => id,
-        Response::Error { message } => return Err(message),
-        other => return Err(format!("the daemon answered {other:?}")),
+        other => return Err(unexpected(other)),
     };
-    println!("Asked to restore {shown} (restore {id}).");
+    let mut note = format!("Asked to restore {shown} (restore {}).\n", printable(&id));
     if linked.state == FolderState::Stopped {
-        println!("Run koi daemon to send it. koi restores shows how it went.");
+        note.push_str("Run koi _daemon to send it. koi history requests shows how it went.\n");
     } else {
-        println!(
-            "The folder sends it with its next commit. koi restores {} shows how it went.",
-            linked.path
-        );
+        note.push_str(&format!(
+            "The folder sends it with its next commit. koi history requests {} shows how it went.\n",
+            printable(&linked.path)
+        ));
     }
-    Ok(())
+    let value = printable(&id);
+    let data = RestoreAskedData {
+        request_id: id,
+        folder: linked.path.clone(),
+        path: below.join("/"),
+    };
+    let done = Done {
+        outcome: Outcome::Accepted,
+        ..Done::value(data, &value, note)
+    };
+    Ok(done.then(&["koi", "history", "requests", &linked.path]))
 }
 
-/// `koi restores [folder]`: the restores asked for in the folder's space, those that ended first.
-pub async fn restores(paths: &Paths, folder: &Path, json: bool) -> Result<(), String> {
+/// `koi history requests [folder]`: the restores asked for in the folder's space, those that ended first.
+async fn requests(paths: &Paths, folder: &Path) -> Result<Done, CliError> {
     let (linked, _) = locate(paths, folder).await?;
     let request = Request::Restores {
         space_id: linked.space_id.clone(),
     };
     let restores = match ipc::run(paths, request).await? {
         Response::Restores { restores } => restores,
-        Response::Error { message } => return Err(message),
-        other => return Err(format!("the daemon answered {other:?}")),
+        other => return Err(unexpected(other)),
     };
-    if json {
-        return print_json(&restores);
-    }
-    print!("{}", restores_report(&restores, &linked));
-    Ok(())
+    let data = RequestsData {
+        folder: linked.path.clone(),
+        requests: restores.iter().map(RequestData::of).collect(),
+    };
+    Ok(Done::ok(data, restores_report(&restores, &linked)))
 }
 
 /// Why no single deletion could be picked.
@@ -198,29 +269,33 @@ impl NotPicked<'_> {
     fn message(&self, shown: &str, linked: &FolderStatus) -> String {
         match self {
             Self::None { live: true } => {
-                format!("{shown} is not deleted; koi versions lists the versions of a file")
+                format!("{shown} is not deleted; koi history versions lists the versions of a file")
             }
             Self::None { live: false } => format!(
-                "nothing deleted at {shown} is in the trash of {}; koi trash lists what is",
+                "nothing deleted at {shown} is in the trash of {}; koi history trash lists what is",
                 linked.path
             ),
             Self::Several(found) => {
-                let mut message = format!(
-                    "{} deletions had the path {shown}; pick one with --node:",
-                    found.len()
-                );
-                for node in found {
-                    message.push_str(&format!(
-                        "\n  {}  {}, {}",
-                        node.node_id,
-                        kind(node),
-                        size(content_size(node.current.as_ref()))
-                    ));
-                }
-                message
+                let candidates: Vec<String> = (found.iter())
+                    .map(|node| {
+                        format!(
+                            "{} ({}, {})",
+                            node.node_id,
+                            kind(node),
+                            size(content_size(node.current.as_ref()))
+                        )
+                    })
+                    .collect();
+                format!(
+                    "{} deletions had the path {shown}; pick one with --node: {}",
+                    found.len(),
+                    candidates.join(", ")
+                )
             }
             Self::NotThere(node) => {
-                format!("no deletion at {shown} is node {node}; koi trash --json lists them")
+                format!(
+                    "no deletion at {shown} is node {node}; koi history trash --json lists them"
+                )
             }
         }
     }
@@ -271,14 +346,13 @@ fn trashed_at<'a>(
 /// deleted on this device may still be on the server. Symbolic links are followed only up to the linked folder: below
 /// it a link is a node of the space like any other, so the names stay as typed and never select the node a local link
 /// points to.
-async fn locate(paths: &Paths, path: &Path) -> Result<(FolderStatus, Vec<String>), String> {
+async fn locate(paths: &Paths, path: &Path) -> Result<(FolderStatus, Vec<String>), CliError> {
     let folders = match ipc::ask(paths, &Request::Status).await? {
         Some(Response::Status { status }) => status.folders,
-        Some(Response::Error { message }) => return Err(message),
-        Some(other) => return Err(format!("the daemon answered {other:?}")),
+        Some(other) => return Err(unexpected(other)),
         None => Driver::linked_folders(paths).map_err(|error| match error {
-            DriverError::Busy(_) => ipc::busy(paths),
-            other => other.to_string(),
+            DriverError::Busy(_) => CliError::from(ipc::busy(paths)),
+            other => CliError::from(other),
         })?,
     };
     let typed = lexical(&crate::absolute(path)?);
@@ -302,10 +376,10 @@ async fn locate(paths: &Paths, path: &Path) -> Result<(FolderStatus, Vec<String>
             return Ok((folder.clone(), names));
         }
     }
-    Err(format!(
+    Err(CliError::usage(format!(
         "{} is not in a linked folder; koi status lists them",
-        typed.display()
-    ))
+        printable(&typed.display().to_string())
+    )))
 }
 
 /// `path` without `.` names, and with each `..` removing the name before it, worked out without reading the disk.
@@ -344,17 +418,9 @@ fn starts_with(names: &[String], prefix: &[String]) -> bool {
             .all(|(name, wanted)| name_key(name) == name_key(wanted))
 }
 
-async fn call(auth: &Auth, space: &str, call: Call) -> Result<rpc_response::Result, String> {
-    match auth
-        .api()
-        .rpc(auth, space, call)
-        .await
-        .map_err(refusal)?
-        .result
-    {
-        Some(rpc_response::Result::Error(error)) => {
-            Err(format!("the server refused: {}", error.message))
-        }
+async fn call(auth: &Auth, space: &str, call: Call) -> Result<rpc_response::Result, CliError> {
+    match auth.api().rpc(auth, space, call).await?.result {
+        Some(rpc_response::Result::Error(error)) => Err(CliError::rpc_refusal(error)),
         Some(result) => Ok(result),
         None => Err("the server sent an empty answer".into()),
     }
@@ -363,8 +429,8 @@ async fn call(auth: &Auth, space: &str, call: Call) -> Result<rpc_response::Resu
 /// Every page of a listing, from the empty cursor to the page whose `next_cursor` is empty. A cursor the server sends
 /// twice ends the listing with an error instead of a loop.
 async fn every_page<T>(
-    mut page: impl AsyncFnMut(String) -> Result<(Vec<T>, String), String>,
-) -> Result<Vec<T>, String> {
+    mut page: impl AsyncFnMut(String) -> Result<(Vec<T>, String), CliError>,
+) -> Result<Vec<T>, CliError> {
     let mut all = Vec::new();
     let mut cursor = String::new();
     let mut seen = HashSet::new();
@@ -381,7 +447,7 @@ async fn every_page<T>(
     }
 }
 
-async fn tree(auth: &Auth, space: &str) -> Result<Vec<NodeState>, String> {
+async fn tree(auth: &Auth, space: &str) -> Result<Vec<NodeState>, CliError> {
     every_page(async |cursor| {
         match call(
             auth,
@@ -400,7 +466,7 @@ async fn tree(auth: &Auth, space: &str) -> Result<Vec<NodeState>, String> {
     .await
 }
 
-async fn trash_nodes(auth: &Auth, space: &str) -> Result<Vec<NodeState>, String> {
+async fn trash_nodes(auth: &Auth, space: &str) -> Result<Vec<NodeState>, CliError> {
     every_page(async |cursor| {
         match call(
             auth,
@@ -419,7 +485,11 @@ async fn trash_nodes(auth: &Auth, space: &str) -> Result<Vec<NodeState>, String>
     .await
 }
 
-async fn versions_of(auth: &Auth, space: &str, node_id: &str) -> Result<Vec<VersionInfo>, String> {
+async fn versions_of(
+    auth: &Auth,
+    space: &str,
+    node_id: &str,
+) -> Result<Vec<VersionInfo>, CliError> {
     every_page(async |cursor| {
         let request = ListVersions {
             node_id: node_id.to_owned(),
@@ -482,15 +552,15 @@ struct Deleted<'a> {
 }
 
 impl Deleted<'_> {
-    fn json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "node_id": self.node.node_id,
-            "path": self.names.join("/"),
-            "kind": kind(self.node),
-            "trash_group": self.node.trash_group,
-            "files": self.files,
-            "bytes": self.bytes,
-        })
+    fn entry(&self) -> TrashEntry {
+        TrashEntry {
+            node_id: self.node.node_id.clone(),
+            path: self.names.join("/"),
+            kind: kind(self.node),
+            trash_group: self.node.trash_group.clone(),
+            files: self.files,
+            bytes: self.bytes,
+        }
     }
 }
 
@@ -556,7 +626,10 @@ fn kind(node: &NodeState) -> &'static str {
 
 fn trash_report(found: &[Deleted], linked: &FolderStatus) -> String {
     if found.is_empty() {
-        return format!("Nothing from {} is in the trash.\n", linked.path);
+        return format!(
+            "Nothing from {} is in the trash.\n",
+            printable(&linked.path)
+        );
     }
     let mut report = String::new();
     for deleted in found {
@@ -577,7 +650,7 @@ fn trash_report(found: &[Deleted], linked: &FolderStatus) -> String {
 
 fn restores_report(restores: &[RestoreStatus], linked: &FolderStatus) -> String {
     if restores.is_empty() {
-        return format!("No restore was asked for in {}.\n", linked.path);
+        return format!("No restore was asked for in {}.\n", printable(&linked.path));
     }
     let mut report = String::new();
     for restore in restores {
@@ -602,10 +675,13 @@ fn restores_report(restores: &[RestoreStatus], linked: &FolderStatus) -> String 
             "A pending restore goes out with a commit of the folder once the earlier changes of its node have synced.\n",
         );
         if linked.state == FolderState::Stopped {
-            report.push_str("The folder is not syncing: run koi daemon.\n");
+            report.push_str("The folder is not syncing: run koi _daemon.\n");
         }
         if let Some(problem) = &linked.problem {
-            report.push_str(&format!("The folder has a problem: {problem}\n"));
+            report.push_str(&format!(
+                "The folder has a problem: {}\n",
+                printable(problem)
+            ));
         }
         if linked.questions > 0 {
             report.push_str(&format!(
@@ -654,16 +730,6 @@ fn rejection(reason: &RestoreRejection) -> String {
         RestoreRejection::ReadOnly => "the server takes no writes from this device".into(),
         RestoreRejection::Other(reason) => reason.clone(),
     }
-}
-
-fn version_json(version: &VersionInfo) -> serde_json::Value {
-    serde_json::json!({
-        "version_id": version.version_id,
-        "seq": version.seq,
-        "size": content_size(Some(version)),
-        "device_id": version.device_id,
-        "created_at_ms": version.created_at_ms,
-    })
 }
 
 fn versions_report(path: &str, node: &NodeState, kept: &[VersionInfo], now_ms: i64) -> String {
@@ -795,7 +861,10 @@ mod tests {
         let error = every_page(async |_cursor: String| Ok((vec![0], "same".to_owned())))
             .await
             .unwrap_err();
-        assert!(error.contains("same page cursor twice"), "{error}");
+        assert!(
+            error.message.contains("same page cursor twice"),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]
@@ -878,7 +947,10 @@ mod tests {
 
         assert_eq!(live[0].node_id, "docs");
         assert_eq!(trashed[0].node_id, "old");
-        assert_eq!(error, "the server refused: not a member of this space");
+        assert_eq!(
+            error.message,
+            "the server refused: not a member of this space"
+        );
     }
 
     #[test]
@@ -904,13 +976,14 @@ mod tests {
         let folder = dir.path().join("Sync");
         std::fs::create_dir(&folder).unwrap();
 
-        let trashed = trash(&paths, &folder, false).await.unwrap_err();
-        let kept = versions(&paths, &folder.join("a.txt"), false)
-            .await
-            .unwrap_err();
+        let trashed = trash(&paths, &folder).await.unwrap_err();
+        let kept = versions(&paths, &folder.join("a.txt")).await.unwrap_err();
 
-        assert!(trashed.contains("not in a linked folder"), "{trashed}");
-        assert!(kept.contains("not in a linked folder"), "{kept}");
+        assert!(
+            trashed.message.contains("not in a linked folder"),
+            "{trashed:?}"
+        );
+        assert!(kept.message.contains("not in a linked folder"), "{kept:?}");
         assert!(!dir.path().join("profile").exists());
     }
 
@@ -980,6 +1053,18 @@ mod tests {
             trash_report(&[], &linked),
             "Nothing from /home/ada/Koidrive is in the trash.\n"
         );
+        let forged = FolderStatus {
+            path: "/home/ada/Docs\u{1b}[31m\nFORGED".into(),
+            ..linked
+        };
+        assert_eq!(
+            trash_report(&[], &forged),
+            "Nothing from /home/ada/Docs\\u{1b}[31m\\u{a}FORGED is in the trash.\n"
+        );
+        assert_eq!(
+            restores_report(&[], &forged),
+            "No restore was asked for in /home/ada/Docs\\u{1b}[31m\\u{a}FORGED.\n"
+        );
     }
 
     #[test]
@@ -1035,7 +1120,7 @@ mod tests {
         let several = trashed_at(&live, &trash, SPACE, &names("docs/old.txt"), None).unwrap_err();
         assert_eq!(
             several.message("docs/old.txt", &linked()),
-            "2 deletions had the path docs/old.txt; pick one with --node:\n  old-a  file, 7 B\n  old-b  file, 12 B"
+            "2 deletions had the path docs/old.txt; pick one with --node: old-a (file, 7 B), old-b (file, 12 B)"
         );
     }
 
@@ -1089,7 +1174,7 @@ mod tests {
                 "r2  version note-0 of node note\n",
                 "  pending: waits for the folder to sync\n",
                 "A pending restore goes out with a commit of the folder once the earlier changes of its node have synced.\n",
-                "The folder is not syncing: run koi daemon.\n",
+                "The folder is not syncing: run koi _daemon.\n",
                 "The folder has a problem: the root is missing\n",
                 "1 pending decision for the folder: koi resolve lists them.\n",
             )

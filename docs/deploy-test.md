@@ -25,7 +25,7 @@ Every run uses one name, `koidrive-test-<run id>-<run attempt>`, for the Worker 
    1. **Create:** each device writes files, among them a 3 MB and a 2 MB file, and both hold all five.
    2. **Edit:** each device rewrites one of its own files.
    3. **Rename and move:** at the same time, the Linux device renames a file the macOS device wrote into a new folder, and the macOS device moves a file into a folder the Linux device made.
-   4. **Delete:** the macOS device deletes a file the Linux device wrote, and `koi trash` on the Linux device lists it.
+   4. **Delete:** the macOS device deletes a file the Linux device wrote, and `koi history trash` on the Linux device lists it.
    5. **Conflict:** the Linux daemon stops and the Linux device edits `shared.txt`. The macOS device then edits it too, and the server takes that edit. When the Linux daemon starts again, both devices hold two files named `shared…txt`, one with each edit.
    6. **Third device:** a second `koi` profile on the Linux runner pairs, links the space and gets the whole tree from the server.
    7. **Rewind:** the run records a restore point, then each device writes a file. The owner rewinds the space to the point on the real Durable Object ([RFC 0003](../spec/rfc/0003-space-rewind.md)). Each folder must halt with a problem that ends with "this build cannot recover the folder yet", because recovery after a rewind ([RFC 0002 §6](../spec/rfc/0002-commit-outcomes-and-recovery.md#6-recovery-after-a-history-change-or-a-stale-store-73-step-4)) is still a draft. Each device then does what the [owner guide](guide/status.md) says: it unlinks the folder and links a new, empty folder to the space, which must get the restore point's tree.

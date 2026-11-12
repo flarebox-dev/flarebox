@@ -127,7 +127,7 @@ printf '%s\n' "$*" >> "$HOME/systemctl.log"
 EOF
     chmod +x "$tmp/bin/systemctl"
     PATH="$tmp/bin:$PATH" KOIDRIVE_INSTALL_DIR="$HOME/custom bin" sh "$root/install.sh" --systemd
-    grep -F "ExecStart=\"$HOME/custom bin/koi\" daemon" "$XDG_CONFIG_HOME/systemd/user/koidrive.service"
+    grep -F "ExecStart=\"$HOME/custom bin/koi\" _daemon" "$XDG_CONFIG_HOME/systemd/user/koidrive.service"
     grep -x -- '--user daemon-reload' "$HOME/systemctl.log"
     [ "$(wc -l < "$HOME/systemctl.log" | tr -d ' ')" = 1 ]
     pass 'systemd unit follows the custom directory without starting the daemon'

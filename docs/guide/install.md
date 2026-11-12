@@ -45,17 +45,19 @@ KOIDRIVE_SERVER_BUNDLE="$PWD/target/server-bundle" cargo install --locked --path
 
 `pack-bundle.mjs` writes the server's Worker code, its static files and a manifest into `target/server-bundle`. It needs no Cloudflare account. `cargo install` builds the command with that server inside it and puts `koi` in `~/.cargo/bin`. Check it with `koi --version`.
 
-A build without `KOIDRIVE_SERVER_BUNDLE` can't find or deploy a server in your Cloudflare account. `koi setup` with the Cloudflare login, `server deploy`, `server add-device`, `server upgrade` and `server uninstall` without `--bucket` stop with "this koi was built without a server bundle". Everything else works.
+A build without `KOIDRIVE_SERVER_BUNDLE` can't find or deploy a server in your Cloudflare account. `koi setup` with the Cloudflare login, `server deploy`, `server add-device`, `server upgrade` and `server delete` without `--bucket` stop with "this koi was built without a server bundle". Everything else works.
 
 ## Run the sync daemon
 
 Folders sync only while the daemon runs:
 
 ```sh
-koi daemon
+koi _daemon
 ```
 
-It runs in the foreground until you press Ctrl-C or send it SIGTERM. Commands that change this device's folders, such as `link`, `restart` and `lift`, talk to the daemon through a socket when it runs, and open the profile themselves when it doesn't. So `koi link` works without the daemon, and the folder starts syncing when the daemon starts. The `device`, `space` and `usage` commands talk to the server directly. `trash` and `versions` read from the server too, but first ask the daemon, when it runs, which space the folder syncs.
+`_daemon` is the service entry point, so `koi --help` doesn't list it.
+
+It runs in the foreground until you press Ctrl-C or send it SIGTERM. Commands that change this device's folders, such as `folder link`, `folder restart` and `folder retry`, talk to the daemon through a socket when it runs, and open the profile themselves when it doesn't. So `koi folder link` works without the daemon, and the folder starts syncing when the daemon starts. The `device` and `space` commands talk to the server directly. `history trash` and `history versions` read from the server too, but first ask the daemon, when it runs, which space the folder syncs.
 
 The daemon logs at the `info` level. Set `KOIDRIVE_LOG` to change it, for example `KOIDRIVE_LOG=debug`. `--log-format json` writes one JSON object per line.
 
@@ -75,7 +77,7 @@ systemctl --user enable --now koidrive
 
 Read its log with `journalctl --user -u koidrive`. To keep syncing while you are logged out, run `loginctl enable-linger "$USER"`.
 
-**macOS.** Koidrive has no launch agent for the daemon yet. Run `koi daemon` in a terminal.
+**macOS.** Koidrive has no launch agent for the daemon yet. Run `koi _daemon` in a terminal.
 
 ## Files on this machine
 

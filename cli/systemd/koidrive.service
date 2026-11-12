@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# The Koidrive sync daemon as a systemd user service. Set up and link first (koi setup, koi link), then:
+# The Koidrive sync daemon as a systemd user service. Set up and link first (koi setup, koi folder link), then:
 #
 #   install -Dm644 koidrive.service ~/.config/systemd/user/koidrive.service
 #   systemctl --user daemon-reload
@@ -15,7 +15,7 @@ Documentation=https://github.com/koidrive/koidrive
 
 [Service]
 Type=exec
-ExecStart=%h/.local/bin/koi daemon
+ExecStart=%h/.local/bin/koi _daemon
 Restart=on-failure
 RestartSec=10s
 Environment=KOIDRIVE_LOG=info

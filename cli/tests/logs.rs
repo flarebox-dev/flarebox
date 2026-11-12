@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 fn logs_to_a_pipe_are_plain_text() {
     let home = tempfile::tempdir().unwrap();
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_koi"))
-        .arg("daemon")
+        .arg("_daemon")
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", home.path().join("config"))
         .env("XDG_STATE_HOME", home.path().join("state"))
@@ -26,4 +26,87 @@ fn logs_to_a_pipe_are_plain_text() {
     daemon.wait().unwrap();
     assert!(log.contains("the daemon is running"), "{log}");
     assert!(!log.contains('\u{1b}'), "{log:?}");
+}
+
+/// With --json the daemon prints its lifecycle as one JSON object per line on stdout, and its logs as JSON lines on
+/// stderr, with no ANSI escapes even when it was asked for colours.
+#[test]
+fn the_daemon_under_json_prints_its_lifecycle_as_json_lines() {
+    let home = tempfile::tempdir().unwrap();
+    let daemon = |json: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_koi"));
+        command
+            .arg("_daemon")
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join("config"))
+            .env("XDG_STATE_HOME", home.path().join("state"))
+            .env("XDG_RUNTIME_DIR", home.path().join("run"))
+            .env("CLICOLOR_FORCE", "1")
+            .env_remove("NO_COLOR")
+            .env_remove("KOIDRIVE_LOG")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if json {
+            command.arg("--json");
+        }
+        command
+    };
+    let mut running = daemon(true).spawn().expect("run koi");
+    let pid = running.id().to_string();
+    let (_finished, finish) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let waited = finish.recv_timeout(std::time::Duration::from_secs(30));
+        if waited == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+            let _ = Command::new("kill").args(["-KILL", &pid]).status();
+        }
+    });
+    let mut stdout = BufReader::new(running.stdout.take().unwrap());
+    let mut started = String::new();
+    stdout.read_line(&mut started).unwrap();
+    let started: serde_json::Value = serde_json::from_str(&started).unwrap();
+    assert_eq!(started["schema_version"], 1, "{started}");
+    assert_eq!(started["event"], "started", "{started}");
+    assert_eq!(started["folders"], 0, "{started}");
+
+    let help = daemon(true).arg("--help").output().unwrap();
+    assert_eq!(help.status.code(), Some(0), "{help:?}");
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert_eq!(help.lines().count(), 1, "{help}");
+    let envelope: serde_json::Value = serde_json::from_str(&help).unwrap();
+    assert!(
+        (envelope["data"]["help"].as_str().unwrap()).contains("_daemon"),
+        "{envelope}"
+    );
+
+    let busy = daemon(true).output().unwrap();
+    assert_eq!(busy.status.code(), Some(1), "{busy:?}");
+    let busy = String::from_utf8(busy.stdout).unwrap();
+    assert_eq!(busy.lines().count(), 1, "{busy}");
+    let envelope: serde_json::Value = serde_json::from_str(&busy).unwrap();
+    assert_eq!(envelope["error"]["code"], "failed", "{envelope}");
+
+    let killed = Command::new("kill")
+        .args(["-TERM", &running.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let output = running.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let rest: Vec<String> = stdout.lines().map(Result::unwrap).collect();
+    let events: Vec<serde_json::Value> = (rest.iter())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events.len(), 2, "{rest:?}");
+    assert_eq!(events[0]["event"], "stopping");
+    assert_eq!(events[0]["signal"], "SIGTERM");
+    assert_eq!(events[1]["event"], "stopped");
+    assert!(events.iter().all(|event| event["schema_version"] == 1));
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stderr.contains('\u{1b}'), "{stderr:?}");
+    for line in stderr.lines() {
+        let log: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|error| panic!("{line:?} is not a JSON log line: {error}"));
+        assert!(log.get("level").is_some(), "{line}");
+    }
 }

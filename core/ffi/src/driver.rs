@@ -912,6 +912,7 @@ mod tests {
             space_id: "0190a5b0-0000-7000-8000-000000000001".into(),
             space_name: "Documents".into(),
             path: "/Users/ada/Documents".into(),
+            wait: None,
             state,
             history_id: None,
             last_seq: None,
