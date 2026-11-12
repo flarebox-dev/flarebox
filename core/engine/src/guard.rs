@@ -157,18 +157,22 @@ impl RemoteDeletion {
     }
 
     /// Whether this device removed all of this deletion: L holds no node R holds in its trash
-    /// group, and no longer holds its topmost node unless R holds that node live again, as when
-    /// the server restored it on its own for a node below it. A delete the server applied in part,
-    /// keeping a folder for a change the deleting device had not seen, trashes nodes under no
-    /// common folder (spec R7), and a purge leaves R no record of the nodes L still holds under
-    /// the topmost node.
+    /// group, and no longer holds its topmost node while that node is still this deletion's. The
+    /// node is no longer this deletion's when R holds it live again, as when the server restored it
+    /// on its own for a node below it, or trashed in another group, as when that restore was
+    /// followed by a later delete. A delete the server applied in part, keeping a folder for a
+    /// change the deleting device had not seen, trashes nodes under no common folder (spec R7),
+    /// and a purge leaves R no record of the nodes L still holds under the topmost node.
     fn removed(&self, trees: &Trees) -> bool {
-        let group = match &self.trash {
-            Trash::Group { group, .. } => trees.holds_trash_group(group),
-            Trash::Unknown { .. } => false,
+        let top = trees.remote().get(&self.top);
+        let (group, ours) = match &self.trash {
+            Trash::Group { group, .. } => (
+                trees.holds_trash_group(group),
+                top.is_none_or(|node| node.trashed && node.trash_group == *group),
+            ),
+            Trash::Unknown { .. } => (false, top.is_none_or(|node| node.trashed)),
         };
-        let top_live = (trees.remote().get(&self.top)).is_some_and(|node| !node.trashed);
-        (top_live || trees.local().get(&self.top).is_none()) && !group
+        (!ours || trees.local().get(&self.top).is_none()) && !group
     }
 }
 
