@@ -33,7 +33,7 @@ A pull request that fixes one of the issues removes the `#[ignore]` of its sched
 
 The battery runs the property tests at high case counts on GitHub Actions instead of a local machine (`.github/workflows/property-battery.yml`). One job builds the test binaries of every package that depends on proptest and keeps each binary that compiles a file with a `proptest!` block, including files it pulls in with `mod` or `include!` and library unit tests. The build fails if a file with a `proptest!` block is in no test binary, or if the filter selects no test. Then many shards run those binaries with the same case count and a different seed each, and a shard fails if a binary runs a different number of tests than it lists for the filter. Shard `k` uses `PROPTEST_RNG_SEED` = run ID × 1000 + `k`, so every run covers new cases and every failure can be reproduced. A summary job lists each shard's seed, result and log, and the number of cases run.
 
-It runs every night on `main` with the defaults: 24 shards of 8192 cases. Start it for a branch with `scripts/battery.sh`, which needs [gh](https://cli.github.com/) signed in to an account that can run workflows on the repository:
+It runs every night on `main` with the defaults: 24 shards of 8192 cases. It also gates the merge queue: when a queued change touches a path in `.github/property-battery-paths`, compared with the queue's base, the `property battery` job of CI runs 8 shards of 2048 cases with a 30-minute limit per shard, and `ci-report` fails unless it passes. Other changes skip it. The list holds every crate the battery builds (the packages that depend on proptest and their path dependencies) and the files that set how they build. `scripts/battery-paths.sh` prints it, and the `rust` job fails when the committed list differs. Start it for a branch with `scripts/battery.sh`, which needs [gh](https://cli.github.com/) signed in to an account that can run workflows on the repository:
 
 ```sh
 scripts/battery.sh                         # the current branch, as pushed
@@ -58,10 +58,10 @@ The workflow always runs on the branch or tag it tests, using that ref's own cop
 The shard's job summary prints one command per failing test target, for example:
 
 ```sh
-git checkout <commit> && PROPTEST_CASES=8192 PROPTEST_RNG_SEED=<seed> cargo test --locked -p koidrive-sim --test engine_sync
+git fetch origin <commit> && git checkout <commit> && PROPTEST_CASES=8192 PROPTEST_RNG_SEED=<seed> cargo test --locked -p koidrive-sim --test engine_sync
 ```
 
-Running it reproduces the failure locally. The shard's `failure-shard-k` artifact holds the seed, the commands, the test logs and any new `.proptest-regressions` files. Copying a regression file into the checkout replays the shrunk case directly, without the full case count.
+Running it reproduces the failure locally, also for a merge queue commit that never reached a branch. The shard's `failure-shard-k` artifact holds the seed, the commands, the test logs and any new `.proptest-regressions` files. Copying a regression file into the checkout replays the shrunk case directly, without the full case count.
 
 ## The mutation set
 
