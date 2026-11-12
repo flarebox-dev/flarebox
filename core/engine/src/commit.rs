@@ -571,8 +571,8 @@ impl Commits {
     /// pending name: one node of the cycle moves to a free name first and to its own name last, in
     /// the same commit when the commit holds the whole cycle. Otherwise a create or move that only
     /// waits for a name is sent anyway, for the server to rename, except that a folder created
-    /// where a moving folder still is takes a pending name first, and a folder it may be merged
-    /// into is not deleted in the same commit. A delete waits
+    /// where a moving file or folder still is takes a pending name first, and a folder it may be
+    /// merged into is not deleted in the same commit. A delete waits
     /// until nothing that survives is left under it, a create or move until its parent exists, and
     /// a move that would close a cycle against R is reverted: the node is marked in
     /// [`Trees::reverted`], and the effects move it back to its R position on disk, bringing back
@@ -2210,10 +2210,10 @@ fn plan(
         if let Some(Want::Create { shape, .. }) = slot.as_mut()
             && shape.kind == Kind::Dir
         {
-            let held = scratch.held(&shape.parent, &shape.name);
-            if held.iter().any(|other| moving.contains(other)) {
+            if (scratch.holders(&shape.parent, &shape.name)).any(|other| moving.contains(other)) {
                 shape.name = scratch.free_name(&shape.parent, &shape.name);
             } else {
+                let held = scratch.held(&shape.parent, &shape.name);
                 scratch.merged.extend(held);
             }
         }
@@ -2452,22 +2452,26 @@ impl Scratch {
         }
     }
 
-    /// The live folders named `name` under `parent`, which a created folder of that name merges
-    /// into.
-    fn held(&self, parent: &str, name: &str) -> Vec<NodeId> {
-        self.children
-            .get(parent)
+    /// The live nodes named `name` under `parent`.
+    fn holders<'a>(&'a self, parent: &str, name: &str) -> impl Iterator<Item = &'a NodeId> + 'a {
+        (self.children.get(parent))
             .and_then(|keys| keys.get(&name_key(name)))
             .into_iter()
             .flatten()
+    }
+
+    /// The live folders named `name` under `parent`, which a created folder of that name merges
+    /// into.
+    fn held(&self, parent: &str, name: &str) -> Vec<NodeId> {
+        (self.holders(parent, name))
             .filter(|id| self.nodes[*id].kind == Kind::Dir)
             .cloned()
             .collect()
     }
 
-    /// A name under `parent` that nothing holds, for a folder created while the folder holding
-    /// its name moves away: it is renamed to its name in a later commit, instead of being merged
-    /// into the folder that leaves.
+    /// A name under `parent` that nothing holds, for a folder created while the node holding its
+    /// name moves away: it is renamed to its name in a later commit, instead of being merged into
+    /// a folder that leaves or renamed by the server beside a file that leaves.
     fn free_name(&self, parent: &str, name: &str) -> String {
         (1..)
             .map(|n| {
