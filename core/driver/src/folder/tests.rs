@@ -5409,6 +5409,51 @@ fn a_file_moved_out_of_a_removed_folder_with_a_link_in_an_ignored_folder_is_move
     assert_eq!(a.folder.engine.trees.check(), Ok(()));
 }
 
+/// As above, with the move split across two scans: the user moves the file out of the synced folder and removes
+/// `source`, so the scan finds the file only through its link in the ignored folder and the server keeps it. The user
+/// then moves the file back in as `moved`. That is the file placed again, so the server moves it rather than holding
+/// it twice.
+#[test]
+fn a_file_with_a_link_in_an_ignored_folder_moved_back_in_after_its_folder_was_removed_is_moved_on_the_server()
+ {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site.root.join("source")).unwrap();
+    a.create(&mut remote, &site.root.join("source/file"), b"kept");
+    a.create(&mut remote, &site.root.join(".koiignore"), b"ignored/\n");
+    fs::create_dir(site.root.join("ignored")).unwrap();
+    fs::hard_link(
+        site.root.join("source/file"),
+        site.root.join("ignored/alias"),
+    )
+    .unwrap();
+    let away = site.root.with_file_name("away");
+    fs::rename(site.root.join("source/file"), &away).unwrap();
+    fs::remove_dir(site.root.join("source")).unwrap();
+    a.scan_until(|a| !(a.observer.snapshot().entries).contains_key(Path::new("source")));
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    assert!(
+        remote.names().contains(&"file".to_owned()),
+        "{:?}",
+        remote.names()
+    );
+    fs::rename(&away, site.root.join("moved")).unwrap();
+    a.scan_until(|a| (a.observer.snapshot().entries).contains_key(Path::new("moved")));
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    let names = remote.names();
+    assert!(
+        names.contains(&"moved".to_owned()) && !names.contains(&"file".to_owned()),
+        "{names:?}"
+    );
+    assert_eq!(fs::read(site.root.join("moved")).unwrap(), b"kept");
+    assert_eq!(fs::read(site.root.join("ignored/alias")).unwrap(), b"kept");
+    assert_eq!(a.folder.engine.trees.check(), Ok(()));
+}
+
 /// The file moved into an ignored folder has a synced link, `also`, that stays. The file is still left out, so
 /// the server keeps it and its folder.
 #[test]
