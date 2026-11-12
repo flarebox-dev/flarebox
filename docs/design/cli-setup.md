@@ -22,10 +22,10 @@ koi setup                  # on a terminal, asks: log in with Cloudflare, or ent
                                 # otherwise lists the commands below and asks nothing
 koi setup --interactive    # the guided setup, explicitly; fails without a terminal
 koi join <pairing code>    # joins the server named in the code
-koi server deploy          # Cloudflare login, then deploy and claim; fails if a server exists
-koi server add-device      # Cloudflare login, then add this device to the existing server
-koi server upgrade         # Cloudflare login, then upload this CLI's server bundle
-koi server delete          # Cloudflare login, then delete the Worker, empty and delete the bucket
+koi server deploy --interactive      # Cloudflare login, then deploy and claim; fails if a server exists
+koi server add-device --interactive  # Cloudflare login, then add this device to the existing server
+koi server upgrade --interactive     # Cloudflare login, then upload this CLI's server bundle
+koi server delete --interactive      # Cloudflare login, then delete the Worker, empty and delete the bucket
 ```
 
 `koi setup` on a terminal (stdin and stderr, without `--json` or the `CI` variable) offers two choices. "Log in with Cloudflare" runs the OAuth flow (section 2), then looks for a Koidrive server in the chosen account (section 6):
@@ -234,7 +234,7 @@ The Worker is the only place that names the bucket, so the CLI records the bucke
 
 R2 allows buckets with the same name in different jurisdictions, and a bucket outside the default one needs the `cf-r2-jurisdiction` header on every API call ([Data location](#ref-r2-location)). The CLI sends the recorded jurisdiction on every R2 call of the uninstall. That the script settings return the binding's `jurisdiction`, as a Wrangler binding sets it, was not measured; *unverified*.
 
-Every delete treats 404 as done, so a rerun repeats a finished step without error. A rerun with the state file starts at step 3, so it passes the check of step 4 again before it deletes anything in the bucket. If step 4 or 5 finds that the bucket no longer exists, the bucket was deleted before the run stopped, so the CLI deletes the state file and reports the uninstall as complete. The exact R2 error for a missing bucket was not measured; *unverified*. Any other error, such as a 403 or a network failure, keeps the state file for the next rerun. On another machine, or after the state file is lost, the Worker is gone and nothing in the account links the bucket to it. `koi server delete --bucket <name>` then empties and deletes the named bucket after the same confirmation and the check of step 4, recording its `creation_date` first. `--jurisdiction <name>` names a jurisdiction other than the default one. The CLI does not guess the name or the jurisdiction.
+Every delete treats 404 as done, so a rerun repeats a finished step without error. A rerun with the state file starts at step 3, so it passes the check of step 4 again before it deletes anything in the bucket. If step 4 or 5 finds that the bucket no longer exists, the bucket was deleted before the run stopped, so the CLI deletes the state file and reports the uninstall as complete. The exact R2 error for a missing bucket was not measured; *unverified*. Any other error, such as a 403 or a network failure, keeps the state file for the next rerun. On another machine, or after the state file is lost, the Worker is gone and nothing in the account links the bucket to it. `koi server delete --interactive --bucket <name>` then empties and deletes the named bucket after the same confirmation and the check of step 4, recording its `creation_date` first. `--jurisdiction <name>` names a jurisdiction other than the default one. The CLI does not guess the name or the jurisdiction.
 
 ## 6. Finding a Koidrive server in an account
 

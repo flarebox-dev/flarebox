@@ -6,8 +6,8 @@
 
 use koidrive_cloudflare::{ApiError as CloudflareError, OauthError};
 use koidrive_driver::{ConfigError, DriverError, PathsError, SET_UP_AGAIN};
-use koidrive_net::ApiError;
-use koidrive_proto::v1::error::Code as ServerCode;
+use koidrive_net::{ApiError, Resend, ServerError};
+use koidrive_proto::v1::{Error as ProtoError, error::Code as ServerCode};
 use serde::{Deserialize, Serialize};
 
 use crate::report::{Done, Next};
@@ -111,23 +111,49 @@ impl From<&str> for CliError {
     }
 }
 
+impl CliError {
+    /// The server refused this device's credential.
+    fn refused_credential() -> Self {
+        CliError::new(
+            Code::AuthRequired,
+            format!(
+                "the server refused this device's credential, so another device revoked it or the credential is \
+                 wrong. To use this device again, {SET_UP_AGAIN}."
+            ),
+        )
+    }
+
+    /// The `Error` result of an RPC: a refused credential needs a person, and a refusal the server allows sending again
+    /// may pass.
+    pub fn rpc_refusal(error: ProtoError) -> Self {
+        let error = ServerError(error);
+        if error.code() == ServerCode::Unauthenticated {
+            return CliError::refused_credential();
+        }
+        let code = match error.resend() {
+            Resend::Allowed => Code::Unavailable,
+            Resend::Never | Resend::ByCode => Code::Failed,
+        };
+        CliError::new(code, format!("the server refused: {}", error.message()))
+    }
+}
+
 impl From<ApiError> for CliError {
-    /// A refusal of the server: refused credentials need a person, a transport failure or a rate limit may pass.
+    /// A refusal of the server: refused credentials need a person, a transport failure or a refusal the server allows
+    /// sending again may pass.
     fn from(error: ApiError) -> Self {
         if error.is_unauthenticated() {
-            return CliError::new(
-                Code::AuthRequired,
-                format!(
-                    "the server refused this device's credential, so another device revoked it or the credential is \
-                     wrong. To use this device again, {SET_UP_AGAIN}."
-                ),
-            );
+            return CliError::refused_credential();
         }
-        let busy = matches!(error.status(), Some(429 | 502 | 503 | 504))
-            || matches!(
-                error.server().map(|server| server.code()),
-                Some(ServerCode::RetryLater | ServerCode::QuotaExceeded)
-            );
+        let busy = match error
+            .server()
+            .map(|server| (server.code(), server.resend()))
+        {
+            Some((ServerCode::RetryLater | ServerCode::QuotaExceeded, resend)) => {
+                resend == Resend::Allowed
+            }
+            _ => matches!(error.status(), Some(429 | 502 | 503 | 504)),
+        };
         let code = match error {
             ApiError::Transport(_) | ApiError::TooLarge { .. } => Code::Unavailable,
             _ if busy => Code::Unavailable,
@@ -220,7 +246,6 @@ impl From<DriverError> for CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use koidrive_net::ServerError;
     use std::path::PathBuf;
 
     fn refused(status: u16, code: ServerCode) -> ApiError {
@@ -274,11 +299,40 @@ mod tests {
         );
         assert_eq!(
             classify(refused(403, ServerCode::QuotaExceeded)),
-            Code::Unavailable
+            Code::Failed
         );
+        let mut waiting = refused(429, ServerCode::QuotaExceeded);
+        if let ApiError::Server { error, .. } = &mut waiting {
+            error.0.retry_after_ms = 1_000;
+        }
+        assert_eq!(classify(waiting), Code::Unavailable);
         assert_eq!(classify(ApiError::TooLarge { limit: 1 }), Code::Unavailable);
         assert_eq!(classify(ApiError::Status { status: 404 }), Code::Failed);
         assert_eq!(classify(ApiError::Decode("Status")), Code::Failed);
+    }
+
+    #[test]
+    fn an_rpc_refusal_keeps_the_meaning_of_its_code() {
+        let rpc = |code: ServerCode, retry_after_ms: u64| {
+            CliError::rpc_refusal(ProtoError {
+                code: code as i32,
+                message: "refused".into(),
+                retry_after_ms,
+                ..Default::default()
+            })
+        };
+        let revoked = rpc(ServerCode::Unauthenticated, 0);
+        assert_eq!(revoked.code, Code::AuthRequired);
+        assert!(revoked.message.contains(SET_UP_AGAIN), "{revoked:?}");
+        assert_eq!(rpc(ServerCode::RetryLater, 0).code, Code::Unavailable);
+        assert_eq!(
+            rpc(ServerCode::QuotaExceeded, 1_000).code,
+            Code::Unavailable
+        );
+        assert_eq!(rpc(ServerCode::QuotaExceeded, 0).code, Code::Failed);
+        let other = rpc(ServerCode::NotFound, 0);
+        assert_eq!(other.code, Code::Failed);
+        assert_eq!(other.message, "the server refused: refused");
     }
 
     #[test]

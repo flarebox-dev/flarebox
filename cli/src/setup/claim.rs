@@ -186,10 +186,13 @@ impl<'a> Claim<'a> {
                 }
             };
             if started.elapsed() + wait > window {
-                return Err(format!(
-                    "the server did not accept the claim within {} seconds; run the command again to continue",
-                    window.as_secs()
-                ).into());
+                return Err(CliError::new(
+                    crate::error::Code::Unavailable,
+                    format!(
+                        "the server did not accept the claim within {} seconds; run the command again to continue",
+                        window.as_secs()
+                    ),
+                ));
             }
             tokio::time::sleep(wait).await;
         }

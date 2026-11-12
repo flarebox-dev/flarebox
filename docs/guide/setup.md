@@ -38,12 +38,10 @@ Without a terminal on stdin and stderr, with `--json`, or with the `CI` environm
 
 | Command | What it does |
 |---|---|
-| `koi server deploy` | Logs in, deploys a new server and claims it. Stops if the account already has one |
-| `koi server add-device [--worker <name>]` | Logs in and adds this device to the server in the account, without a pairing code. `--worker` names the Worker when there are several |
 | `koi server claim <server-url> <code> --user <name>` | Claims a server deployed with the deploy button |
 | `koi join <code>` | Joins with a pairing code |
 
-The `server` commands log in with Cloudflare in a browser. With `--json` they never open one. They stop with `auth_required` and name the command a person runs on a terminal. See [Agents and scripts](agents.md).
+`koi server deploy` and `koi server add-device [--worker <name>]` log in with Cloudflare in a browser, so a person runs them on a terminal with `--interactive`. Without it, with or without `--json`, they open no browser: they stop with `auth_required` and name the same command with `--interactive`. `deploy` deploys a new server and claims it, and stops if the account already has one. `add-device` adds this device to the server in the account without a pairing code, and `--worker` names the Worker when there are several. See [Agents and scripts](agents.md).
 
 ## Without the Cloudflare login
 

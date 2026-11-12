@@ -6,7 +6,7 @@ Every `koi` command can run without a person at the terminal. Add `--json` and r
 
 `--json` works on every command and in any position, as in `koidrive --json status` or `koi folder link ~/Work --space Work --json`. It selects schema 1, the only schema so far. `--json=1` names it explicitly, and any other version is a usage error. A later schema will need its number; plain `--json` keeps meaning schema 1.
 
-With `--json`, a command prints exactly one JSON object on stdout, also when it fails, when it shows help and when it shows the version. Logs and progress go to stderr. A command with `--json` never asks a question, never reads stdin, never opens a browser and prints no pending-decision line.
+With `--json`, every command except `koi _daemon` prints exactly one JSON object on stdout, also when it fails, when it shows help and when it shows the version. The daemon prints one object per line, as [Watch the daemon](#watch-the-daemon) describes. Logs and progress go to stderr. A command with `--json` never asks a question, never reads stdin, never opens a browser and prints no pending-decision line.
 
 Without `--json`, a command whose result is one value prints only that value on stdout, and what it means on stderr, so that shell capture works: `koi space create` prints the new space's ID, `koi history restore` the restore's ID, and `koi device invite` the pairing code, as in `id=$(koi space create Notes)`.
 

@@ -211,14 +211,14 @@ fn setup_without_a_terminal_lists_the_choices_and_asks_nothing() {
     let text = String::from_utf8(output.stdout).unwrap();
     assert_eq!(output.status.code(), Some(0), "{text}");
     assert!(text.contains("koi join <CODE>"), "{text}");
-    assert!(text.contains("koi server deploy"), "{text}");
+    assert!(text.contains("koi server deploy --interactive"), "{text}");
 
     let (code, envelope) = profile.json(&["setup", "--json"]);
     assert_eq!(code, 0, "{envelope:#}");
     assert_eq!(envelope["data"]["choices"].as_array().unwrap().len(), 5);
     assert_eq!(
         argv(&envelope["next_commands"][1]),
-        ["koi", "server", "deploy"]
+        ["koi", "server", "deploy", "--interactive"]
     );
 
     let output = profile.output(&["setup", "--interactive"]);

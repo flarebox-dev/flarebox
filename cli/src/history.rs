@@ -420,9 +420,7 @@ fn starts_with(names: &[String], prefix: &[String]) -> bool {
 
 async fn call(auth: &Auth, space: &str, call: Call) -> Result<rpc_response::Result, CliError> {
     match auth.api().rpc(auth, space, call).await?.result {
-        Some(rpc_response::Result::Error(error)) => {
-            Err(format!("the server refused: {}", error.message).into())
-        }
+        Some(rpc_response::Result::Error(error)) => Err(CliError::rpc_refusal(error)),
         Some(result) => Ok(result),
         None => Err("the server sent an empty answer".into()),
     }

@@ -202,11 +202,11 @@ fn choices() -> Vec<Choice> {
             "Join a server with a pairing code from a device that is already paired",
         ),
         choice(
-            &["koi", "server", "deploy"],
+            &["koi", "server", "deploy", "--interactive"],
             "Log in with Cloudflare and deploy a server to your account",
         ),
         choice(
-            &["koi", "server", "add-device"],
+            &["koi", "server", "add-device", "--interactive"],
             "Log in with Cloudflare and add this device to the server there, without a pairing code",
         ),
         choice(
@@ -1572,8 +1572,8 @@ mod tests {
             argv,
             [
                 "koi join <CODE>",
-                "koi server deploy",
-                "koi server add-device",
+                "koi server deploy --interactive",
+                "koi server add-device --interactive",
                 "koi server claim <SERVER_URL> <CODE> --user <NAME>",
                 "koi setup --interactive",
             ]
