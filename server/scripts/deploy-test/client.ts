@@ -8,7 +8,7 @@ import { create, type DescMessage, fromBinary, fromJson, type MessageInitShape, 
 import { AccessTokenSchema, DeviceCredentialsSchema, PairStartResponseSchema, TokenRequestSchema } from "../../src/gen/koidrive/v1/auth_pb";
 import { type CommitResult, type Op, OpSchema, type UploadReceipt, UploadReceiptSchema } from "../../src/gen/koidrive/v1/commit_pb";
 import { ClientMessageSchema, RpcRequestSchema, type RpcResponse, RpcResponseSchema, ServerMessageSchema, type Welcome } from "../../src/gen/koidrive/v1/messages_pb";
-import { ChunkRefSchema, type Content, ContentSchema, type NodeState } from "../../src/gen/koidrive/v1/model_pb";
+import { ChunkRefSchema, type CommitRecord, type Content, ContentSchema, type NodeState } from "../../src/gen/koidrive/v1/model_pb";
 import { ChunkPlan_Action, ErrorSchema } from "../../src/gen/koidrive/v1/rpc_pb";
 import { toHex, uuidv7 } from "../../src/ids";
 import type { Credentials, Stats } from "./state.ts";
@@ -239,6 +239,45 @@ export class SpaceClient {
       this.baseSeq = welcome.headSeq;
       this.acceptedSeq = welcome.deviceSeq;
       return welcome;
+    } finally {
+      socket.close(1000);
+    }
+  }
+
+  /** Reads the whole log of the history with Resume from seq 0 over the WebSocket, up to CaughtUp (spec v0 section 7.3). */
+  async log(historyId: string): Promise<CommitRecord[]> {
+    const url = this.device.server.base.replace(/^http/, "ws") + "/v1/spaces/" + this.spaceId + "/ws";
+    stats.requests++;
+    const socket = new WebSocket(url, { headers: { Authorization: "Bearer " + (await this.device.token()) } });
+    socket.binaryType = "arraybuffer";
+    const send = (msg: MessageInitShape<typeof ClientMessageSchema>["msg"]) => {
+      const frame = toBinary(ClientMessageSchema, create(ClientMessageSchema, { msg } as MessageInitShape<typeof ClientMessageSchema>));
+      stats.bytesUp += frame.byteLength;
+      socket.send(frame);
+    };
+    const commits: CommitRecord[] = [];
+    try {
+      return await new Promise<CommitRecord[]>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("no CaughtUp within 60 s on /v1/spaces/" + this.spaceId + "/ws")), 60_000);
+        const end = (error?: Error) => {
+          clearTimeout(timer);
+          if (error) reject(error);
+          else resolve(commits);
+        };
+        socket.addEventListener("open", () => send({ case: "hello", value: { clientName: "koidrive-deploy-test", clientVersion: "0", protoMin: 1, protoMax: 1, maxFormat: 1 } }));
+        socket.addEventListener("message", (event) => {
+          if (!(event.data instanceof ArrayBuffer)) return;
+          stats.bytesDown += event.data.byteLength;
+          const { msg } = fromBinary(ServerMessageSchema, new Uint8Array(event.data));
+          if (msg.case === "welcome") send({ case: "resume", value: { historyId, sinceSeq: 0n } });
+          else if (msg.case === "changes") commits.push(...msg.value.commits);
+          else if (msg.case === "caughtUp") end(msg.value.headSeq === BigInt(commits.length) ? undefined : new Error("Resume from seq 0 sent " + commits.length + " commits up to head " + msg.value.headSeq));
+          else if (msg.case === "resyncRequired") end(new Error("Resume from seq 0 of history " + historyId + " answered ResyncRequired, reason " + msg.value.reason));
+          else if (msg.case === "goodbye") end(new Error("the server said goodbye: " + msg.value.code + " " + msg.value.reason));
+        });
+        socket.addEventListener("error", () => end(new Error("the WebSocket to /v1/spaces/" + this.spaceId + "/ws failed")));
+        socket.addEventListener("close", (event) => end(new Error("the WebSocket to /v1/spaces/" + this.spaceId + "/ws closed with " + event.code + " " + event.reason)));
+      });
     } finally {
       socket.close(1000);
     }
