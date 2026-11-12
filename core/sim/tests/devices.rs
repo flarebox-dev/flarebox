@@ -1617,6 +1617,81 @@ fn an_edit_made_while_its_file_is_parked_for_a_rename_stays_on_the_server() {
 }
 
 #[test]
+fn a_remote_rename_that_lands_while_a_rename_of_this_device_is_in_flight_is_not_sent_after_it() {
+    converge(
+        3,
+        &[
+            vec![(0, file("C.TXT"))],
+            vec![
+                (0, rename(0, 0, "a")),
+                (0, Step::Work(0)),
+                (0, Step::Work(0)),
+                (2, rename(0, 0, "A")),
+                (0, Step::Work(0)),
+                (2, DELIVER),
+                (2, EFFECT),
+                (2, SCAN),
+                (2, rename(0, 0, "C.TXT")),
+                (2, Step::Work(11306161604300316446)),
+            ],
+        ],
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_remote_rename_that_lands_after_a_rename_of_this_device_was_answered_is_not_sent_after_it() {
+    converge(
+        3,
+        &[
+            vec![(0, file("C.TXT"))],
+            vec![
+                (0, rename(0, 0, "a")),
+                (0, Step::Work(0)),
+                (0, Step::Work(0)),
+                (2, rename(0, 0, "A")),
+                (0, Step::Work(0)),
+                (2, DELIVER),
+                (2, EFFECT),
+                (2, SCAN),
+                (2, COMMIT),
+                (2, COMMIT),
+                (2, rename(0, 0, "C.TXT")),
+                (2, Step::Work(11111563161135729838)),
+            ],
+        ],
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_remote_rename_that_lands_after_a_rename_of_this_device_was_acknowledged_is_not_sent_after_it()
+{
+    converge(
+        3,
+        &[
+            vec![(0, file("C.TXT"))],
+            vec![
+                (0, rename(0, 0, "a")),
+                (0, Step::Work(0)),
+                (0, Step::Work(0)),
+                (2, rename(0, 0, "A")),
+                (0, Step::Work(0)),
+                (2, DELIVER),
+                (2, EFFECT),
+                (2, SCAN),
+                (2, COMMIT),
+                (2, rename(0, 0, "C.TXT")),
+                (2, COMMIT),
+                (2, DELIVER),
+                (2, SCAN),
+            ],
+        ],
+    )
+    .unwrap();
+}
+
+#[test]
 fn a_write_a_restore_exposed_stays_on_the_disks_through_a_second_restore() {
     let edit = Step::User(Action {
         kind: 2,

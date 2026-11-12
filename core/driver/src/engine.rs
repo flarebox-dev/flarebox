@@ -1365,8 +1365,10 @@ fn same_kind(before: &engine::QuestionKind, after: &engine::QuestionKind) -> boo
 
 #[cfg(test)]
 mod tests {
+    use koidrive_engine::commit::InFlight;
     use koidrive_engine::effects::{Base, Effect, EffectRecord, Location};
     use koidrive_engine::state::{CommitsState, EffectsState};
+    use koidrive_proto::v1::{self as proto, op};
     use koidrive_proto::v1::{NodePurged, NodeStatus, SpaceUpdated};
     use std::fs;
 
@@ -1745,13 +1747,13 @@ mod tests {
         let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
         let mut plan = |trees: &mut Trees, effects: &mut Effects| {
             trees.settle();
-            (effects.plan(trees, &mut ids, 0).cloned())
+            (effects.plan(trees, None, &mut ids, 0).cloned())
                 .unwrap_or_else(|| panic!("{name}: no effect"))
         };
         for _ in 0..done {
             let record = plan(&mut trees, &mut effects);
             let identity = held(dir(ROOT, ""), 50).identity;
-            (effects.done(&mut trees, &record.effect_id, Some(identity))).unwrap();
+            (effects.done(&mut trees, None, &record.effect_id, Some(identity))).unwrap();
         }
         let record = plan(&mut trees, &mut effects);
         batch(&mut trees);
@@ -1773,6 +1775,25 @@ mod tests {
             record,
             takes,
         }
+    }
+
+    fn sending(mut case: Case, op: op::Op) -> Case {
+        let commit = proto::Commit {
+            device_seq: 1,
+            ops: vec![proto::Op { op: Some(op) }],
+            ..Default::default()
+        };
+        let in_flight = Some(InFlight {
+            commit,
+            deletes: BTreeMap::new(),
+            result: None,
+        });
+        let state = CommitsState {
+            in_flight,
+            ..case.engine.commits.state()
+        };
+        case.engine.commits = Commits::from_state(state).unwrap();
+        case
     }
 
     fn kind(effect: &Effect) -> &'static str {
@@ -1933,6 +1954,43 @@ mod tests {
                 true,
             ),
             case("nothing changed", "move", &rename, 0, unchanged, true),
+            case(
+                "the user moved it",
+                "move",
+                &rename,
+                0,
+                |trees| trees.set_local("n".into(), held(file(ROOT, "renamed", 1), 1)),
+                false,
+            ),
+            sending(
+                case(
+                    "a commit in flight moves it",
+                    "move",
+                    &rename,
+                    0,
+                    unchanged,
+                    false,
+                ),
+                op::Op::Move(proto::Move {
+                    node_id: "n".into(),
+                    new_parent_id: ROOT.into(),
+                    new_name: "x".into(),
+                }),
+            ),
+            sending(
+                case(
+                    "a commit in flight edits it",
+                    "move",
+                    &rename,
+                    0,
+                    unchanged,
+                    true,
+                ),
+                op::Op::UpdateContent(proto::UpdateContent {
+                    node_id: "n".into(),
+                    ..Default::default()
+                }),
+            ),
             case(
                 "another node took the file",
                 "move",
@@ -2099,13 +2157,20 @@ mod tests {
             let context = format!("{}, {}", case.kind, case.name);
             assert_eq!(kind(&case.record.effect), case.kind, "{context}");
             assert_eq!(
-                case.record.applies(&case.engine.trees),
+                case.record
+                    .applies(&case.engine.trees, case.engine.commits.in_flight()),
                 case.takes,
                 "{context}"
             );
             let (mut trees, mut effects) = (case.engine.trees.clone(), case.engine.effects.clone());
             let identity = held(dir(ROOT, ""), 60).identity;
-            let done = effects.done(&mut trees, &case.record.effect_id, Some(identity));
+            let in_flight = case.engine.commits.in_flight();
+            let done = effects.done(
+                &mut trees,
+                in_flight,
+                &case.record.effect_id,
+                Some(identity),
+            );
             assert_eq!(done.is_ok(), case.takes, "{context}: {done:?}");
             assert_eq!(trees.check(), Ok(()), "{context}");
             if !case.takes {
@@ -2137,17 +2202,21 @@ mod tests {
             let Engine {
                 trees,
                 effects,
+                commits,
                 ids,
                 ..
             } = &mut case.engine;
-            let planned = (effects.plan(trees, ids, 0).cloned())
+            let planned = (effects.plan(trees, commits.in_flight(), ids, 0).cloned())
                 .filter(|planned| planned.node == case.record.node);
             let Some(planned) = planned else {
                 continue;
             };
             let context = format!("{}, {}: {planned:?}", case.kind, case.name);
             assert_ne!(planned.effect, case.record.effect, "{context}");
-            assert!(planned.applies(&case.engine.trees), "{context}");
+            assert!(
+                planned.applies(&case.engine.trees, case.engine.commits.in_flight()),
+                "{context}"
+            );
             replanned.push((case.name, kind(&planned.effect)));
         }
         assert_eq!(

@@ -117,11 +117,13 @@ fn effects(trees: &mut Trees) -> Vec<(String, Effect)> {
     let (mut effects, mut ids, mut done) = (Effects::default(), IdGen::new(2), Vec::new());
     loop {
         trees.settle();
-        let Some(record) = effects.plan(trees, &mut ids, NOW).cloned() else {
+        let Some(record) = effects.plan(trees, None, &mut ids, NOW).cloned() else {
             return done;
         };
         let made = identity(100 + done.len() as u128);
-        effects.done(trees, &record.effect_id, Some(made)).unwrap();
+        effects
+            .done(trees, None, &record.effect_id, Some(made))
+            .unwrap();
         done.push((record.node, record.effect));
     }
 }
@@ -659,7 +661,7 @@ fn a_parked_folder_the_rules_now_exclude_frees_its_name_in_s_with_what_it_holds(
     assert_eq!(trees.local().get("old"), Some(&parked));
     assert_eq!(trees.check(), Ok(()));
     assert_eq!(
-        effects::stuck(&trees, &Effects::default()),
+        effects::stuck(&trees, &Effects::default(), None),
         BTreeMap::from([("old".into(), Stuck::Parked)])
     );
 }
@@ -806,12 +808,12 @@ fn a_remote_rules_file_is_written_before_anything_else_below_its_folder() {
     let (mut effects, mut ids, mut order) = (Effects::default(), IdGen::new(2), Vec::new());
     loop {
         trees.settle();
-        let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() else {
+        let Some(record) = effects.plan(&trees, None, &mut ids, NOW).cloned() else {
             break;
         };
         let made = identity(100 + order.len() as u128);
         effects
-            .done(&mut trees, &record.effect_id, Some(made))
+            .done(&mut trees, None, &record.effect_id, Some(made))
             .unwrap();
         if record.node == "z-rules" {
             trees.set_rules(&["d"], rules("secret.txt\n"));

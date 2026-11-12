@@ -552,6 +552,88 @@ fn linked(remote: &mut Remote, name: &str) -> (Site, Device) {
     (site, device)
 }
 
+#[test]
+fn a_refusal_handled_after_a_disconnect_does_not_hold_a_remote_rename() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site.root.join("x"), b"kept");
+    a.settle();
+    let (site_b, mut b) = linked(&mut remote, "b");
+    fs::rename(site.root.join("x"), site.root.join("sent")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    assert!(matches!(a.work.pop_front(), Some(Work::Send(_))));
+    assert!(a.work.is_empty());
+    fs::rename(site.root.join("sent"), site.root.join("x")).unwrap();
+    a.scan_until(|a| {
+        a.folder
+            .engine
+            .trees
+            .local()
+            .iter()
+            .any(|(_, n)| n.shape.name == "x")
+    });
+    fs::rename(site_b.root.join("x"), site_b.root.join("remote")).unwrap();
+    b.scan_until(|b| !b.work.is_empty());
+    b.run(&mut remote);
+    assert_eq!(remote.names(), ["remote"]);
+    a.pull(&remote);
+    a.event(Event::Disconnected {
+        reason: koidrive_net::DisconnectReason::Timeout,
+        retry_in: Duration::from_secs(1),
+    })
+    .unwrap();
+    let step = a.folder.sent(Err(CallError::Server(ServerError(ProtoError {
+        code: Code::ReadOnly as i32,
+        ..Default::default()
+    }))));
+    a.take(step).unwrap();
+    assert!(a.folder.engine.commits.in_flight().is_none());
+    assert!(a.folder.offline);
+    a.run(&mut remote);
+    assert_eq!(names(&site.root), ["remote"]);
+}
+
+#[test]
+fn an_upload_abandoned_after_a_disconnect_does_not_hold_a_remote_rename() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site.root.join("x"), b"kept");
+    a.create(&mut remote, &site.root.join("other"), b"old");
+    a.settle();
+    let (site_b, mut b) = linked(&mut remote, "b");
+    fs::rename(site.root.join("x"), site.root.join("sent")).unwrap();
+    fs::write(site.root.join("other"), b"new").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    assert!(matches!(a.work.pop_front(), Some(Work::Upload(_))));
+    assert!(a.work.is_empty());
+    fs::rename(site.root.join("sent"), site.root.join("x")).unwrap();
+    a.scan_until(|a| {
+        a.folder
+            .engine
+            .trees
+            .local()
+            .iter()
+            .any(|(_, n)| n.shape.name == "x")
+    });
+    fs::rename(site_b.root.join("x"), site_b.root.join("remote")).unwrap();
+    b.scan_until(|b| !b.work.is_empty());
+    b.run(&mut remote);
+    a.pull(&remote);
+    a.event(Event::Disconnected {
+        reason: koidrive_net::DisconnectReason::Timeout,
+        retry_in: Duration::from_secs(1),
+    })
+    .unwrap();
+    let step = a
+        .folder
+        .uploaded(Err(ChunkError::SourceChanged { hash: vec![0; 32] }));
+    a.take(step).unwrap();
+    assert!(a.folder.engine.commits.in_flight().is_none());
+    assert!(a.folder.offline);
+    a.run(&mut remote);
+    assert_eq!(names(&site.root), ["other", "remote"]);
+}
+
 /// A file replaced by a hard link to another file takes that file's content and keeps its own node, so the other
 /// path stays on the server.
 #[test]

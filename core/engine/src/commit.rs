@@ -64,6 +64,12 @@ pub struct InFlight {
     pub result: Option<proto::CommitResult>,
 }
 
+impl InFlight {
+    pub(crate) fn positions(&self, id: &str) -> bool {
+        (self.commit.ops.iter()).any(|op| op.op.as_ref().and_then(positioned) == Some(id))
+    }
+}
+
 /// Why no commit is built or resent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Halt {
@@ -704,12 +710,11 @@ impl Commits {
             Some(op::Op::UpdateContent(update)) => Some(update.node_id.clone()),
             _ => None,
         }));
-        trees.watch_positions(ops.iter().filter_map(|op| match &op.op {
-            Some(op::Op::CreateDir(create)) => Some(create.node_id.clone()),
-            Some(op::Op::CreateFile(create)) => Some(create.node_id.clone()),
-            Some(op::Op::Move(moved)) => Some(moved.node_id.clone()),
-            _ => None,
-        }));
+        trees.watch_positions(
+            (ops.iter()
+                .filter_map(|op| op.op.as_ref().and_then(positioned)))
+            .map(ToOwned::to_owned),
+        );
 
         let commit_id = ids.uuid_v7(now_ms);
         for question in &mut self.questions {
@@ -1493,6 +1498,15 @@ fn carried(
         }
     }
     Ok(found)
+}
+
+fn positioned(op: &op::Op) -> Option<&str> {
+    match op {
+        op::Op::CreateDir(create) => Some(&create.node_id),
+        op::Op::CreateFile(create) => Some(&create.node_id),
+        op::Op::Move(moved) => Some(&moved.node_id),
+        _ => None,
+    }
 }
 
 fn op_node(op: &op::Op) -> &str {

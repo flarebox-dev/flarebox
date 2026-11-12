@@ -828,8 +828,11 @@ fn trash_remotely(trees: &mut Trees, ids: &[&str]) {
 /// Does every effect the planner plans at `now`, and has the guard count each removal.
 fn apply_effects(commits: &mut Commits, trees: &mut Trees, ids: &mut IdGen, now: u64) {
     let mut effects = Effects::default();
-    while let Some(record) = effects.plan(trees, ids, now).cloned() {
-        if let Some(removal) = effects.done(trees, &record.effect_id, None).unwrap() {
+    while let Some(record) = effects.plan(trees, commits.in_flight(), ids, now).cloned() {
+        if let Some(removal) = effects
+            .done(trees, commits.in_flight(), &record.effect_id, None)
+            .unwrap()
+        {
             commits.count_remote(removal, trees, SEQ, ids, now);
         }
         trees.settle();
@@ -940,10 +943,13 @@ fn the_rest_of_a_folder_removed_after_its_notice_was_dismissed_is_not_noticed_ag
     let mut effects = Effects::default();
     while notice(&commits).is_none() {
         let record = effects
-            .plan(&trees, &mut ids, NOW)
+            .plan(&trees, commits.in_flight(), &mut ids, NOW)
             .cloned()
             .expect("a removal");
-        if let Some(removal) = effects.done(&mut trees, &record.effect_id, None).unwrap() {
+        if let Some(removal) = effects
+            .done(&mut trees, commits.in_flight(), &record.effect_id, None)
+            .unwrap()
+        {
             commits.count_remote(removal, &mut trees, SEQ, &mut ids, NOW);
         }
         trees.settle();
@@ -1006,10 +1012,13 @@ fn a_folder_restored_after_its_notice_was_dismissed_is_noticed_when_deleted_agai
     trash_remotely(&mut trees, &["d"]);
     while notice(&commits).is_none() {
         let record = effects
-            .plan(&trees, &mut ids, NOW)
+            .plan(&trees, commits.in_flight(), &mut ids, NOW)
             .cloned()
             .expect("a removal");
-        if let Some(removal) = effects.done(&mut trees, &record.effect_id, None).unwrap() {
+        if let Some(removal) = effects
+            .done(&mut trees, commits.in_flight(), &record.effect_id, None)
+            .unwrap()
+        {
             commits.count_remote(removal, &mut trees, SEQ, &mut ids, NOW);
         }
         trees.settle();
@@ -1019,15 +1028,23 @@ fn a_folder_restored_after_its_notice_was_dismissed_is_noticed_when_deleted_agai
 
     set_remote(&mut trees, false, 3);
     let mut ino = 1000;
-    while let Some(record) = effects.plan(&trees, &mut ids, NOW + 1).cloned() {
+    while let Some(record) = effects
+        .plan(&trees, commits.in_flight(), &mut ids, NOW + 1)
+        .cloned()
+    {
         ino += 1;
         let identity = FileIdentity {
             dev: 1,
             ino,
             birth_ns: Some(0),
         };
-        if let Some(removal) =
-            (effects.done(&mut trees, &record.effect_id, Some(identity))).unwrap()
+        if let Some(removal) = (effects.done(
+            &mut trees,
+            commits.in_flight(),
+            &record.effect_id,
+            Some(identity),
+        ))
+        .unwrap()
         {
             commits.count_remote(removal, &mut trees, SEQ, &mut ids, NOW + 1);
         }
@@ -1079,10 +1096,13 @@ fn a_dismissed_folder_stays_dismissed_when_r_forgets_its_trashed_nodes() {
     trash_remotely(&mut trees, &["d"]);
     while notice(&commits).is_none() {
         let record = effects
-            .plan(&trees, &mut ids, NOW)
+            .plan(&trees, commits.in_flight(), &mut ids, NOW)
             .cloned()
             .expect("a removal");
-        if let Some(removal) = effects.done(&mut trees, &record.effect_id, None).unwrap() {
+        if let Some(removal) = effects
+            .done(&mut trees, commits.in_flight(), &record.effect_id, None)
+            .unwrap()
+        {
             commits.count_remote(removal, &mut trees, SEQ, &mut ids, NOW);
         }
         trees.settle();
@@ -1127,8 +1147,12 @@ fn forget_trashed(trees: &mut Trees) -> Vec<(String, RemoteNode)> {
 fn dismiss_while_removing(commits: &mut Commits, trees: &mut Trees, ids: &mut IdGen) {
     let mut effects = Effects::default();
     while notice(commits).is_none() {
-        let record = (effects.plan(trees, ids, NOW).cloned()).expect("a removal");
-        if let Some(removal) = effects.done(trees, &record.effect_id, None).unwrap() {
+        let record =
+            (effects.plan(trees, commits.in_flight(), ids, NOW).cloned()).expect("a removal");
+        if let Some(removal) = effects
+            .done(trees, commits.in_flight(), &record.effect_id, None)
+            .unwrap()
+        {
             commits.count_remote(removal, trees, SEQ, ids, NOW);
         }
         trees.settle();
@@ -1229,15 +1253,23 @@ fn a_folder_restored_after_a_dismissal_without_its_record_is_noticed_when_delete
     set_remote(&mut trees, false, 3);
     let mut effects = Effects::default();
     let mut ino = 1000;
-    while let Some(record) = effects.plan(&trees, &mut ids, NOW + 1).cloned() {
+    while let Some(record) = effects
+        .plan(&trees, commits.in_flight(), &mut ids, NOW + 1)
+        .cloned()
+    {
         ino += 1;
         let identity = FileIdentity {
             dev: 1,
             ino,
             birth_ns: Some(0),
         };
-        if let Some(removal) =
-            (effects.done(&mut trees, &record.effect_id, Some(identity))).unwrap()
+        if let Some(removal) = (effects.done(
+            &mut trees,
+            commits.in_flight(),
+            &record.effect_id,
+            Some(identity),
+        ))
+        .unwrap()
         {
             commits.count_remote(removal, &mut trees, 3, &mut ids, NOW + 1);
         }
@@ -1314,8 +1346,14 @@ fn a_folder_removal_that_stops_past_the_window_is_noticed() {
     trash_remotely(&mut trees, &["d"]);
     let mut effects = Effects::default();
     for _ in 0..30 {
-        let record = (effects.plan(&trees, &mut ids, NOW).cloned()).expect("a removal");
-        if let Some(removal) = effects.done(&mut trees, &record.effect_id, None).unwrap() {
+        let record = (effects
+            .plan(&trees, commits.in_flight(), &mut ids, NOW)
+            .cloned())
+        .expect("a removal");
+        if let Some(removal) = effects
+            .done(&mut trees, commits.in_flight(), &record.effect_id, None)
+            .unwrap()
+        {
             commits.count_remote(removal, &mut trees, SEQ, &mut ids, NOW);
         }
         trees.settle();

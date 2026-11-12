@@ -911,7 +911,12 @@ fn refuse_and_finish(scenario: &Scenario, refuse: fn(&mut Trees), cut: Option<Cu
         let pending = disk.next(engine, store).unwrap().expect("an effect");
         let staged = ready(pending.stage(&server)).unwrap();
         batch(&mut running, refuse);
-        assert!(!pending.record.applies(&running.engine.trees), "{context}");
+        assert!(
+            !pending
+                .record
+                .applies(&running.engine.trees, running.engine.commits.in_flight()),
+            "{context}"
+        );
         if apply {
             let (disk, engine, store) =
                 (&mut running.disk, &mut running.engine, &mut running.store);
@@ -2407,7 +2412,11 @@ fn a_removal_counts_against_the_files_s_holds_after_it() {
         .set_times(fs::FileTimes::new().set_modified(original_mtime))
         .unwrap();
     let staged = ready(pending.stage(&Server::default())).unwrap();
-    assert!(pending.record.applies(&running.engine.trees));
+    assert!(
+        pending
+            .record
+            .applies(&running.engine.trees, running.engine.commits.in_flight())
+    );
     assert_eq!(
         running
             .disk

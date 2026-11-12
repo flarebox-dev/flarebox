@@ -442,7 +442,12 @@ impl Disk {
             let blocked = engine.effects.blocked().len();
             let Some(record) = engine
                 .effects
-                .plan(&engine.trees, &mut engine.ids, now_ms)
+                .plan(
+                    &engine.trees,
+                    engine.commits.in_flight(),
+                    &mut engine.ids,
+                    now_ms,
+                )
                 .cloned()
             else {
                 if engine.effects.blocked().len() != blocked {
@@ -501,7 +506,7 @@ impl Disk {
         let mut step = |step| hook(Cut::Step(step));
         let now = SystemTime::now();
         let outcome = match &unfetchable {
-            None if record.applies(&engine.trees) => {
+            None if record.applies(&engine.trees, engine.commits.in_flight()) => {
                 self.space
                     .apply(&marker, &effect, &mut contents, now, &mut step)?
             }
@@ -939,7 +944,7 @@ fn acknowledge(
     };
     let settled = store.transaction(|tx| -> Result<_, Stop> {
         let settled = match outcome {
-            _ if !record.applies(&engine.trees) => {
+            _ if !record.applies(&engine.trees, engine.commits.in_flight()) => {
                 engine.effects.failed(&record.effect_id).map_err(refused)?;
                 engine.effects.unblock(&record.node);
                 Settled::Failed("L changed since it was planned".into())
@@ -948,6 +953,7 @@ fn acknowledge(
                 let removal = (engine.effects)
                     .done(
                         &mut engine.trees,
+                        engine.commits.in_flight(),
                         &record.effect_id,
                         identity.map(file_identity),
                     )

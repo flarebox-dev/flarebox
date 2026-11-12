@@ -268,7 +268,7 @@ fn a_first_link_holds_what_matches_nothing_under_one_question_and_sends_nothing_
 fn a_remote_node_whose_name_a_held_entry_takes_is_not_downloaded() {
     let (_, trees, mut ids) = linked();
     let mut effects = Effects::default();
-    assert_eq!(effects.plan(&trees, &mut ids, NOW), None);
+    assert_eq!(effects.plan(&trees, None, &mut ids, NOW), None);
 }
 
 #[test]
@@ -526,7 +526,7 @@ fn discarded(commits: &mut Commits, trees: &mut Trees, ids: &mut IdGen) -> Vec<(
     let mut done = Vec::new();
     for ino in 100.. {
         trees.settle();
-        let Some(record) = effects.plan(trees, ids, NOW).cloned() else {
+        let Some(record) = effects.plan(trees, commits.in_flight(), ids, NOW).cloned() else {
             break;
         };
         let identity = FileIdentity {
@@ -535,7 +535,12 @@ fn discarded(commits: &mut Commits, trees: &mut Trees, ids: &mut IdGen) -> Vec<(
             birth_ns: Some(0),
         };
         effects
-            .done(trees, &record.effect_id, Some(identity))
+            .done(
+                trees,
+                commits.in_flight(),
+                &record.effect_id,
+                Some(identity),
+            )
             .unwrap();
         done.push((record.node, record.effect));
     }
@@ -621,7 +626,10 @@ fn a_discarded_folder_the_user_puts_an_entry_in_is_sent_with_it() {
     assert!(trees.reclaimed("l-new"));
     let mut effects = Effects::default();
     let mut removed = Vec::new();
-    while let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() {
+    while let Some(record) = effects
+        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .cloned()
+    {
         if matches!(
             record.effect,
             Effect::RemoveFile { .. } | Effect::RemoveDir { .. }
@@ -634,7 +642,12 @@ fn a_discarded_folder_the_user_puts_an_entry_in_is_sent_with_it() {
             birth_ns: Some(0),
         };
         effects
-            .done(&mut trees, &record.effect_id, Some(identity))
+            .done(
+                &mut trees,
+                commits.in_flight(),
+                &record.effect_id,
+                Some(identity),
+            )
             .unwrap();
         trees.settle();
     }
@@ -684,7 +697,10 @@ fn a_discarded_folder_whose_subfolder_the_user_puts_an_entry_in_is_sent_with_it(
     assert!(trees.reclaimed("l-sub") && trees.reclaimed("l-new"));
     let mut effects = Effects::default();
     let mut touched = Vec::new();
-    while let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() {
+    while let Some(record) = effects
+        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .cloned()
+    {
         touched.push(record.node.clone());
         let identity = FileIdentity {
             dev: 1,
@@ -692,7 +708,12 @@ fn a_discarded_folder_whose_subfolder_the_user_puts_an_entry_in_is_sent_with_it(
             birth_ns: Some(0),
         };
         effects
-            .done(&mut trees, &record.effect_id, Some(identity))
+            .done(
+                &mut trees,
+                commits.in_flight(),
+                &record.effect_id,
+                Some(identity),
+            )
             .unwrap();
         trees.settle();
     }
@@ -741,7 +762,10 @@ fn a_discarded_file_the_user_edits_is_sent_with_its_folder() {
     trees.settle();
     let mut effects = Effects::default();
     let mut touched = Vec::new();
-    while let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() {
+    while let Some(record) = effects
+        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .cloned()
+    {
         touched.push(record.node.clone());
         let identity = FileIdentity {
             dev: 1,
@@ -749,7 +773,12 @@ fn a_discarded_file_the_user_edits_is_sent_with_its_folder() {
             birth_ns: Some(0),
         };
         effects
-            .done(&mut trees, &record.effect_id, Some(identity))
+            .done(
+                &mut trees,
+                commits.in_flight(),
+                &record.effect_id,
+                Some(identity),
+            )
             .unwrap();
         trees.settle();
     }
@@ -788,7 +817,10 @@ fn an_adopted_folder_keeps_its_rules_unknown() {
         "the folder is adopted"
     );
     assert!(trees.held("r-new"));
-    assert_eq!(Effects::default().plan(&trees, &mut ids, NOW), None);
+    assert_eq!(
+        Effects::default().plan(&trees, commits.in_flight(), &mut ids, NOW),
+        None
+    );
 }
 
 /// On a first link, the person discards A, which takes the name key of the adopted a, so its S
