@@ -75,6 +75,7 @@ async fn read_request(socket: &mut TcpStream) -> (String, Vec<u8>) {
     let mut buffer = [0u8; 4096];
     let (head_end, length) = loop {
         let n = socket.read(&mut buffer).await.unwrap();
+        assert!(n > 0, "the client left before the end of its request");
         request.extend_from_slice(&buffer[..n]);
         if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
             let head = String::from_utf8_lossy(&request[..end]).to_lowercase();
@@ -87,6 +88,7 @@ async fn read_request(socket: &mut TcpStream) -> (String, Vec<u8>) {
     };
     while request.len() < head_end + length {
         let n = socket.read(&mut buffer).await.unwrap();
+        assert!(n > 0, "the client left before the end of its request");
         request.extend_from_slice(&buffer[..n]);
     }
     (
@@ -568,7 +570,12 @@ async fn an_upload_target_that_expires_during_its_batch_is_prepared_again_before
     .await;
 
     let mut reads = Vec::new();
-    let receipts = transfer()
+    let receipts = tokio::time::timeout(
+        Duration::from_secs(30),
+        Transfer {
+            gate: UploadGate::new(1),
+            ..transfer()
+        }
         .upload(&session, &[b.clone(), a.clone()], |chunk| {
             reads.push(chunk.hash.clone());
             let (bytes, delay): (&'static [u8], _) = if chunk.hash == b.hash {
@@ -580,9 +587,11 @@ async fn an_upload_target_that_expires_during_its_batch_is_prepared_again_before
                 tokio::time::sleep(delay).await;
                 Ok(Bytes::from_static(bytes))
             }
-        })
-        .await
-        .unwrap();
+        }),
+    )
+    .await
+    .expect("a chunk deferred for expiry gives its place in the gate back")
+    .unwrap();
 
     assert_eq!(*tickets.lock().unwrap(), ["b", "fresh"]);
     assert_eq!(reads, [b.hash.clone(), a.hash.clone()]);
@@ -875,4 +884,442 @@ async fn an_upload_whose_body_stops_moving_is_retried_after_the_stall_timeout() 
         started.elapsed()
     );
     server.abort();
+}
+
+const HOUR: Duration = Duration::from_secs(3600);
+
+/// How the busy relay answers one PUT: with `status` after `after`, and a receipt if the status is 200.
+#[derive(Clone, Copy)]
+struct Reply {
+    after: Duration,
+    status: u16,
+}
+
+fn ok_after(after: Duration) -> Reply {
+    Reply { after, status: 200 }
+}
+
+/// What the busy relay saw: the ticket of each PUT in the order they arrived, how many PUTs are open now and the most
+/// that were open at once, and the tickets of PUTs whose client left before the answer.
+#[derive(Default)]
+struct Seen {
+    tickets: Vec<String>,
+    open: usize,
+    peak: usize,
+    left: Vec<String>,
+}
+
+/// A relay that serves each PUT on its own task and answers it with `reply(ticket, earlier)`, where `earlier` counts
+/// the PUTs with the same ticket before it. A PUT counts as open from the end of its request to its answer.
+async fn busy_relay(
+    reply: impl Fn(&str, usize) -> Reply + Send + Sync + 'static,
+) -> (SocketAddr, Arc<Mutex<Seen>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let (log, reply) = (seen.clone(), Arc::new(reply));
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let (seen, reply) = (log.clone(), reply.clone());
+            tokio::spawn(async move {
+                let (head, body) = read_request(&mut socket).await;
+                let (_, query) = head.split_once("ticket=").unwrap();
+                let ticket = query.split(' ').next().unwrap().to_owned();
+                let answer = {
+                    let mut seen = seen.lock().unwrap();
+                    let earlier = seen.tickets.iter().filter(|t| **t == ticket).count();
+                    seen.tickets.push(ticket.clone());
+                    seen.open += 1;
+                    seen.peak = seen.peak.max(seen.open);
+                    reply(&ticket, earlier)
+                };
+                let mut probe = [0u8; 1];
+                let left = tokio::select! {
+                    _ = tokio::time::sleep(answer.after) => false,
+                    _ = socket.read(&mut probe) => true,
+                };
+                {
+                    let mut seen = seen.lock().unwrap();
+                    seen.open -= 1;
+                    if left {
+                        seen.left.push(ticket);
+                        return;
+                    }
+                }
+                let (content_type, body) = if answer.status == 200 {
+                    let receipt = UploadReceipt {
+                        hash: Sha256::digest(&body).to_vec(),
+                        size: body.len() as u32,
+                        token: ticket,
+                    };
+                    ("application/x-protobuf", receipt.encode_to_vec())
+                } else {
+                    ("text/plain", Vec::new())
+                };
+                let head = format!(
+                    "HTTP/1.1 {} X\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    answer.status,
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+            });
+        }
+    });
+    (address, seen)
+}
+
+/// `count` distinct chunks named `c0`, `c1` and so on, with their bytes.
+fn named(count: usize) -> Vec<(String, ChunkRef, Bytes)> {
+    (0..count)
+        .map(|i| {
+            let bytes = Bytes::from(format!("chunk {i}"));
+            (format!("c{i}"), chunk(&bytes), bytes)
+        })
+        .collect()
+}
+
+fn refs(parts: &[(String, ChunkRef, Bytes)]) -> Vec<ChunkRef> {
+    parts.iter().map(|(_, chunk, _)| chunk.clone()).collect()
+}
+
+fn names(parts: &[(String, ChunkRef, Bytes)]) -> Vec<String> {
+    parts.iter().map(|(name, _, _)| name.clone()).collect()
+}
+
+/// A session that, in every round, plans an upload of each of `parts` through `relay` with its name as the ticket.
+async fn uploads_through(
+    relay: SocketAddr,
+    parts: &[(String, ChunkRef, Bytes)],
+) -> (Session, Events, Arc<Mutex<Vec<Vec<ChunkRef>>>>) {
+    let plans: Vec<_> = parts
+        .iter()
+        .map(|(name, chunk, _)| upload_plan(relay, chunk, name, HOUR))
+        .collect();
+    scripted_session(move |_| plans.clone()).await
+}
+
+/// Reads any chunk of `parts` from memory.
+fn source(
+    parts: &[(String, ChunkRef, Bytes)],
+) -> impl FnMut(&ChunkRef) -> std::future::Ready<io::Result<Bytes>> + use<> {
+    let bytes: HashMap<_, _> = parts
+        .iter()
+        .map(|(_, chunk, bytes)| (chunk.hash.clone(), bytes.clone()))
+        .collect();
+    move |chunk| std::future::ready(Ok(bytes[&chunk.hash].clone()))
+}
+
+fn tokens(receipts: Vec<UploadReceipt>) -> Vec<String> {
+    receipts.into_iter().map(|receipt| receipt.token).collect()
+}
+
+fn sorted(mut names: Vec<String>) -> Vec<String> {
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn uploads_keep_as_many_chunks_in_flight_as_the_gate_allows_and_no_more() {
+    let parts = named(12);
+    let (relay, seen) = busy_relay(|_, _| ok_after(Duration::from_millis(100))).await;
+    let (session, _events, _) = uploads_through(relay, &parts).await;
+
+    let receipts = transfer()
+        .upload(&session, &refs(&parts), source(&parts))
+        .await
+        .unwrap();
+
+    assert_eq!(sorted(tokens(receipts)), sorted(names(&parts)));
+    assert_eq!(seen.lock().unwrap().peak, DEFAULT_UPLOAD_CONCURRENCY);
+}
+
+#[tokio::test]
+async fn uploads_that_finish_out_of_order_read_and_send_each_distinct_chunk_once() {
+    let parts = named(10);
+    let (sent, present) = parts.split_at(8);
+    let (relay, seen) = busy_relay(|ticket, _| {
+        let index: u64 = ticket[1..].parse().unwrap();
+        ok_after(Duration::from_millis((8 - index) * 20))
+    })
+    .await;
+    let (session, _events, _) = scripted_session({
+        let mut plans: Vec<_> = sent
+            .iter()
+            .map(|(name, chunk, _)| upload_plan(relay, chunk, name, HOUR))
+            .collect();
+        plans.extend(present.iter().map(|(_, chunk, _)| ChunkPlan {
+            hash: chunk.hash.clone(),
+            action: Action::Present as i32,
+            ..Default::default()
+        }));
+        move |_| plans.clone()
+    })
+    .await;
+    let mut chunks = refs(&parts);
+    chunks.extend(refs(&parts[..4]));
+
+    let mut reads = Vec::new();
+    let mut read = source(&parts);
+    let receipts = transfer()
+        .upload(&session, &chunks, |chunk| {
+            reads.push(chunk.hash.clone());
+            read(chunk)
+        })
+        .await
+        .unwrap();
+
+    let receipts = tokens(receipts);
+    assert_ne!(receipts, names(sent), "later uploads finished first");
+    assert_eq!(sorted(receipts), names(sent));
+    reads.sort();
+    let mut expected: Vec<_> = refs(sent).into_iter().map(|chunk| chunk.hash).collect();
+    expected.sort();
+    assert_eq!(
+        reads, expected,
+        "each chunk to send read once, present ones never"
+    );
+    assert_eq!(sorted(seen.lock().unwrap().tickets.clone()), names(sent));
+}
+
+#[tokio::test]
+async fn a_chunk_that_is_retried_does_not_hold_up_the_others() {
+    let parts = named(6);
+    let (relay, seen) = busy_relay(|ticket, earlier| match (ticket, earlier) {
+        ("c0", 0 | 1) => Reply {
+            after: Duration::from_millis(100),
+            status: 503,
+        },
+        ("c0", _) => ok_after(Duration::ZERO),
+        _ => ok_after(Duration::from_millis(10)),
+    })
+    .await;
+    let (session, _events, _) = uploads_through(relay, &parts).await;
+
+    let receipts = transfer()
+        .upload(&session, &refs(&parts), source(&parts))
+        .await
+        .unwrap();
+
+    let receipts = tokens(receipts);
+    assert_eq!(receipts.last().unwrap(), "c0", "{receipts:?}");
+    assert_eq!(sorted(receipts), names(&parts));
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.tickets.iter().filter(|t| *t == "c0").count(), 3);
+}
+
+#[tokio::test]
+async fn a_chunk_that_changed_ends_the_upload_while_others_are_in_flight() {
+    let parts = named(6);
+    let changed = parts[2].1.clone();
+    let (relay, seen) = busy_relay(|_, _| ok_after(Duration::from_secs(30))).await;
+    let (session, _events, _) = uploads_through(relay, &parts).await;
+
+    let (transfer, chunks) = (transfer(), refs(&parts));
+    let mut reads = Vec::new();
+    let mut read = source(&parts);
+    let upload = transfer.upload(&session, &chunks, |chunk| {
+        reads.push(chunk.hash.clone());
+        let bytes = read(chunk);
+        let changed = chunk.hash == changed.hash;
+        async move {
+            if changed {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                return Ok(Bytes::from_static(b"other bytes"));
+            }
+            bytes.await
+        }
+    });
+    let outcome = tokio::time::timeout(Duration::from_secs(5), upload)
+        .await
+        .expect("the upload ends without waiting for the chunks in flight");
+
+    assert!(
+        matches!(&outcome, Err(ChunkError::SourceChanged { hash }) if *hash == changed.hash),
+        "{outcome:?}"
+    );
+    let first_four: Vec<_> = refs(&parts[..4]).into_iter().map(|c| c.hash).collect();
+    assert_eq!(reads, first_four, "no chunk is read after the error");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let seen = seen.lock().unwrap();
+    assert!(
+        seen.tickets
+            .iter()
+            .all(|ticket| ["c0", "c1", "c3"].contains(&ticket.as_str())),
+        "nothing of the changed chunk is sent and nothing starts after it: {:?}",
+        seen.tickets
+    );
+}
+
+#[tokio::test]
+async fn a_chunk_refused_for_good_ends_the_upload_without_waiting_for_slower_ones() {
+    let parts = named(4);
+    let (relay, seen) = busy_relay(|ticket, _| match ticket {
+        "c3" => Reply {
+            after: Duration::ZERO,
+            status: 404,
+        },
+        _ => ok_after(Duration::from_secs(30)),
+    })
+    .await;
+    let (session, _events, _) = uploads_through(relay, &parts).await;
+
+    let (transfer, chunks) = (transfer(), refs(&parts));
+    let upload = transfer.upload(&session, &chunks, source(&parts));
+    let outcome = tokio::time::timeout(Duration::from_secs(5), upload)
+        .await
+        .expect("the upload ends without waiting for the slower chunks");
+
+    assert!(
+        matches!(outcome, Err(ChunkError::Refused { status: 404, .. })),
+        "{outcome:?}"
+    );
+    let abandoned = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            {
+                let seen = seen.lock().unwrap();
+                let others: Vec<_> = seen
+                    .tickets
+                    .iter()
+                    .filter(|t| *t != "c3")
+                    .cloned()
+                    .collect();
+                if !others.is_empty() && sorted(seen.left.clone()) == sorted(others) {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let seen = seen.lock().unwrap();
+    assert!(
+        abandoned.is_ok(),
+        "the client closes every slower upload: {:?} sent, {:?} closed",
+        seen.tickets,
+        seen.left
+    );
+}
+
+#[tokio::test]
+async fn transfers_that_share_a_gate_share_its_limit() {
+    let parts = named(12);
+    let (relay, seen) = busy_relay(|_, _| ok_after(Duration::from_millis(50))).await;
+    let gate = UploadGate::new(2);
+    let (first, second) = parts.split_at(6);
+    let (one, _one_events, _) = uploads_through(relay, first).await;
+    let (two, _two_events, _) = uploads_through(relay, second).await;
+    let sharing = || Transfer {
+        gate: gate.clone(),
+        ..transfer()
+    };
+    let (sharing_one, sharing_two) = (sharing(), sharing());
+    let (first_chunks, second_chunks) = (refs(first), refs(second));
+
+    let (a, b) = tokio::join!(
+        sharing_one.upload(&one, &first_chunks, source(first)),
+        sharing_two.upload(&two, &second_chunks, source(second)),
+    );
+
+    assert_eq!(a.unwrap().len() + b.unwrap().len(), 12);
+    assert_eq!(seen.lock().unwrap().peak, 2);
+}
+
+#[tokio::test]
+async fn one_chunk_at_a_time_reads_and_sends_in_the_order_of_the_chunks() {
+    let [a, b, c, d, e] = [b"chunk a", b"chunk b", b"chunk c", b"chunk d", b"chunk e"]
+        .map(|bytes| (chunk(bytes), Bytes::from_static(bytes)));
+    let (relay, seen) = busy_relay(|ticket, _| match ticket {
+        "stale" => Reply {
+            after: Duration::ZERO,
+            status: 403,
+        },
+        _ => ok_after(Duration::ZERO),
+    })
+    .await;
+    let (session, _events, asked) = scripted_session({
+        let [a, b, c, d, e] = [&a, &b, &c, &d, &e].map(|(chunk, _)| chunk.clone());
+        move |round| match round {
+            0 => vec![
+                upload_plan(relay, &a, "a", HOUR),
+                retry_later(&b),
+                upload_plan(relay, &c, "stale", HOUR),
+                ChunkPlan {
+                    hash: d.hash.clone(),
+                    action: Action::Present as i32,
+                    ..Default::default()
+                },
+                upload_plan(relay, &e, "e", HOUR),
+            ],
+            _ => vec![
+                upload_plan(relay, &b, "b", HOUR),
+                upload_plan(relay, &c, "c", HOUR),
+            ],
+        }
+    })
+    .await;
+    let all = [&a, &b, &c, &d, &e];
+    let chunks: Vec<_> = all.iter().map(|(chunk, _)| chunk.clone()).collect();
+    let name = |hash: &[u8]| {
+        ["a", "b", "c", "d", "e"][all.iter().position(|(c, _)| c.hash == hash).unwrap()]
+    };
+
+    let mut reads = Vec::new();
+    let receipts = Transfer {
+        gate: UploadGate::new(1),
+        ..transfer()
+    }
+    .upload(&session, &chunks, |chunk| {
+        reads.push(name(&chunk.hash));
+        let bytes = all
+            .iter()
+            .find(|(c, _)| c.hash == chunk.hash)
+            .unwrap()
+            .1
+            .clone();
+        std::future::ready(Ok(bytes))
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(reads, ["a", "c", "e", "b", "c"]);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.tickets, ["a", "stale", "e", "b", "c"]);
+    assert_eq!(seen.peak, 1);
+    assert_eq!(tokens(receipts), ["a", "e", "b", "c"]);
+    let asked: Vec<Vec<_>> = asked
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|round| round.iter().map(|chunk| name(&chunk.hash)).collect())
+        .collect();
+    assert_eq!(asked, [vec!["a", "b", "c", "d", "e"], vec!["b", "c"]]);
+}
+
+#[tokio::test]
+async fn four_chunks_at_once_take_at_most_a_third_of_the_time_of_one_at_a_time() {
+    let parts = named(100);
+    let (relay, _) = busy_relay(|_, _| ok_after(Duration::from_millis(50))).await;
+    let mut took = Vec::new();
+    for concurrency in [1, 4] {
+        let (session, _events, _) = uploads_through(relay, &parts).await;
+        let transfer = Transfer {
+            gate: UploadGate::new(concurrency),
+            ..transfer()
+        };
+        let started = Instant::now();
+        let receipts = transfer
+            .upload(&session, &refs(&parts), source(&parts))
+            .await
+            .unwrap();
+        took.push(started.elapsed());
+        assert_eq!(receipts.len(), 100);
+    }
+    assert!(
+        took[1] * 3 <= took[0],
+        "one at a time {:?}, four at once {:?}",
+        took[0],
+        took[1]
+    );
 }

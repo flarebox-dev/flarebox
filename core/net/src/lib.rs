@@ -27,7 +27,9 @@ pub use auth::{
     Stored,
 };
 pub use backoff::Backoff;
-pub use chunks::{ChunkError, MAX_CHUNKS_PER_CALL, Transfer, matches};
+pub use chunks::{
+    ChunkError, DEFAULT_UPLOAD_CONCURRENCY, MAX_CHUNKS_PER_CALL, Transfer, UploadGate, matches,
+};
 pub use error::{ApiError, CallError, NotResent, Resend, ServerError, StopReason};
 pub use event::{Committed, DisconnectReason, Event};
 pub use session::{
