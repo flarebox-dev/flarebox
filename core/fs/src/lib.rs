@@ -1332,9 +1332,7 @@ fn hold_back(
         .map(|path| key(path))
         .collect();
     let seeded: Vec<&PathBuf> = (replaced.iter())
-        .filter(|path| {
-            !earlier.iter().any(|scope| path.starts_with(scope)) && !present.contains(&key(path))
-        })
+        .filter(|path| earlier.unscanned(path) && !present.contains(&key(path)))
         .collect();
     wanted.extend(seeded.iter().map(|path| (key(path), None)));
     let undecided = rules.search(root, &mut wanted, &fresh, seeded.is_empty());
@@ -1622,7 +1620,10 @@ pub trait Watcher {
     /// [`Snapshot::reset`] does. The next poll rescans `scope` and reports
     /// how the disk differs from `known` there, and every file of `known` it
     /// finds as modified. Entries outside `scope` are not reported again
-    /// unless they changed.
+    /// unless they changed. A removal held at or below `scope` is left to
+    /// `known`: that rescan runs the search to its end for each entry of
+    /// `known` whose path now holds another identity, as the first scan of a
+    /// new watcher does.
     fn reset(&mut self, scope: &Path, known: BTreeMap<PathBuf, Known>);
 }
 

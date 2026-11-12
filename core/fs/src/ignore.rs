@@ -83,6 +83,7 @@ struct Search {
     decided: HashMap<Key, Option<PathBuf>>,
     held: BTreeMap<PathBuf, Entry>,
     scanned: Vec<PathBuf>,
+    reseeded: Vec<PathBuf>,
 }
 
 impl Search {
@@ -95,6 +96,18 @@ impl Search {
         if self.pending.is_empty() {
             self.walk = None;
         }
+    }
+}
+
+pub(crate) struct Seeded {
+    scanned: Vec<PathBuf>,
+    reseeded: Vec<PathBuf>,
+}
+
+impl Seeded {
+    pub(crate) fn unscanned(&self, path: &Path) -> bool {
+        let under = |paths: &[PathBuf]| paths.iter().any(|scope| path.starts_with(scope));
+        !under(&self.scanned) || under(&self.reseeded)
     }
 }
 
@@ -133,8 +146,11 @@ impl Rules {
     }
 
     pub(crate) fn forget(&mut self, scope: &Path) {
-        self.search.held.retain(|path, _| !path.starts_with(scope));
-        self.search.prune();
+        let search = &mut self.search;
+        search.held.retain(|path, _| !path.starts_with(scope));
+        search.prune();
+        search.reseeded.push(scope.to_path_buf());
+        search.reseeded = crate::outermost(std::mem::take(&mut search.reseeded));
     }
 
     /// The keys of `path`, under which the rules of the folder there are held.
@@ -457,12 +473,16 @@ impl<'r> Pending<'r> {
         self.rules.search.held.keys()
     }
 
-    pub(crate) fn cover(&mut self, scopes: &[PathBuf]) -> Vec<PathBuf> {
-        let scanned = &mut self.rules.search.scanned;
-        let earlier = scanned.clone();
-        scanned.extend(scopes.iter().cloned());
-        *scanned = crate::outermost(std::mem::take(scanned));
-        earlier
+    pub(crate) fn cover(&mut self, scopes: &[PathBuf]) -> Seeded {
+        let search = &mut self.rules.search;
+        let seeded = Seeded {
+            scanned: search.scanned.clone(),
+            reseeded: search.reseeded.clone(),
+        };
+        search.scanned.extend(scopes.iter().cloned());
+        search.scanned = crate::outermost(std::mem::take(&mut search.scanned));
+        (search.reseeded).retain(|path| !scopes.iter().any(|scope| path.starts_with(scope)));
+        seeded
     }
 
     /// Drops the rules of every folder for which `is_folder` is false, and
