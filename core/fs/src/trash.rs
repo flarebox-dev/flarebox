@@ -1,22 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The local trash `.koidrive/trash/` (design §5.2): every entry an effect
-//! displaced, kept for [`TRASH_RETENTION`] or until the caller's size cap
-//! evicts it, whichever comes first.
-//!
-//! The trash keeps its own index of each entry's size when it entered, with
-//! the content the caller says a file holds, in `.koidrive/trash.json`. The
-//! index is written before the entry moves in, so a crash never leaves an
-//! entry the index does not know. A process that held a descriptor open across
-//! the effect can still write to a trashed file, so before reclaiming a file
-//! the collector compares its size and content with the index and turns a
-//! file that changed into a recovered file at the sync root instead. A change
-//! of metadata alone, such as `chmod -R` on the linked folder, does not count.
-//! A folder is reclaimed only while it is empty. That check is best effort: a
-//! write between the check and the unlink is lost. An entry with no recorded
-//! values, which only an older version or a hand could have put there, is
-//! never deleted: it becomes a recovered file when it is due.
-
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -45,22 +28,15 @@ struct Index {
     entries: BTreeMap<String, Kept>,
 }
 
-/// What the trash recorded about one entry when it entered.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Kept {
-    /// The entry's name before it was displaced, for a recovered copy.
     name: String,
     folder: bool,
     size: u64,
     ctime_ns: i64,
-    /// What the caller identifies a file's content by. A file without it, which
-    /// only an older version indexed, is compared by `ctime_ns`, which that
-    /// version took after the move.
     #[serde(default)]
     content: Option<Vec<u8>>,
     trashed_s: u64,
-    /// Whether `size` and `ctime_ns` were taken when the entry entered. An
-    /// entry found later has no such evidence and is never deleted.
     recorded: bool,
 }
 
@@ -71,7 +47,7 @@ pub struct Reclaimed {
     pub removed: Vec<String>,
     /// Names at the sync root of entries that changed after they entered the
     /// trash, or whose values were never recorded, and were recovered instead
-    /// of deleted. Report them as observations.
+    /// of deleted.
     pub recovered: Vec<OsString>,
 }
 
@@ -94,8 +70,6 @@ impl Space {
         self.trash_with(from, name, entry, original, content, now, &mut || {})
     }
 
-    /// [`Space::trash`], calling `cut` where a crash would leave the entry
-    /// and the index out of step.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn trash_with(
         &self,
@@ -205,10 +179,6 @@ impl Space {
     }
 }
 
-/// Deletes a trash entry that still matches the index: a file with the
-/// recorded size and content, or an empty folder. Returns false, leaving it in
-/// place, when it changed. A file that cannot be opened or read counts as
-/// changed, so it is recovered rather than deleted, and the pass goes on.
 fn remove_unchanged(
     trash: BorrowedFd<'_>,
     entry: &str,
@@ -245,8 +215,6 @@ fn remove_unchanged(
     }
 }
 
-/// What to record about the entry `entry` of `dir`, which had the name
-/// `name` before it was displaced and, for a file, holds `content`.
 fn kept(
     dir: BorrowedFd<'_>,
     entry: &OsStr,

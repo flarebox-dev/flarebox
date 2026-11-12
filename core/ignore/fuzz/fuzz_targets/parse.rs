@@ -1,10 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Arbitrary bytes as a rules file and as a device-local exclude list. Each line of the input is
-//! also used as a path, so the matcher meets names that look like its patterns.
-//!
-//! Run with `cargo +nightly fuzz run parse` in `core/ignore/fuzz`.
-
 #![no_main]
 
 use koidrive_ignore::{Kind, LocalRules, Matcher, NameKey, RuleFile, Status};

@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Fixtures shared by the effect tests: the effects of design §2.5 on small
-//! trees, and what the disk must hold once each has been applied or
-//! recovered.
-
 #![allow(dead_code)]
 
 use std::fs::{self, File, OpenOptions};
@@ -24,11 +20,9 @@ pub const COUNTER: u64 = 5;
 pub const ID: &str = "e1";
 pub const SYNCED: &[u8] = b"synced";
 pub const REMOTE: &[u8] = b"remote";
-/// A user edit of the same length as [`SYNCED`].
 pub const EDITED: &[u8] = b"edited";
 pub const OTHER: &[u8] = b"someone else";
 pub const RECOVERED: &str = "docs/report (recovered 2023-11-14).txt";
-/// 2023-11-14T22:13:20Z.
 pub const NOW: u64 = 1_700_000_000;
 
 pub fn now() -> SystemTime {
@@ -42,8 +36,6 @@ pub fn marker() -> Marker {
     }
 }
 
-/// Compares files with the synced content an effect displaces and the
-/// remote content it writes.
 pub struct Bytes;
 
 fn read(mut file: &File) -> Vec<u8> {
@@ -66,19 +58,14 @@ impl Contents for Bytes {
     }
 }
 
-/// Whether a trashed file holds `content`, its bytes as recorded.
 pub fn same(file: &File, content: &[u8]) -> std::io::Result<bool> {
     Ok(read(file) == content)
 }
 
-/// A space bound to a descriptor of `root` opened here, the way the driver
-/// binds one to the descriptor it locked.
 pub fn bind(root: &Path) -> Space {
     Space::bind(File::open(root).unwrap().into(), root).unwrap()
 }
 
-/// Checks the identity a done outcome carries: that of the entry now at
-/// `path`, or none for an effect that creates and writes nothing.
 pub fn assert_identity(root: &Path, outcome: &Outcome, path: Option<&str>) {
     if let Outcome::Done { identity } = outcome {
         let expected = path.map(|path| entries(root, &[path])[0].id);
@@ -116,9 +103,6 @@ pub fn stage(space: &Space, bytes: &[u8]) {
     space.finish_staged(ID, false).unwrap();
 }
 
-/// Writes `bytes`, of the file's own length, over the file at `path` in
-/// place and sets its modification time back, so that only its content
-/// shows the change.
 pub fn rewrite_keeping_mtime(path: &Path, bytes: &[u8]) {
     let before = fs::metadata(path).unwrap();
     assert_eq!(before.len(), bytes.len() as u64);
@@ -127,7 +111,6 @@ pub fn rewrite_keeping_mtime(path: &Path, bytes: &[u8]) {
     file.set_modified(before.modified().unwrap()).unwrap();
 }
 
-/// The names in `.koidrive/<folder>`, or none when it does not exist.
 pub fn private_names(root: &Path, folder: &str) -> Vec<String> {
     let Ok(listing) = fs::read_dir(root.join(PRIVATE_DIR).join(folder)) else {
         return Vec::new();
@@ -154,18 +137,12 @@ pub fn contents(path: PathBuf) -> Option<Vec<u8>> {
     }
 }
 
-/// What every effect leaves once it is over: nothing in quarantine or
-/// staging, and the marker at the effect's counter.
 pub fn assert_settled(root: &Path) {
     assert_eq!(private_names(root, QUARANTINE_DIR), Vec::<String>::new());
     assert_eq!(private_names(root, STAGING_DIR), Vec::<String>::new());
     assert_eq!(read_marker(root).unwrap(), Some(marker()));
 }
 
-/// One effect on a small tree, with the paths whose observed entries it
-/// needs, what a user does to the tree while the process that ran the effect
-/// is down, and the step from which recovery after a crash completes it, if
-/// any.
 pub struct Scenario {
     pub name: &'static str,
     pub paths: &'static [&'static str],
@@ -176,21 +153,17 @@ pub struct Scenario {
     pub done_from: Option<Step>,
 }
 
-/// `docs/report.txt` holding the synced content, and the remote content
-/// staged.
 fn report(root: &Path, space: &Space) {
     fs::create_dir(root.join("docs")).unwrap();
     fs::write(root.join("docs/report.txt"), SYNCED).unwrap();
     stage(space, REMOTE);
 }
 
-/// [`report`] edited by the user in a way only its content shows.
 fn edited_report(root: &Path, space: &Space) {
     report(root, space);
     rewrite_keeping_mtime(&root.join("docs/report.txt"), EDITED);
 }
 
-/// The staged file replacing `docs/report.txt`.
 fn replacement(entries: &[Entry]) -> Effect {
     let at = at(vec![dir("docs", &entries[0])], "report.txt");
     Effect {
@@ -205,7 +178,6 @@ fn replacement(entries: &[Entry]) -> Effect {
     }
 }
 
-/// Removing the folder `docs/empty`.
 fn folder_removal(entries: &[Entry]) -> Effect {
     Effect {
         id: ID.into(),
@@ -216,7 +188,6 @@ fn folder_removal(entries: &[Entry]) -> Effect {
     }
 }
 
-/// A user creating `docs/report.txt` when that name is free.
 fn take_report(root: &Path) {
     let path = root.join("docs/report.txt");
     if contents(path.clone()).is_none() {
@@ -393,8 +364,6 @@ pub const SCENARIOS: [Scenario; 7] = [
     },
 ];
 
-/// Replacements recovered after a crash whose quarantined entry is put back
-/// or recovered, or whose target name is taken.
 pub const RETURNS: [Scenario; 4] = [
     Scenario {
         name: "edited",
@@ -499,7 +468,6 @@ pub fn scenario(name: &str) -> &'static Scenario {
         .unwrap()
 }
 
-/// Sets `scenario` up at `root` and returns its effect.
 pub fn prepare(scenario: &Scenario, root: &Path) -> Effect {
     fs::create_dir_all(root).unwrap();
     let space = bind(root);
@@ -507,8 +475,6 @@ pub fn prepare(scenario: &Scenario, root: &Path) -> Effect {
     (scenario.build)(&entries(root, scenario.paths))
 }
 
-/// Writes entries as text, one per line, for a child process to rebuild
-/// the same effect from.
 pub fn encode(entries: &[Entry]) -> String {
     entries
         .iter()

@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests that need to interrupt a scan at a fixed point or to take coverage
-//! away from the platform watcher.
-
 use std::fs;
 
 use notify::Watcher as _;
@@ -12,10 +9,6 @@ use super::*;
 
 const WAIT: Duration = Duration::from_secs(10);
 
-/// Whether the permission change a test just made blocks reads, given the read
-/// `probe` that should now fail. Only root reads through it; the test is then
-/// skipped, with a line written straight to stderr so that it shows up even
-/// when test output is captured. Anyone else fails the test.
 fn blocks_reads<T: std::fmt::Debug>(test: &str, probe: std::io::Result<T>) -> bool {
     use std::io::Write;
 
@@ -148,10 +141,6 @@ fn folder_replaced_during_traversal_publishes_nothing() {
     }
 }
 
-/// The reviewer's schedule: after `d` was opened and checked, it moves out of
-/// the root, an unreadable folder (or a symlink) takes its place with the
-/// file still in it, and the file disappears from the detached original. The
-/// scan read the detached copy, so it must publish nothing.
 #[test]
 fn ancestor_replaced_after_opening_publishes_nothing() {
     use std::os::unix::fs::PermissionsExt;
@@ -205,11 +194,6 @@ fn ancestor_replaced_after_opening_publishes_nothing() {
     }
 }
 
-/// The reviewer's ABA schedule: `d` is swapped for an unreadable folder while
-/// the scan reads `m-victim` as missing from the detached original, then the
-/// original gets `m-victim` back and returns to the root. Every folder identity
-/// matches at publication, but the file exists, so its removal is not published
-/// and it is handed back for another rescan.
 #[test]
 fn ancestor_swapped_out_and_back_publishes_no_removal() {
     use std::os::unix::fs::PermissionsExt;
@@ -259,10 +243,6 @@ fn ancestor_swapped_out_and_back_publishes_no_removal() {
     }
 }
 
-/// A removal's parent is swapped for a folder that holds the path while the
-/// confirmation looks through the original, so the confirmation sees the path
-/// gone. The final look from a fresh root finds another folder there, so the
-/// removal is not published and the path is handed back for another rescan.
 #[test]
 fn parent_swapped_during_confirmation_publishes_no_removal() {
     let dir = tempfile::tempdir().unwrap();
@@ -302,10 +282,6 @@ fn parent_swapped_during_confirmation_publishes_no_removal() {
     }
 }
 
-/// Siblings are confirmed against one listing of their parent. A sibling
-/// recreated after that listing, here while another parent is looked at, is
-/// not published as removed: the final look sees the parent changed and hands
-/// back every path confirmed against it. A rescan of those paths settles them.
 #[test]
 fn sibling_recreated_after_its_parent_was_listed_publishes_no_removal() {
     let dir = tempfile::tempdir().unwrap();
@@ -380,8 +356,6 @@ fn sibling_recreated_after_its_parent_was_listed_publishes_no_removal() {
     }
 }
 
-/// The scans of a poll found an unreadable folder and nothing else happened,
-/// so the poll ends on its timeout. It must still report the folder.
 #[test]
 fn idle_native_poll_reports_an_unreadable_folder() {
     use std::os::unix::fs::PermissionsExt;
@@ -416,9 +390,6 @@ fn idle_native_poll_reports_an_unreadable_folder() {
     assert_eq!(second.unwrap(), Poll::default());
 }
 
-/// A watcher that records each registration and fails the ones a test names,
-/// the way notify's backends fail them.
-/// Makes a registration of the folder it is given fail.
 type Fail = fn(&Path) -> notify::Error;
 
 /// A watcher that registers folders the way notify's inotify backend does: a
@@ -475,15 +446,6 @@ impl notify::Watcher for Registrations {
     }
 }
 
-/// The reviewer's registration probe: a recursive registration can fail on a
-/// folder deep inside the one it was asked for, here `a/gone` inside `a`, which
-/// disappears while it is registered. The rest of `a` still needs its watches,
-/// whether the registration first fell back because of an unreadable folder or
-/// because of that failure itself. Only folders that may not be watched or are
-/// gone stay unwatched. A not-found error for a folder that is still there or
-/// that cannot be looked up because its parent may no longer be searched, a
-/// requested folder that is gone, and any other error, such as the watch limit,
-/// are returned.
 #[test]
 fn registration_covers_the_tree_around_a_failed_folder() {
     use std::os::unix::fs::PermissionsExt;
@@ -565,10 +527,6 @@ fn registration_covers_the_tree_around_a_failed_folder() {
     );
 }
 
-/// The reviewer's lookup probe: a folder behind a parent that may not be
-/// searched cannot be looked up, which says nothing about whether it is gone.
-/// Only a lookup that finds nothing, or finds something other than a folder,
-/// does.
 #[test]
 fn folder_behind_an_unsearchable_parent_is_not_gone() {
     use std::os::unix::fs::PermissionsExt;
@@ -615,15 +573,10 @@ fn created(path: &str, kind: EntryKind) -> Change {
     }
 }
 
-/// The identity of the folder at `root`.
 fn root_id(root: &Path) -> FileId {
     stat_fd(open_root(root).unwrap().as_fd()).unwrap().id
 }
 
-/// Replaces the platform watcher with one that watches the root folder only,
-/// as if the watches below it were lost. The new watcher reports on a channel
-/// of its own: the old one stops on its own thread, and an event it reports
-/// for a folder below the root before it stops must not reach the watcher.
 fn lose_coverage(watcher: &mut NativeWatcher) {
     let (sender, events) = mpsc::channel();
     watcher.watcher = notify::recommended_watcher(sender.clone()).unwrap();
@@ -829,9 +782,6 @@ fn a_new_folder_that_vanishes_before_its_watch_is_not_a_watch_failure() {
     );
 }
 
-/// The rescan that registers a new folder reaches another root than the poll
-/// scanned first. The poll reports only the changes from its first root, and
-/// the watcher fails instead of reporting the other root's.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_new_folder_rescan_that_reaches_another_root_fails_the_watcher() {
@@ -984,8 +934,6 @@ fn nothing_is_recovered_from_a_folder_moved_out_of_the_root() {
     assert_eq!(names, [PRIVATE_DIR]);
 }
 
-/// A matcher whose rules files name, one per line, the entries their folder
-/// leaves out. It shares the rules it was given with the test.
 #[derive(Clone, Default)]
 struct Lines(std::sync::Arc<std::sync::Mutex<BTreeMap<PathBuf, Vec<u8>>>>);
 
@@ -1020,9 +968,6 @@ impl Ignore for Lines {
     }
 }
 
-/// The scan reads the changed rules of the root and of `a` and then fails in
-/// `m`. Both rules files must count as unread, for the matcher and for the
-/// next scan, which reports them.
 #[test]
 fn a_failed_scan_leaves_the_rules_as_they_were() {
     let dir = tempfile::tempdir().unwrap();
@@ -1099,8 +1044,6 @@ fn a_failed_scan_leaves_the_rules_as_they_were() {
     );
 }
 
-/// A crash inside [`Space::trash`] leaves nothing that reclamation brings
-/// back to the sync root.
 #[test]
 fn a_crash_while_trashing_brings_nothing_back() {
     let dir = tempfile::tempdir().unwrap();

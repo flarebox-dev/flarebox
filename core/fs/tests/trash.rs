@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The local trash (design §5.2): reclamation by expiry and by the size cap,
-//! and entries written through an old descriptor recovered instead of
-//! deleted, on the file system the tests run on.
-
 mod common;
 
 use std::ffi::OsStr;
@@ -19,7 +15,6 @@ use koidrive_fs::{
 };
 
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
-/// 2023-11-14T22:13:20Z.
 const T0: u64 = 1_700_000_000;
 
 fn at(secs: u64) -> SystemTime {
@@ -39,8 +34,6 @@ fn names(path: &Path) -> Vec<String> {
     names
 }
 
-/// Trashes the root entry `name` as `entry`, recording a file's bytes as its
-/// content.
 fn put(root: &Path, space: &Space, name: &str, entry: &str, now: SystemTime) {
     let path = root.join(name);
     let content = (!path.is_dir()).then(|| fs::read(&path).unwrap());
@@ -120,7 +113,6 @@ fn size_cap_evicts_the_oldest_entries_first() {
         removed(&["e0", "e1"])
     );
     assert_eq!(names(&trash_dir(root)), ["e2", "e3"]);
-    // An empty folder takes no room, so only its expiry reclaims it.
     assert_eq!(
         space.reclaim_trash(at(T0 + 4), 0, &mut same).unwrap(),
         removed(&["e2"])
@@ -181,8 +173,6 @@ fn write_through_an_old_descriptor_is_recovered_under_the_size_cap() {
     put(root, &space, "notes", "e1", at(T0));
     fs::write(root.join("notes (recovered 2023-11-14)"), "taken").unwrap();
 
-    // Same size, so only the ctime tells. Coarse kernel clocks tick every few
-    // milliseconds.
     std::thread::sleep(Duration::from_millis(50));
     held.write_all_at(b"ABCDEFGHIJ", 0).unwrap();
     drop(held);
@@ -204,8 +194,6 @@ fn write_through_an_old_descriptor_is_recovered_under_the_size_cap() {
     assert_eq!(names(&trash_dir(root)), ["e2"]);
 }
 
-/// Changing only an entry's metadata, as `chmod -R`, `chown -R` or `xattr -cr`
-/// on the linked folder does, writes nothing to it, so it is deleted when due.
 #[test]
 fn an_entry_whose_metadata_alone_changed_is_deleted_when_due() {
     let dir = tempfile::tempdir().unwrap();
@@ -231,8 +219,6 @@ fn an_entry_whose_metadata_alone_changed_is_deleted_when_due() {
     assert_eq!(names(root), [PRIVATE_DIR]);
 }
 
-/// A write through an old descriptor that keeps the file's size and sets its
-/// modification time back is still found, by content, and recovered.
 #[test]
 fn a_write_that_keeps_size_and_modification_time_is_recovered_when_due() {
     let dir = tempfile::tempdir().unwrap();
@@ -254,8 +240,6 @@ fn a_write_that_keeps_size_and_modification_time_is_recovered_when_due() {
     );
 }
 
-/// A due file the collector cannot read, as after `chmod -R a-r` on the linked
-/// folder, is recovered, and the entries after it are still reclaimed.
 #[test]
 fn an_unreadable_entry_is_recovered_and_the_pass_goes_on() {
     let dir = tempfile::tempdir().unwrap();
@@ -325,8 +309,6 @@ fn entry_missing_from_the_index_is_kept_for_a_full_period() {
         Reclaimed::default()
     );
     assert_eq!(names(&trash_dir(root)), ["e2"]);
-    // Its size and ctime were not recorded when it entered, so it is
-    // recovered rather than deleted.
     assert_eq!(
         space
             .reclaim_trash(later + TRASH_RETENTION, u64::MAX, &mut same)
@@ -400,8 +382,6 @@ fn recovered_names_keep_the_extension_and_fit() {
     assert!(fitted.ends_with(" (recovered 2026-11-10)"));
 }
 
-/// Moves the root entry `name` into the trash as `entry` without indexing it,
-/// as a crash between the trash's rename and its index write leaves it.
 fn put_unindexed(root: &Path, name: &str, entry: &str) {
     fs::create_dir_all(trash_dir(root)).unwrap();
     fs::rename(root.join(name), trash_dir(root).join(entry)).unwrap();
@@ -579,8 +559,6 @@ fn trash_moved_out_of_the_root_during_reclamation_is_left_alone() {
         .unwrap();
     assert!(made.success());
 
-    // Reclamation blocks reading the index from the FIFO until it is written,
-    // which happens after the trash folder has moved out of the root.
     let reclaim = std::thread::spawn({
         let root = root.to_path_buf();
         move || bind(&root).reclaim_trash(at(T0) + TRASH_RETENTION, u64::MAX, &mut same)

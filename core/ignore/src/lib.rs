@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Which paths of a space this device leaves out of sync: `.koiignore` files, the built-in
-//! exclusions and the device-local list (design §5.1, §5.10).
+//! exclusions and the device-local list.
 //!
 //! # Rules files
 //!
@@ -35,7 +35,7 @@
 //!
 //! # Names
 //!
-//! Patterns and names are compared in the form the engine compares names in (design §5.5): the
+//! Patterns and names are compared in the form the engine compares names in: the
 //! name key of [`NameKey::key`] (`name_key` in production), then NFC. Each pattern line is also
 //! normalized to NFC before it is parsed. A pattern therefore means the same thing on
 //! case-sensitive and case-insensitive volumes, and NFC and NFD spellings of a pattern or a name
@@ -56,8 +56,7 @@
 //!
 //! # Differences from git
 //!
-//! Matching follows git's `dir.c` and `wildmatch.c`, and `tests/git_oracle.rs` compares it with
-//! `git check-ignore` on random trees and rules files. It differs on purpose here:
+//! Matching follows git's `dir.c` and `wildmatch.c`. It differs on purpose here:
 //!
 //! - Case folding is Unicode full case folding through the name key, and it covers the members of
 //!   bracket expressions. Git with `core.ignorecase` folds ASCII only and leaves bracket members
@@ -84,8 +83,7 @@ pub use pattern::{InvalidLine, LineError, RuleFile};
 /// The name of a rules file, compared by key.
 pub const RULES_FILE: &str = ".koiignore";
 
-/// How names are compared. Production uses the engine's `name_key` (NFD, Unicode full case
-/// folding, NFD); the matcher applies NFC on top, so wildcards match composed characters.
+/// How names are compared. The matcher applies NFC on top, so wildcards match composed characters.
 pub trait NameKey {
     fn key(name: &str) -> String;
 }

@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Recovered files (design §5.2): an entry that cannot go back to its name is
-//! given a free name of its own, so it becomes an ordinary new local file.
-
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -12,17 +9,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::resolve::{Folder, Space, Unresolved};
 use crate::root::{flush, rename_no_replace};
 
-/// The longest file name most file systems accept, in bytes.
 const NAME_MAX: usize = 255;
-/// How many numbered names a recovery tries before giving up.
 const ATTEMPTS: u32 = 10_000;
 
-/// The name a recovered copy of `original` gets on `date` (`YYYY-MM-DD`):
-/// `<stem> (recovered <date>)<ext>`, and `<stem> (recovered <date> <n>)<ext>`
-/// for the `n`th attempt after a collision. A folder, a name without an
-/// extension, or a name whose extension leaves no room for the label keeps
-/// its whole name as the stem. The stem is shortened, on a
-/// character boundary when it is UTF-8, so the name fits in 255 bytes.
 pub fn recovered_name(original: &OsStr, folder: bool, date: &str, n: u32) -> OsString {
     let bytes = original.as_bytes();
     let label = match n {
@@ -46,12 +35,6 @@ pub fn recovered_name(original: &OsStr, folder: bool, date: &str, n: u32) -> OsS
 }
 
 impl Space {
-    /// Renames `name` in `from` to the first free recovered name for
-    /// `original` in `to`, never replacing an entry, flushes both folders and
-    /// returns the new path from the root. Both folders are checked from the
-    /// root again before every attempt. When `to` no longer leads to the folder
-    /// it was, the entry is recovered at the sync root instead; when `from`
-    /// does not, nothing is renamed and the error is returned.
     pub(crate) fn move_to_recovered_name(
         &self,
         from: &Folder,
@@ -98,13 +81,12 @@ impl Space {
     }
 }
 
-/// The UTC calendar date of `time` as `YYYY-MM-DD`.
 pub(crate) fn utc_date(time: SystemTime) -> String {
     let secs = match time.duration_since(UNIX_EPOCH) {
         Ok(after) => after.as_secs() as i64,
         Err(before) => -(before.duration().as_secs() as i64),
     };
-    // Howard Hinnant's civil_from_days.
+    // Howard Hinnant's civil_from_days: https://howardhinnant.github.io/date_algorithms.html#civil_from_days
     let z = secs.div_euclid(86_400) + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;

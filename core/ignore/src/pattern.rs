@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! One rules file: splitting it into lines as git's `add_patterns_from_buffer` does, compiling
-//! each line as `parse_path_pattern` does, and matching with the semantics of `wildmatch`.
-
 use std::fmt;
 use std::marker::PhantomData;
 
@@ -10,27 +7,19 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::NameKey;
 
-/// The form names and patterns are compared in: the name key, then NFC.
 pub(crate) fn key<K: NameKey>(name: &str) -> String {
     K::key(name).nfc().collect()
 }
 
-/// Why a line of a rules file is not used. The line is skipped and the rest of the file applies.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LineError {
-    /// The line is not valid UTF-8.
     NotUtf8,
-    /// The line holds a NUL byte, which no name can contain.
     ContainsNul,
-    /// A `[` has no closing `]`, so the pattern could never match.
     UnclosedBracket,
-    /// A `[:name:]` names no POSIX class, so the pattern could never match.
     UnknownClass(String),
-    /// The pattern ends with an unescaped `\`, so it could never match.
     TrailingBackslash,
 }
 
-/// A line that is not used, numbered from 1 as git numbers it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InvalidLine {
     pub line: u32,
@@ -116,8 +105,6 @@ impl<K: NameKey> RuleFile<K> {
         &self.invalid
     }
 
-    /// The last rule matching a path. `path` is the path below the file's directory and
-    /// `basename` its last component, both in key form.
     pub(crate) fn last_match(
         &self,
         path: &[char],
@@ -160,8 +147,6 @@ pub(crate) struct Rule {
     pub(crate) line: u32,
     pub(crate) negated: bool,
     dir_only: bool,
-    /// The pattern has a slash, so it matches the path below the file's directory instead of the
-    /// basename anywhere below it.
     pathname: bool,
     tokens: Vec<Token>,
 }
@@ -179,11 +164,8 @@ impl Rule {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Token {
     Literal(char),
-    /// A `/`, written plain or escaped.
     Slash,
-    /// `?`
     AnyChar,
-    /// `*`, or a run of asterisks that is not a special `**`.
     Star,
     /// `**` at the start or end of the pattern or between slashes. Before a slash that is not
     /// escaped it also matches zero directories with that slash (`or_nothing`), as in git's
@@ -265,12 +247,10 @@ impl Posix {
     }
 }
 
-/// Whether `upper`, as a name, has the single character `c` as key.
 fn folds_to<K: NameKey>(upper: char, c: char) -> bool {
     single_key::<K>(upper) == Some(c)
 }
 
-/// The key of a one-character name, when the key is one character too.
 fn single_key<K: NameKey>(c: char) -> Option<char> {
     let folded = key::<K>(c.encode_utf8(&mut [0; 4]));
     let mut chars = folded.chars();
@@ -298,8 +278,7 @@ impl Class {
     }
 }
 
-/// Compiles one trimmed line, as git's `parse_path_pattern` does, after normalizing it to NFC so
-/// that canonically equivalent spellings compile to the same pattern. `Ok(None)` is a pattern
+/// Compiles one trimmed line, as git's `parse_path_pattern` does. `Ok(None)` is a pattern
 /// that matches nothing and is not an error in git either, such as `!` or `/`.
 fn compile<K: NameKey>(line: &[u8], number: u32) -> Result<Option<Rule>, LineError> {
     if line.is_empty() {
@@ -408,8 +387,6 @@ fn tokenize<K: NameKey>(body: &str) -> Result<Vec<Token>, LineError> {
     Ok(tokens)
 }
 
-/// Parses the bracket expression starting at `chars[open]`, as `wildmatch` reads it, and
-/// returns it with the index after its closing `]`.
 fn parse_class<K: NameKey>(chars: &[char], open: usize) -> Result<(Class, usize), LineError> {
     let mut j = open + 1;
     let negated = matches!(chars.get(j), Some('!' | '^'));
@@ -474,9 +451,6 @@ fn parse_class<K: NameKey>(chars: &[char], open: usize) -> Result<(Class, usize)
     Ok((Class { negated, items }, j))
 }
 
-/// Whether `tokens` match all of `text`, simulated as an automaton so that no pattern takes
-/// exponential time. State `i` is "before token `i`", state `n + 1 + i` is "inside the star
-/// token `i`". In `pathname` mode only `**` and a `/` match a slash.
 fn wildmatch<K: NameKey>(tokens: &[Token], text: &[char], pathname: bool) -> bool {
     let n = tokens.len();
     let mut current = vec![false; 2 * n + 1];
@@ -515,8 +489,6 @@ fn wildmatch<K: NameKey>(tokens: &[Token], text: &[char], pathname: bool) -> boo
     current[n]
 }
 
-/// Adds state `start` and the states reachable from it without reading a character. A loop
-/// rather than recursion, so a long chain of `**/` cannot overflow the stack.
 fn enter(tokens: &[Token], states: &mut [bool], start: usize, pending: &mut Vec<usize>) {
     let n = tokens.len();
     pending.push(start);

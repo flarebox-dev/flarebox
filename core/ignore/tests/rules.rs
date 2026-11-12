@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The rules of design §5.10 and §5.1, one at a time, and the device-local list.
-
 use koidrive_ignore::{
     Change, InvalidLine, Kind, LineError, LocalRules, LocalRulesError, Matcher, NameKey, Reason,
     RuleFile, Status,
@@ -31,7 +29,6 @@ fn kind(path: &str) -> Kind {
     }
 }
 
-/// A matcher with rules files given as (directory, contents); `""` is the root.
 fn matcher_with(local: LocalRules<Folded>, files: &[(&str, &str)]) -> Matcher<Folded> {
     let mut matcher = Matcher::new(local);
     for (dir, text) in files {
@@ -44,7 +41,6 @@ fn matcher(files: &[(&str, &str)]) -> Matcher<Folded> {
     matcher_with(LocalRules::default(), files)
 }
 
-/// The status of a path; a trailing `/` makes it a directory.
 fn status(matcher: &Matcher<Folded>, path: &str) -> Status {
     matcher.status(&split(path), kind(path))
 }
@@ -211,8 +207,6 @@ fn names_match_by_key_after_nfc() {
     assert!(excluded(&m, "x1"));
 }
 
-/// The same pattern spelled NFC or NFD, with Kelvin and Ångström signs or their canonical letters,
-/// selects the same names (review of koidrive#50).
 #[test]
 fn equivalent_pattern_spellings_select_the_same_names() {
     let names = [
@@ -262,8 +256,6 @@ fn equivalent_pattern_spellings_select_the_same_names() {
     assert!(excluded(&m, "\u{e5}") && excluded(&m, "\u{212b}") && excluded(&m, "k"));
 }
 
-/// Every token reads one code point of the NFC key, so wildcards next to a combining mark match
-/// as in git (review of koidrive#50).
 #[test]
 fn wildcards_match_code_points_next_to_combining_marks() {
     let m = matcher(&[("", "q*\n")]);
@@ -330,8 +322,6 @@ fn gitignore_syntax() {
     }
 }
 
-/// Git lets `**` match zero directories only before a slash that is not escaped, so `**\/b`
-/// needs a directory above `b`. An escaped slash before `**` counts like a plain one.
 #[test]
 fn an_escaped_slash_after_a_double_star_needs_a_directory() {
     let cases: &[(&str, &[&str], &[&str])] = &[
@@ -566,8 +556,6 @@ fn a_scope_walk_refuses_excluded_directories() {
     assert!(app.enter("node_modules").is_err());
 }
 
-/// The closure over `**/` is a loop, so a long pattern cannot overflow the stack (review of
-/// koidrive#50).
 #[test]
 fn a_long_globstar_chain_matches_without_recursion() {
     let m = matcher(&[("", &format!("{}a\n", "**/".repeat(50_000)))]);
