@@ -1820,11 +1820,11 @@ fn acknowledged_class(trees: &Trees, id: &str) -> Class {
     classify(local, acknowledged(trees, id), remote)
 }
 
-/// Whether L changed a node whose S update waits, where R still holds it at the waiting position:
-/// L moved it away from that position, or edited it there. Such a node is planned and rebased
-/// against the waiting shape. The update may never fit while L holds the node elsewhere, as when a
-/// folder R trashed takes its name key in S and L cannot remove that folder while the node is
-/// inside it, and an edit is uploaded while only the position waits.
+/// Whether L changed a node whose S update waits: L edited it, or moved it away from the waiting
+/// position while R still holds it there. Such a node is planned and rebased against the waiting
+/// shape. An edit is uploaded while only the position waits, wherever R holds the node, and a move
+/// is planned because the update may never fit while L holds the node elsewhere, as when a folder
+/// R trashed takes its name key in S and L cannot remove that folder while the node is inside it.
 fn changed_locally(trees: &Trees, id: &str) -> bool {
     let (
         Some(local),
@@ -1836,8 +1836,14 @@ fn changed_locally(trees: &Trees, id: &str) -> bool {
     else {
         return false;
     };
-    !local.same(waiting)
-        && (trees.remote().live(id)).is_some_and(|remote| remote.same_position(waiting))
+    let edited = local.kind != waiting.kind
+        || match (&local.content, &waiting.content) {
+            (Some(a), Some(b)) => !same_content(a, b),
+            (a, b) => a.is_some() != b.is_some(),
+        };
+    let moved = !local.same_position(waiting)
+        && (trees.remote().live(id)).is_some_and(|remote| remote.same_position(waiting));
+    edited || moved
 }
 
 /// What is left of a waiting S update. Its position is stale once R no longer has the node there
