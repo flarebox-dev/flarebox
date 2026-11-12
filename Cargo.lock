@@ -1047,7 +1047,7 @@ dependencies = [
 
 [[package]]
 name = "koidrive-chunk"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "fastcdc",
  "koidrive-proto",
@@ -1057,7 +1057,7 @@ dependencies = [
 
 [[package]]
 name = "koidrive-cli"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "bytes",
  "clap",
@@ -1088,7 +1088,7 @@ dependencies = [
 
 [[package]]
 name = "koidrive-cloudflare"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "base64",
  "getrandom 0.4.3",
@@ -1109,7 +1109,7 @@ dependencies = [
 
 [[package]]
 name = "koidrive-driver"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1139,7 +1139,7 @@ dependencies = [
 
 [[package]]
 name = "koidrive-engine"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "koidrive-ignore",
  "koidrive-proto",
@@ -1152,7 +1152,7 @@ dependencies = [
 
 [[package]]
 name = "koidrive-ffi"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "koidrive-driver",
  "koidrive-net",
@@ -1172,7 +1172,7 @@ dependencies = [
 
 [[package]]
 name = "koidrive-fs"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "koidrive-engine",
  "koidrive-ignore",
@@ -1186,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "koidrive-ignore"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "koidrive-engine",
  "proptest",
@@ -1196,7 +1196,7 @@ dependencies = [
 
 [[package]]
 name = "koidrive-net"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "base64",
  "bytes",
@@ -1224,14 +1224,14 @@ dependencies = [
 
 [[package]]
 name = "koidrive-proto"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "prost",
 ]
 
 [[package]]
 name = "koidrive-sim"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "koidrive-engine",
  "koidrive-proto",
@@ -1243,7 +1243,7 @@ dependencies = [
 
 [[package]]
 name = "koidrive-store"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "koidrive-engine",
  "koidrive-fs",
@@ -1257,7 +1257,7 @@ dependencies = [
 
 [[package]]
 name = "koidrive-telemetry"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "getrandom 0.4.3",
  "reqwest",
