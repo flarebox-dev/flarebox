@@ -716,6 +716,46 @@ fn a_parked_edit_whose_node_was_removed_remotely_goes_back_to_its_place() {
 }
 
 #[test]
+fn a_parked_edit_whose_name_the_remote_tree_gives_another_node_stays_parked() {
+    let (mut trees, mut disk) = space(&[
+        ("d", Some(dir(ROOT, "x")), None),
+        ("k", Some(file("d", "k", 1)), None),
+        ("a", Some(file(ROOT, "y", 1)), Some(file(ROOT, "x", 1))),
+    ]);
+    let trashed = |shape| RemoteNode {
+        trashed: true,
+        ..remote(shape)
+    };
+    trees.set_remote("d".into(), trashed(dir(ROOT, "x")));
+    trees.set_remote("k".into(), trashed(file("d", "k", 1)));
+    let edit = |trees: &mut Trees, disk: &mut Disk, id: &str, ino: u64| {
+        let mut node = trees.local().get(id).unwrap().clone();
+        node.shape.content = Some(content(9));
+        disk.entries.get_mut(&ino).unwrap().content = Some(content(9));
+        trees.set_local(id.into(), node);
+    };
+    edit(&mut trees, &mut disk, "k", 2);
+    converge(&mut trees, &mut disk, 8).unwrap();
+    assert!(trees.waiting().contains_key("a"));
+    edit(&mut trees, &mut disk, "a", 3);
+    trees.set_remote("a".into(), trashed(file(ROOT, "x", 1)));
+    trees.set_remote("n".into(), remote(dir(ROOT, "x")));
+    let done = converge(&mut trees, &mut disk, 8).unwrap();
+    assert_eq!(
+        done,
+        [
+            Effect::Move {
+                from: root_at("x"),
+                identity: identity(3),
+                to: Location::Parked("a".into()),
+            },
+            Effect::CreateDir { at: root_at("x") },
+        ]
+    );
+    assert!(trees.local().get("a").unwrap().parked);
+}
+
+#[test]
 fn a_parked_edit_that_the_remote_tree_matches_is_still_moved_out() {
     let (mut trees, mut disk) = space(&[("f", Some(file(ROOT, "a", 1)), Some(file(ROOT, "A", 2)))]);
     trees.settle();

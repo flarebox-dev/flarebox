@@ -652,6 +652,9 @@ impl<'a> View<'a> {
                         || self.trees.waiting().contains_key(id))
                         || self.trees.edited(id)) =>
             {
+                if self.taken_in_remote(id, &local.shape) {
+                    return Step::Blocked(None);
+                }
                 return self.unpark(id, local, &local.shape);
             }
             (Some(local), None) => return self.remove(id, local),
@@ -820,6 +823,15 @@ impl<'a> View<'a> {
             },
         };
         Step::Apply(effect, None)
+    }
+
+    fn taken_in_remote(&self, id: &str, shape: &Shape) -> bool {
+        (self.trees.remote().iter()).any(|(other, node)| {
+            other != id
+                && !node.trashed
+                && node.shape.parent == shape.parent
+                && name_key(&node.shape.name) == name_key(&shape.name)
+        })
     }
 
     /// Why `id` cannot be put at `remote`'s position in L yet, if it cannot.
