@@ -2936,6 +2936,77 @@ fn a_remote_edit_before_an_edit_to_the_content_a_lost_commit_replaced_is_sent_ke
     assert_eq!(trees.class("n"), Class::Remote);
 }
 
+/// GUN-438 with n in the trash: another device restores n from the trash with content 3 at seq 2,
+/// and this device takes it. The server then loses seq 2 and goes back to n in the trash with
+/// content 2, and the user writes content 2 over n. S keeps n, since R holds it only in the trash,
+/// so n is recorded as a file whose edit R's trash may later match. A device then restores n from
+/// the trash with content 2 before this device sends the edit, and L and R hold the same bytes.
+/// Taking that as a change both sides made would leave the edit unsent, and the other device's
+/// resend of content 3 would be written over it. The resend meets the edit instead, and both are
+/// kept (R3).
+#[test]
+fn an_edit_of_a_file_the_server_went_back_to_holding_in_the_trash_is_kept_from_a_resend() {
+    let edited = RemoteNode {
+        content_rev: 2,
+        ..remote(file(ROOT, "n", 3))
+    };
+    let mut trees = trees(&[(
+        "n",
+        Some(file(ROOT, "n", 3)),
+        Some(file(ROOT, "n", 3)),
+        Some(edited),
+    )]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    trees.set_local("n".into(), local(file(ROOT, "n", 2), 1));
+    trees.settle();
+    let (trashed_here, edited) = (trees.trashed_here(), trees.edited_here());
+    trees.set_remote("n".into(), trashed(file(ROOT, "n", 2)));
+    trees.forget_lost(
+        trashed_here,
+        edited,
+        commits.held_through(),
+        commits.accepted(),
+    );
+    trees.settle();
+    assert_eq!(trees.unsent_edits().iter().collect::<Vec<_>>(), ["n"]);
+    trees.set_remote("n".into(), remote_at(file(ROOT, "n", 2), 3));
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::Local);
+    let resent = RemoteNode {
+        content_rev: 4,
+        ..remote_at(file(ROOT, "n", 3), 3)
+    };
+    trees.set_remote("n".into(), resent);
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::Concurrent);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(
+        matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id != "n" && c.content == Some(content(2))),
+        "{:?}",
+        ops(&commit)
+    );
+    assert_eq!(trees.class("n"), Class::Remote);
+}
+
+/// A file the server holds in the trash after a loss, whose content L holds as S does, holds no
+/// edit of this device: it is not recorded, and the trash reads as a remote delete.
+#[test]
+fn a_file_in_the_trash_after_a_loss_that_l_did_not_edit_is_not_recorded() {
+    let mut trees = trees(&[synced("n", file(ROOT, "n", 3))]);
+    let commits = Commits::default();
+    let (trashed_here, edited) = (trees.trashed_here(), trees.edited_here());
+    trees.set_remote("n".into(), trashed(file(ROOT, "n", 2)));
+    trees.forget_lost(
+        trashed_here,
+        edited,
+        commits.held_through(),
+        commits.accepted(),
+    );
+    trees.settle();
+    assert!(trees.unsent_edits().is_empty());
+    assert_eq!(trees.class("n"), Class::Remote);
+}
+
 /// Another device's edit sets n to content 3 at seq 2, and this device takes it. The server then
 /// loses seq 2 and goes back to content 2, the user writes content 2 over n, and a bootstrap lists
 /// n with content 2.

@@ -930,7 +930,9 @@ impl Trees {
     /// would then agree, so the edit would be taken for R's content, and a resend of the lost
     /// content would replace it. Each such file is recorded ([`Trees::unsent_edits`]), so L's
     /// content is sent, and a resend then meets an edit it did not see. A forgotten file whose
-    /// content L, S and R all hold alike is not recorded: only its position was lost.
+    /// content L, S and R all hold alike is not recorded: only its position was lost. A file R holds
+    /// in the trash keeps S, and is recorded when L holds content S does not, since a device that
+    /// restores it from the trash with L's bytes would otherwise make L, S and R agree.
     ///
     /// `accepted` is the count of this device's commits the server still holds (*w*, section
     /// 2.8). An S update that waits ([`Trees::waiting`]) from a commit above it came from a commit
@@ -1033,11 +1035,17 @@ impl Trees {
             .map(|id| (id.to_owned(), waits.contains(id)))
             .collect();
         let content = |shape: Option<&Shape>| shape.and_then(|shape| shape.content.clone());
+        let in_trash: Vec<NodeId> = (self.s.iter())
+            .filter(|(id, _)| self.r.get(id).is_some_and(|remote| remote.trashed))
+            .filter(|(id, _)| self.edited(id))
+            .map(|(id, _)| id.clone())
+            .collect();
         let unsent: Vec<NodeId> = (lost.iter().map(|(id, _)| id))
             .chain(&lost_edits)
+            .chain(&in_trash)
             .filter(|id| {
-                let (Some(local), Some(remote)) =
-                    (content(self.l.live(id)), content(self.r.live(id)))
+                let remote = self.r.get(id).map(|remote| &remote.shape);
+                let (Some(local), Some(remote)) = (content(self.l.live(id)), content(remote))
                 else {
                     return false;
                 };
