@@ -169,6 +169,11 @@ impl Tx<'_> {
         while let Some(row) = rows.next()? {
             state.trees.edited_here.insert(row.get(0)?, row.get(1)?);
         }
+        let mut stmt = self.0.prepare_cached("SELECT node_id FROM unsent_edits")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            state.trees.unsent_edits.insert(row.get(0)?);
+        }
 
         if let Some((accepted, halt, code, cap)) = self
             .0
@@ -248,6 +253,7 @@ impl Tx<'_> {
             "published_nodes",
             "recorded_nodes",
             "edited_here",
+            "unsent_edits",
             "effect_state",
             "failed_effects",
             "restore_intents",
@@ -431,6 +437,19 @@ impl Tx<'_> {
         }
         for (node, seq) in changed {
             put.execute(params![node, seq])?;
+        }
+        let mut remove = self
+            .0
+            .prepare_cached("DELETE FROM unsent_edits WHERE node_id = ?1")?;
+        let mut put = self
+            .0
+            .prepare_cached("INSERT OR IGNORE INTO unsent_edits (node_id) VALUES (?1)")?;
+        let (old, new) = (&before.trees.unsent_edits, &after.trees.unsent_edits);
+        for node in old.difference(new) {
+            remove.execute([node])?;
+        }
+        for node in new.difference(old) {
+            put.execute([node])?;
         }
 
         let (old, new) = (&before.commits, &after.commits);

@@ -391,6 +391,11 @@ const MIGRATIONS: &[&str] = &[
         answered_at_ms INTEGER NOT NULL
     ) STRICT, WITHOUT ROWID;
 ",
+    "
+    CREATE TABLE unsent_edits (
+        node_id TEXT PRIMARY KEY
+    ) STRICT, WITHOUT ROWID;
+",
 ];
 
 /// The schema version this build writes.

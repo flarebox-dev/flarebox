@@ -11,6 +11,7 @@ use koidrive_engine::effects::{Effect, EffectError, Effects, Location};
 use koidrive_engine::ids::IdGen;
 use koidrive_engine::names::{MAX_NAME_BYTES, nfc, normalize_name};
 use koidrive_engine::question::Answer;
+use koidrive_engine::state::TreesState;
 use koidrive_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape};
 use koidrive_proto::v1::{self as proto, CommitResult, OpResult, Welcome, error, op, op_result};
 use prost::Message;
@@ -1124,7 +1125,7 @@ fn edited_at_5_then_lost() -> (Commits, Trees, IdGen) {
 fn an_edit_the_server_lost_is_sent_again() {
     let (mut commits, mut trees, mut ids) = edited_at_5_then_lost();
     let edited = trees.edited_here();
-    assert_eq!(edited, ["a"]);
+    assert_eq!(edited, [("a".to_string(), 5)]);
     trees.set_remote("a".into(), remote(file(ROOT, "a", 1)));
     trees.forget_lost(
         Vec::new(),
@@ -2885,6 +2886,325 @@ fn a_create_the_server_lost_while_its_s_update_waits_is_sent_again() {
     assert_eq!(trees.class("n"), Class::Local);
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert!(matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id == "n"));
+}
+
+#[test]
+fn an_edit_to_the_content_a_lost_commit_replaced_is_sent_after_the_loss() {
+    let (mut trees, mut commits, mut ids) = an_edit_to_the_content_a_lost_commit_replaced();
+    assert_eq!(trees.class("n"), Class::Local);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("n", 2)]);
+    let sent = RemoteNode {
+        content_rev: 3,
+        ..remote(file(ROOT, "n", 2))
+    };
+    trees.set_remote("n".into(), sent);
+    let applied = vec![outcome(op_result::Code::Applied)];
+    commits.received(result(3, applied)).unwrap();
+    assert!(commits.acknowledge(&mut trees, 3));
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::InSync);
+    assert!(trees.unsent_edits().is_empty());
+}
+
+/// content.
+#[test]
+fn a_remote_edit_before_an_edit_to_the_content_a_lost_commit_replaced_is_sent_keeps_both() {
+    let (mut trees, mut commits, mut ids) = an_edit_to_the_content_a_lost_commit_replaced();
+    let resent = RemoteNode {
+        content_rev: 2,
+        ..remote(file(ROOT, "n", 3))
+    };
+    trees.set_remote("n".into(), resent);
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::Concurrent);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(
+        matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id != "n" && c.content == Some(content(2))),
+        "{:?}",
+        ops(&commit)
+    );
+    assert_eq!(trees.class("n"), Class::Remote);
+}
+
+#[test]
+fn an_edit_of_a_file_the_server_went_back_to_holding_in_the_trash_is_kept_from_a_resend() {
+    let edited = RemoteNode {
+        content_rev: 2,
+        ..remote(file(ROOT, "n", 3))
+    };
+    let mut trees = trees(&[(
+        "n",
+        Some(file(ROOT, "n", 3)),
+        Some(file(ROOT, "n", 3)),
+        Some(edited),
+    )]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    trees.set_local("n".into(), local(file(ROOT, "n", 2), 1));
+    trees.settle();
+    let (trashed_here, edited) = (trees.trashed_here(), trees.edited_here());
+    trees.set_remote("n".into(), trashed(file(ROOT, "n", 2)));
+    trees.forget_lost(
+        trashed_here,
+        edited,
+        commits.held_through(),
+        commits.accepted(),
+    );
+    trees.settle();
+    assert_eq!(trees.unsent_edits().iter().collect::<Vec<_>>(), ["n"]);
+    trees.set_remote("n".into(), remote_at(file(ROOT, "n", 2), 3));
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::Local);
+    let resent = RemoteNode {
+        content_rev: 4,
+        ..remote_at(file(ROOT, "n", 3), 3)
+    };
+    trees.set_remote("n".into(), resent);
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::Concurrent);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(
+        matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id != "n" && c.content == Some(content(2))),
+        "{:?}",
+        ops(&commit)
+    );
+    assert_eq!(trees.class("n"), Class::Remote);
+}
+
+#[test]
+fn a_file_in_the_trash_after_a_loss_that_l_did_not_edit_is_not_recorded() {
+    let mut trees = trees(&[synced("n", file(ROOT, "n", 3))]);
+    let commits = Commits::default();
+    let (trashed_here, edited) = (trees.trashed_here(), trees.edited_here());
+    trees.set_remote("n".into(), trashed(file(ROOT, "n", 2)));
+    trees.forget_lost(
+        trashed_here,
+        edited,
+        commits.held_through(),
+        commits.accepted(),
+    );
+    trees.settle();
+    assert!(trees.unsent_edits().is_empty());
+    assert_eq!(trees.class("n"), Class::Remote);
+}
+
+fn an_edit_to_the_content_a_lost_commit_replaced() -> (Trees, Commits, IdGen) {
+    let edited = RemoteNode {
+        content_rev: 2,
+        ..remote(file(ROOT, "n", 3))
+    };
+    let mut trees = trees(&[(
+        "n",
+        Some(file(ROOT, "n", 3)),
+        Some(file(ROOT, "n", 3)),
+        Some(edited),
+    )]);
+    assert_eq!(trees.class("n"), Class::InSync);
+    trees.set_local("n".into(), local(file(ROOT, "n", 2), 1));
+    trees.settle();
+    let commits = Commits::default();
+    let (trashed, edited) = (trees.trashed_here(), trees.edited_here());
+    trees.set_remote("n".into(), remote(file(ROOT, "n", 2)));
+    trees.forget_lost(trashed, edited, commits.held_through(), commits.accepted());
+    trees.settle();
+    (trees, commits, IdGen::new(1))
+}
+
+#[test]
+fn an_edit_this_device_committed_to_the_content_a_lost_commit_replaced_is_sent_again() {
+    let edited = RemoteNode {
+        content_rev: 2,
+        ..remote(file(ROOT, "n", 3))
+    };
+    let mut trees = trees(&[(
+        "n",
+        Some(file(ROOT, "n", 3)),
+        Some(file(ROOT, "n", 3)),
+        Some(edited),
+    )]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    trees.set_local("n".into(), local(file(ROOT, "n", 2), 1));
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("n", 2)]);
+    let applied = RemoteNode {
+        content_rev: 3,
+        ..remote(file(ROOT, "n", 2))
+    };
+    trees.set_remote("n".into(), applied);
+    let results = vec![outcome(op_result::Code::Applied)];
+    commits.received(result(3, results)).unwrap();
+    assert!(commits.acknowledge(&mut trees, 3));
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::InSync);
+    assert_eq!(commits.connected(&welcome(0)), Reconnect::AheadOfServer);
+    let (trashed, edited) = (trees.trashed_here(), trees.edited_here());
+    trees.set_remote("n".into(), remote(file(ROOT, "n", 2)));
+    trees.forget_lost(trashed, edited, commits.held_through(), commits.accepted());
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::Local);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("n", 2)]);
+}
+
+#[test]
+fn a_write_to_the_content_the_server_went_back_to_seen_after_the_bootstrap_is_sent() {
+    let edited = RemoteNode {
+        content_rev: 2,
+        ..remote(file(ROOT, "n", 3))
+    };
+    let mut trees = trees(&[(
+        "n",
+        Some(file(ROOT, "n", 3)),
+        Some(file(ROOT, "n", 3)),
+        Some(edited),
+    )]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let (trashed, edited) = (trees.trashed_here(), trees.edited_here());
+    trees.set_remote("n".into(), remote(file(ROOT, "n", 2)));
+    trees.forget_lost(trashed, edited, commits.held_through(), commits.accepted());
+    trees.settle();
+    trees.set_local("n".into(), local(file(ROOT, "n", 2), 1));
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::Local);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("n", 2)]);
+}
+
+#[test]
+fn an_edit_sent_after_a_loss_and_lost_in_a_second_one_is_sent_again() {
+    let (mut trees, mut commits, mut ids) = an_edit_to_the_content_a_lost_commit_replaced();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("n", 2)]);
+    let applied = RemoteNode {
+        content_rev: 3,
+        ..remote(file(ROOT, "n", 2))
+    };
+    trees.set_remote("n".into(), applied);
+    let results = vec![outcome(op_result::Code::Applied)];
+    commits.received(result(3, results)).unwrap();
+    assert!(commits.acknowledge(&mut trees, 3));
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::InSync);
+    assert_eq!(commits.connected(&welcome(0)), Reconnect::AheadOfServer);
+    let (trashed, edited) = (trees.trashed_here(), trees.edited_here());
+    trees.set_remote("n".into(), remote(file(ROOT, "n", 2)));
+    trees.forget_lost(trashed, edited, commits.held_through(), commits.accepted());
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::Local);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("n", 2)]);
+}
+
+#[test]
+fn an_edit_the_server_kept_is_not_sent_again_after_a_loss() {
+    let mut trees = trees(&[synced("n", file(ROOT, "n", 3))]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    trees.set_local("n".into(), local(file(ROOT, "n", 2), 1));
+    trees.settle();
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    let applied = RemoteNode {
+        content_rev: 2,
+        ..remote(file(ROOT, "n", 2))
+    };
+    trees.set_remote("n".into(), applied);
+    let results = vec![outcome(op_result::Code::Applied)];
+    commits.received(result(2, results)).unwrap();
+    assert!(commits.acknowledge(&mut trees, 2));
+    trees.settle();
+    commit_file(&mut trees, &mut commits, &mut ids, "p", 3);
+    assert_eq!(commits.connected(&welcome(1)), Reconnect::AheadOfServer);
+    assert_eq!(commits.held_through(), 2);
+    let (trashed, edited) = (trees.trashed_here(), trees.edited_here());
+    trees.remove_remote("p");
+    trees.forget_lost(trashed, edited, commits.held_through(), commits.accepted());
+    trees.settle();
+    assert!(trees.unsent_edits().is_empty());
+    assert_eq!(trees.class("n"), Class::InSync);
+}
+
+#[test]
+fn an_edit_back_to_the_recorded_content_after_another_content_is_still_sent() {
+    let (mut trees, mut commits, mut ids) = an_edit_to_the_content_a_lost_commit_replaced();
+    trees.set_local("n".into(), local(file(ROOT, "n", 4), 1));
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::Local);
+    trees.set_local("n".into(), local(file(ROOT, "n", 2), 1));
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::Local);
+    assert!(trees.edited("n"));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("n", 2)]);
+}
+
+#[test]
+fn a_recorded_file_that_l_no_longer_holds_is_no_longer_recorded() {
+    let (mut trees, _, _) = an_edit_to_the_content_a_lost_commit_replaced();
+    assert_eq!(trees.unsent_edits().iter().collect::<Vec<_>>(), ["n"]);
+    trees.remove_local("n");
+    trees.settle();
+    assert!(trees.unsent_edits().is_empty());
+}
+
+#[test]
+fn a_recorded_file_another_device_purges_is_created_again() {
+    let (mut trees, mut commits, mut ids) = an_edit_to_the_content_a_lost_commit_replaced();
+    trees.remove_remote("n");
+    trees.settle();
+    let (mut effects, mut effect_ids) = (Effects::default(), IdGen::new(50));
+    assert!(effects.plan(&trees, &mut effect_ids, NOW).is_none());
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(
+        matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id == "n" && c.content == Some(content(2))),
+        "{:?}",
+        ops(&commit)
+    );
+    trees.set_remote("n".into(), remote_at(file(ROOT, "n", 2), 3));
+    let results = vec![outcome(op_result::Code::Applied)];
+    commits.received(result(3, results)).unwrap();
+    assert!(commits.acknowledge(&mut trees, 3));
+    trees.settle();
+    assert!(trees.unsent_edits().is_empty());
+    assert_eq!(trees.class("n"), Class::InSync);
+}
+
+#[test]
+fn a_recorded_file_whose_s_update_waits_gets_no_download() {
+    let restored = |unsent: bool| {
+        let edited = RemoteNode {
+            content_rev: 2,
+            ..remote(file(ROOT, "n", 3))
+        };
+        let mut trees = Trees::new(ROOT);
+        trees.set_remote("n".into(), edited);
+        trees.set_local("n".into(), local(file(ROOT, "n", 2), 1));
+        trees.set_synced("n".into(), Some(file(ROOT, "n", 3)));
+        let state = TreesState {
+            dirty: ["n".into()].into(),
+            waiting: [(
+                "n".into(),
+                Waiting {
+                    shape: Some(file(ROOT, "n", 2)),
+                    origin: Origin::Other,
+                },
+            )]
+            .into(),
+            unsent_edits: if unsent {
+                ["n".into()].into()
+            } else {
+                Default::default()
+            },
+            ..Default::default()
+        };
+        trees.restore(state).unwrap();
+        trees.rules_scanned();
+        trees.settle();
+        trees
+    };
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    assert!(effects.plan(&restored(false), &mut ids, NOW).is_some());
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    assert!(effects.plan(&restored(true), &mut ids, NOW).is_none());
 }
 
 /// Commits a new file `id`, and acknowledges it at `seq` with R holding the file.
@@ -5432,4 +5752,81 @@ fn a_parked_edit_forked_for_a_concurrent_edit_keeps_its_parked_entry() {
     assert_ne!(fork, "h");
     assert!(node.parked);
     assert_eq!(trees.parked_name(fork), "h");
+}
+
+#[test]
+fn an_edit_made_while_an_unsent_edit_is_out_stays_unsent_when_that_edit_is_acknowledged() {
+    let (mut trees, mut commits, mut ids) = an_edit_to_the_content_a_lost_commit_replaced();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("n", 2)]);
+    trees.set_local("n".into(), local(file(ROOT, "n", 5), 1));
+    let other = RemoteNode {
+        content_rev: 4,
+        ..remote(file(ROOT, "n", 5))
+    };
+    trees.set_remote("n".into(), other);
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    assert_eq!(trees.unsent_edits().iter().collect::<Vec<_>>(), ["n"]);
+    let resent = RemoteNode {
+        content_rev: 5,
+        ..remote(file(ROOT, "n", 6))
+    };
+    trees.set_remote("n".into(), resent);
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::Concurrent);
+}
+
+#[test]
+fn an_edit_of_a_file_whose_chunk_list_r_leaves_out_counts_for_loss_recovery() {
+    let chunk = proto::ChunkRef {
+        hash: vec![7; 32],
+        size: 3,
+        encoding: 0,
+    };
+    let listed = Shape {
+        content: Some(Content {
+            chunks: vec![chunk],
+            chunk_count: 1,
+            ..content(2)
+        }),
+        ..file(ROOT, "n", 2)
+    };
+    let unlisted = RemoteNode {
+        content_rev: 4,
+        ..remote(file(ROOT, "n", 2))
+    };
+    let mut trees = trees(&[("n", Some(listed.clone()), Some(listed), Some(unlisted))]);
+    trees.record_edited("n", 4);
+    assert_eq!(trees.edited_here(), [("n".to_owned(), 4)]);
+}
+
+#[test]
+fn an_edit_of_a_file_in_the_trash_after_a_loss_is_kept_from_a_resend_after_a_restore_of_its_bytes()
+{
+    let mut trees = trees(&[synced("n", file(ROOT, "n", 3))]);
+    let commits = Commits::default();
+    let (trashed_here, edited) = (trees.trashed_here(), trees.edited_here());
+    trees.set_remote("n".into(), trashed(file(ROOT, "n", 2)));
+    trees.forget_lost(
+        trashed_here,
+        edited,
+        commits.held_through(),
+        commits.accepted(),
+    );
+    trees.settle();
+    assert!(trees.unsent_edits().is_empty());
+    trees.set_local("n".into(), local(file(ROOT, "n", 2), 1));
+    trees.set_remote("n".into(), remote_at(file(ROOT, "n", 2), 3));
+    trees.settle();
+    let resent = RemoteNode {
+        content_rev: 4,
+        ..remote_at(file(ROOT, "n", 3), 3)
+    };
+    trees.set_remote("n".into(), resent);
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::Concurrent);
 }

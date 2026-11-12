@@ -10,8 +10,8 @@ use crate::ignore::{LocalRules, Matcher, RuleFile, is_rules_file};
 use crate::names::name_key;
 use crate::state::{Agreed, StateError, TreesState};
 use crate::tree::{
-    FileIdentity, Kind, LocalNode, Names, Node, NodeId, RemoteNode, Shape, Tree, TreeError, same,
-    same_content,
+    Content, FileIdentity, Kind, LocalNode, Names, Node, NodeId, RemoteNode, Shape, Tree,
+    TreeError, same, same_content,
 };
 
 /// The most mutually dependent [`Class::Same`] updates [`Trees::settle`] searches as one group.
@@ -192,6 +192,8 @@ pub struct Trees {
     /// The files whose content an edit of this device set, each with the seq of its commit, while
     /// R holds that content.
     edited_here: BTreeMap<NodeId, u64>,
+    /// See [`TreesState::unsent_edits`].
+    unsent_edits: BTreeSet<NodeId>,
     ignore: Matcher,
     /// Nodes whose local copy the user moved into an ignored folder that is no node. L keeps the
     /// entry each had before the move.
@@ -260,6 +262,7 @@ impl Trees {
             trashed_here: BTreeMap::new(),
             discarded: BTreeSet::new(),
             edited_here: BTreeMap::new(),
+            unsent_edits: BTreeSet::new(),
             ignore: Matcher::new(LocalRules::default()),
             outside: BTreeSet::new(),
             displaced: BTreeMap::new(),
@@ -405,6 +408,7 @@ impl Trees {
         self.count_held_trash(&id, true);
         self.count_trashed(&id, true);
         self.note_position(&id);
+        self.record_edit_in_trash(&id);
     }
 
     pub fn remove_remote(&mut self, id: &str) {
@@ -455,6 +459,7 @@ impl Trees {
         self.l.insert(id.clone(), node);
         self.count_held_trash(&id, true);
         self.note_position(&id);
+        self.record_edit_in_trash(&id);
     }
 
     pub fn remove_local(&mut self, id: &str) {
@@ -462,6 +467,7 @@ impl Trees {
         self.unknown_rules.remove(id);
         self.outside.remove(id);
         self.count_held_trash(id, false);
+        self.unsent_edits.remove(id);
         if let Some(old) = self.l.remove(id) {
             if !old.parked {
                 self.l_names.remove(id, &old.shape);
@@ -862,15 +868,17 @@ impl Trees {
     }
 
     /// The files whose content an edit of this device set, and whose content S and R still hold,
-    /// for [`Trees::forget_lost`] once a bootstrap has replaced R.
-    pub fn edited_here(&self) -> Vec<NodeId> {
-        (self.edited_here.keys())
-            .filter(|id| {
+    /// each with the seq of that edit's commit, for [`Trees::forget_lost`] once a bootstrap has
+    /// replaced R.
+    pub fn edited_here(&self) -> Vec<(NodeId, u64)> {
+        (self.edited_here.iter())
+            .filter(|(id, _)| {
                 let content = |shape: Option<&Shape>| shape.and_then(|shape| shape.content.clone());
                 let remote = content(self.r.live(id));
-                remote.is_some() && remote == content(self.s.live(id))
+                let synced = content(self.s.live(id));
+                matches!((remote, synced), (Some(remote), Some(synced)) if same_content(&remote, &synced))
             })
-            .cloned()
+            .map(|(id, seq)| (id.clone(), *seq))
             .collect()
     }
 
@@ -909,14 +917,25 @@ impl Trees {
     /// since a restore or another change after the loss can take a seq the lost commits had.
     ///
     /// `edited` lists the files whose content an edit of this device set before the bootstrap
-    /// ([`Trees::edited_here`]). A file of it that R now holds, live or in the trash, at the
-    /// position S holds, with content of no revision above `held_through`, lost the edit. S takes
+    /// ([`Trees::edited_here`]), each with the seq of that edit's commit. A file of it that R now
+    /// holds, live or in the trash, at the position S holds, with content of no revision above
+    /// `held_through`, lost the edit. S takes
     /// R's shape for it, so the content L holds is sent again as an edit instead of being kept
     /// beside R's as a conflict copy. A delete R holds trashed the content from before the edit, so
     /// the edit beats it (R8): the server revives the file instead of this device moving the edit
     /// to the local trash. That also undoes a delete by a device that saw the edit before the loss,
     /// which the engine cannot tell apart: the revived file can be deleted again, while an edit in
     /// the local trash would be missing from the server.
+    ///
+    /// A file S forgets that L and R hold may hold, or later get, an edit of this device to the
+    /// bytes R now holds, such as the content the server went back to (GUN-438). So may a file of
+    /// `edited` whose edit's commit has a seq above `held_through`, which the server lost. L and R
+    /// would then agree, so the edit would be taken for R's content, and a resend of the lost
+    /// content would replace it. Each such file is recorded ([`Trees::unsent_edits`]), so L's
+    /// content is sent, and a resend then meets an edit it did not see. A forgotten file whose
+    /// content L, S and R all hold alike is not recorded: only its position was lost. A file R holds
+    /// in the trash keeps S, and is recorded when L holds content S does not, since a device that
+    /// restores it from the trash with L's bytes would otherwise make L, S and R agree.
     ///
     /// `accepted` is the count of this device's commits the server still holds (*w*, section
     /// 2.8). An S update that waits ([`Trees::waiting`]) from a commit above it came from a commit
@@ -939,10 +958,14 @@ impl Trees {
     pub fn forget_lost(
         &mut self,
         trashed: Vec<Trashed>,
-        edited: Vec<NodeId>,
+        edited: Vec<(NodeId, u64)>,
         held_through: u64,
         accepted: u64,
     ) {
+        let lost_edits: BTreeSet<NodeId> = (edited.iter())
+            .filter(|(_, seq)| *seq > held_through)
+            .map(|(id, _)| id.clone())
+            .collect();
         let mut deletes: Vec<(NodeId, Shape)> = (trashed.into_iter())
             .filter(|deleted| {
                 self.l.get(&deleted.id).is_none() && self.s.get(&deleted.id).is_none()
@@ -961,7 +984,7 @@ impl Trees {
             let (id, shape) = deletes.swap_remove(at);
             self.set_synced(id, Some(shape));
         }
-        for id in edited {
+        for (id, _) in edited {
             let Some(remote) = (self.r.get(&id))
                 .filter(|remote| remote.content_rev <= held_through)
                 .filter(|remote| (self.s.live(&id)).is_some_and(|s| s.same_position(&remote.shape)))
@@ -1014,6 +1037,32 @@ impl Trees {
         let lost: Vec<(NodeId, bool)> = (lost.into_iter())
             .map(|id| (id.to_owned(), waits.contains(id)))
             .collect();
+        let content = |shape: Option<&Shape>| shape.and_then(|shape| shape.content.clone());
+        let in_trash: Vec<NodeId> = (self.s.iter())
+            .filter(|(id, _)| self.r.get(id).is_some_and(|remote| remote.trashed))
+            .filter(|(id, _)| self.edited(id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let unsent: Vec<NodeId> = (lost.iter().map(|(id, _)| id))
+            .chain(&lost_edits)
+            .chain(&in_trash)
+            .filter(|id| {
+                let remote = self.r.get(id).map(|remote| &remote.shape);
+                let (Some(local), Some(remote)) = (content(self.l.live(id)), content(remote))
+                else {
+                    return false;
+                };
+                let unchanged = content(self.s.live(id)).is_some_and(|synced| {
+                    same_content(&local, &synced) && same_content(&local, &remote)
+                });
+                lost_edits.contains(*id) || !unchanged
+            })
+            .cloned()
+            .collect();
+        for id in unsent {
+            self.mark(&id);
+            self.unsent_edits.insert(id);
+        }
         for (id, waits) in lost {
             if self.r.get(&id).is_none() {
                 self.reverted.remove(&id);
@@ -1046,7 +1095,58 @@ impl Trees {
     }
 
     pub fn class(&self, id: &str) -> Class {
-        classify(self.l.live(id), self.s.live(id), self.r.live(id))
+        self.class_against(id, self.s.live(id))
+    }
+
+    /// The node's class with `synced` standing in for S. A file whose content in L is an edit the
+    /// server does not hold ([`Trees::unsent_edits`]) is changed locally, although S may hold the
+    /// same bytes.
+    pub fn class_against(&self, id: &str, synced: Option<&Shape>) -> Class {
+        let class = classify(self.l.live(id), synced, self.r.live(id));
+        if !self.unsent_edits.contains(id) {
+            return class;
+        }
+        match class {
+            Class::InSync => Class::Local,
+            Class::Remote => Class::Concurrent,
+            class => class,
+        }
+    }
+
+    /// The files whose content in L is an edit of this device that the server does not hold,
+    /// although S and R may hold the same bytes. A server loss leaves one ([`Trees::forget_lost`]),
+    /// and so does an edit L holds of a file R holds in the trash. It stays until the server
+    /// acknowledges an edit or a create of the file with L's content ([`Trees::sent_edit`]) or
+    /// L no longer holds the file. A later edit in L does not end it,
+    /// since the server holds none of them until one is acknowledged, and neither does R dropping
+    /// the file: the edit beats the removal and the file is created again, as for any edit L holds.
+    pub fn unsent_edits(&self) -> &BTreeSet<NodeId> {
+        &self.unsent_edits
+    }
+
+    /// Records that the server acknowledged an edit of `id` to `sent`, so L's content is no longer
+    /// an edit it lacks ([`Trees::unsent_edits`]), unless L has since taken other content.
+    pub fn sent_edit(&mut self, id: &str, sent: Option<&Content>) {
+        let local = self.l.live(id).and_then(|shape| shape.content.as_ref());
+        if matches!((local, sent), (Some(local), Some(sent)) if !same_content(local, sent)) {
+            return;
+        }
+        if self.unsent_edits.remove(id) {
+            self.mark(id);
+        }
+    }
+
+    fn record_edit_in_trash(&mut self, id: &str) {
+        let local = self.l.live(id).and_then(|shape| shape.content.as_ref());
+        let synced = self.s.live(id).and_then(|shape| shape.content.as_ref());
+        let edited = match (local, synced) {
+            (Some(local), Some(synced)) => !same_content(local, synced),
+            (local, _) => local.is_some(),
+        };
+        let trashed = self.r.get(id).is_some_and(|remote| remote.trashed);
+        if edited && trashed && !self.waiting.contains_key(id) {
+            self.unsent_edits.insert(id.to_owned());
+        }
     }
 
     pub(crate) fn acknowledged(&self, id: &str) -> Option<&Shape> {
@@ -1057,12 +1157,16 @@ impl Trees {
     }
 
     pub(crate) fn acknowledged_class(&self, id: &str) -> Class {
-        classify(self.l.live(id), self.acknowledged(id), self.r.live(id))
+        self.class_against(id, self.acknowledged(id))
     }
 
     /// Whether L holds content that S does not, or, while the node's S update waits, content the
-    /// waiting shape does not: an edit not uploaded yet.
+    /// waiting shape does not: an edit not uploaded yet. So does a file of
+    /// [`Trees::unsent_edits`].
     pub fn edited(&self, id: &str) -> bool {
+        if self.unsent_edits.contains(id) {
+            return true;
+        }
         let content = self.l.get(id).and_then(|node| node.shape.content.as_ref());
         match (
             content,
@@ -1164,7 +1268,7 @@ impl Trees {
             taken.extend(together);
         }
         for id in taken {
-            if !self.parked(&id) {
+            if !self.parked(&id) && !self.unsent_edits.contains(&id) {
                 self.dirty.remove(&id);
             }
         }
@@ -1551,6 +1655,7 @@ impl Trees {
             outside: self.outside.clone(),
             displaced: self.displaced.clone(),
             edited_here: self.edited_here.clone(),
+            unsent_edits: self.unsent_edits.clone(),
         }
     }
 
@@ -1567,7 +1672,9 @@ impl Trees {
             .chain(self.l.iter().map(|(id, _)| id))
             .chain(self.s.iter().map(|(id, _)| id));
         let settled = |id: &NodeId| {
-            self.class(id) == Class::InSync && !self.l.get(id).is_some_and(|node| node.parked)
+            self.class(id) == Class::InSync
+                && !self.l.get(id).is_some_and(|node| node.parked)
+                && !state.unsent_edits.contains(id)
         };
         if let Some(id) = ids
             .filter(|id| !state.dirty.contains(*id))
@@ -1601,6 +1708,13 @@ impl Trees {
         if let Some((id, _)) = state.edited_here.iter().find(|entry| !edited(entry)) {
             return Err(StateError::NotEditedHere(id.clone()));
         }
+        if let Some(id) = state
+            .unsent_edits
+            .iter()
+            .find(|id| self.l.get(id).is_none())
+        {
+            return Err(StateError::NotUnsentEdit(id.clone()));
+        }
         let TreesState {
             dirty,
             unsearched,
@@ -1614,6 +1728,7 @@ impl Trees {
             outside,
             displaced,
             edited_here,
+            unsent_edits,
         } = state;
         self.unsettled = dirty.clone();
         self.same.clear();
@@ -1630,6 +1745,7 @@ impl Trees {
         self.outside = outside;
         self.displaced = displaced;
         self.edited_here = edited_here;
+        self.unsent_edits = unsent_edits;
         self.rules_known = false;
         self.unknown_rules.clear();
         Ok(())

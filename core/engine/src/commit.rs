@@ -1019,6 +1019,7 @@ impl Commits {
                         let shape = created(trees, &synced, &create.node_id, shape);
                         agreed.extend(agree(trees, &create.node_id, result.seq));
                         synced.set(&create.node_id, Some(shape));
+                        trees.sent_edit(&create.node_id, create.content.as_ref());
                     }
                     let exists = taken && trees.remote().live(&create.node_id).is_some();
                     (&create.node_id, applied || exists)
@@ -1047,6 +1048,9 @@ impl Commits {
                     }
                     if applied {
                         trees.record_edited(id, result.seq);
+                    }
+                    if applied || code == Code::ConflictCopy {
+                        trees.sent_edit(id, update.content.as_ref());
                     }
                     if code == Code::ConflictCopy {
                         conflicts.push((index, id.clone(), outcome.node_id.clone()));
@@ -1709,7 +1713,8 @@ fn take_agreed(trees: &Trees, id: &str) -> Option<Shape> {
     (!next.same(synced)).then_some(next)
 }
 
-/// A file whose content changed on both sides, each differently (R3).
+/// A file whose content changed on both sides, each differently (R3). A file of
+/// [`Trees::unsent_edits`] changed locally even where L holds S's bytes.
 fn edited_on_both_sides(trees: &Trees, id: &str) -> bool {
     let content = |shape: Option<&Shape>| shape.and_then(|shape| shape.content.clone());
     let (Some(l), Some(r)) = (
@@ -1720,7 +1725,7 @@ fn edited_on_both_sides(trees: &Trees, id: &str) -> bool {
     };
     let s = content(trees.acknowledged(id));
     let changed = |c: &Content| s.as_ref().is_none_or(|s| !same_content(c, s));
-    changed(&l) && changed(&r) && !same_content(&l, &r)
+    (changed(&l) || trees.unsent_edits().contains(id)) && changed(&r) && !same_content(&l, &r)
 }
 
 fn parked_until_moved(trees: &Trees) -> impl Iterator<Item = &NodeId> {
@@ -2041,8 +2046,8 @@ fn plan(
                 .is_none_or(|other| !same_content(other, content))
         };
         if let Some(content) = &local.content
-            && differs(synced, content)
-            && differs(remote, content)
+            && ((differs(synced, content) && differs(remote, content))
+                || trees.unsent_edits().contains(id))
         {
             wants.push(Want::Content {
                 id: id.clone(),
