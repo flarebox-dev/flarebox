@@ -1300,24 +1300,19 @@ fn diff(old: &BTreeMap<PathBuf, Entry>, new: &BTreeMap<PathBuf, Entry>) -> Vec<C
                         .nth(1)
                         .is_some_and(|(inside, _)| inside.starts_with(path))))
     };
-    let replaced: HashSet<&Path> = (old.iter())
-        .filter(|(path, before)| {
-            before.kind == EntryKind::Dir
-                && (new.get(*path)).is_some_and(|after| !kept(path, before, after))
-        })
-        .map(|(path, _)| path.as_path())
-        .collect();
-    let same = |path: &Path, before: &Entry, after: &Entry| {
-        kept(path, before, after)
-            && (after.id == before.id
-                || !(path.ancestors().skip(1)).any(|above| replaced.contains(above)))
-    };
+    let mut changed: HashSet<&Path> = HashSet::new();
+    for (path, before) in old {
+        let parent_changed = path.parent().is_some_and(|parent| changed.contains(parent));
+        if parent_changed || !new.get(path).is_some_and(|after| kept(path, before, after)) {
+            changed.insert(path);
+        }
+    }
     let mut removed: BTreeMap<&Path, &Entry> = BTreeMap::new();
     let mut created: Vec<(&Path, &Entry)> = Vec::new();
     let mut modified: Vec<&Path> = Vec::new();
     for (path, before) in old {
         match new.get(path) {
-            Some(after) if same(path, before, after) => {
+            Some(after) if !changed.contains(path.as_path()) => {
                 if after.kind == EntryKind::File && after != before {
                     modified.push(path);
                 }
@@ -1328,10 +1323,7 @@ fn diff(old: &BTreeMap<PathBuf, Entry>, new: &BTreeMap<PathBuf, Entry>) -> Vec<C
         }
     }
     for (path, after) in new {
-        if !old
-            .get(path)
-            .is_some_and(|before| same(path, before, after))
-        {
+        if !old.contains_key(path) || changed.contains(path.as_path()) {
             created.push((path, after));
         }
     }

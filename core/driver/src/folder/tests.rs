@@ -641,6 +641,32 @@ fn files_and_folders_swapped_in_one_batch_keep_every_byte() {
     assert_eq!(files(&site.root), swapped);
 }
 
+#[test]
+fn files_moved_between_two_swapped_folders_keep_their_paths_on_both_devices() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site_a.root.join("a")).unwrap();
+    fs::create_dir(site_a.root.join("b")).unwrap();
+    a.create(&mut remote, &site_a.root.join("a/1"), b"one");
+    a.create(&mut remote, &site_a.root.join("b/2"), b"two");
+    let (site, mut b) = linked(&mut remote, "b");
+    b.settle();
+    for (from, to) in [
+        ("a", "t"),
+        ("b", "a"),
+        ("t", "b"),
+        ("a/2", "b/2"),
+        ("b/1", "a/1"),
+    ] {
+        fs::rename(site.root.join(from), site.root.join(to)).unwrap();
+    }
+    sync(&mut remote, (&site_a, &mut a), (&site, &mut b));
+    let kept =
+        [("a/1", "one"), ("b/2", "two")].map(|(path, text)| (path.to_owned(), text.to_owned()));
+    assert_eq!(files(&site.root), kept);
+    assert_eq!(files(&site_a.root), kept);
+}
+
 /// Device a swaps the file `a` with the file `b`, which its rules exclude, through a third name. The file that took
 /// `b` left what this device syncs, so its copy stays on the server.
 #[test]
