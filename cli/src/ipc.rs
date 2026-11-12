@@ -14,8 +14,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use koidrive_driver::{
-    Account, Answer, Credential, Driver, DriverError, FolderStatus, Linked, Paths, Question,
-    RestoreRequest, RestoreStatus, Status,
+    Account, Answer, Answered, Credential, Driver, DriverError, FolderStatus, Linked, Paths,
+    Question, RestoreRequest, RestoreStatus, Status,
 };
 use koidrive_engine::commit::Lift;
 use rustix::io::Errno;
@@ -173,9 +173,10 @@ impl Response {
     }
 }
 
-/// Runs `request` unless an earlier run of `request_id` recorded its response, and records the response unless it is
-/// an error. The record is written in the process that runs the driver, so a client that stops waiting does not keep
-/// the outcome from being recorded.
+/// Runs `request` unless an earlier run of `request_id` recorded its response, and records the response. An error
+/// removes the record instead: the driver fails before its change or rolls it back, and a restart before a lift that
+/// failed is safe to repeat. A run cancelled midway leaves the record without an outcome. The record is written in the
+/// process that runs the driver, so a client that stops waiting does not keep the outcome from being recorded.
 async fn once(driver: &Driver, request_id: RequestId, key: Key, request: Request) -> Response {
     let claim = match request::begin(driver.paths(), &request_id, &key) {
         Ok(Begun::Claimed(claim)) => claim,
@@ -189,9 +190,9 @@ async fn once(driver: &Driver, request_id: RequestId, key: Key, request: Request
         Err(error) => return Response::failed(error),
     };
     let response = Box::pin(handle(driver, request)).await;
-    if !matches!(response, Response::Error { .. })
-        && let Err(error) = claim.finish(&response)
-    {
+    if matches!(response, Response::Error { .. }) {
+        claim.abandon();
+    } else if let Err(error) = claim.finish(&response) {
         tracing::warn!(%request_id, error = error.message, "could not record the outcome of a request");
     }
     response
@@ -255,30 +256,12 @@ pub async fn handle(driver: &Driver, request: Request) -> Response {
         Request::Answer {
             question_id,
             answer,
-        } => match driver.answer(&question_id, answer) {
-            Ok(()) => {
-                if let Err(error) = request::answered(driver.paths(), &question_id, answer) {
-                    tracing::warn!(question_id, %error, "could not record an answer");
-                }
-                Ok(Response::Answered)
-            }
-            Err(DriverError::QuestionNotFound(id)) => {
-                match request::answer_of(driver.paths(), &question_id) {
-                    Some(given) if given == answer => Ok(Response::AlreadyAnswered),
-                    Some(given) => Ok(Response::failed(
-                        CliError::new(
-                            Code::StaleDecision,
-                            format!(
-                                "the decision {question_id:?} was answered with {given}; koi resolve lists the decisions waiting now"
-                            ),
-                        )
-                        .then(&["koi", "resolve", "--json"]),
-                    )),
-                    None => Err(DriverError::QuestionNotFound(id)),
-                }
-            }
-            Err(error) => Err(error),
-        },
+        } => driver
+            .answer(&question_id, answer)
+            .map(|answered| match answered {
+                Answered::Now => Response::Answered,
+                Answered::Already => Response::AlreadyAnswered,
+            }),
         Request::Restore { space_id, restore } => driver
             .restore(&space_id, restore)
             .map(|id| Response::Restore { id }),
@@ -994,10 +977,12 @@ mod tests {
             answer("q1", Answer::Delete).await,
             Response::AlreadyAnswered
         );
-        koidrive_store::Store::open(paths.store(SPACE).unwrap())
-            .unwrap()
-            .transaction(|tx| tx.remove_question("q1"))
-            .unwrap();
+        assert!(
+            koidrive_store::Store::open(paths.store(SPACE).unwrap())
+                .unwrap()
+                .transaction(|tx| tx.take_answer("q1"))
+                .unwrap()
+        );
         assert!(driver.questions().unwrap().is_empty());
         assert_eq!(
             answer("q1", Answer::Delete).await,
@@ -1015,20 +1000,94 @@ mod tests {
         assert_eq!(code, Code::StaleDecision);
         assert_eq!(
             message,
-            "the decision \"q1\" was answered with delete; koi resolve lists the decisions waiting now"
+            "the question was answered with delete; koi resolve lists the decisions waiting now"
         );
         assert_eq!(next, [Next::of(&["koi", "resolve", "--json"])]);
-        let replaced = answer("q0", Answer::Delete).await;
-        assert!(
-            matches!(
-                &replaced,
-                Response::Error {
-                    code: Code::StaleDecision,
-                    ..
-                }
-            ),
-            "{replaced:?}"
-        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_the_daemon_acknowledged_outlives_the_daemon_and_is_unchanged_after_sync_took_it()
+     {
+        let (_dir, paths, _root) = linked_profile();
+        let answer = || Request::Answer {
+            question_id: "q1".into(),
+            answer: Answer::Delete,
+        };
+        let driver = Driver::open(paths.clone()).unwrap();
+        assert_eq!(handle(&driver, answer()).await, Response::Answered);
+        drop(driver);
+        let mut store = koidrive_store::Store::open(paths.store(SPACE).unwrap()).unwrap();
+        assert!(store.transaction(|tx| tx.take_answer("q1")).unwrap());
+        drop(store);
+        let driver = Driver::open(paths.clone()).unwrap();
+        assert_eq!(handle(&driver, answer()).await, Response::AlreadyAnswered);
+    }
+
+    #[tokio::test]
+    async fn question_ids_that_differ_in_case_are_different_questions() {
+        let (_dir, paths, _root) = linked_profile();
+        let driver = Driver::open(paths.clone()).unwrap();
+        let answer = |question_id: &str| {
+            handle(
+                &driver,
+                Request::Answer {
+                    question_id: question_id.into(),
+                    answer: Answer::Delete,
+                },
+            )
+        };
+        assert_eq!(answer("q1").await, Response::Answered);
+        koidrive_store::Store::open(paths.store(SPACE).unwrap())
+            .unwrap()
+            .transaction(|tx| tx.take_answer("q1"))
+            .unwrap();
+        let Response::Error { code, .. } = answer("Q1").await else {
+            panic!("the answer to q1 was taken as one to Q1");
+        };
+        assert_eq!(code, Code::StaleDecision);
+        assert_eq!(answer("q1").await, Response::AlreadyAnswered);
+    }
+
+    #[tokio::test]
+    async fn an_answer_to_a_decision_replaced_before_sync_took_it_is_stale() {
+        let (_dir, paths, _root) = linked_profile();
+        let driver = Driver::open(paths.clone()).unwrap();
+        let answer = || {
+            handle(
+                &driver,
+                Request::Answer {
+                    question_id: "q1".into(),
+                    answer: Answer::Delete,
+                },
+            )
+        };
+        assert_eq!(answer().await, Response::Answered);
+        let replacement = Question {
+            id: "q2".into(),
+            lineage: "q2".into(),
+            space_id: SPACE.into(),
+            asked_at_ms: 20,
+            kind: koidrive_driver::QuestionKind::AmbiguousDisappearance,
+            items: Vec::new(),
+        };
+        koidrive_store::Store::open(paths.store(SPACE).unwrap())
+            .unwrap()
+            .transaction(|tx| {
+                tx.remove_question("q1")?;
+                tx.put_question(&koidrive_store::StoredQuestion {
+                    question_id: "q2".into(),
+                    asked_at_ms: 20,
+                    body: serde_json::to_vec(&replacement).unwrap(),
+                    answer: None,
+                })
+            })
+            .unwrap();
+        assert_eq!(driver.questions().unwrap(), [replacement]);
+        let Response::Error { code, next, .. } = answer().await else {
+            panic!("the dropped answer was reported as taken");
+        };
+        assert_eq!(code, Code::StaleDecision);
+        assert_eq!(next, [Next::of(&["koi", "resolve", "--json"])]);
     }
 
     #[tokio::test]
@@ -1097,7 +1156,7 @@ mod tests {
                 ),
                 "{failed:?}"
             );
-            assert!(!paths.requests().join("r2.json").exists());
+            assert!(!crate::request::request_file(&paths, &id("r2").unwrap()).exists());
         }
     }
 }

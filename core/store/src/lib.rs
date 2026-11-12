@@ -382,6 +382,12 @@ const MIGRATIONS: &[&str] = &[
         node_id TEXT PRIMARY KEY
     ) STRICT, WITHOUT ROWID;
 ",
+    "
+    CREATE TABLE taken_answers (
+        question_id TEXT PRIMARY KEY,
+        answer TEXT NOT NULL
+    ) STRICT, WITHOUT ROWID;
+",
 ];
 
 /// The schema version this build writes.
@@ -1049,6 +1055,33 @@ impl Tx<'_> {
             params![question_id, body],
         )?;
         Ok(())
+    }
+
+    /// Removes an answered question whose answer the engine took, and keeps the answer, so that the same answer given
+    /// again can be told from one to a question the engine dropped. Returns false, changing nothing, when the question
+    /// has no answer.
+    pub fn take_answer(&self, question_id: &str) -> Result<bool> {
+        let kept = self.0.execute(
+            "INSERT OR REPLACE INTO taken_answers (question_id, answer)
+             SELECT question_id, answer FROM questions WHERE question_id = ?1 AND answer IS NOT NULL",
+            [question_id],
+        )?;
+        if kept > 0 {
+            self.remove_question(question_id)?;
+        }
+        Ok(kept > 0)
+    }
+
+    /// The answer the engine took for `question_id`, as [`Tx::take_answer`] kept it.
+    pub fn taken_answer(&self, question_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .0
+            .query_row(
+                "SELECT answer FROM taken_answers WHERE question_id = ?1",
+                [question_id],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     pub fn remove_question(&self, question_id: &str) -> Result<bool> {

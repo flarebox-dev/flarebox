@@ -78,8 +78,8 @@ These commands make a new change each time they run: `koi history restore`, `koi
 
 - The same ID with other arguments fails with `stale_decision` (exit 7) and no next command. Repeat the first call as it was, or pick a new ID.
 - A pairing code expires after about 10 minutes. After that, `koi device invite` with its ID fails with `stale_decision`. Run it with a new ID.
-- A command that failed records nothing, so running it again with its ID tries again.
-- If the first run stopped before it recorded its outcome, or still runs, the command fails with `interrupted` (exit 130). Read the state with `koi status --json` or `koi history requests`. To make the change, use a new ID.
+- A command whose change is known to have failed records nothing, so running it again with its ID tries again.
+- If the first run stopped before it recorded its outcome, still runs, or couldn't tell whether its change happened (for example, the server didn't answer), the command fails with `interrupted` (exit 130). Read the state with `koi status --json` or `koi history requests`. To make the change, use a new ID.
 
 The records are in `requests/` in the profile's state directory (`~/.local/state/koidrive` by default), readable only by you. A record of `koi device invite` holds the pairing code. Pairing codes never appear in the logs.
 

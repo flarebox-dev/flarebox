@@ -2,30 +2,33 @@
 
 //! Records that let an agent run a change again without making it twice. `--request-id` names one change: the first
 //! run records the command, its arguments and its outcome under the ID, and a later run with the same ID and arguments
-//! returns that outcome and changes nothing, also after a restart. `koi resolve` records each answer it gives the same
-//! way, keyed by the decision, because the folder's store drops a question once sync takes its answer.
+//! returns that outcome and changes nothing, also after a restart.
 //!
-//! Each record is one file in the profile's state directory, 0600 in a 0700 directory. A file is written under a
+//! Each record is one file in the profile's state directory, 0600 in a 0700 directory, named by the SHA-256 of the ID
+//! so that IDs differing only in case stay apart on a file system that folds case. A file is written under a
 //! temporary name and then moved into place, so a reader never sees half of one. A request's record is created before
 //! the change, which fails when another run created it first, and gets the outcome after the change. A run that stops
-//! in between leaves a record without an outcome, and the next run with that ID refuses instead of guessing whether
-//! the change happened. A change that fails records nothing, so the next run with its ID tries again.
+//! in between, or that cannot tell whether its change happened, leaves a record without an outcome, and the next run
+//! with that ID refuses instead of guessing. A change known to have failed records nothing, so the next run with its
+//! ID tries again.
 
 use std::fs::{DirBuilder, File};
 use std::io::{self, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
-use koidrive_driver::{Answer, Paths};
+use koidrive_driver::Paths;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::error::{CliError, Code};
 
 /// The most bytes a request ID has.
 const MAX_ID: usize = 128;
 
-/// An ID an agent picks for one change: 1 to 128 ASCII letters, digits, `-` and `_`, so that it names a file.
+/// An ID an agent picks for one change: 1 to 128 ASCII letters, digits, `-` and `_`. IDs that differ in case are
+/// different IDs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct RequestId(String);
@@ -83,6 +86,7 @@ impl Key {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Record {
+    id: RequestId,
     key: Key,
     /// None while the change runs, and after a run that stopped before it recorded what happened.
     outcome: Option<Value>,
@@ -113,8 +117,8 @@ pub fn recorded(paths: &Paths, id: &RequestId, key: &Key) -> Result<Option<Value
         _ => Err(CliError::new(
             Code::Interrupted,
             format!(
-                "the request {id} has no recorded outcome: an earlier run of it is still going, or it stopped before \
-                 it finished. Read the state to see whether the change happened; to make it, run the command with \
+                "the request {id} has no recorded outcome: an earlier run of it is still going, stopped before it \
+                 finished, or could not tell whether its change happened. Read the state to see whether the change happened; to make it, run the command with \
                  a new request ID"
             ),
         )
@@ -134,16 +138,13 @@ pub enum Begun {
 pub fn begin(paths: &Paths, id: &RequestId, key: &Key) -> Result<Begun, CliError> {
     let path = request_file(paths, id);
     let record = Record {
+        id: id.clone(),
         key: key.clone(),
         outcome: None,
     };
     loop {
         if write(&path, &record, false).map_err(|error| format!("{}: {error}", path.display()))? {
-            return Ok(Begun::Claimed(Claim {
-                path,
-                record,
-                settled: false,
-            }));
+            return Ok(Begun::Claimed(Claim { path, record }));
         }
         if let Some(outcome) = recorded(paths, id, key)? {
             return Ok(Begun::Done(outcome));
@@ -151,60 +152,35 @@ pub fn begin(paths: &Paths, id: &RequestId, key: &Key) -> Result<Begun, CliError
     }
 }
 
-/// A request this run makes. Dropping it without [`Claim::finish`] removes the record, for a change that failed.
+/// A request this run makes. Unless [`Claim::finish`] or [`Claim::abandon`] settles it, the record stays without an
+/// outcome: a run cancelled or stopped while it made the change cannot tell whether the change happened.
 pub struct Claim {
     path: PathBuf,
     record: Record,
-    settled: bool,
 }
 
 impl Claim {
     /// Records the outcome of the change. Should that fail, the record stays without an outcome, since the change
     /// happened.
     pub fn finish(mut self, outcome: &impl Serialize) -> Result<(), CliError> {
-        self.settled = true;
         self.record.outcome = Some(serde_json::to_value(outcome).expect("an outcome serializes"));
         write(&self.path, &self.record, true)
             .map(drop)
             .map_err(|error| format!("{}: {error}", self.path.display()).into())
     }
-}
 
-impl Drop for Claim {
-    fn drop(&mut self) {
-        if !self.settled {
-            let _ = std::fs::remove_file(&self.path);
-        }
+    /// Removes the record, for a change known to have failed without an effect, so that the next run with the ID
+    /// tries again.
+    pub fn abandon(self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct Answered {
-    answer: Answer,
-}
-
-/// Records that the decision `decision_id` was answered with `answer`. Decision IDs come from the store; one that
-/// cannot name a file is not recorded.
-pub fn answered(paths: &Paths, decision_id: &str, answer: Answer) -> io::Result<()> {
-    let Ok(id) = RequestId::parse(decision_id) else {
-        return Ok(());
-    };
-    write(&answer_file(paths, &id), &Answered { answer }, true).map(drop)
-}
-
-/// The answer recorded for the decision `decision_id`.
-pub fn answer_of(paths: &Paths, decision_id: &str) -> Option<Answer> {
-    let id = RequestId::parse(decision_id).ok()?;
-    let bytes = std::fs::read(answer_file(paths, &id)).ok()?;
-    Some(serde_json::from_slice::<Answered>(&bytes).ok()?.answer)
-}
-
-fn request_file(paths: &Paths, id: &RequestId) -> PathBuf {
-    paths.requests().join(format!("{id}.json"))
-}
-
-fn answer_file(paths: &Paths, id: &RequestId) -> PathBuf {
-    paths.answers().join(format!("{id}.json"))
+pub(crate) fn request_file(paths: &Paths, id: &RequestId) -> PathBuf {
+    let name: String = (Sha256::digest(id.0.as_bytes()).iter())
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    paths.requests().join(format!("{name}.json"))
 }
 
 /// Writes `value` to `path` whole: to a temporary file in the same directory, then moved into place. Without
@@ -285,11 +261,16 @@ mod tests {
         );
         assert_eq!(recorded(&paths, &id("r2"), &key).unwrap(), None);
         assert_eq!(mode(&paths.requests()), 0o700);
-        assert_eq!(mode(&paths.requests().join("r1.json")), 0o600);
+        assert_eq!(mode(&request_file(&paths, &id("r1"))), 0o600);
         let names: Vec<_> = (std::fs::read_dir(paths.requests()).unwrap())
             .map(|entry| entry.unwrap().file_name())
             .collect();
-        assert_eq!(names, ["r1.json"], "no temporary file is left");
+        let file = request_file(&paths, &id("r1"));
+        assert_eq!(
+            names,
+            [file.file_name().unwrap()],
+            "no temporary file is left"
+        );
     }
 
     #[test]
@@ -300,7 +281,7 @@ mod tests {
             panic!("the first run claims the request");
         };
         claim.finish(&json!("first")).unwrap();
-        let before = std::fs::read(paths.requests().join("r1.json")).unwrap();
+        let before = std::fs::read(request_file(&paths, &id("r1"))).unwrap();
         for other in [
             restart("/b"),
             Key::new("folder retry", json!({ "folder": "/a", "how": "resend" })),
@@ -320,20 +301,47 @@ mod tests {
             assert!(error.next.is_empty());
         }
         assert_eq!(
-            std::fs::read(paths.requests().join("r1.json")).unwrap(),
+            std::fs::read(request_file(&paths, &id("r1"))).unwrap(),
             before
         );
     }
 
     #[test]
-    fn a_run_that_stopped_before_its_outcome_leaves_the_request_interrupted() {
+    fn request_ids_that_differ_in_case_are_different_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let key = restart("/a");
+        let Begun::Claimed(claim) = begin(&paths, &id("Case-A"), &key).unwrap() else {
+            panic!("the first run claims the request");
+        };
+        claim.finish(&json!("first")).unwrap();
+        let Begun::Claimed(claim) = begin(&paths, &id("case-a"), &key).unwrap() else {
+            panic!("another ID replayed the first request");
+        };
+        claim.finish(&json!("second")).unwrap();
+        assert_eq!(
+            recorded(&paths, &id("Case-A"), &key).unwrap(),
+            Some(json!("first"))
+        );
+        assert_eq!(
+            recorded(&paths, &id("case-a"), &key).unwrap(),
+            Some(json!("second"))
+        );
+        let record: Value =
+            serde_json::from_slice(&std::fs::read(request_file(&paths, &id("Case-A"))).unwrap())
+                .unwrap();
+        assert_eq!(record["id"], json!("Case-A"));
+    }
+
+    #[test]
+    fn a_run_cancelled_or_stopped_before_its_outcome_leaves_the_request_interrupted() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::under(dir.path());
         let key = restart("/a");
         let Begun::Claimed(claim) = begin(&paths, &id("r1"), &key).unwrap() else {
             panic!("the first run claims the request");
         };
-        std::mem::forget(claim);
+        drop(claim);
         let Err(error) = begin(&paths, &id("r1"), &key) else {
             panic!("a second run went ahead while the first one's outcome is unknown");
         };
@@ -357,8 +365,8 @@ mod tests {
         let Begun::Claimed(claim) = begin(&paths, &id("r1"), &key).unwrap() else {
             panic!("the first run claims the request");
         };
-        drop(claim);
-        assert!(!paths.requests().join("r1.json").exists());
+        claim.abandon();
+        assert!(!request_file(&paths, &id("r1")).exists());
         assert!(matches!(
             begin(&paths, &id("r1"), &key).unwrap(),
             Begun::Claimed(_)
@@ -393,18 +401,5 @@ mod tests {
             .filter_map(|run| run.join().unwrap().then_some(()))
             .count();
         assert_eq!(claimed, 1);
-    }
-
-    #[test]
-    fn an_answer_is_kept_by_its_decision() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = Paths::under(dir.path());
-        assert_eq!(answer_of(&paths, "q1"), None);
-        answered(&paths, "q1", Answer::Delete).unwrap();
-        assert_eq!(answer_of(&paths, "q1"), Some(Answer::Delete));
-        assert_eq!(answer_of(&paths, "q2"), None);
-        assert_eq!(mode(&paths.answers().join("q1.json")), 0o600);
-        answered(&paths, "../q1", Answer::Delete).unwrap();
-        assert_eq!(answer_of(&paths, "../q1"), None);
     }
 }

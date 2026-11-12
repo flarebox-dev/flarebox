@@ -540,20 +540,26 @@ impl Core for DriverCore {
     }
 
     fn answer(&self, question_id: &str, answer: Answer) -> Result<(), SessionError> {
-        self.change(|driver| {
-            driver
-                .answer(question_id, driver_answer(answer))
-                .map_err(driver_error)
-        })
+        self.change(
+            |driver| match driver.answer(question_id, driver_answer(answer)) {
+                Ok(driver::Answered::Now) => Ok(()),
+                Ok(driver::Answered::Already) => Err(SessionError::QuestionNotFound),
+                Err(error) => Err(driver_error(error)),
+            },
+        )
     }
 
     fn dismiss_notice(&self, notice_id: &str) -> Result<(), SessionError> {
         self.change(
             |driver| match driver.answer(notice_id, driver::Answer::Dismiss) {
-                Err(DriverError::QuestionNotFound(_) | DriverError::AnswerNotAllowed { .. }) => {
-                    Err(SessionError::NoticeNotFound)
-                }
-                done => done.map_err(driver_error),
+                Ok(driver::Answered::Now) => Ok(()),
+                Ok(driver::Answered::Already)
+                | Err(
+                    DriverError::QuestionNotFound(_)
+                    | DriverError::AnswerNotAllowed { .. }
+                    | DriverError::AnsweredOtherwise { .. },
+                ) => Err(SessionError::NoticeNotFound),
+                Err(error) => Err(driver_error(error)),
             },
         )
     }
@@ -841,7 +847,9 @@ fn driver_error(error: DriverError) -> SessionError {
         DriverError::MarkerOfOtherSpace(_) => SessionError::MarkerOfOtherSpace,
         DriverError::UnsupportedFileSystem => SessionError::UnsupportedFileSystem,
         DriverError::NotLinked(_) => SessionError::FolderNotLinked,
-        DriverError::QuestionNotFound(_) => SessionError::QuestionNotFound,
+        DriverError::QuestionNotFound(_) | DriverError::AnsweredOtherwise { .. } => {
+            SessionError::QuestionNotFound
+        }
         DriverError::AnswerNotAllowed { .. } => SessionError::AnswerNotAllowed,
         error @ (DriverError::Credential(_) | DriverError::Store { .. }) => {
             SessionError::NotSaved {

@@ -31,7 +31,7 @@ use koidrive_driver::{
     Answer, Credential, Driver, DriverError, FolderState, FolderStatus, Limit, MAX_DELETIONS,
     Paths, Question, QuestionKind, RecoveryGroup, Status,
 };
-use koidrive_net::{Auth, Reload};
+use koidrive_net::{ApiError, Auth, Reload};
 use koidrive_proto::v1::{CreateSpaceRequest, DeviceInfo, SpaceInfo, SpaceUsage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1090,7 +1090,15 @@ async fn device(paths: Paths, action: DeviceAction) -> Result<Done, CliError> {
                     }
                 }
             };
-            let started = auth.api().pair_start(&auth).await?;
+            let started = match auth.api().pair_start(&auth).await {
+                Ok(started) => started,
+                Err(error) => {
+                    if let Some(claim) = claim.filter(|_| refused(&error)) {
+                        claim.abandon();
+                    }
+                    return Err(error.into());
+                }
+            };
             let invitation = Invitation {
                 code: started.code,
                 server: auth.api().base().to_string(),
@@ -1119,6 +1127,21 @@ async fn device(paths: Paths, action: DeviceAction) -> Result<Done, CliError> {
             );
             Ok(Done::ok(RevokedData { device_id: id }, text))
         }
+    }
+}
+
+/// Whether the server answered that it refused the call, so that the call changed nothing there. Without an answer,
+/// or with an answer that could not be read, the call may have changed something.
+fn refused(error: &ApiError) -> bool {
+    match error {
+        ApiError::Server { .. }
+        | ApiError::Url(_)
+        | ApiError::PathSegment(_)
+        | ApiError::Credential(_) => true,
+        ApiError::Status { status } | ApiError::Unreadable { status } => {
+            (400..500).contains(status)
+        }
+        ApiError::Transport(_) | ApiError::TooLarge { .. } | ApiError::Decode(_) => false,
     }
 }
 
@@ -1867,6 +1890,27 @@ mod tests {
             "stale request: the pairing code of the request r1 expired; run koi device invite with a new request ID"
         );
         assert!(expired.next.is_empty());
+    }
+
+    #[test]
+    fn only_a_refusal_the_server_sent_counts_as_no_change() {
+        let refusal = ApiError::Server {
+            status: 429,
+            error: koidrive_net::ServerError(koidrive_proto::v1::Error::default()),
+        };
+        assert!(refused(&refusal));
+        assert!(refused(&ApiError::Status { status: 403 }));
+        assert!(refused(&ApiError::Unreadable { status: 400 }));
+        let transport = reqwest::Client::new().get("not a url").build().unwrap_err();
+        for unknown in [
+            ApiError::Transport(transport),
+            ApiError::Status { status: 504 },
+            ApiError::Unreadable { status: 502 },
+            ApiError::Decode("PairStartResponse"),
+            ApiError::TooLarge { limit: 1 },
+        ] {
+            assert!(!refused(&unknown), "{unknown:?}");
+        }
     }
 
     #[test]

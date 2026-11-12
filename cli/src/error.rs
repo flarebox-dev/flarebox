@@ -32,7 +32,7 @@ pub enum Code {
     /// The decision answered no longer exists, or a request ID was used before with other arguments or for a pairing
     /// code that has expired.
     StaleDecision,
-    /// A signal stopped the command, or an earlier run with the same request ID stopped before it recorded its outcome.
+    /// A signal stopped the command, or an earlier run with the same request ID has no recorded outcome.
     Interrupted,
 }
 
@@ -212,11 +212,13 @@ impl From<DriverError> for CliError {
                 CliError::new(Code::AuthRequired, message).then(&["koi", "setup"])
             }
             DriverError::NeedsConfirmation => CliError::new(Code::AuthRequired, message),
-            DriverError::QuestionNotFound(_) => CliError::new(
-                Code::StaleDecision,
-                format!("{message}; koi resolve lists the decisions waiting now"),
-            )
-            .then(&["koi", "resolve", "--json"]),
+            DriverError::QuestionNotFound(_) | DriverError::AnsweredOtherwise { .. } => {
+                CliError::new(
+                    Code::StaleDecision,
+                    format!("{message}; koi resolve lists the decisions waiting now"),
+                )
+                .then(&["koi", "resolve", "--json"])
+            }
             DriverError::AnswerNotAllowed { .. } => {
                 CliError::usage(message).then(&["koi", "resolve", "--json"])
             }

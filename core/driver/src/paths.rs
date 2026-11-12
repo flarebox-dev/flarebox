@@ -90,11 +90,6 @@ impl Paths {
         self.state_dir.join("requests")
     }
 
-    /// The answers given to decisions, one file per decision, kept after sync takes an answer and forgets the decision.
-    pub fn answers(&self) -> PathBuf {
-        self.state_dir.join("answers")
-    }
-
     /// The store of one space. Space ids come from the server, so only ids made of hex digits and dashes name a
     /// directory.
     pub fn store(&self, space_id: &str) -> Result<PathBuf, PathsError> {

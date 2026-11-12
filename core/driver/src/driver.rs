@@ -105,6 +105,8 @@ pub enum DriverError {
     NotLinked(PathBuf),
     #[error("no unanswered question has the id {0:?}")]
     QuestionNotFound(String),
+    #[error("the question was answered with {given}")]
+    AnsweredOtherwise { given: Answer },
     #[error("the question accepts only {}", allowed.iter().map(|a| a.as_str()).collect::<Vec<_>>().join(" or "))]
     AnswerNotAllowed { allowed: &'static [Answer] },
     #[error("no linked folder syncs the space {0:?}")]
@@ -165,6 +167,15 @@ pub(crate) fn lift_halt(path: &Path, lift: Lift) -> Result<(), DriverError> {
         LiftError::NotHalted => DriverError::NothingToLift,
         LiftError::NeedsConfirmation => DriverError::NeedsConfirmation,
     })
+}
+
+/// What [`Driver::answer`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Answered {
+    /// The answer is recorded now.
+    Now,
+    /// The question had this answer already, waiting for the engine or taken by it, and nothing changed.
+    Already,
 }
 
 /// What [`Driver::link`] did, with the folder's status.
@@ -836,17 +847,31 @@ impl Driver {
     }
 
     /// Records the answer to a question. The folder's task takes it as the engine's `UserDecision` input, now if it
-    /// runs and otherwise when it next opens the folder.
-    pub fn answer(&self, question_id: &str, answer: Answer) -> Result<(), DriverError> {
+    /// runs and otherwise when it next opens the folder. The same answer again, while it waits for the task or after
+    /// the engine took it, changes nothing. Another answer is refused, and so is any answer to a question the engine
+    /// dropped before it took the answer, as when it asks again about a changed set.
+    pub fn answer(&self, question_id: &str, answer: Answer) -> Result<Answered, DriverError> {
+        let earlier = |given: &str| match given.parse::<Answer>() {
+            Ok(given) if given == answer => Ok(None),
+            Ok(given) => Err(DriverError::AnsweredOtherwise { given }),
+            Err(_) => Err(DriverError::QuestionNotFound(question_id.to_owned())),
+        };
         for space_id in self.space_ids() {
             let path = self.inner.paths.store(&space_id)?;
             let mut store = Store::open(&path).map_err(store_error(&path))?;
             let outcome = store
                 .transaction(|tx| {
-                    let Some(stored) = tx.questions()?.into_iter().find(|stored| {
-                        stored.question_id == question_id && stored.answer.is_none()
-                    }) else {
-                        return Ok(None);
+                    let stored = (tx.questions()?.into_iter())
+                        .find(|stored| stored.question_id == question_id);
+                    let stored = match stored {
+                        None => {
+                            return Ok(tx.taken_answer(question_id)?.map(|given| earlier(&given)));
+                        }
+                        Some(StoredQuestion {
+                            answer: Some(given),
+                            ..
+                        }) => return Ok(Some(earlier(&given.answer))),
+                        Some(stored) => stored,
                     };
                     let Some(question) = decode_question(&space_id, &stored) else {
                         return Ok(None);
@@ -865,13 +890,14 @@ impl Driver {
                         .iter()
                         .filter(|q| q.answer.is_none())
                         .count();
-                    Ok(Some(Ok(left as u64)))
+                    Ok(Some(Ok(Some(left as u64))))
                 })
                 .map_err(store_error(&path))?;
             match outcome {
                 None => continue,
                 Some(Err(error)) => return Err(error),
-                Some(Ok(left)) => {
+                Some(Ok(None)) => return Ok(Answered::Already),
+                Some(Ok(Some(left))) => {
                     if let Some(folder) = self.inner.folders.lock().unwrap().get(&space_id) {
                         folder.status.lock().unwrap().questions = left;
                         if let Some(run) = &folder.run {
@@ -880,7 +906,7 @@ impl Driver {
                     }
                     tracing::info!(space_id, question_id, %answer, "answered a question");
                     self.changed();
-                    return Ok(());
+                    return Ok(Answered::Now);
                 }
             }
         }
@@ -1591,16 +1617,60 @@ mod tests {
                 allowed: [Answer::Delete, Answer::Restore]
             })
         ));
-        driver.answer("q1", Answer::Restore).unwrap();
+        assert_eq!(driver.answer("q1", Answer::Restore).unwrap(), Answered::Now);
         assert!(matches!(
             driver.answer("q1", Answer::Delete),
-            Err(DriverError::QuestionNotFound(_))
+            Err(DriverError::AnsweredOtherwise {
+                given: Answer::Restore
+            })
         ));
         assert_eq!(driver.questions().unwrap(), [mass_delete("q2")]);
         assert_eq!(driver.status().folders[0].questions, 1);
 
         let stored = driver.stored_questions(SPACE).unwrap();
         assert_eq!(stored[0].answer.as_ref().unwrap().answer, "restore");
+    }
+
+    #[test]
+    fn the_same_answer_again_changes_nothing_until_the_engine_drops_the_question_without_it() {
+        let (_dir, paths, _root) = profile(&[mass_delete("q1"), mass_delete("q2")]);
+        let driver = Driver::open(paths.clone()).unwrap();
+        let store = || Store::open(paths.store(SPACE).unwrap()).unwrap();
+        assert_eq!(driver.answer("q1", Answer::Delete).unwrap(), Answered::Now);
+        assert_eq!(
+            driver.answer("q1", Answer::Delete).unwrap(),
+            Answered::Already
+        );
+
+        assert!(store().transaction(|tx| tx.take_answer("q1")).unwrap());
+        assert_eq!(
+            driver.answer("q1", Answer::Delete).unwrap(),
+            Answered::Already
+        );
+        assert!(matches!(
+            driver.answer("q1", Answer::Restore),
+            Err(DriverError::AnsweredOtherwise {
+                given: Answer::Delete
+            })
+        ));
+
+        assert_eq!(driver.answer("q2", Answer::Delete).unwrap(), Answered::Now);
+        store()
+            .transaction(|tx| {
+                tx.remove_question("q2")?;
+                tx.put_question(&StoredQuestion {
+                    question_id: "q3".into(),
+                    asked_at_ms: 20,
+                    body: serde_json::to_vec(&mass_delete("q3")).unwrap(),
+                    answer: None,
+                })
+            })
+            .unwrap();
+        assert!(matches!(
+            driver.answer("q2", Answer::Delete),
+            Err(DriverError::QuestionNotFound(_))
+        ));
+        assert_eq!(driver.questions().unwrap(), [mass_delete("q3")]);
     }
 
     #[tokio::test]
