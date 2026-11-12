@@ -114,14 +114,15 @@ You need a Cloudflare account with R2 turned on, and a Mac or a Linux machine.
 
    This deploys the server to your Cloudflare account and signs in this machine as your first device. Koidrive's public Cloudflare login doesn't exist yet, so for now follow [Without the Cloudflare login](docs/guide/setup.md#without-the-cloudflare-login).
 
-3. **Link a folder and start syncing.**
+3. **Link a folder.**
 
    ```sh
    mkdir -p ~/Koidrive
    koi space create Koidrive
    koi folder link ~/Koidrive --space Koidrive
-   koi _daemon
    ```
+
+   The folder syncs in the background, including after a restart (on macOS, while you're logged in). See [Background sync](docs/guide/install.md#background-sync).
 
 4. **Add your other machines.** On a machine that is signed in, run `koi device invite`. It prints a command with a pairing code. Run that command on the new machine, then link a folder there too.
 
