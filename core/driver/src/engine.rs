@@ -933,9 +933,7 @@ impl Engine {
 
     /// Puts `node`, or a new node when it is `None`, at `path` with `identity`. A file keeps the content L had for it
     /// when `content` is `None`. Changes nothing when the parent folder is not in L, or the path is not a name L can
-    /// hold. A recorded node placed again ([`Trees::ignore_local`]) takes with it the folders above it that L kept only
-    /// for what was recorded below because the disk lost them ([`Trees::keep_lost_local`]) and that hold nothing in L any
-    /// more: they leave L, and their deletion is planned. A folder the user moved into an ignored folder stays.
+    /// hold.
     #[allow(clippy::too_many_arguments)]
     fn place(
         &mut self,

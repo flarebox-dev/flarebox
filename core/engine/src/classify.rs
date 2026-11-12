@@ -193,8 +193,6 @@ pub struct Trees {
     /// Nodes whose local copy the user moved into an ignored folder that is no node. L keeps the
     /// entry each had before the move.
     outside: BTreeSet<NodeId>,
-    /// The folders of `outside` that the disk lost, which L keeps only for what is recorded below them
-    /// ([`Trees::keep_lost_local`]).
     lost: BTreeSet<NodeId>,
     /// The nodes of `outside`, and those L held under them, that left L because another entry took their name
     /// ([`Trees::displace_local`]), each with the identity L held for it.

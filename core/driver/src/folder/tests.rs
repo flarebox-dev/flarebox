@@ -5409,10 +5409,6 @@ fn a_file_moved_out_of_a_removed_folder_with_a_link_in_an_ignored_folder_is_move
     assert_eq!(a.folder.engine.trees.check(), Ok(()));
 }
 
-/// As above, with the move split across two scans: the user moves the file out of the synced folder and removes
-/// `source`, so the scan finds the file only through its link in the ignored folder and the server keeps it. The user
-/// then moves the file back in as `moved`. That is the file placed again, so the server moves it rather than holding
-/// it twice.
 #[test]
 fn a_file_with_a_link_in_an_ignored_folder_moved_back_in_after_its_folder_was_removed_is_moved_on_the_server()
  {
@@ -5450,9 +5446,6 @@ fn a_file_with_a_link_in_an_ignored_folder_moved_back_in_after_its_folder_was_re
     assert_eq!(a.folder.engine.trees.check(), Ok(()));
 }
 
-/// The user moves `source/file` into the ignored folder and removes `source`, so the server keeps both. The user
-/// then moves the file back in as `moved`: the server moves it, and `source`, which nothing it kept is in any more,
-/// is removed.
 #[test]
 fn a_file_moved_back_in_from_an_ignored_folder_after_its_folder_was_removed_takes_the_folder_off_the_server()
  {
@@ -5483,8 +5476,6 @@ fn a_file_moved_back_in_from_an_ignored_folder_after_its_folder_was_removed_take
     assert_eq!(a.folder.engine.trees.check(), Ok(()));
 }
 
-/// The user moves `D/c` into the ignored folder, and then `D` too. When the file comes back as `moved`, `D` holds
-/// nothing in L any more, but it is still on disk in the ignored folder, so the server keeps it.
 #[test]
 fn a_folder_moved_into_an_ignored_folder_after_its_file_stays_on_the_server_when_the_file_comes_back()
  {

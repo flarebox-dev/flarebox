@@ -1636,8 +1636,6 @@ fn a_store_from_before_watched_positions_were_kept_takes_them_from_s() {
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
 }
 
-/// A database of the schema before folders the disk lost were marked keeps its recorded nodes, with none of them
-/// marked lost, and marks them from then on.
 #[test]
 fn a_store_from_before_lost_folders_were_marked_opens_with_none_marked() {
     let dir = tempfile::tempdir().unwrap();
