@@ -266,6 +266,8 @@ function device(name: string): Device {
   const dir = temp(name);
   const xdg = { XDG_CONFIG_HOME: join(dir, "config"), XDG_STATE_HOME: join(dir, "state"), XDG_RUNTIME_DIR: join(dir, "run") };
   for (const path of [...Object.values(xdg), join(dir, "folder")]) mkdirSync(path, { recursive: true, mode: 0o700 });
+  mkdirSync(join(xdg.XDG_CONFIG_HOME, "koidrive"), { recursive: true, mode: 0o700 });
+  writeFileSync(join(xdg.XDG_CONFIG_HOME, "koidrive", "config.toml"), "[service]\nbackground = false\n");
   return { name, dir, folder: join(dir, "folder"), env: { ...process.env, ...xdg } };
 }
 
@@ -305,13 +307,18 @@ async function startDaemon(on: Device): Promise<void> {
       return undefined;
     }
   });
+  if (daemon.exitCode !== null) fail(on.name + "'s daemon exited with " + daemon.exitCode + " while another answered: " + readFileSync(join(on.dir, "daemon.log"), "utf8").slice(-2000));
 }
 
 async function stopDaemon(on: Device): Promise<void> {
   const file = join(on.dir, "daemon.pid");
   const pid = Number(readFileSync(file, "utf8"));
   console.log("\n$ kill -TERM <daemon>   # " + on.name);
-  process.kill(pid, "SIGTERM");
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch (error) {
+    fail(on.name + "'s daemon was gone before it was stopped (" + String(error) + "): " + readFileSync(join(on.dir, "daemon.log"), "utf8").slice(-2000));
+  }
   await until(on.name + "'s daemon to exit", 30_000, () => {
     try {
       process.kill(pid, 0);
