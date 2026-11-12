@@ -19,7 +19,7 @@ cat > "$tmp/services/systemctl" <<'EOF'
 set -f
 printf '%s\n' "$*" >> "$HOME/services.log"
 [ "$1 $2" = '--user list-units' ] || exit 0
-if [ -e "$HOME/nobus" ]; then
+if [ -e "$HOME/unreachable" ]; then
     printf 'Failed to connect to bus: No medium found\n' >&2
     exit 1
 fi
@@ -47,9 +47,12 @@ EOF
 cat > "$tmp/services/launchctl" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >> "$HOME/services.log"
-[ "$*" = list ] || exit 0
-printf 'PID\tStatus\tLabel\n101\t0\tcom.example.other\n102\t0\tdev.koidrive.koiz\n104\t0\tdev.koidrive.koi.backup\n-\t0\tdev.koidrive.koi.0badf00d\n'
-[ ! -e "$HOME/running" ] || sed 's/^/103\t0\t/' "$HOME/running"
+[ "$*" = "print gui/$(id -u)" ] || exit 0
+[ ! -e "$HOME/unreachable" ] || exit 113
+printf 'gui/%s = {\n\ttype = login\n\tservices = {\n' "$(id -u)"
+printf '\t\t%8s %6s \t%s\n' 101 - com.example.other 102 - dev.koidrive.koiz 104 - dev.koidrive.koi.backup 0 0 dev.koidrive.koi.0badf00d
+[ ! -e "$HOME/running" ] || sed 's/^/\t\t     103      - \t/' "$HOME/running"
+printf '\t}\n\n\tunmanaged processes = {\n\t\t     105      - \tdev.koidrive.koi.1a2b3c4e\n\t}\n}\n'
 EOF
 cat > "$tmp/services/ps" <<'EOF'
 #!/bin/sh
@@ -199,7 +202,7 @@ pass 'an upgrade restarts the running background service of every profile'
 if [ "$(uname -s)" = Linux ]; then
     perl -e '$0 = "/opt/custom bin/koi _daemon"; sleep 300' &
     daemon=$!
-    touch "$HOME/nobus"
+    touch "$HOME/unreachable"
     sh "$root/install.sh" 2> "$tmp/nobus.log"
     if ! grep -F "the koi daemon with process ID $daemon still runs the old koi" "$tmp/nobus.log"; then
         cat "$tmp/nobus.log"
@@ -209,7 +212,7 @@ if [ "$(uname -s)" = Linux ]; then
     pass 'an upgrade without a systemd user manager names the daemon that still runs the old koi'
     printf '0::/user.slice/user-%s.slice/user@%s.service/app.slice/koidrive-1a2b3c4d.service\n' "$(id -u)" "$(id -u)" > "$HOME/cgroup"
     sh "$root/install.sh" 2> "$tmp/nobus.log"
-    rm "$HOME/nobus" "$HOME/cgroup"
+    rm "$HOME/unreachable" "$HOME/cgroup"
     kill "$daemon"
     if ! grep -F "Log in as $(id -un) and run: systemctl --user restart koidrive-1a2b3c4d.service" "$tmp/nobus.log"; then
         cat "$tmp/nobus.log"
