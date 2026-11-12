@@ -504,19 +504,27 @@ pub enum Stuck {
     /// node stuck the same way. No effect moves an excluded node, and the node is not parked.
     HeldBy(NodeId),
     /// The node's S update waits for the name this node keeps in S, a node held by an excluded
-    /// one, or for a folder that waits so.
+    /// one, or for a folder that waits so, or the node cannot be put into its folder in R
+    /// because that folder is stuck so.
     Behind(NodeId),
 }
 
 /// The nodes section 5.10 reports as problems: each node the planner considers whose place is held
-/// by the local copy of an excluded node, and each node whose S update waits behind one of them.
+/// by the local copy of an excluded node, each node whose S update waits behind one of them, and
+/// each node that cannot be put into its folder in R because that folder is one of them.
 pub fn stuck(trees: &Trees) -> BTreeMap<NodeId, Stuck> {
     let view = View::new(trees);
-    let mut stuck: BTreeMap<NodeId, Stuck> = (trees.dirty().iter())
+    let planned: Vec<&NodeId> = (trees.dirty().iter())
         .filter(|id| candidate(trees, id) && !trees.held(id))
+        .collect();
+    let unplaced: Vec<(&NodeId, &str)> = (planned.iter())
+        .filter(|id| matches!(view.step(id), Step::Blocked(None)))
+        .filter_map(|id| Some((*id, trees.remote().live(id)?.parent.as_str())))
+        .collect();
+    let mut stuck: BTreeMap<NodeId, Stuck> = (planned.iter())
         .filter_map(|id| {
             let by = view.stuck(id, trees.local().len())?;
-            Some((id.clone(), Stuck::HeldBy(by)))
+            Some(((*id).clone(), Stuck::HeldBy(by)))
         })
         .collect();
     let root = |stuck: &BTreeMap<NodeId, Stuck>, id: &str| match stuck.get(id)? {
@@ -524,7 +532,7 @@ pub fn stuck(trees: &Trees) -> BTreeMap<NodeId, Stuck> {
         Stuck::Behind(root) => Some(root.clone()),
     };
     loop {
-        let behind: Vec<(NodeId, NodeId)> = (trees.waiting().iter())
+        let mut behind: Vec<(NodeId, NodeId)> = (trees.waiting().iter())
             .filter(|(id, _)| !stuck.contains_key(*id))
             .filter_map(|(id, waiting)| {
                 let shape = waiting.shape.as_ref()?;
@@ -543,6 +551,11 @@ pub fn stuck(trees: &Trees) -> BTreeMap<NodeId, Stuck> {
                 Some((id.clone(), root?))
             })
             .collect();
+        behind.extend(
+            (unplaced.iter())
+                .filter(|(id, _)| !stuck.contains_key(*id))
+                .filter_map(|(id, parent)| Some(((*id).clone(), root(&stuck, parent)?))),
+        );
         if behind.is_empty() {
             return stuck;
         }
