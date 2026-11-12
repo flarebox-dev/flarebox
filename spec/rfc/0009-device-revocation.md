@@ -20,13 +20,13 @@ An owner who has lost every device first adds a new one with owner recovery (dep
 
 ## 2. What a revocation stops
 
-The Account DO sets `revoked_at_ms` on the principal's row in one transaction, then answers 204. From that moment:
+The Account DO sets `revoked_at_ms` on the principal's row in one transaction, delivers a notice to every space, and answers 204 once each space took its notice or its lease has run out (RFC 0014 §2). From that moment:
 
 | Credential or channel | Effect |
 |---|---|
 | Refresh credential | `POST /v1/token` answers `UNAUTHENTICATED` (401), the same answer as for an unknown device or a wrong credential (RFC 0006 §7). |
-| Access tokens | Every request is refused with `UNAUTHENTICATED` (401), although the token's signature stays valid until it expires (at most 15 minutes after issue, spec v0 §15.2). The Worker reads the principal's current row before it serves any authenticated route, and the Space DO reads it again before each HTTP RPC, each WebSocket upgrade and each WebSocket message. |
-| Open WebSockets | The next message from the device closes its socket with 4003 (spec v0 §7.1). A socket that sends nothing is closed with 4003 when the space takes the revocation notice, or when the space next pushes a commit, whichever comes first. A notice that cannot be delivered is retried every 30 seconds until the space takes it. |
+| Access tokens | Every request is refused with `UNAUTHENTICATED` (401), although the token's signature stays valid until it expires (at most 15 minutes after issue, spec v0 §15.2). The Worker reads the principal's current row before it serves any authenticated route. The Space DO checks the principal before each HTTP RPC, each WebSocket upgrade and each WebSocket message, from the Account DO's answer or a lease of it that ends before the 204 (RFC 0014). |
+| Open WebSockets | The next message from the device closes its socket with 4003 (spec v0 §7.1). A socket that sends nothing is closed with 4003 when the space takes the revocation notice, or when the space next pushes a commit after the 204, whichever comes first. A notice that cannot be delivered is retried every 30 seconds until the space takes it. |
 | Pairing codes the device started | `POST /v1/pair/complete` refuses them with `FORBIDDEN`, as it refuses a wrong code. |
 
 The bound is therefore zero for every request that starts after the 204: no access token, refresh credential or socket of the revoked principal authorizes anything after that. A request the server already accepted before the revocation may still finish. For example, a commit that passed its device check before the revocation was committed may still be applied.
