@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use koidrive_proto::v1::{Commit, NodeStatus, error};
-use koidrive_sim::world::{Action, Failure, NAMES, Outcome, Reply, Step, World};
+use koidrive_sim::world::disk::Disk;
+use koidrive_sim::world::{Action, Cut, Failure, NAMES, Outcome, Reply, Step, World};
 
 fn user(kind: u8, target: usize, parent: usize, name: &str) -> Step {
     let name = NAMES.iter().position(|other| *other == name).unwrap();
@@ -522,4 +523,42 @@ fn accepted_write_not_yet_in_the_remote_tree_is_required() {
     recovering(&world, 0);
     erase_disk(&mut world, 0);
     assert!(matches!(world.phase(1, &[]), Err(Failure::Broken(_))));
+}
+
+#[test]
+fn rewound_write_only_a_quarantine_holds() {
+    for swept in [false, true] {
+        let mut world = synced(2, &[vec![(0, Step::Backup), (0, file("a"))]]);
+        world
+            .run(
+                1,
+                &[
+                    (0, Step::Drop),
+                    (1, user(2, 0, 0, "a")),
+                    (1, SCAN),
+                    (1, COMMIT),
+                    (1, COMMIT),
+                    (1, DELIVER),
+                    (0, Step::Connect),
+                    (0, DELIVER),
+                    (0, Step::Effect(Outcome::Crash(Cut::Quarantined))),
+                    (1, delete(0)),
+                    (0, Step::Rewind),
+                ],
+            )
+            .unwrap();
+        assert!(world.devices[0].disk.holds(1) && !world.devices[0].disk.shows(1));
+        assert!(!world.devices[1].disk.holds(1));
+        if swept {
+            let record = (world.devices[0].engine.effects.in_flight())
+                .unwrap()
+                .clone();
+            world.devices[0].disk = Disk::default();
+            world.devices[0].disk.apply(&record, None);
+            assert!(matches!(world.phase(2, &[]), Err(Failure::Broken(_))));
+        } else {
+            world.phase(2, &[]).unwrap();
+            assert!(world.devices[0].disk.binned(1));
+        }
+    }
 }

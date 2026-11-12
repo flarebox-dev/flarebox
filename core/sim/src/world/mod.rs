@@ -712,7 +712,7 @@ impl World {
             .retain(|write, _| !stored(&backup.in_history, *write));
         for write in taken {
             let holders: BTreeSet<usize> = (self.devices.iter().enumerate())
-                .filter(|(_, device)| device.disk.shows(write))
+                .filter(|(_, device)| device.disk.holds(write))
                 .map(|(d, _)| d)
                 .collect();
             if !holders.is_empty() {
