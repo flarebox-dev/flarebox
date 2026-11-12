@@ -1,6 +1,6 @@
 # Testing
 
-The Rust checks that run on every pull request are listed in [CONTRIBUTING.md](../CONTRIBUTING.md). This page covers the property tests and the heavier runs that check them at scale.
+The Rust checks that run on every pull request are the `rust` job of [CI](../.github/workflows/ci.yml). This page covers the property tests and the heavier runs that check them at scale.
 
 ## Property tests
 

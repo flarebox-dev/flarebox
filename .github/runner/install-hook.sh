@@ -6,7 +6,7 @@
 # is idle. It copies the hook to a root-owned path, and in each runner directory it writes .env
 # (with ACTIONS_RUNNER_HOOK_JOB_STARTED) and .path (system directories first, so the runner finds
 # /bin/bash for the hook), makes both files owned by root and immutable, and checks the result.
-# CONTRIBUTING.md explains why.
+# README.md in this directory explains why.
 #
 # It reads and prepares every file before it changes anything, so a read error changes nothing.
 # It then updates one runner at a time; if that fails or the script gets SIGTERM, SIGINT or SIGHUP,
