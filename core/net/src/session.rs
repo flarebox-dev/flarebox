@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The WebSocket session with one space (spec v0 section 7): `Hello` and `Welcome`, RPCs matched by `req_id`, the
-//! change stream, `Reauth`, and reconnects with backoff that resend only what RFC 0002 section 2 allows.
-
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -50,41 +47,26 @@ use crate::stream::{Fed, Stream};
 /// The protocol minor versions under `/v1/` this client speaks (spec v0 section 9.1).
 pub const PROTO_MIN: u32 = 1;
 pub const PROTO_MAX: u32 = 1;
-/// A `ServerMessage` is at most 1 MiB (spec v0 section 7.2, RFC 0001 section 7). A larger one breaks the protocol.
 pub const MAX_SERVER_MESSAGE: usize = 1 << 20;
-/// A `ClientMessage` is at most 8 MiB; the server closes the connection on a larger one.
 pub const MAX_CLIENT_MESSAGE: usize = 8 << 20;
 
-/// WebSocket close codes the server uses (spec v0 section 7.1, RFC 0003 section 3).
 const CLOSE_TOKEN_EXPIRED: u16 = 4001;
 const CLOSE_UNSUPPORTED_VERSION: u16 = 4002;
 const CLOSE_DEVICE_REVOKED: u16 = 4003;
-/// Checks the token at least this often, whatever expiry the server sent.
 const MAX_REAUTH_WAIT: Duration = Duration::from_secs(3600);
-/// The most bytes read of a refused upgrade's body.
 const MAX_REFUSAL: usize = 64 << 10;
-/// Bounds reading the rest of a refused upgrade's body.
 const REFUSAL_READ_TIMEOUT: Duration = Duration::from_secs(5);
-/// Refusals in a row whose protobuf error cannot be read, after which the session stops instead of trying again.
 const MAX_UNREADABLE_REFUSALS: u32 = 5;
-/// Waits at least this long between token refreshes, even when a new token is already due because the refresh
-/// margin is longer than the token's lifetime or the clocks disagree.
 const MIN_REAUTH_WAIT: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
 pub struct SessionConfig {
     pub space_id: String,
-    /// Sent first on every connection.
     pub hello: Hello,
     pub backoff: Backoff,
-    /// WebSocket ping interval. The connection counts as lost when nothing arrives for two intervals.
     pub ping_interval: Duration,
-    /// Bounds getting an access token, the TCP connection, TLS and the WebSocket upgrade together, and each token
-    /// refresh for `Reauth`, which runs while the connection keeps serving.
     pub connect_timeout: Duration,
-    /// Bounds the wait for `Welcome` after `Hello`.
     pub welcome_timeout: Duration,
-    /// Bounds sending one message. A server that stops reading for this long counts as lost.
     pub write_timeout: Duration,
     /// How many times a call refused with `CODE_RETRY_LATER`, or with `CODE_QUOTA_EXCEEDED` and a wait, is sent again
     /// before the error is returned. Any other refusal is returned at once.
@@ -137,8 +119,6 @@ impl Events {
 #[derive(Debug)]
 pub struct Session {
     commands: mpsc::UnboundedSender<Command>,
-    /// Set by `close`; the task drops the connection and whatever it is waiting on, a blocked write included.
-    /// Dropping the session has the same effect.
     closing: watch::Sender<bool>,
     stopped: Arc<OnceLock<StopReason>>,
     commit_lock: Mutex<()>,
@@ -229,7 +209,6 @@ impl Session {
         }
     }
 
-    /// At most 1,000 hashes per call.
     pub async fn get_download_targets(
         &self,
         hashes: Vec<Vec<u8>>,
@@ -315,8 +294,6 @@ impl Session {
         let _ = self.task.await;
     }
 
-    /// Sends one call, again after `CODE_RETRY_LATER` up to the configured number of times. A refused call changed
-    /// nothing, so sending it unchanged is safe, a commit included.
     async fn call(
         &self,
         call: Call,
@@ -376,7 +353,6 @@ fn websocket_url(base: &Url, space_id: &str) -> Result<Url, StopReason> {
     Ok(url)
 }
 
-/// What identifies the commit in flight for the resend rule.
 #[derive(Clone, Debug)]
 struct CommitSlot {
     commit_id: String,
@@ -384,8 +360,7 @@ struct CommitSlot {
     device_seq: u64,
 }
 
-/// RFC 0002 section 2: after a reconnect the commit in flight, with slot `a + 1`, is resent unchanged only when
-/// `Welcome.device_seq` is `a` (not accepted) or `a + 1` (accepted, response lost), in the same history.
+/// RFC 0002 section 2.
 fn may_resend(slot: &CommitSlot, welcome: &Welcome) -> Result<(), NotResent> {
     if welcome.history_id != slot.history_id {
         return Err(NotResent::HistoryChanged {
@@ -420,7 +395,6 @@ struct PendingCall {
     call: Call,
     commit: Option<CommitSlot>,
     reply: Reply,
-    /// Whether the call went out on a connection. A pending call that did was not answered there.
     sent: bool,
 }
 
@@ -428,7 +402,6 @@ trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 type Socket = WebSocketStream<Shared>;
 
-/// How one connection ended.
 enum Exit {
     Reconnect { reason: DisconnectReason, now: bool },
     Stop(StopReason),
@@ -468,22 +441,14 @@ struct Task {
     events: mpsc::UnboundedSender<Event>,
     stopped: Arc<OnceLock<StopReason>>,
     next_req: u64,
-    /// Calls not yet answered, by `req_id`. A call keeps its `req_id` when it is resent on a new connection.
     pending: BTreeMap<u64, PendingCall>,
-    /// Commits being resent over HTTP RPC, by `req_id`, and the requests, each ending with its `req_id`.
     over_http: BTreeMap<u64, PendingCall>,
     http: JoinSet<(u64, Result<RpcResponse, ApiError>)>,
     stream: Stream,
-    /// Failed connection attempts since the last `Welcome`.
     attempt: u32,
-    /// The access token of the current connection.
     token: Option<String>,
-    /// A token the server closed the connection over, rejected before the next connection gets a token. Not
-    /// rejected at once, because a refresh in flight may hold the token lock until the connection is dropped.
     expired: Option<String>,
-    /// The least wait before the next connection, when the server asked for one while refusing this one.
     asked_wait: Option<Duration>,
-    /// Refusals in a row, since the last connection, whose protobuf error could not be read.
     unreadable_refusals: u32,
 }
 
@@ -526,7 +491,6 @@ impl Task {
         self.emit(Event::Stopped(reason));
     }
 
-    /// Waits between connections while taking calls for the next one. False when the session was closed.
     async fn idle(&mut self, delay: Duration) -> bool {
         let deadline = sleep(delay);
         tokio::pin!(deadline);
@@ -568,7 +532,6 @@ impl Task {
         self.serve(socket, token).await
     }
 
-    /// Opens the WebSocket within `connect_timeout` and waits for an acceptable `Welcome`.
     async fn establish(&mut self) -> Result<(Socket, AccessToken, Welcome), Exit> {
         let (mut socket, token) = timeout(self.config.connect_timeout, self.open())
             .await
@@ -577,7 +540,6 @@ impl Task {
         Ok((socket, token, welcome))
     }
 
-    /// Gets a token and opens the WebSocket: TCP, TLS for `wss`, and the upgrade.
     async fn open(&mut self) -> Result<(Socket, AccessToken), Exit> {
         if let Some(expired) = self.expired.clone() {
             self.auth.reject(&expired).await;
@@ -624,9 +586,6 @@ impl Task {
         Ok((socket, token))
     }
 
-    /// The WebSocket upgrade, through tungstenite's client handshake. When the server refuses it, the rest of the
-    /// refusal's body is read from the connection, which `Shared` keeps after tungstenite lets go of it, so that H1
-    /// sees the whole `Error` however the body is framed.
     async fn upgrade(&mut self, io: Box<dyn Io>, token: &AccessToken) -> Result<Socket, Exit> {
         let mut request = self
             .url
@@ -675,8 +634,6 @@ impl Task {
         Err(self.refused(status, &token.token).await)
     }
 
-    /// Counts refusals in a row whose error could not be read: `MAX_UNREADABLE_REFUSALS` of them stop the session (H1),
-    /// and one whose error could be read starts the count again.
     fn count_refusal(&mut self, status: u16, readable: bool) -> Result<(), Exit> {
         if readable {
             self.unreadable_refusals = 0;
@@ -692,8 +649,6 @@ impl Task {
         ))))
     }
 
-    /// Applies H1 to a refusal while connecting: one the client may not resend stops the session, and one it may
-    /// resend makes the next attempt wait at least as long as the server asked. `None` leaves it to the caller.
     fn refused_with(&mut self, server: &ServerError) -> Option<Exit> {
         match server.resend() {
             Resend::Never => Some(Exit::Stop(StopReason::Refused(server.to_string()))),
@@ -705,7 +660,6 @@ impl Task {
         }
     }
 
-    /// The WebSocket upgrade was answered with an HTTP error.
     async fn refused(&mut self, status: u16, token: &str) -> Exit {
         match status {
             401 => {
@@ -724,7 +678,6 @@ impl Task {
         }
     }
 
-    /// rustls with the platform verifier, so the operating system's trust store decides, as for HTTP.
     fn tls_config(&mut self) -> Result<Arc<rustls::ClientConfig>, Exit> {
         if let Some(config) = &self.tls {
             return Ok(config.clone());
@@ -767,12 +720,8 @@ impl Task {
         }
     }
 
-    /// Resends the calls of a dropped connection. A commit goes only where `may_resend` allows it, and a commit that
-    /// went out on the dropped connection goes over HTTP RPC instead of this one: a commit that breaks the server's
-    /// storage gets no answer on a socket, whose connection then closes, but HTTP RPC answers it with
-    /// `QUOTA_EXCEEDED` and a wait. The other calls go on this connection. A commit still out over HTTP RPC is
-    /// checked against each later `Welcome` as well, and once one refuses it, its HTTP answer is ignored and it is
-    /// not sent on the socket.
+    /// A commit that went out on a dropped connection goes over HTTP RPC: when a commit hits a Cloudflare Durable Objects
+    /// storage limit, the socket gets no answer and closes, but HTTP RPC answers `QUOTA_EXCEEDED` with a wait.
     async fn resend(&mut self, welcome: &Welcome, socket: &mut Socket) -> Result<(), Exit> {
         for calls in [&mut self.pending, &mut self.over_http] {
             let refused: Vec<(u64, NotResent)> = (calls.iter())
@@ -817,8 +766,6 @@ impl Task {
         Ok(())
     }
 
-    /// The answer to a commit resent over HTTP RPC. A refusal or a result is the call's answer, as on the socket. A
-    /// request that did not reach the server sends the commit on the socket instead.
     async fn answered_over_http(
         &mut self,
         req_id: u64,
@@ -949,7 +896,6 @@ impl Task {
         }
     }
 
-    /// Accepts the `Welcome` only if it chose a protocol version this client offered in `Hello`.
     fn negotiated(&self, welcome: Welcome) -> Result<Welcome, Exit> {
         let hello = &self.config.hello;
         if (hello.proto_min..=hello.proto_max).contains(&welcome.proto) {
@@ -970,7 +916,6 @@ impl Task {
         Instant::now() + wait.clamp(MIN_REAUTH_WAIT, MAX_REAUTH_WAIT)
     }
 
-    /// Reads one WebSocket item: a server message, nothing to act on, or the end of the connection.
     async fn frame(
         &mut self,
         item: Option<Result<WsMessage, tungstenite::Error>>,
@@ -1001,7 +946,6 @@ impl Task {
         }
     }
 
-    /// The server is closing the connection with this code.
     fn closed(&mut self, code: Option<u16>, reason: String) -> Exit {
         match code {
             Some(CLOSE_UNSUPPORTED_VERSION) => Exit::Stop(StopReason::UnsupportedVersion(reason)),
@@ -1084,7 +1028,6 @@ impl Task {
         self.write(socket, WsMessage::Binary(bytes.into())).await
     }
 
-    /// Sends one WebSocket message within `write_timeout`.
     async fn write(&self, socket: &mut Socket, message: WsMessage) -> Result<(), Exit> {
         match timeout(self.config.write_timeout, socket.send(message)).await {
             Ok(Ok(())) => Ok(()),
@@ -1104,10 +1047,8 @@ impl Task {
     }
 }
 
-/// A token refresh for `Reauth`, run alongside the connection so a slow `/v1/token` does not hold up the stream.
 type Refresh = Pin<Box<dyn Future<Output = Result<Result<AccessToken, ApiError>, Elapsed>> + Send>>;
 
-/// The result of the refresh in progress; never resolves when there is none.
 async fn refreshed(
     refreshing: &mut Option<Refresh>,
 ) -> Result<Result<AccessToken, ApiError>, Elapsed> {
@@ -1158,10 +1099,6 @@ impl AsyncWrite for Shared {
     }
 }
 
-/// Reads the whole body of a refused upgrade with hyper's HTTP/1 parser, given the `head` tungstenite parsed, the
-/// `tail` it read after it, and then the connection. Hyper decides the framing and checks it, so the body is only
-/// returned once it is complete, within `MAX_REFUSAL` bytes and `REFUSAL_READ_TIMEOUT`; `None` when it is
-/// incomplete, malformed or larger.
 async fn refusal_body(
     head: &tungstenite::http::response::Parts,
     tail: Vec<u8>,
@@ -1199,8 +1136,6 @@ async fn refusal_body(
     timeout(REFUSAL_READ_TIMEOUT, read).await.ok().flatten()
 }
 
-/// The connection of a refused upgrade as hyper's client sees it: its request goes nowhere, since the server has
-/// already answered, and the answer is the refusal's head and the bytes after it, then the rest of the connection.
 struct Replay<R> {
     answer: Bytes,
     rest: R,
@@ -1252,7 +1187,6 @@ impl<R: Unpin> AsyncWrite for Replay<R> {
     }
 }
 
-/// Resolves once the session is closed or dropped.
 async fn closed(closing: &mut watch::Receiver<bool>) {
     let _ = closing.wait_for(|closed| *closed).await;
 }

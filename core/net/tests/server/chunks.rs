@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Chunk transfer and the 1 MiB message bound against the real Worker.
-
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::io;
@@ -27,7 +25,6 @@ fn chunk(bytes: &[u8]) -> ChunkRef {
     }
 }
 
-/// A file's content made of these chunks, in order (spec v0 section 5.1).
 fn content(chunks: &[ChunkRef]) -> Content {
     let mut manifest = Sha256::new();
     for chunk in chunks {
@@ -66,7 +63,6 @@ fn new_transfer(api: &Api) -> Transfer {
     transfer
 }
 
-/// Serves chunk bytes from memory and counts the reads.
 struct Source {
     bytes: HashMap<Vec<u8>, Bytes>,
     reads: Cell<usize>,

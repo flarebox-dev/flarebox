@@ -1,10 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The V0 compatibility vectors: chunk offsets, lengths and SHA-256s for fixed
-//! inputs, computed by `scripts/fastcdc_reference.py`, which shares no code
-//! with this crate. A failure here means the boundary algorithm changed and
-//! the `fastcdc2020-1m-4m-16m` identifier no longer describes it.
-
 use koidrive_chunk::{ChunkerConfig, chunks};
 
 enum Input {
@@ -173,7 +168,6 @@ const GOLDEN: &[Golden] = &[
     },
 ];
 
-/// xorshift64*, the same generator as tests/chunking.rs and the reference script.
 fn noise(len: usize, mut seed: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(len);
     while out.len() < len {

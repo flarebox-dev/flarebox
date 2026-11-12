@@ -12,13 +12,11 @@ use tokio::sync::Mutex;
 use crate::api::Api;
 use crate::error::ApiError;
 
-/// How long before its expiry an access token is replaced. Tokens live 15 minutes (spec v0 section 15.2).
 pub const DEFAULT_REFRESH_MARGIN: Duration = Duration::from_secs(120);
 
 /// How old a refresh credential gets before the process that owns it replaces it (RFC 0011 section 2).
 pub const ROTATION_PERIOD: Duration = Duration::from_secs(24 * 3600);
 
-/// How long after the server time S a proposed credential may still be stored: its deadline is S plus this.
 const ROTATION_DEADLINE_MS: i64 = 60_000;
 
 /// A device's long-lived credentials from `POST /v1/claim` or `POST /v1/pair/complete`. The caller stores them.
@@ -87,22 +85,17 @@ pub trait CredentialStore: Send + Sync {
 pub type Reload = Arc<dyn Fn() -> io::Result<Stored> + Send + Sync>;
 
 enum Rotation {
-    /// Presents the credential it was given and nothing else.
     Off,
-    /// Owns the stored credential and rotates it (RFC 0011 section 2, the process that rotates).
     Owner {
         store: Arc<dyn CredentialStore>,
         period: Duration,
     },
-    /// Reads the stored credential again when it is refused (RFC 0011 section 2, processes that only read).
     Reader(Reload),
 }
 
 struct State {
     token: Option<AccessToken>,
     stored: Stored,
-    /// A credential the server stored that the store could not make current. The store still holds it in the staged
-    /// slot, so it stays there until a retried promotion succeeds.
     unstored_promotion: Option<Staged>,
 }
 
@@ -172,7 +165,6 @@ impl Auth {
         self
     }
 
-    /// Replaces tokens this long before they expire. A session also sends `Reauth` at that point.
     pub fn with_refresh_margin(self, margin: Duration) -> Self {
         Auth { margin, ..self }
     }
@@ -251,7 +243,6 @@ impl Auth {
         }
     }
 
-    /// Proposes `staged` with the current credential and acts on the answer.
     async fn settle(
         &self,
         state: &mut State,
@@ -282,10 +273,6 @@ impl Auth {
         }
     }
 
-    /// The server stores `staged` now, whether or not the store can record it. A store that could not keeps it in the
-    /// staged slot. This process presents it from now on and retries the promotion before every refresh, and it stages
-    /// no other credential until the promotion succeeds. A restart before then presents the old credential, is refused,
-    /// and promotes the staged one again.
     fn promote(&self, state: &mut State, store: &dyn CredentialStore, staged: &Staged) {
         state.unstored_promotion = match store.promote(staged) {
             Ok(()) => None,
@@ -363,7 +350,6 @@ impl Auth {
         self.api.token(&request).await
     }
 
-    /// When the token should be replaced: the refresh margin before it expires.
     pub(crate) fn refresh_at(&self, token: &AccessToken) -> SystemTime {
         UNIX_EPOCH
             .checked_add(Duration::from_millis(token.expires_at_ms.max(0) as u64))
@@ -375,7 +361,6 @@ impl Auth {
         SystemTime::now() >= self.refresh_at(token)
     }
 
-    /// Drops the cached token if it is the one the server refused, so the next call fetches a new one.
     pub(crate) async fn reject(&self, token: &str) {
         let mut state = self.state.lock().await;
         if state
@@ -388,7 +373,6 @@ impl Auth {
     }
 }
 
-/// A refresh credential as the server generates one at pairing: 32 random bytes, base64url without padding.
 fn new_refresh_credential() -> String {
     let mut bytes = [0u8; 32];
     rustls::crypto::aws_lc_rs::default_provider()

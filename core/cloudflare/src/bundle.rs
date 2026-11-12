@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The server bundle the CLI embeds, and the upload it turns into (docs/design/cli-setup.md sections 4.2 and 4.3).
-
 use std::fmt;
 use std::fs;
 use std::io;
@@ -13,13 +11,10 @@ use serde_json::{Map, Value};
 use crate::api::Jurisdiction;
 use crate::secret::Secret;
 
-/// The tag every upload sets, which `koi setup` looks for to find a Koidrive server in an account (section 6).
 pub const SERVER_TAG: &str = "koidrive-server";
 
-/// The name of the one-time claim secret (section 4.4).
 pub const RECOVERY_KEY_SECRET: &str = "KOIDRIVE_RECOVERY_KEY";
 
-/// `manifest.json` of a server bundle, written by `server/scripts/pack-bundle.mjs` from `server/wrangler.jsonc`.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
@@ -46,8 +41,6 @@ pub(crate) struct DurableObject {
     class_name: String,
 }
 
-/// One entry of Wrangler's migration list: a tag, and step fields such as `new_sqlite_classes` that the upload passes
-/// on unchanged.
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct Migration {
     tag: String,
@@ -154,7 +147,6 @@ impl Bundle {
     }
 }
 
-/// The file at `path`, which must be a regular file and not a link.
 fn read(path: &Path) -> Result<Vec<u8>, BundleError> {
     let unreadable = |source| BundleError::Read {
         path: path.to_owned(),
@@ -168,7 +160,6 @@ fn read(path: &Path) -> Result<Vec<u8>, BundleError> {
     fs::read(path).map_err(unreadable)
 }
 
-/// Checks that `path` is a directory and not a link.
 fn directory(path: &Path) -> Result<(), BundleError> {
     let metadata = fs::symlink_metadata(path).map_err(|source| BundleError::Read {
         path: path.to_owned(),
@@ -217,7 +208,6 @@ pub struct UploadPlan {
     pub(crate) module: Vec<u8>,
 }
 
-/// The deployed script is at a migration tag that the bundle does not list.
 #[derive(Debug, thiserror::Error)]
 #[error(
     "the deployed server is at storage migration {deployed_tag:?}, which this koi release does not know, so the \
@@ -227,7 +217,6 @@ pub struct NewerDeployment {
     pub deployed_tag: String,
 }
 
-/// The `metadata` part of `PUT /workers/scripts/<name>`.
 #[derive(Debug, Serialize)]
 pub(crate) struct Metadata {
     main_module: String,
@@ -662,7 +651,6 @@ mod tests {
         );
     }
 
-    /// A bundle directory with `main_module` as the module name, and a file outside the bundle.
     fn bundle_dir(main_module: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("bundle");

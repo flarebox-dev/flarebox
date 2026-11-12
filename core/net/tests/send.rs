@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! A task started with `tokio::spawn` can transfer chunks: the futures of [`Transfer::upload`] and
-//! [`Transfer::download`] are `Send` when their callbacks hold state. Nothing here runs a transfer; the test is that
-//! this file compiles.
-
 use std::io;
 use std::sync::Arc;
 
@@ -11,7 +7,6 @@ use bytes::Bytes;
 use koidrive_net::{ChunkError, Session, Transfer};
 use koidrive_proto::v1::{ChunkRef, UploadReceipt};
 
-/// Reads each chunk on a blocking thread from a source the callback holds.
 async fn upload(
     session: Arc<Session>,
     transfer: Transfer,
@@ -29,7 +24,6 @@ async fn upload(
     transfer.upload(&session, &chunks, read).await
 }
 
-/// Hands each chunk to a writer the callback borrows.
 async fn download(
     session: Arc<Session>,
     transfer: Transfer,

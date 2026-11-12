@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! OAuth 2.0 Authorization Code with PKCE against Cloudflare's dashboard, for a public client without a secret
-//! (docs/design/cli-setup.md section 2). Every token stays in memory; the caller revokes the grant when its command
-//! ends (section 7).
-
 use std::io;
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
@@ -19,8 +15,6 @@ use url::Url;
 
 use crate::secret::Secret;
 
-/// The private development client, until the public client on koidrive.com exists (cli-setup.md section 11,
-/// decision 9). Change it here only.
 pub const CLIENT_ID: &str = "ba83f6f3a70d657a488265284052a549";
 
 /// The scopes `koi setup` needs (cli-setup.md section 3).
@@ -33,10 +27,8 @@ pub const SCOPES: [&str; 4] = [
 
 const CALLBACK_PATH: &str = "/oauth/callback";
 
-/// The longest request head the loopback listener reads. A browser's callback request is a few KiB.
 const MAX_REQUEST_HEAD: usize = 64 * 1024;
 
-/// How long the loopback listener waits for one connection's request head, or for its answer to be written.
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 const CALLBACK_PAGE: &str = "<!doctype html>\n<meta charset=\"utf-8\">\n<title>Koidrive</title>\n\
@@ -54,7 +46,6 @@ pub fn http_client() -> Result<reqwest::Client, reqwest::Error> {
         .build()
 }
 
-/// The dashboard's OAuth endpoints. Tests point them at a local server.
 #[derive(Clone, Debug)]
 pub struct Endpoints {
     pub authorize: Url,
@@ -93,8 +84,7 @@ pub enum OauthError {
         "the address is not the login callback; it must be the http://127.0.0.1 page the browser opened after Authorize"
     )]
     NotCallback,
-    /// The callback's `state` is missing or belongs to another login. The loopback listener answers it with 400 and
-    /// keeps waiting.
+    /// The callback's `state` is missing or belongs to another login.
     #[error("the login callback belongs to another login attempt; start the login again")]
     StateMismatch,
     #[error("Cloudflare did not authorize the login: {}", oauth_message(.error, .description))]
@@ -306,7 +296,6 @@ impl Loopback {
         }
     }
 
-    /// The URL of a request line such as `GET /oauth/callback?code=... HTTP/1.1`.
     fn request_url(&self, line: &str) -> Option<Url> {
         let mut parts = line.split(' ');
         let (_method, target, version) = (parts.next()?, parts.next()?, parts.next()?);
@@ -317,8 +306,8 @@ impl Loopback {
     }
 }
 
-/// The request line of a connection's request. It reads the whole head, because closing a socket with unread bytes
-/// resets the connection, and the browser would then show an error instead of the page.
+/// Reads the whole head, because closing a socket with unread bytes resets the connection, and the browser would
+/// then show an error instead of the page.
 async fn read_request_line(mut stream: TcpStream) -> (TcpStream, Option<String>) {
     let mut buffer = Vec::new();
     let read = tokio::time::timeout(CONNECTION_TIMEOUT, async {
@@ -362,10 +351,7 @@ pub struct Grant {
     endpoints: Endpoints,
     client_id: String,
     access: Secret,
-    /// `None` once a refresh has failed: the grant cannot be refreshed again.
     refresh: Option<Secret>,
-    /// A refresh token the grant no longer refreshes with but Cloudflare may still accept: the one a failed refresh
-    /// sent, or a new one with too few scopes. Only [`Grant::revoke`] sends it, so a failed revocation can be retried.
     stale: Option<Secret>,
     expires_at: Instant,
 }
@@ -454,7 +440,6 @@ impl Grant {
     }
 }
 
-/// A successful token response. It is never logged: it holds both tokens.
 #[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
@@ -495,8 +480,7 @@ async fn token_request(
     serde_json::from_slice(&body).map_err(|_| OauthError::MalformedTokenResponse)
 }
 
-/// The scopes of [`SCOPES`] that a token response's `scope` lacks. A response without `scope` was granted as
-/// requested (RFC 6749 section 5.1).
+/// A response without `scope` was granted as requested (RFC 6749 section 5.1).
 fn missing_scopes(granted: Option<&str>) -> Vec<&'static str> {
     let Some(granted) = granted else {
         return Vec::new();
@@ -507,8 +491,6 @@ fn missing_scopes(granted: Option<&str>) -> Vec<&'static str> {
         .collect()
 }
 
-/// When the tokens of a response expire, or why they cannot be used: a scope of [`SCOPES`] is missing, or
-/// `expires_in` is too large to be a time. The caller then revokes the tokens it was given.
 fn usable(sent: Instant, tokens: &TokenResponse) -> Result<Instant, OauthError> {
     let missing = missing_scopes(tokens.scope.as_deref());
     if !missing.is_empty() {
@@ -520,7 +502,6 @@ fn usable(sent: Instant, tokens: &TokenResponse) -> Result<Instant, OauthError> 
         .ok_or(OauthError::MalformedTokenResponse)
 }
 
-/// Compares two byte strings in time that depends only on their lengths.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len()
         && a.iter()

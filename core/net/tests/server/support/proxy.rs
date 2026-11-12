@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! A TCP proxy in front of the Worker that can drop a connection at a chosen moment.
-
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,9 +12,7 @@ use url::Url;
 pub enum Fault {
     #[default]
     None,
-    /// Drop the connection that next carries bytes from the client, before forwarding them.
     DropOnClientData,
-    /// Drop the connection that next carries bytes from the server, before forwarding them.
     DropOnServerData,
 }
 
@@ -27,7 +23,6 @@ pub struct Proxy {
     corrupt: Arc<Mutex<Corrupt>>,
 }
 
-/// How many chunk bodies to damage on the way, by flipping one byte.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Corrupt {
     pub uploads: u32,
@@ -73,23 +68,18 @@ impl Proxy {
         *self.fault.lock().unwrap() = fault;
     }
 
-    /// True once the armed fault has dropped a connection.
     pub fn fired(&self) -> bool {
         *self.fault.lock().unwrap() == Fault::None
     }
 
-    /// Damages the next chunk bodies that pass: a relay upload (`PUT .../chunks/...`) or a chunk download
-    /// (an `application/octet-stream` response).
     pub fn corrupt(&self, corrupt: Corrupt) {
         *self.corrupt.lock().unwrap() = corrupt;
     }
 
-    /// Corruptions still armed.
     pub fn corrupt_left(&self) -> Corrupt {
         *self.corrupt.lock().unwrap()
     }
 
-    /// Bytes sent by clients on WebSocket connections after the upgrade request.
     pub fn websocket_client_bytes(&self) -> u64 {
         self.websocket_client_bytes.load(Ordering::SeqCst)
     }
@@ -159,7 +149,6 @@ fn contains(data: &[u8], needle: &[u8]) -> bool {
     data.windows(needle.len()).any(|w| w == needle)
 }
 
-/// Uses up one armed corruption of this kind, if any.
 fn take(corrupt: &Mutex<Corrupt>, kind: impl FnOnce(&mut Corrupt) -> &mut u32) -> bool {
     let mut corrupt = corrupt.lock().unwrap();
     let left = kind(&mut corrupt);
@@ -168,8 +157,6 @@ fn take(corrupt: &Mutex<Corrupt>, kind: impl FnOnce(&mut Corrupt) -> &mut u32) -
     armed
 }
 
-/// Flips the first body byte in `data`: after the header end when the headers are here, else the first byte.
-/// Returns whether a byte was flipped.
 fn flip_body(data: &mut [u8]) -> bool {
     let start = match data.windows(4).position(|w| w == b"\r\n\r\n") {
         Some(end) => end + 4,

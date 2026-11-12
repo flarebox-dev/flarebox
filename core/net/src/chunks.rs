@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Chunk upload and download (spec v0 sections 8 and 10). Targets come from the server, through the Worker relay or
-//! as presigned URLs, and are used as given: the client never builds a storage key. Every chunk is checked against
-//! its SHA-256 and size before it is sent and after it is received.
-
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::io;
@@ -29,18 +25,12 @@ use crate::backoff::Backoff;
 use crate::error::{CallError, Resend, ServerError};
 use crate::session::Session;
 
-/// The most chunks one `PrepareUpload` or `GetDownloadTargets` takes (spec v0 section 13).
 pub const MAX_CHUNKS_PER_CALL: usize = 1000;
 /// How many chunks a [`Transfer`] uploads at once unless it is given another [`UploadGate`].
 pub const DEFAULT_UPLOAD_CONCURRENCY: usize = 4;
-/// A target this close to its expiry is fetched again before use.
 const TARGET_MARGIN: Duration = Duration::from_secs(60);
-/// The most bytes reserved up front for one downloaded chunk. A larger chunk's buffer grows as its bytes arrive, so a
-/// size the server or another device claims does not reserve memory by itself.
 const MAX_PREALLOCATION: usize = 4 << 20;
-/// The most bytes read of an answer other than chunk bytes: a receipt or an error. Anything longer is not read.
 const SMALL_ANSWER: usize = 64 << 10;
-/// An upload's body goes to the connection in slices of this size, so that its progress can be seen.
 const SLICE: usize = 64 << 10;
 
 /// True when `bytes` are the chunk: their SHA-256 is its hash and their length its size.
@@ -82,12 +72,9 @@ pub enum ChunkError {
     },
 }
 
-/// How one transfer attempt ended.
 enum Attempt<T> {
     Done(T),
-    /// The ticket or URL was refused or expired: ask the server for a new target.
     Expired,
-    /// Worth trying again with the same target after a backoff.
     Retry(ChunkError),
     Fail(ChunkError),
 }
@@ -115,7 +102,6 @@ impl UploadGate {
         }
     }
 
-    /// The configured limit, including places currently occupied by uploads.
     pub fn concurrency(&self) -> usize {
         self.concurrency
     }
@@ -140,10 +126,7 @@ pub struct Transfer {
     /// Attempts per chunk, and rounds of asking the server again for chunks it deferred or whose target expired. Only a
     /// round in which no chunk was uploaded or found present counts.
     pub attempts: u32,
-    /// Bounds a download from sending the request to the last byte of the answer, and an upload from the last slice
-    /// of its body to the last byte of the answer.
     pub attempt_timeout: Duration,
-    /// Bounds the wait for the connection to take the next slice of an upload's body.
     pub stall_timeout: Duration,
 }
 
@@ -190,7 +173,6 @@ impl Transfer {
         let mut receipts = Vec::new();
         let mut round = 0;
         while !todo.is_empty() {
-            // Positions in `todo`, so that the next round asks for the deferred chunks in their first order.
             let mut deferred = Vec::new();
             let mut wait = Duration::ZERO;
             for (first, batch) in (0..)
@@ -239,8 +221,6 @@ impl Transfer {
                         permit = self.gate.enter(), if started < uploads.len() => {
                             let (index, chunk, target) = uploads[started];
                             started += 1;
-                            // A target that looks expiring on arrival means this clock runs ahead of the server's, so
-                            // it is sent as given and the relay judges the ticket.
                             if expiring(target) && !expiring_at(target, prepared) {
                                 deferred.push(index);
                             } else {
@@ -365,8 +345,6 @@ impl Transfer {
         })
     }
 
-    /// Runs one transfer up to `attempts` times, waiting as long as the server asked or else with backoff. `None`
-    /// means the target needs renewing.
     async fn retrying<T, F: Future<Output = Attempt<T>>>(
         &self,
         mut attempt: impl FnMut() -> F,
@@ -397,11 +375,8 @@ impl Transfer {
         }
     }
 
-    /// One upload. It ends when the connection takes no slice of the body for `stall_timeout`, or when the answer is
-    /// not complete `attempt_timeout` after the last slice. The connection takes slices into its send buffers, so
-    /// the answer wait also covers sending what those buffers still hold. On an uplink too slow to empty them within
-    /// `attempt_timeout`, an upload that keeps moving still ends. The relay answers with an `UploadReceipt`; a
-    /// presigned URL answers without a body to keep.
+    /// One upload. The connection takes slices into its send buffers, so the answer wait also covers sending what
+    /// those buffers still hold.
     async fn put(
         &self,
         target: &Target,
@@ -454,7 +429,6 @@ impl Transfer {
             };
             match status {
                 StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Attempt::Expired,
-                // The bytes were checked before sending, so a hash mismatch at the server happened on the way.
                 StatusCode::BAD_REQUEST => Attempt::Retry(refused),
                 status if retryable(status) => Attempt::Retry(refused),
                 _ => Attempt::Fail(refused),
@@ -469,9 +443,6 @@ impl Transfer {
         }
     }
 
-    /// Returns once the upload behind `progress` has passed its deadline, with what it was waiting for. While the body
-    /// is sent, it also wakes by the time an answer deadline starting now would pass, because the last slice can be
-    /// taken at any moment and start that shorter wait.
     async fn stalled(&self, progress: &Mutex<Progress>) -> String {
         loop {
             let now = *progress.lock().unwrap();
@@ -498,7 +469,6 @@ impl Transfer {
         }
     }
 
-    /// One download within `attempt_timeout`, read up to the chunk's size and checked against its hash.
     async fn get(&self, target: &Target, chunk: &ChunkRef) -> Attempt<Bytes> {
         let attempt = async {
             let mut response = match self.request(&self.http, target, "GET").send().await {
@@ -556,7 +526,6 @@ impl Transfer {
         self.bounded(chunk, attempt).await
     }
 
-    /// Ends an attempt that has not finished within `attempt_timeout`, so a server that trickles its answer is retried.
     async fn bounded<T>(
         &self,
         chunk: &ChunkRef,
@@ -591,16 +560,12 @@ impl Transfer {
     }
 }
 
-/// Where an upload is, for its deadline.
 #[derive(Clone, Copy)]
 enum Progress {
-    /// Sending the body; the connection took a slice at this time.
     Body(Instant),
-    /// Waiting for the answer since the connection took the last slice.
     Answer(Instant),
 }
 
-/// An upload's body, handed out a slice at a time, noting when the connection takes each one.
 struct Sending {
     rest: Bytes,
     progress: Arc<Mutex<Progress>>,
@@ -658,9 +623,6 @@ fn expiring_at(target: &Target, now: SystemTime) -> bool {
     (now + TARGET_MARGIN).as_millis() >= target.expires_at_ms as u128
 }
 
-/// Applies H1 when the server sent an error: an unknown code, or `QUOTA_EXCEEDED` without a wait, fails the
-/// transfer, and `RETRY_LATER` or `QUOTA_EXCEEDED` with a wait retries it. Any other refusal is given back for its
-/// HTTP status to decide.
 fn by_code<T>(refused: ChunkError) -> Result<Attempt<T>, ChunkError> {
     let ChunkError::Refused {
         error: Some(error), ..
@@ -681,7 +643,6 @@ fn retryable(status: StatusCode) -> bool {
         || status.is_server_error()
 }
 
-/// Reads a small answer, a receipt or an error, or gives `None` once it passes `SMALL_ANSWER`.
 async fn small_answer(mut response: reqwest::Response) -> Result<Option<Vec<u8>>, reqwest::Error> {
     let mut body = Vec::new();
     while let Some(part) = response.chunk().await? {
@@ -701,7 +662,6 @@ fn protobuf(response: &reqwest::Response) -> bool {
         .is_some_and(|value| value.starts_with("application/x-protobuf"))
 }
 
-/// A transport error, without the URL: chunk URLs carry tickets.
 fn unavailable(chunk: &ChunkRef, error: reqwest::Error) -> ChunkError {
     let message = error.without_url().to_string();
     ChunkError::Unavailable {

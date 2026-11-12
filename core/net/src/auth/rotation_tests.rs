@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! RFC 0011 section 2 against a stub server that follows section 1 and can hold, drop or lose a request's answer.
-
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -15,16 +13,11 @@ use tokio::sync::oneshot;
 
 use super::*;
 
-/// What the stub does with the next token request.
 enum Plan {
     Answer,
-    /// Applies the request and closes the connection without an answer.
     LoseAnswer,
-    /// Closes the connection without applying the request, as if it never arrived.
     Drop,
-    /// Holds the request, then applies and answers it once released.
     Hold(oneshot::Receiver<()>),
-    /// Closes the connection at once, and applies the request without an answer once released.
     Delay(oneshot::Receiver<()>),
 }
 
@@ -39,7 +32,6 @@ struct Server {
 }
 
 impl Server {
-    /// RFC 0011 section 1: the answer to `request`, or the refusal of its credential.
     fn apply(&mut self, request: &TokenRequest) -> Result<AccessToken, ()> {
         if request.refresh_credential != self.current {
             return Err(());
@@ -215,7 +207,6 @@ impl MemoryStore {
     }
 }
 
-/// An `Auth` that owns the credential "old", is due for rotation, and refreshes on every call.
 fn rotating(api: Api, store: &Arc<MemoryStore>) -> Auth {
     let stored = Stored {
         current: Credentials {
@@ -230,7 +221,6 @@ fn rotating(api: Api, store: &Arc<MemoryStore>) -> Auth {
         .with_refresh_margin(Duration::from_secs(3600))
 }
 
-/// The client holds the one credential the server accepts, and has nothing staged.
 fn settled(auth: &Auth, stub: &Stub, store: &MemoryStore) {
     assert_eq!(auth.credentials().refresh_credential, stub.server().current);
     assert_eq!(store.staged(), None);
