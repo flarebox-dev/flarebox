@@ -3316,6 +3316,54 @@ fn a_lost_move_is_sent_again_when_the_move_it_followed_was_lost_too() {
     assert_eq!(sent, [mv("n", ROOT, "y")]);
 }
 
+fn take_remote_move(name: &str, rev: u64, trees: &mut Trees) {
+    trees.set_remote("n".into(), remote_at(file(ROOT, name, 1), rev));
+    trees.set_local("n".into(), local(file(ROOT, name, 1), 1));
+    trees.settle();
+}
+
+#[test]
+fn a_lost_first_move_is_sent_again_when_the_remote_move_it_followed_was_lost_too() {
+    let (mut trees, mut commits, mut ids) = n_at_x();
+    take_remote_move("z", 7, &mut trees);
+    move_n_to_y_at(9, &mut trees, &mut commits, &mut ids);
+    let n = remote(file(ROOT, "x", 1));
+    let sent = lose_with_n_at(n, 0, &mut trees, &mut commits, &mut ids);
+    assert_eq!(commits.held_through(), 0);
+    assert_eq!(sent, [mv("n", ROOT, "y")]);
+}
+
+#[test]
+fn a_lost_move_is_sent_again_over_any_position_the_server_kept_from_before_it() {
+    let (mut trees, mut commits, mut ids) = n_at_x();
+    take_remote_move("w", 5, &mut trees);
+    take_remote_move("z", 7, &mut trees);
+    move_n_to_y_at(9, &mut trees, &mut commits, &mut ids);
+    let n = remote_at(file(ROOT, "w", 1), 5);
+    let sent = lose_with_n_at(n, 0, &mut trees, &mut commits, &mut ids);
+    assert_eq!(sent, [mv("n", ROOT, "y")]);
+}
+
+#[test]
+fn a_lost_move_is_sent_again_over_a_position_the_server_kept_that_a_listing_skipped() {
+    let (mut trees, mut commits, mut ids) = n_moved_to_z_at_7_after_a_commit_at_5();
+    move_n_to_y_at(9, &mut trees, &mut commits, &mut ids);
+    let n = remote_at(file(ROOT, "w", 1), 4);
+    let sent = lose_with_n_at(n, 1, &mut trees, &mut commits, &mut ids);
+    assert_eq!(sent, [mv("n", ROOT, "y")]);
+}
+
+#[test]
+fn a_lost_move_is_not_sent_over_a_position_this_device_never_saw() {
+    let (mut trees, mut commits, mut ids) = n_at_x();
+    take_remote_move("z", 7, &mut trees);
+    move_n_to_y_at(9, &mut trees, &mut commits, &mut ids);
+    let n = remote_at(file(ROOT, "w", 1), 3);
+    let sent = lose_with_n_at(n, 0, &mut trees, &mut commits, &mut ids);
+    assert!(sent.is_empty());
+    assert_eq!(trees.class("n"), Class::Remote);
+}
+
 #[test]
 fn an_edit_to_the_content_a_lost_commit_replaced_is_sent_after_the_loss() {
     let (mut trees, mut commits, mut ids) = an_edit_to_the_content_a_lost_commit_replaced();

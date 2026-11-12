@@ -1333,6 +1333,11 @@ impl Commits {
         while self.slots.len() > SLOTS_KEPT {
             self.slots.pop_first();
         }
+        if self.slots.len() == SLOTS_KEPT
+            && let Some((_, &oldest)) = self.slots.first_key_value()
+        {
+            trees.forget_past_positions_below(oldest);
+        }
         self.cap = self.cap.map(|cap| cap * 2).filter(|cap| *cap < MAX_OPS);
         true
     }

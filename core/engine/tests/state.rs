@@ -104,14 +104,21 @@ fn trees_state() -> TreesState {
         lost: ["a".into()].into(),
         displaced: Default::default(),
         edited_here: [("a".into(), 1)].into(),
-        moved_here: [("a".into(), MovedHere { seq: 1, from: None })].into(),
-        moved_from: [(
-            "p".into(),
-            Agreed {
+        moved_here: [(
+            "a".into(),
+            MovedHere {
+                seq: 1,
+                upgraded: false,
+            },
+        )]
+        .into(),
+        past_positions: [(
+            "a".into(),
+            vec![Agreed {
                 rev: 1,
                 parent: ROOT.into(),
                 name: "q".into(),
-            },
+            }],
         )]
         .into(),
         unsent_edits: Default::default(),
@@ -489,19 +496,22 @@ fn trees_restore_a_valid_state_and_refuse_each_broken_one() {
             StateError::NotRemote("gone".into()),
         ),
         (
-            "R's record before a move of a node the commit in flight does not move",
+            "earlier records of a node R does not hold",
             trees(),
             broken(trees_state(), |state| {
-                let from = state.moved_from["p"].clone();
-                state.moved_from.insert("a".into(), from);
+                let past = state.past_positions["a"].clone();
+                state.past_positions.insert("gone".into(), past);
             }),
-            StateError::NotMovedFrom("a".into()),
+            StateError::NotPastPosition("gone".into()),
         ),
         (
             "a node moved here that R holds at a revision before that commit",
             trees(),
             broken(trees_state(), |state| {
-                let moved = MovedHere { seq: 2, from: None };
+                let moved = MovedHere {
+                    seq: 2,
+                    upgraded: false,
+                };
                 state.moved_here.insert("a".into(), moved);
             }),
             StateError::NotMovedHere("a".into()),

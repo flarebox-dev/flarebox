@@ -190,32 +190,34 @@ impl Tx<'_> {
         while let Some(row) = rows.next()? {
             state.trees.edited_here.insert(row.get(0)?, row.get(1)?);
         }
+        let mut stmt = self
+            .0
+            .prepare_cached("SELECT node_id, seq, upgraded FROM moved_here")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let moved = MovedHere {
+                seq: row.get(1)?,
+                upgraded: row.get(2)?,
+            };
+            state.trees.moved_here.insert(row.get(0)?, moved);
+        }
         let mut stmt = self.0.prepare_cached(
-            "SELECT node_id, seq, from_rev, from_parent_id, from_name FROM moved_here",
+            "SELECT node_id, rev, parent_id, name FROM past_positions ORDER BY node_id, position",
         )?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
-            let parent = row.get::<_, Option<String>>(3)?.unwrap_or_default();
-            let from = (row.get::<_, Option<u64>>(2)?)
-                .zip(row.get::<_, Option<String>>(4)?)
-                .map(|(rev, name)| Agreed { rev, parent, name });
-            let seq = row.get(1)?;
-            state
-                .trees
-                .moved_here
-                .insert(row.get(0)?, MovedHere { seq, from });
-        }
-        let mut stmt = self
-            .0
-            .prepare_cached("SELECT node_id, rev, parent_id, name FROM moved_from")?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let from = Agreed {
+            let past = Agreed {
                 rev: row.get(1)?,
                 parent: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
                 name: row.get(3)?,
             };
-            state.trees.moved_from.insert(row.get(0)?, from);
+            let node: NodeId = row.get(0)?;
+            state
+                .trees
+                .past_positions
+                .entry(node)
+                .or_default()
+                .push(past);
         }
         let mut stmt = self.0.prepare_cached("SELECT node_id FROM unsent_edits")?;
         let mut rows = stmt.query([])?;
@@ -327,7 +329,7 @@ impl Tx<'_> {
             "recorded_nodes",
             "edited_here",
             "moved_here",
-            "moved_from",
+            "past_positions",
             "unsent_edits",
             "replaced_versions",
             "resends",
@@ -530,36 +532,38 @@ impl Tx<'_> {
             .0
             .prepare_cached("DELETE FROM moved_here WHERE node_id = ?1")?;
         let mut put = self.0.prepare_cached(
-            "INSERT OR REPLACE INTO moved_here (node_id, seq, from_rev, from_parent_id, from_name)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT OR REPLACE INTO moved_here (node_id, seq, upgraded) VALUES (?1, ?2, ?3)",
         )?;
         let (removed, changed) = differences(&before.trees.moved_here, &after.trees.moved_here);
         for node in removed {
             remove.execute([node])?;
         }
         for (node, moved) in changed {
-            let from = moved.from.as_ref();
-            put.execute(params![
-                node,
-                moved.seq,
-                from.map(|from| from.rev),
-                from.and_then(|from| non_empty(&from.parent)),
-                from.map(|from| &from.name),
-            ])?;
+            put.execute(params![node, moved.seq, moved.upgraded])?;
         }
         let mut remove = self
             .0
-            .prepare_cached("DELETE FROM moved_from WHERE node_id = ?1")?;
+            .prepare_cached("DELETE FROM past_positions WHERE node_id = ?1")?;
         let mut put = self.0.prepare_cached(
-            "INSERT OR REPLACE INTO moved_from (node_id, rev, parent_id, name)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO past_positions (node_id, position, rev, parent_id, name)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
         )?;
-        let (removed, changed) = differences(&before.trees.moved_from, &after.trees.moved_from);
+        let (removed, changed) =
+            differences(&before.trees.past_positions, &after.trees.past_positions);
         for node in removed {
             remove.execute([node])?;
         }
-        for (node, from) in changed {
-            put.execute(params![node, from.rev, non_empty(&from.parent), &from.name])?;
+        for (node, past) in changed {
+            remove.execute([node])?;
+            for (index, position) in past.iter().enumerate() {
+                put.execute(params![
+                    node,
+                    index,
+                    position.rev,
+                    non_empty(&position.parent),
+                    &position.name
+                ])?;
+            }
         }
         let mut remove = self
             .0
