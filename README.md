@@ -104,6 +104,12 @@ You need a Cloudflare account with R2 turned on, and a Mac or a Linux machine.
    curl -fsSL https://raw.githubusercontent.com/koidrive/koidrive/main/install.sh | sh
    ```
 
+   On Linux with systemd, install the user service too:
+
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/koidrive/koidrive/main/install.sh | sh -s -- --systemd
+   ```
+
    Downloads start with the first release. Until then, [build from source](docs/guide/install.md#build-from-source).
 
 2. **Set up your server and this machine.**
@@ -120,6 +126,17 @@ You need a Cloudflare account with R2 turned on, and a Mac or a Linux machine.
    mkdir -p ~/Koidrive
    koi space create Koidrive
    koi folder link ~/Koidrive --space Koidrive
+   ```
+
+   On Linux with the user service, start syncing with:
+
+   ```sh
+   systemctl --user enable --now koidrive
+   ```
+
+   On macOS, or without the service, run the daemon in a terminal and keep it open:
+
+   ```sh
    koi _daemon
    ```
 
