@@ -936,9 +936,10 @@ impl Commits {
     /// when both send a file the server lost again (section 4.4), and it may have deleted the node
     /// since. S stays without a node R holds live, so the next plan compares L with what R holds
     /// instead of sending the create again: equal content leaves nothing to send, and other
-    /// content is kept beside R's as a new node (section 2.4). A node R holds in the trash takes
-    /// R's content at the position the create sent as its S, so L follows the delete unless it
-    /// changed the node since the create was sent, which revives it (R8).
+    /// content is kept beside R's as a new node (section 2.4). A node R holds in the trash keeps
+    /// the S that L and R agreed on while the create was out, and otherwise takes R's content at the
+    /// position the create sent as its S. So L follows the delete unless it holds content the
+    /// server never showed for the node, which revives it (R8).
     ///
     /// A `Restore` op changes neither S nor L. What it sent is an instruction, and only the server
     /// knows the nodes and the content it brought back, so all of it is a remote change that R
@@ -1099,6 +1100,7 @@ impl Commits {
                 && taken
                 && let Some((sent_parent, sent_name)) = sent
                 && let Some(remote) = trees.remote().get(node).filter(|remote| remote.trashed)
+                && synced.get(trees, node).is_none()
             {
                 let shape = Shape {
                     parent: merged.get(sent_parent).unwrap_or(sent_parent).clone(),

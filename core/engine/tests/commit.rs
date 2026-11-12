@@ -4440,6 +4440,24 @@ fn a_create_refused_for_a_node_another_device_renamed_and_deleted_follows_the_de
 }
 
 #[test]
+fn a_create_refused_for_a_node_another_device_created_edited_and_deleted_follows_the_delete() {
+    let mut trees = trees(&[("n", Some(file(ROOT, "a", 1)), None, None)]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    trees.set_remote("n".into(), remote(file(ROOT, "a", 1)));
+    trees.settle();
+    trees.set_remote("n".into(), trashed(file(ROOT, "a", 2)));
+    let exists = OpResult {
+        reject_reason: "ID_EXISTS".into(),
+        ..outcome(op_result::Code::Rejected)
+    };
+    acknowledge(&mut commits, &mut trees, vec![exists]);
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::Remote);
+    assert!(build(&mut commits, &mut trees, &mut ids).is_none());
+}
+
+#[test]
 fn a_create_refused_for_a_node_another_device_deleted_sends_an_edit_made_since_to_its_bytes() {
     let mut trees = trees(&[("n", Some(file(ROOT, "a", 1)), None, None)]);
     let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
