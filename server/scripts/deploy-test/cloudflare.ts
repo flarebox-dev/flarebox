@@ -28,6 +28,17 @@ export class ApiError extends Error {
   }
 }
 
+export class DeadlineError extends ApiError {
+  constructor(message: string) {
+    super(message, 0);
+  }
+}
+
+interface Deadline {
+  atMs: number;
+  what: string;
+}
+
 export function accountFromEnv(): Account | undefined {
   const id = process.env.CLOUDFLARE_ACCOUNT_ID ?? "";
   const token = process.env.CLOUDFLARE_API_TOKEN ?? "";
@@ -44,15 +55,34 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+export const LISTING_MS = 60_000;
+const LISTING_EVERY_MS = 5_000;
+
+async function listed<T>(read: (deadline: Deadline) => Promise<T | undefined>): Promise<T | undefined> {
+  const deadline = { atMs: Date.now() + LISTING_MS, what: "the listing did not appear within " + LISTING_MS / 1000 + " s" };
+  for (;;) {
+    let value: T | undefined;
+    try {
+      value = await read(deadline);
+    } catch (error) {
+      if (error instanceof DeadlineError) return undefined;
+      throw error;
+    }
+    const remaining = deadline.atMs - Date.now();
+    if (value !== undefined || remaining <= 0) return value;
+    await sleep(Math.min(LISTING_EVERY_MS, remaining));
+  }
+}
+
 function keyPath(key: string): string {
   return key.split("/").map(encodeURIComponent).join("/");
 }
 
-async function send(account: Account, method: string, path: string, init: { body?: unknown; allowMissing?: boolean; deadline?: number; retry?: boolean } = {}): Promise<Response | undefined> {
+async function send(account: Account, method: string, path: string, init: { body?: unknown; allowMissing?: boolean; deadline?: Deadline; retry?: boolean } = {}): Promise<Response | undefined> {
   const what = method + " " + path.split("?")[0];
   for (let attempt = 1; ; attempt++) {
-    const remaining = init.deadline === undefined ? REQUEST_MS : init.deadline - Date.now();
-    if (remaining <= 0) throw new ApiError("bucket-emptying job exceeded its six-minute deadline", 0);
+    const remaining = init.deadline === undefined ? REQUEST_MS : init.deadline.atMs - Date.now();
+    if (remaining <= 0) throw new DeadlineError(init.deadline!.what);
     let response: Response;
     try {
       response = await fetch(API + path, {
@@ -62,8 +92,9 @@ async function send(account: Account, method: string, path: string, init: { body
         signal: AbortSignal.timeout(Math.min(REQUEST_MS, remaining)),
       });
     } catch (error) {
+      if (init.deadline && Date.now() >= init.deadline.atMs) throw new DeadlineError(init.deadline.what);
       if (init.retry === false || attempt >= ATTEMPTS) throw new ApiError(what + " failed: " + (error instanceof Error ? error.message : String(error)), 0);
-      await sleep(Math.max(0, Math.min(2000 * attempt, init.deadline === undefined ? Infinity : init.deadline - Date.now())));
+      await sleep(Math.max(0, Math.min(2000 * attempt, init.deadline === undefined ? Infinity : init.deadline.atMs - Date.now())));
       continue;
     }
     if (response.ok) return response;
@@ -73,7 +104,7 @@ async function send(account: Account, method: string, path: string, init: { body
     }
     if ((response.status === 429 || response.status >= 500) && init.retry !== false && attempt < ATTEMPTS) {
       await response.body?.cancel();
-      await sleep(Math.max(0, Math.min(2000 * attempt, init.deadline === undefined ? Infinity : init.deadline - Date.now())));
+      await sleep(Math.max(0, Math.min(2000 * attempt, init.deadline === undefined ? Infinity : init.deadline.atMs - Date.now())));
       continue;
     }
     const text = await response.text();
@@ -92,9 +123,18 @@ interface Envelope<T> {
   result_info?: { cursor?: string; is_truncated?: boolean; page?: number; total_pages?: number };
 }
 
-async function call<T>(account: Account, method: string, path: string, body?: unknown): Promise<Envelope<T>> {
-  const response = await send(account, method, path, { body });
-  return (await response!.json()) as Envelope<T>;
+async function json<T>(response: Response, deadline?: Deadline): Promise<T> {
+  try {
+    return (await response.json()) as T;
+  } catch (error) {
+    if (deadline && Date.now() >= deadline.atMs) throw new DeadlineError(deadline.what);
+    throw error;
+  }
+}
+
+async function call<T>(account: Account, method: string, path: string, body?: unknown, deadline?: Deadline): Promise<Envelope<T>> {
+  const response = await send(account, method, path, { body, deadline });
+  return json<Envelope<T>>(response!, deadline);
 }
 
 export async function createBucket(account: Account, name: string): Promise<void> {
@@ -117,17 +157,23 @@ export async function getWorker(account: Account, name: string): Promise<{ id: s
   return { id: worker.id };
 }
 
-export async function workerHasTag(account: Account, name: string, tag: string): Promise<boolean> {
-  for (let page = 1; ; page++) {
-    const response = await send(account, "GET", `/accounts/${account.id}/workers/scripts/${name}/versions?per_page=100&page=${page}`, { allowMissing: true });
-    if (!response) return false;
-    const items = ((await response.json()) as Envelope<{ items?: { id: string }[] }>).result?.items ?? [];
-    for (const item of items) {
-      const version = await call<{ annotations?: Record<string, string> }>(account, "GET", `/accounts/${account.id}/workers/scripts/${name}/versions/${item.id}`);
-      if (version.result?.annotations?.["workers/tag"] === tag) return true;
+export type WorkerTag = "tagged" | "untagged" | "unlisted";
+
+export async function workerTag(account: Account, name: string, tag: string): Promise<WorkerTag> {
+  const found = await listed(async (deadline): Promise<WorkerTag | undefined> => {
+    for (let page = 1; ; page++) {
+      const response = await send(account, "GET", `/accounts/${account.id}/workers/scripts/${name}/versions?per_page=100&page=${page}`, { allowMissing: true, deadline });
+      if (!response) return page === 1 ? undefined : "untagged";
+      const items = (await json<Envelope<{ items?: { id: string }[] }>>(response, deadline)).result?.items ?? [];
+      if (page === 1 && items.length === 0) return undefined;
+      for (const item of items) {
+        const version = await call<{ annotations?: Record<string, string> }>(account, "GET", `/accounts/${account.id}/workers/scripts/${name}/versions/${item.id}`, undefined, deadline);
+        if (version.result?.annotations?.["workers/tag"] === tag) return "tagged";
+      }
+      if (items.length < 100) return "untagged";
     }
-    if (items.length < 100) return false;
-  }
+  });
+  return found ?? "unlisted";
 }
 
 export async function listObjects(account: Account, bucket: string, prefix = ""): Promise<R2Object[] | undefined> {
@@ -161,17 +207,17 @@ function bucketJob(value: unknown): { id: string; status: "ENQUEUED" | "RUNNING"
 
 export async function emptyBucket(account: Account, bucket: string): Promise<void> {
   const path = `/accounts/${account.id}/r2/buckets/${bucket}/jobs`;
-  const deadline = Date.now() + 6 * 60_000;
+  const deadline = { atMs: Date.now() + 6 * 60_000, what: "bucket-emptying job exceeded its six-minute deadline" };
   const created = await send(account, "POST", path, { body: { jobType: "prefixDelete", prefix: "" }, deadline, retry: false });
-  let job = bucketJob(await created!.json());
+  let job = bucketJob(await json(created!, deadline));
   const id = job.id;
   while (job.status !== "COMPLETED") {
     if (job.status === "FAILED" || job.status === "CANCELLED") throw new ApiError("bucket-emptying job " + job.status, 200);
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) throw new ApiError("bucket-emptying job exceeded its six-minute deadline", 0);
+    const remaining = deadline.atMs - Date.now();
+    if (remaining <= 0) throw new DeadlineError(deadline.what);
     await sleep(Math.min(5000, remaining));
     const response = await send(account, "GET", path + "/" + encodeURIComponent(id), { deadline });
-    job = bucketJob(await response!.json());
+    job = bucketJob(await json(response!, deadline));
   }
 }
 
@@ -202,14 +248,23 @@ export async function namespacesOf(account: Account, script: string): Promise<Na
   }
 }
 
-export async function activeVersion(account: Account, name: string): Promise<string | undefined> {
-  const listed = await call<{ deployments: { created_on: string; versions: { version_id: string; percentage: number }[] }[] }>(
-    account,
-    "GET",
-    `/accounts/${account.id}/workers/scripts/${name}/deployments`,
-  );
-  const newest = [...(listed.result?.deployments ?? [])].sort((a, b) => b.created_on.localeCompare(a.created_on))[0];
-  return newest?.versions.find((version) => version.percentage === 100)?.version_id;
+export interface Deployment {
+  created_on: string;
+  versions: { version_id: string; percentage: number }[];
+}
+
+export function serves(deployment: Deployment | undefined, versionId: string): boolean {
+  return deployment?.versions.some((version) => version.version_id === versionId && version.percentage === 100) ?? false;
+}
+
+export async function newestDeployment(account: Account, name: string, versionId: string): Promise<Deployment | undefined> {
+  let newest: Deployment | undefined;
+  await listed(async (deadline) => {
+    const response = await call<{ deployments: Deployment[] }>(account, "GET", `/accounts/${account.id}/workers/scripts/${name}/deployments`, undefined, deadline);
+    newest = [...(response.result?.deployments ?? [])].sort((a, b) => b.created_on.localeCompare(a.created_on))[0];
+    return serves(newest, versionId) ? newest : undefined;
+  });
+  return newest;
 }
 
 export interface Subscription {

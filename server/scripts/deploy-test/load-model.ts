@@ -141,6 +141,42 @@ export function saturated(summary: StepSummary): string | undefined {
   return undefined;
 }
 
+export interface UsageReading {
+  requests: number;
+  rowsWritten: number;
+}
+
+export function settledRows(readings: UsageReading[], commits: number): number | undefined {
+  const [previous, last] = readings.slice(-2);
+  if (!previous || !last) return undefined;
+  const complete = last.requests >= commits && last.rowsWritten >= commits;
+  const unchanged = last.requests === previous.requests && last.rowsWritten === previous.rowsWritten;
+  return complete && unchanged ? last.rowsWritten : undefined;
+}
+
+export async function calibrate(
+  read: () => Promise<UsageReading>,
+  commits: number,
+  untilMs: number,
+  everyMs: number,
+  log: (line: string) => void,
+): Promise<{ rows: number; readings: UsageReading[] }> {
+  const readings: UsageReading[] = [];
+  while (Date.now() < untilMs) {
+    try {
+      readings.push(await read());
+    } catch (error) {
+      log("Analytics API: " + (error instanceof Error ? error.message : String(error)).slice(0, 200));
+    }
+    const rows = settledRows(readings, commits);
+    if (rows !== undefined) return { rows, readings };
+    const remaining = untilMs - Date.now();
+    if (remaining <= 0) break;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(everyMs, remaining)));
+  }
+  return { rows: 0, readings };
+}
+
 export function commitBudget(maxRowsWritten: number, rowsPerCommit: number): number {
   return Math.floor(maxRowsWritten / (Math.max(rowsPerCommit, 1) * BUDGET_MARGIN));
 }

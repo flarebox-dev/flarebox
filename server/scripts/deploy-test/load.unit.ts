@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { describe, expect, it } from "vitest";
-import { commitBudget, commitsAt, emptyCounts, layout, percentile, readConfig, saturated, summarize, workersPlan } from "./load-model.ts";
+import { describe, expect, it, vi } from "vitest";
+import { calibrate, commitBudget, commitsAt, emptyCounts, layout, percentile, readConfig, saturated, settledRows, summarize, workersPlan, type UsageReading } from "./load-model.ts";
 
 describe("the load test's configuration", () => {
   it("runs the plan's steps by default", () => {
@@ -79,6 +79,51 @@ describe("the run's limits", () => {
   it("leaves headroom in the commit budget", () => {
     expect(commitBudget(40_000_000, 32)).toBe(1_000_000);
     expect(commitBudget(1000, 0)).toBe(800);
+  });
+
+  it("calibrates only from Analytics readings that cover every commit and stopped changing", () => {
+    const commits = 1480;
+    const seen = [
+      { requests: 0, rowsWritten: 0 },
+      { requests: 900, rowsWritten: 8235 },
+      { requests: 900, rowsWritten: 8235 },
+      { requests: 1490, rowsWritten: 16324 },
+    ];
+    expect(settledRows(seen.slice(0, 1), commits)).toBeUndefined();
+    expect(settledRows(seen.slice(0, 3), commits)).toBeUndefined();
+    expect(settledRows(seen, commits)).toBeUndefined();
+    expect(settledRows([...seen, { requests: 1490, rowsWritten: 18100 }], commits)).toBeUndefined();
+    expect(settledRows([...seen, { requests: 1490, rowsWritten: 18100 }, { requests: 1490, rowsWritten: 18100 }], commits)).toBe(18100);
+    expect(settledRows([{ requests: 1490, rowsWritten: 33 }, { requests: 1490, rowsWritten: 33 }], commits)).toBeUndefined();
+  });
+
+  it("calibrates from the first settled Analytics reading, and falls back once the wait runs out", async () => {
+    vi.useFakeTimers();
+    try {
+      const settled = { requests: 1490, rowsWritten: 18100 };
+      const early = calibrate(async () => settled, 1490, Date.now() + 20 * 60_000, 60_000, () => {});
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(await early).toEqual({ rows: 18100, readings: [settled, settled] });
+
+      const lines: string[] = [];
+      let reads = 0;
+      const lagging = async (): Promise<UsageReading> => {
+        reads++;
+        if (reads === 2) throw new Error("HTTP 502");
+        return { requests: 100, rowsWritten: 500 };
+      };
+      const startMs = Date.now();
+      const fallback = calibrate(lagging, 1490, startMs + 20 * 60_000, 60_000, (line) => lines.push(line));
+      await vi.advanceTimersByTimeAsync(20 * 60_000);
+      const result = await fallback;
+      expect(result.rows).toBe(0);
+      expect(result.readings).toHaveLength(19);
+      expect(reads).toBe(20);
+      expect(lines).toEqual(["Analytics API: HTTP 502"]);
+      expect(Date.now() - startMs).toBe(20 * 60_000);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("interpolates commits from the timeline", () => {
