@@ -463,9 +463,15 @@ async fn a_dropped_commit_is_not_resent_when_welcome_cannot_account_for_it() {
 async fn the_stream_resumes_from_the_last_seq_after_a_reconnect() {
     let (listener, auth) = listen().await;
     let (session, mut events) = Session::start(auth, config()).unwrap();
-    session.subscribe("h", 2);
-    let record = |seq| CommitRecord {
+    session.subscribe(Resume {
+        history_id: "h".into(),
+        since_seq: 2,
+        ..Default::default()
+    });
+    let record = |seq: u64| CommitRecord {
         seq,
+        commit_id: format!("c{seq}"),
+        committed_at_ms: seq as i64 * 10,
         ..Default::default()
     };
     let server = tokio::spawn(async move {
@@ -474,7 +480,8 @@ async fn the_stream_resumes_from_the_last_seq_after_a_reconnect() {
             recv(&mut ws).await,
             client_message::Msg::Resume(Resume {
                 history_id: "h".into(),
-                since_seq: 2
+                since_seq: 2,
+                ..Default::default()
             })
         );
         push(
@@ -486,7 +493,10 @@ async fn the_stream_resumes_from_the_last_seq_after_a_reconnect() {
         .await;
         push(
             &mut ws,
-            server_message::Msg::CaughtUp(CaughtUp { head_seq: 4 }),
+            server_message::Msg::CaughtUp(CaughtUp {
+                head_seq: 4,
+                ..Default::default()
+            }),
         )
         .await;
         drop(ws);
@@ -495,7 +505,9 @@ async fn the_stream_resumes_from_the_last_seq_after_a_reconnect() {
             recv(&mut ws).await,
             client_message::Msg::Resume(Resume {
                 history_id: "h".into(),
-                since_seq: 4
+                since_seq: 4,
+                since_commit_id: "c4".into(),
+                since_committed_at_ms: 40,
             })
         );
         push(
@@ -521,7 +533,10 @@ async fn the_stream_resumes_from_the_last_seq_after_a_reconnect() {
 async fn a_welcome_with_a_protocol_not_offered_stops_before_anything_is_sent() {
     let (listener, auth) = listen().await;
     let (session, mut events) = Session::start(auth, config()).unwrap();
-    session.subscribe("h", 0);
+    session.subscribe(Resume {
+        history_id: "h".into(),
+        ..Default::default()
+    });
     let server = tokio::spawn(async move {
         let mut ws = accept(
             &listener,

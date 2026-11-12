@@ -14,7 +14,8 @@ use koidrive_engine::tree::{Kind, LocalNode, Tree};
 use koidrive_fs::{EntryKind, Marker, RootProblem, write_marker};
 use koidrive_net::Committed;
 use koidrive_proto::v1::{
-    ListTrash, ListTree, ListVersions, Op, PrepareUpload, Resume, ResyncRequired, chunk_plan, op,
+    CaughtUp, ListTrash, ListTree, ListVersions, Op, PrepareUpload, Resume, ResyncRequired,
+    chunk_plan, op,
 };
 use koidrive_sim::space::{Role, Session as Caller, SpaceDo};
 
@@ -297,11 +298,7 @@ impl Device {
 
     /// What the session delivers after a `Resume`: the log after `since_seq`, with this device's own commits as
     /// their results, then `CaughtUp`.
-    fn resume(&mut self, remote: &Remote, history_id: String, since_seq: u64) -> Result<(), Stop> {
-        let resume = Resume {
-            history_id,
-            since_seq,
-        };
+    fn resume(&mut self, remote: &Remote, resume: Resume) -> Result<(), Stop> {
         let records = match remote.space.resume(&resume) {
             Ok(records) => records,
             Err(resync) => return self.event(Event::ResyncRequired(resync)),
@@ -318,7 +315,13 @@ impl Device {
             self.event(event)?;
         }
         let head_seq = remote.space.head_seq();
-        self.event(Event::CaughtUp { head_seq })
+        let (head_commit_id, head_committed_at_ms) =
+            remote.space.token_at(head_seq).unwrap_or_default();
+        self.event(Event::CaughtUp(CaughtUp {
+            head_seq,
+            head_commit_id,
+            head_committed_at_ms,
+        }))
     }
 
     /// What a live session pushes: everything after the cursor.
@@ -329,17 +332,19 @@ impl Device {
             .cursor
             .clone()
             .expect("R follows the log");
-        self.resume(remote, cursor.history_id, cursor.last_seq)
-            .unwrap();
+        let resume = Resume {
+            since_seq: cursor.last_seq,
+            since_commit_id: cursor.commit_id,
+            since_committed_at_ms: cursor.committed_at_ms,
+            history_id: cursor.history_id,
+        };
+        self.resume(remote, resume).unwrap();
     }
 
     /// Runs one piece of work and feeds its result back.
     fn perform(&mut self, work: Work, remote: &mut Remote) -> Result<(), Stop> {
         let step = match work {
-            Work::Subscribe {
-                history_id,
-                since_seq,
-            } => return self.resume(remote, history_id, since_seq),
+            Work::Subscribe(since) => return self.resume(remote, since),
             Work::List { trash } | Work::ListAfter(_, Listing { trash, .. }) => {
                 let trash = match trash {
                     true => remote.trash_pages(TREE_PAGE),
@@ -968,6 +973,38 @@ fn a_commit_result_is_acknowledged_once_whether_the_call_or_the_stream_brings_it
     }
 }
 
+/// RFC 0013 §6: a server from before commit tokens sends results with no time. The cursor then
+/// holds no token at the result's seq instead of a commit ID paired with time 0, which a server
+/// that checks tokens would take for another commit.
+#[test]
+fn a_result_without_a_time_leaves_the_cursor_token_unknown() {
+    for legacy in [false, true] {
+        let mut remote = Remote::new();
+        let (site, mut a) = linked(&mut remote, "legacy-result");
+        fs::write(site.root.join("notes.txt"), b"a retained commit").unwrap();
+        a.scan_until(|a| !a.work.is_empty());
+        let upload = a.work.pop_front().unwrap();
+        a.perform(upload, &mut remote).unwrap();
+        let Some(Work::Send(commit)) = a.work.pop_front() else {
+            panic!("the commit is sent after its upload");
+        };
+        let mut result = remote.commit(&a.caller, &commit).unwrap();
+        if legacy {
+            result.committed_at_ms = 0;
+        }
+        let step = a.folder.sent(Ok(result));
+        a.take(step).unwrap();
+        let cursor = site.stored().cursor.unwrap();
+        assert_eq!(cursor.last_seq, 1);
+        assert_eq!(cursor.commit_id.is_empty(), legacy);
+        let since = resume(&cursor.history_id, &cursor.base());
+        assert!(
+            remote.space.resume(&since).is_ok(),
+            "legacy={legacy}, resume={since:?}"
+        );
+    }
+}
+
 #[test]
 fn a_remote_file_becomes_one_effect_and_its_observation_changes_nothing() {
     let mut remote = Remote::new();
@@ -1303,11 +1340,12 @@ fn a_bootstrap_whose_pages_were_read_at_two_heads_replaces_r_after_the_replay() 
     b.take(step).unwrap();
     assert!(matches!(
         b.work.front(),
-        Some(Work::Subscribe { since_seq, .. }) if *since_seq == first_head
+        Some(Work::Subscribe(Resume { since_seq, .. })) if *since_seq == first_head
     ));
-    b.event(Event::CaughtUp {
+    b.event(Event::CaughtUp(CaughtUp {
         head_seq: first_head,
-    })
+        ..Default::default()
+    }))
     .unwrap();
     assert_eq!(b.state(), FolderState::Bootstrapping);
     assert_eq!(b.folder.engine.cursor, None);
@@ -4967,6 +5005,7 @@ fn the_status_names_a_node_the_server_rejected_an_op_for_and_why() {
             ..Default::default()
         }],
         changes: Vec::new(),
+        ..Default::default()
     };
     let step = a.folder.sent(Ok(result));
     a.take(step).unwrap();
@@ -5108,6 +5147,7 @@ fn the_reason_of_a_result_that_waits_for_the_log_outlasts_the_first_scan() {
             ..Default::default()
         }],
         changes: Vec::new(),
+        ..Default::default()
     };
     let step = a.folder.sent(Ok(result.clone()));
     a.take(step).unwrap();
@@ -5752,4 +5792,51 @@ fn a_question_asked_again_about_the_same_files_after_an_answer_starts_its_own_li
     assert_eq!(paths(second), paths(&first));
     assert_ne!(second.id, first.id);
     assert_eq!(second.lineage, second.id);
+}
+
+/// GUN-423: the server loses `two.txt`'s commit, and c commits `three.txt` to the restored server, so its
+/// head is back at b's cursor when b reconnects. b's Resume names the commit it saw at that seq, which the server no
+/// longer has, so b lists the tree again instead of resuming on a fork: it gets `three.txt`, and `two.txt`,
+/// which b still holds, is created again.
+#[test]
+fn a_cursor_the_restored_head_caught_up_with_lists_the_tree_again() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("one.txt"), b"one");
+    let mut restored = backup(&remote, &a);
+    a.create(&mut remote, &site_a.root.join("two.txt"), b"two");
+    let (site_b, mut b) = linked(&mut remote, "b");
+    b.settle();
+    assert_eq!(names(&site_b.root), ["one.txt", "two.txt"]);
+    let (site_c, mut c) = linked(&mut restored, "c");
+    c.create(&mut restored, &site_c.root.join("three.txt"), b"three");
+    let welcome = restored.space.welcome(&b.caller);
+    assert_eq!(
+        welcome.head_seq,
+        b.folder.engine.cursor.as_ref().unwrap().last_seq
+    );
+    b.event(Event::Disconnected {
+        reason: koidrive_net::DisconnectReason::Timeout,
+        retry_in: Duration::from_secs(1),
+    })
+    .unwrap();
+    b.event(Event::Connected(welcome)).unwrap();
+    for _ in 0..3 {
+        b.pull(&restored);
+        b.run(&mut restored);
+        b.settle();
+    }
+    c.pull(&restored);
+    c.run(&mut restored);
+    c.create(&mut restored, &site_c.root.join("four.txt"), b"four");
+    for _ in 0..2 {
+        b.pull(&restored);
+        b.run(&mut restored);
+        b.settle();
+    }
+    assert_eq!(names(&site_b.root), restored.names());
+    assert_eq!(
+        names(&site_b.root),
+        ["four.txt", "one.txt", "three.txt", "two.txt"]
+    );
 }

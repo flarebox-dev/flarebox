@@ -117,6 +117,7 @@ fn write_input(tx: &Tx<'_>, seq: u64) -> Result<(), Error> {
         history_id: "history".into(),
         last_seq: seq,
         ahead_of_server: false,
+        ..Default::default()
     })
 }
 

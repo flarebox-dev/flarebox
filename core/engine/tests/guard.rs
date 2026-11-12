@@ -121,6 +121,7 @@ fn acknowledge(commits: &mut Commits, trees: &mut Trees, seq: u64) {
             seq,
             results: vec![ok; ops],
             changes: vec![],
+            ..Default::default()
         })
         .unwrap();
     assert!(commits.acknowledge(trees, seq));

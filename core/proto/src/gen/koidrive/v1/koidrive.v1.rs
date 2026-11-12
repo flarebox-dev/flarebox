@@ -592,6 +592,12 @@ pub struct Commit {
     /// ignore it.
     #[prost(string, tag="8")]
     pub run_id: ::prost::alloc::string::String,
+    /// The commit token at base_seq (RFC 0013). Both empty when base_seq is 0 or the client does not know it. A server
+    /// that holds another commit at base_seq refuses the commit with CODE_AHEAD_OF_SERVER.
+    #[prost(string, tag="9")]
+    pub base_commit_id: ::prost::alloc::string::String,
+    #[prost(int64, tag="10")]
+    pub base_committed_at_ms: i64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OpResult {
@@ -658,6 +664,9 @@ pub struct CommitResult {
     pub results: ::prost::alloc::vec::Vec<OpResult>,
     #[prost(message, repeated, tag="3")]
     pub changes: ::prost::alloc::vec::Vec<ChangeRecord>,
+    /// When the server applied the commit at seq: with the commit's commit_id, the commit token at seq (RFC 0013).
+    #[prost(int64, tag="4")]
+    pub committed_at_ms: i64,
 }
 /// The first record of every R2 export file (spec v0 section 11, RFC 0004).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -929,6 +938,11 @@ pub struct TreePage {
     /// head_seq when this page was read.
     #[prost(uint64, tag="3")]
     pub head_seq: u64,
+    /// The commit token at head_seq (RFC 0013). Empty at seq 0.
+    #[prost(string, tag="4")]
+    pub head_commit_id: ::prost::alloc::string::String,
+    #[prost(int64, tag="5")]
+    pub head_committed_at_ms: i64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListTrash {
@@ -1043,6 +1057,13 @@ pub struct Resume {
     /// The last seq the client applied completely.
     #[prost(uint64, tag="2")]
     pub since_seq: u64,
+    /// The commit token at since_seq: the commit_id and committed_at_ms of the commit the client applied there (RFC
+    /// 0013). Both empty at seq 0 or when the client does not know it. A server that holds another commit at since_seq
+    /// answers ResyncRequired with REASON_AHEAD_OF_SERVER.
+    #[prost(string, tag="3")]
+    pub since_commit_id: ::prost::alloc::string::String,
+    #[prost(int64, tag="4")]
+    pub since_committed_at_ms: i64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Changes {
@@ -1050,10 +1071,15 @@ pub struct Changes {
     pub commits: ::prost::alloc::vec::Vec<CommitRecord>,
 }
 /// Sent once the backlog after a Resume is delivered; live pushes follow.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CaughtUp {
     #[prost(uint64, tag="1")]
     pub head_seq: u64,
+    /// The commit token at head_seq (RFC 0013). Empty at seq 0.
+    #[prost(string, tag="2")]
+    pub head_commit_id: ::prost::alloc::string::String,
+    #[prost(int64, tag="3")]
+    pub head_committed_at_ms: i64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RpcRequest {

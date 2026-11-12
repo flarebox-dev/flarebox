@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use koidrive_engine::classify::Trees;
-use koidrive_engine::commit::Commits;
+use koidrive_engine::commit::{Base, Commits};
 use koidrive_engine::effects::Effects;
 use koidrive_engine::ids::IdGen;
 use koidrive_engine::tree::{Kind, LocalNode, NodeId, RemoteNode, Shape};
@@ -25,8 +25,8 @@ pub struct Engine {
     pub commits: Commits,
     pub effects: Effects,
     pub ids: IdGen,
-    /// The highest seq up to which R holds every record.
-    pub last_seq: u64,
+    /// The highest seq up to which R holds every record, with the commit token there (RFC 0013).
+    pub cursor: Base,
     /// The server lost commits that R holds, so R waits for a listing of the server's tree and
     /// nothing is planned until it comes (section 4.4).
     pub behind: bool,
@@ -39,7 +39,7 @@ impl Engine {
             commits: Commits::default(),
             effects: Effects::default(),
             ids: IdGen::new(seed),
-            last_seq: 0,
+            cursor: Base::default(),
             behind: false,
         }
     }
@@ -68,7 +68,7 @@ impl Engine {
             commits,
             effects: Effects::from_state(self.effects.state()).map_err(refused)?,
             ids: IdGen::new(self.ids.state),
-            last_seq: self.last_seq,
+            cursor: self.cursor.clone(),
             behind: self.behind,
         };
         if loaded != *self {
@@ -174,8 +174,9 @@ pub enum Message {
         request: u64,
         result: Result<CommitResult, Error>,
     },
-    /// The server's tree and trash at `head`, listed for a device whose R the server is behind.
-    Listing { nodes: Vec<NodeState>, head: u64 },
+    /// The server's tree and trash at `head`, with the commit token there, listed for a device
+    /// whose R the server is behind.
+    Listing { nodes: Vec<NodeState>, head: Base },
 }
 
 /// A connection. Breaking it loses every message still on its way.

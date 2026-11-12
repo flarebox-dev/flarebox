@@ -711,6 +711,7 @@ fn a_discard_whose_s_update_waits_stays_after_a_server_loss() {
         seq: 2,
         results: vec![applied],
         changes: vec![],
+        ..Default::default()
     };
     commits.received(result).unwrap();
     assert!(commits.acknowledge(&mut trees, 2));

@@ -5,15 +5,31 @@
 
 use std::collections::BTreeMap;
 
-use koidrive_proto::v1::{CommitRecord, Resume, ResyncRequired};
+use koidrive_proto::v1::{CaughtUp, CommitRecord, Resume, ResyncRequired};
 
 use crate::event::{Committed, Event};
 
-/// The last seq passed on, in its history.
+/// The last seq passed on, in its history, with the commit token there (RFC 0013). The token always moves with the
+/// seq, so a `Resume` never names a token at another seq.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Cursor {
     pub history_id: String,
     pub seq: u64,
+    pub commit_id: String,
+    pub committed_at_ms: i64,
+}
+
+impl Cursor {
+    /// Moves to `seq` with its commit token. A token with no time is unknown, as in the result of a server from before
+    /// RFC 0013, so the cursor then holds none and may take the head's from a `CaughtUp`.
+    fn advance(&mut self, seq: u64, commit_id: &str, committed_at_ms: i64) {
+        self.seq = seq;
+        self.commit_id = match committed_at_ms {
+            0 => String::new(),
+            _ => commit_id.to_owned(),
+        };
+        self.committed_at_ms = committed_at_ms;
+    }
 }
 
 #[derive(Debug, Default)]
@@ -42,11 +58,13 @@ impl Fed {
 }
 
 impl Stream {
-    /// Starts the stream after `since_seq`, the last seq the driver applied completely.
-    pub fn subscribe(&mut self, history_id: String, since_seq: u64) -> Resume {
+    /// Starts the stream after `since_seq`, the last seq the driver applied completely, with its commit token.
+    pub fn subscribe(&mut self, since: Resume) -> Resume {
         self.cursor = Some(Cursor {
-            history_id,
-            seq: since_seq,
+            history_id: since.history_id,
+            seq: since.since_seq,
+            commit_id: since.since_commit_id,
+            committed_at_ms: since.since_committed_at_ms,
         });
         self.held.clear();
         self.resuming = true;
@@ -76,7 +94,7 @@ impl Stream {
                 self.gap(&mut fed);
                 break;
             }
-            cursor.seq = record.seq;
+            cursor.advance(record.seq, &record.commit_id, record.committed_at_ms);
             fed.record(record);
             self.release(&mut fed);
         }
@@ -89,7 +107,10 @@ impl Stream {
         match &mut self.cursor {
             None => fed.events.push(Event::Committed(committed)),
             Some(cursor) if seq <= cursor.seq + 1 => {
-                cursor.seq = cursor.seq.max(seq);
+                if seq == cursor.seq + 1 {
+                    let at = committed.result.committed_at_ms;
+                    cursor.advance(seq, &committed.commit_id, at);
+                }
                 fed.events.push(Event::Committed(committed));
                 self.release(&mut fed);
             }
@@ -101,12 +122,20 @@ impl Stream {
         fed
     }
 
-    pub fn caught_up(&mut self, head_seq: u64) -> Fed {
+    /// The backlog is delivered. A cursor at the head with no token takes the head's.
+    pub fn caught_up(&mut self, caught_up: CaughtUp) -> Fed {
         let mut fed = Fed::default();
         self.resuming = false;
-        match &self.cursor {
-            Some(cursor) if cursor.seq < head_seq => self.gap(&mut fed),
-            _ => fed.events.push(Event::CaughtUp { head_seq }),
+        match &mut self.cursor {
+            Some(cursor) if cursor.seq < caught_up.head_seq => self.gap(&mut fed),
+            Some(cursor) => {
+                if cursor.seq == caught_up.head_seq && cursor.commit_id.is_empty() {
+                    let (id, at) = (&caught_up.head_commit_id, caught_up.head_committed_at_ms);
+                    cursor.advance(caught_up.head_seq, id, at);
+                }
+                fed.events.push(Event::CaughtUp(caught_up));
+            }
+            None => fed.events.push(Event::CaughtUp(caught_up)),
         }
         fed
     }
@@ -132,7 +161,10 @@ impl Stream {
                 break;
             }
             let committed = entry.remove();
-            cursor.seq = cursor.seq.max(committed.result.seq);
+            if committed.result.seq == cursor.seq + 1 {
+                let at = committed.result.committed_at_ms;
+                cursor.advance(committed.result.seq, &committed.commit_id, at);
+            }
             fed.events.push(Event::Committed(committed));
         }
     }
@@ -149,6 +181,8 @@ impl Stream {
         Some(Resume {
             history_id: cursor.history_id.clone(),
             since_seq: cursor.seq,
+            since_commit_id: cursor.commit_id.clone(),
+            since_committed_at_ms: cursor.committed_at_ms,
         })
     }
 }
@@ -163,7 +197,26 @@ mod tests {
         CommitRecord {
             seq,
             commit_id: format!("c{seq}"),
+            committed_at_ms: seq as i64 * 10,
             ..Default::default()
+        }
+    }
+
+    /// A `Resume` after `seq`, with the token of `record(seq)`.
+    fn since(seq: u64) -> Resume {
+        Resume {
+            history_id: "h".into(),
+            since_seq: seq,
+            since_commit_id: format!("c{seq}"),
+            since_committed_at_ms: seq as i64 * 10,
+        }
+    }
+
+    fn head(seq: u64) -> CaughtUp {
+        CaughtUp {
+            head_seq: seq,
+            head_commit_id: format!("c{seq}"),
+            head_committed_at_ms: seq as i64 * 10,
         }
     }
 
@@ -172,6 +225,7 @@ mod tests {
             commit_id: format!("own{seq}"),
             result: CommitResult {
                 seq,
+                committed_at_ms: seq as i64 * 10,
                 ..Default::default()
             },
         }
@@ -183,28 +237,22 @@ mod tests {
             .flat_map(|event| match event {
                 Event::Changes(records) => records.iter().map(|r| format!("r{}", r.seq)).collect(),
                 Event::Committed(c) => vec![format!("own{}", c.result.seq)],
-                Event::CaughtUp { head_seq } => vec![format!("caught_up{head_seq}")],
+                Event::CaughtUp(c) => vec![format!("caught_up{}", c.head_seq)],
                 other => vec![format!("{other:?}")],
             })
             .collect()
     }
 
-    fn subscribed(since: u64) -> Stream {
+    fn subscribed(seq: u64) -> Stream {
         let mut stream = Stream::default();
-        stream.subscribe("h".into(), since);
+        stream.subscribe(since(seq));
         stream
     }
 
     #[test]
     fn subscribe_resumes_from_the_given_seq() {
         let mut stream = Stream::default();
-        assert_eq!(
-            stream.subscribe("h".into(), 7),
-            Resume {
-                history_id: "h".into(),
-                since_seq: 7
-            }
-        );
+        assert_eq!(stream.subscribe(since(7)), since(7));
     }
 
     #[test]
@@ -219,16 +267,10 @@ mod tests {
     #[test]
     fn a_gap_stops_delivery_and_asks_for_one_resume_from_the_cursor() {
         let mut stream = subscribed(2);
-        stream.caught_up(2);
+        stream.caught_up(head(2));
         let fed = stream.changes(vec![record(3), record(5), record(6)]);
         assert_eq!(seqs(&fed), ["r3"]);
-        assert_eq!(
-            fed.resume,
-            Some(Resume {
-                history_id: "h".into(),
-                since_seq: 3
-            })
-        );
+        assert_eq!(fed.resume, Some(since(3)));
         let again = stream.changes(vec![record(7)]);
         assert_eq!(
             (seqs(&again), again.resume),
@@ -244,7 +286,7 @@ mod tests {
     #[test]
     fn an_own_result_takes_its_place_between_records() {
         let mut stream = subscribed(4);
-        stream.caught_up(4);
+        stream.caught_up(head(4));
         assert_eq!(seqs(&stream.changes(vec![record(5)])), ["r5"]);
         assert_eq!(seqs(&stream.committed(committed(6))), ["own6"]);
         assert_eq!(seqs(&stream.changes(vec![record(7)])), ["r7"]);
@@ -253,23 +295,17 @@ mod tests {
     #[test]
     fn a_result_ahead_of_missing_seqs_is_held_until_they_arrive() {
         let mut stream = subscribed(4);
-        stream.caught_up(4);
+        stream.caught_up(head(4));
         let fed = stream.committed(committed(7));
         assert!(fed.events.is_empty());
-        assert_eq!(
-            fed.resume,
-            Some(Resume {
-                history_id: "h".into(),
-                since_seq: 4
-            })
-        );
+        assert_eq!(fed.resume, Some(since(4)));
         let replay = stream.changes(vec![record(5), record(6), record(7), record(8)]);
         assert_eq!(
             seqs(&replay),
             ["r5", "r6", "own7", "r8"],
             "the replayed record 7 is the same commit"
         );
-        assert_eq!(seqs(&stream.caught_up(8)), ["caught_up8"]);
+        assert_eq!(seqs(&stream.caught_up(head(8))), ["caught_up8"]);
     }
 
     #[test]
@@ -287,15 +323,9 @@ mod tests {
     #[test]
     fn caught_up_below_the_head_resumes_instead_of_reporting() {
         let mut stream = subscribed(4);
-        let fed = stream.caught_up(6);
+        let fed = stream.caught_up(head(6));
         assert!(fed.events.is_empty());
-        assert_eq!(
-            fed.resume,
-            Some(Resume {
-                history_id: "h".into(),
-                since_seq: 4
-            })
-        );
+        assert_eq!(fed.resume, Some(since(4)));
     }
 
     #[test]
@@ -326,19 +356,13 @@ mod tests {
     fn a_reconnect_resumes_from_the_last_seq_passed_on() {
         let mut stream = subscribed(1);
         stream.changes(vec![record(2), record(3)]);
-        assert_eq!(
-            stream.reconnected(),
-            Some(Resume {
-                history_id: "h".into(),
-                since_seq: 3
-            })
-        );
+        assert_eq!(stream.reconnected(), Some(since(3)));
     }
 
     #[test]
     fn a_reconnect_drops_results_held_from_the_previous_connection() {
         let mut stream = subscribed(1);
-        stream.caught_up(1);
+        stream.caught_up(head(1));
         assert!(stream.committed(committed(3)).events.is_empty());
         stream.reconnected();
         assert_eq!(
@@ -346,6 +370,68 @@ mod tests {
             ["r2"],
             "a restored server's record 2 does not release the old connection's result 3"
         );
-        assert_eq!(seqs(&stream.caught_up(2)), ["caught_up2"]);
+        assert_eq!(seqs(&stream.caught_up(head(2))), ["caught_up2"]);
+    }
+
+    #[test]
+    fn the_token_moves_with_records_and_own_results() {
+        let mut stream = subscribed(4);
+        stream.caught_up(head(4));
+        stream.committed(committed(5));
+        assert_eq!(
+            stream.reconnected(),
+            Some(Resume {
+                since_commit_id: "own5".into(),
+                ..since(5)
+            })
+        );
+        stream.changes(vec![record(5), record(6)]);
+        assert_eq!(stream.reconnected(), Some(since(6)));
+    }
+
+    #[test]
+    fn caught_up_at_the_cursor_gives_a_missing_token_and_keeps_a_known_one() {
+        let mut stream = Stream::default();
+        stream.subscribe(Resume {
+            history_id: "h".into(),
+            since_seq: 4,
+            ..Default::default()
+        });
+        assert_eq!(seqs(&stream.caught_up(head(4))), ["caught_up4"]);
+        assert_eq!(stream.reconnected(), Some(since(4)));
+        let other = CaughtUp {
+            head_commit_id: "other".into(),
+            ..head(4)
+        };
+        stream.caught_up(other);
+        assert_eq!(stream.reconnected(), Some(since(4)));
+    }
+    /// A result with no time, from a server before RFC 0013, leaves the token unknown, and the next
+    /// `CaughtUp` at that seq supplies it, also for a result held until the records before it came.
+    #[test]
+    fn a_result_without_a_time_takes_its_token_from_caught_up() {
+        for held in [false, true] {
+            let mut stream = subscribed(4);
+            stream.caught_up(head(4));
+            let seq = if held { 7 } else { 5 };
+            let mut own = committed(seq);
+            own.result.committed_at_ms = 0;
+            stream.committed(own);
+            if held {
+                stream.changes(vec![record(5), record(6)]);
+            }
+            stream.caught_up(CaughtUp {
+                head_commit_id: format!("own{seq}"),
+                ..head(seq)
+            });
+            assert_eq!(
+                stream.reconnected(),
+                Some(Resume {
+                    since_commit_id: format!("own{seq}"),
+                    ..since(seq)
+                }),
+                "held={held}"
+            );
+        }
     }
 }

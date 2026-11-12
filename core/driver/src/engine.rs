@@ -13,7 +13,7 @@ use std::hash::BuildHasher;
 use std::path::{Component, Path, PathBuf};
 
 use koidrive_engine::classify::Trees;
-use koidrive_engine::commit::Commits;
+use koidrive_engine::commit::{Base, Commits};
 use koidrive_engine::effects::Effects;
 use koidrive_engine::ids::IdGen;
 use koidrive_engine::question as engine;
@@ -22,7 +22,7 @@ use koidrive_engine::tree::{
 };
 use koidrive_fs::{Entry, EntryKind, FileId, Known, Snapshot};
 use koidrive_proto::v1::{
-    ChangeRecord, CommitRecord, NodeKind, NodeState, TrashPage, TreePage, change_record,
+    CaughtUp, ChangeRecord, CommitRecord, NodeKind, NodeState, TrashPage, TreePage, change_record,
 };
 use koidrive_store::{Cursor, EngineState, Error, StoredQuestion, SyncedNode, Tx};
 
@@ -295,23 +295,25 @@ impl Engine {
             if record.seq != cursor.last_seq + 1 {
                 return Ok(Applied::Gap);
             }
-            self.apply_commit(tx, record.seq, &record.changes)?;
+            self.apply_commit(tx, record_base(record), &record.changes)?;
         }
         Ok(Applied::Through)
     }
 
-    /// Applies the changes of commit `seq`, the one after the cursor: each node takes its state after the commit,
-    /// the cursor moves to `seq`, and a commit result R has now reached is acknowledged. A change of a kind this
+    /// Applies the changes of commit `at`, the one after the cursor: each node takes its state after the commit,
+    /// the cursor moves to `at` with its commit token (RFC 0013), and a commit result R has now reached is
+    /// acknowledged. A change of a kind this
     /// build does not know stops the task before anything of the commit is applied (spec v0 section 9.1).
     pub fn apply_commit(
         &mut self,
         tx: &Tx<'_>,
-        seq: u64,
+        at: Base,
         changes: &[ChangeRecord],
     ) -> Result<(), Stop> {
         if changes.iter().any(|change| change.change.is_none()) {
             return Err(Stop::Protocol(format!(
-                "commit {seq} holds a kind of change this build does not know; update Koidrive"
+                "commit {} holds a kind of change this build does not know; update Koidrive",
+                at.seq
             )));
         }
         let Some(cursor) = &mut self.cursor else {
@@ -336,9 +338,29 @@ impl Engine {
                 }
             }
         }
-        cursor.last_seq = seq;
+        cursor.last_seq = at.seq;
+        cursor.commit_id = at.commit_id;
+        cursor.committed_at_ms = at.committed_at_ms;
         tx.set_cursor(cursor)?;
-        self.commits.acknowledge(&mut self.trees, seq);
+        self.commits.acknowledge(&mut self.trees, at.seq);
+        Ok(())
+    }
+
+    /// Takes the commit token at the cursor from a `CaughtUp` at the cursor's seq when the cursor holds none, as one
+    /// stored before tokens (RFC 0013). A cursor the server is behind keeps waiting for its listing.
+    pub fn caught_up(&mut self, tx: &Tx<'_>, caught_up: &CaughtUp) -> Result<(), Stop> {
+        let Some(cursor) = &mut self.cursor else {
+            return Ok(());
+        };
+        if cursor.commit_id.is_empty()
+            && !cursor.ahead_of_server
+            && cursor.last_seq > 0
+            && cursor.last_seq == caught_up.head_seq
+        {
+            cursor.commit_id.clone_from(&caught_up.head_commit_id);
+            cursor.committed_at_ms = caught_up.head_committed_at_ms;
+            tx.set_cursor(cursor)?;
+        }
         Ok(())
     }
 
@@ -404,7 +426,9 @@ impl Engine {
         }
         let cursor = Cursor {
             history_id: staging.history_id,
-            last_seq: staging.last_seq,
+            last_seq: staging.last.seq,
+            commit_id: staging.last.commit_id,
+            committed_at_ms: staging.last.committed_at_ms,
             ahead_of_server: false,
         };
         tx.set_cursor(&cursor)?;
@@ -1065,13 +1089,22 @@ fn remote_node(state: &NodeState) -> Result<(NodeId, RemoteNode), Stop> {
     })
 }
 
+/// The seq of a commit of the log with its commit token (RFC 0013).
+fn record_base(record: &CommitRecord) -> Base {
+    Base {
+        seq: record.seq,
+        commit_id: record.commit_id.clone(),
+        committed_at_ms: record.committed_at_ms,
+    }
+}
+
 /// A bootstrap's tree while the log catches it up (design §4.4). It is kept in memory, so the store's R stays the
 /// valid tree it was until this one may replace it.
 #[derive(Debug)]
 pub(crate) struct Staging {
     history_id: String,
-    /// The first page's `head_seq`, then the seq of the last commit replayed.
-    last_seq: u64,
+    /// The first page's head, then the last commit replayed, each with its commit token (RFC 0013).
+    last: Base,
     /// The highest `head_seq` of any page.
     highest_page_seq: u64,
     /// The head of the last `CaughtUp`.
@@ -1087,7 +1120,11 @@ impl Staging {
     pub fn new(history_id: String, pages: Vec<TreePage>, trash: Vec<TrashPage>) -> Self {
         let mut staging = Staging {
             history_id,
-            last_seq: pages.first().map_or(0, |page| page.head_seq),
+            last: pages.first().map_or_else(Base::default, |page| Base {
+                seq: page.head_seq,
+                commit_id: page.head_commit_id.clone(),
+                committed_at_ms: page.head_committed_at_ms,
+            }),
             highest_page_seq: pages.iter().map(|page| page.head_seq).max().unwrap_or(0),
             caught_up: None,
             nodes: pages
@@ -1117,29 +1154,35 @@ impl Staging {
     }
 
     pub fn last_seq(&self) -> u64 {
-        self.last_seq
+        self.last.seq
+    }
+
+    /// The last commit replayed, with its commit token, to resume the log from (RFC 0013).
+    pub fn last(&self) -> &Base {
+        &self.last
     }
 
     /// Replays commits of the log in seq order. A node state replaces the listed node only when it is newer, since a
     /// page read later can already hold the result of a commit replayed now.
     pub fn replay(&mut self, records: &[CommitRecord]) -> Result<Applied, Stop> {
         for record in records {
-            if record.seq <= self.last_seq {
+            if record.seq <= self.last.seq {
                 continue;
             }
-            if record.seq != self.last_seq + 1 {
+            if record.seq != self.last.seq + 1 {
                 return Ok(Applied::Gap);
             }
-            self.replay_commit(record.seq, &record.changes)?;
+            self.replay_commit(record_base(record), &record.changes)?;
         }
         Ok(Applied::Through)
     }
 
-    /// Replays commit `seq`, the one after the last replayed.
-    pub fn replay_commit(&mut self, seq: u64, changes: &[ChangeRecord]) -> Result<(), Stop> {
+    /// Replays commit `at`, the one after the last replayed.
+    pub fn replay_commit(&mut self, at: Base, changes: &[ChangeRecord]) -> Result<(), Stop> {
         if changes.iter().any(|change| change.change.is_none()) {
             return Err(Stop::Protocol(format!(
-                "commit {seq} holds a kind of change this build does not know; update Koidrive"
+                "commit {} holds a kind of change this build does not know; update Koidrive",
+                at.seq
             )));
         }
         for change in changes {
@@ -1152,7 +1195,7 @@ impl Staging {
                 }
             }
         }
-        self.last_seq = seq;
+        self.last = at;
         Ok(())
     }
 
@@ -1164,8 +1207,8 @@ impl Staging {
     /// True once the tree may replace R: the replay has reached the highest `head_seq` of any page and the head
     /// of the last `CaughtUp`.
     pub fn ready(&self) -> bool {
-        self.last_seq >= self.highest_page_seq
-            && self.caught_up.is_some_and(|head| self.last_seq >= head)
+        self.last.seq >= self.highest_page_seq
+            && self.caught_up.is_some_and(|head| self.last.seq >= head)
     }
 }
 
@@ -1238,7 +1281,7 @@ mod tests {
         Cursor {
             history_id: "h".into(),
             last_seq: seq,
-            ahead_of_server: false,
+            ..Default::default()
         }
     }
 
@@ -1297,6 +1340,74 @@ mod tests {
                 assert_eq!(names(tx, &engine), ["a2", "c"]);
                 assert_eq!(tx.cursor()?, Some(cursor(6)));
                 assert_eq!(engine.cursor, Some(cursor(6)));
+                Ok::<_, Stop>(())
+            })
+            .unwrap();
+    }
+
+    /// The cursor takes the commit token of each record it moves to, and a listing's from its first page (RFC 0013).
+    #[test]
+    fn the_cursor_carries_the_token_of_the_commit_it_stands_at() {
+        let (_dir, mut store) = store();
+        store
+            .transaction(|tx| {
+                let mut engine = Engine::load(tx, ROOT)?;
+                let page = TreePage {
+                    head_seq: 3,
+                    head_commit_id: "c3".into(),
+                    head_committed_at_ms: 30,
+                    ..Default::default()
+                };
+                engine.replace_remote(tx, Staging::new("h".into(), vec![page], Vec::new()))?;
+                assert_eq!(
+                    tx.cursor()?.unwrap().base(),
+                    koidrive_engine::commit::Base {
+                        seq: 3,
+                        commit_id: "c3".into(),
+                        committed_at_ms: 30,
+                    }
+                );
+                let next = CommitRecord {
+                    commit_id: "c4".into(),
+                    committed_at_ms: 40,
+                    ..record(4, vec![change_record::Change::Node(node("a", "a"))])
+                };
+                engine.apply_records(tx, &[next])?;
+                let at = koidrive_engine::commit::Base {
+                    seq: 4,
+                    commit_id: "c4".into(),
+                    committed_at_ms: 40,
+                };
+                assert_eq!(tx.cursor()?.unwrap().base(), at);
+                assert_eq!(engine.cursor.as_ref().unwrap().base(), at);
+                Ok::<_, Stop>(())
+            })
+            .unwrap();
+    }
+
+    /// A cursor stored before tokens takes the token of a `CaughtUp` at its seq, and only there (RFC 0013).
+    #[test]
+    fn a_cursor_without_a_token_takes_the_one_caught_up_at_its_seq() {
+        let (_dir, mut store) = store();
+        store
+            .transaction(|tx| {
+                let mut engine = Engine::load(tx, ROOT)?;
+                engine.replace_remote(tx, listed(4, Vec::new()))?;
+                let head = |head_seq| CaughtUp {
+                    head_seq,
+                    head_commit_id: format!("c{head_seq}"),
+                    head_committed_at_ms: 10 * head_seq as i64,
+                };
+                engine.caught_up(tx, &head(5))?;
+                assert_eq!(tx.cursor()?, Some(cursor(4)));
+                engine.caught_up(tx, &head(4))?;
+                let learned = Cursor {
+                    commit_id: "c4".into(),
+                    committed_at_ms: 40,
+                    ..cursor(4)
+                };
+                assert_eq!(tx.cursor()?, Some(learned.clone()));
+                assert_eq!(engine.cursor, Some(learned));
                 Ok::<_, Stop>(())
             })
             .unwrap();

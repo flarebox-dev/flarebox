@@ -34,6 +34,25 @@ pub const MAX_COMMIT_BYTES: usize = 512 * 1024;
 /// and framing.
 const RECORD_BYTES: usize = 256;
 
+/// The seq a commit builds on and the commit token there (RFC 0013): the `commit_id` and
+/// `committed_at_ms` of the commit R applied at that seq. An empty token claims nothing, so a
+/// server checks only the seq.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Base {
+    pub seq: u64,
+    pub commit_id: String,
+    pub committed_at_ms: i64,
+}
+
+impl From<u64> for Base {
+    fn from(seq: u64) -> Self {
+        Self {
+            seq,
+            ..Self::default()
+        }
+    }
+}
+
 /// The commit in flight as it is persisted before it is sent (section 2.2).
 #[derive(Clone, Debug, PartialEq)]
 pub struct InFlight {
@@ -521,8 +540,9 @@ impl Commits {
     /// Builds the next commit from local changes, unless one is in flight or committing has
     /// stopped. While committing has stopped it still makes the waiting S updates that fit (see
     /// [`Trees::waiting`]), so the effects plan their nodes again as downloads go on. The caller
-    /// builds only when connected and caught up, with `base_seq` the `last_seq` of R and
-    /// `history_id` the history R belongs to.
+    /// builds only when connected and caught up, with `base` the `last_seq` of R and its commit
+    /// token, and `history_id` the history R belongs to. A resend keeps the token, so a server that
+    /// lost the commit at `base_seq` refuses it (RFC 0013).
     ///
     /// Concurrent changes are rebased onto R first (section 2.4): a file whose content changed
     /// differently on both sides is forked, its local version becoming a new node that is created
@@ -568,8 +588,9 @@ impl Commits {
         ids: &mut IdGen,
         now_ms: u64,
         history_id: &str,
-        base_seq: u64,
+        base: impl Into<Base>,
     ) -> Option<&proto::Commit> {
+        let base = base.into();
         if self.in_flight.is_some() {
             return None;
         }
@@ -655,7 +676,9 @@ impl Commits {
         self.in_flight = Some(InFlight {
             commit: proto::Commit {
                 commit_id: ids.uuid_v7(now_ms),
-                base_seq,
+                base_seq: base.seq,
+                base_commit_id: base.commit_id,
+                base_committed_at_ms: base.committed_at_ms,
                 ops,
                 history_id: history_id.to_owned(),
                 device_seq: self.accepted + 1,

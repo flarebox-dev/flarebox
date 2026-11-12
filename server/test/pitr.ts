@@ -8,7 +8,7 @@ import { type Pitr, pitrBackend } from "../src/space/pitr";
 
 type Row = Record<string, SqlStorageValue>;
 
-interface Dump {
+export interface Dump {
   schema: { type: string; sql: string }[];
   rows: Map<string, Row[]>;
 }
@@ -43,7 +43,7 @@ function copy(row: Row): Row {
   return Object.fromEntries(Object.entries(row).map(([key, value]) => [key, value instanceof ArrayBuffer ? value.slice(0) : value]));
 }
 
-function dump(sql: SqlStorage): Dump {
+export function dump(sql: SqlStorage): Dump {
   const schema = userTables(sql);
   const rows = new Map<string, Row[]>();
   for (const { type, name } of schema) {
@@ -52,7 +52,7 @@ function dump(sql: SqlStorage): Dump {
   return { schema: schema.map(({ type, sql }) => ({ type, sql })), rows };
 }
 
-function load(sql: SqlStorage, from: Dump): void {
+export function load(sql: SqlStorage, from: Dump): void {
   for (const { type, name } of userTables(sql)) if (type === "table") sql.exec(`DROP TABLE "${name}"`);
   for (const { type, sql: create } of from.schema) if (type === "table") sql.exec(create);
   for (const [name, rows] of from.rows) {

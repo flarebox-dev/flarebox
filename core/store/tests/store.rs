@@ -141,6 +141,8 @@ fn reopening_keeps_data_and_schema_version() {
         history_id: "h1".into(),
         last_seq: 7,
         ahead_of_server: true,
+        commit_id: "c7".into(),
+        committed_at_ms: 70,
     };
     Store::open(&path)
         .unwrap()
@@ -472,6 +474,7 @@ fn engine_state() -> EngineState {
                     seq: 30,
                     results: vec![applied.clone(), applied.clone(), applied],
                     changes: vec![],
+                    ..Default::default()
                 }),
             }),
             problems: nodes(["rejected"]),
@@ -999,6 +1002,8 @@ fn a_cursor_stored_before_it_could_record_a_server_behind_it_records_none() {
         history_id: "h1".into(),
         last_seq: 7,
         ahead_of_server: true,
+        commit_id: "c7".into(),
+        committed_at_ms: 70,
     };
     Store::open(&path)
         .unwrap()
@@ -1020,6 +1025,7 @@ fn a_cursor_stored_before_it_could_record_a_server_behind_it_records_none() {
     .unwrap();
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
         .unwrap();
+    drop_cursor_tokens(&conn);
     conn.pragma_update(None, "user_version", 4).unwrap();
     drop(conn);
 
@@ -1030,6 +1036,8 @@ fn a_cursor_stored_before_it_could_record_a_server_behind_it_records_none() {
         stored,
         Some(Cursor {
             ahead_of_server: false,
+            commit_id: String::new(),
+            committed_at_ms: 0,
             ..cursor
         })
     );
@@ -1061,6 +1069,7 @@ fn a_store_from_before_contents_were_watched_opens_with_nothing_watched() {
     .unwrap();
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
         .unwrap();
+    drop_cursor_tokens(&conn);
     conn.pragma_update(None, "user_version", 5).unwrap();
     drop(conn);
 
@@ -1102,6 +1111,7 @@ fn a_store_from_before_edits_were_recorded_opens_with_none_recorded() {
     .unwrap();
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
         .unwrap();
+    drop_cursor_tokens(&conn);
     conn.pragma_update(None, "user_version", 10).unwrap();
     drop(conn);
 
@@ -1137,6 +1147,7 @@ fn a_store_from_before_deletes_were_recorded_opens_with_none_recorded() {
     .unwrap();
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
         .unwrap();
+    drop_cursor_tokens(&conn);
     conn.pragma_update(None, "user_version", 6).unwrap();
     drop(conn);
 
@@ -1179,6 +1190,7 @@ fn a_store_from_before_the_guard_opens_with_an_empty_guard() {
     .unwrap();
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
         .unwrap();
+    drop_cursor_tokens(&conn);
     conn.pragma_update(None, "user_version", 7).unwrap();
     drop(conn);
 
@@ -1227,6 +1239,7 @@ fn a_store_from_before_questions_showed_local_shapes_keeps_its_questions() {
     .unwrap();
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
         .unwrap();
+    drop_cursor_tokens(&conn);
     conn.pragma_update(None, "user_version", 8).unwrap();
     drop(conn);
 
@@ -1259,6 +1272,7 @@ fn a_store_from_before_nodes_in_ignored_folders_were_stored_opens_with_none_reco
     .unwrap();
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
         .unwrap();
+    drop_cursor_tokens(&conn);
     conn.pragma_update(None, "user_version", 9).unwrap();
     drop(conn);
 
@@ -1296,6 +1310,7 @@ fn a_store_from_before_remote_removals_were_counted_opens_with_none_counted() {
         .unwrap();
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
         .unwrap();
+    drop_cursor_tokens(&conn);
     conn.pragma_update(None, "user_version", 11).unwrap();
     drop(conn);
 
@@ -1323,6 +1338,7 @@ fn a_store_from_before_positions_were_watched_opens_with_none_watched() {
     conn.execute_batch("DROP TABLE watched_positions;").unwrap();
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
         .unwrap();
+    drop_cursor_tokens(&conn);
     conn.pragma_update(None, "user_version", 12).unwrap();
     drop(conn);
 
@@ -1396,12 +1412,57 @@ fn a_store_from_before_waiting_updates_kept_their_origin_takes_the_accepted_slot
          ALTER TABLE watched_positions DROP COLUMN name;",
     )
     .unwrap();
+    drop_cursor_tokens(&conn);
     conn.pragma_update(None, "user_version", 13).unwrap();
     drop(conn);
 
     let mut store = Store::open(&path).unwrap();
     assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
+}
+
+/// Takes the cursor back to the schema before commit tokens (RFC 0013).
+fn drop_cursor_tokens(conn: &Connection) {
+    conn.execute_batch(
+        "ALTER TABLE remote_cursor DROP COLUMN commit_id;
+         ALTER TABLE remote_cursor DROP COLUMN committed_at_ms;",
+    )
+    .unwrap();
+}
+
+/// A database of the schema before commit tokens keeps its cursor, with no token at its seq, so its next Resume
+/// claims none (RFC 0013).
+#[test]
+fn a_cursor_stored_before_commit_tokens_opens_with_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let cursor = Cursor {
+        history_id: "h1".into(),
+        last_seq: 7,
+        ahead_of_server: false,
+        commit_id: "c7".into(),
+        committed_at_ms: 70,
+    };
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| tx.set_cursor(&cursor))
+        .unwrap();
+    let conn = Connection::open(&path).unwrap();
+    drop_cursor_tokens(&conn);
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+        .unwrap();
+    drop(conn);
+
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(
+        store.transaction(|tx| tx.cursor()).unwrap(),
+        Some(Cursor {
+            commit_id: String::new(),
+            committed_at_ms: 0,
+            ..cursor
+        })
+    );
 }
 
 /// A database of schema 14, which kept only the revision of a watched position, takes the position
@@ -1437,6 +1498,7 @@ fn a_store_from_before_watched_positions_were_kept_takes_them_from_s() {
          ALTER TABLE watched_positions DROP COLUMN name;",
     )
     .unwrap();
+    drop_cursor_tokens(&conn);
     conn.pragma_update(None, "user_version", 14).unwrap();
     drop(conn);
 
@@ -1487,6 +1549,7 @@ fn a_version_3_store_opens_with_empty_restore_tables() {
     .unwrap();
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
         .unwrap();
+    drop_cursor_tokens(&conn);
     conn.pragma_update(None, "user_version", 3).unwrap();
     drop(conn);
 
@@ -1570,6 +1633,7 @@ fn failed_transaction_rolls_back() {
             history_id: "h1".into(),
             last_seq: 1,
             ahead_of_server: false,
+            ..Default::default()
         })?;
         Err(Error::SchemaTooNew {
             found: 0,

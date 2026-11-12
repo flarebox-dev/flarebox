@@ -53,7 +53,7 @@ pub mod disk;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use koidrive_engine::commit::{self, Reconnect};
+use koidrive_engine::commit::{self, Base, Reconnect};
 use koidrive_engine::effects::{Effect, EffectRecord};
 use koidrive_engine::tree::{Content, NodeId, RemoteNode, same, same_content};
 use koidrive_proto::v1::{
@@ -293,18 +293,24 @@ fn resent_over_revert(
 /// Applies the result of the commit in flight to R when it is the next commit, and acknowledges
 /// the commit once R holds its records (section 2.7).
 fn acknowledge(engine: &mut Engine) -> Result<(), Failure> {
-    let flight = engine.commits.in_flight();
-    let next = flight.and_then(|flight| flight.result.as_ref());
-    if let Some(result) = next
-        .filter(|result| result.seq == engine.last_seq + 1)
-        .cloned()
+    let next = (engine.commits.in_flight())
+        .and_then(|flight| Some((flight.commit.commit_id.clone(), flight.result.clone()?)));
+    if let Some((commit_id, result)) =
+        next.filter(|(_, result)| result.seq == engine.cursor.seq + 1)
     {
         engine.apply(&result.changes)?;
-        engine.last_seq = result.seq;
+        engine.cursor = match result.committed_at_ms {
+            0 => Base::from(result.seq),
+            committed_at_ms => Base {
+                seq: result.seq,
+                commit_id,
+                committed_at_ms,
+            },
+        };
     }
     engine
         .commits
-        .acknowledge(&mut engine.trees, engine.last_seq);
+        .acknowledge(&mut engine.trees, engine.cursor.seq);
     Ok(())
 }
 
@@ -333,9 +339,14 @@ fn trashed_under(space: &SpaceDo, write: i64, folders: &BTreeSet<&str>) -> bool 
 /// The listing a device whose R the server is behind reads in place of the log: every node of the
 /// server's tree and trash at its head (section 4.4).
 fn listing(space: &SpaceDo) -> Message {
+    let (commit_id, committed_at_ms) = space.token_at(space.head_seq()).unwrap_or_default();
     Message::Listing {
         nodes: space.nodes(),
-        head: space.head_seq(),
+        head: Base {
+            seq: space.head_seq(),
+            commit_id,
+            committed_at_ms,
+        },
     }
 }
 
@@ -825,14 +836,14 @@ impl World {
             effects,
             commits,
             ids,
-            last_seq,
+            cursor,
             ..
         } = &mut device.engine;
         let reported = match applied {
             Some(Ok(identity)) => {
                 (effects.done(trees, &record.effect_id, identity)).map(|removal| {
                     if let Some(removal) = removal {
-                        commits.count_remote(removal, trees, *last_seq, ids, NOW as u64);
+                        commits.count_remote(removal, trees, cursor.seq, ids, NOW as u64);
                     }
                 })
             }
@@ -890,7 +901,7 @@ impl World {
                 effects,
                 commits,
                 ids,
-                last_seq,
+                cursor,
                 ..
             } = &mut device.engine;
             let download = match &record.effect {
@@ -931,7 +942,7 @@ impl World {
                     );
                     (effects.done(trees, &record.effect_id, identity)).map(|removal| {
                         if let Some(removal) = removal {
-                            commits.count_remote(removal, trees, *last_seq, ids, NOW as u64);
+                            commits.count_remote(removal, trees, cursor.seq, ids, NOW as u64);
                         }
                     })
                 }
@@ -985,7 +996,9 @@ impl World {
         }
         let resume = Resume {
             history_id: self.space.history_id().to_owned(),
-            since_seq: engine.last_seq,
+            since_seq: engine.cursor.seq,
+            since_commit_id: engine.cursor.commit_id.clone(),
+            since_committed_at_ms: engine.cursor.committed_at_ms,
         };
         match self.space.resume(&resume) {
             Ok(backlog) => Ok(Message::Records(backlog)),
@@ -1065,7 +1078,7 @@ impl World {
                 let Engine {
                     trees,
                     commits,
-                    last_seq,
+                    cursor,
                     behind,
                     ..
                 } = &mut self.devices[d].engine;
@@ -1093,7 +1106,7 @@ impl World {
                     }
                 }
                 trees.forget_lost(trashed, edited, commits.held_through(), commits.accepted());
-                *last_seq = head;
+                *cursor = head;
                 *behind = false;
                 let backlog = self.resume(d)?;
                 let link = self.devices[d].link.as_mut().expect("checked above");
@@ -1102,16 +1115,20 @@ impl World {
             Message::Records(records) => {
                 for record in records {
                     let engine = &mut self.devices[d].engine;
-                    if record.seq > engine.last_seq + 1 {
+                    if record.seq > engine.cursor.seq + 1 {
                         note(&mut self.seen, "records arrive past a gap");
                         let backlog = self.resume(d)?;
                         let link = self.devices[d].link.as_mut().expect("checked above");
                         link.inbox.push(backlog);
                         break;
                     }
-                    if record.seq == engine.last_seq + 1 {
+                    if record.seq == engine.cursor.seq + 1 {
                         engine.apply(&record.changes)?;
-                        engine.last_seq = record.seq;
+                        engine.cursor = Base {
+                            seq: record.seq,
+                            commit_id: record.commit_id.clone(),
+                            committed_at_ms: record.committed_at_ms,
+                        };
                         let flight = engine.commits.in_flight();
                         if flight.is_some_and(|f| f.commit.commit_id == record.commit_id) {
                             note(&mut self.seen, "own commit replayed before its result");
@@ -1137,10 +1154,10 @@ impl World {
                         note(
                             &mut self.seen,
                             match result.seq {
-                                seq if seq <= device.engine.last_seq => {
+                                seq if seq <= device.engine.cursor.seq => {
                                     "result arrives after its records"
                                 }
-                                seq if seq == device.engine.last_seq + 1 => {
+                                seq if seq == device.engine.cursor.seq + 1 => {
                                     "result arrives in order"
                                 }
                                 _ => "result arrives before earlier commits",
@@ -1202,7 +1219,7 @@ impl World {
             return Ok(false);
         };
         let engine = &mut device.engine;
-        if engine.behind || engine.last_seq < link.head {
+        if engine.behind || engine.cursor.seq < link.head {
             return Ok(false);
         }
         let Some(flight) = engine.commits.in_flight() else {
@@ -1212,10 +1229,10 @@ impl World {
                 trees,
                 commits,
                 ids,
-                last_seq,
+                cursor,
                 ..
             } = engine;
-            commits.build(trees, ids, NOW as u64, &history, *last_seq);
+            commits.build(trees, ids, NOW as u64, &history, cursor.clone());
             if commits.in_flight().is_none() && !commits.problems().is_empty() {
                 note(&mut self.seen, "no commit built while a node is a problem");
             }
@@ -1485,7 +1502,7 @@ impl World {
                 None => "offline".to_owned(),
                 Some(link) => format!("online, {} messages on their way", link.inbox.len()),
             };
-            writeln!(out, "device {d}: {link}, last_seq {}", engine.last_seq).unwrap();
+            writeln!(out, "device {d}: {link}, last_seq {}", engine.cursor.seq).unwrap();
             for (ino, entry) in device.disk.entries() {
                 let place = match &entry.place {
                     Place::Root => "root".to_owned(),

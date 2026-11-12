@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use koidrive_engine::commit::{Commits, Failure, Halt as CommitHalt, Reconnect};
+use koidrive_engine::commit::{Base, Commits, Failure, Halt as CommitHalt, Reconnect};
 use koidrive_engine::ignore::LocalRules;
 use koidrive_engine::state::CommitsState;
 use koidrive_engine::tree::{RemoteNode, Tree};
@@ -35,7 +35,7 @@ use koidrive_net::{
 use koidrive_proto::v1::error::Code;
 use koidrive_proto::v1::resync_required::Reason;
 use koidrive_proto::v1::{
-    ChunkRef, Commit, CommitRecord, CommitResult, Error as ProtoError, TrashPage, TreePage,
+    ChunkRef, Commit, CommitRecord, CommitResult, Error as ProtoError, Resume, TrashPage, TreePage,
     UploadReceipt, Welcome, op, op_result,
 };
 use koidrive_store::{Cursor, Link, Store, Tx};
@@ -174,7 +174,7 @@ enum Next {
 /// Work a step asks the shell to start. Each owns what it needs.
 pub(crate) enum Work {
     /// `Session::subscribe`.
-    Subscribe { history_id: String, since_seq: u64 },
+    Subscribe(Resume),
     /// Read every page of the tree, then every page of the trash when `trash` is set. Answered with
     /// [`Folder::listed`].
     List { trash: bool },
@@ -339,11 +339,15 @@ impl Folder {
             Event::Connected(welcome) => self.connected(&welcome, &mut work)?,
             Event::Changes(records) => self.changes(&records, &mut work)?,
             Event::Committed(committed) => self.result(&committed.commit_id, committed.result)?,
-            Event::CaughtUp { head_seq } => {
+            Event::CaughtUp(caught_up) => {
+                let head_seq = caught_up.head_seq;
                 self.head_seq = Some(head_seq);
                 match &mut self.stream {
                     Stream::Replaying(staging) => staging.caught_up(head_seq),
-                    Stream::Following { head } => *head = Some(head_seq),
+                    Stream::Following { head } => {
+                        *head = Some(head_seq);
+                        self.step(|engine, tx| engine.caught_up(tx, &caught_up))?;
+                    }
                     Stream::Connecting | Stream::Listing { .. } => {}
                 }
                 self.publish_remote()?;
@@ -430,10 +434,7 @@ impl Folder {
             seq = staging.last_seq(),
             "read the space's tree"
         );
-        let work = vec![Work::Subscribe {
-            history_id: self.history_id.clone(),
-            since_seq: staging.last_seq(),
-        }];
+        let work = vec![Work::Subscribe(resume(&self.history_id, staging.last()))];
         self.stream = Stream::Replaying(staging);
         Ok(work)
     }
@@ -1002,10 +1003,7 @@ impl Folder {
                 });
             }
             (Stream::Connecting, Some(cursor)) => {
-                work.push(Work::Subscribe {
-                    history_id: cursor.history_id.clone(),
-                    since_seq: cursor.last_seq,
-                });
+                work.push(Work::Subscribe(resume(&cursor.history_id, &cursor.base())));
                 self.stream = Stream::Following { head: None };
             }
             (Stream::Following { head }, _) => *head = None,
@@ -1016,12 +1014,11 @@ impl Folder {
 
     /// Commits of the log. A gap subscribes again from the last commit applied.
     fn changes(&mut self, records: &[CommitRecord], work: &mut Vec<Work>) -> Result<(), Stop> {
-        let (applied, history_id, since_seq) = match &mut self.stream {
+        let (applied, since) = match &mut self.stream {
             Stream::Connecting | Stream::Listing { .. } => return Ok(()),
             Stream::Replaying(staging) => (
                 staging.replay(records)?,
-                staging.history_id().to_owned(),
-                staging.last_seq(),
+                resume(staging.history_id(), staging.last()),
             ),
             Stream::Following { .. } => {
                 let (applied, nodes) = self.step(|engine, tx| {
@@ -1029,7 +1026,7 @@ impl Folder {
                 })?;
                 self.remote_nodes = nodes;
                 let cursor = self.engine.cursor.as_ref().expect("R follows the log");
-                (applied, cursor.history_id.clone(), cursor.last_seq)
+                (applied, resume(&cursor.history_id, &cursor.base()))
             }
         };
         if applied == Applied::Gap {
@@ -1037,10 +1034,7 @@ impl Folder {
                 space_id = self.link.space_id,
                 "the change stream skipped a seq; resuming"
             );
-            work.push(Work::Subscribe {
-                history_id,
-                since_seq,
-            });
+            work.push(Work::Subscribe(since));
         }
         self.publish_remote()
     }
@@ -1072,9 +1066,17 @@ impl Folder {
                 Stop::Protocol(format!("the result of commit {commit_id}: {error:?}"))
             })
         };
+        let at = match result.committed_at_ms {
+            0 => Base::from(result.seq),
+            committed_at_ms => Base {
+                seq: result.seq,
+                commit_id: commit_id.to_owned(),
+                committed_at_ms,
+            },
+        };
         if let Stream::Replaying(staging) = &mut self.stream {
             if result.seq == staging.last_seq() + 1 {
-                staging.replay_commit(result.seq, &result.changes)?;
+                staging.replay_commit(at, &result.changes)?;
             }
             if ours {
                 self.step(|engine, _| receive(engine, result))?;
@@ -1084,7 +1086,7 @@ impl Folder {
         self.remote_nodes = self.step(|engine, tx| {
             let next = (engine.cursor.as_ref()).is_some_and(|c| result.seq == c.last_seq + 1);
             if next {
-                engine.apply_commit(tx, result.seq, &result.changes)?;
+                engine.apply_commit(tx, at.clone(), &result.changes)?;
             }
             if ours {
                 receive(engine, result)?;
@@ -1271,7 +1273,7 @@ impl Folder {
                 &mut engine.ids,
                 now_ms,
                 &cursor.history_id,
-                cursor.last_seq,
+                cursor.base(),
             );
             Ok(built.cloned())
         })?;
@@ -1369,6 +1371,16 @@ impl From<Stop> for Halt {
 
 /// Work that is running, or nothing.
 type Slot<'a, T> = Option<Pin<Box<dyn Future<Output = T> + Send + 'a>>>;
+
+/// A `Resume` of `history_id` from `since`, with its commit token (RFC 0013).
+fn resume(history_id: &str, since: &Base) -> Resume {
+    Resume {
+        history_id: history_id.to_owned(),
+        since_seq: since.seq,
+        since_commit_id: since.commit_id.clone(),
+        since_committed_at_ms: since.committed_at_ms,
+    }
+}
 
 /// What lifts a halt for a refusal with `code` (RFC 0006 section 1, point 5, and section 10).
 fn lift_hint(code: i32) -> &'static str {
@@ -1595,10 +1607,7 @@ impl FolderTask {
                 };
                 for work in work {
                     match work {
-                        Work::Subscribe {
-                            history_id,
-                            since_seq,
-                        } => session.subscribe(history_id, since_seq),
+                        Work::Subscribe(since) => session.subscribe(since),
                         Work::List { trash } => {
                             let listing = Listing {
                                 trash,

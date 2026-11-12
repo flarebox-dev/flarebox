@@ -139,6 +139,7 @@ fn a_restore_is_neither_lost_nor_sent_twice_wherever_the_process_stops() {
         seq: 8,
         results: vec![applied],
         changes: vec![],
+        ..Default::default()
     };
     commits.received(result).unwrap();
     save(&db, &commits);

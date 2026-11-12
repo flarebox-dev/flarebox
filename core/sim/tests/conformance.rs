@@ -874,6 +874,8 @@ impl Run {
             device_seq,
             require_head: opt_bool(body, "require_head")?.unwrap_or(false),
             run_id: String::new(),
+            base_commit_id: String::new(),
+            base_committed_at_ms: 0,
         };
         let expect = expectation(
             step,
