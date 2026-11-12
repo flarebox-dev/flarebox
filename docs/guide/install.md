@@ -10,7 +10,7 @@ Downloads become available with the first published CLI release. Until then, bui
 
 The installer downloads the latest GitHub Release for x86_64 or arm64, checks its SHA256 checksum, and installs it in `~/.local/bin`. It needs `curl`, `tar`, `awk`, `grep`, `sed`, `mktemp`, and either `sha256sum` or `shasum`. It never needs root. Add `~/.local/bin` to your shell's `PATH` if the installer warns that it is missing, then run `koi --version`. The installer also warns when another program named `koi` comes first on `PATH`, such as the Koi theme switcher for KDE; put `~/.local/bin` before it. It refuses to replace a `koi` in the install directory that is another program.
 
-Run the same command again to upgrade. When the [background service](#background-sync) runs, the installer restarts it, so it runs the new `koi`. To choose a version or another directory, set `KOIDRIVE_VERSION` or `KOIDRIVE_INSTALL_DIR` on the `sh` command:
+Run the same command again to upgrade. The installer restarts the [background service](#background-sync) of every profile that runs one, so each runs the new `koi`. To choose a version or another directory, set `KOIDRIVE_VERSION` or `KOIDRIVE_INSTALL_DIR` on the `sh` command:
 
 ```sh
 curl -fsSL https://koidrive.com/install.sh | KOIDRIVE_VERSION=v0.1.0 KOIDRIVE_INSTALL_DIR="$HOME/bin" sh

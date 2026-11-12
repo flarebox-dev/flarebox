@@ -98,20 +98,26 @@ main() {
         fi
     fi
 
-    if [ "$os" = unknown-linux-musl ]; then
-        if command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet koidrive.service 2>/dev/null; then
-            if systemctl --user restart koidrive.service; then
-                printf 'Restarted the background service koidrive.service\n'
-            else
-                printf 'Warning: koi is installed, but the background service koidrive.service did not restart. Run: systemctl --user restart koidrive.service\n' >&2
-            fi
-        fi
-    elif launchctl print "gui/$(id -u)/dev.koidrive.koi" >/dev/null 2>&1; then
-        if launchctl kickstart -k "gui/$(id -u)/dev.koidrive.koi"; then
-            printf 'Restarted the background service dev.koidrive.koi\n'
+    restart() {
+        service=$1
+        shift
+        if "$@"; then
+            printf 'Restarted the background service %s
+' "$service"
         else
-            printf 'Warning: koi is installed, but the background service dev.koidrive.koi did not restart. Run: launchctl kickstart -k gui/%s/dev.koidrive.koi\n' "$(id -u)" >&2
+            printf 'Warning: koi is installed, but the background service %s did not restart. Run: %s
+' "$service" "$*" >&2
         fi
+    }
+    if [ "$os" = unknown-linux-musl ]; then
+        command -v systemctl >/dev/null 2>&1 || return 0
+        for unit in $(systemctl --user list-units --type=service --state=active --plain --no-legend 'koidrive.service' 'koidrive-*.service' 2>/dev/null | awk '{print $1}'); do
+            restart "$unit" systemctl --user restart "$unit"
+        done
+    else
+        for label in $(launchctl list 2>/dev/null | awk '$3 == "dev.koidrive.koi" || index($3, "dev.koidrive.koi.") == 1 {print $3}'); do
+            restart "$label" launchctl kickstart -k "gui/$(id -u)/$label"
+        done
     fi
 }
 

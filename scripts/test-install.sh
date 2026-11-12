@@ -18,8 +18,13 @@ for manager in systemctl launchctl; do
     cat > "$tmp/services/$manager" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >> "$HOME/services.log"
+running() { [ ! -e "$HOME/running" ] || cat "$HOME/running"; }
 case "$*" in
-    '--user is-active --quiet koidrive.service' | "print gui/$(id -u)/dev.koidrive.koi") [ -e "$HOME/running" ] ;;
+    "--user list-units --type=service --state=active --plain --no-legend koidrive.service koidrive-*.service")
+        running | sed 's/$/ loaded active running Koidrive sync/' ;;
+    list)
+        printf 'PID\tStatus\tLabel\n101\t0\tcom.example.other\n102\t0\tdev.koidrive.koiz\n'
+        running | sed 's/^/103\t0\t/' ;;
 esac
 EOF
     chmod +x "$tmp/services/$manager"
@@ -131,24 +136,34 @@ KOIDRIVE_INSTALL_DIR=relative reject 'relative install directory' 'KOIDRIVE_INST
 unset KOIDRIVE_INSTALL_DIR
 
 if [ "$(uname -s)" = Linux ]; then
-    restart='--user restart koidrive.service'
+    services='koidrive.service
+koidrive-1a2b3c4d.service'
+    restarts='--user restart koidrive.service
+--user restart koidrive-1a2b3c4d.service'
 else
-    restart="kickstart -k gui/$(id -u)/dev.koidrive.koi"
+    services='dev.koidrive.koi
+dev.koidrive.koi.1a2b3c4d'
+    restarts="kickstart -k gui/$(id -u)/dev.koidrive.koi
+kickstart -k gui/$(id -u)/dev.koidrive.koi.1a2b3c4d"
 fi
 rm -f "$HOME/services.log"
 sh "$root/install.sh"
-if grep -q -x -- "$restart" "$HOME/services.log"; then
-    cat "$HOME/services.log"
-    printf 'Expected an upgrade to leave a service that is not running alone\n' >&2
+if grep -E -e '--user restart|kickstart' "$HOME/services.log"; then
+    printf 'Expected an upgrade to leave services that are not running alone\n' >&2
     exit 1
 fi
-pass 'an upgrade leaves a service that is not running alone'
-touch "$HOME/running"
+pass 'an upgrade leaves services that are not running alone'
+printf '%s\n' "$services" > "$HOME/running"
+rm -f "$HOME/services.log"
 sh "$root/install.sh" > "$tmp/restart.log"
-grep -x -- "$restart" "$HOME/services.log"
-grep -F 'Restarted the background service' "$tmp/restart.log"
+grep -E -e '--user restart|kickstart' "$HOME/services.log" > "$tmp/restarted"
+if [ "$(cat "$tmp/restarted")" != "$restarts" ] || [ "$(grep -c -F 'Restarted the background service' "$tmp/restart.log")" != 2 ]; then
+    cat "$HOME/services.log" "$tmp/restart.log"
+    printf 'Expected an upgrade to restart exactly the running services of every profile\n' >&2
+    exit 1
+fi
 rm "$HOME/running"
-pass 'an upgrade restarts the running background service'
+pass 'an upgrade restarts the running background service of every profile'
 
 if [ "$(uname -s)" = Linux ]; then
     printf 'Passed 18 installer tests on %s\n' "$(uname -s)"
