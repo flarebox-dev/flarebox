@@ -127,6 +127,10 @@ impl Rules {
         !self.search.pending.is_empty()
     }
 
+    pub(crate) fn held(&self) -> Option<&BTreeMap<PathBuf, Entry>> {
+        Some(&self.search.held).filter(|held| !held.is_empty())
+    }
+
     pub(crate) fn forget(&mut self, scope: &Path) {
         self.search.held.retain(|path, _| !path.starts_with(scope));
         self.search.prune();

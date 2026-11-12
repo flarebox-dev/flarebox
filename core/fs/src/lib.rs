@@ -87,6 +87,7 @@
 //! Symbolic links and special files are not synced in v0 (spec §5.1) and are
 //! skipped.
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -1587,6 +1588,7 @@ pub trait Watcher {
 pub struct NativeWatcher {
     root: PathBuf,
     snapshot: Snapshot,
+    view: OnceCell<Snapshot>,
     dirty: BTreeSet<PathBuf>,
     unreadable: BTreeSet<PathBuf>,
     rules: Option<Rules>,
@@ -1641,6 +1643,7 @@ impl NativeWatcher {
         Ok(Self {
             root,
             snapshot: previous,
+            view: OnceCell::new(),
             dirty: BTreeSet::from([PathBuf::new()]),
             unreadable: BTreeSet::new(),
             #[cfg(target_os = "linux")]
@@ -1902,6 +1905,7 @@ fn vanished(err: &notify::Error) -> bool {
 
 impl Watcher for NativeWatcher {
     fn poll(&mut self, timeout: Duration) -> Result<Poll> {
+        self.view.take();
         let deadline = Instant::now() + timeout;
         let mut root = None;
         loop {
@@ -1971,7 +1975,7 @@ impl Watcher for NativeWatcher {
     }
 
     fn snapshot(&self) -> &Snapshot {
-        &self.snapshot
+        view(&self.snapshot, self.rules.as_ref(), &self.view)
     }
 
     fn reset(&mut self, scope: &Path, known: BTreeMap<PathBuf, Known>) {
@@ -1984,6 +1988,7 @@ impl Watcher for NativeWatcher {
         if let Some(rules) = &mut self.rules {
             rules.forget(scope);
         }
+        self.view.take();
         self.snapshot.reset(scope, known);
         self.dirty.insert(scope.to_path_buf());
     }
@@ -1994,6 +1999,7 @@ impl Watcher for NativeWatcher {
 pub struct RescanWatcher {
     root: PathBuf,
     snapshot: Snapshot,
+    view: OnceCell<Snapshot>,
     interval: Duration,
     rules: Option<Rules>,
     stopped: Box<dyn Fn() -> bool + Send>,
@@ -2004,6 +2010,7 @@ impl RescanWatcher {
         Ok(Self {
             root: std::fs::canonicalize(root)?,
             snapshot: previous,
+            view: OnceCell::new(),
             interval,
             rules: None,
             stopped: Box::new(|| false),
@@ -2037,6 +2044,7 @@ impl RescanWatcher {
 
 impl Watcher for RescanWatcher {
     fn poll(&mut self, timeout: Duration) -> Result<Poll> {
+        self.view.take();
         let deadline = Instant::now() + timeout;
         loop {
             let rescan = self.snapshot.rescan_under(
@@ -2073,15 +2081,32 @@ impl Watcher for RescanWatcher {
     }
 
     fn snapshot(&self) -> &Snapshot {
-        &self.snapshot
+        view(&self.snapshot, self.rules.as_ref(), &self.view)
     }
 
     fn reset(&mut self, scope: &Path, known: BTreeMap<PathBuf, Known>) {
         if let Some(rules) = &mut self.rules {
             rules.forget(scope);
         }
+        self.view.take();
         self.snapshot.reset(scope, known);
     }
+}
+
+fn view<'a>(
+    snapshot: &'a Snapshot,
+    rules: Option<&Rules>,
+    view: &'a OnceCell<Snapshot>,
+) -> &'a Snapshot {
+    let Some(held) = rules.and_then(Rules::held) else {
+        return snapshot;
+    };
+    view.get_or_init(|| {
+        let mut view = snapshot.clone();
+        view.entries
+            .extend(held.iter().map(|(path, entry)| (path.clone(), *entry)));
+        view
+    })
 }
 
 fn watch_error(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Error {
