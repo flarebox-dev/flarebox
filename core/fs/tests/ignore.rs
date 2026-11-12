@@ -569,6 +569,27 @@ fn rescan_watcher_goes_on_with_a_search_without_waiting_for_its_interval() {
 }
 
 #[test]
+fn a_watcher_started_from_the_snapshot_of_another_reports_the_removal_it_held() {
+    let dir = large_ignored_tree();
+    let root = dir.path();
+    write(root, "f.txt", "f");
+    let mut held = rules().with_search_budget(100);
+    let snapshot = Snapshot::scan_with_rules(root, &mut held).unwrap();
+    let hour = Duration::from_secs(3600);
+    let mut first = RescanWatcher::with_rules(root, snapshot, hour, held).unwrap();
+    fs::remove_file(root.join("f.txt")).unwrap();
+    let poll = first.poll(Duration::ZERO).unwrap();
+    assert_eq!(poll.changes, []);
+    assert_eq!(poll.pending, [PathBuf::from("f.txt")]);
+
+    let fresh = rules().with_search_budget(100);
+    let mut second =
+        RescanWatcher::with_rules(root, first.snapshot().clone(), hour, fresh).unwrap();
+    let poll = second.poll(Duration::from_secs(5)).unwrap();
+    assert_eq!(poll.changes, [removed("f.txt", File)]);
+}
+
+#[test]
 fn a_folder_removed_while_the_search_for_its_file_runs_is_removed() {
     let dir = large_ignored_tree();
     let root = dir.path();
