@@ -95,9 +95,15 @@ pub struct Disk {
     pub(super) quarantine: Option<Entry>,
     /// The effects whose displaced entry is in the local trash.
     trash: BTreeSet<String>,
+    binned: BTreeSet<i64>,
+    marker: u64,
 }
 
 impl Disk {
+    pub fn marker(&self) -> u64 {
+        self.marker
+    }
+
     pub fn entries(&self) -> &BTreeMap<u64, Entry> {
         &self.entries
     }
@@ -150,6 +156,15 @@ impl Disk {
             current = &self.entries[ino].place;
         }
         false
+    }
+
+    pub fn binned(&self, write: i64) -> bool {
+        self.binned.contains(&write)
+    }
+
+    pub fn shows(&self, write: i64) -> bool {
+        (self.entries.values())
+            .any(|entry| entry.content.as_ref().is_some_and(|c| c.mtime_ns == write))
     }
 
     /// True when some file, parked, in quarantine or neither, holds the write with this tag.
@@ -222,7 +237,9 @@ impl Disk {
     /// has the identity the effect names, a displaced file has the identity and content the
     /// engine last saw, and no create or rename replaces an entry. A displaced entry goes to
     /// the local trash also when the new entry finds its name taken.
-    pub fn apply(&mut self, record: &EffectRecord, until: Cut) -> Applied {
+    pub fn apply(&mut self, record: &EffectRecord, until: Option<Cut>) -> Option<Applied> {
+        self.marker = record.counter;
+        let until = until?;
         let mut trashed = None;
         let outcome = self.change(&record.effect, until, &mut trashed);
         if until == Cut::Done {
@@ -235,7 +252,9 @@ impl Disk {
         if until == Cut::Done && outcome.is_ok() && removal {
             self.trash.insert(record.effect_id.clone());
         }
-        Applied { outcome, trashed }
+        self.binned
+            .extend(trashed.as_ref().map(|content| content.mtime_ns));
+        Some(Applied { outcome, trashed })
     }
 
     fn change(
@@ -319,6 +338,7 @@ impl Disk {
     /// user moved or deleted the entry before the effect reached it. Anything else is an effect
     /// that stopped early or whose target the user has changed since.
     pub fn recover(&mut self, record: &EffectRecord) -> Applied {
+        self.marker = record.counter;
         let staged = std::mem::take(&mut self.staged);
         let Some(entry) = self.quarantine.take() else {
             let outcome = match staged {
@@ -342,6 +362,8 @@ impl Disk {
             }
             _ => Ok(None),
         };
+        self.binned
+            .extend(entry.content.as_ref().map(|content| content.mtime_ns));
         Applied {
             outcome,
             trashed: entry.content,

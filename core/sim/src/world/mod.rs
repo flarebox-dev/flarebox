@@ -170,6 +170,13 @@ pub enum Step {
     /// server, so every connection breaks. The commits since the copy are lost, and the server
     /// gives their seqs and device slots again (design section 2.8).
     Restore,
+    /// Rewinds the space to the last copy of the server's storage with a new history, as its
+    /// owner can (RFC 0003), so every connection breaks and every device recovers (section 6.4).
+    Rewind,
+    CopyStore,
+    /// Crashes the device and puts the last copy of its store back, as a store restored from a
+    /// backup is. The disk stays as it is.
+    RollBack,
 }
 
 /// The content of a write: three bytes that name the device and the text, so writes of different
@@ -378,6 +385,7 @@ struct Exposure {
 struct Backup {
     space: SpaceDo,
     held: Held,
+    in_history: Held,
 }
 
 fn note(seen: &mut BTreeMap<&'static str, u64>, what: &'static str) {
@@ -403,6 +411,7 @@ pub struct World {
     published: BTreeSet<i64>,
     /// What every node of the server, live or trashed, has held at some time.
     held: Held,
+    in_history: Held,
     /// The first change a commit made that no user asked for.
     unasked: Option<String>,
     /// The writes that a download left on a disk in a file the engine then took for a new one. A
@@ -426,6 +435,7 @@ pub struct World {
     /// The files whose content a restore rolled back, each with the digest of the content the
     /// restored server holds, until the devices are quiet again.
     rolled_back: BTreeMap<NodeId, Vec<u8>>,
+    rewound: BTreeMap<i64, BTreeSet<usize>>,
 }
 
 impl World {
@@ -434,7 +444,7 @@ impl World {
         let space = SpaceDo::new(5, NOW);
         let devices = (0..devices)
             .map(|d| {
-                let engine = Engine::new(space.space_id(), 100 + d as u64);
+                let engine = Engine::new(space.space_id(), space.history_id(), 100 + d as u64);
                 Device {
                     session: Session {
                         device_id: format!("device-{d}"),
@@ -448,6 +458,9 @@ impl World {
                     engine,
                     down: false,
                     link: Some(Link::default()),
+                    recovering: None,
+                    store_copy: None,
+                    rolled_back: false,
                 }
             })
             .collect::<Vec<_>>();
@@ -463,13 +476,25 @@ impl World {
             writers: BTreeMap::new(),
             published: BTreeSet::new(),
             held: Held::new(),
+            in_history: Held::new(),
             unasked: None,
             copied: BTreeSet::new(),
             backup: None,
             retired: BTreeSet::new(),
             exposed: BTreeMap::new(),
             rolled_back: BTreeMap::new(),
+            rewound: BTreeMap::new(),
         }
+    }
+
+    pub fn space(&self) -> &SpaceDo {
+        &self.space
+    }
+
+    /// Forgets the server's log up to its head. A device that resumes below it is refused.
+    pub fn truncate_log(&mut self) {
+        let head = self.space.head_seq();
+        self.space.truncate_log(head);
     }
 
     /// Runs one phase: a schedule of steps, after which the faults stop, the devices become
@@ -541,9 +566,36 @@ impl World {
                 self.backup = Some(Backup {
                     space: self.space.clone(),
                     held: self.held.clone(),
+                    in_history: self.in_history.clone(),
                 });
             }
             Step::Restore => self.restore(),
+            Step::Rewind => self.rewind(),
+            Step::CopyStore => {
+                let device = &mut self.devices[d];
+                device.store_copy = Some(device.store.clone());
+            }
+            Step::RollBack => {
+                let device = &mut self.devices[d];
+                if let Some(copy) = device.store_copy.clone() {
+                    note(&mut self.seen, "store rolled back");
+                    if device.recovering.take().is_some() {
+                        note(&mut self.seen, "store rolled back during a recovery");
+                    }
+                    device.store = copy;
+                    device.rolled_back = true;
+                    device.down = true;
+                    device.link = None;
+                }
+            }
+            Step::Crash if self.devices[d].recovering.is_some() => {
+                note(&mut self.seen, "crash during a recovery");
+                let device = &mut self.devices[d];
+                device.recovering = None;
+                device.down = true;
+                device.link = None;
+            }
+            _ if self.devices[d].recovering.is_some() => {}
             _ if self.devices[d].down => self.restart(d)?,
             Step::Scan => {
                 self.scan(d)?;
@@ -651,6 +703,59 @@ impl World {
         }
     }
 
+    fn rewind(&mut self) {
+        let Some(backup) = &self.backup else {
+            return;
+        };
+        note(&mut self.seen, "server rewound");
+        let taken: Vec<i64> = (self.writers.keys())
+            .filter(|write| {
+                stored(&self.in_history, **write) && !stored(&backup.in_history, **write)
+            })
+            .copied()
+            .collect();
+        self.space.rewind(&backup.space, NOW);
+        self.in_history = backup.in_history.clone();
+        self.rewound
+            .retain(|write, _| !stored(&backup.in_history, *write));
+        for write in taken {
+            let holders: BTreeSet<usize> = (self.devices.iter().enumerate())
+                .filter(|(_, device)| device.disk.holds(write))
+                .map(|(d, _)| d)
+                .collect();
+            if !holders.is_empty() {
+                note(&mut self.seen, "rewind takes a write a disk holds");
+            }
+            if holders.len() == 1 {
+                note(&mut self.seen, "rewind takes a write only one disk holds");
+            }
+            self.exposed.remove(&write);
+            self.rewound.entry(write).or_default().extend(holders);
+        }
+        for device in &mut self.devices {
+            device.link = None;
+        }
+    }
+
+    fn recover(&mut self, d: usize, why: String) -> Result<(), Failure> {
+        let device = &mut self.devices[d];
+        if device.engine.history == self.space.history_id() && !device.rolled_back {
+            return Err(Failure::Broken(format!(
+                "recovery started with no rewind and no rolled-back store: {why}"
+            )));
+        }
+        note(
+            &mut self.seen,
+            match device.engine.history == self.space.history_id() {
+                true => "recovery starts after a store rollback",
+                false => "recovery starts after a rewind",
+            },
+        );
+        device.recovering = Some(why);
+        device.link = None;
+        Ok(())
+    }
+
     /// Restores the server from the last copy. A write is lost with the restore when the server
     /// held it only after the copy, or when a file of the server held it before the restore and
     /// no longer holds it after: it is retired when no disk holds it, and exposed otherwise.
@@ -682,6 +787,7 @@ impl World {
         let before = shapes(&self.space);
         let held_before = writes(&self.space);
         self.space.restore(&backup.space);
+        self.in_history = backup.in_history.clone();
         let after = shapes(&self.space);
         let held_after = writes(&self.space);
         for (id, (.., digest)) in &after {
@@ -771,6 +877,9 @@ impl World {
     /// A full rescan. True when L changed.
     fn scan(&mut self, d: usize) -> Result<bool, Failure> {
         let device = &mut self.devices[d];
+        if device.recovering.is_some() {
+            return Ok(false);
+        }
         if device.rescan() > 0 {
             note(
                 &mut self.seen,
@@ -792,9 +901,16 @@ impl World {
     /// committing has stopped.
     fn effect(&mut self, d: usize, outcome: Outcome) -> Result<bool, Failure> {
         let device = &mut self.devices[d];
+        if device.recovering.is_some() {
+            return Ok(false);
+        }
         let Some(record) = device.engine.effects.in_flight().cloned() else {
             let commits = &device.engine.commits;
-            if device.engine.behind || commits.in_flight().is_some() && commits.halted().is_none() {
+            let listing = device.link.as_ref().is_some_and(|link| link.listing);
+            if device.engine.behind
+                || listing
+                || commits.in_flight().is_some() && commits.halted().is_none()
+            {
                 return Ok(false);
             }
             let Engine {
@@ -809,11 +925,12 @@ impl World {
             return Ok(planned);
         };
         let applies = record.applies(&device.engine.trees);
-        let applied = match outcome {
-            Outcome::Run if applies => Some(device.disk.apply(&record, Cut::Done)),
-            Outcome::Crash(cut) if applies => Some(device.disk.apply(&record, cut)),
+        let until = match outcome {
+            Outcome::Run if applies => Some(Cut::Done),
+            Outcome::Crash(cut) if applies => Some(cut),
             _ => None,
         };
+        let applied = device.disk.apply(&record, until);
         if let Some(applied) = applied.as_ref().filter(|applied| {
             !resent_over_revert(&self.exposed, &self.rolled_back, &record, applied)
         }) {
@@ -898,6 +1015,20 @@ impl World {
         let device = &mut self.devices[d];
         device.down = false;
         device.engine = device.store.reload()?;
+        let effects = &device.engine.effects;
+        let (marker, cleared) = (device.disk.marker(), effects.cleared());
+        if marker > cleared + u64::from(effects.in_flight().is_some()) {
+            return self.recover(
+                d,
+                format!("the root marker counts {marker} effects, more than the store"),
+            );
+        }
+        if marker < cleared {
+            return Err(Failure::Broken(format!(
+                "the store counts {cleared} effects, more than the root marker's {marker}"
+            )));
+        }
+        let device = &mut self.devices[d];
         if let Some(record) = device.engine.effects.in_flight().cloned() {
             let quarantined = device.disk.quarantine.is_some();
             let applied = device.disk.recover(&record);
@@ -937,8 +1068,10 @@ impl World {
                             &mut self.seen,
                             "restart takes a file of the user for the download",
                         );
-                        let writes = self.held.entry(record.node.clone()).or_default();
-                        writes.insert(found.mtime_ns, found.manifest_digest.clone());
+                        for held in [&mut self.held, &mut self.in_history] {
+                            let writes = held.entry(record.node.clone()).or_default();
+                            writes.insert(found.mtime_ns, found.manifest_digest.clone());
+                        }
                         self.published.insert(found.mtime_ns);
                     }
                     note(
@@ -1003,7 +1136,7 @@ impl World {
             return Ok(listing(&self.space));
         }
         let resume = Resume {
-            history_id: self.space.history_id().to_owned(),
+            history_id: engine.history.clone(),
             since_seq: engine.cursor.seq,
             since_commit_id: engine.cursor.commit_id.clone(),
             since_committed_at_ms: engine.cursor.committed_at_ms,
@@ -1013,6 +1146,15 @@ impl World {
             Err(resync) if resync.reason() == resync_required::Reason::AheadOfServer => {
                 note(&mut self.seen, "resume finds the server behind");
                 engine.behind = true;
+                Ok(listing(&self.space))
+            }
+            Err(resync) if resync.reason() == resync_required::Reason::LogTruncated => {
+                note(&mut self.seen, "resume finds the log truncated");
+                let link = self.devices[d]
+                    .link
+                    .as_mut()
+                    .expect("a resume runs on a link");
+                link.listing = true;
                 Ok(listing(&self.space))
             }
             Err(error) => Err(Failure::Broken(format!(
@@ -1026,11 +1168,18 @@ impl World {
             return Ok(());
         }
         let welcome = self.space.welcome(&self.devices[d].session);
+        if self.devices[d].engine.history != welcome.history_id {
+            return self.recover(d, "the server's history changed".into());
+        }
         match self.devices[d].engine.commits.connected(&welcome) {
             Reconnect::Recovery => {
-                return Err(Failure::Broken(
-                    "recovery started with no rewind and no rolled-back store".into(),
-                ));
+                return self.recover(
+                    d,
+                    format!(
+                        "the server counts {} commits of this device, which the store cannot account for",
+                        welcome.device_seq
+                    ),
+                );
             }
             Reconnect::AheadOfServer => {
                 note(&mut self.seen, "reconnect finds the server lost commits");
@@ -1048,12 +1197,13 @@ impl World {
             ),
             Reconnect::Idle => {}
         }
-        let backlog = self.resume(d)?;
         self.devices[d].link = Some(Link {
-            inbox: vec![backlog],
             head: welcome.head_seq,
             ..Default::default()
         });
+        let backlog = self.resume(d)?;
+        let link = self.devices[d].link.as_mut().expect("set above");
+        link.inbox.push(backlog);
         self.devices[d].persist()
     }
 
@@ -1062,23 +1212,21 @@ impl World {
     /// Records that arrive while R waits for a listing are dropped, and the listing asks for the
     /// backlog after its head, as the driver subscribes again from the listing's seq.
     fn deliver(&mut self, d: usize, index: usize) -> Result<bool, Failure> {
-        let behind = self.devices[d].engine.behind;
-        let Some(link) = self.devices[d]
-            .link
-            .as_mut()
-            .filter(|l| !l.inbox.is_empty())
-        else {
+        let device = &mut self.devices[d];
+        let behind = device.engine.behind;
+        let Some(link) = device.link.as_mut().filter(|l| !l.inbox.is_empty()) else {
             return Ok(false);
         };
+        let waits = behind || link.listing;
         let message = link.inbox.remove(index % link.inbox.len());
         match message {
-            Message::Records(_) if behind => {
+            Message::Records(_) if waits => {
                 note(
                     &mut self.seen,
                     "records dropped while R waits for a listing",
                 );
             }
-            Message::Listing { .. } if !behind => {
+            Message::Listing { .. } if !waits => {
                 note(&mut self.seen, "listing arrives twice");
             }
             Message::Listing { nodes, head } => {
@@ -1113,9 +1261,13 @@ impl World {
                         trees.set_remote(id, node);
                     }
                 }
-                trees.forget_lost(trashed, edited, commits.held_through(), commits.accepted());
+                if *behind {
+                    trees.forget_lost(trashed, edited, commits.held_through(), commits.accepted());
+                }
                 *cursor = head;
                 *behind = false;
+                let link = self.devices[d].link.as_mut().expect("checked above");
+                link.listing = false;
                 let backlog = self.resume(d)?;
                 let link = self.devices[d].link.as_mut().expect("checked above");
                 link.inbox.push(backlog);
@@ -1205,6 +1357,14 @@ impl World {
                             let listed = listing(&self.space);
                             (device.link.as_mut()).expect("answered").inbox.push(listed);
                         }
+                        commit::Failure::Halted(commit::Halt::Recovery) => {
+                            note(&mut self.seen, "recovery starts after a refused commit");
+                            device.persist()?;
+                            let code = error::Code::try_from(error.code);
+                            return self
+                                .recover(d, format!("the server refused a commit with {code:?}"))
+                                .map(|()| true);
+                        }
                         failure => {
                             return Err(Failure::Broken(format!(
                                 "{error:?} on a commit led to {failure:?}"
@@ -1228,11 +1388,11 @@ impl World {
             return Ok(false);
         };
         let engine = &mut device.engine;
-        if engine.behind || engine.cursor.seq < link.head {
+        if engine.behind || link.listing || engine.cursor.seq < link.head {
             return Ok(false);
         }
         let Some(flight) = engine.commits.in_flight() else {
-            let history = self.space.history_id().to_owned();
+            let history = engine.history.clone();
             engine.trees.settle();
             let Engine {
                 trees,
@@ -1364,8 +1524,13 @@ impl World {
                             self.published.extend(after.into_keys());
                             for node in self.space.nodes() {
                                 if let Some(content) = node.current.and_then(|v| v.content) {
-                                    let writes = self.held.entry(node.node_id).or_default();
-                                    writes.insert(content.mtime_ns, content.manifest_digest);
+                                    for held in [&mut self.held, &mut self.in_history] {
+                                        let writes = held.entry(node.node_id.clone()).or_default();
+                                        writes.insert(
+                                            content.mtime_ns,
+                                            content.manifest_digest.clone(),
+                                        );
+                                    }
                                 }
                             }
                             note(&mut self.seen, "commit applied");
@@ -1423,11 +1588,17 @@ impl World {
             if self.devices[d].down {
                 self.restart(d)?;
             }
+            if self.devices[d].recovering.is_some() {
+                continue;
+            }
             if self.devices[d].engine.effects.in_flight().is_some() {
                 self.effect(d, Outcome::Run)?;
             }
             self.devices[d].link = None;
             self.connect(d)?;
+            if self.devices[d].recovering.is_some() {
+                continue;
+            }
             let device = &mut self.devices[d];
             let blocked: Vec<NodeId> = device.engine.effects.blocked().keys().cloned().collect();
             for node in blocked {
@@ -1438,6 +1609,9 @@ impl World {
         for _ in 0..ROUNDS {
             let before: Vec<Engine> = self.devices.iter().map(|d| d.engine.clone()).collect();
             for d in 0..self.devices.len() {
+                if self.devices[d].recovering.is_some() {
+                    continue;
+                }
                 let at = |failure: Failure| {
                     failure.at(format!("after the faults stopped, on device {d}"))
                 };
@@ -1460,7 +1634,10 @@ impl World {
                     );
                 }
             }
-            let idle = |device: &Device| device.link.as_ref().is_some_and(|l| l.inbox.is_empty());
+            let idle = |device: &Device| {
+                device.recovering.is_some()
+                    || device.link.as_ref().is_some_and(|l| l.inbox.is_empty())
+            };
             if self.devices.iter().all(idle)
                 && self.devices.iter().map(|d| &d.engine).eq(before.iter())
             {
@@ -1608,6 +1785,7 @@ impl World {
     fn kept(&self) -> Result<(), Failure> {
         let lost = (self.writers.iter()).find(|(write, writer)| {
             !stored(&self.held, **write)
+                && !self.rewound.contains_key(write)
                 && !self.removed[**writer].contains(write)
                 && !self.devices[**writer].disk.holds(**write)
         });
@@ -1620,6 +1798,24 @@ impl World {
         let server: BTreeSet<i64> = (self.space.nodes().into_iter())
             .filter_map(|node| Some(node.current?.content?.mtime_ns))
             .collect();
+        let dropped = (self.rewound.iter())
+            .flat_map(|(write, holders)| holders.iter().map(move |d| (*write, *d)))
+            .find(|(write, d)| {
+                let disk = &self.devices[*d].disk;
+                !self.removed[*d].contains(write) && !disk.holds(*write) && !disk.binned(*write)
+            });
+        if let Some((write, d)) = dropped {
+            return Err(Failure::Broken(format!(
+                "a rewind took write {write} from the server while the disk of device {d} held \
+                 it, and it left that disk though its user never overwrote or deleted it"
+            )));
+        }
+        if let Some(write) = (self.rewound.keys()).find(|write| server.contains(write)) {
+            return Err(Failure::Broken(format!(
+                "a rewind took write {write} from the server, and a device sent it again though no \
+                 user answered to keep it"
+            )));
+        }
         let gone = (self.exposed.keys()).find(|write| {
             !server.contains(write) && !self.removed.iter().any(|removed| removed.contains(write))
         });
@@ -1677,6 +1873,9 @@ impl World {
             .map(|state| RemoteNode::from_state(state).expect("a file or a folder"))
             .collect();
         for (d, device) in self.devices.iter().enumerate() {
+            if device.recovering.is_some() {
+                continue;
+            }
             let engine = &device.engine;
             let fail =
                 |why: String| Err(Failure::Diverged(format!("device {d} is quiet, but {why}")));
@@ -1805,6 +2004,7 @@ impl World {
             !live.contains_key(write)
                 && !self.published.contains(write)
                 && !self.removed[**writer].contains(write)
+                && self.devices[**writer].recovering.is_none()
         });
         match lost {
             Some((write, writer)) => Err(Failure::Diverged(format!(
@@ -1854,7 +2054,7 @@ mod tests {
                 content: Some(incoming),
             }),
         };
-        let applied = disk.apply(&record, Cut::Done);
+        let applied = disk.apply(&record, Some(Cut::Done)).unwrap();
         assert!(lost(&Held::new(), 0, &record, &applied).is_err());
         let rolled_back = BTreeMap::from([("a".into(), old.manifest_digest)]);
         for file in ["a", "b"] {

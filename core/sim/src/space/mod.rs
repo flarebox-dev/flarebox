@@ -390,6 +390,7 @@ pub struct SpaceDo {
     /// go between that check and the commit.
     objects: HashMap<Vec<u8>, u32>,
     head_seq: u64,
+    restore_seq: u64,
     log_floor_seq: u64,
     /// The commit token at `log_floor_seq` (RFC 0013), kept when the log is truncated past it.
     floor_token: Option<(String, i64)>,
@@ -435,6 +436,7 @@ impl SpaceDo {
             receipts: HashMap::new(),
             objects: HashMap::new(),
             head_seq: 0,
+            restore_seq: 0,
             log_floor_seq: 0,
             floor_token: None,
         }
@@ -533,8 +535,13 @@ impl SpaceDo {
             None
         };
         if let Some(reason) = reason {
+            let restore_seq = match reason {
+                resync_required::Reason::HistoryChanged => self.restore_seq,
+                _ => 0,
+            };
             return Err(ResyncRequired {
                 reason: reason as i32,
+                restore_seq,
                 ..Default::default()
             });
         }
@@ -558,7 +565,14 @@ impl SpaceDo {
         self.objects = objects;
     }
 
-    /// Forgets the log up to and including `floor_seq`, so that older resumes need a bootstrap.
+    pub fn rewind(&mut self, backup: &SpaceDo, now_ms: i64) {
+        self.restore(backup);
+        self.history_id = self.state.ids.uuid_v7(now_ms as u64);
+        self.restore_seq = self.head_seq;
+    }
+
+    /// Forgets the log up to and including `floor_seq`, so that older resumes need a bootstrap,
+    /// and the results of the commits it held, except each device's latest (RFC 0002 section 2).
     pub fn truncate_log(&mut self, floor_seq: u64) {
         let floor = floor_seq.min(self.head_seq).max(self.log_floor_seq);
         if floor != self.log_floor_seq {
@@ -566,6 +580,11 @@ impl SpaceDo {
             self.log_floor_seq = floor;
         }
         self.log.retain(|r| r.seq > floor);
+        let latest = &self.device_seqs;
+        self.results.retain(|_, stored| {
+            stored.result.seq > floor
+                || latest.get(&stored.device_id) == Some(&stored.request.device_seq)
+        });
     }
 
     /// Answers one RPC the way the server's `call` does. A new commit also returns its record.

@@ -35,8 +35,14 @@ fn action() -> impl Strategy<Value = Action> {
         })
 }
 
-/// One step. With `restores`, also a backup or a restore of the server.
-fn step(restores: bool) -> BoxedStrategy<Step> {
+#[derive(Clone, Copy)]
+enum Losses {
+    None,
+    Restores,
+    Rewinds,
+}
+
+fn step(losses: Losses) -> BoxedStrategy<Step> {
     let cut = prop_oneof![Just(Cut::Quarantined), Just(Cut::Placed), Just(Cut::Done)];
     let outcome = prop_oneof![
         5 => Just(Outcome::Run),
@@ -67,19 +73,27 @@ fn step(restores: bool) -> BoxedStrategy<Step> {
         1 => Just(Step::Crash),
     ]
     .boxed();
-    if !restores {
-        return steps;
+    match losses {
+        Losses::None => steps,
+        Losses::Restores => prop_oneof![
+            19 => steps,
+            1 => prop_oneof![Just(Step::Backup), Just(Step::Restore)],
+        ]
+        .boxed(),
+        Losses::Rewinds => prop_oneof![
+            60 => steps,
+            2 => Just(Step::Backup),
+            1 => Just(Step::Rewind),
+            3 => Just(Step::CopyStore),
+            2 => Just(Step::RollBack),
+        ]
+        .boxed(),
     }
-    prop_oneof![
-        19 => steps,
-        1 => prop_oneof![Just(Step::Backup), Just(Step::Restore)],
-    ]
-    .boxed()
 }
 
-fn phases(restores: bool) -> impl Strategy<Value = Vec<Vec<(usize, Step)>>> {
+fn phases(losses: Losses) -> impl Strategy<Value = Vec<Vec<(usize, Step)>>> {
     prop::collection::vec(
-        prop::collection::vec((0..3usize, step(restores)), 0..48),
+        prop::collection::vec((0..3usize, step(losses)), 0..48),
         1..=3,
     )
 }
@@ -126,24 +140,34 @@ proptest! {
     ))]
 
     #[test]
-    fn devices_lose_no_write(devices in 2..=3usize, phases in phases(false)) {
+    fn devices_lose_no_write(devices in 2..=3usize, phases in phases(Losses::None)) {
         keep(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
 
     #[test]
-    fn devices_converge_once_the_faults_stop(devices in 2..=3usize, phases in phases(false)) {
+    fn devices_converge_once_the_faults_stop(devices in 2..=3usize, phases in phases(Losses::None)) {
         converge(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
 
     #[test]
     #[ignore = "a server restore still breaks these: an edit equal to the restored bytes is undone (GUN-438)"]
-    fn devices_lose_no_write_across_server_restores(devices in 2..=3usize, phases in phases(true)) {
+    fn devices_lose_no_write_across_server_restores(devices in 2..=3usize, phases in phases(Losses::Restores)) {
         keep(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
 
     #[test]
     #[ignore = "a server restore still breaks these: an edit equal to the restored bytes is undone (GUN-438)"]
-    fn devices_converge_across_server_restores(devices in 2..=3usize, phases in phases(true)) {
+    fn devices_converge_across_server_restores(devices in 2..=3usize, phases in phases(Losses::Restores)) {
+        converge(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
+    }
+
+    #[test]
+    fn devices_lose_no_write_across_rewinds_and_rollbacks(devices in 2..=3usize, phases in phases(Losses::Rewinds)) {
+        keep(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
+    }
+
+    #[test]
+    fn devices_converge_across_rewinds_and_rollbacks(devices in 2..=3usize, phases in phases(Losses::Rewinds)) {
         converge(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
 }
@@ -152,8 +176,29 @@ proptest! {
 /// harness counts, so a change to the strategies cannot drop one without this test failing.
 #[test]
 fn the_schedules_reach_every_fault() {
+    reaches(Losses::None, &EVENTS);
+}
+
+#[test]
+fn the_rewind_schedules_reach_every_recovery() {
+    reaches(
+        Losses::Rewinds,
+        &[
+            "server rewound",
+            "rewind takes a write a disk holds",
+            "rewind takes a write only one disk holds",
+            "store rolled back",
+            "recovery starts after a rewind",
+            "recovery starts after a store rollback",
+            "crash during a recovery",
+            "store rolled back during a recovery",
+        ],
+    );
+}
+
+fn reaches(losses: Losses, events: &[&str]) {
     let mut runner = TestRunner::deterministic();
-    let strategy = (2..=3usize, phases(false));
+    let strategy = (2..=3usize, phases(losses));
     let mut seen: BTreeMap<&str, u64> = BTreeMap::new();
     for _ in 0..256 {
         let (devices, phases) = strategy.new_tree(&mut runner).unwrap().current();
@@ -165,7 +210,7 @@ fn the_schedules_reach_every_fault() {
     for (what, count) in &seen {
         println!("{count:>8} {what}");
     }
-    for what in EVENTS {
+    for what in events {
         assert!(
             seen.contains_key(what),
             "no schedule of the sample reached: {what}"
