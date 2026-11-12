@@ -7199,3 +7199,62 @@ fn a_folder_delete_waits_while_a_resent_answer_delete_below_it_requires_the_orig
     let commit = build(&mut Commits::default(), &mut trees, &mut IdGen::new(1)).unwrap();
     assert_eq!(ops(&commit), [required]);
 }
+
+fn kept_original_recorded() -> Trees {
+    let (mut commits, mut trees, mut ids, copy) = answered_conflict(Answer::KeepOriginal);
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    let in_trash = RemoteNode {
+        trashed: true,
+        trash_group: "1:0".into(),
+        ..remote_at(copy, 1)
+    };
+    trees.set_remote("y".into(), in_trash);
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    assert_eq!(kept_originals(&trees), [("y".into(), "f".into())]);
+    trees
+}
+
+fn kept_originals(trees: &Trees) -> Vec<(String, String)> {
+    trees.state().kept_originals.into_iter().collect()
+}
+
+#[test]
+fn a_kept_original_is_forgotten_once_another_device_restores_the_copy() {
+    let mut trees = kept_original_recorded();
+    trees.set_remote("y".into(), remote_at(file(ROOT, "f (conflict)", 2), 7));
+    assert_eq!(kept_originals(&trees), []);
+}
+
+#[test]
+fn a_kept_original_is_forgotten_once_l_holds_the_copy_again() {
+    let mut trees = kept_original_recorded();
+    trees.set_local("y".into(), local(file(ROOT, "f (conflict)", 2), 2));
+    assert_eq!(kept_originals(&trees), []);
+}
+
+#[test]
+fn a_kept_original_waiting_to_be_sent_again_is_forgotten_once_another_device_trashes_the_copy() {
+    let mut trees = trees(&[
+        synced("f", file(ROOT, "f", 1)),
+        (
+            "y",
+            None,
+            Some(file(ROOT, "y", 2)),
+            Some(remote(file(ROOT, "y", 2))),
+        ),
+    ]);
+    let mut state = trees.state();
+    state.kept_originals.insert("y".into(), "f".into());
+    trees.restore(state).unwrap();
+    let in_trash = RemoteNode {
+        trashed: true,
+        trash_group: "7:0".into(),
+        ..remote_at(file(ROOT, "y", 2), 7)
+    };
+    trees.set_remote("y".into(), in_trash);
+    assert_eq!(kept_originals(&trees), []);
+}

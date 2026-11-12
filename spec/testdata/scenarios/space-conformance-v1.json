@@ -10694,6 +10694,275 @@
           "live": []
         }
       ]
+    },
+    {
+      "name": "rfc0015-a-delete-requires-a-folder-by-the-id-an-earlier-op-of-its-commit-merged",
+      "covers": [
+        "RFC 0015 section 2",
+        "R2"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "one"
+            }
+          ]
+        },
+        "c2": {
+          "chunks": [
+            {
+              "text": "two"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d1",
+                  "parent": "root",
+                  "name": "Photos"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "y",
+                  "parent": "root",
+                  "name": "notes.txt",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "d1",
+              "y"
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "create_dir": {
+                  "node": "d2",
+                  "parent": "root",
+                  "name": "photos"
+                }
+              },
+              {
+                "delete": {
+                  "node": "y",
+                  "requires": {
+                    "node": "d2",
+                    "content_rev": 1,
+                    "meta_rev": 1
+                  }
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "MERGED_INTO",
+                "node": "d1"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "y"
+            ]
+          }
+        },
+        {
+          "live": [
+            "d1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "rfc0015-a-delete-r7-keeps-does-not-keep-the-node-it-requires",
+      "covers": [
+        "RFC 0015 section 2",
+        "R7"
+      ],
+      "devices": {
+        "a": {
+          "name": "Laptop"
+        },
+        "b": {
+          "name": "Desk"
+        }
+      },
+      "contents": {
+        "c1": {
+          "chunks": [
+            {
+              "text": "one"
+            }
+          ]
+        },
+        "c2": {
+          "chunks": [
+            {
+              "text": "two"
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 0,
+            "ops": [
+              {
+                "create_file": {
+                  "node": "f",
+                  "parent": "root",
+                  "name": "notes.txt",
+                  "content": "c1"
+                }
+              },
+              {
+                "create_file": {
+                  "node": "y",
+                  "parent": "root",
+                  "name": "notes 2.txt",
+                  "content": "c1"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 1,
+            "results": [
+              {
+                "code": "APPLIED"
+              },
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "f",
+              "y"
+            ]
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "update_content": {
+                  "node": "y",
+                  "content": "c2"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 2,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "y"
+            ]
+          }
+        },
+        {
+          "device": "a",
+          "commit": {
+            "base_seq": 1,
+            "ops": [
+              {
+                "delete": {
+                  "node": "y",
+                  "requires": {
+                    "node": "f",
+                    "content_rev": 1,
+                    "meta_rev": 1
+                  }
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 3,
+            "results": [
+              {
+                "code": "SUPERSEDED"
+              }
+            ],
+            "changed": []
+          }
+        },
+        {
+          "device": "b",
+          "commit": {
+            "base_seq": 2,
+            "ops": [
+              {
+                "delete": {
+                  "node": "f"
+                }
+              }
+            ]
+          },
+          "expect": {
+            "seq": 4,
+            "results": [
+              {
+                "code": "APPLIED"
+              }
+            ],
+            "changed": [
+              "f"
+            ]
+          }
+        },
+        {
+          "live": [
+            "y"
+          ]
+        }
+      ]
     }
   ]
 }
