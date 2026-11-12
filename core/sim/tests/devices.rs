@@ -186,9 +186,12 @@ fn the_rewind_schedules_reach_every_recovery() {
         &[
             "server rewound",
             "rewind takes a write a disk holds",
+            "rewind takes a write only one disk holds",
             "store rolled back",
             "recovery starts after a rewind",
             "recovery starts after a store rollback",
+            "crash during a recovery",
+            "store rolled back during a recovery",
         ],
     );
 }

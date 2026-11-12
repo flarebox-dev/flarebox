@@ -559,7 +559,6 @@ impl World {
             }
             Step::Restore => self.restore(),
             Step::Rewind => self.rewind(),
-            _ if self.devices[d].recovering.is_some() => {}
             Step::CopyStore => {
                 let device = &mut self.devices[d];
                 device.store_copy = Some(device.store.clone());
@@ -568,12 +567,23 @@ impl World {
                 let device = &mut self.devices[d];
                 if let Some(copy) = device.store_copy.clone() {
                     note(&mut self.seen, "store rolled back");
+                    if device.recovering.take().is_some() {
+                        note(&mut self.seen, "store rolled back during a recovery");
+                    }
                     device.store = copy;
                     device.rolled_back = true;
                     device.down = true;
                     device.link = None;
                 }
             }
+            Step::Crash if self.devices[d].recovering.is_some() => {
+                note(&mut self.seen, "crash during a recovery");
+                let device = &mut self.devices[d];
+                device.recovering = None;
+                device.down = true;
+                device.link = None;
+            }
+            _ if self.devices[d].recovering.is_some() => {}
             _ if self.devices[d].down => self.restart(d)?,
             Step::Scan => {
                 self.scan(d)?;
@@ -686,24 +696,34 @@ impl World {
             return;
         };
         note(&mut self.seen, "server rewound");
-        let writes = |space: &SpaceDo| -> BTreeSet<i64> {
-            (space.nodes().into_iter())
-                .filter(|node| node.status == NodeStatus::Live as i32)
-                .filter_map(|node| Some(node.current?.content?.mtime_ns))
-                .collect()
-        };
-        let before = writes(&self.space);
+        let taken: Vec<i64> = (self.writers.keys())
+            .filter(|write| stored(&self.held, **write) && !stored(&backup.held, **write))
+            .copied()
+            .collect();
         self.space.rewind(&backup.space, NOW);
-        let after = writes(&self.space);
-        for write in before.difference(&after) {
+        self.rewound
+            .retain(|write, _| !stored(&backup.held, *write));
+        for write in taken {
             let holders: BTreeSet<usize> = (self.devices.iter().enumerate())
-                .filter(|(_, device)| device.disk.holds(*write))
+                .filter(|(_, device)| {
+                    let remote = device.engine.trees.remote();
+                    device.disk.shows(write)
+                        && (remote.iter()).any(|(_, node)| {
+                            !node.trashed
+                                && (node.shape.content.as_ref())
+                                    .is_some_and(|c| c.mtime_ns == write)
+                        })
+                })
                 .map(|(d, _)| d)
                 .collect();
             if !holders.is_empty() {
                 note(&mut self.seen, "rewind takes a write a disk holds");
-                self.rewound.entry(*write).or_default().extend(holders);
             }
+            if holders.len() == 1 {
+                note(&mut self.seen, "rewind takes a write only one disk holds");
+            }
+            self.exposed.remove(&write);
+            self.rewound.entry(write).or_default().extend(holders);
         }
         for device in &mut self.devices {
             device.link = None;
@@ -878,7 +898,11 @@ impl World {
         }
         let Some(record) = device.engine.effects.in_flight().cloned() else {
             let commits = &device.engine.commits;
-            if device.engine.behind || commits.in_flight().is_some() && commits.halted().is_none() {
+            let listing = device.link.as_ref().is_some_and(|link| link.listing);
+            if device.engine.behind
+                || listing
+                || commits.in_flight().is_some() && commits.halted().is_none()
+            {
                 return Ok(false);
             }
             let Engine {
@@ -892,13 +916,13 @@ impl World {
             device.persist()?;
             return Ok(planned);
         };
-        device.disk.begin(&record);
         let applies = record.applies(&device.engine.trees);
-        let applied = match outcome {
-            Outcome::Run if applies => Some(device.disk.apply(&record, Cut::Done)),
-            Outcome::Crash(cut) if applies => Some(device.disk.apply(&record, cut)),
+        let until = match outcome {
+            Outcome::Run if applies => Some(Cut::Done),
+            Outcome::Crash(cut) if applies => Some(cut),
             _ => None,
         };
+        let applied = device.disk.apply(&record, until);
         if let Some(applied) = applied.as_ref().filter(|applied| {
             !resent_over_revert(&self.exposed, &self.rolled_back, &record, applied)
         }) {
@@ -998,7 +1022,6 @@ impl World {
         }
         let device = &mut self.devices[d];
         if let Some(record) = device.engine.effects.in_flight().cloned() {
-            device.disk.begin(&record);
             let quarantined = device.disk.quarantine.is_some();
             let applied = device.disk.recover(&record);
             if !resent_over_revert(&self.exposed, &self.rolled_back, &record, &applied) {
@@ -1115,6 +1138,15 @@ impl World {
                 engine.behind = true;
                 Ok(listing(&self.space))
             }
+            Err(resync) if resync.reason() == resync_required::Reason::LogTruncated => {
+                note(&mut self.seen, "resume finds the log truncated");
+                let link = self.devices[d]
+                    .link
+                    .as_mut()
+                    .expect("a resume runs on a link");
+                link.listing = true;
+                Ok(listing(&self.space))
+            }
             Err(error) => Err(Failure::Broken(format!(
                 "the server refused a resume: {error:?}"
             ))),
@@ -1155,12 +1187,13 @@ impl World {
             ),
             Reconnect::Idle => {}
         }
-        let backlog = self.resume(d)?;
         self.devices[d].link = Some(Link {
-            inbox: vec![backlog],
             head: welcome.head_seq,
             ..Default::default()
         });
+        let backlog = self.resume(d)?;
+        let link = self.devices[d].link.as_mut().expect("set above");
+        link.inbox.push(backlog);
         self.devices[d].persist()
     }
 
@@ -1169,23 +1202,21 @@ impl World {
     /// Records that arrive while R waits for a listing are dropped, and the listing asks for the
     /// backlog after its head, as the driver subscribes again from the listing's seq.
     fn deliver(&mut self, d: usize, index: usize) -> Result<bool, Failure> {
-        let behind = self.devices[d].engine.behind;
-        let Some(link) = self.devices[d]
-            .link
-            .as_mut()
-            .filter(|l| !l.inbox.is_empty())
-        else {
+        let device = &mut self.devices[d];
+        let behind = device.engine.behind;
+        let Some(link) = device.link.as_mut().filter(|l| !l.inbox.is_empty()) else {
             return Ok(false);
         };
+        let waits = behind || link.listing;
         let message = link.inbox.remove(index % link.inbox.len());
         match message {
-            Message::Records(_) if behind => {
+            Message::Records(_) if waits => {
                 note(
                     &mut self.seen,
                     "records dropped while R waits for a listing",
                 );
             }
-            Message::Listing { .. } if !behind => {
+            Message::Listing { .. } if !waits => {
                 note(&mut self.seen, "listing arrives twice");
             }
             Message::Listing { nodes, head } => {
@@ -1220,9 +1251,13 @@ impl World {
                         trees.set_remote(id, node);
                     }
                 }
-                trees.forget_lost(trashed, edited, commits.held_through(), commits.accepted());
+                if *behind {
+                    trees.forget_lost(trashed, edited, commits.held_through(), commits.accepted());
+                }
                 *cursor = head;
                 *behind = false;
+                let link = self.devices[d].link.as_mut().expect("checked above");
+                link.listing = false;
                 let backlog = self.resume(d)?;
                 let link = self.devices[d].link.as_mut().expect("checked above");
                 link.inbox.push(backlog);
@@ -1312,6 +1347,7 @@ impl World {
                             (device.link.as_mut()).expect("answered").inbox.push(listed);
                         }
                         commit::Failure::Halted(commit::Halt::Recovery) => {
+                            note(&mut self.seen, "recovery starts after a refused commit");
                             device.persist()?;
                             let code = error::Code::try_from(error.code);
                             return self
@@ -1341,7 +1377,7 @@ impl World {
             return Ok(false);
         };
         let engine = &mut device.engine;
-        if engine.behind || engine.cursor.seq < link.head {
+        if engine.behind || link.listing || engine.cursor.seq < link.head {
             return Ok(false);
         }
         let Some(flight) = engine.commits.in_flight() else {
@@ -1727,6 +1763,7 @@ impl World {
     fn kept(&self) -> Result<(), Failure> {
         let lost = (self.writers.iter()).find(|(write, writer)| {
             !stored(&self.held, **write)
+                && !self.rewound.contains_key(write)
                 && !self.removed[**writer].contains(write)
                 && !self.devices[**writer].disk.holds(**write)
         });
@@ -1742,14 +1779,18 @@ impl World {
         let dropped = (self.rewound.iter())
             .flat_map(|(write, holders)| holders.iter().map(move |d| (*write, *d)))
             .find(|(write, d)| {
-                !server.contains(write)
-                    && !self.removed[*d].contains(write)
-                    && !self.devices[*d].disk.holds(*write)
+                !self.removed[*d].contains(write) && !self.devices[*d].disk.holds(*write)
             });
         if let Some((write, d)) = dropped {
             return Err(Failure::Broken(format!(
                 "a rewind took write {write} from the server while the disk of device {d} held \
                  it, and it left that disk though its user never overwrote or deleted it"
+            )));
+        }
+        if let Some(write) = (self.rewound.keys()).find(|write| server.contains(write)) {
+            return Err(Failure::Broken(format!(
+                "a rewind took write {write} from the server, and a device sent it again though no \
+                 user answered to keep it"
             )));
         }
         let gone = (self.exposed.keys()).find(|write| {
@@ -1990,7 +2031,7 @@ mod tests {
                 content: Some(incoming),
             }),
         };
-        let applied = disk.apply(&record, Cut::Done);
+        let applied = disk.apply(&record, Some(Cut::Done)).unwrap();
         assert!(lost(&Held::new(), 0, &record, &applied).is_err());
         let rolled_back = BTreeMap::from([("a".into(), old.manifest_digest)]);
         for file in ["a", "b"] {

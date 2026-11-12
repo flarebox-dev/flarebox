@@ -565,9 +565,6 @@ impl SpaceDo {
         self.objects = objects;
     }
 
-    /// Rewinds the space to `backup`, a copy of it from earlier, as the owner's rewind does (RFC
-    /// 0003): the storage is restored as by [`SpaceDo::restore`], and a new history begins at the
-    /// copy's head, so every commit and resume of an earlier history is refused.
     pub fn rewind(&mut self, backup: &SpaceDo, now_ms: i64) {
         self.restore(backup);
         self.history_id = self.state.ids.uuid_v7(now_ms as u64);

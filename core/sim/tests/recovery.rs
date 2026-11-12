@@ -161,6 +161,35 @@ fn stale_store_replay() {
 }
 
 #[test]
+fn store_rollback_below_the_log_floor() {
+    let mut world = synced(2, &[vec![(0, file("a"))]]);
+    world
+        .run(
+            0,
+            &[
+                (0, Step::CopyStore),
+                (0, Step::Drop),
+                (1, file("b")),
+                (1, SCAN),
+                (1, COMMIT),
+                (1, COMMIT),
+            ],
+        )
+        .unwrap();
+    world.truncate_log();
+    world
+        .run(
+            1,
+            &[(0, Step::RollBack), (0, Step::Connect), (0, Step::Connect)],
+        )
+        .unwrap();
+    assert!(world.seen.contains_key("resume finds the log truncated"));
+    assert!(world.devices[0].recovering.is_none());
+    world.phase(1, &[]).unwrap();
+    assert_eq!(live(&world), ["a", "b"]);
+}
+
+#[test]
 fn remote_rename_then_store_rollback() {
     let mut world = synced(2, &[vec![(0, file("a"))]]);
     world
@@ -295,4 +324,132 @@ fn refused_then_replan() {
             .all(|device| device.recovering.is_none())
     );
     assert_eq!(world.space().device_seq("device-0"), 5);
+}
+
+#[test]
+fn rewound_write_only_one_disk_holds() {
+    let mut world = synced(2, &[vec![(0, Step::Backup), (0, file("a"))]]);
+    assert!(world.devices[0].disk.holds(1) && world.devices[1].disk.holds(1));
+    world
+        .run(
+            1,
+            &[
+                (0, Step::Drop),
+                (1, delete(0)),
+                (1, SCAN),
+                (1, COMMIT),
+                (1, COMMIT),
+                (1, DELIVER),
+                (0, Step::Rewind),
+            ],
+        )
+        .unwrap();
+    assert!(
+        world
+            .seen
+            .contains_key("rewind takes a write only one disk holds")
+    );
+    world.phase(2, &[]).unwrap();
+    assert!(world.devices[0].disk.holds(1));
+}
+
+#[test]
+fn rewound_write_another_device_overwrote() {
+    let mut world = synced(2, &[vec![(0, Step::Backup), (0, file("a"))]]);
+    world
+        .run(
+            1,
+            &[
+                (0, Step::Drop),
+                (1, overwrite(0)),
+                (1, SCAN),
+                (1, COMMIT),
+                (1, COMMIT),
+                (1, DELIVER),
+                (1, delete(0)),
+                (0, Step::Rewind),
+            ],
+        )
+        .unwrap();
+    world.phase(2, &[]).unwrap();
+    assert!(world.devices[0].disk.holds(1));
+}
+
+#[test]
+fn rewound_write_is_held_and_never_uploaded_unanswered() {
+    let mut world = synced(2, &[vec![(0, Step::Backup), (0, file("a"))]]);
+    world.run(1, &[(0, Step::Rewind)]).unwrap();
+    world.phase(2, &[]).unwrap();
+    assert_eq!(live(&world), Vec::<String>::new());
+    assert!(world.devices[0].disk.holds(1) && world.devices[1].disk.holds(1));
+}
+
+#[test]
+fn crash_and_rollback_during_recovery() {
+    for fault in [Step::Crash, Step::RollBack] {
+        let mut world = synced(1, &[vec![(0, Step::Backup), (0, file("a"))]]);
+        world
+            .run(
+                1,
+                &[(0, Step::CopyStore), (0, Step::Rewind), (0, Step::Connect)],
+            )
+            .unwrap();
+        recovering(&world, 0);
+        world
+            .run(1, &[(0, fault), (0, Step::Connect), (0, Step::Connect)])
+            .unwrap();
+        assert!(
+            world.seen["recovery starts after a rewind"] >= 2,
+            "{fault:?}"
+        );
+        recovering(&world, 0);
+        world.phase(2, &[]).unwrap();
+        assert!(world.devices[0].disk.holds(1), "{fault:?}");
+    }
+}
+
+#[test]
+fn commit_refused_after_store_rollback() {
+    let act = |kind, name, text| {
+        Step::User(Action {
+            kind,
+            target: 0,
+            parent: 0,
+            name,
+            text,
+        })
+    };
+    let mut world = World::new(2);
+    world.trace = std::env::var_os("KOIDRIVE_SIM_TRACE").is_some();
+    world
+        .run(
+            0,
+            &[
+                (0, act(1, 0, 0)),
+                (0, act(1, 1, 1)),
+                (0, act(0, 0, 0)),
+                (0, Step::Work(0)),
+                (0, act(2, 0, 0)),
+                (0, EFFECT),
+                (0, act(0, 0, 0)),
+                (0, COMMIT),
+                (0, act(0, 0, 0)),
+                (0, Step::CopyStore),
+                (0, Step::Work(2445374581055045480)),
+                (0, Step::Work(0)),
+                (0, Step::Work(0)),
+                (0, Step::Work(0)),
+                (0, act(0, 0, 0)),
+                (0, Step::RollBack),
+            ],
+        )
+        .unwrap();
+    world.phase(1, &[]).unwrap();
+    assert!(
+        world
+            .seen
+            .contains_key("recovery starts after a refused commit"),
+        "{:?}",
+        world.seen
+    );
 }

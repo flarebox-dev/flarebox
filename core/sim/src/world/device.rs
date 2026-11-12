@@ -191,6 +191,7 @@ pub struct Link {
     /// The request whose answer the device waits for.
     pub awaiting: Option<u64>,
     pub requests: u64,
+    pub listing: bool,
 }
 
 pub struct Device {
