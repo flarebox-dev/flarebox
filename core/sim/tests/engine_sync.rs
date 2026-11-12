@@ -1308,7 +1308,7 @@ fn run_ignoring(
     prop_assert_eq!(unsettled, Vec::<&String>::new());
     prop_assert!(commits.problems().is_empty(), "{:?}", commits.problems());
     prop_assert!(effects.blocked().is_empty(), "{:?}", effects.blocked());
-    let reported = koidrive_engine::effects::stuck(&device.trees);
+    let reported = koidrive_engine::effects::stuck(&device.trees, &effects);
     let stays_parked = |id: &str| {
         waiting.contains(id)
             || !device.trees.reverted().contains(id)

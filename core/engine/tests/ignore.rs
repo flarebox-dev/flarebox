@@ -659,7 +659,7 @@ fn a_parked_folder_the_rules_now_exclude_frees_its_name_in_s_with_what_it_holds(
     assert_eq!(trees.local().get("old"), Some(&parked));
     assert_eq!(trees.check(), Ok(()));
     assert_eq!(
-        effects::stuck(&trees),
+        effects::stuck(&trees, &Effects::default()),
         BTreeMap::from([("old".into(), Stuck::Parked)])
     );
 }

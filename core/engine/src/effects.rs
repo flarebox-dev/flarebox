@@ -237,6 +237,19 @@ impl Effects {
         }
         self.failed
             .retain(|id, _| candidate(trees, id) || trees.waiting().contains_key(id));
+        let (node, effect, after) = self.choose(trees)?;
+        self.failed.remove(&node);
+        self.in_flight = Some(EffectRecord {
+            effect_id: ids.uuid_v7(now_ms),
+            node,
+            counter: self.cleared + 1,
+            effect,
+            after,
+        });
+        self.in_flight.as_ref()
+    }
+
+    fn choose(&self, trees: &Trees) -> Option<(NodeId, Effect, Option<Shape>)> {
         let view = View::new(trees);
         let writes_rules = |id: &str| {
             let remote = trees.remote().live(id)?;
@@ -295,7 +308,7 @@ impl Effects {
                 Step::Blocked(None) | Step::Skip => {}
             }
         }
-        let (node, effect, after) = chosen.or_else(|| {
+        chosen.or_else(|| {
             blockers.into_iter().find_map(|id| {
                 if !view.parkable(&id) {
                     return None;
@@ -303,16 +316,7 @@ impl Effects {
                 let (effect, after) = view.park(&id)?;
                 (self.failed.get(&id) != Some(&effect)).then_some((id, effect, after))
             })
-        })?;
-        self.failed.remove(&node);
-        self.in_flight = Some(EffectRecord {
-            effect_id: ids.uuid_v7(now_ms),
-            node,
-            counter: self.cleared + 1,
-            effect,
-            after,
-        });
-        self.in_flight.as_ref()
+        })
     }
 
     /// The driver did the effect. L takes the node's new shape, with `identity` for an entry the
@@ -516,7 +520,7 @@ pub enum Stuck {
 /// The nodes section 5.10 reports as problems: each node the planner considers whose place is held
 /// by the local copy of an excluded node, each node whose S update waits behind one of them, and
 /// each node that cannot be put into its folder in R because that folder is one of them.
-pub fn stuck(trees: &Trees) -> BTreeMap<NodeId, Stuck> {
+pub fn stuck(trees: &Trees, effects: &Effects) -> BTreeMap<NodeId, Stuck> {
     let view = View::new(trees);
     let planned: Vec<&NodeId> = (trees.dirty().iter())
         .filter(|id| candidate(trees, id) && !trees.held(id))
@@ -531,11 +535,7 @@ pub fn stuck(trees: &Trees) -> BTreeMap<NodeId, Stuck> {
             Some(((*id).clone(), Stuck::HeldBy(by)))
         })
         .collect();
-    let idle = planned.iter().all(|id| match view.step(id) {
-        Step::Apply(..) => false,
-        Step::Blocked(Some(holder)) => !view.parkable(&holder),
-        _ => true,
-    });
+    let idle = effects.in_flight().is_none() && effects.choose(trees).is_none();
     let parked: Vec<(NodeId, Stuck)> = (planned.iter())
         .filter(|_| idle)
         .filter(|id| !stuck.contains_key(**id))

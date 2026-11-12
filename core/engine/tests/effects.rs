@@ -1455,7 +1455,10 @@ fn a_file_parked_for_a_name_swap_is_not_reported_while_the_swap_goes_on() {
     disk.apply(&park.effect).unwrap();
     effects.done(&mut trees, &park.effect_id, None).unwrap();
     trees.settle();
-    assert_eq!(koidrive_engine::effects::stuck(&trees), BTreeMap::new());
+    assert_eq!(
+        koidrive_engine::effects::stuck(&trees, &effects),
+        BTreeMap::new()
+    );
 }
 
 #[test]
@@ -1483,6 +1486,37 @@ fn an_ignored_parked_file_whose_local_name_an_excluded_folder_holds_goes_into_it
     let p = trees.local().get("p").unwrap();
     assert!(!p.parked);
     assert_eq!(p.shape, file("e", "A", 1));
+}
+
+#[test]
+fn a_parked_node_that_can_go_nowhere_is_reported_beside_a_failed_effect() {
+    let (mut trees, mut disk) = space(&[
+        ("h", Some(file(ROOT, "a", 1)), Some(file(ROOT, "a", 1))),
+        ("far", None, Some(dir(ROOT, "archive"))),
+        ("f", Some(file(ROOT, "f", 1)), Some(file("far", "f", 1))),
+        ("g", None, Some(file(ROOT, "g", 1))),
+    ]);
+    trees.set_rules(
+        &[] as &[&str],
+        Some(koidrive_engine::ignore::RuleFile::parse(b"archive/\n")),
+    );
+    let mut f = trees.local().get("f").unwrap().clone();
+    f.shape = file(ROOT, "a", 1);
+    f.parked = true;
+    trees.set_local("f".into(), f);
+    let entry = disk.entries.get_mut(&3).unwrap();
+    entry.area = Area::Parked;
+    entry.name = "f".into();
+    trees.check().unwrap();
+    disk.matches(&trees).unwrap();
+    trees.settle();
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    let record = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    assert_eq!(record.node, "g");
+    effects.failed(&record.effect_id).unwrap();
+    assert!(effects.plan(&trees, &mut ids, NOW).is_none());
+    let reported = koidrive_engine::effects::stuck(&trees, &effects);
+    assert!(reported.contains_key("f"), "{reported:?}");
 }
 
 /// A valid tree over `n0`, `n1`, ... from one [`Draw`] per node, as in tests/trees.rs, where each

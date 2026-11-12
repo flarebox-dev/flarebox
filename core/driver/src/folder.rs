@@ -798,7 +798,7 @@ impl Folder {
             self.engine.effects.in_flight(),
             self.engine.commits.in_flight(),
         ) {
-            (None, None) => effects::stuck(trees),
+            (None, None) => effects::stuck(trees, &self.engine.effects),
             _ => BTreeMap::new(),
         };
         let state = match &self.stream {
