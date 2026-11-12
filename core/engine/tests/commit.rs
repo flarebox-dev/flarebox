@@ -3396,7 +3396,8 @@ fn a_waiting_update_is_made_while_committing_is_halted() {
 }
 
 /// As above, with an edit the user made after the commit: L leaves the waiting shape, so nothing
-/// but building makes the update. Once it fits, building makes it while committing is halted,
+/// but building makes the update. The edit is planned against the waiting shape and goes out with
+/// the commit that is refused. Once the update fits, building makes it while committing is halted,
 /// and the edit stays the user's.
 #[test]
 fn a_waiting_update_is_made_while_committing_is_halted_under_a_local_edit() {
@@ -3405,7 +3406,11 @@ fn a_waiting_update_is_made_while_committing_is_halted_under_a_local_edit() {
     trees.set_local("p".into(), local(file(ROOT, "p", 3), 3));
     trees.settle();
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
-    assert!(matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id == "p"));
+    assert!(
+        matches!(&ops(&commit)[..], [op::Op::UpdateContent(u), op::Op::CreateFile(c)] if u.node_id == "n" && c.node_id == "p"),
+        "{:?}",
+        ops(&commit)
+    );
     assert_eq!(
         commits.failed(&refusal(error::Code::ReadOnly, 0)),
         Ok(Failure::Halted(Halt::ReadOnly))

@@ -587,7 +587,7 @@ impl Commits {
     /// edit of a file is sent before the restore of an earlier version and so becomes a version
     /// itself. While such an op is left for a later commit, the restore waits with it. It also
     /// waits while its node is not settled: a node left out of planning (a problem node, a node
-    /// whose S update waits and that L did not move away from the waiting position, a parked one),
+    /// whose S update waits and that L did not change, a parked one),
     /// and a node L and R agree on while S lags ([`Class::Same`]). A folder is not deleted in the
     /// commit that restores a node into it.
     ///
@@ -619,7 +619,7 @@ impl Commits {
         self.ask_again(trees, ids, now_ms);
         trees.reclaim();
         let parked = trees.local().iter().filter(|(_, node)| node.parked);
-        let waiting = (trees.waiting().keys()).filter(|id| !moved_locally(trees, id));
+        let waiting = (trees.waiting().keys()).filter(|id| !changed_locally(trees, id));
         let mut skip: BTreeSet<NodeId> = self
             .problems
             .iter()
@@ -1820,11 +1820,12 @@ fn acknowledged_class(trees: &Trees, id: &str) -> Class {
     classify(local, acknowledged(trees, id), remote)
 }
 
-/// Whether L moved a node whose S update waits away from the waiting position, where R still
-/// holds it. Such a node is planned and rebased against the waiting shape, since the update may
-/// never fit while L holds the node elsewhere, as when a folder R trashed takes its name key in S
-/// and L cannot remove that folder while the node is inside it.
-fn moved_locally(trees: &Trees, id: &str) -> bool {
+/// Whether L changed a node whose S update waits, where R still holds it at the waiting position:
+/// L moved it away from that position, or edited it there. Such a node is planned and rebased
+/// against the waiting shape. The update may never fit while L holds the node elsewhere, as when a
+/// folder R trashed takes its name key in S and L cannot remove that folder while the node is
+/// inside it, and an edit is uploaded while only the position waits.
+fn changed_locally(trees: &Trees, id: &str) -> bool {
     let (
         Some(local),
         Some(Waiting {
@@ -1835,8 +1836,8 @@ fn moved_locally(trees: &Trees, id: &str) -> bool {
     else {
         return false;
     };
-    let held = |shape: &Shape| shape.same_position(waiting);
-    !held(local) && trees.remote().live(id).is_some_and(held)
+    !local.same(waiting)
+        && (trees.remote().live(id)).is_some_and(|remote| remote.same_position(waiting))
 }
 
 /// What is left of a waiting S update. Its position is stale once R no longer has the node there
