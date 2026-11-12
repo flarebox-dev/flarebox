@@ -330,8 +330,6 @@ impl FsObserver {
         }
     }
 
-    /// Forgets or moves the unread files that `changes` replace: a new change to a path is read afresh, and a rename
-    /// carries the files under it along unless it moves them into an excluded path.
     fn supersede(&mut self, changes: &[Change]) {
         let mut moves: BTreeMap<&Path, Option<&Path>> = BTreeMap::new();
         for change in changes {
@@ -1201,6 +1199,119 @@ mod tests {
             &[("a", "b"), ("b/locked", "b/moved")],
             "b/moved",
         );
+    }
+
+    #[test]
+    fn an_unread_file_in_a_folder_renamed_only_in_case_is_read_at_its_new_path() {
+        unread_file_read_at(&["Docs"], "Docs/locked", &[("Docs", "docs")], "docs/locked");
+    }
+
+    #[test]
+    fn an_unread_file_in_a_folder_whose_case_rotated_through_a_third_name_is_read_at_its_new_path()
+    {
+        unread_file_read_at(
+            &["A", "b"],
+            "A/locked",
+            &[("A", "t"), ("b", "B"), ("t", "a")],
+            "a/locked",
+        );
+    }
+
+    #[test]
+    fn an_unread_file_in_three_rotated_folders_is_read_at_its_new_path() {
+        unread_file_read_at(
+            &["a", "b", "c"],
+            "a/locked",
+            &[("a", "t"), ("c", "a"), ("b", "c"), ("t", "b")],
+            "b/locked",
+        );
+    }
+
+    #[test]
+    fn an_unread_file_whose_folder_moved_before_a_new_file_took_its_path_is_read_at_its_new_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = marked();
+        fs::create_dir(dir.path().join("a")).unwrap();
+        let file = dir.path().join("a/locked");
+        fs::write(&file, b"content").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&file).is_ok() {
+            assert!(rustix::process::geteuid().is_root());
+            eprintln!("SKIPPED: running as root, so permissions do not block reads");
+            return;
+        }
+        let mut observer = observer(dir.path());
+        observe_until(&mut observer, |seen| seen.len() >= 2);
+
+        fs::rename(dir.path().join("a"), dir.path().join("b")).unwrap();
+        fs::create_dir(dir.path().join("a")).unwrap();
+        fs::write(dir.path().join("a/locked"), b"new").unwrap();
+        observe_until(&mut observer, |seen| {
+            seen.iter()
+                .any(|change| matches!(change, Observed::Renamed { .. }))
+        });
+        assert_eq!(
+            observer.unread.keys().collect::<Vec<_>>(),
+            [Path::new("b/locked")]
+        );
+        fs::set_permissions(
+            dir.path().join("b/locked"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let (seen, _) = observe_until(&mut observer, |seen| {
+            seen.iter()
+                .any(|change| matches!(change, Observed::Modified { .. }))
+        });
+        let read: Vec<_> = (seen.iter())
+            .filter_map(|change| match change {
+                Observed::Modified { path, content, .. } => {
+                    Some((path.clone(), content.as_ref().map(|c| c.size)))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(read, [(PathBuf::from("b/locked"), Some(7))]);
+    }
+
+    #[test]
+    fn an_unread_file_unlocked_as_it_and_its_folder_are_renamed_is_read_at_its_new_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = marked();
+        fs::create_dir(dir.path().join("a")).unwrap();
+        let file = dir.path().join("a/locked");
+        fs::write(&file, b"content").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&file).is_ok() {
+            assert!(rustix::process::geteuid().is_root());
+            eprintln!("SKIPPED: running as root, so permissions do not block reads");
+            return;
+        }
+        let mut observer = observer(dir.path());
+        observe_until(&mut observer, |seen| seen.len() >= 2);
+
+        fs::rename(dir.path().join("a"), dir.path().join("b")).unwrap();
+        fs::rename(dir.path().join("b/locked"), dir.path().join("b/moved")).unwrap();
+        fs::set_permissions(
+            dir.path().join("b/moved"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let (seen, _) = observe_until(&mut observer, |seen| {
+            seen.iter()
+                .any(|change| matches!(change, Observed::Modified { .. }))
+        });
+        let read: Vec<_> = (seen.iter())
+            .filter_map(|change| match change {
+                Observed::Modified { path, content, .. } => {
+                    Some((path.clone(), content.as_ref().map(|c| c.size)))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(read, [(PathBuf::from("b/moved"), Some(7))]);
     }
 
     #[test]
