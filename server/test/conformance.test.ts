@@ -1,22 +1,37 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { create, fromBinary, type MessageInitShape, toBinary } from "@bufbuild/protobuf";
+import { create, type DescMessage, fromBinary, type MessageInitShape, toBinary } from "@bufbuild/protobuf";
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import file from "../../spec/testdata/scenarios/space-conformance-v1.json";
+import hand from "../../spec/testdata/scenarios/space-conformance-v1.json";
+import sequences from "../../spec/testdata/scenarios/space-commit-sequences-v1.json";
 import { signChunkGrant, sha256 } from "../src/crypto";
-import { type Op, OpResult_Code, OpSchema, type OpResult, type UploadReceipt, UploadReceiptSchema } from "../src/gen/koidrive/v1/commit_pb";
+import {
+  type CommitResult,
+  CommitResultSchema,
+  type Op,
+  OpResult_Code,
+  OpSchema,
+  type OpResult,
+  OpResultSchema,
+  type UploadReceipt,
+  UploadReceiptSchema,
+} from "../src/gen/koidrive/v1/commit_pb";
 import { RpcRequestSchema, type RpcResponse, RpcResponseSchema } from "../src/gen/koidrive/v1/messages_pb";
 import {
+  type ChangeRecord,
+  ChangeRecordSchema,
   type ChunkRef,
   ChunkRefSchema,
   type Content,
   ContentSchema,
   NodeKind,
   type NodeState,
+  NodeStateSchema,
   NodeStatus,
   type VersionInfo,
+  VersionInfoSchema,
 } from "../src/gen/koidrive/v1/model_pb";
 import { ChunkPlan_Action, Error_Code, type Error as RpcError } from "../src/gen/koidrive/v1/rpc_pb";
 import { toHex, uuidv7 } from "../src/ids";
@@ -27,7 +42,11 @@ import { OWNER, targetIncarnation } from "./helpers";
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 type Obj = { [key: string]: Json };
 
-const doc = file as unknown as Obj;
+const doc = hand as unknown as Obj;
+const files: [string, Obj][] = [
+  ["space-conformance-v1.json", doc],
+  ["space-commit-sequences-v1.json", sequences as unknown as Obj],
+];
 const ORIGIN = "https://koidrive.test";
 const CHUNKER = "fastcdc2020-1m-4m-16m";
 
@@ -71,6 +90,26 @@ function req<T>(found: T | undefined, field: string): T {
   if (found === undefined) fail(`missing field ${field}`);
   return found;
 }
+
+function every(value: Obj, fields: string[]): void {
+  for (const field of fields) if (!(field in value)) fail(`missing field ${field}`);
+}
+
+function covered(schema: DescMessage, compared: string[]): void {
+  for (const field of schema.fields) if (!compared.includes(field.localName)) fail(`${schema.typeName}.${field.name} is not compared`);
+}
+
+function within(prefix: string, check: () => void): void {
+  try {
+    check();
+  } catch (error) {
+    if (error instanceof Failure) fail(`${prefix}: ${error.message}`);
+    throw error;
+  }
+}
+
+const NODE_FIELDS = ["node", "parent", "name", "kind", "status", "content_rev", "meta_rev", "trash_group", "current"];
+const CURRENT_FIELDS = ["version", "seq", "content", "chunks_inline", "device", "user", "created_at_ms"];
 
 function strings(list: Json[], what: string): string[] {
   return list.map((v) => (typeof v === "string" ? v : fail(`${what} must list strings, got ${show(v)}`)));
@@ -153,13 +192,13 @@ class Run {
     this.mtimeNs = mtimeNs;
   }
 
-  static async start(scenario: Obj): Promise<Run> {
+  static async start(scenario: Obj, file: Obj): Promise<Run> {
     keys(scenario, "a scenario", ["name", "covers", "reference_only", "devices", "spaces", "contents", "steps"]);
     req(optStr(scenario, "name"), "name");
     optStr(scenario, "reference_only");
     optList(scenario, "covers");
-    const nowMs = req(optInt(doc, "now_ms"), "now_ms");
-    const mtimeText = req(optStr(doc, "mtime_ns"), "mtime_ns");
+    const nowMs = req(optInt(file, "now_ms"), "now_ms");
+    const mtimeText = req(optStr(file, "mtime_ns"), "mtime_ns");
     if (!/^-?\d+$/.test(mtimeText)) fail("mtime_ns must be an int64 written as a string");
     const run = new Run(nowMs, BigInt(mtimeText));
     const names = "spaces" in scenario ? strings(req(optList(scenario, "spaces"), "spaces"), "spaces") : ["main"];
@@ -487,7 +526,7 @@ class Run {
     const sent = this.sentSlots.get(`${device}/${commitId}`);
     const deviceSeq = given === undefined ? (sent ?? (this.slots.get(device) ?? 0n) + 1n) : BigInt(given);
     if (sent === undefined) this.sentSlots.set(`${device}/${commitId}`, deviceSeq);
-    const expect = expectation(step, ["missing", "missing_some"], ["seq", "results", "changed"]);
+    const expect = expectation(step, ["missing", "missing_some"], ["seq", "results", "changed", "response"]);
     const result = await this.rpc(space, session, atMs, {
       case: "commit",
       value: {
@@ -531,6 +570,11 @@ class Run {
       this.slots.set(device, deviceSeq);
     }
     const committed = result.value;
+    if ("response" in expect) {
+      keys(expect, "a full expect", ["response"]);
+      this.checkResponse(space, expect.response!, committed);
+      return;
+    }
     const seq = optUint(expect, "seq");
     if (seq !== undefined && committed.seq !== BigInt(seq)) fail(`seq ${committed.seq}, expected ${seq}`);
     const results = optList(expect, "results");
@@ -538,7 +582,7 @@ class Run {
       if (results.length !== committed.results.length) fail(`${committed.results.length} results, expected ${results.length}`);
       for (const [i, want] of results.entries()) {
         try {
-          this.checkResult(space, want, committed.results[i]!);
+          this.checkResult(space, want, committed.results[i]!, false);
         } catch (error) {
           if (error instanceof Failure) fail(`result ${i + 1}: ${error.message}`);
           throw error;
@@ -553,8 +597,37 @@ class Run {
     }
   }
 
-  private checkResult(space: string, wanted: Json, got: OpResult): void {
-    const want = keys(wanted, "a result", ["code", "node", "name", "reason"]);
+  private checkResponse(space: string, wanted: Json, got: CommitResult): void {
+    const fields = ["seq", "committed_at_ms", "results", "changes"];
+    const want = keys(wanted, "response", fields);
+    every(want, fields);
+    covered(CommitResultSchema, ["seq", "committedAtMs", "results", "changes"]);
+    const seq = req(optUint(want, "seq"), "seq");
+    if (got.seq !== BigInt(seq)) fail(`seq ${got.seq}, expected ${seq}`);
+    const at = req(optInt(want, "committed_at_ms"), "committed_at_ms");
+    if (got.committedAtMs !== BigInt(at)) fail(`committed_at_ms ${got.committedAtMs}, expected ${at}`);
+    const results = req(optList(want, "results"), "results");
+    if (results.length !== got.results.length) fail(`${got.results.length} results, expected ${results.length}`);
+    for (const [i, result] of results.entries()) within(`result ${i + 1}`, () => this.checkResult(space, result, got.results[i]!, true));
+    const changes = req(optList(want, "changes"), "changes");
+    if (changes.length !== got.changes.length) fail(`${got.changes.length} changes, expected ${changes.length}`);
+    for (const [i, change] of changes.entries()) within(`change ${i + 1}`, () => this.checkChange(space, change, got.changes[i]!));
+  }
+
+  private checkChange(space: string, wanted: Json, got: ChangeRecord): void {
+    const want = keys(wanted, "a change", ["node"]);
+    covered(ChangeRecordSchema, ["node", "purged", "space", "member"]);
+    const change = got.change;
+    if (change.case !== "node") fail(`${change.case === undefined ? "an empty change" : `a ${change.case} change`}, expected a node`);
+    if (want.node === undefined) fail("missing field node");
+    this.checkNodeState(space, want.node, change.value, true);
+  }
+
+  private checkResult(space: string, wanted: Json, got: OpResult, complete: boolean): void {
+    const fields = ["code", "node", "name", "reason"];
+    const want = keys(wanted, "a result", fields);
+    if (complete) every(want, fields);
+    covered(OpResultSchema, ["code", "nodeId", "name", "rejectReason"]);
     const code = OpResult_Code[got.code] ?? "?";
     const wantCode = req(optStr(want, "code"), "code");
     if (code !== wantCode) fail(`${code} ${show(got.rejectReason)}, expected ${wantCode}`);
@@ -564,6 +637,53 @@ class Run {
     if (reason !== undefined && got.rejectReason !== reason) fail(`reason ${show(got.rejectReason)}, expected ${reason}`);
     const node = optStr(want, "node");
     if (node !== undefined) this.expectId(space, node, got.nodeId);
+  }
+
+  private device(symbol: string): Session {
+    return this.devices.get(symbol) ?? fail(`unknown device ${symbol}`);
+  }
+
+  private checkCurrent(space: string, wanted: Json, got: VersionInfo): void {
+    const want = keys(wanted, "a current version", CURRENT_FIELDS);
+    every(want, CURRENT_FIELDS);
+    covered(VersionInfoSchema, ["versionId", "seq", "content", "deviceId", "userId", "createdAtMs"]);
+    within("version", () => this.expectId(space, req(optStr(want, "version"), "version"), got.versionId));
+    const seq = req(optUint(want, "seq"), "seq");
+    if (got.seq !== BigInt(seq)) fail(`seq ${got.seq}, expected ${seq}`);
+    const at = req(optInt(want, "created_at_ms"), "created_at_ms");
+    if (got.createdAtMs !== BigInt(at)) fail(`created_at_ms ${got.createdAtMs}, expected ${at}`);
+    const device = this.device(req(optStr(want, "device"), "device"));
+    if (got.deviceId !== device.deviceId) fail(`device_id ${got.deviceId}, expected ${device.deviceName}'s`);
+    const user = this.device(req(optStr(want, "user"), "user"));
+    if (got.userId !== user.userId) fail(`user_id ${got.userId}, expected ${user.userId}`);
+    const inline = req(optBool(want, "chunks_inline"), "chunks_inline");
+    const content = want.content;
+    if (content === null) {
+      if (got.content) fail("a content, expected none");
+    } else if (typeof content !== "string") fail(`content must be a string or null, got ${show(content)}`);
+    else if (!got.content) fail(`no content, expected ${content}`);
+    else this.checkFullContent(got.content, content, inline);
+  }
+
+  private checkFullContent(got: Content, symbol: string, inline: boolean): void {
+    covered(ContentSchema, ["size", "mtimeNs", "executable", "chunks", "chunkCount", "manifestDigest", "chunker"]);
+    covered(ChunkRefSchema, ["hash", "size", "encoding"]);
+    const want = this.content(symbol).content;
+    const listed = inline ? want.chunks : [];
+    const sameChunks =
+      got.chunks.length === listed.length &&
+      got.chunks.every((chunk, i) => toHex(chunk.hash) === toHex(listed[i]!.hash) && chunk.size === listed[i]!.size && chunk.encoding === listed[i]!.encoding);
+    const fields: [string, boolean][] = [
+      ["size", got.size === want.size],
+      ["mtime_ns", got.mtimeNs === want.mtimeNs],
+      ["executable", got.executable === want.executable],
+      ["chunks", sameChunks],
+      ["chunk_count", got.chunkCount === want.chunkCount],
+      ["manifest_digest", toHex(got.manifestDigest) === toHex(want.manifestDigest)],
+      ["chunker", got.chunker === want.chunker],
+    ];
+    const differ = fields.filter(([, same]) => !same).map(([field]) => field);
+    if (differ.length > 0) fail(`content differs from ${symbol} in ${differ.join(", ")}`);
   }
 
   private checkContent(got: Content | undefined, symbol: string): void {
@@ -665,7 +785,7 @@ class Run {
   }
 
   private async checkNode(space: string, wanted: Json): Promise<void> {
-    const want = keys(wanted, "a node", ["node", "absent", "parent", "name", "kind", "status", "content_rev", "meta_rev", "trash_group", "content"]);
+    const want = object(wanted, "a node");
     const symbol = req(optStr(want, "node"), "node");
     const id = this.known(space, symbol);
     const got: NodeState | undefined = await this.read(space, (sql) => {
@@ -680,6 +800,15 @@ class Run {
       return;
     }
     if (!got) fail(`${symbol} does not exist`);
+    this.checkNodeState(space, want, got, "current" in want);
+  }
+
+  private checkNodeState(space: string, wanted: Json, got: NodeState, complete: boolean): void {
+    const want = keys(wanted, "a node", complete ? NODE_FIELDS : [...NODE_FIELDS, "absent", "content"]);
+    if (complete) every(want, NODE_FIELDS);
+    covered(NodeStateSchema, ["nodeId", "parentId", "name", "kind", "status", "contentRev", "metaRev", "trashGroup", "current"]);
+    const symbol = req(optStr(want, "node"), "node");
+    within("node", () => this.expectId(space, symbol, got.nodeId));
     const differs = (field: string, value: unknown) => fail(`${symbol}.${field} is ${String(value)}, expected ${show(want[field])}`);
     const parent = optStr(want, "parent");
     if (parent !== undefined) {
@@ -722,13 +851,20 @@ class Run {
         throw error;
       }
     }
+    if ("current" in want) {
+      const current = want.current;
+      if (current === null) {
+        if (got.current) fail(`${symbol} has a current version, expected none`);
+      } else if (!got.current) fail(`${symbol} has no current version, expected one`);
+      else within(`${symbol}.current`, () => this.checkCurrent(space, current!, got.current!));
+    }
   }
 }
 
-async function run(scenario: Json): Promise<string | undefined> {
+async function run(scenario: Json, file: Obj = doc): Promise<string | undefined> {
   try {
     const found = object(scenario, "a scenario");
-    const runner = await Run.start(found);
+    const runner = await Run.start(found, file);
     await runner.steps({
       ...found,
       steps: req(optList(found, "steps"), "steps").filter((step) => !(object(step, "a step").reference_only !== undefined)),
@@ -740,22 +876,24 @@ async function run(scenario: Json): Promise<string | undefined> {
   }
 }
 
-keys(doc, "the file", ["format", "version", "spec", "unicode", "now_ms", "mtime_ns", "conventions", "scenarios"]);
-const scenarios = req(optList(doc, "scenarios"), "scenarios");
-
-describe("space conformance (spec/testdata/scenarios/space-conformance-v1.json)", () => {
-  it("reads format koidrive.space-conformance version 1", () => {
-    expect([doc.format, doc.version]).toEqual(["koidrive.space-conformance", 1]);
-  });
-
-  for (const scenario of scenarios) {
-    const { name, reference_only } = object(scenario, "a scenario");
-    const test = reference_only === undefined ? it : it.skip;
-    test(String(name), { timeout: 120_000 }, async () => {
-      expect(await run(scenario)).toBeUndefined();
+for (const [path, file] of files) {
+  keys(file, "the file", ["format", "version", "spec", "unicode", "now_ms", "mtime_ns", "conventions", "scenarios"]);
+  describe(`space conformance (spec/testdata/scenarios/${path})`, () => {
+    it("reads format koidrive.space-conformance version 1", () => {
+      expect([file.format, file.version]).toEqual(["koidrive.space-conformance", 1]);
     });
-  }
-});
+
+    for (const scenario of req(optList(file, "scenarios"), "scenarios")) {
+      const { name, reference_only } = object(scenario, "a scenario");
+      const test = reference_only === undefined ? it : it.skip;
+      test(String(name), { timeout: 120_000 }, async () => {
+        expect(await run(scenario, file)).toBeUndefined();
+      });
+    }
+  });
+}
+
+const scenarios = req(optList(doc, "scenarios"), "scenarios");
 
 describe("conformance runner self-tests", () => {
   const base = scenarios[0]!;
@@ -801,6 +939,22 @@ describe("conformance runner self-tests", () => {
       (s) => void (object(object(s.steps[0]!.expect, "expect").missing_some, "missing_some").total = 1000),
       "does not give the total 1000 first",
     ],
+    ["an unknown scenario field fails", base, (s) => void ((s as unknown as Obj).covres = ["R1"]), "unknown field covres in a scenario"],
+    ["an unknown step field fails", base, (s) => void (s.steps[0]!.devcie = "a"), "step 1: unknown field devcie in a step"],
+    ["an unknown commit field fails", base, (s) => void (object(s.steps[0]!.commit, "commit").base = 0), "step 1: unknown field base in commit"],
+    [
+      "an unknown op field fails",
+      base,
+      (s) => void (object(object((object(s.steps[0]!.commit, "commit").ops as Json[])[0], "op").create_file, "create_file").mode = "x"),
+      "step 1: unknown field mode in create_file",
+    ],
+    [
+      "an unknown result field fails",
+      base,
+      (s) => void (object((object(s.steps[0]!.expect, "expect").results as Json[])[0], "result").nmae = "x"),
+      "step 1: result 1: unknown field nmae in a result",
+    ],
+    ["an unknown node field fails", base, (s) => void (object((s.steps[2]!.nodes as Json[])[0], "node").stauts = "LIVE"), "step 3: unknown field stauts in a node"],
   ];
   for (const [name, scenario, edit, reason] of cases) {
     it(name, async () => {
