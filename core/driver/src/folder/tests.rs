@@ -2931,6 +2931,59 @@ fn a_file_whose_place_an_excluded_folder_holds_is_named_with_what_waits_for_its_
     assert_eq!(remote.names(), ["a", "a", "ß"]);
 }
 
+/// Device `b` excludes the folder `q/x`. Device `a` renames that folder to `q/y`, then moves the file `p/f` to `q/x` and
+/// deletes the folder `p`. On `b` the excluded folder keeps its place, so nothing can put the file at `q/x`, and `p`
+/// can't be removed while the file is in it. The folder is up to date, and its problem names the file and the entry
+/// that holds its name.
+#[test]
+fn a_folder_to_remove_that_holds_a_file_an_excluded_entry_keeps_out_lets_the_folder_settle() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    for dir in ["p", "q", "q/x"] {
+        fs::create_dir(site_a.root.join(dir)).unwrap();
+    }
+    a.create(&mut remote, &site_a.root.join("p/f"), b"in p");
+    let (site, b) = linked(&mut remote, "b");
+    drop(b);
+    let sync = SyncRules {
+        include: Vec::new(),
+        exclude: vec!["x/".into()],
+    };
+    let mut b = site.start_with(&sync);
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    b.run(&mut remote);
+
+    fs::rename(site_a.root.join("q/x"), site_a.root.join("q/y")).unwrap();
+    a.settle();
+    a.run(&mut remote);
+    fs::rename(site_a.root.join("p/f"), site_a.root.join("q/x")).unwrap();
+    fs::remove_dir(site_a.root.join("p")).unwrap();
+    a.settle();
+    a.run(&mut remote);
+    assert_eq!(remote.names(), ["q", "x", "y"]);
+
+    b.pull(&remote);
+    b.run(&mut remote);
+    b.settle();
+    assert!(b.run(&mut remote).is_empty());
+
+    let view = b.folder.view();
+    assert_eq!(
+        (view.state, view.problem),
+        (
+            FolderState::UpToDate,
+            Some(
+                "1 item could not be synced: p/f (its name here is taken by q/x, which this device's rules exclude); \
+                 run koi folder restart once it is fixed"
+                    .into()
+            )
+        )
+    );
+    assert_eq!(fs::read(site.root.join("p/f")).unwrap(), b"in p");
+    assert!(site.root.join("q/x").is_dir());
+}
+
 /// Whether L, as the site's store holds it, has an entry named `name`.
 fn local_holds(site: &Site, name: &str) -> bool {
     (site.stored().trees.local().iter()).any(|(_, node)| node.shape.name == name)

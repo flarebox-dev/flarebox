@@ -896,7 +896,7 @@ impl Folder {
     fn settled(&self, held: &BTreeMap<String, Stuck>) -> bool {
         let trees = &self.engine.trees;
         let mut above_blocked = BTreeSet::new();
-        for node in self.engine.effects.blocked().keys() {
+        for node in (self.engine.effects.blocked().keys()).chain(held.keys()) {
             let mut current = node.as_str();
             for _ in 0..trees.local().len() {
                 match trees.local().get(current) {
