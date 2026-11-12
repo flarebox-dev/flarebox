@@ -263,7 +263,8 @@ pub enum MassDeleteLimit {
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct RecoveryCause {
     pub trigger: RecoveryTrigger,
-    /// The point in time the space was rewound to, when the server reports it.
+    /// The point in time the owner asked to rewind the space to, when the server reports it. The server restores
+    /// the space's state at about that time (RFC 0003 §2).
     pub restore_point_ms: Option<i64>,
 }
 

@@ -81,7 +81,8 @@ impl Space {
     }
 }
 
-pub(crate) fn utc_date(time: SystemTime) -> String {
+/// `YYYY-MM-DD` of a time, in UTC.
+pub fn utc_date(time: SystemTime) -> String {
     let secs = match time.duration_since(UNIX_EPOCH) {
         Ok(after) => after.as_secs() as i64,
         Err(before) => -(before.duration().as_secs() as i64),

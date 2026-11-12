@@ -1049,6 +1049,12 @@ pub struct Welcome {
     /// The highest device_seq the server accepted from this device in the current history, 0 if none.
     #[prost(uint64, tag="10")]
     pub device_seq: u64,
+    /// When the current history began with a rewind: the head_seq right after the rewind and the point in time it
+    /// restored, in Unix milliseconds, as in ResyncRequired. Both 0 otherwise.
+    #[prost(uint64, tag="11")]
+    pub restore_seq: u64,
+    #[prost(int64, tag="12")]
+    pub restore_point_ms: i64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Resume {

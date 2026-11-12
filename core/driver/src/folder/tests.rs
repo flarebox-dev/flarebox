@@ -2239,6 +2239,44 @@ fn a_new_store_on_a_device_that_synced_the_space_before_goes_on_from_the_servers
 }
 
 #[test]
+fn a_rewound_space_stops_the_folder_at_welcome_with_the_seq_it_was_rewound_to() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site.root.join("notes.txt"), b"written on a");
+    let welcome = Welcome {
+        history_id: "rewound".into(),
+        restore_seq: 7,
+        restore_point_ms: 1_794_442_424_000,
+        ..remote.space.welcome(&a.caller)
+    };
+    let stop = a.event(Event::Connected(welcome)).unwrap_err();
+    assert_eq!(
+        stop.to_string(),
+        "the space was rewound on the server to seq 7 (requested 2026-11-12 00:13 UTC); this build cannot recover the folder yet"
+    );
+    assert_eq!(a.work.len(), 0);
+}
+
+#[test]
+fn a_history_changed_resync_names_the_seq_even_when_it_is_0() {
+    let mut remote = Remote::new();
+    let (_site, mut a) = linked(&mut remote, "a");
+    let stop = a
+        .event(Event::ResyncRequired(ResyncRequired {
+            reason: Reason::HistoryChanged as i32,
+            restore_seq: 0,
+            restore_point_ms: 1_794_442_424_000,
+        }))
+        .unwrap_err();
+    assert!(
+        stop.to_string().starts_with(
+            "the space was rewound on the server to seq 0 (requested 2026-11-12 00:13 UTC)"
+        ),
+        "{stop}"
+    );
+}
+
+#[test]
 fn a_never_synced_store_takes_the_servers_count_only_at_its_first_welcome() {
     let remote = Remote::new();
     let site = Site::new(&remote, "a");

@@ -380,9 +380,10 @@ impl Folder {
                     self.list_again(&mut work);
                 }
                 Ok(Reason::HistoryChanged) => {
-                    return Err(Stop::Recovery(
-                        "the space was rewound or restored on the server".into(),
-                    ));
+                    return Err(Stop::Recovery(rewound(
+                        resync.restore_seq,
+                        resync.restore_point_ms,
+                    )));
                 }
                 Ok(Reason::Unspecified) | Err(_) => {
                     return Err(Stop::Protocol(format!(
@@ -1014,9 +1015,9 @@ impl Folder {
         if let Some(cursor) = &self.engine.cursor
             && cursor.history_id != welcome.history_id
         {
-            return Err(Stop::Recovery(format!(
-                "the server's history of this space changed from {} to {} (a rewind or a restore)",
-                cursor.history_id, welcome.history_id
+            return Err(Stop::Recovery(rewound(
+                welcome.restore_seq,
+                welcome.restore_point_ms,
             )));
         }
         let commits = &self.engine.commits;
@@ -2046,6 +2047,18 @@ fn later(
             _ => None,
         }),
     })
+}
+
+fn rewound(restore_seq: u64, restore_point_ms: i64) -> String {
+    let Ok(requested @ 1..) = u64::try_from(restore_point_ms) else {
+        return "the space was rewound or restored on the server".into();
+    };
+    let at = UNIX_EPOCH + Duration::from_millis(requested);
+    format!(
+        "the space was rewound on the server to seq {restore_seq} (requested {} {})",
+        koidrive_fs::utc_date(at),
+        utc(at)
+    )
 }
 
 /// The time of day of `at` in UTC, such as `00:00 UTC`.
