@@ -599,9 +599,10 @@ impl Engine {
     /// (`Removed::path`, `Renamed::from`) are resolved before any change applies. The changes apply in batch order,
     /// except that a change waits for the change of the batch that creates or moves its folder into place, and for
     /// the rename that moves the entry at its path away. A scan lists renames before creations, so otherwise a file
-    /// moved into a new folder would find no folder. A cycle of such waits, as in a swap, applies in batch order, and
-    /// a node whose rename is still to come is set aside while another entry takes its name, with what is under it,
-    /// until its own rename places it. A renamed or
+    /// moved into a new folder would find no folder. A cycle of such waits, as in a swap or a file moved into a new
+    /// folder that takes its name, goes on in batch order with a change whose folder is in place. The waits for folders
+    /// follow paths toward the root, so such a change is always left. A node whose rename is still to come is set aside
+    /// while another entry takes its name, with what is under it, until its own rename places it. A renamed or
     /// modified entry is the node L holds at its path with its identity, else the node with its identity, else the
     /// node at its path. A
     /// created entry with the identity of a node L holds is that node, wherever L had it. So is a created entry with
@@ -656,22 +657,27 @@ impl Engine {
             })
             .collect();
         let mut waits = vec![0; changes.len()];
-        let mut unblocks: Vec<Vec<usize>> = vec![Vec::new(); changes.len()];
+        let mut arrivals = vec![0; changes.len()];
+        let mut unblocks: Vec<Vec<(usize, bool)>> = vec![Vec::new(); changes.len()];
         for (at, change) in changes.iter().enumerate() {
             let firsts = match change {
                 Observed::Created { path, .. } | Observed::Renamed { to: path, .. } => [
-                    path.parent().and_then(|dir| arrival.get(dir)),
-                    leaving.get(path.as_path()),
+                    (path.parent().and_then(|dir| arrival.get(dir)), true),
+                    (leaving.get(path.as_path()), false),
                 ],
                 Observed::Modified { path, .. } => [
-                    path.parent().and_then(|dir| arrival.get(dir)),
-                    arrival.get(path.as_path()),
+                    (path.parent().and_then(|dir| arrival.get(dir)), true),
+                    (arrival.get(path.as_path()), true),
                 ],
-                Observed::Removed { .. } => [None, None],
+                Observed::Removed { .. } => [(None, false), (None, false)],
             };
-            for &first in firsts.into_iter().flatten().filter(|&&first| first != at) {
+            for (first, arrives) in firsts {
+                let Some(&first) = first.filter(|&&first| first != at) else {
+                    continue;
+                };
                 waits[at] += 1;
-                unblocks[first].push(at);
+                arrivals[at] += usize::from(arrives);
+                unblocks[first].push((at, arrives));
             }
         }
         let mut ready: BTreeSet<usize> = (0..changes.len()).filter(|&at| waits[at] == 0).collect();
@@ -679,12 +685,13 @@ impl Engine {
         let mut done = vec![false; changes.len()];
         while order.len() < changes.len() {
             let at = (ready.pop_first())
-                .or_else(|| (0..changes.len()).find(|&at| !done[at]))
-                .expect("a change is left");
+                .or_else(|| (0..changes.len()).find(|&at| !done[at] && arrivals[at] == 0))
+                .expect("a change whose folder is in place is left");
             done[at] = true;
             order.push(at);
-            for &next in &unblocks[at] {
+            for &(next, arrives) in &unblocks[at] {
                 waits[next] -= 1;
+                arrivals[next] -= usize::from(arrives);
                 if waits[next] == 0 && !done[next] {
                     ready.insert(next);
                 }
