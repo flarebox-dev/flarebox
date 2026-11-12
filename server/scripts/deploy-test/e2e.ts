@@ -255,7 +255,7 @@ interface Folder {
   problem: string | null;
 }
 
-interface Device {
+export interface Device {
   name: string;
   dir: string;
   folder: string;
@@ -291,7 +291,8 @@ function folder(on: Device): Folder {
   return status.data.folders[0] ?? fail(on.name + " has no linked folder");
 }
 
-async function startDaemon(on: Device): Promise<void> {
+export async function startDaemon(on: Device): Promise<void> {
+  if (answers(on)) fail("a daemon already answers for " + on.name + "'s profile, so the one started here could not take it");
   console.log("\n$ koi _daemon >> daemon.log &   # " + on.name);
   const log = openSync(join(on.dir, "daemon.log"), "a");
   const daemon = spawn(env("KOI"), ["_daemon"], { env: { ...on.env, KOIDRIVE_LOG: "info,koidrive_driver=debug,koidrive_engine=debug" }, detached: true, stdio: ["ignore", log, log] });
@@ -301,13 +302,16 @@ async function startDaemon(on: Device): Promise<void> {
   await until(on.name + "'s daemon to answer", 30_000, () => {
     if (daemon.exitCode !== null) fail(on.name + "'s daemon exited with " + daemon.exitCode + ": " + readFileSync(join(on.dir, "daemon.log"), "utf8").slice(-2000));
     if (!existsSync(runtime) || !readdirSync(runtime).some((name) => /^daemon-[0-9a-f]{8}\.sock$/.test(name))) return undefined;
-    try {
-      return (JSON.parse(koi(on, ["status", "--json"], null)) as { data: { running: boolean } }).data.running ? true : undefined;
-    } catch {
-      return undefined;
-    }
+    return answers(on) ? true : undefined;
   });
-  if (daemon.exitCode !== null) fail(on.name + "'s daemon exited with " + daemon.exitCode + " while another answered: " + readFileSync(join(on.dir, "daemon.log"), "utf8").slice(-2000));
+}
+
+function answers(on: Device): boolean {
+  try {
+    return (JSON.parse(koi(on, ["status", "--json"], null)) as { data: { running: boolean } }).data.running;
+  } catch {
+    return false;
+  }
 }
 
 async function stopDaemon(on: Device): Promise<void> {
