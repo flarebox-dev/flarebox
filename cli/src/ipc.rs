@@ -355,8 +355,9 @@ async fn unreadable(folders: Vec<FolderStatus>) -> Vec<Blocked> {
     blocked
 }
 
-/// Binds the daemon's socket, unless a process still answers on it. The caller holds the profile lock, so a socket
-/// file that doesn't answer is stale.
+/// Binds the daemon's socket, unless another process still answers on it. The caller holds the profile lock, so a
+/// socket file that doesn't answer, or that this process created, is stale. A child spawned while this process listened
+/// can still hold the old listener, but it reports this process as its creator.
 ///
 /// The directory must belong to this user and be closed to everyone else, so no other user can reach the socket even
 /// before its mode is set. The socket is bound under a temporary name and renamed once it is 0600, so it never
@@ -391,11 +392,13 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
             "lets other users in through an ACL; remove it with chmod -N".to_owned(),
         ));
     }
-    static BOUND: std::sync::Mutex<BTreeSet<PathBuf>> = std::sync::Mutex::new(BTreeSet::new());
-    let mut bound = BOUND
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !bound.contains(path) && std::os::unix::net::UnixStream::connect(path).is_ok() {
+    let creator = std::os::unix::net::UnixStream::connect(path).and_then(|stream| {
+        stream.set_nonblocking(true)?;
+        UnixStream::from_std(stream)?.peer_cred()
+    });
+    if let Ok(peer) = creator
+        && peer.pid() != i32::try_from(std::process::id()).ok()
+    {
         return Err(io::Error::new(
             io::ErrorKind::AddrInUse,
             format!("another process answers on {}", path.display()),
@@ -415,7 +418,6 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
         .inspect_err(|_| {
             let _ = fs::remove_file(&temp);
         })?;
-    bound.insert(path.to_path_buf());
     listener.set_nonblocking(true)?;
     UnixListener::from_std(listener)
 }
@@ -840,10 +842,54 @@ mod tests {
         let run = dir.path().join("run");
         DirBuilder::new().mode(0o700).create(&run).unwrap();
         let socket = run.join("daemon.sock");
-        let _live = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let mut other = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ipc::tests::listen_until_stdin_closes",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("KOI_TEST_LISTEN", &socket)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut lines =
+            std::io::BufRead::lines(std::io::BufReader::new(other.stdout.take().unwrap()));
+        assert!(lines.any(|line| line.unwrap() == "listening"));
         let error = bind(&socket).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
         tokio::net::UnixStream::connect(&socket).await.unwrap();
+        drop(other.stdin.take());
+        other.wait().unwrap();
+    }
+
+    #[test]
+    #[ignore = "the other process of a_socket_another_process_answers_on_is_left_alone"]
+    fn listen_until_stdin_closes() {
+        let Some(socket) = std::env::var_os("KOI_TEST_LISTEN") else {
+            return;
+        };
+        let _listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        println!("listening");
+        let _ = io::Read::read_to_end(&mut io::stdin(), &mut Vec::new());
+    }
+
+    #[tokio::test]
+    async fn a_socket_this_process_created_is_taken_while_a_copy_of_it_listens() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        DirBuilder::new().mode(0o700).create(&run).unwrap();
+        let socket = run.join("daemon.sock");
+        let first = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let _copy = first.try_clone().unwrap();
+        drop(first);
+        let listener = bind(&socket).unwrap();
+        let _client = UnixStream::connect(&socket).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
