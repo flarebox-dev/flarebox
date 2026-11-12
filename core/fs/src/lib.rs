@@ -494,7 +494,9 @@ pub struct Rescan {
     /// The changes, already applied to the snapshot.
     pub changes: Vec<Change>,
     /// Paths the scan saw disappear but could not confirm gone: present,
-    /// unreadable, or under a parent that changed during the confirmation.
+    /// unreadable, or under a parent that changed during the confirmation,
+    /// and paths gone from where the search under left-out entries has not
+    /// finished.
     /// The snapshot keeps what it knew about them and everything below them;
     /// rescan them later.
     pub unsettled: Vec<PathBuf>,
@@ -572,7 +574,11 @@ impl Snapshot {
     /// below its folder. An entry the rules now leave out leaves the snapshot
     /// without a change, and one they include again is reported as created.
     /// A removal whose entry the scan finds under a left-out entry is reported
-    /// as [`Change::Ignored`].
+    /// as [`Change::Ignored`]. Each rescan looks at a bounded number of
+    /// left-out entries ([`Rules::with_search_budget`]). A removal the search
+    /// has not decided within that bound keeps its entry and is returned in
+    /// [`Rescan::unsettled`], and the next rescans of its path go on with the
+    /// search.
     ///
     /// On any error `rules` are unchanged too.
     pub fn rescan_with_rules(
@@ -791,7 +797,7 @@ impl Snapshot {
                     }),
             );
         }
-        let unsettled = keep_unconfirmed(
+        let mut unsettled = keep_unconfirmed(
             root,
             &root_stat.id,
             again.as_fd(),
@@ -800,20 +806,27 @@ impl Snapshot {
             &mut *scan.cut,
         )?;
         let mut changes = diff(&old, &scan.new);
+        if let Some(rules) = &mut scan.rules {
+            rules.settle();
+            unsettled.extend(find_ignored(
+                &mut changes,
+                &old,
+                &mut scan.new,
+                rules,
+                again.as_fd(),
+            ));
+            unsettled.sort();
+        }
         for path in old.keys().chain(&left_out) {
             self.entries.remove(path);
         }
         self.entries.append(&mut scan.new);
         let (rules, read) = match scan.rules.take() {
-            Some(mut rules) => {
-                rules.settle();
-                find_ignored(&mut changes, &old, &self.entries, &mut rules, again.as_fd());
-                rules.finish(|dir| {
-                    self.entries
-                        .get(dir)
-                        .is_some_and(|entry| entry.kind == EntryKind::Dir)
-                })
-            }
+            Some(rules) => rules.finish(|dir| {
+                self.entries
+                    .get(dir)
+                    .is_some_and(|entry| entry.kind == EntryKind::Dir)
+            }),
             None => (Vec::new(), Vec::new()),
         };
         Ok(Rescan {
@@ -1020,7 +1033,12 @@ fn keep_unconfirmed(
     }
 
     kept.sort();
-    for path in &kept {
+    keep(&kept, old, new);
+    Ok(kept)
+}
+
+fn keep(paths: &[PathBuf], old: &BTreeMap<PathBuf, Entry>, new: &mut BTreeMap<PathBuf, Entry>) {
+    for path in paths {
         new.retain(|inside, _| !inside.starts_with(path));
         new.extend(
             old.range(path.clone()..)
@@ -1028,7 +1046,6 @@ fn keep_unconfirmed(
                 .map(|(inside, entry)| (inside.clone(), *entry)),
         );
     }
-    Ok(kept)
 }
 
 /// What one look at a folder found, for comparing two looks.
@@ -1149,10 +1166,10 @@ fn take_left_out(
 fn find_ignored(
     changes: &mut Vec<Change>,
     old: &BTreeMap<PathBuf, Entry>,
-    new: &BTreeMap<PathBuf, Entry>,
+    new: &mut BTreeMap<PathBuf, Entry>,
     rules: &mut Pending<'_>,
     root: BorrowedFd<'_>,
-) {
+) -> Vec<PathBuf> {
     let replaced: BTreeSet<PathBuf> = (changes.iter())
         .filter_map(|change| match change {
             Change::Modified { path }
@@ -1172,7 +1189,7 @@ fn find_ignored(
         })
         .collect();
     if removed.is_empty() && replaced.is_empty() {
-        return;
+        return Vec::new();
     }
     let renamed: HashMap<&Path, &Path> = (changes.iter())
         .filter_map(|change| match change {
@@ -1189,7 +1206,7 @@ fn find_ignored(
                     .is_some_and(|after| after.id == entry.id && after.kind == entry.kind)
             })
     };
-    let held: BTreeSet<&PathBuf> = (removed.iter().copied())
+    let mut held: BTreeSet<&PathBuf> = (removed.iter().copied())
         .filter(|dir| old[*dir].kind == EntryKind::Dir)
         .flat_map(|dir| {
             (old.range(dir.clone()..).skip(1))
@@ -1198,13 +1215,31 @@ fn find_ignored(
         })
         .filter(|path| !removed.contains(path) && !carried(path))
         .collect();
-    let key = |path: &PathBuf| ((old[path].id, old[path].kind), None);
-    let mut wanted: Wanted = (removed.iter().chain(&held).copied()).map(key).collect();
-    rules.find(root, &mut wanted, true);
-    let mut swapped: Wanted = (replaced.iter().map(key))
+    let key = |path: &PathBuf| (old[path].id, old[path].kind);
+    let mut wanted: Wanted = (removed.iter().chain(&held).copied())
+        .map(|path| (key(path), None))
+        .collect();
+    let undecided = rules.search(root, &mut wanted);
+    let deferred: Vec<PathBuf> = (removed.iter().copied())
+        .filter(|path| {
+            wanted.get(&key(path)) == Some(&None)
+                && (held.iter().copied())
+                    .filter(|inside| inside.starts_with(path))
+                    .chain([*path])
+                    .any(|inside| undecided.contains(&key(inside)))
+        })
+        .cloned()
+        .collect();
+    if !deferred.is_empty() {
+        held.retain(|path| !deferred.iter().any(|dir| path.starts_with(dir)));
+        keep(&deferred, old, new);
+        *changes = diff(old, new);
+    }
+    let mut swapped: Wanted = (replaced.iter())
+        .map(|path| (key(path), None))
         .filter(|(id, _)| !wanted.contains_key(id))
         .collect();
-    rules.find(root, &mut swapped, false);
+    rules.find(root, &mut swapped);
     wanted.extend(swapped);
     let found = |path: &Path| {
         let entry = &old[path];
@@ -1243,6 +1278,7 @@ fn find_ignored(
         }
     }
     changes.extend(moved);
+    deferred
 }
 
 /// Sorts the paths and drops every path inside another one.
