@@ -4,7 +4,7 @@
 //! server, and chunks held in memory. A test runs the work a step returns and feeds the result back, so it chooses
 //! the order results arrive in. After every step the store is loaded again and compared with the engine in memory.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 
@@ -121,6 +121,30 @@ impl Remote {
             .collect();
         names.sort();
         names
+    }
+
+    fn tree(&self) -> BTreeMap<String, String> {
+        let root = self.space.space_id();
+        let live = koidrive_proto::v1::NodeStatus::Live as i32;
+        let nodes: BTreeMap<String, koidrive_proto::v1::NodeState> =
+            (self.space.nodes().into_iter())
+                .filter(|node| node.status == live)
+                .map(|node| (node.node_id.clone(), node))
+                .collect();
+        let path = |id: &String| {
+            let mut names = Vec::new();
+            let mut node = &nodes[id];
+            while node.node_id != root {
+                names.push(node.name.as_str());
+                node = &nodes[&node.parent_id];
+            }
+            names.reverse();
+            names.join("/")
+        };
+        (nodes.keys())
+            .filter(|id| **id != root)
+            .map(|id| (path(id), id.clone()))
+            .collect()
     }
 }
 
@@ -7248,4 +7272,77 @@ fn a_file_unreadable_until_its_folder_swapped_names_reaches_the_other_device() {
         .map(|(path, text)| (path.to_owned(), text.to_owned()));
     assert_eq!(files(&site.root), moved);
     assert_eq!(files(&site_a.root), moved);
+}
+
+#[test]
+fn a_held_folder_another_devices_rules_leave_out_stays_held_when_renamed() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("notes.txt"), b"written on a");
+    let site = Site::new(&remote, "b");
+    fs::create_dir(site.root.join("held")).unwrap();
+    fs::write(site.root.join("held/a.txt"), b"inside").unwrap();
+    let mut b = site.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    a.create(&mut remote, &site_a.root.join(".koiignore"), b"held/\n");
+    b.pull(&remote);
+    b.run(&mut remote);
+    b.scan_until(|b| !b.folder.disk.awaits_rules());
+    b.run(&mut remote);
+    fs::rename(site.root.join("held"), site.root.join("open")).unwrap();
+    for _ in 0..3 {
+        b.scan(Duration::from_millis(300));
+        b.run(&mut remote);
+        b.settle();
+        b.run(&mut remote);
+    }
+    assert_eq!(remote.names(), [".koiignore", "notes.txt"]);
+}
+
+#[test]
+fn a_folder_that_returns_from_a_path_the_rules_exclude_keeps_its_node() {
+    let cases: [(&[&str], &str, &str); 5] = [
+        (&["docs/x.txt", "docs/sub/y.txt"], "docs", "docs2"),
+        (&["a/docs/sub/y.txt"], "a/docs", "a/notes"),
+        (&["a/docs/x.txt", "b/z.txt"], "a/docs", "b/notes"),
+        (&["docs/sub/y.txt"], "docs/sub", "sub"),
+        (&["docs/sub/deep/y.txt", "b/z.txt"], "docs/sub", "b/sub"),
+    ];
+    for (made, from, to) in cases {
+        let mut remote = Remote::new();
+        let (site, mut b) = linked(&mut remote, "b");
+        for file in made {
+            let path = site.root.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, file.as_bytes()).unwrap();
+        }
+        for rules in [&b""[..], b"docs/\n"] {
+            fs::write(site.root.join(".koiignore"), rules).unwrap();
+            for _ in 0..3 {
+                b.scan(Duration::from_millis(300));
+                b.run(&mut remote);
+            }
+        }
+        let before = remote.tree();
+        assert!(before.contains_key(from), "{from} is synced: {before:?}");
+        fs::rename(site.root.join(from), site.root.join(to)).unwrap();
+        for _ in 0..3 {
+            b.scan(Duration::from_millis(300));
+            b.run(&mut remote);
+            b.settle();
+            b.run(&mut remote);
+        }
+        let moved = |path: &String| match path.strip_prefix(from) {
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("{to}{rest}"),
+            _ => path.clone(),
+        };
+        let expected: BTreeMap<String, String> = (before.iter())
+            .map(|(path, id)| (moved(path), id.clone()))
+            .collect();
+        assert_eq!(remote.tree(), expected, "{from} -> {to}");
+    }
 }
