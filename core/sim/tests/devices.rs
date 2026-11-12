@@ -1260,10 +1260,9 @@ fn an_edit_made_while_its_file_is_parked_for_a_rename_stays_on_the_server() {
         (1, overwrite(0)),
         (1, SCAN),
         (1, COMMIT),
-        (1, EFFECT),
         (1, COMMIT),
         (1, DELIVER),
-        (1, COMMIT),
+        (1, EFFECT),
         (1, COMMIT),
     ]);
     let world = converge(2, &[synced, racing]).unwrap();
