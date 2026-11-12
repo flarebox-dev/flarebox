@@ -4,7 +4,8 @@ import { create, fromBinary, type MessageInitShape, toBinary } from "@bufbuild/p
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import file from "../../spec/testdata/scenarios/space-conformance-v1.json";
+import hand from "../../spec/testdata/scenarios/space-conformance-v1.json";
+import sequences from "../../spec/testdata/scenarios/space-commit-sequences-v1.json";
 import { signChunkGrant, sha256 } from "../src/crypto";
 import { type Op, OpResult_Code, OpSchema, type OpResult, type UploadReceipt, UploadReceiptSchema } from "../src/gen/koidrive/v1/commit_pb";
 import { RpcRequestSchema, type RpcResponse, RpcResponseSchema } from "../src/gen/koidrive/v1/messages_pb";
@@ -27,7 +28,11 @@ import { OWNER, targetIncarnation } from "./helpers";
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 type Obj = { [key: string]: Json };
 
-const doc = file as unknown as Obj;
+const doc = hand as unknown as Obj;
+const files: [string, Obj][] = [
+  ["space-conformance-v1.json", doc],
+  ["space-commit-sequences-v1.json", sequences as unknown as Obj],
+];
 const ORIGIN = "https://koidrive.test";
 const CHUNKER = "fastcdc2020-1m-4m-16m";
 
@@ -153,13 +158,13 @@ class Run {
     this.mtimeNs = mtimeNs;
   }
 
-  static async start(scenario: Obj): Promise<Run> {
+  static async start(scenario: Obj, file: Obj): Promise<Run> {
     keys(scenario, "a scenario", ["name", "covers", "reference_only", "devices", "spaces", "contents", "steps"]);
     req(optStr(scenario, "name"), "name");
     optStr(scenario, "reference_only");
     optList(scenario, "covers");
-    const nowMs = req(optInt(doc, "now_ms"), "now_ms");
-    const mtimeText = req(optStr(doc, "mtime_ns"), "mtime_ns");
+    const nowMs = req(optInt(file, "now_ms"), "now_ms");
+    const mtimeText = req(optStr(file, "mtime_ns"), "mtime_ns");
     if (!/^-?\d+$/.test(mtimeText)) fail("mtime_ns must be an int64 written as a string");
     const run = new Run(nowMs, BigInt(mtimeText));
     const names = "spaces" in scenario ? strings(req(optList(scenario, "spaces"), "spaces"), "spaces") : ["main"];
@@ -725,10 +730,10 @@ class Run {
   }
 }
 
-async function run(scenario: Json): Promise<string | undefined> {
+async function run(scenario: Json, file: Obj = doc): Promise<string | undefined> {
   try {
     const found = object(scenario, "a scenario");
-    const runner = await Run.start(found);
+    const runner = await Run.start(found, file);
     await runner.steps({
       ...found,
       steps: req(optList(found, "steps"), "steps").filter((step) => !(object(step, "a step").reference_only !== undefined)),
@@ -740,22 +745,24 @@ async function run(scenario: Json): Promise<string | undefined> {
   }
 }
 
-keys(doc, "the file", ["format", "version", "spec", "unicode", "now_ms", "mtime_ns", "conventions", "scenarios"]);
-const scenarios = req(optList(doc, "scenarios"), "scenarios");
-
-describe("space conformance (spec/testdata/scenarios/space-conformance-v1.json)", () => {
-  it("reads format koidrive.space-conformance version 1", () => {
-    expect([doc.format, doc.version]).toEqual(["koidrive.space-conformance", 1]);
-  });
-
-  for (const scenario of scenarios) {
-    const { name, reference_only } = object(scenario, "a scenario");
-    const test = reference_only === undefined ? it : it.skip;
-    test(String(name), { timeout: 120_000 }, async () => {
-      expect(await run(scenario)).toBeUndefined();
+for (const [path, file] of files) {
+  keys(file, "the file", ["format", "version", "spec", "unicode", "now_ms", "mtime_ns", "conventions", "scenarios"]);
+  describe(`space conformance (spec/testdata/scenarios/${path})`, () => {
+    it("reads format koidrive.space-conformance version 1", () => {
+      expect([file.format, file.version]).toEqual(["koidrive.space-conformance", 1]);
     });
-  }
-});
+
+    for (const scenario of req(optList(file, "scenarios"), "scenarios")) {
+      const { name, reference_only } = object(scenario, "a scenario");
+      const test = reference_only === undefined ? it : it.skip;
+      test(String(name), { timeout: 120_000 }, async () => {
+        expect(await run(scenario, file)).toBeUndefined();
+      });
+    }
+  });
+}
+
+const scenarios = req(optList(doc, "scenarios"), "scenarios");
 
 describe("conformance runner self-tests", () => {
   const base = scenarios[0]!;
@@ -801,6 +808,22 @@ describe("conformance runner self-tests", () => {
       (s) => void (object(object(s.steps[0]!.expect, "expect").missing_some, "missing_some").total = 1000),
       "does not give the total 1000 first",
     ],
+    ["an unknown scenario field fails", base, (s) => void ((s as unknown as Obj).covres = ["R1"]), "unknown field covres in a scenario"],
+    ["an unknown step field fails", base, (s) => void (s.steps[0]!.devcie = "a"), "step 1: unknown field devcie in a step"],
+    ["an unknown commit field fails", base, (s) => void (object(s.steps[0]!.commit, "commit").base = 0), "step 1: unknown field base in commit"],
+    [
+      "an unknown op field fails",
+      base,
+      (s) => void (object(object((object(s.steps[0]!.commit, "commit").ops as Json[])[0], "op").create_file, "create_file").mode = "x"),
+      "step 1: unknown field mode in create_file",
+    ],
+    [
+      "an unknown result field fails",
+      base,
+      (s) => void (object((object(s.steps[0]!.expect, "expect").results as Json[])[0], "result").nmae = "x"),
+      "step 1: result 1: unknown field nmae in a result",
+    ],
+    ["an unknown node field fails", base, (s) => void (object((s.steps[2]!.nodes as Json[])[0], "node").stauts = "LIVE"), "step 3: unknown field stauts in a node"],
   ];
   for (const [name, scenario, edit, reason] of cases) {
     it(name, async () => {

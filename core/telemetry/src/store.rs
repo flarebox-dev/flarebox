@@ -501,6 +501,25 @@ mod tests {
     }
 
     #[test]
+    fn a_new_id_is_drawn_only_once_the_old_queue_is_gone() {
+        for (on, draw) in [
+            (
+                true,
+                Store::reset as fn(&Store) -> io::Result<Option<InstallId>>,
+            ),
+            (false, |store: &Store| store.set(true).map(|s| s.install_id)),
+            (false, |store: &Store| store.install_id().map(Some)),
+        ] {
+            let (_dir, store) = store();
+            store.set(on).unwrap();
+            let before = store.settings().unwrap().install_id;
+            fs::create_dir(store.dir.join("queue.json")).unwrap();
+            assert!(draw(&store).is_err());
+            assert_eq!(store.settings().unwrap().install_id, before);
+        }
+    }
+
+    #[test]
     fn sums_from_several_processes_add_up() {
         let (_dir, store) = store();
         store.set(true).unwrap();
