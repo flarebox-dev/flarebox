@@ -498,9 +498,9 @@ fn a_folder_renamed_to_the_name_a_file_left_for_a_new_folder_keeps_the_file() {
 }
 
 /// Device b renames the file `a` to `x`, makes a folder `a` and moves `x` into it as `a/ß` before its observer looks.
-/// The scan reports the move of `a` into the folder that takes its name. L stays a tree that a restart can load, and
-/// the file reaches the server and device a in the new folder. The commit creates the folder while the file still
-/// holds its name, so the server renames the folder (design §2.6).
+/// The scan reports the move of `a` into the folder that takes its name. L stays a tree that a restart can load. The
+/// folder is created under a pending name while the file still holds its name, and takes its name once the file has
+/// moved into it (design §2.6), so the file reaches the server and device a at `a/ß`.
 #[test]
 fn a_file_moved_into_a_new_folder_that_takes_its_name_in_one_batch_keeps_l_a_tree() {
     let mut remote = Remote::new();
@@ -512,9 +512,8 @@ fn a_file_moved_into_a_new_folder_that_takes_its_name_in_one_batch_keeps_l_a_tre
     fs::create_dir(site.root.join("a")).unwrap();
     fs::rename(site.root.join("x"), site.root.join("a/ß")).unwrap();
     sync(&mut remote, (&site_a, &mut a), (&site, &mut b));
-    let folder = "a (conflict from b 2023-11-14)";
-    assert_eq!(remote.names(), [folder, "ß"]);
-    let moved = [(format!("{folder}/ß"), "the file".to_owned())];
+    assert_eq!(remote.names(), ["a", "ß"]);
+    let moved = [("a/ß".to_owned(), "the file".to_owned())];
     assert_eq!(files(&site_a.root), moved);
     assert_eq!(files(&site.root), moved);
 }
