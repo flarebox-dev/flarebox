@@ -379,19 +379,39 @@ function explain(on: Device, files: Map<string, string>): void {
   } catch {}
 }
 
-/** Waits until the device's folder holds one of the trees, and its store holds the server's head. */
+/** The seq at which a device's folder last held each tree, kept across the phases of its job. */
+export type Seqs = Partial<Record<Tree, number>>;
+
+const seqsFile = (on: Device) => temp(on.name + "-seqs.json");
+
+function seqs(on: Device): Seqs {
+  return existsSync(seqsFile(on)) ? (JSON.parse(readFileSync(seqsFile(on), "utf8")) as Seqs) : {};
+}
+
+/** The tree a device's folder held at seq, the server's head. */
+export function treeAt(recorded: Seqs, seq: number): Tree | undefined {
+  return (Object.keys(recorded) as Tree[]).find((tree) => recorded[tree] === seq);
+}
+
+/**
+ * Waits until the device's folder holds one of the trees, and its store holds the server's head. Records the head's seq
+ * for the tree.
+ */
 async function reach(on: Device, ...wanted: Tree[]): Promise<[Tree, Map<string, string>]> {
   let files = new Map<string, string>();
   try {
-    return await until("the " + wanted.join(" or ") + " tree on " + on.name, SYNC_MS, () => {
+    const [tree, seq] = await until("the " + wanted.join(" or ") + " tree on " + on.name, SYNC_MS, () => {
       try {
         files = listing(on.folder);
       } catch {
         return undefined;
       }
       const tree = wanted.find((name) => matches(files, trees[name]));
-      return tree && folder(on).state === "up_to_date" ? ([tree, files] as [Tree, Map<string, string>]) : undefined;
+      const status = folder(on);
+      return tree && status.state === "up_to_date" ? ([tree, status.head_seq ?? 0] as [Tree, number]) : undefined;
     });
+    writeFileSync(seqsFile(on), JSON.stringify({ ...seqs(on), [tree]: seq }));
+    return [tree, files];
   } catch (error) {
     explain(on, files);
     throw error;
@@ -416,11 +436,14 @@ function rewound(name: string): Device {
   return { ...on, folder: join(on.dir, "rewound") };
 }
 
+const rewoundTreeFile = (on: Device) => temp(on.name + "-rewound-tree");
+
 /**
  * Waits until the rewind halts the folder, which this build cannot recover, then does what docs/guide/status.md tells an
- * owner to do: unlinks it and links a new, empty folder, which must get the restore point's tree.
+ * owner to do: unlinks it and links a new, empty folder. The rewind restores approximately the restore point (RFC 0003
+ * section 2), so the new folder must get the tree this device held at the seq it restored, restoreSeq when given.
  */
-async function recover(on: Device): Promise<void> {
+async function recover(on: Device, restoreSeq?: number): Promise<void> {
   const halted = await until("the rewind to halt the folder on " + on.name, HALT_MS, () => {
     const status = folder(on);
     return status.state === "halted" ? status : undefined;
@@ -431,7 +454,16 @@ async function recover(on: Device): Promise<void> {
   const fresh = rewound(on.name);
   mkdirSync(fresh.folder, { recursive: true, mode: 0o700 });
   koi(fresh, ["folder", "link", fresh.folder, "--space", SPACE]);
-  passed("7. Rewind", fresh, (await reach(fresh, "conflicted"))[1]);
+  const seq = await until("the new folder on " + on.name + " to read the rewound space", SYNC_MS, () => {
+    const status = folder(fresh);
+    return status.state === "up_to_date" && status.head_seq ? status.head_seq : undefined;
+  });
+  if (restoreSeq !== undefined && seq !== restoreSeq) fail("the new folder on " + on.name + " holds seq " + seq + ", but the rewind restored seq " + restoreSeq);
+  const recorded = seqs(on);
+  const tree = treeAt(recorded, seq) ?? fail("the rewind restored seq " + seq + ", and " + on.name + " held none of the scenarios' trees at that seq: " + JSON.stringify(recorded));
+  console.log("The rewind restored seq " + seq + ", the " + tree + " tree" + (tree === "conflicted" ? "" : "; the conflicted tree before the restore point was at seq " + recorded.conflicted));
+  writeFileSync(rewoundTreeFile(on), tree);
+  passed("7. Rewind", fresh, (await reach(fresh, tree))[1]);
 }
 
 const restorePointFile = () => temp("restore-point");
@@ -604,13 +636,13 @@ const phases: Record<string, (step: string) => Promise<void>> = {
       API_POLL_MS,
     );
     console.log("Rewound the space to " + new Date(point).toISOString() + ": " + JSON.stringify(result));
-    await recover(linux);
+    await recover(linux, Number(result.restoreSeq));
   },
 
   async "mac-final"(step) {
     const mac = rewound("mac");
     await afterPeerStep(step);
-    const [, files] = await reach(mac, "conflicted");
+    const [, files] = await reach(mac, readFileSync(rewoundTreeFile(mac), "utf8") as Tree);
     mkdirSync(temp("mac-listing"), { recursive: true });
     writeFileSync(temp("mac-listing", "listing.txt"), format(files));
     await stopDaemon(mac);
@@ -619,7 +651,7 @@ const phases: Record<string, (step: string) => Promise<void>> = {
   async "linux-final"(step) {
     const linux = rewound("linux");
     await afterPeerStep(step);
-    const [, files] = await reach(linux, "conflicted");
+    const [, files] = await reach(linux, readFileSync(rewoundTreeFile(linux), "utf8") as Tree);
     await download("e2e-macos-listing", temp("mac-listing"));
     const mac = readFileSync(temp("mac-listing", "listing.txt"), "utf8");
     if (mac !== format(files)) fail("macOS and Linux ended with different trees.\nmacOS:\n" + mac + "Linux:\n" + format(files));

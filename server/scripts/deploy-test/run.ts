@@ -388,7 +388,7 @@ function bytes(n: number): string {
 async function analytics(account: Account, state: State | undefined, namespaces: Namespace[]): Promise<[string, string][]> {
   const start = new Date((state?.deployments[0]?.atMs ?? Date.now() - 3_600_000) - 60_000).toISOString();
   const end = new Date().toISOString();
-  const vars = { account: account.id, script: state?.name ?? testName(), start, end, ids: namespaces.map((namespace) => namespace.id) };
+  const vars = { account: account.id, script: state?.name ?? testName(), start, end, day: start.slice(0, 10), ids: namespaces.map((namespace) => namespace.id) };
   const accounts = (inner: string, args: string) =>
     `query (${args}) { viewer { accounts(filter: { accountTag: $account }) { ${inner} } } }`;
   const queries: [string, string, string, (data: unknown) => string][] = [
@@ -412,9 +412,9 @@ async function analytics(account: Account, state: State | undefined, namespaces:
       },
     ],
     [
-      "Durable Object storage (largest sample)",
-      "$account: string!, $ids: [string!], $start: Time!, $end: Time!",
-      "durableObjectsStorageGroups(limit: 1000, filter: { namespaceId_in: $ids, datetime_geq: $start, datetime_leq: $end }) { max { storedBytes } }",
+      "Durable Object storage of the whole account (largest sample)",
+      "$account: string!, $day: Date!",
+      "durableObjectsStorageGroups(limit: 1000, filter: { date_geq: $day }) { max { storedBytes } }",
       (data) => {
         const rows = (data as { viewer: { accounts: { durableObjectsStorageGroups: { max: { storedBytes: number } }[] }[] } }).viewer.accounts[0]!.durableObjectsStorageGroups;
         return rows.length === 0 ? "no sample yet" : bytes(Math.max(...rows.map((row) => row.max.storedBytes)));
