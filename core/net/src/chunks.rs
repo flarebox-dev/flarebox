@@ -172,7 +172,19 @@ impl Transfer {
         &self,
         session: &Session,
         chunks: &[ChunkRef],
+        read: impl FnMut(&ChunkRef) -> R,
+    ) -> Result<Vec<UploadReceipt>, ChunkError> {
+        self.upload_observed(session, chunks, read, |_| {}).await
+    }
+
+    /// [`Transfer::upload`], calling `stored` with each chunk once the server or its storage took it, also when a
+    /// later chunk ends the upload.
+    pub async fn upload_observed<R: Future<Output = io::Result<Bytes>>>(
+        &self,
+        session: &Session,
+        chunks: &[ChunkRef],
         mut read: impl FnMut(&ChunkRef) -> R,
+        mut stored: impl FnMut(&ChunkRef),
     ) -> Result<Vec<UploadReceipt>, ChunkError> {
         let mut todo = distinct(chunks);
         let mut receipts = Vec::new();
@@ -218,8 +230,10 @@ impl Transfer {
                     tokio::select! {
                         biased;
                         Some(sent) = running.next() => match sent? {
-                            (_, Some(Some(receipt))) => receipts.push(receipt),
-                            (_, Some(None)) => {}
+                            (index, Some(receipt)) => {
+                                stored(&todo[index]);
+                                receipts.extend(receipt);
+                            }
                             (index, None) => deferred.push(index),
                         },
                         permit = self.gate.enter(), if started < uploads.len() => {

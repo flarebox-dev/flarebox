@@ -32,6 +32,10 @@ pub(crate) struct Seen {
     pub peak: usize,
     /// The hash of each upload, in the order they arrived.
     pub hashes: Vec<Vec<u8>>,
+    /// A hash whose every upload it answers with 403.
+    pub refuse: Option<Vec<u8>>,
+    /// The hash of each upload it answered with a receipt.
+    pub stored: Vec<Vec<u8>>,
 }
 
 /// A relay that holds each upload until `expected` uploads are open at once, or for at most [`HOLD_LIMIT`], then
@@ -59,15 +63,16 @@ pub(crate) async fn relay_refusing(
                     return;
                 };
                 let hash = unhex(&ticket);
-                let mut arrived = 0;
+                let (mut arrived, mut refuse) = (0, false);
                 open.send_modify(|open| {
                     *open += 1;
                     let mut seen = seen.lock().unwrap();
                     seen.hashes.push(hash.clone());
                     arrived = seen.hashes.len();
+                    refuse = seen.refuse.as_ref() == Some(&hash);
                     seen.peak = seen.peak.max(*open);
                 });
-                if arrived <= refused {
+                if arrived <= refused || refuse {
                     open.send_modify(|open| *open -= 1);
                     let head =
                         "HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
@@ -79,6 +84,7 @@ pub(crate) async fn relay_refusing(
                     .await;
                 tokio::time::sleep(SETTLE).await;
                 open.send_modify(|open| *open -= 1);
+                seen.lock().unwrap().stored.push(hash.clone());
                 let receipt = UploadReceipt {
                     hash,
                     size: size as u32,

@@ -1723,14 +1723,52 @@ fn a_chunk_sent_again_after_a_refused_ticket_counts_its_bytes_once() {
         let transfer = Transfer::new(&api);
         (upload_counted(&session, &transfer, upload).await, seen)
     });
-    let (receipts, bytes) = result.unwrap();
-    assert_eq!(receipts.len(), 3);
+    let (receipts, bytes) = result;
+    assert_eq!(receipts.unwrap().len(), 3);
     assert_eq!(
         seen.lock().unwrap().hashes.len(),
         4,
         "the refused chunk is sent again"
     );
     assert_eq!(bytes, distinct.values().sum::<u64>());
+}
+
+#[test]
+fn an_upload_that_fails_after_storing_some_chunks_counts_the_bytes_of_those() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    for i in 0..3 {
+        fs::write(site.root.join(format!("{i}.txt")), format!("file {i}")).unwrap();
+    }
+    a.scan_until(|a| !a.work.is_empty());
+    let Some(Work::Upload(upload)) = a.work.pop_front() else {
+        panic!("the content is uploaded first");
+    };
+    let sizes: BTreeMap<_, _> = (upload.chunks.iter())
+        .map(|chunk| (chunk.hash.clone(), u64::from(chunk.size)))
+        .collect();
+    assert_eq!(sizes.len(), 3);
+    let refused = upload.chunks.last().unwrap().hash.clone();
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (result, seen) = runtime.block_on(async {
+        let (relay, seen) = crate::scripted::relay(1).await;
+        seen.lock().unwrap().refuse = Some(refused.clone());
+        let (session, _events, api) = crate::scripted::session(relay).await;
+        let mut transfer = Transfer::new(&api);
+        transfer.attempts = 1;
+        transfer.backoff = koidrive_net::Backoff {
+            initial: Duration::from_millis(1),
+            max: Duration::from_millis(1),
+        };
+        (upload_counted(&session, &transfer, upload).await, seen)
+    });
+    let (receipts, bytes) = result;
+    assert!(receipts.is_err(), "the refused chunk ends the upload");
+    let stored = seen.lock().unwrap().stored.clone();
+    assert_eq!(stored.len(), 2);
+    assert!(!stored.contains(&refused));
+    assert_eq!(bytes, stored.iter().map(|hash| sizes[hash]).sum::<u64>());
 }
 
 #[test]

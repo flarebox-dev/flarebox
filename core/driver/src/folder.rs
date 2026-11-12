@@ -2007,43 +2007,38 @@ async fn stage_effect(
     (pending, staged)
 }
 
-/// Uploads the chunks of `upload` the server lacks, and counts their bytes in [`crate::volume`] once all are stored.
+/// Uploads the chunks of `upload` the server lacks, and counts the bytes of each in [`crate::volume`] once it is
+/// stored.
 async fn upload_chunks(
     session: &Session,
     transfer: &Transfer,
     upload: Upload,
 ) -> Result<Vec<UploadReceipt>, ChunkError> {
-    let (receipts, bytes) = upload_counted(session, transfer, upload).await?;
+    let (receipts, bytes) = upload_counted(session, transfer, upload).await;
     crate::volume::uploaded(bytes);
-    Ok(receipts)
+    receipts
 }
 
-/// Uploads the chunks of `upload` the server lacks, each read on a thread that may block, and returns their receipts
-/// with the bytes of the distinct chunks it read. A chunk read again, after a refused ticket or a failed attempt,
-/// counts once.
+/// Uploads the chunks of `upload` the server lacks, each read on a thread that may block. Returns the outcome with the
+/// bytes of the chunks stored, also when the upload failed after storing some.
 async fn upload_counted(
     session: &Session,
     transfer: &Transfer,
     upload: Upload,
-) -> Result<(Vec<UploadReceipt>, u64), ChunkError> {
+) -> (Result<Vec<UploadReceipt>, ChunkError>, u64) {
     let upload = Arc::new(upload);
-    let sizes = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
     let read = |chunk: &ChunkRef| {
-        let (upload, chunk, sizes) = (upload.clone(), chunk.clone(), sizes.clone());
+        let (upload, chunk) = (upload.clone(), chunk.clone());
         async move {
-            let hash = chunk.hash.clone();
-            let bytes = tokio::task::spawn_blocking(move || upload.read(&chunk))
+            tokio::task::spawn_blocking(move || upload.read(&chunk))
                 .await
-                .map_err(io::Error::other)??;
-            if let Ok(mut sizes) = sizes.lock() {
-                sizes.insert(hash, bytes.len() as u64);
-            }
-            Ok(bytes)
+                .map_err(io::Error::other)?
         }
     };
-    let receipts = transfer.upload(session, &upload.chunks, read).await?;
-    let bytes = sizes.lock().map(|sizes| sizes.values().sum()).unwrap_or(0);
-    Ok((receipts, bytes))
+    let mut bytes = 0;
+    let stored = |chunk: &ChunkRef| bytes += u64::from(chunk.size);
+    let receipts = (transfer.upload_observed(session, &upload.chunks, read, stored)).await;
+    (receipts, bytes)
 }
 
 #[cfg(test)]

@@ -18,7 +18,7 @@ pub struct Volume {
     /// Commit records of the server's log that reached this device. The result of this device's own commit counts
     /// under `commits_sent` instead.
     pub commits_received: u64,
-    /// Chunk bytes of uploads that stored every chunk the server lacked, each distinct chunk once.
+    /// Bytes of the chunks uploads stored, each once.
     pub bytes_uploaded: u64,
     /// Chunk bytes downloaded and checked against their hash.
     pub bytes_downloaded: u64,
