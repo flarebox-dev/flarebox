@@ -401,13 +401,14 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
     private knownCheck(deviceId: string): SessionCheck | undefined {
       if (this.revoked(deviceId)) return { active: false, revoked: true, closed: false, kind: "", scope: null, leaseMs: 0 };
       const lease = this.leases.get(deviceId);
-      const leftMs = lease ? lease.untilMs - this.clock() : 0;
+      if (!lease) return undefined;
+      const leftMs = lease.untilMs - this.clock();
       if (leftMs <= 0) return undefined;
-      if (leftMs < lease!.check.leaseMs / 2) {
+      if (leftMs < lease.check.leaseMs / 2) {
         this.renewalsDue.add(deviceId);
         this.renewLeases();
       }
-      return lease!.check;
+      return lease.check;
     }
 
     private storeLease(deviceId: string, check: SessionCheck, askedAtMs: number): void {
