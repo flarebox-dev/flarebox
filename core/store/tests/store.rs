@@ -1877,14 +1877,17 @@ fn link_and_questions_persist() {
     let mut store = Store::open(&path).unwrap();
     store
         .transaction(|tx| {
-            assert_eq!(tx.taken_answer("q2")?, None);
+            assert_eq!(tx.taken_question("q2")?, None);
+            let q2 = (tx.questions()?.into_iter())
+                .find(|question| question.question_id == "q2")
+                .unwrap();
             tx.put_question(&question("q3", 30))?;
             assert!(
                 !tx.take_answer("q3")?,
                 "an unanswered question has nothing to take"
             );
             assert!(tx.take_answer("q2")?);
-            assert_eq!(tx.taken_answer("q2")?, Some(answer.answer.clone()));
+            assert_eq!(tx.taken_question("q2")?, Some(q2));
             let left: Vec<String> = (tx.questions()?.into_iter())
                 .map(|question| question.question_id)
                 .collect();
@@ -1894,8 +1897,9 @@ fn link_and_questions_persist() {
         .unwrap();
     let mut store = Store::open(&path).unwrap();
     assert_eq!(
-        store.transaction(|tx| tx.taken_answer("q2")).unwrap(),
-        Some(answer.answer.clone()),
+        (store.transaction(|tx| tx.taken_question("q2")).unwrap())
+            .and_then(|question| question.answer),
+        Some(answer.clone()),
         "a taken answer outlives the store's reopening"
     );
 }

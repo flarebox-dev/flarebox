@@ -73,6 +73,10 @@ pub enum Request {
         replan: bool,
     },
     Questions,
+    /// `Driver::answered_question`.
+    AnsweredQuestion {
+        question_id: String,
+    },
     Answer {
         question_id: String,
         answer: Answer,
@@ -139,6 +143,9 @@ pub enum Response {
     },
     Questions {
         questions: Vec<Question>,
+    },
+    AnsweredQuestion {
+        question: Option<Question>,
     },
     Answered,
     /// The decision was answered before with the same answer.
@@ -253,6 +260,9 @@ pub async fn handle(driver: &Driver, request: Request) -> Response {
         Request::Questions => driver
             .questions()
             .map(|questions| Response::Questions { questions }),
+        Request::AnsweredQuestion { question_id } => driver
+            .answered_question(&question_id)
+            .map(|question| Response::AnsweredQuestion { question }),
         Request::Answer {
             question_id,
             answer,
@@ -582,7 +592,7 @@ pub fn busy(paths: &Paths) -> String {
 }
 
 /// Runs `request` in the daemon, or in a driver of its own when no daemon runs. A failed request is an error. Without
-/// a daemon and without a state directory, the status and the questions are read as a profile that is not set up,
+/// a daemon and without a state directory, the status and the questions, answered or not, are read as a profile that is not set up,
 /// without opening a driver, so reading them creates nothing.
 pub async fn run(paths: &Paths, request: Request) -> Result<Response, CliError> {
     let response = match ask(paths, &request).await? {
@@ -596,6 +606,11 @@ pub async fn run(paths: &Paths, request: Request) -> Result<Response, CliError> 
             Response::Questions {
                 questions: Vec::new(),
             }
+        }
+        None if matches!(request, Request::AnsweredQuestion { .. })
+            && !paths.state_dir.exists() =>
+        {
+            Response::AnsweredQuestion { question: None }
         }
         None => {
             let driver = Driver::open(paths.clone()).map_err(|error| match error {
@@ -957,6 +972,82 @@ mod tests {
             })
             .unwrap();
         (dir, paths, root)
+    }
+
+    #[tokio::test]
+    async fn resolve_reads_a_decision_sync_took_so_the_same_word_is_unchanged_and_another_is_stale()
+    {
+        use koidrive_engine::question::{ConflictFile, Revisions};
+
+        let (_dir, paths, _root) = linked_profile();
+        let file = |node_id: &str| ConflictFile {
+            node_id: node_id.into(),
+            revisions: Revisions {
+                content_rev: 2,
+                meta_rev: 1,
+            },
+        };
+        let conflict = Question {
+            id: "c1".into(),
+            lineage: "c1".into(),
+            space_id: SPACE.into(),
+            asked_at_ms: 20,
+            kind: koidrive_driver::QuestionKind::Conflict {
+                original: file("n-original"),
+                copy: file("n-copy"),
+                sent_in: None,
+            },
+            items: Vec::new(),
+        };
+        let store = || koidrive_store::Store::open(paths.store(SPACE).unwrap()).unwrap();
+        store()
+            .transaction(|tx| {
+                tx.put_question(&koidrive_store::StoredQuestion {
+                    question_id: conflict.id.clone(),
+                    asked_at_ms: conflict.asked_at_ms,
+                    body: serde_json::to_vec(&conflict).unwrap(),
+                    answer: None,
+                })
+            })
+            .unwrap();
+        let resolve =
+            |id: &str, word: &str| crate::resolve(&paths, Some(id.into()), Some(word.into()));
+        let outcome = |done: Result<crate::report::Done, CliError>| match done {
+            Ok(done) => Ok(done.outcome),
+            Err(error) => Err(error.code),
+        };
+        use crate::report::Outcome;
+
+        assert_eq!(
+            outcome(resolve("c1", "keep-node:n-original").await),
+            Ok(Outcome::Accepted)
+        );
+        assert_eq!(
+            outcome(resolve("c1", "keep-node:n-original").await),
+            Ok(Outcome::Unchanged)
+        );
+        assert!(store().transaction(|tx| tx.take_answer("c1")).unwrap());
+        assert_eq!(
+            outcome(resolve("c1", "keep-node:n-original").await),
+            Ok(Outcome::Unchanged)
+        );
+        for other in ["keep-node:n-copy", "keep-both"] {
+            assert_eq!(
+                outcome(resolve("c1", other).await),
+                Err(Code::StaleDecision),
+                "{other}"
+            );
+        }
+
+        assert_eq!(
+            outcome(resolve("q1", "delete").await),
+            Ok(Outcome::Accepted)
+        );
+        store().transaction(|tx| tx.remove_question("q1")).unwrap();
+        assert_eq!(
+            outcome(resolve("q1", "delete").await),
+            Err(Code::StaleDecision)
+        );
     }
 
     #[tokio::test]

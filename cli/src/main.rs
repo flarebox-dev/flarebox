@@ -853,6 +853,17 @@ async fn questions(paths: &Paths) -> Result<Vec<Question>, CliError> {
     }
 }
 
+/// The decision `id` once it has an answer, waiting for sync or taken by it, for an answer given again.
+async fn answered_question(paths: &Paths, id: &str) -> Result<Option<Question>, CliError> {
+    let request = Request::AnsweredQuestion {
+        question_id: id.to_owned(),
+    };
+    match ipc::run(paths, request).await? {
+        Response::AnsweredQuestion { question } => Ok(question),
+        other => Err(unexpected(other)),
+    }
+}
+
 /// `koi status`: this device, its folders and the decisions waiting in them. It succeeds whenever it reads the
 /// status; with `check` it exits with the status of the most urgent condition (see [`report::check_exit`]).
 async fn status(paths: &Paths, check: bool) -> Result<Done, CliError> {
@@ -900,10 +911,13 @@ async fn resolve(
         done.decisions = questions.iter().map(Decision::of).collect();
         return Ok(done);
     };
-    let question = (questions.iter())
-        .find(|question| question.id == id)
-        .ok_or_else(|| DriverError::QuestionNotFound(id.clone()))?;
-    let answer = answer_to(question, &word)
+    let question = match questions.into_iter().find(|question| question.id == id) {
+        Some(question) => question,
+        None => answered_question(paths, &id)
+            .await?
+            .ok_or_else(|| DriverError::QuestionNotFound(id.clone()))?,
+    };
+    let answer = answer_to(&question, &word)
         .map_err(|message| CliError::usage(message).then(&["koi", "resolve", "--json"]))?;
     let request = Request::Answer {
         question_id: id.clone(),

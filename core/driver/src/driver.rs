@@ -846,6 +846,31 @@ impl Driver {
         Ok(questions)
     }
 
+    /// The question `question_id` once it has an answer, while the answer waits for the engine or after the engine took
+    /// it, so that an answer given again can be read against it. None when the question is unanswered or the engine
+    /// dropped it before it took an answer.
+    pub fn answered_question(&self, question_id: &str) -> Result<Option<Question>, DriverError> {
+        for space_id in self.space_ids() {
+            let path = self.inner.paths.store(&space_id)?;
+            let mut store = Store::open(&path).map_err(store_error(&path))?;
+            let stored = store
+                .transaction(|tx| {
+                    let waiting = (tx.questions()?.into_iter()).find(|stored| {
+                        stored.question_id == question_id && stored.answer.is_some()
+                    });
+                    match waiting {
+                        Some(stored) => Ok(Some(stored)),
+                        None => tx.taken_question(question_id),
+                    }
+                })
+                .map_err(store_error(&path))?;
+            if let Some(question) = stored.and_then(|stored| decode_question(&space_id, &stored)) {
+                return Ok(Some(question));
+            }
+        }
+        Ok(None)
+    }
+
     /// Records the answer to a question. The folder's task takes it as the engine's `UserDecision` input, now if it
     /// runs and otherwise when it next opens the folder. The same answer again, while it waits for the task or after
     /// the engine took it, changes nothing. Another answer is refused, and so is any answer to a question the engine
@@ -865,7 +890,9 @@ impl Driver {
                         .find(|stored| stored.question_id == question_id);
                     let stored = match stored {
                         None => {
-                            return Ok(tx.taken_answer(question_id)?.map(|given| earlier(&given)));
+                            return Ok((tx.taken_question(question_id)?)
+                                .and_then(|taken| taken.answer)
+                                .map(|given| earlier(&given.answer)));
                         }
                         Some(StoredQuestion {
                             answer: Some(given),
@@ -1671,6 +1698,80 @@ mod tests {
             Err(DriverError::QuestionNotFound(_))
         ));
         assert_eq!(driver.questions().unwrap(), [mass_delete("q3")]);
+    }
+
+    #[tokio::test]
+    async fn the_same_answer_again_changes_nothing_after_the_folder_took_it() {
+        use koidrive_engine::question::{ConflictFile, Revisions};
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Koidrive");
+        let paths = Paths::under(&base.join("profile"));
+        linked(&paths, &root, "d1");
+        let file = |node_id: &str| ConflictFile {
+            node_id: node_id.into(),
+            revisions: Revisions {
+                content_rev: 2,
+                meta_rev: 1,
+            },
+        };
+        let kind = QuestionKind::Conflict {
+            original: file("n-original"),
+            copy: file("n-copy"),
+            sent_in: None,
+        };
+        let shown = Question {
+            id: "c1".into(),
+            lineage: "c1".into(),
+            space_id: SPACE.into(),
+            asked_at_ms: 10,
+            kind: kind.clone(),
+            items: Vec::new(),
+        };
+        Store::open(paths.store(SPACE).unwrap())
+            .unwrap()
+            .transaction(|tx| {
+                let mut state = tx.engine_state()?;
+                state.commits.questions = vec![koidrive_engine::question::Question {
+                    id: "c1".into(),
+                    asked_at_ms: 10,
+                    kind,
+                    held: BTreeMap::new(),
+                    answer: None,
+                    shown: BTreeMap::new(),
+                }];
+                tx.set_engine_state(&state)?;
+                tx.put_question(&StoredQuestion {
+                    question_id: "c1".into(),
+                    asked_at_ms: 10,
+                    body: serde_json::to_vec(&shown).unwrap(),
+                    answer: None,
+                })
+            })
+            .unwrap();
+        let driver = Driver::open(paths.clone()).unwrap();
+        assert_eq!(
+            driver.answer("c1", Answer::KeepBoth).unwrap(),
+            Answered::Now
+        );
+
+        driver.start();
+        eventually("the folder takes the answer", || {
+            driver.stored_questions(SPACE).unwrap().is_empty()
+        })
+        .await;
+        assert_eq!(
+            driver.answer("c1", Answer::KeepBoth).unwrap(),
+            Answered::Already
+        );
+        assert!(matches!(
+            driver.answer("c1", Answer::KeepCopy),
+            Err(DriverError::AnsweredOtherwise {
+                given: Answer::KeepBoth
+            })
+        ));
+        driver.stop().await;
     }
 
     #[tokio::test]
