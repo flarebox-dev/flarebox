@@ -823,7 +823,11 @@ impl Engine {
                         continue;
                     }
                     let identity = file_identity(*id);
-                    let takes = |node: &&NodeId| !linked || self.trees.recorded_local(node);
+                    let takes = |node: &&NodeId| {
+                        !linked
+                            || self.trees.recorded_local(node)
+                            || self.trees.displaced_local().contains_key(*node)
+                    };
                     let node = (self.trees.locals_with_identity(&identity).rev())
                         .filter(|node| !staying.contains(*node))
                         .find(takes)
