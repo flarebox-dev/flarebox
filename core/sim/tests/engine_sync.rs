@@ -1321,9 +1321,21 @@ fn run_ignoring(
                     && name_key(&node.shape.name) == name_key(&shape.name)
             })
     };
+    let remote = device.trees.remote();
+    let kept_from_remote = |id: &str| {
+        let mut names = Vec::new();
+        let mut current = id;
+        while let Some(shape) = remote.live(current).filter(|_| names.len() <= remote.len()) {
+            names.push(shape.name.clone());
+            current = &shape.parent;
+        }
+        names.reverse();
+        let kind = (remote.live(id)).map_or(Kind::File, |shape| shape.kind);
+        device.trees.edited(id) && current == remote.root && device.trees.ignores(&names, kind)
+    };
     let nowhere = |id: &str| {
         (local.get(id)).is_some_and(|node| unreachable(id, &node.shape))
-            && (device.trees.remote().live(id)).is_none_or(|shape| unreachable(id, shape))
+            && (remote.live(id)).is_none_or(|shape| unreachable(id, shape) || kept_from_remote(id))
     };
     let stays_parked = |id: &str| {
         waiting.contains(id)
@@ -3822,5 +3834,59 @@ fn a_version_restore_of_a_file_deleted_here_waits_while_its_s_update_waits() {
     ];
     for cut in CUTS {
         run_cut(&seed, &local, &remote, 1, false, &during, cut).unwrap();
+    }
+}
+
+#[test]
+fn an_edited_parked_file_whose_place_here_is_taken_and_whose_server_place_is_excluded_stays_reported()
+ {
+    let seed = [
+        act(0, 0, 0, 5, 0),
+        act(0, 0, 231951485502570629, 2, 0),
+        act(0, 0, 8120665025396950181, 0, 0),
+        act(0, 0, 1064671299086725321, 3, 0),
+        act(0, 0, 376187089449230377, 0, 0),
+        act(1, 0, 294211349795495575, 0, 0),
+    ];
+    let local = [
+        act(1, 0, 0, 5, 0),
+        act(1, 0, 0, 0, 0),
+        act(0, 0, 0, 2, 0),
+        act(0, 0, 5455886572231891135, 0, 0),
+    ];
+    let during = [
+        (true, vec![act(0, 0, 0, 0, 0)]),
+        (
+            false,
+            vec![
+                act(0, 0, 3733456458247703335, 5, 0),
+                act(3, 4675952882751711745, 9164493832926334025, 0, 0),
+            ],
+        ),
+        (false, vec![act(0, 0, 0, 0, 0)]),
+        (false, vec![act(0, 0, 0, 0, 0)]),
+    ];
+    let rulings = [
+        Ruling::File(vec![]),
+        Ruling::Exclude(vec!["/b"]),
+        Ruling::Include(vec!["a"]),
+        Ruling::Include(vec![]),
+        Ruling::Exclude(vec!["a"]),
+    ];
+    for cut in CUTS {
+        let answer = Answer::Publish;
+        run_ignoring(
+            &seed,
+            &local,
+            &[],
+            MAX_OPS,
+            false,
+            &during,
+            cut,
+            &rulings,
+            answer,
+            true,
+        )
+        .unwrap();
     }
 }
