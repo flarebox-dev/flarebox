@@ -594,6 +594,7 @@ fn rescan_request_restores_lost_watch_coverage() {
     fs::create_dir(root.join("sub")).unwrap();
     let mut watcher = NativeWatcher::start(&root, Snapshot::default()).unwrap();
     wait_for(&mut watcher, &[created("sub", EntryKind::Dir)]);
+    watcher.poll(Duration::from_millis(300)).unwrap();
 
     lose_coverage(&mut watcher);
     fs::write(root.join("sub/missed.txt"), "m").unwrap();
@@ -668,16 +669,12 @@ fn folders_included_by_the_registration_rescan_keep_watch_coverage() {
 
     let first = watcher.poll(Duration::ZERO).unwrap();
     watcher.before_register = None;
-    assert_eq!(
-        first.rules,
-        [
-            (PathBuf::new(), Some(b"ig\n".to_vec())),
-            (PathBuf::new(), None),
-        ]
-    );
-    assert!(first.changes.contains(&created("ig", EntryKind::Dir)));
+    assert_eq!(first.rules, [(PathBuf::new(), Some(b"ig\n".to_vec()))]);
+    let second = watcher.poll(Duration::ZERO).unwrap();
+    assert_eq!(second.rules, [(PathBuf::new(), None)]);
+    assert!(second.changes.contains(&created("ig", EntryKind::Dir)));
     assert!(
-        first
+        second
             .changes
             .contains(&created("ig/file.txt", EntryKind::File))
     );
@@ -701,6 +698,55 @@ fn folders_included_by_the_registration_rescan_keep_watch_coverage() {
     assert!(
         seen.contains(&expected),
         "the write inside the newly included folder was not reported; saw {seen:?}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_rename_inside_a_folder_a_poll_moved_comes_in_a_poll_of_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir(root.join("a")).unwrap();
+    fs::write(root.join("a/file"), "x").unwrap();
+    let rules = Rules::new(Box::new(Lines::default()));
+    let mut watcher = NativeWatcher::start_with_rules(&root, Snapshot::default(), rules).unwrap();
+    while !watcher
+        .poll(Duration::from_millis(300))
+        .unwrap()
+        .changes
+        .is_empty()
+    {}
+    let (from, to) = (root.join("b/file"), root.join("b/moved"));
+    let mut once = Some(());
+    watcher.before_register = Some(Box::new(move || {
+        if once.take().is_some() {
+            fs::rename(&from, &to).unwrap();
+        }
+    }));
+
+    fs::rename(root.join("a"), root.join("b")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut polls = Vec::new();
+    while Instant::now() < deadline {
+        let poll = watcher.poll(Duration::from_millis(200)).unwrap();
+        if !poll.changes.is_empty() {
+            polls.push(poll.changes);
+        }
+    }
+    assert_eq!(
+        polls,
+        [
+            vec![Change::Renamed {
+                from: "a".into(),
+                to: "b".into(),
+                kind: EntryKind::Dir,
+            }],
+            vec![Change::Renamed {
+                from: "b/file".into(),
+                to: "b/moved".into(),
+                kind: EntryKind::File,
+            }],
+        ]
     );
 }
 

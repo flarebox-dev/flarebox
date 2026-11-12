@@ -1400,7 +1400,7 @@ fn diff(old: &BTreeMap<PathBuf, Entry>, new: &BTreeMap<PathBuf, Entry>) -> Vec<C
 /// What one [`Watcher::poll`] found.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Poll {
-    /// The changes, already applied to [`Watcher::snapshot`].
+    /// The changes of one scan, already applied to [`Watcher::snapshot`].
     pub changes: Vec<Change>,
     /// Scopes the watcher knows changed but could not settle before the poll
     /// returned: a removal it could not confirm, or a scan that saw the tree
@@ -1465,10 +1465,10 @@ pub struct NativeWatcher {
     /// Folders whose subfolders may be unwatched, which are registered once a
     /// scan has read them: the folders a scan could not read that no scan has
     /// read since, the root while it waits for a scan to read the rules, a
-    /// folder a reset made known, which no scan reports as created, and a
-    /// folder that the rescan after a registration found.
+    /// folder a reset made known, which no scan reports as created.
     #[cfg(target_os = "linux")]
     blocked: BTreeSet<PathBuf>,
+    uncovered: Option<(FileId, BTreeSet<PathBuf>)>,
     rewatch: bool,
     failed: Option<Error>,
     stopped: Box<dyn Fn() -> bool + Send>,
@@ -1513,6 +1513,7 @@ impl NativeWatcher {
             unreadable: BTreeSet::new(),
             #[cfg(target_os = "linux")]
             blocked: BTreeSet::from_iter(deferred.then(PathBuf::new)),
+            uncovered: None,
             rules,
             changed_rules: Vec::new(),
             read: BTreeSet::new(),
@@ -1590,15 +1591,8 @@ impl NativeWatcher {
         readable
     }
 
-    /// Registers watches on the folders the changes created or moved, and on
-    /// the blocked folders that became `readable`, then rescans them, so
-    /// anything written before the watch existed is seen. With rules, it
-    /// registers no folder they leave out. A rescan that opens
-    /// another root folder than `root`, the one the changes came from, fails
-    /// the watcher with [`Error::RootReplaced`], returns nothing and leaves
-    /// the snapshot as it was.
     #[cfg(target_os = "linux")]
-    fn cover(&mut self, changes: &[Change], readable: Vec<PathBuf>, root: FileId) -> Vec<Change> {
+    fn cover(&mut self, changes: &[Change], readable: Vec<PathBuf>, root: FileId) {
         let dirs = outermost(
             changes
                 .iter()
@@ -1618,7 +1612,7 @@ impl NativeWatcher {
                 .collect(),
         );
         if dirs.is_empty() {
-            return Vec::new();
+            return;
         }
         #[cfg(test)]
         if let Some(hook) = self.before_register.as_mut() {
@@ -1642,55 +1636,11 @@ impl NativeWatcher {
             }
         }
         if (self.stopped)() {
-            for dir in dirs {
-                self.blocked.insert(dir.clone());
-                self.dirty.insert(dir);
-            }
-            return Vec::new();
+            self.blocked.extend(dirs.iter().cloned());
+            self.dirty.extend(dirs);
+            return;
         }
-        match self.snapshot.rescan_under(
-            &self.root,
-            dirs.iter().cloned(),
-            Some(root),
-            self.rules.as_mut(),
-            &*self.stopped,
-            &mut |_| {},
-        ) {
-            Ok(rescan) => {
-                // A folder this rescan found was not there when the folders
-                // were registered, or the rules as they were then left it
-                // out. The next poll rescans it and registers it.
-                let found = rescan.changes.iter().filter_map(|change| match change {
-                    Change::Created {
-                        path,
-                        kind: EntryKind::Dir,
-                    }
-                    | Change::Renamed {
-                        to: path,
-                        kind: EntryKind::Dir,
-                        ..
-                    } => Some(path.clone()),
-                    _ => None,
-                });
-                for dir in outermost(found.collect()) {
-                    self.blocked.insert(dir.clone());
-                    self.dirty.insert(dir);
-                }
-                self.changed_rules.extend(rescan.rules);
-                self.dirty.extend(rescan.unsettled);
-                self.blocked.extend(rescan.unreadable.iter().cloned());
-                self.learn(rescan.read, &rescan.unreadable);
-                rescan.changes
-            }
-            Err(Error::Changed | Error::Stopped) => {
-                self.dirty.extend(dirs);
-                Vec::new()
-            }
-            Err(err) => {
-                self.failed = Some(err);
-                Vec::new()
-            }
-        }
+        self.uncovered = Some((root, dirs.into_iter().collect()));
     }
 }
 
@@ -1826,7 +1776,7 @@ impl Watcher for NativeWatcher {
             if let Some(err) = self.failed.take() {
                 return Err(err);
             }
-            if self.dirty.is_empty() {
+            if self.dirty.is_empty() && self.uncovered.is_none() {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if !self.receive(left)? {
                     return Ok(self.report(Vec::new(), root));
@@ -1834,7 +1784,7 @@ impl Watcher for NativeWatcher {
             }
             let settle_until = Instant::now() + MAX_SETTLE;
             while Instant::now() < settle_until && self.receive(SETTLE)? {}
-            if self.rules.is_some() && self.dirty.is_empty() {
+            if self.rules.is_some() && self.dirty.is_empty() && self.uncovered.is_none() {
                 // Every event of the batch lay below a left-out folder. Such
                 // events can keep coming, so they must not hold the poll
                 // past its deadline.
@@ -1850,11 +1800,15 @@ impl Watcher for NativeWatcher {
                 self.blocked.extend(deferred.then(PathBuf::new));
                 self.rewatch = false;
             }
-            let scopes: Vec<PathBuf> = self.dirty.iter().cloned().collect();
+            let (expected, uncovered) = self.uncovered.clone().unzip();
+            let scopes: Vec<PathBuf> = (self.dirty.iter())
+                .chain(uncovered.iter().flatten())
+                .cloned()
+                .collect();
             let rescan = match self.snapshot.rescan_under(
                 &self.root,
                 scopes.iter().cloned(),
-                None,
+                expected,
                 self.rules.as_mut(),
                 &*self.stopped,
                 &mut |_| {},
@@ -1862,8 +1816,13 @@ impl Watcher for NativeWatcher {
                 Ok(rescan) => rescan,
                 Err(Error::Changed) if Instant::now() < deadline => continue,
                 Err(Error::Changed) => return Ok(self.report(Vec::new(), root)),
+                Err(Error::RootReplaced) => {
+                    self.uncovered = None;
+                    return Err(Error::RootReplaced);
+                }
                 Err(err) => return Err(err),
             };
+            self.uncovered = None;
             root = Some(rescan.root);
             self.changed_rules.extend(rescan.rules);
             self.dirty = rescan.unsettled.into_iter().collect();
@@ -1872,12 +1831,7 @@ impl Watcher for NativeWatcher {
             self.learn(rescan.read, &rescan.unreadable);
             let changes = rescan.changes;
             #[cfg(target_os = "linux")]
-            let changes = {
-                let mut changes = changes;
-                let more = self.cover(&changes, readable, rescan.root);
-                changes.extend(more);
-                changes
-            };
+            self.cover(&changes, readable, rescan.root);
             if !changes.is_empty() || !self.changed_rules.is_empty() || Instant::now() >= deadline {
                 return Ok(self.report(changes, root));
             }
