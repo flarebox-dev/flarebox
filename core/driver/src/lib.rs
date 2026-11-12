@@ -30,6 +30,8 @@ mod paths;
 pub mod policy;
 mod question;
 mod restore;
+#[cfg(test)]
+mod scripted;
 mod status;
 
 pub use config::{Config, ConfigError, LocalTrash, SyncRules};

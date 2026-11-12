@@ -94,3 +94,14 @@ max_size_mb = 4096
 ```
 
 The local trash is separate from the space's trash on the server, which [Trash, versions and restore](history.md) covers.
+
+## Uploads at once
+
+Koidrive uploads up to 4 chunks of file content at once. The limit counts across all folders this profile links. Set another number from 1 to 16 in `config.toml`. With 1, Koidrive sends one chunk at a time, as versions before this setting did:
+
+```toml
+[upload]
+concurrency = 1
+```
+
+Restart the daemon after you change it.

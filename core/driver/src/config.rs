@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use koidrive_net::DEFAULT_UPLOAD_CONCURRENCY;
 use serde::Deserialize;
 
 /// The profile's configuration file (`config.toml`). It is device-local: never synced, and it holds no secrets.
@@ -15,6 +16,9 @@ use serde::Deserialize;
 ///
 /// [trash]
 /// max_size_mb = 2048
+///
+/// [upload]
+/// concurrency = 4
 /// ```
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -23,6 +27,8 @@ pub struct Config {
     pub sync: SyncRules,
     #[serde(default)]
     pub trash: LocalTrash,
+    #[serde(default)]
+    pub upload: Uploads,
 }
 
 /// The local trash of every folder the profile links (design §5.2), which holds what sync effects displaced. An
@@ -44,6 +50,47 @@ impl LocalTrash {
     /// The cap in bytes.
     pub fn cap(&self) -> u64 {
         self.max_size_mb.saturating_mul(1_000_000)
+    }
+}
+
+/// How the profile uploads chunks. Every folder the profile links shares the limit, so all of them together have at
+/// most `concurrency` chunk uploads in flight.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Uploads {
+    pub concurrency: UploadConcurrency,
+}
+
+/// How many chunk uploads may be in flight at once, from 1 to 16. 1 sends one chunk at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "i64")]
+pub struct UploadConcurrency(usize);
+
+impl UploadConcurrency {
+    pub const MAX: usize = 16;
+
+    pub fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl Default for UploadConcurrency {
+    fn default() -> Self {
+        UploadConcurrency(DEFAULT_UPLOAD_CONCURRENCY)
+    }
+}
+
+impl TryFrom<i64> for UploadConcurrency {
+    type Error = String;
+
+    fn try_from(value: i64) -> Result<Self, String> {
+        match usize::try_from(value) {
+            Ok(concurrency @ 1..=Self::MAX) => Ok(UploadConcurrency(concurrency)),
+            _ => Err(format!(
+                "concurrency must be from 1 to {}, not {value}",
+                Self::MAX
+            )),
+        }
     }
 }
 
@@ -286,5 +333,37 @@ mod tests {
             Config::load(&path),
             Err(ConfigError::Invalid { .. })
         ));
+    }
+
+    #[test]
+    fn upload_concurrency_is_read_from_1_to_16_and_defaults_to_4() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let load = |text: &str| {
+            std::fs::write(&path, text).unwrap();
+            Config::load(&path).map(|config| config.upload.concurrency.get())
+        };
+        let refused = |text: &str| match load(text) {
+            Err(ConfigError::Invalid { reason, .. }) => reason,
+            other => panic!("{text:?} was not refused: {other:?}"),
+        };
+
+        assert_eq!(load("").unwrap(), 4);
+        assert_eq!(load("[upload]\n").unwrap(), 4);
+        assert_eq!(load("[upload]\nconcurrency = 1\n").unwrap(), 1);
+        assert_eq!(load("[upload]\nconcurrency = 16\n").unwrap(), 16);
+        for bad in [0, 17, -1] {
+            let reason = refused(&format!("[upload]\nconcurrency = {bad}\n"));
+            assert!(
+                reason.contains(&format!("concurrency must be from 1 to 16, not {bad}")),
+                "{reason}"
+            );
+        }
+        let reason = refused("[upload]\nconcurrency = \"8\"\n");
+        assert!(reason.contains("invalid type"), "{reason}");
+        let reason = refused("[upload]\nconcurrency = 2.5\n");
+        assert!(reason.contains("invalid type"), "{reason}");
+        let reason = refused("[upload]\nconcurency = 8\n");
+        assert!(reason.contains("unknown field"), "{reason}");
     }
 }
