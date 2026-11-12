@@ -13,7 +13,7 @@ fn koi(home: &Path, args: &[&str], vars: &[(&str, &str)]) -> Output {
         .env("XDG_RUNTIME_DIR", home.join("run"))
         .env_remove("DO_NOT_TRACK")
         .env_remove("KOIDRIVE_TELEMETRY")
-        .env_remove("KOIDRIVE_TELEMETRY_URL")
+        .env("KOIDRIVE_TELEMETRY_URL", "http://127.0.0.1:9")
         .env_remove("KOIDRIVE_TELEMETRY_TOKEN")
         .env_remove("CI");
     for (name, value) in vars {

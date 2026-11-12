@@ -18,9 +18,9 @@ use crate::system::Environment;
 
 /// The project's host, a CNAME to PostHog's managed reverse proxy.
 pub const ENDPOINT: &str = "https://tel.koidrive.com";
-/// The PostHog project token. It only lets a client add events to the project, and PostHog documents it as public.
-/// Empty until the project exists; without a token nothing is sent and the queue waits.
-pub const PROJECT_TOKEN: &str = "";
+/// The PostHog project token (US Cloud). A client can only add events and evaluate feature flags with it, and PostHog
+/// documents it as public. A build with an empty token sends nothing and its queue waits.
+pub const PROJECT_TOKEN: &str = "phc_zS5sUnZrgWmsxoiodya3UeRdNfBkk5Pvdpsqiii4XqZ8";
 pub const ENDPOINT_VARIABLE: &str = "KOIDRIVE_TELEMETRY_URL";
 pub const TOKEN_VARIABLE: &str = "KOIDRIVE_TELEMETRY_TOKEN";
 
@@ -601,7 +601,9 @@ mod tests {
 
     #[tokio::test]
     async fn without_a_token_nothing_is_sent_and_off_reads_nothing() {
-        assert!(Uploader::from_env(|_| None).unwrap().is_none());
+        let built_in = Uploader::from_env(|_| None).unwrap().unwrap();
+        assert_eq!(built_in.token(), PROJECT_TOKEN);
+        assert_eq!(built_in.url.as_str(), "https://tel.koidrive.com/batch/");
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path());
         queued(&store, 20_404);
