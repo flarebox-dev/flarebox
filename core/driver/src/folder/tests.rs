@@ -1636,7 +1636,12 @@ fn with_four_uploads_at_once_a_file_that_changed_after_it_was_chunked_abandons_t
     };
     assert_eq!(upload.chunks.len(), 8);
     let changed = b"written again after it was chunked";
-    fs::write(site.root.join("5.txt"), changed).unwrap();
+    let last = upload.chunks.last().unwrap();
+    let name = (0..8)
+        .map(|i| format!("{i}.txt"))
+        .find(|name| koidrive_net::matches(last, &fs::read(site.root.join(name)).unwrap()))
+        .unwrap();
+    fs::write(site.root.join(name), changed).unwrap();
     let stale = (upload.chunks.iter())
         .find(|chunk| !koidrive_net::matches(chunk, &upload.read(chunk).unwrap()))
         .unwrap()
@@ -1656,7 +1661,11 @@ fn with_four_uploads_at_once_a_file_that_changed_after_it_was_chunked_abandons_t
         "{result:?}"
     );
     let seen = seen.lock().unwrap();
-    assert_eq!(seen.peak, 4);
+    assert_eq!(
+        seen.peak, 4,
+        "the relay saw these chunks before the changed one ended the upload: {:?}",
+        seen.hashes
+    );
     assert!(!seen.hashes.contains(&stale));
     drop(seen);
 
