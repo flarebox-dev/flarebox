@@ -151,9 +151,9 @@ impl Tx<'_> {
             };
             state.commits.pending.insert(row.get(0)?, pending);
         }
-        let mut stmt = self
-            .0
-            .prepare_cached("SELECT node_id, dev, ino, ino_high, birth_ns FROM recorded_nodes")?;
+        let mut stmt = self.0.prepare_cached(
+            "SELECT node_id, dev, ino, ino_high, birth_ns, lost FROM recorded_nodes",
+        )?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let node: NodeId = row.get(0)?;
@@ -170,6 +170,9 @@ impl Tx<'_> {
                     state.trees.displaced.insert(node, identity);
                 }
                 None => {
+                    if row.get(5)? {
+                        state.trees.lost.insert(node.clone());
+                    }
                     state.trees.outside.insert(node);
                 }
             }
@@ -411,10 +414,11 @@ impl Tx<'_> {
         for node in new.difference(old) {
             insert.execute([node])?;
         }
-        let recorded = |trees: &TreesState| -> BTreeMap<NodeId, Option<FileIdentity>> {
-            let kept = trees.outside.iter().map(|node| (node.clone(), None));
+        let recorded = |trees: &TreesState| -> BTreeMap<NodeId, (Option<FileIdentity>, bool)> {
+            let kept = (trees.outside.iter())
+                .map(|node| (node.clone(), (None, trees.lost.contains(node))));
             let displaced =
-                (trees.displaced.iter()).map(|(node, held)| (node.clone(), Some(*held)));
+                (trees.displaced.iter()).map(|(node, held)| (node.clone(), (Some(*held), false)));
             kept.chain(displaced).collect()
         };
         let (old, new) = (recorded(&before.trees), recorded(&after.trees));
@@ -422,14 +426,14 @@ impl Tx<'_> {
             .0
             .prepare_cached("DELETE FROM recorded_nodes WHERE node_id = ?1")?;
         let mut put = self.0.prepare_cached(
-            "INSERT OR REPLACE INTO recorded_nodes (node_id, displaced, dev, ino, ino_high, birth_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT OR REPLACE INTO recorded_nodes (node_id, displaced, dev, ino, ino_high, birth_ns, lost)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
         let (removed, changed) = differences(&old, &new);
         for node in removed {
             remove.execute([node])?;
         }
-        for (node, identity) in changed {
+        for (node, (identity, lost)) in changed {
             put.execute(params![
                 node,
                 identity.is_some(),
@@ -437,6 +441,7 @@ impl Tx<'_> {
                 identity.map(|held| ino_columns(held.ino).0),
                 identity.map_or(0, |held| ino_columns(held.ino).1),
                 identity.and_then(|held| held.birth_ns),
+                lost,
             ])?;
         }
         let mut remove = self

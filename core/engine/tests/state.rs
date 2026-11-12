@@ -97,6 +97,7 @@ fn trees_state() -> TreesState {
         trashed_here: [("t".into(), 5)].into(),
         discarded: ["a".into()].into(),
         outside: ["a".into()].into(),
+        lost: ["a".into()].into(),
         displaced: Default::default(),
         edited_here: [("a".into(), 1)].into(),
         unsent_edits: Default::default(),
@@ -412,6 +413,14 @@ fn trees_restore_a_valid_state_and_refuse_each_broken_one() {
                 state.outside.insert("t".into());
             }),
             StateError::NotIgnoredLocal("t".into()),
+        ),
+        (
+            "a folder the disk lost that is not recorded",
+            trees(),
+            broken(trees_state(), |state| {
+                state.lost.insert("b".into());
+            }),
+            StateError::NotIgnoredLocal("b".into()),
         ),
         (
             "a displaced node that L holds",

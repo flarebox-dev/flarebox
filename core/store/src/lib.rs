@@ -409,6 +409,9 @@ const MIGRATIONS: &[&str] = &[
         landed INTEGER NOT NULL CHECK (landed IN (0, 1))
     ) STRICT, WITHOUT ROWID;
 ",
+    "
+    ALTER TABLE recorded_nodes ADD COLUMN lost INTEGER NOT NULL DEFAULT 0 CHECK (lost IN (0, 1));
+",
 ];
 
 /// The schema version this build writes.

@@ -193,6 +193,9 @@ pub struct Trees {
     /// Nodes whose local copy the user moved into an ignored folder that is no node. L keeps the
     /// entry each had before the move.
     outside: BTreeSet<NodeId>,
+    /// The folders of `outside` that the disk lost, which L keeps only for what is recorded below them
+    /// ([`Trees::keep_lost_local`]).
+    lost: BTreeSet<NodeId>,
     /// The nodes of `outside`, and those L held under them, that left L because another entry took their name
     /// ([`Trees::displace_local`]), each with the identity L held for it.
     displaced: BTreeMap<NodeId, FileIdentity>,
@@ -260,6 +263,7 @@ impl Trees {
             unsent_edits: BTreeSet::new(),
             ignore: Matcher::new(LocalRules::default()),
             outside: BTreeSet::new(),
+            lost: BTreeSet::new(),
             displaced: BTreeMap::new(),
             rules_known: true,
             unknown_rules: BTreeSet::new(),
@@ -443,6 +447,7 @@ impl Trees {
             self.parked_as.remove(&id);
             self.l_names.insert(&id, &node.shape);
         }
+        self.lost.remove(&id);
         if self.outside.remove(&id) {
             let children: Vec<NodeId> = self.l_names.children(&id).cloned().collect();
             self.outside.extend(children);
@@ -461,6 +466,7 @@ impl Trees {
         self.parked_as.remove(id);
         self.unknown_rules.remove(id);
         self.outside.remove(id);
+        self.lost.remove(id);
         self.count_held_trash(id, false);
         self.unsent_edits.remove(id);
         if let Some(old) = self.l.remove(id) {
@@ -609,7 +615,23 @@ impl Trees {
     pub fn ignore_local(&mut self, id: &str) {
         if self.l.get(id).is_some() {
             self.outside.insert(id.to_owned());
+            self.lost.remove(id);
         }
+    }
+
+    /// Records, as [`Trees::ignore_local`] does, a folder the disk lost that L keeps because a node recorded below it
+    /// is in an ignored folder. Once nothing recorded is left below it, the folder may leave L, since the disk does not
+    /// hold it anywhere. The record is part of the stored state.
+    pub fn keep_lost_local(&mut self, id: &str) {
+        if self.l.get(id).is_some() {
+            self.outside.insert(id.to_owned());
+            self.lost.insert(id.to_owned());
+        }
+    }
+
+    /// The folders [`Trees::keep_lost_local`] recorded that no observation has placed or removed since.
+    pub fn lost_local(&self) -> &BTreeSet<NodeId> {
+        &self.lost
     }
 
     /// Whether [`Trees::ignore_local`] recorded the node, or a folder L holds it under.
@@ -1652,6 +1674,7 @@ impl Trees {
             trashed_here: self.trashed_here.clone(),
             discarded: self.discarded.clone(),
             outside: self.outside.clone(),
+            lost: self.lost.clone(),
             displaced: self.displaced.clone(),
             edited_here: self.edited_here.clone(),
             unsent_edits: self.unsent_edits.clone(),
@@ -1697,6 +1720,9 @@ impl Trees {
         if let Some(id) = (state.outside.iter()).find(|id| self.l.get(id).is_none()) {
             return Err(StateError::NotIgnoredLocal(id.clone()));
         }
+        if let Some(id) = (state.lost.iter()).find(|id| !state.outside.contains(*id)) {
+            return Err(StateError::NotIgnoredLocal(id.clone()));
+        }
         let kept = |id: &&NodeId| self.l.get(id).is_none() && self.r.live(id).is_some();
         if let Some(id) = state.displaced.keys().find(|id| !kept(id)) {
             return Err(StateError::NotDisplaced(id.clone()));
@@ -1725,6 +1751,7 @@ impl Trees {
             trashed_here,
             discarded,
             outside,
+            lost,
             displaced,
             edited_here,
             unsent_edits,
@@ -1742,6 +1769,7 @@ impl Trees {
         self.trashed_here = trashed_here;
         self.discarded = discarded;
         self.outside = outside;
+        self.lost = lost;
         self.displaced = displaced;
         self.edited_here = edited_here;
         self.unsent_edits = unsent_edits;

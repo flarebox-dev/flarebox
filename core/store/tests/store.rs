@@ -453,7 +453,8 @@ fn engine_state() -> EngineState {
             ]),
             trashed_here: BTreeMap::from([("t".into(), 5)]),
             discarded: nodes(["d"]),
-            outside: nodes(["kept"]),
+            outside: nodes(["kept", "lost"]),
+            lost: nodes(["lost"]),
             displaced: BTreeMap::from([(
                 "displaced".into(),
                 FileIdentity {

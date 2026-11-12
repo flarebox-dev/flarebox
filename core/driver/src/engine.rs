@@ -933,9 +933,9 @@ impl Engine {
 
     /// Puts `node`, or a new node when it is `None`, at `path` with `identity`. A file keeps the content L had for it
     /// when `content` is `None`. Changes nothing when the parent folder is not in L, or the path is not a name L can
-    /// hold. A recorded node placed again ([`Trees::ignore_local`]) takes with it the recorded folders above it that
-    /// hold nothing in L any more: the disk lost them and L kept them only for what was recorded below ([`Self::remove`]),
-    /// so they leave L and their deletion is planned.
+    /// hold. A recorded node placed again ([`Trees::ignore_local`]) takes with it the folders above it that L kept only
+    /// for what was recorded below because the disk lost them ([`Trees::keep_lost_local`]) and that hold nothing in L any
+    /// more: they leave L, and their deletion is planned. A folder the user moved into an ignored folder stays.
     #[allow(clippy::too_many_arguments)]
     fn place(
         &mut self,
@@ -1048,7 +1048,7 @@ impl Engine {
         touched.insert(id);
         let mut above = left;
         while let Some(folder) = above.filter(|folder| {
-            self.trees.ignored_local().contains(folder)
+            self.trees.lost_local().contains(folder)
                 && self.trees.local_children(folder).next().is_none()
         }) {
             above = (self.trees.local().get(&folder)).map(|node| node.shape.parent.clone());
@@ -1103,7 +1103,7 @@ impl Engine {
         }
         doomed.retain(|node| !kept.contains(node));
         for folder in &kept {
-            self.trees.ignore_local(folder);
+            self.trees.keep_lost_local(folder);
         }
         for id in &doomed {
             if let (Some(path), Some(node)) = (self.path_of(id), self.trees.local().get(id)) {

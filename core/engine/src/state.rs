@@ -59,6 +59,8 @@ pub struct TreesState {
     /// The nodes whose local copy the user moved into an ignored folder that is no node, and the folders L keeps
     /// for them. L holds each at the position it had before.
     pub outside: BTreeSet<NodeId>,
+    /// The folders of `outside` that the disk lost, which L keeps only for what is recorded below them.
+    pub lost: BTreeSet<NodeId>,
     /// The nodes whose local copy is in an ignored folder and whose name in L another entry took, each with the
     /// identity L held for it. L holds none of them, and R holds each live.
     pub displaced: BTreeMap<NodeId, FileIdentity>,
@@ -147,7 +149,8 @@ pub enum StateError {
     /// A node is recorded as trashed by a delete of this device, but R does not hold it trashed by
     /// that commit.
     NotTrashedHere(NodeId),
-    /// A node is recorded as moved into an ignored folder, but L does not hold it.
+    /// A node is recorded as moved into an ignored folder, or as a folder the disk lost, but L does not hold it or the
+    /// lost folder is not recorded.
     NotIgnoredLocal(NodeId),
     /// A node is recorded as displaced, but L holds it or R does not hold it live.
     NotDisplaced(NodeId),
