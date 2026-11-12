@@ -3764,3 +3764,26 @@ fn a_file_the_user_deleted_while_its_server_move_waited_in_s_is_deleted_on_the_s
     let cut = Cut::Answered;
     run_cut(&seed, &local, &remote, fits, fresh_dir_names, &during, cut).unwrap();
 }
+
+#[test]
+fn an_edit_the_other_device_deleted_gives_way_to_the_folder_it_made_at_that_name() {
+    let seed = [
+        act(1, 0, 0, 2, 0),
+        act(0, 0, 0, 3, 0),
+        act(0, 0, 95372568677471977, 0, 0),
+    ];
+    let local = [
+        act(0, 0, 10639126546080908428, 0, 0),
+        act(0, 0, 2083088007821781, 0, 0),
+        act(5, 0, 0, 0, 3),
+    ];
+    let during = [
+        (
+            false,
+            vec![act(4, 4134113597317913042, 0, 0, 0), act(3, 0, 0, 3, 0)],
+        ),
+        (true, vec![act(2, 0, 0, 0, 0)]),
+        (false, vec![act(4, 0, 0, 0, 0), act(0, 0, 0, 3, 0)]),
+    ];
+    run_cut(&seed, &local, &[], 1, false, &during, Cut::None).unwrap();
+}

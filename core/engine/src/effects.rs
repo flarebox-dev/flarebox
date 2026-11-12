@@ -613,7 +613,21 @@ pub fn location_of(trees: &Trees, id: &str) -> Option<Location> {
 
 pub(crate) fn unparks_to(trees: &Trees, id: &str, target: &Shape) -> bool {
     let view = View::new(trees);
-    view.blocked(id, target).is_none() && (view.location_in(&target.parent, &target.name)).is_some()
+    view.blocked(id, target).is_none()
+        && !forked_aside(trees, id, target)
+        && (view.location_in(&target.parent, &target.name)).is_some()
+}
+
+fn forked_aside(trees: &Trees, id: &str, shape: &Shape) -> bool {
+    trees.remote().live(id).is_none()
+        && trees.edited(id)
+        && (trees.remote().iter()).any(|(other, node)| {
+            other != id
+                && !node.trashed
+                && node.shape.parent == shape.parent
+                && name_key(&node.shape.name) == name_key(&shape.name)
+                && !trees.excluded(other)
+        })
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -653,6 +667,9 @@ impl<'a> View<'a> {
                         || self.trees.waiting().contains_key(id))
                         || self.trees.edited(id)) =>
             {
+                if forked_aside(self.trees, id, &local.shape) {
+                    return Step::Blocked(None);
+                }
                 return self.unpark(id, local, &local.shape);
             }
             (Some(local), None) => return self.remove(id, local),
