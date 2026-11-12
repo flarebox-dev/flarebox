@@ -839,6 +839,201 @@ fn a_folder_moved_into_a_deleted_folder_while_its_create_waits_is_sent() {
     assert_eq!(entries[&folder].place, Place::Root);
 }
 
+#[test]
+fn a_folder_revived_at_its_pending_name_after_its_delete_landed_takes_its_name() {
+    let phases: Vec<Vec<(usize, Step)>> = vec![
+        vec![
+            (2, Step::Work(4007745936436893426)),
+            (
+                1,
+                Step::User(Action {
+                    kind: 1,
+                    target: 13283880982325300966,
+                    parent: 7530012053189467691,
+                    name: 6,
+                    text: 3,
+                }),
+            ),
+            (2, Step::Work(18389991862780469496)),
+            (2, Step::Work(9775417661590067865)),
+            (
+                0,
+                Step::User(Action {
+                    kind: 3,
+                    target: 8851446434072450680,
+                    parent: 2745539858988442782,
+                    name: 0,
+                    text: 2,
+                }),
+            ),
+            (0, Step::Work(4450296097999021389)),
+            (2, Step::Deliver(15501889018198306176)),
+            (
+                1,
+                Step::User(Action {
+                    kind: 1,
+                    target: 4254539288740600970,
+                    parent: 17259486623974888835,
+                    name: 0,
+                    text: 3,
+                }),
+            ),
+            (0, Step::Deliver(7951671155622776781)),
+            (0, Step::Duplicate(16868798682183253529)),
+            (0, Step::Commit(Reply::Served)),
+        ],
+        vec![
+            (1, Step::Commit(Reply::Served)),
+            (
+                2,
+                Step::User(Action {
+                    kind: 0,
+                    target: 4696540523973067749,
+                    parent: 17289433333287293583,
+                    name: 1,
+                    text: 0,
+                }),
+            ),
+            (0, Step::Connect),
+            (0, Step::Scan),
+            (
+                0,
+                Step::User(Action {
+                    kind: 3,
+                    target: 17156652917260369542,
+                    parent: 15791111473684421551,
+                    name: 3,
+                    text: 2,
+                }),
+            ),
+            (1, Step::Work(7157279081864785743)),
+            (1, Step::Duplicate(18363909320702985799)),
+            (2, Step::Deliver(3717140028059626527)),
+            (1, Step::Commit(Reply::Served)),
+            (2, Step::Deliver(12029961515716932305)),
+            (2, Step::Commit(Reply::Refused(error::Code::LimitExceeded))),
+            (
+                2,
+                Step::User(Action {
+                    kind: 3,
+                    target: 13882752570192843626,
+                    parent: 10028917631472640197,
+                    name: 3,
+                    text: 1,
+                }),
+            ),
+            (1, Step::Work(18216690719357743194)),
+            (
+                0,
+                Step::User(Action {
+                    kind: 2,
+                    target: 16789675239341262655,
+                    parent: 995864001040360455,
+                    name: 0,
+                    text: 2,
+                }),
+            ),
+            (0, Step::Work(14807180377262276184)),
+            (0, Step::Duplicate(7397412081686271012)),
+            (0, Step::Work(8057686803297367230)),
+            (1, Step::Work(4512714835434908715)),
+            (
+                0,
+                Step::User(Action {
+                    kind: 4,
+                    target: 17627914801873212641,
+                    parent: 12616595891657092197,
+                    name: 6,
+                    text: 0,
+                }),
+            ),
+            (2, Step::Work(7337790291513551950)),
+            (2, Step::Work(1180466901371692876)),
+            (0, Step::Deliver(3821039509024783184)),
+            (
+                2,
+                Step::User(Action {
+                    kind: 1,
+                    target: 13107520285440010231,
+                    parent: 10598960963687546088,
+                    name: 4,
+                    text: 3,
+                }),
+            ),
+            (
+                1,
+                Step::User(Action {
+                    kind: 2,
+                    target: 2246543535808375351,
+                    parent: 6319698275849929893,
+                    name: 0,
+                    text: 1,
+                }),
+            ),
+            (0, Step::Work(7175920170899054987)),
+            (1, Step::Effect(Outcome::Run)),
+            (1, Step::Work(4159517033770470710)),
+            (0, Step::Work(18404622977775708442)),
+            (0, Step::Commit(Reply::Served)),
+            (
+                0,
+                Step::User(Action {
+                    kind: 4,
+                    target: 6365491237751273237,
+                    parent: 10782634279233329875,
+                    name: 1,
+                    text: 3,
+                }),
+            ),
+            (0, Step::Commit(Reply::Served)),
+            (2, Step::Work(8995257431548856822)),
+            (1, Step::Connect),
+            (0, Step::Deliver(10788655906123123742)),
+            (1, Step::Deliver(16420210780264312280)),
+            (0, Step::Work(479295481448839719)),
+            (0, Step::Work(2208229052780071360)),
+            (0, Step::Duplicate(3038716511811611936)),
+            (0, Step::Effect(Outcome::Fail)),
+            (2, Step::Work(15188616158263645844)),
+            (2, Step::Work(4858157282421835116)),
+        ],
+        vec![
+            (0, Step::Crash),
+            (0, Step::Drop),
+            (
+                0,
+                Step::User(Action {
+                    kind: 3,
+                    target: 17411163511274481715,
+                    parent: 1312539373553298619,
+                    name: 1,
+                    text: 1,
+                }),
+            ),
+            (2, Step::Work(13584574805752267923)),
+            (
+                1,
+                Step::User(Action {
+                    kind: 1,
+                    target: 14844142914246983467,
+                    parent: 13391967695461610201,
+                    name: 5,
+                    text: 3,
+                }),
+            ),
+            (2, Step::Commit(Reply::Served)),
+            (0, Step::Effect(Outcome::Run)),
+            (1, Step::Deliver(7904161053102581264)),
+            (2, Step::Deliver(11456114341529141909)),
+            (0, Step::Work(16877029101800043325)),
+            (1, Step::Work(3138824959598783305)),
+            (0, Step::Effect(Outcome::Run)),
+            (1, Step::Work(9649128248737177936)),
+        ],
+    ];
+    converge(2, &phases).unwrap();
+}
+
 const BACKUP: Step = Step::Backup;
 const RESTORE: Step = Step::Restore;
 

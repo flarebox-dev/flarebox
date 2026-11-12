@@ -96,7 +96,7 @@ Besides the trees the engine persists:
 - the **effect in flight** (at most one in v0): the effect record of §5.2. **[changed]** Effects were not persisted before;
 - the **mass-delete state** of §6.1: the deletion ledger, the held nodes and the pending question. **[changed]**
 - the **restores** a person asked for (§2.6, §6.3): each one that has no outcome yet, under the ID of its request, and the outcomes of the last 1,000 that ended. **[changed]**
-- the **pending names** (§2.6): each node this device sent under a pending name, with that name and the name it takes later, while R holds the node at the pending name. **[changed]**
+- the **pending names** (§2.6): each node this device sent under a pending name, with that name and the name it takes later, while R holds the node at the pending name, live or in the trash. **[changed]**
 
 Nodes the in-flight commit touches are **frozen**: the planner neither changes them on disk nor rebases them until the result is applied.
 

@@ -6168,3 +6168,24 @@ fn a_held_node_at_a_pending_name_gets_no_rename() {
     assert!(!commits.due(&trees));
     assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
 }
+
+#[test]
+fn a_pending_name_is_kept_while_its_node_is_in_the_trash_and_dropped_once_it_is_purged() {
+    let (mut commits, mut trees, mut ids) = owing_its_name(&[
+        ("a", None, None, Some(trashed(dir(ROOT, "a (pending)")))),
+        ("z", Some(file(ROOT, "z", 1)), None, None),
+    ]);
+    let sent = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(uploads(&ops(&sent), 1), "{:?}", ops(&sent));
+    assert!(commits.state().pending.contains_key("a"));
+
+    trees.remove_remote("a");
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    trees.set_local("y".into(), local(file(ROOT, "y", 2), 3));
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(!commits.state().pending.contains_key("a"));
+}

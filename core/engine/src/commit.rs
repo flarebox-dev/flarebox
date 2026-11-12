@@ -680,7 +680,8 @@ impl Commits {
         self.aliases
             .retain(|id, _| trees.local().get(id).is_some() && trees.reverted().contains(id));
         self.pending.retain(|id, pending| {
-            (trees.remote().live(id)).is_some_and(|remote| nfc(&remote.name) == nfc(&pending.sent))
+            (trees.remote().get(id))
+                .is_some_and(|remote| nfc(&remote.shape.name) == nfc(&pending.sent))
         });
         let (planned, deletes, reverts, pending) = plan(
             trees,
