@@ -4401,6 +4401,26 @@ fn a_create_refused_because_another_device_created_and_deleted_the_node_again_is
     };
     acknowledge(&mut commits, &mut trees, vec![exists]);
     assert!(commits.problems().is_empty());
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::Remote);
+    assert!(build(&mut commits, &mut trees, &mut ids).is_none());
+}
+
+#[test]
+fn a_create_refused_for_a_node_another_device_deleted_sends_an_edit_made_since() {
+    let mut trees = trees(&[("n", Some(file(ROOT, "a", 1)), None, None)]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    trees.set_local("n".into(), local(file(ROOT, "a", 2), 1));
+    trees.set_remote("n".into(), trashed(file(ROOT, "a", 1)));
+    let exists = OpResult {
+        reject_reason: "ID_EXISTS".into(),
+        ..outcome(op_result::Code::Rejected)
+    };
+    acknowledge(&mut commits, &mut trees, vec![exists]);
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("n", 2)]);
 }
 
 /// GUN-378. n's move to b is in flight when the user and the other device both move it to c, so S

@@ -934,9 +934,11 @@ impl Commits {
     /// A create the server refuses with ID_EXISTS while R holds the node, live or in the trash, is
     /// no problem. Only another device can have created a node under this device's ID first, as
     /// when both send a file the server lost again (section 4.4), and it may have deleted the node
-    /// since. S stays without the node, so the next plan
-    /// compares L with what R holds instead of sending the create again: equal content leaves
-    /// nothing to send, and other content is kept beside R's as a new node (section 2.4).
+    /// since. S stays without a node R holds live, so the next plan compares L with what R holds
+    /// instead of sending the create again: equal content leaves nothing to send, and other
+    /// content is kept beside R's as a new node (section 2.4). A node R holds in the trash takes
+    /// R's shape as its S, so L follows the delete unless it changed the node since, which revives
+    /// it (R8).
     ///
     /// A `Restore` op changes neither S nor L. What it sent is an instruction, and only the server
     /// knows the nodes and the content it brought back, so all of it is a remote change that R
@@ -1092,9 +1094,16 @@ impl Commits {
                 }
                 _ => continue,
             };
-            let published = matches!(&op.op, Some(op::Op::CreateDir(_) | op::Op::CreateFile(_)))
-                && done
-                && self.published.remove(node);
+            let created = matches!(&op.op, Some(op::Op::CreateDir(_) | op::Op::CreateFile(_)));
+            if created
+                && taken
+                && let Some(remote) = trees.remote().get(node).filter(|remote| remote.trashed)
+            {
+                let shape = remote.shape.clone();
+                trees.sent_edit(node, shape.content.as_ref());
+                synced.set(node, Some(shape));
+            }
+            let published = created && done && self.published.remove(node);
             if renamed
                 && !published
                 && let Some((sent_parent, sent_name)) = sent
