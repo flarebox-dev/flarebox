@@ -3938,6 +3938,57 @@ fn an_edit_of_a_node_waiting_behind_a_problem_node_is_uploaded() {
     assert_eq!(commit.as_ref().map(ops), Some(vec![update("n", 9)]));
 }
 
+/// As in `an_edit_of_a_node_waiting_behind_a_problem_node_is_uploaded`, n's agreement waits behind the problem node m, but the other device has
+/// moved n on to x, and the user edits n at c before the effects run. The edit must be uploaded.
+#[test]
+fn an_edit_of_a_waiting_node_r_moved_on_from_is_uploaded() {
+    let mut trees = trees(&[
+        (
+            "n",
+            Some(file(ROOT, "b", 1)),
+            Some(file(ROOT, "a", 1)),
+            Some(remote(file(ROOT, "a", 1))),
+        ),
+        (
+            "m",
+            Some(file(ROOT, "d", 2)),
+            Some(file(ROOT, "c", 2)),
+            Some(remote(file(ROOT, "c", 2))),
+        ),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("m", ROOT, "d"), mv("n", ROOT, "b")]);
+    let rejected = OpResult {
+        reject_reason: "NAME_INVALID".into(),
+        ..outcome(op_result::Code::Rejected)
+    };
+    trees.set_remote("m".into(), remote_at(file(ROOT, "e", 2), 3));
+    trees.set_local("n".into(), local(file(ROOT, "c", 1), 1));
+    trees.set_remote("n".into(), remote_at(file(ROOT, "c", 1), 4));
+    trees.settle();
+    trees.set_remote("n".into(), remote_at(file(ROOT, "x", 1), 5));
+    trees.settle();
+    let results = vec![rejected, outcome(op_result::Code::Applied)];
+    commits.received(result(2, results)).unwrap();
+    assert!(commits.acknowledge(&mut trees, 5));
+    trees.settle();
+    trees.set_local("n".into(), local(file(ROOT, "c", 9), 1));
+    trees.settle();
+    let mut sent = Vec::new();
+    for seq in 10..14 {
+        if let Some(commit) = build(&mut commits, &mut trees, &mut ids) {
+            sent.extend(ops(&commit));
+            let applied = vec![outcome(op_result::Code::Applied); commit.ops.len()];
+            commits.received(result(seq, applied)).unwrap();
+            assert!(commits.acknowledge(&mut trees, seq));
+            trees.settle();
+        }
+        effects_for(&mut trees, &mut ids, "n");
+    }
+    assert!(sent.contains(&update("n", 9)), "{sent:?}");
+}
+
 /// n's move to b is in flight. The user and the other device move m from c to d with different
 /// content, so S keeps m at c, and then both move n to c. The other device then moves n on to x.
 /// S cannot take the agreed c while m holds it, so the agreement waits: n is not planned, and once
