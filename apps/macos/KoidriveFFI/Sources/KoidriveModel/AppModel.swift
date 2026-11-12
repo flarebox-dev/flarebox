@@ -15,6 +15,8 @@ public final class AppModel {
     public private(set) var unseenQuestionIDs: Set<String>
     /// Whether this profile sends anonymous usage reports, read again after every session call.
     public private(set) var telemetry: TelemetrySetting
+    /// Whether an environment variable such as `DO_NOT_TRACK` keeps usage reports off, so Settings says why its switch is disabled.
+    public var usageReportsTurnedOffByVariable: Bool { telemetry.locked && !telemetry.enabled }
     public let session: SyncSession
     @ObservationIgnored private var consumer: Task<Void, Never>?
 
