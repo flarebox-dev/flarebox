@@ -534,6 +534,18 @@ fn help_named_after_a_group_is_the_help_of_the_commands_after_it() {
     let (code, envelope) = profile.json(&["folder", "link", "help", "--json"]);
     assert_eq!(code, 2, "{envelope:#}");
     assert_eq!(envelope["command"], "folder link", "{envelope:#}");
+    for (args, field) in [
+        (&["--version", "space", "help"][..], "version"),
+        (&["--help", "space", "help"], "help"),
+    ] {
+        let (code, envelope) = profile.json(&[args, &["--json"]].concat());
+        assert_eq!(code, 0, "{args:?} {envelope:#}");
+        assert_eq!(envelope["command"], "", "{args:?} {envelope:#}");
+        assert!(envelope["data"][field].is_string(), "{args:?} {envelope:#}");
+    }
+    let (code, envelope) = profile.json(&["space", "--bogus", "help", "--json"]);
+    assert_eq!(code, 2, "{envelope:#}");
+    assert_eq!(envelope["error"]["code"], "usage", "{envelope:#}");
 }
 
 #[test]

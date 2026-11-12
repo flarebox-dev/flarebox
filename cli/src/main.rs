@@ -661,19 +661,21 @@ fn help_of(path: &str) -> Option<String> {
 /// The command names after `help` when `help` is the first command named, as in `koi help folder --json`.
 /// Clap's own `help` reads every argument as a command name, `--json` included.
 fn help_names(args: &[OsString]) -> Option<Vec<&str>> {
-    let mut names = (args.iter().skip(1))
-        .take_while(|arg| *arg != "--")
-        .filter_map(|arg| arg.to_str())
-        .filter(|arg| !arg.starts_with('-'));
+    let mut words = (args.iter().skip(1)).take_while(|arg| *arg != "--");
     let mut command = Cli::command();
     let mut path = Vec::new();
-    while let Some(name) = names.next() {
-        if name == "help" && command.has_subcommands() {
-            path.extend(names);
+    while let Some(word) = words.next() {
+        let word = word.to_str()?;
+        if word == "--json" || word.starts_with("--json=") {
+            continue;
+        }
+        if word == "help" && command.has_subcommands() {
+            let names = words.filter_map(|arg| arg.to_str());
+            path.extend(names.filter(|arg| !arg.starts_with('-')));
             return Some(path);
         }
-        command = command.find_subcommand(name)?.clone();
-        path.push(name);
+        command = command.find_subcommand(word)?.clone();
+        path.push(word);
     }
     None
 }
@@ -710,7 +712,8 @@ fn command_path(args: &[OsString]) -> String {
         if arg.starts_with('-') {
             continue;
         }
-        let Some(sub) = command.find_subcommand(arg).cloned() else {
+        let found = command.find_subcommand(arg);
+        let Some(sub) = found.filter(|sub| sub.get_name() != "help").cloned() else {
             break;
         };
         path.push(sub.get_name().to_owned());
@@ -2399,6 +2402,10 @@ mod tests {
             "space"
         );
         assert_eq!(command_path(&args(&["koi", "--", "status"])), "");
+        assert_eq!(
+            command_path(&args(&["koi", "space", "--bogus", "help"])),
+            "space"
+        );
         assert_eq!(command_path(&args(&["koi", "-Vh", "space", "list"])), "");
         assert_eq!(command_path(&args(&["koi", "-hV", "folder", "link"])), "");
         assert_eq!(
