@@ -758,6 +758,71 @@ fn an_unrelated_first_rescan_keeps_the_search_for_a_path_another_watcher_held() 
 }
 
 #[test]
+fn a_reset_over_a_held_path_then_a_new_file_there_keeps_the_move() {
+    for native in [false, true] {
+        let dir = large_ignored_tree();
+        let root = dir.path();
+        write(root, "d/f.txt", "old");
+        let mut rules = rules().with_search_budget(100);
+        let start = Snapshot::scan_with_rules(root, &mut rules).unwrap();
+        let id = start.entries[Path::new("d/f.txt")].id;
+        let known: BTreeMap<PathBuf, Known> = (start.entries.iter())
+            .filter(|(path, _)| path.starts_with("d"))
+            .map(|(path, entry)| {
+                let known = Known {
+                    kind: entry.kind,
+                    id: entry.id,
+                };
+                (path.clone(), known)
+            })
+            .collect();
+        let mut watcher: Box<dyn Watcher> = match native {
+            true => Box::new(NativeWatcher::start_with_rules(root, start, rules).unwrap()),
+            false => {
+                Box::new(RescanWatcher::with_rules(root, start, Duration::ZERO, rules).unwrap())
+            }
+        };
+        fs::rename(root.join("d/f.txt"), root.join("ig/zz/deep/f.txt")).unwrap();
+        let mut pending = Vec::new();
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(50));
+            let poll = watcher.poll(Duration::ZERO).unwrap();
+            assert_eq!(poll.changes, [], "native {native}");
+            pending = poll.pending;
+            if !pending.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(pending, [PathBuf::from("d/f.txt")], "native {native}");
+        watcher.reset(Path::new("d"), known);
+        write(root, "d/f.txt", "new");
+
+        let mut changes = Vec::new();
+        for _ in 0..50 {
+            let poll = watcher.poll(Duration::from_millis(200)).unwrap();
+            changes.extend(poll.changes);
+            if poll.pending.is_empty() && changes.len() >= 2 {
+                break;
+            }
+        }
+        changes.sort_by_key(|change| matches!(change, Change::Ignored { .. }));
+        assert_eq!(
+            changes,
+            [
+                created("d/f.txt", File),
+                Change::Ignored {
+                    from: "d/f.txt".into(),
+                    to: "ig/zz/deep/f.txt".into(),
+                    kind: File,
+                    id,
+                },
+            ],
+            "native {native}"
+        );
+    }
+}
+
+#[test]
 fn a_folder_removed_while_the_search_for_its_file_runs_is_removed() {
     let dir = large_ignored_tree();
     let root = dir.path();
