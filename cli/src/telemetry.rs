@@ -16,6 +16,7 @@ use koidrive_telemetry::{
     Environment, Event, InstallId, Mode, Recorder, Sent, Source, Store, Uploader,
     install_panic_hook, should_ask,
 };
+use schemars::JsonSchema;
 use serde::Serialize;
 
 use crate::error::CliError;
@@ -456,12 +457,13 @@ mod tests {
 }
 
 /// `koi telemetry ...`'s result as JSON data.
-#[derive(Serialize)]
-struct StatusData {
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct TelemetryStatusData {
     /// `on`, `off` or `debug`.
     mode: &'static str,
     /// What decided the mode: `do_not_track`, `variable`, `choice` or `unset`.
     source: &'static str,
+    #[schemars(with = "Option<String>")]
     install_id: Option<InstallId>,
     waiting_days: usize,
     waiting_events: usize,
@@ -469,9 +471,10 @@ struct StatusData {
     sends: bool,
 }
 
-#[derive(Serialize)]
-struct ChoiceData {
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct ChoiceData {
     enabled: bool,
+    #[schemars(with = "Option<String>")]
     install_id: Option<InstallId>,
 }
 
@@ -531,7 +534,7 @@ pub fn command(paths: &Paths, action: TelemetryAction) -> Result<Done, CliError>
             } else {
                 "Turn on: koi telemetry on\n"
             });
-            let data = StatusData {
+            let data = TelemetryStatusData {
                 mode,
                 source,
                 install_id: settings.install_id,

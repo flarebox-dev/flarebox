@@ -23,6 +23,8 @@ use serde_json::Value;
 use tokio::sync::OnceCell;
 use url::Url;
 
+mod schema;
+
 const WAIT: Duration = Duration::from_secs(30);
 
 fn server_url() -> Url {
@@ -206,6 +208,7 @@ impl Machine {
     fn envelope(&self, args: &[&str]) -> Value {
         let args: Vec<&str> = args.iter().copied().chain(["--json"]).collect();
         let envelope: Value = serde_json::from_str(&self.run(&args)).unwrap();
+        schema::check(&envelope);
         assert_eq!(envelope["schema_version"], 1, "{envelope:#}");
         assert_eq!(envelope["error"], Value::Null, "{envelope:#}");
         envelope
@@ -427,6 +430,7 @@ async fn a_headless_device_pairs_links_and_follows_the_change_stream() {
     );
 
     let questions: Value = serde_json::from_str(&machine.run(&["resolve", "--json"])).unwrap();
+    schema::check(&questions);
     assert_eq!(questions["decisions"], Value::Array(vec![]));
     assert!(
         machine
@@ -467,6 +471,7 @@ async fn a_headless_device_pairs_links_and_follows_the_change_stream() {
     ]);
     assert_eq!(stale.status.code(), Some(7), "{stale:?}");
     let envelope: Value = serde_json::from_slice(&stale.stdout).unwrap();
+    schema::check(&envelope);
     assert_eq!(envelope["error"]["code"], "stale_decision", "{envelope:#}");
     assert_eq!(envelope["next_commands"], Value::Array(Vec::new()));
 
@@ -1569,6 +1574,7 @@ async fn a_device_shows_a_pairing_code_that_adds_another() {
         .unwrap();
     assert!(traced.status.success(), "{traced:?}");
     let asked: Value = serde_json::from_slice(&traced.stdout).unwrap();
+    schema::check(&asked);
     assert_eq!(asked["outcome"], "ok", "{asked:#}");
     let code = asked["data"]["join_argv"][2].as_str().unwrap();
     let logs = String::from_utf8(traced.stderr).unwrap();

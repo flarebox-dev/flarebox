@@ -10,6 +10,7 @@ use koidrive_driver::{
     WaitKind,
 };
 use koidrive_proto::v1::{DeviceInfo, SpaceInfo, SpaceUsage, device_info::Kind};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -18,7 +19,7 @@ use crate::error::{CliError, Code};
 /// The only schema `--json` speaks.
 pub const SCHEMA_VERSION: u32 = 1;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
     /// The command did what it was asked.
@@ -31,7 +32,7 @@ pub enum Outcome {
 }
 
 /// A command to run next, as the arguments to pass.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Next {
     pub argv: Vec<String>,
 }
@@ -108,14 +109,14 @@ impl Done {
     }
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct ErrorBody {
     pub code: Code,
     pub message: String,
     pub retryable: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct Envelope {
     pub schema_version: u32,
     /// The subcommand path, such as `folder link`; empty for `koi` itself.
@@ -162,7 +163,7 @@ impl Envelope {
 }
 
 /// A decision sync waits on, with every item it holds and the command for each answer.
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct Decision {
     pub id: String,
     pub space_id: String,
@@ -178,7 +179,7 @@ pub struct Decision {
     pub answers: Vec<AnswerChoice>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct Counts {
     pub deletions: u64,
     pub affected_files: u64,
@@ -186,14 +187,14 @@ pub struct Counts {
     pub exceeded: Vec<&'static str>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct Item {
     pub node_id: String,
     pub path: String,
     pub files: u64,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct AnswerChoice {
     pub token: String,
     pub consequence: String,
@@ -282,7 +283,7 @@ pub fn requires_choice(question: &Question) -> bool {
     !matches!(question.kind, QuestionKind::RemoteMassDelete { .. })
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct AccountData {
     pub server: String,
     pub user_id: String,
@@ -304,7 +305,7 @@ impl AccountData {
     }
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct FolderData {
     pub path: String,
     pub space_id: String,
@@ -322,7 +323,7 @@ pub struct FolderData {
 
 /// A call the folder puts off: `quota` when the server refused it for a used-up limit or full storage, `retry` when
 /// it kept failing for another reason. It is sent again at `until_ms`, in Unix milliseconds.
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct WaitData {
     pub kind: &'static str,
     pub until_ms: i64,
@@ -367,7 +368,7 @@ impl FolderData {
     }
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct StatusData {
     pub account: Option<AccountData>,
     pub running: bool,
@@ -378,7 +379,7 @@ pub struct StatusData {
 }
 
 /// Something `status --check` reports. Connecting and catching up are not conditions: they pass on their own.
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 #[serde(tag = "condition", rename_all = "snake_case")]
 pub enum Condition {
     NotSetUp,
@@ -472,7 +473,7 @@ pub fn check_exit(conditions: &[Condition]) -> u8 {
 }
 
 /// One line of `koi _daemon --json`, printed as it happens.
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Lifecycle {
     Started {
@@ -495,7 +496,7 @@ pub enum Lifecycle {
 impl Lifecycle {
     /// The event as one line of JSON, with the schema version.
     pub fn line(&self) -> String {
-        #[derive(Serialize)]
+        #[derive(Serialize, JsonSchema)]
         struct Line<'a> {
             schema_version: u32,
             #[serde(flatten)]
@@ -509,7 +510,7 @@ impl Lifecycle {
     }
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct UnlinkedData {
     /// The space the folder was linked to. Absent when it was not linked.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -517,13 +518,13 @@ pub struct UnlinkedData {
     pub path: String,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct AnsweredData {
     pub decision_id: String,
     pub answer: String,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct DeviceData {
     pub device_id: String,
     pub name: String,
@@ -558,24 +559,24 @@ impl DeviceData {
     }
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct DevicesData {
     pub devices: Vec<DeviceData>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct RevokedData {
     pub device_id: String,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct InvitationData {
     /// The arguments of `koi join` on the new device.
     pub join_argv: Vec<String>,
     pub expires_at_ms: i64,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct SpaceData {
     pub space_id: String,
     pub name: String,
@@ -592,12 +593,12 @@ impl SpaceData {
     }
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct SpacesData {
     pub spaces: Vec<SpaceData>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct UsageData {
     pub space_id: String,
     pub name: String,
@@ -629,20 +630,20 @@ impl UsageData {
 }
 
 /// The spaces that answered, and the ones the server refused with why.
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct UsagesData {
     pub spaces: Vec<UsageData>,
     pub refused: Vec<RefusedSpace>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct RefusedSpace {
     pub space_id: String,
     pub name: String,
     pub message: String,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct TrashEntry {
     pub node_id: String,
     pub path: String,
@@ -652,13 +653,13 @@ pub struct TrashEntry {
     pub bytes: u64,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct TrashData {
     pub folder: String,
     pub entries: Vec<TrashEntry>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct VersionData {
     pub version_id: String,
     pub seq: u64,
@@ -668,34 +669,34 @@ pub struct VersionData {
     pub current: bool,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct VersionsData {
     pub path: String,
     pub node_id: String,
     pub versions: Vec<VersionData>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct RestoreAskedData {
     pub request_id: String,
     pub folder: String,
     pub path: String,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct RequestsData {
     pub folder: String,
     pub requests: Vec<RequestData>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct RequestData {
     pub id: String,
     pub request: RequestedData,
     pub state: RequestState,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RequestedData {
     FromTrash {
@@ -709,7 +710,7 @@ pub enum RequestedData {
     },
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RequestState {
     Pending { waits_for: Option<&'static str> },
@@ -773,25 +774,41 @@ impl RequestData {
 }
 
 /// One way to set up this machine.
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct Choice {
     pub argv: Vec<String>,
     pub description: &'static str,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct ChoicesData {
     pub choices: Vec<Choice>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct HelpData {
     pub help: String,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct VersionInfoData {
     pub version: &'static str,
+}
+
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
+pub struct Empty {}
+
+/// The data of a command that brings the background service in line with the profile, with the service's report.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct WithService<T> {
+    #[serde(flatten)]
+    pub data: T,
+    pub service: crate::service::Report,
+}
+
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
+pub struct DiagnosticsData {
+    pub path: std::path::PathBuf,
 }
 
 #[cfg(test)]

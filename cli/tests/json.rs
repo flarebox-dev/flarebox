@@ -7,6 +7,8 @@ use std::process::{Command, Output, Stdio};
 
 use serde_json::Value;
 
+mod schema;
+
 struct Profile {
     home: tempfile::TempDir,
 }
@@ -46,7 +48,7 @@ impl Profile {
                 String::from_utf8_lossy(&output.stdout)
             )
         });
-        assert_eq!(envelope["schema_version"], 1, "{envelope:#}");
+        schema::check(&envelope);
         for field in [
             "command",
             "outcome",
@@ -440,6 +442,7 @@ fn ctrl_c_ends_a_command_with_an_interrupted_error_and_exit_130() {
         let stderr = String::from_utf8(output.stderr).unwrap();
         if json {
             let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+            schema::check(&envelope);
             assert_eq!(envelope["command"], "join", "{envelope:#}");
             assert_eq!(envelope["outcome"], "error", "{envelope:#}");
             assert_eq!(envelope["error"]["code"], "interrupted", "{envelope:#}");
@@ -474,6 +477,30 @@ fn ctrl_c_during_setup_under_json_prints_the_interrupted_envelope() {
 
     assert_eq!(output.status.code(), Some(130), "{output:?}");
     let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    schema::check(&envelope);
     assert_eq!(envelope["command"], "setup", "{envelope:#}");
     assert_eq!(envelope["error"]["code"], "interrupted", "{envelope:#}");
+}
+
+#[test]
+fn every_command_prints_its_help_as_an_envelope_its_schema_takes() {
+    let profile = Profile::new();
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/json-schema/v1");
+    let mut commands = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let schema: Value =
+            serde_json::from_slice(&std::fs::read(entry.unwrap().path()).unwrap()).unwrap();
+        if let Some(command) = schema["properties"]["command"]["const"].as_str() {
+            commands.push(command.to_owned());
+        }
+    }
+    assert!(commands.len() > 30, "{commands:?}");
+    for command in commands {
+        let mut args: Vec<&str> = command.split_whitespace().collect();
+        args.extend(["--help", "--json"]);
+        let (code, envelope) = profile.json(&args);
+        assert_eq!(code, 0, "{envelope:#}");
+        assert_eq!(envelope["command"], command.as_str(), "{envelope:#}");
+        assert!(envelope["data"]["help"].is_string(), "{envelope:#}");
+    }
 }

@@ -14,6 +14,7 @@ use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use koidrive_driver::{Config, Paths};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::ipc::{self, Request, Response};
@@ -201,7 +202,7 @@ fn xml(text: &str) -> String {
 }
 
 /// What the service manager reports for a service, or what keeps koi from using it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum State {
     Running,
@@ -255,7 +256,7 @@ pub fn plan(folders: usize, state: State, asked: bool) -> Action {
 }
 
 /// A folder that the daemon may not read, as its `access` request finds it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Blocked {
     pub folder: String,
     /// The read still waits after two seconds, usually because macOS is asking the person. Otherwise macOS refused it.
@@ -263,7 +264,7 @@ pub struct Blocked {
 }
 
 /// The service as a command left it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct Report {
     pub manager: &'static str,
     pub name: String,

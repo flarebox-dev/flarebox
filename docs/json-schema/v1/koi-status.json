@@ -1,0 +1,692 @@
+{
+  "$defs": {
+    "AccountData": {
+      "properties": {
+        "device_id": {
+          "type": "string"
+        },
+        "device_name": {
+          "type": "string"
+        },
+        "server": {
+          "type": "string"
+        },
+        "user_id": {
+          "type": "string"
+        },
+        "user_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "server",
+        "user_id",
+        "device_id",
+        "device_name"
+      ],
+      "type": "object"
+    },
+    "AnswerChoice": {
+      "properties": {
+        "argv": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "consequence": {
+          "type": "string"
+        },
+        "token": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "token",
+        "consequence",
+        "argv"
+      ],
+      "type": "object"
+    },
+    "Blocked": {
+      "description": "A folder that the daemon may not read, as its `access` request finds it.",
+      "properties": {
+        "folder": {
+          "type": "string"
+        },
+        "waiting": {
+          "description": "The read still waits after two seconds, usually because macOS is asking the person. Otherwise macOS refused it.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "folder",
+        "waiting"
+      ],
+      "type": "object"
+    },
+    "Code": {
+      "description": "What kind of failure an error is. Each code has one exit status.",
+      "oneOf": [
+        {
+          "const": "failed",
+          "description": "No more specific code applies.",
+          "type": "string"
+        },
+        {
+          "const": "usage",
+          "description": "The arguments are invalid, or input the command needs is missing.",
+          "type": "string"
+        },
+        {
+          "const": "decision_required",
+          "description": "`status --check` found a decision that needs a choice.",
+          "type": "string"
+        },
+        {
+          "const": "auth_required",
+          "description": "Credentials are missing or refused, or a person must log in.",
+          "type": "string"
+        },
+        {
+          "const": "halted",
+          "description": "Sync is halted or stopped, and the command cannot go on until that is fixed.",
+          "type": "string"
+        },
+        {
+          "const": "unavailable",
+          "description": "The server or the network is offline, unavailable or limits the rate for now.",
+          "type": "string"
+        },
+        {
+          "const": "stale_decision",
+          "description": "The decision answered no longer exists, or a request ID was used before with other arguments or for a pairing\ncode that has expired.",
+          "type": "string"
+        },
+        {
+          "const": "interrupted",
+          "description": "A signal stopped the command, or an earlier run with the same request ID has no recorded outcome.",
+          "type": "string"
+        }
+      ]
+    },
+    "Condition": {
+      "description": "Something `status --check` reports. Connecting and catching up are not conditions: they pass on their own.",
+      "oneOf": [
+        {
+          "properties": {
+            "condition": {
+              "const": "not_set_up",
+              "type": "string"
+            }
+          },
+          "required": [
+            "condition"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "condition": {
+              "const": "halted",
+              "type": "string"
+            },
+            "folder": {
+              "type": "string"
+            },
+            "problem": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "condition",
+            "folder",
+            "problem"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "condition": {
+              "const": "stopped",
+              "type": "string"
+            },
+            "folder": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "condition",
+            "folder"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "condition": {
+              "const": "decision_required",
+              "type": "string"
+            },
+            "decision_id": {
+              "type": "string"
+            },
+            "space_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "condition",
+            "decision_id",
+            "space_id"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "condition": {
+              "const": "offline",
+              "type": "string"
+            },
+            "folder": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "condition",
+            "folder"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The folder puts a call off until `until_ms`, because the server refused it or it kept failing.",
+          "properties": {
+            "condition": {
+              "const": "waiting",
+              "type": "string"
+            },
+            "folder": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "until_ms": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "condition",
+            "folder",
+            "kind",
+            "until_ms"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Counts": {
+      "properties": {
+        "affected_files": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "deletions": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exceeded": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "space_files": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "deletions",
+        "affected_files",
+        "space_files",
+        "exceeded"
+      ],
+      "type": "object"
+    },
+    "Decision": {
+      "description": "A decision sync waits on, with every item it holds and the command for each answer.",
+      "properties": {
+        "answers": {
+          "items": {
+            "$ref": "#/$defs/AnswerChoice"
+          },
+          "type": "array"
+        },
+        "asked_at_ms": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "counts": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Counts"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "group": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/Item"
+          },
+          "type": "array"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "requires_choice": {
+          "description": "False for a notice that only takes `dismiss`: it holds nothing and blocks nothing.",
+          "type": "boolean"
+        },
+        "space_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "space_id",
+        "kind",
+        "asked_at_ms",
+        "requires_choice",
+        "items",
+        "answers"
+      ],
+      "type": "object"
+    },
+    "ErrorBody": {
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/Code"
+        },
+        "message": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ],
+      "type": "object"
+    },
+    "FolderData": {
+      "properties": {
+        "head_seq": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "history_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_seq": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "local_entries": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "problem": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "questions": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remote_nodes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "space_id": {
+          "type": "string"
+        },
+        "space_name": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "wait": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WaitData"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "space_id",
+        "space_name",
+        "state",
+        "history_id",
+        "last_seq",
+        "head_seq",
+        "remote_nodes",
+        "local_entries",
+        "questions",
+        "problem",
+        "wait"
+      ],
+      "type": "object"
+    },
+    "HelpData": {
+      "properties": {
+        "help": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "help"
+      ],
+      "type": "object"
+    },
+    "Item": {
+      "properties": {
+        "files": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "node_id": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "node_id",
+        "path",
+        "files"
+      ],
+      "type": "object"
+    },
+    "Next": {
+      "description": "A command to run next, as the arguments to pass.",
+      "properties": {
+        "argv": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "argv"
+      ],
+      "type": "object"
+    },
+    "Outcome": {
+      "oneOf": [
+        {
+          "enum": [
+            "error"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "ok",
+          "description": "The command did what it was asked.",
+          "type": "string"
+        },
+        {
+          "const": "accepted",
+          "description": "The work is recorded and happens later; it has not finished.",
+          "type": "string"
+        },
+        {
+          "const": "unchanged",
+          "description": "The state the command asks for already held, or the command repeated an accepted answer, so nothing changed.",
+          "type": "string"
+        }
+      ]
+    },
+    "Report": {
+      "description": "The service as a command left it.",
+      "properties": {
+        "blocked": {
+          "items": {
+            "$ref": "#/$defs/Blocked"
+          },
+          "type": "array"
+        },
+        "lingers": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "manager": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "problem": {
+          "description": "Why the service cannot run, or did not change as it should.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/State"
+        }
+      },
+      "required": [
+        "manager",
+        "name",
+        "state"
+      ],
+      "type": "object"
+    },
+    "State": {
+      "description": "What the service manager reports for a service, or what keeps koi from using it.",
+      "oneOf": [
+        {
+          "enum": [
+            "running",
+            "not_installed"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "stopped",
+          "description": "Installed, but not running: it failed.",
+          "type": "string"
+        },
+        {
+          "const": "switched_off",
+          "description": "The launch agent is installed but not loaded: the person switched koi off in Login Items, which unloads it.",
+          "type": "string"
+        },
+        {
+          "const": "unavailable",
+          "description": "This machine has no service manager koi can use, such as a Linux system without a systemd user session.",
+          "type": "string"
+        },
+        {
+          "const": "off",
+          "description": "config.toml turns the service off.",
+          "type": "string"
+        }
+      ]
+    },
+    "StatusData": {
+      "properties": {
+        "account": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AccountData"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "conditions": {
+          "description": "Every condition `status --check` weighs, whether or not `--check` was given.",
+          "items": {
+            "$ref": "#/$defs/Condition"
+          },
+          "type": "array"
+        },
+        "folders": {
+          "items": {
+            "$ref": "#/$defs/FolderData"
+          },
+          "type": "array"
+        },
+        "running": {
+          "type": "boolean"
+        },
+        "service": {
+          "$ref": "#/$defs/Report"
+        }
+      },
+      "required": [
+        "account",
+        "running",
+        "folders",
+        "conditions",
+        "service"
+      ],
+      "type": "object"
+    },
+    "WaitData": {
+      "description": "A call the folder puts off: `quota` when the server refused it for a used-up limit or full storage, `retry` when\nit kept failing for another reason. It is sent again at `until_ms`, in Unix milliseconds.",
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "until_ms": {
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "until_ms"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "command": {
+      "const": "status"
+    },
+    "data": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/HelpData"
+        },
+        {
+          "$ref": "#/$defs/StatusData"
+        }
+      ]
+    },
+    "decisions": {
+      "items": {
+        "$ref": "#/$defs/Decision"
+      },
+      "type": "array"
+    },
+    "error": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ErrorBody"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "next_commands": {
+      "items": {
+        "$ref": "#/$defs/Next"
+      },
+      "type": "array"
+    },
+    "outcome": {
+      "$ref": "#/$defs/Outcome"
+    },
+    "schema_version": {
+      "const": 1
+    }
+  },
+  "required": [
+    "schema_version",
+    "command",
+    "outcome",
+    "data",
+    "error",
+    "decisions",
+    "next_commands"
+  ],
+  "title": "koi status --json",
+  "type": "object"
+}

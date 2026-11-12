@@ -15,6 +15,8 @@ mod notify;
 mod pairing;
 mod report;
 mod request;
+#[cfg(test)]
+mod schema;
 mod service;
 mod setup;
 mod telemetry;
@@ -44,9 +46,9 @@ use koidrive_telemetry::schema::{DaemonStart, Failure, SetupStep};
 use crate::error::{CliError, Code};
 use crate::ipc::{Request, Response};
 use crate::report::{
-    AccountData, AnsweredData, Decision, DeviceData, DevicesData, Done, Envelope, FolderData,
-    HelpData, InvitationData, Lifecycle, RefusedSpace, RevokedData, SpaceData, SpacesData,
-    StatusData, UnlinkedData, UsageData, UsagesData, VersionInfoData,
+    AccountData, AnsweredData, Decision, DeviceData, DevicesData, Done, Empty, Envelope,
+    FolderData, HelpData, InvitationData, Lifecycle, RefusedSpace, RevokedData, SpaceData,
+    SpacesData, StatusData, UnlinkedData, UsageData, UsagesData, VersionInfoData, WithService,
 };
 use crate::request::{Begun, Key, RequestId};
 
@@ -471,13 +473,15 @@ async fn run(paths: Paths, command: Command, json: bool) -> Result<Done, CliErro
             return Err(CliError::new(Code::Failed, text.trim_end()));
         }
         done.text.push_str(&text);
-        if done.data.is_null() {
-            done.data = Value::Object(serde_json::Map::new());
-        }
-        if let Value::Object(data) = &mut done.data {
-            let report = serde_json::to_value(&report).expect("the CLI's own types serialize");
-            data.insert("service".to_owned(), report);
-        }
+        let data = match done.data.take() {
+            Value::Null => Value::Object(serde_json::Map::new()),
+            data => data,
+        };
+        done.data = serde_json::to_value(WithService {
+            data,
+            service: report,
+        })
+        .expect("the CLI's own types serialize");
     }
     Ok(done)
 }
@@ -531,7 +535,7 @@ async fn execute(paths: Paths, command: Command, json: bool) -> Result<Done, Cli
         Command::Folder { action } => folder(&paths, action).await,
         Command::Service {
             action: ServiceAction::Start,
-        } => Ok(Done::ok(serde_json::Map::new(), "")),
+        } => Ok(Done::ok(Empty {}, "")),
         Command::Device { action } => device(paths, action).await,
         Command::History { action } => history::run(&paths, action).await,
         Command::Telemetry { action } => telemetry::command(&paths, action),
