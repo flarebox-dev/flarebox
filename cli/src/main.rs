@@ -13,6 +13,7 @@ mod notify;
 mod pairing;
 mod report;
 mod setup;
+mod telemetry;
 
 use std::ffi::OsString;
 use std::io::{self, IsTerminal};
@@ -31,6 +32,8 @@ use koidrive_proto::v1::{CreateSpaceRequest, DeviceInfo, SpaceInfo, SpaceUsage};
 use serde_json::Value;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::EnvFilter;
+
+use koidrive_telemetry::schema::SetupStep;
 
 use crate::error::{CliError, Code};
 use crate::ipc::{Request, Response};
@@ -128,6 +131,12 @@ enum Command {
     History {
         #[command(subcommand)]
         action: history::HistoryAction,
+    },
+    /// Show, turn on or off, preview or reset the anonymous usage reports this machine sends.
+    #[command(arg_required_else_help = true)]
+    Telemetry {
+        #[command(subcommand)]
+        action: telemetry::TelemetryAction,
     },
     /// Run the sync daemon in the foreground until SIGTERM or SIGINT.
     #[command(name = "_daemon", hide = true)]
@@ -227,6 +236,9 @@ pub struct DeviceArgs {
     /// A name for this device, shown on the others, at most 255 bytes. Defaults to this machine's host name.
     #[arg(long, value_parser = short_name)]
     name: Option<String>,
+    /// Turn anonymous usage reports on or off for this machine, without being asked (see koi telemetry).
+    #[arg(long, value_enum)]
+    telemetry: Option<telemetry::Switch>,
 }
 
 impl DeviceArgs {
@@ -300,6 +312,11 @@ fn main() -> ExitCode {
     };
     let daemon_run = matches!(command_args, Command::Daemon { .. });
     let pending_paths = paths.clone();
+    let (name, flow, switch) = telemetry_of(&command_args);
+    let ask = match &command_args {
+        Command::Setup { login, .. } => setup::guided(json, login),
+        _ => false,
+    };
     let (outcome, pending) = runtime.block_on(async {
         let sigint = (!daemon_run).then(|| signal(SignalKind::interrupt()));
         let interrupt = async move {
@@ -317,7 +334,9 @@ fn main() -> ExitCode {
         };
         tokio::select! {
             done = async move {
+                telemetry::start(&paths, switch, ask, name, flow).await;
                 let outcome = run(paths, command_args, json).await;
+                telemetry::finish().await;
                 let pending = match reports_pending && (json || shows_banner) {
                     true => pending_questions(&pending_paths).await,
                     false => Vec::new(),
@@ -329,6 +348,7 @@ fn main() -> ExitCode {
                     Code::Interrupted,
                     "interrupted by Ctrl-C; what the command already did stays done",
                 );
+                telemetry::flush();
                 finish(&command, json, Err(error), Vec::new());
                 let _ = io::Write::flush(&mut io::stdout());
                 std::process::exit(Code::Interrupted.exit().into());
@@ -339,6 +359,45 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     finish(&command, json, outcome, pending)
+}
+
+/// How a command shows in usage reports: its name, the setup flow it runs when that is known before it starts, and
+/// its `--telemetry` flag. `koi setup` learns its flow from the person's choice.
+fn telemetry_of(
+    command: &Command,
+) -> (
+    koidrive_telemetry::schema::Command,
+    Option<koidrive_telemetry::schema::SetupFlow>,
+    Option<telemetry::Switch>,
+) {
+    use koidrive_telemetry::schema::{Command as Name, SetupFlow as Flow};
+    use setup::ServerAction;
+    match command {
+        Command::Status { .. } => (Name::Status, None, None),
+        Command::Resolve { .. } => (Name::Resolve, None, None),
+        Command::Setup { device, .. } => (Name::Setup, None, device.telemetry),
+        Command::Join { device, .. } => (Name::Join, Some(Flow::Join), device.telemetry),
+        Command::Server { action } => {
+            let (flow, device) = match action {
+                ServerAction::Deploy { device, .. } => (Flow::Deploy, Some(device)),
+                ServerAction::AddDevice { device, .. } => (Flow::AddDevice, Some(device)),
+                ServerAction::Claim { device, .. } => (Flow::Claim, Some(device)),
+                ServerAction::Upgrade { .. } => (Flow::Upgrade, None),
+                ServerAction::Delete { .. } => (Flow::Uninstall, None),
+            };
+            (
+                Name::Server,
+                Some(flow),
+                device.and_then(|device| device.telemetry),
+            )
+        }
+        Command::Space { .. } => (Name::Space, None, None),
+        Command::Folder { .. } => (Name::Folder, None, None),
+        Command::Device { .. } => (Name::Device, None, None),
+        Command::History { .. } => (Name::History, None, None),
+        Command::Telemetry { .. } => (Name::Telemetry, None, None),
+        Command::Daemon { .. } => (Name::Daemon, None, None),
+    }
 }
 
 async fn run(paths: Paths, command: Command, json: bool) -> Result<Done, CliError> {
@@ -354,13 +413,17 @@ async fn run(paths: Paths, command: Command, json: bool) -> Result<Done, CliErro
             server,
             device,
         } => {
-            let invitation = pairing::parse(&code, server.as_deref()).map_err(CliError::usage)?;
-            let request = Request::Pair {
-                server: invitation.server,
-                code: invitation.code,
-                name: device.name(),
+            let join = async {
+                let invitation =
+                    pairing::parse(&code, server.as_deref()).map_err(CliError::usage)?;
+                let request = Request::Pair {
+                    server: invitation.server,
+                    code: invitation.code,
+                    name: device.name(),
+                };
+                paired(&paths, ipc::run(&paths, request).await?)
             };
-            paired(&paths, ipc::run(&paths, request).await?)
+            telemetry::step(SetupStep::Pair, join).await
         }
         Command::Server {
             action:
@@ -377,13 +440,15 @@ async fn run(paths: Paths, command: Command, json: bool) -> Result<Done, CliErro
                 user_name: user,
                 name: device.name(),
             };
-            paired(&paths, ipc::run(&paths, request).await?)
+            let claim = async { paired(&paths, ipc::run(&paths, request).await?) };
+            telemetry::step(SetupStep::Claim, claim).await
         }
         Command::Server { action } => setup::server(&paths, action, json).await,
         Command::Space { action } => space(paths, action).await,
         Command::Folder { action } => folder(&paths, action).await,
         Command::Device { action } => device(paths, action).await,
         Command::History { action } => history::run(&paths, action).await,
+        Command::Telemetry { action } => telemetry::command(&paths, action),
     }
 }
 
@@ -595,6 +660,8 @@ async fn daemon(paths: Paths, json: bool) -> Result<Done, CliError> {
     driver.start();
     let server = tokio::spawn(ipc::serve(listener, driver.clone()));
     let notifications = tokio::spawn(notifications);
+    let (stop_telemetry, telemetry_stopped) = tokio::sync::oneshot::channel();
+    let telemetry = tokio::spawn(telemetry::run_daemon(telemetry_stopped));
     let watch = driver.watch();
     let folders = driver.status().folders;
     tracing::info!(
@@ -623,6 +690,8 @@ async fn daemon(paths: Paths, json: bool) -> Result<Done, CliError> {
     notifications.abort();
     let _ = std::fs::remove_file(&socket);
     driver.stop().await;
+    let _ = stop_telemetry.send(());
+    let _ = telemetry.await;
     tracing::info!("the daemon stopped");
     emit(Lifecycle::Stopped);
     Ok(Done::printed())

@@ -16,7 +16,9 @@ You need one server, in a Cloudflare account you own, and at least one device si
 koi setup
 ```
 
-On a terminal, `koi setup` asks how to set up this machine:
+On a terminal, `koi setup` first asks whether to send anonymous usage reports. Press Enter for yes. [Usage reports](telemetry.md) lists what they hold and how to turn them off.
+
+Then it asks how to set up this machine:
 
 1. Log in with Cloudflare. Your browser opens Cloudflare's login page. Pick the account and select Authorize. Then Koidrive looks for its servers in that account:
    - With no server, it deploys one. It creates an R2 bucket, uploads the server as a Worker, turns on its `workers.dev` address, and claims the server with this device.
