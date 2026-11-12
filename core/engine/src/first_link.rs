@@ -134,10 +134,6 @@ pub(crate) fn ask(
     })
 }
 
-/// `top` and the nodes of L below it that neither S nor R holds, with their shapes in L. A node S
-/// or R holds is synced or the server's, so neither it nor what is below it is held. An excluded
-/// node below `top` is not held either, but `top` stays held while the rules leave it out, since
-/// it was held before they did.
 fn unsynced(trees: &Trees, top: &str) -> BTreeMap<NodeId, Shape> {
     let mut members = BTreeMap::new();
     let mut pending = vec![top.to_owned()];
