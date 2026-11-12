@@ -111,8 +111,6 @@ fn content(digest: u8) -> Content {
     }
 }
 
-/// Trees whose file `f` L, S and R hold with content 2, and a state that records the content in L
-/// as an edit of this device the server does not hold.
 fn unsent() -> (Trees, TreesState) {
     let mut trees = Trees::new(ROOT);
     let shape = Shape {
@@ -142,8 +140,6 @@ fn unsent() -> (Trees, TreesState) {
     (trees, state)
 }
 
-/// A file L, S and R hold alike is still a local edit while it is recorded as one the server does
-/// not hold, so the state keeps it dirty, and L holds it.
 #[test]
 fn an_unsent_edit_restores_while_l_holds_the_file_and_it_is_dirty() {
     let (mut trees, state) = unsent();

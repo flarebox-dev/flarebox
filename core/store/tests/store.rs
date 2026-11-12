@@ -1587,8 +1587,6 @@ fn a_store_from_before_published_entries_were_recorded_opens_with_none_recorded(
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), after);
 }
 
-/// A database of the schema before unsent edits were recorded keeps its engine state, with none
-/// recorded, and records them from then on.
 #[test]
 fn a_store_from_before_unsent_edits_were_recorded_opens_with_none_recorded() {
     let dir = tempfile::tempdir().unwrap();

@@ -2888,12 +2888,6 @@ fn a_create_the_server_lost_while_its_s_update_waits_is_sent_again() {
     assert!(matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id == "n"));
 }
 
-/// GUN-438: another device's edit sets n to content 3 at seq 2, and this device takes it. The
-/// server then loses seq 2 and goes back to content 2, and before a bootstrap tells this device,
-/// the user writes content 2 over n. S forgets n, since R no longer holds its content, and L and R
-/// then hold the same content. Taking that as a change both sides made would leave the user's edit
-/// unsent, and the other device's resend of content 3 would later be written over it. The edit is
-/// sent instead.
 #[test]
 fn an_edit_to_the_content_a_lost_commit_replaced_is_sent_after_the_loss() {
     let (mut trees, mut commits, mut ids) = an_edit_to_the_content_a_lost_commit_replaced();
@@ -2913,9 +2907,6 @@ fn an_edit_to_the_content_a_lost_commit_replaced_is_sent_after_the_loss() {
     assert!(trees.unsent_edits().is_empty());
 }
 
-/// As in `an_edit_to_the_content_a_lost_commit_replaced_is_sent_after_the_loss`, but the other
-/// device sends content 3 again, or another content, before this device sends its edit. Both
-/// sides changed the file, so the edit is kept as a new file beside it (R3), and n takes R's
 /// content.
 #[test]
 fn a_remote_edit_before_an_edit_to_the_content_a_lost_commit_replaced_is_sent_keeps_both() {
@@ -2936,14 +2927,6 @@ fn a_remote_edit_before_an_edit_to_the_content_a_lost_commit_replaced_is_sent_ke
     assert_eq!(trees.class("n"), Class::Remote);
 }
 
-/// GUN-438 with n in the trash: another device restores n from the trash with content 3 at seq 2,
-/// and this device takes it. The server then loses seq 2 and goes back to n in the trash with
-/// content 2, and the user writes content 2 over n. S keeps n, since R holds it only in the trash,
-/// so n is recorded as a file whose edit R's trash may later match. A device then restores n from
-/// the trash with content 2 before this device sends the edit, and L and R hold the same bytes.
-/// Taking that as a change both sides made would leave the edit unsent, and the other device's
-/// resend of content 3 would be written over it. The resend meets the edit instead, and both are
-/// kept (R3).
 #[test]
 fn an_edit_of_a_file_the_server_went_back_to_holding_in_the_trash_is_kept_from_a_resend() {
     let edited = RemoteNode {
@@ -2988,8 +2971,6 @@ fn an_edit_of_a_file_the_server_went_back_to_holding_in_the_trash_is_kept_from_a
     assert_eq!(trees.class("n"), Class::Remote);
 }
 
-/// A file the server holds in the trash after a loss, whose content L holds as S does, holds no
-/// edit of this device: it is not recorded, and the trash reads as a remote delete.
 #[test]
 fn a_file_in_the_trash_after_a_loss_that_l_did_not_edit_is_not_recorded() {
     let mut trees = trees(&[synced("n", file(ROOT, "n", 3))]);
@@ -3007,9 +2988,6 @@ fn a_file_in_the_trash_after_a_loss_that_l_did_not_edit_is_not_recorded() {
     assert_eq!(trees.class("n"), Class::Remote);
 }
 
-/// Another device's edit sets n to content 3 at seq 2, and this device takes it. The server then
-/// loses seq 2 and goes back to content 2, the user writes content 2 over n, and a bootstrap lists
-/// n with content 2.
 fn an_edit_to_the_content_a_lost_commit_replaced() -> (Trees, Commits, IdGen) {
     let edited = RemoteNode {
         content_rev: 2,
@@ -3032,10 +3010,6 @@ fn an_edit_to_the_content_a_lost_commit_replaced() -> (Trees, Commits, IdGen) {
     (trees, commits, IdGen::new(1))
 }
 
-/// GUN-438 with this device's commit lost too: the user writes content 2 over n and the server
-/// applies the edit at seq 3. The restore then loses seq 2 and seq 3, and a bootstrap lists n with
-/// content 2 of seq 1. S takes R's shape for the lost edit, so L, S and R hold the same bytes, and
-/// the other device's resend of content 3 would be written over the edit. The edit is sent again.
 #[test]
 fn an_edit_this_device_committed_to_the_content_a_lost_commit_replaced_is_sent_again() {
     let edited = RemoteNode {
@@ -3073,8 +3047,6 @@ fn an_edit_this_device_committed_to_the_content_a_lost_commit_replaced_is_sent_a
     assert_eq!(ops(&commit), [update("n", 2)]);
 }
 
-/// The user's write of content 2 reaches L only after the bootstrap: S forgets n while L still holds
-/// content 3, and then L and R hold the same bytes. The write is still sent.
 #[test]
 fn a_write_to_the_content_the_server_went_back_to_seen_after_the_bootstrap_is_sent() {
     let edited = RemoteNode {
@@ -3099,8 +3071,6 @@ fn a_write_to_the_content_the_server_went_back_to_seen_after_the_bootstrap_is_se
     assert_eq!(ops(&commit), [update("n", 2)]);
 }
 
-/// The recorded edit is sent and applied at seq 3, and a second restore loses seq 3 too. The edit
-/// is sent again.
 #[test]
 fn an_edit_sent_after_a_loss_and_lost_in_a_second_one_is_sent_again() {
     let (mut trees, mut commits, mut ids) = an_edit_to_the_content_a_lost_commit_replaced();
@@ -3126,8 +3096,6 @@ fn an_edit_sent_after_a_loss_and_lost_in_a_second_one_is_sent_again() {
     assert_eq!(ops(&commit), [update("n", 2)]);
 }
 
-/// An edit that the server still holds is not recorded: R holds the content of its commit, so
-/// nothing is sent again.
 #[test]
 fn an_edit_the_server_kept_is_not_sent_again_after_a_loss() {
     let mut trees = trees(&[synced("n", file(ROOT, "n", 3))]);
@@ -3155,8 +3123,6 @@ fn an_edit_the_server_kept_is_not_sent_again_after_a_loss() {
     assert_eq!(trees.class("n"), Class::InSync);
 }
 
-/// Another content in L between the loss and the commit does not end the record: the user's
-/// content 2 is still sent once L holds it again.
 #[test]
 fn an_edit_back_to_the_recorded_content_after_another_content_is_still_sent() {
     let (mut trees, mut commits, mut ids) = an_edit_to_the_content_a_lost_commit_replaced();
@@ -3171,7 +3137,6 @@ fn an_edit_back_to_the_recorded_content_after_another_content_is_still_sent() {
     assert_eq!(ops(&commit), [update("n", 2)]);
 }
 
-/// The record ends when L no longer holds the file.
 #[test]
 fn a_recorded_file_that_l_no_longer_holds_is_no_longer_recorded() {
     let (mut trees, _, _) = an_edit_to_the_content_a_lost_commit_replaced();
@@ -3181,9 +3146,6 @@ fn a_recorded_file_that_l_no_longer_holds_is_no_longer_recorded() {
     assert!(trees.unsent_edits().is_empty());
 }
 
-/// Another device purges the recorded file. The edit beats the removal, as any edit L holds does,
-/// so the file is created again with the edit and no effect removes it, and the record ends once
-/// the create is applied.
 #[test]
 fn a_recorded_file_another_device_purges_is_created_again() {
     let (mut trees, mut commits, mut ids) = an_edit_to_the_content_a_lost_commit_replaced();
@@ -3206,8 +3168,6 @@ fn a_recorded_file_another_device_purges_is_created_again() {
     assert_eq!(trees.class("n"), Class::InSync);
 }
 
-/// While an S update of a recorded file waits, the waiting shape stands for S in the effects. R's
-/// other content is still not written over the edit, which only L holds.
 #[test]
 fn a_recorded_file_whose_s_update_waits_gets_no_download() {
     let restored = |unsent: bool| {
