@@ -3,7 +3,7 @@ name: CLI distribution
 
 on:
   push:
-    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+    tags: ['v[0-9]+.[0-9]+.[0-9]+', 'v[0-9]+.[0-9]+.[0-9]+-alpha.[0-9]+', 'v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+']
   pull_request:
   merge_group:
   workflow_dispatch:
@@ -77,18 +77,28 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    outputs:
+      prerelease: ${{ steps.tag.outputs.prerelease }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
       - name: Refuse a release tag outside main
+        id: tag
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo '::error::Expected a vMAJOR.MINOR.PATCH tag'; exit 1; }
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|rc)\.[0-9]+)?$ ]] || { echo '::error::Expected a vMAJOR.MINOR.PATCH tag, optionally with an -alpha.N or -rc.N suffix'; exit 1; }
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           git merge-base --is-ancestor HEAD origin/main || { echo '::error::Release tags must point to a commit on main'; exit 1; }
+          if [[ "$TAG" == *-* ]]; then
+            echo "$TAG is a prerelease tag: the macOS CLI ships unsigned."
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "$TAG is a release tag: the macOS CLI must be signed with the Developer ID."
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
 
   build:
     name: CLI (${{ matrix.target }})
@@ -130,7 +140,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y shellcheck
+          sudo apt-get install -y shellcheck qemu-user-static
           python3 -m venv "$RUNNER_TEMP/zigbuild"
           "$RUNNER_TEMP/zigbuild/bin/pip" install cargo-zigbuild==0.24.1 ziglang==0.15.2
           echo "$RUNNER_TEMP/zigbuild/bin" >> "$GITHUB_PATH"
@@ -155,6 +165,30 @@ jobs:
           fi
           embedded=$(find "target/$TARGET/release/build" -path '*/out/server_bundle.rs' -exec grep -l include_bytes {} +)
           test -n "$embedded" || { echo '::error::The CLI has no embedded server bundle'; exit 1; }
+      - name: Check the version the CLI reports
+        env:
+          TARGET: ${{ matrix.target }}
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [ "$EVENT" = push ]; then
+            expected=${TAG#v}
+            from="the tag $TAG"
+          else
+            expected=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "koidrive-cli") | .version')
+            from="Cargo.toml"
+          fi
+          binary="target/$TARGET/release/koi"
+          if [ "$TARGET" = aarch64-unknown-linux-musl ]; then
+            actual=$(qemu-aarch64-static "$binary" --version)
+          else
+            actual=$("$binary" --version)
+          fi
+          if [ "$actual" != "koi $expected" ]; then
+            echo "::error::koi --version prints '$actual', but $from needs 'koi $expected'. Set version in [workspace.package] of Cargo.toml to $expected and tag again."
+            exit 1
+          fi
+          echo "koi --version prints '$actual', matching $from."
       - name: Test the installer against a local tarball
         if: matrix.target != 'aarch64-unknown-linux-musl'
         env:
@@ -176,7 +210,7 @@ jobs:
 
   sign-macos:
     name: Sign the macOS CLI
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && needs.release-ref.outputs.prerelease == 'false'
     needs: [build, release-ref]
     runs-on: macos-15
     timeout-minutes: 15
@@ -192,12 +226,8 @@ jobs:
           P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_P12_BASE64 }}
           P12_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD }}
         run: |
-          if [ -z "$P12_BASE64" ] && [ -z "$P12_PASSWORD" ]; then
-            echo '::warning::No Developer ID secrets configured. macOS CLI tarballs are unsigned and not notarized.'
-            exit 0
-          fi
           if [ -z "$P12_BASE64" ] || [ -z "$P12_PASSWORD" ]; then
-            echo '::error::Set both MACOS_DEVELOPER_ID_P12_BASE64 and MACOS_DEVELOPER_ID_P12_PASSWORD, or neither.'
+            echo '::error::A release tag needs MACOS_DEVELOPER_ID_P12_BASE64 and MACOS_DEVELOPER_ID_P12_PASSWORD in the macos-release environment. Only -alpha.N and -rc.N tags ship the macOS CLI unsigned.'
             exit 1
           fi
           umask 077
@@ -235,8 +265,8 @@ jobs:
 
   checksums:
     name: CLI checksums
-    needs: [changes, build, sign-macos]
-    if: always() && needs.build.result == 'success' && (needs.sign-macos.result == 'success' || (github.event_name != 'push' && needs.sign-macos.result == 'skipped'))
+    needs: [changes, release-ref, build, sign-macos]
+    if: always() && needs.build.result == 'success' && (needs.sign-macos.result == 'success' || (needs.sign-macos.result == 'skipped' && (github.event_name != 'push' || needs.release-ref.outputs.prerelease == 'true')))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -305,7 +335,7 @@ jobs:
 
   publish:
     name: Publish CLI tarballs
-    needs: checksums
+    needs: [release-ref, checksums]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -321,9 +351,28 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.release-ref.outputs.prerelease }}
+          # latest: an -alpha.N or -rc.N tag becomes a normal release marked Latest, which install.sh downloads by default.
+          # prerelease: it becomes a GitHub prerelease, which install.sh skips unless KOIDRIVE_VERSION names it.
+          PRERELEASE_TAGS_PUBLISH_AS: latest
         run: |
+          if [ "$PRERELEASE" = true ] && [ "$PRERELEASE_TAGS_PUBLISH_AS" = prerelease ]; then
+            marks=(--prerelease --latest=false)
+            prerelease=true
+          else
+            marks=(--prerelease=false --latest)
+            prerelease=false
+          fi
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" --draft --verify-tag --title "$TAG" --notes 'Koidrive CLI for Linux and macOS. See docs/guide/install.md for installation.'
           fi
           gh release upload "$TAG" dist/* --clobber
-          gh release edit "$TAG" --draft=false
+          gh release edit "$TAG" --draft=false "${marks[@]}"
+          state=$(gh release view "$TAG" --json isDraft,isPrerelease --jq '"draft=\(.isDraft) prerelease=\(.isPrerelease)"')
+          [ "$state" = "draft=false prerelease=$prerelease" ] || { echo "::error::$TAG is $state, expected draft=false prerelease=$prerelease."; exit 1; }
+          latest=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name) || latest=none
+          if [ "$prerelease" = false ] && [ "$latest" != "$TAG" ]; then
+            echo "::error::The latest release is $latest, not $TAG, so install.sh would not download $TAG by default."
+            exit 1
+          fi
+          echo "Published $TAG ($state). The latest release, which install.sh downloads by default, is $latest."

@@ -31,7 +31,7 @@ targets:
         INFOPLIST_KEY_LSUIElement: YES
         INFOPLIST_KEY_CFBundleDisplayName: Koidrive
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.productivity
-        MARKETING_VERSION: 0.0.0
+        MARKETING_VERSION: 0.1.0
         CURRENT_PROJECT_VERSION: 1
         SWIFT_VERSION: 6.0
         ONLY_ACTIVE_ARCH: YES
