@@ -577,7 +577,11 @@ impl Commits {
     /// a move that would close a cycle against R is reverted: the node is marked in
     /// [`Trees::reverted`], and the effects move it back to its R position on disk, bringing back
     /// the folders L deleted on its way. A parked or reverted node waits until the effects have
-    /// moved it, and so does a node with a problem or a waiting S update. A commit stops at
+    /// moved it, and so does a node with a problem or a waiting S update. A parked node that
+    /// neither R nor S holds, such as a file forked from a parked node R no longer has, is moved
+    /// back to the position L keeps for it first; while another entry of L holds that name, the
+    /// effects cannot move it there, so it is created from that position while still parked, and
+    /// the effects then move it to the position R gives it. A commit stops at
     /// [`MAX_OPS`], at [`MAX_COMMIT_BYTES`] of estimated change records, or at half the size of
     /// the last commit that did not fit. The rebase changes the trees even when no commit results,
     /// so the caller plans effects again after building.
@@ -618,16 +622,16 @@ impl Commits {
         }
         self.ask_again(trees, ids, now_ms);
         trees.reclaim();
-        let parked = trees.local().iter().filter(|(_, node)| node.parked);
         let waiting = (trees.waiting().keys()).filter(|id| !changed_locally(trees, id));
         let mut skip: BTreeSet<NodeId> = self
             .problems
             .iter()
             .chain(waiting)
-            .chain(parked.map(|(id, _)| id))
+            .chain(parked_until_moved(trees))
             .cloned()
             .collect();
         let (needed, agreed) = rebase(trees, ids, now_ms, &skip);
+        skip.extend(parked_until_moved(trees).cloned());
         let excluded: Vec<NodeId> = (trees.dirty().iter())
             .filter(|id| trees.excluded(id) || trees.held(id))
             .cloned()
@@ -1737,6 +1741,14 @@ fn edited_on_both_sides(trees: &Trees, id: &str) -> bool {
     changed(&l) && changed(&r) && !same_content(&l, &r)
 }
 
+fn parked_until_moved(trees: &Trees) -> impl Iterator<Item = &NodeId> {
+    let known = |id: &str| trees.remote().get(id).is_some() || trees.synced().get(id).is_some();
+    let free = |shape: &Shape| (trees.local_holders(&shape.parent, &shape.name).next()).is_none();
+    (trees.local().iter())
+        .filter(move |(id, node)| node.parked && (known(id) || free(&node.shape)))
+        .map(|(id, _)| id)
+}
+
 /// The keep rule (R7): a node that changed remotely, or that L still has but must move to its R
 /// position because it is reverted or parked, keeps every node L deleted on the way it will hang
 /// from the root, by setting S := ⊥ for them, so they are downloaded again. A kept node that S
@@ -1750,9 +1762,8 @@ fn keep(trees: &mut Trees, id: &str, needed: &mut BTreeSet<NodeId>) {
         .local()
         .get(id)
         .is_some_and(|node| node.parked || trees.reverted().contains(id));
-    let acknowledged = acknowledged(trees, id);
     if trees.remote().live(id).is_none()
-        || (!reverted && same(trees.remote().live(id), acknowledged))
+        || (!reverted && same(trees.remote().live(id), acknowledged(trees, id)))
     {
         return;
     }
@@ -1773,10 +1784,8 @@ fn keep(trees: &mut Trees, id: &str, needed: &mut BTreeSet<NodeId>) {
             }
             None => {}
             Some(local) => {
-                let moved = trees
-                    .synced()
-                    .live(&current)
-                    .is_none_or(|synced| !local.shape.same_position(synced));
+                let moved = acknowledged(trees, &current)
+                    .is_none_or(|held| !local.shape.same_position(held));
                 if moved && !trees.reverted().contains(&current) {
                     return;
                 }
