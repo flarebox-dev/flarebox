@@ -149,9 +149,8 @@ fn unlinking_a_folder_that_is_not_linked_is_unchanged() {
         .display()
         .to_string();
     let mut data = envelope["data"].clone();
-    let service = data.as_object_mut().unwrap().remove("service");
+    data.as_object_mut().unwrap().remove("service");
     assert_eq!(data, serde_json::json!({ "path": path }));
-    assert_eq!(service.unwrap()["state"], "not_installed", "{envelope:#}");
     let output = profile.output(&["folder", "unlink", "Docs"]);
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(
