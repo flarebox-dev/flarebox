@@ -9,12 +9,13 @@
 import { requireAccount, subscriptions } from "./cloudflare.ts";
 import { workersPlan } from "./load-model.ts";
 
-let listed: { name: string; price: number }[] | undefined;
+let listed: { name: string; price: number; state: string }[] | undefined;
 let unreadable = "";
 try {
   listed = (await subscriptions(requireAccount())).map((subscription) => ({
     name: subscription.rate_plan?.public_name || subscription.rate_plan?.id || subscription.id,
     price: subscription.price ?? 0,
+    state: subscription.state ?? "",
   }));
 } catch (error) {
   unreadable = error instanceof Error ? error.message : String(error);

@@ -27,11 +27,13 @@ const BUDGET_MARGIN = 1.25;
 
 const DEFAULT_STEPS: Record<ScenarioName, number[]> = { s1: [1, 5, 10, 25, 50, 100, 200], s4: [1, 4, 16] };
 
-function whole(env: Record<string, string | undefined>, name: string, fallback: number, min: number): number {
+function whole(env: Record<string, string | undefined>, name: string, fallback: number, min: number, max = Number.MAX_SAFE_INTEGER): number {
   const text = env[name];
   if (text === undefined || text === "") return fallback;
   const value = Number(text);
-  if (!Number.isSafeInteger(value) || value < min) throw new Error(name + " must be a whole number of at least " + min + ", not " + JSON.stringify(text));
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    throw new Error(name + " must be a whole number of at least " + min + (max < Number.MAX_SAFE_INTEGER ? " and at most " + max : "") + ", not " + JSON.stringify(text));
+  }
   return value;
 }
 
@@ -49,8 +51,8 @@ export function readConfig(env: Record<string, string | undefined>): Config {
   const config: Config = {
     scenario,
     steps,
-    warmupMs: whole(env, "LOAD_WARMUP_SECONDS", 120, 0) * 1000,
-    measureMs: whole(env, "LOAD_MEASURE_SECONDS", 480, 10) * 1000,
+    warmupMs: whole(env, "LOAD_WARMUP_SECONDS", 120, 0, 600) * 1000,
+    measureMs: whole(env, "LOAD_MEASURE_SECONDS", 480, 10, 1800) * 1000,
     maxRowsWritten: whole(env, "LOAD_MAX_ROWS_WRITTEN", 40_000_000, 1),
     subscribersPerSpace: whole(env, "LOAD_SUBSCRIBERS", 1, 0),
   };
@@ -173,11 +175,15 @@ export function commitsAt(timeline: [number, number][], atMs: number): number {
   return timeline.at(-1)![1];
 }
 
+/** Subscription states that no longer pay for the plan (Cloudflare's List Subscriptions reference). */
+const ENDED_SUBSCRIPTION = /^(cancelled|failed|expired)$/i;
+
 /** What the account's subscriptions say about its Workers plan, from the API or, failing that, the dispatcher. */
-export function workersPlan(listed: { name: string; price: number }[] | undefined, unreadable: string, confirmed: boolean): { ok: boolean; message: string } {
-  const paid = (listed ?? []).filter((subscription) => /workers/i.test(subscription.name) && subscription.price > 0);
+export function workersPlan(listed: { name: string; price: number; state: string }[] | undefined, unreadable: string, confirmed: boolean): { ok: boolean; message: string } {
+  const paid = (listed ?? []).filter((subscription) => /workers/i.test(subscription.name) && subscription.price > 0 && !ENDED_SUBSCRIPTION.test(subscription.state));
   if (paid.length > 0) return { ok: true, message: "The account subscribes to " + paid.map((subscription) => subscription.name).join(", ") + ", so it is on Workers Paid." };
-  const seen = listed ? "The account's subscriptions list no paid Workers plan (" + (listed.map((subscription) => subscription.name).join(", ") || "none") + ")." : "The account's subscriptions cannot be read: " + unreadable + ".";
+  const seen = listed
+    ? "The account's subscriptions list no active paid Workers plan (" + (listed.map((subscription) => subscription.name + (subscription.state ? " " + subscription.state : "")).join(", ") || "none") + ")." : "The account's subscriptions cannot be read: " + unreadable + ".";
   if (confirmed) return { ok: true, message: seen + " Going on because the run was started with workers_paid=confirmed." };
   return { ok: false, message: seen + " The load test needs Workers Paid, because Workers Free allows 100,000 rows written a day. Nothing was deployed. Once the account is on Workers Paid, start the run again with workers_paid=confirmed." };
 }

@@ -38,8 +38,9 @@ const TOKEN_CHECK_MS = 30_000;
 const PROBE_EVERY_MS = 2_000;
 const CALIBRATION_WRITERS = 5;
 const CALIBRATION_MS = 120_000;
-const CALIBRATION_WAIT_MS = 10 * 60_000;
 const ANALYTICS_LAG_MS = 3 * 60_000;
+const CALIBRATION_WAIT_MS = ANALYTICS_LAG_MS + 10 * 60_000;
+const CALIBRATION_READ_EVERY_MS = 60_000;
 const STORAGE_WAIT_MS = 20 * 60_000;
 
 const config = readConfig(process.env);
@@ -229,9 +230,17 @@ async function write(writer: Writer): Promise<void> {
       }
       continue;
     }
-    await session.keepToken();
     const started = performance.now();
     let response: RpcResponse;
+    try {
+      await session.keepToken();
+    } catch {
+      if (measuring) count(measuring.closes, "token refresh failed");
+      session.close();
+      await sleep(backoffMs);
+      backoffMs = Math.min(backoffMs * 2, 15_000);
+      continue;
+    }
     try {
       response = await session.commit(writer.nodeId, writer.contents[next]!);
     } catch (error) {
@@ -269,14 +278,12 @@ async function write(writer: Writer): Promise<void> {
 /** Keeps a live session open; its pushes give the push lag. */
 async function subscribe(session: Session): Promise<void> {
   while (!stopping) {
-    if (!session.connected) {
-      try {
-        await session.connect();
-      } catch {
-        if (measuring) count(measuring.closes, "connect failed");
-      }
-    } else {
-      await session.keepToken();
+    try {
+      if (!session.connected) await session.connect();
+      else await session.keepToken();
+    } catch {
+      if (measuring) count(measuring.closes, session.connected ? "token refresh failed" : "connect failed");
+      session.close();
     }
     await sleep(1000);
   }
@@ -462,6 +469,7 @@ const results: Record<string, unknown> = { config, startedAt: iso(Date.now()) };
 let calibration: Window | undefined;
 let loadEndMs = 0;
 let stopReason = "";
+let written = false;
 const background: Promise<void>[] = [];
 const subscribing = new Set<Session>();
 
@@ -479,7 +487,8 @@ describe("load test " + config.scenario, () => {
     for (const session of [...writers.flat().map((writer) => writer.session), ...subscribers.flat()]) session.close();
     await Promise.allSettled(background);
     addStats(stats);
-  });
+    if (!written) writeResults("the suite stopped early, so these results are partial");
+  }, 2 * 60_000);
 
   it("sets up the spaces and pairs a device for every writer and subscriber", async () => {
     if (!state.owner || !state.url) throw new Error("nothing is claimed yet; run run.ts deploy and claim first");
@@ -519,19 +528,22 @@ describe("load test " + config.scenario, () => {
     calibration = { label: "calibration", startMs, endMs: startMs + ranMs + 60_000 };
     expect(commits, "calibration commits").toBeGreaterThan(0);
     const namespaces = await namespacesOf(account, state.name);
-    let rows = 0;
-    let previous = -1;
     const deadline = Date.now() + CALIBRATION_WAIT_MS;
+    await sleep(ANALYTICS_LAG_MS);
+    const readings: number[] = [];
     while (Date.now() < deadline) {
-      await sleep(30_000);
       try {
-        rows = rowsWritten(await usage(account, namespaces, calibration));
+        readings.push(rowsWritten(await usage(account, namespaces, calibration)));
       } catch (error) {
         console.log("Analytics API: " + (error instanceof Error ? error.message : String(error)).slice(0, 200));
       }
-      if (rows > 0 && rows === previous) break;
-      previous = rows;
+      const last = readings.slice(-3);
+      if (last.length === 3 && last[0]! > 0 && last.every((reading) => reading === last[0])) break;
+      await sleep(CALIBRATION_READ_EVERY_MS);
     }
+    const settled = readings.slice(-3);
+    const rows = settled.length === 3 && settled[0]! > 0 && settled.every((reading) => reading === settled[0]) ? settled[0]! : 0;
+    if (rows === 0 && readings.length > 0) console.log("Rows written did not settle at a positive count in three readings a minute apart: " + readings.join(", "));
     const rowsPerCommit = rows > 0 ? rows / commits : FALLBACK_ROWS_PER_COMMIT;
     budget = commitBudget(config.maxRowsWritten, rowsPerCommit);
     results.calibration = { commits, ranMs, rowsWritten: rows, rowsPerCommit: rows > 0 ? rowsPerCommit : null, assumed: rows > 0 ? null : FALLBACK_ROWS_PER_COMMIT, budget };
@@ -587,6 +599,7 @@ describe("load test " + config.scenario, () => {
     stopping = true;
     await stop(writers.flat());
     loadEndMs = Date.now();
+    timeline.push([loadEndMs, committed]);
     delay.disable();
     if (stopReason) console.log(stopReason);
     results.stopReason = stopReason || null;
@@ -637,43 +650,51 @@ describe("load test " + config.scenario, () => {
   }, ANALYTICS_LAG_MS + STORAGE_WAIT_MS + 10 * 60_000);
 
   it("writes the results", () => {
-    results.steps = summaries;
-    results.windows = windows;
-    results.calibrationWindow = calibration ?? null;
-    results.timeline = timeline;
-    results.finishedAt = iso(Date.now());
-    const path = join(process.env.RUNNER_TEMP || tmpdir(), "load-results.json");
-    writeFileSync(path, JSON.stringify(results, null, 2));
-    const share = (ms: number | undefined, window: number) => (ms === undefined ? "-" : ((ms / window) * 100).toFixed(0) + "%");
-    const rows = summaries.map((summary) => {
-      const used = typeof summary.usage === "object" ? summary.usage : undefined;
-      const accountDo = used?.AccountDO;
-      const spaceDo = used?.SpaceDO;
-      return [
-        String(summary.step),
-        summary.spaces + " x " + summary.writers / summary.spaces,
-        summary.commitsPerSecond.toFixed(1),
-        fixed(summary.commitMs.p50) + " / " + fixed(summary.commitMs.p95) + " / " + fixed(summary.commitMs.p99),
-        summary.failed + (summary.failed ? " (" + counts(summary.refused) + ")" : ""),
-        counts(summary.closes),
-        fixed(summary.pushLagMs.p50) + " / " + fixed(summary.pushLagMs.p95),
-        fixed(summary.probeMs.p50) + " / " + fixed(summary.probeMs.p95),
-        (summary.generatorCpuShare * 100).toFixed(0) + "%",
-        share(accountDo?.cpuMs, summary.measuredMs) + (accountDo ? ", " + (accountDo.requests / (summary.measuredMs / 1000)).toFixed(0) + " req/s" : ""),
-        share(spaceDo?.busiestObjectCpuMs, summary.measuredMs),
-        used && summary.accepted > 0 ? (rowsWritten(used) / summary.accepted).toFixed(1) : "-",
-      ];
-    });
-    const header = ["Step", "Spaces x writers", "Commits/s", "Commit ms p50 / p95 / p99", "Failed", "Closes", "Push lag ms p50 / p95", "Account probe ms p50 / p95", "Generator CPU", "Account DO CPU", "Busiest SpaceDO CPU", "Rows written per commit"];
-    const table = [header, header.map(() => "---"), ...rows].map((row) => "| " + row.map((cell) => cell.replaceAll("|", "\\|")).join(" | ") + " |").join("\n");
-    const storage = results.storage as { bytesPerCommitOverall: number | null; bytesPerCommitBetweenSamples: number | null; afterLoad: boolean } | undefined;
-    const notes = [
-      "Stop: " + (stopReason || "every step ran"),
-      "Writer commits: " + committed + ", budget " + (Number.isFinite(budget) ? budget : "none"),
-      "SpaceDO stored bytes per commit: " + (storage ? fixed(storage.bytesPerCommitOverall ?? undefined) + " overall, " + fixed(storage.bytesPerCommitBetweenSamples ?? undefined) + " between samples" + (storage.afterLoad ? "" : " (no sample after the load yet)") : "not read"),
-    ];
-    console.log("\n" + table + "\n\n" + notes.join("\n"));
-    if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, "### Load test " + config.scenario + "\n\n" + table + "\n\n" + notes.map((note) => "- " + note).join("\n") + "\n\n");
-    console.log("Wrote " + path);
+    writeResults("");
   });
 });
+
+/** Writes load-results.json and the summary table; partial says why they are incomplete, or is empty. */
+function writeResults(partial: string): void {
+  written = true;
+  results.partial = partial || null;
+  results.steps = summaries;
+  results.windows = windows;
+  results.calibrationWindow = calibration ?? null;
+  results.timeline = timeline;
+  results.finishedAt = iso(Date.now());
+  const path = join(process.env.RUNNER_TEMP || tmpdir(), "load-results.json");
+  writeFileSync(path, JSON.stringify(results, null, 2));
+  const share = (ms: number | undefined, window: number) => (ms === undefined ? "-" : ((ms / window) * 100).toFixed(0) + "%");
+  const rows = summaries.map((summary) => {
+    const used = typeof summary.usage === "object" ? summary.usage : undefined;
+    const accountDo = used?.AccountDO;
+    const spaceDo = used?.SpaceDO;
+    return [
+      String(summary.step),
+      summary.spaces + " x " + summary.writers / summary.spaces,
+      summary.commitsPerSecond.toFixed(1),
+      fixed(summary.commitMs.p50) + " / " + fixed(summary.commitMs.p95) + " / " + fixed(summary.commitMs.p99),
+      summary.failed + (summary.failed ? " (" + counts(summary.refused) + ")" : ""),
+      counts(summary.closes),
+      fixed(summary.pushLagMs.p50) + " / " + fixed(summary.pushLagMs.p95),
+      fixed(summary.probeMs.p50) + " / " + fixed(summary.probeMs.p95),
+      (summary.generatorCpuShare * 100).toFixed(0) + "%",
+      share(accountDo?.cpuMs, summary.measuredMs) + (accountDo ? ", " + (accountDo.requests / (summary.measuredMs / 1000)).toFixed(0) + " req/s" : ""),
+      share(spaceDo?.busiestObjectCpuMs, summary.measuredMs),
+      used && summary.accepted > 0 ? (rowsWritten(used) / summary.accepted).toFixed(1) : "-",
+    ];
+  });
+  const header = ["Step", "Spaces x writers", "Commits/s", "Commit ms p50 / p95 / p99", "Failed", "Closes", "Push lag ms p50 / p95", "Account probe ms p50 / p95", "Generator CPU", "Account DO CPU", "Busiest SpaceDO CPU", "Rows written per commit"];
+  const table = [header, header.map(() => "---"), ...rows].map((row) => "| " + row.map((cell) => cell.replaceAll("|", "\\|")).join(" | ") + " |").join("\n");
+  const storage = results.storage as { bytesPerCommitOverall: number | null; bytesPerCommitBetweenSamples: number | null; afterLoad: boolean } | undefined;
+  const notes = [
+    ...(partial ? ["Partial: " + partial] : []),
+    "Stop: " + (stopReason || "every step ran"),
+    "Writer commits: " + committed + ", budget " + (Number.isFinite(budget) ? budget : "none"),
+    "SpaceDO stored bytes per commit: " + (storage ? fixed(storage.bytesPerCommitOverall ?? undefined) + " overall, " + fixed(storage.bytesPerCommitBetweenSamples ?? undefined) + " between samples" + (storage.afterLoad ? "" : " (no sample after the load yet)") : "not read"),
+  ];
+  console.log("\n" + table + "\n\n" + notes.join("\n"));
+  if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, "### Load test " + config.scenario + "\n\n" + table + "\n\n" + notes.map((note) => "- " + note).join("\n") + "\n\n");
+  console.log("Wrote " + path);
+}

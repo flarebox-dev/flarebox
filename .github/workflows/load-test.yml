@@ -21,11 +21,11 @@ on:
         type: string
         required: false
       warmup_seconds:
-        description: "Seconds of load before each step measures."
+        description: "Seconds of load before each step measures, at most 600."
         type: string
         default: "120"
       measure_seconds:
-        description: "Seconds each step measures."
+        description: "Seconds each step measures, at most 1800."
         type: string
         default: "480"
       max_rows_written:
@@ -33,7 +33,7 @@ on:
         type: string
         default: "40000000"
       workers_paid:
-        description: "confirmed: you checked that the account is on Workers Paid, for when the token may not read the account's subscriptions."
+        description: "confirmed: you checked that the account is on Workers Paid. It overrides the subscriptions check, whether the token can read the subscriptions or not."
         type: choice
         options: [unconfirmed, confirmed]
         default: unconfirmed
@@ -181,7 +181,7 @@ jobs:
           name: load-results-${{ inputs.scenario }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/load-results.json
           retention-days: 30
-          if-no-files-found: ignore
+          if-no-files-found: warn
 
       - name: Tear down the Worker, its Durable Objects and the R2 bucket
         if: always() && steps.secrets.outcome == 'success'

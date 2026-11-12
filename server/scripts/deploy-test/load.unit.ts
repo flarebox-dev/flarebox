@@ -30,6 +30,8 @@ describe("the load test's configuration", () => {
     expect(() => readConfig({ LOAD_SCENARIO: "s1", LOAD_STEPS: "401" })).toThrow(/at most 400/);
     expect(() => readConfig({ LOAD_SCENARIO: "s4", LOAD_STEPS: "1,17" })).toThrow(/425 writers/);
     expect(() => readConfig({ LOAD_SCENARIO: "s1", LOAD_MEASURE_SECONDS: "5" })).toThrow(/at least 10/);
+    expect(() => readConfig({ LOAD_SCENARIO: "s1", LOAD_MEASURE_SECONDS: "1801" })).toThrow(/at most 1800/);
+    expect(() => readConfig({ LOAD_SCENARIO: "s1", LOAD_WARMUP_SECONDS: "601" })).toThrow(/at most 600/);
   });
 });
 
@@ -93,8 +95,10 @@ describe("the run's limits", () => {
   });
 
   it("deploys only on Workers Paid, by the API or by the dispatcher's word", () => {
-    expect(workersPlan([{ name: "Workers Paid", price: 5 }], "", false).ok).toBe(true);
-    expect(workersPlan([{ name: "Workers Free", price: 0 }], "", false)).toMatchObject({ ok: false, message: expect.stringMatching(/no paid Workers plan \(Workers Free\)/) });
+    expect(workersPlan([{ name: "Workers Paid", price: 5, state: "Paid" }], "", false).ok).toBe(true);
+    expect(workersPlan([{ name: "Workers Free", price: 0, state: "Paid" }], "", false)).toMatchObject({ ok: false, message: expect.stringMatching(/no active paid Workers plan \(Workers Free Paid\)/) });
+    expect(workersPlan([{ name: "Workers Paid", price: 5, state: "Cancelled" }], "", false)).toMatchObject({ ok: false, message: expect.stringMatching(/\(Workers Paid Cancelled\)/) });
+    expect(workersPlan([{ name: "Workers Paid", price: 5, state: "Cancelled" }], "", true).ok).toBe(true);
     expect(workersPlan(undefined, "GET /accounts/x/subscriptions returned HTTP 403", false)).toMatchObject({ ok: false, message: expect.stringMatching(/cannot be read.*Nothing was deployed/) });
     expect(workersPlan(undefined, "HTTP 403", true)).toMatchObject({ ok: true, message: expect.stringMatching(/workers_paid=confirmed/) });
   });

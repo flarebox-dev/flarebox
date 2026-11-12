@@ -204,6 +204,7 @@ export async function activeVersion(account: Account, name: string): Promise<str
 export interface Subscription {
   id: string;
   price?: number;
+  state?: string;
   rate_plan?: { id?: string; public_name?: string };
 }
 
