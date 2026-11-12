@@ -2,8 +2,8 @@
 
 // An in-memory stand-in for the parts of the Cloudflare API that run.ts and Wrangler's tail use, plus the two Worker
 // routes the claim calls, for run.unit.ts. Point CLOUDFLARE_API_BASE_URL at url + "/client/v4" and the state's server
-// URL at url. The tail is a minimal WebSocket server that pushes one request event whose log line carries the claim
-// code each time /setup is requested. POST /mock/workers/<name> with an optional {"tag"} uploads a Worker version from
+// URL at url. The tail is a minimal WebSocket server that pushes one request event for each request to /v1/server, and
+// one whose log line carries the claim code for each request to /setup. POST /mock/workers/<name> with an optional {"tag"} uploads a Worker version from
 // another process, creating the Worker if needed, as a concurrent creator or `wrangler deploy --tag` would.
 
 import { createHash } from "node:crypto";
@@ -38,6 +38,10 @@ export class MockCloudflare {
   bucketJobLeftovers: string[] = [];
   readonly bucketJobBodies: unknown[] = [];
   readonly claimCode = "ZQ7K-M2XR-9WPD";
+  /** Events the tail drops before it delivers any, as a tail that is connected but not yet receiving does. */
+  tailDropsFirst = 0;
+  /** Requests to /setup, each of which issues a code. */
+  setupRequests = 0;
   url = "";
   private server: Server | undefined;
   private readonly tails = new Set<Socket>();
@@ -87,13 +91,17 @@ export class MockCloudflare {
     this.tails.add(socket);
   }
 
-  private pushClaimCode(url: string): void {
+  private pushEvent(url: string, messages: string[]): void {
+    if (this.tailDropsFirst > 0) {
+      this.tailDropsFirst--;
+      return;
+    }
     const event = JSON.stringify({
       outcome: "ok",
       scriptName: "mock",
       eventTimestamp: Date.now(),
       event: { request: { url, method: "GET", headers: {} } },
-      logs: [{ message: ["Koidrive claim code (valid for 1 hour): " + this.claimCode], level: "log", timestamp: Date.now() }],
+      logs: messages.map((message) => ({ message: [message], level: "log", timestamp: Date.now() })),
       exceptions: [],
     });
     const payload = Buffer.from(event);
@@ -118,8 +126,13 @@ export class MockCloudflare {
       const missing = () => send(404, { success: false, errors: [{ code: 10007, message: "not found" }], messages: [], result: null });
       let match: RegExpExecArray | null;
 
+      if (path === "/v1/server") {
+        this.pushEvent(this.url + "/v1/server", []);
+        return send(200, { serverVersion: "0.0.0", claimed: false });
+      }
       if (path === "/setup") {
-        this.pushClaimCode(this.url + "/setup");
+        this.setupRequests++;
+        this.pushEvent(this.url + "/setup", ["Koidrive claim code (valid for 1 hour): " + this.claimCode]);
         response.writeHead(200, { "Content-Type": "text/plain" });
         response.end("A one-time claim code, valid for one hour, is in this Worker's logs.\n");
         return;
