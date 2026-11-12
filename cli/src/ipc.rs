@@ -81,8 +81,8 @@ pub enum Request {
         question_id: String,
         answer: Answer,
     },
-    /// Records a restore in the folder of `space_id`, for its engine to send. `folder` and `path`, the folder's root and
-    /// the path in it, come back in the response, so that the record of a request ID can report the restore again
+    /// Records a restore in the folder of `space_id`, for its engine to send. `space_id`, `folder` and `path`, the folder's
+    /// root and the path in it, come back in the response, so that the record of a request ID can report the restore again
     /// when the folder is no longer linked.
     Restore {
         space_id: String,
@@ -156,6 +156,7 @@ pub enum Response {
     AlreadyAnswered,
     Restore {
         id: String,
+        space_id: String,
         folder: String,
         path: String,
     },
@@ -291,7 +292,12 @@ pub async fn handle(driver: &Driver, request: Request) -> Response {
             path,
         } => driver
             .restore(&space_id, restore)
-            .map(|id| Response::Restore { id, folder, path }),
+            .map(|id| Response::Restore {
+                id,
+                space_id,
+                folder,
+                path,
+            }),
         Request::Restores { space_id } => driver
             .restores(&space_id)
             .map(|restores| Response::Restores { restores }),

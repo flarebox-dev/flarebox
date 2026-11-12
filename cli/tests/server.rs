@@ -1289,6 +1289,11 @@ async fn restore_brings_back_a_deleted_file_and_an_earlier_version() {
     let unlinked = machine.envelope(&restore_gone);
     assert_eq!(unlinked["outcome"], "accepted", "{unlinked:#}");
     assert_eq!(unlinked["data"], replayed["data"], "{unlinked:#}");
+    assert_eq!(
+        unlinked["next_commands"],
+        serde_json::json!([]),
+        "{unlinked:#}"
+    );
     assert!(stop(daemon).success());
 }
 
