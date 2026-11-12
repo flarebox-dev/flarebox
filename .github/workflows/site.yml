@@ -9,11 +9,13 @@ on:
       - "site/**"
       - ".github/workflows/site.yml"
       - "scripts/site-setup.sh"
+      - "install.sh"
   pull_request:
     paths:
       - "site/**"
       - ".github/workflows/site.yml"
       - "scripts/site-setup.sh"
+      - "install.sh"
   merge_group:
 
 permissions:
@@ -62,8 +64,10 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
           sparse-checkout: |
-            site
-            scripts
+            /site/
+            /scripts/
+            /install.sh
+          sparse-checkout-cone-mode: false
       - if: steps.credentials.outputs.ready == 'true'
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -82,7 +86,7 @@ jobs:
             404) npx --yes "wrangler@$WRANGLER_VERSION" pages project create "$PROJECT" --production-branch main ;;
             *) echo "::error::Looking up Pages project $PROJECT returned HTTP $status."; exit 1 ;;
           esac
-      - name: Deploy site/ to Cloudflare Pages
+      - name: Deploy site/ and install.sh to Cloudflare Pages
         id: deploy
         if: steps.credentials.outputs.ready == 'true'
         env:
@@ -92,7 +96,10 @@ jobs:
           SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           WRANGLER_OUTPUT_FILE_PATH: ${{ runner.temp }}/wrangler-output.json
         run: |
-          npx --yes "wrangler@$WRANGLER_VERSION" pages deploy site \
+          out="$RUNNER_TEMP/site"
+          cp -R site "$out"
+          cp install.sh "$out/install.sh"
+          npx --yes "wrangler@$WRANGLER_VERSION" pages deploy "$out" \
             --project-name "$PROJECT" --branch "$BRANCH" --commit-hash "$SHA"
           url="$(jq -r 'select(.type == "pages-deploy-detailed") | .alias // .url // empty' "$WRANGLER_OUTPUT_FILE_PATH" | tail -n 1)"
           if [ -z "$url" ]; then
@@ -103,6 +110,31 @@ jobs:
           echo "Deployed $SHA from $BRANCH to $url"
           echo "Deployed \`$SHA\` from \`$BRANCH\` to $url" >> "$GITHUB_STEP_SUMMARY"
           echo "url=$url" >> "$GITHUB_OUTPUT"
+      - name: Check that the deployment serves install.sh unchanged
+        if: steps.deploy.outputs.url != ''
+        env:
+          URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          served="$RUNNER_TEMP/served-install.sh"
+          headers="$RUNNER_TEMP/served-install.headers"
+          for attempt in 1 2 3 4 5 6; do
+            if curl --silent --show-error --fail --dump-header "$headers" --output "$served" "$URL/install.sh"; then
+              break
+            fi
+            [ "$attempt" -lt 6 ] || { echo "::error::$URL/install.sh did not return 200 after 6 attempts."; exit 1; }
+            sleep 10
+          done
+          if ! cmp install.sh "$served"; then
+            echo "::error::$URL/install.sh ($(wc -c <"$served") bytes) differs from install.sh at this commit ($(wc -c <install.sh) bytes)."
+            exit 1
+          fi
+          type="$(tr -d '\r' <"$headers" | awk 'tolower($1) == "content-type:" { $1 = ""; sub(/^ /, ""); print }' | tail -n 1)"
+          case "$type" in
+            text/plain*) ;;
+            *) echo "::error::$URL/install.sh is served as '$type', not text/plain. Check site/_headers."; exit 1 ;;
+          esac
+          echo "$URL/install.sh matches install.sh ($(wc -c <install.sh) bytes, sha256 $(sha256sum install.sh | cut -d' ' -f1)) and is served as $type."
+          grep -i '^cache-control:' "$headers" || true
       - name: Attach koidrive.com, its DNS records and the www redirect
         if: github.event_name == 'push' && steps.deploy.outputs.url != ''
         env:

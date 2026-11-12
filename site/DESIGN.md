@@ -85,5 +85,6 @@ The spacing scale, the type scale, the easings and the durations live in `tokens
 - `site.css` imports `tokens.css` (which imports `fonts.css`) and `base.css`, then styles the page. The nav, hero and footer rules are coreav-dev/site's scoped Astro styles, made global under their class names.
 - `fonts/`: the three WOFF2 files and their licences. `logo/`: the logo and the scripts that draw it.
 - `favicon.*`, `apple-touch-icon.png`, `icon-*.png` and `site.webmanifest`: the icons.
+- `_headers`: serves `/install.sh` as plain text with a five-minute cache. The file itself is the repository's root `install.sh`, which `.github/workflows/site.yml` copies into the deploy at deploy time, so this folder holds no copy of it.
 
 The site is static, with no build step. To preview it, run `python3 -m http.server` in this folder and open the printed address.
