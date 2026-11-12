@@ -20,11 +20,15 @@ jobs:
     name: changes
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
     outputs:
       rust_macos: ${{ steps.paths.outputs.rust_macos }}
       server_macos: ${{ steps.paths.outputs.server_macos }}
       spec_macos: ${{ steps.paths.outputs.spec_macos }}
       macos_app: ${{ steps.paths.outputs.macos_app }}
+      runner_hook: ${{ steps.paths.outputs.runner_hook }}
       site_only: ${{ steps.paths.outputs.site_only }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -36,11 +40,34 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           BASE: ${{ github.event.merge_group.base_sha }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           if [ "$EVENT" = push ]; then
-            echo "Push to $GITHUB_REF: every macOS job runs."
-            printf '%s=true\n' rust_macos server_macos spec_macos macos_app >> "$GITHUB_OUTPUT"
             echo "site_only=false" >> "$GITHUB_OUTPUT"
+            api() {
+              curl -fsS --max-time 15 -H "Authorization: Bearer $GITHUB_TOKEN" -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/$1"
+            }
+            passed=""
+            if ! runs="$(api "workflows/ci.yml/runs?event=merge_group&head_sha=$GITHUB_SHA&status=success&per_page=1")" || ! run="$(jq -ec '.workflow_runs | if type == "array" then .[0] // {} else error("no workflow_runs") end' <<<"$runs")"; then
+              echo "::warning::Looking up the merge queue run of $GITHUB_SHA failed (see the error above), so every macOS job runs."
+            elif [ "$run" = '{}' ]; then
+              echo "No successful merge queue run of ci.yml tested $GITHUB_SHA, so every macOS job runs."
+            elif ! jobs="$(api "runs/$(jq -r .id <<<"$run")/jobs?filter=latest&per_page=100")" || ! passed="$(jq -er '.jobs | if type == "array" then map(select(.conclusion == "success") | .name) | join("\n") else error("no jobs") end' <<<"$jobs")"; then
+              passed=""
+              echo "::warning::Listing the jobs of merge queue run $(jq -r .html_url <<<"$run") failed (see the error above), so every macOS job runs."
+            else
+              echo "Merge queue run $(jq -r .html_url <<<"$run") passed CI on $GITHUB_SHA."
+              echo "Merge queue run $(jq -r .html_url <<<"$run") tested this commit. macOS jobs it passed are skipped here." >> "$GITHUB_STEP_SUMMARY"
+            fi
+            for pair in "rust_macos:rust (macos)" "server_macos:server (macos)" "spec_macos:spec (macos)" "macos_app:macos app" "runner_hook:runner hook"; do
+              if grep -Fxq "${pair#*:}" <<<"$passed"; then
+                echo "${pair%%:*}: covered, because the merge queue run passed ${pair#*:} on this commit"
+                echo "${pair%%:*}=covered" >> "$GITHUB_OUTPUT"
+              else
+                echo "${pair%%:*}: runs, because no merge queue run passed ${pair#*:} on this commit"
+                echo "${pair%%:*}=true" >> "$GITHUB_OUTPUT"
+              fi
+            done
             exit 0
           fi
           if [ "$EVENT" = merge_group ]; then
@@ -57,24 +84,39 @@ jobs:
           printf '%s\n' "$changed"
           if [ -n "$changed" ] && ! grep -qv '^site/' <<<"$changed"; then
             echo "site_only: true, because every changed file is under site/, so the build and test jobs skip."
+            printf '%s=false\n' rust_macos server_macos spec_macos macos_app runner_hook >> "$GITHUB_OUTPUT"
             echo "site_only=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "site_only: false, because a changed file is outside site/."
-            echo "site_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          echo "site_only: false, because a changed file is outside site/."
+          echo "site_only=false" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT" = merge_group ]; then
+            echo "Merge queue run: every macOS job runs."
+            printf '%s=true\n' rust_macos server_macos spec_macos macos_app runner_hook >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          bash scripts/test-macos-changes.sh
+          if ! macos="$(scripts/macos-changes.sh "$BASE" HEAD)"; then
+            echo "::error::Listing the macOS-specific files between $BASE and HEAD failed (see the error above)."
+            exit 1
+          fi
+          echo "Files this pull request changes that can build or behave differently on macOS:"
+          printf '%s\n' "${macos:-none}"
           decide() {
-            if grep -Eq "$2" <<<"$changed"; then
-              echo "$1: runs, because a changed file matches $2"
+            if [ -n "$(tr -d '[:space:]' <<<"$3")" ]; then
+              echo "$1: runs, because of $(tr '\n' ' ' <<<"$3")"
               echo "$1=true" >> "$GITHUB_OUTPUT"
             else
-              echo "$1: skipped, because no changed file matches $2"
+              echo "$1: skipped, because $2. The merge queue runs it."
               echo "$1=false" >> "$GITHUB_OUTPUT"
             fi
           }
-          decide rust_macos '^(\.github/workflows/ci\.yml$|Cargo\.(toml|lock)$|rust-toolchain\.toml$|\.cargo/|cli/|core/|spec/)'
-          echo "server_macos, spec_macos: skipped, because the server and spec checks run on macOS only on pushes to main"
+          workflow="$(grep -E '^(\.github/workflows/ci\.yml$|\.github/actions/self-hosted-rust/|scripts/(test-)?macos-changes\.sh$)' <<<"$changed" || true)"
+          decide rust_macos "no macOS-specific Rust input changed" "$(cut -f1 <<<"$macos" | grep -v '^apps/macos/' || true)"$'\n'"$workflow"
+          decide macos_app "neither the app nor a macOS-specific input of the core changed" "$(cut -f1 <<<"$macos" | grep -v '^cli/' || true)"$'\n'"$workflow"
+          decide runner_hook "neither the runner hook nor ci.yml changed" "$(grep -E '^\.github/(runner/|workflows/ci\.yml$)' <<<"$changed" || true)"
+          echo "server_macos, spec_macos: skipped, because pull requests run the server and spec checks on Linux only. The merge queue runs them on macOS."
           printf '%s=false\n' server_macos spec_macos >> "$GITHUB_OUTPUT"
-          decide macos_app '^(\.github/workflows/ci\.yml$|Cargo\.(toml|lock)$|cli/Cargo\.toml$|rust-toolchain\.toml$|\.cargo/|core/|apps/macos/)'
 
   pick-macos:
     name: pick-macos
@@ -99,7 +141,7 @@ jobs:
           RUNS_ON: ${{ vars.MACOS_RUNS_ON || '["self-hosted","flarebox-mini"]' }}
           RUNNER_STATUS_TOKEN: ${{ secrets.RUNNER_STATUS_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
-          WANTED: macos_app=${{ needs.changes.outputs.macos_app }} rust=${{ needs.changes.outputs.rust_macos }} server=${{ needs.changes.outputs.server_macos }} spec=${{ needs.changes.outputs.spec_macos }} runner_hook=${{ needs.changes.outputs.site_only != 'true' }}
+          WANTED: macos_app=${{ needs.changes.outputs.macos_app }} rust=${{ needs.changes.outputs.rust_macos }} server=${{ needs.changes.outputs.server_macos }} spec=${{ needs.changes.outputs.spec_macos }} runner_hook=${{ needs.changes.outputs.runner_hook }}
         run: |
           hosted='["xcode-27"]'
           api() {
@@ -528,7 +570,7 @@ jobs:
   runner-hook:
     name: runner hook
     needs: [changes, pick-macos]
-    if: needs.changes.outputs.site_only != 'true'
+    if: needs.changes.outputs.runner_hook == 'true'
     runs-on: ${{ fromJSON(needs.pick-macos.outputs.runner_hook).runs_on }}
     timeout-minutes: 5
     steps:
@@ -597,26 +639,29 @@ jobs:
       - name: Fail unless the build and test jobs ran for a change outside site/
         if: needs.changes.outputs.site_only != 'true'
         env:
-          RESULTS: rust=${{ needs.rust.result }} server=${{ needs.server.result }} server-deploy=${{ needs.server-deploy.result }} net-integration=${{ needs.net-integration.result }} driver-integration=${{ needs.driver-integration.result }} cli-integration=${{ needs.cli-integration.result }} ffi-integration=${{ needs.ffi-integration.result }} spec=${{ needs.spec.result }} runner-hook=${{ needs.runner-hook.result }}
+          RESULTS: rust=${{ needs.rust.result }} server=${{ needs.server.result }} server-deploy=${{ needs.server-deploy.result }} net-integration=${{ needs.net-integration.result }} driver-integration=${{ needs.driver-integration.result }} cli-integration=${{ needs.cli-integration.result }} ffi-integration=${{ needs.ffi-integration.result }} spec=${{ needs.spec.result }} runner-hook=${{ needs.changes.outputs.runner_hook == 'true' && needs.runner-hook.result || 'not-needed' }}
         run: |
           echo "Build and test jobs for a change outside site/: $RESULTS"
           for r in $RESULTS; do
-            if [ "${r#*=}" != success ]; then
+            if [ "${r#*=}" != success ] && [ "${r#*=}" != not-needed ]; then
               echo "::error::A change outside site/ must run and pass every build and test job, but ${r%%=*} is ${r#*=}. Only a change whose files are all under site/ may skip them."
               exit 1
             fi
           done
-      - name: Fail unless every macOS job ran on a push to main
+      - name: Fail unless every macOS job ran on this push or passed in the merge queue on the same commit
         if: github.event_name == 'push'
         env:
-          RUST_MACOS: ${{ needs.changes.outputs.rust_macos }}
-          SERVER_MACOS: ${{ needs.changes.outputs.server_macos }}
-          SPEC_MACOS: ${{ needs.changes.outputs.spec_macos }}
-          MACOS_APP_WANTED: ${{ needs.changes.outputs.macos_app }}
+          WANTED: rust=${{ needs.changes.outputs.rust_macos }} server=${{ needs.changes.outputs.server_macos }} spec=${{ needs.changes.outputs.spec_macos }} macos-app=${{ needs.changes.outputs.macos_app }} runner-hook=${{ needs.changes.outputs.runner_hook }}
           MACOS_APP: ${{ needs.macos-app.result }}
         run: |
-          echo "macOS jobs on this push: rust $RUST_MACOS, server $SERVER_MACOS, spec $SPEC_MACOS, macos app $MACOS_APP_WANTED ($MACOS_APP)"
-          if [ "$RUST_MACOS" != true ] || [ "$SERVER_MACOS" != true ] || [ "$SPEC_MACOS" != true ] || [ "$MACOS_APP_WANTED" != true ] || [ "$MACOS_APP" != success ]; then
-            echo "::error::A push to main must run and pass every macOS job, but rust ${RUST_MACOS:-unknown}, server ${SERVER_MACOS:-unknown}, spec ${SPEC_MACOS:-unknown}, macos app ${MACOS_APP_WANTED:-unknown} ($MACOS_APP). Only pull requests and the merge queue may skip a macOS job."
+          echo "macOS jobs on this push (true runs here, covered passed in the merge queue on this commit): $WANTED, macos app result $MACOS_APP"
+          for w in $WANTED; do
+            if [ "${w#*=}" != true ] && [ "${w#*=}" != covered ]; then
+              echo "::error::A push to main must run every macOS job that no merge queue run passed on the same commit, but ${w%%=*} is ${w#*=}. The changes job log says why."
+              exit 1
+            fi
+          done
+          if [ "${WANTED#*macos-app=true}" != "$WANTED" ] && [ "$MACOS_APP" != success ]; then
+            echo "::error::macos app had to run on this push, but its result is $MACOS_APP."
             exit 1
           fi
