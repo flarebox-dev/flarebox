@@ -5444,13 +5444,42 @@ fn a_file_with_a_link_in_an_ignored_folder_moved_back_in_after_its_folder_was_re
     a.run(&mut remote);
     a.settle();
     a.run(&mut remote);
-    let names = remote.names();
-    assert!(
-        names.contains(&"moved".to_owned()) && !names.contains(&"file".to_owned()),
-        "{names:?}"
-    );
+    assert_eq!(remote.names(), [".koiignore", "moved"]);
     assert_eq!(fs::read(site.root.join("moved")).unwrap(), b"kept");
     assert_eq!(fs::read(site.root.join("ignored/alias")).unwrap(), b"kept");
+    assert_eq!(a.folder.engine.trees.check(), Ok(()));
+}
+
+/// The user moves `source/file` into the ignored folder and removes `source`, so the server keeps both. The user
+/// then moves the file back in as `moved`: the server moves it, and `source`, which nothing it kept is in any more,
+/// is removed.
+#[test]
+fn a_file_moved_back_in_from_an_ignored_folder_after_its_folder_was_removed_takes_the_folder_off_the_server()
+ {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site.root.join("source")).unwrap();
+    a.create(&mut remote, &site.root.join("source/file"), b"kept");
+    a.create(&mut remote, &site.root.join(".koiignore"), b"ignored/\n");
+    fs::create_dir(site.root.join("ignored")).unwrap();
+    fs::rename(
+        site.root.join("source/file"),
+        site.root.join("ignored/file"),
+    )
+    .unwrap();
+    fs::remove_dir(site.root.join("source")).unwrap();
+    a.scan_until(|a| !(a.observer.snapshot().entries).contains_key(Path::new("source")));
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    assert_eq!(remote.names(), [".koiignore", "file", "source"]);
+    fs::rename(site.root.join("ignored/file"), site.root.join("moved")).unwrap();
+    a.scan_until(|a| (a.observer.snapshot().entries).contains_key(Path::new("moved")));
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    assert_eq!(remote.names(), [".koiignore", "moved"]);
+    assert_eq!(fs::read(site.root.join("moved")).unwrap(), b"kept");
     assert_eq!(a.folder.engine.trees.check(), Ok(()));
 }
 
