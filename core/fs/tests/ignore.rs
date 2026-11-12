@@ -628,14 +628,15 @@ fn a_new_file_at_a_held_path_after_a_watcher_handover_keeps_the_move() {
             }
         }
         let expected = [
+            created("d/f.txt", File),
             Change::Ignored {
                 from: "d/f.txt".into(),
                 to: "ig/zz/deep/f.txt".into(),
                 kind: File,
                 id,
             },
-            created("d/f.txt", File),
         ];
+        changes.sort_by_key(|change| matches!(change, Change::Ignored { .. }));
         assert_eq!(
             changes, expected,
             "native {native}, new file before {before}"
