@@ -4,6 +4,7 @@ import { create } from "@bufbuild/protobuf";
 import { base64url, fromBase64url, hmac, hmacVerify } from "../crypto";
 import { Error_Code } from "../gen/koidrive/v1/rpc_pb";
 import { type ShareLink, type ShareLinkList, ShareLinkListSchema, ShareLinkSchema } from "../gen/koidrive/v1/share_pb";
+import type { Sql } from "../host";
 import { isUuidV7 } from "../ids";
 import { ClientLimiter } from "./limiter";
 
@@ -89,7 +90,7 @@ export class ShareLinks {
   readonly limiter = new ClientLimiter();
 
   constructor(
-    private readonly sql: SqlStorage,
+    private readonly sql: Sql,
     private readonly deps: ShareLinkDeps,
   ) {}
 
@@ -143,7 +144,7 @@ export class ShareLinks {
       args.expiresAtMs ?? null,
       salt ? SHARE_PASSWORD_KDF : null,
       hash,
-      salt ? salt.buffer : null,
+      salt ? (salt.buffer as ArrayBuffer) : null,
       salt ? SHARE_PASSWORD_ITERATIONS : null,
     );
   }

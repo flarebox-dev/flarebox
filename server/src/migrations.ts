@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import type { Sql } from "./host";
+
 /** One forward-only schema step. A step must leave a database that already has its effect unchanged. */
-export type Migration = string | ((sql: SqlStorage) => void);
+export type Migration = string | ((sql: Sql) => void);
 
 /**
  * Brings a Durable Object's SQLite schema to the newest version. The version is the number of steps applied, kept under
@@ -9,7 +11,7 @@ export type Migration = string | ((sql: SqlStorage) => void);
  * so a failed step leaves the previous version in place. Storage written by a newer release is refused: rolling back
  * the code after a migration ran is not supported, because older code would misread the newer schema.
  */
-export function migrate(sql: SqlStorage, versionTable: string, steps: readonly Migration[]): void {
+export function migrate(sql: Sql, versionTable: string, steps: readonly Migration[]): void {
   const hasTable = sql.exec("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", versionTable).toArray().length > 0;
   let version = hasTable
     ? Number(sql.exec(`SELECT value FROM ${versionTable} WHERE key = 'schema_version'`).toArray()[0]?.value ?? 0)

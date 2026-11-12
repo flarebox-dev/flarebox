@@ -2,6 +2,7 @@
 
 import { create } from "@bufbuild/protobuf";
 import { type SpaceUsage, SpaceUsageSchema } from "../gen/koidrive/v1/auth_pb";
+import type { Sql } from "../host";
 import { toHex } from "../ids";
 import { NodeStatusValue } from "./schema";
 import { type VersionRow, versionChunks } from "./store";
@@ -16,7 +17,7 @@ type Holder = typeof LIVE | typeof TRASH | typeof OLD;
  * Reads what the space holds (RFC 0010 section 2). One pass over the versions keeps, for each chunk, the first holder
  * that holds it, so a chunk shared by files or versions counts once. The cost grows with the versions and their chunks.
  */
-export function readUsage(sql: SqlStorage): SpaceUsage {
+export function readUsage(sql: Sql): SpaceUsage {
   const held = new Map<string, { size: number; holder: Holder }>();
   const versions = [0, 0, 0];
   const cursor = sql.exec(

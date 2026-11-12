@@ -24,6 +24,7 @@ import {
 } from "./gen/koidrive/v1/auth_pb";
 import { Error_Code } from "./gen/koidrive/v1/rpc_pb";
 import type { ShareLink, ShareLinkList } from "./gen/koidrive/v1/share_pb";
+import type { Database, Sql } from "./host";
 import { isUuidV7, uuidv7 } from "./ids";
 import { knownPrincipal } from "./policy";
 import { FORMAT_VERSION } from "./space-do";
@@ -164,7 +165,8 @@ function spaceInfo(row: SpaceRow): SpaceInfo {
 
 /** One per deployment: users, devices, tokens, spaces and share links. */
 export class AccountDO extends DurableObject<Env> {
-  private readonly sql: SqlStorage;
+  private readonly db: Database;
+  private readonly sql: Sql;
   private keyCache: ServerKey | undefined;
   /** Rewinds this instance is driving now, so a retry and the alarm do not run the same phase at once. */
   private readonly driving = new Set<string>();
@@ -176,8 +178,9 @@ export class AccountDO extends DurableObject<Env> {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    this.db = ctx.storage;
     this.sql = ctx.storage.sql;
-    ctx.storage.transactionSync(() => migrate(this.sql));
+    this.db.transactionSync(() => migrate(this.sql));
     this.shares = new ShareLinks(this.sql, {
       clock: () => this.clock(),
       serverSecret: async () => (await this.serverKey()).secret,
@@ -216,7 +219,7 @@ export class AccountDO extends DurableObject<Env> {
     const nowMs = Date.now();
     const code = randomCode(12);
     const hash = await codeHash(code);
-    const stored = this.ctx.storage.transactionSync(() => storeClaimCode(this.sql, hash, nowMs, nowMs + CLAIM_CODE_MS));
+    const stored = this.db.transactionSync(() => storeClaimCode(this.sql, hash, nowMs, nowMs + CLAIM_CODE_MS));
     return stored ? `${code.slice(0, 4)}-${code.slice(4, 8)}-${code.slice(8)}` : undefined;
   }
 
@@ -251,7 +254,7 @@ export class AccountDO extends DurableObject<Env> {
       setupAttempt,
       storeDevice: device.store,
     };
-    const outcome = this.ctx.storage.transactionSync(() => redeemClaim(this.sql, attempt));
+    const outcome = this.db.transactionSync(() => redeemClaim(this.sql, attempt));
     if (!outcome.ok) return outcome;
     // Each check runs right before revokeDevice's first transaction, with no await between them, so a device that
     // refreshed a token while an earlier revocation awaited its notices is kept. The claim has committed, so a failed
@@ -476,7 +479,7 @@ export class AccountDO extends DurableObject<Env> {
    */
   async revokeDevice(deviceId: string): Promise<void> {
     const nowMs = Date.now();
-    this.ctx.storage.transactionSync(() => {
+    this.db.transactionSync(() => {
       const revoked = this.sql.exec("UPDATE devices SET revoked_at_ms = ? WHERE device_id = ? AND revoked_at_ms IS NULL", nowMs, deviceId).rowsWritten;
       if (revoked === 0) return;
       this.sql.exec(

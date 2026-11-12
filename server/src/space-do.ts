@@ -57,6 +57,7 @@ import {
 import type { SessionCheck } from "./account-do";
 import { type Identity, verifyAccessToken } from "./auth";
 import { type ChunkObject, sha256, signChunkGrant, verifyChunkGrant } from "./crypto";
+import type { Database, Sql } from "./host";
 import { fromHex, isUuidV7, toHex, uuidv7 } from "./ids";
 import { policy } from "./policy";
 import { quotaRefusal } from "./quota";
@@ -295,7 +296,8 @@ function fitPage<R, T>(rows: R[], build: (row: R) => T, encodedSize: (item: T) =
 
 /** One per space: tree, versions, chunks and the commit log. */
 export class SpaceDO extends DurableObject<Env> {
-  private readonly sql: SqlStorage;
+  private readonly db: Database;
+  private readonly sql: Sql;
   private readonly pitr: Pitr;
   private spaceKeyCache: Uint8Array | undefined;
   /** The time source for holds, retention and tickets. Tests replace it to move through days. */
@@ -308,9 +310,10 @@ export class SpaceDO extends DurableObject<Env> {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    this.db = ctx.storage;
     this.sql = ctx.storage.sql;
     this.pitr = pitrBackend.open(ctx);
-    ctx.storage.transactionSync(() => {
+    this.db.transactionSync(() => {
       migrate(this.sql);
       bootstrapExport(this.sql, this.clock());
     });
@@ -326,7 +329,7 @@ export class SpaceDO extends DurableObject<Env> {
       if (existing !== args.spaceId) throw new Error("this Space DO already holds another space");
       return;
     }
-    this.ctx.storage.transactionSync(() => {
+    this.db.transactionSync(() => {
       setMeta(this.sql, "space_id", args.spaceId);
       setMeta(this.sql, "name", args.name);
       setMeta(this.sql, "format_version", FORMAT_VERSION);
@@ -879,7 +882,7 @@ export class SpaceDO extends DurableObject<Env> {
     const nowMs = this.clock();
     const confirmed = await this.confirmUploads(referenced, commit.receipts, nowMs);
 
-    const done = this.ctx.storage.transactionSync((): { result: CommitResult; record?: CommitRecord; rearm?: boolean } => {
+    const done = this.db.transactionSync((): { result: CommitResult; record?: CommitRecord; rearm?: boolean } => {
       if (this.revoked(session.deviceId)) fail(Error_Code.UNAUTHENTICATED, "device revoked");
       this.checkOpen();
       const again = this.checkCommitOrder(session.deviceId, commit, digest);
@@ -984,12 +987,12 @@ export class SpaceDO extends DurableObject<Env> {
       checked.push(object);
     }
     if (checked.length > 0) {
-      this.ctx.storage.transactionSync(() => {
+      this.db.transactionSync(() => {
         for (const object of checked) {
           this.sql.exec(
             "UPDATE chunks SET hold_until_ms = MAX(hold_until_ms, ?), head_checked = 1 WHERE hash = ? AND state = ? AND incarnation = ?",
             nowMs + HOLD_MS,
-            fromHex(object.hashHex),
+            fromHex(object.hashHex)!,
             ChunkState.PENDING,
             object.incarnation,
           );
@@ -1023,7 +1026,7 @@ export class SpaceDO extends DurableObject<Env> {
     const chunks = [...byHash.values()];
     const nowMs = this.clock();
     const holdUntil = nowMs + HOLD_MS;
-    const actions = this.ctx.storage.transactionSync(() => {
+    const actions = this.db.transactionSync(() => {
       this.checkOpen();
       return chunks.map((chunk): { action: ChunkPlan_Action; incarnation?: string } => {
         const row = this.sql.exec("SELECT size, state, incarnation FROM chunks WHERE hash = ?", chunk.hash).toArray()[0];
@@ -1164,7 +1167,7 @@ export class SpaceDO extends DurableObject<Env> {
   async collectGarbage(nowMs: number): Promise<GcReport> {
     const settings = this.settings();
     const spaceId = this.spaceId;
-    const purge = this.ctx.storage.transactionSync(() => {
+    const purge = this.db.transactionSync(() => {
       const expired = rows<VersionRow>(
         this.sql.exec(
           "SELECT * FROM versions WHERE superseded_at_ms IS NOT NULL AND superseded_at_ms < ? LIMIT ?",
@@ -1206,7 +1209,7 @@ export class SpaceDO extends DurableObject<Env> {
     });
     if (purge.record) await this.broadcast(purge.record);
 
-    const marked = this.ctx.storage.transactionSync(() => {
+    const marked = this.db.transactionSync(() => {
       const hashes = this.sql
         .exec(
           `SELECT hash FROM chunks WHERE refcount = 0 AND hold_until_ms < ?
@@ -1232,11 +1235,11 @@ export class SpaceDO extends DurableObject<Env> {
       });
       const graceStart = nowMs - settings.chunk_grace_days * DAY_MS;
       const rewound = Number(getMeta(this.sql, "rewind_completed_ms") ?? 0) > graceStart;
-      this.ctx.storage.transactionSync(() => {
+      this.db.transactionSync(() => {
         for (const object of listed.objects) {
           const parsed = parseChunkKey(spaceId, object.key);
           if (!parsed || rewound || object.uploaded.getTime() > graceStart) continue;
-          const hash = fromHex(parsed.hashHex);
+          const hash = fromHex(parsed.hashHex)!;
           if (this.sql.exec("SELECT 1 FROM chunks WHERE hash = ? AND incarnation = ?", hash, parsed.incarnation).toArray().length > 0) continue;
           this.sql.exec("INSERT INTO orphans (key, hash, incarnation) VALUES (?, ?, ?) ON CONFLICT DO NOTHING", object.key, hash, parsed.incarnation);
           sweptChunks++;
@@ -1268,7 +1271,7 @@ export class SpaceDO extends DurableObject<Env> {
         if (!retired.ok) throw new Error(`chunk retirement refused: ${retired.message}`);
         await this.env.BUCKET.delete(objects.map((object) => chunkKey(spaceId, object.hashHex, object.incarnation)));
       }
-      this.ctx.storage.transactionSync(() => {
+      this.db.transactionSync(() => {
         for (const { hash } of rows) this.sql.exec("DELETE FROM chunks WHERE hash = ? AND state = 3", hash);
         for (const { key } of orphans) this.sql.exec("DELETE FROM orphans WHERE key = ?", key);
       });
@@ -1329,7 +1332,7 @@ export class SpaceDO extends DurableObject<Env> {
     if (this.sql.exec("SELECT 1 FROM rewind_markers WHERE rewind_id = ? AND attempt = ?", args.rewindId, args.attempt).toArray().length > 0) {
       return { state: "marker" };
     }
-    const receipt = this.ctx.storage.transactionSync((): RewindReceipt => {
+    const receipt = this.db.transactionSync((): RewindReceipt => {
       const stored = getMeta(this.sql, "rewind_receipt");
       const previous = stored === undefined ? undefined : (JSON.parse(String(stored)) as RewindReceipt);
       if (previous?.rewindId === args.rewindId) return previous;
@@ -1347,7 +1350,7 @@ export class SpaceDO extends DurableObject<Env> {
         this.sql.exec(
           "UPDATE chunks SET state = ?, incarnation = NULL, head_checked = 0 WHERE hash = ? AND incarnation = ?",
           ChunkState.PENDING,
-          fromHex(hashHex),
+          fromHex(hashHex)!,
           incarnation,
         );
       }
@@ -1415,7 +1418,7 @@ export class SpaceDO extends DurableObject<Env> {
 
   /** Runs the R2 export now, or joins the run already in progress. */
   private runExport(): Promise<void> {
-    this.exporting ??= new Exporter(this.ctx.storage, this.env.BUCKET, this.snapshotPageNodes).run(this.clock()).finally(() => {
+    this.exporting ??= new Exporter(this.db, this.env.BUCKET, this.snapshotPageNodes).run(this.clock()).finally(() => {
       this.exporting = undefined;
     });
     return this.exporting;
