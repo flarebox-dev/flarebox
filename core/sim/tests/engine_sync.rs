@@ -907,7 +907,8 @@ fn run_cut(
 /// [`run_cut`] with changes to the ignore rules: the first of `rulings` is made before the offline
 /// local changes, and one more before each of the `during` changes. At the end a node the device
 /// excludes, or cannot place because of an excluded one ([`waits_on_excluded`]), must have R equal
-/// to the server's node, and every other node L = S = R.
+/// to the server's node, and every other node L = S = R. Every write must be on the server or on
+/// the local copy of such a node, which keeps it unsent.
 #[allow(clippy::too_many_arguments)]
 fn run_ignoring(
     seed: &[Action],
@@ -1352,7 +1353,7 @@ fn run_ignoring(
         );
     }
     let unsent = (device.trees.local().iter())
-        .filter(|(id, _)| device.trees.ignored(id))
+        .filter(|(id, _)| device.trees.ignored(id) || waiting.contains(*id))
         .map(|(_, node)| node.shape.content.clone());
     let kept = written(
         server
