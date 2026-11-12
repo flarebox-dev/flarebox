@@ -82,7 +82,7 @@ struct Search {
     pending: HashMap<Key, u64>,
     decided: HashMap<Key, Option<PathBuf>>,
     held: BTreeMap<PathBuf, Entry>,
-    scanned: bool,
+    scanned: Vec<PathBuf>,
 }
 
 impl Search {
@@ -118,9 +118,9 @@ impl Rules {
     }
 
     /// The same rules with a search that looks at `budget` left-out entries
-    /// per rescan.
+    /// per rescan, and at least one.
     pub fn with_search_budget(mut self, budget: usize) -> Self {
-        self.budget = budget;
+        self.budget = budget.max(1);
         self
     }
 
@@ -426,11 +426,23 @@ impl<'r> Pending<'r> {
             .collect()
     }
 
-    pub(crate) fn take_held(&mut self, scopes: &[PathBuf]) -> BTreeMap<PathBuf, Entry> {
+    pub(crate) fn held_in(&self, scopes: &[PathBuf]) -> BTreeMap<PathBuf, Entry> {
+        (self.rules.search.held.iter())
+            .filter(|(path, _)| scopes.iter().any(|scope| path.starts_with(scope)))
+            .map(|(path, entry)| (path.clone(), *entry))
+            .collect()
+    }
+
+    pub(crate) fn take_held(
+        &mut self,
+        scopes: &[PathBuf],
+        stays: &[PathBuf],
+    ) -> BTreeMap<PathBuf, Entry> {
         let held = &mut self.rules.search.held;
-        let (taken, kept) = std::mem::take(held)
-            .into_iter()
-            .partition(|(path, _)| scopes.iter().any(|scope| path.starts_with(scope)));
+        let (taken, kept) = std::mem::take(held).into_iter().partition(|(path, _)| {
+            scopes.iter().any(|scope| path.starts_with(scope))
+                && !stays.iter().any(|kept| path.starts_with(kept))
+        });
         *held = kept;
         taken
     }
@@ -445,8 +457,12 @@ impl<'r> Pending<'r> {
         self.rules.search.held.keys()
     }
 
-    pub(crate) fn first_scan(&mut self) -> bool {
-        !std::mem::replace(&mut self.rules.search.scanned, true)
+    pub(crate) fn cover(&mut self, scopes: &[PathBuf]) -> Vec<PathBuf> {
+        let scanned = &mut self.rules.search.scanned;
+        let earlier = scanned.clone();
+        scanned.extend(scopes.iter().cloned());
+        *scanned = crate::outermost(std::mem::take(scanned));
+        earlier
     }
 
     /// Drops the rules of every folder for which `is_folder` is false, and

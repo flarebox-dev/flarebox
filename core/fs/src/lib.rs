@@ -586,9 +586,11 @@ impl Snapshot {
     /// the search has decided it, or as a rename when that rescan finds its
     /// identity at an included path. An entry that takes its path makes the
     /// search run to its end, so the removal is reported first. The first
-    /// rescan with new `rules` also runs the search to its end for each entry
-    /// whose path now holds another identity, so a removal another watcher
-    /// held is not read as a replacement.
+    /// rescan of a path with new `rules` also runs the search to its end for
+    /// each entry there whose path now holds another identity, so a removal
+    /// another watcher held is not read as a replacement. A held entry whose
+    /// removal the scan cannot confirm, as below a folder it cannot read,
+    /// stays held.
     ///
     /// On any error `rules` are unchanged too.
     pub fn rescan_with_rules(
@@ -815,13 +817,35 @@ impl Snapshot {
             &mut scan.new,
             &mut *scan.cut,
         )?;
+        let stays = match &scan.rules {
+            Some(rules) => {
+                let held = rules.held_in(&scan.replaced);
+                let mut there: BTreeMap<PathBuf, Entry> = (held.keys())
+                    .filter_map(|path| Some((path.clone(), *scan.new.get(path)?)))
+                    .collect();
+                keep_unconfirmed(
+                    root,
+                    &root_stat.id,
+                    again.as_fd(),
+                    &held,
+                    &mut there,
+                    &mut *scan.cut,
+                )?
+            }
+            None => Vec::new(),
+        };
         let mut changes = diff(&old, &scan.new);
         if let Some(rules) = &mut scan.rules {
             rules.settle();
+            let held = rules.take_held(&scan.replaced, &stays);
             find_ignored(
                 &mut changes,
-                &old,
-                &scan.new,
+                Trees {
+                    old: &old,
+                    new: &scan.new,
+                    rest: &self.entries,
+                },
+                held,
                 rules,
                 &scan.replaced,
                 again.as_fd(),
@@ -1159,6 +1183,13 @@ fn take_left_out(
     left_out
 }
 
+#[derive(Clone, Copy)]
+struct Trees<'a> {
+    old: &'a BTreeMap<PathBuf, Entry>,
+    new: &'a BTreeMap<PathBuf, Entry>,
+    rest: &'a BTreeMap<PathBuf, Entry>,
+}
+
 /// Turns each removal whose entry now sits at or below an entry the rules
 /// leave out into [`Change::Ignored`] (design §5.10). A folder is looked for
 /// by its own identity, and so is each entry it held. Such an entry found
@@ -1173,13 +1204,13 @@ fn take_left_out(
 /// a save by rename takes a path the same way and leaves no old file to find.
 fn find_ignored(
     changes: &mut Vec<Change>,
-    old: &BTreeMap<PathBuf, Entry>,
-    new: &BTreeMap<PathBuf, Entry>,
+    trees: Trees<'_>,
+    held: BTreeMap<PathBuf, Entry>,
     rules: &mut Pending<'_>,
     scopes: &[PathBuf],
     root: BorrowedFd<'_>,
 ) {
-    let held = rules.take_held(scopes);
+    let Trees { old, new, rest } = trees;
     let roots = outermost(held.keys().cloned().collect());
     let merged: BTreeMap<PathBuf, Entry>;
     let old = if held.is_empty() {
@@ -1203,7 +1234,7 @@ fn find_ignored(
         *changes = diff(&merged, new);
         &merged
     };
-    hold_back(changes, old, new, rules, root);
+    hold_back(changes, Trees { old, new, rest }, rules, scopes, root);
     for change in changes.iter_mut() {
         match change {
             Change::Removed { path, .. }
@@ -1225,12 +1256,13 @@ fn unaside(path: &Path) -> PathBuf {
 
 fn hold_back(
     changes: &mut Vec<Change>,
-    old: &BTreeMap<PathBuf, Entry>,
-    new: &BTreeMap<PathBuf, Entry>,
+    trees: Trees<'_>,
     rules: &mut Pending<'_>,
+    scopes: &[PathBuf],
     root: BorrowedFd<'_>,
 ) {
-    let first = rules.first_scan();
+    let Trees { old, new, rest } = trees;
+    let earlier = rules.cover(scopes);
     let replaced: BTreeSet<PathBuf> = (changes.iter())
         .filter_map(|change| match change {
             Change::Modified { path }
@@ -1277,7 +1309,18 @@ fn hold_back(
         .filter(|path| !removed.contains(*path) && !carried(path))
         .collect();
     let key = |path: &Path| (old[path].id, old[path].kind);
-    let present: HashSet<Key> = new.values().map(|entry| (entry.id, entry.kind)).collect();
+    let asked: HashSet<Key> = removed
+        .iter()
+        .chain(&replaced)
+        .map(|path| key(path))
+        .collect();
+    let outside = (rest.iter())
+        .filter(|(path, _)| !scopes.iter().any(|scope| path.starts_with(scope)))
+        .map(|(_, entry)| entry);
+    let present: HashSet<Key> = (new.values().chain(outside))
+        .map(|entry| (entry.id, entry.kind))
+        .filter(|key| asked.contains(key))
+        .collect();
     let gone: Vec<&PathBuf> = (removed.iter())
         .filter(|path| !present.contains(&key(path)))
         .chain(held.iter().copied())
@@ -1289,7 +1332,9 @@ fn hold_back(
         .map(|path| key(path))
         .collect();
     let seeded: Vec<&PathBuf> = (replaced.iter())
-        .filter(|path| first && !present.contains(&key(path)))
+        .filter(|path| {
+            !earlier.iter().any(|scope| path.starts_with(scope)) && !present.contains(&key(path))
+        })
         .collect();
     wanted.extend(seeded.iter().map(|path| (key(path), None)));
     let undecided = rules.search(root, &mut wanted, &fresh, seeded.is_empty());
