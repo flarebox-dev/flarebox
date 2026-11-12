@@ -91,6 +91,10 @@ pub enum DriverError {
         "the folder is linked by device {device_id} of {server}; unlink it there first, or remove its .koidrive/device.json"
     )]
     FolderOfOtherDevice { device_id: String, server: String },
+    #[error(
+        "the folder was linked by device {device_id} of {server}, not by this profile's device; unlink it and link it again"
+    )]
+    LinkedByOtherDevice { device_id: String, server: String },
     #[error("the space is already linked to {} on this device", koidrive_fs::quoted(.0))]
     SpaceAlreadyLinked(PathBuf),
     #[error(
@@ -660,13 +664,15 @@ impl Driver {
         }
         let here = (self.inner.folders.lock().unwrap().values())
             .find(|linked| linked.link.root == root)
-            .map(|linked| {
-                (
-                    linked.link.space_id.clone(),
-                    linked.status.lock().unwrap().clone(),
-                )
-            });
-        if let Some((space_id, status)) = here {
+            .map(|linked| (linked.link.clone(), linked.status.lock().unwrap().clone()));
+        if let Some((link, status)) = here {
+            if link.device_id != credential.device_id || link.server_url != credential.server {
+                return Err(DriverError::LinkedByOtherDevice {
+                    device_id: link.device_id,
+                    server: link.server_url,
+                });
+            }
+            let space_id = link.space_id;
             let same = space == space_id || {
                 let auth = self.auth(&credential)?;
                 resolve_space(auth.api().list_spaces(&auth).await?.spaces, space)?.space_id
@@ -3674,6 +3680,16 @@ mod tests {
         });
         let (server, served) =
             serve_recorded(vec![(200, token), (200, spaces.clone()), (200, spaces)]).await;
+        Store::open(paths.store(SPACE).unwrap())
+            .unwrap()
+            .transaction(|tx| {
+                let link = tx.link()?.unwrap();
+                tx.set_link(&Link {
+                    server_url: server.clone(),
+                    ..link
+                })
+            })
+            .unwrap();
         Credential {
             server,
             ..credential("d1")
@@ -3701,6 +3717,19 @@ mod tests {
             .map(|(path, _)| path)
             .collect();
         assert_eq!(paths, ["/v1/token", "/v1/spaces", "/v1/spaces"]);
+    }
+
+    #[tokio::test]
+    async fn linking_a_folder_another_device_linked_is_refused_and_changes_nothing() {
+        let (_dir, paths, root) = profile(&[]);
+        credential("d2").save_new(&paths.credential()).unwrap();
+        let driver = Driver::open(paths).unwrap();
+        let before = driver.status().folders;
+        assert!(matches!(
+            driver.link(&root, SPACE).await,
+            Err(DriverError::LinkedByOtherDevice { device_id, .. }) if device_id == "d1"
+        ));
+        assert_eq!(driver.status().folders, before);
     }
 
     #[tokio::test]

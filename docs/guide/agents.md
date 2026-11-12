@@ -68,7 +68,7 @@ A command can time out before you see its result. Run it again: the commands bel
 
 These commands set a state, so running one again when the state already holds returns `unchanged` with exit status 0:
 
-- `koi folder link <folder> --space <space>` when the folder is already linked to that space. Linking it to another space fails and changes nothing.
+- `koi folder link <folder> --space <space>` when the folder is already linked to that space. Linking it to another space fails and changes nothing. With a space name rather than an ID, the command reads the server's space list, so it fails while the server can't be reached.
 - `koi folder unlink <folder>` when the folder isn't linked. `data` then has only `path`.
 - `koi device revoke <id>` when the device is already revoked.
 - `koi space create <name>` when a space has that name. It prints that space's ID, as for a new space.
@@ -76,7 +76,7 @@ These commands set a state, so running one again when the state already holds re
 
 These commands make a new change each time they run: `koi history restore`, `koi device invite`, `koi folder restart` and `koi folder retry`. Give them `--request-id <id>` on the first attempt. The ID is 1 to 128 ASCII letters, digits, `-` and `_`, and you pick it. Running the command again with the same ID and arguments returns the first outcome, with the same `data` and the same stdout, and changes nothing. This holds after the daemon or the machine restarts.
 
-- The same ID with other arguments fails with `stale_decision` (exit 7) and no next command. Repeat the first call as it was, or pick a new ID.
+- The same ID with other arguments fails with `stale_decision` (exit 7) and no next command. Repeat the first call as it was, or pick a new ID. An ID for `koi device invite` also belongs to the device and server that ran it.
 - A pairing code expires after about 10 minutes. After that, `koi device invite` with its ID fails with `stale_decision`. Run it with a new ID.
 - A command whose change is known to have failed records nothing, so running it again with its ID tries again.
 - If the first run stopped before it recorded its outcome, still runs, or couldn't tell whether its change happened (for example, the server didn't answer), the command fails with `interrupted` (exit 130). Read the state with `koi status --json` or `koi history requests`. To make the change, use a new ID.

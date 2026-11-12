@@ -14,8 +14,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use koidrive_driver::{
-    Account, Answer, Answered, Credential, Driver, DriverError, FolderStatus, Linked, Paths,
-    Question, RestoreRequest, RestoreStatus, Status,
+    Account, Answer, Answered, Credential, Driver, DriverError, FolderState, FolderStatus, Linked,
+    Paths, Question, RestoreRequest, RestoreStatus, Status,
 };
 use koidrive_engine::commit::Lift;
 use rustix::io::Errno;
@@ -81,10 +81,14 @@ pub enum Request {
         question_id: String,
         answer: Answer,
     },
-    /// Records a restore in the folder of `space_id`, for its engine to send.
+    /// Records a restore in the folder of `space_id`, for its engine to send. `folder` and `path`, the folder's root and
+    /// the path in it, come back in the response, so that the record of a request ID can report the restore again
+    /// when the folder is no longer linked.
     Restore {
         space_id: String,
         restore: RestoreRequest,
+        folder: String,
+        path: String,
     },
     Restores {
         space_id: String,
@@ -152,6 +156,8 @@ pub enum Response {
     AlreadyAnswered,
     Restore {
         id: String,
+        folder: String,
+        path: String,
     },
     Restores {
         restores: Vec<RestoreStatus>,
@@ -180,9 +186,10 @@ impl Response {
     }
 }
 
-/// Runs `request` unless an earlier run of `request_id` recorded its response, and records the response. An error
-/// removes the record instead: the driver fails before its change or rolls it back, and a restart before a lift that
-/// failed is safe to repeat. A run cancelled midway leaves the record without an outcome. The record is written in the
+/// Runs `request` unless an earlier run of `request_id` recorded its response, and records the response. A response
+/// the CLI reports as a failure removes the record instead, so the next run with the ID tries again: an error, where the
+/// driver fails before its change or rolls it back, and a restart or lift that left the folder halted, which is safe
+/// to repeat once the cause is fixed. A run cancelled midway leaves the record without an outcome. The record is written in the
 /// process that runs the driver, so a client that stops waiting does not keep the outcome from being recorded.
 async fn once(driver: &Driver, request_id: RequestId, key: Key, request: Request) -> Response {
     let claim = match request::begin(driver.paths(), &request_id, &key) {
@@ -197,7 +204,12 @@ async fn once(driver: &Driver, request_id: RequestId, key: Key, request: Request
         Err(error) => return Response::failed(error),
     };
     let response = Box::pin(handle(driver, request)).await;
-    if matches!(response, Response::Error { .. }) {
+    let failed = match &response {
+        Response::Error { .. } => true,
+        Response::Restarted { folder } => folder.state == FolderState::Halted,
+        _ => false,
+    };
+    if failed {
         claim.abandon();
     } else if let Err(error) = claim.finish(&response) {
         tracing::warn!(%request_id, error = error.message, "could not record the outcome of a request");
@@ -272,9 +284,14 @@ pub async fn handle(driver: &Driver, request: Request) -> Response {
                 Answered::Now => Response::Answered,
                 Answered::Already => Response::AlreadyAnswered,
             }),
-        Request::Restore { space_id, restore } => driver
+        Request::Restore {
+            space_id,
+            restore,
+            folder,
+            path,
+        } => driver
             .restore(&space_id, restore)
-            .map(|id| Response::Restore { id }),
+            .map(|id| Response::Restore { id, folder, path }),
         Request::Restores { space_id } => driver
             .restores(&space_id)
             .map(|restores| Response::Restores { restores }),
@@ -923,11 +940,13 @@ mod tests {
                 node_id: "n1".into(),
                 version_id: "v1".into(),
             },
+            folder: "/home/ada/Docs".into(),
+            path: "a.txt".into(),
         };
         let json = serde_json::to_string(&request).unwrap();
         assert_eq!(
             json,
-            r#"{"request":"restore","space_id":"s1","restore":{"type":"version","node_id":"n1","version_id":"v1"}}"#
+            r#"{"request":"restore","space_id":"s1","restore":{"type":"version","node_id":"n1","version_id":"v1"},"folder":"/home/ada/Docs","path":"a.txt"}"#
         );
         assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
     }
@@ -1179,6 +1198,32 @@ mod tests {
         };
         assert_eq!(code, Code::StaleDecision);
         assert_eq!(next, [Next::of(&["koi", "resolve", "--json"])]);
+    }
+
+    #[tokio::test]
+    async fn a_restart_that_leaves_the_folder_halted_records_nothing_so_its_id_runs_again() {
+        let (_dir, paths, root) = linked_profile();
+        let driver = Driver::open(paths.clone()).unwrap();
+        driver.start();
+        let request_id = RequestId::parse("r1").unwrap();
+        let restart = || {
+            let key = Key::new(
+                "folder restart",
+                serde_json::json!({ "folder": root.display().to_string() }),
+            );
+            Request::Restart {
+                folder: root.clone(),
+            }
+            .once(Some(request_id.clone()), key)
+        };
+        for _ in 0..2 {
+            let Response::Restarted { folder } = handle(&driver, restart()).await else {
+                panic!("the restart failed");
+            };
+            assert_eq!(folder.state, FolderState::Halted, "{folder:?}");
+            assert!(!crate::request::request_file(&paths, &request_id).exists());
+        }
+        driver.stop().await;
     }
 
     #[tokio::test]

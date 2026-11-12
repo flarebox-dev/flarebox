@@ -235,6 +235,7 @@ impl From<DriverError> for CliError {
             | DriverError::FolderHoldsProfile(_)
             | DriverError::FolderOverlaps(_)
             | DriverError::FolderOfOtherDevice { .. }
+            | DriverError::LinkedByOtherDevice { .. }
             | DriverError::SpaceAlreadyLinked(_)
             | DriverError::MarkerOfOtherSpace(_)
             | DriverError::UnsupportedFileSystem
@@ -369,6 +370,10 @@ mod tests {
             DriverError::FolderHoldsProfile(PathBuf::from("/home/ada/.local/state/koidrive")),
             DriverError::FolderOfOtherDevice {
                 device_id: "d2".into(),
+                server: "https://files.example.com".into(),
+            },
+            DriverError::LinkedByOtherDevice {
+                device_id: "d1".into(),
                 server: "https://files.example.com".into(),
             },
             DriverError::SpaceAlreadyLinked(PathBuf::from("/home/ada/Docs")),

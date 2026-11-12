@@ -148,8 +148,9 @@ async fn versions(paths: &Paths, file: &Path) -> Result<Done, CliError> {
 /// `koi history restore <path>`: asks the folder's engine to bring the deletion at `path` back from the trash, or, with
 /// `version`, to make that version of the live file at `path` current again. `node` picks one of several deletions
 /// that had the path. The request is checked against the server's listings first, so a typo fails here and not after
-/// the next commit. With `request_id`, a restore already asked for under that ID is reported again without reading the
-/// server, since the deletion it brought back may have left the trash.
+/// the next commit. With `request_id`, a restore already asked for under that ID is reported again. When a check fails,
+/// the record of the ID is read before the error is reported: the deletion the restore brought back may have left the
+/// trash since, or its folder been unlinked, and another run with the ID may have asked for it meanwhile.
 async fn restore(
     paths: &Paths,
     path: &Path,
@@ -165,15 +166,46 @@ async fn restore(
             "node": node,
         }),
     );
-    if let Some(id) = &request_id
-        && let Some(recorded) = request::recorded(paths, id, &key)?
-    {
-        let (linked, below) = locate(paths, path).await?;
-        return match serde_json::from_value(recorded) {
-            Ok(Response::Restore { id }) => Ok(asked(&linked, &below, id)),
-            _ => Err(format!("the record of the request {id} is not a restore").into()),
-        };
+    let (linked, below, restore) = match checked(paths, path, version, node).await {
+        Ok(checked) => checked,
+        Err(error) => {
+            let Some(id) = &request_id else {
+                return Err(error);
+            };
+            return match request::recorded(paths, id, &key)? {
+                None => Err(error),
+                Some(recorded) => match serde_json::from_value(recorded) {
+                    Ok(Response::Restore { id, folder, path }) => {
+                        Ok(asked(&folder, &path, id, None))
+                    }
+                    _ => Err(format!("the record of the request {id} is not a restore").into()),
+                },
+            };
+        }
+    };
+    let request = Request::Restore {
+        space_id: linked.space_id.clone(),
+        restore,
+        folder: linked.path.clone(),
+        path: below.join("/"),
+    };
+    match ipc::run(paths, request.once(request_id, key)).await? {
+        Response::Restore { id, folder, path } => {
+            let state = (folder == linked.path).then_some(linked.state);
+            Ok(asked(&folder, &path, id, state))
+        }
+        other => Err(unexpected(other)),
     }
+}
+
+/// The folder `path` is in, the names below its root, and the restore to ask for, once the server's listings show that
+/// the restore can be made.
+async fn checked(
+    paths: &Paths,
+    path: &Path,
+    version: Option<String>,
+    node: Option<String>,
+) -> Result<(FolderStatus, Vec<String>, RestoreRequest), CliError> {
     let (linked, below) = locate(paths, path).await?;
     if below.is_empty() {
         return Err(CliError::usage(format!(
@@ -230,39 +262,35 @@ async fn restore(
             }
         }
     };
-    let request = Request::Restore {
-        space_id: linked.space_id.clone(),
-        restore: request,
-    };
-    match ipc::run(paths, request.once(request_id, key)).await? {
-        Response::Restore { id } => Ok(asked(&linked, &below, id)),
-        other => Err(unexpected(other)),
-    }
+    Ok((linked, below, request))
 }
 
-/// What `koi history restore` reports for the restore `id` of `below` in `linked`.
-fn asked(linked: &FolderStatus, below: &[String], id: String) -> Done {
-    let shown = printable(&below.join("/"));
+/// What `koi history restore` reports for the restore `id` of `path` in `folder`. `state` is the folder's state as this run
+/// found it, and none when the run reports a restore an earlier run asked for without finding the folder.
+fn asked(folder: &str, path: &str, id: String, state: Option<FolderState>) -> Done {
+    let shown = printable(path);
     let mut note = format!("Asked to restore {shown} (restore {}).\n", printable(&id));
-    if linked.state == FolderState::Stopped {
-        note.push_str("The folder sends it once the daemon runs; koi status shows why it doesn't. koi history requests shows how it went.\n");
-    } else {
-        note.push_str(&format!(
+    note.push_str(&match state {
+        Some(FolderState::Stopped) => {
+            "The folder sends it once the daemon runs; koi status shows why it doesn't. koi history requests shows how it went.\n".to_owned()
+        }
+        Some(_) => format!(
             "The folder sends it with its next commit. koi history requests {} shows how it went.\n",
-            printable(&linked.path)
-        ));
-    }
+            printable(folder)
+        ),
+        None => format!("koi history requests {} shows how it went.\n", printable(folder)),
+    });
     let value = printable(&id);
     let data = RestoreAskedData {
         request_id: id,
-        folder: linked.path.clone(),
-        path: below.join("/"),
+        folder: folder.to_owned(),
+        path: path.to_owned(),
     };
     let done = Done {
         outcome: Outcome::Accepted,
         ..Done::value(data, &value, note)
     };
-    done.then(&["koi", "history", "requests", &linked.path])
+    done.then(&["koi", "history", "requests", folder])
 }
 
 /// `koi history requests [folder]`: the restores asked for in the folder's space, those that ended first.

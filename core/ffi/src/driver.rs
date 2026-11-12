@@ -840,7 +840,8 @@ fn driver_error(error: DriverError) -> SessionError {
             }
         }
         DriverError::FolderInUse(_) => SessionError::FolderInUse,
-        DriverError::FolderOfOtherDevice { device_id, .. } => {
+        DriverError::FolderOfOtherDevice { device_id, .. }
+        | DriverError::LinkedByOtherDevice { device_id, .. } => {
             SessionError::FolderOfOtherDevice { device_id }
         }
         DriverError::SpaceAlreadyLinked(_) => SessionError::SpaceAlreadyLinked,

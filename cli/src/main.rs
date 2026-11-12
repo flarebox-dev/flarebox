@@ -1093,7 +1093,14 @@ async fn device(paths: Paths, action: DeviceAction) -> Result<Done, CliError> {
             let claim = match request.request_id {
                 None => None,
                 Some(id) => {
-                    match request::begin(&paths, &id, &Key::new("device invite", Value::Null))? {
+                    let key = Key::new(
+                        "device invite",
+                        serde_json::json!({
+                            "server": auth.api().base().to_string(),
+                            "device_id": auth.credentials().device_id,
+                        }),
+                    );
+                    match request::begin(&paths, &id, &key)? {
                         Begun::Done(recorded) => {
                             let invitation = serde_json::from_value(recorded).map_err(|error| {
                                 format!("the record of the request {id} cannot be read: {error}")
@@ -1156,15 +1163,20 @@ fn refused(error: &ApiError) -> bool {
     }
 }
 
-/// Every device of the account, page by page.
+/// Every device of the account, page by page. A page that repeats an earlier cursor ends the listing as undecodable, as
+/// in `Api::list_spaces`.
 async fn devices(auth: &Auth) -> Result<Vec<DeviceInfo>, CliError> {
     let mut devices = Vec::new();
     let mut cursor = String::new();
+    let mut seen = std::collections::HashSet::new();
     loop {
         let page = auth.api().list_devices(auth, &cursor).await?;
         devices.extend(page.devices);
         if page.next_cursor.is_empty() {
             return Ok(devices);
+        }
+        if !seen.insert(page.next_cursor.clone()) {
+            return Err(ApiError::Decode("DeviceList").into());
         }
         cursor = page.next_cursor;
     }
@@ -1209,8 +1221,8 @@ fn replayed(id: &RequestId, invitation: &Invitation, now_ms: i64) -> Result<Done
     invited(invitation, now_ms)
 }
 
-/// Runs a space command. Creating a name another space has returns that space, since koi folder link names a space by
-/// its name and the server keeps names unique.
+/// Runs a space command. Creating a name another space has returns that space, also when another run creates it at the
+/// same time, since koi folder link names a space by its name and the server keeps names unique.
 async fn space(paths: Paths, action: SpaceAction) -> Result<Done, CliError> {
     let auth = signed_in(&paths)?;
     let spaces = auth.api().list_spaces(&auth).await?.spaces;
@@ -1227,23 +1239,31 @@ async fn space(paths: Paths, action: SpaceAction) -> Result<Done, CliError> {
             if name.is_empty() {
                 return Err(CliError::usage("a space needs a name"));
             }
-            if let Some(existing) = spaces.iter().find(|space| space.name == name) {
+            let existing = |spaces: &[SpaceInfo]| {
+                let existing = spaces.iter().find(|space| space.name == name)?;
                 let id = printable(&existing.space_id);
                 let note = format!(
                     "The space {} ({id}) already exists.\nLink a folder to it with koi folder link <folder> --space {id}.\n",
                     printable(&existing.name),
                 );
-                return Ok(Done::value(SpaceData::of(existing), &id, note).unchanged());
+                Some(Done::value(SpaceData::of(existing), &id, note).unchanged())
+            };
+            if let Some(done) = existing(&spaces) {
+                return Ok(done);
             }
-            let created = auth
-                .api()
-                .create_space(
-                    &auth,
-                    &CreateSpaceRequest {
-                        name: name.to_owned(),
-                    },
-                )
-                .await?;
+            let request = CreateSpaceRequest {
+                name: name.to_owned(),
+            };
+            let created = match auth.api().create_space(&auth, &request).await {
+                Ok(created) => created,
+                Err(error) => {
+                    let now = auth.api().list_spaces(&auth).await.map(|list| list.spaces);
+                    return match now.ok().as_deref().and_then(existing) {
+                        Some(done) => Ok(done),
+                        None => Err(error.into()),
+                    };
+                }
+            };
             let id = printable(&created.space_id);
             let note = format!(
                 "Created the space {} ({id}).\nLink a folder to it with koi folder link <folder> --space {id}.\n",
@@ -1877,6 +1897,155 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Option<Command>, clap::Error> {
         Cli::try_parse_from(args).map(|cli| cli.command)
+    }
+
+    /// Answers one request per entry of `replies`, a status and a body, on a loopback port, in order, and returns the
+    /// server's URL and, once all are answered, the path of each request.
+    async fn serve(replies: Vec<(u16, Vec<u8>)>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = format!("http://{}/", listener.local_addr().unwrap());
+        let served = tokio::spawn(async move {
+            let mut paths = Vec::new();
+            for (status, body) in replies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                let read = socket.read(&mut request).await.unwrap();
+                let line = String::from_utf8_lossy(&request[..read])
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_owned();
+                paths.push(line.split(' ').nth(1).unwrap().to_owned());
+                let head = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/x-protobuf\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(head.as_bytes()).await.unwrap();
+                socket.write_all(&body).await.unwrap();
+            }
+            paths
+        });
+        (server, served)
+    }
+
+    fn token() -> (u16, Vec<u8>) {
+        let token = koidrive_proto::v1::AccessToken {
+            token: "token".into(),
+            expires_at_ms: i64::MAX,
+            ..Default::default()
+        };
+        (200, prost::Message::encode_to_vec(&token))
+    }
+
+    /// Saves a credential of `device_id` for `server` in `paths`, in place of any other.
+    fn signed_in_as(paths: &Paths, server: &str, device_id: &str) {
+        let _ = std::fs::remove_file(paths.credential());
+        Credential {
+            server: server.into(),
+            user_id: "u1".into(),
+            user_name: None,
+            device_id: device_id.into(),
+            device_name: "vm".into(),
+            refresh_credential: "secret".into(),
+        }
+        .save_new(&paths.credential())
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_device_list_stops_at_a_cursor_it_has_seen() {
+        let page = |cursor: &str| {
+            let page = koidrive_proto::v1::DeviceList {
+                devices: vec![DeviceInfo {
+                    device_id: cursor.into(),
+                    ..Default::default()
+                }],
+                next_cursor: cursor.into(),
+            };
+            (200, prost::Message::encode_to_vec(&page))
+        };
+        let (server, served) = serve(vec![token(), page("a"), page("b"), page("a")]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        signed_in_as(&paths, &server, "d1");
+        let auth = signed_in(&paths).unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), devices(&auth))
+            .await
+            .expect("the listing ended");
+        assert_eq!(outcome.unwrap_err().code, Code::Failed);
+        assert_eq!(served.await.unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_space_another_run_created_first_is_unchanged() {
+        let list = |spaces: Vec<SpaceInfo>| {
+            let list = koidrive_proto::v1::SpaceList {
+                spaces,
+                ..Default::default()
+            };
+            (200, prost::Message::encode_to_vec(&list))
+        };
+        let taken = koidrive_proto::v1::Error {
+            code: koidrive_proto::v1::error::Code::InvalidArgument as i32,
+            message: "you already have a space with this name".into(),
+            ..Default::default()
+        };
+        let notes = SpaceInfo {
+            space_id: ID.into(),
+            name: "Notes".into(),
+            ..Default::default()
+        };
+        let (server, served) = serve(vec![
+            token(),
+            list(Vec::new()),
+            (400, prost::Message::encode_to_vec(&taken)),
+            list(vec![notes]),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        signed_in_as(&paths, &server, "d1");
+        let create = SpaceAction::Create {
+            name: "Notes".into(),
+        };
+        let done = space(paths, create).await.unwrap();
+        assert_eq!(done.outcome, crate::report::Outcome::Unchanged);
+        assert_eq!(done.text, format!("{ID}\n"));
+        assert_eq!(
+            served.await.unwrap(),
+            ["/v1/token", "/v1/spaces", "/v1/spaces", "/v1/spaces"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replayed_invitation_belongs_to_the_device_that_asked_for_it() {
+        let started = koidrive_proto::v1::PairStartResponse {
+            code: "K7QM-2XPD".into(),
+            expires_at_ms: i64::MAX,
+        };
+        let started = (200, prost::Message::encode_to_vec(&started));
+        let (server, served) = serve(vec![token(), started]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let invite = || {
+            device(
+                paths.clone(),
+                DeviceAction::Invite {
+                    request: RequestArg {
+                        request_id: Some(RequestId::parse("r1").unwrap()),
+                    },
+                },
+            )
+        };
+        signed_in_as(&paths, &server, "d1");
+        let first = invite().await.unwrap();
+        assert_eq!(invite().await.unwrap().text, first.text);
+        signed_in_as(&paths, &server, "d2");
+        let other = invite().await.unwrap_err();
+        assert_eq!(other.code, Code::StaleDecision, "{other:?}");
+        assert_eq!(served.await.unwrap(), ["/v1/token", "/v1/pair/start"]);
     }
 
     #[test]

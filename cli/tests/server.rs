@@ -1285,6 +1285,10 @@ async fn restore_brings_back_a_deleted_file_and_an_earlier_version() {
     assert_eq!(stale.status.code(), Some(7), "{stale:?}");
     let stale = String::from_utf8(stale.stderr).unwrap();
     assert!(stale.contains("stale request"), "{stale}");
+    machine.run(&["folder", "unlink", folder_arg]);
+    let unlinked = machine.envelope(&restore_gone);
+    assert_eq!(unlinked["outcome"], "accepted", "{unlinked:#}");
+    assert_eq!(unlinked["data"], replayed["data"], "{unlinked:#}");
     assert!(stop(daemon).success());
 }
 
@@ -1398,14 +1402,17 @@ async fn two_creates_of_one_name_at_once_make_one_space() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy = format!("http://{}/", listener.local_addr().unwrap());
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let listings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let upstream = server_url();
     let service = tokio::spawn(async move {
         while let Ok((tcp, _)) = listener.accept().await {
             let barrier = barrier.clone();
+            let listings = listings.clone();
             let upstream = upstream.clone();
             tokio::spawn(async move {
                 let handler = service_fn(move |request: Request<Incoming>| {
                     let barrier = barrier.clone();
+                    let listings = listings.clone();
                     let upstream = upstream.clone();
                     async move {
                         let (parts, body) = request.into_parts();
@@ -1427,7 +1434,8 @@ async fn two_creates_of_one_name_at_once_make_one_space() {
                         let response = call.send().await.unwrap();
                         let status = response.status();
                         let body = response.bytes().await.unwrap();
-                        if listing {
+                        if listing && listings.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2
+                        {
                             barrier.wait().await;
                         }
                         Ok::<_, std::convert::Infallible>(
@@ -1477,27 +1485,33 @@ async fn two_creates_of_one_name_at_once_make_one_space() {
     fs::create_dir(&root).unwrap();
     credential["server"] = server_url().to_string().into();
     fs::write(&path, serde_json::to_vec(&credential).unwrap()).unwrap();
-    let created = outcomes
-        .iter()
-        .filter(|result| result.status.success())
-        .count();
-    let refused: Vec<String> = outcomes
-        .iter()
-        .filter(|result| !result.status.success())
-        .map(|result| String::from_utf8_lossy(&result.stderr).into_owned())
-        .collect();
-    assert_eq!((created, refused.len()), (1, 1), "{outcomes:?}");
-    assert!(
-        refused[0].contains("already have a space with this name"),
-        "{}",
-        refused[0]
-    );
     assert_eq!(count, 1, "both creates of one name made a space");
     let space_id = &spaces
         .iter()
         .find(|space| space.name == name)
         .unwrap()
         .space_id;
+    for outcome in &outcomes {
+        assert!(outcome.status.success(), "{outcome:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&outcome.stdout),
+            format!(
+                "{space_id}
+"
+            )
+        );
+    }
+    let notes: Vec<String> = (outcomes.iter())
+        .map(|outcome| String::from_utf8_lossy(&outcome.stderr).into_owned())
+        .collect();
+    assert_eq!(
+        notes
+            .iter()
+            .filter(|note| note.starts_with("Created the space"))
+            .count(),
+        1,
+        "{notes:?}"
+    );
     let linked = machine.run(&["folder", "link", root.to_str().unwrap(), "--space", &name]);
     assert!(linked.contains(space_id.as_str()), "{linked}");
 }
