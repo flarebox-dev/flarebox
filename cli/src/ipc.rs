@@ -392,13 +392,7 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
             "lets other users in through an ACL; remove it with chmod -N".to_owned(),
         ));
     }
-    let creator = std::os::unix::net::UnixStream::connect(path).and_then(|stream| {
-        stream.set_nonblocking(true)?;
-        UnixStream::from_std(stream)?.peer_cred()
-    });
-    if let Ok(peer) = creator
-        && peer.pid() != i32::try_from(std::process::id()).ok()
-    {
+    if answers_for_another_process(path)? {
         return Err(io::Error::new(
             io::ErrorKind::AddrInUse,
             format!("another process answers on {}", path.display()),
@@ -420,6 +414,23 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
         })?;
     listener.set_nonblocking(true)?;
     UnixListener::from_std(listener)
+}
+
+fn answers_for_another_process(path: &Path) -> io::Result<bool> {
+    use rustix::net::{AddressFamily, SocketAddrUnix, SocketType};
+    let probe = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None)?;
+    rustix::io::ioctl_fionbio(&probe, true)?;
+    match rustix::net::connect(&probe, &SocketAddrUnix::new(path)?) {
+        Ok(()) => {}
+        Err(Errno::AGAIN | Errno::INPROGRESS) => return Ok(true),
+        Err(_) => return Ok(false),
+    }
+    let Ok(peer) = UnixStream::from_std(std::os::unix::net::UnixStream::from(probe))
+        .and_then(|stream| stream.peer_cred())
+    else {
+        return Ok(false);
+    };
+    Ok(peer.pid() != i32::try_from(std::process::id()).ok())
 }
 
 /// Creates the socket 0600 before binding it, so it is closed to other users from its first moment even if the
@@ -873,6 +884,33 @@ mod tests {
         let _listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
         println!("listening");
         let _ = io::Read::read_to_end(&mut io::stdin(), &mut Vec::new());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_socket_whose_backlog_is_full_is_left_alone() {
+        use rustix::net::{AddressFamily, SocketAddrUnix, SocketType};
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        DirBuilder::new().mode(0o700).create(&run).unwrap();
+        let socket = run.join("daemon.sock");
+        let address = SocketAddrUnix::new(&socket).unwrap();
+        let listener = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+        rustix::net::bind(&listener, &address).unwrap();
+        rustix::net::listen(&listener, 0).unwrap();
+        let mut waiting = Vec::new();
+        loop {
+            let client =
+                rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+            rustix::io::ioctl_fionbio(&client, true).unwrap();
+            match rustix::net::connect(&client, &address) {
+                Ok(()) => waiting.push(client),
+                Err(Errno::AGAIN) => break,
+                Err(error) => panic!("{error}"),
+            }
+        }
+        let error = bind(&socket).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
     }
 
     #[tokio::test]
