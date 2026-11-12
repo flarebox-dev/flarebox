@@ -1895,7 +1895,29 @@ mod tests {
                 |trees| trees.remove_local("n"),
                 true,
             ),
+            case(
+                "another node took the file",
+                "replace a file",
+                &edit,
+                0,
+                |trees| {
+                    trees.remove_local("n");
+                    trees.set_local("u".into(), held(file(ROOT, "a", 1), 1));
+                },
+                false,
+            ),
             case("nothing changed", "move", &rename, 0, unchanged, true),
+            case(
+                "another node took the file",
+                "move",
+                &rename,
+                0,
+                |trees| {
+                    trees.remove_local("n");
+                    trees.set_local("u".into(), held(file(ROOT, "x", 1), 1));
+                },
+                false,
+            ),
             case(
                 "its name went to another node",
                 "move",
@@ -1943,6 +1965,17 @@ mod tests {
                 0,
                 other(file(ROOT, "z", 3)),
                 true,
+            ),
+            case(
+                "another node took the file",
+                "park",
+                &swap,
+                0,
+                |trees| {
+                    trees.remove_local("a");
+                    trees.set_local("u".into(), held(file(ROOT, "x", 1), 1));
+                },
+                false,
             ),
             case(
                 "the file was renamed and its name went to another node",
@@ -2038,6 +2071,7 @@ mod tests {
             "create a folder",
             "move",
             "move out of the parked folder",
+            "park",
             "remove a folder",
             "replace a file",
             "write a file",

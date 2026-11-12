@@ -1248,3 +1248,26 @@ fn an_edited_file_parked_while_a_new_folder_takes_its_name_reaches_the_server() 
     )
     .unwrap();
 }
+
+#[test]
+fn an_edit_made_while_its_file_is_parked_for_a_rename_stays_on_the_server() {
+    let synced = vec![(0, file("c.txt"))];
+    let mut racing = vec![(0, rename(0, 0, "C.TXT")), (0, overwrite(0))];
+    racing.extend(commit(0));
+    racing.extend([
+        (1, DELIVER),
+        (1, EFFECT),
+        (1, overwrite(0)),
+        (1, SCAN),
+        (1, COMMIT),
+        (1, EFFECT),
+        (1, COMMIT),
+        (1, DELIVER),
+        (1, COMMIT),
+        (1, COMMIT),
+    ]);
+    let world = converge(2, &[synced, racing]).unwrap();
+    for device in &world.devices {
+        assert_eq!(device.disk.entries().len(), 2);
+    }
+}
