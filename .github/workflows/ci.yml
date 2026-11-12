@@ -26,6 +26,7 @@ jobs:
       spec_macos: ${{ steps.paths.outputs.spec_macos }}
       macos_app: ${{ steps.paths.outputs.macos_app }}
       site_only: ${{ steps.paths.outputs.site_only }}
+      property_battery: ${{ steps.paths.outputs.property_battery }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -40,6 +41,8 @@ jobs:
             echo "Push to $GITHUB_REF: every macOS job runs."
             printf '%s=true\n' rust_macos server_macos spec_macos macos_app >> "$GITHUB_OUTPUT"
             echo "site_only=false" >> "$GITHUB_OUTPUT"
+            echo "property_battery: skipped, because the nightly battery tests main"
+            echo "property_battery=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git fetch --no-tags --depth=1 origin "$BASE"
@@ -70,6 +73,12 @@ jobs:
           echo "server_macos, spec_macos: skipped, because the server and spec checks run on macOS only on pushes to main"
           printf '%s=false\n' server_macos spec_macos >> "$GITHUB_OUTPUT"
           decide macos_app '^(\.github/workflows/ci\.yml$|Cargo\.(toml|lock)$|cli/Cargo\.toml$|rust-toolchain\.toml$|\.cargo/|core/|apps/macos/)'
+          if [ "$EVENT" = merge_group ]; then
+            decide property_battery "^($(sed 's/[.]/\\./g; s|[^/]$|&$|' .github/property-battery-paths | paste -sd '|' -))"
+          else
+            echo "property_battery: skipped, because the property battery gates only the merge queue"
+            echo "property_battery=false" >> "$GITHUB_OUTPUT"
+          fi
 
   pick-macos:
     name: pick-macos
@@ -256,6 +265,9 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Check that the merge queue runs the property battery for every crate it builds
+        if: matrix.os == 'ubuntu-latest'
+        run: scripts/battery-paths.sh --check
       - run: cargo test --workspace --locked
 
   server:
@@ -562,10 +574,23 @@ jobs:
           git fetch --no-tags --depth=1 origin "$BASE"
           python3 scripts/check-new-comments.py "$BASE" HEAD
 
+  property-battery:
+    name: property battery
+    needs: changes
+    if: needs.changes.outputs.property_battery == 'true'
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/property-battery.yml
+    with:
+      shards: '8'
+      cases: '2048'
+      shard_timeout: 30
+
   ci-report:
     name: ci-report
     if: always()
-    needs: [changes, pick-macos, rust, server, server-deploy, net-integration, driver-integration, cli-integration, ffi-integration, spec, macos-app, runner-hook, comments]
+    needs: [changes, pick-macos, rust, server, server-deploy, net-integration, driver-integration, cli-integration, ffi-integration, spec, macos-app, runner-hook, comments, property-battery]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any CI job failed or was cancelled
@@ -584,12 +609,13 @@ jobs:
           MACOS_APP: ${{ needs.macos-app.result }}
           RUNNER_HOOK: ${{ needs.runner-hook.result }}
           COMMENTS: ${{ needs.comments.result }}
+          PROPERTY_BATTERY: ${{ needs.property-battery.result }}
           FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
         run: |
           echo "site-only change: ${SITE_ONLY:-unknown}. Build and test jobs that skip for a site-only change report skipped."
-          echo "changes: $CHANGES, pick-macos: $PICK_MACOS, rust: $RUST, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, driver-integration: $DRIVER_INTEGRATION, cli-integration: $CLI_INTEGRATION, ffi-integration: $FFI_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP, runner-hook: $RUNNER_HOOK, comments: $COMMENTS"
+          echo "changes: $CHANGES, pick-macos: $PICK_MACOS, rust: $RUST, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, driver-integration: $DRIVER_INTEGRATION, cli-integration: $CLI_INTEGRATION, ffi-integration: $FFI_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP, runner-hook: $RUNNER_HOOK, comments: $COMMENTS, property-battery: $PROPERTY_BATTERY"
           if [ "$FAILED" = "true" ]; then
-            echo "::error::At least one CI job failed or was cancelled (changes: $CHANGES, pick-macos: $PICK_MACOS, rust: $RUST, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, driver-integration: $DRIVER_INTEGRATION, cli-integration: $CLI_INTEGRATION, ffi-integration: $FFI_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP, runner-hook: $RUNNER_HOOK, comments: $COMMENTS). Open that job's log for the cause."
+            echo "::error::At least one CI job failed or was cancelled (changes: $CHANGES, pick-macos: $PICK_MACOS, rust: $RUST, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, driver-integration: $DRIVER_INTEGRATION, cli-integration: $CLI_INTEGRATION, ffi-integration: $FFI_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP, runner-hook: $RUNNER_HOOK, comments: $COMMENTS, property-battery: $PROPERTY_BATTERY). Open that job's log for the cause."
             exit 1
           fi
       - name: Fail unless the build and test jobs ran for a change outside site/
@@ -604,6 +630,15 @@ jobs:
               exit 1
             fi
           done
+      - name: Fail unless the property battery ran for a merge queue change to sync code
+        if: needs.changes.outputs.property_battery == 'true'
+        env:
+          PROPERTY_BATTERY: ${{ needs.property-battery.result }}
+        run: |
+          if [ "$PROPERTY_BATTERY" != success ]; then
+            echo "::error::This merge queue change touches sync code, so the property battery must run and pass, but it is $PROPERTY_BATTERY. Its summary lists each failing shard's seed and repro command."
+            exit 1
+          fi
       - name: Fail unless every macOS job ran on a push to main
         if: github.event_name == 'push'
         env:

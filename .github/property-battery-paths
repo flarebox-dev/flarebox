@@ -1,0 +1,16 @@
+.cargo/
+.github/property-battery-paths
+.github/workflows/property-battery.yml
+Cargo.lock
+Cargo.toml
+core/chunk/
+core/driver/
+core/engine/
+core/fs/
+core/ignore/
+core/net/
+core/proto/
+core/sim/
+core/store/
+core/telemetry/
+rust-toolchain.toml

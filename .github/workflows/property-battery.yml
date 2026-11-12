@@ -23,6 +23,24 @@ on:
         description: Also run the mutation set in scripts/engine-mutations.sh
         type: boolean
         default: false
+  workflow_call:
+    inputs:
+      filter:
+        type: string
+        default: ''
+      cases:
+        type: string
+        default: ''
+      shards:
+        type: string
+        default: ''
+      mutations:
+        type: boolean
+        default: false
+      shard_timeout:
+        description: Minutes before a shard is cancelled
+        type: number
+        default: 300
   schedule:
     - cron: '17 18 * * *'
 
@@ -170,7 +188,7 @@ jobs:
     name: shard ${{ matrix.shard }}
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: ${{ inputs.shard_timeout || 300 }}
     permissions:
       contents: read
     strategy:
@@ -224,7 +242,7 @@ jobs:
               reason="ran $((p + f + i)) of the $expected tests listed for it"
             fi
             if [ -n "$reason" ]; then
-              repro="git checkout $SHA && PROPTEST_CASES=$CASES PROPTEST_RNG_SEED=$seed cargo test --locked -p $package $selector$repro_filter"
+              repro="git fetch origin $SHA && git checkout $SHA && PROPTEST_CASES=$CASES PROPTEST_RNG_SEED=$seed cargo test --locked -p $package $selector$repro_filter"
               failing=$(jq -c --arg target "$package $selector" --arg reason "$reason" --arg repro "$repro" '. + [{target: $target, reason: $reason, repro: $repro}]' <<< "$failing")
               echo "::error title=$package $selector failed on shard $SHARD::Seed $seed, $CASES cases, $reason. Reproduce: $repro"
             fi
@@ -351,7 +369,7 @@ jobs:
             exit 1
           fi
           gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" \
-            --jq '.jobs[] | {name, url: .html_url, conclusion}' | jq -s 'map({(.name): .}) | add // {}' > jobs.json
+            --jq '.jobs[] | {name: (.name | split(" / ") | last), url: .html_url, conclusion}' | jq -s 'map({(.name): .}) | add // {}' > jobs.json
           shopt -s nullglob
           results=(results/result-*.json)
           if [ "${#results[@]}" -gt 0 ]; then jq -s . "${results[@]}" > shards.json; else echo '[]' > shards.json; fi
