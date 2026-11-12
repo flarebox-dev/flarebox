@@ -1067,6 +1067,32 @@ fn an_edit_back_to_the_bytes_a_restore_left_keeps_its_file_and_the_lost_edit_bes
     }
 }
 
+#[test]
+fn a_write_two_downloads_place_after_a_restore_took_it_is_kept_by_both_beside_the_edit_over_it() {
+    let mut lost = vec![(0, file("a"))];
+    lost.extend(commit(0));
+    lost.extend([
+        (1, DELIVER),
+        (1, EFFECT),
+        (2, DELIVER),
+        (2, EFFECT),
+        (0, overwrite(0)),
+        (0, RESTORE),
+        (1, EFFECT),
+        (2, EFFECT),
+    ]);
+    let world = converge(3, &[vec![(0, BACKUP)], lost]).unwrap();
+    for device in &world.devices {
+        let disk = &device.disk;
+        let write = |ino: &u128| disk.entries()[ino].content.as_ref().map(|c| c.mtime_ns);
+        let a = disk.child(&Place::Root, "a").unwrap();
+        assert_eq!(write(&a), Some(2));
+        let mut writes: Vec<Option<i64>> = disk.entries().keys().map(write).collect();
+        writes.sort();
+        assert_eq!(writes, [Some(1), Some(1), Some(2)]);
+    }
+}
+
 fn created_again_by_both_and_deleted_by_one(made: Step, edit: bool) -> World {
     let mut lost = vec![
         (0, RESTORE),
