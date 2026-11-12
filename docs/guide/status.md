@@ -131,3 +131,7 @@ The answer names the file to keep by its node ID, so it means the same file on e
 - `keep-both` keeps both files and closes the decision.
 
 Paths with spaces or other characters a shell reads specially are in single quotes. Both files keep syncing while the decision waits. If the content of either file changes, a new decision with a new ID replaces it. If you rename, move or delete either file yourself, the decision closes. With `--json`, the decision's `answers` have the tokens `keep-node:<id>` and `keep-both`, each with its `argv`.
+
+## Write a file for a problem report
+
+`koi diagnose` writes `koi-diagnostics-<time>.txt` in the current folder and prints its path. The file holds the version of koi, the system, `koi status --json` and the last 200 lines of the daemon's log. Paths, file names, space and device names, the server's address and tokens are replaced by placeholders such as `<folder-1>`. Read the file before you attach it to an [issue](https://github.com/koidrive/koidrive/issues).

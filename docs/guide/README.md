@@ -24,7 +24,7 @@ This guide covers the `koi` command on macOS and Linux, version 0.1.0.
 3. [Folders](folders.md): link a folder, choose what syncs with `.koiignore`, and what Koidrive doesn't sync.
 4. [Conflicts](conflicts.md): what happens when two devices change the same file.
 5. [Trash, versions and restore](history.md): get back a deleted file or an earlier version.
-6. [Status and problems](status.md): read `koi status`, wait out a quota, restart a folder and send refused changes again.
+6. [Status and problems](status.md): read `koi status`, wait out a quota, restart a folder, send refused changes again and write a file for a problem report.
 7. [Devices](devices.md): list and revoke devices, and get back in after losing every device.
 8. [Limits](limits.md): what the Workers Free plan allows, and Koidrive's own limits.
 9. [Back up the server](backup.md): copy the R2 bucket outside Cloudflare, and what the copy can restore.

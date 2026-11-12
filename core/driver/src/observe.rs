@@ -432,7 +432,7 @@ impl FsObserver {
                 None
             }
             Err(error) => {
-                tracing::debug!(path = %path.display(), %error, "a file could not be chunked");
+                tracing::debug!(path = %koidrive_fs::quoted(path), %error, "a file could not be chunked");
                 reads.busy.push(path.to_path_buf());
                 None
             }
@@ -643,7 +643,7 @@ pub(crate) fn open_under(root: impl AsFd, path: &Path) -> io::Result<File> {
     }
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
-        format!("{} is not a relative file path", path.display()),
+        format!("{} is not a relative file path", koidrive_fs::quoted(path)),
     ))
 }
 

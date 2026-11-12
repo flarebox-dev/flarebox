@@ -104,7 +104,7 @@ impl Service {
         (self.home.join("Library/LaunchAgents")).join(format!("{}.plist", self.label()))
     }
 
-    fn log_file(&self) -> PathBuf {
+    pub fn log_file(&self) -> PathBuf {
         (self.home.join("Library/Logs/Koidrive")).join(format!("{}.log", self.label()))
     }
 
@@ -461,7 +461,7 @@ pub fn system() -> Box<dyn Manager> {
 }
 
 /// This profile's service, run by this binary.
-fn this_service(paths: &Paths) -> Result<Service, String> {
+pub fn this_service(paths: &Paths) -> Result<Service, String> {
     let home = (std::env::var_os("HOME").map(PathBuf::from))
         .filter(|home| home.is_absolute())
         .ok_or("HOME is not set to an absolute path")?;

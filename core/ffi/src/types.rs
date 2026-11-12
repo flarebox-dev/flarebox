@@ -566,7 +566,7 @@ pub enum SessionError {
     FolderNotFound,
     #[error("the space is already linked to a folder on this device")]
     SpaceAlreadyLinked,
-    #[error("the folder contains or is inside the linked folder {other}")]
+    #[error("the folder contains or is inside the linked folder {}", koidrive_fs::quoted(.other))]
     FolderOverlaps { other: String },
     #[error("the space is not linked to a folder on this device")]
     FolderNotLinked,

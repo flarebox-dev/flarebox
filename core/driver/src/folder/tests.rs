@@ -2093,7 +2093,7 @@ fn discarding_a_held_folder_that_holds_an_entry_l_does_not_know_keeps_the_folder
         );
         let problem = view.problem.unwrap_or_default();
         assert!(
-            problem.contains(&format!("held (the server's change could not be made here: the folder holds entries this device does not sync: {unknown})")),
+            problem.contains(&format!("\"held\" (the server's change could not be made here: the folder holds entries this device does not sync: {unknown:?})")),
             "{problem}"
         );
     }
@@ -2861,7 +2861,7 @@ fn a_remote_delete_of_a_folder_holding_an_entry_l_does_not_know_names_the_entry_
         assert_eq!(view.state, FolderState::UpToDate, "{unknown}");
         let problem = view.problem.unwrap_or_default();
         assert!(
-            problem.contains(&format!("held (the server's change could not be made here: the folder holds entries this device does not sync: {unknown})")),
+            problem.contains(&format!("\"held\" (the server's change could not be made here: the folder holds entries this device does not sync: {unknown:?})")),
             "{problem}"
         );
 
@@ -2925,9 +2925,9 @@ fn a_remote_delete_of_a_folder_whose_subfolder_holds_an_entry_l_does_not_know_le
     let problem = view.problem.unwrap_or_default();
     assert!(
         problem.contains(&format!(
-            "{} (the server's change could not be made here: the folder holds entries this device does not sync: \
-             build.log)",
-            Path::new("held").join("sub").display()
+            "{:?} (the server's change could not be made here: the folder holds entries this device does not sync: \
+             \"build.log\")",
+            Path::new("held").join("sub")
         )),
         "{problem}"
     );
@@ -3084,15 +3084,16 @@ fn a_file_whose_place_an_excluded_folder_holds_is_named_with_what_waits_for_its_
     assert_eq!(fs::read(site_a.root.join("a/a")).unwrap(), b"edited on b");
 
     let view = b.folder.view();
-    let waits = "waits for a/ß, whose name here is taken by an entry this device's rules exclude";
+    let waits =
+        "waits for \"a/ß\", whose name here is taken by an entry this device's rules exclude";
     assert_eq!(
         (view.state, view.problem),
         (
             FolderState::UpToDate,
             Some(format!(
-                "3 items could not be synced: a ({waits}), a/a ({waits}), a/ß (its name here is taken by a/ß, \
-                 which this device's rules exclude; it is kept in .koidrive/parked/{file}); run koi folder restart \
-                 once they are fixed"
+                "3 items could not be synced: \"a\" ({waits}), \"a/a\" ({waits}), \"a/ß\" (its name here is taken by \
+                 \"a/ß\", which this device's rules exclude; it is kept in \".koidrive/parked/{file}\"); run koi \
+                 folder restart once they are fixed"
             ))
         )
     );
@@ -3144,8 +3145,8 @@ fn a_folder_to_remove_that_holds_a_file_an_excluded_entry_keeps_out_lets_the_fol
         (
             FolderState::UpToDate,
             Some(
-                "1 item could not be synced: p/f (its name here is taken by q/x, which this device's rules exclude); \
-                 run koi folder restart once it is fixed"
+                "1 item could not be synced: \"p/f\" (its name here is taken by \"q/x\", which this device's rules \
+                 exclude); run koi folder restart once it is fixed"
                     .into()
             )
         )
@@ -3192,9 +3193,9 @@ fn a_file_in_a_folder_an_excluded_entry_keeps_out_is_named_with_it() {
         (
             FolderState::UpToDate,
             Some(
-                "2 items could not be synced: foo (its name here is taken by foo, which this device's rules exclude), \
-                 foo/child (waits for foo, whose name here is taken by an entry this device's rules exclude); run koi \
-                 folder restart once they are fixed"
+                "2 items could not be synced: \"foo\" (its name here is taken by \"foo\", which this device's rules \
+                 exclude), \"foo/child\" (waits for \"foo\", whose name here is taken by an entry this device's rules \
+                 exclude); run koi folder restart once they are fixed"
                     .into()
             )
         )
@@ -5494,7 +5495,7 @@ fn the_status_names_a_node_the_server_rejected_an_op_for_and_why() {
     assert_eq!(
         a.folder.view().problem.as_deref(),
         Some(
-            "1 item could not be synced: notes.txt (the server rejected it: INVALID_NAME); run koi folder restart once it is fixed"
+            "1 item could not be synced: \"notes.txt\" (the server rejected it: INVALID_NAME); run koi folder restart once it is fixed"
         )
     );
 }
@@ -5524,7 +5525,7 @@ fn the_status_names_a_node_of_a_refused_commit_and_the_refusal() {
     assert_eq!(
         a.folder.view().problem.as_deref(),
         Some(
-            "1 item could not be synced: notes.txt (the server refused it: CODE_LIMIT_EXCEEDED: the commit is too large); run koi folder restart once it is fixed"
+            "1 item could not be synced: \"notes.txt\" (the server refused it: CODE_LIMIT_EXCEEDED: the commit is too large); run koi folder restart once it is fixed"
         )
     );
 }
@@ -5636,7 +5637,7 @@ fn the_status_names_a_node_whose_effect_failed_and_why() {
     assert_eq!(
         b.folder.view().problem.as_deref(),
         Some(
-            "1 item could not be synced: notes.txt (the server's change could not be made here: another entry holds its name); run koi folder restart once it is fixed"
+            "1 item could not be synced: \"notes.txt\" (the server's change could not be made here: another entry holds its name); run koi folder restart once it is fixed"
         )
     );
 }
@@ -5670,7 +5671,7 @@ fn the_status_names_a_failed_write_in_a_folder_by_its_whole_path() {
     assert_eq!(
         b.folder.view().problem.as_deref(),
         Some(
-            "1 item could not be synced: docs/notes.txt (the server's change could not be made here: another entry \
+            "1 item could not be synced: \"docs/notes.txt\" (the server's change could not be made here: another entry \
              holds its name); run koi folder restart once it is fixed"
         )
     );
@@ -5696,7 +5697,7 @@ fn the_status_names_a_node_stuck_for_two_reasons_once() {
     assert_eq!(
         b.folder.view().problem.as_deref(),
         Some(
-            "1 item could not be synced: notes.txt (the server's change could not be made here: another entry holds \
+            "1 item could not be synced: \"notes.txt\" (the server's change could not be made here: another entry holds \
              its name; the server rejected it: INVALID_NAME); run koi folder restart once it is fixed"
         )
     );
@@ -5748,7 +5749,7 @@ fn the_reason_of_a_result_that_waits_for_the_log_outlasts_the_first_scan() {
     assert_eq!(
         a.folder.view().problem.as_deref(),
         Some(
-            "1 item could not be synced: notes.txt (the server rejected it: INVALID_NAME); run koi folder restart once \
+            "1 item could not be synced: \"notes.txt\" (the server rejected it: INVALID_NAME); run koi folder restart once \
              it is fixed"
         )
     );

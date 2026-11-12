@@ -6,9 +6,11 @@
 //! versions commands talk to the server directly with the credential. With `--json` every command prints one
 //! envelope (see [`report`]) and exits with the status of its [`error::Code`].
 
+mod diagnose;
 mod error;
 mod history;
 mod ipc;
+mod logfile;
 mod notify;
 mod pairing;
 mod report;
@@ -33,6 +35,7 @@ use koidrive_proto::v1::{CreateSpaceRequest, DeviceInfo, SpaceInfo, SpaceUsage};
 use serde_json::Value;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
 use koidrive_telemetry::schema::{DaemonStart, Failure, SetupStep};
 
@@ -144,6 +147,9 @@ enum Command {
         #[command(subcommand)]
         action: telemetry::TelemetryAction,
     },
+    /// Write a file for a report of a problem: the version, the system, the status and the daemon's log, with your
+    /// paths, file names, space and device names, server address and tokens replaced.
+    Diagnose,
     /// Run the sync daemon in the foreground until SIGTERM or SIGINT.
     #[command(name = "_daemon", hide = true)]
     Daemon {
@@ -307,7 +313,15 @@ fn main() -> ExitCode {
         Command::Daemon { log_format } => Some(*log_format),
         _ => None,
     };
-    init_logging(log_format, json);
+    let paths = match Paths::from_env() {
+        Ok(paths) => paths,
+        Err(error) => return finish(&command, json, Err(error.to_string().into()), Vec::new()),
+    };
+    let agent_log = (log_format.is_some())
+        .then(|| service::this_service(&paths).ok())
+        .flatten()
+        .and_then(|service| logfile::CappedLog::of_stderr(service.log_file()));
+    init_logging(log_format, json, agent_log);
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -317,10 +331,6 @@ fn main() -> ExitCode {
             let error = CliError::from(format!("cannot start: {error}"));
             return finish(&command, json, Err(error), Vec::new());
         }
-    };
-    let paths = match Paths::from_env() {
-        Ok(paths) => paths,
-        Err(error) => return finish(&command, json, Err(error.to_string().into()), Vec::new()),
     };
     let daemon_run = matches!(command_args, Command::Daemon { .. });
     let pending_paths = paths.clone();
@@ -409,6 +419,7 @@ fn telemetry_of(
         Command::History { .. } => (Name::History, None, None),
         Command::Service { .. } => (Name::Service, None, None),
         Command::Telemetry { .. } => (Name::Telemetry, None, None),
+        Command::Diagnose => (Name::Diagnose, None, None),
         Command::Daemon { .. } => (Name::Daemon, None, None),
     }
 }
@@ -456,6 +467,7 @@ async fn execute(paths: Paths, command: Command, json: bool) -> Result<Done, Cli
     match command {
         Command::Daemon { .. } => daemon(paths, json).await,
         Command::Status { check } => status(&paths, check).await,
+        Command::Diagnose => diagnose::run(&paths).await,
         Command::Resolve { id, answer } => resolve(&paths, id, answer).await,
         Command::Setup { device, login } => {
             setup::setup(&paths, &device.name(), &login, json).await
@@ -673,14 +685,18 @@ fn command_path(args: &[OsString]) -> String {
 /// Logs go to stderr: structured key-value text by default, one JSON object per line with `--log-format json`. The
 /// level comes from `KOIDRIVE_LOG` (`info` for the daemon, `warn` for other commands). No log line carries a
 /// credential, an access token or a pairing code.
-fn init_logging(daemon: Option<LogFormat>, json: bool) {
+fn init_logging(daemon: Option<LogFormat>, json: bool, agent_log: Option<logfile::CappedLog>) {
     let default = if daemon.is_some() { "info" } else { "warn" };
     let filter =
         EnvFilter::try_from_env("KOIDRIVE_LOG").unwrap_or_else(|_| EnvFilter::new(default));
+    let writer = match agent_log {
+        Some(log) => BoxMakeWriter::new(log),
+        None => BoxMakeWriter::new(std::io::stderr),
+    };
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_ansi(log_ansi(std::io::stderr().is_terminal(), json))
-        .with_writer(std::io::stderr);
+        .with_writer(writer);
     match daemon {
         Some(LogFormat::Json) => builder.json().with_current_span(false).init(),
         _ => builder.init(),

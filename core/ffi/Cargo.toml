@@ -22,6 +22,7 @@ bindgen = ["uniffi/cli"]
 
 [dependencies]
 koidrive-driver = { path = "../driver" }
+koidrive-fs = { path = "../fs" }
 koidrive-net = { path = "../net" }
 koidrive-proto = { path = "../proto" }
 koidrive-telemetry = { path = "../telemetry" }

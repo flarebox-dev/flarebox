@@ -73,7 +73,7 @@ const STAGE_AGAIN: Duration = Duration::from_secs(30);
 /// Why the task stops. The effect in flight, if any, stays in the store for the next start to recover.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Stop {
-    #[error("{} no longer names the folder this task locked (it was moved, replaced or removed)", .0.display())]
+    #[error("{} no longer names the folder this task locked (it was moved, replaced or removed)", koidrive_fs::quoted(.0))]
     Withdrawn(PathBuf),
     #[error("the folder fails its root check: {0}")]
     Root(RootProblem),
@@ -954,11 +954,12 @@ fn acknowledge(
                     Reason::Taken => failed("another entry holds its name"),
                     Reason::Interrupted => failed("it was interrupted"),
                     Reason::Holds(names) => {
-                        let names: Vec<_> =
-                            names.iter().map(|name| name.to_string_lossy()).collect();
+                        let quoted: Vec<_> = (names.iter())
+                            .map(|name| koidrive_fs::quoted(name).to_string())
+                            .collect();
                         Settled::Stuck(format!(
                             "the folder holds entries this device does not sync: {}",
-                            names.join(", ")
+                            quoted.join(", ")
                         ))
                     }
                 }

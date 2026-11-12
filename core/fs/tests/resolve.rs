@@ -348,3 +348,21 @@ fn bind_needs_a_folder_and_held_follows_the_linked_path() {
     assert!(space.held().unwrap());
     assert!(space.parent(&at(Vec::new(), "f")).is_ok());
 }
+
+#[test]
+fn errors_quote_the_paths_they_name() {
+    let missing = Unresolved::Missing(PathBuf::from("Secret Plans/budget 2026.xlsx"));
+    assert_eq!(
+        missing.to_string(),
+        "\"Secret Plans/budget 2026.xlsx\" is missing"
+    );
+    let io = Unresolved::Io {
+        path: PathBuf::from("Jiyeon Passport/scan"),
+        err: std::io::Error::from_raw_os_error(13),
+    };
+    assert!(
+        io.to_string()
+            .starts_with("\"Jiyeon Passport/scan\": Permission denied (os error 13)"),
+        "{io}"
+    );
+}

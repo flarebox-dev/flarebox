@@ -56,12 +56,12 @@ pub enum Location {
 pub enum Unresolved {
     #[error("{0:?} is not a single file name")]
     BadName(OsString),
-    #[error("{} is missing", .0.display())]
+    #[error("{} is missing", crate::quoted(.0))]
     Missing(PathBuf),
     /// A file or a symbolic link has the folder's name.
-    #[error("{} is not a folder", .0.display())]
+    #[error("{} is not a folder", crate::quoted(.0))]
     NotAFolder(PathBuf),
-    #[error("{} is not the folder expected there", .path.display())]
+    #[error("{} is not the folder expected there", crate::quoted(.path))]
     Replaced {
         path: PathBuf,
         expected: FileId,
@@ -69,9 +69,9 @@ pub enum Unresolved {
     },
     /// The path the root was linked at names another folder or nothing: the
     /// root was moved, replaced or removed.
-    #[error("{} no longer names the sync root", .0.display())]
+    #[error("{} no longer names the sync root", crate::quoted(.0))]
     RootWithdrawn(PathBuf),
-    #[error("{}: {err}", .path.display())]
+    #[error("{}: {err}", crate::quoted(.path))]
     Io { path: PathBuf, err: io::Error },
 }
 
@@ -133,7 +133,7 @@ impl Space {
         if stat.file_type != FileType::Directory {
             return Err(io::Error::new(
                 io::ErrorKind::NotADirectory,
-                format!("{} is not a folder", path.display()),
+                format!("{} is not a folder", crate::quoted(path)),
             ));
         }
         Ok(Self {

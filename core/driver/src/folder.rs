@@ -802,9 +802,11 @@ impl Folder {
             Stream::Following { .. } if self.settled(&held) => FolderState::UpToDate,
             Stream::Following { .. } => FolderState::CatchingUp,
         };
-        let named = |id: &String| {
-            (self.item_path(id))
-                .map_or_else(|| format!("node {id}"), |path| path.display().to_string())
+        let quoted_item = |id: &String| {
+            (self.item_path(id)).map_or_else(
+                || format!("node {id}"),
+                |path| koidrive_fs::quoted(&path).to_string(),
+            )
         };
         let mut reasons: BTreeMap<&String, Vec<String>> = BTreeMap::new();
         for id in self.engine.effects.blocked().keys() {
@@ -822,7 +824,7 @@ impl Folder {
                 Stuck::HeldBy(by) => {
                     let why = format!(
                         "its name here is taken by {}, which this device's rules exclude",
-                        named(by)
+                        quoted_item(by)
                     );
                     if !trees.local().get(id).is_some_and(|node| node.parked) {
                         why
@@ -830,18 +832,18 @@ impl Folder {
                         let parked = Path::new(koidrive_fs::PRIVATE_DIR)
                             .join(koidrive_fs::PARKED_DIR)
                             .join(trees.parked_name(id));
-                        format!("{why}; it is kept in {}", parked.display())
+                        format!("{why}; it is kept in {}", koidrive_fs::quoted(&parked))
                     }
                 }
                 Stuck::Behind(node) => format!(
                     "waits for {}, whose name here is taken by an entry this device's rules exclude",
-                    named(node)
+                    quoted_item(node)
                 ),
             };
             reasons.entry(id).or_default().push(why);
         }
         let mut stuck: Vec<String> = (reasons.into_iter())
-            .map(|(id, whys)| format!("{} ({})", named(id), whys.join("; ")))
+            .map(|(id, whys)| format!("{} ({})", quoted_item(id), whys.join("; ")))
             .collect();
         stuck.sort();
         let shown = (self.retrying.values()).find(|retrying| {

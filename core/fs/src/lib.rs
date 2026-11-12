@@ -697,7 +697,7 @@ impl Snapshot {
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("not a relative path inside the root: {}", path.display()),
+                    format!("not a relative path inside the root: {}", quoted(&path)),
                 )
                 .into());
             }
@@ -1992,6 +1992,18 @@ impl Watcher for RescanWatcher {
 
 fn watch_error(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Error {
     Error::Watch(err.into())
+}
+
+/// A path or a name as a log line, an error or a status sentence shows it: in quotes, as `{:?}` writes it, so that a
+/// reader, and `koi diagnose`, can tell where it ends whatever it holds.
+pub fn quoted<P: AsRef<Path> + ?Sized>(path: &P) -> impl std::fmt::Display + '_ {
+    struct Quoted<'a>(&'a Path);
+    impl std::fmt::Display for Quoted<'_> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{:?}", self.0)
+        }
+    }
+    Quoted(path.as_ref())
 }
 
 mod effect;
