@@ -10,6 +10,7 @@ The schema changes add messages and fields only:
 |---|---|---|
 | `RewindRequest` (new, `auth.proto`) | `restore_point_ms = 1`, `expected_history_id = 2`, `rewind_id = 3` | 1 |
 | `RewindResult` (new, `auth.proto`) | `history_id = 1`, `restore_seq = 2`, `restore_point_ms = 3`, `previous_history_id = 4`, `previous_head_seq = 5` | 1 |
+| `Welcome` | `restore_seq = 11`, `restore_point_ms = 12` | 2 |
 
 The chunk key incarnations of §5 are internal to the server and change no message.
 
@@ -53,7 +54,7 @@ At admission, `restore_point_ms` (P) must meet all of these:
 
 The 29-day bound keeps P inside the 30-day PITR range, with a day for the rewind to finish. The window is checked once, at admission. A rewind already admitted is never refused later because time has passed.
 
-P is the requested point. The restored state is the one at the bookmark that PITR selects for P, which is approximately P. `RewindResult.restore_seq` and `ResyncRequired.restore_seq` give the exact `head_seq` of the restored state, and `restore_point_ms` is always the requested P.
+P is the requested point. The restored state is the one at the bookmark that PITR selects for P, which is approximately P. `RewindResult.restore_seq`, `Welcome.restore_seq` and `ResyncRequired.restore_seq` give the exact `head_seq` of the restored state, and `restore_point_ms` is always the requested P.
 
 ## 3. Phases
 

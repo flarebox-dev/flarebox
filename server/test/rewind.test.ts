@@ -236,7 +236,7 @@ describe("space rewind (RFC 0003)", () => {
     const old = await device().commitRaw([op.mkdir(uuidv7(), spaceId, "late")], { historyId: previous });
     expect(old).toMatchObject({ case: "error", value: { code: Error_Code.HISTORY_MISMATCH } });
     const after = await socket(spaceId, token);
-    expect(after.welcome.historyId).toBe(result.historyId);
+    expect(after.welcome).toMatchObject({ historyId: result.historyId, restoreSeq: 1n, restorePointMs: BigInt(p1) });
     after.send({ case: "resume", value: { historyId: previous, sinceSeq: 2n } });
     const resync = await after.until(() => after.received.find((msg) => msg.case === "resyncRequired"));
     expect(resync.value).toMatchObject({ reason: ResyncRequired_Reason.HISTORY_CHANGED, restoreSeq: 1n, restorePointMs: BigInt(p1) });
