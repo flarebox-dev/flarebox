@@ -3,10 +3,8 @@
 Install the `koi` command on Linux or macOS:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/koidrive/koidrive/main/install.sh | sh
+curl -fsSL https://koidrive.com/install.sh | sh
 ```
-
-This URL will move to koidrive.com.
 
 Downloads become available with the first published CLI release. Until then, build from source below.
 
@@ -15,7 +13,7 @@ The installer downloads the latest GitHub Release for x86_64 or arm64, checks it
 Run the same command again to upgrade. To choose a version or another directory, set `KOIDRIVE_VERSION` or `KOIDRIVE_INSTALL_DIR` on the `sh` command:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/koidrive/koidrive/main/install.sh | KOIDRIVE_VERSION=v0.1.0 KOIDRIVE_INSTALL_DIR="$HOME/bin" sh
+curl -fsSL https://koidrive.com/install.sh | KOIDRIVE_VERSION=v0.1.0 KOIDRIVE_INSTALL_DIR="$HOME/bin" sh
 ```
 
 `KOIDRIVE_RELEASE_BASE_URL` replaces `https://github.com/koidrive/koidrive/releases` for a trusted mirror or local tests. The base must serve tarballs and `SHA256SUMS` under `latest/download/` and `download/v<version>/`. This changes the source of both the binary and its checksum, so use only a source you trust.
