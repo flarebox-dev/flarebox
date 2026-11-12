@@ -85,6 +85,13 @@ commit arch >/dev/null
 expect "a file gated on target_arch" "core/chunk/src/simd.rs "
 
 base="$(git rev-parse HEAD)"
+write core/net/src/tls.rs '#[cfg(target_env = "")]
+fn system_roots() {}'
+write core/net/src/target_dir.rs 'fn target_directory() {}'
+commit env >/dev/null
+expect "a file gated on target_env, and not a name that starts with target_" "core/net/src/tls.rs "
+
+base="$(git rev-parse HEAD)"
 {
   echo '#[cfg(target_os = "macos")]'
   seq 200000 | sed 's/.*/fn filler() {}/'

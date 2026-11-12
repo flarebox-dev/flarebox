@@ -9,7 +9,7 @@ if [ "$#" -ne 2 ]; then
 fi
 base=$1
 head=$2
-platform_rust='target_os|target_vendor|target_arch|std::os::(macos|darwin)'
+platform_rust='\btarget_(os|vendor|arch|env|abi|family|pointer_width|endian|has_atomic|feature)\b|std::os::(macos|darwin)'
 
 has() {
   local path=$1 pattern=$2 rev
