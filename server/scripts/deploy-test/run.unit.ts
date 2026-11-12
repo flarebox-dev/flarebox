@@ -75,20 +75,28 @@ interface Step {
   createsWorker: boolean;
   tagged?: boolean;
   status: number;
+  unlistedFirst?: number;
 }
 
 function fakePnpm(steps: { install: Step; deploy: Step }): void {
   const script = `#!${process.execPath}
-const { appendFileSync } = require("node:fs");
+const { appendFileSync, readFileSync } = require("node:fs");
 const steps = ${JSON.stringify(steps)};
 const step = process.argv[2] === "install" ? steps.install : steps.deploy;
 const args = process.argv.slice(2);
 const at = args.indexOf("--tag");
 const tag = at >= 0 ? args.splice(at, 2)[1] : undefined;
 appendFileSync(process.env.FAKE_PNPM_LOG, args.join(" ") + "\\n");
+const deploys = readFileSync(process.env.FAKE_PNPM_LOG, "utf8").split("\\n").filter((line) => line.startsWith("run deploy")).length;
+const unlisted = process.argv[2] !== "install" && deploys <= (step.unlistedFirst ?? 0);
 const body = JSON.stringify(process.argv[2] !== "install" && step.tagged !== false ? { tag } : {});
 const created = step.createsWorker ? fetch(process.env.MOCK_URL + "/mock/workers/${NAME}", { method: "POST", body }) : Promise.resolve();
 created.then(() => {
+  if (unlisted) {
+    console.log("Uploaded ${NAME} (1.00 sec)");
+    console.error("A request to the Cloudflare API (/accounts/x/workers/workers/${NAME}) failed.\\n  This Worker does not exist on your account. [code: 10007]");
+    process.exit(1);
+  }
   if (process.argv[2] !== "install" && step.status === 0) {
     console.log("Deployed ${NAME} triggers\\n  https://${NAME}.mock.workers.dev\\nCurrent Version ID: 00000000-0000-4000-8000-000000000001");
   }
@@ -444,6 +452,24 @@ describe("deploy", () => {
   });
 });
 
+describe("a deploy whose upload the API does not list yet", () => {
+  it("deploys again with the same tag after a backoff when Wrangler's read after the upload finds no Worker", async () => {
+    fakePnpm({ install: { createsWorker: false, status: 0 }, deploy: { createsWorker: true, status: 0, unlistedFirst: 1 } });
+    const deployed = await runTs("deploy", "HEAD");
+    expect(pnpmCalls()).toEqual(["install --frozen-lockfile", "run deploy", "run deploy"]);
+    expect(deployed.output).toContain("did not list the Worker yet (code 10007); deploying again in 10 s");
+    expect(mock.workers.get(NAME)?.versions.map((version) => version.tag)).toEqual([readState().owned.workerTag, readState().owned.workerTag]);
+  });
+
+  it("gives up after three uploads the API never lists", async () => {
+    fakePnpm({ install: { createsWorker: false, status: 0 }, deploy: { createsWorker: true, status: 0, unlistedFirst: 3 } });
+    const deployed = await runTs("deploy", "HEAD");
+    expect(deployed.status).toBe(1);
+    expect(pnpmCalls()).toEqual(["install --frozen-lockfile", "run deploy", "run deploy", "run deploy"]);
+    expect(deployed.output).toContain("deploy test deploy: pnpm run deploy --tag");
+  });
+});
+
 describe("a later deploy of the same run", () => {
   it("refuses to deploy over a Worker that carries no version of this run's deploy", async () => {
     fakePnpm({ install: { createsWorker: false, status: 0 }, deploy: { createsWorker: true, status: 0 } });
@@ -497,58 +523,46 @@ describe("a deploy that fails after creating the Worker", () => {
 
 describe("claim", () => {
   function claimState(): void {
+    mock.workerName = NAME;
     writeState({ url: mock.url, deployments: [{ ref: "HEAD", sha: "0".repeat(40), dir: server, versionId: "v", atMs: Date.now() }] });
   }
 
-  it("shows that the pinned Wrangler writes tail messages to its log file unless told not to", async () => {
-    const logs = join(work, "wrangler-logs");
-    const tail = spawn(join(server, "node_modules", ".bin", "wrangler"), ["tail", NAME, "--format", "pretty"], {
-      cwd: server,
-      env: {
-        PATH: process.env.PATH,
-        HOME: join(work, "home"),
-        CLOUDFLARE_API_BASE_URL: mock.url + "/client/v4",
-        CLOUDFLARE_API_TOKEN: "dummy-token",
-        CLOUDFLARE_ACCOUNT_ID: "0123456789abcdef0123456789abcdef",
-        WRANGLER_SEND_METRICS: "false",
-        WRANGLER_LOG_PATH: logs,
-      },
-    });
-    let output = "";
-    tail.stdout.on("data", (chunk: Buffer) => (output += chunk));
-    tail.stderr.on("data", (chunk: Buffer) => (output += chunk));
-    const closed = new Promise((resolve) => tail.on("close", resolve));
-    try {
-      await vi.waitUntil(() => output.includes("Connected to"), { timeout: 30_000, interval: 200 });
-      await fetch(mock.url + "/setup");
-      await vi.waitUntil(() => output.includes(mock.claimCode), { timeout: 30_000, interval: 200 });
-    } finally {
-      tail.kill("SIGTERM");
-      await closed;
-    }
-    expect(filesContaining(logs, mock.claimCode).length).toBeGreaterThan(0);
-  });
-
-  it("claims with the code from the Worker's tail and leaves the code in no file and no output", async () => {
+  it("claims with the code from the Worker's logs and leaves the code in no file and no output", async () => {
     claimState();
     const { status, output } = await runTs("claim");
     expect(output).toContain("Claimed " + mock.url);
-    expect(output).toContain("No file in Wrangler's directories or the deployed copy holds the claim code");
     expect(status).toBe(0);
     expect(readState().owner?.userId).toBe("user-1");
     expect(output).not.toContain(mock.claimCode);
     expect(filesContaining(work, mock.claimCode)).toEqual([]);
   });
 
-  it("opens /setup only after the tail shows a request, so a tail that starts receiving late still sees the code", async () => {
-    mock.tailDropsFirst = 3;
+  it("keeps querying the logs until the code arrives, and opens /setup once", async () => {
+    mock.logsLagQueries = 3;
     claimState();
     const { status, output } = await runTs("claim");
-    expect(output).toContain("wrangler tail shows this Worker's requests");
     expect(output).toContain("Claimed " + mock.url);
     expect(status).toBe(0);
     expect(mock.setupRequests).toBe(1);
-    expect(output).not.toContain(mock.claimCode);
+    expect(mock.logQueries).toBe(4);
+  });
+
+  it("ignores a claim code another Worker logged", async () => {
+    mock.logs.push({ script: "koidrive-test-2-1", message: "Koidrive claim code (valid for 1 hour): AAAA-BBBB-CCCC", timestamp: Date.now() });
+    claimState();
+    const { status, output } = await runTs("claim");
+    expect(output).toContain("Claimed " + mock.url);
+    expect(status).toBe(0);
+  });
+
+  it("opens no /setup and spends no code when the token cannot query the logs", async () => {
+    mock.observabilityStatus = 403;
+    claimState();
+    const { status, output } = await runTs("claim");
+    expect(status).toBe(1);
+    expect(output).toContain("/setup was not opened and no claim code was spent");
+    expect(output).toContain("the token lacks a permission this call needs");
+    expect(mock.setupRequests).toBe(0);
   });
 
   it("leaves the code in no file and no output when the claim fails", async () => {
@@ -557,7 +571,6 @@ describe("claim", () => {
     const { status, output } = await runTs("claim");
     expect(status).toBe(1);
     expect(output).toContain("the claim failed with HTTP 403");
-    expect(output).toContain("<claim code>");
     expect(output).not.toContain(mock.claimCode);
     expect(filesContaining(work, mock.claimCode)).toEqual([]);
   });

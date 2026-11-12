@@ -248,6 +248,12 @@ export async function namespacesOf(account: Account, script: string): Promise<Na
   }
 }
 
+export async function workerEvents(account: Account, name: string, fromMs: number): Promise<string[]> {
+  const query = { queryId: "deploy-test-" + name, view: "events", limit: 2000, parameters: { filters: [] }, timeframe: { from: fromMs, to: Date.now() } };
+  const response = await call<{ events?: { events?: unknown[] } }>(account, "POST", `/accounts/${account.id}/workers/observability/telemetry/query`, query);
+  return (response.result?.events?.events ?? []).map((event) => JSON.stringify(event)).filter((event) => event.includes(name));
+}
+
 export interface Deployment {
   created_on: string;
   versions: { version_id: string; percentage: number }[];
