@@ -3168,6 +3168,71 @@ fn a_create_the_server_lost_while_its_s_update_waits_is_sent_again() {
 }
 
 #[test]
+fn a_move_another_device_made_after_a_loss_is_taken() {
+    let mut trees = trees(&[(
+        "n",
+        Some(file(ROOT, "x", 1)),
+        Some(file(ROOT, "x", 1)),
+        Some(remote(file(ROOT, "x", 1))),
+    )]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let (trashed, edited, moved) = (
+        trees.trashed_here(),
+        trees.edited_here(),
+        trees.moved_here(),
+    );
+    trees.set_remote("n".into(), remote_at(file(ROOT, "y", 1), 3));
+    trees.forget_lost(
+        trashed,
+        edited,
+        moved,
+        commits.held_through(),
+        commits.accepted(),
+    );
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::Remote);
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+}
+
+#[test]
+fn a_move_of_this_device_the_server_lost_is_sent_again() {
+    let mut trees = trees(&[(
+        "n",
+        Some(file(ROOT, "x", 1)),
+        Some(file(ROOT, "x", 1)),
+        Some(remote(file(ROOT, "x", 1))),
+    )]);
+    trees.set_local("n".into(), local(file(ROOT, "y", 1), 1));
+    trees.settle();
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", ROOT, "y")]);
+    trees.set_remote("n".into(), remote_at(file(ROOT, "y", 1), 2));
+    commits
+        .received(result(2, vec![outcome(op_result::Code::Applied)]))
+        .unwrap();
+    assert!(commits.acknowledge(&mut trees, 2));
+    trees.settle();
+    assert_eq!(commits.connected(&welcome(0)), Reconnect::AheadOfServer);
+    let (trashed, edited, moved) = (
+        trees.trashed_here(),
+        trees.edited_here(),
+        trees.moved_here(),
+    );
+    trees.set_remote("n".into(), remote(file(ROOT, "x", 1)));
+    trees.forget_lost(
+        trashed,
+        edited,
+        moved,
+        commits.held_through(),
+        commits.accepted(),
+    );
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", ROOT, "y")]);
+}
+
+#[test]
 fn an_edit_to_the_content_a_lost_commit_replaced_is_sent_after_the_loss() {
     let (mut trees, mut commits, mut ids) = an_edit_to_the_content_a_lost_commit_replaced();
     assert_eq!(trees.class("n"), Class::Local);

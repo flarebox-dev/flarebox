@@ -67,6 +67,9 @@ pub struct TreesState {
     /// The files whose content an edit of this device set, each with the seq of its commit, while
     /// R holds that content.
     pub edited_here: BTreeMap<NodeId, u64>,
+    /// The nodes whose position a create or a move of this device set, each with the seq of its
+    /// commit, while R holds them live at that position.
+    pub moved_here: BTreeMap<NodeId, u64>,
     /// The files whose content in L is an edit of this device that the server does not hold,
     /// although S and R may hold the same bytes (section 4.4).
     pub unsent_edits: BTreeSet<NodeId>,
@@ -173,6 +176,9 @@ pub enum StateError {
     /// A file is recorded as edited by this device, but R does not hold the content of that
     /// commit.
     NotEditedHere(NodeId),
+    /// A node is recorded as moved by this device, but R does not hold it live at the position of
+    /// that commit.
+    NotMovedHere(NodeId),
     /// A file is recorded with an edit the server does not hold, but L does not hold it.
     NotUnsentEdit(NodeId),
     NotRemote(NodeId),

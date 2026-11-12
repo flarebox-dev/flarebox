@@ -193,6 +193,8 @@ pub struct Trees {
     /// The files whose content an edit of this device set, each with the seq of its commit, while
     /// R holds that content.
     edited_here: BTreeMap<NodeId, u64>,
+    /// See [`TreesState::moved_here`].
+    moved_here: BTreeMap<NodeId, u64>,
     /// See [`TreesState::unsent_edits`].
     unsent_edits: BTreeSet<NodeId>,
     replaced_versions: BTreeMap<NodeId, Vec<String>>,
@@ -267,6 +269,7 @@ impl Trees {
             trashed_here: BTreeMap::new(),
             discarded: BTreeMap::new(),
             edited_here: BTreeMap::new(),
+            moved_here: BTreeMap::new(),
             unsent_edits: BTreeSet::new(),
             replaced_versions: BTreeMap::new(),
             resends: BTreeSet::new(),
@@ -496,6 +499,9 @@ impl Trees {
         if (self.edited_here.get(&id)).is_some_and(|&seq| node.trashed || node.edit_rev != seq) {
             self.edited_here.remove(&id);
         }
+        if (self.moved_here.get(&id)).is_some_and(|&seq| node.trashed || node.meta_rev != seq) {
+            self.moved_here.remove(&id);
+        }
         if node.is_live() && node.shape.kind == Kind::File && is_rules_file(&node.shape.name) {
             self.remote_rules_files.insert(id.clone());
         } else {
@@ -575,6 +581,7 @@ impl Trees {
         self.edited_here.remove(id);
         self.replaced_versions.remove(id);
         self.resends.remove(id);
+        self.moved_here.remove(id);
         if self.r.remove(id).is_some() {
             self.mark(id);
         }
@@ -1190,6 +1197,27 @@ impl Trees {
         }
     }
 
+    /// Records that a create or a move of this device, in the commit at `seq`, set the position of
+    /// `id`, if R holds the position of that commit.
+    pub fn record_moved(&mut self, id: &str, seq: u64) {
+        if (self.r.get(id)).is_some_and(|remote| !remote.trashed && remote.meta_rev == seq) {
+            self.moved_here.insert(id.to_owned(), seq);
+        }
+    }
+
+    /// The nodes whose position a create or a move of this device set, and whose position S and R
+    /// still hold, each with the seq of that commit, for [`Trees::forget_lost`] once a bootstrap
+    /// has replaced R.
+    pub fn moved_here(&self) -> Vec<(NodeId, u64)> {
+        (self.moved_here.iter())
+            .filter(|(id, _)| {
+                let (remote, synced) = (self.r.live(id), self.s.live(id));
+                remote.zip(synced).is_some_and(|(r, s)| r.same_position(s))
+            })
+            .map(|(id, seq)| (id.clone(), *seq))
+            .collect()
+    }
+
     /// The files whose content an edit of this device set, and whose content S and R still hold,
     /// each with the seq of that edit's commit, for [`Trees::forget_lost`] once a bootstrap has
     /// replaced R.
@@ -1256,6 +1284,13 @@ impl Trees {
     /// unless it is a file whose edit the server lost (see `edited` below).
     /// S then forgets each such ancestor only once the delete has taken what it held: the update
     /// waits ([`Trees::waiting`]) and is made as soon as it fits.
+    ///
+    /// A node R holds live as S does but at another position keeps S, so R's position is a remote
+    /// move: a device that did not set S's position cannot tell whether a lost commit set it, and
+    /// sending it again would undo a move another device made since. `moved` lists the
+    /// nodes whose position a create or a move of this device set before the bootstrap
+    /// ([`Trees::moved_here`]), each with the seq of that commit. S forgets such a node when the
+    /// seq is above `held_through`, so the position this device set is sent again.
     ///
     /// `trashed` lists what deletes of this device had trashed before the bootstrap
     /// ([`Trees::trashed_here`]), and `held_through` the seq of the newest commit of this device the
@@ -1327,9 +1362,14 @@ impl Trees {
         trashed: Vec<Trashed>,
         edited: Vec<(NodeId, u64)>,
         synced: Vec<NodeId>,
+        moved: Vec<(NodeId, u64)>,
         held_through: u64,
         accepted: u64,
     ) {
+        let lost_moves: BTreeSet<NodeId> = (moved.into_iter())
+            .filter(|(_, seq)| *seq > held_through)
+            .map(|(id, _)| id)
+            .collect();
         let lost_edits: BTreeSet<NodeId> = (edited.iter())
             .filter(|(_, seq)| *seq > held_through)
             .map(|(id, _)| id.clone())
@@ -1414,8 +1454,17 @@ impl Trees {
         }
         let mut lost: BTreeSet<&str> = (self.s.iter())
             .filter(|(id, synced)| {
+                let moved = |remote: &Shape| {
+                    let at = Shape {
+                        parent: remote.parent.clone(),
+                        name: remote.name.clone(),
+                        ..(*synced).clone()
+                    };
+                    at.same(remote) && !lost_moves.contains(*id)
+                };
                 self.r.get(id).is_none()
-                    || (self.r.live(id)).is_some_and(|remote| !same(Some(remote), Some(*synced)))
+                    || (self.r.live(id))
+                        .is_some_and(|remote| !remote.same(synced) && !moved(remote))
             })
             .map(|(id, _)| id.as_str())
             .collect();
@@ -2079,6 +2128,7 @@ impl Trees {
             lost: self.lost.clone(),
             displaced: self.displaced.clone(),
             edited_here: self.edited_here.clone(),
+            moved_here: self.moved_here.clone(),
             unsent_edits: self.unsent_edits.clone(),
             replaced_versions: self.replaced_versions.clone(),
             resends: self.resends.clone(),
@@ -2138,6 +2188,12 @@ impl Trees {
         if let Some((id, _)) = state.edited_here.iter().find(|entry| !edited(entry)) {
             return Err(StateError::NotEditedHere(id.clone()));
         }
+        let moved = |(id, seq): &(&NodeId, &u64)| {
+            (self.r.get(id)).is_some_and(|remote| !remote.trashed && remote.meta_rev == **seq)
+        };
+        if let Some((id, _)) = state.moved_here.iter().find(|entry| !moved(entry)) {
+            return Err(StateError::NotMovedHere(id.clone()));
+        }
         if let Some(id) = state
             .unsent_edits
             .iter()
@@ -2165,6 +2221,7 @@ impl Trees {
             lost,
             displaced,
             edited_here,
+            moved_here,
             unsent_edits,
             replaced_versions,
             resends,
@@ -2186,6 +2243,7 @@ impl Trees {
         self.lost = lost;
         self.displaced = displaced;
         self.edited_here = edited_here;
+        self.moved_here = moved_here;
         self.unsent_edits = unsent_edits;
         self.replaced_versions = replaced_versions;
         self.resends = resends;

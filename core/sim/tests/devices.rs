@@ -153,7 +153,6 @@ proptest! {
     }
 
     #[test]
-    #[ignore = "after a server loss, a device can move a node back to a position it never set (GUN-531)"]
     fn devices_converge_across_server_restores(devices in 2..=3usize, phases in phases(Losses::Restores)) {
         converge(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
@@ -1373,6 +1372,33 @@ fn a_write_two_downloads_place_after_a_restore_took_it_is_kept_once_beside_the_e
         let mut writes: Vec<Option<i64>> = disk.entries().keys().map(write).collect();
         writes.sort();
         assert_eq!(writes, [Some(1), Some(2)]);
+    }
+}
+
+#[test]
+fn a_folder_renamed_after_a_restore_is_not_moved_back_by_a_device_that_never_moved_it() {
+    let world = converge(
+        3,
+        &[
+            vec![(2, file("ss")), (2, folder("A"))],
+            vec![(0, BACKUP), (2, rename(0, 0, "b"))],
+            vec![
+                (0, folder("c.txt")),
+                (0, SCAN),
+                (1, rename(0, 0, "a")),
+                (0, COMMIT),
+                (0, RESTORE),
+            ],
+        ],
+    )
+    .unwrap();
+    for device in &world.devices {
+        let disk = &device.disk;
+        let paths: BTreeSet<Vec<String>> = (disk.entries().keys())
+            .filter_map(|ino| disk.path(*ino))
+            .collect();
+        let expected = [["a"], ["b"], ["c.txt"]].map(|path| path.map(String::from).to_vec());
+        assert_eq!(paths, BTreeSet::from(expected));
     }
 }
 

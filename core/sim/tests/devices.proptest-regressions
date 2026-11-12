@@ -21,3 +21,8 @@ cc f2098253217140721824a954e37edd294b34ced8e1c4f1e806988bf13b4c0b7b # shrinks to
 cc 4da93369d9a1d2d4c2614b29b46995a1b22f2b5f786b7e71a0061e65fea6be92
 cc 6738d936980638b431ef9488520fbef10ada8585333b827d5fa44480e7bdbb2a
 cc 67e7d4cee5fe483f5ce25dd05944c6a5fae035595279e174de613c490e1e8793 # shrinks to devices = 3, a delete that passes over a resend before the author sends its edit again (GUN-594)
+cc d0cb3650fe1d0604389f180bdab44357972b413356715972a89822c8d6af46d7 # shrinks to devices = 2, an idle device moves a node back after a loss (GUN-531)
+cc bdcce502c58379486cab2a00fd8447273e2ab6211f717b604cca9c8319aeada6 # shrinks to devices = 2, an idle device moves a node back after a loss (GUN-531)
+cc 68654da6b50a61ba293c575cf05e716abb81193b69af5cfbe24db42e5e7b7632 # shrinks to devices = 2, an idle device moves a node back after a loss (GUN-531)
+cc 983f64c2abba506df7a72b26947385874cb8f2a3521904be65666312cb101dd7 # shrinks to devices = 2, an idle device moves a node back after a loss (GUN-531)
+cc 18555b6559389c2f0cf875ca50440b251f21be3461f2f0ef389abb726948752b # shrinks to devices = 2, an idle device moves a node back after a loss (GUN-531)

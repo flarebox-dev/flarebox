@@ -1187,6 +1187,9 @@ impl Commits {
                 }
                 _ => continue,
             };
+            if applied && sent.is_some() {
+                trees.record_moved(node, result.seq);
+            }
             let created = matches!(&op.op, Some(op::Op::CreateDir(_) | op::Op::CreateFile(_)));
             if created
                 && taken

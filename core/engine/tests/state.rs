@@ -102,6 +102,7 @@ fn trees_state() -> TreesState {
         lost: ["a".into()].into(),
         displaced: Default::default(),
         edited_here: [("a".into(), 1)].into(),
+        moved_here: [("a".into(), 1)].into(),
         unsent_edits: Default::default(),
         resends: Default::default(),
         replaced_versions: [("a".into(), vec!["v1".into()])].into(),
@@ -475,6 +476,22 @@ fn trees_restore_a_valid_state_and_refuse_each_broken_one() {
                     .insert("gone".into(), vec!["v1".into()]);
             }),
             StateError::NotRemote("gone".into()),
+        ),
+        (
+            "a node moved here that R holds trashed",
+            trees(),
+            broken(trees_state(), |state| {
+                state.moved_here.insert("t".into(), 5);
+            }),
+            StateError::NotMovedHere("t".into()),
+        ),
+        (
+            "a node moved here whose position R holds from another commit",
+            trees(),
+            broken(trees_state(), |state| {
+                state.moved_here.insert("a".into(), 2);
+            }),
+            StateError::NotMovedHere("a".into()),
         ),
     ];
     for (name, mut trees, state, error) in cases {

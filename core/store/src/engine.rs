@@ -190,6 +190,13 @@ impl Tx<'_> {
         while let Some(row) = rows.next()? {
             state.trees.edited_here.insert(row.get(0)?, row.get(1)?);
         }
+        let mut stmt = self
+            .0
+            .prepare_cached("SELECT node_id, seq FROM moved_here")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            state.trees.moved_here.insert(row.get(0)?, row.get(1)?);
+        }
         let mut stmt = self.0.prepare_cached("SELECT node_id FROM unsent_edits")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
@@ -299,6 +306,7 @@ impl Tx<'_> {
             "pending_names",
             "recorded_nodes",
             "edited_here",
+            "moved_here",
             "unsent_edits",
             "replaced_versions",
             "resends",
@@ -491,6 +499,19 @@ impl Tx<'_> {
             .0
             .prepare_cached("INSERT OR REPLACE INTO edited_here (node_id, seq) VALUES (?1, ?2)")?;
         let (removed, changed) = differences(&before.trees.edited_here, &after.trees.edited_here);
+        for node in removed {
+            remove.execute([node])?;
+        }
+        for (node, seq) in changed {
+            put.execute(params![node, seq])?;
+        }
+        let mut remove = self
+            .0
+            .prepare_cached("DELETE FROM moved_here WHERE node_id = ?1")?;
+        let mut put = self
+            .0
+            .prepare_cached("INSERT OR REPLACE INTO moved_here (node_id, seq) VALUES (?1, ?2)")?;
+        let (removed, changed) = differences(&before.trees.moved_here, &after.trees.moved_here);
         for node in removed {
             remove.execute([node])?;
         }
