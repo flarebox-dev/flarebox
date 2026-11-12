@@ -110,6 +110,18 @@ pub(crate) enum Stop {
     Protocol(String),
 }
 
+impl Stop {
+    pub(crate) fn after_call(error: &CallError, why: String) -> Stop {
+        match error {
+            CallError::Server(_) => Stop::Refused(why),
+            CallError::Stopped(reason) => Stop::Session(reason.clone()),
+            CallError::NotResent(_) | CallError::TooLarge { .. } | CallError::UnexpectedResult => {
+                Stop::Protocol(why)
+            }
+        }
+    }
+}
+
 /// Why [`Pending::stage`] returned without a staged file. The effect stays in flight.
 #[derive(Debug)]
 pub(crate) enum Stall {
@@ -879,10 +891,17 @@ impl Pending {
             None => Ok(self.staged(Some(format!("its content cannot be downloaded: {error}")))),
             Some(Disposition::RetryAfter(wait)) => Err(later(wait)),
             Some(Disposition::Backoff) => Err(later(STAGE_AGAIN)),
-            Some(Disposition::Halt) => Err(Stall::Halt(Stop::Record {
-                effect_id: self.record.effect_id.clone(),
-                what: format!("its content could not be downloaded: {error}"),
-            })),
+            Some(Disposition::Halt) => {
+                let what = format!("its content could not be downloaded: {error}");
+                Err(Stall::Halt(match &error {
+                    ChunkError::Call(call) => Stop::after_call(call, what),
+                    ChunkError::Refused { .. } => Stop::Refused(what),
+                    _ => Stop::Record {
+                        effect_id: self.record.effect_id.clone(),
+                        what,
+                    },
+                }))
+            }
         }
     }
 }
