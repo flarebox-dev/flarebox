@@ -270,8 +270,9 @@ function wranglerDirs(): string[] {
 
 /**
  * Claims the deployment as an owner would, with no human: opens /setup, reads the one-time code from the Worker's own
- * log through wrangler tail, and redeems it. The tail connects before /setup, because the Worker issues a new code only
- * after the last one expired an hour later. The code stays in this process's memory: Wrangler's diagnostic log file is
+ * log through wrangler tail, and redeems it. /setup opens only once the tail shows a request to /v1/server, because the
+ * Worker logs a code once and issues no other until it expires an hour later, and a tail can connect before it receives
+ * the Worker's events. The code stays in this process's memory: Wrangler's diagnostic log file is
  * turned off and pointed at a directory that is deleted afterwards, the tail output is never printed unredacted, and
  * the run fails if any file in Wrangler's directories or the deployed copy still holds the code's log line.
  */
@@ -295,7 +296,16 @@ async function claim(): Promise<void> {
   const redacted = (text: string) => (code ? text.replaceAll(code, "<claim code>") : text).replace(/\b[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}\b/g, "<claim code>");
   try {
     await until(() => (log.includes("Connected to") ? true : exited !== undefined ? fail("wrangler tail exited with " + exited) : undefined), "wrangler tail to connect", TAIL_MS);
-    await sleep(3000);
+    const deadline = Date.now() + TAIL_MS;
+    while (!log.includes("/v1/server")) {
+      if (exited !== undefined) fail("wrangler tail exited with " + exited);
+      if (Date.now() > deadline) {
+        fail("wrangler tail showed none of this Worker's requests to /v1/server within " + TAIL_MS / 1000 + " s, so /setup was not opened and no claim code was spent; run the claim again");
+      }
+      await fetch(url + "/v1/server", { signal: AbortSignal.timeout(10_000) }).then((response) => response.body?.cancel(), () => undefined);
+      await sleep(2000);
+    }
+    console.log("wrangler tail shows this Worker's requests, so it will see the claim code");
     const setup = await fetch(url + "/setup", { signal: AbortSignal.timeout(15_000) });
     const page = await setup.text();
     if (!setup.ok || !page.includes("claim code")) fail("/setup did not issue a claim code (HTTP " + setup.status + "): " + page.slice(0, 200));

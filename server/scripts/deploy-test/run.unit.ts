@@ -416,6 +416,17 @@ describe("claim", () => {
     expect(filesContaining(work, mock.claimCode)).toEqual([]);
   });
 
+  it("opens /setup only after the tail shows a request, so a tail that starts receiving late still sees the code", async () => {
+    mock.tailDropsFirst = 3;
+    claimState();
+    const { status, output } = await runTs("claim");
+    expect(output).toContain("wrangler tail shows this Worker's requests");
+    expect(output).toContain("Claimed " + mock.url);
+    expect(status).toBe(0);
+    expect(mock.setupRequests).toBe(1);
+    expect(output).not.toContain(mock.claimCode);
+  });
+
   it("leaves the code in no file and no output when the claim fails", async () => {
     mock.claimStatus = 403;
     claimState();
