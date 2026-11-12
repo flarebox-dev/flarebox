@@ -1458,6 +1458,39 @@ fn the_last_of_two_lost_renames_is_kept_through_the_restore() {
 }
 
 #[test]
+fn a_lost_rename_sent_again_before_a_later_lost_rename_keeps_the_later_one() {
+    let mut lost = vec![
+        (0, rename(0, 0, "ss")),
+        (0, SCAN),
+        (0, COMMIT),
+        (0, COMMIT),
+        (0, DELIVER),
+        (0, DELIVER),
+        (0, RESTORE),
+        (1, Step::Connect),
+    ];
+    for _ in 0..12 {
+        lost.extend([(1, Step::Work(0)), (1, DELIVER), (1, EFFECT)]);
+    }
+    lost.push((0, Step::Connect));
+    let world = converge(
+        2,
+        &[
+            vec![(0, file("a"))],
+            vec![(0, BACKUP), (1, rename(0, 0, "b"))],
+            lost,
+        ],
+    )
+    .unwrap();
+    for device in &world.devices {
+        let names: Vec<&str> = (device.disk.entries().values())
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["ss"]);
+    }
+}
+
+#[test]
 fn a_file_renamed_by_the_server_in_a_folder_it_merged_is_not_moved_back() {
     converge(
         2,
