@@ -5662,7 +5662,7 @@ fn a_commit_too_large_to_send_counts_as_too_large_and_never_as_refused() {
     );
     let problem = a.folder.view().problem.unwrap();
     assert!(
-        problem.contains("notes.txt (it is too large to send"),
+        problem.contains("\"notes.txt\" (it is too large to send"),
         "{problem}"
     );
 }
