@@ -2246,7 +2246,8 @@ fn plan(
             .iter()
             .map(|node| record_cost(trees.synced().live(node)))
             .sum();
-        let kept = (scratch.subtree(id).iter()).any(|node| trees.excluded(node));
+        let kept = (scratch.subtree(id).iter())
+            .any(|node| trees.excluded(node) || trees.kept_original(node).is_some());
         match children.get(id.as_str()) {
             Some(kids) if kept || bytes > MAX_COMMIT_BYTES || split.contains(id) => {
                 tops.extend(kids)

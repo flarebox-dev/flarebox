@@ -8271,3 +8271,80 @@ fn a_lost_keep_original_is_sent_again_requiring_the_original() {
         .collect();
     assert_eq!(required, [Some(original.node_id)]);
 }
+
+fn keep_original_lost_below_a_removed_folder(deleted_on_c: bool) -> (Remote, Commit) {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site_a.root.join("d")).unwrap();
+    a.create(&mut remote, &site_a.root.join("d/main.go"), b"v1");
+    let (site_b, mut b) = linked(&mut remote, "b");
+    b.settle();
+    fs::write(site_a.root.join("d/main.go"), b"from a").unwrap();
+    fs::write(site_b.root.join("d/main.go"), b"from b").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(&mut remote);
+    b.scan_until(|b| !b.work.is_empty());
+    b.run(&mut remote);
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+    let mut chunks = Server::default();
+    chunks.chunks.clone_from(&remote.chunks.chunks);
+    let mut restored = Remote {
+        space: remote.space.clone(),
+        chunks,
+        results: remote.results.clone(),
+    };
+    answer(&site_b, Answer::KeepOriginal);
+    let step = b.folder.requested();
+    b.take(step).unwrap();
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+    assert_eq!(remote.names(), ["d", "main.go"]);
+    drop(b);
+    fs::rename(site_b.root.join("d/main.go"), site_b.root.join("main.go")).unwrap();
+    fs::remove_dir(site_b.root.join("d")).unwrap();
+
+    let (site_c, mut c) = linked(&mut restored, "c");
+    c.settle();
+    fs::rename(site_c.root.join("d/main.go"), site_c.root.join("main.go")).unwrap();
+    c.scan_until(|c| !c.work.is_empty());
+    c.run(&mut restored);
+    let mut b = site_b.start();
+    b.connect(&restored);
+    b.scan_until(|b| b.folder.scanned);
+    let sent = loop {
+        let work = b.work.pop_front().unwrap();
+        if let Work::Send(commit) = work {
+            break commit;
+        }
+        b.perform(work, &mut restored).unwrap();
+    };
+    if deleted_on_c {
+        fs::remove_file(site_c.root.join("main.go")).unwrap();
+        c.scan_until(|c| !c.work.is_empty());
+        c.run(&mut restored);
+    }
+    b.perform(Work::Send(sent.clone()), &mut restored).unwrap();
+    for _ in 0..3 {
+        b.pull(&restored);
+        b.run(&mut restored);
+        b.settle();
+    }
+    (restored, sent)
+}
+
+#[test]
+fn a_lost_keep_original_below_a_removed_folder_keeps_the_copy_once_the_original_is_deleted() {
+    let (restored, sent) = keep_original_lost_below_a_removed_folder(true);
+
+    assert_eq!(restored.names(), ["d", COPY]);
+    let deleted: Vec<_> = (resent_deletes(std::slice::from_ref(&sent)).into_iter())
+        .map(|delete| delete.requires.is_some())
+        .collect();
+    assert_eq!(deleted, [true]);
+}
+
+#[test]
+fn a_lost_keep_original_below_a_removed_folder_deletes_the_folder_after_the_copy() {
+    let (restored, _) = keep_original_lost_below_a_removed_folder(false);
+
+    assert_eq!(restored.names(), ["main.go"]);
+}

@@ -7171,3 +7171,31 @@ fn keep_the_copy_deletes_the_copy_only_while_the_original_holds_the_content_it_t
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert_eq!(ops(&commit), [delete_copy_requiring(6, 3)]);
 }
+
+#[test]
+fn a_folder_delete_waits_while_a_resent_answer_delete_below_it_requires_the_original() {
+    let mut trees = trees(&[
+        synced("f", file(ROOT, "f", 1)),
+        (
+            "d",
+            None,
+            Some(dir(ROOT, "d")),
+            Some(remote(dir(ROOT, "d"))),
+        ),
+        (
+            "y",
+            None,
+            Some(file("d", "y", 2)),
+            Some(remote(file("d", "y", 2))),
+        ),
+    ]);
+    let mut state = trees.state();
+    state.kept_originals.insert("y".into(), "f".into());
+    trees.restore(state).unwrap();
+    trees.set_rules::<&str>(&[], None);
+    trees.rules_scanned();
+    let held = trees.remote().get("f").unwrap();
+    let required = delete_copy_requiring(held.content_rev, held.meta_rev);
+    let commit = build(&mut Commits::default(), &mut trees, &mut IdGen::new(1)).unwrap();
+    assert_eq!(ops(&commit), [required]);
+}
