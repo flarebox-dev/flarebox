@@ -7,8 +7,8 @@
 # merge queue run for main (refs/heads/gh-readonly-queue/main/...), or a pull request whose head
 # branch is in koidrive/koidrive. It refuses every other event, pull requests from forks
 # included, whatever runs-on the workflow asked for. It fails closed: a job whose event it cannot
-# read does not run. It uses only
-# the macOS base system (/bin/bash and /usr/bin/jq). CONTRIBUTING.md says how to install it.
+# read does not run. It uses only the macOS base system (/bin/bash and /usr/bin/jq). README.md
+# in this directory says how to install it.
 set -u
 
 repository=koidrive/koidrive
