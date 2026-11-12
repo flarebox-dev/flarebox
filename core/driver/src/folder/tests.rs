@@ -6042,6 +6042,55 @@ fn keeping_the_copy_of_a_conflict_gives_the_original_its_content_and_moves_the_c
     assert_eq!(shown(&site_b), []);
 }
 
+/// The server is restored from a backup taken before `b` answered the conflict between `main.go` and [`COPY`],
+/// after `b` carried the answer out. `b` sends what the answer wrote again, and the question stays closed.
+fn answered_then_lost(given: Answer) -> (Site, Remote) {
+    let mut remote = Remote::new();
+    let ((site_a, mut a), (site_b, mut b)) = edited_on_both(&mut remote);
+    let mut chunks = Server::default();
+    chunks.chunks.clone_from(&remote.chunks.chunks);
+    let mut restored = Remote {
+        space: remote.space.clone(),
+        chunks,
+        results: remote.results.clone(),
+    };
+    answer(&site_b, given);
+    let step = b.folder.requested();
+    b.take(step).unwrap();
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+    assert_eq!(remote.names(), ["main.go"]);
+    b.event(Event::Connected(restored.space.welcome(&b.caller)))
+        .unwrap();
+    for _ in 0..3 {
+        b.pull(&restored);
+        b.run(&mut restored);
+        b.settle();
+    }
+    assert_eq!(b.state(), FolderState::UpToDate);
+    (site_b, restored)
+}
+
+#[test]
+fn a_kept_original_the_server_lost_moves_the_copy_to_the_trash_again() {
+    let (site, restored) = answered_then_lost(Answer::KeepOriginal);
+    let kept = [("main.go".to_owned(), "from a".to_owned())];
+    assert_eq!(files(&site.root), kept);
+    assert_eq!(restored.names(), ["main.go"]);
+    assert_eq!(shown(&site), []);
+}
+
+#[test]
+fn a_kept_copy_the_server_lost_gives_the_original_its_content_again() {
+    let (site, mut restored) = answered_then_lost(Answer::KeepCopy);
+    let kept = [("main.go".to_owned(), "from b".to_owned())];
+    assert_eq!(files(&site.root), kept);
+    assert_eq!(restored.names(), ["main.go"]);
+    let (other, mut c) = linked(&mut restored, "c");
+    c.settle();
+    assert_eq!(files(&other.root), kept);
+    assert_eq!(shown(&site), []);
+}
+
 /// Another device edits the copy before the server takes the answer to delete it. The server keeps the copy, and
 /// the conflict is asked again.
 #[test]

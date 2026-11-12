@@ -1169,10 +1169,12 @@ impl Commits {
             };
             *sent_in = None;
             match (sent, code) {
-                (op::Op::Delete(_), Code::Applied) => {
+                (op::Op::Delete(delete), Code::Applied) => {
+                    trees.record_trashed(&delete.node_id, result.seq);
                     closed.insert(id);
                 }
                 (op::Op::UpdateContent(update), Code::Applied) => {
+                    trees.record_edited(&update.node_id, result.seq);
                     let remote = trees.remote().get(&original.node_id);
                     let took = remote.filter(|node| {
                         (node.shape.content.as_ref().zip(update.content.as_ref()))
