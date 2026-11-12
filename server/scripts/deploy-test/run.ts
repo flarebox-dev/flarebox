@@ -250,16 +250,17 @@ async function deploy(account: Account, ref: string): Promise<void> {
   console.log(url + " serves Koidrive " + info.serverVersion + (info.claimed ? ", claimed" : ", not claimed yet"));
 }
 
-async function provenKey(account: Account, name: string, fromMs: number, marker: string, deadline: Deadline): Promise<WorkerKey | undefined> {
+async function provenKey(account: Account, name: string, fromMs: number, marker: string, deadline: Deadline): Promise<{ key: WorkerKey; timestamp: unknown } | undefined> {
   for (const key of WORKER_KEYS) {
-    let events: { text: string }[];
+    let events: { timestamp: unknown; text: string }[];
     try {
       events = await workerEvents(account, key, name, fromMs, deadline);
     } catch (error) {
       if (error instanceof ApiError && error.status === 400) continue;
       throw error;
     }
-    if (events.some((event) => event.text.includes(marker))) return key;
+    const probe = events.find((event) => event.text.includes(marker));
+    if (probe) return { key, timestamp: probe.timestamp };
   }
   return undefined;
 }
@@ -280,9 +281,9 @@ async function claim(account: Account): Promise<void> {
   const marker = "/deploy-test-probe-" + randomBytes(8).toString("hex");
   await fetch(url + marker, { signal: AbortSignal.timeout(15_000) }).then((response) => response.body?.cancel(), () => undefined);
   const probe = { atMs: Date.now() + CLAIM_LOG_MS, what: "no query of this Worker's logs showed its request to " + marker + " within " + CLAIM_LOG_MS / 1000 + " s" };
-  let key: WorkerKey | undefined;
+  let proven: { key: WorkerKey; timestamp: unknown } | undefined;
   try {
-    while (!(key = await provenKey(account, state.name, fromMs, marker, probe))) {
+    while (!(proven = await provenKey(account, state.name, fromMs, marker, probe))) {
       if (Date.now() > probe.atMs) throw new DeadlineError(probe.what);
       await sleep(CLAIM_LOG_EVERY_MS);
     }
@@ -290,7 +291,8 @@ async function claim(account: Account): Promise<void> {
     if (!(error instanceof ApiError)) throw error;
     fail(error.message + ", so /setup was not opened and no claim code was spent");
   }
-  console.log("Workers Logs shows this Worker's request to " + marker + " when filtered on " + key);
+  const { key } = proven;
+  console.log("Workers Logs shows this Worker's request to " + marker + " when filtered on " + key + ", with event timestamp " + JSON.stringify(proven.timestamp) + " (Date.now() " + Date.now() + ")");
   const setup = await fetch(url + "/setup", { signal: AbortSignal.timeout(15_000) });
   const page = await setup.text();
   if (!setup.ok || !page.includes("claim code")) fail("/setup did not issue a claim code (HTTP " + setup.status + "): " + page.slice(0, 200));

@@ -534,6 +534,8 @@ describe("claim", () => {
     expect(status).toBe(0);
     expect(readState().owner?.userId).toBe("user-1");
     expect(output).toContain("filtered on $metadata.service");
+    const [, eventMs, nowMs] = /with event timestamp (\d+) \(Date\.now\(\) (\d+)\)/.exec(output) ?? [];
+    expect(Math.abs(Number(nowMs) - Number(eventMs))).toBeLessThan(60_000);
     expect(mock.queryDryFlags.length).toBeGreaterThan(0);
     expect(mock.queryDryFlags.every((dry) => dry === true)).toBe(true);
     expect(output).not.toContain(mock.claimCode);
