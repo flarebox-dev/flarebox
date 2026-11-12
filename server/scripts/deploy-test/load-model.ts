@@ -154,6 +154,29 @@ export function settledRows(readings: UsageReading[], commits: number): number |
   return complete && unchanged ? last.rowsWritten : undefined;
 }
 
+export async function calibrate(
+  read: () => Promise<UsageReading>,
+  commits: number,
+  untilMs: number,
+  everyMs: number,
+  log: (line: string) => void,
+): Promise<{ rows: number; readings: UsageReading[] }> {
+  const readings: UsageReading[] = [];
+  while (Date.now() < untilMs) {
+    try {
+      readings.push(await read());
+    } catch (error) {
+      log("Analytics API: " + (error instanceof Error ? error.message : String(error)).slice(0, 200));
+    }
+    const rows = settledRows(readings, commits);
+    if (rows !== undefined) return { rows, readings };
+    const remaining = untilMs - Date.now();
+    if (remaining <= 0) break;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(everyMs, remaining)));
+  }
+  return { rows: 0, readings };
+}
+
 export function commitBudget(maxRowsWritten: number, rowsPerCommit: number): number {
   return Math.floor(maxRowsWritten / (Math.max(rowsPerCommit, 1) * BUDGET_MARGIN));
 }

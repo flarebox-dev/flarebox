@@ -20,8 +20,8 @@ import {
   FALLBACK_ROWS_PER_COMMIT,
   layout,
   readConfig,
+  calibrate,
   saturated,
-  settledRows,
   type StepCounts,
   type StepSummary,
   summarize,
@@ -510,19 +510,12 @@ describe("load test " + config.scenario, () => {
     const namespaces = await namespacesOf(account, state.name);
     const deadline = Date.now() + CALIBRATION_WAIT_MS;
     await sleep(ANALYTICS_LAG_MS);
-    const readings: UsageReading[] = [];
-    let rows = 0;
-    while (Date.now() < deadline) {
-      try {
-        const used = await usage(account, namespaces, calibration);
-        readings.push({ requests: used.SpaceDO?.requests ?? 0, rowsWritten: rowsWritten(used) });
-      } catch (error) {
-        console.log("Analytics API: " + (error instanceof Error ? error.message : String(error)).slice(0, 200));
-      }
-      rows = settledRows(readings, commits) ?? 0;
-      if (rows > 0) break;
-      await sleep(CALIBRATION_READ_EVERY_MS);
-    }
+    const window = calibration;
+    const read = async (): Promise<UsageReading> => {
+      const used = await usage(account, namespaces, window);
+      return { requests: used.SpaceDO?.requests ?? 0, rowsWritten: rowsWritten(used) };
+    };
+    const { rows, readings } = await calibrate(read, commits, deadline, CALIBRATION_READ_EVERY_MS, console.log);
     if (rows === 0 && readings.length > 0) {
       console.log(
         "Analytics did not report SpaceDO requests and rows written of at least the " + commits + " commits, unchanged a minute apart, within " + CALIBRATION_WAIT_MS / 60_000 + " minutes. Requests / rows written per reading: " +

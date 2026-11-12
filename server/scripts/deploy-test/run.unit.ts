@@ -239,11 +239,17 @@ describe("reading what the API lists late", () => {
   async function withFetch<T>(fetchStub: (url: string) => Promise<Response>, read: () => Promise<T>, advanceMs: number): Promise<T> {
     vi.useFakeTimers();
     vi.stubGlobal("fetch", fetchStub);
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation((ms) => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(new DOMException("The operation was aborted due to timeout", "TimeoutError")), ms);
+      return controller.signal;
+    });
     try {
       const result = read();
       await vi.advanceTimersByTimeAsync(advanceMs);
       return await result;
     } finally {
+      timeout.mockRestore();
       vi.useRealTimers();
       vi.unstubAllGlobals();
     }
@@ -263,7 +269,7 @@ describe("reading what the API lists late", () => {
     const newest = await withFetch(fetchStub, () => newestDeployment(account, NAME, "v2"), LISTING_MS);
     expect(newest).toEqual(split);
     expect(serves(newest, "v2")).toBe(false);
-    expect(fetchStub).toHaveBeenCalledTimes(13);
+    expect(fetchStub).toHaveBeenCalledTimes(12);
   });
 
   it("reads a new Worker's versions again until they are listed", async () => {
@@ -285,7 +291,60 @@ describe("reading what the API lists late", () => {
     expect(untagged).toHaveBeenCalledTimes(2);
     const unlisted = vi.fn(async () => Response.json({ result: { items: [] } }));
     expect(await withFetch(unlisted, () => workerTag(account, NAME, "this-runs-tag"), LISTING_MS)).toBe("unlisted");
-    expect(unlisted).toHaveBeenCalledTimes(13);
+    expect(unlisted).toHaveBeenCalledTimes(12);
+  });
+
+  function slowFetch(delayMs: (url: string) => number, body: (url: string) => unknown, started: number[]) {
+    return vi.fn(
+      (url: string, init?: RequestInit) =>
+        new Promise<Response>((resolve, reject) => {
+          started.push(Date.now());
+          const timer = setTimeout(() => resolve(Response.json(body(url))), delayMs(url));
+          init?.signal?.addEventListener("abort", () => {
+            clearTimeout(timer);
+            reject(init.signal!.reason);
+          });
+        }),
+    );
+  }
+
+  it("stops reading slow deployments at 60 s and keeps the last listing it got", async () => {
+    const split = { created_on: "2026-11-12T10:00:00Z", versions: [{ version_id: "v1", percentage: 50 }, { version_id: "v2", percentage: 50 }] };
+    const started: number[] = [];
+    const fetchStub = slowFetch(() => 50_000, () => ({ result: { deployments: [split] } }), started);
+    const run = await withFetch(
+      fetchStub,
+      async () => {
+        const startMs = Date.now();
+        const newest = await newestDeployment(account, NAME, "v2");
+        return { newest, tookMs: Date.now() - startMs, startedMs: started.map((at) => at - startMs) };
+      },
+      LISTING_MS,
+    );
+    expect(run.newest).toEqual(split);
+    expect(run.tookMs).toBeLessThanOrEqual(LISTING_MS);
+    expect(run.startedMs).toEqual([0, 55_000]);
+  });
+
+  it("stops reading a slow Worker's versions at 60 s and reports them unlisted", async () => {
+    const started: number[] = [];
+    const fetchStub = slowFetch(
+      () => 40_000,
+      (url) => (url.includes("/versions/") ? { result: { id: "v1", annotations: { "workers/tag": "this-runs-tag" } } } : { result: { items: [{ id: "v1" }] } }),
+      started,
+    );
+    const run = await withFetch(
+      fetchStub,
+      async () => {
+        const startMs = Date.now();
+        const tag = await workerTag(account, NAME, "this-runs-tag");
+        return { tag, tookMs: Date.now() - startMs, startedMs: started.map((at) => at - startMs) };
+      },
+      LISTING_MS,
+    );
+    expect(run.tag).toBe("unlisted");
+    expect(run.tookMs).toBeLessThanOrEqual(LISTING_MS);
+    expect(run.startedMs).toEqual([0, 40_000]);
   });
 });
 
