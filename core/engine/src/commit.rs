@@ -17,7 +17,7 @@ use crate::ids::{IdGen, unix_ms};
 use crate::names::{MAX_NAME_BYTES, name_key, nfc};
 use crate::question::{Answer, ConflictFile, Question, QuestionKind, Revisions};
 use crate::restore::{Outcome, RESOLVED_KEPT, Rejection, Resolved, RestoreId, RestoreIntent};
-use crate::state::{Agreed, CommitsState, StateError};
+use crate::state::{Agreed, CommitsState, Pending, StateError};
 use crate::tree::{Content, Kind, Names, NodeId, Shape, same, same_content};
 
 /// The most ops one commit holds (spec v0 section 13).
@@ -173,6 +173,7 @@ pub struct Commits {
     /// until the server applies their create. The person chose to keep them beside what R holds,
     /// so a create of one that takes a conflict name asks nothing.
     published: BTreeSet<NodeId>,
+    pending: BTreeMap<NodeId, Pending>,
     guard: GuardState,
 }
 
@@ -192,6 +193,7 @@ impl Commits {
             slots: self.slots.clone(),
             questions: self.questions.clone(),
             published: self.published.clone(),
+            pending: self.pending.clone(),
             guard: self.guard.clone(),
         }
     }
@@ -251,6 +253,7 @@ impl Commits {
             slots,
             questions,
             published,
+            pending,
             guard,
         } = state;
         Ok(Self {
@@ -266,6 +269,7 @@ impl Commits {
             slots,
             questions,
             published,
+            pending,
             guard,
         })
     }
@@ -675,7 +679,8 @@ impl Commits {
         self.published.retain(|id| trees.local().get(id).is_some());
         self.aliases
             .retain(|id, _| trees.local().get(id).is_some() && trees.reverted().contains(id));
-        let (planned, deletes, reverts) = plan(
+        self.retire_pending(trees);
+        let (planned, deletes, reverts, pending) = plan(
             trees,
             &skip,
             &needed,
@@ -684,10 +689,12 @@ impl Commits {
             &self.split,
             &self.aliases,
             &self.restores,
+            &self.pending,
         );
         for id in reverts {
             trees.revert(id);
         }
+        self.pending.extend(pending);
         let ops: Vec<proto::Op> = planned.into_iter().chain(answered).collect();
         if ops.is_empty() {
             return None;
@@ -806,6 +813,17 @@ impl Commits {
         }
         self.questions = kept;
         ops
+    }
+
+    /// Whether a build has something to do: a node is dirty or its S update waits, a restore is
+    /// queued, a conflict question is due ([`Commits::conflicts_due`]), or a node L and R both
+    /// hold at the pending name a commit gave it is owed its own name.
+    pub fn due(&self, trees: &Trees) -> bool {
+        !trees.dirty().is_empty()
+            || !trees.waiting().is_empty()
+            || !self.restores.is_empty()
+            || self.conflicts_due(trees)
+            || renames_owed(trees, &self.pending).next().is_some()
     }
 
     /// Whether a build has something to do for a conflict question: a file of it was renamed,
@@ -949,6 +967,31 @@ impl Commits {
     /// S stays a valid tree. When the updates together would break it, because S still lags R
     /// elsewhere, each is made as soon as it fits and the rest wait (see [`Trees::waiting`]).
     pub fn acknowledge(&mut self, trees: &mut Trees, last_seq: u64) -> bool {
+        let acknowledged = self.acknowledge_flight(trees, last_seq);
+        self.retire_pending(trees);
+        acknowledged
+    }
+
+    fn retire_pending(&mut self, trees: &Trees) {
+        let flight = self.in_flight.as_ref();
+        self.pending.retain(|id, pending| {
+            let owed_in_flight = flight.is_some_and(|flight| {
+                flight.commit.ops.iter().any(|op| {
+                    matches!(&op.op, Some(op::Op::Move(moved))
+                        if moved.node_id == *id && nfc(&moved.new_name) == nfc(&pending.name))
+                })
+            });
+            if (trees.remote().get(id))
+                .is_some_and(|remote| nfc(&remote.shape.name) == nfc(&pending.sent))
+            {
+                pending.landed = true;
+                return true;
+            }
+            (flight.is_some() && !pending.landed) || owed_in_flight
+        });
+    }
+
+    fn acknowledge_flight(&mut self, trees: &mut Trees, last_seq: u64) -> bool {
         let Some(flight) = self
             .in_flight
             .take_if(|flight| flight.result.as_ref().is_some_and(|r| r.seq <= last_seq))
@@ -956,6 +999,7 @@ impl Commits {
             return false;
         };
         let result = flight.result.expect("taken with a result");
+        let sent_under = self.pending.clone();
         let mut synced = Synced::default();
         let mut merged: BTreeMap<NodeId, NodeId> = BTreeMap::new();
         let mut agreed: BTreeMap<NodeId, Agreed> = BTreeMap::new();
@@ -1078,8 +1122,21 @@ impl Commits {
                         agreed.extend(agree(trees, id, result.seq));
                         synced.set(id, Some(shape));
                     }
-                    if cycle {
+                    let owed = sent_under.get(id).is_some_and(|pending| {
+                        nfc(&moved.new_name) == nfc(&pending.name)
+                            && trees.local().get(id).is_some_and(|local| {
+                                local.shape.parent == moved.new_parent_id
+                                    && nfc(&local.shape.name) == nfc(&pending.sent)
+                            })
+                    });
+                    if cycle || (applied && owed) {
                         trees.revert(id.clone());
+                    }
+                    if applied
+                        && (sent_under.get(id))
+                            .is_some_and(|pending| nfc(&moved.new_name) != nfc(&pending.sent))
+                    {
+                        self.pending.remove(id);
                     }
                     (id, applied || cycle)
                 }
@@ -1831,6 +1888,20 @@ fn agree(trees: &Trees, id: &str, seq: u64) -> Option<(NodeId, Agreed)> {
     (trees.position_after(id, seq)).map(|at| (id.to_owned(), at.clone()))
 }
 
+fn renames_owed<'a>(
+    trees: &'a Trees,
+    pending: &'a BTreeMap<NodeId, Pending>,
+) -> impl Iterator<Item = (&'a NodeId, &'a Shape, &'a Pending)> + 'a {
+    (pending.iter())
+        .filter(|(id, _)| !trees.excluded(id) && !trees.held(id))
+        .filter_map(|(id, pending)| {
+            let local = trees.local().get(id).filter(|node| !node.parked)?;
+            let remote = trees.remote().live(id)?;
+            (nfc(&remote.name) == nfc(&pending.sent) && local.shape.same_position(remote))
+                .then_some((id, remote, pending))
+        })
+}
+
 fn changed_locally(trees: &Trees, id: &str) -> bool {
     let Some(Waiting {
         shape: Some(waiting),
@@ -1976,12 +2047,13 @@ enum Fit {
     Wait,
 }
 
-type Planned = (Vec<proto::Op>, BTreeMap<NodeId, Vec<NodeId>>, Vec<NodeId>);
+type Planned = (
+    Vec<proto::Op>,
+    BTreeMap<NodeId, Vec<NodeId>>,
+    Vec<NodeId>,
+    BTreeMap<NodeId, Pending>,
+);
 
-/// The ops for every queued restore and every local change, in an order valid on a scratch copy
-/// of R, the nodes each delete covers, and the nodes to revert: moves that close a cycle, and
-/// nodes in a merged folder that S or R already has where the folder it was merged into holds
-/// them, so they follow R. The ops `answered` already holds for the commit count toward its limits.
 #[allow(clippy::too_many_arguments)]
 fn plan(
     trees: &Trees,
@@ -1992,6 +2064,7 @@ fn plan(
     split: &BTreeSet<NodeId>,
     aliases: &BTreeMap<NodeId, NodeId>,
     restores: &BTreeMap<RestoreId, RestoreIntent>,
+    owed: &BTreeMap<NodeId, Pending>,
 ) -> Planned {
     let mut wants = Vec::new();
     if !restores.is_empty() {
@@ -2014,6 +2087,7 @@ fn plan(
     }
     let mut deleted = BTreeSet::new();
     let mut reverts = Vec::new();
+    let mut pending = BTreeMap::new();
     for id in trees.dirty().iter().filter(|id| !problems.contains(*id)) {
         let class = trees.acknowledged_class(id);
         if !matches!(class, Class::Local | Class::Concurrent) {
@@ -2079,6 +2153,15 @@ fn plan(
                 content: content.clone(),
             });
         }
+    }
+    for (id, remote, pending) in
+        renames_owed(trees, owed).filter(|(id, ..)| !problems.contains(*id))
+    {
+        wants.push(Want::Move {
+            id: id.clone(),
+            parent: remote.parent.clone(),
+            name: pending.name.clone(),
+        });
     }
     let mut scratch = Scratch::new(trees);
     let mut tops = Vec::new();
@@ -2253,10 +2336,19 @@ fn plan(
             let Some(Want::Move { id, parent, name }) = &wants[cycle[0]] else {
                 unreachable!("a name cycle holds moves");
             };
+            let sent = scratch.free_name(parent, name);
+            pending.insert(
+                id.clone(),
+                Pending {
+                    sent: sent.clone(),
+                    name: name.clone(),
+                    landed: false,
+                },
+            );
             let aside = Want::Move {
                 id: id.clone(),
                 parent: parent.clone(),
-                name: scratch.free_name(parent, name),
+                name: sent,
             };
             let all: usize = (cycle.iter())
                 .filter_map(|at| wants[*at].as_ref())
@@ -2285,11 +2377,20 @@ fn plan(
         if !room(&mut emitted, &mut bytes, slot.as_ref().expect("checked")) {
             break true;
         }
-        if let Some(Want::Create { shape, .. }) = slot.as_mut()
+        if let Some(Want::Create { id, shape }) = slot.as_mut()
             && shape.kind == Kind::Dir
         {
             if (scratch.holders(&shape.parent, &shape.name)).any(|other| moving.contains(other)) {
-                shape.name = scratch.free_name(&shape.parent, &shape.name);
+                let sent = scratch.free_name(&shape.parent, &shape.name);
+                let name = std::mem::replace(&mut shape.name, sent.clone());
+                pending.insert(
+                    id.clone(),
+                    Pending {
+                        sent,
+                        name,
+                        landed: false,
+                    },
+                );
             } else {
                 let held = scratch.held(&shape.parent, &shape.name);
                 scratch.merged.extend(held);
@@ -2306,7 +2407,15 @@ fn plan(
             }
         }
     }
-    (ops, deletes, reverts)
+    pending.retain(|id, pending| {
+        let last = ops.iter().rev().find_map(|op| match &op.op {
+            Some(op::Op::CreateDir(create)) if create.node_id == *id => Some(&create.name),
+            Some(op::Op::Move(moved)) if moved.node_id == *id => Some(&moved.new_name),
+            _ => None,
+        });
+        last == Some(&pending.sent)
+    });
+    (ops, deletes, reverts, pending)
 }
 
 /// A cycle of moves that each wait only for a name held by the node of the next one, as in a swap

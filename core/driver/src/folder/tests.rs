@@ -29,6 +29,101 @@ use crate::question::Answer;
 
 const NOW: i64 = 1_700_000_000_000;
 
+#[test]
+fn a_folder_brought_back_at_its_pending_name_takes_its_own_name() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("a"), b"the file");
+    let (site, mut b) = linked(&mut remote, "b");
+    b.settle();
+    fs::rename(site.root.join("a"), site.root.join("x")).unwrap();
+    fs::create_dir(site.root.join("a")).unwrap();
+    fs::rename(site.root.join("x"), site.root.join("a/child")).unwrap();
+    b.scan_until(|b| !b.work.is_empty());
+    let Some(Work::Send(commit)) = b.work.pop_front() else {
+        panic!("a commit is sent");
+    };
+    let result = remote.commit(&b.caller, &commit).unwrap();
+    fs::remove_dir_all(site.root.join("a")).unwrap();
+    b.settle();
+    a.pull(&remote);
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    let child = files(&site_a.root).into_iter().next().unwrap().0;
+    a.create(&mut remote, &site_a.root.join(child), b"edited remotely");
+    b.pull(&remote);
+    let step = b.folder.sent(Ok(result));
+    b.take(step).unwrap();
+    for _ in 0..6 {
+        b.run(&mut remote);
+        b.settle();
+    }
+    assert_eq!(
+        files(&site.root),
+        [("a/child".to_owned(), "edited remotely".to_owned())]
+    );
+}
+
+#[test]
+fn a_file_sent_aside_in_a_split_swap_and_deleted_in_flight_takes_its_name() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("a"), b"file A");
+    a.create(&mut remote, &site_a.root.join("b"), b"file B");
+    let (site, mut b) = linked(&mut remote, "b");
+    b.settle();
+    for (from, to) in [("a", "tmp"), ("b", "a"), ("tmp", "b")] {
+        fs::rename(site.root.join(from), site.root.join(to)).unwrap();
+    }
+    b.scan_until(|b| !b.work.is_empty());
+    let Some(Work::Send(_)) = b.work.pop_front() else {
+        panic!("the swap is sent");
+    };
+    let refusal = koidrive_proto::v1::Error {
+        code: koidrive_proto::v1::error::Code::LimitExceeded as i32,
+        ..Default::default()
+    };
+    let step = b.folder.sent(Err(CallError::Server(ServerError(refusal))));
+    b.take(step).unwrap();
+    for _ in 0..3 {
+        if !b.work.is_empty() {
+            break;
+        }
+        b.scan(Duration::from_millis(150));
+    }
+    let Some(Work::Send(split)) = b.work.pop_front() else {
+        panic!("the split swap is sent");
+    };
+    let moves: Vec<String> = (split.ops.iter())
+        .filter_map(|op| match &op.op {
+            Some(op::Op::Move(moved)) => Some(moved.new_name.clone()),
+            _ => None,
+        })
+        .collect();
+    let [aside] = &moves[..] else {
+        panic!("one move aside: {moves:?}");
+    };
+    let target = aside.strip_suffix(" (pending)").unwrap().to_owned();
+    let result = remote.commit(&b.caller, &split).unwrap();
+    fs::remove_file(site.root.join(&target)).unwrap();
+    b.settle();
+    for _ in 0..12 {
+        a.pull(&remote);
+        a.run(&mut remote);
+        a.scan(Duration::from_millis(150));
+    }
+    fs::write(site_a.root.join(aside), b"edited remotely").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(&mut remote);
+    b.pull(&remote);
+    let step = b.folder.sent(Ok(result));
+    b.take(step).unwrap();
+    sync(&mut remote, (&site_a, &mut a), (&site, &mut b));
+    assert!(remote.names().iter().all(|name| !name.contains("(pending")));
+    assert!(files(&site.root).contains(&(target, "edited remotely".to_owned())));
+}
+
 /// The server: the space, the bytes of the chunks devices uploaded, and the result of each commit by its ID.
 struct Remote {
     space: SpaceDo,

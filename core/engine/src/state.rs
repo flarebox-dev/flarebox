@@ -70,6 +70,18 @@ pub struct TreesState {
     pub unsent_edits: BTreeSet<NodeId>,
 }
 
+/// A node this device sent under a pending name (docs/design/sync-engine.md section 2.6).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pending {
+    /// The pending name the node was sent under.
+    pub sent: String,
+    /// The name L gave the node, which it takes once it leaves the pending name.
+    pub name: String,
+    /// Whether R has held the node under `sent`. Until then the commit that sends it there may
+    /// still be in flight, and R need not hold it there.
+    pub landed: bool,
+}
+
 /// What [`Commits`](crate::commit::Commits) holds.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CommitsState {
@@ -103,6 +115,9 @@ pub struct CommitsState {
     /// The local entries a Publish answer to a first link's question released, until the server
     /// applies their create.
     pub published: BTreeSet<NodeId>,
+    /// The nodes this device sent under a pending name, while R holds each at that name, live or
+    /// in the trash, and until a move of this device that takes it off that name is acknowledged.
+    pub pending: BTreeMap<NodeId, Pending>,
     /// The mass-delete guard's window and confirmed deletions.
     pub guard: GuardState,
 }
