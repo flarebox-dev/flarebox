@@ -599,6 +599,51 @@ describe("space rewind (RFC 0003)", () => {
     }
   });
 
+  it("answers the space closed to a check the Space DO makes while the admission waits for rewindInfo (RFC 0014)", async () => {
+    const { spaceId, createdAtMs, creds, device } = await newSpace();
+    const token = creds.access!.token;
+    const a = device();
+    await createFile(a, spaceId, "notes.txt", "first");
+    const point = createdAtMs + MINUTE;
+    await snapshot(spaceId, point);
+    await a.commit([op.mkdir(uuidv7(), spaceId, "after the point")]);
+    const history = await a.history();
+    const leased = await socket(spaceId, token);
+
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const prototype = await runInDurableObject(space(spaceId), (instance: SpaceDO) => Object.getPrototypeOf(instance) as SpaceDO);
+    const [info, prepare] = [prototype.rewindInfo, prototype.rewindPrepare];
+    let inside = false;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    prototype.rewindInfo = async function (this: SpaceDO, restorePointMs: number) {
+      const answer = info.call(this, restorePointMs);
+      inside = true;
+      await held;
+      return answer;
+    };
+    prototype.rewindPrepare = async () => {
+      throw new Error("injected prepare failure");
+    };
+    try {
+      await setAccountClock(createdAtMs + 5 * MINUTE);
+      const rewindId = uuidv7();
+      const admission = rewind(token, spaceId, { restorePointMs: point, expectedHistoryId: history, rewindId });
+      await leased.until(() => inside || undefined);
+      leased.send({ case: "rpc", value: { reqId: 1n, call: { case: "listTree", value: {} } } });
+      await leased.until(() => leased.state.closed);
+      expect(leased.state.closed).toBe(Close.SPACE_REWOUND);
+      expect(leased.received.some((msg) => msg.case === "rpc")).toBe(false);
+      release();
+      expect((await admission).status).toBe(503);
+      expect(await rewindRecord(rewindId)).toMatchObject({ phase: "admitted" });
+    } finally {
+      release();
+      prototype.rewindInfo = info;
+      prototype.rewindPrepare = prepare;
+    }
+  });
+
   it("writes one marker per attempt however often preparing repeats, and removes them when the rewind fails", async () => {
     const { spaceId } = await newSpace();
     const rewindId = uuidv7();
