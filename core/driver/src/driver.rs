@@ -1706,7 +1706,7 @@ mod tests {
             .collect();
         assert_eq!(tasks.len(), 2);
 
-        let (relay, seen) = crate::scripted::relay(Duration::from_millis(300)).await;
+        let (relay, seen) = crate::scripted::relay(3).await;
         let uploads = tasks.iter().enumerate().map(|(folder, task)| async move {
             let (session, _events, _) = crate::scripted::session(relay).await;
             let chunks: Vec<_> = (0..6)

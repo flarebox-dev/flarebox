@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! A scripted server for tests that run real chunk uploads: a session whose every `PrepareUpload` gets an `UPLOAD` plan
-//! for each chunk, and a relay that holds each upload for a while before it answers with a receipt.
+//! for each chunk, and a relay that holds each upload until a given number are open before it answers with a receipt.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -16,42 +16,52 @@ use koidrive_proto::v1::{
 use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+/// How long the relay holds an upload at most while it waits for more to arrive.
+const HOLD_LIMIT: Duration = Duration::from_secs(5);
+/// How long the relay keeps holding its uploads once enough are open, so that any upload beyond the expected number
+/// arrives while they are still open and counts towards the peak.
+const SETTLE: Duration = Duration::from_millis(100);
 
 /// What the relay saw.
 #[derive(Default)]
 pub(crate) struct Seen {
-    /// Uploads it has read and not answered yet.
-    open: usize,
     /// The most uploads it held at once.
     pub peak: usize,
     /// The hash of each upload, in the order they arrived.
     pub hashes: Vec<Vec<u8>>,
 }
 
-/// A relay that answers each upload `hold` after it arrived. The ticket of an upload is its chunk's hash in hex.
-pub(crate) async fn relay(hold: Duration) -> (SocketAddr, Arc<Mutex<Seen>>) {
+/// A relay that holds each upload until `expected` uploads are open at once, or for at most [`HOLD_LIMIT`], then
+/// for [`SETTLE`] more, and answers it with a receipt. The ticket of an upload is its chunk's hash in hex.
+pub(crate) async fn relay(expected: usize) -> (SocketAddr, Arc<Mutex<Seen>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let seen = Arc::new(Mutex::new(Seen::default()));
     let log = seen.clone();
+    let open = Arc::new(watch::Sender::new(0usize));
     tokio::spawn(async move {
         loop {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let seen = log.clone();
+            let (seen, open) = (log.clone(), open.clone());
             tokio::spawn(async move {
                 let Some((ticket, size)) = read_upload(&mut socket).await else {
                     return;
                 };
                 let hash = unhex(&ticket);
-                {
+                open.send_modify(|open| {
+                    *open += 1;
                     let mut seen = seen.lock().unwrap();
                     seen.hashes.push(hash.clone());
-                    seen.open += 1;
-                    seen.peak = seen.peak.max(seen.open);
-                }
-                tokio::time::sleep(hold).await;
-                seen.lock().unwrap().open -= 1;
+                    seen.peak = seen.peak.max(*open);
+                });
+                let mut enough = open.subscribe();
+                let _ = tokio::time::timeout(HOLD_LIMIT, enough.wait_for(|open| *open >= expected))
+                    .await;
+                tokio::time::sleep(SETTLE).await;
+                open.send_modify(|open| *open -= 1);
                 let receipt = UploadReceipt {
                     hash,
                     size: size as u32,

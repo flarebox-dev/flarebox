@@ -97,7 +97,7 @@ The local trash is separate from the space's trash on the server, which [Trash, 
 
 ## Uploads at once
 
-Koidrive uploads up to 4 chunks of file content at once. The limit counts across all linked folders on this device. Set another number from 1 to 16 in `config.toml`. With 1, Koidrive sends one chunk at a time, as versions before this setting did:
+Koidrive uploads up to 4 chunks of file content at once. The limit counts across all folders this profile links. Set another number from 1 to 16 in `config.toml`. With 1, Koidrive sends one chunk at a time, as versions before this setting did:
 
 ```toml
 [upload]

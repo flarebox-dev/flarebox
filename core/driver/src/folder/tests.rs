@@ -1650,7 +1650,7 @@ fn with_four_uploads_at_once_a_file_that_changed_after_it_was_chunked_abandons_t
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let (result, seen) = runtime.block_on(async {
-        let (relay, seen) = crate::scripted::relay(Duration::from_millis(300)).await;
+        let (relay, seen) = crate::scripted::relay(4).await;
         let (session, _events, api) = crate::scripted::session(relay).await;
         let mut transfer = Transfer::new(&api);
         transfer.gate = UploadGate::new(4);

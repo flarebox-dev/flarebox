@@ -53,7 +53,7 @@ impl LocalTrash {
     }
 }
 
-/// How this device uploads chunks. Every folder the profile links shares the limit, so all of them together have at
+/// How the profile uploads chunks. Every folder the profile links shares the limit, so all of them together have at
 /// most `concurrency` chunk uploads in flight.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]

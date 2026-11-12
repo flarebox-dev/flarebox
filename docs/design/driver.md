@@ -66,7 +66,7 @@ The matcher is the engine's (`koidrive_engine::ignore`, over `koidrive-ignore`).
 
 `[trash]` caps the local trash of each folder (sync-engine.md §5.2), which holds what sync effects displaced. A running folder reclaims it when it starts and then once a day. Entries older than seven days go first, then the oldest entries while the trash holds more than `max_size_mb` megabytes. A file written after it entered the trash comes back at the root as a recovered file instead.
 
-`[upload]` limits how many chunk uploads are in flight at once. `Driver::open` makes one `koidrive_net::UploadGate` from `concurrency`, and every folder's `Transfer` gets a clone of it, so all folders together stay within the limit. A value outside 1 to 16 is refused when the driver opens. 1 sends one chunk at a time.
+`[upload]` limits how many chunk uploads are in flight at once. `Driver::open` makes one `koidrive_net::UploadGate` from `concurrency`, and every folder's `Transfer` gets a clone of it, so all folders this profile links stay within the limit together. Each profile has its own gate. A value outside 1 to 16 is refused when the driver opens. 1 sends one chunk at a time.
 
 ## The driver API
 
