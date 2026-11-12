@@ -6,77 +6,55 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Koidrive, your own Dropbox on Cloudflare</title>
 <meta name="description" content="Koidrive is an open-source file sync service whose server, metadata and file chunks live in a Cloudflare account you own.">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Koidrive, your own Dropbox on Cloudflare">
+<meta property="og:description" content="Koidrive is an open-source file sync service whose server, metadata and file chunks live in a Cloudflare account you own.">
+<meta property="og:image" content="https://koidrive.com/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Koidrive koi icon and wordmark">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Koidrive, your own Dropbox on Cloudflare">
+<meta name="twitter:description" content="Koidrive is an open-source file sync service whose server, metadata and file chunks live in a Cloudflare account you own.">
+<meta name="twitter:image" content="https://koidrive.com/og.png">
+<meta name="theme-color" content="#030201">
+<link rel="icon" href="favicon.ico" sizes="32x32">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="manifest" href="site.webmanifest">
+<link rel="preload" href="fonts/outfit-latin-500-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="fonts/onest-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="site.css">
 </head>
 <body>
-<a class="skip" href="#main">Skip to content</a>
+<a class="skip-link" href="#main">Skip to content</a>
 
-<header class="site-nav">
-  <div class="container">
-    <nav class="site-nav__bar cut" aria-label="Main">
-      <a class="wordmark" href="#top" aria-label="Koidrive, back to the top">Koidrive</a>
-      <a class="key key--primary key--small" href="https://github.com/koidrive/koidrive">See GitHub</a>
-    </nav>
-  </div>
+<header>
+  <nav class="container nav" aria-label="Main">
+    <a class="brand" href="/" aria-label="Koidrive home"><img class="brand-icon" src="logo/nav-icon.svg" alt="" width="24" height="28"><img class="wordmark" src="logo/wordmark.svg" alt="" width="118" height="24"></a>
+    <ul class="links">
+      <li><a class="link" href="https://github.com/koidrive/koidrive">GitHub</a></li>
+    </ul>
+  </nav>
 </header>
 
 <main id="main">
-  <section class="hero" id="top" aria-labelledby="hero-title">
-    <div class="container hero__grid">
-      <div class="hero__text">
-        <h1 id="hero-title">Your own Dropbox on Cloudflare</h1>
-        <p class="lead">The open-source server, its database and your files stay in your account.</p>
+  <section class="hero" aria-labelledby="hero-title">
+    <div class="container ledge bare">
+      <div class="head">
+        <div class="claim">
+          <h1 id="hero-title">Your own Dropbox on Cloudflare</h1>
+          <div class="cta">
+            <a class="btn btn--primary" href="https://github.com/koidrive/koidrive">See GitHub</a>
+          </div>
+        </div>
+        <div class="act">
+          <p class="soon">The first release is coming soon.</p>
+        </div>
       </div>
-
-      <figure class="term cut" aria-label="Installing Koidrive and running setup in a terminal">
-        <ul class="term__cmds">
-          <li class="cmd"><code><span class="term__prompt" aria-hidden="true">$ </span><span data-cmd>brew install koidrive/tap/koidrive</span></code><button class="copy" type="button" aria-live="polite">Copy</button></li>
-          <li class="cmd"><code><span class="term__prompt" aria-hidden="true">$ </span><span data-cmd>koi setup</span></code><button class="copy" type="button" aria-live="polite">Copy</button></li>
-        </ul>
-        <ol class="term__log" data-run>
-          <li style="--i: 0"><svg class="ok" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>Logged in with Cloudflare</span></li>
-          <li style="--i: 1"><svg class="ok" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>Created the R2 bucket <b>koidrive</b></span></li>
-          <li style="--i: 2"><svg class="ok" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>Uploaded the Worker with <b>AccountDO</b> and <b>SpaceDO</b></span></li>
-          <li style="--i: 3"><svg class="ok" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>Serving at <b class="url">https://koidrive.example.workers.dev</b></span></li>
-          <li style="--i: 4"><svg class="ok" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>Claimed the server with a one-time secret</span></li>
-          <li style="--i: 5"><svg class="ok" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>Saved the device credentials and deleted the secret</span></li>
-          <li style="--i: 6"><svg class="ok" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg><span>Revoked the Cloudflare login</span></li>
-        </ol>
-      </figure>
     </div>
   </section>
 </main>
 
-<footer class="site-foot">
-  <div class="container">
-    <p>Cloudflare, Workers, Durable Objects and R2 are trademarks of Cloudflare, Inc. Koidrive is not affiliated with or endorsed by Cloudflare, Inc.</p>
-  </div>
-</footer>
-
-<script>
-document.querySelectorAll('.cmd .copy').forEach((b) => {
-  const cmd = b.closest('.cmd').querySelector('[data-cmd]');
-  const text = cmd.textContent;
-  const show = (label, name) => {
-    b.textContent = label;
-    b.setAttribute('aria-label', name);
-    setTimeout(() => { b.textContent = 'Copy'; b.setAttribute('aria-label', 'Copy ' + text); }, 2400);
-  };
-  const fail = () => {
-    getSelection().selectAllChildren(cmd);
-    show('Copy failed', 'Could not copy. ' + text + ' is selected, so copy it with your keyboard.');
-  };
-  b.setAttribute('aria-label', 'Copy ' + text);
-  b.addEventListener('click', () => {
-    if (!navigator.clipboard) return fail();
-    navigator.clipboard.writeText(text).then(() => show('Copied', 'Copied ' + text), fail);
-  });
-});
-const run = document.querySelector('[data-run]');
-if (run && !matchMedia('(prefers-reduced-motion: reduce)').matches) {
-  run.classList.add('is-waiting');
-  new IntersectionObserver(([e], io) => { if (e.isIntersecting) { run.classList.remove('is-waiting'); io.disconnect(); } }).observe(run);
-}
-</script>
 </body>
 </html>

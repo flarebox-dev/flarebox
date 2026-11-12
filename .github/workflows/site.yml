@@ -1,0 +1,122 @@
+# SPDX-License-Identifier: Apache-2.0
+
+name: Site
+
+# Cloudflare Pages builds the site from this repository on its own: a preview for each branch
+# and production from main (build command "sh scripts/site-build.sh", output "site-dist").
+# This workflow holds no Cloudflare credentials. It waits for the Pages check run on the
+# commit, then checks that the deployment serves install.sh unchanged.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - "install.sh"
+      - "scripts/site-build.sh"
+      - ".github/workflows/site.yml"
+  pull_request:
+    paths:
+      - "site/**"
+      - "install.sh"
+      - "scripts/site-build.sh"
+      - ".github/workflows/site.yml"
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: site-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  installer:
+    name: installer
+    # Pages builds no previews for pull requests from forks, and a merge group deploys nothing.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      checks: read
+    env:
+      SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      PROJECT: koidrive
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            /install.sh
+          sparse-checkout-cone-mode: false
+      - name: Wait for the Cloudflare Pages deployment of this commit
+        id: pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          for attempt in $(seq 1 60); do
+            runs="$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" \
+              --jq '[.check_runs[] | select(.app.slug == "cloudflare-workers-and-pages")]')"
+            count="$(jq 'length' <<<"$runs")"
+            if [ "$count" -gt 1 ]; then
+              echo "::error::Commit $SHA has $count Cloudflare check runs; expected one Pages project."
+              exit 1
+            fi
+            if [ "$count" = 1 ] && [ "$(jq -r '.[0].status' <<<"$runs")" = completed ]; then
+              conclusion="$(jq -r '.[0].conclusion' <<<"$runs")"
+              if [ "$conclusion" != success ]; then
+                echo "::error::The Cloudflare Pages build of $SHA ended with '$conclusion': $(jq -r '.[0].details_url' <<<"$runs")"
+                exit 1
+              fi
+              url="$(jq -r '.[0].output.summary' <<<"$runs" | grep -oE "href='https://[0-9a-f]{8}\.$PROJECT\.pages\.dev'" | head -n 1 | sed "s/^href='//; s/'$//")"
+              if [ -z "$url" ]; then
+                echo "::error::The Cloudflare Pages check run for $SHA names no deployment URL on $PROJECT.pages.dev:"
+                jq -r '.[0].output.summary' <<<"$runs"
+                exit 1
+              fi
+              echo "Cloudflare Pages deployed $SHA to $url"
+              echo "url=$url" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::No completed Cloudflare Pages check run for $SHA after 15 minutes. Check the project's build watch paths and branch controls."
+          exit 1
+      - name: Check that the deployment serves install.sh unchanged
+        env:
+          DEPLOYMENT: ${{ steps.pages.outputs.url }}
+          PRODUCTION: ${{ github.event_name == 'push' && 'https://koidrive.com' || '' }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          check() {
+            local url=$1/install.sh attempts=$2 expected=$3 revision=$4 served="$RUNNER_TEMP/served-install.sh" headers="$RUNNER_TEMP/served-install.headers" status type media
+            for attempt in $(seq 1 "$attempts"); do
+              status="$(curl --silent --show-error --max-time 20 --dump-header "$headers" --output "$served" --write-out '%{http_code}' "$url")" || status=000
+              [ "$status" != 200 ] || cmp -s "$expected" "$served" || status="200 with other bytes"
+              [ "$status" != 200 ] || break
+              [ "$attempt" -lt "$attempts" ] || { echo "::error::$url returned HTTP $status, not 200 with install.sh at $revision, after $attempts attempts."; return 1; }
+              sleep 10
+            done
+            type="$(tr -d '\r' <"$headers" | awk 'tolower($1) == "content-type:" { $1 = ""; sub(/^ /, ""); print }' | tail -n 1)"
+            media="$(printf '%s' "${type%%;*}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
+            if [ "$media" != text/plain ]; then
+              echo "::error::$url is served as '$type', not text/plain. Check site/_headers."
+              return 1
+            fi
+            echo "$url matches install.sh at $revision ($(wc -c <"$expected") bytes, sha256 $(sha256sum "$expected" | cut -d' ' -f1)) and is served as $type."
+            grep -i '^cache-control:' "$headers" || true
+          }
+          check "$DEPLOYMENT" 12 install.sh "$SHA"
+          if [ -n "$PRODUCTION" ] && ! check "$PRODUCTION" 36 install.sh "$SHA"; then
+            main="$(gh api "repos/$REPO/commits/main" --jq .sha)"
+            if [ "$main" = "$SHA" ]; then
+              exit 1
+            fi
+            echo "::notice::main moved on to $main while this check ran, so production is checked against install.sh at $main."
+            gh api -H "Accept: application/vnd.github.raw" "repos/$REPO/contents/install.sh?ref=$main" >"$RUNNER_TEMP/main-install.sh"
+            check "$PRODUCTION" 36 "$RUNNER_TEMP/main-install.sh" "$main"
+          fi

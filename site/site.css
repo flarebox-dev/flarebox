@@ -1,61 +1,275 @@
+/* Hallmark · checked: 2026-11-11 · genre: modern-minimal (from DESIGN.md) · system: locked, site/DESIGN.md (Ultraviolet on Rim's night, after coreav-dev/site) · posture: committed · hero: Ledge, bare, on coreav-dev/site's markup and values, See GitHub 40px under the headline, the columns centred on each other · nav: edge-aligned · footer: colophon · copy: requested Koidrive rename, commands and repository URLs unchanged
+ * floor: 0 FAIL · fixed: 2 (kept: the dropped #top, recorded below; at 320 the Copy pill covered the long argument, so it now drops under the commands) · structural: 0 printed · contrast: pass
+ * built: the project · redesign: polish · v2.0.0 */
+/* Hallmark · dismissed 77 · the maintainer scoped the page to the hero and the footer, so no sections are added below the install block */
+/* Hallmark · dropped #top, top · the wordmark links to "/" as coreav-dev/site's does, so the hero no longer carries the id top */
+/* Hallmark · answered F3 · the headline balances its lines: "Your own Dropbox / on Cloudflare" from 375 to 480 and from 961 to 1920, one line from 600 to 900 where the stacked head is full width, three lines at 320 */
+/* Hallmark · finish-review: in-thread designer's critique, then a cross-lab review (BOX-139) · 13 findings · fixed 5: the head sat 28px under the screen's middle, now 8px over it; the ® stood 1 to 2px off the "e", now 3 to 6px; the commands were 13px, under the 14px labels, now 14px on a 24px line; Copy grew with its label and reflowed the panel, now 104px in every state; under 60rem an empty field row added 64px under the head, now gone · kept 8: the "Y" inks 1.5px inside the column edge; the nav centres the wordmark and the link, so their baselines differ by 7px; the block is wider than its commands; Copy's hover is a small step on the surface; two GitHub links on the first screen; the phone page has empty paper above the footer; the footer is below the fold on desktop; Copy sits under the commands under 415px (coreav-dev/site's layout or the reviewers' and the maintainer's choices) · logo round: the cube lockup sits on the wordmark's centre within 0.5px with a 10px gap, crisp at 1x on desktop; kept: on a phone the 23.33px cube leaves its seams soft at 1x, because the lockup's ratios fix that size · gap: none */
+/* Hallmark · Koidrive: supplied koi paths unchanged, chosen Outfit 600 wordmark, app-icon favicons and OG image; install block unchanged · self-critique: the nav's viewBox crop removes the unused padding, so its 28/23.33px visible height balances the 24/20px wordmark without scaling the lockup · sweep: 0 FAIL, 1 file-URL font WARN, 2 section-count NOTEs; HTTP font captures loaded · cross-lab identity review pending */
+/* Hallmark · install block removed (maintainer, 2026-11-11): no release or Homebrew tap exists yet and the command will be renamed, so the commands, Copy and its script are gone; the act column holds one release line on the install block's surface */
 /* SPDX-License-Identifier: Apache-2.0 */
+/* The page, built on coreav-dev/site (see DESIGN.md): its edge-aligned nav and its Ledge hero in the bare form,
+   with their values. Shared pieces first, then the page from top to bottom. */
 @import url("./tokens.css");
 @import url("./base.css");
 
-@font-face { font-family: "Familjen Grotesk"; src: url("fonts/familjen-grotesk.woff2") format("woff2"); font-weight: 400 700; font-style: normal; font-display: swap; }
-@font-face { font-family: "IBM Plex Sans"; src: url("fonts/ibm-plex-sans.woff2") format("woff2"); font-weight: 100 700; font-style: normal; font-display: swap; }
-@font-face { font-family: "JetBrains Mono"; src: url("fonts/jetbrains-mono.woff2") format("woff2"); font-weight: 100 800; font-style: normal; font-display: swap; }
+/* The page fills the screen, however short it is. */
+body {
+  display: flex;
+  flex-direction: column;
+  min-height: 100dvh;
+  color: var(--color-ink-2);
+}
 
-.skip { position: absolute; left: var(--space-md); top: calc(-1 * var(--space-3xl)); z-index: var(--z-toast); padding: var(--space-xs) var(--space-md); background: var(--color-ink); color: var(--color-paper); }
-.skip:focus-visible { top: var(--space-md); }
+main {
+  flex: 1;
+}
 
-.cut { border: var(--rule-hair) solid var(--color-rule); border-radius: var(--radius-card); }
-@supports (corner-shape: bevel) { .cut { border-radius: var(--cut-l) 4px var(--cut-l) 4px; corner-shape: bevel round bevel round; } }
+h1,
+h2,
+h3 {
+  line-height: 1;
+}
 
-.key { display: inline-flex; align-items: center; gap: var(--space-xs); min-height: 48px; padding: 0 var(--space-lg); border: var(--rule-hair) solid var(--color-rule-2); border-radius: var(--radius-input); background: var(--color-key-face); color: var(--color-ink); font: 500 var(--text-md)/1 var(--font-display); white-space: nowrap; text-decoration: none; cursor: pointer; box-shadow: var(--shadow-key); transition: transform var(--dur-micro) var(--ease-out), box-shadow var(--dur-micro) var(--ease-out), background-color var(--dur-short) var(--ease-out); }
-.key:hover { transform: translateY(-1px); }
-.key:active { transform: translateY(3px); box-shadow: var(--shadow-key-press); }
-.key:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 3px; }
-.key:disabled, .key[aria-disabled="true"] { opacity: 0.55; cursor: not-allowed; transform: none; }
-.key--primary { background: var(--color-accent); border-color: var(--color-accent-edge); color: var(--color-accent-ink); box-shadow: var(--shadow-key-accent); }
-.key--primary:hover { background: var(--color-accent-deep); }
-.key--small { min-height: 44px; padding: 0 var(--space-md); }
-@media (prefers-reduced-motion: reduce) { .key { transition: background-color var(--dur-short) linear; } .key:hover, .key:active { transform: none; } }
+code,
+kbd,
+pre {
+  font-family: var(--font-outlier);
+}
 
-.site-nav { position: sticky; top: var(--space-sm); z-index: var(--z-sticky-nav); margin-top: var(--space-sm); }
-.site-nav__bar { display: flex; align-items: center; justify-content: space-between; gap: var(--space-lg); min-height: 64px; padding: 0 var(--space-xs) 0 var(--space-lg); background: color-mix(in oklab, var(--color-paper) 92%, transparent); backdrop-filter: blur(8px); box-shadow: var(--shadow-card); }
-.wordmark { display: inline-flex; align-items: center; gap: var(--space-xs); font: 600 var(--text-lg)/1 var(--font-display); letter-spacing: var(--tracking-display); color: var(--color-ink); text-decoration: none; }
-.wordmark:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 4px; }
+.skip-link {
+  position: absolute;
+  left: var(--gutter);
+  top: var(--space-sm);
+  z-index: var(--z-modal);
+  padding: var(--space-xs) var(--space-md);
+  border-radius: var(--radius-pill);
+  background: var(--color-accent);
+  color: var(--color-accent-ink);
+  font-family: var(--font-display);
+  font-weight: 500;
+  transform: translateY(-200%);
+}
 
-.hero { position: relative; }
-.hero__grid { display: grid; grid-template-columns: minmax(0, 6fr) minmax(0, 6fr); gap: var(--space-2xl); align-items: center; min-height: calc(100dvh - 64px - var(--space-sm) * 2); padding-block: var(--space-xl); }
-.hero__text { display: grid; gap: var(--space-lg); align-content: center; }
-.hero h1 { font-size: min(var(--text-display), 4.75rem); max-width: 16ch; }
-.hero .lead { color: var(--color-ink-2); max-width: 32ch; }
-.term { margin: 0; overflow: hidden; background: var(--color-graphite); color: var(--color-graphite-ink); border-color: var(--color-graphite-2); box-shadow: var(--shadow-card); font: 400 var(--text-md)/1.5 var(--font-outlier); }
-.term__cmds { margin: 0; padding: var(--space-lg) var(--space-lg) var(--space-md); list-style: none; display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-xs); background: var(--color-graphite-2); }
-.cmd { display: flex; align-items: center; justify-content: space-between; gap: var(--space-md); min-height: 48px; }
-.cmd code { min-width: 0; overflow-wrap: anywhere; font-size: var(--text-md); }
-.term__prompt { color: var(--color-accent-2); }
-.copy { flex-shrink: 0; min-height: 44px; padding: 0 var(--space-md); border: var(--rule-hair) solid var(--color-graphite-muted); border-radius: var(--radius-input); background: transparent; color: var(--color-graphite-ink); font: 500 var(--text-sm)/1 var(--font-display); cursor: pointer; transition: background-color var(--dur-short) var(--ease-out), transform var(--dur-micro) var(--ease-out); }
-.copy:hover { background: var(--color-graphite-2); }
-.copy:active { transform: translateY(1px); }
-.copy:focus-visible { outline: 2px solid var(--color-accent-2); outline-offset: 2px; }
-.copy:disabled { opacity: 0.55; cursor: not-allowed; transform: none; }
-.term__log { margin: 0; padding: var(--space-xl) var(--space-lg) var(--space-2xl); list-style: none; display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-lg); align-content: start; }
-.term__log li { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: start; gap: var(--space-sm); color: var(--color-graphite-ink); }
-.term__log .ok { margin-top: 0.2em; color: var(--color-accent-2); }
-.term__log b { font-weight: 500; color: var(--color-accent-2); overflow-wrap: anywhere; }
-.term__log.is-waiting li { opacity: 0; transform: translateY(4px); }
-.term__log li { transition: opacity var(--dur-long) var(--ease-out), transform var(--dur-long) var(--ease-out); transition-delay: calc(var(--i, 0) * 70ms); }
-@media (prefers-reduced-motion: reduce) { .term__log li { transition: none; } .copy { transition: none; } .copy:active { transform: none; } }
+.skip-link:focus {
+  transform: none;
+}
 
-code { font-family: var(--font-outlier); font-size: 0.9em; }
-.site-foot { padding-block: var(--space-xl) var(--space-2xl); border-top: var(--rule-hair) solid var(--color-rule); font-size: var(--text-sm); color: var(--color-muted); }
-.site-foot p { max-width: 75ch; }
+/* The pill pair: Outfit 500, one orange fill, an inset-outlined second. */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  min-height: 48px;
+  padding: 0 var(--space-lg);
+  border: none;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px currentColor;
+  color: var(--color-ink);
+  font: 500 var(--text-md) / 1 var(--font-display);
+  white-space: nowrap;
+  text-decoration: none;
+  transition:
+    background-color var(--dur-micro) var(--ease-out),
+    transform var(--dur-micro) var(--ease-out);
+}
+
+.btn:active {
+  transform: translateY(1px);
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 3px;
+}
+
+.btn--primary {
+  background: var(--color-accent);
+  box-shadow: none;
+  color: var(--color-accent-ink);
+}
+
+.btn--primary:hover {
+  background: var(--color-accent-deep);
+}
+
+.btn[aria-disabled="true"] {
+  opacity: 0.55;
+  cursor: not-allowed;
+  transform: none;
+}
+
+a:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
+  border-radius: var(--space-2xs);
+}
+
+a:hover {
+  text-decoration-color: var(--color-accent);
+}
+
+/* Edge-aligned nav: the wordmark and the links at opposite edges, no rule under them. */
+.nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-lg);
+  min-height: 72px;
+}
+
+/* The lockup uses the owner's koi icon and the existing wordmark proportions. */
+.brand {
+  --mark: 24px;
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: calc(var(--mark) * 5 / 12);
+}
+
+.brand-icon {
+  display: block;
+  flex: none;
+  width: auto;
+  height: calc(var(--mark) * 7 / 6);
+}
+
+/* The wordmark's box is its ink, so its height is about the cap height. */
+.wordmark {
+  display: block;
+  height: var(--mark);
+  width: auto;
+}
+
+/* The links' text ends on the column's edge; their padding is the tap target, outside it. */
+.links {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  margin: 0 calc(-1 * var(--space-md)) 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 40px;
+  padding: 0 var(--space-md);
+  border-radius: var(--radius-pill);
+  color: var(--color-ink);
+  font: 500 var(--text-sm) / 1 var(--font-display);
+  text-decoration: none;
+  white-space: nowrap;
+  transition: background-color var(--dur-micro) var(--ease-out);
+}
+
+.link:hover {
+  background: var(--color-rule-2);
+}
+
+/* Ledge: the field above, the head resting at the base of the screen. Koidrive has no field, so it takes the bare
+   form, where the head alone sits in the middle of the screen. */
+/* The bottom padding repeats the nav's 72px, so the head centres on the screen, not on the space under the nav. */
+.hero {
+  display: grid;
+  min-height: calc(100svh - 72px);
+  padding-block: var(--space-lg) calc(var(--space-xl) + 72px);
+}
+
+.ledge {
+  display: grid;
+  grid-template-rows: 1fr auto;
+  grid-template-areas: "field" "head";
+  gap: var(--space-lg);
+}
+
+.bare {
+  grid-template-rows: none;
+  grid-template-areas: "head";
+  align-content: center;
+}
+
+.bare .head {
+  padding-top: 0;
+  border-top: none;
+}
+
+/* The claim (the headline and See GitHub) and the release line, centred on each other. */
+.head {
+  grid-area: head;
+  display: grid;
+  grid-template-columns: minmax(0, 6fr) minmax(0, 6fr);
+  gap: var(--space-lg) var(--gap-columns);
+  align-items: center;
+  padding-top: var(--space-lg);
+  border-top: var(--rule-hair) solid var(--color-rule);
+}
+
+.hero h1 {
+  max-width: none;
+  min-width: 0;
+  overflow-wrap: break-word;
+  text-wrap: balance;
+  color: var(--color-ink);
+  font-size: clamp(2.5rem, 4.6vw, 4.5rem);
+}
+
+.cta {
+  display: flex;
+  gap: var(--space-sm);
+  margin-top: var(--space-md);
+}
+
+/* A pill straight under the headline needs more room than CoreAV's 16px, which sits under smaller text. */
+.claim .cta {
+  margin-top: var(--space-xl);
+}
+
+/* The release line, where the install commands go once there is a release: the surface fill, no border,
+   the 16px surface radius and one line of body text in the ink. */
+.soon {
+  padding: var(--space-md);
+  background: var(--color-surface);
+  border-radius: var(--radius-card);
+  color: var(--color-ink);
+}
 
 @media (max-width: 60rem) {
-  .hero__grid { grid-template-columns: minmax(0, 1fr); gap: var(--space-xl); min-height: 0; padding-block: var(--space-2xl) var(--space-xl); }
-  .term__log { gap: var(--space-md); padding-bottom: var(--space-xl); }
+  .hero {
+    min-height: 0;
+    padding-block: var(--space-2xl) var(--space-3xl);
+  }
+
+  .ledge {
+    grid-template-rows: none;
+    grid-template-areas: "head" "field";
+    gap: var(--space-2xl);
+  }
+
+  .ledge.bare {
+    grid-template-areas: "head";
+    row-gap: 0;
+  }
+
+  .head {
+    grid-template-columns: minmax(0, 1fr);
+    padding-top: 0;
+    border-top: none;
+  }
+
+  .claim .cta {
+    margin-top: var(--space-lg);
+  }
 }
-@media (max-width: 40rem) { .term { font-size: 0.8125rem; } .term__cmds, .term__log { padding-inline: var(--space-md); } .cmd code { font-size: 0.8125rem; white-space: nowrap; overflow-x: auto; scrollbar-width: thin; } .term__log b.url { display: block; } }
+
+@media (max-width: 40rem) {
+  .brand {
+    --mark: 20px;
+  }
+
+  /* On a phone the nav is the lockup alone; See GitHub stays in the hero. */
+  .links {
+    display: none;
+  }
+}
