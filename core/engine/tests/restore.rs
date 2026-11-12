@@ -80,7 +80,7 @@ fn trees(nodes: &[Row]) -> Trees {
         if let Some(shape) = l {
             let identity = FileIdentity {
                 dev: 1,
-                ino: ino as u64 + 1,
+                ino: ino as u128 + 1,
                 birth_ns: Some(0),
             };
             let node = LocalNode {

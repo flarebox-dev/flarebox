@@ -49,7 +49,7 @@ fn trees(local: &[(&str, Shape)], remote: &[(&str, Shape)]) -> Trees {
     for (ino, (id, shape)) in local.iter().enumerate() {
         let identity = FileIdentity {
             dev: 1,
-            ino: ino as u64 + 1,
+            ino: ino as u128 + 1,
             birth_ns: Some(0),
         };
         let node = LocalNode {
@@ -630,7 +630,7 @@ fn a_discarded_folder_the_user_puts_an_entry_in_is_sent_with_it() {
         }
         let identity = FileIdentity {
             dev: 1,
-            ino: 100 + removed.len() as u64,
+            ino: 100 + removed.len() as u128,
             birth_ns: Some(0),
         };
         effects
@@ -688,7 +688,7 @@ fn a_discarded_folder_whose_subfolder_the_user_puts_an_entry_in_is_sent_with_it(
         touched.push(record.node.clone());
         let identity = FileIdentity {
             dev: 1,
-            ino: 100 + touched.len() as u64,
+            ino: 100 + touched.len() as u128,
             birth_ns: Some(0),
         };
         effects
@@ -745,7 +745,7 @@ fn a_discarded_file_the_user_edits_is_sent_with_its_folder() {
         touched.push(record.node.clone());
         let identity = FileIdentity {
             dev: 1,
-            ino: 100 + touched.len() as u64,
+            ino: 100 + touched.len() as u128,
             birth_ns: Some(0),
         };
         effects

@@ -55,7 +55,7 @@ fn remote(shape: Shape) -> RemoteNode {
     }
 }
 
-fn identity(ino: u64) -> FileIdentity {
+fn identity(ino: u128) -> FileIdentity {
     FileIdentity {
         dev: 1,
         ino,
@@ -63,7 +63,7 @@ fn identity(ino: u64) -> FileIdentity {
     }
 }
 
-fn local(shape: Shape, ino: u64) -> LocalNode {
+fn local(shape: Shape, ino: u128) -> LocalNode {
     LocalNode {
         shape,
         identity: identity(ino),
@@ -78,7 +78,7 @@ fn trees(nodes: &[Row]) -> Trees {
     let mut trees = Trees::new(ROOT);
     for (i, (id, l, s, r)) in nodes.iter().enumerate() {
         if let Some(shape) = l {
-            trees.set_local((*id).into(), local(shape.clone(), i as u64 + 1));
+            trees.set_local((*id).into(), local(shape.clone(), i as u128 + 1));
         }
         trees.set_synced((*id).into(), s.clone());
         if let Some(shape) = r {
@@ -120,7 +120,7 @@ fn effects(trees: &mut Trees) -> Vec<(String, Effect)> {
         let Some(record) = effects.plan(trees, &mut ids, NOW).cloned() else {
             return done;
         };
-        let made = identity(100 + done.len() as u64);
+        let made = identity(100 + done.len() as u128);
         effects.done(trees, &record.effect_id, Some(made)).unwrap();
         done.push((record.node, record.effect));
     }
@@ -791,7 +791,7 @@ fn a_remote_rules_file_is_written_before_anything_else_below_its_folder() {
         let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() else {
             break;
         };
-        let made = identity(100 + order.len() as u64);
+        let made = identity(100 + order.len() as u128);
         effects
             .done(&mut trees, &record.effect_id, Some(made))
             .unwrap();

@@ -106,7 +106,7 @@ fn write_input(tx: &Tx<'_>, seq: u64) -> Result<(), Error> {
             shape: shape(n),
             identity: FileId {
                 dev: 1,
-                ino: n,
+                ino: n.into(),
                 birth_ns: None,
             },
             parked: false,

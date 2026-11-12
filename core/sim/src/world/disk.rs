@@ -22,7 +22,7 @@ use koidrive_engine::tree::{Content, FileIdentity, same_content};
 pub enum Place {
     Root,
     /// Inside the directory with this inode.
-    In(u64),
+    In(u128),
     /// In the parked directory, under this name.
     Parked(String),
 }
@@ -77,7 +77,7 @@ pub struct Applied {
     pub trashed: Option<Content>,
 }
 
-pub fn identity(ino: u64) -> FileIdentity {
+pub fn identity(ino: u128) -> FileIdentity {
     FileIdentity {
         dev: 1,
         ino,
@@ -87,8 +87,8 @@ pub fn identity(ino: u64) -> FileIdentity {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Disk {
-    entries: BTreeMap<u64, Entry>,
-    inos: u64,
+    entries: BTreeMap<u128, Entry>,
+    inos: u128,
     /// The download of the effect in flight is staged and has no name in the folder yet.
     pub(super) staged: bool,
     /// The entry that the effect in flight displaced and has not sent to the local trash yet.
@@ -104,24 +104,24 @@ impl Disk {
         self.marker
     }
 
-    pub fn entries(&self) -> &BTreeMap<u64, Entry> {
+    pub fn entries(&self) -> &BTreeMap<u128, Entry> {
         &self.entries
     }
 
-    pub fn children<'a>(&'a self, place: &'a Place) -> impl Iterator<Item = u64> + 'a {
+    pub fn children<'a>(&'a self, place: &'a Place) -> impl Iterator<Item = u128> + 'a {
         self.entries
             .iter()
             .filter(move |(_, entry)| entry.place == *place)
             .map(|(ino, _)| *ino)
     }
 
-    pub fn child(&self, place: &Place, name: &str) -> Option<u64> {
+    pub fn child(&self, place: &Place, name: &str) -> Option<u128> {
         self.children(place)
             .find(|ino| self.entries[ino].name == name)
     }
 
     /// The names from the root to the entry, or `None` for an entry in the parked directory.
-    pub fn path(&self, ino: u64) -> Option<Vec<String>> {
+    pub fn path(&self, ino: u128) -> Option<Vec<String>> {
         let mut names = Vec::new();
         let mut current = ino;
         loop {
@@ -138,7 +138,7 @@ impl Disk {
     }
 
     /// The entries the user sees, which leaves out the parked directory, in inode order.
-    pub fn visible(&self) -> Vec<u64> {
+    pub fn visible(&self) -> Vec<u128> {
         self.entries
             .keys()
             .copied()
@@ -147,7 +147,7 @@ impl Disk {
     }
 
     /// True when `ancestor` is `place` or holds it.
-    pub fn inside(&self, place: &Place, ancestor: u64) -> bool {
+    pub fn inside(&self, place: &Place, ancestor: u128) -> bool {
         let mut current = place;
         while let Place::In(ino) = current {
             if *ino == ancestor {
@@ -182,7 +182,7 @@ impl Disk {
     }
 
     /// Creates an entry, unless the name is taken.
-    pub fn create(&mut self, place: Place, name: &str, content: Option<Content>) -> Option<u64> {
+    pub fn create(&mut self, place: Place, name: &str, content: Option<Content>) -> Option<u128> {
         if self.child(&place, name).is_some() {
             return None;
         }
@@ -199,14 +199,14 @@ impl Disk {
     }
 
     /// Replaces a file's content in place and returns the content it held.
-    pub fn overwrite(&mut self, ino: u64, content: Content) -> Option<Content> {
+    pub fn overwrite(&mut self, ino: u128, content: Content) -> Option<Content> {
         let entry = self.entries.get_mut(&ino)?;
         entry.held.push(content.manifest_digest.clone());
         entry.content.replace(content)
     }
 
     /// Moves an entry, unless the name is taken or the target is inside the entry.
-    pub fn rename(&mut self, ino: u64, place: Place, name: &str) -> Result<(), Refused> {
+    pub fn rename(&mut self, ino: u128, place: Place, name: &str) -> Result<(), Refused> {
         if self.child(&place, name).is_some() {
             return Err(Refused::Taken);
         }
@@ -220,8 +220,8 @@ impl Disk {
     }
 
     /// Deletes an entry with everything in it and returns the contents of the deleted files.
-    pub fn delete(&mut self, ino: u64) -> Vec<Content> {
-        let doomed: Vec<u64> = self
+    pub fn delete(&mut self, ino: u128) -> Vec<Content> {
+        let doomed: Vec<u128> = self
             .entries
             .iter()
             .filter(|(other, entry)| **other == ino || self.inside(&entry.place, ino))
@@ -404,7 +404,7 @@ impl Disk {
     }
 
     /// The file an effect displaces, when it still is the file the engine saw.
-    fn displaced(&self, displaced: &Displaced) -> Result<u64, Refused> {
+    fn displaced(&self, displaced: &Displaced) -> Result<u128, Refused> {
         let ino = self
             .at(&displaced.at)?
             .filter(|ino| *ino == displaced.identity.ino);
@@ -416,7 +416,7 @@ impl Disk {
     }
 
     /// The entry at a location, if one is there.
-    fn at(&self, at: &Location) -> Result<Option<u64>, Refused> {
+    fn at(&self, at: &Location) -> Result<Option<u128>, Refused> {
         let (place, name) = self.locate(at)?;
         Ok(match place {
             Place::Parked(_) => self.children(&place).next(),

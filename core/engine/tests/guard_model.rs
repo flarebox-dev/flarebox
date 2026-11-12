@@ -176,7 +176,7 @@ struct World {
     ids: IdGen,
     now: u64,
     last_seq: u64,
-    ino: u64,
+    ino: u128,
     model: Model,
 }
 
@@ -728,7 +728,7 @@ fn remote(node: &ServerNode) -> RemoteNode {
     }
 }
 
-fn local(shape: Shape, ino: u64) -> LocalNode {
+fn local(shape: Shape, ino: u128) -> LocalNode {
     LocalNode {
         shape,
         identity: identity(ino),
@@ -736,7 +736,7 @@ fn local(shape: Shape, ino: u64) -> LocalNode {
     }
 }
 
-fn identity(ino: u64) -> FileIdentity {
+fn identity(ino: u128) -> FileIdentity {
     FileIdentity {
         dev: 1,
         ino,

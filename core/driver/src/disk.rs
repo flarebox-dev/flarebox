@@ -734,7 +734,8 @@ impl Upload {
         let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
         let file = File::from(rustix::fs::openat(folder.fd(), name, flags, Mode::empty())?);
         let meta = file.metadata()?;
-        let same = |id: FileId| meta.is_file() && meta.dev() == id.dev && meta.ino() == id.ino;
+        let same =
+            |id: FileId| meta.is_file() && meta.dev() == id.dev && u128::from(meta.ino()) == id.ino;
         if !source.identity.is_some_and(same) {
             return Err(gone());
         }

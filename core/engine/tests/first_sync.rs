@@ -67,7 +67,7 @@ fn first_sync(files: usize, per_dir: usize) -> (Duration, usize, usize) {
         planned += 1;
         let identity = FileIdentity {
             dev: 1,
-            ino: planned as u64,
+            ino: planned as u128,
             birth_ns: Some(0),
         };
         effects

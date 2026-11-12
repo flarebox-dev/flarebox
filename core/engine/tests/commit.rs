@@ -73,7 +73,7 @@ fn trashed(shape: Shape) -> RemoteNode {
     }
 }
 
-fn local(shape: Shape, ino: u64) -> LocalNode {
+fn local(shape: Shape, ino: u128) -> LocalNode {
     LocalNode {
         shape,
         identity: FileIdentity {
@@ -98,7 +98,7 @@ fn trees(nodes: &[Row]) -> Trees {
     let mut trees = Trees::new(ROOT);
     for (i, (id, l, s, r)) in nodes.iter().enumerate() {
         if let Some(shape) = l {
-            trees.set_local((*id).into(), local(shape.clone(), i as u64 + 1));
+            trees.set_local((*id).into(), local(shape.clone(), i as u128 + 1));
         }
         trees.set_synced((*id).into(), s.clone());
         if let Some(node) = r {
@@ -1723,7 +1723,7 @@ fn a_commit_holds_at_most_the_op_limit_with_parents_first() {
     rows.extend((0..MAX_OPS).map(|i| (format!("f{i:04}"), file("d", &format!("{i}"), 1))));
     let mut trees = Trees::new(ROOT);
     for (i, (id, shape)) in rows.into_iter().enumerate() {
-        trees.set_local(id, local(shape, i as u64 + 1));
+        trees.set_local(id, local(shape, i as u128 + 1));
     }
     trees.settle();
     let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
@@ -3212,7 +3212,7 @@ fn a_recorded_file_whose_s_update_waits_gets_no_download() {
 
 /// Commits a new file `id`, and acknowledges it at `seq` with R holding the file.
 fn commit_file(trees: &mut Trees, commits: &mut Commits, ids: &mut IdGen, id: &str, seq: u64) {
-    trees.set_local(id.into(), local(file(ROOT, id, 7), 100 + seq));
+    trees.set_local(id.into(), local(file(ROOT, id, 7), 100 + u128::from(seq)));
     trees.settle();
     let commit = build(commits, trees, ids).unwrap();
     assert!(
