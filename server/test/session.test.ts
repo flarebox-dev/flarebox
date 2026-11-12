@@ -1063,6 +1063,64 @@ describe("RFC 0014 session leases", () => {
     }
   });
 
+  it("renews only leases that an event used past half their life, so an idle device takes the cold path again", async () => {
+    const { owner, device: writer, spaceId, socket } = await connected("Busy writer");
+    const idle = await pairDevice(owner, "Idle reader");
+    const idleSocket = await Socket.connect(spaceId, idle);
+    await idleSocket.start();
+    await ageLeases(spaceId, SESSION_LEASE_MS * 0.6);
+    const renewal = await holdAccount("checkSessions");
+    try {
+      expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+      await vi.waitFor(() => expect(renewal.asked).toEqual([[writer.deviceId]]));
+    } finally {
+      renewal.restore();
+    }
+    await revokeRowOnly(idle.deviceId);
+    await ageLeases(spaceId, SESSION_LEASE_MS * 0.5);
+    expect(await listTree(idleSocket)).toMatchObject({ case: "goodbye", value: { code: Close.DEVICE_REVOKED } });
+  });
+
+  it("stores nothing from a failed renewal, so the lease runs out as before", async () => {
+    const { device, spaceId, socket } = await connected("Failed renewal");
+    await ageLeases(spaceId, SESSION_LEASE_MS * 0.6);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const prototype = await runInDurableObject(account(), (instance: AccountDO) => Object.getPrototypeOf(instance) as AccountDO);
+    const original = prototype.checkSessions;
+    let calls = 0;
+    prototype.checkSessions = async () => {
+      calls++;
+      throw new Error("injected renewal failure");
+    };
+    try {
+      expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+      await vi.waitFor(() => expect(calls).toBe(1));
+    } finally {
+      prototype.checkSessions = original;
+    }
+    await revokeRowOnly(device.deviceId);
+    expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+    await ageLeases(spaceId, SESSION_LEASE_MS * 0.5);
+    expect(await listTree(socket)).toMatchObject({ case: "goodbye", value: { code: Close.DEVICE_REVOKED } });
+  });
+
+  it("sends a new renewal once a renewal that never answers has been out for a lease", async () => {
+    const { spaceId, socket } = await connected("Hung renewal");
+    await ageLeases(spaceId, SESSION_LEASE_MS * 0.6);
+    const renewal = await holdAccount("checkSessions");
+    try {
+      expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+      await vi.waitFor(() => expect(renewal.asked).toHaveLength(1));
+      await ageLeases(spaceId, SESSION_LEASE_MS * 0.5);
+      expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+      await ageLeases(spaceId, SESSION_LEASE_MS * 0.6);
+      expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+      await vi.waitFor(() => expect(renewal.asked).toHaveLength(2));
+    } finally {
+      renewal.restore();
+    }
+  });
+
   it("still waits for the Account DO once a lease has run out", async () => {
     const { spaceId, socket } = await connected("Expired lease");
     await passLeases(spaceId);

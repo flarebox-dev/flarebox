@@ -287,7 +287,8 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
     private alarmStale = false;
     private readonly leases = new Map<string, { check: SessionCheck; askedAtMs: number; untilMs: number }>();
     private leaseGeneration = 0;
-    private renewing = false;
+    private readonly renewalsDue = new Set<string>();
+    private renewing: { atMs: number; forMs: number } | undefined;
 
     async init(args: { spaceId: string; name: string; ownerUserId: string; spaceKey: Uint8Array }): Promise<void> {
       const existing = getMeta(this.sql, "space_id");
@@ -402,7 +403,10 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       const lease = this.leases.get(deviceId);
       const leftMs = lease ? lease.untilMs - this.clock() : 0;
       if (leftMs <= 0) return undefined;
-      if (leftMs < lease!.check.leaseMs / 2) this.renewLeases();
+      if (leftMs < lease!.check.leaseMs / 2) {
+        this.renewalsDue.add(deviceId);
+        this.renewLeases();
+      }
       return lease!.check;
     }
 
@@ -412,11 +416,19 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
     }
 
     private renewLeases(): void {
-      if (this.renewing) return;
       const askedAtMs = this.clock();
-      const deviceIds = [...this.leases].filter(([, lease]) => lease.untilMs - askedAtMs < lease.check.leaseMs / 2).map(([deviceId]) => deviceId);
+      if (this.renewing && askedAtMs - this.renewing.atMs < this.renewing.forMs) return;
+      const due = [...this.renewalsDue].flatMap((deviceId) => {
+        const lease = this.leases.get(deviceId);
+        const leftMs = lease ? lease.untilMs - askedAtMs : 0;
+        return lease && leftMs > 0 && leftMs < lease.check.leaseMs / 2 ? [{ deviceId, leaseMs: lease.check.leaseMs }] : [];
+      });
+      this.renewalsDue.clear();
+      if (due.length === 0) return;
+      const deviceIds = due.map(({ deviceId }) => deviceId);
       const generation = this.leaseGeneration;
-      this.renewing = true;
+      const renewal = { atMs: askedAtMs, forMs: Math.max(...due.map(({ leaseMs }) => leaseMs)) };
+      this.renewing = renewal;
       this.account()
         .checkSessions(deviceIds, String(getMeta(this.sql, "space_id")))
         .then(
@@ -430,7 +442,7 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
           (error) => console.error("account lease renewal failed", error),
         )
         .finally(() => {
-          this.renewing = false;
+          if (this.renewing === renewal) this.renewing = undefined;
         });
     }
 

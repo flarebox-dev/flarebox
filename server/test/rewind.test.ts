@@ -642,7 +642,7 @@ describe("space rewind (RFC 0003)", () => {
     }
   });
 
-  it("drops a lease renewal that was in flight when the admission closed the space (RFC 0014)", async () => {
+  it.each(["running", "ended"])("drops a lease renewal that was in flight when the admission closed the space, with the lease %s at admission (RFC 0014)", async (atAdmission) => {
     const { spaceId, createdAtMs, creds, device } = await newSpace();
     const token = creds.access!.token;
     const a = device();
@@ -684,6 +684,7 @@ describe("space rewind (RFC 0003)", () => {
     try {
       expect(await listTree(2n)).toMatchObject({ case: "rpc" });
       await leased.until(() => renewing || undefined);
+      if (atAdmission === "ended") await age(SESSION_LEASE_MS * 0.5);
       await setAccountClock(createdAtMs + 5 * MINUTE);
       const rewindId = uuidv7();
       expect((await rewind(token, spaceId, { restorePointMs: point, expectedHistoryId: history, rewindId })).status).toBe(503);
