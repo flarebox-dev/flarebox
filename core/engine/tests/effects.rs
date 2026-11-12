@@ -1402,6 +1402,40 @@ fn a_reverted_parked_edit_whose_r_folder_the_rules_exclude_stays_at_its_local_po
     }));
 }
 
+#[test]
+fn an_edit_whose_r_folder_the_rules_exclude_is_not_parked_to_free_its_name() {
+    let (mut trees, mut disk) = space(&[
+        ("logs", Some(dir(ROOT, "logs")), Some(dir(ROOT, "logs"))),
+        ("f", Some(file(ROOT, "b", 1)), Some(file("logs", "f", 1))),
+        ("g", Some(file(ROOT, "x", 3)), Some(file(ROOT, "a", 3))),
+    ]);
+    trees.set_rules(
+        &[] as &[&str],
+        Some(koidrive_engine::ignore::RuleFile::parse(b"logs/\n")),
+    );
+    let mut f = trees.local().get("f").unwrap().clone();
+    f.shape = file(ROOT, "a", 2);
+    trees.set_local("f".into(), f);
+    trees.revert("f".into());
+    let entry = disk.entries.get_mut(&2).unwrap();
+    entry.name = "a".into();
+    entry.content = Some(content(2));
+    trees.check().unwrap();
+    disk.matches(&trees).unwrap();
+    let done = converge(&mut trees, &mut disk, 10).unwrap();
+    assert!(done.is_empty(), "{done:?}");
+    assert_eq!(trees.local().get("f").unwrap().shape, file(ROOT, "a", 2));
+    let (mut commits, mut ids) = (koidrive_engine::commit::Commits::default(), IdGen::new(1));
+    let commit = commits
+        .build(&mut trees, &mut ids, NOW, "history", 7)
+        .unwrap();
+    assert!(commit.ops.iter().any(|op| match &op.op {
+        Some(koidrive_proto::v1::op::Op::UpdateContent(op)) => op.content == Some(content(2)),
+        Some(koidrive_proto::v1::op::Op::CreateFile(op)) => op.content == Some(content(2)),
+        _ => false,
+    }));
+}
+
 /// A valid tree over `n0`, `n1`, ... from one [`Draw`] per node, as in tests/trees.rs, where each
 /// node has the kind and file content of `kinds`. S and R are drawn with their own ranks, so their
 /// moves can swap, rotate and nest into each other.

@@ -961,6 +961,7 @@ impl<'a> View<'a> {
                         .is_some_and(|remote| node.shape.same_position(remote))
             })
             && self.stuck(id, trees.local().len()).is_none()
+            && !(trees.remote().live(id)).is_some_and(|remote| self.goes_home(id, remote))
     }
 
     fn park(&self, id: &str) -> Option<(Effect, Option<Shape>)> {
