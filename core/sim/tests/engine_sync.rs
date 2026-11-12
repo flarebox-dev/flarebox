@@ -1075,7 +1075,12 @@ fn run_ignoring(
                 .count(),
         );
         if let Some(record) = effects
-            .plan(&device.trees, &mut device.ids, NOW as u64)
+            .plan(
+                &device.trees,
+                commits.in_flight(),
+                &mut device.ids,
+                NOW as u64,
+            )
             .cloned()
         {
             let known = device.trees.remote().get(&record.node).is_some()
@@ -1093,7 +1098,12 @@ fn run_ignoring(
             }
             let identity = device.identity();
             effects
-                .done(&mut device.trees, &record.effect_id, Some(identity))
+                .done(
+                    &mut device.trees,
+                    commits.in_flight(),
+                    &record.effect_id,
+                    Some(identity),
+                )
                 .unwrap();
             continue;
         }
@@ -1308,7 +1318,7 @@ fn run_ignoring(
     prop_assert_eq!(unsettled, Vec::<&String>::new());
     prop_assert!(commits.problems().is_empty(), "{:?}", commits.problems());
     prop_assert!(effects.blocked().is_empty(), "{:?}", effects.blocked());
-    let reported = koidrive_engine::effects::stuck(&device.trees, &effects);
+    let reported = koidrive_engine::effects::stuck(&device.trees, &effects, commits.in_flight());
     let local = device.trees.local();
     let unreachable = |id: &str, shape: &koidrive_engine::tree::Shape| {
         let folder = shape.parent == local.root

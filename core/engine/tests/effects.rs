@@ -294,7 +294,7 @@ fn converge(trees: &mut Trees, disk: &mut Disk, budget: usize) -> Result<Vec<Eff
     let (mut effects, mut ids, mut done) = (Effects::default(), IdGen::new(1), Vec::new());
     for _ in 0..=budget {
         trees.settle();
-        let Some(record) = effects.plan(trees, &mut ids, NOW).cloned() else {
+        let Some(record) = effects.plan(trees, None, &mut ids, NOW).cloned() else {
             return Ok(done);
         };
         if record.counter != effects.cleared() + 1 {
@@ -302,7 +302,7 @@ fn converge(trees: &mut Trees, disk: &mut Disk, budget: usize) -> Result<Vec<Eff
         }
         let created = disk.apply(&record.effect)?;
         effects
-            .done(trees, &record.effect_id, created)
+            .done(trees, None, &record.effect_id, created)
             .map_err(|e| format!("{e:?}"))?;
         trees.check().map_err(|e| format!("{e:?}"))?;
         disk.matches(trees)?;
@@ -515,10 +515,10 @@ fn only_a_node_whose_only_change_is_remote_gets_an_effect_and_one_at_a_time() {
     trees.settle();
     assert_eq!(trees.class("edited"), Class::Concurrent);
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
-    let first = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    let first = effects.plan(&trees, None, &mut ids, NOW).unwrap().clone();
     assert_eq!(first.node, "g");
     assert_eq!(first.counter, 1);
-    assert_eq!(effects.plan(&trees, &mut ids, NOW), None);
+    assert_eq!(effects.plan(&trees, None, &mut ids, NOW), None);
     assert_eq!(effects.in_flight(), Some(&first));
 }
 
@@ -527,16 +527,16 @@ fn a_failed_effect_is_not_emitted_again_unchanged() {
     let (mut trees, _) = space(&[("f", Some(file(ROOT, "f", 1)), Some(file(ROOT, "f", 2)))]);
     trees.settle();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
-    let first = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    let first = effects.plan(&trees, None, &mut ids, NOW).unwrap().clone();
     let id = first.effect_id.clone();
     assert_eq!(effects.failed(&id), Ok(()));
     assert_eq!(effects.cleared(), 1);
-    assert_eq!(effects.plan(&trees, &mut ids, NOW), None);
+    assert_eq!(effects.plan(&trees, None, &mut ids, NOW), None);
     assert_eq!(effects.blocked().get("f"), Some(&first.effect));
 
     let same = trees.local().get("f").unwrap().clone();
     trees.set_local("f".into(), same.clone());
-    assert_eq!(effects.plan(&trees, &mut ids, NOW), None);
+    assert_eq!(effects.plan(&trees, None, &mut ids, NOW), None);
 
     trees.set_local(
         "f".into(),
@@ -545,7 +545,7 @@ fn a_failed_effect_is_not_emitted_again_unchanged() {
             ..same
         },
     );
-    let again = effects.plan(&trees, &mut ids, NOW).unwrap();
+    let again = effects.plan(&trees, None, &mut ids, NOW).unwrap();
     assert_eq!(again.counter, 2);
     assert_ne!(again.effect_id, id);
 }
@@ -562,7 +562,7 @@ fn a_node_whose_park_failed_gets_no_effect_until_l_changes() {
     trees.settle();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
     let mut planned = Vec::new();
-    while let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() {
+    while let Some(record) = effects.plan(&trees, None, &mut ids, NOW).cloned() {
         effects.failed(&record.effect_id).unwrap();
         planned.push(record.effect);
         if planned.len() == 6 {
@@ -588,7 +588,7 @@ fn a_node_whose_park_failed_gets_no_effect_until_l_changes() {
     let mut found = trees.local().get("d").unwrap().clone();
     found.identity = identity(7);
     trees.set_local("d".into(), found);
-    let again = effects.plan(&trees, &mut ids, NOW).unwrap();
+    let again = effects.plan(&trees, None, &mut ids, NOW).unwrap();
     assert!(
         matches!(again.effect, Effect::Move { to: Location::At { .. }, identity: moved, .. } if moved == identity(7)),
         "{:?}",
@@ -601,14 +601,14 @@ fn a_blocked_node_can_be_unblocked_by_the_caller() {
     let (mut trees, _) = space(&[("f", Some(file(ROOT, "f", 1)), Some(file(ROOT, "f", 2)))]);
     trees.settle();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
-    let first = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    let first = effects.plan(&trees, None, &mut ids, NOW).unwrap().clone();
     effects.failed(&first.effect_id).unwrap();
-    assert_eq!(effects.plan(&trees, &mut ids, NOW), None);
+    assert_eq!(effects.plan(&trees, None, &mut ids, NOW), None);
     assert!(effects.unblock("f"));
     assert!(!effects.unblock("f"));
     assert!(effects.blocked().is_empty());
     assert_eq!(
-        effects.plan(&trees, &mut ids, NOW).map(|r| &r.effect),
+        effects.plan(&trees, None, &mut ids, NOW).map(|r| &r.effect),
         Some(&first.effect)
     );
 }
@@ -621,14 +621,14 @@ fn a_failed_create_is_planned_again_once_its_parent_has_a_new_identity() {
     ]);
     trees.settle();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
-    let first = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    let first = effects.plan(&trees, None, &mut ids, NOW).unwrap().clone();
     effects.failed(&first.effect_id).unwrap();
     let mut parent = trees.local().get("d").unwrap().clone();
     parent.identity = identity(7);
     trees.set_local("d".into(), parent);
     trees.settle();
     assert_eq!(trees.class("f"), Class::Remote);
-    let again = effects.plan(&trees, &mut ids, NOW).unwrap();
+    let again = effects.plan(&trees, None, &mut ids, NOW).unwrap();
     assert_eq!(
         again.effect,
         Effect::WriteFile {
@@ -652,7 +652,7 @@ fn an_edit_observed_while_parked_is_moved_out_and_never_displaced() {
     let (mut trees, mut disk) = space(&[("f", Some(file(ROOT, "a", 1)), Some(file(ROOT, "A", 2)))]);
     trees.settle();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
-    let park = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    let park = effects.plan(&trees, None, &mut ids, NOW).unwrap().clone();
     assert!(matches!(
         park.effect,
         Effect::Move {
@@ -661,14 +661,16 @@ fn an_edit_observed_while_parked_is_moved_out_and_never_displaced() {
         }
     ));
     disk.apply(&park.effect).unwrap();
-    effects.done(&mut trees, &park.effect_id, None).unwrap();
+    effects
+        .done(&mut trees, None, &park.effect_id, None)
+        .unwrap();
     let mut observed = trees.local().get("f").unwrap().clone();
     observed.shape.content = Some(content(3));
     disk.entries.get_mut(&1).unwrap().content = Some(content(3));
     trees.set_local("f".into(), observed);
     trees.settle();
     assert_eq!(trees.class("f"), Class::Concurrent);
-    let out = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    let out = effects.plan(&trees, None, &mut ids, NOW).unwrap().clone();
     assert_eq!(
         out.effect,
         Effect::Move {
@@ -678,12 +680,14 @@ fn an_edit_observed_while_parked_is_moved_out_and_never_displaced() {
         }
     );
     disk.apply(&out.effect).unwrap();
-    effects.done(&mut trees, &out.effect_id, None).unwrap();
+    effects
+        .done(&mut trees, None, &out.effect_id, None)
+        .unwrap();
     disk.matches(&trees).unwrap();
     assert_eq!(trees.local().get("f").unwrap().shape, file(ROOT, "A", 3));
     trees.settle();
     assert_eq!(trees.class("f"), Class::Concurrent);
-    assert_eq!(effects.plan(&trees, &mut ids, NOW), None);
+    assert_eq!(effects.plan(&trees, None, &mut ids, NOW), None);
 }
 
 #[test]
@@ -694,9 +698,11 @@ fn a_parked_edit_whose_node_was_removed_remotely_goes_back_to_its_place() {
     ]);
     trees.settle();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
-    let park = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    let park = effects.plan(&trees, None, &mut ids, NOW).unwrap().clone();
     disk.apply(&park.effect).unwrap();
-    effects.done(&mut trees, &park.effect_id, None).unwrap();
+    effects
+        .done(&mut trees, None, &park.effect_id, None)
+        .unwrap();
     let mut observed = trees.local().get("a").unwrap().clone();
     observed.shape.content = Some(content(3));
     disk.entries.get_mut(&1).unwrap().content = Some(content(3));
@@ -704,7 +710,7 @@ fn a_parked_edit_whose_node_was_removed_remotely_goes_back_to_its_place() {
     trees.remove_remote("a");
     trees.remove_remote("b");
     trees.settle();
-    let out = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    let out = effects.plan(&trees, None, &mut ids, NOW).unwrap().clone();
     assert_eq!(
         out.effect,
         Effect::Move {
@@ -760,9 +766,11 @@ fn a_parked_edit_that_the_remote_tree_matches_is_still_moved_out() {
     let (mut trees, mut disk) = space(&[("f", Some(file(ROOT, "a", 1)), Some(file(ROOT, "A", 2)))]);
     trees.settle();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
-    let park = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    let park = effects.plan(&trees, None, &mut ids, NOW).unwrap().clone();
     disk.apply(&park.effect).unwrap();
-    effects.done(&mut trees, &park.effect_id, None).unwrap();
+    effects
+        .done(&mut trees, None, &park.effect_id, None)
+        .unwrap();
     let mut observed = trees.local().get("f").unwrap().clone();
     observed.shape.content = Some(content(3));
     disk.entries.get_mut(&1).unwrap().content = Some(content(3));
@@ -772,7 +780,7 @@ fn a_parked_edit_that_the_remote_tree_matches_is_still_moved_out() {
     trees.settle();
     assert_eq!(trees.class("f"), Class::InSync);
     assert!(trees.dirty().contains("f"));
-    let out = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    let out = effects.plan(&trees, None, &mut ids, NOW).unwrap().clone();
     assert_eq!(
         out.effect,
         Effect::Move {
@@ -782,7 +790,9 @@ fn a_parked_edit_that_the_remote_tree_matches_is_still_moved_out() {
         }
     );
     disk.apply(&out.effect).unwrap();
-    effects.done(&mut trees, &out.effect_id, None).unwrap();
+    effects
+        .done(&mut trees, None, &out.effect_id, None)
+        .unwrap();
     disk.matches(&trees).unwrap();
     assert_in_sync(&mut trees);
 }
@@ -793,20 +803,23 @@ fn done_takes_only_the_effect_in_flight_and_a_created_entry_needs_its_identity()
     trees.settle();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
     let id = effects
-        .plan(&trees, &mut ids, NOW)
+        .plan(&trees, None, &mut ids, NOW)
         .unwrap()
         .effect_id
         .clone();
     assert_eq!(
-        effects.done(&mut trees, "other", Some(identity(5))),
+        effects.done(&mut trees, None, "other", Some(identity(5))),
         Err(EffectError::NotInFlight("other".into()))
     );
     assert_eq!(
-        effects.done(&mut trees, &id, None),
+        effects.done(&mut trees, None, &id, None),
         Err(EffectError::MissingIdentity)
     );
     assert!(effects.in_flight().is_some());
-    assert_eq!(effects.done(&mut trees, &id, Some(identity(5))), Ok(None));
+    assert_eq!(
+        effects.done(&mut trees, None, &id, Some(identity(5))),
+        Ok(None)
+    );
     assert_eq!(trees.local().get("d").unwrap().identity, identity(5));
     assert_eq!(effects.cleared(), 1);
     assert_in_sync(&mut trees);
@@ -820,8 +833,8 @@ fn done_refuses_an_outcome_whose_name_another_node_took() {
     let (mut trees, _) = space(&[("n", None, Some(file(ROOT, "a", 1)))]);
     trees.settle();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
-    let record = effects.plan(&trees, &mut ids, NOW).cloned().unwrap();
-    assert!(record.applies(&trees));
+    let record = effects.plan(&trees, None, &mut ids, NOW).cloned().unwrap();
+    assert!(record.applies(&trees, None));
     trees.set_local(
         "u".into(),
         LocalNode {
@@ -830,9 +843,9 @@ fn done_refuses_an_outcome_whose_name_another_node_took() {
             parked: false,
         },
     );
-    assert!(!record.applies(&trees));
+    assert!(!record.applies(&trees, None));
     assert_eq!(
-        effects.done(&mut trees, &record.effect_id, Some(identity(5))),
+        effects.done(&mut trees, None, &record.effect_id, Some(identity(5))),
         Err(EffectError::DoesNotApply(record.effect_id.clone()))
     );
     assert_eq!(effects.in_flight(), Some(&record));
@@ -850,13 +863,13 @@ fn a_file_an_effect_removes_after_the_server_restored_it_is_downloaded_again() {
     let (mut trees, mut disk) = space(&[("f", Some(file(ROOT, "f", 1)), None)]);
     trees.settle();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
-    let record = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    let record = effects.plan(&trees, None, &mut ids, NOW).unwrap().clone();
     assert!(matches!(record.effect, Effect::RemoveFile { .. }));
 
     trees.set_remote("f".into(), remote(file(ROOT, "f", 1)));
     let created = disk.apply(&record.effect).unwrap();
     effects
-        .done(&mut trees, &record.effect_id, created)
+        .done(&mut trees, None, &record.effect_id, created)
         .unwrap();
     trees.check().unwrap();
     trees.settle();
@@ -874,13 +887,13 @@ fn a_move_r_undid_while_it_was_in_flight_is_moved_back() {
     let (mut trees, mut disk) = space(&[("f", Some(file(ROOT, "a", 1)), Some(file(ROOT, "b", 1)))]);
     trees.settle();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
-    let record = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    let record = effects.plan(&trees, None, &mut ids, NOW).unwrap().clone();
     assert!(matches!(record.effect, Effect::Move { .. }));
 
     trees.set_remote("f".into(), remote(file(ROOT, "a", 1)));
     let created = disk.apply(&record.effect).unwrap();
     effects
-        .done(&mut trees, &record.effect_id, created)
+        .done(&mut trees, None, &record.effect_id, created)
         .unwrap();
     trees.check().unwrap();
     trees.settle();
@@ -899,7 +912,7 @@ fn a_move_r_undid_with_new_content_while_it_was_in_flight_keeps_the_new_content(
     let (mut trees, mut disk) = space(&[("f", Some(file(ROOT, "a", 1)), Some(file(ROOT, "b", 1)))]);
     trees.settle();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
-    let record = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    let record = effects.plan(&trees, None, &mut ids, NOW).unwrap().clone();
     assert!(matches!(record.effect, Effect::Move { .. }));
 
     trees.set_remote("f".into(), remote(file(ROOT, "a", 2)));
@@ -911,7 +924,7 @@ fn a_move_r_undid_with_new_content_while_it_was_in_flight_keeps_the_new_content(
     assert_eq!(trees.synced().live("f"), Some(&file(ROOT, "a", 2)));
     let created = disk.apply(&record.effect).unwrap();
     effects
-        .done(&mut trees, &record.effect_id, created)
+        .done(&mut trees, None, &record.effect_id, created)
         .unwrap();
     assert_eq!(trees.synced().live("f"), Some(&file(ROOT, "b", 2)));
     assert_eq!(trees.local().live("f"), Some(&file(ROOT, "b", 2)));
@@ -931,7 +944,7 @@ fn an_edit_made_while_a_move_r_undid_was_in_flight_is_uploaded_without_the_move(
     let (mut trees, mut disk) = space(&[("f", Some(file(ROOT, "a", 1)), Some(file(ROOT, "b", 1)))]);
     trees.settle();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
-    let record = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    let record = effects.plan(&trees, None, &mut ids, NOW).unwrap().clone();
     assert!(matches!(record.effect, Effect::Move { .. }));
 
     trees.set_remote("f".into(), remote(file(ROOT, "a", 1)));
@@ -942,7 +955,7 @@ fn an_edit_made_while_a_move_r_undid_was_in_flight_is_uploaded_without_the_move(
     trees.settle();
     let created = disk.apply(&record.effect).unwrap();
     effects
-        .done(&mut trees, &record.effect_id, created)
+        .done(&mut trees, None, &record.effect_id, created)
         .unwrap();
     trees.settle();
     assert_eq!(trees.local().live("f"), Some(&file(ROOT, "b", 2)));
@@ -973,11 +986,11 @@ fn a_reverted_move_keeps_an_edit_that_was_not_uploaded() {
     trees.revert("f".into());
     trees.settle();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
-    let record = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    let record = effects.plan(&trees, None, &mut ids, NOW).unwrap().clone();
     assert!(matches!(record.effect, Effect::Move { .. }));
     let created = disk.apply(&record.effect).unwrap();
     effects
-        .done(&mut trees, &record.effect_id, created)
+        .done(&mut trees, None, &record.effect_id, created)
         .unwrap();
     trees.settle();
     assert!(trees.edited("f"));
@@ -1006,7 +1019,7 @@ fn a_reverted_file_that_the_user_deleted_is_not_downloaded_again() {
     trees.settle();
     assert_eq!(trees.class("n"), Class::Local);
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
-    assert_eq!(effects.plan(&trees, &mut ids, NOW), None);
+    assert_eq!(effects.plan(&trees, None, &mut ids, NOW), None);
 }
 
 /// A parked file holds an edit, and the user deleted its folder, which the server keeps. When R
@@ -1444,7 +1457,7 @@ fn a_file_parked_for_a_name_swap_is_not_reported_while_the_swap_goes_on() {
     ]);
     trees.settle();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
-    let park = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    let park = effects.plan(&trees, None, &mut ids, NOW).unwrap().clone();
     assert!(matches!(
         park.effect,
         Effect::Move {
@@ -1453,10 +1466,12 @@ fn a_file_parked_for_a_name_swap_is_not_reported_while_the_swap_goes_on() {
         }
     ));
     disk.apply(&park.effect).unwrap();
-    effects.done(&mut trees, &park.effect_id, None).unwrap();
+    effects
+        .done(&mut trees, None, &park.effect_id, None)
+        .unwrap();
     trees.settle();
     assert_eq!(
-        koidrive_engine::effects::stuck(&trees, &effects),
+        koidrive_engine::effects::stuck(&trees, &effects, None),
         BTreeMap::new()
     );
 }
@@ -1511,11 +1526,11 @@ fn a_parked_node_that_can_go_nowhere_is_reported_beside_a_failed_effect() {
     disk.matches(&trees).unwrap();
     trees.settle();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
-    let record = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    let record = effects.plan(&trees, None, &mut ids, NOW).unwrap().clone();
     assert_eq!(record.node, "g");
     effects.failed(&record.effect_id).unwrap();
-    assert!(effects.plan(&trees, &mut ids, NOW).is_none());
-    let reported = koidrive_engine::effects::stuck(&trees, &effects);
+    assert!(effects.plan(&trees, None, &mut ids, NOW).is_none());
+    let reported = koidrive_engine::effects::stuck(&trees, &effects, None);
     assert!(reported.contains_key("f"), "{reported:?}");
 }
 
@@ -1612,7 +1627,7 @@ fn an_edit_saved_while_its_file_is_parked_survives_a_folder_taking_its_name() {
     let (mut trees, mut disk) = space(&[("a", Some(file(ROOT, "x", 1)), Some(file(ROOT, "X", 1)))]);
     trees.settle();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
-    let park = effects.plan(&trees, &mut ids, NOW).cloned().unwrap();
+    let park = effects.plan(&trees, None, &mut ids, NOW).cloned().unwrap();
     assert!(
         matches!(
             park.effect,
@@ -1628,7 +1643,9 @@ fn an_edit_saved_while_its_file_is_parked_survives_a_folder_taking_its_name() {
     trees.set_local("a".into(), node);
     disk.entries.get_mut(&1).unwrap().content = Some(content(9));
     let created = disk.apply(&park.effect).unwrap();
-    effects.done(&mut trees, &park.effect_id, created).unwrap();
+    effects
+        .done(&mut trees, None, &park.effect_id, created)
+        .unwrap();
     let a = trees.local().get("a").unwrap();
     assert!(a.parked && a.shape.content == Some(content(9)));
     trees.set_remote(
@@ -1656,7 +1673,7 @@ fn an_edit_saved_while_its_file_is_parked_survives_a_folder_taking_its_name() {
         })
     });
     let next = effects
-        .plan(&trees, &mut ids, NOW)
+        .plan(&trees, commits.in_flight(), &mut ids, NOW)
         .map(|record| record.effect.clone());
     assert!(
         sent || next.is_some(),

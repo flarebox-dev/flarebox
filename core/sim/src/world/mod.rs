@@ -919,14 +919,17 @@ impl World {
                 trees,
                 effects,
                 ids,
+                commits,
                 ..
             } = &mut device.engine;
             trees.settle();
-            let planned = effects.plan(trees, ids, NOW as u64).is_some();
+            let planned = effects
+                .plan(trees, commits.in_flight(), ids, NOW as u64)
+                .is_some();
             device.persist()?;
             return Ok(planned);
         };
-        let applies = record.applies(&device.engine.trees);
+        let applies = record.applies(&device.engine.trees, device.engine.commits.in_flight());
         let until = match outcome {
             Outcome::Run if applies => Some(Cut::Done),
             Outcome::Crash(cut) if applies => Some(cut),
@@ -968,11 +971,13 @@ impl World {
         } = &mut device.engine;
         let reported = match applied {
             Some(Ok(identity)) => {
-                (effects.done(trees, &record.effect_id, identity)).map(|removal| {
-                    if let Some(removal) = removal {
-                        commits.count_remote(removal, trees, cursor.seq, ids, NOW as u64);
-                    }
-                })
+                (effects.done(trees, commits.in_flight(), &record.effect_id, identity)).map(
+                    |removal| {
+                        if let Some(removal) = removal {
+                            commits.count_remote(removal, trees, cursor.seq, ids, NOW as u64);
+                        }
+                    },
+                )
             }
             _ => effects.failed(&record.effect_id).map(|()| {
                 if !applies {
@@ -1049,7 +1054,7 @@ impl World {
                 Effect::WriteFile { content, .. } => Some(content),
                 _ => None,
             };
-            let applies = record.applies(trees);
+            let applies = record.applies(trees, commits.in_flight());
             let refuted = matches!(
                 &applied.outcome,
                 Ok(identity) if !effects.confirms(trees, identity.as_ref())
@@ -1083,11 +1088,13 @@ impl World {
                             false => "restart finds the effect in flight done",
                         },
                     );
-                    (effects.done(trees, &record.effect_id, identity)).map(|removal| {
-                        if let Some(removal) = removal {
-                            commits.count_remote(removal, trees, cursor.seq, ids, NOW as u64);
-                        }
-                    })
+                    (effects.done(trees, commits.in_flight(), &record.effect_id, identity)).map(
+                        |removal| {
+                            if let Some(removal) = removal {
+                                commits.count_remote(removal, trees, cursor.seq, ids, NOW as u64);
+                            }
+                        },
+                    )
                 }
                 outcome => {
                     note(

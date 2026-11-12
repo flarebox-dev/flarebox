@@ -61,7 +61,7 @@ fn first_sync(files: usize, per_dir: usize) -> (Duration, usize, usize) {
     loop {
         trees.settle();
         rows += trees.take_changed().len();
-        let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() else {
+        let Some(record) = effects.plan(&trees, None, &mut ids, NOW).cloned() else {
             break;
         };
         planned += 1;
@@ -71,7 +71,7 @@ fn first_sync(files: usize, per_dir: usize) -> (Duration, usize, usize) {
             birth_ns: Some(0),
         };
         effects
-            .done(&mut trees, &record.effect_id, Some(identity))
+            .done(&mut trees, None, &record.effect_id, Some(identity))
             .unwrap();
     }
     let elapsed = Duration::try_from(clock_gettime(ClockId::ThreadCPUTime) - started).unwrap();

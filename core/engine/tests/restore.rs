@@ -296,7 +296,9 @@ fn a_trash_restore_is_one_op_and_its_result_is_downloaded() {
     assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
 
     let mut effects = Effects::default();
-    let record = effects.plan(&trees, &mut ids, NOW).unwrap();
+    let record = effects
+        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .unwrap();
     assert_eq!((&record.node, &record.after), (&n, &Some(shape)));
     assert!(matches!(
         &record.effect,
@@ -330,7 +332,9 @@ fn a_version_restore_leaves_s_and_l_alone_and_the_file_is_replaced() {
     assert_eq!(trees.class(&n), Class::Remote);
 
     let mut effects = Effects::default();
-    let record = effects.plan(&trees, &mut ids, NOW).unwrap();
+    let record = effects
+        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .unwrap();
     let Effect::WriteFile {
         content: written,
         replaces: Some(replaced),

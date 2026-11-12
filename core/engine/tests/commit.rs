@@ -441,9 +441,9 @@ fn a_move_that_closes_a_cycle_against_r_is_reverted() {
 /// Applies the effect that moves the reverted `node` back to its R position.
 fn moves_back(trees: &mut Trees, ids: &mut IdGen, node: &str) {
     let mut effects = Effects::default();
-    let record = effects.plan(trees, ids, NOW).unwrap().clone();
+    let record = effects.plan(trees, None, ids, NOW).unwrap().clone();
     assert_eq!(record.node, node);
-    effects.done(trees, &record.effect_id, None).unwrap();
+    effects.done(trees, None, &record.effect_id, None).unwrap();
     trees.settle();
     assert_eq!(
         trees.local().get(node).map(|n| &n.shape),
@@ -480,14 +480,22 @@ fn a_reverted_move_brings_back_the_folders_l_deleted_on_its_way() {
     let reverted: Vec<&str> = trees.reverted().iter().map(String::as_str).collect();
     assert_eq!(reverted, ["d", "p"]);
     let mut effects = Effects::default();
-    while let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() {
+    while let Some(record) = effects
+        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .cloned()
+    {
         let identity = FileIdentity {
             dev: 1,
             ino: 99,
             birth_ns: Some(0),
         };
         effects
-            .done(&mut trees, &record.effect_id, Some(identity))
+            .done(
+                &mut trees,
+                commits.in_flight(),
+                &record.effect_id,
+                Some(identity),
+            )
             .unwrap();
         trees.settle();
     }
@@ -673,12 +681,20 @@ fn a_conflict_survives_an_effect_whose_s_update_waits() {
     assert!(trees.waiting().contains_key("n"));
     assert_eq!(trees.check(), Ok(()));
     let mut effects = Effects::default();
-    let record = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    let record = effects
+        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .unwrap()
+        .clone();
     assert_eq!(record.node, "n");
-    effects.done(&mut trees, &record.effect_id, None).unwrap();
+    effects
+        .done(&mut trees, commits.in_flight(), &record.effect_id, None)
+        .unwrap();
     trees.settle();
     for _ in 0..4 {
-        let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() else {
+        let Some(record) = effects
+            .plan(&trees, commits.in_flight(), &mut ids, NOW)
+            .cloned()
+        else {
             break;
         };
         if record.node == "p" {
@@ -687,6 +703,7 @@ fn a_conflict_survives_an_effect_whose_s_update_waits() {
             effects
                 .done(
                     &mut trees,
+                    commits.in_flight(),
                     &record.effect_id,
                     Some(local(file(ROOT, "x", 2), 10).identity),
                 )
@@ -694,7 +711,11 @@ fn a_conflict_survives_an_effect_whose_s_update_waits() {
         }
         trees.settle();
     }
-    assert!(effects.plan(&trees, &mut ids, NOW).is_none());
+    assert!(
+        effects
+            .plan(&trees, commits.in_flight(), &mut ids, NOW)
+            .is_none()
+    );
     assert!(trees.waiting().contains_key("n"));
     assert_eq!(trees.local().live("n"), trees.remote().live("n"));
     assert_eq!(trees.check(), Ok(()));
@@ -723,23 +744,36 @@ fn a_parked_fork_recovers_after_its_empty_local_parent_is_deleted() {
     trees.revert("c".into());
     let (mut commits, mut ids, mut effects) =
         (Commits::default(), IdGen::new(1), Effects::default());
-    let parking = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    let parking = effects
+        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .unwrap()
+        .clone();
     assert!(matches!(&parking.effect, Effect::Move { to: Location::Parked(id), .. } if id == "a"));
-    effects.done(&mut trees, &parking.effect_id, None).unwrap();
+    effects
+        .done(&mut trees, commits.in_flight(), &parking.effect_id, None)
+        .unwrap();
     trees.set_remote("a".into(), trashed(file("d", "y", 1)));
     trees.set_remote("c".into(), trashed(file("d", "x", 4)));
     trees.remove_local("c");
     trees.remove_local("d");
     trees.settle();
     assert_eq!(trees.check(), Ok(()));
-    assert!(effects.plan(&trees, &mut ids, NOW).is_none());
+    assert!(
+        effects
+            .plan(&trees, commits.in_flight(), &mut ids, NOW)
+            .is_none()
+    );
     for ino in 10..26 {
         trees.settle();
         assert_eq!(trees.check(), Ok(()));
-        if let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() {
+        if let Some(record) = effects
+            .plan(&trees, commits.in_flight(), &mut ids, NOW)
+            .cloned()
+        {
             effects
                 .done(
                     &mut trees,
+                    commits.in_flight(),
                     &record.effect_id,
                     Some(local(dir(ROOT, "d"), ino).identity),
                 )
@@ -863,7 +897,8 @@ fn a_folder_renamed_back_after_its_move_was_renamed_by_the_server_keeps_the_user
         trees.settle();
         assert!(!trees.reverted().contains("n"), "{back_before_the_result}");
         let mut effects = Effects::default();
-        let planned = (effects.plan(&trees, &mut ids, NOW)).map(|record| record.effect.clone());
+        let planned = (effects.plan(&trees, commits.in_flight(), &mut ids, NOW))
+            .map(|record| record.effect.clone());
         assert_eq!(planned, None, "{back_before_the_result}");
         let commit = build(&mut commits, &mut trees, &mut ids);
         assert_eq!(
@@ -898,7 +933,10 @@ fn a_parked_file_forked_in_a_build_is_created_only_after_the_effects_move_it_bac
         (Commits::default(), IdGen::new(1), Effects::default());
     assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
     trees.settle();
-    let unparked = effects.plan(&trees, &mut ids, NOW).cloned().unwrap();
+    let unparked = effects
+        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .cloned()
+        .unwrap();
     assert!(matches!(
         &unparked.effect,
         Effect::Move {
@@ -906,7 +944,9 @@ fn a_parked_file_forked_in_a_build_is_created_only_after_the_effects_move_it_bac
             ..
         }
     ));
-    effects.done(&mut trees, &unparked.effect_id, None).unwrap();
+    effects
+        .done(&mut trees, commits.in_flight(), &unparked.effect_id, None)
+        .unwrap();
     trees.settle();
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert!(matches!(
@@ -941,19 +981,26 @@ fn a_parked_folder_the_server_lost_is_created_again_after_a_delete_empties_it() 
     trees.forget_lost(Vec::new(), Vec::new(), 0, 0);
     trees.settle();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
-    let removed = effects.plan(&trees, &mut ids, NOW).cloned().unwrap();
+    let removed = effects.plan(&trees, None, &mut ids, NOW).cloned().unwrap();
     assert_eq!(removed.node, "one");
     assert!(matches!(removed.effect, Effect::RemoveFile { .. }));
-    effects.done(&mut trees, &removed.effect_id, None).unwrap();
+    effects
+        .done(&mut trees, None, &removed.effect_id, None)
+        .unwrap();
     trees.settle();
-    assert!(effects.plan(&trees, &mut ids, NOW).is_none());
+    assert!(effects.plan(&trees, None, &mut ids, NOW).is_none());
     let mut commits = Commits::default();
     assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
     trees.settle();
-    let unparked = effects.plan(&trees, &mut ids, NOW).cloned().unwrap();
+    let unparked = effects
+        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .cloned()
+        .unwrap();
     assert_eq!(unparked.node, "albums");
     assert!(matches!(unparked.effect, Effect::Move { .. }));
-    effects.done(&mut trees, &unparked.effect_id, None).unwrap();
+    effects
+        .done(&mut trees, commits.in_flight(), &unparked.effect_id, None)
+        .unwrap();
     trees.settle();
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert!(matches!(&ops(&commit)[..], [op::Op::CreateDir(c)] if c.node_id == "albums"));
@@ -1199,13 +1246,18 @@ fn a_local_edit_on_a_reverted_file_is_kept_on_disk_and_uploaded() {
     trees.set_remote("a".into(), remote(file(ROOT, "x (conflict)", 1)));
     trees.set_local("a".into(), local(file(ROOT, "x", 2), 1));
     let mut effects = Effects::default();
-    let record = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    let record = effects
+        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .unwrap()
+        .clone();
     assert!(
         matches!(record.effect, Effect::Move { .. }),
         "{:?}",
         record.effect
     );
-    effects.done(&mut trees, &record.effect_id, None).unwrap();
+    effects
+        .done(&mut trees, commits.in_flight(), &record.effect_id, None)
+        .unwrap();
     trees.settle();
     assert_eq!(
         trees.local().get("a").unwrap().shape,
@@ -1300,7 +1352,10 @@ fn a_reverted_file_deleted_remotely_keeps_its_unuploaded_edit_as_a_new_file() {
     trees.settle();
     assert!(trees.reverted().contains("a"));
     let mut effects = Effects::default();
-    assert_eq!(effects.plan(&trees, &mut ids, NOW), None);
+    assert_eq!(
+        effects.plan(&trees, commits.in_flight(), &mut ids, NOW),
+        None
+    );
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     let [op::Op::CreateFile(create)] = &ops(&commit)[..] else {
         panic!("{:?}", ops(&commit));
@@ -1367,10 +1422,15 @@ fn two_reverted_files_that_block_each_other_are_placed_through_parking() {
     trees.settle();
     let mut effects = Effects::default();
     for _ in 0..8 {
-        let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() else {
+        let Some(record) = effects
+            .plan(&trees, commits.in_flight(), &mut ids, NOW)
+            .cloned()
+        else {
             break;
         };
-        effects.done(&mut trees, &record.effect_id, None).unwrap();
+        effects
+            .done(&mut trees, commits.in_flight(), &record.effect_id, None)
+            .unwrap();
         trees.settle();
     }
     assert_eq!(trees.local().get("a").unwrap().shape, file(ROOT, "y", 1));
@@ -1409,7 +1469,10 @@ fn a_folder_deleted_around_a_parked_node_is_brought_back_for_it() {
         let mut effects = Effects::default();
         for ino in 10..18 {
             trees.settle();
-            let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() else {
+            let Some(record) = effects
+                .plan(&trees, commits.in_flight(), &mut ids, NOW)
+                .cloned()
+            else {
                 break;
             };
             let identity = FileIdentity {
@@ -1418,7 +1481,12 @@ fn a_folder_deleted_around_a_parked_node_is_brought_back_for_it() {
                 birth_ns: Some(0),
             };
             effects
-                .done(&mut trees, &record.effect_id, Some(identity))
+                .done(
+                    &mut trees,
+                    commits.in_flight(),
+                    &record.effect_id,
+                    Some(identity),
+                )
                 .unwrap();
         }
         trees.settle();
@@ -1450,21 +1518,35 @@ fn a_parked_file_rekeyed_for_its_edit_is_moved_out_from_where_it_was_parked() {
     trees.revert("c".into());
     let (mut commits, mut ids, mut effects) =
         (Commits::default(), IdGen::new(1), Effects::default());
-    let parking = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    let parking = effects
+        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .unwrap()
+        .clone();
     assert!(
         matches!(&parking.effect, Effect::Move { to: Location::Parked(id), .. } if id == "a"),
         "{parking:?}"
     );
-    effects.done(&mut trees, &parking.effect_id, None).unwrap();
+    effects
+        .done(&mut trees, commits.in_flight(), &parking.effect_id, None)
+        .unwrap();
     trees.set_remote("a".into(), trashed(file(ROOT, "y", 1)));
     trees.set_remote("c".into(), trashed(file(ROOT, "x", 4)));
     trees.set_local("b".into(), local(file(ROOT, "x", 3), 3));
     trees.settle();
-    let remove = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    let remove = effects
+        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .unwrap()
+        .clone();
     assert_eq!(remove.node, "c");
-    effects.done(&mut trees, &remove.effect_id, None).unwrap();
+    effects
+        .done(&mut trees, commits.in_flight(), &remove.effect_id, None)
+        .unwrap();
     trees.settle();
-    assert!(effects.plan(&trees, &mut ids, NOW).is_none());
+    assert!(
+        effects
+            .plan(&trees, commits.in_flight(), &mut ids, NOW)
+            .is_none()
+    );
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert_eq!(commit.ops.len(), 2);
     let rekeyed = trees
@@ -1492,7 +1574,10 @@ fn a_parked_file_rekeyed_for_its_edit_is_moved_out_from_where_it_was_parked() {
     let mut unparked = false;
     for ino in 10..16 {
         trees.settle();
-        let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() else {
+        let Some(record) = effects
+            .plan(&trees, commits.in_flight(), &mut ids, NOW)
+            .cloned()
+        else {
             break;
         };
         if record.node == rekeyed {
@@ -1508,7 +1593,12 @@ fn a_parked_file_rekeyed_for_its_edit_is_moved_out_from_where_it_was_parked() {
             birth_ns: Some(0),
         };
         effects
-            .done(&mut trees, &record.effect_id, Some(identity))
+            .done(
+                &mut trees,
+                commits.in_flight(),
+                &record.effect_id,
+                Some(identity),
+            )
             .unwrap();
     }
     assert!(unparked);
@@ -1620,7 +1710,10 @@ fn a_file_whose_s_update_waits_is_removed_or_uploaded_anew_after_a_remote_delete
         trees.settle();
         let mut removed = false;
         for _ in 0..4 {
-            let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() else {
+            let Some(record) = effects
+                .plan(&trees, commits.in_flight(), &mut ids, NOW)
+                .cloned()
+            else {
                 break;
             };
             if record.node == "h" {
@@ -1629,7 +1722,9 @@ fn a_file_whose_s_update_waits_is_removed_or_uploaded_anew_after_a_remote_delete
             }
             assert_eq!(record.node, "n", "{record:?}");
             removed = matches!(record.effect, Effect::RemoveFile { .. });
-            effects.done(&mut trees, &record.effect_id, None).unwrap();
+            effects
+                .done(&mut trees, commits.in_flight(), &record.effect_id, None)
+                .unwrap();
             trees.settle();
         }
         let commit = build(&mut commits, &mut trees, &mut ids);
@@ -1673,13 +1768,15 @@ fn a_parked_reverted_folder_the_server_lacks_is_removed_even_when_its_name_is_ta
     trees.revert("n".into());
     trees.settle();
     let mut effects = Effects::default();
-    let record = effects.plan(&trees, &mut IdGen::new(1), NOW).cloned();
+    let record = effects.plan(&trees, None, &mut IdGen::new(1), NOW).cloned();
     let record = record.expect("an effect for the parked folder");
     assert!(
         matches!(record.effect, Effect::RemoveDir { .. }),
         "{record:?}"
     );
-    effects.done(&mut trees, &record.effect_id, None).unwrap();
+    effects
+        .done(&mut trees, None, &record.effect_id, None)
+        .unwrap();
     trees.settle();
     assert_eq!(trees.work(), vec![]);
     assert!(trees.local().get("n").is_none());
@@ -2064,8 +2161,13 @@ fn a_folder_merged_into_one_l_holds_elsewhere_is_removed_once_its_files_follow_i
     let reverted: Vec<&str> = trees.reverted().iter().map(String::as_str).collect();
     assert_eq!(reverted, ["a", "c", "g"]);
     let mut effects = Effects::default();
-    while let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() {
-        effects.done(&mut trees, &record.effect_id, None).unwrap();
+    while let Some(record) = effects
+        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .cloned()
+    {
+        effects
+            .done(&mut trees, commits.in_flight(), &record.effect_id, None)
+            .unwrap();
         trees.settle();
     }
     assert_eq!(trees.local().get("a"), None);
@@ -2128,10 +2230,18 @@ fn a_conflict_copy_downloaded_before_its_result_is_kept_once() {
         ino,
         birth_ns: Some(0),
     };
-    let download = effects.plan(&trees, &mut ids, NOW).cloned().unwrap();
+    let download = effects
+        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .cloned()
+        .unwrap();
     assert_eq!(download.node, "y");
     effects
-        .done(&mut trees, &download.effect_id, Some(identity(9)))
+        .done(
+            &mut trees,
+            commits.in_flight(),
+            &download.effect_id,
+            Some(identity(9)),
+        )
         .unwrap();
     trees.settle();
     let copy = OpResult {
@@ -2140,9 +2250,17 @@ fn a_conflict_copy_downloaded_before_its_result_is_kept_once() {
     };
     acknowledge(&mut commits, &mut trees, vec![copy]);
     let mut ino = 10;
-    while let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() {
+    while let Some(record) = effects
+        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .cloned()
+    {
         effects
-            .done(&mut trees, &record.effect_id, Some(identity(ino)))
+            .done(
+                &mut trees,
+                commits.in_flight(),
+                &record.effect_id,
+                Some(identity(ino)),
+            )
             .unwrap();
         ino += 1;
         trees.settle();
@@ -2181,7 +2299,10 @@ fn a_conflict_copy_whose_result_arrives_during_its_download_keeps_the_local_file
         ino,
         birth_ns: Some(0),
     };
-    let download = effects.plan(&trees, &mut ids, NOW).cloned().unwrap();
+    let download = effects
+        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .cloned()
+        .unwrap();
     assert_eq!(download.node, "y");
     let copy = OpResult {
         node_id: "y".into(),
@@ -2189,18 +2310,31 @@ fn a_conflict_copy_whose_result_arrives_during_its_download_keeps_the_local_file
     };
     acknowledge(&mut commits, &mut trees, vec![copy]);
     assert_eq!(trees.local().get("y").unwrap().identity.ino, 1);
-    assert!(!download.applies(&trees));
+    assert!(!download.applies(&trees, commits.in_flight()));
     assert_eq!(
-        effects.done(&mut trees, &download.effect_id, Some(identity(9))),
+        effects.done(
+            &mut trees,
+            commits.in_flight(),
+            &download.effect_id,
+            Some(identity(9))
+        ),
         Err(EffectError::DoesNotApply(download.effect_id.clone()))
     );
     effects.failed(&download.effect_id).unwrap();
     effects.unblock("y");
     trees.settle();
     let mut ino = 10;
-    while let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() {
+    while let Some(record) = effects
+        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .cloned()
+    {
         effects
-            .done(&mut trees, &record.effect_id, Some(identity(ino)))
+            .done(
+                &mut trees,
+                commits.in_flight(),
+                &record.effect_id,
+                Some(identity(ino)),
+            )
             .unwrap();
         ino += 1;
         trees.settle();
@@ -2253,14 +2387,22 @@ fn a_conflict_copy_whose_s_update_waits_behind_a_new_folder_is_moved_to_its_name
     assert!(trees.waiting().contains_key("y"));
     let mut effects = Effects::default();
     let mut ino = 10;
-    while let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() {
+    while let Some(record) = effects
+        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .cloned()
+    {
         let identity = FileIdentity {
             dev: 1,
             ino,
             birth_ns: Some(0),
         };
         effects
-            .done(&mut trees, &record.effect_id, Some(identity))
+            .done(
+                &mut trees,
+                commits.in_flight(),
+                &record.effect_id,
+                Some(identity),
+            )
             .unwrap();
         ino += 1;
         trees.settle();
@@ -3157,7 +3299,11 @@ fn a_recorded_file_another_device_purges_is_created_again() {
     trees.remove_remote("n");
     trees.settle();
     let (mut effects, mut effect_ids) = (Effects::default(), IdGen::new(50));
-    assert!(effects.plan(&trees, &mut effect_ids, NOW).is_none());
+    assert!(
+        effects
+            .plan(&trees, commits.in_flight(), &mut effect_ids, NOW)
+            .is_none()
+    );
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert!(
         matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id == "n" && c.content == Some(content(2))),
@@ -3207,9 +3353,13 @@ fn a_recorded_file_whose_s_update_waits_gets_no_download() {
         trees
     };
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
-    assert!(effects.plan(&restored(false), &mut ids, NOW).is_some());
+    assert!(
+        effects
+            .plan(&restored(false), None, &mut ids, NOW)
+            .is_some()
+    );
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
-    assert!(effects.plan(&restored(true), &mut ids, NOW).is_none());
+    assert!(effects.plan(&restored(true), None, &mut ids, NOW).is_none());
 }
 
 /// Commits a new file `id`, and acknowledges it at `seq` with R holding the file.
@@ -3491,7 +3641,10 @@ fn a_lost_update_is_not_the_effects_base_while_it_cannot_fit() {
     };
     for _ in 0..3 {
         assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
-        let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() else {
+        let Some(record) = effects
+            .plan(&trees, commits.in_flight(), &mut ids, NOW)
+            .cloned()
+        else {
             break;
         };
         if record.node == "h" {
@@ -3499,7 +3652,12 @@ fn a_lost_update_is_not_the_effects_base_while_it_cannot_fit() {
             continue;
         }
         effects
-            .done(&mut trees, &record.effect_id, Some(identity))
+            .done(
+                &mut trees,
+                commits.in_flight(),
+                &record.effect_id,
+                Some(identity),
+            )
             .unwrap();
         trees.settle();
     }
@@ -3642,7 +3800,7 @@ fn effects_for(trees: &mut Trees, ids: &mut IdGen, node: &str) -> Vec<Effect> {
     let mut effects = Effects::default();
     let mut planned = Vec::new();
     for _ in 0..8 {
-        let Some(record) = effects.plan(trees, ids, NOW).cloned() else {
+        let Some(record) = effects.plan(trees, None, ids, NOW).cloned() else {
             break;
         };
         if record.node == node {
@@ -3655,7 +3813,9 @@ fn effects_for(trees: &mut Trees, ids: &mut IdGen, node: &str) -> Vec<Effect> {
             ino: 100,
             birth_ns: Some(0),
         });
-        effects.done(trees, &record.effect_id, identity).unwrap();
+        effects
+            .done(trees, None, &record.effect_id, identity)
+            .unwrap();
         trees.settle();
     }
     planned
@@ -3916,7 +4076,7 @@ fn a_waiting_blocker_whose_parking_failed_is_not_parked_again_unchanged() {
     trees.set_remote("h".into(), remote(file(ROOT, "old", 9)));
     trees.settle();
     let mut effects = Effects::default();
-    let first = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    let first = effects.plan(&trees, None, &mut ids, NOW).unwrap().clone();
     assert_eq!(first.node, "n");
     assert!(matches!(
         first.effect,
@@ -3926,7 +4086,7 @@ fn a_waiting_blocker_whose_parking_failed_is_not_parked_again_unchanged() {
         }
     ));
     effects.failed(&first.effect_id).unwrap();
-    assert_eq!(effects.plan(&trees, &mut ids, NOW), None);
+    assert_eq!(effects.plan(&trees, None, &mut ids, NOW), None);
     assert!(effects.blocked().contains_key("n"));
 }
 
@@ -4059,7 +4219,7 @@ fn a_removal_r_undid_whose_s_update_does_not_fit_yet_waits() {
         ("f", Some(file(ROOT, "f", 1)), Some(file("d", "f", 1)), None),
     ]);
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
-    let record = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    let record = effects.plan(&trees, None, &mut ids, NOW).unwrap().clone();
     assert_eq!(record.node, "d");
     assert!(
         matches!(record.effect, Effect::RemoveDir { .. }),
@@ -4067,7 +4227,9 @@ fn a_removal_r_undid_whose_s_update_does_not_fit_yet_waits() {
     );
     trees.set_remote("d".into(), remote(dir(ROOT, "d")));
     trees.set_remote("f".into(), remote(file("d", "f", 1)));
-    effects.done(&mut trees, &record.effect_id, None).unwrap();
+    effects
+        .done(&mut trees, None, &record.effect_id, None)
+        .unwrap();
     trees.settle();
 
     assert_eq!(effects_for(&mut trees, &mut ids, "d"), []);
@@ -4167,10 +4329,15 @@ fn a_removal_that_waits_after_both_sides_dropped_the_node_is_kept_until_it_fits(
         }),
         Reconnect::Idle
     );
-    let record = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    let record = effects
+        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .unwrap()
+        .clone();
     assert_eq!(record.node, "d");
     assert!(matches!(record.effect, Effect::RemoveDir { .. }));
-    effects.done(&mut trees, &record.effect_id, None).unwrap();
+    effects
+        .done(&mut trees, commits.in_flight(), &record.effect_id, None)
+        .unwrap();
     trees.settle();
     assert_eq!(
         trees.waiting().get("d").map(|waiting| &waiting.shape),
@@ -4200,8 +4367,13 @@ fn a_kept_removal_is_made_once_s_no_longer_holds_anything_under_it() {
         }),
         Reconnect::Idle
     );
-    let record = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
-    effects.done(&mut trees, &record.effect_id, None).unwrap();
+    let record = effects
+        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .unwrap()
+        .clone();
+    effects
+        .done(&mut trees, commits.in_flight(), &record.effect_id, None)
+        .unwrap();
     trees.settle();
     assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
     assert_eq!(commits.connected(&welcome(0)), Reconnect::Idle);
@@ -5773,7 +5945,7 @@ fn a_parked_edit_whose_name_a_new_folder_holds_is_sent() {
         (Effects::default(), Commits::default(), IdGen::new(1));
     assert_eq!(
         effects
-            .plan(&trees, &mut ids, NOW)
+            .plan(&trees, commits.in_flight(), &mut ids, NOW)
             .map(|record| record.effect.clone()),
         None
     );
@@ -5812,7 +5984,11 @@ fn a_blocker_at_its_r_position_is_not_parked() {
     assert_eq!(trees.check(), Ok(()));
     let (mut effects, mut commits, mut ids) =
         (Effects::default(), Commits::default(), IdGen::new(1));
-    assert!(effects.plan(&trees, &mut ids, NOW).is_none());
+    assert!(
+        effects
+            .plan(&trees, commits.in_flight(), &mut ids, NOW)
+            .is_none()
+    );
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert!(uploads(&ops(&commit), 2), "{:?}", ops(&commit));
 }
@@ -5933,7 +6109,7 @@ fn a_parked_edit_whose_name_goes_to_a_folder_this_device_excludes_is_not_held_ba
     trees.set_rules::<&str>(&[], Some(RuleFile::parse(b"x/\n")));
     trees.settle();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
-    let park = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    let park = effects.plan(&trees, None, &mut ids, NOW).unwrap().clone();
     assert!(matches!(
         &park.effect,
         Effect::Move {
@@ -5941,7 +6117,9 @@ fn a_parked_edit_whose_name_goes_to_a_folder_this_device_excludes_is_not_held_ba
             ..
         }
     ));
-    effects.done(&mut trees, &park.effect_id, None).unwrap();
+    effects
+        .done(&mut trees, None, &park.effect_id, None)
+        .unwrap();
     let mut edited = trees.local().get("h").unwrap().clone();
     edited.shape.content = Some(content(2));
     trees.set_local("h".into(), edited);
@@ -5949,7 +6127,7 @@ fn a_parked_edit_whose_name_goes_to_a_folder_this_device_excludes_is_not_held_ba
     trees.set_remote("n".into(), remote(dir(ROOT, "x")));
     trees.settle();
     assert!(trees.excluded("n") && !trees.excluded("h"));
-    let back = effects.plan(&trees, &mut ids, NOW).cloned();
+    let back = effects.plan(&trees, None, &mut ids, NOW).cloned();
     assert_eq!(
         back.map(|record| record.effect),
         Some(Effect::Move {
@@ -5992,7 +6170,7 @@ fn a_parked_edit_whose_name_a_synced_folder_holds_is_sent() {
         (Effects::default(), Commits::default(), IdGen::new(1));
     assert_eq!(
         effects
-            .plan(&trees, &mut ids, NOW)
+            .plan(&trees, commits.in_flight(), &mut ids, NOW)
             .map(|record| record.effect.clone()),
         None
     );
@@ -6055,7 +6233,7 @@ fn a_parked_edit_goes_back_to_its_name_when_another_folder_gets_that_name() {
     trees.settle();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
     let mut moved_back = false;
-    while let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() {
+    while let Some(record) = effects.plan(&trees, None, &mut ids, NOW).cloned() {
         moved_back |= matches!(
             &record.effect,
             Effect::Move { from: Location::Parked(_), to: Location::At { dirs, name, .. }, .. }
@@ -6064,6 +6242,7 @@ fn a_parked_edit_goes_back_to_its_name_when_another_folder_gets_that_name() {
         effects
             .done(
                 &mut trees,
+                None,
                 &record.effect_id,
                 Some(local(dir("d", "x"), 9).identity),
             )
@@ -6071,6 +6250,152 @@ fn a_parked_edit_goes_back_to_its_name_when_another_folder_gets_that_name() {
         trees.settle();
     }
     assert!(moved_back);
+}
+
+#[test]
+fn a_remote_move_waits_exactly_while_a_commit_in_flight_moves_the_node() {
+    use error::Code;
+    type Exit = Box<dyn Fn(&mut Commits, &mut Trees)>;
+    let ok = || vec![outcome(op_result::Code::Applied)];
+    let mut exits: Vec<(String, bool, Exit)> = (0..=i32::from(u8::MAX))
+        .filter_map(|code| Code::try_from(code).ok())
+        .map(|code| {
+            let exit: Exit = Box::new(move |commits: &mut Commits, _: &mut Trees| {
+                commits.failed(&refusal(code, 0)).unwrap();
+            });
+            (format!("{code:?}"), true, exit)
+        })
+        .collect();
+    let others: [(&str, bool, Exit); 7] = [
+        (
+            "QuotaExceeded with a retry time",
+            true,
+            Box::new(|commits, _| {
+                commits.failed(&refusal(Code::QuotaExceeded, 1)).unwrap();
+            }),
+        ),
+        (
+            "abandoned",
+            true,
+            Box::new(|commits, _| assert!(commits.abandon())),
+        ),
+        (
+            "lifted to resend",
+            true,
+            Box::new(|commits, _| {
+                commits.failed(&refusal(Code::Forbidden, 0)).unwrap();
+                commits.lift(Lift::Resend).unwrap();
+            }),
+        ),
+        (
+            "lifted to replan",
+            true,
+            Box::new(|commits, _| {
+                commits.failed(&refusal(Code::Forbidden, 0)).unwrap();
+                commits.lift(Lift::Replan).unwrap();
+            }),
+        ),
+        (
+            "reconnected before its result",
+            true,
+            Box::new(|commits, _| {
+                assert_eq!(commits.connected(&welcome(0)), Reconnect::Resend);
+            }),
+        ),
+        (
+            "reconnected to a server that lost it",
+            true,
+            Box::new(move |commits, _| {
+                commits.received(result(1, ok())).unwrap();
+                assert_eq!(commits.connected(&welcome(0)), Reconnect::AheadOfServer);
+            }),
+        ),
+        (
+            "acknowledged",
+            false,
+            Box::new(move |commits, trees| {
+                commits.received(result(1, ok())).unwrap();
+                assert!(commits.acknowledge(trees, 1));
+            }),
+        ),
+    ];
+    exits.extend(others.map(|(name, undone, exit)| (name.to_owned(), undone, exit)));
+    let mut released = Vec::new();
+    for (name, undone, exit) in exits {
+        let mut trees = trees(&[synced("n", file(ROOT, "x", 1))]);
+        let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+        trees.set_local("n".into(), local(file(ROOT, "sent", 1), 1));
+        let sent = build(&mut commits, &mut trees, &mut ids).unwrap();
+        assert_eq!(ops(&sent), [mv("n", ROOT, "sent")]);
+        if undone {
+            trees.set_local("n".into(), local(file(ROOT, "x", 1), 1));
+        }
+        trees.set_remote("n".into(), remote(file(ROOT, "remote", 1)));
+        trees.settle();
+        let mut effects = Effects::default();
+        let planned = effects.plan(&trees, commits.in_flight(), &mut ids, NOW);
+        assert_eq!(planned, None, "{name}");
+        exit(&mut commits, &mut trees);
+        trees.settle();
+        let planned = (effects.plan(&trees, commits.in_flight(), &mut ids, NOW)).cloned();
+        if commits.in_flight().is_some() {
+            assert_eq!(planned, None, "{name}");
+            continue;
+        }
+        let next = planned.unwrap_or_else(|| panic!("{name}: R's move is not planned"));
+        let to = next.after.as_ref().map(|after| after.name.as_str());
+        assert_eq!(to, Some("remote"), "{name}");
+        (effects.done(&mut trees, commits.in_flight(), &next.effect_id, None)).unwrap();
+        trees.settle();
+        assert_eq!(trees.class("n"), Class::InSync, "{name}");
+        released.push(name);
+    }
+    assert_eq!(
+        released,
+        [
+            "LimitExceeded",
+            "ReadOnly",
+            "UnsupportedVersion",
+            "HeadMoved",
+            "AheadOfServer",
+            "abandoned",
+            "lifted to replan",
+            "reconnected to a server that lost it",
+            "acknowledged",
+        ]
+    );
+}
+#[test]
+fn a_rename_of_a_node_whose_update_waits_is_kept_from_an_effect_planned_before_it() {
+    let (mut trees, commits, mut ids) = a_move_and_edit_whose_s_update_waits();
+    let moved = RemoteNode {
+        meta_rev: 3,
+        ..remote(file(ROOT, "z", 1))
+    };
+    trees.set_remote("n".into(), moved);
+    trees.settle();
+    let mut effects = Effects::default();
+    let record = loop {
+        let record = (effects.plan(&trees, commits.in_flight(), &mut ids, NOW))
+            .cloned()
+            .unwrap();
+        if record.node == "n" {
+            break record;
+        }
+        (effects.done(&mut trees, commits.in_flight(), &record.effect_id, None)).unwrap();
+        trees.settle();
+    };
+    assert_eq!(
+        record.after.as_ref().map(|after| after.name.as_str()),
+        Some("z")
+    );
+    trees.set_local("n".into(), local(file(ROOT, "c", 1), 2));
+    trees.settle();
+    assert!(trees.waiting().contains_key("n"));
+    assert!(!record.applies(&trees, commits.in_flight()));
+    let done = effects.done(&mut trees, commits.in_flight(), &record.effect_id, None);
+    assert!(done.is_err(), "{done:?}");
+    assert_eq!(trees.local().live("n"), Some(&file(ROOT, "c", 1)));
 }
 
 fn owing_its_name(rows: &[Row]) -> (Commits, Trees, IdGen) {

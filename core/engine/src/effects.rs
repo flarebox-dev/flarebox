@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::classify::{Class, Origin, Trees};
+use crate::commit::InFlight;
 use crate::guard::RemoteRemoval;
 use crate::ids::IdGen;
 use crate::ignore::is_rules_file;
@@ -113,10 +114,13 @@ impl EffectRecord {
     /// may have given the effect's name to another node, taken a folder on its way out of L, moved
     /// such a folder under the node, put an entry into a folder it removes, or put the node it
     /// creates into L. A commit's rebase or result may also have given the entry that a move or a
-    /// replacement takes to another node of L. The planner plans none of these either, so an effect
-    /// that fails for one of them and is unblocked is planned again only once L has changed.
-    pub fn applies(&self, trees: &Trees) -> bool {
-        View::new(trees).applies(self)
+    /// replacement takes to another node of L. L also keeps the position of a node that a commit in
+    /// flight moves or creates, while that commit is in flight, and of a node the user moved, as
+    /// when a scan sees the user's move after the effect was planned. The planner plans none of
+    /// these either, so an effect that fails for one of them and is unblocked is planned again only
+    /// once L or R has changed.
+    pub fn applies(&self, trees: &Trees, in_flight: Option<&InFlight>) -> bool {
+        View::new(trees).applies(self, in_flight)
     }
 
     fn parks(&self) -> bool {
@@ -231,13 +235,19 @@ impl Effects {
     /// (section 5.10). The driver reads the rules of a rules file it wrote and passes them to
     /// [`Trees::set_rules`] before it asks for the next effect, so the rules are in force before
     /// the nodes they cover arrive.
-    pub fn plan(&mut self, trees: &Trees, ids: &mut IdGen, now_ms: u64) -> Option<&EffectRecord> {
+    pub fn plan(
+        &mut self,
+        trees: &Trees,
+        in_flight: Option<&InFlight>,
+        ids: &mut IdGen,
+        now_ms: u64,
+    ) -> Option<&EffectRecord> {
         if self.in_flight.is_some() || !trees.rules_known() {
             return None;
         }
         self.failed
             .retain(|id, _| candidate(trees, id) || trees.waiting().contains_key(id));
-        let (node, effect, after) = self.choose(trees)?;
+        let (node, effect, after) = self.choose(trees, in_flight)?;
         self.failed.remove(&node);
         self.in_flight = Some(EffectRecord {
             effect_id: ids.uuid_v7(now_ms),
@@ -249,7 +259,11 @@ impl Effects {
         self.in_flight.as_ref()
     }
 
-    fn choose(&self, trees: &Trees) -> Option<(NodeId, Effect, Option<Shape>)> {
+    fn choose(
+        &self,
+        trees: &Trees,
+        in_flight: Option<&InFlight>,
+    ) -> Option<(NodeId, Effect, Option<Shape>)> {
         let view = View::new(trees);
         let writes_rules = |id: &str| {
             let remote = trees.remote().live(id)?;
@@ -298,6 +312,7 @@ impl Effects {
             match view.step(id) {
                 Step::Apply(effect, _)
                     if self.failed.get(id) == Some(&effect) || park_failed(id) => {}
+                Step::Apply(_, Some(after)) if view.holds_position(id, &after, in_flight) => {}
                 Step::Apply(effect, after) => {
                     chosen = Some((id.clone(), effect, after));
                     break;
@@ -342,12 +357,13 @@ impl Effects {
     pub fn done(
         &mut self,
         trees: &mut Trees,
+        in_flight: Option<&InFlight>,
         effect_id: &str,
         identity: Option<FileIdentity>,
     ) -> Result<Option<RemoteRemoval>, EffectError> {
-        if (self.in_flight.as_ref())
-            .is_some_and(|record| record.effect_id == effect_id && !record.applies(trees))
-        {
+        if (self.in_flight.as_ref()).is_some_and(|record| {
+            record.effect_id == effect_id && !record.applies(trees, in_flight)
+        }) {
             return Err(EffectError::DoesNotApply(effect_id.to_owned()));
         }
         let identity = match self.in_flight.as_ref().map(|record| &record.effect) {
@@ -520,7 +536,11 @@ pub enum Stuck {
 /// The nodes section 5.10 reports as problems: each node the planner considers whose place is held
 /// by the local copy of an excluded node, each node whose S update waits behind one of them, and
 /// each node that cannot be put into its folder in R because that folder is one of them.
-pub fn stuck(trees: &Trees, effects: &Effects) -> BTreeMap<NodeId, Stuck> {
+pub fn stuck(
+    trees: &Trees,
+    effects: &Effects,
+    in_flight: Option<&InFlight>,
+) -> BTreeMap<NodeId, Stuck> {
     let view = View::new(trees);
     let planned: Vec<&NodeId> = (trees.dirty().iter())
         .filter(|id| candidate(trees, id) && !trees.held(id))
@@ -535,7 +555,7 @@ pub fn stuck(trees: &Trees, effects: &Effects) -> BTreeMap<NodeId, Stuck> {
             Some(((*id).clone(), Stuck::HeldBy(by)))
         })
         .collect();
-    let idle = effects.in_flight().is_none() && effects.choose(trees).is_none();
+    let idle = effects.in_flight().is_none() && effects.choose(trees, in_flight).is_none();
     let parked: Vec<(NodeId, Stuck)> = (planned.iter())
         .filter(|_| idle)
         .filter(|id| !stuck.contains_key(**id))
@@ -810,7 +830,7 @@ impl<'a> View<'a> {
     /// a create while L does not hold the node, and anything else while its folder is one
     /// [`View::step`] could place the node in and no other node holds its exact name. L tells
     /// names apart exactly, so a name another node holds in another case does not stop it.
-    fn applies(&self, record: &EffectRecord) -> bool {
+    fn applies(&self, record: &EffectRecord, in_flight: Option<&InFlight>) -> bool {
         let Some(after) = &record.after else {
             return self.trees.local_children(&record.node).next().is_none();
         };
@@ -838,6 +858,9 @@ impl<'a> View<'a> {
             Effect::CreateDir { .. } | Effect::WriteFile { replaces: None, .. }
         );
         if creates && self.trees.local().get(&record.node).is_some() {
+            return false;
+        }
+        if self.holds_position(&record.node, after, in_flight) {
             return false;
         }
         let local = self.trees.local();
@@ -963,6 +986,20 @@ impl<'a> View<'a> {
             }
         }
         false
+    }
+
+    fn holds_position(&self, id: &str, after: &Shape, in_flight: Option<&InFlight>) -> bool {
+        let trees = self.trees;
+        let Some(local) = trees.local().get(id) else {
+            return false;
+        };
+        if local.shape.same_position(after) {
+            return false;
+        }
+        in_flight.is_some_and(|flight| flight.positions(id))
+            || (!local.parked
+                && !trees.reverted().contains(id)
+                && (trees.acknowledged(id)).is_some_and(|base| !local.shape.same_position(base)))
     }
 
     fn parkable(&self, id: &str) -> bool {

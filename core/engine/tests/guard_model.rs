@@ -283,7 +283,14 @@ impl World {
                 events.push(Event::Restore(member));
             }
         }
-        if (Effects::default().plan(&self.trees, &mut self.ids.clone(), self.now)).is_some() {
+        if (Effects::default().plan(
+            &self.trees,
+            self.commits.in_flight(),
+            &mut self.ids.clone(),
+            self.now,
+        ))
+        .is_some()
+        {
             events.extend([Event::Step, Event::StepAll]);
         }
         if commits {
@@ -497,13 +504,26 @@ impl World {
         let noticed = self.notice().is_some();
         let mut effects = Effects::default();
         for _ in 0..limit {
-            let Some(record) = effects.plan(&self.trees, &mut self.ids, self.now).cloned() else {
+            let Some(record) = effects
+                .plan(
+                    &self.trees,
+                    self.commits.in_flight(),
+                    &mut self.ids,
+                    self.now,
+                )
+                .cloned()
+            else {
                 break;
             };
             self.ino += 1;
             let identity = Some(identity(self.ino));
             let removal = effects
-                .done(&mut self.trees, &record.effect_id, identity)
+                .done(
+                    &mut self.trees,
+                    self.commits.in_flight(),
+                    &record.effect_id,
+                    identity,
+                )
                 .unwrap();
             if let Some(removal) = removal {
                 let node = &removal.within[0];
@@ -557,10 +577,24 @@ impl World {
     fn step_past_the_model(&mut self) {
         self.now += 1;
         let mut effects = Effects::default();
-        while let Some(record) = effects.plan(&self.trees, &mut self.ids, self.now).cloned() {
+        while let Some(record) = effects
+            .plan(
+                &self.trees,
+                self.commits.in_flight(),
+                &mut self.ids,
+                self.now,
+            )
+            .cloned()
+        {
             self.ino += 1;
             let identity = Some(identity(self.ino));
-            let removal = (effects.done(&mut self.trees, &record.effect_id, identity)).unwrap();
+            let removal = (effects.done(
+                &mut self.trees,
+                self.commits.in_flight(),
+                &record.effect_id,
+                identity,
+            ))
+            .unwrap();
             if let Some(removal) = removal {
                 (self.commits).count_remote(
                     removal,
