@@ -129,7 +129,7 @@ jobs:
             exit 1
           fi
           type="$(tr -d '\r' <"$headers" | awk 'tolower($1) == "content-type:" { $1 = ""; sub(/^ /, ""); print }' | tail -n 1)"
-          media="$(printf '%s' "${type%%;*}" | tr -d ' \t' | tr '[:upper:]' '[:lower:]')"
+          media="$(printf '%s' "${type%%;*}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
           if [ "$media" != text/plain ]; then
             echo "::error::$URL/install.sh is served as '$type', not text/plain. Check site/_headers."
             exit 1
