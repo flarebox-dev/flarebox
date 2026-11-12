@@ -2121,7 +2121,11 @@ fn plan(
             *scratch.unsent.entry(node.clone()).or_default() += 1;
         }
     }
-    let unsettled = |node: &&str| problems.contains(*node) || trees.class(node) == Class::Same;
+    let unsettled = |node: &&str| {
+        problems.contains(*node)
+            || trees.waiting().contains_key(*node)
+            || trees.class(node) == Class::Same
+    };
     for node in restored.into_iter().filter(unsettled) {
         *scratch.unsent.entry(node.to_owned()).or_default() += 1;
     }
