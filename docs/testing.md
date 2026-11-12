@@ -1,6 +1,6 @@
 # Testing
 
-The Rust checks that run on every pull request are the `rust` job of [CI](../.github/workflows/ci.yml). This page covers the property tests and the heavier runs that check them at scale.
+The Rust checks that run on each pull request are the `rust` job of [CI](../.github/workflows/ci.yml), which skips a pull request whose changed files are all under `site/`. This page covers the property tests and the heavier runs that check them at scale.
 
 ## Property tests
 
