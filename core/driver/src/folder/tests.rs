@@ -5447,6 +5447,42 @@ fn a_file_with_a_link_in_an_ignored_folder_moved_back_in_after_its_folder_was_re
 }
 
 #[test]
+fn two_links_moved_into_an_ignored_folder_and_linked_back_in_turn_keep_their_nodes() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site.root.join(".koiignore"), b"ig/\n");
+    a.create(&mut remote, &site.root.join("one"), b"kept");
+    fs::hard_link(site.root.join("one"), site.root.join("two")).unwrap();
+    a.scan_until(|a| (a.observer.snapshot().entries).contains_key(Path::new("two")));
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    let before = server_nodes(&remote);
+    let (one, two) = (live_id(&before, "one"), live_id(&before, "two"));
+    fs::create_dir(site.root.join("ig")).unwrap();
+    fs::rename(site.root.join("one"), site.root.join("ig/one")).unwrap();
+    fs::rename(site.root.join("two"), site.root.join("ig/two")).unwrap();
+    a.scan_until(|a| !(a.observer.snapshot().entries).contains_key(Path::new("two")));
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    for back in ["back1", "back2"] {
+        fs::hard_link(site.root.join("ig/one"), site.root.join(back)).unwrap();
+        a.scan_until(|a| (a.observer.snapshot().entries).contains_key(Path::new(back)));
+        a.run(&mut remote);
+        a.settle();
+        a.run(&mut remote);
+    }
+    let after = server_nodes(&remote);
+    assert_eq!(remote.names(), [".koiignore", "back1", "back2"]);
+    assert_eq!(
+        BTreeSet::from([live_id(&after, "back1"), live_id(&after, "back2")]),
+        BTreeSet::from([one, two])
+    );
+    assert_eq!(a.folder.engine.trees.check(), Ok(()));
+}
+
+#[test]
 fn a_file_moved_back_in_from_an_ignored_folder_after_its_folder_was_removed_takes_the_folder_off_the_server()
  {
     let mut remote = Remote::new();
