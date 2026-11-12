@@ -300,7 +300,7 @@ impl Effects {
                     || trees.excluded(&id)
                     || trees.held(&id)
                     || trees.local().get(&id).is_none_or(|node| node.parked)
-                    || view.stuck(&id, trees.local().len())
+                    || view.stuck(&id, trees.local().len()).is_some()
                 {
                     return None;
                 }
@@ -495,6 +495,76 @@ fn candidate(trees: &Trees, id: &str) -> bool {
             && trees.remote().live(id).is_none()
             && !trees.edited(id));
     changed && !forgets && !trees.excluded(id) && !trees.reclaimed(id)
+}
+
+/// Why a node stays as it is for as long as this device's rules do (section 5.10).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Stuck {
+    /// The local copy of this excluded node holds the place the node goes to, itself or through a
+    /// node stuck the same way. No effect moves an excluded node, and the node is not parked.
+    HeldBy(NodeId),
+    /// The node's S update waits for the name this node keeps in S, a node held by an excluded
+    /// one, or for a folder that waits so, or the node cannot be put into its folder in R
+    /// because that folder is stuck so.
+    Behind(NodeId),
+}
+
+/// The nodes section 5.10 reports as problems: each node the planner considers whose place is held
+/// by the local copy of an excluded node, each node whose S update waits behind one of them, and
+/// each node that cannot be put into its folder in R because that folder is one of them.
+pub fn stuck(trees: &Trees) -> BTreeMap<NodeId, Stuck> {
+    let view = View::new(trees);
+    let planned: Vec<&NodeId> = (trees.dirty().iter())
+        .filter(|id| candidate(trees, id) && !trees.held(id))
+        .collect();
+    let unplaced: Vec<(&NodeId, &str)> = (planned.iter())
+        .filter(|id| matches!(view.step(id), Step::Blocked(None)))
+        .filter_map(|id| Some((*id, trees.remote().live(id)?.parent.as_str())))
+        .collect();
+    let mut stuck: BTreeMap<NodeId, Stuck> = (planned.iter())
+        .filter_map(|id| {
+            let by = view.stuck(id, trees.local().len())?;
+            Some(((*id).clone(), Stuck::HeldBy(by)))
+        })
+        .collect();
+    let root = |stuck: &BTreeMap<NodeId, Stuck>, id: &str| match stuck.get(id)? {
+        Stuck::HeldBy(_) => Some(id.to_owned()),
+        Stuck::Behind(root) => Some(root.clone()),
+    };
+    loop {
+        let mut behind: Vec<(NodeId, NodeId)> = (trees.waiting().iter())
+            .filter(|(id, _)| !stuck.contains_key(*id))
+            .filter_map(|(id, waiting)| {
+                let shape = waiting.shape.as_ref()?;
+                let key = name_key(&shape.name);
+                let holder = trees.synced_children(&shape.parent).find(|other| {
+                    *other != id
+                        && (trees.synced().live(other)).is_some_and(|s| name_key(&s.name) == key)
+                });
+                let root = match holder {
+                    Some(holder) => root(&stuck, holder),
+                    None if trees.synced().live(&shape.parent).is_none() => {
+                        root(&stuck, &shape.parent)
+                    }
+                    None => None,
+                };
+                Some((id.clone(), root?))
+            })
+            .collect();
+        behind.extend(
+            (unplaced.iter())
+                .filter(|(id, _)| !stuck.contains_key(*id))
+                .filter_map(|(id, parent)| Some(((*id).clone(), root(&stuck, parent)?))),
+        );
+        if behind.is_empty() {
+            return stuck;
+        }
+        stuck.extend(
+            behind
+                .into_iter()
+                .map(|(id, root)| (id, Stuck::Behind(root))),
+        );
+    }
 }
 
 /// Whether L holds a node whose way to the root passes `id`. Each node on that way goes to its R
@@ -791,15 +861,18 @@ impl<'a> View<'a> {
         false
     }
 
-    /// True when `id` could not leave the parked directory again: the name it moves to is held by
-    /// an excluded node, whose local copy no effect moves, or by a node that is stuck the same way.
-    /// Parking it would hide it for as long as the rules stay as they are.
-    fn stuck(&self, id: &str, depth: usize) -> bool {
+    /// The excluded node that keeps `id` from its place, if one does: the name it moves to is held
+    /// by an excluded node, whose local copy no effect moves, or by a node that is stuck the same
+    /// way. Parking `id` would hide it for as long as the rules stay as they are.
+    fn stuck(&self, id: &str, depth: usize) -> Option<NodeId> {
         match self.step(id) {
             Step::Blocked(Some(holder)) if holder != id => {
-                self.trees.excluded(&holder) || (depth > 0 && self.stuck(&holder, depth - 1))
+                if self.trees.excluded(&holder) {
+                    return Some(holder);
+                }
+                self.stuck(&holder, depth.checked_sub(1)?)
             }
-            _ => false,
+            _ => None,
         }
     }
 

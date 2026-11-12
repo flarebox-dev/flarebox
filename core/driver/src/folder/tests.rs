@@ -314,6 +314,10 @@ impl Device {
             };
             self.event(event)?;
         }
+        self.caught_up(remote)
+    }
+
+    fn caught_up(&mut self, remote: &Remote) -> Result<(), Stop> {
         let head_seq = remote.space.head_seq();
         let (head_commit_id, head_committed_at_ms) =
             remote.space.token_at(head_seq).unwrap_or_default();
@@ -324,21 +328,32 @@ impl Device {
         }))
     }
 
-    /// What a live session pushes: everything after the cursor.
-    fn pull(&mut self, remote: &Remote) {
+    /// The `Resume` of a session that follows the log from the cursor.
+    fn since(&self) -> Resume {
         let cursor = self
             .folder
             .engine
             .cursor
             .clone()
             .expect("R follows the log");
-        let resume = Resume {
+        Resume {
             since_seq: cursor.last_seq,
             since_commit_id: cursor.commit_id,
             since_committed_at_ms: cursor.committed_at_ms,
             history_id: cursor.history_id,
-        };
-        self.resume(remote, resume).unwrap();
+        }
+    }
+
+    /// What a live session pushes: everything after the cursor.
+    fn pull(&mut self, remote: &Remote) {
+        self.resume(remote, self.since()).unwrap();
+    }
+
+    /// What a live session pushes when everything after the cursor arrives in one message.
+    fn pull_at_once(&mut self, remote: &Remote) {
+        let records = remote.space.resume(&self.since()).unwrap();
+        self.event(Event::Changes(records)).unwrap();
+        self.caught_up(remote).unwrap();
     }
 
     /// Runs one piece of work and feeds its result back.
@@ -2847,6 +2862,174 @@ fn a_scan_that_unblocks_a_node_without_planning_an_effect_stores_it_unblocked() 
     assert!(!site.stored().effects.blocked().contains_key(&held));
     b.settle();
     assert_eq!(b.state(), FolderState::UpToDate);
+}
+
+/// Device `a` turns the file `a` into a folder `a` that holds the file as `a/ß` and a new file `a/a`. Device `b` parks
+/// the file to make room for the folder. Before `b` moves the file into the folder, the user there makes a folder `ß`
+/// in it and then excludes `ss/`, which `ß` matches after case folding. Nothing can put the file at `a/ß` or back
+/// at `a`, so the folder `a` and the files in it wait for the name the file keeps (design §5.10). The folder is up to
+/// date, its problem names the file, where it is kept and the entry that holds its name, and what waits behind it. The
+/// excluded folder and the file's bytes stay as they are.
+#[test]
+fn a_file_whose_place_an_excluded_folder_holds_is_named_with_what_waits_for_its_name() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("a"), b"moved on a");
+    let (site, mut b) = linked(&mut remote, "b");
+    fs::rename(site_a.root.join("a"), site_a.root.join("x")).unwrap();
+    a.settle();
+    a.run(&mut remote);
+    fs::create_dir(site_a.root.join("a")).unwrap();
+    fs::rename(site_a.root.join("x"), site_a.root.join("a/ß")).unwrap();
+    fs::write(site_a.root.join("a/a"), b"written on a").unwrap();
+    a.settle();
+    a.run(&mut remote);
+    assert_eq!(remote.names(), ["a", "a", "ß"]);
+
+    let file = node_named(&b, "a");
+    let parked = site.root.join(".koidrive/parked").join(&file);
+    b.pull_at_once(&remote);
+    while !site.root.join("a").is_dir() {
+        let work = b.work.pop_front().expect("the folder is created");
+        b.perform(work, &mut remote).unwrap();
+    }
+    assert_eq!(fs::read(&parked).unwrap(), b"moved on a");
+    fs::create_dir(site.root.join("a/ß")).unwrap();
+    b.scan_until(|b| {
+        (b.folder.engine.trees.local().iter()).any(|(_, node)| node.shape.name == "ß")
+    });
+    drop(b);
+
+    let sync = SyncRules {
+        include: Vec::new(),
+        exclude: vec!["ss/".into()],
+    };
+    let mut b = site.start_with(&sync);
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    b.run(&mut remote);
+    b.settle();
+    fs::write(site.root.join("a/a"), b"edited on b").unwrap();
+    b.settle();
+    assert!(b.run(&mut remote).is_empty());
+
+    let view = b.folder.view();
+    let waits = "waits for a/ß, whose name here is taken by an entry this device's rules exclude";
+    assert_eq!(
+        (view.state, view.problem),
+        (
+            FolderState::UpToDate,
+            Some(format!(
+                "3 items could not be synced: a ({waits}), a/a ({waits}), a/ß (its name here is taken by a/ß, \
+                 which this device's rules exclude; it is kept in .koidrive/parked/{file}); run koi folder restart \
+                 once they are fixed"
+            ))
+        )
+    );
+    assert_eq!(fs::read_dir(site.root.join("a/ß")).unwrap().count(), 0);
+    assert_eq!(fs::read(&parked).unwrap(), b"moved on a");
+    assert_eq!(remote.names(), ["a", "a", "ß"]);
+}
+
+/// Device `b` excludes the folder `q/x`. Device `a` renames that folder to `q/y`, then moves the file `p/f` to `q/x` and
+/// deletes the folder `p`. On `b` the excluded folder keeps its place, so nothing can put the file at `q/x`, and `p`
+/// can't be removed while the file is in it. The folder is up to date, and its problem names the file and the entry
+/// that holds its name.
+#[test]
+fn a_folder_to_remove_that_holds_a_file_an_excluded_entry_keeps_out_lets_the_folder_settle() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    for dir in ["p", "q", "q/x"] {
+        fs::create_dir(site_a.root.join(dir)).unwrap();
+    }
+    a.create(&mut remote, &site_a.root.join("p/f"), b"in p");
+    let (site, b) = linked(&mut remote, "b");
+    drop(b);
+    let sync = SyncRules {
+        include: Vec::new(),
+        exclude: vec!["x/".into()],
+    };
+    let mut b = site.start_with(&sync);
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    b.run(&mut remote);
+
+    fs::rename(site_a.root.join("q/x"), site_a.root.join("q/y")).unwrap();
+    a.settle();
+    a.run(&mut remote);
+    fs::rename(site_a.root.join("p/f"), site_a.root.join("q/x")).unwrap();
+    fs::remove_dir(site_a.root.join("p")).unwrap();
+    a.settle();
+    a.run(&mut remote);
+    assert_eq!(remote.names(), ["q", "x", "y"]);
+
+    b.pull(&remote);
+    b.run(&mut remote);
+    b.settle();
+    assert!(b.run(&mut remote).is_empty());
+
+    let view = b.folder.view();
+    assert_eq!(
+        (view.state, view.problem),
+        (
+            FolderState::UpToDate,
+            Some(
+                "1 item could not be synced: p/f (its name here is taken by q/x, which this device's rules exclude); \
+                 run koi folder restart once it is fixed"
+                    .into()
+            )
+        )
+    );
+    assert_eq!(fs::read(site.root.join("p/f")).unwrap(), b"in p");
+    assert!(site.root.join("q/x").is_dir());
+}
+
+/// Device `b` excludes `skip/`. Device `a` moves the file `foo` to `skip/foo`, then makes a folder `foo` with the file
+/// `foo/child` in it. On `b` the excluded file keeps the name `foo`, so the folder can't be created and the file in it
+/// can't be written. The folder is up to date, and its problem names both and the entry that holds the name.
+#[test]
+fn a_file_in_a_folder_an_excluded_entry_keeps_out_is_named_with_it() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("foo"), b"kept on b");
+    let (site, b) = linked(&mut remote, "b");
+    drop(b);
+    let sync = SyncRules {
+        include: Vec::new(),
+        exclude: vec!["skip/".into()],
+    };
+    let mut b = site.start_with(&sync);
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    b.run(&mut remote);
+
+    fs::create_dir(site_a.root.join("skip")).unwrap();
+    fs::rename(site_a.root.join("foo"), site_a.root.join("skip/foo")).unwrap();
+    fs::create_dir(site_a.root.join("foo")).unwrap();
+    fs::write(site_a.root.join("foo/child"), b"written on a").unwrap();
+    a.settle();
+    a.run(&mut remote);
+    assert_eq!(remote.names(), ["child", "foo", "foo", "skip"]);
+
+    b.pull_at_once(&remote);
+    b.run(&mut remote);
+    b.settle();
+    assert!(b.run(&mut remote).is_empty());
+
+    let view = b.folder.view();
+    assert_eq!(
+        (view.state, view.problem),
+        (
+            FolderState::UpToDate,
+            Some(
+                "2 items could not be synced: foo (its name here is taken by foo, which this device's rules exclude), \
+                 foo/child (waits for foo, whose name here is taken by an entry this device's rules exclude); run koi \
+                 folder restart once they are fixed"
+                    .into()
+            )
+        )
+    );
+    assert_eq!(fs::read(site.root.join("foo")).unwrap(), b"kept on b");
 }
 
 /// Whether L, as the site's store holds it, has an entry named `name`.
