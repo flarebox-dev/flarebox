@@ -346,7 +346,6 @@ enum Cut<'a> {
     OpeningDir(&'a Path),
     /// A removal's confirmation just opened this folder.
     Confirming(&'a Path),
-    /// The search under left-out folders is about to look at this entry.
     Searching(&'a Path),
 }
 

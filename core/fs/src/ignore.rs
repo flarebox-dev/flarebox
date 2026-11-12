@@ -120,17 +120,22 @@ struct Listing {
 struct Walk {
     listings: Vec<Listing>,
     folders: Vec<Folder>,
+    later: Vec<(PathBuf, FileId)>,
+    reach: Option<Reach>,
+    above: Option<OwnedFd>,
+}
+
+struct Reach {
+    dir: PathBuf,
+    id: FileId,
+    fd: OwnedFd,
+    opened: usize,
 }
 
 struct Folder {
     dir: PathBuf,
     id: FileId,
-    entries: Entries,
-}
-
-enum Entries {
-    Open(Dir),
-    Read(Vec<OsString>),
+    entries: Dir,
 }
 
 const OPEN_FOLDERS: usize = 16;
@@ -403,6 +408,7 @@ impl<'r> Pending<'r> {
         }
         let mut left = if bounded { *budget } else { usize::MAX };
         let mut looked = false;
+        let mut checked = false;
         while (left > 0 || !looked) && !pending.is_empty() {
             let walk = walking.get_or_insert_with(|| {
                 *walks += 1;
@@ -415,17 +421,33 @@ impl<'r> Pending<'r> {
                         .rev()
                         .collect(),
                     folders: Vec::new(),
+                    later: Vec::new(),
+                    reach: None,
+                    above: None,
                 }
             });
             let mut opened: Option<(PathBuf, OwnedFd)> = None;
             let mut moved = false;
-            while (left > 0 || !looked) && !pending.is_empty() {
+            if !checked {
+                checked = true;
+                let mut parent = walk.above.as_ref().map(|fd| fd.as_fd());
+                for folder in &walk.folders {
+                    left = left.saturating_sub(1);
+                    cut(Cut::Confirming(&folder.dir));
+                    let still = (parent.zip(folder.dir.file_name()))
+                        .and_then(|(parent, name)| stat_at(parent, name).ok())
+                        .and_then(|stat| stat.entry())
+                        .is_some_and(|entry| entry.id == folder.id);
+                    if !still {
+                        moved = true;
+                        break;
+                    }
+                    parent = folder.entries.fd().ok();
+                }
+            }
+            while !moved && (left > 0 || !looked) && !pending.is_empty() {
                 let (dir, name) = match walk.folders.last_mut() {
-                    Some(Folder {
-                        dir,
-                        entries: Entries::Open(entries),
-                        ..
-                    }) => {
+                    Some(Folder { dir, entries, .. }) => {
                         let Some(Ok(item)) = entries.read() else {
                             walk.folders.pop();
                             continue;
@@ -436,18 +458,49 @@ impl<'r> Pending<'r> {
                         }
                         (dir.clone(), name)
                     }
-                    Some(Folder {
-                        dir,
-                        entries: Entries::Read(names),
-                        ..
-                    }) => {
-                        let Some(name) = names.pop() else {
-                            walk.folders.pop();
-                            continue;
-                        };
-                        (dir.clone(), name)
-                    }
                     None => {
+                        if walk.reach.is_none()
+                            && let Some((dir, id)) = walk.later.pop()
+                        {
+                            walk.reach = (root.try_clone_to_owned().ok()).map(|fd| Reach {
+                                dir,
+                                id,
+                                fd,
+                                opened: 0,
+                            });
+                            continue;
+                        }
+                        if let Some(reach) = &mut walk.reach {
+                            left = left.saturating_sub(1);
+                            looked = true;
+                            let below: PathBuf = reach.dir.iter().take(reach.opened + 1).collect();
+                            cut(Cut::OpeningDir(&below));
+                            let Some(next) = (below.file_name())
+                                .and_then(|name| open_dir_at(reach.fd.as_fd(), name).ok())
+                            else {
+                                moved = true;
+                                break;
+                            };
+                            let before = std::mem::replace(&mut reach.fd, next);
+                            reach.opened += 1;
+                            if below != reach.dir {
+                                continue;
+                            }
+                            let Some(Reach { dir, id, fd, .. }) = walk.reach.take() else {
+                                continue;
+                            };
+                            let Ok(entries) = (stat_fd(fd.as_fd()).ok())
+                                .filter(|stat| stat.id == id)
+                                .ok_or(())
+                                .and_then(|_| Dir::read_from(&fd).map_err(|_| ()))
+                            else {
+                                moved = true;
+                                break;
+                            };
+                            walk.above = Some(before);
+                            walk.folders.push(Folder { dir, id, entries });
+                            continue;
+                        }
                         let Some(listing) = walk.listings.last_mut() else {
                             break;
                         };
@@ -460,41 +513,20 @@ impl<'r> Pending<'r> {
                 };
                 left = left.saturating_sub(1);
                 looked = true;
-                let top = walk.folders.last();
-                if !matches!(
-                    top,
-                    Some(Folder {
-                        entries: Entries::Open(_),
-                        ..
-                    })
-                ) && opened.as_ref().is_none_or(|(at, _)| *at != dir)
-                {
+                if walk.folders.is_empty() && opened.as_ref().is_none_or(|(at, _)| *at != dir) {
                     left = left.saturating_sub(dir.components().count());
-                    let id = top.map(|folder| folder.id);
                     opened = match open_attached(root, &dir, cut) {
-                        Ok(Some((fd, chain))) if id.is_none_or(|id| chain.last() == Some(&id)) => {
-                            Some((dir.clone(), fd))
-                        }
+                        Ok(Some((fd, _))) => Some((dir.clone(), fd)),
                         _ => {
-                            if top.is_some() {
-                                walk.folders.pop();
-                            } else {
-                                walk.listings.pop();
-                            }
+                            walk.listings.pop();
                             continue;
                         }
                     };
                 }
                 let parent = match (walk.folders.last(), &opened) {
-                    (
-                        Some(Folder {
-                            entries: Entries::Open(entries),
-                            ..
-                        }),
-                        _,
-                    ) => entries.fd().ok(),
-                    (_, Some((_, fd))) => Some(fd.as_fd()),
-                    _ => None,
+                    (Some(Folder { entries, .. }), _) => entries.fd().ok(),
+                    (None, Some((_, fd))) => Some(fd.as_fd()),
+                    (None, None) => None,
                 };
                 let Some(parent) = parent else { continue };
                 let path = dir.join(&name);
@@ -518,36 +550,25 @@ impl<'r> Pending<'r> {
                 if entry.kind != EntryKind::Dir {
                     continue;
                 }
+                if walk.folders.len() >= OPEN_FOLDERS {
+                    walk.later.push((path, entry.id));
+                    continue;
+                }
                 left = left.saturating_sub(1);
+                cut(Cut::OpeningDir(&path));
                 let Ok(sub) = open_dir_at(parent, &name) else {
                     continue;
                 };
                 let Ok(entries) = Dir::read_from(&sub) else {
                     continue;
                 };
-                let open_count = (walk.folders.iter())
-                    .filter(|folder| matches!(folder.entries, Entries::Open(_)))
-                    .count();
-                if open_count >= OPEN_FOLDERS
-                    && let Some(oldest) = (walk.folders.iter_mut())
-                        .find(|folder| matches!(folder.entries, Entries::Open(_)))
-                    && let Entries::Open(dir) = &mut oldest.entries
-                {
-                    let mut names = Vec::new();
-                    while let Some(Ok(item)) = dir.read() {
-                        let name = OsStr::from_bytes(item.file_name().to_bytes()).to_os_string();
-                        if name != "." && name != ".." {
-                            names.push(name);
-                        }
-                    }
-                    left = left.saturating_sub(names.len());
-                    names.reverse();
-                    oldest.entries = Entries::Read(names);
+                if walk.folders.is_empty() {
+                    walk.above = opened.take().map(|(_, fd)| fd);
                 }
                 walk.folders.push(Folder {
                     dir: path,
                     id: entry.id,
-                    entries: Entries::Open(entries),
+                    entries,
                 });
             }
             if moved {
@@ -558,7 +579,11 @@ impl<'r> Pending<'r> {
                 }
                 continue;
             }
-            if walk.listings.is_empty() && walk.folders.is_empty() {
+            if walk.listings.is_empty()
+                && walk.folders.is_empty()
+                && walk.later.is_empty()
+                && walk.reach.is_none()
+            {
                 *walking = None;
                 let done = *walks;
                 pending.retain(|key, needs| {

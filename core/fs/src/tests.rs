@@ -1126,12 +1126,12 @@ fn a_crash_while_trashing_brings_nothing_back() {
 fn a_search_looks_at_a_bounded_number_of_entries_per_rescan_under_deep_and_wide_left_out_folders() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("space");
-    let deep: PathBuf = std::iter::once("ig").chain(["d"; 100]).collect();
+    let deep: PathBuf = ["ig", "wide"].into_iter().chain(["d"; 100]).collect();
     fs::create_dir_all(root.join(&deep)).unwrap();
     fs::write(root.join(deep.join("f")), "f").unwrap();
-    fs::create_dir_all(root.join("ig/wide")).unwrap();
     for i in 0..1000 {
         fs::write(root.join(format!("ig/wide/{i}")), "w").unwrap();
+        fs::write(root.join(deep.parent().unwrap().join(format!("{i}"))), "w").unwrap();
     }
     fs::write(root.join(".koiignore"), "ig\n").unwrap();
     fs::write(root.join("f.txt"), "f").unwrap();
@@ -1152,10 +1152,10 @@ fn a_search_looks_at_a_bounded_number_of_entries_per_rescan_under_deep_and_wide_
                 Some(&mut rules),
                 &|| false,
                 &mut |cut| match cut {
-                    Cut::Searching(path) => {
-                        assert!(path.starts_with("ig"), "{path:?}");
+                    Cut::Searching(path) | Cut::OpeningDir(path) if path.starts_with("ig") => {
                         looked += 1;
                     }
+                    Cut::Searching(path) => panic!("{path:?}"),
                     Cut::Confirming(_) => looked += 1,
                     _ => {}
                 },
