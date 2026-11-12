@@ -11,7 +11,6 @@ import { clientKey } from "./limiter";
 import { LINK_ID, SESSION_MS, type ShareOutcome } from "./links";
 import type { ShareFile } from "./space";
 
-/** Headers on every public API reply (RFC 0005 section 3). */
 export const PUBLIC_HEADERS: Record<string, string> = {
   "Cache-Control": "no-store",
   "X-Robots-Tag": "noindex, nofollow",
@@ -19,7 +18,6 @@ export const PUBLIC_HEADERS: Record<string, string> = {
   "X-Content-Type-Options": "nosniff",
 };
 
-/** Headers on every page and asset of the viewer (RFC 0005 section 8); server/web/public/_headers repeats them for the assets. */
 export const VIEWER_HEADERS: Record<string, string> = {
   "Content-Security-Policy":
     "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
@@ -55,7 +53,6 @@ function refusal(request: Request, failure: Failure): Response {
   return response;
 }
 
-/** A refusal of the download route, as plain text, because a browser shows it as a page. */
 function textRefusal(failure: Failure): Response {
   const response = new Response(failure.message + "\n", { status: failure.status, headers: { "Content-Type": "text/plain; charset=utf-8" } });
   if (failure.retryAfterMs !== undefined) response.headers.set("Retry-After", String(Math.ceil(failure.retryAfterMs / 1000)));
@@ -83,10 +80,6 @@ function contentDisposition(name: string): string {
 
 class ChunkCheckFailed extends Error {}
 
-/**
- * Opens one chunk object in R2 after checking that it exists, has the chunk's size, and, when R2 holds a SHA-256
- * checksum for it, that the checksum is the chunk's hash (RFC 0005 section 7).
- */
 async function openChunk(objects: ObjectStore, chunk: ShareFile["chunks"][number]): Promise<ReadableStream<Uint8Array>> {
   const object = await objects.get(chunk.key);
   if (!object) throw new ChunkCheckFailed(`chunk object ${chunk.key} is missing`);
@@ -112,11 +105,6 @@ function attachmentHeaders(name: string): Record<string, string> {
   };
 }
 
-/**
- * Streams a file chunk by chunk (RFC 0005 section 7). The first chunk is opened and checked before the headers go out.
- * Each later chunk is opened only when the recipient has taken the previous one, and only after the fence check passes.
- * A failed check aborts the stream; the response never switches to a chunk list read after it started.
- */
 async function download(request: Request, env: Env, file: ShareFile, fenceCheck: () => Promise<Failure | undefined>): Promise<Response> {
   if (file.chunks.length === 0) return new Response(new Uint8Array(0), { headers: { ...attachmentHeaders(file.name), "Content-Length": "0" } });
   let current: ReadableStreamDefaultReader<Uint8Array>;
@@ -167,7 +155,6 @@ async function download(request: Request, env: Env, file: ShareFile, fenceCheck:
   return new Response(readable, { headers: { ...attachmentHeaders(file.name), "Content-Length": String(file.size) } });
 }
 
-/** The public API of RFC 0005 section 3. */
 async function publicApi(request: Request, env: Env, linkId: string, rest: string): Promise<Response> {
   if (!LINK_ID.test(linkId)) {
     return refusal(request, { ok: false, code: Error_Code.NOT_FOUND, message: "this link does not exist, has expired or was revoked", status: 404 });
@@ -223,7 +210,6 @@ async function publicApi(request: Request, env: Env, linkId: string, rest: strin
   });
 }
 
-/** The owner API of RFC 0005 section 2. */
 async function ownerApi(request: Request, env: Env, spaceId: string, linkId: string | undefined, identity: Identity): Promise<Response> {
   const url = new URL(request.url);
   const method = request.method;
@@ -251,8 +237,6 @@ async function ownerApi(request: Request, env: Env, spaceId: string, linkId: str
   return new Response("Method Not Allowed", { status: 405 });
 }
 
-/** Routes share-link requests, or returns undefined for any other path. authenticate checks a device access token. */
-/** GET /s/{link_id}: the viewer page, the same for every well-formed link_id, which it does not look up (RFC 0005 section 3). */
 async function viewer(request: Request, env: Env, linkId: string): Promise<Response> {
   const headers = { ...VIEWER_HEADERS, "Cache-Control": "no-store" };
   if (request.method !== "GET" && request.method !== "HEAD") return withHeaders(new Response("Method Not Allowed", { status: 405 }), headers);

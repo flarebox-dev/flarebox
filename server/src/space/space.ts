@@ -92,34 +92,25 @@ import { PROTO_MAX, PROTO_MIN, SERVER_VERSION } from "../version";
 export const FORMAT_VERSION = 1;
 const HOUR_MS = 3_600_000;
 const DAY_MS = 24 * HOUR_MS;
-/** How long a PrepareUpload reservation protects a chunk from GC (spec v0 section 12). */
 export const HOLD_MS = DAY_MS;
-/** Lifetime of chunk tickets and upload receipts. */
 export const GRANT_MS = HOUR_MS;
 const MAX_OPS = 1000;
 const MAX_CHUNKS_PER_CALL = 1000;
-/**
- * Pending chunks without a valid receipt that one commit call checks in R2, so a call stays well inside a Worker
- * invocation's subrequest limit; the rest are listed as missing and checked on the retry (RFC 0002 section 11).
- */
+/** A call stays well inside a Worker invocation's subrequest limit. */
 export const MAX_HEAD_CHECKS = 50;
-/** chunk_grace_days cannot be set lower (RFC 0003 section 5, rule 4). */
+/** RFC 0003 section 5, rule 4. */
 const MIN_CHUNK_GRACE_DAYS = 30;
-/** A MISSING_CHUNKS error lists at most this many hashes, the most one PrepareUpload takes; a retry after uploading them lists the rest. */
 export const MAX_MISSING_LISTED = MAX_CHUNKS_PER_CALL;
 export const MAX_CHUNK_BYTES = 16 * 1024 * 1024;
-/** Spec v0 section 7.2: a ServerMessage is at most 1 MiB, a ClientMessage at most 8 MiB. */
 const MAX_SERVER_FRAME = 1024 * 1024;
 export const MAX_CLIENT_FRAME = 8 * 1024 * 1024;
 const MAX_REQ_ID = 2n ** 64n - 1n;
 const RETRY_LATER_MS = 60_000;
-/** Room for the ServerMessage, RpcResponse and page fields around a page's items: tags, lengths, req_id, cursor and head_seq. */
 const PAGE_ENVELOPE_BYTES = 1024;
 const GC_BATCH = 1000;
 const GC_RETRY_MS = 10 * 60_000;
 const R2_DELETE_BATCH = 1000;
 const ORPHAN_SWEEP_MS = 7 * DAY_MS;
-/** While a rewind holds the space closed, the alarm runs no work and checks again this much later (RFC 0003 section 4). */
 const CLOSED_RECHECK_MS = 10 * 60_000;
 const EXPORT_RETRY_MS = 60_000;
 
@@ -127,12 +118,9 @@ export type Role = "owner" | "editor" | "viewer";
 
 const SHARE_CLOSED = { ok: false, code: Error_Code.RETRY_LATER, message: "this link is temporarily unavailable; retry later", status: 503 } as const;
 
-/** Header the Worker sets on the WebSocket upgrade it forwards: JSON of {@link Connect}. */
 export const CONNECT_HEADER = "X-Koidrive-Connect";
-/** How long past its access token's expiry a connection may stay open (spec v0 section 7.1). */
 export const TOKEN_GRACE_MS = 60_000;
 
-/** WebSocket close codes. */
 export const Close = {
   TRY_AGAIN_LATER: 1013,
   PROTOCOL: 4000,
@@ -147,7 +135,6 @@ export interface Connect {
   origin: string;
 }
 
-/** Per-connection state kept in the WebSocket attachment so it survives hibernation. */
 export interface Attachment {
   connId: string;
   identity: Identity;
@@ -158,17 +145,14 @@ export interface Attachment {
   live: boolean;
 }
 
-/** Who is calling, as established by the Worker from the access token and by the WebSocket Hello. */
 export interface Session {
   deviceId: string;
   userId: string;
   deviceName: string;
-  /** The principal's kind and scope, from its row in the Account DO (RFC 0006 section 2). */
   kind: string;
   scope: string | null;
   role: Role;
   maxFormat: number;
-  /** Public origin of the deployment, used to build chunk URLs. */
   origin: string;
 }
 
@@ -180,7 +164,6 @@ export interface SpaceSettings {
 
 const DEFAULT_SETTINGS: SpaceSettings = { version_retention_days: 30, trash_retention_days: 30, chunk_grace_days: 30 };
 
-/** What the Account DO hands the Space DO to complete a rewind (RFC 0003 section 3, step 4). */
 export interface RewindCompletion {
   rewindId: string;
   attempt: number;
@@ -192,7 +175,6 @@ export interface RewindCompletion {
   retired: { hashHex: string; incarnation: string }[];
 }
 
-/** Stored in meta when a rewind completes, so a repeated completion call returns it again. */
 export interface RewindReceipt {
   rewindId: string;
   historyId: string;
@@ -266,22 +248,16 @@ function opContent(op: Op): Content | undefined | null {
   return null;
 }
 
-/** The size of a reply as a WebSocket ServerMessage, which is a few bytes more than the HTTP body. */
 function frameBytes(response: RpcResponse): number {
   return toBinary(ServerMessageSchema, create(ServerMessageSchema, { msg: { case: "rpc", value: response } })).length;
 }
 
-/** Wraps a non-commit result, refusing it if its WebSocket frame would exceed 1 MiB. Commit replies are bounded when stored. */
 function reply(reqId: bigint, result: RpcResponse["result"]): { response: RpcResponse } {
   const response = create(RpcResponseSchema, { reqId, result });
   if (frameBytes(response) > MAX_SERVER_FRAME) fail(Error_Code.LIMIT_EXCEEDED, "the reply does not fit in one 1 MiB message");
   return { response };
 }
 
-/**
- * Takes items from the front while a page of them fits in one 1 MiB ServerMessage, counting each item's field tag and
- * length prefix and leaving room for the envelope. The first item is always taken; the commit size limit keeps it small enough.
- */
 function fitPage<R, T>(rows: R[], build: (row: R) => T, encodedSize: (item: T) => number): T[] {
   const page: T[] = [];
   let bytes = PAGE_ENVELOPE_BYTES;
@@ -294,13 +270,8 @@ function fitPage<R, T>(rows: R[], build: (row: R) => T, encodedSize: (item: T) =
   return page;
 }
 
-/** The Account DO calls a space makes. */
 export type Directory = Pick<AccountDO, "checkSession" | "checkSessions" | "isSpaceClosed" | "retireChunks" | "serverKey" | "shareResolve">;
 
-/**
- * The logic of one space: tree, versions, chunks and the commit log. It reaches its host only through state, objects,
- * pitr and account, so the class it extends can be any host's object base.
- */
 export function spaceLogic<B extends abstract new (...args: any[]) => object>(Base: B) {
   abstract class Space extends Base {
     protected abstract readonly db: Database;
@@ -310,17 +281,12 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
     protected abstract readonly objects: ObjectStore;
     protected abstract account(): Directory;
     private spaceKeyCache: Uint8Array | undefined;
-    /** The time source for holds, retention and tickets. Tests replace it to move through days. */
     clock: () => number = () => Date.now();
-    /** Nodes per snapshot page of the R2 export. Tests lower it to write several pages. */
     snapshotPageNodes = 1000;
     private exporting: Promise<void> | undefined;
-    /** A stored commit could not set the alarm, so the next commit sets it. */
     private alarmStale = false;
-    /** Device checks the Account DO answered, each usable until untilMs on this object's clock (RFC 0014 section 1). */
     private readonly leases = new Map<string, { check: SessionCheck; untilMs: number }>();
 
-    /** Creates the space on first call; later calls with the same id do nothing. */
     async init(args: { spaceId: string; name: string; ownerUserId: string; spaceKey: Uint8Array }): Promise<void> {
       const existing = getMeta(this.sql, "space_id");
       if (existing !== undefined) {
@@ -344,8 +310,6 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
         );
         startExport(this.sql, 0, this.clock(), false);
       });
-      // RFC 0003 section 7: a space's first history writes its descriptor when the space is created. A failed write is
-      // retried by the alarm.
       try {
         await this.runExport();
       } catch (error) {
@@ -354,16 +318,11 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       await this.schedule("gc", this.clock() + DAY_MS);
     }
 
-    /** Answers one binary RpcRequest with a binary RpcResponse (the HTTP path, and tests). */
     async rpc(session: Session, request: Uint8Array): Promise<Uint8Array> {
       const { response } = await this.call(session, fromBinary(RpcRequestSchema, request));
       return toBinary(RpcResponseSchema, response);
     }
 
-    /**
-     * The HTTP RPC path: the role comes from the member list, the format from the device's last Hello. The Account DO is
-     * asked again here, because the Worker's check may precede a rewind that closed the space (RFC 0003 section 4).
-     */
     async httpRpc(connect: Connect, request: Uint8Array): Promise<Uint8Array> {
       const req = fromBinary(RpcRequestSchema, request);
       const role = this.memberRole(connect.identity.userId);
@@ -381,10 +340,6 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       return toBinary(RpcResponseSchema, response);
     }
 
-    /**
-     * A platform limit can stop any query of a message, before an RPC is even read, so the session gets a Notice and is
-     * closed instead of an answer that never comes (spec v0 sections 7.2 and 13). Any other error escapes as before.
-     */
     async webSocketMessage(ws: Socket, message: string | ArrayBuffer): Promise<void> {
       try {
         await this.receive(ws, message);
@@ -427,7 +382,6 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       return this.goodbye(ws, Close.PROTOCOL, "empty ClientMessage");
     }
 
-    /** Closes every connection of a revoked device with 4003. */
     async closeDevice(deviceId: string): Promise<void> {
       this.recordRevoked(deviceId);
       for (const ws of this.state.getWebSockets(deviceId)) this.goodbye(ws, Close.DEVICE_REVOKED, "device revoked");
@@ -441,10 +395,6 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       return this.sql.exec("SELECT 1 FROM revoked_devices WHERE device_id = ?", deviceId).toArray().length > 0;
     }
 
-    /**
-     * The device's check without asking the Account DO: a recorded revocation, or a lease that has not run out (RFC 0014
-     * section 1). A lease runs from the moment the Space DO asked, so it ends no later than the Account DO expects.
-     */
     private knownCheck(deviceId: string): SessionCheck | undefined {
       if (this.revoked(deviceId)) return { active: false, revoked: true, closed: false, kind: "", scope: null, leaseMs: 0 };
       const lease = this.leases.get(deviceId);
@@ -453,11 +403,8 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
     }
 
     /**
-     * The device's check: whether it is still active, its kind and scope, and whether a rewind holds the space closed
-     * (RFC 0003 section 4). Without a lease it asks the Account DO and leases the answer. Other events wait while it asks,
-     * so messages of one connection keep their order and no notice or rewind admission lands between the answer and its
-     * lease. Returns undefined when the Account DO cannot answer; the error is caught inside the callback, because an
-     * exception there would reset this object and drop every connection.
+     * The error is caught inside the callback, because an exception there would reset this object and drop every
+     * connection.
      */
     protected async checkDevice(deviceId: string): Promise<SessionCheck | undefined> {
       const known = this.knownCheck(deviceId);
@@ -479,10 +426,6 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       return check;
     }
 
-    /**
-     * checkDevice for every device with a live connection, asking the Account DO once for those without a lease, so that a
-     * push reaches only principals that may still read the space. Returns undefined when the Account DO cannot answer.
-     */
     private async checkDevices(deviceIds: string[]): Promise<Map<string, SessionCheck> | undefined> {
       const checks = new Map<string, SessionCheck>();
       const unknown = deviceIds.filter((deviceId) => {
@@ -512,12 +455,10 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       return checks;
     }
 
-    /** A rewind of this space has written its marker and not yet restored or aborted (RFC 0003 section 3). */
     private checkOpen(): void {
       if (this.sql.exec("SELECT 1 FROM rewind_markers LIMIT 1").toArray().length > 0) fail(Error_Code.RETRY_LATER, "the space is being rewound");
     }
 
-    /** Closes connections whose access token expired more than a minute ago; returns when to check next. */
     closeExpired(nowMs: number): number | undefined {
       let next: number | undefined;
       for (const ws of this.state.getWebSockets()) {
@@ -533,13 +474,11 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       return row ? (String(row.role) as Role) : undefined;
     }
 
-    /** The caller of one request: the kind and scope come from the device check, whatever the token claims. */
     private sessionOf(connect: Connect, role: Role, maxFormat: number, { kind, scope }: SessionCheck): Session {
       const { identity, origin } = connect;
       return { deviceId: identity.deviceId, userId: identity.userId, deviceName: identity.deviceName, kind, scope, role, maxFormat, origin };
     }
 
-    /** Sends one ServerMessage; a socket this server already closed gets nothing. */
     private send(ws: Socket, msg: ServerMessage["msg"]): void {
       if (ws.readyState !== WebSocket.OPEN) return;
       ws.send(toBinary(ServerMessageSchema, create(ServerMessageSchema, { msg })));
@@ -550,16 +489,9 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
         this.send(ws, { case: "goodbye", value: create(GoodbyeSchema, { code, reason }) });
         ws.close(code, reason);
       } catch {
-        // Already closed.
       }
     }
 
-    /** Pushes a new commit to every caught-up connection except the one that made it. */
-    /**
-     * Pushes a commit to the live connections, checking each principal first (RFC 0006 section 7): a connection whose
-     * principal was revoked, expired or became unknown is closed with 4003 instead, and every connection is closed with
-     * 1013 when the Account DO cannot answer. A closed connection catches up with Resume when it reconnects.
-     */
     private async broadcast(record: CommitRecord, exceptConnId?: string): Promise<void> {
       const sockets = this.state.getWebSockets().filter((ws) => {
         const attachment = ws.deserializeAttachment() as Attachment;
@@ -579,7 +511,6 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
           try {
             ws.send(frame);
           } catch {
-            // The socket is closing; the client catches up with Resume when it reconnects.
           }
         }
       }
@@ -617,7 +548,6 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       this.send(ws, { case: "welcome", value: welcome });
     }
 
-    /** Sends every commit after since_seq, then CaughtUp, then marks the connection live (spec v0 section 7.3). */
     private resume(ws: Socket, attachment: Attachment, resume: Resume): void {
       const head = this.headSeq;
       let reason: ResyncRequired_Reason | undefined;
@@ -678,7 +608,6 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       const current = this.sql.exec("SELECT due_ms FROM schedule WHERE task = 'tokens'").toArray()[0];
       if (!current || Number(current.due_ms) > dueMs) await this.schedule("tokens", dueMs);
     }
-    /** Runs one RPC. A new commit also returns its CommitRecord so the caller can push it. */
     async call(session: Session, request: RpcRequest): Promise<{ response: RpcResponse; record?: CommitRecord }> {
       const reqId = request.reqId;
       try {
@@ -752,11 +681,6 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       }
     }
 
-    /**
-     * The result stored for a commit, in the log or as its device's latest accepted commit (RFC 0002 section 2), with the
-     * device that made it and the digest of its request, which rows stored before RFC 0006 lack. A result stored before
-     * RFC 0013 has no committed_at_ms, so it takes its commit's from the log.
-     */
     private storedResult(commitId: string): { result: CommitResult; deviceId: string; digest: Uint8Array | null } | undefined {
       const row =
         this.sql.exec("SELECT results, device_id, request_digest FROM commits WHERE commit_id = ?", commitId).toArray()[0] ??
@@ -774,16 +698,11 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       };
     }
 
-    /** The commit token at seq (RFC 0013): the commit_id and committed_at_ms of the commit there, empty where the log holds none. */
     private tokenAt(seq: number): { commitId: string; committedAtMs: bigint } {
       const row = this.sql.exec("SELECT commit_id, committed_at_ms FROM commits WHERE seq = ?", seq).toArray()[0];
       return { commitId: String(row?.commit_id ?? ""), committedAtMs: BigInt(Number(row?.committed_at_ms ?? 0)) };
     }
 
-    /**
-     * Whether a client's token at seq names another commit than the one the log holds there (RFC 0013). An empty token,
-     * seq 0 and a seq below the log's floor claim nothing; any other seq the log holds no commit for never matches.
-     */
     private tokenDiffers(seq: bigint, commitId: string, committedAtMs: bigint): boolean {
       if (commitId === "" || seq === 0n || seq < BigInt(Number(getMeta(this.sql, "log_floor_seq")))) return false;
       const held = this.tokenAt(Number(seq));
@@ -795,11 +714,6 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       return BigInt(Number(row?.device_seq ?? 0));
     }
 
-    /**
-     * RFC 0002 section 3, steps 1 to 4: the history fence, the stored result, the device counter and the base.
-     * Returns the stored result of a commit that was already accepted; throws for a refused one. A stored result is
-     * returned only to the device that made the commit, for the same request (RFC 0006 section 8).
-     */
     private checkCommitOrder(deviceId: string, commit: Commit, digest: Uint8Array): CommitResult | undefined {
       if (commit.historyId !== getMeta(this.sql, "history_id")) fail(Error_Code.HISTORY_MISMATCH, "the commit was built in another history of this space");
       const stored = this.storedResult(commit.commitId);
@@ -823,7 +737,6 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       return undefined;
     }
 
-    /** Appends a commit to the log; digest is that of the device's request, and null for a commit the server makes. */
     private appendCommit(record: CommitRecord, result: CommitResult, digest: Uint8Array | null): void {
       const recordBytes = toBinary(CommitRecordSchema, record);
       const resultBytes = toBinary(CommitResultSchema, result);
@@ -853,7 +766,6 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       const digest = await commitDigest(commit);
       const stored = this.checkCommitOrder(session.deviceId, commit, digest);
       if (stored) {
-        // The accepted attempt may have failed to set the alarm after its transaction.
         await this.armAfterCommit();
         return { result: stored };
       }
@@ -936,10 +848,6 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       return { result: done.result, record: done.record };
     }
 
-    /**
-     * Sets the alarm after a commit is stored. A failure does not fail the stored commit: it is logged, and the next commit
-     * or the next open sets the alarm from the durable schedule.
-     */
     private async armAfterCommit(): Promise<void> {
       try {
         await this.armAlarm();
@@ -950,12 +858,6 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       }
     }
 
-    /**
-     * Finds which pending chunks a commit may use, and under which incarnation: those with a valid receipt for the row's
-     * incarnation, those an earlier head check found, and, for up to MAX_HEAD_CHECKS others, those whose object R2 holds
-     * with the right size (RFC 0002 section 11). A found chunk is recorded on its row and its hold extended, so a retry
-     * checks the next ones. The commit transaction checks the row again.
-     */
     private async confirmUploads(referenced: Map<string, ChunkRef>, receipts: readonly UploadReceipt[], nowMs: number): Promise<Map<string, string>> {
       const spaceId = this.spaceId;
       const confirmed = new Map<string, string>();
@@ -1000,7 +902,6 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       return `${session.origin}/v1/spaces/${object.spaceId}/chunks/${object.hashHex}?inc=${object.incarnation}&ticket=${ticket}`;
     }
 
-    /** A fresh key incarnation: this history's rewind number and the next value of a counter that only goes up (RFC 0003 section 5, rule 6). */
     private allocateIncarnation(): string {
       const next = Number(getMeta(this.sql, "next_incarnation") ?? 1);
       setMeta(this.sql, "next_incarnation", next + 1);
@@ -1140,7 +1041,6 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       return create(TrashPageSchema, this.nodePage(2, request.cursor, request.limit));
     }
 
-    /** Lowers the refcounts of a version's distinct chunks and deletes it. */
     private dropVersion(version: VersionRow, nowMs: number): void {
       const distinct = new Map(versionChunks(this.sql, version).map((chunk) => [toHex(chunk.hash), chunk.hash]));
       for (const hash of distinct.values()) {
@@ -1154,10 +1054,6 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       this.sql.exec("DELETE FROM versions WHERE version_id = ?", version.version_id);
     }
 
-    /**
-     * Expires old versions, purges old trash, and deletes unreferenced chunks in two phases (spec v0 section 12).
-     * Each run handles at most one batch of each kind; `more` asks for another run soon.
-     */
     async collectGarbage(nowMs: number): Promise<GcReport> {
       const settings = this.settings();
       const spaceId = this.spaceId;
@@ -1171,7 +1067,6 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
         );
         for (const version of expired) this.dropVersion(version, nowMs);
 
-        // Leaves first, so that a node is never left behind with a purged parent.
         const changes: ChangeRecord[] = [];
         for (let budget = GC_BATCH; budget > 0; ) {
           const due = rows<NodeRow>(
@@ -1217,8 +1112,6 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
         return hashes.length;
       });
 
-      // RFC 0003 section 5, rule 3: an object whose incarnation no row holds is an orphan once both its upload and the
-      // latest rewind completion are more than chunk_grace_days old.
       let sweptChunks = 0;
       let sweeping = false;
       if (nowMs >= Number(getMeta(this.sql, "orphan_sweep_due_ms") ?? 0)) {
@@ -1244,7 +1137,6 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
         sweeping = listed.truncated;
       }
 
-      // RFC 0003 section 5, rule 8: every delete targets one incarnation, after the Account DO recorded it as retired.
       let deletedChunks = 0;
       for (;;) {
         const rows = this.sql
@@ -1281,21 +1173,12 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       };
     }
 
-    /**
-     * Rewind admission (RFC 0003 section 3, step 1): the current history and head, whether the history's descriptor is
-     * durable in R2 (section 7), and the bookmark for the restore point. It stores nothing, but drops every lease, so the
-     * next check of any device asks the Account DO, which holds the space closed from before this call (RFC 0014 section 3).
-     */
     async rewindInfo(restorePointMs: number): Promise<{ historyId: string; headSeq: number; descriptorDurable: boolean; bookmark: string }> {
       this.leases.clear();
       const bookmark = await this.pitr.bookmarkForTime(restorePointMs);
       return { historyId: String(getMeta(this.sql, "history_id")), headSeq: this.headSeq, descriptorDurable: descriptorDurable(this.sql), bookmark };
     }
 
-    /**
-     * Step 2: closes every socket with 4004, writes the attempt's marker once, and reports whether the bookmark B to
-     * restore is earlier than the bookmark M read after the marker.
-     */
     async rewindPrepare(args: { rewindId: string; attempt: number; bookmark: string }): Promise<{ historyId: string; headSeq: number; earlier: boolean }> {
       for (const ws of this.state.getWebSockets()) this.goodbye(ws, Close.SPACE_REWOUND, "the space is being rewound");
       this.sql.exec("INSERT INTO rewind_markers (rewind_id, attempt) VALUES (?, ?) ON CONFLICT DO NOTHING", args.rewindId, args.attempt);
@@ -1304,26 +1187,20 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       return { historyId: String(getMeta(this.sql, "history_id")), headSeq: this.headSeq, earlier: args.bookmark < marked };
     }
 
-    /** Step 3: arms the restore of B and restarts the object, so the call always ends in an error. */
+    /** Restarts the object, so the call always ends in an error. */
     async rewindArm(bookmark: string): Promise<void> {
       await this.pitr.restoreOnNextStart(bookmark);
       this.state.abort("restarting to restore the space");
     }
 
-    /** Restarts the object, so that a restore armed earlier has applied when it next answers (step 4). */
     async restart(): Promise<void> {
       this.state.abort("restarting");
     }
 
-    /** Step 6: removes the markers of a rewind that failed before any restore could run. */
     async rewindAbort(rewindId: string): Promise<void> {
       this.sql.exec("DELETE FROM rewind_markers WHERE rewind_id = ?", rewindId);
     }
 
-    /**
-     * Step 4, after the restart: reports a marker that is still present, returns the receipt of a completion that already
-     * ran, or completes the rewind of the restored database in one transaction. Every call then sets the alarm.
-     */
     async rewindComplete(args: RewindCompletion): Promise<{ state: "marker" } | { state: "completed"; receipt: RewindReceipt }> {
       if (this.sql.exec("SELECT 1 FROM rewind_markers WHERE rewind_id = ? AND attempt = ?", args.rewindId, args.attempt).toArray().length > 0) {
         return { state: "marker" };
@@ -1341,7 +1218,6 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
         for (const deviceId of args.revokedDevices) {
           this.sql.exec("INSERT INTO revoked_devices (device_id, revoked_at_ms) VALUES (?, ?) ON CONFLICT DO NOTHING", deviceId, args.completedAtMs);
         }
-        // Section 5, rule 9: a retired incarnation or a deleting row counts as absent.
         for (const { hashHex, incarnation } of args.retired) {
           this.sql.exec(
             "UPDATE chunks SET state = ?, incarnation = NULL, head_checked = 0 WHERE hash = ? AND incarnation = ?",
@@ -1351,11 +1227,9 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
           );
         }
         this.sql.exec("UPDATE chunks SET state = ?, incarnation = NULL, head_checked = 0 WHERE state = ?", ChunkState.PENDING, ChunkState.DELETING);
-        // Rule 2: every unreferenced chunk waits a full grace after the completion.
         const holdUntil = args.completedAtMs + this.settings().chunk_grace_days * DAY_MS;
         this.sql.exec("UPDATE chunks SET state = ?, hold_until_ms = ? WHERE refcount = 0", ChunkState.PENDING, holdUntil);
         this.sql.exec("DELETE FROM rewind_markers");
-        // Section 7: the new history exports after restore_seq under its own prefix, starting with a full snapshot.
         startExport(this.sql, completed.restoreSeq, args.completedAtMs, true);
         setMeta(this.sql, "rewind_receipt", JSON.stringify(completed));
         return completed;
@@ -1364,18 +1238,15 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       return { state: "completed", receipt };
     }
 
-    /** What the space holds, for its owner only (RFC 0010). The Worker has checked the closure. */
     async usage(userId: string): Promise<{ ok: true; value: SpaceUsage } | { ok: false; code: Error_Code; message: string }> {
       if (this.memberRole(userId) !== "owner") return { ok: false, code: Error_Code.FORBIDDEN, message: "only the space's owner can read its usage" };
       return { ok: true, value: readUsage(this.sql) };
     }
 
-    /** Whether a node can be the root of a new share link (RFC 0005 section 2). The Account DO has checked the closure. */
     async shareCheckNode(nodeId: string): Promise<ShareOutcome<null>> {
       return checkLinkRoot(this.sql, nodeId);
     }
 
-    /** The public reads of a share link (RFC 0005 sections 3 and 7). Each first asks the Account DO whether a rewind holds the space closed. */
     async shareInfo(rootId: string, expiresAtMs: number): Promise<ShareOutcome<ShareInfo>> {
       return (await this.closedForRewind()) ? SHARE_CLOSED : shareInfo(this.sql, rootId, expiresAtMs);
     }
@@ -1388,7 +1259,6 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       return (await this.closedForRewind()) ? SHARE_CLOSED : shareFile(this.sql, this.spaceId, rootId, nodeId);
     }
 
-    /** The fence check before each later chunk of a download: the link resolves again, and the space was not rewound. */
     async shareContinue(link: { linkId: string; client: string; session?: string }, fence: DownloadFence): Promise<ShareOutcome<null>> {
       let resolved;
       try {
@@ -1400,7 +1270,6 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       return checkFence(this.sql, this.spaceId, resolved, fence);
     }
 
-    /** Whether a rewind holds this space closed; an unanswered check counts as closed. */
     private async closedForRewind(): Promise<boolean> {
       const spaceId = getMeta(this.sql, "space_id");
       if (spaceId === undefined) return false;
@@ -1412,7 +1281,6 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       }
     }
 
-    /** Runs the R2 export now, or joins the run already in progress. */
     private runExport(): Promise<void> {
       this.exporting ??= new Exporter(this.db, this.objects, this.snapshotPageNodes).run(this.clock()).finally(() => {
         this.exporting = undefined;

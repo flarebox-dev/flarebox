@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Digest v1 of a commit request (RFC 0006 section 8). Its coverage is frozen: the projection copies exactly the fields
-// that section lists, so a field added to the schema later never changes a digest a Space DO has stored.
-
 import { create, toBinary } from "@bufbuild/protobuf";
 import { type Commit, CommitSchema, type Op, OpSchema } from "../gen/koidrive/v1/commit_pb";
 import { type Content, ContentSchema } from "../gen/koidrive/v1/model_pb";
@@ -46,7 +43,6 @@ function op({ op }: Op): Op {
   }
 }
 
-/** SHA-256 of the v1 projection of the request: base_seq, ops, device_seq and require_head, with no unknown fields. */
 export async function commitDigest(commit: Commit): Promise<Uint8Array> {
   const projected = create(CommitSchema, {
     baseSeq: commit.baseSeq,

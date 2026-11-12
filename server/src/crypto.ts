@@ -36,14 +36,12 @@ export async function hmacVerify(secret: Uint8Array, message: string, mac: Uint8
   return crypto.subtle.verify("HMAC", key, mac, encoder.encode(message));
 }
 
-/** The per-space secret for chunk tickets and upload receipts, derived from a server key. */
 export function deriveSpaceKey(serverKey: Uint8Array, spaceId: string): Promise<Uint8Array> {
   return hmac(serverKey, `koidrive/space-key/v1|${spaceId}`);
 }
 
 export type ChunkGrant = "put" | "get" | "receipt";
 
-/** The chunk a grant covers: one incarnation of one hash in one space (RFC 0003 section 5, rule 7). */
 export interface ChunkObject {
   spaceId: string;
   hashHex: string;
@@ -54,10 +52,6 @@ function grantMessage(grant: ChunkGrant, chunk: ChunkObject, size: number, expir
   return `${grant}|${chunk.spaceId}|${chunk.hashHex}|${chunk.incarnation}|${size}|${expiresAtMs}`;
 }
 
-/**
- * Signs a chunk ticket (put, get) or upload receipt as "v1.<expires_at_ms>.<mac>".
- * Get tickets pass size 0 because a download does not depend on it.
- */
 export async function signChunkGrant(spaceKey: Uint8Array, grant: ChunkGrant, chunk: ChunkObject, size: number, expiresAtMs: number): Promise<string> {
   const mac = await hmac(spaceKey, grantMessage(grant, chunk, size, expiresAtMs));
   return `v1.${expiresAtMs}.${base64url(mac)}`;

@@ -31,30 +31,21 @@ import { type Outcome, type ResolvedLink, type ShareOutcome, ShareLinks } from "
 
 const CLAIM_CODE_MS = 3_600_000;
 const PAIRING_CODE_MS = 10 * 60_000;
-/** Principals per page of GET /v1/devices (RFC 0006 section 7). */
 const DEVICE_PAGE = 100;
-/** Spaces per page of GET /v1/spaces (RFC 0007 section 2). */
 const SPACE_PAGE = 100;
 const BASE32 = "ABCDEFGHJKMNPQRSTVWXYZ0123456789";
 const DAY_MS = 24 * 3_600_000;
-/** A refresh credential as a device generates one: 32 random bytes, base64url without padding (RFC 0011 section 1). */
 const REFRESH_CREDENTIAL = /^[A-Za-z0-9_-]{43}$/;
-/** How long a chunk retirement record is kept: PITR cannot restore a state older than 30 days (RFC 0003 section 5, rule 10). */
 const RETIREMENT_KEEP_MS = 30 * DAY_MS;
 /** PITR restores any point in the past 30 days. */
 const PITR_WINDOW_MS = 30 * DAY_MS;
-/** Admissible restore points lie from one minute to 29 days back (RFC 0003 section 2). */
 const REWIND_MIN_AGE_MS = 60_000;
 const REWIND_MAX_AGE_MS = 29 * DAY_MS;
-/** The Account DO alarm retries a rewind phase with backoff from one second up to ten minutes (RFC 0003 section 3). */
 const REWIND_RETRY_MIN_MS = 1000;
-/** How long the alarm waits before it delivers a revocation notice again to a space that did not take it. */
 const NOTICE_RETRY_MS = 30_000;
-/** How long a Space DO may use a device check before it asks again (RFC 0014 section 1). */
 export const SESSION_LEASE_MS = 5000;
 const REWIND_RETRY_MAX_MS = 10 * 60_000;
 
-/** The phases of a rewind record (RFC 0003 section 3). */
 type RewindPhase = "admitted" | "prepared" | "arming" | "completed" | "failed";
 
 interface RewindRow {
@@ -99,7 +90,6 @@ function randomCode(length: number): string {
   return Array.from(bytes, (byte) => BASE32[byte % BASE32.length]).join("");
 }
 
-/** Codes are shown to people, so case and separators do not matter. */
 function normalizeCode(code: string): string {
   return code.toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
@@ -130,12 +120,6 @@ interface DeviceRow {
   rotation_clock_ms: number;
 }
 
-/**
- * What checkSession answers: kind and scope come from the device's row, never from its token (RFC 0006 section 2).
- * revoked is set only for a device whose revocation is recorded, which cannot be undone; a device that is inactive
- * for another reason, such as an expired credential or a kind this server does not know, may become active again.
- * leaseMs is how long a Space DO may use the answer, counted from when it asked (RFC 0014 section 1).
- */
 export interface SessionCheck {
   active: boolean;
   revoked: boolean;
@@ -164,13 +148,8 @@ function spaceInfo(row: SpaceRow): SpaceInfo {
   });
 }
 
-/** The Space DO calls the account makes. */
 export type SpaceDirectory = Pick<SpaceDO, "closeDevice" | "init" | "restart" | "rewindAbort" | "rewindArm" | "rewindComplete" | "rewindInfo" | "rewindPrepare" | "shareCheckNode">;
 
-/**
- * The logic of the deployment's account: users, devices, tokens, spaces and share links. It reaches its host only
- * through state and spaceStub, so the class it extends can be any host's object base.
- */
 export function accountLogic<B extends abstract new (...args: any[]) => object>(Base: B) {
   abstract class Account extends Base {
     protected abstract readonly db: Database;
@@ -178,19 +157,13 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
     protected abstract readonly state: ObjectState;
     protected abstract spaceStub(spaceId: string): SpaceDirectory;
     private keyCache: ServerKey | undefined;
-    /** Rewinds this instance is driving now, so a retry and the alarm do not run the same phase at once. */
     private readonly driving = new Set<string>();
-    /** The [owner, name] of each space whose create is setting up its Space DO, as JSON. */
     private readonly creating = new Set<string>();
-    /** Spaces whose rewind admission has started and not yet been recorded or refused. Checks answer them closed (RFC 0014 section 3). */
     private readonly admitting = new Set<string>();
-    /** How long a Space DO may use a device check (RFC 0014 section 1). Tests lower it. */
     sessionLeaseMs = SESSION_LEASE_MS;
-    /** The time rewinds are admitted, completed and timed out against, and token refreshes read. Tests replace it to move through days or back. */
     clock: () => number = () => Date.now();
     protected abstract readonly shares: ShareLinks;
 
-    /** The signing key for tokens, tickets and receipts, created with crypto.getRandomValues on first use. */
     async serverKey(): Promise<ServerKey> {
       if (this.keyCache) return this.keyCache;
       let row = this.sql.exec("SELECT kid, secret FROM server_keys WHERE status = 'active' LIMIT 1").toArray()[0];
@@ -208,15 +181,10 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       return this.sql.exec("SELECT 1 FROM users LIMIT 1").toArray().length > 0;
     }
 
-    /** ServerInfo.setup_attempts: an Account DO still on code from before ClaimRequest.setup_attempt lacks this method. */
     async handlesSetupAttempts(): Promise<boolean> {
       return true;
     }
 
-    /**
-     * Starts an owner claim: returns a fresh one-time code for the Worker to write to its log, or undefined when
-     * the deployment is claimed or a code is still valid.
-     */
     async issueClaimCode(): Promise<string | undefined> {
       const nowMs = Date.now();
       const code = randomCode(12);
@@ -225,12 +193,6 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       return stored ? `${code.slice(0, 4)}-${code.slice(4, 8)}-${code.slice(8)}` : undefined;
     }
 
-    /**
-     * Redeems a claim code or the recovery key the Worker is configured with. On a deployment without an owner either one
-     * makes the caller the owner; on a claimed deployment the key adds a device for the owner. client is the caller's
-     * address, for failure counts. A key claim with a setup attempt then revokes that attempt's earlier unused devices.
-     * Everything that can fail is prepared first, so the transaction stores the owner, the key's use and the device together.
-     */
     async claim(
       args: { code: string; userName: string; deviceName: string; platform: string; setupAttempt?: string },
       client = "",
@@ -258,15 +220,10 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       };
       const outcome = this.db.transactionSync(() => redeemClaim(this.sql, attempt));
       if (!outcome.ok) return outcome;
-      // Each check runs right before revokeDevice's first transaction, with no await between them, so a device that
-      // refreshed a token while an earlier revocation awaited its notices is kept. The claim has committed, so a failed
-      // revocation must not cost the caller its credentials; that device stays unused, as its credentials reached nobody.
       for (const deviceId of outcome.revoke) {
         if (!stillUnused(this.sql, deviceId, setupAttempt, userId)) continue;
         await this.revokeDevice(deviceId).catch((error: unknown) => console.error("setup attempt cleanup failed", deviceId, error));
       }
-      // A later claim of the same attempt may have revoked this device while the loop awaited. Its credentials would not
-      // work, so the caller is told instead and claims again with a new key.
       if (this.activeDevice(device.credentials.deviceId) === undefined) {
         return failure(Error_Code.FORBIDDEN, "a later claim of this setup attempt replaced this one; set a new recovery key and claim again");
       }
@@ -279,15 +236,10 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       return create(DeviceCredentialsSchema, { ...device.credentials, userName: this.userName(userId) });
     }
 
-    /** The user's display name, as the first claim stored it (RFC 0008). */
     private userName(userId: string): string {
       return String(this.sql.exec("SELECT name FROM users WHERE user_id = ?", userId).toArray()[0]?.name ?? "");
     }
 
-    /**
-     * Creates the credentials and access token of a full-scope device that never expires, the only principal 0.1.0 issues,
-     * without storing anything; store() inserts it. issuedBy is the principal whose request creates it (RFC 0006 section 6).
-     */
     private async prepareDevice(userId: string, deviceName: string, platform: string, nowMs: number, issuedBy: string | null) {
       const deviceId = uuidv7(nowMs);
       const name = deviceName || "Unnamed device";
@@ -315,7 +267,6 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       return { credentials, store };
     }
 
-    /** An access token for the principal, which never outlives its credential (RFC 0006 section 2). */
     private async accessToken(device: Pick<DeviceRow, "user_id" | "device_id" | "name" | "kind" | "scope" | "expires_at_ms">, nowMs: number) {
       const expiresAtMs = Math.min(nowMs + ACCESS_TOKEN_MS, device.expires_at_ms ?? Infinity);
       const token = await signAccessToken(await this.serverKey(), {
@@ -333,10 +284,6 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       return this.activeDevice(deviceId) !== undefined;
     }
 
-    /**
-     * The principal, if it may act at all: not revoked, not expired, and of a kind and scope this server knows. Every
-     * check of a principal goes through here, so its current row always decides, whatever a token claims.
-     */
     private activeDevice(deviceId: string): DeviceRow | undefined {
       const row = this.sql.exec("SELECT * FROM devices WHERE device_id = ? AND revoked_at_ms IS NULL", deviceId).toArray()[0] as unknown as
         | DeviceRow
@@ -346,7 +293,6 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       return row;
     }
 
-    /** Called for an already paired device; returns an 8-character one-time code valid for 10 minutes. */
     async startPairing(deviceId: string): Promise<Outcome<{ code: string; expiresAtMs: number }>> {
       const nowMs = Date.now();
       if (!this.activeDevice(deviceId)) return failure(Error_Code.UNAUTHENTICATED, "device is not active");
@@ -357,10 +303,6 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       return ok({ code: `${code.slice(0, 4)}-${code.slice(4)}`, expiresAtMs });
     }
 
-    /**
-     * Redeems a pairing code for a new device of the same user. A correct code always redeems; a wrong one counts against
-     * client, the caller's address, and an address with too many recent wrong codes gets RETRY_LATER for wrong codes.
-     */
     async completePairing(args: { code: string; deviceName: string; platform: string }, client: string): Promise<Outcome<DeviceCredentials>> {
       const nowMs = Date.now();
       const row = this.sql
@@ -371,12 +313,6 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       return ok(await this.addDevice(inviter.user_id, args.deviceName, args.platform, nowMs, inviter.device_id));
     }
 
-    /**
-     * POST /v1/token. A request that sets rotation is answered with the principal's rotation clock, the later of now and
-     * every time answered before, which the same write stores; a proposal is stored in place of the presented credential
-     * when that time is at most its deadline (RFC 0011 section 1). The hashes are computed first, so nothing awaits
-     * between reading the row and writing it.
-     */
     async refreshAccess(args: {
       deviceId: string;
       refreshCredential: string;
@@ -413,13 +349,6 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       return ok(token);
     }
 
-    /**
-     * GET /v1/devices: the user's principals in the order their rows were stored, revoked ones included (RFC 0006
-     * section 7). A device stored after a listing passed newer ones gets the highest list_seq, so a later page lists it.
-     * A cursor of digits is the list_seq the page starts after. Any other cursor is a device_id, which an AccountDO from
-     * before the list_seq step returned and a Worker from that release still passes during a deploy, so that listing
-     * finishes in the device_id order it started in.
-     */
     async listDevices(args: { userId: string; callerId: string; cursor: string }): Promise<DeviceList> {
       const byDeviceId = !/^\d{0,15}$/.test(args.cursor);
       const found = (
@@ -447,16 +376,7 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       });
     }
 
-    /**
-     * DELETE /v1/devices/{device_id}: revokes one of the user's principals. A device revokes itself when it signs out, but
-     * the user's last active device does so only with confirmLastDevice, which its client sends after telling the person,
-     * so that no request takes an owner's last device by surprise (RFC 0009 section 5). Revoking a revoked one changes
-     * nothing, but delivers the notices still pending for it.
-     */
     async revokeUserDevice(args: { userId: string; callerId: string; deviceId: string; confirmLastDevice: boolean }): Promise<Outcome<null>> {
-      // The Worker checked the caller in an earlier event, and a concurrent revocation may have revoked it since. Checked
-      // again here, with no await before revokeDevice's update, so of two devices revoking each other only one succeeds,
-      // and of two last devices signing out at once the second must confirm.
       if (!this.activeDevice(args.callerId)) return failure(Error_Code.UNAUTHENTICATED, "this device was revoked");
       const found = this.sql.exec("SELECT 1 FROM devices WHERE device_id = ? AND user_id = ?", args.deviceId, args.userId).toArray().length > 0;
       if (!found) return failure(Error_Code.NOT_FOUND, "no such device");
@@ -467,20 +387,11 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       return ok(null);
     }
 
-    /** Whether no other device of the user is active, so that revoking this one leaves the user with none. */
     private isLastActiveDevice(userId: string, deviceId: string): boolean {
       const others = this.sql.exec("SELECT device_id FROM devices WHERE user_id = ? AND kind = 'device' AND device_id != ? AND revoked_at_ms IS NULL", userId, deviceId).toArray();
       return !others.some((row) => this.activeDevice(String(row.device_id)) !== undefined);
     }
 
-    /**
-     * Revokes a device: its refresh credential stops working and its open WebSockets close with 4003. The revocation and
-     * a notice to every space are stored together, and a notice stays until its space took it, so a space that cannot be
-     * reached now gets it on a repeat or from the alarm. The alarm is armed before the first delivery, so the notices are
-     * retried even if this object is evicted before it delivers them. While a notice is still pending, it returns only
-     * once a lease granted before the revocation has run out, so no space trusts the device after this returns (RFC 0014
-     * section 2).
-     */
     async revokeDevice(deviceId: string): Promise<void> {
       const nowMs = Date.now();
       this.db.transactionSync(() => {
@@ -500,7 +411,6 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       if (leaseLeftMs > 0) await new Promise((resolve) => setTimeout(resolve, leaseLeftMs));
     }
 
-    /** Delivers the pending revocation notices, of one device or all that are due, and arms the alarm for those that failed. */
     private async deliverNotices(deviceId?: string): Promise<void> {
       const pending = (
         deviceId === undefined
@@ -521,11 +431,6 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       await this.armAlarm();
     }
 
-    /**
-     * Creates a space, refusing a name the owner already uses. Names compare exactly after trimming, as `koi folder
-     * link --space` resolves them. While the Space DO is set up, the name is held in memory, so a concurrent create of it is
-     * refused and an aborted create leaves nothing behind; the row is stored once the Space DO holds the space.
-     */
     async createSpace(args: { userId: string; name: string }): Promise<Outcome<SpaceInfo>> {
       const nowMs = Date.now();
       const spaceId = uuidv7(nowMs);
@@ -552,10 +457,6 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       return ok(spaceInfo({ space_id: spaceId, name, owner_id: args.userId, created_at_ms: nowMs, format_version: FORMAT_VERSION }));
     }
 
-    /**
-     * Records chunk key incarnations as retired before the space deletes their objects (RFC 0003 section 5, rule 8).
-     * The records live here, out of the Space DO's PITR, and are kept for at least RETIREMENT_KEEP_MS.
-     */
     async retireChunks(spaceId: string, objects: { hashHex: string; incarnation: string }[]): Promise<Outcome<null>> {
       const nowMs = Date.now();
       if (this.spaceClosed(spaceId)) return failure(Error_Code.RETRY_LATER, "the space is being rewound");
@@ -572,15 +473,10 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       return ok(null);
     }
 
-    /** checkSession for several devices at once, keyed by device. */
     async checkSessions(deviceIds: string[], spaceId: string): Promise<Record<string, SessionCheck>> {
       return Object.fromEntries(await Promise.all(deviceIds.map(async (deviceId) => [deviceId, await this.checkSession(deviceId, spaceId)])));
     }
 
-    /**
-     * Whether the device is active, with the kind and scope of its current row, and whether a rewind holds the space, if
-     * one is named, closed (RFC 0003 section 4).
-     */
     async checkSession(deviceId: string, spaceId?: string): Promise<SessionCheck> {
       const device = this.activeDevice(deviceId);
       const revoked = this.sql.exec("SELECT 1 FROM devices WHERE device_id = ? AND revoked_at_ms IS NOT NULL", deviceId).toArray().length > 0;
@@ -599,7 +495,6 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       return this.heldClosed(spaceId);
     }
 
-    /** Whether checks answer the space closed: a rewind holds it, or a rewind's admission has started (RFC 0014 section 3). */
     private heldClosed(spaceId: string): boolean {
       return this.spaceClosed(spaceId) || this.admitting.has(spaceId);
     }
@@ -612,10 +507,6 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       return this.sql.exec("SELECT * FROM rewinds WHERE rewind_id = ?", rewindId).toArray()[0] as unknown as RewindRow | undefined;
     }
 
-    /**
-     * POST /v1/spaces/{space_id}/rewind (RFC 0003 section 1). A known rewind_id answers with that rewind's state; a new one
-     * is checked, admitted and driven as far as it goes now. The alarm drives the rest.
-     */
     async rewind(args: RewindArgs): Promise<Outcome<RewindResult>> {
       if (!isUuidV7(args.rewindId)) return failure(Error_Code.INVALID_ARGUMENT, "rewind_id must be a UUIDv7");
       const known = this.rewindRow(args.rewindId);
@@ -641,8 +532,6 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       if (closedBefore.length > 0) return failure(Error_Code.INVALID_ARGUMENT, "restore_point_ms lies inside an earlier rewind of this space");
       if (this.heldClosed(args.spaceId)) return failure(Error_Code.RETRY_LATER, "another rewind of this space has not ended");
 
-      // Checks answer the space closed from here, before rewindInfo drops the Space DO's leases, so no lease from before
-      // the admission outlives it (RFC 0014 section 3).
       this.admitting.add(args.spaceId);
       try {
         let info;
@@ -690,10 +579,6 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       return failure(Error_Code.RETRY_LATER, "the rewind is running" + (row.error ? "; last error: " + row.error : ""));
     }
 
-    /**
-     * Moves a rewind through its phases (RFC 0003 section 3). Each phase is recorded before the call it starts; an error
-     * leaves the recorded phase and schedules the alarm with backoff.
-     */
     private async drive(rewindId: string): Promise<void> {
       if (this.driving.has(rewindId)) return;
       this.driving.add(rewindId);
@@ -722,7 +607,6 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
             try {
               await this.spaceStub(row.space_id).restart();
             } catch {
-              // The restart ends the call; any pending restore has applied once the object starts again.
             }
             const nowMs = this.clock();
             const completion = await this.spaceStub(row.space_id).rewindComplete({
@@ -778,7 +662,6 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       }
     }
 
-    /** Step 6: only when no restore can have happened or be pending. Removes the markers and reopens the space unchanged. */
     private async failRewind(row: RewindRow, reason: string): Promise<void> {
       await this.spaceStub(row.space_id).rewindAbort(row.rewind_id);
       this.sql.exec(
@@ -790,10 +673,6 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       );
     }
 
-    /**
-     * Sets the alarm for the next due rewind or revocation notice, at least a second ahead so that work done right now is
-     * not retried in a loop.
-     */
     private async armAlarm(): Promise<void> {
       const rewind = this.sql.exec("SELECT MIN(next_try_ms) AS due FROM rewinds WHERE phase NOT IN ('completed', 'failed')").one().due;
       const notice = this.sql.exec("SELECT MIN(next_try_ms) AS due FROM revocation_notices").one().due;
@@ -810,10 +689,6 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       await this.deliverNotices();
     }
 
-    /**
-     * GET /v1/spaces: the user's spaces in the order their rows were stored, one page at a time (RFC 0007 section 2). A
-     * space stored after a listing passed newer ones gets the highest list_seq, so a later page still lists it.
-     */
     async listSpaces(args: { userId: string; after: number }): Promise<SpaceList> {
       const found = this.sql
         .exec("SELECT * FROM spaces WHERE owner_id = ? AND list_seq > ? ORDER BY list_seq LIMIT ?", args.userId, args.after, SPACE_PAGE + 1)
@@ -825,7 +700,6 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       });
     }
 
-    /** Records a read-only share link with a 128-bit random id. */
     async createShareLink(args: { spaceId: string; nodeId: string; createdBy: string; expiresAtMs?: number; password?: string }): Promise<string> {
       return this.shares.create(args);
     }
@@ -834,12 +708,10 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       this.shares.revoke(linkId);
     }
 
-    /** Resolves a share link, checking expiry, revocation and the password, and locking it after repeated failures. */
     async openShareLink(linkId: string, password: string | undefined): Promise<Outcome<{ spaceId: string; nodeId: string }>> {
       return this.shares.open(linkId, password);
     }
 
-    /** The owner API and public API of RFC 0005; see ShareLinks. */
     async shareCreate(args: Parameters<ShareLinks["ownerCreate"]>[0]): Promise<ShareOutcome<ShareLink>> {
       return this.shares.ownerCreate(args, () => this.spaceStub(args.spaceId).shareCheckNode(args.nodeId));
     }

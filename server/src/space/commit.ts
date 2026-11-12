@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Applies the ops of one commit inside the Space DO transaction, following the rules in spec v0 section 6.
-
 import { create } from "@bufbuild/protobuf";
 import {
   type CreateDir,
@@ -36,7 +34,6 @@ import {
 
 export const MAX_DEPTH = 256;
 
-/** Rejects a whole call; the transaction rolls back. */
 export class CallFailure extends Error {
   constructor(
     readonly code: Error_Code,
@@ -56,12 +53,10 @@ export interface Committer {
 
 export interface ApplyContext {
   seq: number;
-  /** The commit's ID, which names the trash groups of its deletes (RFC 0012). */
   commitId: string;
   baseSeq: number;
   nowMs: number;
   committer: Committer;
-  /** Called after each op with the transition it made; false refuses the whole commit (RFC 0006 section 3). */
   authorize(op: Op, effect: OpEffect): boolean;
 }
 
@@ -78,11 +73,9 @@ function rejected(reason: Reject): OpResult {
 export class CommitApplier {
   private readonly remap = new Map<string, string>();
   private readonly touched = new Set<string>();
-  /** What the op being applied changed and created, and the parents it replaced. */
   private changed = new Set<string>();
   private created = new Set<string>();
   private parentBefore = new Map<string, string | null>();
-  /** The files this commit sent from the live tree to the trash. */
   private readonly trashed = new Set<string>();
 
   constructor(
@@ -105,12 +98,6 @@ export class CommitApplier {
     return { results, changes };
   }
 
-  /**
-   * The transition of the op just applied. The ancestry and subtree are read when asked for, so they are valid only
-   * during the authorize call, before the next op changes the tree. Before the op, only the nodes in parentBefore had
-   * another parent, so the earlier ancestry is the current one with those parents put back. Every ID given to the
-   * effect, or named by the op, is resolved through R2's re-keying first.
-   */
   private effect(op: Op): OpEffect {
     const { changed, created, parentBefore } = this;
     const { op: named } = op;
@@ -151,14 +138,12 @@ export class CommitApplier {
     };
   }
 
-  /** Records a change of the op being applied, and the parent a node had before the op moved it. */
   private touch(nodeId: string, previousParent?: string | null): void {
     this.touched.add(nodeId);
     this.changed.add(nodeId);
     if (previousParent !== undefined && !this.parentBefore.has(nodeId)) this.parentBefore.set(nodeId, previousParent);
   }
 
-  /** Live files the applied commit leaves in the trash, those a later op restored excluded (RFC 0006 section 10). */
   trashedFiles(): number {
     let count = 0;
     for (const nodeId of this.trashed) if (getNode(this.sql, nodeId)?.status === NodeStatusValue.TRASHED) count++;
@@ -204,10 +189,6 @@ export class CommitApplier {
     return node.meta_rev > this.ctx.baseSeq && node.meta_dev !== this.dev;
   }
 
-  /**
-   * Whether this commit's device has not seen where node is now (RFC 0002 section 9). The commit that last put node under
-   * its parent or brought it back from the trash came after the base, and its device is another one or not recorded.
-   */
   private unseenParent(node: NodeRow): boolean {
     return node.parent_rev > this.ctx.baseSeq && node.parent_dev !== this.dev;
   }
@@ -226,11 +207,6 @@ export class CommitApplier {
     }
   }
 
-  /**
-   * Rejects the commit when placing node under parent would put it or a descendant, trashed ones included, deeper
-   * than MAX_DEPTH. A destination no deeper than the current position cannot, because the tree already satisfies
-   * the limit.
-   */
   private checkSubtreeDepth(node: NodeRow, parent: NodeRow): void {
     const newDepth = this.depth(parent) + 1;
     if (newDepth <= this.depth(node)) return;
@@ -259,7 +235,6 @@ export class CommitApplier {
     )[0];
   }
 
-  /** R1: the desired name, or the first free conflict name. A name reserved at the root counts as taken there. */
   private pickName(parentId: string, desired: string, excludeId: string): { name: string; renamed: boolean } {
     const atRoot = !getNode(this.sql, parentId)?.parent_id;
     let name = desired;
@@ -276,7 +251,6 @@ export class CommitApplier {
     }
   }
 
-  /** Brings one trashed node back under parentId, renaming it on a name clash. parentDev is empty unless the op named both. */
   private reviveOne(node: NodeRow, parentId: string, desiredName: string, parentDev: string): { name: string; renamed: boolean } {
     const picked = this.pickName(parentId, desiredName, node.node_id);
     this.sql.exec(
@@ -295,7 +269,6 @@ export class CommitApplier {
     return picked;
   }
 
-  /** R8: revives the trashed ancestor chain ending at nodeId, top-down. */
   private reviveChain(nodeId: string): void {
     const chain: NodeRow[] = [];
     for (let cur = getNode(this.sql, nodeId); cur && cur.status === NodeStatusValue.TRASHED; cur = getNode(this.sql, cur.parent_id ?? "")) {
@@ -304,7 +277,6 @@ export class CommitApplier {
     for (const node of chain.reverse()) this.reviveOne(node, node.parent_id!, node.name, "");
   }
 
-  /** Revives the trashed descendants of parentId that went to the trash with it. */
   private reviveGroup(parentId: string, group: string): void {
     const children = rows<NodeRow>(
       this.sql.exec("SELECT * FROM nodes WHERE parent_id = ? AND status = 2 AND trash_group = ?", parentId, group),
@@ -315,7 +287,6 @@ export class CommitApplier {
     }
   }
 
-  /** R8 for the target of an edit or move: its ancestors, itself and its trash group come back. renamed tells whether the target took a conflict name. */
   private reviveTarget(node: NodeRow): { node: NodeRow; renamed: boolean } {
     if (node.status !== NodeStatusValue.TRASHED) return { node, renamed: false };
     const group = node.trash_group!;
@@ -325,7 +296,6 @@ export class CommitApplier {
     return { node: getNode(this.sql, node.node_id)!, renamed };
   }
 
-  /** Resolves a parent for a create or move, reviving it when trashed. */
   private parentFor(parentId: string): NodeRow | Reject {
     const parent = this.node(parentId);
     if (!parent) return "NOT_FOUND";
@@ -495,11 +465,6 @@ export class CommitApplier {
     return result(picked.renamed ? OpResult_Code.APPLIED_RENAMED : OpResult_Code.APPLIED, "", picked.name);
   }
 
-  /**
-   * R7 and RFC 0002 section 9: trashes the part of the subtree whose placement this commit's device has seen. Nodes with
-   * unseen changes stay with their ancestors, and a node with an unseen placement stays with its whole subtree. Returns
-   * true when node stays.
-   */
   private trashSubtree(node: NodeRow, group: string): boolean {
     if (this.unseenParent(node)) return true;
     let keep = this.unseenContent(node) || this.unseenMeta(node);

@@ -41,7 +41,6 @@ function account(env: Env) {
   return env.ACCOUNT.get(env.ACCOUNT.idFromName("account"));
 }
 
-/** The server key, read once per isolate and Account DO binding so that tokens verify without a DO call. A failed read is not kept. */
 function key(env: Env): Promise<ServerKey> {
   let cached = serverKeys.get(env.ACCOUNT);
   if (!cached) {
@@ -56,10 +55,6 @@ function key(env: Env): Promise<ServerKey> {
   return cached;
 }
 
-/**
- * Checks the access token and the device, whose current row gives the identity its kind and scope (RFC 0006 section 2).
- * With a space, it also refuses a space that a rewind holds closed (RFC 0003 section 4).
- */
 async function authenticate(request: Request, env: Env, spaceId?: string): Promise<Identity | Response> {
   const token = bearerToken(request);
   const identity = token ? await verifyAccessToken(await key(env), token, Date.now()) : undefined;
@@ -70,20 +65,17 @@ async function authenticate(request: Request, env: Env, spaceId?: string): Promi
   return { ...identity, kind: check.kind, scope: check.scope };
 }
 
-/** Refuses an action the principal lacks the capability for (RFC 0006 section 3), or returns undefined. */
 function refuseWithout(request: Request, identity: Identity, capability: Capability): Response | undefined {
   if (policy.can(identity, capability)) return undefined;
   return errorReply(request, Error_Code.FORBIDDEN, `this device may not use ${capability}`);
 }
 
-/** The list_seq a page of GET /v1/spaces or GET /v1/devices starts after: 0, or the cursor the previous page sent. */
 function listCursor(url: URL): number {
   const cursor = url.searchParams.get("cursor") ?? "";
   if (!/^\d{0,15}$/.test(cursor)) throw new BadRequest("malformed cursor");
   return Number(cursor);
 }
 
-/** GET /v1/devices and DELETE /v1/devices/{device_id} (RFC 0006 section 7, RFC 0009). */
 async function devices(request: Request, env: Env, deviceId: string | undefined): Promise<Response> {
   const identity = await authenticate(request, env);
   if (identity instanceof Response) return identity;
@@ -102,17 +94,14 @@ async function devices(request: Request, env: Env, deviceId: string | undefined)
 }
 
 const encoder = new TextEncoder();
-/** The most UTF-8 bytes in a name or platform a request carries (RFC 0007 section 1). */
 const MAX_NAME_BYTES = 255;
 
-/** Refuses a request whose name or platform is too long, before it changes anything (RFC 0007 section 1). */
 function checkNames(fields: Record<string, string>): void {
   for (const [field, value] of Object.entries(fields)) {
     if (encoder.encode(value).length > MAX_NAME_BYTES) throw new BadRequest(`${field} is longer than ${MAX_NAME_BYTES} bytes`);
   }
 }
 
-/** HTTP statuses of the rewind endpoint's errors (RFC 0003 section 1). */
 const REWIND_STATUS: Partial<Record<Error_Code, number>> = { [Error_Code.HISTORY_MISMATCH]: 409, [Error_Code.RETRY_LATER]: 503 };
 
 async function rewind(request: Request, env: Env, spaceId: string): Promise<Response> {
@@ -132,7 +121,6 @@ async function rewind(request: Request, env: Env, spaceId: string): Promise<Resp
   return reply(request, RewindResultSchema, create(RewindResultSchema, outcome.value));
 }
 
-/** GET /v1/spaces/{space_id}/usage, owner only (RFC 0010). */
 async function usage(request: Request, env: Env, spaceId: string): Promise<Response> {
   const identity = await authenticate(request, env, spaceId);
   if (identity instanceof Response) return identity;
@@ -143,16 +131,10 @@ async function usage(request: Request, env: Env, spaceId: string): Promise<Respo
   return reply(request, SpaceUsageSchema, outcome.value);
 }
 
-/** The per-space ticket key, derived for each request from the cached server key, so a request keeps no per-space state. */
 async function spaceKey(env: Env, spaceId: string): Promise<Uint8Array> {
   return deriveSpaceKey((await key(env)).secret, spaceId);
 }
 
-/**
- * Relay-mode chunk transfer (spec v0 sections 8 and 10). The ticket from PrepareUpload or GetDownloadTargets is the
- * only credential; it names the key incarnation to read or write (RFC 0003 section 5). R2 checks the SHA-256 of an
- * upload, and the receipt lets the Space DO accept it in a commit for that incarnation only.
- */
 async function chunk(request: Request, env: Env, objects: ObjectStore, spaceId: string, hex: string): Promise<Response> {
   const params = new URL(request.url).searchParams;
   const ticket = params.get("ticket") ?? "";
