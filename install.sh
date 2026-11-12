@@ -9,14 +9,7 @@ main() {
         exit 1
     }
 
-    service=ask
-    case "${1:-}" in
-        --systemd) service=yes ;;
-        --no-systemd) service=no ;;
-        '') ;;
-        *) fail 'Usage: sh install.sh [--systemd | --no-systemd]' ;;
-    esac
-    [ "$#" -le 1 ] || fail 'Expected at most one option'
+    [ "$#" -eq 0 ] || fail 'Usage: sh install.sh'
 
     case "$(uname -s)" in
         Linux) os=unknown-linux-musl ;;
@@ -30,9 +23,6 @@ main() {
     esac
     if [ "$os" = apple-darwin ] && [ "$arch" = x86_64 ] && [ "$(sysctl -n hw.optional.arm64 2>/dev/null || true)" = 1 ]; then
         arch=aarch64
-    fi
-    if [ "$service" = yes ] && [ "$os" != unknown-linux-musl ]; then
-        fail '--systemd is available only on Linux'
     fi
 
     for command in curl tar mktemp awk grep sed; do
@@ -108,35 +98,19 @@ main() {
         fi
     fi
 
-    if [ "$os" = unknown-linux-musl ] && [ "$service" != no ]; then
-        if ! command -v systemctl >/dev/null 2>&1; then
-            [ "$service" != yes ] || fail 'systemctl is not available; the binary was installed without a user service'
+    if [ "$os" = unknown-linux-musl ]; then
+        if command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet koidrive.service 2>/dev/null; then
+            if systemctl --user restart koidrive.service; then
+                printf 'Restarted the background service koidrive.service\n'
+            else
+                printf 'Warning: koi is installed, but the background service koidrive.service did not restart. Run: systemctl --user restart koidrive.service\n' >&2
+            fi
+        fi
+    elif launchctl print "gui/$(id -u)/dev.koidrive.koi" >/dev/null 2>&1; then
+        if launchctl kickstart -k "gui/$(id -u)/dev.koidrive.koi"; then
+            printf 'Restarted the background service dev.koidrive.koi\n'
         else
-            if [ "$service" = ask ]; then
-                answer=
-                if [ -r /dev/tty ] && [ -w /dev/tty ] && (exec 3<> /dev/tty) 2>/dev/null; then
-                    printf 'Install the systemd user service? [y/N] ' > /dev/tty
-                    read -r answer < /dev/tty || answer=
-                else
-                    printf 'No terminal available. To install the user service, rerun with sh -s -- --systemd.\n'
-                fi
-                case "$answer" in y|Y|yes|YES) service=yes ;; esac
-            fi
-            if [ "$service" = yes ]; then
-                tar -xzOf "$tmp/$archive" koidrive.service > "$tmp/koidrive.service"
-                unit_dir=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
-                mkdir -p "$unit_dir"
-                escaped=$(printf '%s' "$install_dir/koi" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g; s/\$/$$/g')
-                staged=$(mktemp "$unit_dir/.koidrive.XXXXXXXX")
-                KOIDRIVE_UNIT_BINARY=$escaped awk '{ if ($0 ~ /^ExecStart=/) printf "ExecStart=\"%s\" _daemon\n", ENVIRON["KOIDRIVE_UNIT_BINARY"]; else print }' "$tmp/koidrive.service" > "$staged"
-                chmod 644 "$staged"
-                mv -f "$staged" "$unit_dir/koidrive.service"
-                staged=
-                systemctl --user daemon-reload
-                printf 'Installed %s/koidrive.service\n' "$unit_dir"
-                printf 'After setup and link, start syncing with: systemctl --user enable --now koidrive\n'
-                printf 'If the service is already running, restart it with: systemctl --user restart koidrive\n'
-            fi
+            printf 'Warning: koi is installed, but the background service dev.koidrive.koi did not restart. Run: launchctl kickstart -k gui/%s/dev.koidrive.koi\n' "$(id -u)" >&2
         fi
     fi
 }

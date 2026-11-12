@@ -266,12 +266,13 @@ pub enum Command {
     Folder,
     Device,
     History,
+    Service,
     Daemon,
     Telemetry,
 }
 
 impl Command {
-    pub const ALL: [Command; 11] = [
+    pub const ALL: [Command; 12] = [
         Command::Status,
         Command::Resolve,
         Command::Setup,
@@ -281,6 +282,7 @@ impl Command {
         Command::Folder,
         Command::Device,
         Command::History,
+        Command::Service,
         Command::Daemon,
         Command::Telemetry,
     ];
@@ -296,6 +298,7 @@ impl Command {
             Command::Folder => "folder",
             Command::Device => "device",
             Command::History => "history",
+            Command::Service => "service",
             Command::Daemon => "daemon",
             Command::Telemetry => "telemetry",
         }

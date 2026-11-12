@@ -1320,7 +1320,10 @@ impl Session {
                     "Continuing the uninstall that stopped earlier ({}).",
                     state.bucket
                 );
-                return uninstall::finish(self, &file, state).await;
+                let script = state.script.clone();
+                uninstall::finish(self, &file, state).await?;
+                self.forget(paths, &script).await;
+                return Ok(());
             }
             Some(other) => return Err(unfinished(&other, self.account(), file.path())),
             None => {}
@@ -1351,7 +1354,31 @@ impl Session {
             "--yes",
         ).await?;
         file.save(&state)?;
-        uninstall::finish(self, &file, state).await
+        let script = state.script.clone();
+        uninstall::finish(self, &file, state).await?;
+        self.forget(paths, &script).await;
+        Ok(())
+    }
+
+    /// Stops and removes this device's background service when the deleted Worker `script` was the server it syncs
+    /// with, at its workers.dev address.
+    async fn forget(&mut self, paths: &Paths, script: &str) {
+        if script.is_empty() {
+            return;
+        }
+        let url = match self.worker_url(script).await {
+            Ok(url) => url,
+            Err(error) => {
+                println!(
+                    "Couldn't check whether this device synced with the deleted server: {}. If it did, unlink its folders with koi folder unlink, which also removes the background service.",
+                    printable(error.message.trim_end_matches('.'))
+                );
+                return;
+            }
+        };
+        if let Some(report) = crate::service::forget(paths, &url) {
+            print!("{}", report.text());
+        }
     }
 }
 

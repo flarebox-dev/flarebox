@@ -160,14 +160,13 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: sh scripts/test-install.sh "target/$TARGET/release/koi" "$TARGET"
-      - name: Package the CLI and user unit
+      - name: Package the CLI
         env:
           TARGET: ${{ matrix.target }}
         run: |
           mkdir -p dist package
           cp "target/$TARGET/release/koi" package/koi
-          cp cli/systemd/koidrive.service package/koidrive.service
-          tar -czf "dist/koidrive-$TARGET.tar.gz" -C package koi koidrive.service
+          tar -czf "dist/koidrive-$TARGET.tar.gz" -C package koi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cli-${{ matrix.target }}
@@ -219,7 +218,7 @@ jobs:
             tar -xzf "$archive" -C package
             codesign --force --keychain "$keychain" --sign "$identity" --options runtime --timestamp package/koi
             codesign --verify --strict --verbose=2 package/koi
-            tar -czf "$archive" -C package koi koidrive.service
+            tar -czf "$archive" -C package koi
             rm -rf package
           done
       - name: Remove signing material

@@ -217,7 +217,7 @@ async fn restore(
     };
     let mut note = format!("Asked to restore {shown} (restore {}).\n", printable(&id));
     if linked.state == FolderState::Stopped {
-        note.push_str("Run koi _daemon to send it. koi history requests shows how it went.\n");
+        note.push_str("The folder sends it once the daemon runs; koi status shows why it doesn't. koi history requests shows how it went.\n");
     } else {
         note.push_str(&format!(
             "The folder sends it with its next commit. koi history requests {} shows how it went.\n",

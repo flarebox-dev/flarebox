@@ -19,6 +19,9 @@ use serde::Deserialize;
 ///
 /// [upload]
 /// concurrency = 4
+///
+/// [service]
+/// background = false
 /// ```
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -29,6 +32,22 @@ pub struct Config {
     pub trash: LocalTrash,
     #[serde(default)]
     pub upload: Uploads,
+    #[serde(default)]
+    pub service: BackgroundService,
+}
+
+/// The background service that the koi command installs and starts while the profile links a folder. With
+/// `background = false` it neither installs, starts nor removes it, and the person runs `koi _daemon` some other way.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BackgroundService {
+    pub background: bool,
+}
+
+impl Default for BackgroundService {
+    fn default() -> Self {
+        BackgroundService { background: true }
+    }
 }
 
 /// The local trash of every folder the profile links (design §5.2), which holds what sync effects displaced. An
@@ -326,6 +345,14 @@ mod tests {
         ));
 
         assert_eq!(Config::default().trash.cap(), 2_048_000_000);
+        assert!(Config::default().service.background);
+        std::fs::write(&path, "[service]\nbackground = false\n").unwrap();
+        assert!(!Config::load(&path).unwrap().service.background);
+        std::fs::write(&path, "[service]\nbackgrund = false\n").unwrap();
+        assert!(matches!(
+            Config::load(&path),
+            Err(ConfigError::Invalid { .. })
+        ));
         std::fs::write(&path, "[trash]\nmax_size_mb = 10\n").unwrap();
         assert_eq!(Config::load(&path).unwrap().trash.cap(), 10_000_000);
         std::fs::write(&path, "[trash]\nmax_size_gb = 10\n").unwrap();

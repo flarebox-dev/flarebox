@@ -391,6 +391,17 @@ jobs:
           cache-dependency-path: server/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
         working-directory: server
+      - name: Start a systemd user instance for the runner user
+        run: |
+          sudo loginctl enable-linger "$USER"
+          runtime="/run/user/$(id -u)"
+          for _ in $(seq 1 100); do
+            if [ -S "$runtime/systemd/private" ]; then break; fi
+            sleep 0.2
+          done
+          XDG_RUNTIME_DIR="$runtime" systemctl --user show-environment > /dev/null
+          echo "XDG_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"
+          echo "KOIDRIVE_TEST_SYSTEMD=1" >> "$GITHUB_ENV"
       - name: Test the koi command and daemon against the Worker under wrangler dev
         run: cli/scripts/integration-test.sh
 

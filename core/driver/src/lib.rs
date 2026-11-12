@@ -34,7 +34,7 @@ mod restore;
 mod scripted;
 mod status;
 
-pub use config::{Config, ConfigError, LocalTrash, SyncRules};
+pub use config::{BackgroundService, Config, ConfigError, LocalTrash, SyncRules};
 pub use credential::{Credential, CredentialError, SET_UP_AGAIN, api_for};
 pub use driver::{Driver, DriverError};
 pub use folder::MAX_FORMAT;
