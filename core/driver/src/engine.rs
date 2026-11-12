@@ -605,12 +605,13 @@ impl Engine {
     /// follow paths toward the root, so such a change is always left. A node whose rename is still to come is set aside
     /// while another entry takes its name, with what is under it, until its own rename places it. A renamed or
     /// modified entry is the node L holds at its path with its identity, else the node with its identity, else the
-    /// node at its path. A
-    /// created entry with the identity of a node L holds is that node, wherever L had it. So is a created entry with
-    /// the path and identity a node had before an earlier change of the batch took it out of L, unless the batch
-    /// placed that node again. That keeps a child's node when its folder is replaced around it. Any other created
-    /// entry is a new node. An entry that another path also links is a hard link, a file of its own (design §5.6),
-    /// so its identity never takes a node from another path.
+    /// node at its path. A created entry with the identity of a node L holds is that node, wherever L had it, except a
+    /// folder L holds on disk, not recorded, at a path no change of the batch leaves: the scan kept the folder there
+    /// with a new identity, as when an entry moved back into a new folder made at its path, so the created folder is a
+    /// new one. So is a created entry with the path and identity a node had before an earlier change of the batch took
+    /// it out of L, unless the batch placed that node again. That keeps a child's node when its folder is replaced
+    /// around it. Any other created entry is a new node. An entry that another path also links is a hard link, a file
+    /// of its own (design §5.6), so its identity never takes a node from another path.
     ///
     /// A node that held the name a change puts an entry at is gone from there, so it leaves L with everything under
     /// it. A file that arrives over a file keeps the node of the file it replaces when L's own node for the arriving
@@ -636,6 +637,30 @@ impl Engine {
                 } => resolve(&self.trees, from, &file_identity(*id), *linked),
                 Observed::Created { .. } | Observed::Modified { .. } => None,
             })
+            .collect();
+        let left: Vec<&Path> = (changes.iter())
+            .filter_map(|change| match change {
+                Observed::Removed { path, .. } | Observed::Renamed { from: path, .. } => {
+                    Some(path.as_path())
+                }
+                Observed::Created { .. } | Observed::Modified { .. } => None,
+            })
+            .collect();
+        let staying: BTreeSet<NodeId> = (changes.iter())
+            .filter_map(|change| match change {
+                Observed::Created {
+                    kind: EntryKind::Dir,
+                    id,
+                    ..
+                } => self.trees.local_with_identity(&file_identity(*id)),
+                _ => None,
+            })
+            .filter(|node| {
+                !self.trees.recorded_local(node)
+                    && (self.path_of(node))
+                        .is_some_and(|at| !left.iter().any(|path| at.starts_with(path)))
+            })
+            .cloned()
             .collect();
         let moving: BTreeSet<NodeId> = (changes.iter().zip(&before))
             .filter(|(change, _)| matches!(change, Observed::Renamed { .. }))
@@ -785,6 +810,7 @@ impl Engine {
                     }
                     let identity = file_identity(*id);
                     let node = (self.trees.local_with_identity(&identity))
+                        .filter(|node| !staying.contains(*node))
                         .or_else(|| self.trees.displaced_with_identity(&identity))
                         .filter(|_| !linked)
                         .cloned()
