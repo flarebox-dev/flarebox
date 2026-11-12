@@ -1075,11 +1075,18 @@ describe("RFC 0014 session leases", () => {
     };
   }
 
-  async function steadyLoad(devices: number, leaseMs: number, delayMs: number, forMs: number) {
+  let pool: DeviceCredentials[] | undefined;
+  async function devicePool(): Promise<DeviceCredentials[]> {
+    if (pool) return pool;
     const owner = await getOwner();
-    const spaceId = await createSpace(owner);
-    const creds: DeviceCredentials[] = [];
-    for (let i = 0; i < devices; i++) creds.push(await pairDevice(owner, "Steady " + i));
+    const paired: DeviceCredentials[] = [];
+    for (let i = 0; i < 24; i++) paired.push(await pairDevice(owner, "Pooled " + i));
+    return (pool = paired);
+  }
+
+  async function steadyLoad(leaseMs: number, delayMs: number, forMs: number) {
+    const spaceId = await createSpace(await getOwner());
+    const creds = await devicePool();
     return withLease(leaseMs, async () => {
       const slow = await slowAccount(delayMs);
       try {
@@ -1102,16 +1109,14 @@ describe("RFC 0014 session leases", () => {
   }
 
   it("answers 24 devices from leases when checking them one at a time would outlast a lease", { timeout: 60_000 }, async () => {
-    const { replies, checks } = await steadyLoad(24, 1000, 50, 3000);
+    const { replies, checks } = await steadyLoad(1000, 50, 3000);
     expect(replies).toBeGreaterThan(1000);
     expect(checks * 100).toBeLessThan(replies);
   });
 
   it("checks 24 devices that connect at once without leases in a few Account DO calls", { timeout: 60_000 }, async () => {
-    const owner = await getOwner();
-    const spaceId = await createSpace(owner);
-    const creds: DeviceCredentials[] = [];
-    for (let i = 0; i < 24; i++) creds.push(await pairDevice(owner, "Storm " + i));
+    const spaceId = await createSpace(await getOwner());
+    const creds = await devicePool();
     const slow = await slowAccount(50);
     try {
       const sockets = await Promise.all(creds.map((cred) => Socket.connect(spaceId, cred)));
