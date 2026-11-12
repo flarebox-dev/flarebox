@@ -549,6 +549,14 @@ describe("claim", () => {
     expect(status).toBe(0);
   });
 
+  it("tries $workers.scriptName when the API rejects a filter on $metadata.service", async () => {
+    mock.rejectedKeys = ["$metadata.service"];
+    claimState();
+    const { status, output } = await runTs("claim");
+    expect(output).toContain("filtered on $workers.scriptName");
+    expect(status).toBe(0);
+  });
+
   it("keeps querying the logs until the code arrives, and opens /setup once", async () => {
     mock.codeLagQueries = 3;
     claimState();

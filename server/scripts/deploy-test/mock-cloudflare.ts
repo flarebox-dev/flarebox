@@ -30,6 +30,7 @@ export class MockCloudflare {
   readonly queryDryFlags: unknown[] = [];
   workerName = "";
   filterKeys = ["$metadata.service", "$workers.scriptName"];
+  rejectedKeys: string[] = [];
   codeLagQueries = 0;
   observabilityStatus = 200;
   logQueries = 0;
@@ -139,6 +140,9 @@ export class MockCloudflare {
         if (this.observabilityStatus !== 200) return send(this.observabilityStatus, { success: false, errors: [{ code: 10000, message: "Authentication error" }], messages: [], result: null });
         const { timeframe, parameters, dry } = JSON.parse(body) as { timeframe: { from: number; to: number }; parameters: { filters: { key: string; operation: string; value: string }[] }; dry?: unknown };
         this.queryDryFlags.push(dry);
+        if (parameters.filters.some((candidate) => this.rejectedKeys.includes(candidate.key))) {
+          return send(400, { success: false, errors: [{ code: 10001, message: "unknown key" }], messages: [], result: null });
+        }
         const filter = parameters.filters.find((candidate) => this.filterKeys.includes(candidate.key) && candidate.operation === "eq");
         const index = this.logQueries++;
         const events = this.logs

@@ -176,7 +176,7 @@ jobs:
         run: node scripts/deploy-test/run.ts deploy "$REF"
 
       - name: Claim it with the code from its own log
-        timeout-minutes: 8
+        timeout-minutes: 10
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

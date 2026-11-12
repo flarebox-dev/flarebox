@@ -249,7 +249,14 @@ async function deploy(account: Account, ref: string): Promise<void> {
 
 async function provenKey(account: Account, name: string, fromMs: number, marker: string): Promise<WorkerKey | undefined> {
   for (const key of WORKER_KEYS) {
-    if ((await workerEvents(account, key, name, fromMs)).some((event) => event.includes(marker))) return key;
+    let events: string[];
+    try {
+      events = await workerEvents(account, key, name, fromMs);
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 400) continue;
+      throw error;
+    }
+    if (events.some((event) => event.includes(marker))) return key;
   }
   return undefined;
 }
