@@ -270,7 +270,7 @@ function fitPage<R, T>(rows: R[], build: (row: R) => T, encodedSize: (item: T) =
   return page;
 }
 
-export type Directory = Pick<AccountDO, "checkSession" | "checkSessions" | "isSpaceClosed" | "retireChunks" | "serverKey" | "shareResolve">;
+export type Directory = Pick<AccountDO, "checkSessions" | "isSpaceClosed" | "retireChunks" | "serverKey" | "shareResolve">;
 
 export function spaceLogic<B extends abstract new (...args: any[]) => object>(Base: B) {
   abstract class Space extends Base {
@@ -289,6 +289,7 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
     private leaseGeneration = 0;
     private readonly renewalsDue = new Set<string>();
     private renewing: { atMs: number; forMs: number } | undefined;
+    private gathering: { deviceIds: Set<string>; answers: Promise<Record<string, SessionCheck> | undefined> } | undefined;
 
     async init(args: { spaceId: string; name: string; ownerUserId: string; spaceKey: Uint8Array }): Promise<void> {
       const existing = getMeta(this.sql, "space_id");
@@ -450,28 +451,23 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
         });
     }
 
-    /**
-     * The error is caught inside the callback, because an exception there would reset this object and drop every
-     * connection.
-     */
     protected async checkDevice(deviceId: string): Promise<SessionCheck | undefined> {
+      return this.knownCheck(deviceId) ?? (await this.coldCheck([deviceId]))?.[deviceId];
+    }
+
+    protected async admitDevice(deviceId: string): Promise<SessionCheck | undefined> {
       const known = this.knownCheck(deviceId);
       if (known) return known;
-      const account = this.account();
-      const spaceId = String(getMeta(this.sql, "space_id"));
-      const check = await this.state.blockConcurrencyWhile(async () => {
-        const askedAtMs = this.clock();
-        try {
-          const answer = await account.checkSession(deviceId, spaceId);
-          this.storeLease(deviceId, answer, askedAtMs);
-          return answer;
-        } catch (error) {
-          console.error("account device check failed", error);
-          return undefined;
-        }
-      });
-      if (check?.revoked) this.recordRevoked(deviceId);
-      return check;
+      if (!this.gathering) {
+        const gathered = new Set<string>();
+        const answers = new Promise((resolve) => setTimeout(resolve, 0)).then(() => {
+          this.gathering = undefined;
+          return this.coldCheck(gathered);
+        });
+        this.gathering = { deviceIds: gathered, answers };
+      }
+      this.gathering.deviceIds.add(deviceId);
+      return (await this.gathering.answers)?.[deviceId];
     }
 
     private async checkDevices(deviceIds: string[]): Promise<Map<string, SessionCheck> | undefined> {
@@ -482,12 +478,29 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
         return !known;
       });
       if (unknown.length === 0) return checks;
+      const answered = await this.coldCheck(unknown);
+      if (!answered) return undefined;
+      for (const deviceId of unknown) if (answered[deviceId]) checks.set(deviceId, answered[deviceId]);
+      return checks;
+    }
+
+    /**
+     * The error is caught inside the callback, because an exception there would reset this object and drop every
+     * connection.
+     */
+    private async coldCheck(deviceIds: Iterable<string>): Promise<Record<string, SessionCheck> | undefined> {
       const account = this.account();
       const spaceId = String(getMeta(this.sql, "space_id"));
-      const answered = await this.state.blockConcurrencyWhile(async () => {
+      const answers = await this.state.blockConcurrencyWhile(async () => {
         const askedAtMs = this.clock();
+        const asked = new Set(deviceIds);
+        for (const ws of this.state.getWebSockets()) {
+          const deviceId = (ws.deserializeAttachment() as Attachment).identity.deviceId;
+          const lease = this.leases.get(deviceId);
+          if ((!lease || lease.untilMs - askedAtMs < lease.check.leaseMs / 2) && !this.revoked(deviceId)) asked.add(deviceId);
+        }
         try {
-          const answers = await account.checkSessions(unknown, spaceId);
+          const answers = await account.checkSessions([...asked], spaceId);
           for (const [deviceId, check] of Object.entries(answers)) this.storeLease(deviceId, check, askedAtMs);
           return answers;
         } catch (error) {
@@ -495,12 +508,8 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
           return undefined;
         }
       });
-      if (!answered) return undefined;
-      for (const [deviceId, check] of Object.entries(answered)) {
-        if (check.revoked) this.recordRevoked(deviceId);
-        checks.set(deviceId, check);
-      }
-      return checks;
+      for (const [deviceId, check] of Object.entries(answers ?? {})) if (check.revoked) this.recordRevoked(deviceId);
+      return answers;
     }
 
     private checkOpen(): void {

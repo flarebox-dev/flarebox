@@ -47,7 +47,7 @@ export class SpaceDO extends spaceLogic(DurableObject<Env>) {
     if (!connect) return new Response("missing identity", { status: 401 });
     const role = this.memberRole(connect.identity.userId);
     if (!role) return new Response("not a member of this space", { status: 403 });
-    const check = await this.checkDevice(connect.identity.deviceId);
+    const check = await this.admitDevice(connect.identity.deviceId);
     if (check === undefined) return new Response("could not check the device; retry later", { status: 503 });
     if (!check.active) return new Response("device revoked", { status: 401 });
     if (check.closed) return new Response("the space is being rewound; retry later", { status: 503 });
