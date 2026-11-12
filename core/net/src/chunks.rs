@@ -13,12 +13,15 @@ use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use hyper::body::{Body, Frame, SizeHint};
 use koidrive_proto::v1::{ChunkRef, Target, UploadReceipt, chunk_plan::Action};
 use prost::Message;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::{Method, StatusCode};
 use sha2::{Digest, Sha256};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 use crate::api::Api;
@@ -28,6 +31,8 @@ use crate::session::Session;
 
 /// The most chunks one `PrepareUpload` or `GetDownloadTargets` takes (spec v0 section 13).
 pub const MAX_CHUNKS_PER_CALL: usize = 1000;
+/// How many chunks a [`Transfer`] uploads at once unless it is given another [`UploadGate`].
+pub const DEFAULT_UPLOAD_CONCURRENCY: usize = 4;
 /// A target this close to its expiry is fetched again before use.
 const TARGET_MARGIN: Duration = Duration::from_secs(60);
 /// The most bytes reserved up front for one downloaded chunk. A larger chunk's buffer grows as its bytes arrive, so a
@@ -87,12 +92,44 @@ enum Attempt<T> {
     Fail(ChunkError),
 }
 
+/// Limits how many chunk uploads are in flight at once. Clones share the limit, so every [`Transfer`] given a clone of
+/// one gate counts against the same number. A chunk takes its place before it is read and gives it back when its
+/// upload ends, so the limit also bounds the chunk bytes held in memory.
+#[derive(Clone, Debug)]
+pub struct UploadGate {
+    permits: Arc<Semaphore>,
+}
+
+impl UploadGate {
+    /// A gate that lets `concurrency` chunks be in flight at once.
+    ///
+    /// # Panics
+    ///
+    /// If `concurrency` is 0, since no upload could ever start.
+    pub fn new(concurrency: usize) -> Self {
+        assert!(concurrency > 0, "an upload gate needs at least one place");
+        UploadGate {
+            permits: Arc::new(Semaphore::new(concurrency)),
+        }
+    }
+
+    async fn enter(&self) -> OwnedSemaphorePermit {
+        self.permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the semaphore is never closed")
+    }
+}
+
 /// Moves chunk bytes between the client and the targets the server hands out.
 #[derive(Clone, Debug)]
 pub struct Transfer {
     http: reqwest::Client,
     uploads: reqwest::Client,
     pub backoff: Backoff,
+    /// Bounds the chunks this transfer uploads at once, together with every other transfer that shares the gate.
+    pub gate: UploadGate,
     /// Attempts per chunk, and rounds of asking the server again for chunks it deferred or whose target expired. Only a
     /// round in which no chunk was uploaded or found present counts.
     pub attempts: u32,
@@ -109,15 +146,18 @@ impl Transfer {
             http: api.http().clone(),
             uploads: api.uploads().clone(),
             backoff: Backoff::default(),
+            gate: UploadGate::new(DEFAULT_UPLOAD_CONCURRENCY),
             attempts: 5,
             attempt_timeout: Duration::from_secs(120),
             stall_timeout: Duration::from_secs(60),
         }
     }
 
-    /// Uploads the chunks the server does not hold yet and returns their receipts for the commit. `read` gives a
-    /// chunk's bytes; it is called only for chunks the server asks for. Chunks are handled in order, each distinct
-    /// hash once. Presigned targets give no receipt; the server checks those chunks itself at commit time.
+    /// Uploads the chunks the server does not hold yet and returns their receipts for the commit, in the order the
+    /// uploads finished. `read` gives a chunk's bytes; it is called only for chunks the server asks for, each distinct
+    /// hash once. Chunks start in order, as many at once as the gate lets in, and a chunk is read only once it has its
+    /// place. The first chunk that fails for good ends the upload, and the chunks still in flight are dropped.
+    /// Presigned targets give no receipt; the server checks those chunks itself at commit time.
     ///
     /// The future `read` returns borrows neither the chunk nor `read` itself. That keeps this transfer `Send`, so a
     /// spawned task can run it.
@@ -131,9 +171,13 @@ impl Transfer {
         let mut receipts = Vec::new();
         let mut round = 0;
         while !todo.is_empty() {
+            // Positions in `todo`, so that the next round asks for the deferred chunks in their first order.
             let mut deferred = Vec::new();
             let mut wait = Duration::ZERO;
-            for batch in todo.chunks(MAX_CHUNKS_PER_CALL) {
+            for (first, batch) in (0..)
+                .step_by(MAX_CHUNKS_PER_CALL)
+                .zip(todo.chunks(MAX_CHUNKS_PER_CALL))
+            {
                 let result = session.prepare_upload(batch.to_vec()).await?;
                 let prepared = SystemTime::now();
                 let plans: HashMap<_, _> = result
@@ -141,7 +185,8 @@ impl Transfer {
                     .iter()
                     .map(|plan| (plan.hash.as_slice(), plan))
                     .collect();
-                for chunk in batch {
+                let mut uploads = Vec::new();
+                for (index, chunk) in (first..).zip(batch) {
                     let no_target = || ChunkError::NoTarget {
                         hash: chunk.hash.clone(),
                     };
@@ -150,35 +195,54 @@ impl Transfer {
                         Action::Present => {}
                         Action::RetryLater => {
                             wait = wait.max(Duration::from_millis(plan.retry_after_ms));
-                            deferred.push(chunk.clone());
+                            deferred.push(index);
                         }
-                        Action::Upload => {
-                            let target = plan.target.as_ref().ok_or_else(no_target)?;
-                            // A target that looks expiring on arrival means this clock runs ahead of the server's, so it
-                            // is sent as given and the relay judges the ticket.
+                        Action::Upload => uploads.push((
+                            index,
+                            chunk,
+                            plan.target.as_ref().ok_or_else(no_target)?,
+                        )),
+                        Action::Unspecified => return Err(no_target()),
+                    }
+                }
+                let mut started = 0;
+                let mut running = FuturesUnordered::new();
+                loop {
+                    tokio::select! {
+                        biased;
+                        Some(sent) = running.next() => match sent? {
+                            (_, Some(Some(receipt))) => receipts.push(receipt),
+                            (_, Some(None)) => {}
+                            (index, None) => deferred.push(index),
+                        },
+                        permit = self.gate.enter(), if started < uploads.len() => {
+                            let (index, chunk, target) = uploads[started];
+                            started += 1;
+                            // A target that looks expiring on arrival means this clock runs ahead of the server's, so
+                            // it is sent as given and the relay judges the ticket.
                             if expiring(target) && !expiring_at(target, prepared) {
-                                deferred.push(chunk.clone());
-                                continue;
-                            }
-                            let bytes = read(chunk).await.map_err(|source| ChunkError::Io {
-                                hash: chunk.hash.clone(),
-                                source,
-                            })?;
-                            if !matches(chunk, &bytes) {
-                                return Err(ChunkError::SourceChanged {
-                                    hash: chunk.hash.clone(),
+                                deferred.push(index);
+                            } else {
+                                let bytes = read(chunk);
+                                running.push(async move {
+                                    let _permit = permit;
+                                    let bytes = bytes.await.map_err(|source| ChunkError::Io {
+                                        hash: chunk.hash.clone(),
+                                        source,
+                                    })?;
+                                    if !matches(chunk, &bytes) {
+                                        return Err(ChunkError::SourceChanged {
+                                            hash: chunk.hash.clone(),
+                                        });
+                                    }
+                                    let sent = self
+                                        .retrying(|| self.put(target, chunk, bytes.clone()))
+                                        .await?;
+                                    Ok((index, sent))
                                 });
                             }
-                            match self
-                                .retrying(|| self.put(target, chunk, bytes.clone()))
-                                .await?
-                            {
-                                Some(Some(receipt)) => receipts.push(receipt),
-                                Some(None) => {}
-                                None => deferred.push(chunk.clone()),
-                            }
                         }
-                        Action::Unspecified => return Err(no_target()),
+                        else => break,
                     }
                 }
             }
@@ -186,11 +250,12 @@ impl Transfer {
                 break;
             }
             let progressed = deferred.len() < todo.len();
+            deferred.sort_unstable();
             if !progressed && round >= self.attempts {
                 let message =
                     "the server kept deferring the upload or refusing its ticket".to_owned();
                 return Err(ChunkError::Unavailable {
-                    hash: deferred[0].hash.clone(),
+                    hash: todo[deferred[0]].hash.clone(),
                     message,
                 });
             }
@@ -203,7 +268,10 @@ impl Transfer {
             if !progressed {
                 round += 1;
             }
-            todo = deferred;
+            todo = deferred
+                .into_iter()
+                .map(|index| todo[index].clone())
+                .collect();
         }
         Ok(receipts)
     }

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use koidrive_net::{Api, Auth, Backoff, ChunkError, Event, Session, Transfer, matches};
+use koidrive_net::{Api, Auth, Backoff, ChunkError, Event, Session, Transfer, UploadGate, matches};
 use koidrive_proto::v1::{
     ChunkRef, CommitResult, Content, CreateFile, Op, UploadReceipt, change_record, error::Code, op,
     op_result,
@@ -212,6 +212,40 @@ async fn upload_commit_and_download_round_trip() {
             Bytes::from_static(b"second chunk")
         ]
     );
+}
+
+#[tokio::test]
+#[ignore = "needs a local Worker; run core/net/scripts/integration-test.sh"]
+async fn forty_chunks_uploaded_four_at_once_commit_and_download_intact() {
+    let space = new_space().await;
+    let writer_auth = auth(owner().await);
+    let (writer, mut events) = start(writer_auth.clone(), &space);
+    let history = connected(&mut events).await.history_id;
+    let parts: Vec<Bytes> = (0..40u8).map(|i| Bytes::from(vec![i; 64 << 10])).collect();
+    let chunks: Vec<ChunkRef> = parts.iter().map(|p| chunk(p)).collect();
+    let source = Source {
+        bytes: parts.iter().map(|p| (chunk(p).hash, p.clone())).collect(),
+        reads: Cell::new(0),
+    };
+    let mut transfer = new_transfer(writer_auth.api());
+    transfer.gate = UploadGate::new(4);
+
+    let receipts = upload(&transfer, &writer, &source, &chunks).await.unwrap();
+    assert_eq!(
+        (receipts.len(), source.reads.get()),
+        (40, 40),
+        "one read and one receipt per chunk"
+    );
+    let mut sent = commit(
+        &history,
+        0,
+        1,
+        vec![create_file(&space.space_id, "forty", content(&chunks))],
+    );
+    sent.receipts = receipts;
+    assert!(applied(&writer.commit(sent).await.unwrap()));
+
+    assert_eq!(download(&transfer, &writer, &chunks).await.unwrap(), parts);
 }
 
 #[tokio::test]
