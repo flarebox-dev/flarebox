@@ -1420,3 +1420,25 @@ fn an_edit_made_while_its_file_is_parked_for_a_rename_stays_on_the_server() {
         assert_eq!(device.disk.entries().len(), 2);
     }
 }
+
+#[test]
+fn a_write_a_restore_exposed_stays_on_the_disks_through_a_second_restore() {
+    let edit = Step::User(Action {
+        kind: 2,
+        target: 0,
+        parent: 0,
+        name: 0,
+        text: 7,
+    });
+    let mut lost = vec![(0, RESTORE), (0, Step::Connect), (1, Step::Connect)];
+    for _ in 0..30 {
+        lost.extend([(0, Step::Work(0)), (1, Step::Work(0))]);
+    }
+    lost.push((0, RESTORE));
+    let world = keep(
+        2,
+        &[vec![(0, file("a"))], vec![(0, BACKUP), (0, edit)], lost],
+    )
+    .unwrap();
+    assert!(world.devices.iter().all(|device| device.disk.holds(2)));
+}

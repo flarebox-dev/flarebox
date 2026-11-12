@@ -826,7 +826,7 @@ impl World {
             }
             if self.devices.iter().any(|device| device.disk.holds(*write)) {
                 self.retired.remove(write);
-            } else {
+            } else if taken || !self.exposed.contains_key(write) {
                 self.retired.insert(*write);
             }
             let holds =
