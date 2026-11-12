@@ -49,7 +49,7 @@ Linking the first folder installs a service that runs the sync daemon, starts it
 
 `koi status` shows the service on its `Background service` line. With `--json`, `status` and the commands above add it as `service`, with `state` set to `running`, `stopped`, `switched_off`, `not_installed`, `unavailable` or `off`, and `problem`, when koi knows the cause, saying why it isn't running.
 
-Give each profile its own `XDG_STATE_HOME`, and its own `XDG_RUNTIME_DIR` when that is set, since the daemon's socket lives there. The service is named with a hash of the state folder. Two profiles that share either folder can't sync side by side.
+Give each profile its own `XDG_STATE_HOME`. The service and the daemon's socket are named with a hash of the state folder, so profiles that share `XDG_RUNTIME_DIR` sync side by side. Two profiles that share a state folder can't.
 
 **Linux.** Koidrive uses a systemd user service, `koidrive.service`. It writes the unit, based on [cli/systemd/koidrive.service](../../cli/systemd/koidrive.service), to `~/.local/state/koidrive/systemd/` and enables it with `systemctl --user enable`. Read its log with `journalctl --user -u koidrive`, or with the unit name that `koi status` shows for another profile.
 
@@ -99,4 +99,4 @@ The daemon logs at the `info` level. Set `KOIDRIVE_LOG` to change it, for exampl
 | `~/Library/LaunchAgents/dev.koidrive.koi.plist` | On macOS, the background service's launch agent. Its log is in `~/Library/Logs/Koidrive/` |
 | `.koidrive/` in each linked folder | The folder's marker, the record of the device that linked it, and the local trash |
 
-`XDG_CONFIG_HOME` and `XDG_STATE_HOME` replace `~/.config` and `~/.local/state` when they are set to absolute paths, on macOS too. Koidrive ignores a relative value. The daemon's socket is in `$XDG_RUNTIME_DIR/koidrive/`, or in the state folder when `XDG_RUNTIME_DIR` isn't set to an absolute path.
+`XDG_CONFIG_HOME` and `XDG_STATE_HOME` replace `~/.config` and `~/.local/state` when they are set to absolute paths, on macOS too. Koidrive ignores a relative value. The daemon's socket is `$XDG_RUNTIME_DIR/koidrive/daemon-<hash>.sock`, named with a hash of the state folder, or `daemon.sock` in the state folder when `XDG_RUNTIME_DIR` isn't set to an absolute path.

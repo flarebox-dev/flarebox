@@ -8,7 +8,6 @@
 
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
@@ -61,13 +60,7 @@ impl Service {
         };
         let default = paths.state_dir == home.join(".local/state/koidrive")
             && paths.config_file == home.join(".config/koidrive/config.toml");
-        let suffix = (!default).then(|| {
-            let hash = (paths.state_dir.as_os_str().as_bytes().iter())
-                .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-                    (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
-                });
-            format!("{:08x}", hash >> 32)
-        });
+        let suffix = (!default).then(|| paths.profile_key());
         Ok(Service {
             suffix,
             binary: text(binary)?,

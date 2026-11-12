@@ -159,6 +159,21 @@ impl Machine {
         self.home.path().join(rel)
     }
 
+    fn socket(&self) -> PathBuf {
+        let vars = [
+            ("XDG_CONFIG_HOME", self.path("config")),
+            ("XDG_STATE_HOME", self.path("state")),
+            ("XDG_RUNTIME_DIR", self.path("run")),
+        ];
+        koidrive_driver::Paths::from_vars(|name| {
+            (vars.iter())
+                .find(|(key, _)| *key == name)
+                .map(|(_, path)| path.clone().into())
+        })
+        .unwrap()
+        .socket()
+    }
+
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_koi"));
         command
@@ -351,7 +366,7 @@ async fn a_headless_device_pairs_links_and_follows_the_change_stream() {
         .stderr(File::create(&log_path).unwrap())
         .spawn()
         .unwrap();
-    let socket = machine.path("run/koidrive/daemon.sock");
+    let socket = machine.socket();
     let started = Instant::now();
     while !socket.exists() {
         assert!(
@@ -623,7 +638,7 @@ async fn a_device_revokes_a_lost_one_and_stops_syncing_when_another_revokes_it()
         .spawn()
         .unwrap();
     let started = Instant::now();
-    while !machine.path("run/koidrive/daemon.sock").exists() {
+    while !machine.socket().exists() {
         assert!(
             started.elapsed() < WAIT,
             "the daemon did not open its socket"
@@ -680,7 +695,7 @@ async fn a_device_revokes_a_lost_one_and_stops_syncing_when_another_revokes_it()
         "--space",
         &space_name,
     ]);
-    let socket = machine.path("run/koidrive/daemon.sock");
+    let socket = machine.socket();
     if socket.exists() {
         fs::remove_file(&socket).unwrap();
     }
@@ -970,7 +985,7 @@ async fn trash_and_versions_list_what_the_space_keeps() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let socket = machine.path("run/koidrive/daemon.sock");
+    let socket = machine.socket();
     let started = Instant::now();
     while !socket.exists() {
         assert!(
@@ -1153,7 +1168,7 @@ async fn restore_brings_back_a_deleted_file_and_an_earlier_version() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let socket = machine.path("run/koidrive/daemon.sock");
+    let socket = machine.socket();
     eventually("the daemon to open its socket", || socket.exists()).await;
     machine
         .status_until("the first sync", |status| {

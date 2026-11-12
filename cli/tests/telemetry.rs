@@ -73,7 +73,7 @@ fn a_daemon_that_cannot_start_is_counted_by_why() {
     let body: serde_json::Value = serde_json::from_str(&preview).unwrap();
     let report = &body["batch"][0]["properties"];
     assert_eq!(report["c.daemon_start_failed.socket"], 1, "{preview}");
-    assert!(!preview.contains("koidrive/daemon.sock"), "{preview}");
+    assert!(!preview.contains("run/koidrive"), "{preview}");
 }
 
 #[test]

@@ -454,9 +454,17 @@ fn ctrl_c_ends_a_command_with_an_interrupted_error_and_exit_130() {
 #[test]
 fn ctrl_c_during_setup_under_json_prints_the_interrupted_envelope() {
     let profile = Profile::new();
-    let run = profile.home.path().join("run").join("koidrive");
-    std::fs::create_dir_all(&run).unwrap();
-    let silent = std::os::unix::net::UnixListener::bind(run.join("daemon.sock")).unwrap();
+    let home = profile.home.path();
+    let socket = koidrive_driver::Paths::from_vars(|name| match name {
+        "XDG_CONFIG_HOME" => Some(home.join("config").into()),
+        "XDG_STATE_HOME" => Some(home.join("state").into()),
+        "XDG_RUNTIME_DIR" => Some(home.join("run").into()),
+        _ => None,
+    })
+    .unwrap()
+    .socket();
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let silent = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     let child = (profile.command(&["setup", "--json"]))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
