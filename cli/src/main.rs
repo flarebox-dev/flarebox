@@ -1144,17 +1144,14 @@ async fn device(paths: Paths, action: DeviceAction) -> Result<Done, CliError> {
     }
 }
 
-/// Whether the server answered that it refused the call, so that the call changed nothing there. Without an answer,
-/// or with an answer that could not be read, the call may have changed something.
+/// Whether the call changed nothing on the server: it was never sent, or the server refused it with a 4xx status. Without
+/// an answer, or with a 5xx status, whether or not its error could be read, the call may have changed something.
 fn refused(error: &ApiError) -> bool {
     match error {
-        ApiError::Server { .. }
-        | ApiError::Url(_)
-        | ApiError::PathSegment(_)
-        | ApiError::Credential(_) => true,
-        ApiError::Status { status } | ApiError::Unreadable { status } => {
-            (400..500).contains(status)
-        }
+        ApiError::Url(_) | ApiError::PathSegment(_) | ApiError::Credential(_) => true,
+        ApiError::Server { status, .. }
+        | ApiError::Status { status }
+        | ApiError::Unreadable { status } => (400..500).contains(status),
         ApiError::Transport(_) | ApiError::TooLarge { .. } | ApiError::Decode(_) => false,
     }
 }
@@ -1916,7 +1913,15 @@ mod tests {
         assert!(refused(&ApiError::Status { status: 403 }));
         assert!(refused(&ApiError::Unreadable { status: 400 }));
         let transport = reqwest::Client::new().get("not a url").build().unwrap_err();
+        let internal = koidrive_proto::v1::Error {
+            code: koidrive_proto::v1::error::Code::Internal as i32,
+            ..Default::default()
+        };
         for unknown in [
+            ApiError::Server {
+                status: 500,
+                error: koidrive_net::ServerError(internal),
+            },
             ApiError::Transport(transport),
             ApiError::Status { status: 504 },
             ApiError::Unreadable { status: 502 },
