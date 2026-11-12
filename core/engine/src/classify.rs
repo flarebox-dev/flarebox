@@ -367,6 +367,14 @@ impl Trees {
         self.l_identities.get(identity).and_then(|ids| ids.last())
     }
 
+    /// The nodes of L, placed or parked, with `identity`, in ID order.
+    pub fn locals_with_identity(
+        &self,
+        identity: &FileIdentity,
+    ) -> impl DoubleEndedIterator<Item = &NodeId> {
+        self.l_identities.get(identity).into_iter().flatten()
+    }
+
     /// The placed nodes of L under `parent` whose name has the `name_key` of `name`.
     pub fn local_holders<'a>(
         &'a self,

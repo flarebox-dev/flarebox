@@ -823,10 +823,11 @@ impl Engine {
                         continue;
                     }
                     let identity = file_identity(*id);
-                    let node = (self.trees.local_with_identity(&identity))
+                    let takes = |node: &&NodeId| !linked || self.trees.recorded_local(node);
+                    let node = (self.trees.locals_with_identity(&identity).rev())
                         .filter(|node| !staying.contains(*node))
-                        .or_else(|| self.trees.displaced_with_identity(&identity))
-                        .filter(|node| !linked || self.trees.recorded_local(node))
+                        .find(takes)
+                        .or_else(|| self.trees.displaced_with_identity(&identity).filter(takes))
                         .cloned()
                         .or_else(|| {
                             (gone.get(path))
