@@ -270,7 +270,7 @@ function fitPage<R, T>(rows: R[], build: (row: R) => T, encodedSize: (item: T) =
   return page;
 }
 
-export type Directory = Pick<AccountDO, "checkSession" | "checkSessions" | "isSpaceClosed" | "retireChunks" | "serverKey" | "shareResolve">;
+export type Directory = Pick<AccountDO, "checkSessions" | "isSpaceClosed" | "retireChunks" | "serverKey" | "shareResolve">;
 
 export function spaceLogic<B extends abstract new (...args: any[]) => object>(Base: B) {
   abstract class Space extends Base {
@@ -289,6 +289,7 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
     private leaseGeneration = 0;
     private readonly renewalsDue = new Set<string>();
     private renewing: { atMs: number; forMs: number } | undefined;
+    private gathering: { deviceIds: Set<string>; answers: Promise<Record<string, SessionCheck> | undefined> } | undefined;
 
     async init(args: { spaceId: string; name: string; ownerUserId: string; spaceKey: Uint8Array }): Promise<void> {
       const existing = getMeta(this.sql, "space_id");
@@ -468,11 +469,26 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       return checks;
     }
 
+    private async coldChecks(deviceIds: string[]): Promise<Map<string, SessionCheck> | undefined> {
+      if (!this.gathering) {
+        const gathered = new Set<string>();
+        const answers = new Promise((resolve) => setTimeout(resolve, 0)).then(() => {
+          this.gathering = undefined;
+          return this.checkGathered(gathered);
+        });
+        this.gathering = { deviceIds: gathered, answers };
+      }
+      for (const deviceId of deviceIds) this.gathering.deviceIds.add(deviceId);
+      const answers = await this.gathering.answers;
+      if (!answers) return undefined;
+      return new Map(deviceIds.flatMap((deviceId) => (answers[deviceId] ? [[deviceId, answers[deviceId]] as const] : [])));
+    }
+
     /**
      * The error is caught inside the callback, because an exception there would reset this object and drop every
      * connection.
      */
-    private async coldChecks(deviceIds: string[]): Promise<Map<string, SessionCheck> | undefined> {
+    private async checkGathered(deviceIds: Set<string>): Promise<Record<string, SessionCheck> | undefined> {
       const account = this.account();
       const spaceId = String(getMeta(this.sql, "space_id"));
       const answers = await this.state.blockConcurrencyWhile(async () => {
@@ -492,13 +508,8 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
           return undefined;
         }
       });
-      if (!answers) return undefined;
-      const checks = new Map<string, SessionCheck>();
-      for (const [deviceId, check] of Object.entries(answers)) {
-        if (check.revoked) this.recordRevoked(deviceId);
-        if (deviceIds.includes(deviceId)) checks.set(deviceId, check);
-      }
-      return checks;
+      for (const [deviceId, check] of Object.entries(answers ?? {})) if (check.revoked) this.recordRevoked(deviceId);
+      return answers;
     }
 
     private checkOpen(): void {

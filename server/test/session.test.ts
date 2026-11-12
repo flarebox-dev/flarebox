@@ -1107,6 +1107,45 @@ describe("RFC 0014 session leases", () => {
     expect(checks * 100).toBeLessThan(replies);
   });
 
+  it("checks 24 devices that connect at once without leases in a few Account DO calls", { timeout: 60_000 }, async () => {
+    const owner = await getOwner();
+    const spaceId = await createSpace(owner);
+    const creds: DeviceCredentials[] = [];
+    for (let i = 0; i < 24; i++) creds.push(await pairDevice(owner, "Storm " + i));
+    const slow = await slowAccount(50);
+    try {
+      const sockets = await Promise.all(creds.map((cred) => Socket.connect(spaceId, cred)));
+      expect(slow.calls.checkSessions).toBeLessThanOrEqual(3);
+      for (const socket of sockets) socket.ws.close();
+    } finally {
+      slow.restore();
+    }
+  });
+
+  it("renews with a lapsed device's check every connected lease past half, and no lease short of half", async () => {
+    const owner = await getOwner();
+    const spaceId = await createSpace(owner);
+    const [lapsed, pastHalf, fresh] = [await pairDevice(owner, "Lapsed"), await pairDevice(owner, "Past half"), await pairDevice(owner, "Fresh")];
+    const sockets = await Promise.all([lapsed, pastHalf, fresh].map((device) => Socket.connect(spaceId, device)));
+    for (const socket of sockets) await socket.start();
+    await runInDurableObject(env.SPACE.get(env.SPACE.idFromName(spaceId)), (instance: SpaceDO) => {
+      const leases = (instance as unknown as { leases: Map<string, { untilMs: number }> }).leases;
+      leases.delete(lapsed.deviceId);
+      leases.get(pastHalf.deviceId)!.untilMs = instance.clock() + SESSION_LEASE_MS * 0.4;
+      leases.get(fresh.deviceId)!.untilMs = instance.clock() + SESSION_LEASE_MS * 0.9;
+    });
+    const check = await holdAccount("checkSessions");
+    try {
+      const reply = listTree(sockets[0]!);
+      await vi.waitFor(() => expect(check.asked).toHaveLength(1));
+      expect([...(check.asked[0] as string[])].sort()).toEqual([lapsed.deviceId, pastHalf.deviceId].sort());
+      check.release();
+      expect(await reply).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+    } finally {
+      check.restore();
+    }
+  });
+
   it("renews in one blocking check every connected device whose lease has run out", async () => {
     const owner = await getOwner();
     const spaceId = await createSpace(owner);
