@@ -54,11 +54,17 @@ jobs:
               echo "Linux targets: skipped, because no changed file matches $pattern. The merge queue run of this workflow builds them."
               linux=false
             fi
-            pattern='^(cli/|\.cargo/|install\.sh$|scripts/test-install\.sh$|scripts/(test-)?publish-release\.sh$|\.github/workflows/release-cli\.yml$|Cargo\.(toml|lock)$|rust-toolchain\.toml$)'
-            if grep -Eq "$pattern" <<<"$changed"; then
-              echo "macOS targets: build, because a changed file matches $pattern"
+            bash scripts/test-macos-changes.sh
+            if ! platform="$(scripts/macos-changes.sh "$BASE" HEAD)"; then
+              echo "::error::Listing the macOS-specific files between $BASE and HEAD failed (see the error above)."
+              exit 1
+            fi
+            pattern='^(install\.sh$|scripts/test-install\.sh$|scripts/(test-)?publish-release\.sh$|scripts/(test-)?macos-changes\.sh$|\.github/workflows/release-cli\.yml$)'
+            reasons="$(cut -f1 <<<"$platform" | grep -Ev '^(apps/macos|core/ffi)/' || true)"$'\n'"$(grep -E "$pattern" <<<"$changed" || true)"
+            if [ -n "$(tr -d '[:space:]' <<<"$reasons")" ]; then
+              echo "macOS targets: build, because of $(tr '\n' ' ' <<<"$reasons")"
             else
-              echo "macOS targets: skipped, because no changed file matches $pattern. The merge queue run of this workflow builds them."
+              echo "macOS targets: skipped, because no file changed that builds or behaves differently on macOS. The merge queue run of this workflow builds them."
               macos=false
             fi
           else
