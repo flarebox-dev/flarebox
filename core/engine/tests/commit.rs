@@ -9,6 +9,7 @@ use koidrive_engine::commit::{
 };
 use koidrive_engine::effects::{Effect, EffectError, Effects, Location};
 use koidrive_engine::ids::IdGen;
+use koidrive_engine::ignore::RuleFile;
 use koidrive_engine::names::{MAX_NAME_BYTES, nfc, normalize_name};
 use koidrive_engine::question::Answer;
 use koidrive_engine::state::TreesState;
@@ -5829,4 +5830,88 @@ fn an_edit_of_a_file_in_the_trash_after_a_loss_is_kept_from_a_resend_after_a_res
     trees.set_remote("n".into(), resent);
     trees.settle();
     assert_eq!(trees.class("n"), Class::Concurrent);
+}
+
+#[test]
+fn a_parked_edit_whose_name_goes_to_a_folder_this_device_excludes_is_not_held_back() {
+    let mut trees = trees(&[(
+        "h",
+        Some(file(ROOT, "x", 1)),
+        Some(file(ROOT, "x", 1)),
+        Some(remote(file(ROOT, "X", 1))),
+    )]);
+    trees.set_rules::<&str>(&[], Some(RuleFile::parse(b"x/\n")));
+    trees.settle();
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    let park = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    assert!(matches!(
+        &park.effect,
+        Effect::Move {
+            to: Location::Parked(_),
+            ..
+        }
+    ));
+    effects.done(&mut trees, &park.effect_id, None).unwrap();
+    let mut edited = trees.local().get("h").unwrap().clone();
+    edited.shape.content = Some(content(2));
+    trees.set_local("h".into(), edited);
+    trees.set_remote("h".into(), trashed(file(ROOT, "X", 1)));
+    trees.set_remote("n".into(), remote(dir(ROOT, "x")));
+    trees.settle();
+    assert!(trees.excluded("n") && !trees.excluded("h"));
+    let back = effects.plan(&trees, &mut ids, NOW).cloned();
+    assert_eq!(
+        back.map(|record| record.effect),
+        Some(Effect::Move {
+            from: Location::Parked("h".into()),
+            identity: local(file(ROOT, "x", 1), 1).identity,
+            to: Location::At {
+                base: koidrive_engine::effects::Base::Root,
+                dirs: vec![],
+                name: "x".into(),
+            },
+        })
+    );
+}
+
+#[test]
+fn a_parked_edit_whose_name_a_synced_folder_holds_is_sent() {
+    let mut trees = trees(&[
+        (
+            "h",
+            Some(file(ROOT, "ss", 1)),
+            Some(file(ROOT, "ss", 1)),
+            Some(trashed(file(ROOT, "ß", 1))),
+        ),
+        (
+            "n",
+            Some(dir(ROOT, "ß")),
+            Some(dir(ROOT, "ß")),
+            Some(remote(dir(ROOT, "ß"))),
+        ),
+    ]);
+    trees.set_local(
+        "h".into(),
+        LocalNode {
+            parked: true,
+            ..local(file(ROOT, "ss", 2), 1)
+        },
+    );
+    trees.settle();
+    let (mut effects, mut commits, mut ids) =
+        (Effects::default(), Commits::default(), IdGen::new(1));
+    assert_eq!(
+        effects
+            .plan(&trees, &mut ids, NOW)
+            .map(|record| record.effect.clone()),
+        None
+    );
+    let commit = build(&mut commits, &mut trees, &mut ids);
+    assert!(
+        commit
+            .as_ref()
+            .is_some_and(|commit| uploads(&ops(commit), 2)),
+        "{:?}",
+        commit.as_ref().map(ops)
+    );
 }

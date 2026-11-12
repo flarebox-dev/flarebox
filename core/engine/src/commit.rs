@@ -1651,7 +1651,10 @@ fn rebase(
 ) -> (BTreeSet<NodeId>, Vec<(NodeId, Option<Shape>)>) {
     let dirty: Vec<NodeId> = trees.dirty().iter().cloned().collect();
     for id in &dirty {
-        let held = trees.reverted().contains(id) || trees.waiting().contains_key(id);
+        let held = trees.reverted().contains(id)
+            || trees.waiting().contains_key(id)
+            || (trees.local().get(id)).is_some_and(|node| node.parked)
+                && (trees.remote().get(id).is_some() || trees.synced().get(id).is_some());
         if held
             && trees.remote().live(id).is_none()
             && trees.edited(id)

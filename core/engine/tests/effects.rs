@@ -1185,3 +1185,62 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn an_edit_saved_while_its_file_is_parked_survives_a_folder_taking_its_name() {
+    let (mut trees, mut disk) = space(&[("a", Some(file(ROOT, "x", 1)), Some(file(ROOT, "X", 1)))]);
+    trees.settle();
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    let park = effects.plan(&trees, &mut ids, NOW).cloned().unwrap();
+    assert!(
+        matches!(
+            park.effect,
+            Effect::Move {
+                to: Location::Parked(_),
+                ..
+            }
+        ),
+        "{park:?}"
+    );
+    let mut node = trees.local().get("a").unwrap().clone();
+    node.shape.content = Some(content(9));
+    trees.set_local("a".into(), node);
+    disk.entries.get_mut(&1).unwrap().content = Some(content(9));
+    let created = disk.apply(&park.effect).unwrap();
+    effects.done(&mut trees, &park.effect_id, created).unwrap();
+    let a = trees.local().get("a").unwrap();
+    assert!(a.parked && a.shape.content == Some(content(9)));
+    trees.set_remote(
+        "a".into(),
+        RemoteNode {
+            trashed: true,
+            ..remote(file(ROOT, "X", 1))
+        },
+    );
+    trees.set_remote("n".into(), remote(dir(ROOT, "x")));
+    let done = converge(&mut trees, &mut disk, 8).unwrap();
+    let mut commits = koidrive_engine::commit::Commits::default();
+    let commit = commits
+        .build(&mut trees, &mut ids, NOW, "history", 7)
+        .cloned();
+    let sent = commit.as_ref().is_some_and(|commit| {
+        commit.ops.iter().any(|op| match &op.op {
+            Some(koidrive_proto::v1::op::Op::CreateFile(create)) => {
+                create.content == Some(content(9))
+            }
+            Some(koidrive_proto::v1::op::Op::UpdateContent(update)) => {
+                update.content == Some(content(9))
+            }
+            _ => false,
+        })
+    });
+    let next = effects
+        .plan(&trees, &mut ids, NOW)
+        .map(|record| record.effect.clone());
+    assert!(
+        sent || next.is_some(),
+        "stuck: effects {done:?}, then no commit ({commit:?}) and no effect; a = {:?}, waiting {:?}",
+        trees.local().get("a"),
+        trees.waiting().keys().collect::<Vec<_>>()
+    );
+}
