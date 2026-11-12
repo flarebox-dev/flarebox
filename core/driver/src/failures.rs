@@ -6,12 +6,18 @@ use std::sync::Mutex;
 use koidrive_net::{CallError, ChunkError, ServerError, StopReason};
 use koidrive_proto::v1::error::Code;
 pub use koidrive_telemetry::schema::Failure;
-pub(crate) use koidrive_telemetry::schema::{Asked, Halted, Refusal, Transfer};
+pub(crate) use koidrive_telemetry::schema::{Asked, Halted, Refusal, TooLarge, Transfer};
 
 use crate::disk::Stop;
 use crate::question::QuestionKind;
 
 static FAILURES: Mutex<BTreeMap<Failure, u64>> = Mutex::new(BTreeMap::new());
+
+#[cfg(test)]
+thread_local! {
+    static HERE: std::cell::RefCell<BTreeMap<Failure, u64>> =
+        const { std::cell::RefCell::new(BTreeMap::new()) };
+}
 
 /// How many times each kind failed in this process.
 pub fn failures() -> BTreeMap<Failure, u64> {
@@ -26,10 +32,17 @@ pub(crate) fn count(failure: Failure) -> u64 {
     failures().get(&failure).copied().unwrap_or(0)
 }
 
+#[cfg(test)]
+pub(crate) fn take_counted_here() -> BTreeMap<Failure, u64> {
+    HERE.take()
+}
+
 pub(crate) fn failed(failure: Failure) {
     if let Ok(mut failures) = FAILURES.lock() {
         *failures.entry(failure).or_default() += 1;
     }
+    #[cfg(test)]
+    HERE.with_borrow_mut(|here| *here.entry(failure).or_default() += 1);
 }
 
 pub(crate) fn refusal(error: &ServerError) -> Refusal {

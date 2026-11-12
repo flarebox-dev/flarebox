@@ -361,6 +361,7 @@ pub(crate) struct Server {
     pub unavailable: Mutex<u32>,
     /// While set, every download is refused with this error.
     pub refusal: Mutex<Option<ServerError>>,
+    pub call_error: Mutex<Option<CallError>>,
     /// Runs once, before the first chunk is handed over.
     during: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
@@ -390,6 +391,9 @@ impl Fetch for Server {
         chunks: &[ChunkRef],
         write: &mut (dyn FnMut(&ChunkRef, &[u8]) -> io::Result<()> + Send),
     ) -> Result<(), ChunkError> {
+        if let Some(error) = self.call_error.lock().unwrap().clone() {
+            return Err(ChunkError::Call(error));
+        }
         if let Some(error) = self.refusal.lock().unwrap().clone() {
             return Err(ChunkError::Refused {
                 hash: chunks[0].hash.clone(),

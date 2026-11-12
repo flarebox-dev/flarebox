@@ -5534,9 +5534,6 @@ fn the_status_names_a_node_of_a_refused_commit_and_the_refusal() {
 fn a_refused_commit_counts_its_code_and_each_node_it_leaves_out() {
     use crate::failures::{self, Failure, Refusal};
 
-    let refused = Failure::Refused(Refusal::LimitExceeded);
-    let problem = Failure::ProblemNode(Refusal::LimitExceeded);
-    let before = (failures::count(refused), failures::count(problem));
     let mut remote = Remote::new();
     let (site, mut a) = linked(&mut remote, "a");
     fs::write(site.root.join("notes.txt"), b"written on a").unwrap();
@@ -5553,11 +5550,18 @@ fn a_refused_commit_counts_its_code_and_each_node_it_leaves_out() {
         message: "the commit of /home/alice/notes.txt is too large".into(),
         ..Default::default()
     };
+    failures::take_counted_here();
     let step = a.folder.sent(Err(CallError::Server(ServerError(refusal))));
     a.take(step).unwrap();
     assert_eq!(a.folder.engine.commits.problems().len(), 1);
-    assert!(failures::count(refused) > before.0);
-    assert!(failures::count(problem) > before.1);
+    assert_eq!(
+        failures::take_counted_here(),
+        [
+            (Failure::Refused(Refusal::LimitExceeded), 1),
+            (Failure::ProblemNode(Refusal::LimitExceeded), 1)
+        ]
+        .into()
+    );
 }
 
 #[test]
@@ -5627,6 +5631,140 @@ fn a_conflict_copy_is_counted_as_a_question_asked() {
     let (_, (_, mut b)) = edited_on_both(&mut remote);
     assert!(b.folder.take_questions_changed());
     assert!(failures::count(asked) > before);
+}
+
+#[test]
+fn a_commit_too_large_to_send_counts_as_too_large_and_never_as_refused() {
+    use crate::failures::{self, Failure, TooLarge};
+
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::write(site.root.join("notes.txt"), b"written on a").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    let Some(upload @ Work::Upload(_)) = a.work.pop_front() else {
+        panic!("the new file is uploaded");
+    };
+    a.perform(upload, &mut remote).unwrap();
+    let Some(Work::Send(_)) = a.work.pop_front() else {
+        panic!("the commit is sent");
+    };
+    failures::take_counted_here();
+    let step = a.folder.sent(Err(CallError::TooLarge { bytes: 9 << 20 }));
+    a.take(step).unwrap();
+    assert_eq!(a.folder.engine.commits.problems().len(), 1);
+    assert_eq!(
+        failures::take_counted_here(),
+        [
+            (Failure::TooLarge(TooLarge::Commit), 1),
+            (Failure::TooLarge(TooLarge::ProblemNode), 1)
+        ]
+        .into()
+    );
+    let problem = a.folder.view().problem.unwrap();
+    assert!(
+        problem.contains("notes.txt (it is too large to send"),
+        "{problem}"
+    );
+}
+
+fn forbidden() -> ServerError {
+    ServerError(koidrive_proto::v1::Error {
+        code: Code::Forbidden as i32,
+        message: "not a member".into(),
+        ..Default::default()
+    })
+}
+
+#[test]
+fn an_upload_that_halts_is_counted_by_its_cause() {
+    use crate::failures::{self, Halted};
+
+    let cases = [
+        (ChunkError::NoTarget { hash: Vec::new() }, Halted::Protocol),
+        (
+            ChunkError::Call(CallError::UnexpectedResult),
+            Halted::Protocol,
+        ),
+        (
+            ChunkError::Call(CallError::Server(forbidden())),
+            Halted::Refused,
+        ),
+        (
+            ChunkError::Refused {
+                hash: Vec::new(),
+                status: 403,
+                error: Some(forbidden()),
+            },
+            Halted::Refused,
+        ),
+    ];
+    for (error, halted) in cases {
+        let mut remote = Remote::new();
+        let (site, mut a) = linked(&mut remote, "a");
+        fs::write(site.root.join("notes.txt"), b"written on a").unwrap();
+        a.scan_until(|a| !a.work.is_empty());
+        let Some(Work::Upload(_)) = a.work.pop_front() else {
+            panic!("the new file is uploaded");
+        };
+        let shown = error.to_string();
+        let Err(stop) = a.folder.uploaded(Err(error)) else {
+            panic!("{shown} halts the upload");
+        };
+        assert_eq!(failures::halted(&stop), halted, "{shown}");
+    }
+}
+
+#[test]
+fn a_download_that_halts_is_counted_by_its_cause() {
+    use crate::failures::{self, Halted};
+
+    let cases = [
+        (
+            CallError::Stopped(StopReason::CredentialsRefused),
+            Halted::CredentialsRefused,
+        ),
+        (CallError::Server(forbidden()), Halted::Refused),
+        (CallError::UnexpectedResult, Halted::Protocol),
+    ];
+    for (error, halted) in cases {
+        let mut remote = Remote::new();
+        let (site_a, mut a) = linked(&mut remote, "a");
+        a.create(&mut remote, &site_a.root.join("notes.txt"), b"written on a");
+        let site = Site::new(&remote, "b");
+        let mut b = site.start();
+        b.connect(&remote);
+        b.scan_until(|b| b.folder.scanned);
+        *remote.chunks.call_error.lock().unwrap() = Some(error.clone());
+        let pending = loop {
+            match b.work.pop_front().expect("an effect is staged") {
+                Work::Stage(pending) => break pending,
+                other => b.perform(other, &mut remote).unwrap(),
+            }
+        };
+        let staged = ready(pending.stage(&remote.chunks));
+        let Err(stop) = b.folder.staged(pending, staged) else {
+            panic!("{error} halts the download");
+        };
+        assert_eq!(failures::halted(&stop), halted, "{error}");
+    }
+}
+
+#[test]
+fn a_listing_that_halts_is_counted_by_its_cause() {
+    use crate::failures::{self, Halted};
+
+    let cases = [
+        (
+            CallError::Stopped(StopReason::DeviceRevoked),
+            Halted::DeviceRevoked,
+        ),
+        (CallError::Server(forbidden()), Halted::Refused),
+        (CallError::UnexpectedResult, Halted::Protocol),
+    ];
+    for (error, halted) in cases {
+        let stop = super::later("s1", "tree", Listing::default(), &error).unwrap_err();
+        assert_eq!(failures::halted(&stop), halted, "{error}");
+    }
 }
 
 /// GUN-388, for an effect that failed: the node is named with why the effect failed.

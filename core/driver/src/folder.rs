@@ -209,6 +209,11 @@ pub(crate) struct Listing {
     failures: u32,
 }
 
+enum NotTaken {
+    Refused(ServerError),
+    TooLarge { bytes: usize },
+}
+
 /// How reading the tree ended.
 #[derive(Debug)]
 pub(crate) enum Listed {
@@ -652,9 +657,12 @@ impl Folder {
             Disposition::RetryAfter(wait) => wait,
             Disposition::Backoff => self.backoff.delay(self.failures),
             Disposition::Halt => {
-                return Err(Stop::Refused(format!(
-                    "uploading a file's content failed: {error}"
-                )));
+                let why = format!("uploading a file's content failed: {error}");
+                return Err(match &error {
+                    ChunkError::Call(call) => Stop::after_call(call, why),
+                    ChunkError::Refused { .. } => Stop::Refused(why),
+                    _ => Stop::Protocol(why),
+                });
             }
         };
         tracing::info!(space_id = self.link.space_id, %error, ?wait, "uploading again later");
@@ -694,7 +702,9 @@ impl Folder {
                 self.commit_ended();
                 self.result(&commit.commit_id, result)?;
             }
-            Err(CallError::Server(refusal)) => self.refused(commit, &refusal, &mut work)?,
+            Err(CallError::Server(refusal)) => {
+                self.refused(commit, NotTaken::Refused(refusal), &mut work)?
+            }
             Err(CallError::Stopped(_)) => {
                 self.flight = Flight::Unknown;
                 return Ok(work);
@@ -711,12 +721,7 @@ impl Folder {
                 )));
             }
             Err(CallError::TooLarge { bytes }) => {
-                let refusal = ServerError(ProtoError {
-                    code: Code::LimitExceeded as i32,
-                    message: format!("the commit is {bytes} bytes, more than a message may hold"),
-                    ..ProtoError::default()
-                });
-                self.refused(commit, &refusal, &mut work)?;
+                self.refused(commit, NotTaken::TooLarge { bytes }, &mut work)?
             }
             Err(error @ CallError::UnexpectedResult) => {
                 return Err(Stop::Protocol(format!("sending a commit failed: {error}")));
@@ -1217,13 +1222,20 @@ impl Folder {
         Ok(())
     }
 
-    /// The server refused `commit`.
     fn refused(
         &mut self,
         commit: Commit,
-        refusal: &ServerError,
+        not_taken: NotTaken,
         work: &mut Vec<Work>,
     ) -> Result<(), Stop> {
+        let refusal = &match &not_taken {
+            NotTaken::Refused(refusal) => refusal.clone(),
+            NotTaken::TooLarge { bytes } => ServerError(ProtoError {
+                code: Code::LimitExceeded as i32,
+                message: format!("the commit is {bytes} bytes, more than a message may hold"),
+                ..ProtoError::default()
+            }),
+        };
         let before = self.engine.commits.problems().clone();
         let failure = self.step(|engine, tx| {
             let failure = (engine.commits.failed(&refusal.0))
@@ -1240,12 +1252,25 @@ impl Folder {
             ?failure,
             "a commit was refused"
         );
-        let code = failures::refusal(refusal);
-        failures::failed(failures::Failure::Refused(code));
+        let (counted, node_counted, why) = match not_taken {
+            NotTaken::Refused(_) => {
+                let code = failures::refusal(refusal);
+                (
+                    failures::Failure::Refused(code),
+                    failures::Failure::ProblemNode(code),
+                    format!("the server refused it: {described}"),
+                )
+            }
+            NotTaken::TooLarge { .. } => (
+                failures::Failure::TooLarge(failures::TooLarge::Commit),
+                failures::Failure::TooLarge(failures::TooLarge::ProblemNode),
+                format!("it is too large to send: {}", refusal.message()),
+            ),
+        };
+        failures::failed(counted);
         for id in self.engine.commits.problems().difference(&before) {
-            failures::failed(failures::Failure::ProblemNode(code));
-            let why = format!("the server refused it: {described}");
-            self.refused_nodes.insert(id.clone(), why);
+            failures::failed(node_counted);
+            self.refused_nodes.insert(id.clone(), why.clone());
         }
         match failure {
             Failure::Resend if refusal.code() == Code::MissingChunks => {
@@ -2004,9 +2029,10 @@ fn later(
         Disposition::RetryAfter(wait) => wait,
         Disposition::Backoff => Backoff::default().delay(listing.failures),
         Disposition::Halt => {
-            return Err(Stop::Refused(format!(
-                "reading the space's {what} failed: {why}"
-            )));
+            return Err(Stop::after_call(
+                error,
+                format!("reading the space's {what} failed: {why}"),
+            ));
         }
     };
     tracing::info!(space_id, %error, ?wait, "reading the {what} again later");

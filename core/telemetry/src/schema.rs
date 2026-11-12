@@ -282,6 +282,8 @@ pub enum Failure {
     Refused(Refusal),
     /// The server refused an op of a commit, and the folder shows its node as a problem.
     ProblemNode(Refusal),
+    /// A commit was larger than a message may hold, so this device did not send it.
+    TooLarge(TooLarge),
     /// A question for the person was asked, also when one is asked again.
     Asked(Asked),
     /// The daemon could not start.
@@ -295,6 +297,7 @@ impl Failure {
             .chain(Transfer::ALL.iter().copied().map(Failure::Download))
             .chain(Refusal::ALL.iter().copied().map(Failure::Refused))
             .chain(Refusal::ALL.iter().copied().map(Failure::ProblemNode))
+            .chain(TooLarge::ALL.iter().copied().map(Failure::TooLarge))
             .chain(Asked::ALL.iter().copied().map(Failure::Asked))
             .chain(DaemonStart::ALL.iter().copied().map(Failure::DaemonStart))
     }
@@ -306,6 +309,7 @@ impl Failure {
             Failure::Download(why) => ("download_failed", why.name()),
             Failure::Refused(code) => ("refused", code.name()),
             Failure::ProblemNode(code) => ("problem_node", code.name()),
+            Failure::TooLarge(what) => ("too_large", what.name()),
             Failure::Asked(kind) => ("asked", kind.name()),
             Failure::DaemonStart(why) => ("daemon_start_failed", why.name()),
         }
@@ -431,6 +435,16 @@ labels! {
         ConfirmationRequired => "confirmation_required",
         /// A code this build does not know, or none.
         Unknown => "unknown",
+    }
+}
+
+labels! {
+    /// What a commit too large to send cost.
+    pub enum TooLarge {
+        /// The commit, which is split and sent again.
+        Commit => "commit",
+        /// A node whose op alone is too large, which the folder shows as a problem.
+        ProblemNode => "problem_node",
     }
 }
 
