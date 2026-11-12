@@ -931,11 +931,15 @@ impl Commits {
     /// move into the merged directory and the emptied one is removed. The accepted counter takes
     /// the commit's slot. Returns false while there is nothing to acknowledge.
     ///
-    /// A create the server refuses with ID_EXISTS while R holds the node live is no problem. Only
-    /// another device can have created a node under this device's ID first, as when both send a
-    /// file the server lost again (section 4.4). S stays without the node, so the next plan
-    /// compares L with what R holds instead of sending the create again: equal content leaves
-    /// nothing to send, and other content is kept beside R's as a new node (section 2.4).
+    /// A create the server refuses with ID_EXISTS while R holds the node, live or in the trash, is
+    /// no problem. Only another device can have created a node under this device's ID first, as
+    /// when both send a file the server lost again (section 4.4), and it may have deleted the node
+    /// since. S stays without a node R holds live, so the next plan compares L with what R holds
+    /// instead of sending the create again: equal content leaves nothing to send, and other
+    /// content is kept beside R's as a new node (section 2.4). A node R holds in the trash keeps
+    /// the S that L and R agreed on while the create was out, and otherwise takes R's content at the
+    /// position the create sent as its S. So L follows the delete unless it holds content the
+    /// server never showed for the node, which revives it (R8).
     ///
     /// A `Restore` op changes neither S nor L. What it sent is an instruction, and only the server
     /// knows the nodes and the content it brought back, so all of it is a remote change that R
@@ -1003,7 +1007,7 @@ impl Commits {
                         agreed.extend(agree(trees, &create.node_id, result.seq));
                         synced.set(&create.node_id, Some(shape));
                     }
-                    let exists = taken && trees.remote().live(&create.node_id).is_some();
+                    let exists = taken && trees.remote().get(&create.node_id).is_some();
                     (
                         &create.node_id,
                         applied || exists || code == Code::MergedInto,
@@ -1022,7 +1026,7 @@ impl Commits {
                         synced.set(&create.node_id, Some(shape));
                         trees.sent_edit(&create.node_id, create.content.as_ref());
                     }
-                    let exists = taken && trees.remote().live(&create.node_id).is_some();
+                    let exists = taken && trees.remote().get(&create.node_id).is_some();
                     (&create.node_id, applied || exists)
                 }
                 Some(op::Op::UpdateContent(update)) => {
@@ -1091,9 +1095,26 @@ impl Commits {
                 }
                 _ => continue,
             };
-            let published = matches!(&op.op, Some(op::Op::CreateDir(_) | op::Op::CreateFile(_)))
-                && done
-                && self.published.remove(node);
+            let created = matches!(&op.op, Some(op::Op::CreateDir(_) | op::Op::CreateFile(_)));
+            if created
+                && taken
+                && let Some((sent_parent, sent_name)) = sent
+                && let Some(remote) = trees.remote().get(node).filter(|remote| remote.trashed)
+                && synced.get(trees, node).is_none()
+            {
+                let shape = Shape {
+                    parent: merged.get(sent_parent).unwrap_or(sent_parent).clone(),
+                    name: sent_name.clone(),
+                    ..remote.shape.clone()
+                };
+                synced.set(node, Some(shape));
+                let content = match &op.op {
+                    Some(op::Op::CreateFile(create)) => create.content.as_ref(),
+                    _ => None,
+                };
+                trees.sent_edit(node, content);
+            }
+            let published = created && done && self.published.remove(node);
             if renamed
                 && !published
                 && let Some((sent_parent, sent_name)) = sent

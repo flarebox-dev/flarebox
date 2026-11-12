@@ -9,7 +9,7 @@
 //! refuses a state. `devices_converge_once_the_faults_stop` also asks that every disk reaches the
 //! server's tree and that no commit makes a change the user of its device never made.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use koidrive_proto::v1::error;
 use koidrive_sim::world::disk::Place;
@@ -155,7 +155,7 @@ proptest! {
     }
 
     #[test]
-    #[ignore = "a write can stay off the server after several server restores (GUN-480)"]
+    #[ignore = "after a server loss, a device can move a node back to a position it never set (GUN-531)"]
     fn devices_converge_across_server_restores(devices in 2..=3usize, phases in phases(Losses::Restores)) {
         converge(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
@@ -1046,6 +1046,157 @@ fn a_copy_of_a_rolled_back_write_after_the_recovery_is_refused() {
     );
 }
 
+#[test]
+fn an_edit_back_to_the_bytes_a_restore_left_keeps_its_file_and_the_lost_edit_beside_it() {
+    let world = converge(
+        2,
+        &[
+            vec![(0, file("a"))],
+            vec![(0, BACKUP), (1, overwrite(0))],
+            vec![(0, RESTORE), (0, overwrite(0))],
+        ],
+    )
+    .unwrap();
+    for device in &world.devices {
+        let disk = &device.disk;
+        let write = |ino: u128| disk.entries()[&ino].content.as_ref().map(|c| c.mtime_ns);
+        let a = disk.child(&Place::Root, "a").unwrap();
+        assert_eq!(write(a), Some(3));
+        let writes: BTreeSet<Option<i64>> = disk.entries().keys().map(|ino| write(*ino)).collect();
+        assert_eq!(writes, BTreeSet::from([Some(2), Some(3)]));
+    }
+}
+
+#[test]
+fn a_write_two_downloads_place_after_a_restore_took_it_is_kept_by_both_beside_the_edit_over_it() {
+    let mut lost = vec![(0, file("a"))];
+    lost.extend(commit(0));
+    lost.extend([
+        (1, DELIVER),
+        (1, EFFECT),
+        (2, DELIVER),
+        (2, EFFECT),
+        (0, overwrite(0)),
+        (0, RESTORE),
+        (1, EFFECT),
+        (2, EFFECT),
+    ]);
+    let world = converge(3, &[vec![(0, BACKUP)], lost]).unwrap();
+    for device in &world.devices {
+        let disk = &device.disk;
+        let write = |ino: &u128| disk.entries()[ino].content.as_ref().map(|c| c.mtime_ns);
+        let a = disk.child(&Place::Root, "a").unwrap();
+        assert_eq!(write(&a), Some(2));
+        let mut writes: Vec<Option<i64>> = disk.entries().keys().map(write).collect();
+        writes.sort();
+        assert_eq!(writes, [Some(1), Some(1), Some(2)]);
+    }
+}
+
+fn created_again_by_both_and_deleted_by_one(made: Step, edit: bool) -> World {
+    let mut lost = vec![
+        (0, RESTORE),
+        (0, Step::Connect),
+        (1, Step::Connect),
+        (0, DELIVER),
+        (1, DELIVER),
+    ];
+    lost.extend(edit.then_some((1, overwrite(0))));
+    lost.extend([
+        (1, SCAN),
+        (1, COMMIT),
+        (0, SCAN),
+        (0, COMMIT),
+        (0, COMMIT),
+        (0, DELIVER),
+        (0, DELIVER),
+        (0, delete(0)),
+        (0, SCAN),
+        (0, COMMIT),
+        (0, COMMIT),
+        (0, DELIVER),
+        (0, DELIVER),
+        (1, COMMIT),
+        (1, DELIVER),
+        (1, DELIVER),
+        (1, DELIVER),
+    ]);
+    converge(2, &[Vec::new(), vec![(0, BACKUP), (0, made)], lost]).unwrap()
+}
+
+#[test]
+fn a_lost_folder_another_device_creates_again_and_deletes_first_is_deleted_on_both() {
+    let world = created_again_by_both_and_deleted_by_one(folder("a"), false);
+    assert!(
+        world
+            .devices
+            .iter()
+            .all(|device| device.disk.entries().is_empty())
+    );
+}
+
+#[test]
+fn a_lost_file_another_device_creates_again_and_deletes_first_is_deleted_on_both() {
+    let world = created_again_by_both_and_deleted_by_one(file("a"), false);
+    assert!(
+        world
+            .devices
+            .iter()
+            .all(|device| device.disk.entries().is_empty())
+    );
+}
+
+#[test]
+fn an_edit_of_a_lost_file_another_device_creates_again_and_deletes_first_revives_it() {
+    let world = created_again_by_both_and_deleted_by_one(file("a"), true);
+    for device in &world.devices {
+        let disk = &device.disk;
+        let a = disk.child(&Place::Root, "a").unwrap();
+        assert_eq!(disk.entries().len(), 1);
+        assert_eq!(
+            disk.entries()[&a].content.as_ref().map(|c| c.mtime_ns),
+            Some(2)
+        );
+    }
+}
+
+#[test]
+fn a_swap_after_a_restore_passes_through_the_pending_name_of_a_name_a_lost_commit_gave() {
+    let u = |kind, target, parent, name, text| {
+        Step::User(Action {
+            kind,
+            target,
+            parent,
+            name,
+            text,
+        })
+    };
+    let phases = vec![
+        vec![
+            (1, u(0, 0, 0, 2, 0)),
+            (1, u(1, 0, 6892790594048859264, 0, 0)),
+        ],
+        vec![
+            (0, u(2, 0, 0, 0, 0)),
+            (0, BACKUP),
+            (0, u(1, 0, 1923514285381434823, 0, 0)),
+            (2, u(1, 0, 0, 1, 0)),
+            (0, u(1, 0, 13397848212569861839, 2, 0)),
+            (0, u(1, 0, 0, 3, 0)),
+        ],
+        vec![
+            (2, u(0, 0, 3443233485426864259, 1, 0)),
+            (0, Step::Work(0)),
+            (0, Step::Work(0)),
+            (0, Step::Work(0)),
+            (1, DELIVER),
+            (0, RESTORE),
+            (1, Step::Effect(Outcome::Crash(Cut::Placed))),
+        ],
+    ];
+    converge(2, &phases).unwrap();
+}
+
 /// Once the devices are quiet after a restore that lost a rename, the old name is refused like
 /// any other name the user did not give.
 #[test]
@@ -1268,4 +1419,108 @@ fn an_edit_made_while_its_file_is_parked_for_a_rename_stays_on_the_server() {
     for device in &world.devices {
         assert_eq!(device.disk.entries().len(), 2);
     }
+}
+
+#[test]
+fn a_write_a_restore_exposed_stays_on_the_disks_through_a_second_restore() {
+    let edit = Step::User(Action {
+        kind: 2,
+        target: 0,
+        parent: 0,
+        name: 0,
+        text: 7,
+    });
+    let mut lost = vec![(0, RESTORE), (0, Step::Connect), (1, Step::Connect)];
+    for _ in 0..30 {
+        lost.extend([(0, Step::Work(0)), (1, Step::Work(0))]);
+    }
+    lost.push((0, RESTORE));
+    let world = keep(
+        2,
+        &[vec![(0, file("a"))], vec![(0, BACKUP), (0, edit)], lost],
+    )
+    .unwrap();
+    assert!(world.devices.iter().all(|device| device.disk.holds(2)));
+}
+
+#[test]
+fn a_lost_file_another_device_creates_again_renames_and_deletes_stays_deleted() {
+    let lost = vec![
+        (0, RESTORE),
+        (0, Step::Connect),
+        (1, Step::Connect),
+        (0, DELIVER),
+        (1, DELIVER),
+        (1, SCAN),
+        (1, COMMIT),
+        (0, SCAN),
+        (0, COMMIT),
+        (0, COMMIT),
+        (0, DELIVER),
+        (0, DELIVER),
+        (0, rename(0, 0, "b")),
+        (0, SCAN),
+        (0, COMMIT),
+        (0, COMMIT),
+        (0, DELIVER),
+        (0, DELIVER),
+        (0, delete(0)),
+        (0, SCAN),
+        (0, COMMIT),
+        (0, COMMIT),
+        (0, DELIVER),
+        (0, DELIVER),
+        (1, COMMIT),
+        (1, DELIVER),
+        (1, DELIVER),
+        (1, DELIVER),
+    ];
+    let world = converge(2, &[Vec::new(), vec![(0, BACKUP), (0, file("a"))], lost]).unwrap();
+    assert!(
+        world
+            .devices
+            .iter()
+            .all(|device| device.disk.entries().is_empty())
+    );
+}
+
+#[test]
+fn a_lost_file_created_again_edited_and_deleted_stays_deleted() {
+    let lost = vec![
+        (0, RESTORE),
+        (0, Step::Connect),
+        (1, Step::Connect),
+        (0, DELIVER),
+        (1, DELIVER),
+        (1, SCAN),
+        (1, COMMIT),
+        (0, SCAN),
+        (0, COMMIT),
+        (0, COMMIT),
+        (0, DELIVER),
+        (0, DELIVER),
+        (0, overwrite(0)),
+        (0, SCAN),
+        (0, COMMIT),
+        (0, COMMIT),
+        (0, DELIVER),
+        (0, DELIVER),
+        (0, delete(0)),
+        (0, SCAN),
+        (0, COMMIT),
+        (0, COMMIT),
+        (0, DELIVER),
+        (0, DELIVER),
+        (1, COMMIT),
+        (1, DELIVER),
+        (1, DELIVER),
+        (1, DELIVER),
+    ];
+    let world = converge(2, &[Vec::new(), vec![(0, BACKUP), (0, file("a"))], lost]).unwrap();
+    assert!(
+        world
+            .devices
+            .iter()
+            .all(|device| device.disk.entries().is_empty())
+    );
 }
