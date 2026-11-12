@@ -1140,7 +1140,7 @@ impl Trees {
     }
 
     pub fn kept_original(&self, id: &str) -> Option<&NodeId> {
-        self.kept_originals.get(id)
+        (self.kept_originals.get(id)).filter(|kept| self.l.get(kept).is_some())
     }
 
     /// Records that an edit of this device, in the commit at `seq`, set the content of `id`, if R
@@ -1298,7 +1298,8 @@ impl Trees {
                 self.l.get(&deleted.id).is_none() && self.s.get(&deleted.id).is_none()
             })
             .filter(|deleted| {
-                (deleted.kept.as_ref()).is_none_or(|kept| self.r.live(kept).is_some())
+                (deleted.kept.as_ref())
+                    .is_none_or(|kept| self.l.get(kept).is_none() || self.r.live(kept).is_some())
             })
             .filter_map(|deleted| {
                 let remote = (self.r.get(&deleted.id))

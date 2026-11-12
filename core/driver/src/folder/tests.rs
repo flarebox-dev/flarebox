@@ -8348,3 +8348,103 @@ fn a_lost_keep_original_below_a_removed_folder_deletes_the_folder_after_the_copy
 
     assert_eq!(restored.names(), ["main.go"]);
 }
+
+fn keep_original_lost_then_its_folder_removed(original_moved_out: bool) -> (Remote, Site) {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    fs::create_dir_all(site_a.root.join("d/e")).unwrap();
+    a.create(&mut remote, &site_a.root.join("d/e/main.go"), b"v1");
+    let (site_b, mut b) = linked(&mut remote, "b");
+    b.settle();
+    fs::write(site_a.root.join("d/e/main.go"), b"from a").unwrap();
+    fs::write(site_b.root.join("d/e/main.go"), b"from b").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(&mut remote);
+    b.scan_until(|b| !b.work.is_empty());
+    b.run(&mut remote);
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+    let mut chunks = Server::default();
+    chunks.chunks.clone_from(&remote.chunks.chunks);
+    let mut restored = Remote {
+        space: remote.space.clone(),
+        chunks,
+        results: remote.results.clone(),
+    };
+    answer(&site_b, Answer::KeepOriginal);
+    let step = b.folder.requested();
+    b.take(step).unwrap();
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+    drop(b);
+    if original_moved_out {
+        fs::rename(site_b.root.join("d/e/main.go"), site_b.root.join("main.go")).unwrap();
+    }
+    fs::remove_dir_all(site_b.root.join("d")).unwrap();
+
+    let mut b = site_b.start();
+    b.connect(&restored);
+    b.scan_until(|b| b.folder.scanned);
+    for _ in 0..5 {
+        b.run(&mut restored);
+        b.pull(&restored);
+        b.run(&mut restored);
+        b.settle();
+    }
+    (restored, site_b)
+}
+
+#[test]
+fn a_lost_keep_original_whose_folder_the_person_removed_with_the_original_brings_nothing_back() {
+    let (restored, site_b) = keep_original_lost_then_its_folder_removed(false);
+
+    assert_eq!(restored.names(), Vec::<String>::new());
+    assert_eq!(names(&site_b.root), Vec::<String>::new());
+}
+
+#[test]
+fn a_lost_keep_original_moved_out_of_a_folder_the_person_removed_keeps_only_the_original() {
+    let (restored, site_b) = keep_original_lost_then_its_folder_removed(true);
+
+    assert_eq!(restored.names(), ["main.go"]);
+    assert_eq!(
+        files(&site_b.root),
+        [("main.go".to_owned(), "from a".to_owned())]
+    );
+}
+
+#[test]
+fn a_lost_keep_original_whose_original_both_devices_deleted_brings_nothing_back() {
+    let mut remote = Remote::new();
+    let ((site_a, mut a), (site_b, mut b)) = edited_on_both(&mut remote);
+    let mut chunks = Server::default();
+    chunks.chunks.clone_from(&remote.chunks.chunks);
+    let mut restored = Remote {
+        space: remote.space.clone(),
+        chunks,
+        results: remote.results.clone(),
+    };
+    answer(&site_b, Answer::KeepOriginal);
+    let step = b.folder.requested();
+    b.take(step).unwrap();
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+    fs::remove_file(site_b.root.join("main.go")).unwrap();
+    b.scan_until(|b| !b.work.is_empty());
+    b.run(&mut remote);
+    assert_eq!(remote.names(), Vec::<String>::new());
+
+    let (site_c, mut c) = linked(&mut restored, "c");
+    c.settle();
+    fs::remove_file(site_c.root.join("main.go")).unwrap();
+    c.scan_until(|c| !c.work.is_empty());
+    c.run(&mut restored);
+    assert_eq!(restored.names(), [COPY]);
+
+    b.event(Event::Connected(restored.space.welcome(&b.caller)))
+        .unwrap();
+    for _ in 0..3 {
+        b.pull(&restored);
+        b.run(&mut restored);
+        b.settle();
+    }
+    assert_eq!(restored.names(), Vec::<String>::new());
+    assert_eq!(names(&site_b.root), Vec::<String>::new());
+}
