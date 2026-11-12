@@ -37,7 +37,7 @@ pub enum TelemetryAction {
     On,
     /// Stop sending usage reports, and delete the install id and everything not sent yet.
     Off,
-    /// Print the reports that wait to be sent, exactly as they would be sent. Sends nothing.
+    /// Print the reports that wait to be sent, as the daemon would send them. Sends nothing.
     Preview,
     /// Draw a new install id and delete everything not sent yet.
     Reset,
@@ -144,27 +144,45 @@ async fn question() -> Option<bool> {
     }
 }
 
-/// Runs one setup step and records how it ended and how long it took.
+/// Runs one setup step and records how it ended and how long it took. A step dropped before it ends, by Ctrl-C or
+/// a signal, is recorded as aborted.
 pub async fn step<T, E>(step: SetupStep, work: impl Future<Output = Result<T, E>>) -> Result<T, E> {
-    let started = Instant::now();
-    let outcome = work.await;
-    if let Some(run) = RUN.get()
-        && let Some(flow) = flow()
-    {
-        run.recorder.event(Event::SetupStep {
-            day: koidrive_telemetry::today(),
-            flow,
-            step,
-            outcome: if outcome.is_ok() {
-                Outcome::Ok
-            } else {
-                Outcome::Failed
-            },
-            cloudflare_code: None,
-            seconds_magnitude: magnitude(started.elapsed().as_secs()),
-        });
+    let mut running = Running {
+        step,
+        started: Instant::now(),
+        outcome: Outcome::Aborted,
+    };
+    let result = work.await;
+    running.outcome = if result.is_ok() {
+        Outcome::Ok
+    } else {
+        Outcome::Failed
+    };
+    result
+}
+
+/// A step in progress, which records itself when it is dropped.
+struct Running {
+    step: SetupStep,
+    started: Instant,
+    outcome: Outcome,
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        if let Some(run) = RUN.get()
+            && let Some(flow) = flow()
+        {
+            run.recorder.event(Event::SetupStep {
+                day: koidrive_telemetry::today(),
+                flow,
+                step: self.step,
+                outcome: self.outcome,
+                cloudflare_code: None,
+                seconds_magnitude: magnitude(self.started.elapsed().as_secs()),
+            });
+        }
     }
-    outcome
 }
 
 /// Moves what this run recorded to disk. A setup command also tries to send it, for at most two seconds.
@@ -215,8 +233,8 @@ async fn send(store: &Store, client: Client) -> Option<Sent> {
     .ok()
 }
 
-/// The daemon's loop: every ten minutes, and once more when it stops, it moves the sums to disk and sends what is
-/// due. It reads the choice again each time, so `koi telemetry off` stops it without a restart.
+/// The daemon's loop: every ten minutes it moves the sums to disk and sends what is due. When it stops it only moves
+/// them to disk, so that stopping never waits on the network; a later run sends them. It reads the choice again each time, so `koi telemetry off` stops it without a restart.
 pub async fn run_daemon(mut stop: tokio::sync::oneshot::Receiver<()>) {
     let Some(run) = RUN.get() else { return };
     loop {
@@ -263,6 +281,16 @@ pub fn command(paths: &Paths, action: TelemetryAction) -> Result<Done, CliError>
             paths.state_dir.display()
         ))
     };
+    let overridden = |choice: bool| -> Result<&'static str, CliError> {
+        let status = store.status(var).map_err(failed)?;
+        Ok(match (status.mode != Mode::Off) == choice {
+            true => "",
+            false if status.source == Source::DoNotTrack => {
+                "DO_NOT_TRACK keeps reports off until it is unset.\n"
+            }
+            false => "KOIDRIVE_TELEMETRY overrides this choice until it is unset.\n",
+        })
+    };
     match action {
         TelemetryAction::Status => {
             let settings = store.settings().map_err(failed)?;
@@ -290,7 +318,7 @@ pub fn command(paths: &Paths, action: TelemetryAction) -> Result<Done, CliError>
                 queued.days.len(),
                 queued.events.len()
             ));
-            if on && !sends {
+            if status.mode == Mode::On && !sends {
                 text.push_str(
                     "This build has no project token, so reports wait on this machine and are not sent.\n",
                 );
@@ -316,7 +344,10 @@ pub fn command(paths: &Paths, action: TelemetryAction) -> Result<Done, CliError>
                 enabled: true,
                 install_id: settings.install_id,
             };
-            let text = "Usage reports are on. See what is sent with koi telemetry preview.\n";
+            let text = format!(
+                "Usage reports are on. See what is sent with koi telemetry preview.\n{}",
+                overridden(true)?
+            );
             Ok(Done::ok(data, text).then(&["koi", "telemetry", "preview"]))
         }
         TelemetryAction::Off => {
@@ -325,8 +356,10 @@ pub fn command(paths: &Paths, action: TelemetryAction) -> Result<Done, CliError>
                 enabled: false,
                 install_id: None,
             };
-            let text =
-                "Usage reports are off. The install id and the reports not sent yet are deleted.\n";
+            let text = format!(
+                "Usage reports are off. The install id and the reports not sent yet are deleted.\n{}",
+                overridden(false)?
+            );
             Ok(Done::ok(data, text))
         }
         TelemetryAction::Preview => {

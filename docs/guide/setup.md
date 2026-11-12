@@ -16,7 +16,7 @@ You need one server, in a Cloudflare account you own, and at least one device si
 koi setup
 ```
 
-On a terminal, `koi setup` first asks whether to send anonymous usage reports. Press Enter for yes. [Usage reports](telemetry.md) lists what they hold and how to turn them off.
+On a terminal, `koi setup` first asks whether to send anonymous usage reports, unless you already chose or an environment variable decides it. Press Enter for yes. [Usage reports](telemetry.md) lists what they hold and how to turn them off.
 
 Then it asks how to set up this machine:
 

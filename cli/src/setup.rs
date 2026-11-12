@@ -289,13 +289,15 @@ pub async fn setup(
         "2" => {
             crate::telemetry::set_flow(SetupFlow::Pairing);
             let code = prompt("Pairing code: ").await?;
-            let invitation = crate::pairing::parse(&code, None).map_err(CliError::usage)?;
-            let request = Request::Pair {
-                server: invitation.server,
-                code: invitation.code,
-                name: device_name.to_owned(),
+            let pair = async {
+                let invitation = crate::pairing::parse(&code, None).map_err(CliError::usage)?;
+                let request = Request::Pair {
+                    server: invitation.server,
+                    code: invitation.code,
+                    name: device_name.to_owned(),
+                };
+                report_paired(paths, ipc::run(paths, request).await?)
             };
-            let pair = async { report_paired(paths, ipc::run(paths, request).await?) };
             crate::telemetry::step(SetupStep::Pair, pair).await?;
         }
         other => return Err(CliError::usage(format!("{other:?} is not 1 or 2"))),
@@ -577,11 +579,19 @@ pub(crate) async fn prompt(question: &str) -> Result<String, CliError> {
     std::io::stdout()
         .flush()
         .map_err(|error| error.to_string())?;
-    read_answer(|| {
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line).map(|_| line)
-    })
-    .await
+    read_answer(|| read_line(std::io::stdin().lock())).await
+}
+
+/// Reads one line. A closed input is an error rather than an empty answer, so Ctrl-D never reads as Enter.
+fn read_line(mut input: impl std::io::BufRead) -> std::io::Result<String> {
+    let mut line = String::new();
+    match input.read_line(&mut line)? {
+        0 => Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "stdin closed before an answer",
+        )),
+        _ => Ok(line),
+    }
 }
 
 /// Runs the blocking `read` on a thread of its own, so the caller can stop waiting for it: `with_session` ends the
@@ -953,6 +963,7 @@ impl Session {
         if let Some(state) = self.resumable(paths)? {
             return self.finish_deploy(paths, state, device_name).await;
         }
+        crate::telemetry::step(SetupStep::R2Checkout, self.require_r2()).await?;
         let found = self.find_servers().await?;
         if let Some(server) = found.first() {
             return Err(format!(
@@ -1023,7 +1034,6 @@ impl Session {
     /// Picks a free Worker name and a new bucket name, then deploys and claims a new server (sections 4.3 and 4.4).
     async fn deploy(&mut self, paths: &Paths, device_name: &str) -> Result<(), CliError> {
         let bundle = embedded_bundle()?;
-        crate::telemetry::step(SetupStep::R2Checkout, self.require_r2()).await?;
         let api = self.fresh().await?;
         let scripts: Vec<String> = api
             .scripts(self.account())
@@ -1539,6 +1549,14 @@ mod tests {
 
     use super::fake::{self, ACCOUNT, Fake, Reply, cf, proto, revoked, tokens};
     use super::*;
+
+    #[test]
+    fn a_closed_input_is_not_an_empty_answer() {
+        let closed = read_line(&b""[..]).unwrap_err();
+        assert_eq!(closed.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(read_line(&b"\n"[..]).unwrap(), "\n");
+        assert_eq!(read_line(&b"n\n"[..]).unwrap(), "n\n");
+    }
 
     #[test]
     fn setup_guides_only_on_two_terminals_without_json_or_ci() {

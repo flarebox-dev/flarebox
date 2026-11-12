@@ -1,6 +1,6 @@
 # Usage reports
 
-Koidrive can send anonymous usage reports to the Koidrive project. They help fix what breaks: where setup fails, which errors happen on real machines, and how fast sync is. Reports never hold your files' names, paths or contents, your server's address or your account.
+Koidrive can send anonymous usage reports to the Koidrive project. They help fix what breaks: which setup steps fail and where Koidrive crashes. Reports never hold your files' names, paths or contents, your server's address or your account.
 
 ## Turn reports on or off
 
@@ -16,13 +16,13 @@ Press Enter or type `y` to send them, or type `n` to not send them. Change your 
 koi telemetry status    # whether reports are sent, why, and what waits to be sent
 koi telemetry on
 koi telemetry off       # also deletes the install id and the reports not sent yet
-koi telemetry preview   # prints the waiting reports exactly as they would be sent
+koi telemetry preview   # prints the waiting reports as the daemon would send them
 koi telemetry reset     # draws a new install id and deletes the reports not sent yet
 ```
 
-The other commands never ask. They send reports only when this profile already chose to send them, or when `KOIDRIVE_TELEMETRY` turns them on. `koi setup`, `koi join`, `koi server deploy`, `koi server add-device` and `koi server claim` also take `--telemetry on` or `--telemetry off`, which stores the choice without asking. `koi setup` doesn't ask with `--json`, or when the `CI` variable is set to anything but `0` or `false`.
+The other commands never ask. They send reports only when this profile already chose to send them, or when `KOIDRIVE_TELEMETRY` turns them on. `koi setup`, `koi join`, `koi server deploy`, `koi server add-device` and `koi server claim` also take `--telemetry on` or `--telemetry off`, which stores the choice without asking. `koi setup` doesn't ask with `--json`, or when the `CI` variable is set to any value. With `--interactive` it asks unless `CI` is set to something other than `0` or `false`.
 
-A running daemon notices `koi telemetry off` and `reset` at its next ten-minute tick. A daemon that started while reports were off starts sending them only after it restarts.
+A running daemon notices `koi telemetry off` and `reset` at its next ten-minute tick. A daemon that started while reports were off records nothing of its own until it restarts, but it still sends what later commands queue. When the daemon stops, it writes what it holds to disk and leaves the sending to its next run.
 
 These environment variables override the choice:
 
