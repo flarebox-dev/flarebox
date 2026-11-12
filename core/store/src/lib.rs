@@ -401,6 +401,13 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE recorded_nodes
         ADD COLUMN ino_high INTEGER NOT NULL DEFAULT 0 CHECK (ino IS NOT NULL OR ino_high = 0);
 ",
+    "
+    CREATE TABLE pending_names (
+        node_id TEXT PRIMARY KEY,
+        sent TEXT NOT NULL,
+        name TEXT NOT NULL
+    ) STRICT, WITHOUT ROWID;
+",
 ];
 
 /// The schema version this build writes.

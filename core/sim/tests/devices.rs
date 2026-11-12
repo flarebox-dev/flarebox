@@ -1524,3 +1524,70 @@ fn a_lost_file_created_again_edited_and_deleted_stays_deleted() {
             .all(|device| device.disk.entries().is_empty())
     );
 }
+
+#[test]
+fn a_folder_sent_at_a_pending_name_that_an_edit_brings_back_takes_its_name() {
+    let phases = vec![
+        vec![(0, file("a"))],
+        vec![
+            (1, overwrite(0)),
+            (0, Step::Work(0)),
+            (0, Step::Work(0)),
+            (0, file("b")),
+            (0, Step::Work(0)),
+            (0, Step::Work(0)),
+            (0, folder("A")),
+            (0, folder("c.txt")),
+            (1, folder("a")),
+            (0, Step::Work(191953005214663284)),
+            (0, overwrite(9057257590032405897)),
+            (0, Step::Work(1656413589262271176)),
+            (0, rename(5708514389238217460, 9546544883134816759, "a")),
+            (0, Step::Work(0)),
+            (0, COMMIT),
+            (0, delete(4880399959711454722)),
+        ],
+    ];
+    converge(2, &phases).unwrap();
+}
+
+#[test]
+fn a_folder_sent_at_a_pending_name_for_a_case_folded_name_that_an_edit_brings_back_takes_its_name()
+{
+    let act = |kind, target, parent, name: &str, text| {
+        let name = NAMES.iter().position(|other| *other == name).unwrap();
+        Step::User(Action {
+            kind,
+            target,
+            parent,
+            name,
+            text,
+        })
+    };
+    let phases = vec![
+        vec![(1, file("ß")), (0, file("a")), (0, file("c.txt"))],
+        vec![
+            (0, overwrite(2828337353004866769)),
+            (0, folder("a")),
+            (0, Step::Work(0)),
+            (0, Step::Work(15079979194851)),
+            (
+                0,
+                act(0, 17522603601231760989, 2149907348572024772, "ss", 1),
+            ),
+            (1, act(2, 4682896762454486991, 9427922460036998013, "ß", 1)),
+            (0, rename(14663728549993967226, 16228656401449306453, "A")),
+            (0, Step::Connect),
+            (0, SCAN),
+            (0, Step::Work(13397615803372223702)),
+            (0, Step::Work(8052162068318610133)),
+            (
+                0,
+                act(1, 14296328599741790799, 10114328226956053520, "ß", 3),
+            ),
+            (0, act(4, 11544038771373029048, 9096678758980585778, "A", 2)),
+            (0, COMMIT),
+        ],
+    ];
+    converge(2, &phases).unwrap();
+}

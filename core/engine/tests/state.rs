@@ -11,7 +11,7 @@ use koidrive_engine::guard::{Counted, GuardState, RemoteDeletion, Trash};
 use koidrive_engine::ids::uuid_v7;
 use koidrive_engine::question::{Answer, Held, Limit, Question, QuestionKind, Revisions};
 use koidrive_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
-use koidrive_engine::state::{Agreed, CommitsState, EffectsState, StateError, TreesState};
+use koidrive_engine::state::{Agreed, CommitsState, EffectsState, Pending, StateError, TreesState};
 use koidrive_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape, TreeError};
 use koidrive_proto::v1::{Commit, CommitResult, Delete, Move, Op, OpResult, op};
 
@@ -222,6 +222,14 @@ fn commits_state() -> CommitsState {
         slots: [(2, 5), (3, 8)].into(),
         questions: questions(),
         published: ["n".into()].into(),
+        pending: [(
+            "q".into(),
+            Pending {
+                sent: "q (pending)".into(),
+                name: "q".into(),
+            },
+        )]
+        .into(),
         guard: guard_state(),
     }
 }
