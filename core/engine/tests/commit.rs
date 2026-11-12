@@ -778,6 +778,15 @@ fn a_parked_fork_recovers_after_its_empty_local_parent_is_deleted() {
         trees.work()
     );
     assert!(trees.work().is_empty());
+    let (id, fork) = (trees.remote().iter())
+        .find(|(_, node)| !node.trashed && node.shape.content == Some(content(2)))
+        .expect("the edited fork is on the server");
+    assert!(trees.remote().live(&fork.shape.parent).is_some());
+    assert_eq!(fork.shape.name, "x");
+    assert_eq!(
+        trees.local().get(id).map(|node| &node.shape),
+        Some(&fork.shape)
+    );
 }
 
 /// Another device renames and rewrites n, and the disk takes both, so L and R agree. S cannot take
