@@ -594,7 +594,11 @@ fn expectation<'a>(
 fn chunk_list(chunks: &[Value]) -> Result<Vec<ChunkRef>, String> {
     let mut out = Vec::new();
     for chunk in chunks {
-        keys(chunk, "a chunk", &["text", "counter_le32", "size"])?;
+        keys(
+            chunk,
+            "a chunk",
+            &["text", "counter_le32", "size", "repeat"],
+        )?;
         let pieces: Vec<Vec<u8>> = match (opt_str(chunk, "text")?, opt_u64(chunk, "counter_le32")?)
         {
             (Some(text), None) => vec![text.as_bytes().to_vec()],
@@ -606,12 +610,16 @@ fn chunk_list(chunks: &[Value]) -> Result<Vec<ChunkRef>, String> {
             }
         };
         let size = opt_u64(chunk, "size")?;
-        for bytes in pieces {
-            out.push(ChunkRef {
-                hash: Sha256::digest(&bytes).to_vec(),
+        let listed: Vec<ChunkRef> = pieces
+            .iter()
+            .map(|bytes| ChunkRef {
+                hash: Sha256::digest(bytes).to_vec(),
                 size: size.map_or(bytes.len() as u32, |s| s as u32),
                 encoding: 0,
-            });
+            })
+            .collect();
+        for _ in 0..opt_u64(chunk, "repeat")?.unwrap_or(1) {
+            out.extend(listed.iter().cloned());
         }
     }
     Ok(out)

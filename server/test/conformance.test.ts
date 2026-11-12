@@ -145,7 +145,7 @@ const encoder = new TextEncoder();
 async function chunkList(list: Json[]): Promise<Chunk[]> {
   const out: Chunk[] = [];
   for (const entry of list) {
-    const chunk = keys(entry, "a chunk", ["text", "counter_le32", "size"]);
+    const chunk = keys(entry, "a chunk", ["text", "counter_le32", "size", "repeat"]);
     const text = optStr(chunk, "text");
     const counter = optUint(chunk, "counter_le32");
     let pieces: Uint8Array[];
@@ -158,7 +158,9 @@ async function chunkList(list: Json[]): Promise<Chunk[]> {
       });
     } else fail(`a chunk needs exactly one of text and counter_le32: ${show(entry)}`);
     const size = optUint(chunk, "size");
-    for (const bytes of pieces) out.push({ ref: create(ChunkRefSchema, { hash: await sha256(bytes), size: size ?? bytes.length }), bytes });
+    const listed: Chunk[] = [];
+    for (const bytes of pieces) listed.push({ ref: create(ChunkRefSchema, { hash: await sha256(bytes), size: size ?? bytes.length }), bytes });
+    for (let i = 0; i < (optUint(chunk, "repeat") ?? 1); i++) out.push(...listed);
   }
   return out;
 }
