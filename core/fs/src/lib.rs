@@ -491,14 +491,15 @@ pub struct Snapshot {
 /// What one [`Snapshot::rescan`] found.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Rescan {
-    /// The changes, already applied to the snapshot.
+    /// The changes, already applied to the snapshot. A removal held back for
+    /// the search under left-out entries leaves the snapshot without one.
     pub changes: Vec<Change>,
     /// Paths the scan saw disappear but could not confirm gone: present,
-    /// unreadable, or under a parent that changed during the confirmation,
-    /// and paths gone from where the search under left-out entries has not
-    /// finished.
-    /// The snapshot keeps what it knew about them and everything below them;
-    /// rescan them later.
+    /// unreadable, or under a parent that changed during the confirmation.
+    /// The snapshot keeps what it knew about them and everything below them.
+    /// Also the paths of removals held back while the search under left-out
+    /// entries goes on: the snapshot holds nothing there, and the rules hold
+    /// the entries until the search decides. Rescan them later.
     pub unsettled: Vec<PathBuf>,
     /// Folders the scan may not open or list, and folders with a rules file
     /// it cannot read when no earlier scan read one for them, so that what
@@ -576,11 +577,14 @@ impl Snapshot {
     /// A removal whose entry the scan finds under a left-out entry is reported
     /// as [`Change::Ignored`]. Each rescan looks at a bounded number of
     /// left-out entries ([`Rules::with_search_budget`]). A removal the search
-    /// has not decided within that bound keeps its entry, at the path the
-    /// renames of the same scan move it to, and is returned in
+    /// has not decided within that bound is held back: the snapshot drops its
+    /// entry without a change, `rules` hold it at the path the renames of this
+    /// and later scans move it to, and that path is returned in
     /// [`Rescan::unsettled`]. The search goes on in the next rescans, of any
     /// paths, and the removal is reported by the next rescan of its path after
-    /// the search has decided it.
+    /// the search has decided it, or as a rename when that rescan finds its
+    /// identity at an included path. An entry that takes its path makes the
+    /// search run to its end, so the removal is reported first.
     ///
     /// On any error `rules` are unchanged too.
     pub fn rescan_with_rules(
@@ -810,13 +814,15 @@ impl Snapshot {
         let mut changes = diff(&old, &scan.new);
         if let Some(rules) = &mut scan.rules {
             rules.settle();
-            unsettled.extend(find_ignored(
+            find_ignored(
                 &mut changes,
                 &old,
-                &mut scan.new,
+                &scan.new,
                 rules,
+                &scan.replaced,
                 again.as_fd(),
-            ));
+            );
+            unsettled.extend(outermost(rules.held().cloned().collect()));
             unsettled.sort();
         }
         for path in old.keys().chain(&left_out) {
@@ -1164,10 +1170,63 @@ fn take_left_out(
 fn find_ignored(
     changes: &mut Vec<Change>,
     old: &BTreeMap<PathBuf, Entry>,
-    new: &mut BTreeMap<PathBuf, Entry>,
+    new: &BTreeMap<PathBuf, Entry>,
+    rules: &mut Pending<'_>,
+    scopes: &[PathBuf],
+    root: BorrowedFd<'_>,
+) {
+    let held = rules.take_held(scopes);
+    let roots = outermost(held.keys().cloned().collect());
+    let merged: BTreeMap<PathBuf, Entry>;
+    let old = if held.is_empty() {
+        old
+    } else {
+        let aside = |path: &Path| -> PathBuf {
+            let (top, below) = (roots.iter())
+                .find_map(|top| Some((top, path.strip_prefix(top).ok()?)))
+                .expect("held below a root");
+            let mut name = top.as_os_str().to_owned();
+            name.push("\0");
+            Path::new(&name)
+                .components()
+                .chain(below.components())
+                .collect()
+        };
+        merged = (old.iter())
+            .map(|(path, entry)| (path.clone(), *entry))
+            .chain(held.iter().map(|(path, entry)| (aside(path), *entry)))
+            .collect();
+        *changes = diff(&merged, new);
+        &merged
+    };
+    hold_back(changes, old, new, rules, root);
+    for change in changes.iter_mut() {
+        match change {
+            Change::Removed { path, .. }
+            | Change::Renamed { from: path, .. }
+            | Change::Ignored { from: path, .. } => *path = unaside(path),
+            Change::Created { .. } | Change::Modified { .. } => {}
+        }
+    }
+    changes.retain(|change| !matches!(change, Change::Renamed { from, to, .. } if from == to));
+}
+
+fn unaside(path: &Path) -> PathBuf {
+    (path.iter())
+        .map(|name| {
+            let name = name.as_bytes();
+            OsStr::from_bytes(name.strip_suffix(b"\0").unwrap_or(name))
+        })
+        .collect()
+}
+
+fn hold_back(
+    changes: &mut Vec<Change>,
+    old: &BTreeMap<PathBuf, Entry>,
+    new: &BTreeMap<PathBuf, Entry>,
     rules: &mut Pending<'_>,
     root: BorrowedFd<'_>,
-) -> Vec<PathBuf> {
+) {
     let replaced: BTreeSet<PathBuf> = (changes.iter())
         .filter_map(|change| match change {
             Change::Modified { path }
@@ -1186,8 +1245,8 @@ fn find_ignored(
         })
         .collect();
     if removed.is_empty() && replaced.is_empty() {
-        rules.hold(HashMap::new(), |path| old.contains_key(path));
-        return Vec::new();
+        rules.hold(BTreeMap::new());
+        return;
     }
     let renamed: HashMap<PathBuf, PathBuf> = (changes.iter())
         .filter_map(|change| match change {
@@ -1214,16 +1273,26 @@ fn find_ignored(
         .filter(|path| !removed.contains(*path) && !carried(path))
         .collect();
     let key = |path: &Path| (old[path].id, old[path].kind);
-    let mut wanted: Wanted = (removed.iter().chain(held.iter().copied()))
-        .map(|path| (key(path), None))
+    let present: HashSet<Key> = new.values().map(|entry| (entry.id, entry.kind)).collect();
+    let gone: Vec<&PathBuf> = (removed.iter())
+        .filter(|path| !present.contains(&key(path)))
+        .chain(held.iter().copied())
         .collect();
-    let undecided = rules.search(root, &mut wanted);
+    let mut wanted: Wanted = gone.iter().map(|path| (key(path), None)).collect();
+    let fresh: HashSet<Key> = (gone.iter().copied())
+        .filter(|path| !path.as_os_str().as_bytes().contains(&0))
+        .chain(&replaced)
+        .map(|path| key(path))
+        .collect();
+    let undecided = rules.search(root, &mut wanted, &fresh, true);
     let relocated = |path: &Path| {
-        (path.ancestors().skip(1))
-            .find_map(|above| Some(renamed.get(above)?.join(path.strip_prefix(above).ok()?)))
-            .unwrap_or_else(|| path.to_path_buf())
+        unaside(
+            &(path.ancestors().skip(1))
+                .find_map(|above| Some(renamed.get(above)?.join(path.strip_prefix(above).ok()?)))
+                .unwrap_or_else(|| path.to_path_buf()),
+        )
     };
-    let deferred: Vec<(PathBuf, PathBuf)> = (removed.iter())
+    let mut deferred: Vec<(PathBuf, PathBuf)> = (removed.iter())
         .filter(|path| {
             wanted.get(&key(path)) == Some(&None)
                 && (held.iter().copied())
@@ -1233,11 +1302,23 @@ fn find_ignored(
         })
         .map(|path| (path.clone(), relocated(path)))
         .collect();
-    let mut kept = HashMap::new();
+    let taken = (changes.iter()).any(|change| match change {
+        Change::Created { path, .. }
+        | Change::Modified { path }
+        | Change::Renamed { to: path, .. } => (deferred.iter()).any(|(_, to)| path.starts_with(to)),
+        Change::Removed { .. } | Change::Ignored { .. } => false,
+    });
+    if taken {
+        rules.search(root, &mut wanted, &HashSet::new(), false);
+        deferred.clear();
+    }
+    let mut kept = BTreeMap::new();
     if !deferred.is_empty() {
         held.retain(|path| !deferred.iter().any(|(dir, _)| path.starts_with(dir)));
-        for (from, to) in &deferred {
-            new.retain(|inside, _| !inside.starts_with(to));
+        changes.retain(|change| {
+            !matches!(change, Change::Removed { path, .. } if deferred.iter().any(|(dir, _)| dir == path))
+        });
+        for (from, _) in &deferred {
             for (inside, entry) in (old.range(from.clone()..))
                 .take_while(|(inside, _)| inside.starts_with(from))
                 .filter(|(inside, _)| {
@@ -1246,15 +1327,11 @@ fn find_ignored(
                         .any(|above| renamed.contains_key(above))
                 })
             {
-                let below = inside.strip_prefix(from).expect("taken below the folder");
-                let at: PathBuf = to.components().chain(below.components()).collect();
-                kept.insert((entry.id, entry.kind), at.clone());
-                new.insert(at, *entry);
+                kept.insert(relocated(inside), *entry);
             }
         }
-        *changes = diff(old, new);
     }
-    rules.hold(kept, |path| old.contains_key(path));
+    rules.hold(kept);
     let mut swapped: Wanted = (replaced.iter())
         .map(|path| (key(path), None))
         .filter(|(id, _)| !wanted.contains_key(id))
@@ -1298,7 +1375,6 @@ fn find_ignored(
         }
     }
     changes.extend(moved);
-    deferred.into_iter().map(|(_, to)| to).collect()
 }
 
 /// Sorts the paths and drops every path inside another one.
@@ -1905,6 +1981,9 @@ impl Watcher for NativeWatcher {
         {
             self.blocked.insert(scope.to_path_buf());
         }
+        if let Some(rules) = &mut self.rules {
+            rules.forget(scope);
+        }
         self.snapshot.reset(scope, known);
         self.dirty.insert(scope.to_path_buf());
     }
@@ -1998,6 +2077,9 @@ impl Watcher for RescanWatcher {
     }
 
     fn reset(&mut self, scope: &Path, known: BTreeMap<PathBuf, Known>) {
+        if let Some(rules) = &mut self.rules {
+            rules.forget(scope);
+        }
         self.snapshot.reset(scope, known);
     }
 }
@@ -2031,7 +2113,7 @@ pub use effect::{
     Action, Contents, Displaced, Effect, Outcome, QUARANTINE_DIR, Reason, STAGING_DIR, Step,
 };
 pub use ignore::{Ignore, Ignored, RULES_FILE, Rules};
-use ignore::{Pending, RulesRead, Wanted};
+use ignore::{Key, Pending, RulesRead, Wanted};
 pub use recovered::{recovered_name, utc_date};
 pub use resolve::{Base, Dir, Folder, Location, PARKED_DIR, Space, Unresolved};
 pub use root::{

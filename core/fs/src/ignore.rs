@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 
 use rustix::fs::{FileType, Mode, OFlags};
 
-use crate::{EntryKind, FileId, Stat, is_gone, list, open_attached, open_dir_at, stat_at, stat_fd};
+use crate::{
+    Entry, EntryKind, FileId, Stat, is_gone, list, open_attached, open_dir_at, stat_at, stat_fd,
+};
 
 /// The name of a rules file.
 pub const RULES_FILE: &str = ".koiignore";
@@ -79,7 +81,20 @@ struct Search {
     walk: Option<Vec<Listing>>,
     pending: HashMap<Key, u64>,
     decided: HashMap<Key, Option<PathBuf>>,
-    held: HashMap<Key, PathBuf>,
+    held: BTreeMap<PathBuf, Entry>,
+}
+
+impl Search {
+    fn prune(&mut self) {
+        let keys: HashSet<Key> = (self.held.values())
+            .map(|entry| (entry.id, entry.kind))
+            .collect();
+        self.pending.retain(|key, _| keys.contains(key));
+        self.decided.retain(|key, _| keys.contains(key));
+        if self.pending.is_empty() {
+            self.walk = None;
+        }
+    }
 }
 
 struct Listing {
@@ -110,6 +125,11 @@ impl Rules {
 
     pub(crate) fn searching(&self) -> bool {
         !self.search.pending.is_empty()
+    }
+
+    pub(crate) fn forget(&mut self, scope: &Path) {
+        self.search.held.retain(|path, _| !path.starts_with(scope));
+        self.search.prune();
     }
 
     /// The keys of `path`, under which the rules of the folder there are held.
@@ -293,7 +313,13 @@ impl<'r> Pending<'r> {
         });
     }
 
-    pub(crate) fn search(&mut self, root: BorrowedFd<'_>, wanted: &mut Wanted) -> HashSet<Key> {
+    pub(crate) fn search(
+        &mut self,
+        root: BorrowedFd<'_>,
+        wanted: &mut Wanted,
+        fresh: &HashSet<Key>,
+        bounded: bool,
+    ) -> HashSet<Key> {
         let Rules {
             ignored,
             budget,
@@ -311,14 +337,17 @@ impl<'r> Pending<'r> {
         for (key, found) in wanted.iter_mut() {
             match decided.get(key) {
                 Some(Some(path)) if holds(root, path, *key) => *found = Some(path.clone()),
-                Some(None) => {}
+                Some(None) if !fresh.contains(key) => {}
                 _ => {
                     decided.remove(key);
-                    pending.entry(*key).or_insert(next);
+                    let needs = pending.entry(*key).or_insert(next);
+                    if fresh.contains(key) {
+                        *needs = next;
+                    }
                 }
             }
         }
-        let mut left = *budget;
+        let mut left = if bounded { *budget } else { usize::MAX };
         while left > 0 && !pending.is_empty() {
             let listings = walk.get_or_insert_with(|| {
                 *walks += 1;
@@ -392,19 +421,23 @@ impl<'r> Pending<'r> {
             .collect()
     }
 
-    pub(crate) fn hold(&mut self, held: HashMap<Key, PathBuf>, scanned: impl Fn(&Path) -> bool) {
+    pub(crate) fn take_held(&mut self, scopes: &[PathBuf]) -> BTreeMap<PathBuf, Entry> {
+        let held = &mut self.rules.search.held;
+        let (taken, kept) = std::mem::take(held)
+            .into_iter()
+            .partition(|(path, _)| scopes.iter().any(|scope| path.starts_with(scope)));
+        *held = kept;
+        taken
+    }
+
+    pub(crate) fn hold(&mut self, held: BTreeMap<PathBuf, Entry>) {
         let search = &mut self.rules.search;
-        search.held.retain(|_, path| !scanned(path));
         search.held.extend(held);
-        search
-            .pending
-            .retain(|key, _| search.held.contains_key(key));
-        search
-            .decided
-            .retain(|key, _| search.held.contains_key(key));
-        if search.pending.is_empty() {
-            search.walk = None;
-        }
+        search.prune();
+    }
+
+    pub(crate) fn held(&self) -> impl Iterator<Item = &PathBuf> {
+        self.rules.search.held.keys()
     }
 
     /// Drops the rules of every folder for which `is_folder` is false, and
