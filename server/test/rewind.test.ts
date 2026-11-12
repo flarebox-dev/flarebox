@@ -5,6 +5,7 @@ import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AccountDO } from "../src/account-do";
+import { SESSION_LEASE_MS } from "../src/account/account";
 import {
   ClaimRequestSchema,
   CreateSpaceRequestSchema,
@@ -638,6 +639,63 @@ describe("space rewind (RFC 0003)", () => {
       release();
       prototype.rewindInfo = info;
       prototype.rewindPrepare = prepare;
+    }
+  });
+
+  it("drops a lease renewal that was in flight when the admission closed the space (RFC 0014)", async () => {
+    const { spaceId, createdAtMs, creds, device } = await newSpace();
+    const token = creds.access!.token;
+    const a = device();
+    await createFile(a, spaceId, "notes.txt", "first");
+    const point = createdAtMs + MINUTE;
+    await snapshot(spaceId, point);
+    await a.commit([op.mkdir(uuidv7(), spaceId, "after the point")]);
+    const history = await a.history();
+    const leased = await socket(spaceId, token);
+    const age = (byMs: number) =>
+      runInDurableObject(space(spaceId), (instance: SpaceDO) => {
+        const offsetMs = instance.clock() - Date.now() + byMs;
+        instance.clock = () => Date.now() + offsetMs;
+      });
+    const listTree = async (reqId: bigint) => {
+      leased.send({ case: "rpc", value: { reqId, call: { case: "listTree", value: {} } } });
+      return leased.until(() => leased.state.closed ?? received(reqId));
+    };
+    const received = (reqId: bigint) => leased.received.find((msg) => msg.case === "rpc" && msg.value.reqId === reqId);
+    await age(SESSION_LEASE_MS + 1000);
+    expect(await listTree(1n)).toMatchObject({ case: "rpc" });
+    await age(SESSION_LEASE_MS * 0.6);
+
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const accountPrototype = await runInDurableObject(account(), (instance: AccountDO) => Object.getPrototypeOf(instance) as AccountDO);
+    const spacePrototype = await runInDurableObject(space(spaceId), (instance: SpaceDO) => Object.getPrototypeOf(instance) as SpaceDO);
+    const [checkSessions, prepare] = [accountPrototype.checkSessions, spacePrototype.rewindPrepare];
+    let renewing = false;
+    const { promise: held, resolve: release } = Promise.withResolvers<void>();
+    accountPrototype.checkSessions = async function (this: AccountDO, deviceIds: string[], askedSpaceId: string) {
+      const answers = await checkSessions.call(this, deviceIds, askedSpaceId);
+      renewing = true;
+      await held;
+      return answers;
+    };
+    spacePrototype.rewindPrepare = async () => {
+      throw new Error("injected prepare failure");
+    };
+    try {
+      expect(await listTree(2n)).toMatchObject({ case: "rpc" });
+      await leased.until(() => renewing || undefined);
+      await setAccountClock(createdAtMs + 5 * MINUTE);
+      const rewindId = uuidv7();
+      expect((await rewind(token, spaceId, { restorePointMs: point, expectedHistoryId: history, rewindId })).status).toBe(503);
+      expect(await rewindRecord(rewindId)).toMatchObject({ phase: "admitted" });
+      release();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(await listTree(3n)).toBe(Close.SPACE_REWOUND);
+      expect(received(3n)).toBeUndefined();
+    } finally {
+      release();
+      accountPrototype.checkSessions = checkSessions;
+      spacePrototype.rewindPrepare = prepare;
     }
   });
 
