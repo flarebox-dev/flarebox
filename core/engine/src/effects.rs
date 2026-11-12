@@ -112,8 +112,9 @@ impl EffectRecord {
     /// before it plans one. The engine plans an effect for L as it is then, and a later observation
     /// may have given the effect's name to another node, taken a folder on its way out of L, moved
     /// such a folder under the node, put an entry into a folder it removes, or put the node it
-    /// creates into L. The planner plans none of these either, so an effect that fails for one of
-    /// them and is unblocked is planned again only once L has changed.
+    /// creates into L. A commit's rebase or result may also have given the entry that a move or a
+    /// replacement takes to another node of L. The planner plans none of these either, so an effect
+    /// that fails for one of them and is unblocked is planned again only once L has changed.
     pub fn applies(&self, trees: &Trees) -> bool {
         View::new(trees).applies(self)
     }
@@ -758,6 +759,22 @@ impl<'a> View<'a> {
         let Some(after) = &record.after else {
             return self.trees.local_children(&record.node).next().is_none();
         };
+        let kept = match &record.effect {
+            Effect::Move { identity, .. } => Some(identity),
+            Effect::WriteFile {
+                replaces: Some(displaced),
+                ..
+            } => Some(&displaced.identity),
+            _ => None,
+        };
+        let held_by_node = |identity: &FileIdentity| {
+            (self.trees.local().get(&record.node)).is_some_and(|node| node.identity == *identity)
+        };
+        if kept.is_some_and(|identity| {
+            !held_by_node(identity) && self.trees.local_with_identity(identity).is_some()
+        }) {
+            return false;
+        }
         if record.parks() {
             return true;
         }
