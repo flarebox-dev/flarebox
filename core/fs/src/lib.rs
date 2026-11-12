@@ -844,7 +844,7 @@ impl Snapshot {
                 .collect();
             let earlier = rules.cover(&scan.replaced, &unread);
             let held = rules.take_held(&scan.replaced, &stays);
-            find_ignored(
+            let arrivals = find_ignored(
                 &mut changes,
                 Trees {
                     old: &old,
@@ -858,6 +858,9 @@ impl Snapshot {
                 again.as_fd(),
                 &mut *scan.cut,
             );
+            for arrival in &arrivals {
+                scan.new.retain(|path, _| !path.starts_with(arrival));
+            }
             unsettled.extend(outermost(rules.held().cloned().collect()));
             unsettled.sort();
         }
@@ -1220,7 +1223,7 @@ fn find_ignored(
     scopes: &[PathBuf],
     root: BorrowedFd<'_>,
     cut: &mut dyn FnMut(Cut<'_>),
-) {
+) -> Vec<PathBuf> {
     let Trees { old, new, rest } = trees;
     let roots = outermost(held.keys().cloned().collect());
     let merged: BTreeMap<PathBuf, Entry>;
@@ -1245,7 +1248,7 @@ fn find_ignored(
         *changes = diff(&merged, new);
         &merged
     };
-    hold_back(
+    let arrivals = hold_back(
         changes,
         Trees { old, new, rest },
         earlier,
@@ -1262,6 +1265,7 @@ fn find_ignored(
             Change::Created { .. } | Change::Modified { .. } => {}
         }
     }
+    arrivals
 }
 
 fn unaside(path: &Path) -> PathBuf {
@@ -1281,7 +1285,7 @@ fn hold_back(
     scopes: &[PathBuf],
     root: BorrowedFd<'_>,
     cut: &mut dyn FnMut(Cut<'_>),
-) {
+) -> Vec<PathBuf> {
     let Trees { old, new, rest } = trees;
     let replaced: BTreeSet<PathBuf> = (changes.iter())
         .filter_map(|change| match change {
@@ -1302,7 +1306,7 @@ fn hold_back(
         .collect();
     if removed.is_empty() && replaced.is_empty() {
         rules.hold(BTreeMap::new());
-        return;
+        return Vec::new();
     }
     let renamed: HashMap<PathBuf, PathBuf> = (changes.iter())
         .filter_map(|change| match change {
@@ -1355,7 +1359,7 @@ fn hold_back(
         .filter(|path| earlier.unscanned(path) && !present.contains(&key(path)))
         .collect();
     wanted.extend(seeded.iter().map(|path| (key(path), None)));
-    let undecided = rules.search(root, &mut wanted, &fresh, seeded.is_empty(), cut);
+    let undecided = rules.search(root, &mut wanted, &fresh, true, cut);
     let relocated = |path: &Path| {
         unaside(
             &(path.ancestors().skip(1))
@@ -1373,17 +1377,36 @@ fn hold_back(
         })
         .map(|path| (path.clone(), relocated(path)))
         .collect();
-    let taken = (changes.iter()).any(|change| match change {
-        Change::Created { path, .. }
-        | Change::Modified { path }
-        | Change::Renamed { to: path, .. } => (deferred.iter()).any(|(_, to)| path.starts_with(to)),
-        Change::Removed { .. } | Change::Ignored { .. } => false,
+    let taken = |path: &Path| (deferred.iter()).any(|(_, to)| path.starts_with(to));
+    let mut arrivals: Vec<PathBuf> = (changes.iter())
+        .filter_map(|change| match change {
+            Change::Created { path, .. } if taken(path) => Some(path.clone()),
+            _ => None,
+        })
+        .collect();
+    let finish = (changes.iter()).any(|change| match change {
+        Change::Modified { path } | Change::Renamed { to: path, .. } => taken(path),
+        _ => false,
     });
-    if taken {
+    let mut unseen: Vec<PathBuf> = (seeded.iter())
+        .filter(|path| undecided.contains(&key(path)))
+        .map(|path| (*path).clone())
+        .collect();
+    if finish {
         rules.search(root, &mut wanted, &HashSet::new(), false, cut);
         deferred.clear();
+        unseen.clear();
+        arrivals.clear();
     }
-    let mut kept = BTreeMap::new();
+    changes.retain(|change| match change {
+        Change::Created { path, .. } => !arrivals.contains(path),
+        Change::Modified { path } => !unseen.contains(path),
+        _ => true,
+    });
+    let mut kept: BTreeMap<PathBuf, Entry> = (unseen.iter())
+        .map(|path| (path.clone(), old[path]))
+        .collect();
+    arrivals.extend(unseen);
     if !deferred.is_empty() {
         held.retain(|path| !deferred.iter().any(|(dir, _)| path.starts_with(dir)));
         changes.retain(|change| {
@@ -1446,6 +1469,7 @@ fn hold_back(
         }
     }
     changes.extend(moved);
+    arrivals
 }
 
 /// Sorts the paths and drops every path inside another one.

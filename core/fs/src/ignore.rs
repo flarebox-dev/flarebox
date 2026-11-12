@@ -173,9 +173,11 @@ impl Rules {
 
     pub(crate) fn forget(&mut self, scope: &Path) {
         let search = &mut self.search;
-        search.held.retain(|path, _| !path.starts_with(scope));
+        let (dropped, kept) = (std::mem::take(&mut search.held).into_iter())
+            .partition::<BTreeMap<_, _>, _>(|(path, _)| path.starts_with(scope));
+        search.held = kept;
         search.prune();
-        search.reseeded.push(scope.to_path_buf());
+        search.reseeded.extend(dropped.into_keys());
         search.reseeded = crate::outermost(std::mem::take(&mut search.reseeded));
     }
 

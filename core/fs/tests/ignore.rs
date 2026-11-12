@@ -1084,12 +1084,21 @@ fn a_new_entry_at_the_path_of_a_deferred_move_into_an_ignored_folder_keeps_the_m
         let rescan = snapshot
             .rescan_with_rules(root, whole(), &mut rules)
             .unwrap();
-        let mut expected = vec![Change::Ignored {
-            from: "d/f.txt".into(),
-            to: "ig/zz/deep/f.txt".into(),
-            kind: File,
-            id,
-        }];
+        assert!(
+            !(rescan.changes.iter()).any(|change| matches!(change, Change::Created { .. })),
+            "{deferred} {renamed}: {:?}",
+            rescan.changes
+        );
+        let mut changes = rescan.changes;
+        let mut unsettled = rescan.unsettled;
+        while !unsettled.is_empty() {
+            let rescan = snapshot
+                .rescan_with_rules(root, whole(), &mut rules)
+                .unwrap();
+            changes.extend(rescan.changes);
+            unsettled = rescan.unsettled;
+        }
+        let mut expected = Vec::new();
         if renamed {
             expected.push(Change::Renamed {
                 from: "d".into(),
@@ -1097,9 +1106,14 @@ fn a_new_entry_at_the_path_of_a_deferred_move_into_an_ignored_folder_keeps_the_m
                 kind: Dir,
             });
         }
+        expected.push(Change::Ignored {
+            from: at.into(),
+            to: "ig/zz/deep/f.txt".into(),
+            kind: File,
+            id,
+        });
         expected.push(created(at, File));
-        assert_eq!(rescan.changes, expected, "{deferred} {renamed}");
-        assert_eq!(rescan.unsettled, [] as [PathBuf; 0]);
+        assert_eq!(changes, expected, "{deferred} {renamed}");
     }
 }
 
@@ -2740,4 +2754,51 @@ fn an_unreadable_folder_past_the_open_folder_cap_does_not_stop_the_search() {
             );
         }
     }
+}
+
+#[test]
+fn a_first_rescan_from_a_snapshot_another_watcher_held_does_not_finish_the_search_at_once() {
+    let dir = large_ignored_tree();
+    let root = dir.path();
+    write(root, "d/f.txt", "old");
+    let mut held = rules().with_search_budget(100);
+    let start = Snapshot::scan_with_rules(root, &mut held).unwrap();
+    let id = start.entries[Path::new("d/f.txt")].id;
+    let mut a = RescanWatcher::with_rules(root, start, Duration::ZERO, held).unwrap();
+    fs::rename(root.join("d/f.txt"), root.join("ig/zz/deep/f.txt")).unwrap();
+    assert_eq!(
+        a.poll(Duration::ZERO).unwrap().pending,
+        [PathBuf::from("d/f.txt")]
+    );
+    write(root, "d/f.txt", "new");
+
+    let mut snapshot = a.snapshot().clone();
+    let mut fresh = rules().with_search_budget(100);
+    let first = snapshot
+        .rescan_with_rules(root, whole(), &mut fresh)
+        .unwrap();
+    assert_eq!(first.changes, []);
+    assert_eq!(first.unsettled, [PathBuf::from("d/f.txt")]);
+    let mut changes = Vec::new();
+    let mut unsettled = first.unsettled;
+    while !unsettled.is_empty() {
+        let rescan = snapshot
+            .rescan_with_rules(root, whole(), &mut fresh)
+            .unwrap();
+        changes.extend(rescan.changes);
+        unsettled = rescan.unsettled;
+    }
+    changes.sort_by_key(|change| matches!(change, Change::Ignored { .. }));
+    assert_eq!(
+        changes,
+        [
+            created("d/f.txt", File),
+            Change::Ignored {
+                from: "d/f.txt".into(),
+                to: "ig/zz/deep/f.txt".into(),
+                kind: File,
+                id,
+            },
+        ]
+    );
 }
