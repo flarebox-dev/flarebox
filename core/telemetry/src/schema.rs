@@ -944,6 +944,96 @@ mod tests {
     }
 
     #[test]
+    fn the_failure_keys_are_exactly_these() {
+        let mut keys: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for failure in Failure::all() {
+            let (group, name) = failure.key();
+            keys.entry(group).or_default().push(name);
+        }
+        let transfer = vec![
+            "call",
+            "source_changed",
+            "corrupt",
+            "refused",
+            "unavailable",
+            "no_target",
+            "io",
+        ];
+        let refusal = vec![
+            "unauthenticated",
+            "forbidden",
+            "invalid_argument",
+            "missing_chunks",
+            "limit_exceeded",
+            "quota_exceeded",
+            "read_only",
+            "retry_later",
+            "unsupported_version",
+            "internal",
+            "history_mismatch",
+            "stale_device_state",
+            "head_moved",
+            "ahead_of_server",
+            "not_found",
+            "confirmation_required",
+            "unknown",
+        ];
+        let halted = vec![
+            "withdrawn",
+            "root",
+            "replaced",
+            "other_root",
+            "placement",
+            "claim",
+            "no_replace",
+            "store_behind",
+            "disk_behind",
+            "record",
+            "store",
+            "io",
+            "session_start",
+            "session_closed",
+            "credentials_refused",
+            "device_revoked",
+            "unsupported_version",
+            "not_a_member",
+            "space_not_found",
+            "connection_refused",
+            "recovery",
+            "refused",
+            "protocol",
+            "signed_out",
+            "start",
+            "unlink",
+        ];
+        assert_eq!(
+            keys,
+            BTreeMap::from([
+                ("halted", halted),
+                ("upload_failed", transfer.clone()),
+                ("download_failed", transfer),
+                ("refused", refusal.clone()),
+                ("problem_node", refusal),
+                ("too_large", vec!["commit", "problem_node"]),
+                (
+                    "asked",
+                    vec![
+                        "mass_delete",
+                        "remote_mass_delete",
+                        "ambiguous_disappearance",
+                        "recovery",
+                        "conflict",
+                    ]
+                ),
+                (
+                    "daemon_start_failed",
+                    vec!["busy", "profile", "socket", "signals"]
+                ),
+            ])
+        );
+    }
+
+    #[test]
     fn every_command_is_listed_once() {
         let names: std::collections::BTreeSet<_> = Command::ALL.map(Command::name).into();
         assert_eq!(names.len(), Command::ALL.len());
