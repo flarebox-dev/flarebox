@@ -8,7 +8,7 @@ import { BinaryWriter } from "@bufbuild/protobuf/wire";
 import { ExportHeaderSchema, NodeSnapshotSchema, RetainedVersionSchema } from "../gen/koidrive/v1/export_pb";
 import type { CommitRecord } from "../gen/koidrive/v1/model_pb";
 import { sha256 } from "../crypto";
-import type { Database, Sql } from "../host";
+import type { Database, ObjectStore, Sql } from "../host";
 import { toHex, uuidv7Ms } from "../ids";
 import { getMeta, INLINE_CHUNKS, type NodeRow, nodeState, rows, setMeta, type VersionRow, versionInfo } from "./store";
 
@@ -162,7 +162,7 @@ async function gzip(data: Uint8Array): Promise<Uint8Array> {
 export class Exporter {
   constructor(
     private readonly storage: Database,
-    private readonly bucket: R2Bucket,
+    private readonly bucket: ObjectStore,
     private readonly pageNodes: number,
   ) {}
 
