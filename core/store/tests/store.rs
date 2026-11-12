@@ -563,6 +563,7 @@ fn engine_state() -> EngineState {
                 Pending {
                     sent: "a (pending)".into(),
                     name: "a".into(),
+                    landed: true,
                 },
             )]),
             guard: GuardState {

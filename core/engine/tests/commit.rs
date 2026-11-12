@@ -6080,6 +6080,7 @@ fn owing_its_name(rows: &[Row]) -> (Commits, Trees, IdGen) {
         Pending {
             sent: "a (pending)".into(),
             name: "a".into(),
+            landed: true,
         },
     )]);
     let commits = Commits::from_state(CommitsState {
@@ -6251,6 +6252,35 @@ fn a_rename_another_device_makes_off_a_pending_name_ends_the_owed_rename_before_
     assert!(
         next.as_ref()
             .is_none_or(|commit| !ops(commit).contains(&mv("a", ROOT, "a"))),
+        "{:?}",
+        next.as_ref().map(ops)
+    );
+}
+
+#[test]
+fn a_rename_another_device_makes_while_this_device_moves_the_node_ends_the_owed_rename() {
+    let (mut commits, mut trees, mut ids) = owing_its_name(&[
+        synced("d", dir(ROOT, "d")),
+        synced("a", dir(ROOT, "a (pending)")),
+    ]);
+    trees.set_local("a".into(), local(dir("d", "a (pending)"), 2));
+    let sent = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&sent), [mv("a", "d", "a (pending)")]);
+    trees.set_remote("a".into(), remote_at(dir("d", "a (pending)"), 8));
+    assert!(!commits.acknowledge(&mut trees, 8));
+    trees.set_remote("a".into(), remote_at(dir("d", "c"), 9));
+    assert!(!commits.acknowledge(&mut trees, 9));
+    trees.set_remote("a".into(), remote_at(dir("d", "a (pending)"), 10));
+    assert!(!commits.acknowledge(&mut trees, 10));
+    commits
+        .received(result(8, vec![outcome(op_result::Code::Applied)]))
+        .unwrap();
+    assert!(commits.acknowledge(&mut trees, 10));
+    trees.settle();
+    let next = build(&mut commits, &mut trees, &mut ids);
+    assert!(
+        next.as_ref()
+            .is_none_or(|commit| !ops(commit).contains(&mv("a", "d", "a"))),
         "{:?}",
         next.as_ref().map(ops)
     );

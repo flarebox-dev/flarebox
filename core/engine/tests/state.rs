@@ -227,6 +227,7 @@ fn commits_state() -> CommitsState {
             Pending {
                 sent: "q (pending)".into(),
                 name: "q".into(),
+                landed: true,
             },
         )]
         .into(),

@@ -141,12 +141,13 @@ impl Tx<'_> {
         }
         let mut stmt = self
             .0
-            .prepare_cached("SELECT node_id, sent, name FROM pending_names")?;
+            .prepare_cached("SELECT node_id, sent, name, landed FROM pending_names")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let pending = Pending {
                 sent: row.get(1)?,
                 name: row.get(2)?,
+                landed: row.get(3)?,
             };
             state.commits.pending.insert(row.get(0)?, pending);
         }
@@ -540,14 +541,14 @@ impl Tx<'_> {
             .0
             .prepare_cached("DELETE FROM pending_names WHERE node_id = ?1")?;
         let mut put = self.0.prepare_cached(
-            "INSERT OR REPLACE INTO pending_names (node_id, sent, name) VALUES (?1, ?2, ?3)",
+            "INSERT OR REPLACE INTO pending_names (node_id, sent, name, landed) VALUES (?1, ?2, ?3, ?4)",
         )?;
         let (removed, changed) = differences(&old.pending, &new.pending);
         for node in removed {
             remove.execute([node])?;
         }
         for (node, pending) in changed {
-            put.execute(params![node, pending.sent, pending.name])?;
+            put.execute(params![node, pending.sent, pending.name, pending.landed])?;
         }
         if old.guard != new.guard {
             self.update_guard(&old.guard, &new.guard)?;
