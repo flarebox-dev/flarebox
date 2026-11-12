@@ -81,7 +81,7 @@ Read its log with `journalctl --user -u koidrive`. To keep syncing while you are
 
 | Path | What it holds |
 |---|---|
-| `~/.config/koidrive/config.toml` | Your settings: [selective sync](folders.md#sync-only-part-of-a-space-on-this-device) and the [local trash](folders.md#the-local-trash) size. You edit it. Koidrive never writes it |
+| `~/.config/koidrive/config.toml` | Your settings: [selective sync](folders.md#sync-only-part-of-a-space-on-this-device), the [local trash](folders.md#the-local-trash) size and how many [uploads run at once](folders.md#uploads-at-once). You edit it. Koidrive never writes it |
 | `~/.local/state/koidrive/credential.json` | This device's credential. On macOS, Koidrive keeps it out of Time Machine backups |
 | `~/.local/state/koidrive/spaces/` | The sync state of each linked folder |
 | `.koidrive/` in each linked folder | The folder's marker, the record of the device that linked it, and the local trash |

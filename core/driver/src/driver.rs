@@ -14,7 +14,7 @@ use koidrive_engine::guard::Window;
 use koidrive_engine::ignore::LocalRules;
 use koidrive_fs::{Marker, probe_no_replace, read_marker, write_marker};
 use koidrive_ignore::LocalRulesError;
-use koidrive_net::{ApiError, Auth, ROTATION_PERIOD};
+use koidrive_net::{ApiError, Auth, ROTATION_PERIOD, UploadGate};
 use koidrive_proto::v1::{ClaimRequest, DeviceCredentials, PairCompleteRequest, SpaceInfo};
 use koidrive_store::{EngineState, GivenAnswer, Link, Store, StoredQuestion};
 use tokio::sync::{Notify, watch};
@@ -183,6 +183,8 @@ struct Inner {
     local: LocalRules,
     /// The size cap in bytes of each folder's local trash, from `[trash]`.
     trash_cap: u64,
+    /// The limit on chunk uploads in flight from `[upload]`, which the uploads of every folder share.
+    upload_gate: UploadGate,
     /// Held for the whole of a pair, claim, sign-out, link or unlink, so one runs at a time: a sign-out waits for a
     /// claim or a link in flight and then undoes it, and a credential the server issued is always stored.
     lifecycle: tokio::sync::Mutex<()>,
@@ -329,6 +331,7 @@ impl Driver {
                 matcher,
                 local,
                 trash_cap: config.trash.cap(),
+                upload_gate: UploadGate::new(config.upload.concurrency.get()),
                 paths,
                 _lock: lock,
                 lifecycle: tokio::sync::Mutex::new(()),
@@ -1012,44 +1015,9 @@ impl Driver {
 
     /// Starts the task of `folder`. `linked` are the roots of the profile's other folders, which it must not overlap.
     fn spawn(&self, folder: &mut Folder, credential: &Credential, linked: Vec<PathBuf>) {
-        if folder.link.device_id != credential.device_id
-            || folder.link.server_url != credential.server
-        {
-            return halt(
-                folder,
-                format!(
-                    "the folder was linked by device {} of {}, not by this profile's device {}; unlink it and link it again",
-                    folder.link.device_id, folder.link.server_url, credential.device_id
-                ),
-            );
-        }
-        let auth = match self.auth(credential) {
-            Ok(auth) => auth,
-            Err(error) => return halt(folder, error.to_string()),
-        };
-        let store = match self.inner.paths.store(&folder.link.space_id) {
-            Ok(store) => store,
-            Err(error) => return halt(folder, error.to_string()),
-        };
-        let task = FolderTask {
-            link: folder.link.clone(),
-            store,
-            auth,
-            status: folder.status.clone(),
-            matcher: self.inner.matcher.clone(),
-            local: self.inner.local.clone(),
-            trash_cap: self.inner.trash_cap,
-            private_dirs: self.inner.paths.private_dirs(),
-            linked,
-            owner: Owner {
-                server: credential.server.clone(),
-                device_id: credential.device_id.clone(),
-            },
-            observer: Mutex::default(),
-            changed: self.inner.changed.clone(),
-            requests: Arc::default(),
-            #[cfg(test)]
-            observe_fault: self.inner.observe_fault.clone(),
+        let task = match self.task(folder, credential, linked) {
+            Ok(task) => task,
+            Err(problem) => return halt(folder, problem),
         };
         let requests = task.requests.clone();
         let (stop, stopped) = watch::channel(false);
@@ -1064,6 +1032,48 @@ impl Driver {
             requests,
             done,
         });
+    }
+
+    /// The task that syncs `folder`, or the problem that keeps it from starting.
+    fn task(
+        &self,
+        folder: &Folder,
+        credential: &Credential,
+        linked: Vec<PathBuf>,
+    ) -> Result<FolderTask, String> {
+        if folder.link.device_id != credential.device_id
+            || folder.link.server_url != credential.server
+        {
+            return Err(format!(
+                "the folder was linked by device {} of {}, not by this profile's device {}; unlink it and link it again",
+                folder.link.device_id, folder.link.server_url, credential.device_id
+            ));
+        }
+        let auth = self.auth(credential).map_err(|error| error.to_string())?;
+        let store = (self.inner.paths)
+            .store(&folder.link.space_id)
+            .map_err(|error| error.to_string())?;
+        Ok(FolderTask {
+            link: folder.link.clone(),
+            store,
+            auth,
+            status: folder.status.clone(),
+            matcher: self.inner.matcher.clone(),
+            local: self.inner.local.clone(),
+            trash_cap: self.inner.trash_cap,
+            upload_gate: self.inner.upload_gate.clone(),
+            private_dirs: self.inner.paths.private_dirs(),
+            linked,
+            owner: Owner {
+                server: credential.server.clone(),
+                device_id: credential.device_id.clone(),
+            },
+            observer: Mutex::default(),
+            changed: self.inner.changed.clone(),
+            requests: Arc::default(),
+            #[cfg(test)]
+            observe_fault: self.inner.observe_fault.clone(),
+        })
     }
 
     /// The process's one [`Auth`] for `credential`, the one this profile is signed in with.
@@ -1619,19 +1629,24 @@ mod tests {
     /// Pairs the profile at `paths` as `device_id` and links `root` as a folder that passes its root check.
     fn linked(paths: &Paths, root: &Path, device_id: &str) {
         paired(paths, device_id);
+        linked_to(paths, root, device_id, SPACE);
+    }
+
+    /// Links `root` for the paired `device_id` as a folder of `space_id` that passes its root check.
+    fn linked_to(paths: &Paths, root: &Path, device_id: &str, space_id: &str) {
         fs::create_dir_all(root).unwrap();
         write_marker(
             root,
             &Marker {
-                space_id: SPACE.into(),
+                space_id: space_id.into(),
                 effects: 0,
             },
         )
         .unwrap();
-        let store_path = paths.store(SPACE).unwrap();
+        let store_path = paths.store(space_id).unwrap();
         fs::create_dir_all(store_path.parent().unwrap()).unwrap();
         let link = Link {
-            space_id: SPACE.into(),
+            space_id: space_id.into(),
             space_name: "Projects".into(),
             root: root.to_path_buf(),
             root_dev: fs::metadata(root).unwrap().dev(),
@@ -1665,6 +1680,57 @@ mod tests {
         })
         .await;
         driver.status().folders[0].problem.clone().unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_folders_of_a_profile_share_one_limit_on_uploads_in_flight() {
+        use koidrive_proto::v1::ChunkRef;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let paths = Paths::under(&base.join("profile"));
+        paired(&paths, "d1");
+        linked_to(&paths, &base.join("A"), "d1", SPACE);
+        linked_to(
+            &paths,
+            &base.join("B"),
+            "d1",
+            "0190f0a0-0000-7000-8000-000000000002",
+        );
+        fs::create_dir_all(paths.config_file.parent().unwrap()).unwrap();
+        fs::write(&paths.config_file, "[upload]\nconcurrency = 3\n").unwrap();
+        let driver = Driver::open(paths).unwrap();
+        let credential = driver.credential().unwrap();
+        let tasks: Vec<_> = (driver.inner.folders.lock().unwrap().values())
+            .map(|folder| driver.task(folder, &credential, Vec::new()).unwrap())
+            .collect();
+        assert_eq!(tasks.len(), 2);
+
+        let (relay, seen) = crate::scripted::relay(Duration::from_millis(300)).await;
+        let uploads = tasks.iter().enumerate().map(|(folder, task)| async move {
+            let (session, _events, _) = crate::scripted::session(relay).await;
+            let chunks: Vec<_> = (0..6)
+                .map(|i| {
+                    let bytes = format!("chunk {i} of folder {folder}");
+                    let chunk = ChunkRef {
+                        hash: koidrive_chunk::chunk_hash(bytes.as_bytes()).to_vec(),
+                        size: bytes.len() as u32,
+                        ..Default::default()
+                    };
+                    (chunk, bytes::Bytes::from(bytes))
+                })
+                .collect();
+            let refs: Vec<_> = chunks.iter().map(|(chunk, _)| chunk.clone()).collect();
+            let read = |wanted: &ChunkRef| {
+                let found = chunks.iter().find(|(chunk, _)| chunk == wanted).unwrap();
+                std::future::ready(Ok(found.1.clone()))
+            };
+            task.transfer().upload(&session, &refs, read).await.unwrap()
+        });
+        let receipts = futures_util::future::join_all(uploads).await;
+
+        assert_eq!(receipts.iter().map(Vec::len).sum::<usize>(), 12);
+        assert_eq!(seen.lock().unwrap().peak, 3);
     }
 
     #[tokio::test]

@@ -29,8 +29,10 @@ tracing = "0.1.41"
 url = "2.5.8"
 
 [dev-dependencies]
+futures-util = { version = "0.3.31", default-features = false, features = ["sink", "std"] }
 koidrive-sim = { path = "../sim" }
 reqwest = { version = "0.13.5", default-features = false }
 tempfile = "3.27.0"
 tokio = { version = "1.48", features = ["full", "test-util"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

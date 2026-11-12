@@ -1111,6 +1111,7 @@ name = "koidrive-driver"
 version = "0.0.0"
 dependencies = [
  "bytes",
+ "futures-util",
  "koidrive-chunk",
  "koidrive-engine",
  "koidrive-fs",
@@ -1127,6 +1128,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-tungstenite",
  "toml",
  "tracing",
  "tracing-subscriber",

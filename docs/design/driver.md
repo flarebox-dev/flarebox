@@ -55,6 +55,9 @@ exclude = ["*.iso"]       # .koiignore patterns
 
 [trash]
 max_size_mb = 2048        # the default
+
+[upload]
+concurrency = 4           # the default, from 1 to 16
 ```
 
 The rules apply to every folder of the profile (H13). `Config::load` checks them with `SyncRules::lines`, and `ignore::local_rules` turns them into the matcher's device-local list (`koidrive_ignore::LocalRules`): with an include list, only the listed paths, what is under them and the folders leading to them are synced, and the exclude patterns narrow that further. A path is excluded when the built-in exclusions, this list or the folder's own `.koiignore` files exclude it, so the device can always narrow what it syncs and no `.koiignore` pattern widens it. Like `.koiignore`, the rules only save bandwidth and disk: the server still sends every name in the space, and the credential can read everything.
@@ -62,6 +65,8 @@ The rules apply to every folder of the profile (H13). `Config::load` checks them
 The matcher is the engine's (`koidrive_engine::ignore`, over `koidrive-ignore`). `ignore::matcher` builds the part every folder shares, the built-in exclusions and the device list, and `ignore::scan_rules` gives each watcher of `core/fs` the rules it scans with, which also read the folder's `.koiignore` files (design §5.10). The scans leave excluded paths out, so the observer reports none; it passes the rules of each changed `.koiignore` file on in `Observation::rules`, and its first batch follows the scan of the whole tree and lists them all.
 
 `[trash]` caps the local trash of each folder (sync-engine.md §5.2), which holds what sync effects displaced. A running folder reclaims it when it starts and then once a day. Entries older than seven days go first, then the oldest entries while the trash holds more than `max_size_mb` megabytes. A file written after it entered the trash comes back at the root as a recovered file instead.
+
+`[upload]` limits how many chunk uploads are in flight at once. `Driver::open` makes one `koidrive_net::UploadGate` from `concurrency`, and every folder's `Transfer` gets a clone of it, so all folders together stay within the limit. A value outside 1 to 16 is refused when the driver opens. 1 sends one chunk at a time.
 
 ## The driver API
 

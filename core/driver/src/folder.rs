@@ -30,7 +30,7 @@ use koidrive_engine::tree::{RemoteNode, Tree};
 use koidrive_fs::{Snapshot, check_root};
 use koidrive_net::{
     Auth, Backoff, CallError, ChunkError, Event, NotResent, ServerError, Session, SessionConfig,
-    StopReason, Transfer,
+    StopReason, Transfer, UploadGate,
 };
 use koidrive_proto::v1::error::Code;
 use koidrive_proto::v1::resync_required::Reason;
@@ -1322,6 +1322,8 @@ pub(crate) struct FolderTask {
     pub local: LocalRules,
     /// The size cap in bytes of the folder's local trash.
     pub trash_cap: u64,
+    /// The profile's one limit on chunk uploads in flight, which this folder shares with the others.
+    pub upload_gate: UploadGate,
     /// The profile's private directories, which the folder must neither hold nor sit inside.
     pub private_dirs: Vec<PathBuf>,
     /// The roots of the profile's other linked folders.
@@ -1469,6 +1471,13 @@ async fn finished<T>(slot: &mut Slot<'_, T>) -> T {
 }
 
 impl FolderTask {
+    /// Moves the folder's chunks. Its uploads wait for a place in the profile's gate.
+    pub(crate) fn transfer(&self) -> Transfer {
+        let mut transfer = Transfer::new(self.auth.api());
+        transfer.gate = self.upload_gate.clone();
+        transfer
+    }
+
     /// Syncs the folder until `stop` is set. After a [`Halt::Root`] it syncs again, waiting longer after each one up
     /// to [`ROOT_RECHECK`]; after a [`Halt::Person`] it waits for `stop`. A sync after the first takes only the
     /// folder the first one locked: another one at the path, even with the space's marker, waits for a restart.
@@ -1547,7 +1556,7 @@ impl FolderTask {
             Ok(started) => started,
             Err(reason) => return Halt::Person(reason.to_string()),
         };
-        let transfer = Transfer::new(self.auth.api());
+        let transfer = self.transfer();
         self.publish(&mut folder);
         let stop = {
             let (session, transfer) = (&session, &transfer);
