@@ -1048,6 +1048,9 @@ impl Commits {
                     if applied {
                         trees.record_edited(id, result.seq);
                     }
+                    if applied || code == Code::ConflictCopy {
+                        trees.sent_edit(id);
+                    }
                     if code == Code::ConflictCopy {
                         conflicts.push((index, id.clone(), outcome.node_id.clone()));
                     }
@@ -2045,8 +2048,8 @@ fn plan(
                 .is_none_or(|other| !same_content(other, content))
         };
         if let Some(content) = &local.content
-            && differs(synced, content)
-            && differs(remote, content)
+            && ((differs(synced, content) && differs(remote, content))
+                || trees.unsent_edits().contains_key(id))
         {
             wants.push(Want::Content {
                 id: id.clone(),

@@ -2887,6 +2887,73 @@ fn a_create_the_server_lost_while_its_s_update_waits_is_sent_again() {
     assert!(matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id == "n"));
 }
 
+/// GUN-438: another device's edit sets n to content 3 at seq 2, and this device takes it. The
+/// server then loses seq 2 and goes back to content 2, and before a bootstrap tells this device,
+/// the user writes content 2 over n. S forgets n, since R no longer holds its content, and L and R
+/// then hold the same content. Taking that as a change both sides made would leave the user's edit
+/// unsent, and the other device's resend of content 3 would later be written over it. The edit is
+/// sent instead.
+#[test]
+fn an_edit_to_the_content_a_lost_commit_replaced_is_sent_after_the_loss() {
+    let (mut trees, mut commits, mut ids) = an_edit_to_the_content_a_lost_commit_replaced();
+    assert_eq!(trees.class("n"), Class::Local);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("n", 2)]);
+    let sent = RemoteNode {
+        content_rev: 3,
+        ..remote(file(ROOT, "n", 2))
+    };
+    trees.set_remote("n".into(), sent);
+    let applied = vec![outcome(op_result::Code::Applied)];
+    commits.received(result(3, applied)).unwrap();
+    assert!(commits.acknowledge(&mut trees, 3));
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::InSync);
+    assert!(trees.unsent_edits().is_empty());
+}
+
+/// As in `an_edit_to_the_content_a_lost_commit_replaced_is_sent_after_the_loss`, but the other
+/// device sends content 3 again before this device sends its edit. The resend is not written over
+/// the edit, and the edit is still sent.
+#[test]
+fn a_resend_of_the_lost_content_is_not_written_over_an_edit_to_the_content_it_replaced() {
+    let (mut trees, mut commits, mut ids) = an_edit_to_the_content_a_lost_commit_replaced();
+    let resent = RemoteNode {
+        content_rev: 2,
+        ..remote(file(ROOT, "n", 3))
+    };
+    trees.set_remote("n".into(), resent);
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::Concurrent);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("n", 2)]);
+}
+
+/// Another device's edit sets n to content 3 at seq 2, and this device takes it. The server then
+/// loses seq 2 and goes back to content 2, the user writes content 2 over n, and a bootstrap lists
+/// n with content 2.
+fn an_edit_to_the_content_a_lost_commit_replaced() -> (Trees, Commits, IdGen) {
+    let edited = RemoteNode {
+        content_rev: 2,
+        ..remote(file(ROOT, "n", 3))
+    };
+    let mut trees = trees(&[(
+        "n",
+        Some(file(ROOT, "n", 3)),
+        Some(file(ROOT, "n", 3)),
+        Some(edited),
+    )]);
+    assert_eq!(trees.class("n"), Class::InSync);
+    trees.set_local("n".into(), local(file(ROOT, "n", 2), 1));
+    trees.settle();
+    let commits = Commits::default();
+    let (trashed, edited) = (trees.trashed_here(), trees.edited_here());
+    trees.set_remote("n".into(), remote(file(ROOT, "n", 2)));
+    trees.forget_lost(trashed, edited, commits.held_through(), commits.accepted());
+    trees.settle();
+    (trees, commits, IdGen::new(1))
+}
+
 /// Commits a new file `id`, and acknowledges it at `seq` with R holding the file.
 fn commit_file(trees: &mut Trees, commits: &mut Commits, ids: &mut IdGen, id: &str, seq: u64) {
     trees.set_local(id.into(), local(file(ROOT, id, 7), 100 + seq));

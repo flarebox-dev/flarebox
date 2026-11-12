@@ -4,7 +4,7 @@
 //! valid state restores to the same value, and a state that breaks one invariant is refused with
 //! the error that names it.
 
-use koidrive_engine::classify::{Origin, Trees, Waiting};
+use koidrive_engine::classify::{Class, Origin, Trees, Waiting};
 use koidrive_engine::commit::{Commits, Halt, InFlight, MAX_OPS};
 use koidrive_engine::effects::{Effect, EffectRecord, Effects, Location};
 use koidrive_engine::guard::{Counted, GuardState, RemoteDeletion, Trash};
@@ -12,7 +12,7 @@ use koidrive_engine::ids::uuid_v7;
 use koidrive_engine::question::{Answer, Held, Limit, Question, QuestionKind, Revisions};
 use koidrive_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
 use koidrive_engine::state::{Agreed, CommitsState, EffectsState, StateError, TreesState};
-use koidrive_engine::tree::{FileIdentity, Kind, LocalNode, RemoteNode, Shape, TreeError};
+use koidrive_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape, TreeError};
 use koidrive_proto::v1::{Commit, CommitResult, Delete, Move, Op, OpResult, op};
 
 const ROOT: &str = "root";
@@ -99,7 +99,75 @@ fn trees_state() -> TreesState {
         outside: ["a".into()].into(),
         displaced: Default::default(),
         edited_here: [("a".into(), 1)].into(),
+        unsent_edits: Default::default(),
     }
+}
+
+fn content(digest: u8) -> Content {
+    Content {
+        size: 3,
+        manifest_digest: vec![digest; 32],
+        ..Default::default()
+    }
+}
+
+/// Trees whose file `f` L, S and R hold with content 2, and a state that records content 2 as an
+/// edit of this device the server does not hold.
+fn unsent() -> (Trees, TreesState) {
+    let mut trees = Trees::new(ROOT);
+    let shape = Shape {
+        parent: ROOT.into(),
+        name: "f".into(),
+        kind: Kind::File,
+        content: Some(content(2)),
+    };
+    trees.set_remote("f".into(), remote(shape.clone()));
+    let identity = FileIdentity {
+        dev: 1,
+        ino: 1,
+        birth_ns: Some(0),
+    };
+    let local = LocalNode {
+        shape: shape.clone(),
+        identity,
+        parked: false,
+    };
+    trees.set_local("f".into(), local);
+    trees.set_synced("f".into(), Some(shape));
+    let state = TreesState {
+        dirty: ["f".into()].into(),
+        unsent_edits: [("f".into(), content(2))].into(),
+        ..Default::default()
+    };
+    (trees, state)
+}
+
+/// A file L, S and R hold alike is still a local edit while its content is recorded as one the
+/// server does not hold, so the state keeps it dirty.
+#[test]
+fn an_unsent_edit_restores_while_l_holds_its_content_and_the_file_is_dirty() {
+    let (mut trees, state) = unsent();
+    trees.restore(state.clone()).unwrap();
+    assert_eq!(trees.state(), state);
+    assert_eq!(trees.class("f"), Class::Local);
+    let (mut trees, state) = unsent();
+    let clean = TreesState {
+        dirty: Default::default(),
+        ..state
+    };
+    assert_eq!(trees.restore(clean), Err(StateError::NotDirty("f".into())));
+    let (mut trees, mut state) = unsent();
+    state.unsent_edits.insert("f".into(), content(3));
+    assert_eq!(
+        trees.restore(state),
+        Err(StateError::NotUnsentEdit("f".into()))
+    );
+    let (mut trees, mut state) = unsent();
+    state.unsent_edits.insert("g".into(), content(2));
+    assert_eq!(
+        trees.restore(state),
+        Err(StateError::NotUnsentEdit("g".into()))
+    );
 }
 
 /// A restore of the trashed node `n`.

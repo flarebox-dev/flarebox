@@ -19,7 +19,7 @@ use crate::effects::{Effect, EffectRecord};
 use crate::guard::GuardState;
 use crate::question::Question;
 use crate::restore::{Resolved, RestoreId, RestoreIntent};
-use crate::tree::{FileIdentity, NodeId, TreeError};
+use crate::tree::{Content, FileIdentity, NodeId, TreeError};
 
 /// A position L and R agreed on, with the revision of R's record that held it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +65,9 @@ pub struct TreesState {
     /// The files whose content an edit of this device set, each with the seq of its commit, while
     /// R holds that content.
     pub edited_here: BTreeMap<NodeId, u64>,
+    /// The files whose content in L is an edit of this device that the server does not hold,
+    /// although S and R may hold the same bytes, each with that content (section 4.4).
+    pub unsent_edits: BTreeMap<NodeId, Content>,
 }
 
 /// What [`Commits`](crate::commit::Commits) holds.
@@ -136,6 +139,9 @@ pub enum StateError {
     /// A file is recorded as edited by this device, but R does not hold the content of that
     /// commit.
     NotEditedHere(NodeId),
+    /// A file is recorded with an edit the server does not hold, but L does not hold that content
+    /// or R does not hold the file.
+    NotUnsentEdit(NodeId),
     /// The commit in flight does not take the slot after the accepted counter.
     DeviceSeq { accepted: u64, device_seq: u64 },
     /// The result of the commit in flight does not have one outcome per op.

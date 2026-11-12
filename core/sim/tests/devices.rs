@@ -150,13 +150,12 @@ proptest! {
     }
 
     #[test]
-    #[ignore = "a server restore still breaks these: an edit equal to the restored bytes is undone (GUN-438)"]
     fn devices_lose_no_write_across_server_restores(devices in 2..=3usize, phases in phases(Losses::Restores)) {
         keep(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
 
     #[test]
-    #[ignore = "a server restore still breaks these: an edit equal to the restored bytes is undone (GUN-438)"]
+    #[ignore = "a write can stay off the server after several server restores (GUN-480)"]
     fn devices_converge_across_server_restores(devices in 2..=3usize, phases in phases(Losses::Restores)) {
         converge(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
