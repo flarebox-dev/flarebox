@@ -135,11 +135,11 @@ pub enum EntryKind {
 
 /// What survives a rename and changes when a path is deleted and created
 /// again. The birth time guards against inode numbers being reused, on file
-/// systems that report it.
+/// systems that report it. `ino` is 128 bits wide because ReFS file IDs are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileId {
     pub dev: u64,
-    pub ino: u64,
+    pub ino: u128,
     pub birth_ns: Option<i64>,
 }
 
@@ -221,7 +221,7 @@ fn statx(dir: BorrowedFd<'_>, name: &OsStr, flags: rustix::fs::AtFlags) -> io::R
         file_type: FileType::from_raw_mode(RawMode::from(st.stx_mode)),
         id: FileId {
             dev: rustix::fs::makedev(st.stx_dev_major, st.stx_dev_minor),
-            ino: st.stx_ino,
+            ino: st.stx_ino.into(),
             birth_ns,
         },
         size: st.stx_size,
@@ -259,7 +259,7 @@ fn from_stat(st: rustix::fs::Stat) -> Stat {
         file_type: FileType::from_raw_mode(RawMode::from(st.st_mode)),
         id: FileId {
             dev: st.st_dev as u64,
-            ino: st.st_ino,
+            ino: st.st_ino.into(),
             birth_ns: i64::try_from(nanos(st.st_birthtime, st.st_birthtime_nsec)).ok(),
         },
         size: st.st_size as u64,

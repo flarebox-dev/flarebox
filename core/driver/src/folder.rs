@@ -1421,7 +1421,7 @@ fn unanswered(tx: &Tx<'_>) -> Result<u64, koidrive_store::Error> {
 /// What the observer's thread sends to the task.
 pub(crate) enum FromDisk {
     /// A stamped batch, with the number of entries the folder holds after it.
-    Batch(Batch, u64),
+    Batch(Box<Batch>, u64),
     /// The first scan of the folder is done. Sent once, after the batch of that scan if it had one.
     Scanned,
     /// The folder cannot be observed at all.
@@ -1696,7 +1696,7 @@ impl FolderTask {
                     Some(seen) = from_disk.recv() => match seen {
                         // The observer reaches the folder by its path, so a folder replaced before its
                         // first scan is scanned or fails there before the recheck below sees it.
-                        FromDisk::Batch(batch, entries) => match folder.observed(batch, entries) {
+                        FromDisk::Batch(batch, entries) => match folder.observed(*batch, entries) {
                             Err(Stop::OtherRoot) if !claim::still_locked(&lock, &self.link.root) => {
                                 break Halt::Root(Halted::Replaced, REPLACED.to_owned());
                             }
@@ -1896,7 +1896,7 @@ impl FolderTask {
                             "observed the folder"
                         );
                         let entries = observer.snapshot().entries.len() as u64;
-                        let _ = sender.send(FromDisk::Batch(batch, entries));
+                        let _ = sender.send(FromDisk::Batch(Box::new(batch), entries));
                     }
                     Err(error) => {
                         tracing::warn!(space_id = link.space_id, %error, "observing the folder failed");

@@ -713,7 +713,7 @@ fn a_file_swapped_into_a_name_the_rules_exclude_keeps_its_remote_copy() {
     fs::rename(site.root.join("a"), site.root.join("tmp")).unwrap();
     fs::rename(site.root.join("b"), site.root.join("a")).unwrap();
     fs::rename(site.root.join("tmp"), site.root.join("b")).unwrap();
-    let included_ino = fs::metadata(site.root.join("a")).unwrap().ino();
+    let included_ino = u128::from(fs::metadata(site.root.join("a")).unwrap().ino());
     a.scan_until(|a| {
         a.observer
             .snapshot()

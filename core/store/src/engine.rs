@@ -16,7 +16,7 @@ use koidrive_proto::v1::{Commit, CommitResult, Content, NodeKind};
 use prost::{Message, Oneof};
 use rusqlite::{OptionalExtension, params};
 
-use crate::{Error, Result, Tx, decode, non_empty};
+use crate::{Error, Result, Tx, decode, ino_columns, ino_from_columns, non_empty};
 
 /// What the engine needs to continue where it stopped, besides the nodes of R, L and S, which the
 /// store keeps per node.
@@ -141,7 +141,7 @@ impl Tx<'_> {
         }
         let mut stmt = self
             .0
-            .prepare_cached("SELECT node_id, dev, ino, birth_ns FROM recorded_nodes")?;
+            .prepare_cached("SELECT node_id, dev, ino, ino_high, birth_ns FROM recorded_nodes")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let node: NodeId = row.get(0)?;
@@ -152,8 +152,8 @@ impl Tx<'_> {
                 Some((dev, ino)) => {
                     let identity = FileIdentity {
                         dev: dev as u64,
-                        ino: ino as u64,
-                        birth_ns: row.get(3)?,
+                        ino: ino_from_columns(ino, row.get(3)?),
+                        birth_ns: row.get(4)?,
                     };
                     state.trees.displaced.insert(node, identity);
                 }
@@ -409,8 +409,8 @@ impl Tx<'_> {
             .0
             .prepare_cached("DELETE FROM recorded_nodes WHERE node_id = ?1")?;
         let mut put = self.0.prepare_cached(
-            "INSERT OR REPLACE INTO recorded_nodes (node_id, displaced, dev, ino, birth_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT OR REPLACE INTO recorded_nodes (node_id, displaced, dev, ino, ino_high, birth_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )?;
         let (removed, changed) = differences(&old, &new);
         for node in removed {
@@ -421,7 +421,8 @@ impl Tx<'_> {
                 node,
                 identity.is_some(),
                 identity.map(|held| held.dev as i64),
-                identity.map(|held| held.ino as i64),
+                identity.map(|held| ino_columns(held.ino).0),
+                identity.map_or(0, |held| ino_columns(held.ino).1),
                 identity.and_then(|held| held.birth_ns),
             ])?;
         }
@@ -768,6 +769,8 @@ struct StoredIdentity {
     ino: u64,
     #[prost(int64, optional, tag = "3")]
     birth_ns: Option<i64>,
+    #[prost(uint64, tag = "4")]
+    ino_high: u64,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -961,8 +964,9 @@ impl From<&FileIdentity> for StoredIdentity {
     fn from(identity: &FileIdentity) -> Self {
         Self {
             dev: identity.dev,
-            ino: identity.ino,
+            ino: identity.ino as u64,
             birth_ns: identity.birth_ns,
+            ino_high: (identity.ino >> 64) as u64,
         }
     }
 }
@@ -971,7 +975,7 @@ impl From<StoredIdentity> for FileIdentity {
     fn from(identity: StoredIdentity) -> Self {
         Self {
             dev: identity.dev,
-            ino: identity.ino,
+            ino: (u128::from(identity.ino_high) << 64) | u128::from(identity.ino),
             birth_ns: identity.birth_ns,
         }
     }

@@ -275,7 +275,7 @@ fn three_trees_round_trip() {
         .unwrap();
 }
 
-fn identity(ino: u64) -> FileIdentity {
+fn identity(ino: u128) -> FileIdentity {
     FileIdentity {
         dev: u64::MAX,
         ino,
@@ -1034,6 +1034,7 @@ fn a_cursor_stored_before_it_could_record_a_server_behind_it_records_none() {
         .unwrap();
     drop_cursor_tokens(&conn);
     conn.execute_batch("DROP TABLE taken_answers;").unwrap();
+    drop_ino_high(&conn);
     conn.pragma_update(None, "user_version", 4).unwrap();
     drop(conn);
 
@@ -1081,6 +1082,7 @@ fn a_store_from_before_contents_were_watched_opens_with_nothing_watched() {
         .unwrap();
     drop_cursor_tokens(&conn);
     conn.execute_batch("DROP TABLE taken_answers;").unwrap();
+    drop_ino_high(&conn);
     conn.pragma_update(None, "user_version", 5).unwrap();
     drop(conn);
 
@@ -1126,6 +1128,7 @@ fn a_store_from_before_edits_were_recorded_opens_with_none_recorded() {
         .unwrap();
     drop_cursor_tokens(&conn);
     conn.execute_batch("DROP TABLE taken_answers;").unwrap();
+    drop_ino_high(&conn);
     conn.pragma_update(None, "user_version", 10).unwrap();
     drop(conn);
 
@@ -1165,6 +1168,7 @@ fn a_store_from_before_deletes_were_recorded_opens_with_none_recorded() {
         .unwrap();
     drop_cursor_tokens(&conn);
     conn.execute_batch("DROP TABLE taken_answers;").unwrap();
+    drop_ino_high(&conn);
     conn.pragma_update(None, "user_version", 6).unwrap();
     drop(conn);
 
@@ -1211,6 +1215,7 @@ fn a_store_from_before_the_guard_opens_with_an_empty_guard() {
         .unwrap();
     drop_cursor_tokens(&conn);
     conn.execute_batch("DROP TABLE taken_answers;").unwrap();
+    drop_ino_high(&conn);
     conn.pragma_update(None, "user_version", 7).unwrap();
     drop(conn);
 
@@ -1263,6 +1268,7 @@ fn a_store_from_before_questions_showed_local_shapes_keeps_its_questions() {
         .unwrap();
     drop_cursor_tokens(&conn);
     conn.execute_batch("DROP TABLE taken_answers;").unwrap();
+    drop_ino_high(&conn);
     conn.pragma_update(None, "user_version", 8).unwrap();
     drop(conn);
 
@@ -1299,6 +1305,7 @@ fn a_store_from_before_nodes_in_ignored_folders_were_stored_opens_with_none_reco
         .unwrap();
     drop_cursor_tokens(&conn);
     conn.execute_batch("DROP TABLE taken_answers;").unwrap();
+    drop_ino_high(&conn);
     conn.pragma_update(None, "user_version", 9).unwrap();
     drop(conn);
 
@@ -1340,6 +1347,7 @@ fn a_store_from_before_remote_removals_were_counted_opens_with_none_counted() {
         .unwrap();
     drop_cursor_tokens(&conn);
     conn.execute_batch("DROP TABLE taken_answers;").unwrap();
+    drop_ino_high(&conn);
     conn.pragma_update(None, "user_version", 11).unwrap();
     drop(conn);
 
@@ -1372,6 +1380,7 @@ fn a_store_from_before_positions_were_watched_opens_with_none_watched() {
         .unwrap();
     drop_cursor_tokens(&conn);
     conn.execute_batch("DROP TABLE taken_answers;").unwrap();
+    drop_ino_high(&conn);
     conn.pragma_update(None, "user_version", 12).unwrap();
     drop(conn);
 
@@ -1450,6 +1459,7 @@ fn a_store_from_before_waiting_updates_kept_their_origin_takes_the_accepted_slot
     .unwrap();
     drop_cursor_tokens(&conn);
     conn.execute_batch("DROP TABLE taken_answers;").unwrap();
+    drop_ino_high(&conn);
     conn.pragma_update(None, "user_version", 13).unwrap();
     drop(conn);
 
@@ -1458,6 +1468,22 @@ fn a_store_from_before_waiting_updates_kept_their_origin_takes_the_accepted_slot
     before.commits.published.clear();
     before.trees.unsent_edits.clear();
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
+}
+
+fn drop_ino_high(conn: &Connection) {
+    conn.execute_batch("ALTER TABLE local_nodes DROP COLUMN ino_high;")
+        .unwrap();
+    let recorded: bool = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE name = 'recorded_nodes'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    if recorded {
+        conn.execute_batch("ALTER TABLE recorded_nodes DROP COLUMN ino_high;")
+            .unwrap();
+    }
 }
 
 /// Takes the cursor back to the schema before commit tokens (RFC 0013).
@@ -1492,6 +1518,7 @@ fn a_cursor_stored_before_commit_tokens_opens_with_none() {
         "DROP TABLE published_nodes; DROP TABLE taken_answers; DROP TABLE unsent_edits;",
     )
     .unwrap();
+    drop_ino_high(&conn);
     conn.pragma_update(None, "user_version", 15).unwrap();
     drop(conn);
 
@@ -1543,6 +1570,7 @@ fn a_store_from_before_watched_positions_were_kept_takes_them_from_s() {
     .unwrap();
     drop_cursor_tokens(&conn);
     conn.execute_batch("DROP TABLE taken_answers;").unwrap();
+    drop_ino_high(&conn);
     conn.pragma_update(None, "user_version", 14).unwrap();
     drop(conn);
 
@@ -1570,6 +1598,7 @@ fn a_store_from_before_published_entries_were_recorded_opens_with_none_recorded(
         "DROP TABLE published_nodes; DROP TABLE taken_answers; DROP TABLE unsent_edits;",
     )
     .unwrap();
+    drop_ino_high(&conn);
     conn.pragma_update(None, "user_version", 16).unwrap();
     drop(conn);
 
@@ -1599,8 +1628,8 @@ fn a_store_from_before_unsent_edits_were_recorded_opens_with_none_recorded() {
         .unwrap();
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch("DROP TABLE unsent_edits;").unwrap();
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
-        .unwrap();
+    drop_ino_high(&conn);
+    conn.pragma_update(None, "user_version", 18).unwrap();
     drop(conn);
 
     let mut store = Store::open(&path).unwrap();
@@ -1615,6 +1644,116 @@ fn a_store_from_before_unsent_edits_were_recorded_opens_with_none_recorded() {
     drop(store);
     let mut store = Store::open(&path).unwrap();
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), after);
+}
+
+#[test]
+fn a_store_from_before_inodes_took_128_bits_keeps_every_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let state = engine_state();
+    let local =
+        [("a", u64::MAX), ("b", 1 << 63), ("c", 42), ("d", 0)].map(|(node_id, ino)| LocalNode {
+            node_id: node_id.into(),
+            shape: file_shape("root", node_id),
+            identity: FileId {
+                dev: u64::MAX,
+                ino: ino.into(),
+                birth_ns: Some(-1),
+            },
+            parked: false,
+        });
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| {
+            tx.set_engine_state(&state)?;
+            for node in &local {
+                tx.put_local_node(node)?;
+            }
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+    let conn = Connection::open(&path).unwrap();
+    drop_ino_high(&conn);
+    conn.pragma_update(None, "user_version", 19).unwrap();
+    let stored: i64 = conn
+        .query_row(
+            "SELECT ino FROM local_nodes WHERE node_id = 'a'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, -1, "the low 64 bits keep their encoding");
+    drop(conn);
+
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    store
+        .transaction(|tx| {
+            assert_eq!(tx.local_nodes()?, local);
+            assert_eq!(tx.engine_state()?, state);
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn an_inode_wider_than_64_bits_survives_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let wide = |ino: u128| FileIdentity {
+        dev: 1,
+        ino,
+        birth_ns: None,
+    };
+    let mut state = engine_state();
+    state.trees.displaced.insert("wide".into(), wide(u128::MAX));
+    state.effects.failed.insert(
+        "w".into(),
+        Effect::Move {
+            from: Location::At {
+                base: Base::Parked {
+                    node: "p".into(),
+                    identity: wide(1 << 64),
+                },
+                dirs: vec![Dir {
+                    name: "sub".into(),
+                    identity: wide((1 << 127) | 1),
+                }],
+                name: "a".into(),
+            },
+            identity: wide(u128::MAX - 1),
+            to: Location::Parked("w".into()),
+        },
+    );
+    let local = [("a", u128::MAX), ("b", 1 << 64)].map(|(node_id, ino)| LocalNode {
+        node_id: node_id.into(),
+        shape: file_shape("root", node_id),
+        identity: FileId {
+            dev: 1,
+            ino,
+            birth_ns: None,
+        },
+        parked: false,
+    });
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| {
+            tx.set_engine_state(&state)?;
+            for node in &local {
+                tx.put_local_node(node)?;
+            }
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+
+    let mut store = Store::open(&path).unwrap();
+    store
+        .transaction(|tx| {
+            assert_eq!(tx.local_nodes()?, local);
+            assert_eq!(tx.engine_state()?, state);
+            Ok::<_, Error>(())
+        })
+        .unwrap();
 }
 
 /// A database of the schema before restores gains the two restore tables, empty, and keeps the
@@ -1662,6 +1801,7 @@ fn a_version_3_store_opens_with_empty_restore_tables() {
         .unwrap();
     drop_cursor_tokens(&conn);
     conn.execute_batch("DROP TABLE taken_answers;").unwrap();
+    drop_ino_high(&conn);
     conn.pragma_update(None, "user_version", 3).unwrap();
     drop(conn);
 

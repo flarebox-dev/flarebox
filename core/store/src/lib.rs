@@ -396,6 +396,11 @@ const MIGRATIONS: &[&str] = &[
         node_id TEXT PRIMARY KEY
     ) STRICT, WITHOUT ROWID;
 ",
+    "
+    ALTER TABLE local_nodes ADD COLUMN ino_high INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE recorded_nodes
+        ADD COLUMN ino_high INTEGER NOT NULL DEFAULT 0 CHECK (ino IS NOT NULL OR ino_high = 0);
+",
 ];
 
 /// The schema version this build writes.
@@ -832,7 +837,7 @@ impl Tx<'_> {
     /// Every node of the local tree, ordered by `node_id`.
     pub fn local_nodes(&self) -> Result<Vec<LocalNode>> {
         let mut stmt = self.0.prepare_cached(
-            "SELECT node_id, parent_id, name, kind, content, dev, ino, birth_ns, parked
+            "SELECT node_id, parent_id, name, kind, content, dev, ino, ino_high, birth_ns, parked
              FROM local_nodes ORDER BY node_id",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -841,10 +846,10 @@ impl Tx<'_> {
                 ShapeRow::read(row, 1)?,
                 FileId {
                     dev: row.get::<_, i64>(5)? as u64,
-                    ino: row.get::<_, i64>(6)? as u64,
-                    birth_ns: row.get(7)?,
+                    ino: ino_from_columns(row.get(6)?, row.get(7)?),
+                    birth_ns: row.get(8)?,
                 },
-                row.get::<_, bool>(8)?,
+                row.get::<_, bool>(9)?,
             ))
         })?;
         rows.map(|row| {
@@ -859,15 +864,15 @@ impl Tx<'_> {
         .collect()
     }
 
-    /// Inserts or replaces the local node. `dev` and `ino` are stored as their
-    /// two's-complement `i64` bit patterns, so every `u64` round-trips.
+    /// Inserts or replaces the local node. `dev` is stored as its two's-complement `i64` bit
+    /// pattern and `ino` as the bit patterns of its low and high 64 bits, so every value round-trips.
     pub fn put_local_node(&self, node: &LocalNode) -> Result<()> {
         let shape = &node.shape;
         self.0
             .prepare_cached(
                 "INSERT OR REPLACE INTO local_nodes
-                 (node_id, parent_id, name, kind, content, dev, ino, birth_ns, parked)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 (node_id, parent_id, name, kind, content, dev, ino, ino_high, birth_ns, parked)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?
             .execute(params![
                 node.node_id,
@@ -876,7 +881,8 @@ impl Tx<'_> {
                 shape.kind,
                 shape.content.as_ref().map(Content::encode_to_vec),
                 node.identity.dev as i64,
-                node.identity.ino as i64,
+                ino_columns(node.identity.ino).0,
+                ino_columns(node.identity.ino).1,
                 node.identity.birth_ns,
                 node.parked,
             ])?;
@@ -1157,6 +1163,14 @@ fn read_chunk(row: &rusqlite::Row<'_>) -> rusqlite::Result<CachedChunk> {
         size: row.get(1)?,
         last_used_ms: row.get(2)?,
     })
+}
+
+fn ino_columns(ino: u128) -> (i64, i64) {
+    (ino as u64 as i64, (ino >> 64) as u64 as i64)
+}
+
+fn ino_from_columns(low: i64, high: i64) -> u128 {
+    (u128::from(high as u64) << 64) | u128::from(low as u64)
 }
 
 fn non_empty(value: &str) -> Option<&str> {

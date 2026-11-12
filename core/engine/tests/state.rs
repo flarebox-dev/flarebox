@@ -43,7 +43,7 @@ fn trees() -> Trees {
         let shape = dir(ROOT, id);
         let identity = FileIdentity {
             dev: 1,
-            ino: ino as u64,
+            ino: ino as u128,
             birth_ns: Some(0),
         };
         trees.set_remote(id.into(), remote(shape.clone()));

@@ -1693,7 +1693,7 @@ mod tests {
         }
     }
 
-    fn held(shape: Shape, ino: u64) -> LocalNode {
+    fn held(shape: Shape, ino: u128) -> LocalNode {
         LocalNode {
             shape,
             identity: FileIdentity {
@@ -1729,7 +1729,7 @@ mod tests {
         for (at, (id, synced, remote)) in nodes.iter().enumerate() {
             trees.set_synced((*id).into(), synced.clone());
             if let Some(shape) = synced {
-                trees.set_local((*id).into(), held(shape.clone(), at as u64 + 1));
+                trees.set_local((*id).into(), held(shape.clone(), at as u128 + 1));
             }
             if let Some(shape) = remote {
                 let node = RemoteNode {
@@ -2158,7 +2158,7 @@ mod tests {
     fn ino(ino: u64) -> FileId {
         FileId {
             dev: 1,
-            ino,
+            ino: ino.into(),
             birth_ns: None,
         }
     }

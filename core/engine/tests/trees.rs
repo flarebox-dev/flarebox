@@ -51,7 +51,7 @@ fn remote(shape: Shape) -> RemoteNode {
     }
 }
 
-fn local(shape: Shape, ino: u64) -> LocalNode {
+fn local(shape: Shape, ino: u128) -> LocalNode {
     LocalNode {
         shape,
         identity: FileIdentity {
@@ -353,7 +353,7 @@ fn settling_never_gives_two_siblings_one_name_key() {
 }
 
 /// Sets a node to `shape` in L and R, with `from` as its S shape.
-fn same_change(trees: &mut Trees, id: &str, from: Shape, to: Shape, ino: u64) {
+fn same_change(trees: &mut Trees, id: &str, from: Shape, to: Shape, ino: u128) {
     trees.set_synced(id.into(), Some(from));
     trees.set_local(id.into(), local(to.clone(), ino));
     trees.set_remote(id.into(), remote(to));
@@ -478,7 +478,7 @@ fn rotation(n: usize) -> Trees {
     for i in 0..n {
         let from = file(ROOT, &format!("x{i}"), 1);
         let to = file(ROOT, &format!("x{}", (i + 1) % n), 1);
-        same_change(&mut trees, &format!("f{i:02}"), from, to, i as u64);
+        same_change(&mut trees, &format!("f{i:02}"), from, to, i as u128);
     }
     trees
 }
@@ -622,7 +622,7 @@ fn forgetting_what_the_server_lost_keeps_the_rest_of_s() {
         ("same", file(ROOT, "same", 1)),
     ];
     for (ino, (id, shape)) in shapes.iter().enumerate() {
-        trees.set_local(id.to_string(), local(shape.clone(), ino as u64));
+        trees.set_local(id.to_string(), local(shape.clone(), ino as u128));
         trees.set_synced(id.to_string(), Some(shape.clone()));
     }
     trees.set_remote("photos".into(), remote(dir(ROOT, "photos")));
@@ -662,7 +662,7 @@ fn a_remote_delete_below_a_folder_the_server_lost_stays_a_remote_delete() {
         ("two", file("albums", "two", 1)),
     ];
     for (ino, (id, shape)) in shapes.iter().enumerate() {
-        trees.set_local(id.to_string(), local(shape.clone(), ino as u64));
+        trees.set_local(id.to_string(), local(shape.clone(), ino as u128));
         trees.set_synced(id.to_string(), Some(shape.clone()));
     }
     trees.set_remote(
@@ -731,7 +731,7 @@ proptest! {
                 trees.set_remote(id.clone(), remote(shape));
             }
             if let Some(shape) = l[i].clone() {
-                trees.set_local(id.clone(), local(shape, i as u64));
+                trees.set_local(id.clone(), local(shape, i as u128));
             }
         }
         prop_assert_eq!(trees.check(), Ok(()));
@@ -774,7 +774,7 @@ proptest! {
             let id = format!("n{i}");
             if let Some(shape) = &shape {
                 trees.set_remote(id.clone(), remote(shape.clone()));
-                trees.set_local(id.clone(), local(shape.clone(), i as u64));
+                trees.set_local(id.clone(), local(shape.clone(), i as u128));
             }
             trees.set_synced(id, shape);
         }
@@ -918,7 +918,7 @@ proptest! {
                 _ => r[i].clone(),
             };
             if let Some(shape) = l {
-                trees.set_local(id, local(shape, i as u64));
+                trees.set_local(id, local(shape, i as u128));
             }
         }
         prop_assert_eq!(trees.synced().check(Names::ByKey), Ok(()));

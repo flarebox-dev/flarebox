@@ -189,7 +189,7 @@ fn parked_base_checks_the_parked_folder_identity() {
     let node_id = |path: &Path| {
         use std::os::unix::fs::MetadataExt;
         let meta = fs::symlink_metadata(path).unwrap();
-        (meta.dev(), meta.ino())
+        (meta.dev(), u128::from(meta.ino()))
     };
 
     let parked_scan = Snapshot::scan(&parked).unwrap();

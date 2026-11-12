@@ -39,7 +39,7 @@ fn space(loose: usize, inside: usize) -> Trees {
     nodes
         .extend((0..inside).map(|i| (format!("d/g{i}"), shape("d", &format!("g{i}"), Kind::File))));
     for (ino, (id, shape)) in nodes.into_iter().enumerate() {
-        put_back(&mut trees, &id, shape.clone(), ino as u64 + 1);
+        put_back(&mut trees, &id, shape.clone(), ino as u128 + 1);
         trees.set_synced(id.clone(), Some(shape.clone()));
         trees.set_remote(
             id,
@@ -56,7 +56,7 @@ fn space(loose: usize, inside: usize) -> Trees {
     trees
 }
 
-fn put_back(trees: &mut Trees, id: &str, shape: Shape, ino: u64) {
+fn put_back(trees: &mut Trees, id: &str, shape: Shape, ino: u128) {
     let identity = FileIdentity {
         dev: 1,
         ino,
@@ -611,7 +611,7 @@ fn an_unanswered_question_keeps_holding_what_is_left_when_it_shrinks() {
             &mut trees,
             &format!("f{i}"),
             shape(ROOT, &format!("f{i}"), Kind::File),
-            100 + i as u64,
+            100 + i as u128,
         );
     }
     trees.settle();
@@ -1272,7 +1272,7 @@ fn nested() -> Trees {
     nodes.extend(inner);
     let mut trees = Trees::new(ROOT);
     for (ino, (id, shape)) in nodes.into_iter().enumerate() {
-        put_back(&mut trees, &id, shape.clone(), ino as u64 + 1);
+        put_back(&mut trees, &id, shape.clone(), ino as u128 + 1);
         trees.set_synced(id.clone(), Some(shape.clone()));
         let node = RemoteNode {
             shape,

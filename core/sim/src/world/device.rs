@@ -108,11 +108,11 @@ impl Engine {
     /// leaves L. A parked entry keeps the position L holds for it and takes the content it has.
     pub fn scan(&mut self, disk: &Disk) {
         let root = self.trees.local().root.clone();
-        let known: BTreeMap<u64, NodeId> = (self.trees.local().iter())
+        let known: BTreeMap<u128, NodeId> = (self.trees.local().iter())
             .map(|(id, node)| (node.identity.ino, id.clone()))
             .collect();
-        let mut nodes: BTreeMap<u64, NodeId> = BTreeMap::new();
-        let mut queue: VecDeque<u64> = (disk.entries().iter())
+        let mut nodes: BTreeMap<u128, NodeId> = BTreeMap::new();
+        let mut queue: VecDeque<u128> = (disk.entries().iter())
             .filter(|(_, entry)| !matches!(entry.place, Place::In(_)))
             .map(|(ino, _)| *ino)
             .collect();

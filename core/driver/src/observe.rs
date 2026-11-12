@@ -577,8 +577,9 @@ fn read_content(
 ) -> io::Result<Option<Content>> {
     let file = open_beneath(root, path)?;
     let before = file.metadata()?;
-    let same_file =
-        before.is_file() && before.dev() == entry.id.dev && before.ino() == entry.id.ino;
+    let same_file = before.is_file()
+        && before.dev() == entry.id.dev
+        && u128::from(before.ino()) == entry.id.ino;
     if !same_file || !same_version(&before, entry) {
         return Ok(None);
     }
@@ -789,7 +790,7 @@ mod tests {
         fs::write(dir.path().join("a.txt"), b"one").unwrap();
         let mut observer = observer(dir.path());
         observe_until(&mut observer, |seen| !seen.is_empty());
-        let id = fs::metadata(dir.path().join("a.txt")).unwrap().ino();
+        let id = u128::from(fs::metadata(dir.path().join("a.txt")).unwrap().ino());
 
         fs::rename(dir.path().join("a.txt"), dir.path().join("b.txt")).unwrap();
         let (seen, _) = observe_until(&mut observer, |seen| {
@@ -1374,7 +1375,7 @@ mod tests {
         fs::create_dir_all(root.join("ignored/folder")).unwrap();
         fs::write(root.join("ignored/folder/inner"), b"inner").unwrap();
         fs::write(root.join("tracked"), b"one").unwrap();
-        let tracked = fs::metadata(root.join("tracked")).unwrap().ino();
+        let tracked = u128::from(fs::metadata(root.join("tracked")).unwrap().ino());
         let dev = fs::metadata(root).unwrap().dev();
         let mut observer = FsObserver::start(
             root,

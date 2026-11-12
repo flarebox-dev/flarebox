@@ -45,7 +45,7 @@ fn dir(parent: &str, name: &str) -> Shape {
     }
 }
 
-fn identity(ino: u64) -> FileIdentity {
+fn identity(ino: u128) -> FileIdentity {
     FileIdentity {
         dev: 1,
         ino,
@@ -75,7 +75,7 @@ fn root_at(name: &str) -> Location {
 enum Area {
     Root,
     Parked,
-    Dir(u64),
+    Dir(u128),
 }
 
 #[derive(Clone, Debug)]
@@ -89,12 +89,12 @@ struct Entry {
 /// Entries by inode number, which is also the identity's `ino`.
 #[derive(Default)]
 struct Disk {
-    entries: BTreeMap<u64, Entry>,
-    next: u64,
+    entries: BTreeMap<u128, Entry>,
+    next: u128,
 }
 
 impl Disk {
-    fn find(&self, area: Area, name: &str) -> Option<u64> {
+    fn find(&self, area: Area, name: &str) -> Option<u128> {
         let key = name_key(name);
         self.entries
             .iter()
@@ -125,7 +125,7 @@ impl Disk {
         Ok((area, name.clone()))
     }
 
-    fn existing(&self, at: &Location, identity: &FileIdentity) -> Result<u64, String> {
+    fn existing(&self, at: &Location, identity: &FileIdentity) -> Result<u128, String> {
         let (area, name) = self.resolve(at)?;
         match self.find(area, &name) {
             Some(ino) if ino == identity.ino => Ok(ino),
@@ -141,14 +141,14 @@ impl Disk {
         }
     }
 
-    fn check_content(&self, ino: u64, displaced: &Displaced) -> Result<(), String> {
+    fn check_content(&self, ino: u128, displaced: &Displaced) -> Result<(), String> {
         match &self.entries[&ino].content {
             Some(c) if same_content(c, &displaced.content) => Ok(()),
             _ => Err(format!("{:?} holds other content", displaced.at)),
         }
     }
 
-    fn add(&mut self, area: Area, name: String, kind: Kind, content: Option<Content>) -> u64 {
+    fn add(&mut self, area: Area, name: String, kind: Kind, content: Option<Content>) -> u128 {
         self.next += 1;
         self.entries.insert(
             self.next,
@@ -253,10 +253,10 @@ impl Disk {
 fn space(nodes: &[(&str, Option<Shape>, Option<Shape>)]) -> (Trees, Disk) {
     let mut trees = Trees::new(ROOT);
     let mut disk = Disk {
-        next: nodes.len() as u64,
+        next: nodes.len() as u128,
         ..Disk::default()
     };
-    let ino = |id: &str| nodes.iter().position(|n| n.0 == id).unwrap() as u64 + 1;
+    let ino = |id: &str| nodes.iter().position(|n| n.0 == id).unwrap() as u128 + 1;
     for (i, (id, synced, after)) in nodes.iter().enumerate() {
         trees.set_synced((*id).into(), synced.clone());
         if let Some(shape) = synced {
@@ -265,7 +265,7 @@ fn space(nodes: &[(&str, Option<Shape>, Option<Shape>)]) -> (Trees, Disk) {
                 parent => Area::Dir(ino(parent)),
             };
             disk.entries.insert(
-                i as u64 + 1,
+                i as u128 + 1,
                 Entry {
                     area,
                     name: shape.name.clone(),
@@ -277,7 +277,7 @@ fn space(nodes: &[(&str, Option<Shape>, Option<Shape>)]) -> (Trees, Disk) {
                 (*id).into(),
                 LocalNode {
                     shape: shape.clone(),
-                    identity: identity(i as u64 + 1),
+                    identity: identity(i as u128 + 1),
                     parked: false,
                 },
             );
@@ -728,7 +728,7 @@ fn a_parked_edit_whose_name_the_remote_tree_gives_another_node_stays_parked() {
     };
     trees.set_remote("d".into(), trashed(dir(ROOT, "x")));
     trees.set_remote("k".into(), trashed(file("d", "k", 1)));
-    let edit = |trees: &mut Trees, disk: &mut Disk, id: &str, ino: u64| {
+    let edit = |trees: &mut Trees, disk: &mut Disk, id: &str, ino: u128| {
         let mut node = trees.local().get(id).unwrap().clone();
         node.shape.content = Some(content(9));
         disk.entries.get_mut(&ino).unwrap().content = Some(content(9));

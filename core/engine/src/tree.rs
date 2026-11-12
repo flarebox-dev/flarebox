@@ -153,7 +153,7 @@ impl RemoteNode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FileIdentity {
     pub dev: u64,
-    pub ino: u64,
+    pub ino: u128,
     /// `None` when the filesystem does not report a birth time, which never equals a known one.
     pub birth_ns: Option<i64>,
 }
