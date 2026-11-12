@@ -7094,3 +7094,80 @@ fn a_lost_create_under_a_folder_deleted_after_the_loss_is_not_sent_again() {
     assert_eq!(trees.class("c"), Class::Remote);
     assert!(build(&mut commits, &mut trees, &mut ids).is_none());
 }
+
+fn answered_conflict(answer: Answer) -> (Commits, Trees, IdGen, Shape) {
+    let mut trees = trees(&[(
+        "f",
+        Some(file(ROOT, "f", 2)),
+        Some(file(ROOT, "f", 1)),
+        Some(remote(file(ROOT, "f", 1))),
+    )]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    let copy = file(ROOT, "f (conflict)", 2);
+    let original = RemoteNode {
+        content_rev: 4,
+        ..remote_at(file(ROOT, "f", 3), 3)
+    };
+    trees.set_remote("f".into(), original);
+    trees.set_remote("y".into(), remote_at(copy.clone(), 5));
+    let made = OpResult {
+        node_id: "y".into(),
+        ..outcome(op_result::Code::ConflictCopy)
+    };
+    acknowledge(&mut commits, &mut trees, vec![made]);
+    for (id, shape, ino) in [("f", file(ROOT, "f", 3), 1), ("y", copy.clone(), 2)] {
+        trees.set_local(id.into(), local(shape.clone(), ino));
+        trees.set_synced(id.into(), Some(shape));
+    }
+    trees.settle();
+    let question = commits.questions()[0].id.clone();
+    assert!(commits.decide(&question, answer));
+    (commits, trees, ids, copy)
+}
+
+fn delete_copy_requiring(content_rev: u64, meta_rev: u64) -> op::Op {
+    op::Op::Delete(proto::Delete {
+        node_id: "y".into(),
+        requires: Some(proto::NodeRevisions {
+            node_id: "f".into(),
+            content_rev,
+            meta_rev,
+        }),
+    })
+}
+
+#[test]
+fn keep_the_original_deletes_the_copy_only_while_the_original_is_at_the_revisions_r_holds() {
+    let (mut commits, mut trees, mut ids, _) = answered_conflict(Answer::KeepOriginal);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [delete_copy_requiring(4, 3)]);
+}
+
+#[test]
+fn keep_the_copy_deletes_the_copy_only_while_the_original_holds_the_content_it_took() {
+    let (mut commits, mut trees, mut ids, copy) = answered_conflict(Answer::KeepCopy);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(matches!(ops(&commit)[..], [op::Op::UpdateContent(_)]));
+    let took = Shape {
+        name: "f".into(),
+        ..copy
+    };
+    trees.set_remote(
+        "f".into(),
+        RemoteNode {
+            content_rev: 6,
+            ..remote_at(took.clone(), 3)
+        },
+    );
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    trees.set_local("f".into(), local(took.clone(), 1));
+    trees.set_synced("f".into(), Some(took));
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [delete_copy_requiring(6, 3)]);
+}

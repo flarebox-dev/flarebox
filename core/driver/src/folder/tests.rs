@@ -7345,6 +7345,48 @@ fn a_conflict_whose_file_changes_before_the_answer_reaches_the_server_is_asked_a
     assert_ne!(second.id, first.id);
 }
 
+fn original_changed_before_the_answer_reaches_the_server(
+    change: impl FnOnce(&Path),
+) -> (Remote, Site, Site) {
+    let mut remote = Remote::new();
+    let ((site_a, mut a), (site_b, mut b)) = edited_on_both(&mut remote);
+    answer(&site_b, Answer::KeepOriginal);
+    let step = b.folder.requested();
+    b.take(step).unwrap();
+    assert!(matches!(b.work.front(), Some(Work::Send(_))));
+    change(&site_a.root);
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(&mut remote);
+    b.run(&mut remote);
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+    (remote, site_a, site_b)
+}
+
+#[test]
+fn a_kept_original_deleted_before_the_answer_reaches_the_server_keeps_the_copy() {
+    let (remote, site_a, site_b) = original_changed_before_the_answer_reaches_the_server(|root| {
+        fs::remove_file(root.join("main.go")).unwrap()
+    });
+
+    assert_eq!(remote.names(), [COPY]);
+    let copy = [(COPY.to_owned(), "from b".to_owned())];
+    assert_eq!(files(&site_a.root), copy);
+    assert_eq!(files(&site_b.root), copy);
+}
+
+#[test]
+fn a_kept_original_renamed_before_the_answer_reaches_the_server_keeps_the_copy() {
+    let (remote, site_a, site_b) = original_changed_before_the_answer_reaches_the_server(|root| {
+        fs::rename(root.join("main.go"), root.join("renamed.go")).unwrap()
+    });
+
+    assert_eq!(remote.names(), [COPY, "renamed.go"]);
+    let both = [(COPY, "from b"), ("renamed.go", "from a")]
+        .map(|(path, text)| (path.to_owned(), text.to_owned()));
+    assert_eq!(files(&site_a.root), both);
+    assert_eq!(files(&site_b.root), both);
+}
+
 /// The server rejects the op that carries out keep the original, and neither file changed. The engine drops the
 /// answer, so the folder shows the conflict again under the same ID with no answer and marks the questions changed.
 #[test]

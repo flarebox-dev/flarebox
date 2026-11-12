@@ -795,9 +795,14 @@ impl Commits {
                 let remote = trees.remote().get(&file.node_id).expect("live in R");
                 remote.shape.content.clone()
             };
+            let held = trees.remote().get(&original.node_id).expect("live in R");
             let delete_copy = op::Op::Delete(proto::Delete {
                 node_id: copy.node_id.clone(),
-                requires: None,
+                requires: Some(proto::NodeRevisions {
+                    node_id: original.node_id.clone(),
+                    content_rev: held.content_rev,
+                    meta_rev: held.meta_rev,
+                }),
             });
             let op = match question.answer {
                 Some(Answer::KeepOriginal) => Some(delete_copy),

@@ -6,9 +6,9 @@ use koidrive_engine::ids::IdGen;
 use koidrive_engine::names::MAX_NAME_BYTES;
 use koidrive_proto::v1::{
     ChangeRecord, ChunkRef, Commit, CommitResult, Content, CreateDir, CreateFile, Delete, Error,
-    ListVersions, Move, NodeKind, NodeState, NodeStatus, Op, OpResult, PrepareUpload, Restore,
-    RpcRequest, UpdateContent, UploadReceipt, VersionInfo, change_record, chunk_plan, error, op,
-    op_result, rpc_request, rpc_response,
+    ListVersions, Move, NodeKind, NodeRevisions, NodeState, NodeStatus, Op, OpResult,
+    PrepareUpload, Restore, RpcRequest, UpdateContent, UploadReceipt, VersionInfo, change_record,
+    chunk_plan, error, op, op_result, rpc_request, rpc_response,
 };
 use koidrive_sim::space::{Role, Session, SpaceDo, node_states};
 use serde_json::{Map, Value, json};
@@ -1208,7 +1208,7 @@ impl Run {
                 "create_dir" | "move" => &["node", "parent", "name"],
                 "create_file" => &["node", "parent", "name", "content"],
                 "update_content" => &["node", "content"],
-                "delete" => &["node"],
+                "delete" => &["node", "requires"],
                 "restore" => &["node", "version", "parent", "name"],
                 "empty" => &[],
                 other => return Err(format!("unknown op {other}")),
@@ -1254,7 +1254,17 @@ impl Run {
                 }),
                 "delete" => op::Op::Delete(Delete {
                     node_id: node,
-                    requires: None,
+                    requires: match body.get("requires") {
+                        None => None,
+                        Some(requires) => {
+                            keys(requires, "requires", &["node", "content_rev", "meta_rev"])?;
+                            Some(NodeRevisions {
+                                node_id: self.id(space, req(opt_str(requires, "node"), "node")?)?,
+                                content_rev: req(opt_u64(requires, "content_rev"), "content_rev")?,
+                                meta_rev: req(opt_u64(requires, "meta_rev"), "meta_rev")?,
+                            })
+                        }
+                    },
                 }),
                 _ => op::Op::Restore(Restore {
                     node_id: node,
