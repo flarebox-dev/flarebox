@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::classify::{Class, Origin, Trees, classify};
+use crate::classify::{Class, Origin, Trees};
 use crate::guard::RemoteRemoval;
 use crate::ids::IdGen;
 use crate::ignore::is_rules_file;
@@ -372,10 +372,7 @@ impl Effects {
                 }
             });
         let parked = record.parks();
-        let base = match trees.waiting().get(&record.node) {
-            Some(waiting) => waiting.shape.as_ref(),
-            None => trees.synced().live(&record.node),
-        };
+        let base = trees.acknowledged(&record.node);
         let local = trees.local().live(&record.node);
         let unchanged = match (&record.effect, local, base) {
             (Effect::Move { .. }, Some(local), Some(base)) => {
@@ -600,11 +597,12 @@ fn holds_below(trees: &Trees, id: &str) -> bool {
 /// may never fit S while L holds that shape, as when its name key is taken in S, so the effects
 /// take R's shape and the update stops waiting once L leaves it.
 fn remote_only(trees: &Trees, id: &str) -> bool {
-    let (local, remote) = (trees.local().live(id), trees.remote().live(id));
-    match trees.waiting().get(id) {
-        Some(waiting) => classify(local, waiting.shape.as_ref(), remote) == Class::Remote,
-        None => trees.class(id) == Class::Remote,
-    }
+    trees.acknowledged_class(id) == Class::Remote
+}
+
+pub(crate) fn unparks_to(trees: &Trees, id: &str, target: &Shape) -> bool {
+    let view = View::new(trees);
+    view.blocked(id, target).is_none() && (view.location_in(&target.parent, &target.name)).is_some()
 }
 
 #[allow(clippy::large_enum_variant)]
