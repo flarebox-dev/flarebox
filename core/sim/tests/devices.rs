@@ -1123,3 +1123,60 @@ fn a_device_holding_the_result_of_a_commit_the_server_lost_lists_r_again() {
     ];
     converge(2, &phases).unwrap();
 }
+
+#[test]
+fn an_edit_made_after_its_commit_was_built_follows_the_conflict_copy_to_its_name() {
+    let synced = vec![(0, file("c.txt"))];
+    let mut racing = vec![(0, rename(0, 0, "b")), (0, overwrite(0))];
+    racing.extend(commit(0));
+    racing.extend([
+        (1, overwrite(0)),
+        (1, file("C.TXT")),
+        (1, SCAN),
+        (1, COMMIT),
+        (1, overwrite(0)),
+        (1, COMMIT),
+        (1, DELIVER),
+    ]);
+    let world = converge(2, &[synced, racing]).unwrap();
+    for device in &world.devices {
+        assert_eq!(device.disk.entries().len(), 3);
+    }
+}
+
+#[test]
+fn a_conflict_copy_whose_name_a_file_of_the_same_commit_took_reaches_its_name() {
+    let u = |kind, target, parent, name, text| {
+        Step::User(Action {
+            kind,
+            target,
+            parent,
+            name,
+            text,
+        })
+    };
+    let phases = [
+        vec![(0, u(1, 0, 0, 3, 0)), (0, Step::Work(0))],
+        vec![
+            (1, u(2, 0, 0, 0, 0)),
+            (1, Step::Work(0)),
+            (2, u(0, 0, 0, 0, 0)),
+            (1, u(1, 0, 0, 0, 3)),
+            (0, u(0, 8058298412, 13820684896388115470, 3, 2)),
+            (1, u(2, 5595505104648703704, 14520073170452222456, 0, 3)),
+            (2, Step::Work(1546513718156240915)),
+            (2, COMMIT),
+            (1, Step::Work(4166004558488083538)),
+            (0, u(2, 6580354071670050619, 8205634420763423225, 3, 3)),
+            (1, u(3, 2072403800777770851, 14264798506198798549, 4, 0)),
+            (0, u(3, 3355719809822832468, 4572565801030521563, 0, 1)),
+            (1, u(1, 11181736274241258047, 5920353529640080243, 0, 0)),
+            (1, Step::Work(1407293088156174997)),
+            (1, u(1, 9500849518790139864, 10437075667485134398, 5, 2)),
+            (1, Step::Work(4005447178108011140)),
+            (1, u(2, 7452752783842175740, 3965247538109782643, 4, 3)),
+            (1, COMMIT),
+        ],
+    ];
+    converge(3, &phases).unwrap();
+}
