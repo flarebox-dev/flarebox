@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! One-request HTTP servers that answer chunk transfers in scripted ways.
-
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -44,7 +42,6 @@ fn transfer() -> Transfer {
     }
 }
 
-/// Serves each scripted response to one request, in order, and returns the target URL and the request bodies.
 async fn serve(
     responses: Vec<(u16, &'static str, Vec<u8>)>,
 ) -> (Target, tokio::task::JoinHandle<Vec<Vec<u8>>>) {
@@ -78,7 +75,6 @@ async fn serve(
     )
 }
 
-/// Reads one request and returns its head and body.
 async fn read_request(socket: &mut TcpStream) -> (String, Vec<u8>) {
     let mut request = Vec::new();
     let mut buffer = [0u8; 4096];
@@ -106,7 +102,6 @@ async fn read_request(socket: &mut TcpStream) -> (String, Vec<u8>) {
     )
 }
 
-/// Answers one request with a body that never ends: `part` again and again, `every` apart, until the client leaves.
 async fn endless(
     status: u16,
     content_type: &'static str,
@@ -481,7 +476,6 @@ async fn a_target_inside_the_expiry_margin_is_still_tried() {
     server.await.unwrap();
 }
 
-/// An `UPLOAD` plan for `chunk` through the relay at `relay`, with a ticket that expires `lifetime` from now.
 fn upload_plan(relay: SocketAddr, chunk: &ChunkRef, ticket: &str, lifetime: Duration) -> ChunkPlan {
     let expires = SystemTime::now() + lifetime;
     ChunkPlan {
@@ -496,8 +490,6 @@ fn upload_plan(relay: SocketAddr, chunk: &ChunkRef, ticket: &str, lifetime: Dura
     }
 }
 
-/// A relay that refuses the ticket `stale` with 403, as the Worker refuses an expired ticket, and answers any other
-/// ticket with a receipt. Returns its address and the tickets it saw, in order.
 async fn relay() -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -531,7 +523,6 @@ async fn relay() -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
     (address, tickets)
 }
 
-/// A session whose server answers its n-th `PrepareUpload` with `plans(n)`, and the chunks each call asked for.
 async fn scripted_session(
     mut plans: impl FnMut(usize) -> Vec<ChunkPlan> + Send + 'static,
 ) -> (Session, Events, Arc<Mutex<Vec<Vec<ChunkRef>>>>) {
@@ -802,8 +793,6 @@ async fn refusals_follow_the_server_error_code_before_the_http_status() {
     server.await.unwrap();
 }
 
-/// Accepts one upload and returns its target, the socket and the bytes of the body already read with the head, and
-/// the body's length.
 async fn accept_upload() -> (Target, tokio::task::JoinHandle<(TcpStream, usize, usize)>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/chunk", listener.local_addr().unwrap());
@@ -897,7 +886,6 @@ async fn an_upload_whose_body_stops_moving_is_retried_after_the_stall_timeout() 
 
 const HOUR: Duration = Duration::from_secs(3600);
 
-/// How the busy relay answers one PUT: with `status` after `after`, and a receipt if the status is 200.
 #[derive(Clone, Copy)]
 struct Reply {
     after: Duration,
@@ -908,8 +896,6 @@ fn ok_after(after: Duration) -> Reply {
     Reply { after, status: 200 }
 }
 
-/// What the busy relay saw: the ticket of each PUT in the order they arrived, how many PUTs are open now and the most
-/// that were open at once, and the tickets of PUTs whose client left before the answer.
 #[derive(Default)]
 struct Seen {
     tickets: Vec<String>,
@@ -918,8 +904,6 @@ struct Seen {
     left: Vec<String>,
 }
 
-/// A relay that serves each PUT on its own task and answers it with `reply(ticket, earlier)`, where `earlier` counts
-/// the PUTs with the same ticket before it. A PUT counts as open from the end of its request to its answer.
 async fn busy_relay(
     reply: impl Fn(&str, usize) -> Reply + Send + Sync + 'static,
 ) -> (SocketAddr, Arc<Mutex<Seen>>) {
@@ -979,7 +963,6 @@ async fn busy_relay(
     (address, seen)
 }
 
-/// `count` distinct chunks named `c0`, `c1` and so on, with their bytes.
 fn named(count: usize) -> Vec<(String, ChunkRef, Bytes)> {
     (0..count)
         .map(|i| {
@@ -997,7 +980,6 @@ fn names(parts: &[(String, ChunkRef, Bytes)]) -> Vec<String> {
     parts.iter().map(|(name, _, _)| name.clone()).collect()
 }
 
-/// A session that, in every round, plans an upload of each of `parts` through `relay` with its name as the ticket.
 async fn uploads_through(
     relay: SocketAddr,
     parts: &[(String, ChunkRef, Bytes)],
@@ -1009,7 +991,6 @@ async fn uploads_through(
     scripted_session(move |_| plans.clone()).await
 }
 
-/// Reads any chunk of `parts` from memory.
 fn source(
     parts: &[(String, ChunkRef, Bytes)],
 ) -> impl FnMut(&ChunkRef) -> std::future::Ready<io::Result<Bytes>> + use<> {

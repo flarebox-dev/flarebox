@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Session behaviour against a scripted WebSocket server. The real Worker is covered by `tests/server.rs`.
-
 use std::time::{Duration, UNIX_EPOCH};
 
 use koidrive_proto::v1::{
@@ -22,7 +20,6 @@ pub(crate) async fn listen() -> (TcpListener, Arc<Auth>) {
     listen_on("127.0.0.1:0", Duration::from_secs(3600), None).await
 }
 
-/// A scripted server at `address` and an `Auth` for it whose cached token expires after `lifetime`.
 async fn listen_on(
     address: &str,
     lifetime: Duration,
@@ -59,13 +56,11 @@ pub(crate) fn config() -> SessionConfig {
     config
 }
 
-/// Accepts one connection, reads `Hello`, and answers with this `Welcome`.
 pub(crate) async fn accept(listener: &TcpListener, welcome: Welcome) -> Server {
     let (tcp, _) = listener.accept().await.unwrap();
     accept_upgrade(tcp, welcome).await
 }
 
-/// Completes the upgrade on an accepted connection, reads `Hello`, and answers with this `Welcome`.
 async fn accept_upgrade(tcp: TcpStream, welcome: Welcome) -> Server {
     let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
     assert!(matches!(recv(&mut ws).await, client_message::Msg::Hello(_)));
@@ -134,7 +129,6 @@ async fn next(events: &mut Events) -> Event {
         .expect("events ended")
 }
 
-/// A `ServerMessage` carrying a `Notice` whose encoding is exactly `size` bytes.
 fn notice_of_size(size: usize) -> Notice {
     let mut notice = Notice {
         message: String::new(),
@@ -654,8 +648,6 @@ async fn a_malformed_server_message_drops_the_connection_as_a_protocol_violation
     drop(server.await.unwrap());
 }
 
-/// Queues about 10 MB of protocol-sized requests on a connection whose server has stopped reading, so the session
-/// blocks in a socket write.
 async fn block_a_write(session: &Arc<Session>) {
     let calls = tokio::spawn({
         let session = session.clone();
@@ -899,7 +891,6 @@ async fn a_token_expiry_close_during_a_refresh_reconnects_with_a_new_token() {
     drop(refresh);
 }
 
-/// Reads one HTTP request on an accepted connection: its head and its body.
 async fn read_http(tcp: &mut TcpStream) -> (String, Vec<u8>) {
     let mut request = Vec::new();
     let mut chunk = [0; 4096];
@@ -927,7 +918,6 @@ async fn read_http(tcp: &mut TcpStream) -> (String, Vec<u8>) {
     (head, request[end..end + length].to_vec())
 }
 
-/// Answers an HTTP request whose head and body were read with this status and protobuf body.
 async fn write_http(tcp: &mut TcpStream, status: u16, body: Vec<u8>) {
     let head = format!(
         "HTTP/1.1 {status} X\r\ncontent-type: application/x-protobuf\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
@@ -1029,7 +1019,6 @@ async fn a_commit_out_over_http_is_not_sent_on_the_socket_after_a_welcome_of_ano
     drop(server.await.unwrap());
 }
 
-/// Answers one HTTP request on an accepted connection with this status and a protobuf `Error`.
 async fn answer_with_error(tcp: &mut TcpStream, status: u16, error: ProtoError) {
     let mut request = [0; 4096];
     assert!(tcp.read(&mut request).await.unwrap() > 0);
@@ -1167,7 +1156,6 @@ async fn a_refresh_refused_with_an_unknown_code_stops_the_session() {
     ));
 }
 
-/// Answers one HTTP request with this status and a protobuf body, sending the body 30 ms after the head.
 async fn answer_in_two_parts(tcp: &mut TcpStream, status: u16, body: Vec<u8>) {
     let mut request = [0; 4096];
     assert!(tcp.read(&mut request).await.unwrap() > 0);
@@ -1254,7 +1242,6 @@ async fn a_401_with_an_unknown_code_stops_the_session_with_its_message() {
     );
 }
 
-/// Reads one request, then writes `parts` 30 ms apart, and returns the request's head.
 async fn answer_in_parts(tcp: &mut TcpStream, parts: Vec<Vec<u8>>) -> String {
     let mut request = [0; 4096];
     let n = tcp.read(&mut request).await.unwrap();
@@ -1310,16 +1297,13 @@ async fn a_refusal_whose_error_cannot_be_read_is_retried_a_bounded_number_of_tim
         {
             attempts += 1;
             let answer = if attempts == MAX_UNREADABLE_REFUSALS {
-                // A refusal that is read ends the run.
                 vec![b"HTTP/1.1 500 X\r\ncontent-length: 0\r\n\r\n".to_vec()]
             } else if attempts % 2 == 0 {
-                // A whole body that is not an `Error`.
                 vec![
                     b"HTTP/1.1 500 X\r\ncontent-type: application/x-protobuf\r\ncontent-length: 3\r\n\r\n".to_vec(),
                     vec![0xff; 3],
                 ]
             } else {
-                // A body cut short.
                 vec![
                     b"HTTP/1.1 500 X\r\ncontent-type: application/x-protobuf\r\ncontent-length: 1000\r\n\r\n".to_vec(),
                     vec![0x08; 10],
@@ -1409,7 +1393,6 @@ async fn malformed_chunked_refusals_are_left_to_their_status() {
     }
 }
 
-/// Answers a request with `status` and an endless protobuf body, until the client hangs up.
 async fn answer_endlessly(mut tcp: TcpStream, status: u16) {
     let mut request = [0; 4096];
     assert!(tcp.read(&mut request).await.unwrap() > 0);
@@ -1436,7 +1419,6 @@ async fn an_oversized_token_answer_is_a_transport_failure_and_is_asked_again() {
     assert!(again.is_ok(), "the token is asked for again");
 }
 
-/// Answers a request with a whole protobuf error body that is not an `Error`.
 async fn answer_not_an_error(mut tcp: TcpStream) {
     let mut request = [0; 4096];
     assert!(tcp.read(&mut request).await.unwrap() > 0);
@@ -1447,7 +1429,6 @@ async fn answer_not_an_error(mut tcp: TcpStream) {
         .unwrap();
 }
 
-/// Answers a request with a protobuf error that ends before its Content-Length.
 async fn answer_cut_short(mut tcp: TcpStream) {
     let mut request = [0; 4096];
     assert!(tcp.read(&mut request).await.unwrap() > 0);
@@ -1458,7 +1439,6 @@ async fn answer_cut_short(mut tcp: TcpStream) {
         .unwrap();
 }
 
-/// The first event that is not a connection coming or going.
 async fn settled(events: &mut Events) -> Event {
     let settle = async {
         loop {
@@ -1518,7 +1498,6 @@ async fn unreadable_token_errors_stop_the_session_in_a_row() {
     assert_eq!(server.await.unwrap(), MAX_UNREADABLE_REFUSALS);
 }
 
-/// `refusal_body` fed arbitrary and truncated answers.
 mod refusal_reader {
     use proptest::prelude::*;
 
@@ -1544,7 +1523,6 @@ mod refusal_reader {
         Some(("content-length", length.to_string()))
     }
 
-    /// Reads an answer whose first `split` bytes tungstenite already read, and whose connection then ends.
     fn read(framing: Framing, answer: &[u8], split: usize) -> Option<Bytes> {
         let (tail, rest) = answer.split_at(split.min(answer.len()));
         tokio::runtime::Builder::new_current_thread()

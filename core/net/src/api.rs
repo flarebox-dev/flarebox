@@ -16,24 +16,16 @@ use crate::auth::Auth;
 use crate::error::{ApiError, ServerError};
 
 pub(crate) const PROTOBUF: &str = "application/x-protobuf";
-/// Bounds making a connection, including TLS.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-/// Bounds the wait for any single read of a response.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
-/// Bounds a whole call to an HTTP endpoint.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-/// The most bytes read of a single answer of fixed shape. RFC 0007 section 3 bounds each at 4 KiB in binary protobuf,
-/// because every name the server stores is at most 255 bytes (section 1). The largest is `DeviceCredentials`, whose
-/// access token carries the device name JSON-escaped and base64url-encoded.
+/// RFC 0007 section 3 bounds each answer of fixed shape at 4 KiB in binary protobuf.
 const MAX_ANSWER: usize = 4 << 10;
 /// The most bytes read of one `SpaceList` page (RFC 0007 section 3).
 const MAX_SPACE_PAGE: usize = 32 << 10;
 /// The most bytes read of one `DeviceList` page (RFC 0007 section 3).
 const MAX_DEVICE_PAGE: usize = 64 << 10;
-/// The most a listing of `SpaceList` pages holds at once, the pages kept plus the one being read: about 400,000 spaces.
 const MAX_SPACE_LISTING: usize = 128 << 20;
-/// The most bytes read of an error. The server's error messages are sentences it writes itself, without names or other
-/// text from clients.
 const MAX_ERROR: usize = 1 << 20;
 
 /// The HTTP endpoints of one Koidrive deployment (spec v0 section 15.1). Bodies are binary protobuf.
@@ -105,15 +97,13 @@ impl Api {
     }
 
     /// The client for chunk uploads. It has no read timeout, because reqwest starts that timer when it sends the
-    /// request and would end an upload whose body takes longer than that to send. [`crate::Transfer`] bounds an
-    /// upload by its progress instead.
+    /// request and would end an upload whose body takes longer than that to send.
     pub(crate) fn uploads(&self) -> &reqwest::Client {
         &self.uploads
     }
 
-    /// The URL of the path `segments` below the base. Each segment is percent-encoded, so an ID holding `/`, `?` or `#`
-    /// stays one segment of the path. An empty segment, `.`, `..`, or one that holds an ASCII control character would name
-    /// another path, so it is refused: the `url` crate drops tabs and line breaks, so `.\t.` would be read as `..`.
+    /// The URL of the path `segments` below the base. An empty segment, `.`, `..`, or one that holds an ASCII control
+    /// character is refused: the `url` crate drops tabs and line breaks, so `.\t.` would be read as `..`.
     pub(crate) fn url(&self, segments: &[&str]) -> Result<Url, ApiError> {
         let another_path = segments.iter().find(|segment| {
             matches!(**segment, "" | "." | "..") || segment.contains(|c: char| c.is_ascii_control())
@@ -237,7 +227,6 @@ impl Api {
         .await
     }
 
-    /// `POST /v1/spaces/{space_id}/rewind`, owner only (RFC 0003 section 1). Retry with the same `rewind_id`.
     pub async fn rewind(
         &self,
         auth: &Auth,
@@ -328,8 +317,6 @@ impl Api {
             .body(body.encode_to_vec())
     }
 
-    /// Sends with the current access token. A 401 gets one retry with a fresh token, because the cached one may have
-    /// expired on the server's clock.
     async fn authed<M: Message + Default>(
         &self,
         auth: &Auth,
@@ -360,7 +347,6 @@ impl Api {
         }
     }
 
-    /// Sends a request and reads its answer, a `what` of at most `limit` bytes or an error of at most `MAX_ERROR`.
     async fn send<M: Message + Default>(
         &self,
         request: RequestBuilder,
@@ -441,7 +427,6 @@ fn loopback(url: &Url) -> bool {
 mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// The longest name the server stores (RFC 0007 section 1).
     const MAX_NAME: usize = 255;
     use tokio::net::TcpListener;
 
@@ -558,8 +543,6 @@ mod tests {
         );
         server.await.unwrap();
     }
-    /// Answers one request with `status` and a chunked protobuf `body`, or an endless one when `body` is `None`.
-    /// The task ends once the answer is sent or the client hangs up.
     async fn answering(status: u16, body: Option<Vec<u8>>) -> (Url, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap())
@@ -741,7 +724,6 @@ mod tests {
         );
     }
 
-    /// An `Auth` for `base` holding an access token valid for an hour.
     fn signed_in(base: Url) -> Auth {
         let credentials = crate::auth::Credentials {
             user_id: "u".into(),
@@ -760,7 +742,6 @@ mod tests {
         Auth::new(Api::local_development(base).unwrap(), credentials).with_token(token)
     }
 
-    /// Answers one `SpaceList` page per connection, in order, and returns the request line of each.
     async fn paging(
         pages: Vec<(Vec<&'static str>, &'static str)>,
     ) -> (Url, tokio::task::JoinHandle<Vec<String>>) {

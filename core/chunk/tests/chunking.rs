@@ -15,7 +15,6 @@ fn split(data: &[u8], config: ChunkerConfig) -> Vec<Chunk> {
     chunks(data, config).collect::<io::Result<_>>().unwrap()
 }
 
-/// Deterministic pseudo-random bytes (xorshift64*), so tests need no RNG crate.
 fn noise(len: usize, mut seed: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(len);
     while out.len() < len {
@@ -28,7 +27,6 @@ fn noise(len: usize, mut seed: u64) -> Vec<u8> {
     out
 }
 
-/// Yields at most a few bytes per read call, like a slow pipe.
 struct Trickle<'a>(&'a [u8], usize);
 
 impl Read for Trickle<'_> {
@@ -218,7 +216,6 @@ fn an_insertion_changes_only_nearby_chunks() {
     );
 }
 
-/// Yields `good` bytes, then fails with `kind` once and keeps yielding.
 struct FailOnce<'a> {
     data: &'a [u8],
     good: usize,

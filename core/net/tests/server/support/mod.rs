@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared setup for the tests against a local Worker. `core/net/scripts/integration-test.sh` starts `wrangler dev`
-//! from `server/` and sets `KOIDRIVE_TEST_SERVER` (its URL) and `KOIDRIVE_TEST_SERVER_LOG` (its output, where the
-//! Worker prints the claim code).
-
 #![allow(dead_code)]
 
 pub mod proxy;
@@ -32,7 +28,6 @@ pub fn api() -> Api {
 
 static OWNER: OnceCell<DeviceCredentials> = OnceCell::const_new();
 
-/// The deployment's owner, claimed once for every test with the code the Worker prints to its log.
 pub async fn owner() -> Credentials {
     let owner = OWNER.get_or_init(claim).await;
     Credentials::from(owner)
@@ -68,8 +63,6 @@ async fn claim() -> DeviceCredentials {
     api().claim(&request).await.expect("the claim succeeds")
 }
 
-/// The claim code on a Worker log line that mentions one: the last word made of letters and digits in dash-separated
-/// groups, such as `ABCD-EFGH-JKLM`.
 fn claim_code(line: &str) -> Option<String> {
     if !line.to_ascii_lowercase().contains("claim code") {
         return None;
@@ -90,7 +83,6 @@ pub fn auth(credentials: Credentials) -> Arc<Auth> {
     Arc::new(Auth::new(api(), credentials))
 }
 
-/// A new device of the owner, paired by the owner's device.
 pub async fn new_device(name: &str) -> Credentials {
     let owner = auth(owner().await);
     let started = owner.api().pair_start(&owner).await.unwrap();
@@ -134,7 +126,6 @@ pub fn start(auth: Arc<Auth>, space: &SpaceInfo) -> (Session, Events) {
     Session::start(auth, config(space)).unwrap()
 }
 
-/// Waits for the first event that `pick` accepts, skipping the others.
 pub async fn until<T>(events: &mut Events, mut pick: impl FnMut(&Event) -> Option<T>) -> T {
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
@@ -156,7 +147,6 @@ pub async fn connected(events: &mut Events) -> koidrive_proto::v1::Welcome {
     .await
 }
 
-/// A UUIDv7 string, as clients choose for node and commit ids.
 pub fn uuidv7() -> String {
     let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The API client against a local fake of the Cloudflare API.
-
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
@@ -65,7 +63,6 @@ impl Seen {
     }
 }
 
-/// Answers each request with the first unused reply for its method, path and query, and records it.
 struct Fake {
     base: Url,
     seen: Arc<Mutex<Vec<Seen>>>,
@@ -106,7 +103,6 @@ impl Fake {
         self.seen.lock().unwrap().clone()
     }
 
-    /// Method and path of every request, each sent with the client's token.
     fn calls(&self) -> Vec<(String, String)> {
         let seen = self.seen();
         for request in &seen {
@@ -838,8 +834,6 @@ async fn workers_dev_is_enabled_and_the_subdomain_read() {
     assert_eq!(fake.calls().len(), 2);
 }
 
-/// The hash the prototype sent and Cloudflare accepted: SHA-256 of the base64 contents and the extension, cut to 32
-/// hex digits.
 fn prototype_hash(contents: &[u8], extension: &str) -> String {
     let digest = Sha256::digest(format!("{}{extension}", STANDARD.encode(contents)));
     digest

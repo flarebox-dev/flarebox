@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The OAuth login against a local stand-in for the dashboard's token and revoke endpoints. No test reaches
-//! Cloudflare.
-
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -19,7 +16,6 @@ use url::Url;
 
 const PORT: u16 = 49152;
 
-/// A form the fake server received, with the path it was posted to.
 #[derive(Clone, Debug)]
 struct Received {
     path: String,
@@ -39,7 +35,6 @@ impl Received {
     }
 }
 
-/// Answers each request with the next queued response, and 500 once they run out.
 struct FakeServer {
     endpoints: Endpoints,
     received: Arc<Mutex<Vec<Received>>>,
@@ -150,7 +145,6 @@ fn callback(port: u16, query: &str) -> Url {
     Url::parse(&format!("http://127.0.0.1:{port}/oauth/callback?{query}")).unwrap()
 }
 
-/// The code a login sent to the token endpoint, which is the only place a test can see an `AuthorizationCode`.
 async fn code_sent(server: &FakeServer, login: Login, code: AuthorizationCode) -> String {
     login.exchange(&client(), code).await.unwrap();
     server
@@ -162,7 +156,6 @@ async fn code_sent(server: &FakeServer, login: Login, code: AuthorizationCode) -
         .to_owned()
 }
 
-/// Sends one GET to the loopback listener and returns the status code and body.
 async fn get(port: u16, target: &str) -> (u16, String) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     let request =
@@ -600,7 +593,6 @@ async fn a_later_revoke_retries_the_new_refresh_token_of_a_refused_scope() {
     assert_eq!(revoked, ["refresh-2", "access-2", "refresh-2", "access-2"]);
 }
 
-/// A token response whose `expires_in` is too large to be a time.
 fn endless_tokens(access: &str, refresh: &str) -> (u16, String) {
     let body = serde_json::json!({
         "access_token": access,

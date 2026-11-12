@@ -9,8 +9,7 @@ use crate::error::StopReason;
 /// What a session reports, in the order the driver must handle it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
-    /// A connection is up: the server's `Welcome`. It follows every reconnect. The driver compares
-    /// `history_id` and `device_seq` with its store (RFC 0002 sections 2 and 6).
+    /// A connection is up: the server's `Welcome`. It follows every reconnect (RFC 0002 sections 2 and 6).
     Connected(Welcome),
     /// Commits from the log, contiguous and in seq order, continuing from the subscribed seq.
     Changes(Vec<CommitRecord>),

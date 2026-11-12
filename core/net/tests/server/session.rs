@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The session against the real Worker.
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,7 +32,6 @@ fn applied(result: &CommitResult) -> bool {
         .all(|r| r.code == op_result::Code::Applied as i32)
 }
 
-/// The `Welcome` of the connection a call was answered on, which the session queued before the answer.
 fn queued_welcome(events: &mut Events) -> Welcome {
     while let Some(event) = events.try_next() {
         if let Event::Connected(welcome) = event {

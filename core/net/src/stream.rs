@@ -1,16 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The order of the change stream (spec v0 section 7.3, RFC 0002 section 5): records and this device's commit
-//! results are passed on only in contiguous seq order. Free of I/O.
-
 use std::collections::BTreeMap;
 
 use koidrive_proto::v1::{CaughtUp, CommitRecord, Resume, ResyncRequired};
 
 use crate::event::{Committed, Event};
 
-/// The last seq passed on, in its history, with the commit token there (RFC 0013). The token always moves with the
-/// seq, so a `Resume` never names a token at another seq.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Cursor {
     pub history_id: String,
@@ -20,8 +15,6 @@ pub(crate) struct Cursor {
 }
 
 impl Cursor {
-    /// Moves to `seq` with its commit token. A token with no time is unknown, as in the result of a server from before
-    /// RFC 0013, so the cursor then holds none and may take the head's from a `CaughtUp`.
     fn advance(&mut self, seq: u64, commit_id: &str, committed_at_ms: i64) {
         self.seq = seq;
         self.commit_id = match committed_at_ms {
@@ -35,13 +28,10 @@ impl Cursor {
 #[derive(Debug, Default)]
 pub(crate) struct Stream {
     cursor: Option<Cursor>,
-    /// Commit results that arrived while earlier seqs were missing, by seq.
     held: BTreeMap<u64, Committed>,
-    /// A `Resume` is outstanding, so a gap needs no other one.
     resuming: bool,
 }
 
-/// What one server message produced: events in order, and a `Resume` to send when the stream has a gap.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct Fed {
     pub events: Vec<Event>,
@@ -58,7 +48,6 @@ impl Fed {
 }
 
 impl Stream {
-    /// Starts the stream after `since_seq`, the last seq the driver applied completely, with its commit token.
     pub fn subscribe(&mut self, since: Resume) -> Resume {
         self.cursor = Some(Cursor {
             history_id: since.history_id,
@@ -71,10 +60,6 @@ impl Stream {
         self.resume_message().expect("just subscribed")
     }
 
-    /// The `Resume` a new connection sends, if the stream is subscribed. Results held from the previous connection
-    /// are dropped, so every event after the new `Connected` comes from the new connection: the server sends their
-    /// records again from the cursor, their callers got them already, and a server that lost them must not release
-    /// them with records of its own.
     pub fn reconnected(&mut self) -> Option<Resume> {
         self.held.clear();
         self.resuming = self.cursor.is_some();
@@ -122,7 +107,6 @@ impl Stream {
         fed
     }
 
-    /// The backlog is delivered. A cursor at the head with no token takes the head's.
     pub fn caught_up(&mut self, caught_up: CaughtUp) -> Fed {
         let mut fed = Fed::default();
         self.resuming = false;
@@ -140,8 +124,6 @@ impl Stream {
         fed
     }
 
-    /// The server cannot resume from the cursor: stop until the driver subscribes again. Held results are dropped;
-    /// their callers still get them, and the driver bootstraps anyway.
     pub fn resync(&mut self, resync: ResyncRequired) -> Fed {
         self.cursor = None;
         self.held.clear();
@@ -202,7 +184,6 @@ mod tests {
         }
     }
 
-    /// A `Resume` after `seq`, with the token of `record(seq)`.
     fn since(seq: u64) -> Resume {
         Resume {
             history_id: "h".into(),
@@ -406,8 +387,6 @@ mod tests {
         stream.caught_up(other);
         assert_eq!(stream.reconnected(), Some(since(4)));
     }
-    /// A result with no time, from a server before RFC 0013, leaves the token unknown, and the next
-    /// `CaughtUp` at that seq supplies it, also for a result held until the records before it came.
     #[test]
     fn a_result_without_a_time_takes_its_token_from_caught_up() {
         for held in [false, true] {

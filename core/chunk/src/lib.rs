@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Content-defined chunking and chunk hashing (spec v0 §10).
+//! Content-defined chunking and chunk hashing.
 //!
 //! A file smaller than [ChunkerConfig::small_file_threshold] is one chunk, and
 //! an empty file has none. Larger files are cut with FastCDC 2020 at the
@@ -12,9 +12,7 @@
 //! algorithm is frozen as the `fastcdc2020` profile: the v2020 algorithm of
 //! fastcdc-rs 5.0.0 with its Gear table (the first eight bytes, big-endian, of
 //! MD5 over 64 repetitions of each byte value), hash seed 0 and normalization
-//! level 1. `tests/golden.rs` pins the V0 output against an independent
-//! implementation (`scripts/fastcdc_reference.py`); changing any of these
-//! needs a new identifier.
+//! level 1.
 
 use std::fmt;
 use std::io::{self, Chain, Cursor, Read};
@@ -26,9 +24,7 @@ use sha2::{Digest, Sha256};
 const MIB: u32 = 1 << 20;
 const FAMILY: &str = "fastcdc2020";
 
-/// Chunk boundary parameters. [ChunkerConfig::V0] is the spec's; smaller
-/// configurations exist for tests and simulations that need many chunks from
-/// little data.
+/// Chunk boundary parameters. [ChunkerConfig::V0] is the spec's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkerConfig {
     min_size: u32,
@@ -103,7 +99,6 @@ impl ChunkerConfig {
         self.max_size
     }
 
-    /// Files shorter than this many bytes are stored as one chunk.
     pub fn small_file_threshold(&self) -> u32 {
         self.small_file_threshold
     }
@@ -172,7 +167,6 @@ impl ChunkerConfig {
     }
 }
 
-/// Returned by [ChunkerConfig::new] for sizes FastCDC cannot use.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvalidConfig(&'static str);
 
@@ -259,7 +253,6 @@ pub fn chunks<R: Read>(reader: R, config: ChunkerConfig) -> Chunks<R> {
     }
 }
 
-/// The iterator returned by [chunks].
 pub struct Chunks<R: Read> {
     state: State<R>,
 }

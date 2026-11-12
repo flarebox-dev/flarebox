@@ -11,8 +11,7 @@ use prost::Message;
 pub struct ServerError(pub ProtoError);
 
 impl ServerError {
-    /// The `Error` in a protobuf body, or `None` when there is none. An empty body carries no refusal, so it is not
-    /// read as `UNSPECIFIED`.
+    /// An empty body carries no refusal, so it is not read as `UNSPECIFIED`.
     pub(crate) fn decode(body: &[u8]) -> Option<ServerError> {
         if body.is_empty() {
             return None;
@@ -44,7 +43,6 @@ impl ServerError {
         }
     }
 
-    /// The hashes listed with `CODE_MISSING_CHUNKS`.
     pub fn missing_chunks(&self) -> &[Vec<u8>] {
         &self.0.missing_chunks
     }

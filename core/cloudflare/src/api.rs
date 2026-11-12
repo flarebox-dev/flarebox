@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Cloudflare API v4 calls that deploy, find, upgrade and remove a Koidrive server (docs/design/cli-setup.md
-//! sections 4 to 6). Each call answers Cloudflare's envelope `{success, errors, result}`.
-
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::Path;
@@ -21,24 +18,18 @@ use url::Url;
 use crate::bundle::{Asset, UploadPlan};
 use crate::secret::Secret;
 
-/// Every byte outside RFC 3986's unreserved characters is percent-encoded in a path segment, so a name can never add a
-/// segment or a query.
 const SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'_')
     .remove(b'.')
     .remove(b'~');
 
-/// The most results R2 returns in one page of objects or buckets.
 const R2_PAGE: usize = 1000;
 
-/// The most accounts `GET /accounts` returns in one page.
 const ACCOUNTS_PAGE: usize = 50;
 
-/// The most pages of accounts the client reads, so an answer that ignores `page` cannot keep it reading.
 const ACCOUNTS_PAGES: usize = 100;
 
-/// A message from Cloudflare's `errors` list, such as `10042` when R2 is not enabled.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct CloudflareMessage {
     pub code: u64,
@@ -213,7 +204,7 @@ fn null_as_default<'de, D: Deserializer<'de>, T: Default + Deserialize<'de>>(
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
-/// A client for one access token. `base` is `https://api.cloudflare.com/client/v4/`, or a local server in tests.
+/// A client for one access token. `base` is `https://api.cloudflare.com/client/v4/`.
 #[derive(Clone, Debug)]
 pub struct Cloudflare {
     http: reqwest::Client,
@@ -421,15 +412,14 @@ impl Cloudflare {
 
     /// Uploads the assets that Cloudflare does not hold yet and returns the completion token for `UploadPlan::new`.
     ///
-    /// A file's hash is the first 32 hex digits of the SHA-256 of its base64 contents followed by its extension, as in
-    /// the prototype that Cloudflare accepted (cli-setup.md section 4.3).
+    /// A file's hash is the first 32 hex digits of the SHA-256 of its base64 contents followed by its extension.
     pub async fn upload_assets(
         &self,
         account: &str,
         script: &str,
         assets: &[Asset],
     ) -> Result<Secret, ApiError> {
-        /// `buckets` must be present: an empty list is what makes `jwt` a completion token.
+        /// An empty list is what makes `jwt` a completion token.
         #[derive(Deserialize)]
         struct Session {
             jwt: String,
@@ -620,7 +610,6 @@ impl Cloudflare {
         .await
     }
 
-    /// The URL of `base` followed by `segments`, each one percent-encoded.
     fn url(&self, segments: &[&str]) -> Result<Url, ApiError> {
         let mut path = self.base.path().trim_end_matches('/').to_owned();
         for segment in segments {
@@ -643,7 +632,6 @@ impl Cloudflare {
             .bearer_auth(self.token.expose())
     }
 
-    /// A request to an R2 endpoint, which names the jurisdiction it acts in.
     fn r2(&self, method: Method, url: Url, jurisdiction: Jurisdiction) -> RequestBuilder {
         self.request(method, url)
             .header("cf-r2-jurisdiction", jurisdiction.as_str())
@@ -696,7 +684,6 @@ impl Cloudflare {
     }
 }
 
-/// See `Cloudflare::upload_assets`.
 fn asset_hash(asset: &Asset) -> String {
     let extension = Path::new(&asset.path)
         .extension()
@@ -710,8 +697,7 @@ fn asset_hash(asset: &Asset) -> String {
         .collect()
 }
 
-/// The `Content-Type` that Cloudflare serves the asset with. It must be right, because the viewer's `_headers` sets
-/// `X-Content-Type-Options: nosniff`. `application/null` makes Cloudflare send no `Content-Type`.
+/// `application/null` makes Cloudflare send no `Content-Type`.
 fn content_type(path: &str) -> &'static str {
     let extension = Path::new(path)
         .extension()

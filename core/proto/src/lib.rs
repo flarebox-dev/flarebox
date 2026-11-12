@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Protocol types generated from `spec/proto`. The code in `src/gen/` is
-//! written by `buf generate` in `spec/`; do not edit it by hand.
+//! written by `buf generate` in `spec/`.
 
 #[allow(clippy::all)]
 pub mod v1 {
