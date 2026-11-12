@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The parts of e2e.ts that need no server: matching a folder against a scenario's tree, and sealing the macOS
-// device's pairing code.
+// The parts of e2e.ts that need no server: matching a folder against a scenario's tree, finding the tree a rewind
+// restored, and sealing the macOS device's pairing code.
 
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { type Content, contents, format, keypair, listing, matches, seal, trees, unseal } from "./e2e.ts";
+import { type Content, contents, format, keypair, listing, matches, seal, treeAt, trees, unseal } from "./e2e.ts";
 
 const roots: string[] = [];
 
@@ -58,6 +58,19 @@ describe("a folder against a scenario's tree", () => {
     const text = format(listing(folder({ "b.txt": "fromMac", "a/c.txt": "fromLinux" })));
     expect(text.split("\n").map((line) => line.slice(66))).toEqual(["a/c.txt", "b.txt", ""]);
     expect(text).toMatch(/^[0-9a-f]{64} {2}a\/c\.txt\n/);
+  });
+});
+
+describe("the tree a rewind restored", () => {
+  const recorded = { created: 2, edited: 4, moved: 6, deleted: 7, conflicted: 9 };
+
+  it("is the tree the device held at the restored seq, also when it is not the restore point's", () => {
+    expect(treeAt(recorded, 9)).toBe("conflicted");
+    expect(treeAt(recorded, 7)).toBe("deleted");
+  });
+
+  it("is none for a seq at which the device held no scenario's tree", () => {
+    expect(treeAt(recorded, 8)).toBeUndefined();
   });
 });
 
