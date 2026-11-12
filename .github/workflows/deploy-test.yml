@@ -21,9 +21,9 @@ on:
         type: string
         required: false
       bench_ns:
-        description: "bench only: comma-separated supported concurrency values. This build accepts only 1; other values fail before deployment."
+        description: "bench only: comma-separated unique concurrency values from 1,2,4,8, at most four."
         type: string
-        default: '1'
+        default: '1,2,4,8'
       bench_repetitions:
         description: "bench only: repetitions per concurrency value, integer 1 through 3. Each measurement uploads 1 GiB."
         type: string

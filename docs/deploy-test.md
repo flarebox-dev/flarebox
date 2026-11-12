@@ -88,14 +88,14 @@ Open **Actions**, **Deploy test**, **Run workflow**, keep `main` under "Use work
 gh workflow run deploy-test.yml --ref main -f mode=smoke
 gh workflow run deploy-test.yml --ref main -f mode=upgrade -f from_ref=<commit or tag>
 gh workflow run deploy-test.yml --ref main -f mode=e2e
-gh workflow run deploy-test.yml --ref main -f mode=bench -f bench_ns=1 -f bench_repetitions=3
+gh workflow run deploy-test.yml --ref main -f mode=bench -f bench_ns=1,2,4,8 -f bench_repetitions=3
 ```
 
 For `upgrade`, `from_ref` is the release to upgrade from. Left empty, it is the newest tag before the commit under test; there is no release tag yet, so until the first release the run needs `from_ref`, an ancestor of the commit under test at or after `8c9bf4a`, the first commit whose `server/` deploys on its own. For `e2e`, approve the deployment within about 45 minutes: the macOS job builds `koi` while it waits and fails if the deploy job has not sent its pairing code by then. Runs never overlap: a second run waits for the first.
 
 ## Benchmark chunk uploads
 
-Choose `bench` as shown above to deploy, claim, and run the Rust release test `upload_benchmark` in target `upload_bench`. `bench_ns` defaults to `1`. This build accepts only N=1; the trusted job rejects unsupported values before deployment. The concurrency follow-up will enable the four-value sweep of `1,2,4,8`. `bench_repetitions` defaults to `3` and accepts integers from `1` through `3`. Each measurement uploads 1 GiB, so the default uploads 3 GiB before retries. The future four-value sweep is bounded at 12 GiB. `KOIDRIVE_BENCH_MIB` reduces the payload for local runs only.
+Choose `bench` as shown above to deploy, claim, and run the Rust release test `upload_benchmark` in target `upload_bench`. `bench_ns` defaults to `1,2,4,8` and accepts up to four unique comma-separated values from that set. The trusted job rejects unsupported values before deployment. Each measurement sets its upload gate to N and records the gate's configured concurrency, even when N differs from the client's default. `bench_repetitions` defaults to `3` and accepts integers from `1` through `3`. Each measurement uploads 1 GiB, so the full default sweep uploads 12 GiB before retries. `KOIDRIVE_BENCH_MIB` reduces the payload for local runs only.
 
 Each measurement keeps its fresh payload in memory as 256 chunks of 4 MiB and uses a fresh space. The order of N values rotates between repetitions. Generation, initial hashing, space creation, session setup, and commit happen outside the timer. `Transfer::upload`, including hash validation, upload planning, PUTs, and retry waits, runs inside it. MB/s uses decimal megabytes. Upload timing includes Worker and R2 work and cannot isolate R2 latency.
 

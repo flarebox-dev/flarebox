@@ -61,19 +61,10 @@ function run({ command, env = {} }: { command?: string; env?: NodeJS.ProcessEnv 
 }
 
 describe("benchmark input validation before deployment", () => {
-  it.each(["1"])("accepts the supported workflow list %s without state or cargo", async (ns) => {
+  it.each(["1", "2", "4", "8", "1,2,4,8", "8,1"])("accepts the supported workflow list %s without state or cargo", async (ns) => {
     rmSync(join(work, "state.json"));
     const result = await run({ command: "validate", env: { KOIDRIVE_BENCH_NS: ns, KOIDRIVE_BENCH_REPETITIONS: "3" } });
     expect(result).toEqual({ status: 0, output: "" });
-    expect(existsSync(join(work, "cargo.json"))).toBe(false);
-  });
-
-  it.each(["2", "4", "8", "1,2,4,8", "8,1"])("refuses unsupported list %s before deployment without state or cargo", async (ns) => {
-    rmSync(join(work, "state.json"));
-    fakeCargo();
-    const result = await run({ command: "validate", env: { KOIDRIVE_BENCH_NS: ns } });
-    expect(result.status).toBe(1);
-    expect(result.output).toContain("supports only 1 on this build");
     expect(existsSync(join(work, "cargo.json"))).toBe(false);
   });
 
@@ -101,7 +92,7 @@ describe("Rust benchmark child", () => {
     const child = JSON.parse(readFileSync(join(work, "cargo.json"), "utf8"));
     expect(child.args).toEqual(["test", "-p", "koidrive-net", "--release", "--locked", "--test", "upload_bench", "upload_benchmark", "--", "--ignored", "--exact", "--nocapture"]);
     expect(child.cwd).toBe(join(here, "..", "..", ".."));
-    expect(child.env).toMatchObject({ KOIDRIVE_BENCH_URL: "https://koidrive-test.example.workers.dev", KOIDRIVE_BENCH_OWNER: JSON.stringify(owner), KOIDRIVE_BENCH_NS: "1", KOIDRIVE_BENCH_REPETITIONS: "3", RUNNER_OS: "Linux", GITHUB_STEP_SUMMARY: join(work, "summary.md"), CARGO_TARGET_DIR: join(work, "target") });
+    expect(child.env).toMatchObject({ KOIDRIVE_BENCH_URL: "https://koidrive-test.example.workers.dev", KOIDRIVE_BENCH_OWNER: JSON.stringify(owner), KOIDRIVE_BENCH_NS: "1,2,4,8", KOIDRIVE_BENCH_REPETITIONS: "3", RUNNER_OS: "Linux", GITHUB_STEP_SUMMARY: join(work, "summary.md"), CARGO_TARGET_DIR: join(work, "target") });
     expect(child.env).not.toHaveProperty("CLOUDFLARE_API_TOKEN");
     expect(child.env).not.toHaveProperty("CLOUDFLARE_ACCOUNT_ID");
     expect(child.env).not.toHaveProperty("GH_TOKEN");
@@ -110,12 +101,12 @@ describe("Rust benchmark child", () => {
     expect(JSON.parse(readFileSync(join(work, "state.json"), "utf8")).stats).toEqual({ requests: 2, bytesUp: 3, bytesDown: 4 });
   });
 
-  it("refuses unsupported concurrency without reading state or launching cargo", async () => {
+  it.each(["0", "3", "16"])("refuses unsupported concurrency %s without reading state or launching cargo", async (ns) => {
     fakeCargo();
     writeFileSync(join(work, "state.json"), "invalid private state");
-    const result = await run({ env: { KOIDRIVE_BENCH_NS: "1,2,4,8", KOIDRIVE_BENCH_REPETITIONS: "1" } });
+    const result = await run({ env: { KOIDRIVE_BENCH_NS: ns, KOIDRIVE_BENCH_REPETITIONS: "1" } });
     expect(result.status).toBe(1);
-    expect(result.output).toContain("supports only 1 on this build");
+    expect(result.output).toContain("supports only 1,2,4,8 on this build");
     expect(existsSync(join(work, "cargo.json"))).toBe(false);
   });
 
