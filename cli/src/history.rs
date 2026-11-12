@@ -158,13 +158,10 @@ async fn restore(
     node: Option<String>,
     request_id: Option<RequestId>,
 ) -> Result<Done, CliError> {
-    let key = Key::new(
-        "history restore",
-        serde_json::json!({
-            "path": lexical(&crate::absolute(path)?).display().to_string(),
-            "version": version,
-            "node": node,
-        }),
+    let key = Key::restore(
+        &lexical(&crate::absolute(path)?),
+        version.as_deref(),
+        node.as_deref(),
     );
     if let Some(id) = &request_id
         && let Some(recorded) = request::recorded(paths, id, &key)?
@@ -1118,14 +1115,7 @@ mod tests {
     }
 
     fn restore_key(root: &Path) -> Key {
-        Key::new(
-            "history restore",
-            serde_json::json!({
-                "path": root.join("a.txt").display().to_string(),
-                "version": null,
-                "node": null,
-            }),
-        )
+        Key::restore(&root.join("a.txt"), None, None)
     }
 
     async fn restore_again(paths: &Paths, root: &Path, id: &str) -> Result<Done, CliError> {

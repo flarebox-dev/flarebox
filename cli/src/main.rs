@@ -955,10 +955,7 @@ async fn folder(paths: &Paths, action: FolderAction) -> Result<Done, CliError> {
         },
         FolderAction::Restart { folder, request } => {
             let folder = absolute(&folder)?;
-            let key = Key::new(
-                "folder restart",
-                serde_json::json!({ "folder": folder.display().to_string() }),
-            );
+            let key = Key::restart(&folder);
             Request::Restart { folder }.once(request.request_id, key)
         }
         FolderAction::Retry {
@@ -968,13 +965,7 @@ async fn folder(paths: &Paths, action: FolderAction) -> Result<Done, CliError> {
             ..
         } => {
             let folder = absolute(&folder)?;
-            let key = Key::new(
-                "folder retry",
-                serde_json::json!({
-                    "folder": folder.display().to_string(),
-                    "how": if replan { "replan" } else { "resend" },
-                }),
-            );
+            let key = Key::retry(&folder, replan);
             Request::Lift { folder, replan }.once(request.request_id, key)
         }
     };

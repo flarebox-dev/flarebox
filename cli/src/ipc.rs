@@ -1213,10 +1213,7 @@ mod tests {
         driver.start();
         let request_id = RequestId::parse("r1").unwrap();
         let restart = || {
-            let key = Key::new(
-                "folder restart",
-                serde_json::json!({ "folder": root.display().to_string() }),
-            );
+            let key = Key::restart(&root);
             Request::Restart {
                 folder: root.clone(),
             }
@@ -1238,10 +1235,7 @@ mod tests {
         let driver = Driver::open(paths.clone()).unwrap();
         let id = |text: &str| Some(RequestId::parse(text).unwrap());
         let restart = |folder: &Path, request_id| {
-            let key = Key::new(
-                "folder restart",
-                serde_json::json!({ "folder": folder.display().to_string() }),
-            );
+            let key = Key::restart(folder);
             Request::Restart {
                 folder: folder.to_path_buf(),
             }

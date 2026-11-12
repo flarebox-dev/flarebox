@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use koidrive_driver::Paths;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::error::{CliError, Code};
@@ -81,6 +81,34 @@ impl Key {
             command: command.to_owned(),
             arguments,
         }
+    }
+
+    pub fn restart(folder: &Path) -> Self {
+        Key::new(
+            "folder restart",
+            json!({ "folder": folder.as_os_str().as_encoded_bytes() }),
+        )
+    }
+
+    pub fn retry(folder: &Path, replan: bool) -> Self {
+        Key::new(
+            "folder retry",
+            json!({
+                "folder": folder.as_os_str().as_encoded_bytes(),
+                "how": if replan { "replan" } else { "resend" },
+            }),
+        )
+    }
+
+    pub fn restore(path: &Path, version: Option<&str>, node: Option<&str>) -> Self {
+        Key::new(
+            "history restore",
+            json!({
+                "path": path.as_os_str().as_encoded_bytes(),
+                "version": version,
+                "node": node,
+            }),
+        )
     }
 }
 
@@ -206,9 +234,9 @@ fn write(path: &Path, value: &impl Serialize, replace: bool) -> io::Result<bool>
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
-
-    use serde_json::json;
 
     use super::*;
 
@@ -217,7 +245,7 @@ mod tests {
     }
 
     fn restart(folder: &str) -> Key {
-        Key::new("folder restart", json!({ "folder": folder }))
+        Key::restart(Path::new(folder))
     }
 
     fn mode(path: &Path) -> u32 {
@@ -274,6 +302,28 @@ mod tests {
     }
 
     #[test]
+    fn folders_whose_names_differ_only_in_bytes_that_are_not_utf_8_have_distinct_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let folder = |name: &[u8]| Path::new(OsStr::from_bytes(name)).to_path_buf();
+        let (first, second) = (folder(b"/a/\xff"), folder(b"/a/\xfe"));
+        assert_eq!(first.display().to_string(), second.display().to_string());
+        let Begun::Claimed(claim) = begin(&paths, &id("r1"), &Key::restart(&first)).unwrap() else {
+            panic!("the first run claims the request");
+        };
+        claim.finish(&json!("first")).unwrap();
+        let Err(error) = begin(&paths, &id("r1"), &Key::restart(&second)) else {
+            panic!("the second folder reused the record of the first");
+        };
+        assert_eq!(error.code, Code::StaleDecision);
+        assert_ne!(Key::retry(&first, false), Key::retry(&second, false));
+        assert_ne!(
+            Key::restore(&first, None, None),
+            Key::restore(&second, None, None)
+        );
+    }
+
+    #[test]
     fn the_same_id_with_other_arguments_is_a_stale_request_that_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::under(dir.path());
@@ -282,10 +332,7 @@ mod tests {
         };
         claim.finish(&json!("first")).unwrap();
         let before = std::fs::read(request_file(&paths, &id("r1"))).unwrap();
-        for other in [
-            restart("/b"),
-            Key::new("folder retry", json!({ "folder": "/a", "how": "resend" })),
-        ] {
+        for other in [restart("/b"), Key::retry(Path::new("/a"), false)] {
             let Err(error) = begin(&paths, &id("r1"), &other) else {
                 panic!("{other:?} reused the ID");
             };

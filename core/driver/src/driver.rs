@@ -107,6 +107,8 @@ pub enum DriverError {
     UnsupportedFileSystem,
     #[error("{} is not a linked folder", koidrive_fs::quoted(.0))]
     NotLinked(PathBuf),
+    #[error("unlinking {0} did not finish; unlink it again to finish")]
+    UnlinkUnfinished(PathBuf),
     #[error("no unanswered question has the id {0:?}")]
     QuestionNotFound(String),
     #[error("the question was answered with {given}")]
@@ -664,8 +666,14 @@ impl Driver {
         }
         let here = (self.inner.folders.lock().unwrap().values())
             .find(|linked| linked.link.root == root)
-            .map(|linked| (linked.link.clone(), linked.status.lock().unwrap().clone()));
-        if let Some((link, status)) = here {
+            .map(|linked| {
+                let status = linked.status.lock().unwrap().clone();
+                (linked.link.clone(), status, linked.unlink.is_some())
+            });
+        if let Some((link, status, unlinking)) = here {
+            if unlinking {
+                return Err(DriverError::UnlinkUnfinished(root));
+            }
             if link.device_id != credential.device_id || link.server_url != credential.server {
                 return Err(DriverError::LinkedByOtherDevice {
                     device_id: link.device_id,
@@ -3182,6 +3190,32 @@ mod tests {
 
         gate.open();
         sign_out.await.unwrap().unwrap();
+        signed_out(&driver, &paths, &root);
+    }
+
+    #[tokio::test]
+    async fn linking_a_folder_whose_unlink_is_unfinished_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Koidrive");
+        let paths = Paths::under(&base.join("profile"));
+        let (driver, gate) = paused_driver(&paths, &root).await;
+        let unlink = tokio::spawn({
+            let driver = driver.clone();
+            let root = root.clone();
+            async move { driver.unlink(&root).await }
+        });
+        assert!(still_waiting(&unlink).await);
+        unlink.abort();
+        assert!(unlink.await.unwrap_err().is_cancelled());
+        gate.open();
+        let space_id = driver.status().folders[0].space_id.clone();
+        let linked = driver.link(&root, &space_id).await;
+        assert!(
+            matches!(linked, Err(DriverError::UnlinkUnfinished(ref folder)) if *folder == root),
+            "{linked:?}"
+        );
+        driver.sign_out(true).await.unwrap();
         signed_out(&driver, &paths, &root);
     }
 

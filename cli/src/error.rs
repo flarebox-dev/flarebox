@@ -222,6 +222,12 @@ impl From<DriverError> for CliError {
             DriverError::AnswerNotAllowed { .. } => {
                 CliError::usage(message).then(&["koi", "resolve", "--json"])
             }
+            DriverError::UnlinkUnfinished(folder) => CliError::usage(message).then(&[
+                "koi",
+                "folder",
+                "unlink",
+                &folder.display().to_string(),
+            ]),
             DriverError::EmptyName
             | DriverError::EmptyUserName
             | DriverError::SpaceNotFound(_)
