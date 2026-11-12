@@ -56,6 +56,13 @@
         "about": {
           "type": "string"
         },
+        "conflicts": {
+          "description": "What it can't be given with, named as in `requires`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "name": {
           "type": "string"
         },
@@ -64,12 +71,21 @@
         },
         "required": {
           "type": "boolean"
+        },
+        "requires": {
+          "description": "What it needs beside it: argument names, and options as `--long`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "required": [
         "name",
         "required",
         "repeated",
+        "requires",
+        "conflicts",
         "about"
       ],
       "type": "object"
@@ -181,6 +197,13 @@
           "description": "The subcommand path, as in the envelope's `command`.",
           "type": "string"
         },
+        "groups": {
+          "description": "Arguments that are given together or apart, named as in `requires`.",
+          "items": {
+            "$ref": "#/$defs/GroupInfo"
+          },
+          "type": "array"
+        },
         "options": {
           "items": {
             "$ref": "#/$defs/OptionInfo"
@@ -199,14 +222,20 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "usage": {
+          "description": "Clap's usage line, as `--help` shows it.",
+          "type": "string"
         }
       },
       "required": [
         "command",
         "about",
+        "usage",
         "aliases",
         "arguments",
         "options",
+        "groups",
         "subcommands",
         "auth",
         "output",
@@ -554,6 +583,30 @@
       ],
       "type": "object"
     },
+    "GroupInfo": {
+      "properties": {
+        "members": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "multiple": {
+          "description": "More than one member may be given.",
+          "type": "boolean"
+        },
+        "required": {
+          "description": "One of the members must be given.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "members",
+        "required",
+        "multiple"
+      ],
+      "type": "object"
+    },
     "HelpData": {
       "properties": {
         "commands": {
@@ -621,6 +674,13 @@
         "about": {
           "type": "string"
         },
+        "conflicts": {
+          "description": "What it can't be given with, named as in `requires`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "global": {
           "description": "Whether every subcommand takes it too.",
           "type": "boolean"
@@ -628,8 +688,19 @@
         "long": {
           "type": "string"
         },
+        "require_equals": {
+          "description": "A value follows an equals sign, as in `--json=1`, never as the next argument.",
+          "type": "boolean"
+        },
         "required": {
           "type": "boolean"
+        },
+        "requires": {
+          "description": "What it needs beside it, named as in the arguments, and options as `--long`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "short": {
           "maxLength": 1,
@@ -646,6 +717,10 @@
             "null"
           ]
         },
+        "value_optional": {
+          "description": "The value may be left out, as in `--json`.",
+          "type": "boolean"
+        },
         "values": {
           "description": "The values it accepts, when it accepts only some.",
           "items": {
@@ -658,8 +733,12 @@
         "long",
         "short",
         "value",
+        "value_optional",
+        "require_equals",
         "values",
         "required",
+        "requires",
+        "conflicts",
         "global",
         "about"
       ],
