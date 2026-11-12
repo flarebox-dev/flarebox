@@ -139,20 +139,24 @@ enum Command {
 
 impl Command {
     /// Whether the command reports the decisions pending in the profile after its own output: on stderr as a banner,
-    /// or in the JSON envelope. `status` and `resolve` show the decisions themselves, and the daemon never ends.
+    /// or in the JSON envelope. `status` and a `resolve` that lists show the decisions themselves, and the daemon never
+    /// ends. A `resolve` that answers reports the decisions still pending.
     fn reports_pending(&self) -> bool {
         !matches!(
             self,
-            Command::Daemon { .. } | Command::Status { .. } | Command::Resolve { .. }
+            Command::Daemon { .. } | Command::Status { .. } | Command::Resolve { id: None, .. }
         )
     }
 }
 
 impl Cli {
     /// Whether the command ends with the pending-decision banner on stderr. JSON output carries decisions as data,
-    /// without decoration.
+    /// without decoration, and `resolve` names itself.
     fn shows_banner(&self) -> bool {
-        self.json.is_none() && self.command.as_ref().is_some_and(Command::reports_pending)
+        self.json.is_none()
+            && (self.command.as_ref()).is_some_and(|command| {
+                command.reports_pending() && !matches!(command, Command::Resolve { .. })
+            })
     }
 }
 
@@ -591,6 +595,7 @@ async fn daemon(paths: Paths, json: bool) -> Result<Done, CliError> {
     driver.start();
     let server = tokio::spawn(ipc::serve(listener, driver.clone()));
     let notifications = tokio::spawn(notifications);
+    let watch = driver.watch();
     let folders = driver.status().folders;
     tracing::info!(
         socket = %socket.display(),
@@ -603,7 +608,7 @@ async fn daemon(paths: Paths, json: bool) -> Result<Done, CliError> {
         socket: socket.display().to_string(),
         folders: folders.len(),
     });
-    let states = json.then(|| tokio::spawn(folder_states(driver.clone(), folders)));
+    let states = json.then(|| tokio::spawn(folder_states(driver.clone(), watch, folders)));
     let signal = tokio::select! {
         _ = terminate.recv() => "SIGTERM",
         _ = interrupt.recv() => "SIGINT",
@@ -611,6 +616,7 @@ async fn daemon(paths: Paths, json: bool) -> Result<Done, CliError> {
     tracing::info!(signal, "stopping the daemon");
     if let Some(states) = states {
         states.abort();
+        let _ = states.await;
     }
     emit(Lifecycle::Stopping { signal });
     server.abort();
@@ -622,12 +628,16 @@ async fn daemon(paths: Paths, json: bool) -> Result<Done, CliError> {
     Ok(Done::printed())
 }
 
-/// Prints a `folder_state` line whenever a folder's state differs from the one last printed for it.
-async fn folder_states(driver: Driver, folders: Vec<FolderStatus>) {
+/// Prints a `folder_state` line whenever a folder's state differs from the one last printed for it. `watch` was
+/// subscribed before `folders` was read, so a change in between still wakes the loop.
+async fn folder_states(
+    driver: Driver,
+    mut watch: tokio::sync::watch::Receiver<()>,
+    folders: Vec<FolderStatus>,
+) {
     let mut shown: std::collections::HashMap<String, FolderState> = (folders.into_iter())
         .map(|folder| (folder.path, folder.state))
         .collect();
-    let mut watch = driver.watch();
     while watch.changed().await.is_ok() {
         for folder in driver.status().folders {
             if shown.get(&folder.path) == Some(&folder.state) {
@@ -1905,10 +1915,18 @@ mod tests {
             &["koi", "space", "usage", "--json"],
             &["koi", "status"],
             &["koi", "resolve"],
+            &["koi", "resolve", "q1", "delete"],
             &["koi", "_daemon"],
         ] {
             assert!(!shows(args), "{args:?}");
         }
+        let reports = |args: &[&str]| {
+            (Cli::try_parse_from(args).unwrap().command)
+                .is_some_and(|command| command.reports_pending())
+        };
+        assert!(reports(&["koi", "resolve", "q1", "delete", "--json"]));
+        assert!(!reports(&["koi", "resolve", "--json"]));
+        assert!(!reports(&["koi", "status", "--json"]));
     }
 
     #[test]
