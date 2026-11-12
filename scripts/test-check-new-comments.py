@@ -209,6 +209,19 @@ class NewComments(unittest.TestCase):
         code, out = self.comments_only({"server/src/a.ts": "export function f() {\n  return /*\n  */ 1;\n}\n"}, {"server/src/a.ts": "export function f() {\n  return 1;\n}\n"})
         self.assertEqual((code, out.splitlines()[0]), (1, "server/src/a.ts: code differs once comments are stripped"))
 
+    def test_a_rust_inner_attribute_on_the_first_line_is_code(self):
+        self.assertFlags({"core/a/src/lib.rs": "#![no_std]\n"}, {"core/a/src/lib.rs": "#![no_std] // why\n"}, ("core/a/src/lib.rs", 1))
+        code, out = self.comments_only({"core/a/src/lib.rs": "#![no_std]\n"}, {"core/a/src/lib.rs": "#![forbid(unsafe_code)]\n"})
+        self.assertEqual((code, out.splitlines()[0]), (1, "core/a/src/lib.rs: code differs once comments are stripped"))
+
+    def test_markers_fail_in_clap_help_text(self):
+        self.assertFlags({"cli/src/a.rs": "#[derive(Parser)]\nstruct Cli {}\n"}, {"cli/src/a.rs": "#[derive(Parser)]\n/// TODO: describe\nstruct Cli {}\n"}, ("cli/src/a.rs", 2))
+
+    def test_comments_only_counts_a_changed_doctest_body_as_code(self):
+        before = "/// Adds.\n///\n/// ```\n/// assert_eq!(a::add(1, 1), 2);\n/// ```\npub fn add(a: u8, b: u8) -> u8 { a + b }\n"
+        code, out = self.comments_only({"core/a/src/lib.rs": before}, {"core/a/src/lib.rs": before.replace("2);", "3);")})
+        self.assertEqual((code, out.splitlines()[0].split(":")[0]), (1, "core/a/src/lib.rs"))
+
 
 if __name__ == "__main__":
     unittest.main()

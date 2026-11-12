@@ -143,7 +143,7 @@ def comment_spans(src, lang, tokens=None):
                     tokens_end[0] = i
         return i
 
-    code(src.find("\n") if src.startswith("#!") else 0, None)
+    code(src.find("\n") if src.startswith("#!") and not src.startswith("#![") else 0, None)
     return found
 
 
@@ -187,7 +187,17 @@ def code_tokens(src, lang):
     spans = comment_spans(src, lang, tokens)
     if lang != "rust":
         return tokens, []
-    docs = [src[s:e] for s, e in spans if is_doc(src[s:e], lang)]
+    docs, end = [], None
+    for s, e in spans:
+        text = src[s:e]
+        if not is_doc(text, lang):
+            end = None
+            continue
+        if end is not None and re.fullmatch(r"\n[ \t]*", src[end:s]) and text[:3] == docs[-1][:3] and text.startswith(("///", "//!")):
+            docs[-1] += "\n" + text
+        else:
+            docs.append(text)
+        end = e
     return tokens, [d for d in docs if macro_docs(src, lang) or "```" in d]
 
 
@@ -257,10 +267,12 @@ def check(base, head):
         for number in f["added"]:
             for doc, piece in new_lines.get(number, []):
                 words = [w.lower() for w in WORD.findall(piece)]
-                if not words or (doc and help_text):
+                if not words:
                     continue
                 if MARKER.search(piece):
                     problems.append((path, number, "marker", piece))
+                elif doc and help_text:
+                    continue
                 elif any(is_subsequence(words, run) for run in runs):
                     continue
                 elif PRAGMA.search(piece) or any(LINK.search(p) for p in comment_run(new_lines, number)):
