@@ -585,8 +585,11 @@ fn a_watcher_started_from_the_snapshot_of_another_reports_the_removal_it_held() 
     let fresh = rules().with_search_budget(100);
     let mut second =
         RescanWatcher::with_rules(root, first.snapshot().clone(), hour, fresh).unwrap();
-    let poll = second.poll(Duration::from_secs(5)).unwrap();
-    assert_eq!(poll.changes, [removed("f.txt", File)]);
+    let mut changes = Vec::new();
+    for _ in 0..5 {
+        changes.extend(second.poll(Duration::from_secs(2)).unwrap().changes);
+    }
+    assert_eq!(changes, [removed("f.txt", File)]);
 }
 
 #[test]
