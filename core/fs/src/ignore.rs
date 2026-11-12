@@ -7,13 +7,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use rustix::fs::{FileType, Mode, OFlags};
+use rustix::fs::{Dir, FileType, Mode, OFlags};
 
 use crate::{
-    Entry, EntryKind, FileId, Stat, is_gone, list, open_attached, open_dir_at, stat_at, stat_fd,
+    Cut, Entry, EntryKind, FileId, Stat, is_gone, open_attached, open_dir_at, stat_at, stat_fd,
 };
 
 /// The name of a rules file.
@@ -78,7 +79,7 @@ pub struct Rules {
 #[derive(Default)]
 struct Search {
     walks: u64,
-    walk: Option<Vec<Listing>>,
+    walk: Option<Walk>,
     pending: HashMap<Key, u64>,
     decided: HashMap<Key, Option<PathBuf>>,
     held: BTreeMap<PathBuf, Entry>,
@@ -115,6 +116,24 @@ struct Listing {
     dir: PathBuf,
     names: Vec<OsString>,
 }
+
+struct Walk {
+    listings: Vec<Listing>,
+    folders: Vec<Folder>,
+}
+
+struct Folder {
+    dir: PathBuf,
+    id: FileId,
+    entries: Entries,
+}
+
+enum Entries {
+    Open(Dir),
+    Read(Vec<OsString>),
+}
+
+const OPEN_FOLDERS: usize = 16;
 
 const SEARCH_BUDGET: usize = 20_000;
 
@@ -294,7 +313,7 @@ impl<'r> Pending<'r> {
     /// Replaces the left-out names of every folder the scan listed.
     pub(crate) fn settle(&mut self) {
         for (folder, names) in std::mem::take(&mut self.listed) {
-            if let Some(walk) = &mut self.rules.search.walk {
+            if let Some(Walk { listings: walk, .. }) = &mut self.rules.search.walk {
                 let before = self.rules.ignored.get(&folder);
                 let added: Vec<OsString> = (names.iter().rev())
                     .filter(|name| !before.is_some_and(|before| before.contains(*name)))
@@ -353,6 +372,7 @@ impl<'r> Pending<'r> {
         wanted: &mut Wanted,
         fresh: &HashSet<Key>,
         bounded: bool,
+        cut: &mut dyn FnMut(Cut<'_>),
     ) -> HashSet<Key> {
         let Rules {
             ignored,
@@ -362,7 +382,7 @@ impl<'r> Pending<'r> {
         } = &mut *self.rules;
         let Search {
             walks,
-            walk,
+            walk: walking,
             pending,
             decided,
             ..
@@ -382,60 +402,164 @@ impl<'r> Pending<'r> {
             }
         }
         let mut left = if bounded { *budget } else { usize::MAX };
-        while left > 0 && !pending.is_empty() {
-            let listings = walk.get_or_insert_with(|| {
+        let mut looked = false;
+        while (left > 0 || !looked) && !pending.is_empty() {
+            let walk = walking.get_or_insert_with(|| {
                 *walks += 1;
-                (ignored.iter())
-                    .map(|(dir, names)| Listing {
-                        dir: dir.clone(),
-                        names: names.iter().rev().cloned().collect(),
-                    })
-                    .rev()
-                    .collect()
+                Walk {
+                    listings: (ignored.iter())
+                        .map(|(dir, names)| Listing {
+                            dir: dir.clone(),
+                            names: names.iter().rev().cloned().collect(),
+                        })
+                        .rev()
+                        .collect(),
+                    folders: Vec::new(),
+                }
             });
-            while left > 0
-                && !pending.is_empty()
-                && let Some(mut listing) = listings.pop()
-            {
-                let Ok(Some((dir, _))) = open_attached(root, &listing.dir, &mut |_| {}) else {
+            let mut opened: Option<(PathBuf, OwnedFd)> = None;
+            let mut moved = false;
+            while (left > 0 || !looked) && !pending.is_empty() {
+                let (dir, name) = match walk.folders.last_mut() {
+                    Some(Folder {
+                        dir,
+                        entries: Entries::Open(entries),
+                        ..
+                    }) => {
+                        let Some(Ok(item)) = entries.read() else {
+                            walk.folders.pop();
+                            continue;
+                        };
+                        let name = OsStr::from_bytes(item.file_name().to_bytes()).to_os_string();
+                        if name == "." || name == ".." {
+                            continue;
+                        }
+                        (dir.clone(), name)
+                    }
+                    Some(Folder {
+                        dir,
+                        entries: Entries::Read(names),
+                        ..
+                    }) => {
+                        let Some(name) = names.pop() else {
+                            walk.folders.pop();
+                            continue;
+                        };
+                        (dir.clone(), name)
+                    }
+                    None => {
+                        let Some(listing) = walk.listings.last_mut() else {
+                            break;
+                        };
+                        let Some(name) = listing.names.pop() else {
+                            walk.listings.pop();
+                            continue;
+                        };
+                        (listing.dir.clone(), name)
+                    }
+                };
+                left = left.saturating_sub(1);
+                looked = true;
+                let top = walk.folders.last();
+                if !matches!(
+                    top,
+                    Some(Folder {
+                        entries: Entries::Open(_),
+                        ..
+                    })
+                ) && opened.as_ref().is_none_or(|(at, _)| *at != dir)
+                {
+                    left = left.saturating_sub(dir.components().count());
+                    let id = top.map(|folder| folder.id);
+                    opened = match open_attached(root, &dir, cut) {
+                        Ok(Some((fd, chain))) if id.is_none_or(|id| chain.last() == Some(&id)) => {
+                            Some((dir.clone(), fd))
+                        }
+                        _ => {
+                            if top.is_some() {
+                                walk.folders.pop();
+                            } else {
+                                walk.listings.pop();
+                            }
+                            continue;
+                        }
+                    };
+                }
+                let parent = match (walk.folders.last(), &opened) {
+                    (
+                        Some(Folder {
+                            entries: Entries::Open(entries),
+                            ..
+                        }),
+                        _,
+                    ) => entries.fd().ok(),
+                    (_, Some((_, fd))) => Some(fd.as_fd()),
+                    _ => None,
+                };
+                let Some(parent) = parent else { continue };
+                let path = dir.join(&name);
+                cut(Cut::Searching(&path));
+                let Some(entry) = stat_at(parent, &name).ok().and_then(|stat| stat.entry()) else {
                     continue;
                 };
-                let mut below = Vec::new();
-                while left > 0
-                    && let Some(name) = listing.names.pop()
+                let key = (entry.id, entry.kind);
+                if pending.contains_key(&key) {
+                    left = left.saturating_sub(path.components().count());
+                    if !holds(root, &path, key) {
+                        moved = true;
+                        break;
+                    }
+                    pending.remove(&key);
+                    if let Some(found) = wanted.get_mut(&key) {
+                        *found = Some(path.clone());
+                    }
+                    decided.insert(key, Some(path.clone()));
+                }
+                if entry.kind != EntryKind::Dir {
+                    continue;
+                }
+                left = left.saturating_sub(1);
+                let Ok(sub) = open_dir_at(parent, &name) else {
+                    continue;
+                };
+                let Ok(entries) = Dir::read_from(&sub) else {
+                    continue;
+                };
+                let open_count = (walk.folders.iter())
+                    .filter(|folder| matches!(folder.entries, Entries::Open(_)))
+                    .count();
+                if open_count >= OPEN_FOLDERS
+                    && let Some(oldest) = (walk.folders.iter_mut())
+                        .find(|folder| matches!(folder.entries, Entries::Open(_)))
+                    && let Entries::Open(dir) = &mut oldest.entries
                 {
-                    left -= 1;
-                    let Some(entry) = stat_at(dir.as_fd(), &name)
-                        .ok()
-                        .and_then(|stat| stat.entry())
-                    else {
-                        continue;
-                    };
-                    let key = (entry.id, entry.kind);
-                    let path = listing.dir.join(&name);
-                    if pending.remove(&key).is_some() {
-                        if let Some(found) = wanted.get_mut(&key) {
-                            *found = Some(path.clone());
+                    let mut names = Vec::new();
+                    while let Some(Ok(item)) = dir.read() {
+                        let name = OsStr::from_bytes(item.file_name().to_bytes()).to_os_string();
+                        if name != "." && name != ".." {
+                            names.push(name);
                         }
-                        decided.insert(key, Some(path.clone()));
                     }
-                    if entry.kind == EntryKind::Dir
-                        && let Ok(sub) = open_dir_at(dir.as_fd(), &name)
-                        && let Ok(names) = list(sub.as_fd())
-                    {
-                        below.push(Listing {
-                            dir: path,
-                            names: names.into_iter().rev().collect(),
-                        });
-                    }
+                    left = left.saturating_sub(names.len());
+                    names.reverse();
+                    oldest.entries = Entries::Read(names);
                 }
-                if !listing.names.is_empty() {
-                    listings.push(listing);
-                }
-                listings.extend(below.into_iter().rev());
+                walk.folders.push(Folder {
+                    dir: path,
+                    id: entry.id,
+                    entries: Entries::Open(entries),
+                });
             }
-            if listings.is_empty() {
-                *walk = None;
+            if moved {
+                *walking = None;
+                let again = *walks + 1;
+                for needs in pending.values_mut() {
+                    *needs = again;
+                }
+                continue;
+            }
+            if walk.listings.is_empty() && walk.folders.is_empty() {
+                *walking = None;
                 let done = *walks;
                 pending.retain(|key, needs| {
                     let open = *needs > done;
@@ -447,7 +571,7 @@ impl<'r> Pending<'r> {
             }
         }
         if pending.is_empty() {
-            *walk = None;
+            *walking = None;
         }
         (wanted.keys())
             .filter(|key| pending.contains_key(key))
