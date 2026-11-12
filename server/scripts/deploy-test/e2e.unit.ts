@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The parts of e2e.ts that need no server: matching a folder against a scenario's tree, finding the tree a rewind
-// restored, and sealing the macOS device's pairing code.
+// The parts of e2e.ts that need no server: matching a folder against a scenario's tree, checking the space after
+// a rewind against the log before it, and sealing the macOS device's pairing code.
 
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { create } from "@bufbuild/protobuf";
 import { afterEach, describe, expect, it } from "vitest";
-import { type Content, contents, format, keypair, listing, matches, seal, treeAt, trees, unseal } from "./e2e.ts";
+import { CommitRecordSchema, NodeKind, type NodeState, NodeStateSchema, NodeStatus } from "../../src/gen/koidrive/v1/model_pb.ts";
+import { type Content, contents, format, keypair, listing, matches, replay, rewindMismatch, seal, trees, unseal } from "./e2e.ts";
 
 const roots: string[] = [];
 
@@ -61,16 +63,35 @@ describe("a folder against a scenario's tree", () => {
   });
 });
 
-describe("the tree a rewind restored", () => {
-  const recorded = { created: 2, edited: 4, moved: 6, deleted: 7, conflicted: 9 };
+describe("the space after a rewind against the log before it", () => {
+  const node = (nodeId: string, parentId: string, name: string, kind: NodeKind, versionId = "") =>
+    create(NodeStateSchema, { nodeId, parentId, name, kind, status: NodeStatus.LIVE, current: versionId ? { versionId } : undefined });
+  const commit = (seq: bigint, ...nodes: NodeState[]) =>
+    create(CommitRecordSchema, { seq, commitId: "c" + seq, changes: nodes.map((value) => ({ change: { case: "node" as const, value } })) });
+  const root = node("root", "", "", NodeKind.DIR);
+  const log = [
+    commit(1n, node("d", "root", "docs", NodeKind.DIR), node("a", "d", "a.txt", NodeKind.FILE, "a1")),
+    commit(2n, node("a", "d", "a.txt", NodeKind.FILE, "a2")),
+    commit(3n, node("b", "root", "b.txt", NodeKind.FILE, "b1")),
+  ];
+  const restored = (seq: bigint) => new Map([["root", root], ...replay(log, seq)]);
 
-  it("is the tree the device held at the restored seq, also when it is not the restore point's", () => {
-    expect(treeAt(recorded, 9)).toBe("conflicted");
-    expect(treeAt(recorded, 7)).toBe("deleted");
+  it("is the state of the log at the restored seq, at any seq", () => {
+    for (const seq of [1n, 2n, 3n]) expect(rewindMismatch(log, log.slice(0, Number(seq)), restored(seq), seq)).toBeUndefined();
   });
 
-  it("is none for a seq at which the device held no scenario's tree", () => {
-    expect(treeAt(recorded, 8)).toBeUndefined();
+  it("is not when an edited file comes back with its earlier version or goes missing", () => {
+    const older = restored(2n).set("a", node("a", "d", "a.txt", NodeKind.FILE, "a1"));
+    expect(rewindMismatch(log, log.slice(0, 2), older, 2n)).toMatch(/not the tree the log before it holds at seq 2/);
+    const missing = restored(2n);
+    missing.delete("a");
+    expect(rewindMismatch(log, log.slice(0, 2), missing, 2n)).toMatch(/not the tree the log before it holds at seq 2/);
+  });
+
+  it("is not when the server holds the state one seq away from the seq it reports", () => {
+    expect(rewindMismatch(log, log.slice(0, 2), restored(2n), 3n)).toMatch(/log after the rewind is \[1 c1, 2 c2\], but the log before it up to seq 3/);
+    expect(rewindMismatch(log, log.slice(0, 3), restored(2n), 3n)).toMatch(/not the tree the log before it holds at seq 3/);
+    expect(rewindMismatch(log, log.slice(0, 2), restored(3n), 2n)).toMatch(/not the tree the log before it holds at seq 2/);
   });
 });
 
