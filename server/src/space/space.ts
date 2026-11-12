@@ -411,6 +411,11 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       return lease.check;
     }
 
+    private dropLeases(): void {
+      this.leases.clear();
+      this.leaseGeneration++;
+    }
+
     private storeLease(deviceId: string, check: SessionCheck, askedAtMs: number): void {
       if ((this.leases.get(deviceId)?.askedAtMs ?? -Infinity) > askedAtMs) return;
       this.leases.set(deviceId, { check, askedAtMs, untilMs: askedAtMs + check.leaseMs });
@@ -1219,8 +1224,7 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
     }
 
     async rewindInfo(restorePointMs: number): Promise<{ historyId: string; headSeq: number; descriptorDurable: boolean; bookmark: string }> {
-      this.leases.clear();
-      this.leaseGeneration++;
+      this.dropLeases();
       const bookmark = await this.pitr.bookmarkForTime(restorePointMs);
       return { historyId: String(getMeta(this.sql, "history_id")), headSeq: this.headSeq, descriptorDurable: descriptorDurable(this.sql), bookmark };
     }
