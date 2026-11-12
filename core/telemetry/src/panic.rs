@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Records where the process panicked, never the panic's message, which can hold a path.
-
 use std::panic;
 
 use crate::recorder::Pending;

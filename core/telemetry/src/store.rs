@@ -1,11 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The files of telemetry under the profile's state directory, which belongs to one machine and is never copied
-//! (`koidrive_driver::Paths`): the choice and the install id in `settings.json`, and what waits to be sent in
-//! `queue.json`. Every process of the profile writes the queue under `lock`, so the daemon and a command that runs
-//! next to it do not lose each other's sums. A batch being sent stays in the queue, marked as out, until its send
-//! ends, so a send that is cancelled or killed before an answer loses nothing.
-
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -19,9 +13,7 @@ use crate::consent::{self, Status};
 use crate::recorder::Pending;
 use crate::schema::{DailyReport, Event, EventUuid, InstallId};
 
-/// Days a report or an event waits to be sent before it is dropped.
 pub const KEEP_DAYS: u32 = 14;
-/// Events the queue holds at most; the oldest go first.
 pub const MAX_EVENTS: usize = 500;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,7 +60,6 @@ struct Queue {
     days: BTreeMap<u32, DailyReport>,
     #[serde(default)]
     events: Vec<Event>,
-    /// The batch a send took and has not settled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     out: Option<Out>,
 }
@@ -89,7 +80,6 @@ impl Out {
         Ok(Out { id, batch, uuids })
     }
 
-    /// Without what is older than [`KEEP_DAYS`]. None when nothing is left, or when its uuids don't match its batch.
     fn trimmed(self, today: u32) -> Option<Self> {
         if self.uuids.len() != self.batch.days.len() + self.batch.events.len() {
             return None;
@@ -139,13 +129,10 @@ impl Queue {
         }
     }
 
-    /// The events of the batch that is out, which count toward the caps until it is sent.
     fn out_events(&self) -> impl Iterator<Item = &Event> {
         self.out.iter().flat_map(|out| &out.batch.events)
     }
 
-    /// Drops what is older than [`KEEP_DAYS`], in the batch that is out too, and the oldest events over
-    /// [`MAX_EVENTS`].
     fn trim(&mut self, today: u32) {
         self.out = self.out.take().and_then(|out| out.trimmed(today));
         let oldest = today.saturating_sub(KEEP_DAYS);
@@ -181,9 +168,8 @@ impl Store {
     }
 
     /// Stores the person's choice. Turning it on keeps the install id or draws one. Turning it off deletes the id and
-    /// everything waiting to be sent. A `settings.json` that cannot be parsed is replaced, so a broken file never
-    /// stops someone from choosing, least of all from turning reports off. Whenever no id is kept, the queue goes too,
-    /// so nothing recorded under a lost id, with a broken or a deleted file, is ever sent under a new one.
+    /// everything waiting to be sent. A `settings.json` that cannot be parsed is replaced. Whenever no id is kept, the
+    /// queue goes too.
     pub fn set(&self, on: bool) -> io::Result<Settings> {
         let _lock = self.lock(true)?;
         let mut settings = match self.settings() {
@@ -202,8 +188,8 @@ impl Store {
         Ok(settings)
     }
 
-    /// Deletes everything waiting to be sent and then draws a new install id, so a crash between the two never leaves
-    /// old reports under the new id. Without an id there is nothing to reset.
+    /// Deletes everything waiting to be sent and then draws a new install id.
+    /// Without an id there is nothing to reset.
     pub fn reset(&self) -> io::Result<Option<InstallId>> {
         let _lock = self.lock(true)?;
         remove(&self.dir.join("queue.json"))?;
@@ -231,19 +217,15 @@ impl Store {
         Ok(id)
     }
 
-    /// Adds what a recorder took to the queue and drops what is older than [`KEEP_DAYS`].
     pub fn absorb(&self, pending: Pending) -> io::Result<()> {
         self.absorb_at(pending, crate::today(), true)
     }
 
-    /// Like [`Store::absorb`], but gives up instead of waiting when another process holds the queue. A panic hook
-    /// uses it, since the panicking thread may hold the lock itself.
     pub fn try_absorb(&self, pending: Pending) -> io::Result<()> {
         self.absorb_at(pending, crate::today(), false)
     }
 
-    /// Like [`Store::absorb`], but only while the profile's install id is still `id`. A process that recorded under one
-    /// id uses it, so its sums are dropped instead of moving to the new id after a reset, or after off and on.
+    /// Like [`Store::absorb`], but only while the profile's install id is still `id`.
     pub fn absorb_as(&self, pending: Pending, id: &InstallId) -> io::Result<()> {
         self.absorb_for(pending, crate::today(), true, Some(id))
     }
@@ -252,8 +234,6 @@ impl Store {
         self.absorb_for(pending, today, wait, None)
     }
 
-    /// Adds `pending` while the profile has an install id, and only when it is `expected` if that is given. Without an
-    /// id telemetry was turned off, and what was recorded before must not be kept.
     fn absorb_for(
         &self,
         pending: Pending,
@@ -276,10 +256,6 @@ impl Store {
         write(&self.dir.join("queue.json"), &queue)
     }
 
-    /// Hands out the batch an earlier send left out, unchanged but for what expired. Without one, it marks the reports
-    /// of days before `today` and every event as out and hands them over, each with a new uuid. None while the profile
-    /// has no id, or while another send has a batch out. The caller settles it with [`Store::sent`] or
-    /// [`Store::give_back`].
     pub fn take(&self, today: u32) -> io::Result<Option<Sending>> {
         let sending = match self.send_lock() {
             Ok(file) => file,
@@ -322,20 +298,14 @@ impl Store {
         }))
     }
 
-    /// Removes a batch the endpoint accepted, or refused for good.
     pub fn sent(&self, sending: Sending) -> io::Result<()> {
         self.settle(sending, true)
     }
 
-    /// Leaves a batch that was not sent in the queue, for the next take to send again as it is. It is dropped when
-    /// the profile's install id is no longer the batch's: telemetry was turned off or reset while the batch was out,
-    /// so it must not be sent again, under the old id or a new one.
     pub fn give_back(&self, sending: Sending) -> io::Result<()> {
         self.settle(sending, false)
     }
 
-    /// Touches the queue's batch only when it is the one `sending` took, so a [`Sending`] of another profile
-    /// changes nothing.
     fn settle(&self, sending: Sending, sent: bool) -> io::Result<()> {
         let _lock = self.lock(true)?;
         let id = self.settings()?.install_id;
@@ -362,8 +332,6 @@ impl Store {
         })
     }
 
-    /// The queue. One that cannot be parsed, such as one a newer build wrote or one a crash left empty, is dropped,
-    /// so it cannot stop every later write. Any other read error is returned, so the file is not overwritten.
     fn queue(&self) -> io::Result<Queue> {
         match read(&self.dir.join("queue.json")) {
             Err(error) if error.kind() == io::ErrorKind::InvalidData => {
@@ -378,12 +346,10 @@ impl Store {
         self.flock("lock", wait)
     }
 
-    /// Held by a send from its take until it settles, never while the queue's lock is waited for elsewhere.
     fn send_lock(&self) -> io::Result<File> {
         self.flock("send.lock", false)
     }
 
-    /// Creates the directory, and any missing parent, readable by the owner alone.
     fn flock(&self, name: &str, wait: bool) -> io::Result<File> {
         fs::DirBuilder::new()
             .recursive(true)
@@ -413,7 +379,6 @@ fn read<T: Default + for<'de> Deserialize<'de>>(path: &Path) -> io::Result<T> {
     }
 }
 
-/// Writes through a temporary file and a rename, so a crash leaves the old file or the new one.
 fn write<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     let temporary = path.with_extension("json.tmp");
     fs::write(&temporary, serde_json::to_vec(value)?)?;

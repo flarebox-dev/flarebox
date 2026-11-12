@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The conflict rules of spec v0 section 6 on the reference Space DO, following the scenarios of the
-//! TypeScript server's tests (server/test/space-do.test.ts in koidrive#6).
-
 use std::collections::{BTreeMap, HashMap};
 
 use koidrive_engine::ids::IdGen;
@@ -21,7 +18,6 @@ const NOW: i64 = 1_794_268_740_000;
 struct Space {
     space: SpaceDo,
     ids: IdGen,
-    /// The `device_seq` each `commit_id` was first sent with: a retry keeps it (RFC 0002 section 2).
     sent: HashMap<String, u64>,
 }
 
@@ -113,7 +109,6 @@ impl Space {
             .map(|done| done.result)
     }
 
-    /// Commits at the client's base and moves the base to the new head, as a caught-up client would.
     fn commit(
         &mut self,
         c: &mut Client,
@@ -170,7 +165,6 @@ fn chunk(seed: &[u8], size: u32) -> ChunkRef {
     }
 }
 
-/// A content listing `chunks` inline, with a correct size, count and manifest digest.
 fn content_of(chunks: Vec<ChunkRef>) -> Content {
     let list: Vec<u8> = chunks
         .iter()
@@ -694,7 +688,6 @@ fn r7_trashes_a_whole_subtree_under_one_trash_group() {
     assert!(again.changes.is_empty());
 }
 
-/// RFC 0012: each Delete of a commit takes the group `<commit_id>:<op index>`.
 #[test]
 fn deletes_in_one_commit_take_trash_groups_of_its_id() {
     let mut s = Space::new();
@@ -731,8 +724,6 @@ fn deletes_in_one_commit_take_trash_groups_of_its_id() {
     );
 }
 
-/// RFC 0012, GUN-404: a commit that takes the seq of a commit the server lost does not take the
-/// trash groups of its Deletes.
 #[test]
 fn a_delete_at_a_lost_seq_takes_another_trash_group() {
     let mut s = Space::new();
@@ -1279,7 +1270,6 @@ fn version_pages_split_versions_of_one_commit_by_version_id() {
     );
 }
 
-/// The server reads the cursor's seq with JavaScript's `Number` and accepts only safe integers.
 #[test]
 fn version_cursors_follow_the_servers_number_parsing() {
     let mut s = Space::new();
@@ -1492,10 +1482,6 @@ fn a_receipt_holds_only_for_its_space_and_size_and_a_stored_object_outlasts_it()
     assert!(attempt(&mut s, receipts, NOW + 3_600_001).is_ok());
 }
 
-/// GUN-454. A's commit at seq 2 is lost when the space is restored from a backup at seq 1, and B's
-/// commit then takes seq 2. A commit or a resume of A from seq 2 names A's lost commit by its
-/// token, so the server answers `AHEAD_OF_SERVER` instead of reading B's seq 2 as the base A saw
-/// (RFC 0013). One that names B's commit is taken.
 #[test]
 fn a_base_naming_a_commit_the_server_lost_is_ahead_of_the_server() {
     let mut s = Space::new();
@@ -1572,8 +1558,6 @@ fn a_base_naming_a_commit_the_server_lost_is_ahead_of_the_server() {
     assert_eq!(on(&mut s, &kept_id, kept.committed_at_ms).unwrap().seq, 3);
 }
 
-/// RFC 0006 section 8: a retry is matched by digest v1, which covers neither base token field, so
-/// a retry that changes only them gets the stored result, as on the server.
 #[test]
 fn a_retry_that_changes_only_its_base_token_gets_the_stored_result() {
     let mut s = Space::new();
@@ -1610,9 +1594,6 @@ fn a_retry_that_changes_only_its_base_token_gets_the_stored_result() {
     }
 }
 
-/// RFC 0013 sections 3 and 4: the log keeps the floor commit's token, so a resume or a commit at
-/// the floor is checked, while a commit based below it is not: its commit is gone from the log, so
-/// the token claims nothing and a truncated log is not read as a loss.
 #[test]
 fn a_token_below_the_floor_claims_nothing() {
     let mut s = Space::new();

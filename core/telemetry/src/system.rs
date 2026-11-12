@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The coarse facts about the machine that every report carries.
-
 use std::fs;
 
 use crate::schema::{Arch, Build, Client, Distro, Os, OsVersion, Version};
@@ -71,15 +69,12 @@ impl Environment {
 const MACOS_VERSION: &str = "/System/Library/CoreServices/SystemVersion.plist";
 const OS_RELEASE: &str = "/etc/os-release";
 
-/// `ProductVersion` of SystemVersion.plist, such as `15.4.1`, as major and minor.
 fn macos_version(plist: &str) -> Option<OsVersion> {
     let after = plist.split("<key>ProductVersion</key>").nth(1)?;
     let value = after.split("<string>").nth(1)?.split("</string>").next()?;
     numbers(value)
 }
 
-/// `ID` and `VERSION_ID` of os-release. A distribution not in [`Distro`] is `other`, and its version is dropped,
-/// since a rare distribution with its version could tell one machine apart.
 fn os_release(release: &str) -> (Option<OsVersion>, Distro) {
     let field = |name: &str| {
         release.lines().find_map(|line| {

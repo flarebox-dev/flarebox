@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Random commits from several devices with stale bases keep the reference server's tree valid.
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use koidrive_engine::ids::IdGen;
@@ -115,7 +113,6 @@ fn session(device: usize) -> Session {
     }
 }
 
-/// Runs the actions and returns the final tree, checking the invariants after every commit.
 fn run(actions: &[Action]) -> Vec<NodeState> {
     let mut space = SpaceDo::new(11, NOW);
     let mut ids = IdGen::new(12);

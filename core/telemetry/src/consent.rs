@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Whether reports are recorded and sent: the environment first, then the choice stored in the profile.
-
 use std::ffi::OsString;
 
 /// What the telemetry of this process does.
