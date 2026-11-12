@@ -16,7 +16,6 @@ export function uuidv7(nowMs: number = Date.now()): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-/** The Unix time in milliseconds that a UUIDv7 carries. */
 export function uuidv7Ms(id: string): number {
   return parseInt(id.slice(0, 8) + id.slice(9, 13), 16);
 }

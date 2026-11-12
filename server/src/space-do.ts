@@ -11,7 +11,6 @@ import { type Attachment, CONNECT_HEADER, type Connect, spaceLogic, TOKEN_GRACE_
 export { Close, CONNECT_HEADER, GRANT_MS, HOLD_MS, MAX_HEAD_CHECKS } from "./space/space";
 export type { Role, Session } from "./space/space";
 
-/** One per space: tree, versions, chunks and the commit log. The logic is in space/space.ts. */
 export class SpaceDO extends spaceLogic(DurableObject<Env>) {
   protected readonly db: Database;
   protected readonly sql: Sql;
@@ -26,7 +25,6 @@ export class SpaceDO extends spaceLogic(DurableObject<Env>) {
       migrate(this.sql);
       bootstrapExport(this.sql, this.clock());
     });
-    // The schedule is committed before the alarm is set, so a failed or interrupted setAlarm is repaired on open.
     void ctx.blockConcurrencyWhile(() => this.armAlarm());
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
@@ -43,7 +41,6 @@ export class SpaceDO extends spaceLogic(DurableObject<Env>) {
     return this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName("account"));
   }
 
-  /** Accepts a WebSocket upgrade forwarded by the Worker after it checked the access token. */
   override async fetch(request: Request): Promise<Response> {
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return new Response("expected a WebSocket upgrade", { status: 426 });
     const connect = JSON.parse(request.headers.get(CONNECT_HEADER) ?? "null") as Connect | null;

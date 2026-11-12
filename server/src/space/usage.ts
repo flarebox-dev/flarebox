@@ -7,16 +7,11 @@ import { toHex } from "../ids";
 import { NodeStatusValue } from "./schema";
 import { type VersionRow, versionChunks } from "./store";
 
-/** Where a version's chunks count. A lower value wins for a chunk that several versions hold (RFC 0010 section 2). */
 const LIVE = 0;
 const TRASH = 1;
 const OLD = 2;
 type Holder = typeof LIVE | typeof TRASH | typeof OLD;
 
-/**
- * Reads what the space holds (RFC 0010 section 2). One pass over the versions keeps, for each chunk, the first holder
- * that holds it, so a chunk shared by files or versions counts once. The cost grows with the versions and their chunks.
- */
 export function readUsage(sql: Sql): SpaceUsage {
   const held = new Map<string, { size: number; holder: Holder }>();
   const versions = [0, 0, 0];

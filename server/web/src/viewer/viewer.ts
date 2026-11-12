@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The share-link viewer of RFC 0005 section 8. It talks only to this origin and renders every name with textContent.
-
 type NodeKind = "NODE_KIND_UNSPECIFIED" | "NODE_KIND_DIR" | "NODE_KIND_FILE" | "NODE_KIND_SYMLINK";
 
-/** The proto3 JSON forms of ShareInfo, ShareEntry, ShareListing and Error: 64-bit numbers arrive as strings, defaults are omitted. */
+/** The proto3 JSON forms: 64-bit numbers arrive as strings, defaults are omitted. */
 interface ShareInfo {
   passwordRequired?: boolean;
   kind?: NodeKind;
@@ -34,7 +32,6 @@ interface ApiError {
 }
 
 interface Reply<T> {
-  /** 0 when the request did not reach the server. */
   status: number;
   body: T | null;
 }

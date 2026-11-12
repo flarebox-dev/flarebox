@@ -18,10 +18,8 @@ export interface QuotaRefusal {
 }
 
 /**
- * The QUOTA_EXCEEDED answer for an error that reports a platform limit, or undefined for any other error. The wait runs
- * until the next 00:00 UTC, when free-plan daily limits reset, except in the first 30 minutes after it, when it is 5
- * minutes, because the errors can outlast the reset (spec v0 section 13, RFC 0001 section 9). A full storage needs the
- * owner to act, so a client tries again on the same schedule instead of in a loop.
+ * The wait runs until the next 00:00 UTC, when free-plan daily limits reset, except in the first 30 minutes after it,
+ * because the errors can outlast the reset.
  */
 export function quotaRefusal(error: unknown, nowMs: number): QuotaRefusal | undefined {
   const text = error instanceof Error ? error.message : String(error);

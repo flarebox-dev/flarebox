@@ -11,26 +11,20 @@ import type { ResolvedLink, ShareOutcome } from "./links";
 import { NodeKindValue, NodeStatusValue, ChunkState } from "../space/schema";
 import { chunkKey, getMeta, getNode, getVersion, type NodeRow, PAGE_CHUNKS, rows, versionChunks } from "../space/store";
 
-/** Entries per listing page (RFC 0005 section 3). Names are at most 255 bytes, so a page stays far below 1 MiB. */
 export const LISTING_PAGE = 500;
-/** Chunks one link download covers: one GetVersionChunks page (RFC 0005 section 11). */
 export const MAX_DOWNLOAD_CHUNKS = PAGE_CHUNKS;
-/** Levels a reachability walk climbs: the path depth limit of spec v0 section 13. */
 const MAX_DEPTH = 256;
 
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
 
-/** What the Worker needs to stream a file: one entry per chunk of the current version, in order, with its R2 key. */
 export interface ShareFile {
   name: string;
   size: number;
   chunks: { key: string; hashHex: string; size: number }[];
-  /** The space's history when the chunk list was read: half of the download's fence. */
   historyId: string;
 }
 
-/** What a download started with (RFC 0005 section 7): the space's history and its rewind generation. */
 export interface DownloadFence {
   historyId: string;
   generation: number;
@@ -47,10 +41,6 @@ function refuse(code: Error_Code, message: string, status: number): { ok: false;
   return { ok: false, code, message, status };
 }
 
-/**
- * The node when it is reachable through a link with this root (RFC 0005 section 6): it is live, and following
- * parent_id from it reaches the root through live nodes only.
- */
 export function reachable(sql: Sql, rootId: string, nodeId: string): NodeRow | undefined {
   if (!isUuidV7(nodeId)) return undefined;
   const node = getNode(sql, nodeId);
@@ -79,14 +69,12 @@ function entry(sql: Sql, node: NodeRow): ShareEntry {
   });
 }
 
-/** Whether a node can be the root of a new link: a live node of this space. */
 export function checkLinkRoot(sql: Sql, nodeId: string): ShareOutcome<null> {
   const node = isUuidV7(nodeId) ? getNode(sql, nodeId) : undefined;
   if (!node || node.status !== NodeStatusValue.LIVE) return refuse(Error_Code.NOT_FOUND, "node_id is not a live node of this space", 404);
   return { ok: true, value: null };
 }
 
-/** GET /v1/share/{link_id}: the link's root. */
 export function shareInfo(sql: Sql, rootId: string, expiresAtMs: number): ShareOutcome<ShareInfo> {
   const root = reachable(sql, rootId, rootId);
   if (!root) return notReachable();
@@ -94,7 +82,6 @@ export function shareInfo(sql: Sql, rootId: string, expiresAtMs: number): ShareO
   return { ok: true, value: create(ShareInfoSchema, { kind, name, rootId, size, mtimeMs, expiresAtMs: BigInt(expiresAtMs) }) };
 }
 
-/** GET /v1/share/{link_id}/list: one page of a reachable folder's live children, by name_key and then node_id. */
 export function shareListing(sql: Sql, rootId: string, dirId: string, cursor: string): ShareOutcome<ShareListing> {
   const dir = reachable(sql, rootId, dirId || rootId);
   if (!dir) return notReachable();
@@ -138,10 +125,6 @@ export function shareListing(sql: Sql, rootId: string, dirId: string, cursor: st
   };
 }
 
-/**
- * GET /v1/share/{link_id}/file/{node_id}: the chunks of a reachable file's current version, each with the R2 key of its
- * current incarnation (RFC 0005 section 7). The keys come only from this space's rows.
- */
 export function shareFile(sql: Sql, spaceId: string, rootId: string, nodeId: string): ShareOutcome<ShareFile> {
   const node = reachable(sql, rootId, nodeId);
   if (!node) return notReachable();
@@ -169,10 +152,6 @@ export function shareFile(sql: Sql, spaceId: string, rootId: string, nodeId: str
   return { ok: true, value: { name: node.name, size: version.size, chunks, historyId: String(getMeta(sql, "history_id")) } };
 }
 
-/**
- * Whether a download may go on with its next chunk: the link resolved again, and neither the space's rewind generation
- * nor its history changed since the download started (RFC 0005 section 7, step 5).
- */
 export function checkFence(sql: Sql, spaceId: string, resolved: ShareOutcome<ResolvedLink>, fence: DownloadFence): ShareOutcome<null> {
   if (!resolved.ok) return resolved;
   if (resolved.value.spaceId !== spaceId || resolved.value.generation !== fence.generation || String(getMeta(sql, "history_id")) !== fence.historyId) {

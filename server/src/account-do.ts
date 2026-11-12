@@ -8,7 +8,6 @@ import { ShareLinks } from "./share/links";
 
 export type { Outcome } from "./share/links";
 
-/** One per deployment: users, devices, tokens, spaces and share links. The logic is in account/account.ts. */
 export class AccountDO extends accountLogic(DurableObject<Env>) {
   protected readonly db: Database;
   protected readonly sql: Sql;

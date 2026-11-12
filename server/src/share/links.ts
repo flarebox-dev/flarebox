@@ -16,7 +16,6 @@ export const SHARE_PASSWORD_ITERATIONS = 100_000;
 const SHARE_PASSWORD_KDF = "pbkdf2-sha256";
 const SHARE_FAILURES_BEFORE_LOCK = 5;
 export const SHARE_LOCK_MS = 15 * 60_000;
-/** Limits of RFC 0005 sections 2 and 11. */
 export const DEFAULT_EXPIRY_MS = 7 * DAY_MS;
 export const MAX_EXPIRY_MS = 365 * DAY_MS;
 const MIN_EXPIRY_MS = 60_000;
@@ -24,10 +23,8 @@ export const MAX_ACTIVE_LINKS = 1000;
 const LIST_PAGE = 100;
 const PASSWORD_MIN = 8;
 const PASSWORD_MAX = 256;
-/** Lifetime of the session a correct password opens (RFC 0005 section 4). */
 export const SESSION_MS = 3_600_000;
 
-/** The one spelling of 16 bytes in unpadded base64url: 22 characters, the last with its four unused bits zero. */
 export const LINK_ID = /^[A-Za-z0-9_-]{21}[AQgw]$/;
 
 export interface ShareLinkRow {
@@ -47,7 +44,6 @@ export interface ShareLinkRow {
 }
 
 export type Outcome<T> = { ok: true; value: T } | { ok: false; code: Error_Code; message: string };
-/** A refusal with the HTTP status it maps to, and a wait for RETRY_LATER where one is known. */
 export type ShareOutcome<T> = { ok: true; value: T } | { ok: false; code: Error_Code; message: string; status: number; retryAfterMs?: number };
 
 function ok<T>(value: T): { ok: true; value: T } {
@@ -71,7 +67,6 @@ function sameHash(a: ArrayBuffer, b: ArrayBuffer): boolean {
   return a.byteLength === b.byteLength && crypto.subtle.timingSafeEqual(a, b);
 }
 
-/** A link that resolved, with the space's rewind generation: the number of rewinds ever admitted for it (RFC 0005 section 7). */
 export interface ResolvedLink {
   spaceId: string;
   nodeId: string;
@@ -85,7 +80,6 @@ export interface ShareLinkDeps {
   spaceClosed(spaceId: string): boolean;
 }
 
-/** The Account DO's share links (spec v0 section 4.2, RFC 0001 section 8, RFC 0005). */
 export class ShareLinks {
   readonly limiter = new ClientLimiter();
 
@@ -98,7 +92,6 @@ export class ShareLinks {
     return this.sql.exec("SELECT * FROM share_links WHERE link_id = ?", linkId).toArray()[0] as unknown as ShareLinkRow | undefined;
   }
 
-  /** The link when it exists and is neither revoked nor expired. */
   private active(linkId: string, nowMs: number): ShareLinkRow | undefined {
     const link = this.row(linkId);
     if (!link || link.revoked_at_ms !== null || (link.expires_at_ms !== null && link.expires_at_ms <= nowMs)) return undefined;
@@ -117,7 +110,6 @@ export class ShareLinks {
     );
   }
 
-  /** Records a read-only share link with a 128-bit random id and returns the id. */
   async create(args: { spaceId: string; nodeId: string; createdBy: string; expiresAtMs?: number | null; password?: string }): Promise<string> {
     const linkId = base64url(crypto.getRandomValues(new Uint8Array(16)));
     const salt = args.password ? crypto.getRandomValues(new Uint8Array(16)) : undefined;
@@ -153,7 +145,6 @@ export class ShareLinks {
     this.sql.exec("UPDATE share_links SET revoked_at_ms = ? WHERE link_id = ? AND revoked_at_ms IS NULL", this.deps.clock(), linkId);
   }
 
-  /** Resolves a link, checking expiry, revocation and the password, and locking it after repeated failures (RFC 0001 section 8.2). */
   async open(linkId: string, password: string | undefined): Promise<Outcome<{ spaceId: string; nodeId: string }>> {
     const nowMs = this.deps.clock();
     const found = this.active(linkId, nowMs);
@@ -194,10 +185,6 @@ export class ShareLinks {
     });
   }
 
-  /**
-   * POST /v1/spaces/{space_id}/links (RFC 0005 section 2). checkNode asks the Space DO whether the node is live. The
-   * count and the insert run together after the last await, so concurrent creates cannot pass the cap.
-   */
   async ownerCreate(
     args: { userId: string; spaceId: string; nodeId: string; expiresAtMs: number; noExpiry: boolean; password: string; origin: string },
     checkNode: () => Promise<ShareOutcome<null>>,
@@ -230,7 +217,6 @@ export class ShareLinks {
     return ok(this.message(this.row(linkId)!, args.origin));
   }
 
-  /** GET /v1/spaces/{space_id}/links: every link of the space, newest first. */
   ownerList(args: { userId: string; spaceId: string; cursor: string; origin: string }): ShareOutcome<ShareLinkList> {
     if (!this.ownsSpace(args.userId, args.spaceId)) return notOwner();
     let found: ShareLinkRow[];
@@ -264,7 +250,6 @@ export class ShareLinks {
     );
   }
 
-  /** DELETE /v1/spaces/{space_id}/links/{link_id}. Revoking a revoked link again changes nothing. */
   ownerRevoke(args: { userId: string; spaceId: string; linkId: string }): ShareOutcome<null> {
     if (!this.ownsSpace(args.userId, args.spaceId)) return notOwner();
     const link = this.row(args.linkId);
@@ -290,10 +275,6 @@ export class ShareLinks {
     return mac !== undefined && hmacVerify(await this.sessionKey(), this.sessionMessage(link, expiresAtMs), mac);
   }
 
-  /**
-   * Resolves a link for a public request (RFC 0005 section 3): counts the request unless it is a download's re-check,
-   * refuses unknown, revoked and expired links alike, and asks for a session on a protected link.
-   */
   async resolve(args: { linkId: string; client: string; session?: string; counted: boolean }): Promise<ShareOutcome<ResolvedLink>> {
     const nowMs = this.deps.clock();
     if (args.counted) {
@@ -313,7 +294,6 @@ export class ShareLinks {
     return ok({ spaceId: link.space_id, nodeId: link.node_id, expiresAtMs: link.expires_at_ms ?? 0, generation: Number(rewinds?.rewind_count ?? 0) });
   }
 
-  /** POST /v1/share/{link_id}/unlock (RFC 0005 section 4): checks the password and signs a one-hour session for a protected link. */
   async unlock(args: { linkId: string; client: string; password: string }): Promise<ShareOutcome<{ session?: string }>> {
     const nowMs = this.deps.clock();
     const wait = this.limiter.request(args.client, nowMs);

@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The R2 metadata export of spec v0 section 11, written per history (RFC 0003 section 7) in the format of RFC 0004.
-// Each step records what it is about to write before it writes, so a crash or an unknown outcome is safe to repeat.
-
 import { create, toBinary } from "@bufbuild/protobuf";
 import { BinaryWriter } from "@bufbuild/protobuf/wire";
 import { ExportHeaderSchema, NodeSnapshotSchema, RetainedVersionSchema } from "../gen/koidrive/v1/export_pb";
@@ -13,18 +10,12 @@ import { toHex, uuidv7Ms } from "../ids";
 import { getMeta, INLINE_CHUNKS, type NodeRow, nodeState, rows, setMeta, type VersionRow, versionInfo } from "./store";
 
 const DAY_MS = 24 * 3_600_000;
-/** Spec v0 section 11: a log segment is written once this many commits wait, or this long after the first of them. */
 const SEGMENT_COMMITS = 1000;
 const SEGMENT_DELAY_MS = 5 * 60_000;
-/** A segment also ends once its records reach this size, so that one segment fits in memory. */
 const SEGMENT_BYTES = 16 * 1024 * 1024;
-/** Spec v0 section 11: a snapshot is due a day after the last one if the space changed, or after 50,000 commits. */
 const SNAPSHOT_COMMITS = 50_000;
-/** A snapshot page ends once its records reach this size. */
 const PAGE_BYTES = 8 * 1024 * 1024;
-/** RFC 0004 section 7: the two newest completed snapshots of the current history are kept. */
 const KEPT_SNAPSHOTS = 2;
-/** Steps one run takes before it leaves the rest to the next alarm. */
 const STEPS_PER_RUN = 25;
 const LIST_LIMIT = 1000;
 
@@ -44,32 +35,21 @@ interface Snapshot {
 interface RunningSnapshot {
   startSeq: number;
   createdAtMs: number;
-  /** The last node_id written. */
   cursor: string;
-  /** The next page number; a number is taken before its page's write is issued. */
   nextPage: number;
   pages: PageEntry[];
-  /** head_seq when the last page was read. */
   endSeq?: number;
-  /** The manifest's bytes, recorded before its first write so every retry writes the same. */
   manifest?: string;
 }
 
 interface ExportState {
-  /** The descriptor waits for the first snapshot: the history was started by a rewind. */
   baseline: boolean;
-  /** The current history's descriptor is durable. */
   descriptor: boolean;
-  /** A snapshot that starts at or after this seq is due at once. */
   dueSeq: number | null;
-  /** The snapshot cadence counts from here: the last completed snapshot, or the history's start. */
   since: { seq: number; atMs: number };
-  /** A log segment whose range was recorded before its write. */
   segment?: { first: number; last: number };
   running?: RunningSnapshot;
-  /** Completed snapshots of this history, oldest first. */
   done: Snapshot[];
-  /** start_seq of an older snapshot being deleted. */
   pruning?: number;
 }
 
@@ -97,11 +77,6 @@ function scheduleExport(sql: Sql, dueMs: number, lowerOnly: boolean): void {
   );
 }
 
-/**
- * Starts the export of the current history, inside the transaction that creates the space or completes a rewind. A
- * space's first history exports from seq 0 and writes its descriptor at once. A history that a rewind started exports
- * from restore_seq: a full snapshot is due at once, and the descriptor waits for it (RFC 0003 section 7).
- */
 export function startExport(sql: Sql, fromSeq: number, atMs: number, baseline: boolean): void {
   setMeta(sql, "exported_seq", fromSeq);
   const state: ExportState = { baseline, descriptor: false, dueSeq: baseline ? fromSeq : null, since: { seq: fromSeq, atMs }, done: [] };
@@ -109,11 +84,6 @@ export function startExport(sql: Sql, fromSeq: number, atMs: number, baseline: b
   scheduleExport(sql, atMs, false);
 }
 
-/**
- * Starts the export of a space that a server without the export created, when its object opens. Its current history
- * exports from restore_seq if a rewind started it, else from seq 0, and a full snapshot is due at once, because the log
- * of earlier commits omits the chunk lists of large versions.
- */
 export function bootstrapExport(sql: Sql, atMs: number): void {
   if (getMeta(sql, "space_id") === undefined || getMeta(sql, "export_state") !== undefined) return;
   const restoreSeq = getMeta(sql, "restore_seq");
@@ -124,16 +94,10 @@ export function bootstrapExport(sql: Sql, atMs: number): void {
   setMeta(sql, "export_state", JSON.stringify(state));
 }
 
-/** Whether the current history's descriptor is durable in R2, which rewind admission requires (RFC 0003 section 1). */
 export function descriptorDurable(sql: Sql): boolean {
   return readState(sql).descriptor;
 }
 
-/**
- * Schedules the export a new commit makes due, inside the commit's transaction: a segment five minutes after the first
- * waiting commit or at once after 1,000, and a snapshot at once after a version whose chunk list the log omits
- * (RFC 0004 section 3). Returns whether the schedule changed.
- */
 export function noteCommitted(sql: Sql, record: CommitRecord): boolean {
   const seq = Number(record.seq);
   const atMs = Number(record.committedAtMs);
@@ -158,7 +122,6 @@ async function gzip(data: Uint8Array): Promise<Uint8Array> {
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
-/** Writes the export of one Space DO to R2, one recorded step at a time. */
 export class Exporter {
   constructor(
     private readonly storage: Database,
@@ -170,7 +133,6 @@ export class Exporter {
     return this.storage.sql;
   }
 
-  /** Takes steps until nothing is due or the run's budget is spent, then schedules the next run. */
   async run(nowMs: number): Promise<void> {
     for (let i = 0; i < STEPS_PER_RUN; i++) {
       const step = this.next(nowMs);
@@ -210,7 +172,6 @@ export class Exporter {
     return Number(this.sql.exec("SELECT committed_at_ms FROM commits WHERE seq = ?", exportedSeq(this.sql) + 1).one().committed_at_ms);
   }
 
-  /** The step that is due now, if any. */
   private next(nowMs: number): Step | undefined {
     const state = readState(this.sql);
     const head = this.headSeq;
@@ -233,7 +194,6 @@ export class Exporter {
     return undefined;
   }
 
-  /** When the next step falls due with no further commit: a segment's delay or a snapshot's day. */
   private nextDue(): number | undefined {
     const state = readState(this.sql);
     const head = this.headSeq;
@@ -270,7 +230,6 @@ export class Exporter {
     return toBinary(ExportHeaderSchema, create(ExportHeaderSchema, { format, formatVersion: 1, spaceId: this.spaceId, historyId: this.historyId }));
   }
 
-  /** Records the range of the next segment: the waiting commits, at most 1,000 of them and SEGMENT_BYTES of records. */
   private cutSegment(): void {
     const first = exportedSeq(this.sql) + 1;
     const found = this.sql.exec("SELECT seq, length(record) AS bytes FROM commits WHERE seq >= ? ORDER BY seq LIMIT ?", first, SEGMENT_COMMITS).toArray();
@@ -287,7 +246,6 @@ export class Exporter {
     });
   }
 
-  /** Writes the recorded segment. A retry writes the same range with the same records. */
   private async writeSegment(): Promise<void> {
     const { first, last } = readState(this.sql).segment!;
     const writer = new BinaryWriter();
@@ -305,7 +263,6 @@ export class Exporter {
     });
   }
 
-  /** One node of a snapshot page, with every chunk list complete (RFC 0004 section 3). */
   private nodeSnapshot(node: NodeRow): Uint8Array {
     const previous = rows<VersionRow>(
       this.sql.exec("SELECT * FROM versions WHERE node_id = ? AND version_id IS NOT ? ORDER BY seq, version_id", node.node_id, node.cur_version_id),
@@ -316,10 +273,6 @@ export class Exporter {
     );
   }
 
-  /**
-   * Reads the next node range and writes it as a page. The page number is taken before the write is issued and never
-   * written again, so a write whose outcome is unknown cannot replace a later page's bytes (RFC 0004 section 4).
-   */
   private async writePage(): Promise<void> {
     const running = readState(this.sql).running!;
     const head = this.headSeq;
@@ -356,10 +309,6 @@ export class Exporter {
     });
   }
 
-  /**
-   * Writes the manifest once its pages and the log through end_seq are durable. Its bytes are recorded before the first
-   * write, so a late write can only store the same manifest (RFC 0004 section 4).
-   */
   private async writeManifest(): Promise<void> {
     let running = readState(this.sql).running!;
     if (running.manifest === undefined) {
@@ -389,7 +338,6 @@ export class Exporter {
     });
   }
 
-  /** Deletes an older snapshot: its manifest first, then everything under its pages/ prefix, orphan pages included. */
   private async prune(): Promise<void> {
     const dir = this.key(`snap/${seqName(readState(this.sql).pruning!)}/`);
     await this.bucket.delete(dir + "manifest.json");
@@ -401,7 +349,6 @@ export class Exporter {
     });
   }
 
-  /** Writes the current history's descriptor (RFC 0004 section 2). Its content is fixed for the history. */
   private async writeDescriptor(): Promise<void> {
     const spaceId = this.spaceId;
     const descriptor = {

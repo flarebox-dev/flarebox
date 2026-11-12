@@ -2,7 +2,6 @@
 
 import { base64url, fromBase64url, hmac, hmacVerify } from "./crypto";
 
-/** Lifetime of an access token (spec v0 section 15.2). */
 export const ACCESS_TOKEN_MS = 15 * 60_000;
 
 export interface ServerKey {
@@ -10,13 +9,11 @@ export interface ServerKey {
   secret: Uint8Array;
 }
 
-/** Who a valid access token speaks for. */
 export interface Identity {
   userId: string;
   deviceId: string;
   deviceName: string;
   expiresAtMs: number;
-  /** The principal's kind and scope (RFC 0006 section 2). A token without them speaks for a full-scope device. */
   kind: string;
   scope: string | null;
 }
@@ -24,7 +21,6 @@ export interface Identity {
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-/** "v1.<kid>.<base64url JSON claims>.<base64url HMAC-SHA256>". Opaque to clients. */
 export async function signAccessToken(key: ServerKey, identity: Identity): Promise<string> {
   const payload = base64url(
     encoder.encode(

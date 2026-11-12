@@ -15,9 +15,7 @@ import {
 } from "../gen/koidrive/v1/model_pb";
 import type { Sql, SqlCursor, SqlRow, SqlValue } from "../host";
 
-/** Chunks per row of version_chunk_pages, and per GetVersionChunks page. */
 export const PAGE_CHUNKS = 4096;
-/** Versions with more chunks than this carry only chunk_count in messages. */
 export const INLINE_CHUNKS = 16384;
 const CHUNK_ENTRY_BYTES = 36;
 
@@ -32,10 +30,6 @@ export interface NodeRow {
   content_dev: string;
   meta_rev: number;
   meta_dev: string;
-  /**
-   * The seq and device of the commit that last gave the node a new parent or brought it back from the trash. parent_dev
-   * is empty unless that commit's op named both the node and the parent.
-   */
   parent_rev: number;
   parent_dev: string;
   cur_version_id: string | null;
@@ -61,15 +55,12 @@ export interface VersionRow {
   superseded_at_ms: number | null;
 }
 
-/** A chunk key incarnation, "<rewind number>.<counter>" (RFC 0003 section 5, rules 5 and 6). */
 export const INCARNATION = /^\d{1,15}\.\d{1,15}$/;
 
-/** R2 key of one incarnation of a chunk: spaces/<space_id>/chunks/<first two hex digits>/<hex>/<incarnation>. */
 export function chunkKey(spaceId: string, hashHex: string, incarnation: string): string {
   return `spaces/${spaceId}/chunks/${hashHex.slice(0, 2)}/${hashHex}/${incarnation}`;
 }
 
-/** The hash and incarnation an R2 key names, or undefined for a key outside the layout. */
 export function parseChunkKey(spaceId: string, key: string): { hashHex: string; incarnation: string } | undefined {
   const match = /^([0-9a-f]{2})\/([0-9a-f]{64})\/([^/]+)$/.exec(key.slice(`spaces/${spaceId}/chunks/`.length));
   if (!key.startsWith(`spaces/${spaceId}/chunks/`) || !match || !match[2]!.startsWith(match[1]!) || !INCARNATION.test(match[3]!)) return undefined;
@@ -80,7 +71,6 @@ export function rows<T>(cursor: SqlCursor<SqlRow>): T[] {
   return cursor.toArray() as unknown as T[];
 }
 
-/** (32-byte hash || u32 LE size) for every chunk, the layout manifest_digest is computed over. */
 export function encodeChunkList(chunks: readonly ChunkRef[]): Uint8Array {
   const out = new Uint8Array(chunks.length * CHUNK_ENTRY_BYTES);
   const view = new DataView(out.buffer);
@@ -134,7 +124,6 @@ export function versionChunks(sql: Sql, version: VersionRow): ChunkRef[] {
   return out;
 }
 
-/** Lists the chunks when inline is set and the version has at most INLINE_CHUNKS of them, or always when complete is set. */
 export function versionContent(sql: Sql, version: VersionRow, inline: boolean, complete = false): Content {
   return create(ContentSchema, {
     size: BigInt(version.size),

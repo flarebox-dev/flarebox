@@ -3,9 +3,6 @@
 import type { Sql } from "../host";
 import { type Migration, migrate as runMigrations } from "../migrations";
 
-// Space DO storage, following spec v0 section 4.1. Migrations only move forward.
-
-/** Append-only: never edit or reorder a step that has been merged. */
 export const MIGRATIONS: readonly Migration[] = [
   `
   CREATE TABLE meta (key TEXT PRIMARY KEY, value BLOB NOT NULL);
@@ -71,16 +68,12 @@ export const MIGRATIONS: readonly Migration[] = [
   `
   CREATE TABLE IF NOT EXISTS rewind_markers (rewind_id TEXT NOT NULL, attempt INTEGER NOT NULL, PRIMARY KEY (rewind_id, attempt));
   `,
-  // RFC 0006 section 8: the digest of each commit request, stored with its result. Rows stored before have none.
   (sql) => {
     for (const table of ["commits", "device_commits"]) {
       const columns = sql.exec(`SELECT name FROM pragma_table_info('${table}')`).toArray().map((row) => row.name);
       if (!columns.includes("request_digest")) sql.exec(`ALTER TABLE ${table} ADD COLUMN request_digest BLOB`);
     }
   },
-  // RFC 0002 section 9: the seq and device of the commit that last gave a node a new parent. A row stored before gets its
-  // meta_rev, which is never lower, and no device, so a stale Delete keeps the subtree of such a row whenever its meta
-  // changed after the commit's base.
   (sql) => {
     const columns = sql.exec("SELECT name FROM pragma_table_info('nodes')").toArray().map((row) => row.name);
     if (columns.includes("parent_rev")) return;

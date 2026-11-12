@@ -3,12 +3,6 @@
 import type { Sql } from "../host";
 import { type Migration, migrate as runMigrations } from "../migrations";
 
-// Account DO storage, following spec v0 section 4.2. Migrations only move forward.
-
-/**
- * Append-only: never edit or reorder a step that has been merged. The first two steps are the unversioned schemas of
- * #8 and #25, kept with IF NOT EXISTS so that storage those builds wrote migrates in place.
- */
 export const MIGRATIONS: readonly Migration[] = [
   `
   CREATE TABLE IF NOT EXISTS users (user_id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at_ms INTEGER NOT NULL);
@@ -45,7 +39,6 @@ export const MIGRATIONS: readonly Migration[] = [
     window_start_ms INTEGER NOT NULL, PRIMARY KEY (scope, client));
   CREATE TABLE IF NOT EXISTS used_recovery_keys (key_hash BLOB PRIMARY KEY, used_at_ms INTEGER NOT NULL);
   `,
-  // RFC 0006 section 2: every device is a principal. Existing rows become full-scope devices that never expire.
   (sql) => {
     const columns = sql.exec("SELECT name FROM pragma_table_info('devices')").toArray().map((row) => row.name);
     if (!columns.includes("kind")) sql.exec("ALTER TABLE devices ADD COLUMN kind TEXT NOT NULL DEFAULT 'device'");
@@ -53,31 +46,26 @@ export const MIGRATIONS: readonly Migration[] = [
     if (!columns.includes("expires_at_ms")) sql.exec("ALTER TABLE devices ADD COLUMN expires_at_ms INTEGER");
     if (!columns.includes("issued_by")) sql.exec("ALTER TABLE devices ADD COLUMN issued_by TEXT");
   },
-  // RFC 0006 section 7: a revocation's notice to each space, kept until the space took it.
   `
   CREATE TABLE IF NOT EXISTS revocation_notices (device_id TEXT NOT NULL, space_id TEXT NOT NULL, next_try_ms INTEGER NOT NULL,
     PRIMARY KEY (device_id, space_id));
   `,
-  // RFC 0007 section 2: spaces are listed in the order their rows were stored, which a space id does not give.
   (sql) => {
     const columns = sql.exec("SELECT name FROM pragma_table_info('spaces')").toArray().map((row) => row.name);
     if (!columns.includes("list_seq")) sql.exec("ALTER TABLE spaces ADD COLUMN list_seq INTEGER");
     sql.exec("UPDATE spaces SET list_seq = rowid WHERE list_seq IS NULL");
     sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS spaces_list_seq ON spaces(list_seq)");
   },
-  // RFC 0006 section 7: devices are listed in the order their rows were stored, which a device id does not give.
   (sql) => {
     const columns = sql.exec("SELECT name FROM pragma_table_info('devices')").toArray().map((row) => row.name);
     if (!columns.includes("list_seq")) sql.exec("ALTER TABLE devices ADD COLUMN list_seq INTEGER");
     sql.exec("UPDATE devices SET list_seq = rowid WHERE list_seq IS NULL");
     sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS devices_list_seq ON devices(list_seq)");
   },
-  // The setup attempt of a device made by a recovery-key claim (ClaimRequest.setup_attempt).
   (sql) => {
     const columns = sql.exec("SELECT name FROM pragma_table_info('devices')").toArray().map((row) => row.name);
     if (!columns.includes("setup_attempt")) sql.exec("ALTER TABLE devices ADD COLUMN setup_attempt TEXT");
   },
-  // RFC 0011 section 1: the latest server_time_ms answered for each principal, so that the answered times never decrease.
   (sql) => {
     const columns = sql.exec("SELECT name FROM pragma_table_info('devices')").toArray().map((row) => row.name);
     if (!columns.includes("rotation_clock_ms")) sql.exec("ALTER TABLE devices ADD COLUMN rotation_clock_ms INTEGER NOT NULL DEFAULT 0");
