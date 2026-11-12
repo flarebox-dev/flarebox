@@ -555,6 +555,36 @@ fn a_folder_created_where_a_moving_folder_still_is_takes_a_pending_name_first() 
 }
 
 #[test]
+fn a_folder_created_where_a_moving_file_still_is_takes_a_pending_name_first() {
+    let mut trees = trees(&[
+        (
+            "h",
+            Some(file("n", "ß", 1)),
+            Some(file(ROOT, "a", 1)),
+            Some(remote(file(ROOT, "a", 1))),
+        ),
+        ("n", Some(dir(ROOT, "a")), None, None),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let first = build(&mut commits, &mut trees, &mut ids).unwrap();
+    let create = op::Op::CreateDir(proto::CreateDir {
+        node_id: "n".into(),
+        parent_id: ROOT.into(),
+        name: "a (pending)".into(),
+    });
+    assert_eq!(ops(&first), [create, mv("h", "n", "ß")]);
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied); 2],
+    );
+    trees.set_remote("n".into(), remote(dir(ROOT, "a (pending)")));
+    trees.set_remote("h".into(), remote(file("n", "ß", 1)));
+    let second = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&second), [mv("n", ROOT, "a")]);
+}
+
+#[test]
 fn a_renamed_result_reverts_the_local_name_to_the_server_one() {
     let mut trees = trees(&[("a", Some(file(ROOT, "x", 1)), None, None)]);
     let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
