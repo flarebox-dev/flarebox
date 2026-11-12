@@ -27,7 +27,7 @@ import type { ShareLink, ShareLinkList } from "./gen/koidrive/v1/share_pb";
 import type { Database, Sql } from "./host";
 import { isUuidV7, uuidv7 } from "./ids";
 import { knownPrincipal } from "./policy";
-import { FORMAT_VERSION } from "./space-do";
+import { FORMAT_VERSION } from "./space/space";
 import { type Outcome, type ResolvedLink, type ShareOutcome, ShareLinks } from "./share/links";
 
 export type { Outcome } from "./share/links";

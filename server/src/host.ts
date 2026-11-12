@@ -65,3 +65,32 @@ export interface ObjectStore {
   list(options: { prefix: string; cursor?: string; limit: number }): Promise<ObjectList>;
   delete(keys: string | string[]): Promise<void>;
 }
+
+/** One end of a hibernatable WebSocket. The attachment is a small value kept with the socket across hibernation. */
+export interface Socket {
+  readonly readyState: number;
+  send(message: ArrayBuffer | ArrayBufferView | string): void;
+  close(code?: number, reason?: string): void;
+  serializeAttachment(value: unknown): void;
+  deserializeAttachment(): unknown;
+}
+
+/** An object's database, its durable writes and its one alarm. */
+export interface ObjectStorage extends Database {
+  /** Resolves when every write made so far is durable. */
+  sync(): Promise<void>;
+  /** Runs the object's alarm handler at scheduledTimeMs, replacing any earlier setting. */
+  setAlarm(scheduledTimeMs: number): Promise<void>;
+  deleteAlarm(): Promise<void>;
+}
+
+/** What an object asks of its host: storage, its open sockets, exclusive sections and a restart. */
+export interface ObjectState {
+  readonly storage: ObjectStorage;
+  /** The open sockets, or those accepted with tag. */
+  getWebSockets(tag?: string): Socket[];
+  /** Runs callback while no other event of this object runs. */
+  blockConcurrencyWhile<T>(callback: () => Promise<T>): Promise<T>;
+  /** Ends the object's current instance; the next event starts a fresh one from storage. */
+  abort(reason?: string): void;
+}

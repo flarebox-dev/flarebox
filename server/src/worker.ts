@@ -28,7 +28,7 @@ import { fromHex, isUuidV7 } from "./ids";
 import { type Capability, policy } from "./policy";
 import { quotaRefusal } from "./quota";
 import { shareRoute } from "./share/routes";
-import { CONNECT_HEADER, type Connect, GRANT_MS, MAX_CHUNK_BYTES, MAX_CLIENT_FRAME } from "./space-do";
+import { CONNECT_HEADER, type Connect, GRANT_MS, MAX_CHUNK_BYTES, MAX_CLIENT_FRAME } from "./space/space";
 import { chunkKey, INCARNATION } from "./space/store";
 import { PROTO_MAX, PROTO_MIN, SERVER_VERSION } from "./version";
 
