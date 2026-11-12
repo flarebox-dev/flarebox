@@ -9,7 +9,7 @@ koi status
 ```
 Device: laptop (019a...) on https://koidrive.alice.workers.dev
 Daemon: running
-/home/alice/Koidrive  space Koidrive (019a...)  UpToDate  seq 1204 of 1204, 3120 remote nodes, 3118 local entries, 0 pending decisions
+/home/alice/Koidrive  space Koidrive (019a...)  UpToDate  seq 1204 of 1204, 3120 remote nodes, 3118 local entries, 0 need you
 ```
 
 Each linked folder has one line. Its state is one of these:
@@ -83,7 +83,7 @@ If the fix is a newer `koi`, install it and restart the daemon before you run `f
 Some changes wait for you to decide. `koi status` shows each pending decision under its folder: what it holds, and for each answer what it does and the command that gives it:
 
 ```
-/home/alice/Koidrive  space Koidrive (019a...)  UpToDate  seq 1210 of 1210, 3120 remote nodes, 2002 local entries, 1 pending decision
+/home/alice/Koidrive  space Koidrive (019a...)  UpToDate  seq 1210 of 1210, 3120 remote nodes, 2002 local entries, 1 needs you
   019b...: held 1 deletions that would remove 1116 of 3118 files, more than half of the space in 10 minutes; first path: Photos
   Delete these files on the server and other devices:
     koi resolve 019b... delete

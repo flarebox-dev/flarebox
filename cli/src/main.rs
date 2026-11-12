@@ -1082,6 +1082,11 @@ fn count(n: u64, noun: &str) -> String {
     format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
 }
 
+/// How many decisions wait for the person, as summary lines say it.
+fn need_you(n: u64) -> String {
+    format!("{n} {}", if n == 1 { "needs you" } else { "need you" })
+}
+
 /// Bytes in decimal units, such as 999 B, 1.0 kB or 1.5 GB.
 fn size(bytes: u64) -> String {
     if bytes < 1000 {
@@ -1256,7 +1261,7 @@ fn folder_text(folder: &FolderStatus) -> String {
             .local_entries
             .map(|entries| format!(", {entries} local entries"))
             .unwrap_or_default(),
-        count(folder.questions, "pending decision")
+        need_you(folder.questions)
     );
     if let Some(problem) = &folder.problem {
         text.push_str(&format!("  {}\n", printable(problem)));
@@ -1416,13 +1421,7 @@ fn question_notice(question: &Question) -> String {
 /// The line every command but `status`, `resolve` and `daemon` prints on stderr while decisions are pending.
 fn banner(questions: &[Question]) -> Option<String> {
     let n = questions.len() as u64;
-    let verb = if n == 1 { "is" } else { "are" };
-    (n > 0).then(|| {
-        format!(
-            "koi: {} {verb} waiting; run {RESOLVE}",
-            count(n, "sync decision")
-        )
-    })
+    (n > 0).then(|| format!("koi: {}; run {RESOLVE}", need_you(n)))
 }
 
 /// The decisions pending in the profile, asked of the daemon. Without a daemon there are none to report, because a
@@ -1934,7 +1933,7 @@ mod tests {
         assert_eq!(banner(&[]), None);
         assert_eq!(
             banner(&[held((30, 30, 40), &[Limit::Share], 1)]).as_deref(),
-            Some("koi: 1 sync decision is waiting; run koi resolve")
+            Some("koi: 1 needs you; run koi resolve")
         );
         assert_eq!(
             banner(&[
@@ -1942,7 +1941,7 @@ mod tests {
                 held((2_000, 2_000, 9_000), &[Limit::Deletions], 1)
             ])
             .as_deref(),
-            Some("koi: 2 sync decisions are waiting; run koi resolve")
+            Some("koi: 2 need you; run koi resolve")
         );
     }
 

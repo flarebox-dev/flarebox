@@ -685,8 +685,8 @@ fn restores_report(restores: &[RestoreStatus], linked: &FolderStatus) -> String 
         }
         if linked.questions > 0 {
             report.push_str(&format!(
-                "{} for the folder: {} lists them.\n",
-                crate::count(linked.questions, "pending decision"),
+                "{}: {} lists them.\n",
+                crate::need_you(linked.questions),
                 crate::RESOLVE
             ));
         }
@@ -1176,7 +1176,7 @@ mod tests {
                 "A pending restore goes out with a commit of the folder once the earlier changes of its node have synced.\n",
                 "The folder is not syncing: run koi _daemon.\n",
                 "The folder has a problem: the root is missing\n",
-                "1 pending decision for the folder: koi resolve lists them.\n",
+                "1 needs you: koi resolve lists them.\n",
             )
         );
         let two = FolderStatus {
@@ -1184,8 +1184,7 @@ mod tests {
             ..linked()
         };
         assert!(
-            restores_report(&restores, &two)
-                .ends_with("2 pending decisions for the folder: koi resolve lists them.\n")
+            restores_report(&restores, &two).ends_with("2 need you: koi resolve lists them.\n")
         );
         assert_eq!(
             restores_report(&restores[..1], &folder),
