@@ -5915,3 +5915,70 @@ fn a_parked_edit_whose_name_a_synced_folder_holds_is_sent() {
         commit.as_ref().map(ops)
     );
 }
+
+#[test]
+fn a_parked_edit_is_sent_before_the_folder_taking_its_name_downloads() {
+    let mut trees = trees(&[
+        (
+            "h",
+            None,
+            Some(file(ROOT, "x", 1)),
+            Some(trashed(file(ROOT, "x", 1))),
+        ),
+        ("n", None, None, Some(remote(dir(ROOT, "x")))),
+    ]);
+    trees.set_local(
+        "h".into(),
+        LocalNode {
+            parked: true,
+            ..local(file(ROOT, "x", 2), 1)
+        },
+    );
+    trees.settle();
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let sent = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(ops(&sent).iter().any(|op| matches!(
+        op,
+        op::Op::CreateFile(create) if create.content == Some(content(2))
+    )));
+}
+
+#[test]
+fn a_parked_edit_goes_back_to_its_name_when_another_folder_gets_that_name() {
+    let mut trees = trees(&[
+        synced("d", dir(ROOT, "d")),
+        (
+            "h",
+            None,
+            Some(file(ROOT, "x", 1)),
+            Some(trashed(file(ROOT, "x", 1))),
+        ),
+        ("n", None, None, Some(remote(dir("d", "x")))),
+    ]);
+    trees.set_local(
+        "h".into(),
+        LocalNode {
+            parked: true,
+            ..local(file(ROOT, "x", 2), 2)
+        },
+    );
+    trees.settle();
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    let mut moved_back = false;
+    while let Some(record) = effects.plan(&trees, &mut ids, NOW).cloned() {
+        moved_back |= matches!(
+            &record.effect,
+            Effect::Move { from: Location::Parked(_), to: Location::At { dirs, name, .. }, .. }
+                if dirs.is_empty() && name == "x"
+        );
+        effects
+            .done(
+                &mut trees,
+                &record.effect_id,
+                Some(local(dir("d", "x"), 9).identity),
+            )
+            .unwrap();
+        trees.settle();
+    }
+    assert!(moved_back);
+}
