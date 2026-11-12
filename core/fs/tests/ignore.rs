@@ -886,13 +886,21 @@ fn listed(root: &Path, under: &Path, into: &mut Vec<(PathBuf, bool)>) {
     }
 }
 
-fn on_disk(root: &Path) -> BTreeSet<(u64, u64)> {
+fn on_disk(root: &Path) -> Vec<FileId> {
     let mut all = Vec::new();
     listed(root, Path::new(""), &mut all);
     (all.iter())
         .map(|(path, _)| {
             let meta = fs::symlink_metadata(root.join(path)).unwrap();
-            (meta.dev(), meta.ino())
+            let born = meta.created().ok().map(|time| {
+                let since = time.duration_since(std::time::UNIX_EPOCH).unwrap();
+                i64::try_from(since.as_nanos()).unwrap()
+            });
+            FileId {
+                dev: meta.dev(),
+                ino: meta.ino(),
+                birth_ns: born,
+            }
         })
         .collect()
 }
@@ -1050,7 +1058,7 @@ impl Synced {
             );
         }
         let disk = on_disk(root);
-        let there = |id: &FileId| disk.contains(&(id.dev, id.ino));
+        let there = |id: &FileId| disk.contains(id);
         for change in changes {
             if let Change::Ignored { to, id, .. } = change {
                 let meta = fs::symlink_metadata(root.join(to)).unwrap();
