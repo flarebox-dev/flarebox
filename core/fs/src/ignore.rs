@@ -77,8 +77,9 @@ pub struct Rules {
 struct Search {
     walks: u64,
     walk: Option<Vec<Listing>>,
-    wanted: HashMap<(FileId, EntryKind), u64>,
-    found: HashMap<(FileId, EntryKind), PathBuf>,
+    pending: HashMap<Key, u64>,
+    decided: HashMap<Key, Option<PathBuf>>,
+    held: HashMap<Key, PathBuf>,
 }
 
 struct Listing {
@@ -105,6 +106,10 @@ impl Rules {
     pub fn with_search_budget(mut self, budget: usize) -> Self {
         self.budget = budget;
         self
+    }
+
+    pub(crate) fn searching(&self) -> bool {
+        !self.search.pending.is_empty()
     }
 
     /// The keys of `path`, under which the rules of the folder there are held.
@@ -135,7 +140,9 @@ impl Rules {
 
 /// The entries a search looks for, by identity and kind, and where it found
 /// each one.
-pub(crate) type Wanted = HashMap<(FileId, EntryKind), Option<PathBuf>>;
+pub(crate) type Wanted = HashMap<Key, Option<PathBuf>>;
+
+pub(crate) type Key = (FileId, EntryKind);
 
 /// The rules during one scan. Until the scan is published, [`Pending::undo`]
 /// takes back everything it changed in them.
@@ -286,40 +293,35 @@ impl<'r> Pending<'r> {
         });
     }
 
-    pub(crate) fn search(
-        &mut self,
-        root: BorrowedFd<'_>,
-        wanted: &mut Wanted,
-    ) -> HashSet<(FileId, EntryKind)> {
+    pub(crate) fn search(&mut self, root: BorrowedFd<'_>, wanted: &mut Wanted) -> HashSet<Key> {
         let Rules {
             ignored,
             budget,
             search,
             ..
         } = &mut *self.rules;
-        search.wanted.retain(|key, _| wanted.contains_key(key));
-        search.found.retain(|key, path| {
-            let at = (path.parent())
-                .zip(path.file_name())
-                .and_then(|(parent, name)| {
-                    let (dir, _) = open_attached(root, parent, &mut |_| {}).ok()??;
-                    stat_at(dir.as_fd(), name).ok()?.entry()
-                });
-            wanted.contains_key(key) && at.is_some_and(|entry| (entry.id, entry.kind) == *key)
-        });
-        let next = search.walks + 1;
+        let Search {
+            walks,
+            walk,
+            pending,
+            decided,
+            ..
+        } = search;
+        let next = *walks + 1;
         for (key, found) in wanted.iter_mut() {
-            match search.found.get(key) {
-                Some(path) => *found = Some(path.clone()),
-                None => {
-                    search.wanted.entry(*key).or_insert(next);
+            match decided.get(key) {
+                Some(Some(path)) if holds(root, path, *key) => *found = Some(path.clone()),
+                Some(None) => {}
+                _ => {
+                    decided.remove(key);
+                    pending.entry(*key).or_insert(next);
                 }
             }
         }
         let mut left = *budget;
-        while !search.wanted.is_empty() {
-            let walk = search.walk.get_or_insert_with(|| {
-                search.walks += 1;
+        while left > 0 && !pending.is_empty() {
+            let listings = walk.get_or_insert_with(|| {
+                *walks += 1;
                 (ignored.iter())
                     .map(|(dir, names)| Listing {
                         dir: dir.clone(),
@@ -329,8 +331,8 @@ impl<'r> Pending<'r> {
                     .collect()
             });
             while left > 0
-                && !search.wanted.is_empty()
-                && let Some(mut listing) = walk.pop()
+                && !pending.is_empty()
+                && let Some(mut listing) = listings.pop()
             {
                 let Ok(Some((dir, _))) = open_attached(root, &listing.dir, &mut |_| {}) else {
                     continue;
@@ -346,10 +348,13 @@ impl<'r> Pending<'r> {
                     else {
                         continue;
                     };
+                    let key = (entry.id, entry.kind);
                     let path = listing.dir.join(&name);
-                    if search.wanted.remove(&(entry.id, entry.kind)).is_some() {
-                        wanted.insert((entry.id, entry.kind), Some(path.clone()));
-                        search.found.insert((entry.id, entry.kind), path.clone());
+                    if pending.remove(&key).is_some() {
+                        if let Some(found) = wanted.get_mut(&key) {
+                            *found = Some(path.clone());
+                        }
+                        decided.insert(key, Some(path.clone()));
                     }
                     if entry.kind == EntryKind::Dir
                         && let Ok(sub) = open_dir_at(dir.as_fd(), &name)
@@ -362,27 +367,44 @@ impl<'r> Pending<'r> {
                     }
                 }
                 if !listing.names.is_empty() {
-                    walk.push(listing);
+                    listings.push(listing);
                 }
-                walk.extend(below.into_iter().rev());
+                listings.extend(below.into_iter().rev());
             }
-            if walk.is_empty() {
-                search.walk = None;
-                let done = search.walks;
-                search.wanted.retain(|_, needs| *needs > done);
-            }
-            if left == 0 {
-                break;
+            if listings.is_empty() {
+                *walk = None;
+                let done = *walks;
+                pending.retain(|key, needs| {
+                    let open = *needs > done;
+                    if !open {
+                        decided.insert(*key, None);
+                    }
+                    open
+                });
             }
         }
-        if search.wanted.is_empty() {
+        if pending.is_empty() {
+            *walk = None;
+        }
+        (wanted.keys())
+            .filter(|key| pending.contains_key(key))
+            .copied()
+            .collect()
+    }
+
+    pub(crate) fn hold(&mut self, held: HashMap<Key, PathBuf>, scanned: impl Fn(&Path) -> bool) {
+        let search = &mut self.rules.search;
+        search.held.retain(|_, path| !scanned(path));
+        search.held.extend(held);
+        search
+            .pending
+            .retain(|key, _| search.held.contains_key(key));
+        search
+            .decided
+            .retain(|key, _| search.held.contains_key(key));
+        if search.pending.is_empty() {
             search.walk = None;
         }
-        let undecided: HashSet<(FileId, EntryKind)> = search.wanted.keys().copied().collect();
-        if undecided.is_empty() {
-            search.found.clear();
-        }
-        undecided
     }
 
     /// Drops the rules of every folder for which `is_folder` is false, and
@@ -472,4 +494,16 @@ fn read_rules(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<Option<Vec<u8>>> 
         return Err(io::ErrorKind::FileTooLarge.into());
     }
     Ok(Some(bytes))
+}
+
+fn holds(root: BorrowedFd<'_>, path: &Path, key: Key) -> bool {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return false;
+    };
+    let Ok(Some((dir, _))) = open_attached(root, parent, &mut |_| {}) else {
+        return false;
+    };
+    (stat_at(dir.as_fd(), name).ok())
+        .and_then(|stat| stat.entry())
+        .is_some_and(|entry| (entry.id, entry.kind) == key)
 }

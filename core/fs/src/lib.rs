@@ -576,9 +576,11 @@ impl Snapshot {
     /// A removal whose entry the scan finds under a left-out entry is reported
     /// as [`Change::Ignored`]. Each rescan looks at a bounded number of
     /// left-out entries ([`Rules::with_search_budget`]). A removal the search
-    /// has not decided within that bound keeps its entry and is returned in
-    /// [`Rescan::unsettled`], and the next rescans of its path go on with the
-    /// search.
+    /// has not decided within that bound keeps its entry, at the path the
+    /// renames of the same scan move it to, and is returned in
+    /// [`Rescan::unsettled`]. The search goes on in the next rescans, of any
+    /// paths, and the removal is reported by the next rescan of its path after
+    /// the search has decided it.
     ///
     /// On any error `rules` are unchanged too.
     pub fn rescan_with_rules(
@@ -1033,12 +1035,7 @@ fn keep_unconfirmed(
     }
 
     kept.sort();
-    keep(&kept, old, new);
-    Ok(kept)
-}
-
-fn keep(paths: &[PathBuf], old: &BTreeMap<PathBuf, Entry>, new: &mut BTreeMap<PathBuf, Entry>) {
-    for path in paths {
+    for path in &kept {
         new.retain(|inside, _| !inside.starts_with(path));
         new.extend(
             old.range(path.clone()..)
@@ -1046,6 +1043,7 @@ fn keep(paths: &[PathBuf], old: &BTreeMap<PathBuf, Entry>, new: &mut BTreeMap<Pa
                 .map(|(inside, entry)| (inside.clone(), *entry)),
         );
     }
+    Ok(kept)
 }
 
 /// What one look at a folder found, for comparing two looks.
@@ -1181,19 +1179,19 @@ fn find_ignored(
             _ => None,
         })
         .collect();
-    let removed: BTreeSet<&PathBuf> = changes
-        .iter()
+    let removed: BTreeSet<PathBuf> = (changes.iter())
         .filter_map(|change| match change {
-            Change::Removed { path, .. } => Some(path),
+            Change::Removed { path, .. } => Some(path.clone()),
             _ => None,
         })
         .collect();
     if removed.is_empty() && replaced.is_empty() {
+        rules.hold(HashMap::new(), |path| old.contains_key(path));
         return Vec::new();
     }
-    let renamed: HashMap<&Path, &Path> = (changes.iter())
+    let renamed: HashMap<PathBuf, PathBuf> = (changes.iter())
         .filter_map(|change| match change {
-            Change::Renamed { from, to, .. } => Some((from.as_path(), to.as_path())),
+            Change::Renamed { from, to, .. } => Some((from.clone(), to.clone())),
             _ => None,
         })
         .collect();
@@ -1206,21 +1204,26 @@ fn find_ignored(
                     .is_some_and(|after| after.id == entry.id && after.kind == entry.kind)
             })
     };
-    let mut held: BTreeSet<&PathBuf> = (removed.iter().copied())
+    let mut held: BTreeSet<&PathBuf> = (removed.iter())
         .filter(|dir| old[*dir].kind == EntryKind::Dir)
         .flat_map(|dir| {
             (old.range(dir.clone()..).skip(1))
                 .take_while(move |(path, _)| path.starts_with(dir))
                 .map(|(path, _)| path)
         })
-        .filter(|path| !removed.contains(path) && !carried(path))
+        .filter(|path| !removed.contains(*path) && !carried(path))
         .collect();
-    let key = |path: &PathBuf| (old[path].id, old[path].kind);
-    let mut wanted: Wanted = (removed.iter().chain(&held).copied())
+    let key = |path: &Path| (old[path].id, old[path].kind);
+    let mut wanted: Wanted = (removed.iter().chain(held.iter().copied()))
         .map(|path| (key(path), None))
         .collect();
     let undecided = rules.search(root, &mut wanted);
-    let deferred: Vec<PathBuf> = (removed.iter().copied())
+    let relocated = |path: &Path| {
+        (path.ancestors().skip(1))
+            .find_map(|above| Some(renamed.get(above)?.join(path.strip_prefix(above).ok()?)))
+            .unwrap_or_else(|| path.to_path_buf())
+    };
+    let deferred: Vec<(PathBuf, PathBuf)> = (removed.iter())
         .filter(|path| {
             wanted.get(&key(path)) == Some(&None)
                 && (held.iter().copied())
@@ -1228,13 +1231,30 @@ fn find_ignored(
                     .chain([*path])
                     .any(|inside| undecided.contains(&key(inside)))
         })
-        .cloned()
+        .map(|path| (path.clone(), relocated(path)))
         .collect();
+    let mut kept = HashMap::new();
     if !deferred.is_empty() {
-        held.retain(|path| !deferred.iter().any(|dir| path.starts_with(dir)));
-        keep(&deferred, old, new);
+        held.retain(|path| !deferred.iter().any(|(dir, _)| path.starts_with(dir)));
+        for (from, to) in &deferred {
+            new.retain(|inside, _| !inside.starts_with(to));
+            for (inside, entry) in (old.range(from.clone()..))
+                .take_while(|(inside, _)| inside.starts_with(from))
+                .filter(|(inside, _)| {
+                    !(inside.ancestors())
+                        .take_while(|above| above != from)
+                        .any(|above| renamed.contains_key(above))
+                })
+            {
+                let below = inside.strip_prefix(from).expect("taken below the folder");
+                let at: PathBuf = to.components().chain(below.components()).collect();
+                kept.insert((entry.id, entry.kind), at.clone());
+                new.insert(at, *entry);
+            }
+        }
         *changes = diff(old, new);
     }
+    rules.hold(kept, |path| old.contains_key(path));
     let mut swapped: Wanted = (replaced.iter())
         .map(|path| (key(path), None))
         .filter(|(id, _)| !wanted.contains_key(id))
@@ -1278,7 +1298,7 @@ fn find_ignored(
         }
     }
     changes.extend(moved);
-    deferred
+    deferred.into_iter().map(|(_, to)| to).collect()
 }
 
 /// Sorts the paths and drops every path inside another one.
@@ -1967,7 +1987,9 @@ impl Watcher for RescanWatcher {
             if !poll.changes.is_empty() || !poll.rules.is_empty() || left.is_zero() {
                 return Ok(poll);
             }
-            std::thread::sleep(self.interval.min(left));
+            if !self.rules.as_ref().is_some_and(Rules::searching) {
+                std::thread::sleep(self.interval.min(left));
+            }
         }
     }
 
