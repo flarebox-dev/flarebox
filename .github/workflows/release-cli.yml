@@ -28,18 +28,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 2
       - name: Decide which targets the change needs
         id: targets
         env:
           EVENT: ${{ github.event_name }}
-          BASE: ${{ github.event.pull_request.base.sha }}
           LINUX: '[{"target":"x86_64-unknown-linux-musl","runner":"ubuntu-latest"},{"target":"aarch64-unknown-linux-musl","runner":"ubuntu-latest"}]'
           MACOS: '[{"target":"aarch64-apple-darwin","runner":"macos-15"},{"target":"x86_64-apple-darwin","runner":"macos-15-intel"}]'
         run: |
           linux=true
           macos=true
           if [ "$EVENT" = pull_request ]; then
-            git fetch --no-tags --depth=1 origin "$BASE"
+            BASE=$(git rev-parse HEAD^1)
             if ! git diff -z --name-only --no-renames "$BASE" HEAD > "$RUNNER_TEMP/changed"; then
               echo "::error::git diff between $BASE and HEAD failed, so the changed paths are unknown."
               exit 1

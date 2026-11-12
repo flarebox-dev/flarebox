@@ -30,11 +30,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 2
       - name: Decide which jobs the change needs
         id: paths
         env:
           EVENT: ${{ github.event_name }}
-          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          BASE: ${{ github.event.merge_group.base_sha }}
         run: |
           if [ "$EVENT" = push ]; then
             echo "Push to $GITHUB_REF: every macOS job runs."
@@ -42,7 +43,11 @@ jobs:
             echo "site_only=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git fetch --no-tags --depth=1 origin "$BASE"
+          if [ "$EVENT" = merge_group ]; then
+            git fetch --no-tags --depth=1 origin "$BASE"
+          else
+            BASE=$(git rev-parse HEAD^1)
+          fi
           if ! git diff -z --name-only --no-renames "$BASE" HEAD > "$RUNNER_TEMP/changed"; then
             echo "::error::git diff between $BASE and HEAD failed, so the changed paths are unknown."
             exit 1
@@ -448,6 +453,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 2
       - uses: bufbuild/buf-action@37ac33d8960807670a6e9719080e885197b09cc6 # v1.7.0
         with:
           version: 1.75.0
@@ -463,9 +469,15 @@ jobs:
           fi
       - name: Check for breaking changes against the base
         env:
-          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || 'refs/heads/main' }}
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.merge_group.base_sha || 'refs/heads/main' }}
         run: |
-          git fetch --no-tags --depth=1 origin "+$BASE:refs/remotes/origin/breaking-base"
+          if [ "$EVENT" = pull_request ]; then
+            BASE=$(git rev-parse HEAD^1)
+            git update-ref refs/remotes/origin/breaking-base "$BASE"
+          else
+            git fetch --no-tags --depth=1 origin "+$BASE:refs/remotes/origin/breaking-base"
+          fi
           if ! buf breaking --against "../.git#ref=refs/remotes/origin/breaking-base,subdir=spec"; then
             echo "::error::The schema in spec/proto breaks compatibility with the base $BASE (see the buf output above). Keep field numbers, names and types stable; reserve removed fields instead of deleting them."
             exit 1
@@ -553,13 +565,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 2
       - name: Test the new-comment check
         run: python3 scripts/test-check-new-comments.py -v
       - name: Fail on comments that this change adds
         env:
-          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.merge_group.base_sha }}
         run: |
-          git fetch --no-tags --depth=1 origin "$BASE"
+          if [ "$EVENT" = merge_group ]; then
+            git fetch --no-tags --depth=1 origin "$BASE"
+          else
+            BASE=$(git rev-parse HEAD^1)
+          fi
           python3 scripts/check-new-comments.py "$BASE" HEAD
 
   ci-report:
