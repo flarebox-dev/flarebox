@@ -820,6 +820,17 @@ impl Commits {
     /// Whether a build has something to do for a conflict question: a file of it was renamed,
     /// moved, deleted or changed since it was asked, or its answer can be carried out
     /// ([`Commits::conflicts`]). The caller builds then even when nothing else changed.
+    /// Whether a build has something to do: a node is dirty or its S update waits, a restore is
+    /// queued, a conflict question is due ([`Commits::conflicts_due`]), or a node L, S and R all
+    /// hold at the pending name a commit gave it is owed its own name.
+    pub fn due(&self, trees: &Trees) -> bool {
+        !trees.dirty().is_empty()
+            || !trees.waiting().is_empty()
+            || !self.restores.is_empty()
+            || self.conflicts_due(trees)
+            || renames_owed(trees, &self.pending).next().is_some()
+    }
+
     pub fn conflicts_due(&self, trees: &Trees) -> bool {
         self.questions.iter().any(|question| match &question.kind {
             QuestionKind::Conflict { original, copy, .. } => {
@@ -1847,6 +1858,21 @@ fn agree(trees: &Trees, id: &str, seq: u64) -> Option<(NodeId, Agreed)> {
     (trees.position_after(id, seq)).map(|at| (id.to_owned(), at.clone()))
 }
 
+fn renames_owed<'a>(
+    trees: &'a Trees,
+    pending: &'a BTreeMap<NodeId, Pending>,
+) -> impl Iterator<Item = (&'a NodeId, &'a Shape, &'a Pending)> + 'a {
+    pending.iter().filter_map(|(id, pending)| {
+        let local = trees.local().get(id).filter(|node| !node.parked)?;
+        let synced = trees.acknowledged(id)?;
+        let remote = trees.remote().live(id)?;
+        (nfc(&remote.name) == nfc(&pending.sent)
+            && local.shape.same_position(remote)
+            && synced.same_position(remote))
+        .then_some((id, remote, pending))
+    })
+}
+
 fn changed_locally(trees: &Trees, id: &str) -> bool {
     let Some(Waiting {
         shape: Some(waiting),
@@ -2099,21 +2125,14 @@ fn plan(
             });
         }
     }
-    for (id, pending) in owed.iter().filter(|(id, _)| !problems.contains(*id)) {
-        let (Some(local), Some(synced), Some(remote)) = (
-            trees.local().get(id).filter(|node| !node.parked),
-            trees.acknowledged(id),
-            trees.remote().live(id),
-        ) else {
-            continue;
-        };
-        if local.shape.same_position(remote) && synced.same_position(remote) {
-            wants.push(Want::Move {
-                id: id.clone(),
-                parent: remote.parent.clone(),
-                name: pending.name.clone(),
-            });
-        }
+    for (id, remote, pending) in
+        renames_owed(trees, owed).filter(|(id, ..)| !problems.contains(*id))
+    {
+        wants.push(Want::Move {
+            id: id.clone(),
+            parent: remote.parent.clone(),
+            name: pending.name.clone(),
+        });
     }
     let mut scratch = Scratch::new(trees);
     let mut tops = Vec::new();

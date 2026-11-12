@@ -1403,7 +1403,9 @@ impl World {
                 cursor,
                 ..
             } = engine;
-            commits.build(trees, ids, NOW as u64, &history, cursor.clone());
+            if commits.due(trees) {
+                commits.build(trees, ids, NOW as u64, &history, cursor.clone());
+            }
             if commits.in_flight().is_none() && !commits.problems().is_empty() {
                 note(&mut self.seen, "no commit built while a node is a problem");
             }

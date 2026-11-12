@@ -29,6 +29,42 @@ use crate::question::Answer;
 
 const NOW: i64 = 1_700_000_000_000;
 
+#[test]
+fn a_folder_brought_back_at_its_pending_name_takes_its_own_name() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("a"), b"the file");
+    let (site, mut b) = linked(&mut remote, "b");
+    b.settle();
+    fs::rename(site.root.join("a"), site.root.join("x")).unwrap();
+    fs::create_dir(site.root.join("a")).unwrap();
+    fs::rename(site.root.join("x"), site.root.join("a/child")).unwrap();
+    b.scan_until(|b| !b.work.is_empty());
+    let Some(Work::Send(commit)) = b.work.pop_front() else {
+        panic!("a commit is sent");
+    };
+    let result = remote.commit(&b.caller, &commit).unwrap();
+    fs::remove_dir_all(site.root.join("a")).unwrap();
+    b.settle();
+    a.pull(&remote);
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    let child = files(&site_a.root).into_iter().next().unwrap().0;
+    a.create(&mut remote, &site_a.root.join(child), b"edited remotely");
+    b.pull(&remote);
+    let step = b.folder.sent(Ok(result));
+    b.take(step).unwrap();
+    for _ in 0..6 {
+        b.run(&mut remote);
+        b.settle();
+    }
+    assert_eq!(
+        files(&site.root),
+        [("a/child".to_owned(), "edited remotely".to_owned())]
+    );
+}
+
 /// The server: the space, the bytes of the chunks devices uploaded, and the result of each commit by its ID.
 struct Remote {
     space: SpaceDo,
