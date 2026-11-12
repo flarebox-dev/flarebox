@@ -5750,6 +5750,31 @@ fn a_download_that_halts_is_counted_by_its_cause() {
 }
 
 #[test]
+fn a_download_refused_for_good_halts_as_refused() {
+    use crate::failures::{self, Halted};
+
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("notes.txt"), b"written on a");
+    let site = Site::new(&remote, "b");
+    let mut b = site.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    *remote.chunks.refusal.lock().unwrap() = Some(forbidden());
+    let pending = loop {
+        match b.work.pop_front().expect("an effect is staged") {
+            Work::Stage(pending) => break pending,
+            other => b.perform(other, &mut remote).unwrap(),
+        }
+    };
+    let staged = ready(pending.stage(&remote.chunks));
+    let Err(stop) = b.folder.staged(pending, staged) else {
+        panic!("a refusal for good halts the download");
+    };
+    assert_eq!(failures::halted(&stop), Halted::Refused);
+}
+
+#[test]
 fn a_listing_that_halts_is_counted_by_its_cause() {
     use crate::failures::{self, Halted};
 
