@@ -349,8 +349,6 @@ fn bind_needs_a_folder_and_held_follows_the_linked_path() {
     assert!(space.parent(&at(Vec::new(), "f")).is_ok());
 }
 
-/// A path in an error is quoted, so that a reader, and the redaction of `koi diagnose`, can tell where a name that holds
-/// spaces or `: ` ends.
 #[test]
 fn errors_quote_the_paths_they_name() {
     let missing = Unresolved::Missing(PathBuf::from("Secret Plans/budget 2026.xlsx"));

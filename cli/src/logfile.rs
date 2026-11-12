@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The launch agent's log. launchd appends the daemon's stdout and stderr to the file the property list names and never
-//! rotates it, so the daemon keeps it under [`MAX`] bytes itself: before a line would take the file past it, the file
-//! becomes `<name>.1`, replacing an older one, and a new file takes its place as stdout and stderr.
-
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::MetadataExt;
@@ -12,19 +8,17 @@ use std::sync::{Mutex, PoisonError};
 
 use tracing_subscriber::fmt::MakeWriter;
 
-/// The most bytes the log holds, besides the previous log in `<name>.1`.
 pub const MAX: u64 = 10 * 1024 * 1024;
 
+// launchd appends to the file the property list names and never rotates it.
 pub struct CappedLog {
     path: PathBuf,
     max: u64,
     file: Mutex<File>,
-    /// Points stdout and stderr at a new log, so that what bypasses the logger, such as a panic, lands there too.
     redirect: fn(&File) -> io::Result<()>,
 }
 
 impl CappedLog {
-    /// The log at `path`, when it is the file stderr writes to, as launchd sets it up for the launch agent.
     pub fn of_stderr(path: PathBuf) -> Option<Self> {
         let stderr = rustix::fs::fstat(io::stderr()).ok()?;
         let log = fs::metadata(&path).ok()?;
@@ -67,7 +61,6 @@ impl CappedLog {
     }
 }
 
-/// Where the log before the current one is kept.
 pub fn previous(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(".1");

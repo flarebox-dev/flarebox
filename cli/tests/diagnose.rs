@@ -8,7 +8,6 @@ use std::process::Command;
 const SERVER: &str = "https://koi-ada-7f3k.workers.dev";
 const TOKEN: &str = "kdr_9f8e7d6c5b4a39281706f5e4d3c2b1a0";
 
-/// `koi` with the default profile of `home`, so that its launch agent is `dev.koidrive.koi`.
 fn koi(home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_koi"));
     command
@@ -20,7 +19,6 @@ fn koi(home: &Path) -> Command {
     command
 }
 
-/// A home whose profile is paired with a server by a planted credential.
 fn paired_home() -> tempfile::TempDir {
     let home = tempfile::tempdir().unwrap();
     let state = home.path().join(".local/state/koidrive");
@@ -39,13 +37,10 @@ fn paired_home() -> tempfile::TempDir {
     home
 }
 
-/// The launch agent's log of the default profile in `home`.
 fn agent_log(home: &Path) -> PathBuf {
     home.join("Library/Logs/Koidrive/dev.koidrive.koi.log")
 }
 
-/// The file holds the status and the daemon's log, and none of the paths, names, server address or token planted in
-/// the profile and its log.
 #[test]
 fn diagnose_writes_a_file_without_the_profiles_paths_names_server_or_token() {
     let home = paired_home();
@@ -96,7 +91,6 @@ fn diagnose_writes_a_file_without_the_profiles_paths_names_server_or_token() {
     }
 }
 
-/// A daemon whose stderr is the launch agent's log moves a log past its cap aside and starts a new one.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_daemon_moves_a_full_launch_agent_log_aside() {

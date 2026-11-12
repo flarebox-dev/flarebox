@@ -400,7 +400,8 @@ pub enum Error {
     )]
     SchemaTooOld { found: u32, supported: u32 },
     #[error(
-        "{0} holds changes that are not in the database file yet; the daemon applies them when it starts"
+        "{} holds changes that are not in the database file yet; the daemon applies them when it starts",
+        koidrive_fs::quoted(.0)
     )]
     LogNotApplied(PathBuf),
     #[error("the database did not accept the durability settings: {0:?}")]

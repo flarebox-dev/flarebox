@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! `koi diagnose`: one text file to attach to a report of a problem. It holds the version, the system, the service,
-//! `koi status --json` and the end of the daemon's log. Every path, file name, space and device name, server address
-//! and token in it is replaced by a placeholder such as `<folder-1>`, the same one wherever the value appears.
-
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -18,14 +14,10 @@ use crate::error::CliError;
 use crate::report::Done;
 use crate::service;
 
-/// Where problems are reported (CONTRIBUTING.md).
 const ISSUES: &str = "https://github.com/koidrive/koidrive/issues";
 
-/// How many of the daemon's last log lines the file holds.
 const LOG_LINES: usize = 200;
 
-/// The fields of `koi status --json` whose string values name something of the person's, with the placeholder kind
-/// each gets.
 const NAMED: [(&str, &str); 6] = [
     ("path", "folder"),
     ("folder", "folder"),
@@ -35,8 +27,6 @@ const NAMED: [(&str, &str); 6] = [
     ("user_name", "user"),
 ];
 
-/// The log fields whose values stay, redacted like any text: causes, ids and waits. `signal` stays as it is, since the
-/// daemon writes only a signal's name there. Any other field, such as a path or a name, is replaced whole.
 const KEPT: [&str; 8] = [
     "error",
     "problem",
@@ -50,7 +40,6 @@ const KEPT: [&str; 8] = [
 
 const LEVELS: [&str; 5] = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"];
 
-/// Names of Koidrive's own that look like a file or a host name.
 const OURS: [&str; 4] = [
     "config.toml",
     "credential.json",
@@ -58,7 +47,6 @@ const OURS: [&str; 4] = [
     ".koiignore",
 ];
 
-/// Writes the file into the current directory and returns its path.
 pub async fn run(paths: &Paths) -> Result<Done, CliError> {
     let mut redactor = Redactor::default();
     know_profile(&mut redactor, paths);
@@ -86,8 +74,6 @@ pub async fn run(paths: &Paths) -> Result<Done, CliError> {
     })
 }
 
-/// The values of this profile that are not in its status: the home folder and the user, the host, the profile's own
-/// folders and the stored credential.
 fn know_profile(redactor: &mut Redactor, paths: &Paths) {
     let home = std::env::var("HOME").unwrap_or_default();
     for path in [
@@ -144,7 +130,6 @@ fn bundle(
     )
 }
 
-/// The operating system, its version and the processor.
 fn system() -> String {
     let arch = std::env::consts::ARCH;
     if cfg!(target_os = "macos") {
@@ -169,7 +154,6 @@ fn system() -> String {
     format!("{name} ({arch}), kernel {kernel}")
 }
 
-/// The end of the service's log: the launch agent's log file on macOS, the unit's journal elsewhere.
 fn daemon_log(paths: &Paths) -> Result<String, String> {
     let service = service::this_service(paths)?;
     if cfg!(target_os = "macos") {
@@ -206,7 +190,6 @@ fn daemon_log(paths: &Paths) -> Result<String, String> {
     }
 }
 
-/// Replaces what names something of the person's with placeholders, numbered by kind in the order first seen.
 #[derive(Default)]
 struct Redactor {
     placeholders: BTreeMap<String, String>,
@@ -226,7 +209,6 @@ impl Redactor {
         placeholder
     }
 
-    /// Notes a value to find in any text.
     fn know(&mut self, kind: &'static str, value: &str) {
         if !value.trim().is_empty() {
             self.name(kind, value);
@@ -244,7 +226,6 @@ impl Redactor {
         }
     }
 
-    /// Notes the values of the status's named fields.
     fn register(&mut self, value: &Value) {
         match value {
             Value::Object(fields) => {
@@ -276,8 +257,6 @@ impl Redactor {
         }
     }
 
-    /// One line of the daemon's log, `<time> <LEVEL> <target>: <message> <field>=<value>...`. A line in another shape,
-    /// such as a panic's, is left out.
     fn log_line(&mut self, line: &str) -> String {
         let Some((time, level, target, rest)) = log_parts(line) else {
             return "<redacted>".to_owned();
@@ -298,7 +277,6 @@ impl Redactor {
         out
     }
 
-    /// Replaces the known values, quoted text, paths, URLs, addresses, file and host names, and long tokens.
     fn text(&mut self, text: &str) -> String {
         let mut known: Vec<(String, String)> = (self.placeholders.iter())
             .map(|(value, placeholder)| (value.clone(), placeholder.clone()))
@@ -350,7 +328,6 @@ impl Redactor {
     }
 }
 
-/// Where the quoted string that starts `text` ends, skipping the quotes a backslash escapes, as `{:?}` writes them.
 fn closing_quote(text: &str) -> Option<usize> {
     let mut chars = text.char_indices().skip(1);
     while let Some((index, c)) = chars.next() {
@@ -365,7 +342,6 @@ fn closing_quote(text: &str) -> Option<usize> {
     None
 }
 
-/// Splits a log line into its time, level, target and the rest.
 fn log_parts(line: &str) -> Option<(&str, &str, &str, &str)> {
     let (time, rest) = line.split_once(' ')?;
     let (level, rest) = rest.trim_start().split_once(' ')?;
@@ -376,42 +352,48 @@ fn log_parts(line: &str) -> Option<(&str, &str, &str, &str)> {
         .then_some((time, level, target, rest))
 }
 
-/// Where each ` <field>=` of a log line's fields starts, after its space.
 fn field_starts(text: &str) -> Vec<usize> {
-    (text.match_indices(' '))
-        .map(|(index, _)| index + 1)
-        .filter(|&start| {
-            let key = &text[start..];
-            let len = key
-                .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
-                .unwrap_or(key.len());
-            len > 0 && !key.starts_with(|c: char| c.is_ascii_digit()) && key[len..].starts_with('=')
-        })
-        .collect()
+    let mut starts = Vec::new();
+    let mut index = 0;
+    while let Some(c) = text[index..].chars().next() {
+        if c == '"'
+            && let Some(end) = closing_quote(&text[index..])
+        {
+            index += end + 1;
+            continue;
+        }
+        index += c.len_utf8();
+        let key = &text[index..];
+        let len = key
+            .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+            .unwrap_or(key.len());
+        if c == ' '
+            && len > 0
+            && !key.starts_with(|c: char| c.is_ascii_digit())
+            && key[len..].starts_with('=')
+        {
+            starts.push(index);
+        }
+    }
+    starts
 }
 
 fn delimiter(c: char) -> bool {
     c.is_whitespace() || "\"'<>()[]{},;=".contains(c)
 }
 
-/// How far a path that starts `text` goes. File and folder names hold spaces, commas, quotes, parentheses and `: `, so
-/// nothing in the text can end one, except an operating system error that ends the line, as in
-/// `<path>: Permission denied (os error 13)`. Any other path runs to the end of the line, hiding what follows it.
 fn path_len(text: &str) -> usize {
     let line = &text[..text.find('\n').unwrap_or(text.len())];
     let end = os_error_start(line).unwrap_or(line.len());
     line[..end].trim_end_matches(['.', ':']).len()
 }
 
-/// Where `: <description> (os error <code>)` starts at the end of `line`, as Rust shows an operating system error.
-/// The descriptions the system gives hold no `: `.
 fn os_error_start(line: &str) -> Option<usize> {
     let (head, code) = (line.trim_end().strip_suffix(')')?).rsplit_once(" (os error ")?;
     code.parse::<i32>().ok()?;
     head.rfind(": ")
 }
 
-/// What a word is, when it names something: a URL, an address, a path, a file or host name, or a token.
 fn kind_of(word: &str) -> Option<&'static str> {
     if word.contains("://") {
         return Some("url");
@@ -442,7 +424,6 @@ fn kind_of(word: &str) -> Option<&'static str> {
     .then_some("token")
 }
 
-/// Whether a word is an IP address, with or without a port.
 fn ip_address(word: &str) -> bool {
     let host = (word.rsplit_once(':'))
         .filter(|(_, port)| port.parse::<u16>().is_ok())
@@ -550,8 +531,6 @@ thread 'tokio-runtime-worker' panicked at /Users/ada/Secret Plans/ledger.rs:1:1:
         assert_eq!(redactor.text("ada and adam"), "<user-1> and adam");
     }
 
-    /// The daemon logs a file it cannot read as `reason=the folder: <path>: <error>`, and file names hold spaces,
-    /// commas, quotes and parentheses.
     #[test]
     fn a_path_is_redacted_to_the_error_after_it_whatever_its_name_holds() {
         let mut redactor = Redactor::default();
@@ -592,8 +571,6 @@ thread 'tokio-runtime-worker' panicked at /Users/ada/Secret Plans/ledger.rs:1:1:
         }
     }
 
-    /// Paths built from random name parts, in the lines the daemon writes about a file or folder: no word of a name
-    /// reaches the file.
     #[test]
     fn no_word_of_a_random_path_survives_in_the_lines_the_daemon_writes() {
         const WORDS: [&str; 8] = [
@@ -607,6 +584,7 @@ thread 'tokio-runtime-worker' panicked at /Users/ada/Secret Plans/ledger.rs:1:1:
             "x7",
         ];
         const GLUE: [&str; 10] = [" ", ": ", ", ", " (", ")", "'", "\"", ".", "-", ""];
+        const FIELD_GLUE: [&str; 2] = [" n=", " v2="];
         const EXTENSIONS: [&str; 4] = ["", ".pdf", ".mp4", ".tar.gz"];
         let relative_shapes = [
             "2026-11-12T06:29:23.000001Z  WARN koidrive_driver::folder: sync of a folder halted space_id=s1 reason=the folder: {}: Permission denied (os error 13)",
@@ -620,17 +598,20 @@ thread 'tokio-runtime-worker' panicked at /Users/ada/Secret Plans/ledger.rs:1:1:
         ];
         let mut rng = fastrand::Rng::with_seed(262);
         for _ in 0..2000 {
+            let relative = rng.bool();
             let mut path = String::new();
             for _ in 0..rng.usize(1..5) {
                 path.push('/');
                 for _ in 0..rng.usize(1..5) {
                     path.push_str(WORDS[rng.usize(..WORDS.len())]);
-                    path.push_str(GLUE[rng.usize(..GLUE.len())]);
+                    path.push_str(match relative && rng.u8(..4) == 0 {
+                        true => FIELD_GLUE[rng.usize(..FIELD_GLUE.len())],
+                        false => GLUE[rng.usize(..GLUE.len())],
+                    });
                 }
                 path.push_str(WORDS[rng.usize(..WORDS.len())]);
             }
             path.push_str(EXTENSIONS[rng.usize(..EXTENSIONS.len())]);
-            let relative = rng.bool();
             if relative {
                 path = format!("{:?}", Path::new(&path[1..]));
             }
@@ -655,7 +636,6 @@ thread 'tokio-runtime-worker' panicked at /Users/ada/Secret Plans/ledger.rs:1:1:
         }
     }
 
-    /// The driver quotes a path relative to the folder, as in `the folder: "Secret Plans/budget.xlsx" is missing`.
     #[test]
     fn a_quoted_path_relative_to_the_folder_is_redacted_whole() {
         let mut redactor = Redactor::default();
@@ -679,6 +659,66 @@ thread 'tokio-runtime-worker' panicked at /Users/ada/Secret Plans/ledger.rs:1:1:
             quoted("Kim \"Private\" Ledger")
         ));
         assert_eq!(out, "the folder: \"<name-3>\" is not a folder");
+    }
+
+    #[test]
+    fn stuck_items_the_driver_names_are_redacted_whole() {
+        let quoted = |path: &str| format!("{:?}", Path::new(path));
+        let problem = format!(
+            "2 items could not be synced: {} (the server did not take it), {} (its name here is taken by {}, which this device's rules exclude; it is kept in {}); run koi folder restart once they are fixed",
+            quoted("김건우 여권.jpg"),
+            quoted("가족 사진/Q3 연봉 계약서.pdf"),
+            quoted("가족 사진/q3 연봉 계약서.pdf"),
+            quoted(".koidrive/parked/3 Q3 연봉 계약서.pdf"),
+        );
+        let status = json!({"running": true, "folders": [{"path": "/Users/ada/Sync", "space_id": "s1", "space_name": "Family", "state": "catching_up", "problem": problem}]});
+        let text = bundle(
+            &mut Redactor::default(),
+            "macOS",
+            &status,
+            &Ok(String::new()),
+        );
+        for word in ["김건우", "여권", "가족", "연봉", "Q3", "q3"] {
+            assert!(!text.contains(word), "{word} in {text}");
+        }
+        assert!(
+            text.contains(
+                r#"2 items could not be synced: \"<name-1>\" (the server did not take it)"#
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("run koi folder restart once they are fixed"),
+            "{text}"
+        );
+        let problem = format!(
+            "1 item could not be synced: {} (the server did not take it); run koi folder restart once it is fixed",
+            quoted("Secret Plans/budget 2026.xlsx")
+        );
+        let out = Redactor::default().json(&json!({ "problem": problem }));
+        assert_eq!(
+            out,
+            json!({ "problem": "1 item could not be synced: \"<name-1>\" (the server did not take it); run koi folder restart once it is fixed" })
+        );
+    }
+
+    #[test]
+    fn a_field_inside_a_quoted_name_does_not_split_the_line() {
+        let mut redactor = Redactor::default();
+        let line = |name: &str| {
+            format!(
+                "2026-11-12T06:29:23.000001Z  WARN koidrive_driver::folder: sync of a folder halted space_id=s1 reason=the folder: {:?} is missing",
+                Path::new(name)
+            )
+        };
+        assert_eq!(
+            redactor.log_line(&line("Kim Gunwoo survey n=30/results.xlsx")),
+            "2026-11-12T06:29:23.000001Z WARN koidrive_driver::folder: sync of a folder halted space_id=s1 reason=the folder: \"<name-1>\" is missing"
+        );
+        assert_eq!(
+            redactor.log_line(&line("Jiyeon contract v2=final path=draft")),
+            "2026-11-12T06:29:23.000001Z WARN koidrive_driver::folder: sync of a folder halted space_id=s1 reason=the folder: \"<name-2>\" is missing"
+        );
     }
 
     #[test]

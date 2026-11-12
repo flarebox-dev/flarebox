@@ -1154,6 +1154,7 @@ name = "koidrive-ffi"
 version = "0.0.0"
 dependencies = [
  "koidrive-driver",
+ "koidrive-fs",
  "koidrive-net",
  "koidrive-proto",
  "koidrive-store",

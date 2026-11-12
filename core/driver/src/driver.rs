@@ -37,7 +37,7 @@ const SERVER_WAIT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, thiserror::Error)]
 pub enum DriverError {
-    #[error("another Koidrive process is using this profile ({0})")]
+    #[error("another Koidrive process is using this profile ({})", koidrive_fs::quoted(.0))]
     Busy(PathBuf),
     #[error("this device is not set up; run koi setup first")]
     NotPaired,
@@ -73,23 +73,24 @@ pub enum DriverError {
     SpaceNotFound(String),
     #[error("several spaces are called {name:?}; name one by id: {}", ids.join(", "))]
     SpaceAmbiguous { name: String, ids: Vec<String> },
-    #[error("{0} does not exist")]
+    #[error("{} does not exist", koidrive_fs::quoted(.0))]
     FolderNotFound(PathBuf),
-    #[error("{0} is not a folder")]
+    #[error("{} is not a folder", koidrive_fs::quoted(.0))]
     NotAFolder(PathBuf),
     #[error(
-        "the folder overlaps Koidrive's own files at {0}; link a folder that neither holds nor sits inside it"
+        "the folder overlaps Koidrive's own files at {}; link a folder that neither holds nor sits inside it",
+        koidrive_fs::quoted(.0)
     )]
     FolderHoldsProfile(PathBuf),
-    #[error("the folder overlaps the linked folder {0}")]
+    #[error("the folder overlaps the linked folder {}", koidrive_fs::quoted(.0))]
     FolderOverlaps(PathBuf),
-    #[error("another Koidrive process is syncing {0}; stop it, or unlink the folder there")]
+    #[error("another Koidrive process is syncing {}; stop it, or unlink the folder there", koidrive_fs::quoted(.0))]
     FolderInUse(PathBuf),
     #[error(
         "the folder is linked by device {device_id} of {server}; unlink it there first, or remove its .koidrive/device.json"
     )]
     FolderOfOtherDevice { device_id: String, server: String },
-    #[error("the space is already linked to {0} on this device")]
+    #[error("the space is already linked to {} on this device", koidrive_fs::quoted(.0))]
     SpaceAlreadyLinked(PathBuf),
     #[error(
         "the folder is marked for space {0}; unlink it there first, or remove its .koidrive folder"
@@ -99,7 +100,7 @@ pub enum DriverError {
         "the folder's file system cannot rename without replacing, so files cannot be applied safely"
     )]
     UnsupportedFileSystem,
-    #[error("{0} is not a linked folder")]
+    #[error("{} is not a linked folder", koidrive_fs::quoted(.0))]
     NotLinked(PathBuf),
     #[error("no unanswered question has the id {0:?}")]
     QuestionNotFound(String),
@@ -115,12 +116,12 @@ pub enum DriverError {
         "the server waits for the space's owner to confirm the folder's changes, and Koidrive cannot ask for that yet"
     )]
     NeedsConfirmation,
-    #[error("the sync state at {path} cannot be used: {error}")]
+    #[error("the sync state at {} cannot be used: {error}", koidrive_fs::quoted(.path))]
     Store {
         path: PathBuf,
         error: koidrive_store::Error,
     },
-    #[error("{path}: {error}")]
+    #[error("{}: {error}", koidrive_fs::quoted(.path))]
     Io { path: PathBuf, error: io::Error },
 }
 
@@ -697,7 +698,7 @@ impl Driver {
         Store::open(&store_path)
             .and_then(|mut store| store.transaction(|tx| tx.set_link(&link)))
             .map_err(store_error(&store_path))?;
-        tracing::info!(space_id = link.space_id, path = %link.root.display(), "linked a folder");
+        tracing::info!(space_id = link.space_id, path = %koidrive_fs::quoted(&link.root), "linked a folder");
         let status = Arc::new(Mutex::new(folder_status(&link, None, 0, 0)));
         let linked = roots(&folders);
         let mut folder = Folder {
@@ -744,7 +745,7 @@ impl Driver {
         match forgotten {
             Ok(()) => {
                 folders.remove(&link.space_id);
-                tracing::info!(space_id = link.space_id, path = %link.root.display(), "unlinked a folder");
+                tracing::info!(space_id = link.space_id, path = %koidrive_fs::quoted(&link.root), "unlinked a folder");
             }
             Err(ref error) => {
                 if let Some(folder) = folders.get_mut(&link.space_id) {
@@ -1211,7 +1212,7 @@ fn folder_status(
     FolderStatus {
         space_id: link.space_id.clone(),
         space_name: link.space_name.clone(),
-        path: link.root.display().to_string(),
+        path: link.root.to_string_lossy().into_owned(),
         state: FolderState::Stopped,
         history_id: cursor.as_ref().map(|cursor| cursor.history_id.clone()),
         last_seq: cursor.map(|cursor| cursor.last_seq),
@@ -1280,7 +1281,7 @@ fn read_folders(
             })
             .map_err(store_error(&path))?;
         let Some(link) = link else {
-            tracing::warn!(path = %path.display(), "a store records no linked folder; ignoring it");
+            tracing::warn!(path = %koidrive_fs::quoted(&path), "a store records no linked folder; ignoring it");
             continue;
         };
         let status = folder_status(&link, cursor, nodes, questions as u64);

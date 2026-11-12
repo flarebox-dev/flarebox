@@ -134,13 +134,13 @@ pub struct SyncRules {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("cannot read {path}: {source}")]
+    #[error("cannot read {}: {source}", koidrive_fs::quoted(.path))]
     Io {
         path: PathBuf,
         #[source]
         source: io::Error,
     },
-    #[error("{path} is not valid: {reason}")]
+    #[error("{} is not valid: {reason}", koidrive_fs::quoted(.path))]
     Invalid { path: PathBuf, reason: String },
 }
 

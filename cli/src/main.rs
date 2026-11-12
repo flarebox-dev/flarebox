@@ -684,8 +684,7 @@ fn command_path(args: &[OsString]) -> String {
 
 /// Logs go to stderr: structured key-value text by default, one JSON object per line with `--log-format json`. The
 /// level comes from `KOIDRIVE_LOG` (`info` for the daemon, `warn` for other commands). No log line carries a
-/// credential, an access token or a pairing code. A daemon whose stderr is the launch agent's log writes to
-/// `agent_log`, which keeps the file under its cap.
+/// credential, an access token or a pairing code.
 fn init_logging(daemon: Option<LogFormat>, json: bool, agent_log: Option<logfile::CappedLog>) {
     let default = if daemon.is_some() { "info" } else { "warn" };
     let filter =

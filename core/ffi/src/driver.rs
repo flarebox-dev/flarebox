@@ -614,7 +614,7 @@ fn now_ms() -> i64 {
 
 fn not_saved(path: &Path) -> impl FnOnce(io::Error) -> SessionError + '_ {
     move |error| SessionError::NotSaved {
-        reason: format!("{}: {error}", path.display()),
+        reason: format!("{}: {error}", koidrive_fs::quoted(path)),
     }
 }
 
@@ -829,7 +829,7 @@ fn driver_error(error: DriverError) -> SessionError {
         DriverError::NotAFolder(_) => SessionError::NotAFolder,
         DriverError::FolderHoldsProfile(other) | DriverError::FolderOverlaps(other) => {
             SessionError::FolderOverlaps {
-                other: other.display().to_string(),
+                other: other.to_string_lossy().into_owned(),
             }
         }
         DriverError::FolderInUse(_) => SessionError::FolderInUse,

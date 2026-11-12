@@ -49,24 +49,26 @@ impl fmt::Debug for Credential {
 
 #[derive(Debug, thiserror::Error)]
 pub enum CredentialError {
-    #[error("cannot use the credential file {path}: {source}")]
+    #[error("cannot use the credential file {}: {source}", koidrive_fs::quoted(.path))]
     Io {
         path: PathBuf,
         #[source]
         source: io::Error,
     },
-    #[error("the credential file {path} is not valid: {reason}")]
+    #[error("the credential file {} is not valid: {reason}", koidrive_fs::quoted(.path))]
     Invalid { path: PathBuf, reason: String },
     #[error(
-        "the credential file {path} can be read by other users (mode {mode:o}); run chmod 600 on it"
+        "the credential file {} can be read by other users (mode {mode:o}); run chmod 600 on it",
+        koidrive_fs::quoted(.path)
     )]
     Exposed { path: PathBuf, mode: u32 },
-    #[error("the credential file {path} belongs to another user")]
+    #[error("the credential file {} belongs to another user", koidrive_fs::quoted(.path))]
     NotOwned { path: PathBuf },
-    #[error("this profile already has a credential at {path}")]
+    #[error("this profile already has a credential at {}", koidrive_fs::quoted(.path))]
     Exists { path: PathBuf },
     #[error(
-        "cannot keep the credential file {path} out of Time Machine backups ({source}); Koidrive does not use a credential that backups would copy. Restore write access to the file (it may be locked), keep the profile on storage that supports extended attributes, then restart Koidrive"
+        "cannot keep the credential file {} out of Time Machine backups ({source}); Koidrive does not use a credential that backups would copy. Restore write access to the file (it may be locked), keep the profile on storage that supports extended attributes, then restart Koidrive",
+        koidrive_fs::quoted(.path)
     )]
     NotExcludedFromBackups {
         path: PathBuf,
@@ -172,7 +174,7 @@ impl Credential {
             {
                 return Ok(());
             }
-            tracing::info!(path = %path.display(), "excluding the credential from backups again");
+            tracing::info!(path = %koidrive_fs::quoted(path), "excluding the credential from backups again");
         }
         exclude_from_backups(&file).map_err(|source| CredentialError::NotExcludedFromBackups {
             path: path.to_path_buf(),
