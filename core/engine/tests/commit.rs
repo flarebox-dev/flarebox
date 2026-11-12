@@ -3,7 +3,7 @@
 //! Building commits from local changes and acknowledging their results (docs/design/sync-engine.md
 //! sections 2.4, 2.6, 2.7, 2.8 and 4.2, and RFC 0002), on hand-built trees and results.
 
-use koidrive_engine::classify::{Class, Origin, Trees};
+use koidrive_engine::classify::{Class, Origin, Trees, Waiting};
 use koidrive_engine::commit::{
     Commits, Failure, Halt, Lift, LiftError, MAX_COMMIT_BYTES, MAX_OPS, Reconnect,
 };
@@ -5372,20 +5372,12 @@ fn a_parked_edit_whose_name_a_new_folder_holds_is_sent() {
 
 #[test]
 fn a_blocker_at_its_r_position_is_not_parked() {
-    let mut trees = trees(&[
-        (
-            "h",
-            Some(file(ROOT, "ss", 1)),
-            Some(file(ROOT, "ss", 1)),
-            Some(trashed(file(ROOT, "ss", 1))),
-        ),
-        (
-            "n",
-            Some(file(ROOT, "ß", 1)),
-            Some(file(ROOT, "ß", 1)),
-            Some(remote(file(ROOT, "ß", 3))),
-        ),
-    ]);
+    let mut trees = trees(&[(
+        "h",
+        Some(file(ROOT, "ss", 1)),
+        Some(file(ROOT, "ss", 1)),
+        Some(trashed(file(ROOT, "ß", 1))),
+    )]);
     trees.set_local(
         "h".into(),
         LocalNode {
@@ -5393,22 +5385,23 @@ fn a_blocker_at_its_r_position_is_not_parked() {
             ..local(file(ROOT, "ss", 2), 1)
         },
     );
+    trees.set_local("n".into(), local(dir(ROOT, "ß"), 2));
+    trees.set_remote("n".into(), remote(dir(ROOT, "ß")));
     trees.settle();
+    let mut state = trees.state();
+    state.waiting.insert(
+        "n".into(),
+        Waiting {
+            shape: Some(dir(ROOT, "ß")),
+            origin: Origin::Commit(1),
+        },
+    );
+    trees.restore(state).unwrap();
+    trees.rules_scanned();
+    assert_eq!(trees.check(), Ok(()));
     let (mut effects, mut commits, mut ids) =
         (Effects::default(), Commits::default(), IdGen::new(1));
-    let (node, effect_id) = effects
-        .plan(&trees, &mut ids, NOW)
-        .map(|record| (record.node.clone(), record.effect_id.clone()))
-        .unwrap();
-    assert_eq!(node, "n");
-    effects.failed(&effect_id).unwrap();
-    let next = effects
-        .plan(&trees, &mut ids, NOW)
-        .map(|record| (record.node.clone(), record.effect.clone()));
-    assert!(
-        !matches!(&next, Some((node, Effect::Move { to: Location::Parked(_), .. })) if node == "n"),
-        "{next:?}"
-    );
+    assert!(effects.plan(&trees, &mut ids, NOW).is_none());
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert!(uploads(&ops(&commit), 2), "{:?}", ops(&commit));
 }
