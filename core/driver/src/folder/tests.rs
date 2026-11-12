@@ -5483,6 +5483,37 @@ fn a_file_moved_back_in_from_an_ignored_folder_after_its_folder_was_removed_take
     assert_eq!(a.folder.engine.trees.check(), Ok(()));
 }
 
+/// The user moves `D/c` into the ignored folder, and then `D` too. When the file comes back as `moved`, `D` holds
+/// nothing in L any more, but it is still on disk in the ignored folder, so the server keeps it.
+#[test]
+fn a_folder_moved_into_an_ignored_folder_after_its_file_stays_on_the_server_when_the_file_comes_back()
+ {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site.root.join("D")).unwrap();
+    a.create(&mut remote, &site.root.join("D/c"), b"kept");
+    a.create(&mut remote, &site.root.join(".koiignore"), b"ignored/\n");
+    fs::create_dir(site.root.join("ignored")).unwrap();
+    fs::rename(site.root.join("D/c"), site.root.join("ignored/c")).unwrap();
+    a.scan_until(|a| !(a.observer.snapshot().entries).contains_key(Path::new("D/c")));
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    fs::rename(site.root.join("D"), site.root.join("ignored/D")).unwrap();
+    a.scan_until(|a| !(a.observer.snapshot().entries).contains_key(Path::new("D")));
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    fs::rename(site.root.join("ignored/c"), site.root.join("moved")).unwrap();
+    a.scan_until(|a| (a.observer.snapshot().entries).contains_key(Path::new("moved")));
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    assert!(site.root.join("ignored/D").is_dir());
+    assert_eq!(remote.names(), [".koiignore", "D", "moved"]);
+    assert_eq!(a.folder.engine.trees.check(), Ok(()));
+}
+
 /// The file moved into an ignored folder has a synced link, `also`, that stays. The file is still left out, so
 /// the server keeps it and its folder.
 #[test]
