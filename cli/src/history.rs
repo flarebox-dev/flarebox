@@ -296,7 +296,10 @@ fn asked(folder: &str, path: &str, id: String, state: Option<FolderState>) -> Do
     let mut note = format!("Asked to restore {shown} (restore {}).\n", printable(&id));
     match state {
         Some(FolderState::Stopped) => {
-            note.push_str("The folder sends it once the daemon runs; koi status shows why it doesn't. koi history requests shows how it went.\n")
+            note.push_str(&format!(
+                "The folder sends it once the daemon runs; koi status shows why it doesn't. koi history requests {} shows how it went.\n",
+                printable(folder)
+            ))
         }
         Some(_) => note.push_str(&format!(
             "The folder sends it with its next commit. koi history requests {} shows how it went.\n",

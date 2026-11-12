@@ -1136,8 +1136,9 @@ async fn device(paths: Paths, action: DeviceAction) -> Result<Done, CliError> {
                     "this device cannot revoke itself; revoke it from another device",
                 ));
             }
-            let revoked = (devices(&auth).await?.iter())
-                .any(|device| device.device_id == id && device.revoked_at_ms != 0);
+            let revoked = devices(&auth).await.is_ok_and(|devices| {
+                (devices.iter()).any(|device| device.device_id == id && device.revoked_at_ms != 0)
+            });
             if revoked {
                 let text = format!("Device {id} is already revoked.\n");
                 return Ok(Done::ok(RevokedData { device_id: id }, text).unchanged());
