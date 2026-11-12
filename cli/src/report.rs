@@ -879,6 +879,91 @@ pub struct ChoicesData {
 #[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct HelpData {
     pub help: String,
+    /// The command asked about and every command under it.
+    pub commands: Vec<CommandInfo>,
+}
+
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
+pub struct CommandInfo {
+    /// The subcommand path, as in the envelope's `command`.
+    pub command: String,
+    pub about: String,
+    /// Clap's usage line, as `--help` shows it.
+    pub usage: String,
+    pub aliases: Vec<String>,
+    pub arguments: Vec<ArgumentInfo>,
+    pub options: Vec<OptionInfo>,
+    /// Arguments that are given together or apart, named as in `requires`.
+    pub groups: Vec<GroupInfo>,
+    pub subcommands: Vec<String>,
+    pub auth: Auth,
+    pub output: Output,
+    /// The file of the schema of its envelope in docs/json-schema/v1.
+    pub schema: String,
+}
+
+/// What the command signs in with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Auth {
+    None,
+    /// This device's credential, from `koi setup`. Without one it fails with `auth_required`.
+    Device,
+    /// A Cloudflare login, which only `--interactive` starts. Without one it fails with `auth_required`.
+    Cloudflare,
+}
+
+/// What it prints on stdout with `--json`. It never reads stdin then.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Output {
+    /// One envelope.
+    Envelope,
+    /// One JSON object per line while it runs.
+    Lines,
+}
+
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
+pub struct ArgumentInfo {
+    pub name: String,
+    pub required: bool,
+    pub repeated: bool,
+    /// What it needs beside it: argument names, and options as `--long`.
+    pub requires: Vec<String>,
+    /// What it can't be given with, named as in `requires`.
+    pub conflicts: Vec<String>,
+    pub about: String,
+}
+
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
+pub struct GroupInfo {
+    pub members: Vec<String>,
+    /// One of the members must be given.
+    pub required: bool,
+    /// More than one member may be given.
+    pub multiple: bool,
+}
+
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
+pub struct OptionInfo {
+    pub long: String,
+    pub short: Option<char>,
+    /// The name of the value it takes, or null for a flag.
+    pub value: Option<String>,
+    /// The value may be left out, as in `--json`.
+    pub value_optional: bool,
+    /// A value follows an equals sign, as in `--json=1`, never as the next argument.
+    pub require_equals: bool,
+    /// The values it accepts, when it accepts only some.
+    pub values: Vec<String>,
+    pub required: bool,
+    /// What it needs beside it, named as in the arguments, and options as `--long`.
+    pub requires: Vec<String>,
+    /// What it can't be given with, named as in `requires`.
+    pub conflicts: Vec<String>,
+    /// Whether every subcommand takes it too.
+    pub global: bool,
+    pub about: String,
 }
 
 #[derive(Debug, PartialEq, Serialize, JsonSchema)]

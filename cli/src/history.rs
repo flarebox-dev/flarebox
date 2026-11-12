@@ -83,8 +83,8 @@ pub async fn run(paths: &Paths, action: HistoryAction) -> Result<Done, CliError>
 /// `koi history trash [folder]`: the deletions in the trash of the folder's space, or of the part under `folder`
 /// when it is a folder inside a linked one.
 async fn trash(paths: &Paths, folder: &Path) -> Result<Done, CliError> {
-    let (linked, below) = locate(paths, folder).await?;
     let auth = signed_in(paths)?;
+    let (linked, below) = locate(paths, folder).await?;
     let space = linked.space_id.as_str();
     let live = tree(&auth, space).await?;
     let trashed = trash_nodes(&auth, space).await?;
@@ -99,6 +99,7 @@ async fn trash(paths: &Paths, folder: &Path) -> Result<Done, CliError> {
 
 /// `koi history versions <file>`: the versions the server keeps of a live file, newest first.
 async fn versions(paths: &Paths, file: &Path) -> Result<Done, CliError> {
+    let auth = signed_in(paths)?;
     let (linked, below) = locate(paths, file).await?;
     if below.is_empty() {
         return Err(CliError::usage(format!(
@@ -106,7 +107,6 @@ async fn versions(paths: &Paths, file: &Path) -> Result<Done, CliError> {
             linked.path
         )));
     }
-    let auth = signed_in(paths)?;
     let space = linked.space_id.as_str();
     let live = tree(&auth, space).await?;
     let node = find(&live, space, &below).ok_or_else(|| {
@@ -227,6 +227,7 @@ async fn checked(
     version: Option<String>,
     node: Option<String>,
 ) -> Result<(FolderStatus, Vec<String>, RestoreRequest), CliError> {
+    let auth = signed_in(paths)?;
     let (linked, below) = locate(paths, path).await?;
     if below.is_empty() {
         return Err(CliError::usage(format!(
@@ -234,7 +235,6 @@ async fn checked(
             linked.path
         )));
     }
-    let auth = signed_in(paths)?;
     let space = linked.space_id.as_str();
     let shown = printable(&below.join("/"));
     let live = tree(&auth, space).await?;
@@ -1184,11 +1184,12 @@ mod tests {
         let trashed = trash(&paths, &folder).await.unwrap_err();
         let kept = versions(&paths, &folder.join("a.txt")).await.unwrap_err();
 
-        assert!(
-            trashed.message.contains("not in a linked folder"),
+        assert_eq!(
+            trashed.code,
+            crate::error::Code::AuthRequired,
             "{trashed:?}"
         );
-        assert!(kept.message.contains("not in a linked folder"), "{kept:?}");
+        assert_eq!(kept.code, crate::error::Code::AuthRequired, "{kept:?}");
         assert!(!dir.path().join("profile").exists());
     }
 

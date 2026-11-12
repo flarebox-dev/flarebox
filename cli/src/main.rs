@@ -11,6 +11,7 @@ mod error;
 mod history;
 mod ipc;
 mod logfile;
+mod manifest;
 mod notify;
 mod pairing;
 mod report;
@@ -314,7 +315,7 @@ fn main() -> ExitCode {
     if let Some(names) = help_names(&args).filter(|_| json_requested(&args)) {
         let path = names.join(" ");
         let outcome = help_of(&path)
-            .map(help_done)
+            .map(|help| help_done(help, &path))
             .ok_or_else(|| CliError::usage(format!("no command is named {}", printable(&path))));
         return finish(format!("help {path}").trim_end(), true, outcome, Vec::new());
     }
@@ -326,7 +327,7 @@ fn main() -> ExitCode {
     let shows_banner = cli.shows_banner();
     let Some(command_args) = cli.command else {
         let help = Cli::command().render_help().to_string();
-        return finish(&command, json, Ok(help_done(help)), Vec::new());
+        return finish(&command, json, Ok(help_done(help, "")), Vec::new());
     };
     let reports_pending = command_args.reports_pending();
     let log_format = match &command_args {
@@ -615,8 +616,11 @@ fn parse_failure(error: clap::Error, args: &[OsString], command: &str, json: boo
         return ExitCode::from(2);
     }
     let outcome = match kind {
-        _ if bare_group => Ok(help_done(help_of(command).expect("clap parsed the path"))),
-        ErrorKind::DisplayHelp => Ok(help_done(rendered)),
+        _ if bare_group => Ok(help_done(
+            help_of(command).expect("clap parsed the path"),
+            command,
+        )),
+        ErrorKind::DisplayHelp => Ok(help_done(rendered, command)),
         ErrorKind::DisplayVersion => Ok(Done::ok(
             VersionInfoData {
                 version: env!("CARGO_PKG_VERSION"),
@@ -680,8 +684,12 @@ fn help_names(args: &[OsString]) -> Option<Vec<&str>> {
     None
 }
 
-fn help_done(help: String) -> Done {
-    Done::ok(HelpData { help: help.clone() }, help)
+fn help_done(help: String, command: &str) -> Done {
+    let data = HelpData {
+        help: help.clone(),
+        commands: manifest::commands(command),
+    };
+    Done::ok(data, help)
 }
 
 /// Whether the arguments ask for JSON, read before clap parses them so that a usage error is JSON too.
