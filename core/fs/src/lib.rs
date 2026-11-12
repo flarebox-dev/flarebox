@@ -585,7 +585,10 @@ impl Snapshot {
     /// paths, and the removal is reported by the next rescan of its path after
     /// the search has decided it, or as a rename when that rescan finds its
     /// identity at an included path. An entry that takes its path makes the
-    /// search run to its end, so the removal is reported first.
+    /// search run to its end, so the removal is reported first. The first
+    /// rescan with new `rules` also runs the search to its end for each entry
+    /// whose path now holds another identity, so a removal another watcher
+    /// held is not read as a replacement.
     ///
     /// On any error `rules` are unchanged too.
     pub fn rescan_with_rules(
