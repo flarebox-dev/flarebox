@@ -39,7 +39,7 @@ const SERVING_MS = 3 * 60_000;
 const CLAIM_LOG_MS = 4 * 60_000;
 const CLAIM_LOG_EVERY_MS = 5_000;
 const CLOCK_SKEW_MS = 60_000;
-const CODE_WINDOW_MS = 55 * 60_000;
+const CODE_LIFETIME_MS = 60 * 60_000;
 const DEPLOY_ATTEMPTS = 3;
 const DEPLOY_RETRY_MS = 10_000;
 const PROPAGATION_MS = 15_000;
@@ -252,31 +252,31 @@ async function deploy(account: Account, ref: string): Promise<void> {
 
 async function provenKey(account: Account, name: string, fromMs: number, marker: string, deadline: Deadline): Promise<WorkerKey | undefined> {
   for (const key of WORKER_KEYS) {
-    let events: string[];
+    let events: { text: string }[];
     try {
       events = await workerEvents(account, key, name, fromMs, deadline);
     } catch (error) {
       if (error instanceof ApiError && error.status === 400) continue;
       throw error;
     }
-    if (events.some((event) => event.includes(marker))) return key;
+    if (events.some((event) => event.text.includes(marker))) return key;
   }
   return undefined;
 }
 
 async function claimCode(account: Account, key: WorkerKey, name: string, fromMs: number, deadline: Deadline): Promise<string | undefined> {
-  for (const event of await workerEvents(account, key, name, fromMs, deadline)) {
-    const code = CLAIM_CODE.exec(event)?.[1];
-    if (code) return code;
-  }
-  return undefined;
+  const live = Date.now() - CODE_LIFETIME_MS;
+  const codes = (await workerEvents(account, key, name, fromMs, deadline))
+    .map((event) => ({ atMs: typeof event.timestamp === "number" ? event.timestamp : Infinity, code: CLAIM_CODE.exec(event.text)?.[1] }))
+    .filter((event) => event.code !== undefined && event.atMs > live);
+  return codes.sort((a, b) => b.atMs - a.atMs)[0]?.code;
 }
 
 async function claim(account: Account): Promise<void> {
   const state = readState();
   const first = state.deployments[0] ?? fail("nothing is deployed yet");
   const url = state.url!;
-  const fromMs = Math.max(first.atMs, Date.now() - CODE_WINDOW_MS) - CLOCK_SKEW_MS;
+  const fromMs = first.atMs - CLOCK_SKEW_MS;
   const marker = "/deploy-test-probe-" + randomBytes(8).toString("hex");
   await fetch(url + marker, { signal: AbortSignal.timeout(15_000) }).then((response) => response.body?.cancel(), () => undefined);
   const probe = { atMs: Date.now() + CLAIM_LOG_MS, what: "no query of this Worker's logs showed its request to " + marker + " within " + CLAIM_LOG_MS / 1000 + " s" };
