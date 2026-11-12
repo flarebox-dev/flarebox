@@ -69,7 +69,12 @@ pub struct Rules {
     /// The names each listed folder holds that a rule leaves out
     /// ([`Ignored::Rule`] only).
     ignored: BTreeMap<PathBuf, BTreeSet<OsString>>,
+    budget: usize,
 }
+
+/// How many left-out entries one rescan looks at by default when it searches
+/// for the entries it saw disappear.
+pub const SEARCH_BUDGET: usize = 20_000;
 
 impl Rules {
     pub fn new(ignore: Box<dyn Ignore + Send>) -> Self {
@@ -78,7 +83,15 @@ impl Rules {
             ignore,
             files: BTreeMap::new(),
             ignored: BTreeMap::new(),
+            budget: SEARCH_BUDGET,
         }
+    }
+
+    /// The same rules with a search that looks at `budget` left-out entries
+    /// per rescan.
+    pub fn with_search_budget(mut self, budget: usize) -> Self {
+        self.budget = budget;
+        self
     }
 
     /// The keys of `path`, under which the rules of the folder there are held.

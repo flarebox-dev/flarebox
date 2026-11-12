@@ -423,6 +423,60 @@ fn a_file_moved_into_an_ignored_folder_is_ignored_not_removed() {
 }
 
 #[test]
+fn a_search_through_a_large_ignored_folder_goes_on_across_rescans() {
+    for (gone, to) in [
+        ("f.txt", Some("ig/zz/deep/f.txt")),
+        ("d", Some("ig/zz/deep/d")),
+        ("d/g.txt", None),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, RULES_FILE, "ig/\n");
+        for n in 0..30 {
+            for m in 0..10 {
+                write(root, &format!("ig/{n:02}/{m}.txt"), "x");
+            }
+        }
+        fs::create_dir_all(root.join("ig/zz/deep")).unwrap();
+        write(root, "f.txt", "f");
+        write(root, "d/g.txt", "g");
+        let mut rules = rules().with_search_budget(100);
+        let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
+        let before = &snapshot.entries[Path::new(gone)];
+        let (id, kind) = (before.id, before.kind);
+        match to {
+            Some(to) => fs::rename(root.join(gone), root.join(to)).unwrap(),
+            None => fs::remove_file(root.join(gone)).unwrap(),
+        }
+        let mut paths = whole().to_vec();
+        let mut rescans = 0;
+        let changes = loop {
+            rescans += 1;
+            assert!(rescans < 20, "{gone}: the search never ended");
+            let rescan = snapshot.rescan_with_rules(root, paths, &mut rules).unwrap();
+            if !rescan.changes.is_empty() {
+                break rescan.changes;
+            }
+            assert_eq!(rescan.unsettled, [PathBuf::from(gone)], "{gone}");
+            assert!(snapshot.entries.contains_key(Path::new(gone)), "{gone}");
+            paths = rescan.unsettled;
+        };
+        assert!(rescans > 2, "{gone}: {rescans} rescans");
+        let expected = match to {
+            Some(to) => Change::Ignored {
+                from: gone.into(),
+                to: to.into(),
+                kind,
+                id,
+            },
+            None => removed(gone, kind),
+        };
+        assert_eq!(changes, [expected], "{gone}");
+        assert!(!snapshot.entries.contains_key(Path::new(gone)), "{gone}");
+    }
+}
+
+#[test]
 fn a_folder_moved_into_an_ignored_folder_is_ignored_as_a_whole() {
     let (dir, mut snapshot, mut rules) = tree_with_an_ignored_folder();
     let root = dir.path();
