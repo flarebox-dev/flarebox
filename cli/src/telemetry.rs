@@ -234,21 +234,68 @@ async fn send(store: &Store, client: Client) -> Option<Sent> {
 }
 
 /// The daemon's loop: every ten minutes it moves the sums to disk and sends what is due. When it stops it only moves
-/// them to disk, so that stopping never waits on the network; a later run sends them. It reads the choice again each time, so `koi telemetry off` stops it without a restart.
-pub async fn run_daemon(mut stop: tokio::sync::oneshot::Receiver<()>) {
+/// them to disk, so that stopping never waits on the network; a later run sends them. It reads the choice again each
+/// time, so `koi telemetry off` stops it without a restart.
+pub async fn run_daemon(stop: tokio::sync::oneshot::Receiver<()>) {
     let Some(run) = RUN.get() else { return };
+    every(TICK, stop, flush, || send(&run.store, Client::CliDaemon)).await;
+}
+
+/// Runs `tick` and then `work` every `period` until `stop` fires, and `tick` once more then. A `work` still running
+/// when `stop` fires is dropped, so stopping never waits on it.
+async fn every<W: Future>(
+    period: Duration,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+    mut tick: impl FnMut(),
+    mut work: impl FnMut() -> W,
+) {
     loop {
-        let stopping = tokio::select! {
-            _ = tokio::time::sleep(TICK) => false,
-            _ = &mut stop => true,
+        tokio::select! {
+            _ = tokio::time::sleep(period) => {}
+            _ = &mut stop => break,
+        }
+        tick();
+        tokio::select! {
+            _ = work() => {}
+            _ = &mut stop => break,
+        }
+    }
+    tick();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn stopping_drops_a_send_in_progress_and_flushes_once_more() {
+        let (stop_daemon, stop) = tokio::sync::oneshot::channel();
+        let (sending, sent) = tokio::sync::oneshot::channel();
+        let mut sending = Some(sending);
+        let ticks = Cell::new(0);
+        let looping = every(
+            Duration::from_millis(1),
+            stop,
+            || ticks.set(ticks.get() + 1),
+            || {
+                if let Some(sending) = sending.take() {
+                    let _ = sending.send(());
+                }
+                std::future::pending::<()>()
+            },
+        );
+        let stopper = async {
+            sent.await.unwrap();
+            stop_daemon.send(()).unwrap();
         };
-        flush();
-        if !stopping {
-            send(&run.store, Client::CliDaemon).await;
-        }
-        if stopping {
-            return;
-        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(looping, stopper)
+        })
+        .await
+        .expect("stopping waited for the send");
+        assert_eq!(ticks.get(), 2);
     }
 }
 
