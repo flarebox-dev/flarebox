@@ -30,3 +30,4 @@ This guide covers the `koi` command on macOS and Linux, version 0.1.0.
 9. [Back up the server](backup.md): copy the R2 bucket outside Cloudflare, and what the copy can restore.
 10. [Uninstall](uninstall.md): remove a device, or remove everything.
 11. [Agents and scripts](agents.md): the JSON envelope, the exit codes and `koi status --check`.
+12. [Usage reports](telemetry.md): what the anonymous usage reports hold, and how to turn them off.

@@ -153,10 +153,10 @@ mod tests {
         let recorder = Recorder::on();
         recorder.count_on(10, Counter::Command(Command::Status), 1);
         recorder.count_on(10, Counter::Command(Command::Status), 2);
-        recorder.count_on(11, Counter::Command(Command::Link), 1);
+        recorder.count_on(11, Counter::Command(Command::Folder), 1);
         let taken = recorder.take();
         assert_eq!(taken.days[&10].counters["command"]["status"], 3);
-        assert_eq!(taken.days[&11].counters["command"]["link"], 1);
+        assert_eq!(taken.days[&11].counters["command"]["folder"], 1);
         assert_eq!(recorder.take(), Pending::default());
     }
 

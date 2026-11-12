@@ -254,69 +254,48 @@ impl Measure {
     }
 }
 
-/// The CLI commands, by name.
+/// The CLI's top-level commands, by name. A group such as `koi folder` counts once, whichever action it runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
+    Status,
+    Resolve,
     Setup,
     Join,
     Server,
     Space,
-    Link,
-    Unlink,
-    Restart,
-    Lift,
-    Status,
-    Questions,
+    Folder,
     Device,
-    Trash,
-    Versions,
-    Restore,
-    Restores,
-    Usage,
+    History,
     Daemon,
     Telemetry,
 }
 
 impl Command {
-    pub const ALL: [Command; 18] = [
+    pub const ALL: [Command; 11] = [
+        Command::Status,
+        Command::Resolve,
         Command::Setup,
         Command::Join,
         Command::Server,
         Command::Space,
-        Command::Link,
-        Command::Unlink,
-        Command::Restart,
-        Command::Lift,
-        Command::Status,
-        Command::Questions,
+        Command::Folder,
         Command::Device,
-        Command::Trash,
-        Command::Versions,
-        Command::Restore,
-        Command::Restores,
-        Command::Usage,
+        Command::History,
         Command::Daemon,
         Command::Telemetry,
     ];
 
     pub fn name(self) -> &'static str {
         match self {
+            Command::Status => "status",
+            Command::Resolve => "resolve",
             Command::Setup => "setup",
             Command::Join => "join",
             Command::Server => "server",
             Command::Space => "space",
-            Command::Link => "link",
-            Command::Unlink => "unlink",
-            Command::Restart => "restart",
-            Command::Lift => "lift",
-            Command::Status => "status",
-            Command::Questions => "questions",
+            Command::Folder => "folder",
             Command::Device => "device",
-            Command::Trash => "trash",
-            Command::Versions => "versions",
-            Command::Restore => "restore",
-            Command::Restores => "restores",
-            Command::Usage => "usage",
+            Command::History => "history",
             Command::Daemon => "daemon",
             Command::Telemetry => "telemetry",
         }

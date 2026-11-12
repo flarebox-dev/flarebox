@@ -31,6 +31,8 @@ use koidrive_proto::v1::ServerInfo;
 use tokio::signal::unix::{SignalKind, signal};
 use url::Url;
 
+use koidrive_telemetry::schema::{SetupFlow, SetupStep};
+
 use crate::DeviceArgs;
 use crate::error::{CliError, Code};
 use crate::ipc::{self, Request, Response};
@@ -190,6 +192,12 @@ fn this_mode(json: bool, interactive: bool) -> Result<Mode, CliError> {
     Ok(mode)
 }
 
+/// Whether `koi setup` guides on this process, which main asks before the command runs so that the usage-report
+/// question comes first. It records the mode for [`prompt`] as [`this_mode`] does.
+pub fn guided(json: bool, login: &LoginArgs) -> bool {
+    this_mode(json, login.interactive).is_ok_and(|mode| mode == Mode::Guided)
+}
+
 /// The ways to set up this machine, which `koi setup` lists when it does not guide.
 fn choices() -> Vec<Choice> {
     let choice = |argv: &[&str], description| Choice {
@@ -271,6 +279,7 @@ pub async fn setup(
     println!("  2. Enter a pairing code from another device");
     match prompt("Choose 1 or 2: ").await?.as_str() {
         "1" => {
+            crate::telemetry::set_flow(SetupFlow::Cloudflare);
             bundled()?;
             with_session(login, async |session| {
                 session.setup(paths, device_name).await
@@ -278,14 +287,18 @@ pub async fn setup(
             .await?;
         }
         "2" => {
+            crate::telemetry::set_flow(SetupFlow::Pairing);
             let code = prompt("Pairing code: ").await?;
-            let invitation = crate::pairing::parse(&code, None).map_err(CliError::usage)?;
-            let request = Request::Pair {
-                server: invitation.server,
-                code: invitation.code,
-                name: device_name.to_owned(),
+            let pair = async {
+                let invitation = crate::pairing::parse(&code, None).map_err(CliError::usage)?;
+                let request = Request::Pair {
+                    server: invitation.server,
+                    code: invitation.code,
+                    name: device_name.to_owned(),
+                };
+                report_paired(paths, ipc::run(paths, request).await?)
             };
-            report_paired(paths, ipc::run(paths, request).await?)?;
+            crate::telemetry::step(SetupStep::Pair, pair).await?;
         }
         other => return Err(CliError::usage(format!("{other:?} is not 1 or 2"))),
     }
@@ -405,7 +418,7 @@ pub async fn server(paths: &Paths, action: ServerAction, json: bool) -> Result<D
             bundled()?;
             with_session(&login, async |session| {
                 let found = session.pick(worker.as_deref()).await?;
-                session.upgrade(&found, yes).await
+                crate::telemetry::step(SetupStep::Upgrade, session.upgrade(&found, yes)).await
             })
             .await?;
         }
@@ -423,15 +436,14 @@ pub async fn server(paths: &Paths, action: ServerAction, json: bool) -> Result<D
                 bundled()?;
             }
             with_session(&login, async |session| {
-                session
-                    .uninstall(
-                        paths,
-                        worker.as_deref(),
-                        bucket.as_deref(),
-                        jurisdiction,
-                        yes,
-                    )
-                    .await
+                let uninstall = session.uninstall(
+                    paths,
+                    worker.as_deref(),
+                    bucket.as_deref(),
+                    jurisdiction,
+                    yes,
+                );
+                crate::telemetry::step(SetupStep::Remove, uninstall).await
             })
             .await?;
         }
@@ -521,9 +533,11 @@ async fn with_session(
         how
     };
     SESSION.store(true, Ordering::Relaxed);
-    let outcome = guarded(Session::login(args), stopped, work).await;
+    let login = crate::telemetry::step(SetupStep::Login, Session::login(args));
+    let outcome = guarded(login, stopped, work).await;
     SESSION.store(false, Ordering::Relaxed);
     if let (Err(error), Some(code)) = (&outcome, status) {
+        crate::telemetry::flush();
         eprintln!("koi: {}", printable(&error.message));
         std::process::exit(code);
     }
@@ -553,7 +567,7 @@ async fn guarded(
 }
 
 /// Asks `question` on stdout and reads one line of the answer from stdin, in a guided command only.
-async fn prompt(question: &str) -> Result<String, CliError> {
+pub(crate) async fn prompt(question: &str) -> Result<String, CliError> {
     if !GUIDED.load(Ordering::Relaxed) {
         return Err(format!(
             "{} needs an answer, and this command does not ask without a terminal",
@@ -565,11 +579,19 @@ async fn prompt(question: &str) -> Result<String, CliError> {
     std::io::stdout()
         .flush()
         .map_err(|error| error.to_string())?;
-    read_answer(|| {
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line).map(|_| line)
-    })
-    .await
+    read_answer(|| read_line(std::io::stdin().lock())).await
+}
+
+/// Reads one line. A closed input is an error rather than an empty answer, so Ctrl-D never reads as Enter.
+fn read_line(mut input: impl std::io::BufRead) -> std::io::Result<String> {
+    let mut line = String::new();
+    match input.read_line(&mut line)? {
+        0 => Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "stdin closed before an answer",
+        )),
+        _ => Ok(line),
+    }
 }
 
 /// Runs the blocking `read` on a thread of its own, so the caller can stop waiting for it: `with_session` ends the
@@ -941,6 +963,7 @@ impl Session {
         if let Some(state) = self.resumable(paths)? {
             return self.finish_deploy(paths, state, device_name).await;
         }
+        crate::telemetry::step(SetupStep::R2Checkout, self.require_r2()).await?;
         let found = self.find_servers().await?;
         if let Some(server) = found.first() {
             return Err(format!(
@@ -981,7 +1004,7 @@ impl Session {
             );
             return self.finish_deploy(paths, state, device_name).await;
         }
-        self.require_r2().await?;
+        crate::telemetry::step(SetupStep::R2Checkout, self.require_r2()).await?;
         let mut found = self.find_servers().await?;
         let server = match found.len() {
             0 => return self.deploy(paths, device_name).await,
@@ -1011,7 +1034,6 @@ impl Session {
     /// Picks a free Worker name and a new bucket name, then deploys and claims a new server (sections 4.3 and 4.4).
     async fn deploy(&mut self, paths: &Paths, device_name: &str) -> Result<(), CliError> {
         let bundle = embedded_bundle()?;
-        self.require_r2().await?;
         let api = self.fresh().await?;
         let scripts: Vec<String> = api
             .scripts(self.account())
@@ -1042,7 +1064,8 @@ impl Session {
         let bundle = embedded_bundle()?;
         let mut key = None;
         if state.step < Step::BucketCreated {
-            create_bucket(self, &file, &mut state).await?;
+            crate::telemetry::step(SetupStep::Bucket, create_bucket(self, &file, &mut state))
+                .await?;
         }
         if state.step < Step::ScriptUploaded {
             keep_script_name(
@@ -1063,15 +1086,15 @@ impl Session {
                 name: state.bucket.clone(),
                 jurisdiction: state.jurisdiction,
             };
-            self.upload(&bundle, &state.script, &bucket, None, Some(&secret))
-                .await?;
+            let upload = self.upload(&bundle, &state.script, &bucket, None, Some(&secret));
+            crate::telemetry::step(SetupStep::Script, upload).await?;
             state.step = Step::ScriptUploaded;
             file.save(&state)?;
             key = Some(secret);
         }
         let url = self.worker_url(&state.script).await?;
         if state.step < Step::Serving {
-            self.serve(&state.script, &url).await?;
+            crate::telemetry::step(SetupStep::Serving, self.serve(&state.script, &url)).await?;
             state.step = Step::Serving;
             file.save(&state)?;
         }
@@ -1090,9 +1113,9 @@ impl Session {
             info: server_info(&url).await,
             url,
         };
-        Claim::new(self, paths, &server, device_name, state, key)
-            .run(Duration::from_secs(60))
-            .await
+        let claim =
+            Claim::new(self, paths, &server, device_name, state, key).run(Duration::from_secs(60));
+        crate::telemetry::step(SetupStep::Claim, claim).await
     }
 
     /// Adds this device to a server that already exists (section 4.5). `interactive` lets it finish a deploy that
@@ -1179,9 +1202,8 @@ impl Session {
                 ..SetupState::default()
             },
         };
-        Claim::new(self, paths, &server, device_name, state, None)
-            .run(window)
-            .await
+        let claim = Claim::new(self, paths, &server, device_name, state, None).run(window);
+        crate::telemetry::step(SetupStep::Claim, claim).await
     }
 
     /// Turns on the Worker's workers.dev route and waits until the server answers there.
@@ -1527,6 +1549,14 @@ mod tests {
 
     use super::fake::{self, ACCOUNT, Fake, Reply, cf, proto, revoked, tokens};
     use super::*;
+
+    #[test]
+    fn a_closed_input_is_not_an_empty_answer() {
+        let closed = read_line(&b""[..]).unwrap_err();
+        assert_eq!(closed.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(read_line(&b"\n"[..]).unwrap(), "\n");
+        assert_eq!(read_line(&b"n\n"[..]).unwrap(), "n\n");
+    }
 
     #[test]
     fn setup_guides_only_on_two_terminals_without_json_or_ci() {
