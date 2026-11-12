@@ -159,6 +159,13 @@ impl Disk {
             .any(|entry| entry.content.as_ref().is_some_and(|c| c.mtime_ns == write))
     }
 
+    pub fn reads(&self, at: &Location, ino: u64, write: i64) -> bool {
+        self.locate(at).is_ok_and(|(place, name)| {
+            self.child(&place, &name) == Some(ino)
+                && (self.entries[&ino].content.as_ref()).is_some_and(|c| c.mtime_ns == write)
+        })
+    }
+
     /// Creates an entry, unless the name is taken.
     pub fn create(&mut self, place: Place, name: &str, content: Option<Content>) -> Option<u64> {
         if self.child(&place, name).is_some() {

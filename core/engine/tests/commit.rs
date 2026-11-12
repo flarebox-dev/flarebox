@@ -864,6 +864,44 @@ fn a_folder_renamed_back_after_its_move_was_renamed_by_the_server_keeps_the_user
 /// Once one is removed, albums is not removed too: the commit layer forgets its S first, then the
 /// effects move it out of the parked directory, and it is created again.
 #[test]
+fn a_parked_file_forked_in_a_build_is_created_only_after_the_effects_move_it_back() {
+    let mut trees = trees(&[(
+        "a",
+        Some(file(ROOT, "x", 2)),
+        Some(file(ROOT, "x", 1)),
+        Some(trashed(file(ROOT, "x", 1))),
+    )]);
+    trees.set_local(
+        "a".into(),
+        LocalNode {
+            parked: true,
+            ..local(file(ROOT, "x", 2), 2)
+        },
+    );
+    trees.revert("a".into());
+    trees.settle();
+    let (mut commits, mut ids, mut effects) =
+        (Commits::default(), IdGen::new(1), Effects::default());
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    trees.settle();
+    let unparked = effects.plan(&trees, &mut ids, NOW).cloned().unwrap();
+    assert!(matches!(
+        &unparked.effect,
+        Effect::Move {
+            from: Location::Parked(_),
+            ..
+        }
+    ));
+    effects.done(&mut trees, &unparked.effect_id, None).unwrap();
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(matches!(
+        &ops(&commit)[..],
+        [op::Op::CreateFile(create)] if create.node_id == unparked.node && create.name == "x"
+    ));
+}
+
+#[test]
 fn a_parked_folder_the_server_lost_is_created_again_after_a_delete_empties_it() {
     let mut trees = trees(&[
         (

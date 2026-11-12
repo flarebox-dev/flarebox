@@ -2435,3 +2435,58 @@ fn a_removal_counts_against_the_files_s_holds_after_it() {
         "11 of 21 files cross the share"
     );
 }
+
+#[test]
+fn a_parked_fork_whose_name_is_taken_is_uploaded_from_the_parked_directory() {
+    let fork = "0190f0a0-0000-7000-8000-0000000000f1";
+    let folder = Folder::new();
+    fs::write(folder.root.join("c.txt"), b"the server's c.txt").unwrap();
+    let held = disk_content(&folder.root.join("c.txt"));
+    folder.seed(
+        &[remote(NODE, "c.txt", Some(held))],
+        &[(NODE, SPACE, "c.txt")],
+        0,
+    );
+    let mut running = folder.start(no_hook()).unwrap();
+    let parked = folder.private("parked");
+    fs::create_dir_all(&parked).unwrap();
+    let entry = parked.join(running.engine.trees.parked_name(fork));
+    fs::write(&entry, b"the person's own c.txt").unwrap();
+    let content = disk_content(&entry);
+    let meta = fs::metadata(&entry).unwrap();
+    batch(&mut running, |trees| {
+        trees.set_local(
+            fork.into(),
+            LocalNode {
+                shape: Shape {
+                    parent: SPACE.into(),
+                    name: "c.txt".into(),
+                    kind: Kind::File,
+                    content: Some(content),
+                },
+                identity: FileIdentity {
+                    dev: meta.dev(),
+                    ino: meta.ino(),
+                    birth_ns: None,
+                },
+                parked: true,
+            },
+        )
+    });
+    let engine = &mut running.engine;
+    let commit = (engine.commits)
+        .build(&mut engine.trees, &mut engine.ids, 1, "history", 2)
+        .cloned()
+        .unwrap();
+    assert!(
+        commit
+            .ops
+            .iter()
+            .any(|op| matches!(&op.op, Some(op::Op::CreateFile(create)) if create.node_id == fork))
+    );
+    let upload = running.disk.upload(&commit, &running.engine);
+    let read: Vec<u8> = (upload.chunks.iter())
+        .flat_map(|chunk| upload.read(chunk).unwrap().to_vec())
+        .collect();
+    assert_eq!(read, b"the person's own c.txt");
+}

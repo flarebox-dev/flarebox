@@ -600,6 +600,12 @@ fn remote_only(trees: &Trees, id: &str) -> bool {
     trees.acknowledged_class(id) == Class::Remote
 }
 
+/// Where the disk holds the entry of the node L holds as `id`: in the parked directory, below a
+/// parked folder, or below the root.
+pub fn location_of(trees: &Trees, id: &str) -> Option<Location> {
+    View::new(trees).location(id)
+}
+
 pub(crate) fn unparks_to(trees: &Trees, id: &str, target: &Shape) -> bool {
     let view = View::new(trees);
     view.blocked(id, target).is_none() && (view.location_in(&target.parent, &target.name)).is_some()
